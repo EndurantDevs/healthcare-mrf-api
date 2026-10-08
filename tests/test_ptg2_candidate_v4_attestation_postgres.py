@@ -27,33 +27,22 @@ from tests.ptg2_attestation_compat_test_support import (
     writer_source_witness_by_field,
 )
 
-
 RAW_CONTAINER_DIGEST = b"\x11" * 32
 MAP_DIGEST = b"\x22" * 32
 
 
 def _v4_identity_and_manifests():
-    source_set_by_field = shared_source_set_metadata(
-        (RAW_CONTAINER_DIGEST.hex(),)
-    )
+    source_set_by_field = shared_source_set_metadata((RAW_CONTAINER_DIGEST.hex(),))
     identity_by_field = writer_identity_by_field()
     identity_by_field.update(
         {
             "storage_generation": "shared_blocks_v4",
-            "source_set_digest": bytes.fromhex(
-                source_set_by_field["raw_container_sha256_digest"]
-            ),
-            "ordered_source_ordinal_digest": ordered_source_ordinal_digest(
-                (RAW_CONTAINER_DIGEST.hex(),)
-            ),
+            "source_set_digest": bytes.fromhex(source_set_by_field["raw_container_sha256_digest"]),
+            "ordered_source_ordinal_digest": ordered_source_ordinal_digest((RAW_CONTAINER_DIGEST.hex(),)),
         }
     )
-    identity_by_field["source_witness_manifest"] = (
-        writer_source_witness_by_field(identity_by_field)
-    )
-    identity_by_field["audit_sample_public"] = (
-        writer_audit_sample_by_field(identity_by_field)
-    )
+    identity_by_field["source_witness_manifest"] = writer_source_witness_by_field(identity_by_field)
+    identity_by_field["audit_sample_public"] = writer_audit_sample_by_field(identity_by_field)
     common_serving_index = {
         "arch_version": "postgres_binary_v3",
         "type": "ptg2_shared_blocks_v4",
@@ -65,9 +54,7 @@ def _v4_identity_and_manifests():
         "coverage_scope_id": identity_by_field["coverage_scope_id"].hex(),
         "source_witness": identity_by_field["source_witness_manifest"],
         "audit_sample": identity_by_field["audit_sample_public"],
-        "provider_identifier_quarantine": identity_by_field[
-            "provider_identifier_quarantine"
-        ],
+        "provider_identifier_quarantine": identity_by_field["provider_identifier_quarantine"],
     }
     snapshot_manifest_by_field = {
         "activation": {
@@ -230,13 +217,10 @@ async def test_real_postgres_v4_candidate_attestation_locks_complete_root(
         pytest.skip("enable the isolated PostgreSQL attestation test")
     schema_name = f"ptg2_v4_attestation_{uuid.uuid4().hex[:16]}"
     quoted_schema = quoted_identifier(schema_name)
-    identity_by_field, snapshot_manifest_by_field, layout_manifest_by_field = (
-        _v4_identity_and_manifests()
-    )
-    report_by_field, evidence_by_field = _v4_report_and_evidence(
-        identity_by_field
-    )
+    identity_by_field, snapshot_manifest_by_field, layout_manifest_by_field = _v4_identity_and_manifests()
+    report_by_field, evidence_by_field = _v4_report_and_evidence(identity_by_field)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+    monkeypatch.setenv("DB_SCHEMA", schema_name)
     monkeypatch.setattr(
         ptg2_candidate_attestation,
         "validate_candidate_release_audit_report",
@@ -253,31 +237,23 @@ async def test_real_postgres_v4_candidate_attestation_locks_complete_root(
             snapshot_manifest_by_field,
             layout_manifest_by_field,
         )
-        assert await _locked_v4_activation_generation(schema_name) == (
-            "shared_blocks_v4"
-        )
-        attestation_result = await (
-            ptg2_candidate_attestation.record_candidate_audit_attestation(
-                snapshot_id="candidate-v4",
-                source_key="source-a",
-                plan_id="12-3456789",
-                plan_market_type="group",
-                report=report_by_field,
-                storage_generation="shared_blocks_v4",
-            )
+        assert await _locked_v4_activation_generation(schema_name) == ("shared_blocks_v4")
+        attestation_result = await ptg2_candidate_attestation.record_candidate_audit_attestation(
+            snapshot_id="candidate-v4",
+            source_key="source-a",
+            plan_id="12-3456789",
+            plan_market_type="group",
+            report=report_by_field,
+            storage_generation="shared_blocks_v4",
         )
         assert attestation_result["status"] == "attested"
-        assert attestation_result["contract"] == (
-            ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
-        )
+        assert attestation_result["contract"] == (ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4)
         await _verify_changed_v4_root_rejection(
             quoted_schema,
             schema_name,
         )
     finally:
         try:
-            await db.execute_ddl(
-                f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
-            )
+            await db.execute_ddl(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
         finally:
             await db.disconnect()

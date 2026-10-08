@@ -34,6 +34,8 @@ async def _validate_partition_binding(
     serving_tables: PTG2ServingTables,
     audit_request: PartitionedCandidateAuditRequest,
     retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+    *,
+    candidate_audit_access: PTG2CandidateAuditAccess | None = None,
 ) -> None:
     """Bind one explicit partition to immutable candidate metadata."""
 
@@ -41,28 +43,16 @@ async def _validate_partition_binding(
     source_witness = serving_tables.source_witness
     audit_sample = serving_tables.audit_sample
     source_count = candidate_batch._required_source_count(serving_tables)
-    if not isinstance(source_witness, Mapping) or not isinstance(
-        audit_sample,
-        Mapping,
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate partition requires sealed audit metadata"
-        )
+    if not isinstance(source_witness, Mapping) or not isinstance(audit_sample, Mapping):
+        raise PTG2ManifestArtifactError("PTG2 candidate partition requires sealed audit metadata")
     if (
-        int(source_witness.get("occurrence_witness_count") or -1)
-        != binding.source_occurrence_count
-        or str(source_witness.get("sample_digest") or "")
-        != binding.source_witness_sample_digest
-        or str(source_witness.get("payload_sha256") or "")
-        != binding.source_witness_payload_sha256
-        or int(audit_sample.get("sample_count") or -1)
-        != binding.persisted_occurrence_count
-        or str(audit_sample.get("sample_digest") or "")
-        != binding.audit_sample_digest
+        int(source_witness.get("occurrence_witness_count") or -1) != binding.source_occurrence_count
+        or str(source_witness.get("sample_digest") or "") != binding.source_witness_sample_digest
+        or str(source_witness.get("payload_sha256") or "") != binding.source_witness_payload_sha256
+        or int(audit_sample.get("sample_count") or -1) != binding.persisted_occurrence_count
+        or str(audit_sample.get("sample_digest") or "") != binding.audit_sample_digest
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate partition disagrees with sealed audit metadata"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate partition disagrees with sealed audit metadata")
     try:
         observed_identity = await fetch_snapshot_source_set_identity(
             session,
@@ -70,6 +60,8 @@ async def _validate_partition_binding(
             logical_snapshot_id=binding.snapshot_id,
             expected_source_count=source_count,
             retention_budget=retention_budget,
+            serving_tables=serving_tables,
+            candidate_audit_access=candidate_audit_access,
         )
         observed_source_set, observed_ordinal_digest, _ = observed_identity
     except PTG2SharedBlockError as exc:
@@ -86,9 +78,7 @@ async def _validate_partition_binding(
         or observed_ordinal_digest != binding.ordered_source_ordinal_digest
         or has_invalid_source_key
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate partition source scope is invalid"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate partition source scope is invalid")
 
 
 def _partition_challenges(
@@ -131,9 +121,7 @@ def _candidate_partition_result(
 ) -> candidate_batch.CandidateAuditBatchResult:
     persisted_count = audit_data.persisted_audit_occurrence_count
     return candidate_batch.CandidateAuditBatchResult(
-        matched_challenge_count=sum(
-            challenge.multiplicity for challenge in audit_data.challenges
-        ),
+        matched_challenge_count=sum(challenge.multiplicity for challenge in audit_data.challenges),
         unique_challenge_count=len(audit_data.challenges),
         witness_io={},
         candidate_processing_io=audit_data.candidate_processing_io,
@@ -158,14 +146,10 @@ async def audit_candidate_partition(
     ):
         raise PTG2ManifestArtifactError("PTG2 candidate audit access mismatch")
     retention_budget = CandidateAuditDecodedRetentionBudget(
-        maximum_bytes=(
-            PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES
-        )
+        maximum_bytes=(PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES)
     )
     bind_shared_block_decoded_retention_budget(retention_budget)
-    await session.execute(
-        text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-    )
+    await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
     serving_tables = await candidate_batch.snapshot_serving_tables(
         session,
         binding.snapshot_id,
@@ -176,25 +160,19 @@ async def audit_candidate_partition(
         serving_tables,
         audit_request,
         retention_budget,
+        candidate_audit_access=access,
     )
     audit_data = await candidate_batch._candidate_data_for_conditions(
         session,
         serving_tables,
         access,
         challenges=_partition_challenges(audit_request),
-        persisted_audit_occurrences=_partition_persisted_occurrences(
-            audit_request
-        ),
+        persisted_audit_occurrences=_partition_persisted_occurrences(audit_request),
         witness_io={},
         retention_budget=retention_budget,
     )
-    if any(
-        not candidate_batch._is_challenge_match(challenge, audit_data)
-        for challenge in audit_data.challenges
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate source witness is missing from the sealed serving layout"
-        )
+    if any(not candidate_batch._is_challenge_match(challenge, audit_data) for challenge in audit_data.challenges):
+        raise PTG2ManifestArtifactError("PTG2 candidate source witness is missing from the sealed serving layout")
     return _candidate_partition_result(audit_data)
 
 

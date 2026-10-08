@@ -16,15 +16,9 @@ def _tables(*, uses_v4: bool) -> PTG2ServingTables:
     return PTG2ServingTables(
         arch_version="postgres_binary_v3",
         shared_snapshot_key=17,
-        storage_generation=(
-            "shared_blocks_v4" if uses_v4 else "shared_blocks_v3"
-        ),
+        storage_generation=("shared_blocks_v4" if uses_v4 else "shared_blocks_v3"),
         cold_lookup_contract="ptg_v3_cold_v2",
-        shared_block_layout=(
-            "packed_snapshot_maps_v4"
-            if uses_v4
-            else "dense_shared_blocks_v3"
-        ),
+        shared_block_layout=("packed_snapshot_maps_v4" if uses_v4 else "dense_shared_blocks_v3"),
         source_count=1,
     )
 
@@ -125,7 +119,7 @@ async def test_provider_procedure_entrypoint_owns_one_v4_scope(
 
     monkeypatch.setattr(
         serving,
-        "snapshot_serving_tables",
+        "read_serving_tables",
         AsyncMock(return_value=_tables(uses_v4=True)),
     )
     monkeypatch.setattr(

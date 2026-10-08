@@ -82,6 +82,10 @@ class _RecordingDB:
 
     async def scalar(self, statement, **_params):
         self.events.append(statement)
+        if "SELECT c.relowner FROM pg_class" in statement and "hp_snapshot_retention" in statement:
+            return None
+        if "SELECT EXISTS(SELECT 1 FROM pg_class" in statement and "hp_snapshot_retention" in statement:
+            return False
         if "to_regclass(:relation) IS NOT NULL" in statement:
             return False
         if "SELECT c.relpersistence::text" in statement:
@@ -99,10 +103,7 @@ class _RecordingDB:
         if "pg_depend AS dependency" in statement:
             return self.dependent_views
         assert "ORDER BY c.relname" in statement
-        return [
-            (name,)
-            for name in sorted(set(params["relation_names"]) & self.existing_names)
-        ]
+        return [(name,) for name in sorted(set(params["relation_names"]) & self.existing_names)]
 
     async def first(self, statement, **_params):
         if "address_alias_state_v1" in statement:
@@ -150,8 +151,7 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
     assert recording_db.statements[0] == "ANALYZE mrf.entity_address_unified_stage;"
     assert recording_db.statements[1] == "SET LOCAL lock_timeout = '50ms';"
     assert recording_db.statements[2] == (
-        "LOCK TABLE mrf.entity_address_unified, mrf.entity_address_unified_stage "
-        "IN ACCESS EXCLUSIVE MODE NOWAIT;"
+        "LOCK TABLE mrf.entity_address_unified, mrf.entity_address_unified_stage IN ACCESS EXCLUSIVE MODE NOWAIT;"
     )
     assert recording_db.statements[3:6] == [
         "DROP TABLE IF EXISTS mrf.entity_address_unified_old;",
@@ -178,17 +178,12 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
     generation_at = recording_db.events.index("result generation published")
     assert stage_rename_at < activation_at < generation_at
     dependency_check_at = next(
-        index
-        for index, statement in enumerate(recording_db.events)
-        if "pg_depend AS dependency" in statement
+        index for index, statement in enumerate(recording_db.events) if "pg_depend AS dependency" in statement
     )
     lock_at = recording_db.events.index(
-        "LOCK TABLE mrf.entity_address_unified, mrf.entity_address_unified_stage "
-        "IN ACCESS EXCLUSIVE MODE NOWAIT;"
+        "LOCK TABLE mrf.entity_address_unified, mrf.entity_address_unified_stage IN ACCESS EXCLUSIVE MODE NOWAIT;"
     )
-    drop_at = recording_db.events.index(
-        "DROP TABLE IF EXISTS mrf.entity_address_unified_old;"
-    )
+    drop_at = recording_db.events.index("DROP TABLE IF EXISTS mrf.entity_address_unified_old;")
     assert lock_at < dependency_check_at < drop_at
 
 
@@ -226,9 +221,7 @@ async def test_partial_evidence_patch_is_bound_to_main_generation_swap(monkeypat
         "ALTER TABLE mrf.entity_address_unified_stage RENAME TO entity_address_unified;"
     )
     delete_at = recording_db.events.index("DELETE FROM mrf.entity_address_evidence;")
-    insert_at = recording_db.events.index(
-        "INSERT INTO mrf.entity_address_evidence SELECT 1;"
-    )
+    insert_at = recording_db.events.index("INSERT INTO mrf.entity_address_evidence SELECT 1;")
     activation_at = next(
         index
         for index, statement in enumerate(recording_db.events)

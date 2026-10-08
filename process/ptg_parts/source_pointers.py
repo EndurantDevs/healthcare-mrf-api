@@ -139,16 +139,12 @@ def candidate_snapshot_attributes(
     """Return immutable-layout metadata that is validated but not live."""
 
     candidate_attributes_by_name = dict(snapshot_attributes)
-    manifest = _manifest_mapping(
-        candidate_attributes_by_name.get("manifest")
-    )
+    manifest = _manifest_mapping(candidate_attributes_by_name.get("manifest"))
     manifest["activation"] = {
         "contract": PTG2_CANDIDATE_ACTIVATION_CONTRACT,
         "state": "validated",
         "source_key": str(source_key),
-        "expected_previous_snapshot_id": (
-            str(previous_snapshot_id) if previous_snapshot_id else None
-        ),
+        "expected_previous_snapshot_id": (str(previous_snapshot_id) if previous_snapshot_id else None),
     }
     candidate_attributes_by_name.update(
         {
@@ -170,9 +166,7 @@ def activated_snapshot_attributes(
     """Return the published state written atomically with live pointers."""
 
     activated_attributes_by_name = dict(candidate_attributes)
-    manifest = _manifest_mapping(
-        activated_attributes_by_name.get("manifest")
-    )
+    manifest = _manifest_mapping(activated_attributes_by_name.get("manifest"))
     activation = _manifest_mapping(manifest.get("activation"))
     if activation.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT:
         raise ValueError("strict V3 snapshot is missing its candidate activation contract")
@@ -295,17 +289,11 @@ async def _source_plan_rows(
     )
     plan_pointer_entries: list[dict[str, Any]] = []
     for plan_scope_record in plan_scope_records:
-        plan_scope_by_field = (
-            plan_scope_record
-            if isinstance(plan_scope_record, dict)
-            else plan_scope_record._mapping
-        )
+        plan_scope_by_field = plan_scope_record if isinstance(plan_scope_record, dict) else plan_scope_record._mapping
         plan_id = str(plan_scope_by_field.get("plan_id") or "").strip()
         if not plan_id:
             continue
-        plan_market_type = str(
-            plan_scope_by_field.get("plan_market_type") or ""
-        ).strip().lower()
+        plan_market_type = str(plan_scope_by_field.get("plan_market_type") or "").strip().lower()
         plan_pointer_entries.append(
             _plan_pointer_entry(
                 plan_id=plan_id,
@@ -381,11 +369,7 @@ async def _compare_and_swap_source_pointer(
 ) -> None:
     """Atomically replace a source pointer at its expected value."""
     cas_query_result = await session.execute(
-        db.text(
-            _SOURCE_POINTER_CAS_SQL.format(
-                schema=_quote_ident(schema_name)
-            )
-        ),
+        db.text(_SOURCE_POINTER_CAS_SQL.format(schema=_quote_ident(schema_name))),
         {
             "source_key": source_key,
             "snapshot_id": snapshot_id,
@@ -454,8 +438,7 @@ async def _stage_snapshot_in_pointer_transaction(
     )
     if not _has_result_row(staging_result):
         raise RuntimeError(
-            f"PTG snapshot {snapshot_attributes.get('snapshot_id')} could not be "
-            "staged as a validated candidate"
+            f"PTG snapshot {snapshot_attributes.get('snapshot_id')} could not be staged as a validated candidate"
         )
 
 
@@ -523,21 +506,13 @@ async def _publish_snapshot_in_pointer_transaction(
     activation = _manifest_mapping(manifest.get("activation"))
     if activation.get("contract") == PTG2_CANDIDATE_ACTIVATION_CONTRACT:
         publication_query_result = await session.execute(
-            db.text(
-                _AUDITED_CANDIDATE_PUBLICATION_SQL.format(
-                    schema=_quote_ident(schema_name)
-                )
-            ),
+            db.text(_AUDITED_CANDIDATE_PUBLICATION_SQL.format(schema=_quote_ident(schema_name))),
             {
                 "snapshot_id": snapshot_attributes["snapshot_id"],
                 "status": snapshot_attributes["status"],
                 "published_at": snapshot_attributes["published_at"],
-                "previous_snapshot_id": snapshot_attributes.get(
-                    "previous_snapshot_id"
-                ),
-                "candidate_activation_contract": (
-                    PTG2_CANDIDATE_ACTIVATION_CONTRACT
-                ),
+                "previous_snapshot_id": snapshot_attributes.get("previous_snapshot_id"),
+                "candidate_activation_contract": (PTG2_CANDIDATE_ACTIVATION_CONTRACT),
                 "activation_json": json.dumps(activation, default=str),
             },
         )
@@ -548,11 +523,7 @@ async def _publish_snapshot_in_pointer_transaction(
             )
         return
     publication_query_result = await session.execute(
-        db.text(
-            _LEGACY_SNAPSHOT_PUBLICATION_SQL.format(
-                schema=_quote_ident(schema_name)
-            )
-        ),
+        db.text(_LEGACY_SNAPSHOT_PUBLICATION_SQL.format(schema=_quote_ident(schema_name))),
         {
             **snapshot_attributes,
             "candidate_activation_contract": PTG2_CANDIDATE_ACTIVATION_CONTRACT,
@@ -564,8 +535,7 @@ async def _publish_snapshot_in_pointer_transaction(
     )
     if not _has_result_row(publication_query_result):
         raise RuntimeError(
-            f"PTG snapshot {snapshot_attributes.get('snapshot_id')} disappeared "
-            "during source-pointer promotion"
+            f"PTG snapshot {snapshot_attributes.get('snapshot_id')} disappeared during source-pointer promotion"
         )
 
 
@@ -589,9 +559,7 @@ async def _reconcile_global_snapshot_pointer(
         },
     )
     if not _has_result_row(reconciliation_result):
-        raise RuntimeError(
-            f"PTG snapshot {snapshot_id} was not available for global pointer reconciliation"
-        )
+        raise RuntimeError(f"PTG snapshot {snapshot_id} was not available for global pointer reconciliation")
 
 
 async def _attempt_global_snapshot_pointer_reconciliation(
@@ -617,9 +585,7 @@ async def _attempt_global_snapshot_pointer_reconciliation(
                 updated_at=updated_at,
             )
     except Exception as exc:
-        if not isinstance(exc, PTG2LifecycleLockDeferred) and not (
-            is_retryable_lifecycle_database_error(exc)
-        ):
+        if not isinstance(exc, PTG2LifecycleLockDeferred) and not (is_retryable_lifecycle_database_error(exc)):
             logger.warning(
                 "Deferred legacy PTG global pointer projection for %s: %s",
                 snapshot_id,
@@ -637,9 +603,7 @@ async def _replace_source_plan_pointers(
     plan_pointer_entries: list[dict[str, Any]],
 ) -> None:
     await session.execute(
-        db.text(
-            f"DELETE FROM {_quote_ident(schema_name)}.ptg2_current_plan_source WHERE source_key = :source_key"
-        ),
+        db.text(f"DELETE FROM {_quote_ident(schema_name)}.ptg2_current_plan_source WHERE source_key = :source_key"),
         {"source_key": source_key},
     )
     for plan_pointer_entry in plan_pointer_entries:
@@ -668,16 +632,8 @@ def _coverage_plan_identity(scope: Any) -> tuple[str, str]:
     """Normalize one logical plan scope into its immutable identity."""
 
     return (
-        str(
-            scope.get("plan_id")
-            if isinstance(scope, Mapping)
-            else getattr(scope, "plan_id", "")
-        ).strip(),
-        str(
-            scope.get("plan_market_type")
-            if isinstance(scope, Mapping)
-            else getattr(scope, "plan_market_type", "")
-        )
+        str(scope.get("plan_id") if isinstance(scope, Mapping) else getattr(scope, "plan_id", "")).strip(),
+        str(scope.get("plan_market_type") if isinstance(scope, Mapping) else getattr(scope, "plan_market_type", ""))
         .strip()
         .lower(),
     )
@@ -692,31 +648,20 @@ def _validated_coverage_plans(
     """Cross-check pointer plans against the sealed coverage-plan set."""
 
     distinct_plans = {
-        _coverage_plan_identity(entry)
-        for entry in plan_pointer_entries
-        if _coverage_plan_identity(entry)[0]
+        _coverage_plan_identity(entry) for entry in plan_pointer_entries if _coverage_plan_identity(entry)[0]
     }
     if not distinct_plans:
-        raise RuntimeError(
-            "strict V3 snapshot has no logical plan for its coverage scope"
-        )
+        raise RuntimeError("strict V3 snapshot has no logical plan for its coverage scope")
     expected_plans = (
-        {
-            _coverage_plan_identity(scope)
-            for scope in coverage_plan_scopes
-        }
+        {_coverage_plan_identity(scope) for scope in coverage_plan_scopes}
         if coverage_plan_scopes is not None
         else set(distinct_plans)
     )
     expected_plans = {plan for plan in expected_plans if plan[0]}
     if not expected_plans:
-        raise ValueError(
-            "strict V3 publication requires logical coverage plans"
-        )
+        raise ValueError("strict V3 publication requires logical coverage plans")
     if distinct_plans != expected_plans:
-        raise RuntimeError(
-            f"PTG snapshot {snapshot_id} plan pointers do not match its immutable coverage scope"
-        )
+        raise RuntimeError(f"PTG snapshot {snapshot_id} plan pointers do not match its immutable coverage scope")
     return expected_plans
 
 
@@ -755,10 +700,7 @@ SELECT plan_id, plan_market_type
 def _observed_coverage_plans(
     scope_records: Sequence[Any],
 ) -> set[tuple[str, str]]:
-    return {
-        _coverage_plan_identity(_row_mapping(scope_record))
-        for scope_record in scope_records
-    }
+    return {_coverage_plan_identity(_row_mapping(scope_record)) for scope_record in scope_records}
 
 
 async def _bind_snapshot_coverage_scope(
@@ -783,9 +725,7 @@ async def _bind_snapshot_coverage_scope(
     primary_plan_id, primary_plan_market_type = min(expected_plans)
     schema = _quote_ident(schema_name)
     scope_upsert_query = await session.execute(
-        db.text(
-            _SNAPSHOT_SCOPE_UPSERT_SQL.format(schema=schema)
-        ),
+        db.text(_SNAPSHOT_SCOPE_UPSERT_SQL.format(schema=schema)),
         {
             "snapshot_id": snapshot_id,
             "plan_id": primary_plan_id,
@@ -794,13 +734,9 @@ async def _bind_snapshot_coverage_scope(
         },
     )
     if not _has_result_row(scope_upsert_query):
-        raise RuntimeError(
-            f"PTG snapshot {snapshot_id} is already bound to another physical coverage scope"
-        )
+        raise RuntimeError(f"PTG snapshot {snapshot_id} is already bound to another physical coverage scope")
     await session.execute(
-        db.text(
-            _SNAPSHOT_PLAN_SCOPE_INSERT_SQL.format(schema=schema)
-        ),
+        db.text(_SNAPSHOT_PLAN_SCOPE_INSERT_SQL.format(schema=schema)),
         [
             {
                 "snapshot_id": snapshot_id,
@@ -811,16 +747,12 @@ async def _bind_snapshot_coverage_scope(
         ],
     )
     observed_scope_records = await session.execute(
-        db.text(
-            _SNAPSHOT_PLAN_SCOPE_SELECT_SQL.format(schema=schema)
-        ),
+        db.text(_SNAPSHOT_PLAN_SCOPE_SELECT_SQL.format(schema=schema)),
         {"snapshot_id": snapshot_id},
     )
     observed_plans = _observed_coverage_plans(observed_scope_records)
     if observed_plans != expected_plans:
-        raise RuntimeError(
-            f"PTG snapshot {snapshot_id} has stale logical coverage-scope mappings"
-        )
+        raise RuntimeError(f"PTG snapshot {snapshot_id} has stale logical coverage-scope mappings")
 
 
 def _candidate_stage_plan_entries(
@@ -942,12 +874,9 @@ async def _locked_snapshot_publication_row(
 
 
 def _needs_audited_candidate_activation(snapshot: dict[str, Any]) -> bool:
-    activation = _manifest_mapping(
-        _manifest_mapping(snapshot.get("manifest")).get("activation")
-    )
+    activation = _manifest_mapping(_manifest_mapping(snapshot.get("manifest")).get("activation"))
     return (
-        str(snapshot.get("status") or "").strip().lower()
-        == PTG2_STATUS_VALIDATED
+        str(snapshot.get("status") or "").strip().lower() == PTG2_STATUS_VALIDATED
         and activation.get("contract") == PTG2_CANDIDATE_ACTIVATION_CONTRACT
     )
 
@@ -1015,9 +944,7 @@ async def _locked_candidate_activation_row(
 
 
 async def _database_utc_timestamp(session: Any) -> datetime.datetime:
-    result = await session.execute(
-        db.text("SELECT timezone('UTC', clock_timestamp())")
-    )
+    result = await session.execute(db.text("SELECT timezone('UTC', clock_timestamp())"))
     timestamp = result.scalar_one()
     if not isinstance(timestamp, datetime.datetime):
         raise RuntimeError("PostgreSQL did not return an activation timestamp")
@@ -1032,23 +959,15 @@ def _candidate_storage_generation(
 
     serving_index = _manifest_mapping(manifest.get("serving_index"))
     layout_generation = normalize_candidate_storage_generation(
-        candidate.get("storage_generation")
-        or PTG2_CANDIDATE_V3_GENERATION
+        candidate.get("storage_generation") or PTG2_CANDIDATE_V3_GENERATION
     )
     manifest_generation = serving_index.get("storage_generation")
     if manifest_generation is None:
         if layout_generation != PTG2_CANDIDATE_V3_GENERATION:
-            raise ValueError(
-                "snapshot storage generation is missing from its sealed manifest"
-            )
+            raise ValueError("snapshot storage generation is missing from its sealed manifest")
         return layout_generation
-    if (
-        normalize_candidate_storage_generation(manifest_generation)
-        != layout_generation
-    ):
-        raise ValueError(
-            "snapshot storage generation does not match its sealed layout"
-        )
+    if normalize_candidate_storage_generation(manifest_generation) != layout_generation:
+        raise ValueError("snapshot storage generation does not match its sealed layout")
     return layout_generation
 
 
@@ -1065,30 +984,20 @@ def _validated_activation_identity(
     manifest = _manifest_mapping(candidate.get("manifest"))
     activation = _manifest_mapping(manifest.get("activation"))
     storage_generation = _candidate_storage_generation(candidate, manifest)
-    if (
-        activation.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT
-        or activation.get("state") != "validated"
-    ):
+    if activation.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT or activation.get("state") != "validated":
         raise ValueError("snapshot is missing its strict activation contract")
     normalized_source_key = str(source_key or "").strip().lower()
     if str(activation.get("source_key") or "").strip().lower() != normalized_source_key:
         raise ValueError("snapshot source_key does not match requested source_key")
-    previous_snapshot_id = (
-        str(activation.get("expected_previous_snapshot_id") or "").strip() or None
-    )
-    row_previous_snapshot_id = (
-        str(candidate.get("previous_snapshot_id") or "").strip() or None
-    )
+    previous_snapshot_id = str(activation.get("expected_previous_snapshot_id") or "").strip() or None
+    row_previous_snapshot_id = str(candidate.get("previous_snapshot_id") or "").strip() or None
     if row_previous_snapshot_id != previous_snapshot_id:
-        raise ValueError(
-            "candidate predecessor disagrees with its immutable activation contract"
-        )
-    if expected_current_snapshot_id is not None and (
-        str(expected_current_snapshot_id or "").strip() or None
-    ) != previous_snapshot_id:
-        raise PTG2SourcePointerConflict(
-            "requested predecessor does not match the candidate"
-        )
+        raise ValueError("candidate predecessor disagrees with its immutable activation contract")
+    if (
+        expected_current_snapshot_id is not None
+        and (str(expected_current_snapshot_id or "").strip() or None) != previous_snapshot_id
+    ):
+        raise PTG2SourcePointerConflict("requested predecessor does not match the candidate")
     plan_id = str(candidate.get("plan_id") or "").strip()
     plan_market_type = str(candidate.get("plan_market_type") or "").strip().lower()
     coverage_scope_id = bytes(candidate.get("coverage_scope_id") or b"")
@@ -1131,27 +1040,16 @@ def _validated_allowed_activation_identity(
     }
     for field_name, required_value in required_contract_by_field.items():
         if allowed_index.get(field_name) != required_value:
-            raise ValueError(
-                "candidate allowed-amount index has an invalid "
-                f"{field_name} binding"
-            )
+            raise ValueError(f"candidate allowed-amount index has an invalid {field_name} binding")
     if allowed_index.get("snapshot_scoped") is not True:
-        raise ValueError(
-            "candidate allowed-amount index is not snapshot scoped"
-        )
+        raise ValueError("candidate allowed-amount index is not snapshot scoped")
     try:
         payment_count = int(allowed_index.get("allowed_amount_payments") or 0)
     except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "candidate allowed-amount payment count is invalid"
-        ) from exc
+        raise ValueError("candidate allowed-amount payment count is invalid") from exc
     if not allowed_index.get("allowed_amount_evidence") or payment_count <= 0:
-        raise ValueError(
-            "candidate allowed-amount index has no payment evidence"
-        )
-    previous_snapshot_id = (
-        str(allowed_index.get("previous_snapshot_id") or "").strip() or None
-    )
+        raise ValueError("candidate allowed-amount index has no payment evidence")
+    previous_snapshot_id = str(allowed_index.get("previous_snapshot_id") or "").strip() or None
     return {
         "source_key": current_source_key,
         "previous_snapshot_id": previous_snapshot_id,
@@ -1178,9 +1076,7 @@ async def activate_ptg2_source_candidate(
         source_key=normalized_source_key,
         snapshot_id=normalized_snapshot_id,
         expected_current_snapshot_id=expected_current_snapshot_id,
-        expected_audit_only_attestation_digest=(
-            expected_audit_only_attestation_digest
-        ),
+        expected_audit_only_attestation_digest=(expected_audit_only_attestation_digest),
         rollback_owner_id=rollback_owner_id,
     )
     return await _attach_legacy_global_pointer_status(
@@ -1208,9 +1104,7 @@ async def _commit_candidate_activation(
             source_key=source_key,
             snapshot_id=snapshot_id,
             expected_current_snapshot_id=expected_current_snapshot_id,
-            expected_audit_only_attestation_digest=(
-                expected_audit_only_attestation_digest
-            ),
+            expected_audit_only_attestation_digest=(expected_audit_only_attestation_digest),
             rollback_owner_id=rollback_owner_id,
         )
 
@@ -1227,9 +1121,7 @@ async def _attach_legacy_global_pointer_status(
         max_requests=1,
         source_key=source_key,
     )
-    global_pointer_status = (
-        "reconciled" if drain.reconciled == 1 else "deferred"
-    )
+    global_pointer_status = "reconciled" if drain.reconciled == 1 else "deferred"
     if "global_pointer" in activation_by_field:
         activation_by_field["global_pointer"] = global_pointer_status
     return activation_by_field
@@ -1268,12 +1160,8 @@ async def _candidate_plan_pointer_entries(
     )
     plan_pointer_entries = [
         _plan_pointer_entry(
-            plan_id=str(
-                _row_mapping(plan_scope_record).get("plan_id") or ""
-            ),
-            plan_market_type=str(
-                _row_mapping(plan_scope_record).get("plan_market_type") or ""
-            ),
+            plan_id=str(_row_mapping(plan_scope_record).get("plan_id") or ""),
+            plan_market_type=str(_row_mapping(plan_scope_record).get("plan_market_type") or ""),
             import_month=import_month,
             source_key=source_key,
             snapshot_id=snapshot_id,
@@ -1343,39 +1231,29 @@ async def _activate_candidate_source_pointer(
 ) -> bytes:
     activation_by_field = activation_context.activation_by_field
     if expected_audit_only_attestation_digest is None:
-        audit_report_digest = (
-            await verify_candidate_audit_attestation_in_transaction(
-                session,
-                schema_name=schema_name,
-                snapshot_id=snapshot_id,
-                snapshot_key=activation_by_field["snapshot_key"],
-                source_key=source_key,
-                plan_id=activation_by_field["plan_id"],
-                plan_market_type=activation_by_field["plan_market_type"],
-                coverage_scope_id=activation_by_field["coverage_scope_id"],
-            )
+        audit_report_digest = await verify_candidate_audit_attestation_in_transaction(
+            session,
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+            snapshot_key=activation_by_field["snapshot_key"],
+            source_key=source_key,
+            plan_id=activation_by_field["plan_id"],
+            plan_market_type=activation_by_field["plan_market_type"],
+            coverage_scope_id=activation_by_field["coverage_scope_id"],
         )
     else:
-        audit_report_digest = (
-            await verify_held_candidate_attestation_in_transaction(
-                session,
-                schema_name=schema_name,
-                snapshot_id=snapshot_id,
-                expected_identity_by_field={
-                    "snapshot_key": activation_by_field["snapshot_key"],
-                    "source_key": source_key,
-                    "plan_id": activation_by_field["plan_id"],
-                    "plan_market_type": activation_by_field[
-                        "plan_market_type"
-                    ],
-                    "coverage_scope_id": activation_by_field[
-                        "coverage_scope_id"
-                    ],
-                },
-                expected_attestation_digest=(
-                    expected_audit_only_attestation_digest
-                ),
-            )
+        audit_report_digest = await verify_held_candidate_attestation_in_transaction(
+            session,
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+            expected_identity_by_field={
+                "snapshot_key": activation_by_field["snapshot_key"],
+                "source_key": source_key,
+                "plan_id": activation_by_field["plan_id"],
+                "plan_market_type": activation_by_field["plan_market_type"],
+                "coverage_scope_id": activation_by_field["coverage_scope_id"],
+            },
+            expected_attestation_digest=(expected_audit_only_attestation_digest),
         )
     await _compare_and_swap_source_pointer(
         session,
@@ -1405,9 +1283,7 @@ async def _promote_allowed_amount_pointer(
         schema_name=schema_name,
         source_key=allowed_activation_by_field["source_key"],
         snapshot_id=snapshot_id,
-        previous_snapshot_id=allowed_activation_by_field[
-            "previous_snapshot_id"
-        ],
+        previous_snapshot_id=allowed_activation_by_field["previous_snapshot_id"],
         import_month=activation_context.import_month,
         updated_at=activation_context.activated_at,
         allow_already_current=False,
@@ -1416,9 +1292,7 @@ async def _promote_allowed_amount_pointer(
         "status": "promoted",
         "source_key": allowed_activation_by_field["source_key"],
         "snapshot_id": snapshot_id,
-        "previous_snapshot_id": allowed_activation_by_field[
-            "previous_snapshot_id"
-        ],
+        "previous_snapshot_id": allowed_activation_by_field["previous_snapshot_id"],
     }
 
 
@@ -1463,22 +1337,16 @@ async def _persist_candidate_activation(
 ) -> None:
     """Publish pointers and consume the exact attestation in one transaction."""
 
-    is_reviewed_audit_only = (
-        expected_audit_only_attestation_digest is not None
-    )
-    activation_mode = (
-        "reviewed_audit_only_control"
-        if is_reviewed_audit_only
-        else "audited_control"
-    )
+    is_reviewed_audit_only = expected_audit_only_attestation_digest is not None
+    activation_mode = "reviewed_audit_only_control" if is_reviewed_audit_only else "audited_control"
     snapshot_attributes = _activated_candidate_attributes(
         activation_context,
         activation_mode=activation_mode,
     )
     if is_reviewed_audit_only and activation_context.activation_by_field["previous_snapshot_id"] is None:
-        snapshot_attributes["manifest"]["activation"]["first_publication_owner_id"] = (
-            str(rollback_owner_id or "").strip()
-        )
+        snapshot_attributes["manifest"]["activation"]["first_publication_owner_id"] = str(
+            rollback_owner_id or ""
+        ).strip()
     await _publish_snapshot_in_pointer_transaction(
         session,
         schema_name=schema_name,
@@ -1501,9 +1369,7 @@ async def _persist_candidate_activation(
             if is_reviewed_audit_only
             else PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE
         ),
-        expected_attestation_digest=(
-            expected_audit_only_attestation_digest
-        ),
+        expected_attestation_digest=(expected_audit_only_attestation_digest),
     )
 
 
@@ -1519,12 +1385,8 @@ def _candidate_activation_result(
         "status": "promoted",
         "source_key": source_key,
         "snapshot_id": snapshot_id,
-        "storage_generation": activation_context.activation_by_field[
-            "storage_generation"
-        ],
-        "previous_snapshot_id": activation_context.activation_by_field[
-            "previous_snapshot_id"
-        ],
+        "storage_generation": activation_context.activation_by_field["storage_generation"],
+        "previous_snapshot_id": activation_context.activation_by_field["previous_snapshot_id"],
         "plan_source_count": len(activation_context.plan_pointer_entries),
         "global_pointer": "pending_compatibility_projection",
     }
@@ -1555,9 +1417,11 @@ async def _activate_source_candidate_tx(
         snapshot_id=snapshot_id,
         expected_current_snapshot_id=expected_current_snapshot_id,
     )
-    if expected_audit_only_attestation_digest is not None and (
-        str(expected_current_snapshot_id or "").strip() or None
-    ) != activation_context.activation_by_field["previous_snapshot_id"]:
+    if (
+        expected_audit_only_attestation_digest is not None
+        and (str(expected_current_snapshot_id or "").strip() or None)
+        != activation_context.activation_by_field["previous_snapshot_id"]
+    ):
         raise PTG2SourcePointerConflict("requested predecessor does not match the candidate")
     await pin_reviewed_activation_predecessor(
         session,
@@ -1565,9 +1429,7 @@ async def _activate_source_candidate_tx(
         activation_by_field=activation_context.activation_by_field,
         activated_at=activation_context.activated_at,
         rollback_owner_id=rollback_owner_id,
-        is_reviewed_audit_only=(
-            expected_audit_only_attestation_digest is not None
-        ),
+        is_reviewed_audit_only=(expected_audit_only_attestation_digest is not None),
     )
     return await _complete_candidate_activation(
         session,
@@ -1575,9 +1437,7 @@ async def _activate_source_candidate_tx(
         source_key=source_key,
         snapshot_id=snapshot_id,
         activation_context=activation_context,
-        expected_audit_only_attestation_digest=(
-            expected_audit_only_attestation_digest
-        ),
+        expected_audit_only_attestation_digest=(expected_audit_only_attestation_digest),
         rollback_owner_id=rollback_owner_id,
     )
 
@@ -1600,9 +1460,7 @@ async def _complete_candidate_activation(
         source_key=source_key,
         snapshot_id=snapshot_id,
         activation_context=activation_context,
-        expected_audit_only_attestation_digest=(
-            expected_audit_only_attestation_digest
-        ),
+        expected_audit_only_attestation_digest=(expected_audit_only_attestation_digest),
     )
     allowed_pointer_by_field = await _promote_allowed_amount_pointer(
         session,
@@ -1617,9 +1475,7 @@ async def _complete_candidate_activation(
         snapshot_id=snapshot_id,
         activation_context=activation_context,
         audit_report_digest=audit_report_digest,
-        expected_audit_only_attestation_digest=(
-            expected_audit_only_attestation_digest
-        ),
+        expected_audit_only_attestation_digest=(expected_audit_only_attestation_digest),
         rollback_owner_id=rollback_owner_id,
     )
     return _candidate_activation_result(
@@ -1730,6 +1586,7 @@ async def activate_ptg2_candidate_in_transaction(
         source_key=source_key,
         snapshot_id=snapshot_id,
     )
+    await _require_canonical_candidate_activation(session, normalized_schema_name, normalized_snapshot_id)
     await _acquire_source_pointer_gc_lock(
         session,
         source_key=normalized_source_key,
@@ -1761,6 +1618,19 @@ async def activate_ptg2_candidate_in_transaction(
     return activation_result
 
 
+async def _require_canonical_candidate_activation(session, schema_name, snapshot_id):
+    """Ordinary activation never substitutes canonical metadata for protected local custody."""
+    declaration = await session.scalar(
+        db.text(
+            f"SELECT manifest::jsonb ? 'physical_binding_contract' OR manifest::jsonb ? 'local_data_preparation' "
+            f"FROM {_quote_ident(schema_name)}.ptg2_snapshot WHERE snapshot_id=:snapshot_id"
+        ),
+        {"snapshot_id": snapshot_id},
+    )
+    if declaration is True:
+        raise ValueError("snapshot-local candidates require protected installed publication")
+
+
 activate_ptg2_source_candidate_in_transaction = activate_ptg2_candidate_in_transaction
 _activate_ptg2_source_candidate_in_transaction = _activate_source_candidate_tx
 
@@ -1786,8 +1656,7 @@ async def _publish_ptg2_source_pointers(
     if not normalized_source_key or not normalized_snapshot_id:
         raise ValueError("source_key and snapshot_id are required")
     if snapshot_attributes is not None and (
-        str(snapshot_attributes.get("snapshot_id") or "").strip()
-        != normalized_snapshot_id
+        str(snapshot_attributes.get("snapshot_id") or "").strip() != normalized_snapshot_id
     ):
         raise ValueError("snapshot attributes do not match the requested snapshot")
     schema_name = resolve_ptg2_schema()
@@ -1811,17 +1680,13 @@ async def _publish_ptg2_source_pointers(
             schema_name=schema_name,
             snapshot_id=normalized_snapshot_id,
         )
-        if require_audit_attestation or _needs_audited_candidate_activation(
-            authoritative_snapshot
-        ):
-            publication_by_field = await (
-                _activate_ptg2_source_candidate_in_transaction(
-                    session,
-                    schema_name=schema_name,
-                    source_key=normalized_source_key,
-                    snapshot_id=normalized_snapshot_id,
-                    expected_current_snapshot_id=previous_snapshot_id,
-                )
+        if require_audit_attestation or _needs_audited_candidate_activation(authoritative_snapshot):
+            publication_by_field = await _activate_ptg2_source_candidate_in_transaction(
+                session,
+                schema_name=schema_name,
+                source_key=normalized_source_key,
+                snapshot_id=normalized_snapshot_id,
+                expected_current_snapshot_id=previous_snapshot_id,
             )
         else:
             if shared_snapshot_key is not None:
@@ -1840,9 +1705,7 @@ async def _publish_ptg2_source_pointers(
             )
             if shared_snapshot_key is not None:
                 if coverage_scope_id is None:
-                    raise ValueError(
-                        "strict V3 publication requires a coverage scope id"
-                    )
+                    raise ValueError("strict V3 publication requires a coverage scope id")
                 await _bind_snapshot_coverage_scope(
                     session,
                     schema_name=schema_name,
@@ -1852,14 +1715,9 @@ async def _publish_ptg2_source_pointers(
                     coverage_plan_scopes=coverage_plan_scopes,
                 )
             if snapshot_attributes is None and (
-                str(authoritative_snapshot.get("status") or "")
-                .strip()
-                .lower()
-                != PTG2_STATUS_PUBLISHED
+                str(authoritative_snapshot.get("status") or "").strip().lower() != PTG2_STATUS_PUBLISHED
             ):
-                raise ValueError(
-                    "source-pointer repoint requires an already published snapshot"
-                )
+                raise ValueError("source-pointer repoint requires an already published snapshot")
             await _compare_and_swap_source_pointer(
                 session,
                 schema_name=schema_name,
@@ -1887,9 +1745,7 @@ async def _publish_ptg2_source_pointers(
                 "previous_snapshot_id": previous_snapshot_id,
                 "plan_source_count": len(plan_pointer_entries),
                 "global_pointer": (
-                    "pending_compatibility_projection"
-                    if should_project_global_pointer
-                    else "not_requested"
+                    "pending_compatibility_projection" if should_project_global_pointer else "not_requested"
                 ),
             }
         await mark_legacy_global_projection_dirty(
@@ -1902,9 +1758,7 @@ async def _publish_ptg2_source_pointers(
         source_key=normalized_source_key,
     )
     if should_project_global_pointer:
-        global_pointer_status = (
-            "reconciled" if projection_drain.reconciled == 1 else "deferred"
-        )
+        global_pointer_status = "reconciled" if projection_drain.reconciled == 1 else "deferred"
         if "global_pointer" in publication_by_field:
             publication_by_field["global_pointer"] = global_pointer_status
     return publication_by_field
@@ -1940,13 +1794,8 @@ async def _publish_ptg2_global_snapshot_pointer(
         authoritative_activation = _manifest_mapping(
             _manifest_mapping(authoritative_snapshot.get("manifest")).get("activation")
         )
-        if (
-            authoritative_activation.get("contract")
-            == PTG2_CANDIDATE_ACTIVATION_CONTRACT
-        ):
-            raise ValueError(
-                "strict V3 candidates must be activated through the audited source-pointer transaction"
-            )
+        if authoritative_activation.get("contract") == PTG2_CANDIDATE_ACTIVATION_CONTRACT:
+            raise ValueError("strict V3 candidates must be activated through the audited source-pointer transaction")
         if shared_snapshot_key is not None:
             await bind_snapshot_to_shared_layout(
                 session,

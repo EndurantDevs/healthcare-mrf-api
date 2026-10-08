@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from api.ptg2_serving import (
     PTG2_SCHEMA,
+    _payload_schema,
     _required_shared_snapshot_key,
     _required_source_count,
 )
@@ -59,9 +60,7 @@ class CandidateWitnessScope:
             "evidence_decompressions": self.unique_evidence_count,
             "evidence_sha256_hashes": self.unique_evidence_count,
             "evidence_json_parses": self.unique_evidence_count,
-            "evidence_reuse_deliveries": (
-                self.evidence_reference_count - self.unique_evidence_count
-            ),
+            "evidence_reuse_deliveries": (self.evidence_reference_count - self.unique_evidence_count),
             "repeated_evidence_decompressions": 0,
             "repeated_evidence_sha256_hashes": 0,
             "repeated_evidence_json_parses": 0,
@@ -96,6 +95,8 @@ async def validate_candidate_source_scope(
     session: Any,
     serving_tables: PTG2ServingTables,
     audit_request: AuditBatchRequest,
+    *,
+    candidate_audit_access=None,
 ) -> CandidateWitnessScope:
     """Derive exact grouped challenges from one sealed witness payload read."""
 
@@ -105,44 +106,30 @@ async def validate_candidate_source_scope(
         serving_tables,
     )
     try:
-        (
-            observed_source_set,
-            observed_source_ordinal_digest,
-            raw_source_sha256,
-        ) = (
-            await fetch_snapshot_source_set_identity(
-                session,
-                schema_name=PTG2_SCHEMA,
-                logical_snapshot_id=audit_request.snapshot_id,
-                expected_source_count=source_count,
-            )
+        observed_identity = await fetch_snapshot_source_set_identity(
+            session,
+            schema_name=PTG2_SCHEMA,
+            logical_snapshot_id=audit_request.snapshot_id,
+            expected_source_count=source_count,
+            serving_tables=serving_tables,
+            candidate_audit_access=candidate_audit_access,
         )
+        observed_source_set, observed_source_ordinal_digest, raw_source_sha256 = observed_identity
     except PTG2SharedBlockError as exc:
         raise PTG2ManifestArtifactError(str(exc)) from exc
     if observed_source_set != serving_tables.source_set:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate source rows disagree with the sealed source set"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate source rows disagree with the sealed source set")
     if observed_source_ordinal_digest != audit_request.ordered_source_ordinal_digest:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate source ordinals disagree with the witness request"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate source ordinals disagree with the witness request")
     witness_scope = await _sealed_witness_challenges(
         session,
         serving_tables,
         raw_source_sha256,
     )
-    if (
-        sum(challenge.multiplicity for challenge in witness_scope.challenges)
-        != audit_request.challenge_count
-        or any(
-            not 0 <= challenge.source_artifact_key < source_count
-            for challenge in witness_scope.challenges
-        )
+    if sum(challenge.multiplicity for challenge in witness_scope.challenges) != audit_request.challenge_count or any(
+        not 0 <= challenge.source_artifact_key < source_count for challenge in witness_scope.challenges
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate source witness challenge scope is invalid"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate source witness challenge scope is invalid")
     return CandidateWitnessScope(
         challenges=witness_scope.challenges,
         record_count=witness_scope.record_count,
@@ -162,31 +149,18 @@ def _validated_request_source_count(
     source_count = _required_source_count(serving_tables)
     audit_sample = serving_tables.audit_sample
     if not isinstance(audit_sample, dict):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate audit requires a sealed persisted audit sample"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate audit requires a sealed persisted audit sample")
     source_witness = serving_tables.source_witness
     if not isinstance(source_witness, dict):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate audit requires a sealed source witness"
-        )
-    if str(audit_sample.get("sample_digest") or "") != (
-        audit_request.audit_sample_digest
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate witness request disagrees with the sealed audit sample"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate audit requires a sealed source witness")
+    if str(audit_sample.get("sample_digest") or "") != (audit_request.audit_sample_digest):
+        raise PTG2ManifestArtifactError("PTG2 candidate witness request disagrees with the sealed audit sample")
     if (
-        int(source_witness.get("occurrence_witness_count") or -1)
-        != audit_request.challenge_count
-        or str(source_witness.get("sample_digest") or "")
-        != audit_request.source_witness_sample_digest
-        or str(source_witness.get("payload_sha256") or "")
-        != audit_request.source_witness_payload_sha256
+        int(source_witness.get("occurrence_witness_count") or -1) != audit_request.challenge_count
+        or str(source_witness.get("sample_digest") or "") != audit_request.source_witness_sample_digest
+        or str(source_witness.get("payload_sha256") or "") != audit_request.source_witness_payload_sha256
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate request disagrees with the sealed source witness"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate request disagrees with the sealed source witness")
     return source_count
 
 
@@ -201,6 +175,7 @@ async def _sealed_witness_challenges(
     try:
         witness_payload = await _sealed_witness_payload(
             session,
+            schema_name=_payload_schema(serving_tables, default_schema=PTG2_SCHEMA),
             snapshot_key=_required_shared_snapshot_key(serving_tables),
             expected_payload_sha256=str(source_witness.get("payload_sha256") or ""),
         )
@@ -209,6 +184,7 @@ async def _sealed_witness_challenges(
             expected_raw_source_sha256=raw_source_sha256,
             expected_metadata=source_witness,
         )
+
         def derive(witness_record, parsed_evidence):
             """Validate one provider or derive its compact occurrence condition."""
 
@@ -231,14 +207,13 @@ async def _sealed_witness_challenges(
             processing_io=processing_io,
         )
     except (RuntimeError, ValueError) as exc:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate persisted source witness is invalid"
-        ) from exc
+        raise PTG2ManifestArtifactError("PTG2 candidate persisted source witness is invalid") from exc
 
 
 async def _sealed_witness_payload(
     session: Any,
     *,
+    schema_name: str,
     snapshot_key: int,
     expected_payload_sha256: str,
 ) -> bytes:
@@ -254,14 +229,14 @@ async def _sealed_witness_payload(
                     SELECT 0 AS part_number,
                            source_witness.payload,
                            NULL::bytea AS part_sha256
-                      FROM {PTG2_SCHEMA}.ptg2_v3_source_audit_witness
+                      FROM {schema_name}.ptg2_v3_source_audit_witness
                            AS source_witness
                      WHERE source_witness.snapshot_key = :shared_snapshot_key
                     UNION ALL
                     SELECT witness_part.part_number,
                            witness_part.payload,
                            witness_part.part_sha256
-                      FROM {PTG2_SCHEMA}.ptg2_v3_source_audit_witness_part
+                      FROM {schema_name}.ptg2_v3_source_audit_witness_part
                            AS witness_part
                      WHERE witness_part.snapshot_key = :shared_snapshot_key
                    ) AS payload_part
@@ -270,9 +245,7 @@ async def _sealed_witness_payload(
         ),
         {"shared_snapshot_key": snapshot_key},
     )
-    payload_part_rows = [
-        _record_fields(payload_record) for payload_record in payload_result
-    ]
+    payload_part_rows = [_record_fields(payload_record) for payload_record in payload_result]
     return assemble_source_witness_payload(
         payload_part_rows,
         expected_payload_sha256=expected_payload_sha256,
@@ -287,20 +260,17 @@ async def validate_persisted_audit_sample(
 
     audit_sample = serving_tables.audit_sample
     if not isinstance(audit_sample, dict):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate audit requires a sealed persisted audit sample"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate audit requires a sealed persisted audit sample")
     sealed_sample_count = int(audit_sample.get("sample_count") or -1)
     if sealed_sample_count < 0:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate audit sample count is invalid"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate audit sample count is invalid")
+    schema_name = _payload_schema(serving_tables, default_schema=PTG2_SCHEMA)
     digest_result = await session.execute(
         text(
             f"""
             SELECT occurrence_id, code_key, provider_set_key, price_key,
                    source_key, npi, atom_ordinal, atom_key
-              FROM {PTG2_SCHEMA}.ptg2_v3_audit_occurrence
+              FROM {schema_name}.ptg2_v3_audit_occurrence
              WHERE snapshot_key = :shared_snapshot_key
              ORDER BY occurrence_id
             """
@@ -309,32 +279,18 @@ async def validate_persisted_audit_sample(
     )
     persisted_rows = [_record_fields(database_row) for database_row in digest_result]
     if len(persisted_rows) != sealed_sample_count:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate persisted audit rows disagree with the sealed sample count"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate persisted audit rows disagree with the sealed sample count")
     source_count = _required_source_count(serving_tables)
     validated_occurrences = tuple(
-        _persisted_audit_occurrence(database_row, source_count)
-        for database_row in persisted_rows
+        _persisted_audit_occurrence(database_row, source_count) for database_row in persisted_rows
     )
     if (
-        len(
-            {
-                validated_occurrence.occurrence_id
-                for validated_occurrence in validated_occurrences
-            }
-        )
+        len({validated_occurrence.occurrence_id for validated_occurrence in validated_occurrences})
         != sealed_sample_count
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate persisted audit rows contain duplicate occurrence ids"
-        )
-    if persisted_audit_sample_digest(persisted_rows) != str(
-        audit_sample.get("sample_digest") or ""
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate persisted audit rows disagree with the sealed sample digest"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate persisted audit rows contain duplicate occurrence ids")
+    if persisted_audit_sample_digest(persisted_rows) != str(audit_sample.get("sample_digest") or ""):
+        raise PTG2ManifestArtifactError("PTG2 candidate persisted audit rows disagree with the sealed sample digest")
     return validated_occurrences
 
 
@@ -345,12 +301,8 @@ def _persisted_audit_occurrence(
     """Validate and freeze one row from the already ordered sample query."""
 
     occurrence_id = database_row.get("occurrence_id")
-    if not isinstance(occurrence_id, (bytes, bytearray, memoryview)) or len(
-        occurrence_id
-    ) != 32:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate persisted audit occurrence id is invalid"
-        )
+    if not isinstance(occurrence_id, (bytes, bytearray, memoryview)) or len(occurrence_id) != 32:
+        raise PTG2ManifestArtifactError("PTG2 candidate persisted audit occurrence id is invalid")
     integer_by_field = {
         field_name: database_row.get(field_name)
         for field_name in (
@@ -364,24 +316,16 @@ def _persisted_audit_occurrence(
         )
     }
     if any(
-        isinstance(raw_value, bool)
-        or not isinstance(raw_value, int)
-        or raw_value < 0
+        isinstance(raw_value, bool) or not isinstance(raw_value, int) or raw_value < 0
         for raw_value in integer_by_field.values()
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate persisted audit coordinate is invalid"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate persisted audit coordinate is invalid")
     source_artifact_key = int(integer_by_field["source_key"])
     npi = int(integer_by_field["npi"])
     if source_artifact_key >= source_count:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate persisted audit source key is invalid"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate persisted audit source key is invalid")
     if not 1_000_000_000 <= npi <= 9_999_999_999:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate persisted audit NPI is invalid"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate persisted audit NPI is invalid")
     return PersistedAuditOccurrence(
         occurrence_id=bytes(occurrence_id),
         code_key=int(integer_by_field["code_key"]),

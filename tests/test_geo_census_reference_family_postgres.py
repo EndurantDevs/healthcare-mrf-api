@@ -2,6 +2,7 @@
 """Native census archive, retained replacement, and generation rollback proof."""
 
 import subprocess
+from contextlib import AsyncExitStack
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -14,7 +15,7 @@ from db.connection import Database
 from process import geo_census_import
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
-from tests.reference_family_generation_fixture import install_source_generation_guards
+from tests.reference_family_generation_fixture import install_source_generation_guards, native_reference_source
 from tests.test_reference_family_archive_postgres import _create_live_family, _database_url, _manifest
 from tests.test_reference_family_result_generation_postgres import (
     _CENSUS_MIGRATION_PATH,
@@ -40,13 +41,16 @@ async def test_census_source_clone_keeps_captured_dependency_identity():
         assert session.in_transaction()
         return dict(dependency_by_dataset)
 
-    async def persist(_session, prepared):
+    async def persist(session, prepared):
+        await custody.retain(session, prepared)
         assert prepared.manifest.dependencies == {"geo": "a" * 64}
 
     async def copy(capture):
         captures.append(capture.manifest.as_dict())
 
+    cleanup = AsyncExitStack()
     try:
+        custody = await cleanup.enter_async_context(native_reference_source(sessions))
         async with sessions.begin() as session:
             await _create_live_family(session, "geo-census", live)
             initial = await generation.publish_local_reference_family_generation(
@@ -60,9 +64,13 @@ async def test_census_source_clone_keeps_captured_dependency_identity():
             dataset_id=identity,
             on_prepared=persist,
             dependency_factory=dependencies,
+            source_copy=custody.source_copy,
+            on_precreated=custody.precreate,
         )
         dependency_by_dataset["geo"] = "b" * 64
-        await archive.export_prepared_reference_family_archive(sessions, prepared=prepared, archive_copy=copy)
+        await archive.export_prepared_reference_family_archive(
+            sessions, prepared=prepared, archive_copy=copy, verify_custody=custody.verify
+        )
         assert captures[0]["dependencies"] == {"geo": "a" * 64}
         async with sessions.begin() as session:
             assert (
@@ -73,6 +81,7 @@ async def test_census_source_clone_keeps_captured_dependency_identity():
             )
             await archive.cleanup_reference_family_stage(session, prepared.ownership)
     finally:
+        await cleanup.aclose()
         async with engine.begin() as connection:
             for schema in (stage, live):
                 await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))

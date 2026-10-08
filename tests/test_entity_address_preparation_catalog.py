@@ -61,7 +61,8 @@ def _sequence(owner):
     }
 
 
-async def test_catalog_seal_binds_all_heaps_sequence_and_schema(monkeypatch):
+@pytest.mark.parametrize("read_only", (False, True))
+async def test_catalog_seal_binds_all_heaps_sequence_and_schema(monkeypatch, read_only):
     owner, proof = _inventory()
     rows = [_heap(oid) for _name, oid in owner.relation_oids]
     session = _session()
@@ -72,11 +73,11 @@ async def test_catalog_seal_binds_all_heaps_sequence_and_schema(monkeypatch):
     monkeypatch.setattr(preparation.destination, "verify_entity_address_archive_stage_ownership", AsyncMock())
     shape_by_field = {"shapes": [[name, oid, {"columns": ["synthetic"]}] for name, oid in owner.relation_oids]}
     monkeypatch.setattr(preparation, "_candidate_schema_identity", AsyncMock(return_value=shape_by_field))
-    seal = await preparation._protected_catalog(session, proof, owner)
+    seal = await preparation._protected_catalog(session, proof, owner, read_only=read_only)
     assert seal == preparation._digest(
         {"relations": rows, "sequence": proof["inventory"]["sequences"][0], "schema": shape_by_field}
     )
-    lock.assert_awaited_once_with(session, owner)
+    lock.assert_awaited_once_with(session, owner, read_only=read_only)
     assert session.scalar.await_args_list[-1].args[1]["relation_oids"] == [201]
 
 

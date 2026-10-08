@@ -217,15 +217,16 @@ async def test_normal_finalizer_forwards_explicit_held_inputs_through_projection
     assert ("publish", "cutover") in events
 
     @asynccontextmanager
-    async def protected_selection(_database, schema):
+    async def held_selection(_database, schema, *, control_context=None):
         assert schema == "mrf"
+        assert control_context is None
         events.append(("custody", "locked"))
         yield bindings
         assert geometry.await_args.kwargs["dependency_bindings"] == bindings
         assert events[-1] != ("custody", "locked")
         events.append(("custody", "released"))
 
-    monkeypatch.setattr(native, "selected_publication_dependencies", protected_selection)
+    monkeypatch.setattr(native, "selected_publication_dependencies", held_selection)
     await native.shutdown(_shutdown_context(refresh_mode=native.ENTITY_ADDRESS_REFRESH_MODE_FULL))
     assert events[-1] == ("custody", "released")
     changed = deepcopy(bindings)

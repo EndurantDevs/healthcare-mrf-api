@@ -4,6 +4,24 @@
 
 It combines multiple public programs into one operational service so applications can query provider directories, plan data, procedure pricing, pharmacy activity, quality benchmarks, and enrollment-derived enrichment from a consistent API layer.
 
+## Database read sessions
+
+`HLTHPRT_API_READER_ENABLED=true` routes pinned NPI, pricing, code and coverage
+statistics requests through a separate database login. Configure
+`HLTHPRT_DB_READER_USER` and `HLTHPRT_DB_READER_PASSWORD` for that login; the user
+must differ from `HLTHPRT_DB_USER`. Reader sessions never fall back to Writer
+credentials. Independent PTG network reads and provider-profile snapshots also
+require this Reader login. Existing control, import and explicit background
+mutation paths retain their Writer connection.
+
+The Reader pool uses `HLTHPRT_DB_READER_POOL_MIN_SIZE` (default 1) and
+`HLTHPRT_DB_READER_POOL_MAX_SIZE` (default 5), in addition to the existing Writer
+pool. Budget both pools per API worker, including the held request connection
+and independent network reads. Before enabling native snapshot reads, provision
+the Reader's schema usage and exact serving/catalog metadata SELECT privileges;
+missing login, identity or privileges fail closed. Reader transactions use
+repeatable-read isolation and read-only mode from their first statement.
+
 ## What This Repository Provides
 
 The service brings together:

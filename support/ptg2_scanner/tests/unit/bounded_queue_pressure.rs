@@ -15,6 +15,21 @@ impl Write for FlushSignalWriter {
     }
 }
 
+#[test]
+fn empty_copy_file_event_drain_does_not_flush() {
+    let (_event_tx, event_rx) = unbounded();
+    let (flush_tx, flush_rx) = unbounded();
+    let mut writer = FlushSignalWriter(flush_tx);
+    let mut gate = CopyFileEventGate::passthrough();
+
+    drain_copy_file_events(&event_rx, &mut writer, &mut gate).unwrap();
+
+    assert_eq!(
+        flush_rx.try_recv(),
+        Err(crossbeam_channel::TryRecvError::Empty)
+    );
+}
+
 fn wait_until_event_is_drained(event_rx: &Receiver<CopyFileEvent>, failure_message: &str) {
     let started_at = Instant::now();
     while !event_rx.is_empty() {

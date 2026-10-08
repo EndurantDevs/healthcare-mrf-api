@@ -59,6 +59,10 @@ class FakeSession:
         self.calls = []
         self.rollback_count = 0
 
+    def begin_nested(self):
+        """Support the async savepoint protocol without changing recorded query results."""
+        return nullcontext()
+
     async def execute(self, *args, **kwargs):
         self.calls.append((args, kwargs))
         value = self._results.pop(0) if self._results else FakeResult()
@@ -100,10 +104,7 @@ class FilteredProviderExpansionHarness:
         limit_per_set,
     ):
         self.membership_limits.append(limit_per_set)
-        return {
-            provider_set_id: self.member_npis[:limit_per_set]
-            for provider_set_id in provider_set_global_ids
-        }
+        return {provider_set_id: self.member_npis[:limit_per_set] for provider_set_id in provider_set_global_ids}
 
     async def filter_npis(self, _session, args, npis, *, limit):
         assert args["provider_sex_code"] == "F"
@@ -116,12 +117,7 @@ class FilteredProviderExpansionHarness:
         return {provider_set_id: 1 for provider_set_id in provider_set_ids}
 
     async def provider_rows(self, *_args, npis, **_kwargs):
-        return {
-            self.provider_set_id: [
-                {"npi": npi, "provider_name": f"Provider {npi}"}
-                for npi in npis
-            ]
-        }
+        return {self.provider_set_id: [{"npi": npi, "provider_name": f"Provider {npi}"} for npi in npis]}
 
     def install(self, monkeypatch):
         patch_values_by_name = {
@@ -145,9 +141,7 @@ class CostProviderSelectionHarness:
         self.rate_rows = [
             {
                 "provider_set_global_id_128": (
-                    self.first_provider_set_id
-                    if index < 64
-                    else self.second_provider_set_id
+                    self.first_provider_set_id if index < 64 else self.second_provider_set_id
                 ),
                 "serving_content_hash_128": f"{index + 1:032x}",
                 "reported_code_system": "CPT",
@@ -179,25 +173,17 @@ class CostProviderSelectionHarness:
             self.second_provider_set_id: (1000000003, 1000000004, 1000000005),
         }
         return {
-            provider_set_id: npis_by_provider_set_id[provider_set_id]
-            for provider_set_id in provider_set_global_ids
+            provider_set_id: npis_by_provider_set_id[provider_set_id] for provider_set_id in provider_set_global_ids
         }
 
     async def reverse_sets(self, _session, _tables, npis):
         return {
-            npi: (
-                (self.first_provider_set_id,)
-                if npi < 1000000003
-                else (self.second_provider_set_id,)
-            )
-            for npi in npis
+            npi: ((self.first_provider_set_id,) if npi < 1000000003 else (self.second_provider_set_id,)) for npi in npis
         }
 
     async def provider_set_keys(self, _session, _tables, provider_set_ids):
         return {
-            provider_set_id: (
-                1 if provider_set_id == self.first_provider_set_id else 2
-            )
+            provider_set_id: (1 if provider_set_id == self.first_provider_set_id else 2)
             for provider_set_id in provider_set_ids
         }
 
@@ -208,11 +194,7 @@ class CostProviderSelectionHarness:
         provider_set_ids_by_npi,
         **_kwargs,
     ):
-        provider_set_ids = {
-            provider_set_id
-            for npi in npis
-            for provider_set_id in provider_set_ids_by_npi[npi]
-        }
+        provider_set_ids = {provider_set_id for npi in npis for provider_set_id in provider_set_ids_by_npi[npi]}
         return {
             provider_set_id: [
                 {"npi": npi, "provider_name": f"Provider {npi}"}
@@ -253,10 +235,7 @@ class ProviderMembershipLoader:
         assert type(use_hot_prefixes) is bool
         self.calls.append((tuple(provider_set_ids), limit_per_set))
         return {
-            provider_set_id: tuple(
-                ptg2_serving._ptg2_npi_member_id(npi)
-                for npi in self.member_npis[:limit_per_set]
-            )
+            provider_set_id: tuple(ptg2_serving._ptg2_npi_member_id(npi) for npi in self.member_npis[:limit_per_set])
             for provider_set_id in provider_set_ids
         }
 
@@ -302,13 +281,7 @@ class ReversePriceFilterHarness:
 
     async def prices(self, _session, _tables, price_set_ids, **_kwargs):
         return {
-            price_set_id: [
-                {
-                    "negotiated_rate": (
-                        "999" if int(price_set_id, 16) == 502 else "1"
-                    )
-                }
-            ]
+            price_set_id: [{"negotiated_rate": ("999" if int(price_set_id, 16) == 502 else "1")}]
             for price_set_id in price_set_ids
         }
 
@@ -379,12 +352,8 @@ class GeoPriceFilterHarness:
 
     async def prices(self, *_args, **_kwargs):
         return {
-            self.first_price_set_id: [
-                {"negotiated_rate": "10", "service_code": ["11"]}
-            ],
-            self.matching_price_set_id: [
-                {"negotiated_rate": "20", "service_code": ["22"]}
-            ],
+            self.first_price_set_id: [{"negotiated_rate": "10", "service_code": ["11"]}],
+            self.matching_price_set_id: [{"negotiated_rate": "20", "service_code": ["22"]}],
         }
 
     async def location(self, *_args, **kwargs):
@@ -472,10 +441,7 @@ class ProviderReverseResponseHarness:
         return None
 
     async def prices(self, _session, _tables, price_set_ids, **_kwargs):
-        return {
-            price_set_id: [{"negotiated_rate": str(index + 1)}]
-            for index, price_set_id in enumerate(price_set_ids)
-        }
+        return {price_set_id: [{"negotiated_rate": str(index + 1)}] for index, price_set_id in enumerate(price_set_ids)}
 
     async def details(self, *_args, **_kwargs):
         return {}
@@ -520,6 +486,13 @@ class ConcurrentSessionFactory:
             yield network_session
         finally:
             self.active -= 1
+
+    @asynccontextmanager
+    async def reader_session(self, *, independent):
+        """Record independent Reader scopes without opening a database connection."""
+        assert independent is True
+        async with self.session() as network_session:
+            yield network_session
 
 
 def _provider_expansion_overlap_fixture():
@@ -660,9 +633,7 @@ def _provider_directory_corroboration_row(address_key):
         "provider_directory_insurance_plan_matches": [],
         "provider_directory_match_type": "npi_address_plan",
         "address_network_binding": "payer_directory_corroborated_location",
-        "address_verification_evidence": {
-            "matched_on": "npi_address_key_role_location_plan"
-        },
+        "address_verification_evidence": {"matched_on": "npi_address_key_role_location_plan"},
     }
 
 
@@ -802,23 +773,29 @@ def test_shared_forward_window_follows_dense_cost_rank_not_provider_count():
 def test_provider_expansion_candidate_window_includes_deep_offset():
     pagination = SimpleNamespace(limit=25, offset=100)
 
-    assert ptg2_serving._ptg2_manifest_rate_candidate_limit(
-        {},
-        pagination,
-        expand_providers=True,
-        location_filter_requested=False,
-    ) == 125
+    assert (
+        ptg2_serving._ptg2_manifest_rate_candidate_limit(
+            {},
+            pagination,
+            expand_providers=True,
+            location_filter_requested=False,
+        )
+        == 125
+    )
 
 
 def test_distance_location_window_includes_deep_offset_sentinel():
     pagination = SimpleNamespace(limit=25, offset=100)
 
-    assert ptg2_serving._ptg2_manifest_rate_candidate_limit(
-        {},
-        pagination,
-        expand_providers=True,
-        location_filter_requested=True,
-    ) == 126
+    assert (
+        ptg2_serving._ptg2_manifest_rate_candidate_limit(
+            {},
+            pagination,
+            expand_providers=True,
+            location_filter_requested=True,
+        )
+        == 126
+    )
 
 
 @pytest.mark.parametrize(
@@ -828,12 +805,15 @@ def test_distance_location_window_includes_deep_offset_sentinel():
 def test_ascending_distance_location_window_stops_at_page_sentinel(order_args):
     pagination = SimpleNamespace(limit=10, offset=0)
 
-    assert ptg2_serving._ptg2_manifest_rate_candidate_limit(
-        order_args,
-        pagination,
-        expand_providers=True,
-        location_filter_requested=True,
-    ) == 11
+    assert (
+        ptg2_serving._ptg2_manifest_rate_candidate_limit(
+            order_args,
+            pagination,
+            expand_providers=True,
+            location_filter_requested=True,
+        )
+        == 11
+    )
 
 
 @pytest.mark.parametrize(
@@ -843,34 +823,34 @@ def test_ascending_distance_location_window_stops_at_page_sentinel(order_args):
         {"order_by": "distance", "order": "desc"},
     ),
 )
-def test_nonascending_location_window_retains_density_floor(
-    order_args, monkeypatch
-):
-    monkeypatch.delenv(
-        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", raising=False
-    )
-    monkeypatch.delenv(
-        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", raising=False
-    )
+def test_nonascending_location_window_retains_density_floor(order_args, monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", raising=False)
+    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", raising=False)
     pagination = SimpleNamespace(limit=10, offset=0)
 
-    assert ptg2_serving._ptg2_manifest_rate_candidate_limit(
-        order_args,
-        pagination,
-        expand_providers=True,
-        location_filter_requested=True,
-    ) == 100
+    assert (
+        ptg2_serving._ptg2_manifest_rate_candidate_limit(
+            order_args,
+            pagination,
+            expand_providers=True,
+            location_filter_requested=True,
+        )
+        == 100
+    )
 
 
 def test_location_rate_window_without_provider_expansion_includes_sentinel():
     pagination = SimpleNamespace(limit=25, offset=100)
 
-    assert ptg2_serving._ptg2_manifest_rate_candidate_limit(
-        {},
-        pagination,
-        expand_providers=False,
-        location_filter_requested=True,
-    ) == 126
+    assert (
+        ptg2_serving._ptg2_manifest_rate_candidate_limit(
+            {},
+            pagination,
+            expand_providers=False,
+            location_filter_requested=True,
+        )
+        == 126
+    )
 
 
 @pytest.mark.asyncio
@@ -963,28 +943,22 @@ def test_provider_expansion_prefix_preserves_graph_member_ordinal():
 def test_provider_expansion_prefix_matches_exhaustive_overlap_order(target_count):
     """Verify provider expansion matches exhaustive overlap order at each target size."""
     rate_rows, npis_by_set = _provider_expansion_overlap_fixture()
-    exhaustive_keys, exhaustive_provider_set_ids = (
-        _exhaustive_provider_expansion_prefix(
-            rate_rows,
-            npis_by_set,
-            target_count,
-        )
+    exhaustive_keys, exhaustive_provider_set_ids = _exhaustive_provider_expansion_prefix(
+        rate_rows,
+        npis_by_set,
+        target_count,
     )
 
-    rank_by_key, selected_npis, selected_provider_set_ids = (
-        ptg2_serving._rank_provider_expansion_prefix(
-            rate_rows,
-            npis_by_set,
-            target_count=target_count,
-        )
+    rank_by_key, selected_npis, selected_provider_set_ids = ptg2_serving._rank_provider_expansion_prefix(
+        rate_rows,
+        npis_by_set,
+        target_count=target_count,
     )
 
     expected_keys = exhaustive_keys[:target_count]
     assert list(rank_by_key) == expected_keys
     assert list(rank_by_key.values()) == list(range(len(expected_keys)))
-    assert selected_npis == tuple(
-        dict.fromkeys(int(key[1]) for key in expected_keys)
-    )
+    assert selected_npis == tuple(dict.fromkeys(int(key[1]) for key in expected_keys))
     assert selected_provider_set_ids == tuple(exhaustive_provider_set_ids)
 
 
@@ -1182,15 +1156,10 @@ async def test_filtered_provider_prefix_cache_reuses_identical_filter(
         limit_per_set,
     ):
         membership_calls.append((tuple(provider_set_ids), limit_per_set))
-        return {
-            selected_provider_set_id: member_npis[:limit_per_set]
-            for selected_provider_set_id in provider_set_ids
-        }
+        return {selected_provider_set_id: member_npis[:limit_per_set] for selected_provider_set_id in provider_set_ids}
 
     async def filter_npis(_session, args_by_name, npis, *, limit):
-        filter_calls.append(
-            (args_by_name["provider_sex_code"], tuple(npis), limit)
-        )
+        filter_calls.append((args_by_name["provider_sex_code"], tuple(npis), limit))
         return tuple(npi for npi in npis if npi % 2 == 0)[:limit]
 
     monkeypatch.setattr(
@@ -1271,15 +1240,10 @@ async def test_strict_cost_provider_selection_bounds_demographic_filter_expansio
     assert selection is not None
     assert cached_selection is not None
     assert harness.membership_limits == [32, 64]
-    assert list(selection.rank_by_key) == [
-        ("npi", str(npi), "CPT", "99213", "FFS", "0")
-        for npi in female_npis
-    ]
+    assert list(selection.rank_by_key) == [("npi", str(npi), "CPT", "99213", "FFS", "0") for npi in female_npis]
     assert cached_selection.rank_by_key == selection.rank_by_key
-    assert [
-        provider["npi"]
-        for provider in selection.providers_by_set[provider_set_id]
-    ] == list(female_npis)
+    assert [provider["npi"] for provider in selection.providers_by_set[provider_set_id]] == list(female_npis)
+
 
 # Strict shared V3 serving contract
 
@@ -1295,10 +1259,13 @@ async def test_taxonomy_enrichment_is_optional_when_reference_tables_are_absent(
 
     monkeypatch.setattr(ptg2_serving, "_is_relation_available", is_relation_available)
 
-    assert await ptg2_serving._taxonomy_rows_for_npis(
-        session,
-        [1234567890],
-    ) == {}
+    assert (
+        await ptg2_serving._taxonomy_rows_for_npis(
+            session,
+            [1234567890],
+        )
+        == {}
+    )
     assert session.calls == []
 
 
@@ -1362,11 +1329,12 @@ async def test_strict_shared_v3_search_matches_persisted_code_system_aliases():
     sql = str(session.calls[0][0][0])
     params_by_name = session.calls[0][0][1]
     assert "code_metadata.reported_code_system IN" in sql
-    assert {
-        value
-        for key, value in params_by_name.items()
-        if key.startswith("reported_code_system")
-    } == {"MS_DRG", "MS-DRG", "MSDRG", "DRG"}
+    assert {value for key, value in params_by_name.items() if key.startswith("reported_code_system")} == {
+        "MS_DRG",
+        "MS-DRG",
+        "MSDRG",
+        "DRG",
+    }
 
 
 @pytest.mark.asyncio
@@ -1494,9 +1462,7 @@ async def test_code_context_expands_equivalent_external_codes(
         code_system=code_system,
     )
 
-    resolved_pairs = {
-        (item["code_system"], item["code"]) for item in context["resolved_codes"]
-    }
+    resolved_pairs = {(item["code_system"], item["code"]) for item in context["resolved_codes"]}
     assert expected_pairs <= resolved_pairs
     assert unexpected_pair not in resolved_pairs
 
@@ -1590,9 +1556,7 @@ def test_manifest_code_filter_uses_resolved_external_context():
         "HCPCS",
     }
     assert set(
-        value
-        for key, value in params_by_name.items()
-        if key.startswith("reported_code_") and "system" not in key
+        value for key, value in params_by_name.items() if key.startswith("reported_code_") and "system" not in key
     ) == {"70551"}
 
 
@@ -1661,9 +1625,7 @@ async def test_inferred_taxonomy_filter_requires_individual_npi():
 @pytest.mark.asyncio
 async def test_exact_scope_filters_snapshot_in_database(monkeypatch):
     monkeypatch.setenv("HLTHPRT_NPI_SEARCH_TAXONOMY_PROJECTION_ENABLED", "1")
-    session = FakeSession(
-        [FakeResult(result_rows=[{"npi": 1234567891}, {"npi": 1234567890}])]
-    )
+    session = FakeSession([FakeResult(result_rows=[{"npi": 1234567891}, {"npi": 1234567890}])])
 
     filtered = await ptg2_serving._membership_exact_scope_npis(
         session,
@@ -1716,10 +1678,7 @@ def test_knn_prefilter_applies_requested_classification_before_raw_limit():
     assert "membership_location_specialty_nt" in sql
     assert "membership_location_specialty_nucc" in sql
     assert "membership_location_inferred_taxonomy_code_0" in sql
-    assert (
-        params_by_name["membership_location_specialty_classification"]
-        == "Orthopaedic Surgery"
-    )
+    assert params_by_name["membership_location_specialty_classification"] == "Orthopaedic Surgery"
 
 
 @pytest.mark.parametrize(
@@ -1901,10 +1860,7 @@ def test_membership_filter_requires_coherence_before_zip_or_radius():
     assert "FROM mrf.geo_zip_lookup AS address_zip" in filter_sql
     assert "FROM tiger.zip_state AS address_zip_state" in filter_sql
     assert "FROM tiger.zcta5 AS address_zcta" in filter_sql
-    assert (
-        "LEFT(addr.postal_code, 5) = :zip5 AND "
-        "(addr.lat IS NULL AND addr.long IS NULL)"
-    ) in filter_sql
+    assert ("LEFT(addr.postal_code, 5) = :zip5 AND (addr.lat IS NULL AND addr.long IS NULL)") in filter_sql
     assert "ST_DWithin" in filter_sql
     assert "addr.npi = ANY(CAST(:candidate_npis AS bigint[]))" in filter_sql
     assert "addr.npi = :provider_npi" in filter_sql
@@ -1943,34 +1899,16 @@ def test_knn_query_carries_bounded_raw_probe_exhaustion_marker():
     assert "_ptg_source_exhausted" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
     assert "_ptg_probe_empty" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
     assert "LEFT JOIN LATERAL" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
-    assert ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL.count(
-        "{knn_prefilter_sql}"
-    ) == 3
-    assert "WHEN (SELECT npi_count <" in (
-        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
-    )
-    assert "WHEN (SELECT npi_count >=" in (
-        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
-    )
-    assert "WHEN geocoded_probe_stats.raw_probe_count <" in (
-        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
-    )
-    assert "geocoded_probe_stats.raw_probe_count < :raw_probe_limit" in (
-        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
-    )
-    assert "(SELECT {raw_geo_radius_sql} OFFSET 0)" in (
-        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
-    )
+    assert ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL.count("{knn_prefilter_sql}") == 3
+    assert "WHEN (SELECT npi_count <" in (ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL)
+    assert "WHEN (SELECT npi_count >=" in (ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL)
+    assert "WHEN geocoded_probe_stats.raw_probe_count <" in (ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL)
+    assert "geocoded_probe_stats.raw_probe_count < :raw_probe_limit" in (ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL)
+    assert "(SELECT {raw_geo_radius_sql} OFFSET 0)" in (ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL)
     assert "AND {raw_geo_radius_sql}" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
-    assert "sparse_geocoded_candidates AS MATERIALIZED" in (
-        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
-    )
-    assert "broad_geocoded_candidates AS MATERIALIZED" in (
-        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
-    )
-    assert ":raw_probe_limit - geocoded_probe_stats.raw_probe_count" in (
-        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
-    )
+    assert "sparse_geocoded_candidates AS MATERIALIZED" in (ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL)
+    assert "broad_geocoded_candidates AS MATERIALIZED" in (ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL)
+    assert ":raw_probe_limit - geocoded_probe_stats.raw_probe_count" in (ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL)
     assert "probe_stats.geocoded_probe_count\n           + probe_stats.exact_zip_probe_count" in (
         ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
     )
@@ -2041,11 +1979,7 @@ async def test_lineage_dropped_prefix_grows_to_later_valid_candidates(monkeypatc
 
     async def fake_location_rows(*_args, limit, **_kwargs):
         location_calls.append(limit)
-        return (
-            lineage_rejected_rows
-            if len(location_calls) == 1
-            else lineage_valid_rows
-        )
+        return lineage_rejected_rows if len(location_calls) == 1 else lineage_valid_rows
 
     async def fake_append(
         _session,
@@ -2080,9 +2014,7 @@ async def test_lineage_dropped_prefix_grows_to_later_valid_candidates(monkeypatc
     )
 
     assert candidates is not None
-    assert [candidate_row["npi"] for candidate_row in candidates.location_rows] == [
-        1000000002
-    ]
+    assert [candidate_row["npi"] for candidate_row in candidates.location_rows] == [1000000002]
     assert len(location_calls) == 2
 
 
@@ -2096,9 +2028,7 @@ async def test_provider_directory_overlay_prefers_corroborated_contact():
     session = FakeSession(
         [
             "mrf.provider_directory_address_corroboration",
-            FakeResult(
-                result_rows=[_provider_directory_corroboration_row(address_key)]
-            ),
+            FakeResult(result_rows=[_provider_directory_corroboration_row(address_key)]),
         ]
     )
     provider_rows = [
@@ -2129,12 +2059,8 @@ async def test_provider_directory_overlay_prefers_corroborated_contact():
 
     assert provider_by_field["phone_number"] == "3125550100"
     assert provider_by_field["phone_extension"] == "45"
-    assert provider_by_field["address_verification"]["address_evidence_level"] == (
-        "payer_directory_network_location"
-    )
-    assert provider_by_field["address_verification"]["provider_directory_org_name"] == (
-        "Synthetic Health"
-    )
+    assert provider_by_field["address_verification"]["address_evidence_level"] == ("payer_directory_network_location")
+    assert provider_by_field["address_verification"]["provider_directory_org_name"] == ("Synthetic Health")
 
 
 def test_provider_directory_network_name_match_uses_synthetic_context_without_mutation():
@@ -2156,9 +2082,7 @@ def test_provider_directory_network_name_match_uses_synthetic_context_without_mu
                 "name": "Synthetic Network",
             }
         ],
-        "address_verification_evidence": {
-            "matched_on": "npi_address_key_role_location"
-        },
+        "address_verification_evidence": {"matched_on": "npi_address_key_role_location"},
     }
     original = copy.deepcopy(address_by_field)
     provider_by_field = {
@@ -2185,9 +2109,7 @@ def test_provider_directory_network_name_match_uses_synthetic_context_without_mu
     assert address_by_field == original
     assert first["address_network_binding"] == "payer_directory_corroborated_location"
     assert first["provider_directory_network_name_matched"] is True
-    assert first["provider_directory_network_matches"] == second[
-        "provider_directory_network_matches"
-    ]
+    assert first["provider_directory_network_matches"] == second["provider_directory_network_matches"]
     match = first["provider_directory_network_matches"][0]
     assert match["provider_directory_org_name"] == "Synthetic Health"
     assert match["provider_directory_issuer_key"] == "synthetichealth"
@@ -2207,9 +2129,7 @@ def test_provider_directory_marker_without_plan_or_network_match_is_inferred():
                 "postal_code": "60001",
                 "address_sources": ["provider_directory_fhir"],
                 "provider_directory_plan_context_matched": False,
-                "address_verification_evidence": {
-                    "matched_on": "npi_address_key_role_location"
-                },
+                "address_verification_evidence": {"matched_on": "npi_address_key_role_location"},
             },
             "prices": [],
         },
@@ -2239,9 +2159,7 @@ def test_compact_item_normalizes_provider_directory_boolean_and_list_fields():
                 "provider_directory_network_context_present": "true",
                 "provider_directory_network_refs": '["Organization/network-1"]',
                 "provider_directory_network_names": ["Synthetic Network"],
-                "provider_directory_network_matches": [
-                    {"name": "Synthetic Network", "resource_id": "network-1"}
-                ],
+                "provider_directory_network_matches": [{"name": "Synthetic Network", "resource_id": "network-1"}],
                 "provider_directory_insurance_plan_refs": "InsurancePlan/plan-1",
                 "provider_directory_insurance_plan_matches": '["InsurancePlan/plan-1"]',
             },
@@ -2254,9 +2172,7 @@ def test_compact_item_normalizes_provider_directory_boolean_and_list_fields():
     assert verification["provider_directory_plan_context_matched"] is False
     assert verification["provider_directory_network_context_present"] is True
     assert verification["provider_directory_network_refs"] == ["Organization/network-1"]
-    assert verification["provider_directory_insurance_plan_refs"] == [
-        "InsurancePlan/plan-1"
-    ]
+    assert verification["provider_directory_insurance_plan_refs"] == ["InsurancePlan/plan-1"]
 
 
 def test_exact_source_item_preserves_null_and_trimmed_empty_procedure_metadata():
@@ -2399,9 +2315,7 @@ def test_manifest_response_keeps_address_verification_in_public_shape():
                     "service_code_system": "CPT",
                     "network_names": ["Synthetic Network"],
                     "source_trace": [{"source_file_version_id": "synthetic-version"}],
-                    "address_verification": {
-                        "address_network_binding": "payer_directory_corroborated_location"
-                    },
+                    "address_verification": {"address_network_binding": "payer_directory_corroborated_location"},
                 }
             ],
             "query": {
@@ -2431,9 +2345,7 @@ def test_manifest_response_keeps_address_verification_in_public_shape():
     )
     assert "result_granularity" not in shaped["query"]
     assert shaped["provenance"]["source_key"] == "synthetic-source"
-    assert shaped["provenance"]["database_evidence"][
-        "server_version_num"
-    ] == 160004
+    assert shaped["provenance"]["database_evidence"]["server_version_num"] == 160004
 
 
 def test_manifest_provider_procedure_item_shapes_address_and_prices():
@@ -2477,9 +2389,7 @@ def test_manifest_provider_procedure_item_shapes_address_and_prices():
     assert provider_by_field["procedure_code"] == "29888"
     assert provider_by_field["prices"][0]["negotiated_rate"] == 1138.57
     assert provider_by_field["address"]["first_line"] == "100 Example Street"
-    assert provider_by_field["address_verification"]["address_evidence_level"] == (
-        "nppes_provider_address"
-    )
+    assert provider_by_field["address_verification"]["address_evidence_level"] == ("nppes_provider_address")
 
 
 def test_provider_rate_items_merge_duplicate_location_and_code_prices():
@@ -2655,9 +2565,7 @@ def test_provider_rate_items_do_not_merge_distinct_source_code_variants(
         "rate_pack_hash": _lineage_ref(202),
     }
 
-    merged = ptg2_serving._merge_ptg2_provider_rate_items(
-        [base_by_field, changed_variant_by_field]
-    )
+    merged = ptg2_serving._merge_ptg2_provider_rate_items([base_by_field, changed_variant_by_field])
 
     assert len(merged) == 2
 
@@ -2928,12 +2836,8 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
 
     assert harness.location_call_by_field["provider_set_keys"] == {4}
     assert harness.location_call_by_field["require_exhaustive"] is False
-    assert [provider_by_field["npi"] for provider_by_field in response["items"]] == [
-        1234567890
-    ]
-    assert response["items"][0]["prices"] == [
-        {"negotiated_rate": 20, "service_code": ["22"]}
-    ]
+    assert [provider_by_field["npi"] for provider_by_field in response["items"]] == [1234567890]
+    assert response["items"][0]["prices"] == [{"negotiated_rate": 20, "service_code": ["22"]}]
     assert response["items"][0]["rate_options"] == [
         {
             "rate_option_ref": encode_rate_option_ref(
@@ -2961,9 +2865,7 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
     (("CPT", "99213"), ("HCPCS", "G0439")),
 )
 @pytest.mark.asyncio
-async def test_geo_cost_order_requires_exhaustive_location_selection(
-    monkeypatch, code_system, code
-):
+async def test_geo_cost_order_requires_exhaustive_location_selection(monkeypatch, code_system, code):
     location_call_by_field = {}
 
     async def fake_location(*_args, **kwargs):
@@ -3041,9 +2943,7 @@ async def test_geo_cost_order_rate_count_gate_precedes_location(
         "_ptg2_manifest_location_provider_matches",
         fake_location,
     )
-    session = FakeSession(
-        [FakeResult(result_rows=[{"code_key": 7, "rate_count": rate_count}])]
-    )
+    session = FakeSession([FakeResult(result_rows=[{"code_key": 7, "rate_count": rate_count}])])
     error_context = (
         pytest.raises(
             ptg2_serving.PTG2LocationScopeError,
@@ -3120,12 +3020,7 @@ async def test_g0289_geo_rate_search_uses_exact_provider_set_coverage(monkeypatc
 def test_g0289_does_not_inherit_a_numeric_cpt_taxonomy_rule():
     """Keep broad HCPCS facility contexts eligible for exact geo selection."""
 
-    assert (
-        ptg2_serving._inferred_provider_taxonomy_rule(
-            {"code_system": "HCPCS", "code": "G0289"}
-        )
-        is None
-    )
+    assert ptg2_serving._inferred_provider_taxonomy_rule({"code_system": "HCPCS", "code": "G0289"}) is None
 
 
 @pytest.mark.asyncio
@@ -3135,9 +3030,7 @@ async def test_provider_reverse_response_uses_page_sentinel_and_honest_total(mon
     harness.install(monkeypatch)
     response = await _search_provider_reverse_response()
 
-    assert [
-        procedure_item["reported_code"] for procedure_item in response["items"]
-    ] == ["99210", "99211"]
+    assert [procedure_item["reported_code"] for procedure_item in response["items"]] == ["99210", "99211"]
     assert response["pagination"] == {
         "total": 3,
         "limit": 2,
@@ -3265,9 +3158,7 @@ async def test_network_descriptor_revalidation_accepts_supported_attestations():
     assert is_current is False
     sql, params = session.calls[0]
     assert "attestation.contract = ANY(" in sql
-    assert params["attestation_contracts"] == list(
-        ptg2_serving.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
-    )
+    assert params["attestation_contracts"] == list(ptg2_serving.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS)
 
 
 @pytest.mark.asyncio
@@ -3349,9 +3240,7 @@ async def test_multi_network_forward_failure_never_returns_partial_union(monkeyp
 async def test_multi_network_reverse_reads_use_independent_concurrent_sessions(monkeypatch):
     session_factory = ConcurrentSessionFactory()
 
-    async def fake_search(
-        _session, _npi, _args, _pagination, *, snapshot_id, serving_tables=None
-    ):
+    async def fake_search(_session, _npi, _args, _pagination, *, snapshot_id, serving_tables=None):
         await asyncio.sleep(0.01)
         assert serving_tables is None
         assert _pagination.limit == 26
@@ -3372,7 +3261,7 @@ async def test_multi_network_reverse_reads_use_independent_concurrent_sessions(m
             "query": {"snapshot_id": snapshot_id},
         }
 
-    monkeypatch.setattr(ptg2_serving.sa_db, "session", session_factory.session)
+    monkeypatch.setattr(ptg2_serving.sa_db, "reader_session", session_factory.reader_session)
     monkeypatch.setattr(
         ptg2_serving,
         "_search_ptg2_provider_procedures_snapshot",

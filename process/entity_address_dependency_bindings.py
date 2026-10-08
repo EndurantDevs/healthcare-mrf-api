@@ -2,12 +2,46 @@
 """Local held dependency locks, projection state, and closed physical relocation."""
 
 import json
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 
 from sqlalchemy import text
 
 from api import ptg2_geo_projection as projection
 from db.models import EntityAddressUnified
+
+PUBLISHER_SELECTED_INPUTS_CONTRACT = "entity-address-publisher-selected-inputs.v1"
+
+
+def validate_publisher_selected_inputs(schema_name, value):
+    """Decode trusted local selection metadata, never confer custody from JSON."""
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"contract", "dependency_bindings"}
+        or value["contract"] != PUBLISHER_SELECTED_INPUTS_CONTRACT
+    ):
+        raise ValueError("entity-address publisher selected inputs are invalid")
+    return {
+        "contract": PUBLISHER_SELECTED_INPUTS_CONTRACT,
+        "dependency_bindings": projection.validate_projection_dependency_bindings(
+            schema_name, value["dependency_bindings"]
+        ),
+    }
+
+
+async def lock_publisher_selected_inputs(session, schema_name, value):
+    """Independently fence the exact locally authenticated six selected heaps."""
+    if not session.in_transaction():
+        raise RuntimeError("entity-address publisher selected inputs require caller transaction")
+    selected = validate_publisher_selected_inputs(schema_name, value)
+    bindings = selected["dependency_bindings"]
+    statement = projection.projection_dependency_lock_sql(schema_name, dependency_bindings=bindings)
+    await session.execute(text(statement.rstrip().removesuffix(";") + " NOWAIT"))
+    if not await session.scalar(
+        text("SELECT " + projection.projection_dependency_bindings_match_sql(schema_name, bindings))
+    ):
+        raise RuntimeError("entity-address publisher selected inputs changed")
+    return selected
 
 
 def validate_schema_name(schema: str) -> str:
@@ -99,26 +133,37 @@ def activate_geo_assurance_candidate_sql(db_schema: str) -> str:
 
 
 @asynccontextmanager
-async def selected_publication_dependencies(database, schema_name):
-    """Hold actual protected TIGER custody through the ordinary native finalizer."""
-    from process.tiger_held_inputs import selected_tiger_inventory
+async def selected_publication_dependencies(database, schema_name, *, control_context=None):
+    """Hold complete protected input families through the ordinary native finalizer."""
+    from process.tiger_held_inputs import selected_captured_inventories, selected_tiger_inventory
 
     schema = projection._sql_identifier(schema_name, field_name="address schema")
     async with database.session_factory() as session, session.begin():
-        inventory = await selected_tiger_inventory(session)
+        node_options_dict = {}
+        if control_context is not None and control_context.get("control_run_id"):
+            from process.entity_address_native_publication import controlled_dependency_node
+
+            node_options_dict["node_id"] = await controlled_dependency_node(session, schema, control_context)
+        captured = await selected_captured_inventories(session, **node_options_dict)
+        inventory = captured.get("tiger") or await selected_tiger_inventory(session, **node_options_dict)
         if inventory is None:
             if await session.scalar(
                 text("""SELECT EXISTS(SELECT 1 FROM pg_inherits
                 WHERE inhparent IN (to_regclass('tiger.zip_state'),to_regclass('tiger.zcta5')))""")
             ):
                 raise RuntimeError("entity-address inherited TIGER publication requires protected captured inputs")
-            yield None
-            return
-        by_name = {relation["relation_name"]: relation for relation in inventory["relations"]}
+            if not captured:
+                yield None
+                return
+        by_name = {
+            relation["relation_name"]: relation for family in captured.values() for relation in family["relations"]
+        }
+        if inventory is not None:
+            by_name.update({relation["relation_name"]: relation for relation in inventory["relations"]})
         bindings_by_name = {}
         for namespace, table in projection._PROJECTION_DEPENDENCIES:
             canonical = f"{namespace or schema}.{table}"
-            physical_schema = by_name[table]["schema_name"] if namespace == "tiger" else schema
+            physical_schema = by_name[table]["schema_name"] if table in by_name else namespace or schema
             relation = (
                 (
                     await session.execute(

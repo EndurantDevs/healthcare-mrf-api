@@ -18,8 +18,7 @@ class NestedProgressHarness:
 
     async def persist_update(self, statement):
         values_by_field = {
-            getattr(key, "key", str(key)): getattr(value, "value", value)
-            for key, value in statement._values.items()
+            getattr(key, "key", str(key)): getattr(value, "value", value) for key, value in statement._values.items()
         }
         self.progress_by_write.append(values_by_field["progress"])
         return 1
@@ -32,6 +31,62 @@ class NestedProgressHarness:
             progress_message="working",
         )
         return {"rows": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_module", ["process.places_zcta", "process.entity_address_unified", "process.nucc"])
+@pytest.mark.parametrize("late_error", [None, ImportCancelledError, RuntimeError])
+async def test_committed_native_handoff_is_not_overwritten_as_terminal(monkeypatch, target_module, late_error):
+    committed_by_field = {"native_handoff": "synthetic"}
+
+    async def target(ctx, _task):
+        ctx["context"].update(control_run_handoff_committed=True, _control_committed_result=committed_by_field)
+        if late_error:
+            raise late_error("synthetic late failure")
+        return committed_by_field
+
+    marks = AsyncMock(return_value=True)
+    monkeypatch.setenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "0")
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", marks)
+    monkeypatch.setattr(control_lifecycle, "_flush_terminal_status_events", AsyncMock())
+    monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: SimpleNamespace(process_data=target))
+    outcome = await control_single_job_start(
+        {}, {"run_id": "synthetic_handoff", "target_module": target_module, "target_function": "process_data"}
+    )
+    assert outcome == {"status": "finalizing", "run_id": "synthetic_handoff", "result": committed_by_field}
+    assert [call.kwargs["status"] for call in marks.await_args_list] == ["running"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError, ImportCancelledError, asyncio.CancelledError])
+async def test_uncertain_nucc_commit_does_not_overwrite_persisted_custody(monkeypatch, failure):
+    async def target(ctx, _task):
+        ctx["context"]["nucc_native_commit_unknown"] = True
+        raise failure("synthetic readback lost")
+
+    marks = AsyncMock(return_value=True)
+    monkeypatch.setenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "0")
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", marks)
+    monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: SimpleNamespace(process_data=target))
+    with pytest.raises(failure):
+        await control_single_job_start(
+            {}, {"run_id": "synthetic_unknown", "target_module": "process.nucc", "target_function": "process_data"}
+        )
+    assert [call.kwargs["status"] for call in marks.await_args_list] == ["running"]
+
+
+def test_nucc_attempt_custody_is_not_copied_from_shared_worker_context():
+    context_by_field = {
+        "context": {
+            "nucc_native_stage": "old",
+            "nucc_native_predecessor": "old",
+            "nucc_native_commit_unknown": True,
+            "start": "original",
+        }
+    }
+    isolated_by_field = control_lifecycle._isolated_control_job_context(context_by_field, "new")
+    assert isolated_by_field["context"] == {"start": "original", "control_run_id": "new"}
+    assert context_by_field["context"]["nucc_native_stage"] == "old"
 
 
 @pytest.mark.asyncio
@@ -205,9 +260,7 @@ async def test_audit_only_terminal_progress_survives_control_wrapper(
 
     assert outcome["status"] == "succeeded"
     assert marks[-1][1]["phase_detail"] == "candidate audit-only complete"
-    assert marks[-1][1]["progress_message"] == (
-        "retained passing attestation without promotion"
-    )
+    assert marks[-1][1]["progress_message"] == ("retained passing attestation without promotion")
     assert marks[-1][1]["progress"] == terminal_progress_by_field
     assert marks[-1][1]["metrics"]["count"] == 26
 
@@ -468,10 +521,7 @@ async def test_mark_control_run_can_preserve_existing_finished_at(monkeypatch):
         preserve_finished_at=True,
     )
 
-    values_by_field = {
-        getattr(key, "key", str(key)): field_value
-        for key, field_value in db_updates[0]._values.items()
-    }
+    values_by_field = {getattr(key, "key", str(key)): field_value for key, field_value in db_updates[0]._values.items()}
     assert "finished_at" not in values_by_field
     assert live_events[-1]["finished_at"] is None
     assert status_events[-1]["finished_at"] is None

@@ -3,7 +3,7 @@
 """Opt-in genuine-role proof using one disposable database and exact UUID roles."""
 
 import os
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -32,18 +32,23 @@ def _admin_url():
 
 
 async def _remove_guard_resources(admin, database_name, role_by_kind, attempted_roles, is_database_attempted):
-    if is_database_attempted:
-        await admin.execute(f'DROP DATABASE IF EXISTS "{database_name}"')
-    for name in reversed(attempted_roles):
+    async def revoke_parameter(name):
         if await admin.fetchval("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)", name):
             await admin.execute(f'REVOKE SET ON PARAMETER session_replication_role FROM "{name}"')
-        await admin.execute(f'DROP ROLE IF EXISTS "{name}"')
-    assert not await admin.fetchval("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)", database_name)
-    assert not await admin.fetchval(
-        "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=ANY($1::text[]))", list(role_by_kind.values())
-    )
-    await admin.close()
-    print("Verified absent:", database_name, *role_by_kind.values())
+
+    async with AsyncExitStack() as admin_cleanup:
+        admin_cleanup.push_async_callback(admin.close)
+        async with AsyncExitStack() as resource_cleanup:
+            for name in attempted_roles:
+                resource_cleanup.push_async_callback(admin.execute, f'DROP ROLE IF EXISTS "{name}"')
+                resource_cleanup.push_async_callback(revoke_parameter, name)
+            if is_database_attempted:
+                resource_cleanup.push_async_callback(admin.execute, f'DROP DATABASE IF EXISTS "{database_name}"')
+        assert not await admin.fetchval("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)", database_name)
+        assert not await admin.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=ANY($1::text[]))", list(role_by_kind.values())
+        )
+        print("Verified absent:", database_name, *role_by_kind.values())
 
 
 @asynccontextmanager
@@ -57,9 +62,13 @@ async def _owned_guard_database(monkeypatch):
     admin = await asyncpg.connect(admin_url.render_as_string(hide_password=False), timeout=10)
     databases = []
     attempted_roles = []
-    connection = None
     is_database_attempted = False
-    try:
+
+    async def remove_attempted_resources():
+        await _remove_guard_resources(admin, database_name, role_by_kind, attempted_roles, is_database_attempted)
+
+    async with AsyncExitStack() as cleanup:
+        cleanup.push_async_callback(remove_attempted_resources)
         assert not await admin.fetchval("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)", database_name)
         assert not await admin.fetchval(
             "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=ANY($1::text[]))", list(role_by_kind.values())
@@ -75,6 +84,7 @@ async def _owned_guard_database(monkeypatch):
         is_database_attempted = True
         await admin.execute(f'CREATE DATABASE "{database_name}" TEMPLATE template0')
         connection = await asyncpg.connect(admin_url.set(database=database_name).render_as_string(hide_password=False))
+        cleanup.push_async_callback(connection.close)
         await connection.execute("CREATE EXTENSION postgis")
         await connection.execute(f'CREATE SCHEMA hp_snapshot_retention AUTHORIZATION "{role_by_kind["owner"]}"')
         for kind in ("writer", "publisher"):
@@ -88,6 +98,7 @@ async def _owned_guard_database(monkeypatch):
             databases.append(
                 Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
             )
+            cleanup.push_async_callback(databases[-1].disconnect)
         monkeypatch.setenv("HLTHPRT_DB_DATABASE", database_name)
         monkeypatch.delenv("HLTHPRT_DB_DATABASE_OVERRIDE", raising=False)
         monkeypatch.setattr(db, "engine", databases[0].engine)
@@ -97,12 +108,6 @@ async def _owned_guard_database(monkeypatch):
         yield SimpleNamespace(
             admin=connection, roles=role_by_kind, publisher=databases[1], admin_role=admin_url.username
         )
-    finally:
-        for database in databases:
-            await database.disconnect()
-        if connection is not None:
-            await connection.close()
-        await _remove_guard_resources(admin, database_name, role_by_kind, attempted_roles, is_database_attempted)
 
 
 async def _provision_test_schema(resources, schema, *, initial_generation):

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -13,6 +15,7 @@ from sqlalchemy import text
 from api.custom_import_provider_sql import ProviderImportQuery, merge_native_params
 from db.connection import ConnectionProxy
 from db.models import EntityAddressUnified
+from process.custom_import.read_core import _local_statement_timeout
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -272,6 +275,21 @@ async def _provider_list_connection(
     if request_session is None:
         raise RuntimeError("custom-import provider query requires a request session")
     yield ConnectionProxy(database, request_session, None)
+
+
+async def _provider_list_count(connection, query, parameters, session, *, deadline=None):
+    """Bound optional Reader aggregates without cancelling their pinned connection."""
+    if deadline is None:
+        rows = await connection.all(query, **parameters)
+    else:
+        remaining_ms = math.ceil((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            raise TimeoutError("optional count deadline expired")
+        async with _local_statement_timeout(session, timeout_ms=remaining_ms):
+            rows = await connection.all(query, **parameters)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("optional count deadline expired")
+    return rows[0][0] if rows else 0
 
 
 def _provider_import_relation_cte(

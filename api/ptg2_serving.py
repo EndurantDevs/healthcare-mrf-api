@@ -49,6 +49,9 @@ from api.plan_pricing_projection_contract import (
     LEGACY_PROJECTION_CONTRACT as LEGACY_PLAN_PRICING_PROJECTION_CONTRACT,
 )
 from api.plan_pricing_projection_contract import (
+    address_provenance_sql,
+)
+from api.plan_pricing_projection_contract import (
     projection_code_identity as _plan_pricing_projection_code_identity,
 )
 from api.plan_pricing_projection_contract import (
@@ -187,9 +190,22 @@ from api.ptg2_snapshot import (
 )
 from api.ptg2_tables import (
     PTG2_V3_ARCH_VERSION,
+    read_serving_tables,
     snapshot_serving_tables,
 )
-from api.ptg2_types import PTG2ServingTables
+from api.ptg2_types import (
+    PTG2ServingTables,
+    _ProviderExpansionRequest,
+    _V4DirectContext,
+    _V4DirectPrefix,
+    _V4DirectResolved,
+    _V4DirectSetPrefix,
+    _V4PatternCompletionRequest,
+    _V4PatternContext,
+    _V4PatternPrefix,
+    _V4PatternTaxonomyRequest,
+    _V4TaxonomyRequest,
+)
 from api.ptg2_v4_graph import (
     load_v4_graph_root,
     load_v4_relation_manifest,
@@ -286,20 +302,22 @@ _PTG2_NETWORK_SERVING_TABLES_CACHE: OrderedDict[
 _PTG2_PROVIDER_NPI_PREFIX_CACHE_MAX_ENTRIES = 4096
 _PTG2_V4_NPI_PREFIX_DIGEST_DOMAIN = b"PTG2V4NPI-PREFIX\x01"
 _PTG2_PROVIDER_NPI_PREFIX_CACHE: OrderedDict[
-    tuple[int, str],
+    tuple[int | str, str],
     tuple[int, tuple[int, ...], bool],
 ] = OrderedDict()
 _PTG2_FILTERED_PROVIDER_PREFIX_CACHE: OrderedDict[
-    tuple[int, str, int, str],
+    tuple[int | str, str, int, str],
     tuple[int, ...],
 ] = OrderedDict()
 _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE: OrderedDict[
-    tuple[int, int],
+    tuple[int | str, int],
     tuple[str, ...],
 ] = OrderedDict()
 _PTG2_NETWORK_SERVING_TABLES_REVALIDATION_SQL = f"""
     SELECT snapshot.snapshot_id,
            binding.snapshot_key,
+           (layout.layout_manifest ? 'physical_binding' OR snapshot.manifest::jsonb ? 'physical_binding_contract')
+               AS has_local_physical_binding,
            layout.generation AS storage_generation,
            layout.layout_manifest->'serving_index'->>'shared_snapshot_key'
                AS layout_snapshot_key,
@@ -1570,7 +1588,8 @@ async def _ptg2_table_columns(session, table_name: str) -> frozenset[str]:
         return frozenset()
     schema_name, bare_table_name = safe_table_name.split(".", 1)
     try:
-        column_result = await session.execute(
+        column_result = await _optional_ptg2_query(
+            session,
             text(
                 """
                 SELECT column_name
@@ -1592,7 +1611,6 @@ async def _ptg2_table_columns(session, table_name: str) -> frozenset[str]:
                 column_names.add(str(column_name))
         return frozenset(column_names)
     except Exception:
-        await _rollback_optional_ptg2_query(session)
         return frozenset()
 
 
@@ -1601,16 +1619,11 @@ async def _has_table_columns(session, table_name: str, required_columns: set[str
     return bool(columns) and set(required_columns).issubset(columns)
 
 
-async def _rollback_optional_ptg2_query(session) -> None:
-    rollback = getattr(session, "rollback", None)
-    if rollback is None:
-        return
-    try:
-        result = rollback()
-        if hasattr(result, "__await__"):
-            await result
-    except Exception:
-        return
+async def _optional_ptg2_query(session, statement, parameters_by_name):
+    """Roll back optional failures only to a savepoint, preserving read fences."""
+
+    async with session.begin_nested():
+        return await session.execute(statement, parameters_by_name)
 
 
 def _ptg2_row_address_key(row: dict[str, Any]) -> str | None:
@@ -1697,7 +1710,8 @@ async def _provider_directory_corroboration_by_key(
     """Read the newest active corroboration for each provider address."""
 
     try:
-        query = await session.execute(
+        query = await _optional_ptg2_query(
+            session,
             text(_PTG2_PROVIDER_DIRECTORY_CORROBORATION_SQL.format(corroboration_table=corroboration_table)),
             {
                 "npis": sorted({npi for npi, _ in lookup_pairs}),
@@ -1708,7 +1722,6 @@ async def _provider_directory_corroboration_by_key(
             },
         )
     except Exception:
-        await _rollback_optional_ptg2_query(session)
         return None
     return {
         (int(fields["npi"]), str(fields["address_key"])): fields
@@ -2141,8 +2154,16 @@ def _required_logical_snapshot_id(serving_tables: PTG2ServingTables) -> str:
     return snapshot_id
 
 
-def _shared_v3_code_table() -> str:
-    return f"{PTG2_SCHEMA}.ptg2_v3_code"
+def _payload_schema(serving_tables: PTG2ServingTables, *, default_schema: str | None = None) -> str:
+    """Use the authenticated physical family, leaving reference schemas unchanged."""
+
+    binding = getattr(serving_tables, "physical_binding", None)
+    return binding.schema_name if binding is not None else (PTG2_SCHEMA if default_schema is None else default_schema)
+
+
+def _shared_v3_code_table(serving_tables: PTG2ServingTables | None = None) -> str:
+    binding = getattr(serving_tables, "physical_binding", None)
+    return binding.relation("ptg2_v3_code") if binding else f"{PTG2_SCHEMA}.ptg2_v3_code"
 
 
 def _shared_v3_snapshot_scope_table() -> str:
@@ -2198,16 +2219,19 @@ def _shared_v3_code_scope_sql(
     return join_sql, filters, query_params_by_name, order_sql
 
 
-def _shared_v3_provider_set_table() -> str:
-    return f"{PTG2_SCHEMA}.ptg2_v3_provider_set"
+def _shared_v3_provider_set_table(serving_tables: PTG2ServingTables | None = None) -> str:
+    binding = getattr(serving_tables, "physical_binding", None)
+    return binding.relation("ptg2_v3_provider_set") if binding else f"{PTG2_SCHEMA}.ptg2_v3_provider_set"
 
 
-def _shared_v3_provider_group_table() -> str:
-    return f"{PTG2_SCHEMA}.ptg2_v3_provider_group"
+def _shared_v3_provider_group_table(serving_tables: PTG2ServingTables | None = None) -> str:
+    binding = getattr(serving_tables, "physical_binding", None)
+    return binding.relation("ptg2_v3_provider_group") if binding else f"{PTG2_SCHEMA}.ptg2_v3_provider_group"
 
 
-def _shared_v3_price_attr_table() -> str:
-    return f"{PTG2_SCHEMA}.ptg2_v3_price_attr"
+def _shared_v3_price_attr_table(serving_tables: PTG2ServingTables | None = None) -> str:
+    binding = getattr(serving_tables, "physical_binding", None)
+    return binding.relation("ptg2_v3_price_attr") if binding else f"{PTG2_SCHEMA}.ptg2_v3_price_attr"
 
 
 def _append_shared_snapshot_filter(
@@ -2247,7 +2271,7 @@ async def _provider_set_ids_for_keys(
         text(
             f"""
             SELECT provider_set_key, provider_set_global_id_128
-            FROM {_shared_v3_provider_set_table()}
+            FROM {_shared_v3_provider_set_table(serving_tables)}
             WHERE snapshot_key = :shared_snapshot_key
               AND provider_set_key = ANY(CAST(:provider_set_keys AS integer[]))
             """
@@ -2281,7 +2305,7 @@ async def _hydrate_provider_set_network_names(
             f"""
             SELECT encode(provider_set_global_id_128, 'hex') AS provider_set_id,
                    network_names
-              FROM {_shared_v3_provider_set_table()}
+              FROM {_shared_v3_provider_set_table(serving_tables)}
              WHERE snapshot_key = :shared_snapshot_key
                AND provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS bytea[]))
             """
@@ -2328,7 +2352,7 @@ def _v4_prefix_query_fragments(
                    , prefix.member_digest AS prefix_member_digest
         """,
         f"""
-              LEFT JOIN {PTG2_SCHEMA}.{PTG2_V4_NPI_PREFIX_TABLE} AS prefix
+              LEFT JOIN {_payload_schema(serving_tables)}.{PTG2_V4_NPI_PREFIX_TABLE} AS prefix
                 ON prefix.snapshot_key = provider_set.snapshot_key
                AND prefix.provider_set_key = provider_set.provider_set_key
         """,
@@ -2388,7 +2412,7 @@ async def _provider_set_metadata_for_ids(
                    provider_set.provider_set_global_id_128,
                    provider_set.provider_count
                    {prefix_projection}
-              FROM {_shared_v3_provider_set_table()} AS provider_set
+              FROM {_shared_v3_provider_set_table(serving_tables)} AS provider_set
               {prefix_join}
              WHERE provider_set.snapshot_key = :shared_snapshot_key
                AND provider_set.provider_set_global_id_128
@@ -2461,7 +2485,7 @@ async def _version_three_provider_pages_for_keys(
         _required_shared_snapshot_key(serving_tables),
         normalized_keys,
         source_count=_required_source_count(serving_tables),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     if provider_pages is None:
         return None
@@ -2493,7 +2517,7 @@ async def _lookup_shared_forward_rows(
         scan_budget=scan_budget,
         **sparse_count_kwargs,
         **dictionary_hints,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
 
 
@@ -2525,7 +2549,7 @@ async def _lookup_shared_forward_prefix_rows(
         scan_budget=scan_budget,
         **sparse_count_kwargs,
         **_version_three_forward_lookup_hints(serving_tables),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
 
 
@@ -2641,7 +2665,7 @@ async def _version_three_forward_page_ids(
         price_keys,
         **_version_three_page_price_lookup_hints(serving_tables),
         shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     if set(price_ids_by_key) != price_keys:
         raise PTG2ManifestArtifactError("PTG2 v3 forward page references an unknown price set")
@@ -2742,7 +2766,7 @@ async def _version_three_forward_page_rows(
         _required_shared_snapshot_key(serving_tables),
         int(code_key),
         source_count=_required_source_count(serving_tables),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     if page_entries is None:
         return None
@@ -2858,7 +2882,7 @@ async def _shared_code_prefix_rows(
         source_count=_required_source_count(serving_tables),
         scan_budget=request.scan_budget,
         **_version_three_forward_lookup_hints(serving_tables),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     if not prefix_rows:
         await _raise_missing_v3_block(session, serving_tables, code_key)
@@ -3349,21 +3373,16 @@ async def _full_shared_code_rows(
     """Read and materialize an authoritative complete by-code block."""
 
     request = _SharedCodeRowsRequest(**request_options)
-    code_data = request.code_data
-    network_names = request.network_names
-    limit = request.limit
-    offset = request.offset
-    descending = request.descending
-    code_key = int(code_data["code_key"])
+    code_key = int(request.code_data["code_key"])
     projected_rows, provider_counts_by_key = await _version_three_projected_code_rows(
         session,
         serving_tables,
-        code_data,
+        request.code_data,
         request.provider_pages_by_key,
-        network_names,
-        limit,
-        offset,
-        descending,
+        request.network_names,
+        request.limit,
+        request.offset,
+        request.descending,
     )
     if projected_rows is not None:
         return projected_rows
@@ -3374,9 +3393,9 @@ async def _full_shared_code_rows(
         _SharedForwardSelection(
             provider_set_keys=request.provider_set_keys,
             provider_counts_by_key=provider_counts_by_key,
-            limit=limit,
-            offset=offset,
-            descending=descending,
+            limit=request.limit,
+            offset=request.offset,
+            descending=request.descending,
             scan_budget=request.scan_budget,
         ),
     )
@@ -3393,12 +3412,12 @@ async def _full_shared_code_rows(
     return _materialize_full_shared_rows(
         forward_rows,
         provider_set_ids_by_key,
-        code_data,
+        request.code_data,
         request.source_trace_set_hash,
-        network_names,
-        limit,
-        offset,
-        descending,
+        request.network_names,
+        request.limit,
+        request.offset,
+        request.descending,
     )
 
 
@@ -3515,7 +3534,7 @@ async def _raise_missing_v3_block(
         session,
         code_key,
         shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     ):
         raise PTG2ManifestArtifactError("PTG2 v3 forward artifact is missing a referenced code block")
 
@@ -3624,6 +3643,7 @@ async def _manifest_reverse_code_rows(
         params["code_row_offset"] = max(int(request.offset_rows or 0), 0)
     return await _execute_manifest_reverse_code_rows(
         session,
+        serving_tables,
         scope_join_sql=scope_join_sql,
         where_sql=where_sql,
         window_sql=window_sql,
@@ -3634,6 +3654,7 @@ async def _manifest_reverse_code_rows(
 
 async def _execute_manifest_reverse_code_rows(
     session,
+    serving_tables: PTG2ServingTables,
     *,
     scope_join_sql: str,
     where_sql: str,
@@ -3656,7 +3677,7 @@ async def _execute_manifest_reverse_code_rows(
                    code_metadata.source_name,
                    code_metadata.source_description,
                    code_metadata.rate_count
-            FROM {_shared_v3_code_table()} code_metadata
+            FROM {_shared_v3_code_table(serving_tables)} code_metadata
             {scope_join_sql}
             {where_sql}
             ORDER BY {plan_order},
@@ -3837,7 +3858,7 @@ async def _version_three_scope_code_keys(
         session,
         _required_shared_snapshot_key(serving_tables),
         provider_set_id_by_key,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     missing_provider_code_keys = set(provider_set_id_by_key).difference(provider_set_code_keys)
     empty_provider_code_keys = {
@@ -3924,7 +3945,7 @@ async def _version_three_forward_entries_for_batch(
         **_version_three_forward_lookup_hints(serving_tables),
         shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
         source_count=_required_source_count(serving_tables),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
 
 
@@ -4042,7 +4063,7 @@ async def _load_version_three_page_projection(
         _required_shared_snapshot_key(serving_tables),
         provider_set_id_by_key,
         source_count=_required_source_count(serving_tables),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     if provider_pages_by_key is None:
         return None
@@ -4073,7 +4094,7 @@ async def _version_three_page_projection_scope(
     if not await has_shared_provider_pages_in_db(
         session,
         _required_shared_snapshot_key(serving_tables),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     ):
         return None
     try:
@@ -4227,7 +4248,7 @@ async def _version_three_reverse_page_selection(
         (page_entry.price_key for page_entry in selected_entries),
         **_version_three_page_price_lookup_hints(serving_tables),
         shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     if set(price_ids_by_key) != {page_entry.price_key for page_entry in selected_entries}:
         raise PTG2ManifestArtifactError("PTG2 v3 reverse page references an unknown price set")
@@ -4524,7 +4545,7 @@ async def _shared_provider_group_ids_for_keys(
         text(
             f"""
             SELECT provider_group_key, provider_group_global_id_128
-              FROM {_shared_v3_provider_group_table()}
+              FROM {_shared_v3_provider_group_table(serving_tables)}
              WHERE snapshot_key = :shared_snapshot_key
                AND provider_group_key = ANY(CAST(:provider_group_keys AS integer[]))
             """
@@ -4553,7 +4574,7 @@ async def _shared_provider_group_keys_for_ids(
         text(
             f"""
             SELECT provider_group_key, provider_group_global_id_128
-              FROM {_shared_v3_provider_group_table()}
+              FROM {_shared_v3_provider_group_table(serving_tables)}
              WHERE snapshot_key = :shared_snapshot_key
                AND provider_group_global_id_128 = ANY(CAST(:provider_group_ids AS bytea[]))
             """
@@ -4617,10 +4638,11 @@ async def _v4_groups_via_sources(
     max_members: int | None,
     maximum_pattern_degree: int,
     maximum_component_degree: int,
+    schema_name: str = PTG2_SCHEMA,
 ) -> dict[int, tuple[int, ...]]:
     """Resolve exact set groups through a bounded per-set pattern/component hop."""
 
-    normalized_set_keys = tuple(sorted({int(provider_set_key) for provider_set_key in provider_set_keys}))
+    normalized_set_keys = tuple(sorted({int(key) for key in provider_set_keys}))
     if not normalized_set_keys:
         return {}
     member_budget = None if max_members is None else int(max_members)
@@ -4630,6 +4652,7 @@ async def _v4_groups_via_sources(
         provider_set_keys=normalized_set_keys,
         maximum_pattern_degree=maximum_pattern_degree,
         maximum_component_degree=maximum_component_degree,
+        schema_name=schema_name,
     )
     pattern_keys, component_keys = _v4_group_source_owner_keys(group_sources)
     groups_by_pattern, groups_by_component = await _load_v4_source_groups(
@@ -4638,6 +4661,7 @@ async def _v4_groups_via_sources(
         pattern_keys=pattern_keys,
         component_keys=component_keys,
         member_budget=member_budget,
+        schema_name=schema_name,
     )
     if set(groups_by_pattern) != set(pattern_keys) or set(groups_by_component) != set(component_keys):
         raise PTG2ManifestArtifactError("PTG2 V4 provider-group relation is incomplete")
@@ -4669,6 +4693,7 @@ async def _load_v4_source_groups(
     pattern_keys: tuple[int, ...],
     component_keys: tuple[int, ...],
     member_budget: int | None,
+    schema_name: str = PTG2_SCHEMA,
 ) -> tuple[dict[int, tuple[int, ...]], dict[int, tuple[int, ...]]]:
     groups_by_pattern = (
         await lookup_v4_relation_members(
@@ -4676,7 +4701,7 @@ async def _load_v4_source_groups(
             snapshot_key=snapshot_key,
             relation="pattern_groups",
             owner_keys=pattern_keys,
-            schema_name=PTG2_SCHEMA,
+            schema_name=schema_name,
             max_members=member_budget,
         )
         if pattern_keys
@@ -4688,7 +4713,7 @@ async def _load_v4_source_groups(
             snapshot_key=snapshot_key,
             relation="component_groups",
             owner_keys=component_keys,
-            schema_name=PTG2_SCHEMA,
+            schema_name=schema_name,
             max_members=member_budget,
         )
         if component_keys
@@ -4732,6 +4757,7 @@ async def _v4_members_via_projection(
     projection_relation: str,
     projected_member_relation: str,
     member_budget: int | None,
+    schema_name: str = PTG2_SCHEMA,
 ) -> dict[int, tuple[int, ...]]:
     """Load and flatten one factored V4 relation."""
 
@@ -4741,7 +4767,7 @@ async def _v4_members_via_projection(
         snapshot_key=snapshot_key,
         relation=projection_relation,
         owner_keys=owner_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=schema_name,
         max_members=projection_budget,
     )
     projection_keys = tuple(
@@ -4758,7 +4784,7 @@ async def _v4_members_via_projection(
         snapshot_key=snapshot_key,
         relation=projected_member_relation,
         owner_keys=projection_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=schema_name,
         max_members=member_budget,
     )
     return _projected_members_by_owner(
@@ -4791,7 +4817,7 @@ async def _v4_members_through_projection(
     root = await load_v4_graph_root(
         session,
         snapshot_key,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     if root.representation == "direct_v1":
         return await lookup_v4_relation_members(
@@ -4799,7 +4825,7 @@ async def _v4_members_through_projection(
             snapshot_key=snapshot_key,
             relation=direct_relation,
             owner_keys=normalized_owner_keys,
-            schema_name=PTG2_SCHEMA,
+            schema_name=_payload_schema(serving_tables),
             max_members=member_budget,
         )
     if projection_relation == "set_patterns" and projected_member_relation == "pattern_groups":
@@ -4811,6 +4837,7 @@ async def _v4_members_through_projection(
             max_members=member_budget,
             maximum_pattern_degree=hot_limits.maximum_patterns_per_set,
             maximum_component_degree=(hot_limits.maximum_components_per_fallback_set),
+            schema_name=_payload_schema(serving_tables),
         )
     return await _v4_members_via_projection(
         session,
@@ -4819,6 +4846,7 @@ async def _v4_members_through_projection(
         projection_relation=projection_relation,
         projected_member_relation=projected_member_relation,
         member_budget=member_budget,
+        schema_name=_payload_schema(serving_tables),
     )
 
 
@@ -5269,7 +5297,7 @@ async def _v4_sets_by_npi(
         serving_tables,
         normalized_npis,
         allowed_provider_set_keys,
-        schema_name,
+        (_payload_schema(serving_tables) if getattr(serving_tables, "physical_binding", None) else schema_name),
         max_members,
         max_projection_members,
     )
@@ -5293,14 +5321,14 @@ async def _v4_npi_groups(
         session,
         snapshot_key=snapshot_key,
         npis=npi_by_owner_id.values(),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     group_keys_by_npi_key = await lookup_v4_relation_members(
         session,
         snapshot_key=snapshot_key,
         relation="npi_groups_exact",
         owner_keys=npi_key_by_value.values(),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
         max_members=max_members,
     )
     group_keys = {int(group_key) for members in group_keys_by_npi_key.values() for group_key in members}
@@ -5353,7 +5381,7 @@ async def _v4_group_npis(
         snapshot_key=snapshot_key,
         relation="group_npis_exact",
         owner_keys=owner_key_by_id.values(),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
         **lookup_options_by_name,
     )
     npi_keys = {int(npi_key) for members in npi_keys_by_group.values() for npi_key in members}
@@ -5361,7 +5389,7 @@ async def _v4_group_npis(
         session,
         snapshot_key=snapshot_key,
         npi_keys=npi_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     if set(npi_by_key) != npi_keys:
         raise PTG2ManifestArtifactError("PTG2 V4 graph references a missing NPI dictionary key")
@@ -5572,7 +5600,7 @@ async def _legacy_shared_graph_members_many(
         _required_shared_snapshot_key(serving_tables),
         direction,
         owner_key_by_id.values(),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
         max_members=max_members,
         max_total_members=max_projection_members,
     )
@@ -5878,7 +5906,7 @@ async def _shared_group_ids_for_set_keys(
         _required_shared_snapshot_key(serving_tables),
         PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
         normalized_provider_set_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     return await _provider_group_ids_for_key_members(
         session,
@@ -5918,12 +5946,13 @@ async def _shared_rate_provider_groups(
 
 async def _shared_rate_code_rows(
     session,
+    serving_tables: PTG2ServingTables,
     scope_join_sql: str,
     filters: list[str],
     params: dict[str, Any],
     plan_order: str,
 ) -> list[dict[str, Any]]:
-    """Read canonical code metadata for one shared plan/code scope."""
+    """Read bound code metadata for one shared plan/code scope."""
 
     code_query_result = await session.execute(
         text(
@@ -5933,7 +5962,7 @@ async def _shared_rate_code_rows(
                    logical_scope.plan_market_type,
                    code_metadata.reported_code_system,
                    code_metadata.reported_code
-              FROM {_shared_v3_code_table()} code_metadata
+              FROM {_shared_v3_code_table(serving_tables)} code_metadata
               {scope_join_sql}
              WHERE {" AND ".join(filters)}
              ORDER BY {plan_order}, code_metadata.reported_code, code_metadata.code_key
@@ -5980,6 +6009,7 @@ async def _shared_rate_code_scope_rows(
     )
     return await _shared_rate_code_rows(
         session,
+        serving_tables,
         scope_join_sql,
         filters,
         params,
@@ -6054,6 +6084,14 @@ def _ptg2_npi_member_id(npi: int) -> str:
     return (b"\x00" * 8 + int(npi).to_bytes(8, "big", signed=False)).hex()
 
 
+def _provider_cache_snapshot_key(serving_tables: PTG2ServingTables) -> int | str:
+    """Separate native families that retain the same producer payload key."""
+
+    snapshot_key = _required_shared_snapshot_key(serving_tables)
+    binding = getattr(serving_tables, "physical_binding", None)
+    return repr(binding) if binding else snapshot_key
+
+
 def _cached_provider_npi_prefixes(
     serving_tables: PTG2ServingTables,
     provider_set_ids: tuple[str, ...],
@@ -6061,7 +6099,7 @@ def _cached_provider_npi_prefixes(
 ) -> tuple[dict[str, tuple[int, ...]], tuple[str, ...]]:
     """Return reusable prefixes and provider sets that still need loading."""
 
-    shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
+    shared_snapshot_key = _provider_cache_snapshot_key(serving_tables)
     npis_by_set: dict[str, tuple[int, ...]] = {}
     missing_provider_set_ids: list[str] = []
     for provider_set_id in provider_set_ids:
@@ -6090,7 +6128,7 @@ def _cache_provider_npi_prefix(
     """Store one bounded provider-set prefix under its sealed snapshot key."""
 
     cache_key = (
-        _required_shared_snapshot_key(serving_tables),
+        _provider_cache_snapshot_key(serving_tables),
         provider_set_id,
     )
     _PTG2_PROVIDER_NPI_PREFIX_CACHE[cache_key] = (
@@ -6291,6 +6329,7 @@ class _V4NpiGroupSources:
     prefix_override_by_id: Mapping[str, _ProviderSetGraphMetadata]
     pattern_keys_by_set: Mapping[int, tuple[int, ...]] | None
     component_keys_by_set: Mapping[int, tuple[int, ...]] = field(default_factory=dict)
+    schema_name: str = PTG2_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -6450,7 +6489,7 @@ async def _apply_v4_npi_prefix_overrides(
         session,
         snapshot_key=int(snapshot_key),
         provider_set_keys=expected_count_by_key,
-        schema_name=PTG2_SCHEMA,
+        schema_name=group_sources.schema_name,
         max_members=sum(expected_count_by_key.values()),
     )
     if set(prefixes_by_key) != set(expected_count_by_key):
@@ -6475,13 +6514,14 @@ async def _load_v4_component_sources(
     snapshot_key: int,
     overflow_set_keys: tuple[int, ...],
     maximum_component_degree: int,
+    schema_name: str = PTG2_SCHEMA,
 ) -> dict[int, tuple[int, ...]]:
     component_prefixes = await lookup_v4_relation_member_prefixes(
         session,
         snapshot_key=int(snapshot_key),
         relation="set_components",
         owner_keys=overflow_set_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=schema_name,
         limit_per_owner=maximum_component_degree + 1,
     )
     if set(component_prefixes) != set(overflow_set_keys):
@@ -6501,10 +6541,11 @@ async def _load_v4_group_sources(
     provider_set_keys: Iterable[int],
     maximum_pattern_degree: int,
     maximum_component_degree: int,
+    schema_name: str = PTG2_SCHEMA,
 ) -> _V4SetGroupSources:
     """Choose the bounded pattern or exact component first hop per set."""
 
-    normalized_set_keys = tuple(sorted({int(provider_set_key) for provider_set_key in provider_set_keys}))
+    normalized_set_keys = tuple(sorted({int(key) for key in provider_set_keys}))
     if not normalized_set_keys:
         return _V4SetGroupSources({}, {})
     pattern_prefixes = await lookup_v4_relation_member_prefixes(
@@ -6512,7 +6553,7 @@ async def _load_v4_group_sources(
         snapshot_key=int(snapshot_key),
         relation="set_patterns",
         owner_keys=normalized_set_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=schema_name,
         limit_per_owner=maximum_pattern_degree + 1,
     )
     if set(pattern_prefixes) != set(normalized_set_keys):
@@ -6535,6 +6576,7 @@ async def _load_v4_group_sources(
         snapshot_key=int(snapshot_key),
         overflow_set_keys=overflow_set_keys,
         maximum_component_degree=maximum_component_degree,
+        schema_name=schema_name,
     )
     return _V4SetGroupSources(
         pattern_keys_by_set=pattern_keys_by_set,
@@ -6597,7 +6639,7 @@ async def _load_v4_npi_group_sources(
     root = await load_v4_graph_root(
         session,
         snapshot_key,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     pattern_keys_by_set: Mapping[int, tuple[int, ...]] | None = None
     component_keys_by_set: Mapping[int, tuple[int, ...]] = {}
@@ -6609,6 +6651,7 @@ async def _load_v4_npi_group_sources(
             provider_set_keys=source_metadata.ordinary_provider_set_keys,
             maximum_pattern_degree=hot_limits.maximum_patterns_per_set,
             maximum_component_degree=(hot_limits.maximum_components_per_fallback_set),
+            schema_name=_payload_schema(serving_tables),
         )
         pattern_keys_by_set = group_sources.pattern_keys_by_set
         component_keys_by_set = group_sources.component_keys_by_set
@@ -6618,6 +6661,7 @@ async def _load_v4_npi_group_sources(
         prefix_override_by_id=source_metadata.prefix_override_by_id,
         pattern_keys_by_set=pattern_keys_by_set,
         component_keys_by_set=component_keys_by_set,
+        schema_name=_payload_schema(serving_tables),
     )
 
 
@@ -6743,7 +6787,7 @@ async def _read_v4_group_prefixes(
             snapshot_key=snapshot_key,
             relation=source_relation,
             owner_keys=source_owner_keys,
-            schema_name=PTG2_SCHEMA,
+            schema_name=group_sources.schema_name,
             limit_per_owner=prefix_size,
         )
         if set(group_keys_by_source) != set(source_owner_keys):
@@ -6848,6 +6892,8 @@ async def _collect_v4_npi_batches(
     state: _V4NpiPrefixState,
     target_count_by_set: Mapping[str, int],
     maximum_batch_size: int,
+    *,
+    schema_name: str = PTG2_SCHEMA,
 ) -> None:
     """Read small group batches until each owner has its exact NPI prefix."""
 
@@ -6858,11 +6904,7 @@ async def _collect_v4_npi_batches(
         target_count_by_set,
         maximum_batch_size,
     )
-    for batch_start in range(
-        0,
-        len(ordered_group_keys),
-        batch_size,
-    ):
+    for batch_start in range(0, len(ordered_group_keys), batch_size):
         group_batch_keys = _active_v4_group_batch(
             ordered_group_keys,
             batch_start,
@@ -6887,7 +6929,7 @@ async def _collect_v4_npi_batches(
             snapshot_key=snapshot_key,
             relation="group_npis_exact",
             owner_keys=group_batch_keys,
-            schema_name=PTG2_SCHEMA,
+            schema_name=schema_name,
             limit_per_owner=group_member_limit,
         )
         if set(npi_keys_by_group) != set(group_batch_keys):
@@ -6995,6 +7037,7 @@ async def _walk_v4_npi_prefixes(
         state,
         target_count_by_set,
         maximum_batch_size,
+        schema_name=group_sources.schema_name,
     )
     _mark_v4_prefix_completion(
         prefix_round,
@@ -7010,6 +7053,8 @@ async def _resolve_v4_npi_member_ids(
     snapshot_key: int,
     provider_set_ids: tuple[str, ...],
     state: _V4NpiPrefixState,
+    *,
+    schema_name: str = PTG2_SCHEMA,
 ) -> dict[str, tuple[str, ...]]:
     """Resolve dense keys only after bounded graph traversal completes."""
 
@@ -7022,7 +7067,7 @@ async def _resolve_v4_npi_member_ids(
         session,
         snapshot_key=snapshot_key,
         npi_keys=selected_npi_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=schema_name,
     )
     if set(npi_by_key) != selected_npi_keys:
         raise PTG2ManifestArtifactError("PTG2 V4 NPI dictionary is incomplete")
@@ -7117,6 +7162,7 @@ async def _v4_npi_prefixes_by_set(
                 snapshot_key,
                 provider_set_ids,
                 state,
+                schema_name=_payload_schema(serving_tables),
             )
 
 
@@ -7382,7 +7428,7 @@ async def _version_three_dictionary_query(
     required_keys: set[tuple[str, int]],
 ):
     _require_strict_shared_v3(serving_tables)
-    dictionary_table = _shared_v3_price_attr_table()
+    dictionary_table = _shared_v3_price_attr_table(serving_tables)
     return await session.execute(
         text(
             f"""
@@ -7518,7 +7564,7 @@ async def _version_three_price_memberships(
     membership_argument_map: dict[str, Any] = {
         "atom_key_bits": atom_key_bits,
         "block_span": serving_tables.price_key_block_span,
-        "schema_name": PTG2_SCHEMA,
+        "schema_name": _payload_schema(serving_tables),
     }
     if retention_budget is not None:
         membership_argument_map["retention_budget"] = retention_budget
@@ -7547,7 +7593,7 @@ async def _version_three_price_atoms(
     atom_argument_map: dict[str, Any] = {
         "atom_key_bits": atom_key_bits,
         "block_span": serving_tables.atom_key_block_span,
-        "schema_name": PTG2_SCHEMA,
+        "schema_name": _payload_schema(serving_tables),
     }
     if retention_budget is not None:
         atom_argument_map["retention_budget"] = retention_budget
@@ -7801,6 +7847,8 @@ def _version_three_price_cache_layout(
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+    if getattr(serving_tables, "physical_binding", None) is not None:
+        constant_payload += b"\0" + str(_provider_cache_snapshot_key(serving_tables)).encode("utf-8")
     return PriceHydrationLayout(
         shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
         storage_generation=str(serving_tables.storage_generation or "").strip().lower(),
@@ -9851,7 +9899,8 @@ def _ptg2_npi_scope_table(
     """Choose the generation-local NPI dictionary without duplicating V4 rows."""
 
     table_name = "ptg2_v4_npi_scope" if bool(getattr(serving_tables, "uses_v4_graph", False)) else "ptg2_v3_npi_scope"
-    return f"{schema_name}.{table_name}"
+    binding = getattr(serving_tables, "physical_binding", None)
+    return binding.relation(table_name) if binding else f"{schema_name}.{table_name}"
 
 
 def _uses_npi_search_taxonomy_projection() -> bool:
@@ -10349,7 +10398,7 @@ def _is_complete_address_provenance_entry(entry: Mapping[str, Any]) -> bool:
     )
 
 
-_ADDRESS_PROVENANCE_SQL = f"""
+_ADDRESS_PROVENANCE_SQL_TEMPLATE = f"""
 WITH requested(location_key, admitted_source_id) AS (
     SELECT *
       FROM UNNEST(
@@ -10364,7 +10413,7 @@ WITH requested(location_key, admitted_source_id) AS (
            unified.address_sources,
            requested.admitted_source_id
       FROM requested
-      JOIN {PTG2_SCHEMA}.entity_address_unified AS unified
+      JOIN $unified_relation AS unified
         ON unified.location_key = requested.location_key
 ), stored_evidence AS MATERIALIZED (
     SELECT stored.evidence_id,
@@ -10380,7 +10429,7 @@ WITH requested(location_key, admitted_source_id) AS (
            stored.last_seen_at,
            stored.retired_at
       FROM requested
-      JOIN {PTG2_SCHEMA}.entity_address_evidence AS stored
+      JOIN $evidence_relation AS stored
         ON stored.location_key = requested.location_key
      WHERE stored.retired_at IS NULL
 ), source_members AS MATERIALIZED (
@@ -10486,7 +10535,7 @@ WITH requested(location_key, admitted_source_id) AS (
       FROM source_members AS source
      CROSS JOIN LATERAL (
          SELECT candidate.*
-           FROM {PTG2_SCHEMA}.mrf_address AS candidate
+           FROM $mrf_relation AS candidate
           WHERE source.source_id = 2
             AND candidate.npi = source.npi
             AND candidate.address_key = source.address_key
@@ -10523,7 +10572,7 @@ WITH requested(location_key, admitted_source_id) AS (
       FROM source_members AS source
      CROSS JOIN LATERAL (
          SELECT candidate.*
-           FROM {PTG2_SCHEMA}.npi_address AS candidate
+           FROM $npi_relation AS candidate
           WHERE source.source_id = 1
             AND candidate.npi = source.npi
             AND candidate.address_key = source.address_key
@@ -10553,7 +10602,7 @@ WITH requested(location_key, admitted_source_id) AS (
       FROM source_members AS source
      CROSS JOIN LATERAL (
          SELECT candidate.*
-           FROM {PTG2_SCHEMA}.doctor_clinician_address AS candidate
+           FROM $doctor_relation AS candidate
           WHERE source.source_id = 3
             AND candidate.npi = source.npi
             AND candidate.address_key = source.address_key
@@ -10624,6 +10673,14 @@ SELECT *
   FROM specific_evidence
  ORDER BY location_key, source_id, source_record_key
 """
+
+
+def _address_provenance_sql(candidate_inputs=None):
+    """Use the same lineage query with exact publisher-selected dependencies."""
+    return address_provenance_sql(_ADDRESS_PROVENANCE_SQL_TEMPLATE, PTG2_SCHEMA, candidate_inputs)
+
+
+_ADDRESS_PROVENANCE_SQL = _address_provenance_sql()
 
 
 def _selected_location_requests(
@@ -10762,6 +10819,7 @@ async def _hydrate_address_provenance(
     use_stored_only: bool = False,
     strict_stored_identity: bool = False,
     backfill_admitted_source_record_ids: bool = False,
+    candidate_inputs=None,
 ) -> str:
     """Validate selected unified addresses with one set-based lineage query."""
 
@@ -10769,12 +10827,17 @@ async def _hydrate_address_provenance(
     provenance_by_location_key: Mapping[str, list[dict[str, Any]]] = {}
     is_evidence_relation_available = True
     if use_stored_only or location_requests:
-        is_evidence_relation_available = await _is_relation_available(session, f"{PTG2_SCHEMA}.entity_address_evidence")
+        evidence_relation = (
+            f"{PTG2_SCHEMA}.entity_address_evidence"
+            if candidate_inputs is None
+            else candidate_inputs.relation("entity_address_evidence")
+        )
+        is_evidence_relation_available = await _is_relation_available(session, evidence_relation)
     if use_stored_only and not is_evidence_relation_available:
         return "unavailable"
     if location_requests and is_evidence_relation_available:
         provenance_result = await session.execute(
-            text(_ADDRESS_PROVENANCE_SQL),
+            text(_ADDRESS_PROVENANCE_SQL if candidate_inputs is None else _address_provenance_sql(candidate_inputs)),
             {
                 "location_keys": [request[0] for request in location_requests],
                 "admitted_source_ids": [request[1] for request in location_requests],
@@ -11200,7 +11263,7 @@ async def _legacy_set_keys_by_npi(
         shared_snapshot_key,
         PTG2_V3_GRAPH_NPI_TO_GROUP,
         normalized_npis,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     group_keys = tuple(
         sorted({int(group_key) for npi_group_keys in group_keys_by_npi.values() for group_key in npi_group_keys})
@@ -11212,7 +11275,7 @@ async def _legacy_set_keys_by_npi(
         shared_snapshot_key,
         PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
         group_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     if set(provider_set_keys_by_group) != set(group_keys):
         raise PTG2ManifestArtifactError("PTG2 shared graph is missing a group-to-provider-set owner")
@@ -11808,7 +11871,7 @@ async def _v4_bounded_npi_sets(
     root = await load_v4_graph_root(
         session,
         snapshot_key,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     if root.representation == "direct_v1":
         maximum_provider_sets = _v4_hot_prefix_limits(serving_tables).maximum_provider_expansion_provider_sets
@@ -11914,7 +11977,7 @@ async def _legacy_explicit_npi_scope(
         shared_snapshot_key,
         PTG2_V3_GRAPH_NPI_TO_GROUP,
         (requested_npi,),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     group_keys = tuple(sorted(group_keys_by_npi.get(requested_npi, ())))
     if not group_keys:
@@ -11924,7 +11987,7 @@ async def _legacy_explicit_npi_scope(
         shared_snapshot_key,
         PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
         group_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     if set(provider_set_keys_by_group) != set(group_keys):
         raise PTG2ManifestArtifactError("PTG2 shared graph is missing a group-to-provider-set owner")
@@ -12291,7 +12354,7 @@ async def _local_inferred_distance_graph_candidates(
     graph_root = await load_v4_graph_root(
         session,
         _required_shared_snapshot_key(serving_tables),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     multiplier = _v4_direct_io_multiplier(serving_tables) if graph_root.representation == "direct_v1" else 1
     with v4_graph_taxonomy_projection_scope(
@@ -13210,7 +13273,7 @@ def _filtered_provider_prefix_cache_key(
     provider_set_id: str,
     args: Mapping[str, Any],
     target_count: int,
-) -> tuple[int, str, int, str] | None:
+) -> tuple[int | str, str, int, str] | None:
     shared_snapshot_key = getattr(serving_tables, "shared_snapshot_key", None)
     if shared_snapshot_key is None:
         return None
@@ -13221,7 +13284,7 @@ def _filtered_provider_prefix_cache_key(
         separators=(",", ":"),
     )
     return (
-        int(shared_snapshot_key),
+        _provider_cache_snapshot_key(serving_tables),
         provider_set_id,
         max(int(target_count), 1),
         filter_signature,
@@ -13679,7 +13742,7 @@ async def _rank_filtered_provider_expansion_prefix(
 
 
 def _cached_provider_set_ids_for_npis(
-    shared_snapshot_key: int,
+    shared_snapshot_key: int | str,
     npis: tuple[int, ...],
 ) -> tuple[dict[int, tuple[str, ...]], tuple[int, ...]]:
     """Return cached reverse memberships and NPIs that still need loading."""
@@ -13698,7 +13761,7 @@ def _cached_provider_set_ids_for_npis(
 
 
 def _cache_provider_set_ids_for_npis(
-    shared_snapshot_key: int,
+    shared_snapshot_key: int | str,
     provider_set_ids_by_npi: Mapping[int, tuple[str, ...]],
 ) -> None:
     """Cache reverse provider-set memberships for one sealed snapshot."""
@@ -13836,7 +13899,7 @@ async def _provider_set_ids_for_selected_npis(
             npis,
             normalized_allowed_keys,
         )
-    shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
+    shared_snapshot_key = _provider_cache_snapshot_key(serving_tables)
     provider_set_ids_by_npi, uncached_npis = _cached_provider_set_ids_for_npis(
         shared_snapshot_key,
         npis,
@@ -13996,6 +14059,7 @@ async def _v4_exact_source_groups(
     owner_keys: tuple[int, ...],
     exact_group_keys: tuple[int, ...],
     maximum_projection_members: int,
+    schema_name: str = PTG2_SCHEMA,
 ) -> dict[int, tuple[int, ...]]:
     """Read one exact group intersection within its remaining logical budget."""
 
@@ -14007,7 +14071,7 @@ async def _v4_exact_source_groups(
         relation=relation,
         owner_keys=owner_keys,
         allowed_member_keys=exact_group_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=schema_name,
         max_members=maximum_projection_members,
     )
 
@@ -14019,6 +14083,7 @@ async def _v4_pattern_exact_groups(
     provider_set_keys: tuple[int, ...],
     exact_group_keys: tuple[int, ...],
     hot_limits: _V4HotPrefixLimits,
+    schema_name: str = PTG2_SCHEMA,
 ) -> dict[int, tuple[int, ...]]:
     """Intersect pattern and component sources without unbounded fanout."""
 
@@ -14028,6 +14093,7 @@ async def _v4_pattern_exact_groups(
         provider_set_keys=provider_set_keys,
         maximum_pattern_degree=hot_limits.maximum_patterns_per_set,
         maximum_component_degree=(hot_limits.maximum_components_per_fallback_set),
+        schema_name=schema_name,
     )
     pattern_keys, component_keys = _v4_group_source_owner_keys(group_sources)
     groups_by_pattern = await _v4_exact_source_groups(
@@ -14037,6 +14103,7 @@ async def _v4_pattern_exact_groups(
         owner_keys=pattern_keys,
         exact_group_keys=exact_group_keys,
         maximum_projection_members=_PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES,
+        schema_name=schema_name,
     )
     remaining_projection_members = _PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES - sum(
         len(group_keys) for group_keys in groups_by_pattern.values()
@@ -14048,6 +14115,7 @@ async def _v4_pattern_exact_groups(
         owner_keys=component_keys,
         exact_group_keys=exact_group_keys,
         maximum_projection_members=remaining_projection_members,
+        schema_name=schema_name,
     )
     if set(groups_by_pattern) != set(pattern_keys) or set(groups_by_component) != set(component_keys):
         raise PTG2ManifestArtifactError("PTG2 V4 exact billing-association projection is incomplete")
@@ -14079,7 +14147,7 @@ async def _v4_exact_groups_by_set(
         graph_root = await load_v4_graph_root(
             session,
             snapshot_key,
-            schema_name=PTG2_SCHEMA,
+            schema_name=_payload_schema(serving_tables),
         )
         if graph_root.representation == "direct_v1":
             groups_by_set = await _v4_exact_source_groups(
@@ -14089,6 +14157,7 @@ async def _v4_exact_groups_by_set(
                 owner_keys=normalized_set_keys,
                 exact_group_keys=normalized_group_keys,
                 maximum_projection_members=(_PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES),
+                schema_name=_payload_schema(serving_tables),
             )
         else:
             groups_by_set = await _v4_pattern_exact_groups(
@@ -14097,6 +14166,7 @@ async def _v4_exact_groups_by_set(
                 provider_set_keys=normalized_set_keys,
                 exact_group_keys=normalized_group_keys,
                 hot_limits=hot_limits,
+                schema_name=_payload_schema(serving_tables),
             )
     return _validated_exact_group_keys_by_set(
         groups_by_set,
@@ -14210,7 +14280,7 @@ async def _exact_npi_billing_associations_by_set(
     )
     association_by_group = await load_provider_group_billing_associations(
         session,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
         snapshot_key=_required_shared_snapshot_key(serving_tables),
         provider_group_refs={group_id for group_ids in group_ids_by_set.values() for group_id in group_ids},
     )
@@ -14953,12 +15023,7 @@ async def _oversized_geo_local_provider_sets(
 ) -> tuple[int, ...] | None:
     """Resolve the bounded exact V4 provider sets for one local geo scope."""
 
-    reverse_geo_scope = await _cached_reverse_geo_scope(
-        session,
-        serving_tables,
-        args,
-        budget,
-    )
+    reverse_geo_scope = await _cached_reverse_geo_scope(session, serving_tables, args, budget)
     if reverse_geo_scope is None:
         return None
     candidate_npis, is_source_exhausted, _candidate_limit = reverse_geo_scope
@@ -14972,7 +15037,9 @@ async def _oversized_geo_local_provider_sets(
         return ()
     try:
         graph_root = await load_v4_graph_root(
-            session, _required_shared_snapshot_key(serving_tables), schema_name=PTG2_SCHEMA
+            session,
+            _required_shared_snapshot_key(serving_tables),
+            schema_name=_payload_schema(serving_tables),
         )
         physical_work_multiplier = (
             _v4_direct_io_multiplier(serving_tables) if graph_root.representation == "direct_v1" else 1
@@ -15029,7 +15096,7 @@ async def _oversized_geo_code_provider_sets(
                     (budget.maximum_geo_provider_sets + 1) * max(len(code_keys), 1),
                 )
             ),
-            schema_name=PTG2_SCHEMA,
+            schema_name=_payload_schema(serving_tables),
         )
     except PTG2ManifestArtifactError as exc:
         if "provider-code intersections exceed their retention limit" not in str(exc):
@@ -16048,6 +16115,7 @@ async def _v4_direct_set_candidates(
     snapshot_key: int,
     provider_set_keys: tuple[int, ...],
     candidate_npi_keys: tuple[int, ...],
+    schema_name: str = PTG2_SCHEMA,
 ) -> dict[int, tuple[int, ...]]:
     """Intersect visited direct-layout sets with the sealed candidate vector."""
 
@@ -16056,7 +16124,7 @@ async def _v4_direct_set_candidates(
         snapshot_key=snapshot_key,
         relation="set_groups_direct",
         owner_keys=provider_set_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=schema_name,
         max_members=None,
     )
     group_keys = _v4_direct_group_keys(groups_by_set, provider_set_keys)
@@ -16068,7 +16136,7 @@ async def _v4_direct_set_candidates(
         relation="group_npis_exact",
         owner_keys=group_keys,
         allowed_member_keys=candidate_npi_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=schema_name,
         max_members=None,
     )
     if set(candidate_npi_keys_by_group) != set(group_keys):
@@ -16191,7 +16259,7 @@ async def _v4_direct_ordered_set_prefixes(
         session,
         snapshot_key=_required_shared_snapshot_key(serving_tables),
         provider_set_keys=tuple(expected_count_by_key),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
         max_members=sum(expected_count_by_key.values()),
     )
     if set(prefixes_by_key) != set(expected_count_by_key):
@@ -16460,6 +16528,7 @@ async def _v4_pattern_completion_projection(
     selected_npi_keys: tuple[int, ...],
     npi_keys_by_pattern: Mapping[int, tuple[int, ...]],
     max_members: int,
+    schema_name: str = PTG2_SCHEMA,
 ) -> tuple[tuple[int, ...], dict[int, tuple[int, ...]]]:
     """Resolve every set reached by patterns of the selected provider NPIs."""
 
@@ -16479,7 +16548,7 @@ async def _v4_pattern_completion_projection(
             snapshot_key=snapshot_key,
             relation="pattern_sets",
             owner_keys=selected_pattern_keys,
-            schema_name=PTG2_SCHEMA,
+            schema_name=schema_name,
             max_members=max_members,
         )
     except PTG2SharedBlockError as exc:
@@ -16498,56 +16567,6 @@ async def _v4_pattern_completion_projection(
     )
 
 
-@dataclass(frozen=True)
-class _V4PatternCompletionRequest:
-    """Inputs and sealed caps for one selected-pattern completion."""
-
-    code_rows: list[Mapping[str, Any]]
-    prefix_rows: list[dict[str, Any]]
-    candidate_provider_set_keys: tuple[int, ...]
-    source_trace_set_hash: str | None
-    network_names: list[str]
-    descending: bool
-    is_source_exhausted: bool
-    maximum_occurrences: int
-    maximum_code_sets: int
-    scan_budget: ForwardReadBudget
-
-
-@dataclass(frozen=True)
-class _ProviderExpansionRequest:
-    """Shared immutable inputs for one cost-ordered provider expansion."""
-
-    code_rows: list[Mapping[str, Any]]
-    args: Mapping[str, Any]
-    snapshot_id: str
-    source_trace_set_hash: str | None
-    network_names: list[str]
-    target_count: int
-    descending: bool
-
-
-@dataclass(frozen=True)
-class _V4PatternTaxonomyRequest(_ProviderExpansionRequest):
-    """Inputs for an exact pattern-quotient taxonomy expansion."""
-
-    projection_rule: V4InferredTaxonomyProjectionRule
-    candidates: Any
-
-
-@dataclass(frozen=True)
-class _V4PatternContext:
-    """Sealed coordinates and caps for one pattern-quotient selection."""
-
-    request: _V4PatternTaxonomyRequest
-    normalized_target_count: int
-    maximum_occurrences: int
-    declared_occurrences: int
-    scan_budget: ForwardReadBudget
-    pattern_keys: tuple[int, ...]
-    snapshot_key: int
-
-
 @dataclass
 class _V4PatternPrefixState:
     """Mutable state for the bounded pattern rate-prefix loop."""
@@ -16558,70 +16577,6 @@ class _V4PatternPrefixState:
     selected_occurrences: tuple[tuple[int, int], ...] = ()
     is_candidate_prefix_exhausted: bool = False
     is_source_exhausted: bool = False
-
-
-@dataclass(frozen=True)
-class _V4PatternPrefix:
-    """Authenticated pattern prefix and its selected completion scope."""
-
-    serving_rows: list[dict[str, Any]]
-    selected_occurrences: tuple[tuple[int, int], ...]
-    selected_npi_keys: tuple[int, ...]
-    completion_provider_set_keys: tuple[int, ...]
-    completion_pattern_keys_by_set: dict[int, tuple[int, ...]]
-    is_candidate_prefix_exhausted: bool
-    is_source_exhausted: bool
-
-
-@dataclass(frozen=True)
-class _V4TaxonomyRequest(_ProviderExpansionRequest):
-    """Inputs for an exact inferred-taxonomy expansion."""
-
-    projection_manifest: Mapping[str, Any]
-    projection_rule: V4InferredTaxonomyProjectionRule
-
-
-@dataclass(frozen=True)
-class _V4DirectContext:
-    """Immutable caps and source coordinates for one direct-layout request."""
-
-    request: _V4TaxonomyRequest
-    candidates: Any
-    snapshot_key: int
-    maximum_occurrences: int
-    maximum_code_sets: int
-    declared_occurrences: int
-    scan_budget: ForwardReadBudget
-    candidate_npi_keys: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class _V4DirectSetPrefix:
-    """Authenticated candidate intersection for one ordered set prefix."""
-
-    candidate_npi_keys: tuple[int, ...]
-    is_complete: bool
-
-
-@dataclass(frozen=True)
-class _V4DirectPrefix:
-    """One authenticated direct-layout rate prefix and its ranked candidates."""
-
-    serving_rows: list[dict[str, Any]]
-    selected_occurrences: tuple[tuple[int, int], ...]
-    is_candidate_prefix_exhausted: bool
-    is_source_exhausted: bool
-
-
-@dataclass(frozen=True)
-class _V4DirectResolved:
-    """Selected NPI identities and exact memberships from one ranked prefix."""
-
-    prefix: _V4DirectPrefix
-    selected_npi_keys: tuple[int, ...]
-    selected_npis: tuple[int, ...]
-    npi_by_key: dict[int, int]
-    provider_set_keys_by_npi: dict[int, tuple[int, ...]]
 
 
 async def _v4_pattern_completion_rate_rows(
@@ -16715,6 +16670,7 @@ def _v4_pattern_context(
         ),
         pattern_keys=tuple(sorted(request.candidates.npi_keys_by_pattern)),
         snapshot_key=_required_shared_snapshot_key(serving_tables),
+        schema_name=_payload_schema(serving_tables),
     )
 
 
@@ -16740,7 +16696,7 @@ async def _v4_pattern_update_candidates(
         relation="set_patterns",
         owner_keys=new_provider_set_keys,
         allowed_member_keys=context.pattern_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=context.schema_name,
         max_members=None,
     )
     if set(new_pattern_keys_by_set) != set(new_provider_set_keys) or any(
@@ -16857,6 +16813,7 @@ async def _v4_pattern_ranked_prefix(
             selected_npi_keys=selected_npi_keys,
             npi_keys_by_pattern=(context.request.candidates.npi_keys_by_pattern),
             max_members=int(context.request.projection_rule.max_online_inferred_taxonomy_retained_memberships),
+            schema_name=_payload_schema(serving_tables),
         )
     return _V4PatternPrefix(
         serving_rows=state.serving_rows,
@@ -16880,7 +16837,7 @@ async def _v4_pattern_npi_identity(
         session,
         snapshot_key=context.snapshot_key,
         npi_keys=prefix.selected_npi_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=context.schema_name,
     )
     if set(npi_by_key) != set(prefix.selected_npi_keys) or len(set(npi_by_key.values())) != len(
         prefix.selected_npi_keys
@@ -17191,6 +17148,7 @@ async def _v4_direct_update_candidates(
             snapshot_key=context.snapshot_key,
             provider_set_keys=fallback_set_keys,
             candidate_npi_keys=context.candidate_npi_keys,
+            schema_name=_payload_schema(serving_tables),
         )
         candidate_npi_keys_by_set.update(
             _v4_direct_merge_fallback(
@@ -17248,7 +17206,7 @@ async def _v4_direct_resolve_prefix(
         session,
         snapshot_key=context.snapshot_key,
         npi_keys=selected_npi_keys,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
     )
     if set(npi_by_key) != set(selected_npi_keys) or len(set(npi_by_key.values())) != len(selected_npi_keys):
         raise PTG2ManifestArtifactError("PTG2 V4 inferred-taxonomy NPI dictionary is incomplete")
@@ -17448,7 +17406,7 @@ async def _select_v4_taxonomy_expansion(
         session,
         snapshot_key=snapshot_key,
         rule_digest=request.projection_rule.rule_digest,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables),
         projection_manifest=request.projection_manifest,
     )
     _validate_v4_inferred_taxonomy_candidates(
@@ -18009,7 +17967,8 @@ async def _procedure_details_for_rows(
         query_parameters_by_name[f"code_system_{idx}"] = code_system
         query_parameters_by_name[f"code_{idx}"] = code
     try:
-        procedure_catalog_query = await session.execute(
+        procedure_catalog_query = await _optional_ptg2_query(
+            session,
             text(
                 f"""
                 SELECT code_system, code, display_name, short_description
@@ -18020,7 +17979,6 @@ async def _procedure_details_for_rows(
             query_parameters_by_name,
         )
     except Exception:
-        await _rollback_optional_ptg2_query(session)
         return {}
     return {
         (
@@ -18437,6 +18395,11 @@ async def _search_manifest_serving_table(
             session,
             serving_tables,
             serving_rows,
+            **(
+                {"candidate_audit_access": candidate_audit_access_from_args(args)}
+                if getattr(serving_tables, "physical_binding", None) is not None
+                else {}
+            ),
         )
         if _include_ptg2_sources(args)
         else {}
@@ -18839,6 +18802,8 @@ async def _ptg2_source_provenance_for_rows(
     session: Any,
     serving_tables: PTG2ServingTables,
     serving_rows: Iterable[Mapping[str, Any]],
+    *,
+    candidate_audit_access: PTG2CandidateAuditAccess | None = None,
 ) -> dict[int, dict[str, Any]]:
     source_keys: set[int] = set()
     for serving_row in serving_rows:
@@ -18851,6 +18816,11 @@ async def _ptg2_source_provenance_for_rows(
             source_keys.add(int(source_key))
         except (TypeError, ValueError) as exc:
             raise PTG2ManifestArtifactError("PTG2 v3 serving row has an invalid source key") from exc
+    read_options_by_name = (
+        {"serving_tables": serving_tables, "candidate_audit_access": candidate_audit_access}
+        if getattr(serving_tables, "physical_binding", None) is not None
+        else {}
+    )
     try:
         return await fetch_snapshot_source_provenance(
             session,
@@ -18858,6 +18828,7 @@ async def _ptg2_source_provenance_for_rows(
             logical_snapshot_id=_required_logical_snapshot_id(serving_tables),
             source_keys=source_keys,
             expected_source_count=_required_source_count(serving_tables),
+            **read_options_by_name,
         )
     except PTG2SharedBlockError as exc:
         raise PTG2ManifestArtifactError(str(exc)) from exc
@@ -18894,23 +18865,11 @@ def _hide_source_artifact_key_unless_requested(
         item.pop("source_artifact_key", None)
 
 
-def _provider_taxonomy_summary_lateral_sql(npi_sql: str, alias: str = "tax") -> str:
-    taxonomy_order_sql = "(UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum"
-    return f"""
-        LEFT JOIN LATERAL (
-            SELECT
-                array_agg(nt.healthcare_provider_taxonomy_code ORDER BY {taxonomy_order_sql}) AS taxonomy_codes,
-                array_agg(COALESCE(nucc.display_name, nucc.classification) ORDER BY {taxonomy_order_sql}) AS specialties,
-                array_remove(array_agg(NULLIF(nucc.classification, '') ORDER BY {taxonomy_order_sql}), NULL) AS classifications,
-                array_remove(array_agg(NULLIF(nucc.specialization, '') ORDER BY {taxonomy_order_sql}), NULL) AS specializations,
-                (array_agg(COALESCE(nucc.display_name, nucc.classification) ORDER BY {taxonomy_order_sql}))[1] AS primary_specialty,
-                (array_remove(array_agg(NULLIF(nucc.specialization, '') ORDER BY {taxonomy_order_sql}), NULL))[1] AS primary_specialization
-            FROM {PTG2_SCHEMA}.npi_taxonomy nt
-            LEFT JOIN {PTG2_SCHEMA}.nucc_taxonomy nucc
-              ON nucc.code = nt.healthcare_provider_taxonomy_code
-            WHERE nt.npi = {npi_sql}
-        ) {alias} ON TRUE
-    """
+def _provider_taxonomy_summary_lateral_sql(npi_sql: str, alias: str = "tax", *, candidate_inputs=None) -> str:
+    """Reuse identical taxonomy selection for canonical and staged providers."""
+    from api.plan_pricing_projection_source import provider_taxonomy_summary_lateral_sql
+
+    return provider_taxonomy_summary_lateral_sql(npi_sql, alias, schema=PTG2_SCHEMA, candidate_inputs=candidate_inputs)
 
 
 def _row_price_response_fields(
@@ -19149,9 +19108,10 @@ async def search_ptg2_serving_table(
     """Serve a published snapshot through the strict shared V3 architecture."""
 
     mode_value = normalize_ptg2_mode(args.get("mode"))
-    tables = serving_tables or await snapshot_serving_tables(
+    tables = await read_serving_tables(
         session,
         snapshot_id,
+        serving_tables=serving_tables,
         candidate_audit_access=candidate_audit_access_from_args(args),
     )
     _require_strict_shared_v3(tables)
@@ -19377,6 +19337,11 @@ async def _provider_procedure_item_context(
             session,
             request.serving_tables,
             procedure_rows.serving_rows,
+            **(
+                {"candidate_audit_access": candidate_audit_access_from_args(request.args)}
+                if getattr(request.serving_tables, "physical_binding", None) is not None
+                else {}
+            ),
         )
         if _include_ptg2_sources(request.args)
         else {}
@@ -19567,17 +19532,9 @@ async def _search_ptg2_manifest_provider_procedures(
             ),
             None,
         )
-    search = await _provider_procedure_search(
-        session,
-        request,
-        tuple(provider_set_ids),
-    )
+    search = await _provider_procedure_search(session, request, tuple(provider_set_ids))
     procedure_rows = await _provider_procedure_rows(session, search)
-    item_context = await _provider_procedure_item_context(
-        session,
-        search,
-        procedure_rows,
-    )
+    item_context = await _provider_procedure_item_context(session, search, procedure_rows)
     response_items = [
         _provider_procedure_item(
             search,
@@ -19604,9 +19561,10 @@ async def _search_ptg2_provider_procedures_snapshot(
     serving_tables: PTG2ServingTables | None = None,
 ) -> dict[str, Any] | None:
     """Search one explicitly selected snapshot for a provider's procedures."""
-    serving_tables = serving_tables or await snapshot_serving_tables(
+    serving_tables = await read_serving_tables(
         session,
         snapshot_id,
+        serving_tables=serving_tables,
         candidate_audit_access=candidate_audit_access_from_args(args),
     )
     _require_strict_shared_v3(serving_tables)
@@ -19676,7 +19634,7 @@ async def _search_provider_procedures_network(
     *,
     serving_tables: PTG2ServingTables | None = None,
 ) -> tuple[str, str, dict[str, Any] | None]:
-    async with sa_db.session() as network_session:
+    async with sa_db.reader_session(independent=True) as network_session:
         response = await _search_ptg2_provider_procedures_snapshot(
             network_session,
             npi,
@@ -20076,7 +20034,7 @@ async def _has_ptg2_table_plan_code(
             f"""
             SELECT EXISTS (
                 SELECT 1
-                FROM {_shared_v3_code_table()} code_metadata
+                FROM {_shared_v3_code_table(serving_tables)} code_metadata
                 {scope_join_sql}
                 WHERE {" AND ".join(code_filters)}
                 LIMIT 1
@@ -20101,9 +20059,10 @@ async def _has_snapshot_plan_code(
     if requested is None:
         return True
     requested_plan, requested_system, requested_code = requested
-    tables = serving_tables or await snapshot_serving_tables(
+    tables = await read_serving_tables(
         session,
         snapshot_id,
+        serving_tables=serving_tables,
         candidate_audit_access=candidate_audit_access_from_args(args),
     )
     return await _has_ptg2_table_plan_code(
@@ -20124,11 +20083,6 @@ async def _search_one_ptg2_snapshot(
     *,
     serving_tables: PTG2ServingTables | None = None,
 ) -> dict[str, Any] | None:
-    serving_tables = serving_tables or await snapshot_serving_tables(
-        session,
-        snapshot_id,
-        candidate_audit_access=candidate_audit_access_from_args(args),
-    )
     db_payload = await search_ptg2_serving_table(
         session,
         snapshot_id,
@@ -20179,6 +20133,8 @@ async def _search_candidate_ptg2_snapshot(
 def _cache_network_serving_tables(serving_tables: PTG2ServingTables) -> None:
     """Remember immutable sealed metadata after its strict database validation."""
 
+    if serving_tables.physical_binding is not None:
+        return
     snapshot_id = str(serving_tables.snapshot_id)
     _PTG2_NETWORK_SERVING_TABLES_CACHE[snapshot_id] = serving_tables
     _PTG2_NETWORK_SERVING_TABLES_CACHE.move_to_end(snapshot_id)
@@ -20192,6 +20148,8 @@ def _is_network_serving_tables_current(
 ) -> bool:
     """Match a cached descriptor to its current published/sealed database chain."""
 
+    if serving_tables.physical_binding is not None or row_fields.get("has_local_physical_binding"):
+        return False
     try:
         snapshot_key = int(row_fields.get("snapshot_key"))
         layout_snapshot_key = int(row_fields.get("layout_snapshot_key"))

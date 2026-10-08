@@ -5,20 +5,37 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
 import asyncpg
 import pytest
-from sqlalchemy import text
+from sqlalchemy import (
+    ARRAY,
+    BigInteger,
+    CheckConstraint,
+    Column,
+    ForeignKey,
+    Identity,
+    Index,
+    MetaData,
+    Table,
+    Text,
+    text,
+)
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as result_generation
-from tests.reference_family_generation_fixture import generation_shape_check, install_source_generation_guards
+from tests.reference_family_generation_fixture import (
+    generation_shape_check,
+    install_source_generation_guards,
+    native_reference_source,
+)
 
 _DSN_ENV = "HLTHPRT_REFERENCE_FAMILY_ARCHIVE_TEST_DSN"
 _LOCAL_DATABASE = re.compile(r"^hc_reference_family_[0-9a-f]{32}$")
@@ -47,7 +64,16 @@ async def _create_live_family(session, importer_id: str, schema_name: str) -> No
         table = model_type.__table__.to_metadata(metadata, schema=schema_name)
         ddl = str(archive.CreateTable(table).compile(dialect=archive.postgresql.dialect()))
         await session.execute(text(ddl))
-        for index in getattr(model_type, "__my_additional_indexes__", ()) or ():
+        indexes = getattr(model_type, "__my_additional_indexes__", ()) or ()
+        if importer_id == "mrf":
+            # Keep the exact ordinary copied-index subset, including the address checksum index.
+            indexes = (
+                tuple(getattr(model_type, "__my_initial_indexes__", ()) or ()) + tuple(indexes)
+                if model_type.__tablename__
+                in {"plan_benefits_marketplace", "mrf_address", "mrf_address_evidence", "plan_search_summary"}
+                else ()
+            )
+        for index in indexes:
             await session.execute(text(archive._additional_index_sql(schema_name, model_type, index)))
     await session.execute(
         text(
@@ -89,7 +115,7 @@ async def _copy_live_to_stage(session, importer_id: str, live_schema: str, stage
         )
 
 
-async def _assert_cancelled_export_cleanup(sessions, live_schema: str, unrelated_schema: str) -> None:
+async def _assert_cancelled_export_cleanup(sessions, live_schema: str, unrelated_schema: str, custody) -> None:
     cancelled_dataset_id = uuid4()
     cancelled_stage = archive.reference_family_stage_schema(cancelled_dataset_id)
 
@@ -104,17 +130,21 @@ async def _assert_cancelled_export_cleanup(sessions, live_schema: str, unrelated
             source_metadata={"source_release": "synthetic-2026", "receipt": "cancelled"},
             dataset_id=cancelled_dataset_id,
             archive_copy=cancel_archive_copy,
+            source_copy=custody.source_copy,
+            on_precreated=custody.precreate,
+            verify_custody=custody.verify,
         )
     async with sessions() as session, session.begin():
         assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": cancelled_stage}) is None
         assert await session.scalar(text(f'SELECT count(*) FROM "{unrelated_schema}".keep_me')) == 1
 
 
-async def _assert_prepared_source_reuse(sessions, live_schema: str) -> None:
+async def _assert_prepared_source_reuse(sessions, live_schema: str, custody) -> None:
     dataset_id = uuid4()
     prepared_sources = []
 
-    async def persist(_session, prepared):
+    async def persist(session, prepared):
+        await custody.retain(session, prepared)
         prepared_sources.append(prepared)
 
     prepared = await archive.prepare_reference_family_archive_source(
@@ -124,6 +154,8 @@ async def _assert_prepared_source_reuse(sessions, live_schema: str) -> None:
         source_metadata={"run_id": "synthetic-prepare"},
         dataset_id=dataset_id,
         on_prepared=persist,
+        source_copy=custody.source_copy,
+        on_precreated=custody.precreate,
     )
     assert prepared_sources == [prepared]
     async with sessions() as session, session.begin():
@@ -134,8 +166,12 @@ async def _assert_prepared_source_reuse(sessions, live_schema: str) -> None:
         captures.append(capture)
 
     try:
-        await archive.export_prepared_reference_family_archive(sessions, prepared=prepared, archive_copy=copy)
-        await archive.export_prepared_reference_family_archive(sessions, prepared=prepared, archive_copy=copy)
+        await archive.export_prepared_reference_family_archive(
+            sessions, prepared=prepared, archive_copy=copy, verify_custody=custody.verify
+        )
+        await archive.export_prepared_reference_family_archive(
+            sessions, prepared=prepared, archive_copy=copy, verify_custody=custody.verify
+        )
         assert [capture.manifest for capture in captures] == [prepared.manifest, prepared.manifest]
         assert all(capture.ownership == prepared.ownership for capture in captures)
         assert prepared.manifest.tables[0].row_count == 1
@@ -144,10 +180,11 @@ async def _assert_prepared_source_reuse(sessions, live_schema: str) -> None:
             await archive.cleanup_reference_family_stage(session, prepared.ownership)
 
 
-async def _assert_prepare_callback_rollback(sessions, live_schema: str) -> None:
+async def _assert_prepare_callback_rollback(sessions, live_schema: str, custody) -> None:
     dataset_id = uuid4()
 
-    async def reject(_session, _prepared):
+    async def reject(session, prepared):
+        await custody.retain(session, prepared)
         raise RuntimeError("synthetic persistence failure")
 
     with pytest.raises(RuntimeError, match="persistence failure"):
@@ -158,6 +195,8 @@ async def _assert_prepare_callback_rollback(sessions, live_schema: str) -> None:
             source_metadata={"run_id": "synthetic-rollback"},
             dataset_id=dataset_id,
             on_prepared=reject,
+            source_copy=custody.source_copy,
+            on_precreated=custody.precreate,
         )
     async with sessions() as session, session.begin():
         assert (
@@ -194,12 +233,14 @@ async def test_native_single_table_activation_cas_rollback_and_cleanup():
     unrelated_schema = f"rf_keep_{token}"
     dataset_id = uuid4()
     stage_schema = archive.reference_family_stage_schema(dataset_id)
+    cleanup = AsyncExitStack()
     try:
+        custody = await cleanup.enter_async_context(native_reference_source(sessions))
         async with sessions() as session, session.begin():
             await _create_places_fixture(session, live_schema, unrelated_schema)
-        await _assert_prepare_callback_rollback(sessions, live_schema)
-        await _assert_prepared_source_reuse(sessions, live_schema)
-        await _assert_cancelled_export_cleanup(sessions, live_schema, unrelated_schema)
+        await _assert_prepare_callback_rollback(sessions, live_schema, custody)
+        await _assert_prepared_source_reuse(sessions, live_schema, custody)
+        await _assert_cancelled_export_cleanup(sessions, live_schema, unrelated_schema, custody)
         manifest = await _manifest(sessions, "places-zcta", live_schema)
         async with sessions() as session, session.begin():
             owner = await archive.precreate_reference_family_restore(
@@ -234,6 +275,7 @@ async def test_native_single_table_activation_cas_rollback_and_cleanup():
             assert await session.scalar(text(f'SELECT count(*) FROM "{unrelated_schema}".keep_me')) == 1
             await archive.cleanup_reference_family_stage(session, owner)
     finally:
+        await cleanup.aclose()
         async with engine.begin() as connection:
             for schema_name in (stage_schema, live_schema, unrelated_schema):
                 await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
@@ -992,6 +1034,7 @@ async def source_reader():
     admin_sessions = async_sessionmaker(admin_engine, expire_on_commit=False)
     reader_engine = create_async_engine(database_url, connect_args={"server_settings": {"role": reader}})
     reader_sessions = async_sessionmaker(reader_engine, expire_on_commit=False)
+    cleanup = AsyncExitStack()
     try:
         async with admin_sessions.begin() as session:
             await _create_places_fixture(session, source_schema, unrelated)
@@ -999,10 +1042,10 @@ async def source_reader():
                 session, importer_id="places-zcta", schema_name=source_schema
             )
             await session.execute(text(f'CREATE ROLE "{reader}" NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB'))
-            database = await session.scalar(text("SELECT current_database()"))
-            await session.execute(text(f'GRANT CREATE ON DATABASE "{database}" TO "{reader}"'))
             await session.execute(text(f'GRANT USAGE ON SCHEMA "{source_schema}" TO "{reader}"'))
             await session.execute(text(f'GRANT SELECT ON ALL TABLES IN SCHEMA "{source_schema}" TO "{reader}"'))
+
+        custody = await cleanup.enter_async_context(native_reference_source(admin_sessions, readers=(reader,)))
 
         yield SimpleNamespace(
             sessions=reader_sessions,
@@ -1013,9 +1056,11 @@ async def source_reader():
             stage=stage,
             dataset_id=dataset_id,
             authority=authority,
+            custody=custody,
         )
     finally:
         await reader_engine.dispose()
+        await cleanup.aclose()
         async with admin_sessions.begin() as session:
             for schema in (stage, source_schema, unrelated):
                 await session.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
@@ -1039,6 +1084,7 @@ async def _prepare_reader_clone(source_reader, concurrent_update):
         return {"source_release": "synthetic"}
 
     async def persist(session, prepared):
+        await source_reader.custody.retain(session, prepared)
         assert prepared.ownership.schema_name == source_reader.stage
         assert (
             await session.scalar(text(f'SELECT measure_name FROM "{source_reader.stage}".pricing_places_zcta')) == "old"
@@ -1051,7 +1097,10 @@ async def _prepare_reader_clone(source_reader, concurrent_update):
         assert blocked.value.orig.sqlstate == "55P03"
 
     return await archive.prepare_reference_family_archive_source(
-        source_reader.sessions,
+        source_reader.admin,
+        source_sessions=source_reader.sessions,
+        source_copy=source_reader.custody.source_copy,
+        on_precreated=source_reader.custody.precreate,
         importer_id="places-zcta",
         schema_name=source_reader.source,
         source_metadata=None,
@@ -1074,6 +1123,13 @@ async def test_readonly_source_export(source_reader, concurrent_update):
 
     prepared = await _prepare_reader_clone(source_reader, concurrent_update)
     assert prepared.manifest.source_serving_generation == source_reader.authority.serving_generation
+    async with source_reader.sessions.begin() as session:
+        with pytest.raises(DBAPIError) as forbidden:
+            async with session.begin_nested():
+                await session.execute(
+                    text(f"UPDATE \"{source_reader.stage}\".pricing_places_zcta SET measure_name='forbidden'")
+                )
+        assert forbidden.value.orig.sqlstate == "42501"
     async with source_reader.admin.begin() as session:
         await session.execute(
             text(f'LOCK TABLE "{source_reader.source}".pricing_places_zcta IN ACCESS EXCLUSIVE MODE NOWAIT')
@@ -1088,10 +1144,149 @@ async def test_readonly_source_export(source_reader, concurrent_update):
                 == "old"
             )
 
-    await archive.export_prepared_reference_family_archive(source_reader.sessions, prepared=prepared, archive_copy=copy)
-    async with source_reader.sessions.begin() as session:
+    await archive.export_prepared_reference_family_archive(
+        source_reader.sessions, prepared=prepared, archive_copy=copy, verify_custody=source_reader.custody.verify
+    )
+    async with source_reader.admin.begin() as session:
         await archive.cleanup_reference_family_stage(session, prepared.ownership)
     async with source_reader.admin.begin() as session:
         assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": source_reader.stage}) is None
         assert await session.scalar(text(f'SELECT count(*) FROM "{source_reader.source}".pricing_places_zcta')) == 1
         assert await session.scalar(text(f'SELECT count(*) FROM "{source_reader.unrelated}".keep_me')) == 1
+
+
+def _scoped_model_spec():
+    metadata = MetaData(schema="synthetic_source")
+    parent = Table(
+        "scoped_parent",
+        metadata,
+        Column("id", BigInteger, Identity(), primary_key=True),
+        Column("label", Text, nullable=False),
+        CheckConstraint("length(label)>0", name="scoped_label_check"),
+    )
+    child = Table(
+        "scoped_child",
+        metadata,
+        Column("id", BigInteger, primary_key=True),
+        Column("parent_id", BigInteger, ForeignKey("synthetic_source.scoped_parent.id"), nullable=False),
+        Column("parent_ids", ARRAY(BigInteger), nullable=False),
+    )
+    Index("scoped_child_parent_idx", child.c.parent_id)
+    parent_model = type("ScopedParent", (), {"__tablename__": parent.name, "__table__": parent})
+    child_model = type("ScopedChild", (), {"__tablename__": child.name, "__table__": child})
+    return archive.ReferenceFamilySpec(
+        "synthetic-scoped",
+        (parent_model, child_model),
+        relationships=((child_model, "parent_ids", parent_model, "id", True, False),),
+    )
+
+
+async def _copy_scoped_model_rows(session, spec, ownership, *, parent_id=1, parent_ids=(1,)):
+    rows_by_table = {"scoped_parent": [(1, "one")], "scoped_child": [(1, parent_id, list(parent_ids))]}
+    for model in spec.model_types:
+        assert (
+            await archive.native_copy_record_batch(
+                session,
+                model,
+                schema_name=ownership.schema_name,
+                table_name=model.__tablename__,
+                columns=tuple(model.__table__.columns.keys()),
+                records=rows_by_table[model.__tablename__],
+            )
+            == 1
+        )
+
+
+async def _assert_completed_scoped_catalog(session, ownership):
+    assert (
+        await session.scalar(
+            text(
+                "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid "
+                "WHERE c.relnamespace=:oid AND i.indisvalid AND i.indisready"
+            ),
+            {"oid": ownership.schema_oid},
+        )
+        == 3
+    )
+    assert (
+        await session.scalar(
+            text(
+                "SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid=c.conrelid "
+                "WHERE r.relnamespace=:oid AND c.contype='f'"
+            ),
+            {"oid": ownership.schema_oid},
+        )
+        == 0
+    )
+    assert (
+        await session.scalar(
+            text("SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid WHERE c.relnamespace=:oid"),
+            {"oid": ownership.schema_oid},
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_scoped_models_native_copy_deferred_indexes_and_exact_custody():
+    """Unregistered model families share native heaps, set checks and restrictive cleanup."""
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    spec = _scoped_model_spec()
+    dataset_id = uuid4()
+    stage = archive.reference_family_stage_schema(dataset_id)
+    try:
+        async with sessions.begin() as session:
+            ownership = await archive.precreate_model_family_stage(session, spec, dataset_id, include_identity=True)
+            assert len(ownership.sequence_oids) == 1
+            sequence_name, _sequence_oid, parent_table, parent_column = ownership.sequence_oids[0]
+            assert (sequence_name, parent_table, parent_column) == ("scoped_parent_id_seq", "scoped_parent", "id")
+            assert (
+                await session.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid WHERE c.relnamespace=:oid"
+                    ),
+                    {"oid": ownership.schema_oid},
+                )
+                == 0
+            )
+            await _copy_scoped_model_rows(session, spec, ownership)
+            await archive.complete_model_family_stage(session, spec, ownership, include_identity=True)
+            assert (
+                await archive.verify_model_family_stage_ownership(session, spec, ownership, include_identity=True)
+                == ownership
+            )
+            await _assert_completed_scoped_catalog(session, ownership)
+        async with sessions.begin() as session:
+            changed = replace(ownership, schema_oid=ownership.schema_oid + 1)
+            with pytest.raises(archive.ReferenceFamilyArchiveError, match="ownership"):
+                await archive.cleanup_model_family_stage(session, spec, changed, include_identity=True)
+            assert await session.scalar(text(f'SELECT count(*) FROM "{stage}".scoped_child')) == 1
+            await archive.cleanup_model_family_stage(session, spec, ownership, include_identity=True)
+            assert await session.scalar(text("SELECT to_regnamespace(:stage)"), {"stage": stage}) is None
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("parent_id", "parent_ids"), ((99, (1,)), (1, (99,)), (1, (None,))))
+async def test_scoped_model_invalid_relationships_roll_back_complete_candidate(parent_id, parent_ids):
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    spec = _scoped_model_spec()
+    dataset_id = uuid4()
+    stage = archive.reference_family_stage_schema(dataset_id)
+    try:
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="relationship"):
+            async with sessions.begin() as session:
+                ownership = await archive.precreate_model_family_stage(session, spec, dataset_id, include_identity=True)
+                await _copy_scoped_model_rows(session, spec, ownership, parent_id=parent_id, parent_ids=parent_ids)
+                await archive.complete_model_family_stage(session, spec, ownership, include_identity=True)
+        async with sessions.begin() as session:
+            assert await session.scalar(text("SELECT to_regnamespace(:stage)"), {"stage": stage}) is None
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage}" CASCADE'))
+        await engine.dispose()

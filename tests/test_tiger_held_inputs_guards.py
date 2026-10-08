@@ -157,6 +157,74 @@ async def test_source_binding_missing_relation_cannot_supply_authority(monkeypat
     session.execute.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selection",
+    (
+        "installed",
+        "both_nodes",
+        "canonical",
+        "foreign_installed",
+        "foreign_only",
+        "duplicate_installed",
+        "duplicate_source",
+    ),
+)
+async def test_tiger_selection_is_node_local(monkeypatch, selection):
+    """Only the local installation preempts a local capture; foreign scopes stay invisible."""
+    inventory = _inventory()
+    generation_by_field = {"node_id": "source", "inventory": deepcopy(inventory)}
+    current_rows = [generation_by_field]
+    if selection in {"both_nodes", "foreign_installed", "foreign_only"}:
+        current_rows.append({**generation_by_field, "node_id": "foreign"})
+    if selection in {"foreign_installed", "foreign_only", "duplicate_source"}:
+        current_rows.pop(0)
+    if selection == "duplicate_installed":
+        current_rows *= 2
+    if selection == "canonical":
+        for relation in generation_by_field["inventory"]["relations"]:
+            relation["schema_name"] = "tiger"
+    family_by_field = {"publication_authority": "captured-epoch"}
+    capture_by_field = {
+        "node_id": "source",
+        "inventory": inventory,
+        "manifest": {"adapter_metadata": {"family": family_by_field}},
+    }
+    source_rows = [capture_by_field, {**capture_by_field, "node_id": "foreign"}]
+    if selection == "foreign_only":
+        source_rows.pop(0)
+    if selection == "duplicate_source":
+        source_rows.append(capture_by_field)
+
+    async def execute(statement, parameters):
+        is_current = held._CURRENT in str(statement)
+        alias = "c" if is_current else "b"
+        assert f"(CAST(:node_id AS text) IS NULL OR {alias}.node_id=:node_id)" in str(statement)
+        assert parameters == {"node_id": "source"}
+        return _result(
+            *(entry for entry in (current_rows if is_current else source_rows) if entry["node_id"] == "source")
+        )
+
+    session = _session(scalars=(301, 302, 303))
+    session.execute = execute
+    monkeypatch.setattr(held, "_source_selection_relations", lambda: ('"example"."binding"', '"example"."package"'))
+    monkeypatch.setattr(held, "_protected_relation", AsyncMock(return_value={"owner_oid": _OWNER}))
+    installed, captured = AsyncMock(), AsyncMock(return_value=inventory)
+    monkeypatch.setattr(held, "_require_installed_selection", installed)
+    monkeypatch.setattr(held, "_require_inventory", AsyncMock(return_value=inventory))
+    monkeypatch.setattr(held, "_require_captured_selection", captured)
+    if selection.startswith("duplicate"):
+        with pytest.raises(RuntimeError, match="protected TIGER input changed"):
+            await held.selected_tiger_inventory(session, node_id="source")
+    else:
+        expected = None if selection in {"canonical", "foreign_only"} else inventory
+        assert await held.selected_tiger_inventory(session, node_id="source") == expected
+    assert installed.await_count == int(selection in {"installed", "both_nodes"})
+    assert captured.await_count == int(selection == "foreign_installed")
+    if captured.await_count:
+        captured.assert_awaited_once_with(session, capture_by_field, family_by_field)
+
+
 def _captured_selection():
     graph_by_field = {"contract": "tiger.closed-inheritance-graph.v1", "database_oid": 77, "relations": _graph_rows()}
     origin_by_field = {

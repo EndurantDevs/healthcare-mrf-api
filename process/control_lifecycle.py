@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import datetime as dt
 import asyncio
+import datetime as dt
 import hashlib
 import logging
 import os
@@ -12,8 +12,8 @@ import weakref
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from functools import lru_cache
-from inspect import signature
 from importlib import import_module
+from inspect import signature
 from typing import Any, AsyncIterator
 
 import redis
@@ -40,7 +40,6 @@ from process.ptg_parts.frozen_rate_privacy import (
 )
 from process.redis_config import build_redis_settings
 
-
 _TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
 _CONTROL_RUN_MARKED = True
 _CONTROL_RUN_NOT_MARKED = False
@@ -57,10 +56,7 @@ async def acquire_control_run_worker_action_lock(
     if not normalized_run_id:
         raise ValueError("run_id is required for the worker action lock")
     await executor.scalar(
-        text(
-            "SELECT pg_catalog.pg_advisory_xact_lock("
-            "pg_catalog.hashtextextended(:lock_name, 0))"
-        ),
+        text("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:lock_name, 0))"),
         lock_name=f"control-run-worker-action:v1:{normalized_run_id}",
     )
 
@@ -74,13 +70,21 @@ def _committed_target_result(
 
     context = control_context.get("context")
     if (
-        target_module == "process.places_zcta"
+        target_module in {"process.places_zcta", "process.entity_address_unified", "process.nucc"}
         and isinstance(context, dict)
         and context.get("control_run_handoff_committed") is True
     ):
         return context.get("_control_committed_result")
     if (
-        target_module not in {"process.npi", "process.massachusetts_profile", "process.kentucky_profile", "process.tennessee_profile", "process.rhode_island_profile", "process.new_york_profile"}
+        target_module
+        not in {
+            "process.npi",
+            "process.massachusetts_profile",
+            "process.kentucky_profile",
+            "process.tennessee_profile",
+            "process.rhode_island_profile",
+            "process.new_york_profile",
+        }
         or not isinstance(context, dict)
         or context.get("control_run_terminal_committed") is not True
     ):
@@ -171,20 +175,14 @@ async def suppress_control_run_heartbeat_persistence(
     normalized_run_id = str(run_id or "").strip()
     if not normalized_run_id:
         raise ValueError("run_id is required for heartbeat persistence suppression")
-    async with _locked_control_run_heartbeat_persistence_gate(
-        normalized_run_id
-    ) as gate:
+    async with _locked_control_run_heartbeat_persistence_gate(normalized_run_id) as gate:
         gate.suppression_depth += 1
     try:
         yield
     finally:
-        async with _locked_control_run_heartbeat_persistence_gate(
-            normalized_run_id
-        ) as gate:
+        async with _locked_control_run_heartbeat_persistence_gate(normalized_run_id) as gate:
             if gate.suppression_depth <= 0:
-                raise RuntimeError(
-                    "control-run heartbeat persistence suppression underflow"
-                )
+                raise RuntimeError("control-run heartbeat persistence suppression underflow")
             gate.suppression_depth -= 1
 
 
@@ -213,34 +211,23 @@ async def _project_control_target_success(
     terminal_projection = _mark_and_flush_terminal_control_run(
         run_id,
         phase_detail=(
-            str(terminal_progress["phase"])
-            if terminal_progress is not None
-            else f"{target_function} succeeded"
+            str(terminal_progress["phase"]) if terminal_progress is not None else f"{target_function} succeeded"
         ),
-        progress_message=(
-            str(terminal_progress["message"])
-            if terminal_progress is not None
-            else "succeeded"
-        ),
+        progress_message=(str(terminal_progress["message"]) if terminal_progress is not None else "succeeded"),
         metrics=terminal_metrics,
         progress=terminal_progress,
         preserve_finished_at=bool(
-            isinstance(job_context_by_field, dict)
-            and job_context_by_field.get("preserve_control_run_finished_at")
+            isinstance(job_context_by_field, dict) and job_context_by_field.get("preserve_control_run_finished_at")
         ),
         attempt_id=attempt_id,
         attempt_started_at=attempt_started_at,
         snapshot_id=_terminal_snapshot_id(terminal_metrics),
         database_state_committed=is_database_state_committed,
         database_heartbeat_at=(
-            job_context_by_field.get("_control_committed_heartbeat_at")
-            if is_database_state_committed
-            else None
+            job_context_by_field.get("_control_committed_heartbeat_at") if is_database_state_committed else None
         ),
         database_finished_at=(
-            job_context_by_field.get("_control_committed_finished_at")
-            if is_database_state_committed
-            else None
+            job_context_by_field.get("_control_committed_finished_at") if is_database_state_committed else None
         ),
     )
     if is_database_state_committed:
@@ -259,18 +246,14 @@ async def control_single_job_start(
     bind_status_event_loop()
     run_id = str(control_task_by_field.get("run_id") or "").strip()
     importer = str(
-        control_task_by_field.get("importer")
-        or control_task_by_field.get("target_function")
-        or "unknown"
+        control_task_by_field.get("importer") or control_task_by_field.get("target_function") or "unknown"
     ).strip()
     target_module = str(control_task_by_field.get("target_module") or "").strip()
     target_function = str(control_task_by_field.get("target_function") or "").strip()
     call_style = str(control_task_by_field.get("call_style") or "ctx_task").strip()
     run_shutdown = bool(control_task_by_field.get("run_shutdown"))
     target_task_by_field = (
-        control_task_by_field.get("task")
-        if isinstance(control_task_by_field.get("task"), dict)
-        else {}
+        control_task_by_field.get("task") if isinstance(control_task_by_field.get("task"), dict) else {}
     )
     ctx = _isolated_control_job_context(ctx, run_id)
 
@@ -325,9 +308,7 @@ async def control_single_job_start(
                 progress_message="target missing",
                 error={
                     "code": "control_target_missing",
-                    "message": (
-                        "target_module and target_function are required"
-                    ),
+                    "message": ("target_module and target_function are required"),
                 },
                 attempt_id=attempt_id,
                 attempt_started_at=started_at if run_id else None,
@@ -366,6 +347,8 @@ async def control_single_job_start(
                 target_result = shutdown_result
             ctx.setdefault("context", {})["run"] = 0
     except ImportCancelledError:
+        if target_module == "process.nucc" and ctx["context"].get("nucc_native_commit_unknown") is True:
+            raise
         committed_result = _committed_target_result(
             ctx,
             target_module=target_module,
@@ -383,6 +366,8 @@ async def control_single_job_start(
             return {"status": "canceled", "run_id": run_id}
         target_result = committed_result
     except asyncio.CancelledError as exc:
+        if target_module == "process.nucc" and ctx["context"].get("nucc_native_commit_unknown") is True:
+            raise
         committed_result = _committed_target_result(
             ctx,
             target_module=target_module,
@@ -407,6 +392,8 @@ async def control_single_job_start(
         while current_task is not None and current_task.cancelling():
             current_task.uncancel()
     except Exception as exc:
+        if target_module == "process.nucc" and ctx["context"].get("nucc_native_commit_unknown") is True:
+            raise
         committed_result = _committed_target_result(
             ctx,
             target_module=target_module,
@@ -432,7 +419,10 @@ async def control_single_job_start(
     committed_result = _committed_target_result(ctx, target_module=target_module)
     if committed_result is not None:
         target_result = committed_result
-    if target_module == "process.places_zcta" and ctx["context"].get("control_run_handoff_committed") is True:
+    if (
+        target_module in {"process.places_zcta", "process.entity_address_unified", "process.nucc"}
+        and ctx["context"].get("control_run_handoff_committed") is True
+    ):
         return {"status": "finalizing", "run_id": run_id, "result": target_result}
     await _project_control_target_success(
         run_id,
@@ -490,24 +480,18 @@ async def _live_progress_heartbeat(
         has_heartbeat_ownership = False
         is_persistence_suppressed = False
         try:
-            async with _locked_control_run_heartbeat_persistence_gate(
-                run_id
-            ) as gate:
+            async with _locked_control_run_heartbeat_persistence_gate(run_id) as gate:
                 is_persistence_suppressed = gate.suppression_depth > 0
                 if not is_persistence_suppressed:
-                    has_heartbeat_ownership = (
-                        await _is_control_run_heartbeat_persisted(
-                            run_id,
-                            target_function,
-                            attempt_id=attempt_id,
-                            attempt_started_at=attempt_started_at,
-                        )
+                    has_heartbeat_ownership = await _is_control_run_heartbeat_persisted(
+                        run_id,
+                        target_function,
+                        attempt_id=attempt_id,
+                        attempt_started_at=attempt_started_at,
                     )
         except Exception:
             logger.debug("Failed to persist live import heartbeat for run %s", run_id, exc_info=True)
-        if not (
-            has_heartbeat_ownership or is_persistence_suppressed
-        ):
+        if not (has_heartbeat_ownership or is_persistence_suppressed):
             continue
         enqueue_live_progress(
             run_id=run_id,
@@ -535,10 +519,14 @@ async def _is_control_run_heartbeat_persisted(
     attempt_started_at: str | None = None,
 ) -> bool:
     live = read_live_progress(run_id)
-    if attempt_id and attempt_started_at and not _is_progress_from_attempt(
-        live,
-        attempt_id=attempt_id,
-        attempt_started_at=attempt_started_at,
+    if (
+        attempt_id
+        and attempt_started_at
+        and not _is_progress_from_attempt(
+            live,
+            attempt_id=attempt_id,
+            attempt_started_at=attempt_started_at,
+        )
     ):
         live = None
     now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
@@ -550,11 +538,7 @@ async def _is_control_run_heartbeat_persisted(
         attempt_started_at=attempt_started_at,
     )
     blocked_statuses = sorted(_TERMINAL_STATUSES | {"canceling"})
-    stmt = (
-        update(ImportRun)
-        .where(ImportRun.run_id == run_id)
-        .where(ImportRun.status.notin_(blocked_statuses))
-    )
+    stmt = update(ImportRun).where(ImportRun.run_id == run_id).where(ImportRun.status.notin_(blocked_statuses))
     stmt = _where_no_places_handoff(stmt)
     if attempt_id and attempt_started_at:
         stmt = _where_control_attempt(
@@ -562,9 +546,7 @@ async def _is_control_run_heartbeat_persisted(
             attempt_id=attempt_id,
             attempt_started_at=attempt_started_at,
         )
-    affected_rows = await _execute_control_run_update(
-        stmt.values(**update_values_by_field).returning(ImportRun.run_id)
-    )
+    affected_rows = await _execute_control_run_update(stmt.values(**update_values_by_field).returning(ImportRun.run_id))
     return affected_rows == 1
 
 
@@ -572,12 +554,20 @@ _persist_control_run_heartbeat = _is_control_run_heartbeat_persisted
 
 
 def _where_no_places_handoff(stmt):
-    """Leave a durable PLACES handoff exclusively with its trusted publisher."""
+    """Leave durable native handoffs exclusively with their trusted publishers."""
     return stmt.where(
         or_(
             ImportRun.importer != "places-zcta",
             ImportRun.metrics["places_handoff"].as_string().is_(None),
-        )
+        ),
+        or_(
+            ImportRun.importer != "entity-address-unified",
+            ImportRun.metrics["address_handoff"].as_string().is_(None),
+        ),
+        or_(
+            ImportRun.importer != "nucc",
+            ImportRun.metrics["nucc_handoff"].as_string().is_(None),
+        ),
     )
 
 
@@ -727,15 +717,9 @@ def _terminal_progress_from_result(
 
 def _terminal_metrics_from_result(result: Any, *, context: Any = None) -> dict[str, Any] | None:
     metrics = (
-        {
-            key: value
-            for key, value in result.items()
-            if key != "terminal_progress"
-        }
+        {key: value for key, value in result.items() if key != "terminal_progress"}
         if isinstance(result, dict)
-        else (
-        {"result": result} if isinstance(result, (int, float, str, bool)) else None
-        )
+        else ({"result": result} if isinstance(result, (int, float, str, bool)) else None)
     )
     context_metrics = _terminal_metrics_from_context(context)
     if metrics is None:
@@ -789,7 +773,8 @@ def _terminal_metrics_from_context(context: Any) -> dict[str, Any] | None:
         "publish_validation",
         "phase_timings",
         "hospital_price_metrics",
-        "audit", "skipped_stage_indexes",
+        "audit",
+        "skipped_stage_indexes",
     )
     metrics_by_name = {key: context[key] for key in keys if key in context}
     staged_rows = metrics_by_name.get("staged_rows")
@@ -864,9 +849,7 @@ def _control_progress_by_field(
             )
         ):
             live_progress_by_field = {}
-        progress_by_field = progress_payload_from_live(
-            live_progress_by_field
-        ) or {
+        progress_by_field = progress_payload_from_live(live_progress_by_field) or {
             "unit": "run",
             "total": 1,
             "done": 0,
@@ -1019,17 +1002,9 @@ async def mark_control_run(
                 ImportRun.status == expected_state[1],
             )
         if status == "running":
-            stmt = stmt.where(
-                ImportRun.status.notin_(
-                    sorted(_TERMINAL_STATUSES | {"canceling"})
-                )
-            )
+            stmt = stmt.where(ImportRun.status.notin_(sorted(_TERMINAL_STATUSES | {"canceling"})))
             if not (attempt_id and attempt_started_at):
-                stmt = stmt.where(
-                    ImportRun.progress[
-                        "attempt_started_at"
-                    ].as_string().is_(None)
-                )
+                stmt = stmt.where(ImportRun.progress["attempt_started_at"].as_string().is_(None))
         elif is_terminal:
             stmt = stmt.where(
                 or_(
@@ -1062,47 +1037,34 @@ async def mark_control_run(
         "status": status,
         "phase": progress_by_field.get("phase") or phase_detail,
         "message": progress_by_field.get("message") or progress_message,
-        "started_at": (
-            isoformat_utc(transition_times.live_started_at)
-            if transition_times.live_started_at
-            else None
-        ),
+        "started_at": (isoformat_utc(transition_times.live_started_at) if transition_times.live_started_at else None),
         "finished_at": (
-            isoformat_utc(transition_times.live_finished_at)
-            if transition_times.live_finished_at
-            else None
+            isoformat_utc(transition_times.live_finished_at) if transition_times.live_finished_at else None
         ),
         "snapshot_id": snapshot_id,
         "publish_event": False,
     }
-    status_event_by_field = project_frozen_status_event({
-        "run_id": run_id,
-        "status": status,
-        "phase_detail": phase_detail,
-        "progress": progress_by_field,
-        "metrics": metrics or {},
-        "error": error,
-        "snapshot_id": snapshot_id,
-        "heartbeat_at": isoformat_utc(
-            transition_times.committed_heartbeat or transition_times.now
-        ),
-        "started_at": (
-            isoformat_utc(transition_times.live_started_at)
-            if transition_times.live_started_at
-            else None
-        ),
-        "finished_at": (
-            isoformat_utc(transition_times.live_finished_at)
-            if transition_times.live_finished_at
-            else None
-        ),
-    })
+    status_event_by_field = project_frozen_status_event(
+        {
+            "run_id": run_id,
+            "status": status,
+            "phase_detail": phase_detail,
+            "progress": progress_by_field,
+            "metrics": metrics or {},
+            "error": error,
+            "snapshot_id": snapshot_id,
+            "heartbeat_at": isoformat_utc(transition_times.committed_heartbeat or transition_times.now),
+            "started_at": (
+                isoformat_utc(transition_times.live_started_at) if transition_times.live_started_at else None
+            ),
+            "finished_at": (
+                isoformat_utc(transition_times.live_finished_at) if transition_times.live_finished_at else None
+            ),
+        }
+    )
     public_progress_by_field = status_event_by_field.get("progress")
     if isinstance(public_progress_by_field, dict):
-        live_update_by_field["message"] = (
-            public_progress_by_field.get("message")
-            or live_update_by_field["message"]
-        )
+        live_update_by_field["message"] = public_progress_by_field.get("message") or live_update_by_field["message"]
     await asyncio.to_thread(
         write_live_progress,
         **live_update_by_field,
@@ -1136,10 +1098,7 @@ def _committed_control_timestamp(value: object) -> dt.datetime:
         parsed = dt.datetime.fromisoformat(value)
     except ValueError:
         raise ValueError("committed control timestamp is invalid") from None
-    if (
-        parsed.tzinfo != dt.UTC
-        or parsed.isoformat(timespec="microseconds") != value
-    ):
+    if parsed.tzinfo != dt.UTC or parsed.isoformat(timespec="microseconds") != value:
         raise ValueError("committed control timestamp is invalid")
     return parsed
 
@@ -1158,9 +1117,7 @@ def _control_attempt_for_run(
     if str(context.get("run_id") or "").strip() != run_id:
         return None, None
     context_attempt_id = str(context.get("attempt_id") or "").strip()
-    context_started_at = str(
-        context.get("attempt_started_at") or ""
-    ).strip()
+    context_started_at = str(context.get("attempt_started_at") or "").strip()
     if not context_attempt_id or not context_started_at:
         return None, None
     return context_attempt_id, context_started_at
@@ -1188,7 +1145,7 @@ def _control_run_db_update_throttle_seconds() -> float:
     raw = os.getenv("HLTHPRT_CONTROL_RUN_DB_UPDATE_THROTTLE_SECONDS", "30")
     try:
         return max(float(raw), 0.0)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 30.0
 
 
@@ -1199,7 +1156,9 @@ def _control_run_db_update_slot_key(*, run_id: str, status: str, phase_detail: s
 
 def _is_db_update_slot_claimed(slot_key: str, throttle_seconds: float) -> bool:
     try:
-        return bool(_control_run_db_throttle_client().set(slot_key, "1", nx=True, px=max(int(throttle_seconds * 1000), 1)))
+        return bool(
+            _control_run_db_throttle_client().set(slot_key, "1", nx=True, px=max(int(throttle_seconds * 1000), 1))
+        )
     except Exception:
         return True
 
@@ -1230,8 +1189,7 @@ def _where_control_attempt(
 
     return stmt.where(
         ImportRun.progress["attempt_id"].as_string() == attempt_id,
-        ImportRun.progress["attempt_started_at"].as_string()
-        == attempt_started_at,
+        ImportRun.progress["attempt_started_at"].as_string() == attempt_started_at,
     )
 
 
@@ -1244,9 +1202,7 @@ def _where_newer_control_attempt_claim(
     """Claim a run only when no newer immutable attempt already owns it."""
 
     stored_attempt_id = ImportRun.progress["attempt_id"].as_string()
-    stored_started_at = ImportRun.progress[
-        "attempt_started_at"
-    ].as_string()
+    stored_started_at = ImportRun.progress["attempt_started_at"].as_string()
     return stmt.where(
         or_(
             stored_started_at.is_(None),
@@ -1271,8 +1227,7 @@ def _is_progress_from_attempt(
         return False
     return (
         str(progress.get("attempt_id") or "") == attempt_id
-        and str(progress.get("attempt_started_at") or "")
-        == attempt_started_at
+        and str(progress.get("attempt_started_at") or "") == attempt_started_at
     )
 
 
@@ -1300,9 +1255,7 @@ def _isolated_control_job_context(ctx: dict[str, Any], run_id: str) -> dict[str,
     """Copy mutable run state so concurrent ARQ jobs cannot overwrite each other."""
     isolated_context_map = dict(ctx)
     shared_context_map = ctx.get("context")
-    job_context_map = (
-        dict(shared_context_map) if isinstance(shared_context_map, dict) else {}
-    )
+    job_context_map = dict(shared_context_map) if isinstance(shared_context_map, dict) else {}
     for key in (
         "audit",
         "finished_at",
@@ -1314,6 +1267,9 @@ def _isolated_control_job_context(ctx: dict[str, Any], run_id: str) -> dict[str,
         "_control_committed_result",
         "_control_attempt_id",
         "_control_attempt_started_at",
+        "nucc_native_stage",
+        "nucc_native_predecessor",
+        "nucc_native_commit_unknown",
     ):
         job_context_map.pop(key, None)
     if run_id:

@@ -27,6 +27,38 @@ def _owner():
     )
 
 
+def _set_owner():
+    from process.entity_address_snapshot_alias import AUTHORITY_TABLE
+
+    return replace(_owner(), relation_oids=tuple(sorted((*_owner().relation_oids, (AUTHORITY_TABLE, 8)))))
+
+
+def test_v2_owner_closed_inventory():
+    assert ownership.validate_entity_address_archive_stage_ownership(_set_owner()) == _set_owner()
+    forged = replace(_set_owner(), relation_oids=tuple(sorted((*_owner().relation_oids, ("unrelated", 8)))))
+    with pytest.raises(ownership.EntityAddressArchiveOwnershipError):
+        ownership.validate_entity_address_archive_stage_ownership(forged)
+
+
+async def test_v2_retirement_rechecks_catalog_under_locks_before_any_drop(monkeypatch):
+    from process import entity_address_snapshot_preparation as protected
+
+    owner = _set_owner()
+    monkeypatch.setattr(protected, "_publisher_authority", AsyncMock(return_value=31))
+    monkeypatch.setattr(ownership, "_validated_publication_owner", lambda *_: ("example", [], {"relation_oid": 8}))
+    monkeypatch.setattr(ownership, "_require_retained_catalog", lambda *_: None)
+    catalog = AsyncMock(side_effect=[[{"nspname": "example", "relname": "retained"}], []])
+    monkeypatch.setattr(ownership, "_retained_relation_catalog", catalog)
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
+    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="catalog changed"):
+        await ownership.cleanup_entity_address_archive_publication(
+            session, owner=owner, publication={}, assert_unreferenced=AsyncMock(return_value=True)
+        )
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert len(statements) == 1 and "ACCESS EXCLUSIVE MODE NOWAIT" in statements[0]
+    assert not any("DROP" in statement for statement in statements)
+
+
 @pytest.mark.parametrize(
     "changes",
     [

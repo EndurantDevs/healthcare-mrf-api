@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from contextlib import nullcontext
 
 from sqlalchemy import text
 
@@ -17,6 +18,7 @@ from process import entity_address_snapshot_serving as serving
 
 EntityAddressSnapshotDestinationError = destination.EntityAddressSnapshotDestinationError
 CONTRACT = "entity_address_archive_preparation.postgres.v1"
+SET_CONTRACT = "entity_address_archive_preparation.postgres.v2"
 _EVIDENCE_SEQUENCE = "entity_address_evidence_evidence_id_seq"
 _ORDINARY_PRINCIPAL_SQL = alias_guard.ORDINARY_PRINCIPAL_SQL
 
@@ -31,6 +33,12 @@ async def prepare_private_entity_address_archive_destination(
 ):
     """Prepare provisional contents while preserving the original private inventory."""
     from process import entity_address_snapshot_destination as native_destination
+    from process.entity_address_snapshot_receipt import CONTRACT as archive_contract
+
+    _require(
+        native_destination.validate_entity_address_archive_receipt(semantic_receipt).contract != archive_contract,
+        "v2 requires authenticated publisher load",
+    )
 
     _require(
         isinstance(destination, Mapping)
@@ -119,6 +127,98 @@ async def _require_no_untrusted_mutation(session, relation_oids, owner_oid, *, s
     _require(unsafe is False, "ordinary mutation is available")
 
 
+async def _seal_published_relation(session, relation_oid, owner_oid):
+    """Preserve read grants while closing effective ordinary DML and ownership bypasses."""
+    _require(await _publisher_authority(session) == owner_oid, "publisher owner differs")
+    relation = (
+        (
+            await session.execute(
+                text(
+                    "SELECT quote_ident(n.nspname)||'.'||quote_ident(c.relname) AS name,quote_ident(r.rolname) AS owner,c.relowner "
+                    "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_roles r ON r.oid=:owner WHERE c.oid=:oid"
+                ),
+                {"owner": owner_oid, "oid": relation_oid},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    if relation["relowner"] == owner_oid:
+        await _require_no_untrusted_mutation(session, [relation_oid], owner_oid)
+        await _seal_owned_sequences(session, relation_oid, owner_oid, relation["owner"])
+        return
+    await session.execute(text(f"ALTER TABLE {relation['name']} OWNER TO {relation['owner']}"))
+    principals = (
+        (
+            await session.execute(
+                text("SELECT quote_ident(principal.rolname) FROM pg_roles principal WHERE " + _ORDINARY_PRINCIPAL_SQL),
+                {"owner_oid": owner_oid},
+            )
+        )
+        .scalars()
+        .all()
+    )
+    columns = (
+        (
+            await session.execute(
+                text(
+                    "SELECT quote_ident(attname) FROM pg_attribute WHERE attrelid=:oid AND attnum>0 AND NOT attisdropped ORDER BY attnum"
+                ),
+                {"oid": relation_oid},
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for principal in ("PUBLIC", *principals):
+        await session.execute(
+            text(f"REVOKE INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER ON {relation['name']} FROM {principal}")
+        )
+        column_names = ",".join(columns)
+        await session.execute(
+            text(
+                f"REVOKE INSERT ({column_names}),UPDATE ({column_names}),REFERENCES ({column_names}) "
+                f"ON {relation['name']} FROM {principal}"
+            )
+        )
+    await _require_no_untrusted_mutation(session, [relation_oid], owner_oid)
+    await _seal_owned_sequences(session, relation_oid, owner_oid, relation["owner"])
+
+
+async def _seal_owned_sequences(session, relation_oid, owner_oid, quoted_owner):
+    """Close sequence mutation without changing the immutable table's read grants."""
+    sequences = (
+        (
+            await session.execute(
+                text(
+                    "SELECT s.oid,quote_ident(n.nspname)||'.'||quote_ident(s.relname) AS name "
+                    "FROM pg_depend d JOIN pg_class s ON s.oid=d.objid JOIN pg_namespace n ON n.oid=s.relnamespace "
+                    "WHERE d.classid='pg_class'::regclass AND d.refclassid='pg_class'::regclass "
+                    "AND d.refobjid=:oid AND d.deptype IN ('a','i') AND s.relkind='S'"
+                ),
+                {"oid": relation_oid},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    principals = (
+        (
+            await session.execute(
+                text("SELECT quote_ident(principal.rolname) FROM pg_roles principal WHERE " + _ORDINARY_PRINCIPAL_SQL),
+                {"owner_oid": owner_oid},
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for sequence in sequences:
+        await session.execute(text(f"ALTER SEQUENCE {sequence['name']} OWNER TO {quoted_owner}"))
+        for principal in ("PUBLIC", *principals):
+            await session.execute(text(f"REVOKE USAGE,UPDATE ON SEQUENCE {sequence['name']} FROM {principal}"))
+    await _require_no_untrusted_mutation(session, [sequence["oid"] for sequence in sequences], owner_oid, sequence=True)
+
+
 async def _require_alias_authority(session, db_schema, owner_oid):
     """Admit only explicitly provisioned, reviewed trigger-only generation authority."""
     try:
@@ -162,9 +262,9 @@ async def _authenticated_preparation(session, stored, preparation, validation, a
     return proof, owner
 
 
-async def _protected_catalog(session, proof, owner):
+async def _protected_catalog(session, proof, owner, *, read_only=False):
     """Lock and fingerprint only the exact frozen heaps, indexes and owned sequence."""
-    await destination.restore._lock_owned_restore_relations(session, owner)
+    await destination.restore._lock_owned_restore_relations(session, owner, read_only=read_only)
     await destination.verify_entity_address_archive_stage_ownership(session, owner=owner)
     owner_oid = proof["frozen_owner_oid"]
     schema_safe = await session.scalar(
@@ -195,7 +295,7 @@ async def _protected_catalog(session, proof, owner):
         .all()
     )
     _require(
-        len(catalog_rows) == 7
+        len(catalog_rows) == len(owner.relation_oids)
         and all(
             catalog_row["relowner"] == owner_oid
             and catalog_row["relkind"] == "r"
@@ -221,6 +321,8 @@ async def _protected_catalog(session, proof, owner):
 async def _candidate_schema_identity(session, owner):
     """Bind local index identities as well as the portable, normalized schema shapes."""
     receipt = destination.restore.importlib.import_module("process.entity_address_snapshot_receipt")
+    is_set = alias.AUTHORITY_TABLE in dict(owner.relation_oids)
+    index_state = ",i.indisvalid,i.indisready,i.indislive" if is_set else ""
     shapes = []
     async with destination.db.bind_existing_session(session), destination._preserve_receipt_settings():
         await receipt._normalize_receipt_session(session, owner.schema_name)
@@ -231,7 +333,7 @@ async def _candidate_schema_identity(session, owner):
             await session.execute(
                 text(
                     "SELECT i.indexrelid AS oid,i.indrelid,c.relname,c.relnamespace,c.relowner,"
-                    "pg_catalog.pg_relation_filenode(c.oid) AS filenode FROM pg_catalog.pg_index i "
+                    "pg_catalog.pg_relation_filenode(c.oid) AS filenode" + index_state + " FROM pg_catalog.pg_index i "
                     "JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid WHERE i.indrelid=ANY(:oids) ORDER BY i.indexrelid"
                 ),
                 {"oids": [oid for _name, oid in owner.relation_oids]},
@@ -240,6 +342,11 @@ async def _candidate_schema_identity(session, owner):
         .mappings()
         .all()
     )
+    if is_set:
+        _require(
+            all(entry["indisvalid"] and entry["indisready"] and entry["indislive"] for entry in indexes),
+            "candidate indexes are incomplete",
+        )
     return {"shapes": shapes, "indexes": [dict(catalog_row) for catalog_row in indexes]}
 
 
@@ -301,6 +408,9 @@ async def validate_entity_address_archive_preparation(
     authenticate_preparation,
 ):
     """Fully scan a frozen private candidate; the caller durably authenticates the seal."""
+    from process.entity_address_snapshot_receipt import CONTRACT as archive_contract
+
+    _require(stored.get("contract") != archive_contract, "v2 requires authenticated publisher load")
     proof, owner = await _authenticated_preparation(session, stored, preparation, None, authenticate_preparation)
     schema = stored["restored"]["db_schema"]
     await alias._lock_alias_relations(session, schema)
@@ -589,6 +699,16 @@ async def activate_validated_entity_address_archive_destination(
     authenticate_preparation,
 ):
     """Publish an authenticated frozen candidate without rescanning candidate or alias rows."""
+    if isinstance(validation, Mapping) and validation.get("contract") == SET_CONTRACT:
+        return await _activate_set_validated_destination(
+            session,
+            stored=stored,
+            validation=validation,
+            preparation=preparation,
+            expected_incumbent=expected_incumbent,
+            callbacks=callbacks,
+            authenticate_preparation=authenticate_preparation,
+        )
     proof, owner = await _authenticated_preparation(session, stored, preparation, validation, authenticate_preparation)
     _require_seal(stored, proof, validation)
     schema = stored["restored"]["db_schema"]
@@ -599,18 +719,7 @@ async def activate_validated_entity_address_archive_destination(
     async with destination.db.bind_existing_session(session):
         schema, names = await _move_to_destination(session, stored, owner)
         prepared = _prepared_adoption(stored)
-        from process.entity_address_dependency_bindings import resolve_prepared_bindings
-
-        expected_bindings = prepared.context.get("dependency_bindings")
-        dependency_bindings = await resolve_prepared_bindings(session, schema, expected_bindings)
-        if dependency_bindings != expected_bindings:
-            changed = await session.scalar(text(
-                f'UPDATE "{schema}".entity_address_geo_assurance_state '
-                "SET candidate_dependency_bindings=CAST(:bindings AS jsonb) "
-                "WHERE singleton IS TRUE AND candidate_dependency_bindings=CAST(:expected AS jsonb) "
-                "RETURNING singleton"
-            ), {"bindings": json.dumps(dependency_bindings), "expected": json.dumps(expected_bindings)})
-            _require(changed is True, "dependency bindings changed")
+        dependency_bindings = await _resolve_dependency_bindings(session, schema, prepared)
         expected_geo = destination._validated_geo_preparation(stored["geo_assurance"], db_schema=schema)
         actual_geo = await destination._capture_geo_preparation(
             session,
@@ -624,7 +733,446 @@ async def activate_validated_entity_address_archive_destination(
         return await destination.adoption.adopt_prepared_entity_address_snapshot(prepared, callbacks=callbacks)
 
 
+async def _resolve_dependency_bindings(session, schema, prepared):
+    """Resolve grouped dependency renames and update the same candidate with compare-and-swap."""
+    from process.entity_address_dependency_bindings import resolve_prepared_bindings
+
+    expected_bindings = prepared.context.get("dependency_bindings")
+    dependency_bindings = await resolve_prepared_bindings(session, schema, expected_bindings)
+    if dependency_bindings != expected_bindings:
+        changed = await session.scalar(
+            text(
+                f'UPDATE "{schema}".entity_address_geo_assurance_state '
+                "SET candidate_dependency_bindings=CAST(:bindings AS jsonb) "
+                "WHERE singleton IS TRUE AND candidate_dependency_bindings=CAST(:expected AS jsonb) RETURNING singleton"
+            ),
+            {"bindings": json.dumps(dependency_bindings), "expected": json.dumps(expected_bindings)},
+        )
+        _require(changed is True, "dependency bindings changed")
+    return dependency_bindings
+
+
+def _loaded_input(owner, semantic_receipt, source_alias_receipt, destination_payload):
+    return {
+        "ownership": owner.as_dict(),
+        "semantic_receipt": semantic_receipt.as_dict(),
+        "source_alias_receipt": source_alias_receipt.as_dict(),
+        "destination": dict(destination_payload),
+    }
+
+
+async def prepare_loaded_entity_address_archive_destination(
+    session,
+    *,
+    owner,
+    semantic_receipt,
+    source_alias_receipt,
+    destination,
+    authenticate_preparation,
+    publisher_selected_inputs=None,
+    authenticate_selected_mrf=None,
+):
+    """Trusted approved-byte heap load, transforms, indexes and set checks on one session."""
+    from process import entity_address_snapshot_destination as native
+    from process.entity_address_dependency_bindings import (
+        lock_publisher_selected_inputs,
+        validate_publisher_selected_inputs,
+    )
+
+    owner, semantic, source_alias = _validated_loaded_input(owner, semantic_receipt, source_alias_receipt, destination)
+    selected = (
+        None
+        if publisher_selected_inputs is None
+        else validate_publisher_selected_inputs(destination["db_schema"], publisher_selected_inputs)
+    )
+    _require(
+        authenticate_selected_mrf is None or (selected is not None and callable(authenticate_selected_mrf)),
+        "selected MRF authentication differs",
+    )
+    owner_oid = await _publisher_authority(session)
+    proof = await authenticate_preparation(session)
+    _require_loaded_inventory(proof, owner, owner_oid)
+    schema, *_ = native.restore._stage_plan(db_schema=destination["db_schema"], import_date=destination["import_date"])
+    _require(schema != owner.schema_name, "destination differs")
+    await _require_alias_authority(session, schema, owner_oid)
+    await _protected_catalog(session, proof, owner)
+    if selected is not None:
+        selected = await lock_publisher_selected_inputs(session, schema, selected)
+    destination_alias = await alias.capture_entity_address_alias_authority_receipt(session, schema_name=schema)
+    async with native.db.bind_existing_session(session):
+        prepared = await _prepare_loaded_sets(
+            session,
+            owner,
+            semantic,
+            source_alias,
+            destination_alias,
+            destination,
+            selected,
+            authenticate_selected_mrf,
+        )
+    return await _loaded_validation(
+        session,
+        prepared,
+        proof,
+        owner,
+        _loaded_input(owner, semantic, source_alias, destination),
+        destination_alias,
+        selected,
+    )
+
+
+async def _loaded_validation(session, prepared, proof, owner, original_input, destination_alias, selected):
+    """Seal the actual indexed candidate while retaining its original dependency input."""
+    schema = original_input["destination"]["db_schema"]
+    stored = prepared.as_dict()
+    validation_by_field = {
+        "contract": SET_CONTRACT,
+        "prepared": stored,
+        "input_sha256": _digest(original_input),
+        "stored_sha256": _digest(stored),
+        "inventory_sha256": proof["inventory_sha256"],
+        "protected_owner_oid": proof["frozen_owner_oid"],
+        "builder_oid": proof["builder_oid"],
+        "catalog_sha256": await _protected_catalog(session, proof, owner),
+        "alias": destination_alias.as_dict(),
+        "alias_catalog_sha256": await _require_alias_authority(session, schema, proof["frozen_owner_oid"]),
+    }
+    if selected is not None:
+        validation_by_field["publisher_selected_inputs_sha256"] = _digest(selected)
+    return validation_by_field
+
+
+def _validated_loaded_input(owner, semantic_receipt, source_alias_receipt, destination_options):
+    """Validate approved immutable input without replacing its dependency bounds."""
+    from process.entity_address_snapshot_receipt import CONTRACT as archive_contract
+
+    owner = destination.validate_entity_address_archive_stage_ownership(owner)
+    semantic = destination.validate_entity_address_archive_receipt(semantic_receipt)
+    source_alias = alias.validate_entity_address_alias_semantic_receipt(source_alias_receipt)
+    _require(semantic.contract == archive_contract and source_alias.contract == alias.SET_CONTRACT, "contracts differ")
+    alias_table = next(entry for entry in semantic.tables if entry.table_name == alias.AUTHORITY_TABLE)
+    _require(alias_table.row_count == source_alias.active_alias_count, "source alias accounting differs")
+    _require(
+        isinstance(destination_options, Mapping)
+        and {"db_schema", "import_date"} <= set(destination_options)
+        and set(destination_options)
+        <= {"db_schema", "import_date", "source_serving_generation", "dependency_bindings"},
+        "destination differs",
+    )
+    return owner, semantic, source_alias
+
+
+def _require_loaded_inventory(proof, owner, owner_oid):
+    """Bind authenticated custody to the exact eight original input OIDs."""
+    _require(
+        isinstance(proof, Mapping)
+        and proof.get("state") == "frozen"
+        and proof.get("frozen_owner_oid") == owner_oid
+        and type(proof.get("builder_oid")) is int
+        and proof["builder_oid"] > 0
+        and proof["builder_oid"] != owner_oid,
+        "frozen authority differs",
+    )
+    inventory = proof.get("inventory")
+    _require(
+        isinstance(inventory, Mapping)
+        and inventory.get("schema_name") == owner.schema_name
+        and inventory.get("schema_oid") == owner.schema_oid
+        and inventory.get("relations")
+        == [{"table_name": name, "relation_oid": oid} for name, oid in owner.relation_oids]
+        and _digest(inventory) == proof.get("inventory_sha256")
+        and len(owner.relation_oids) == 8
+        and alias.AUTHORITY_TABLE in dict(owner.relation_oids),
+        "inventory differs",
+    )
+
+
+async def _prepare_loaded_sets(
+    session,
+    owner,
+    semantic,
+    source_alias,
+    destination_alias,
+    destination_options,
+    selected=None,
+    authenticate_selected_mrf=None,
+):
+    """Apply documented local transforms, complete indexes and validate the isolated candidate."""
+    from process import entity_address_snapshot_destination as native
+    from process.entity_address_snapshot_receipt import CONTRACT as archive_contract
+    from process.entity_address_snapshot_receipt import STAGE_INTEGRITY_CONTRACT
+
+    schema, date = destination_options["db_schema"], destination_options["import_date"]
+    remap, geo, bindings, stage_oids, names = await _complete_loaded_heaps(
+        session, owner, semantic, source_alias, destination_alias, destination_options, selected
+    )
+    prepared = await _audit_loaded_adoption(session, destination_options, selected, authenticate_selected_mrf)
+    prepared.context.update(snapshot_contract=archive_contract)
+    if bindings is not None:
+        prepared.context["dependency_bindings"] = bindings
+    if selected is not None:
+        prepared.context["publisher_selected_inputs"] = selected
+    integrity = await native.capture_entity_address_stage_integrity_receipt(
+        session, schema_name=schema, stage_table_names=names, contract=STAGE_INTEGRITY_CONTRACT
+    )
+    restored = native._prepared_restore_receipt(
+        validated_owner=owner,
+        normalized_date=date,
+        stage_oids=stage_oids,
+        post_remap_receipt=semantic,
+        stage_integrity=integrity,
+        prepared=prepared,
+    )
+    await native.restore._return_owned_relations(session, owner=owner, db_schema=schema, stage_names=names)
+    return native.PreparedEntityAddressSnapshotDestination(
+        restored, semantic, source_alias, destination_alias, remap, geo
+    )
+
+
+async def _complete_loaded_heaps(
+    session, owner, semantic, source_alias, destination_alias, destination_options, selected
+):
+    """Derive model stage names, transform heaps, and complete all indexes before set audit."""
+    native = destination
+    schema, date, names = native.restore._stage_plan(
+        db_schema=destination_options["db_schema"], import_date=destination_options["import_date"]
+    )
+    remap, _ = await native._remap_base_versions(
+        session,
+        schema_name=owner.schema_name,
+        source_alias=source_alias,
+        destination_alias=destination_alias,
+        pre_remap_receipt=semantic,
+    )
+    await native.restore._reset_restored_evidence_sequence(session, owner)
+    stage_oids = await native.restore._move_owned_relations(
+        session, owner=owner, db_schema=schema, stage_names=names, heaps=True
+    )
+    projection_options_by_field = dict(destination_options)
+    if selected is not None:
+        projection_options_by_field["dependency_bindings"] = selected["dependency_bindings"]
+    geo, bindings = await _project_loaded_geo(
+        session, semantic, projection_options_by_field, names, stage_oids, selected
+    )
+    await native.restore._return_owned_relations(session, owner=owner, db_schema=schema, stage_names=names)
+    await native.restore.complete_entity_address_archive_restore(
+        session, owner=owner, db_schema=schema, import_date=date
+    )
+    await native.restore._actual_receipt(session, schema_name=owner.schema_name, expected=semantic)
+    await alias.require_matching_entity_address_alias_authority(
+        session, authority_schema=owner.schema_name, alias_schema=schema
+    )
+    await native.restore._move_owned_relations(session, owner=owner, db_schema=schema, stage_names=names)
+    return remap, geo, bindings, stage_oids, names
+
+
+async def _audit_loaded_adoption(session, destination_options, selected, authenticate_selected_mrf):
+    """Audit future archive coverage only after the isolated candidate's indexes are complete."""
+    native = destination
+    schema, date = destination_options["db_schema"], destination_options["import_date"]
+    if authenticate_selected_mrf is None:
+        archive_scope = nullcontext(None)
+    else:
+        archive_scope = native.restore.family_archive.selected_canonical_archive(
+            session,
+            schema_name=schema,
+            owner_oid=await _publisher_authority(session),
+            selected_relations={
+                "npi": selected["dependency_bindings"][f"{schema}.npi_address"],
+                "mrf": selected["dependency_bindings"][f"{schema}.mrf_address"],
+            },
+            authenticate_inventory=authenticate_selected_mrf,
+        )
+    async with archive_scope as archive_relation:
+        return await native.adoption.prepare_completed_entity_address_snapshot_adoption(
+            db_schema=schema,
+            import_date=date,
+            preserve_unversioned_base_rows=True,
+            source_serving_generation=destination_options.get("source_serving_generation"),
+            **({} if archive_relation is None else {"archive_relation": archive_relation}),
+        )
+
+
+async def _project_loaded_geo(session, semantic, destination_options, names, stage_oids, selected=None):
+    """Derive geo fields once from the explicitly locked local dependency set."""
+    native = destination
+    schema = destination_options["db_schema"]
+    main = names[native.entity_address_unified.EntityAddressUnified.__tablename__]
+    main_rows = native._main_table_receipt(semantic).row_count
+    bindings = destination_options.get("dependency_bindings")
+    if bindings is not None:
+        bindings = native.geo_projection.validate_projection_dependency_bindings(schema, bindings)
+    options = {} if bindings is None else {"dependency_bindings": bindings}
+    projected = await native.entity_address_unified._materialize_geo_assurance(
+        schema, main, force=True, context={}, run_id="", stage_rows=main_rows, **options
+    )
+    _require(projected == main_rows, "geo projection accounting differs")
+    geo = await native._capture_geo_preparation(
+        session,
+        db_schema=schema,
+        stage_table_oid=dict(stage_oids)[main],
+        projected_rows=projected,
+        publisher_selected_inputs_sha256=None if selected is None else _digest(selected),
+        **options,
+    )
+    return geo, bindings
+
+
+async def _activate_set_validated_destination(
+    session, *, stored, validation, preparation, expected_incumbent, callbacks, authenticate_preparation
+):
+    """Recheck the immutable seal and publish all seven serving OIDs in the caller transaction."""
+    prepared_stored = _validated_set_prepared(validation)
+    proof, owner = await _authenticated_preparation(
+        session, prepared_stored, preparation, validation, authenticate_preparation
+    )
+    _require_set_input(stored, validation, prepared_stored, proof, owner)
+    schema = prepared_stored["restored"]["db_schema"]
+    await serving.require_entity_address_receive_incumbent(session, schema_name=schema, expected=expected_incumbent)
+    await _require_alias_fence(session, schema, proof, validation)
+    await _lock_publication_state(session, schema, proof["frozen_owner_oid"])
+    _require(await _protected_catalog(session, proof, owner) == validation["catalog_sha256"], "catalog seal differs")
+    async with destination.db.bind_existing_session(session):
+        schema, _names = await _move_to_destination(session, prepared_stored, owner)
+        prepared = _prepared_adoption(prepared_stored)
+        prepared.context["protected_owner_oid"] = proof["frozen_owner_oid"]
+        prepared.context["protected_stage_oids"] = {
+            entry["table_name"]: entry["oid"] for entry in prepared_stored["restored"]["stage_relation_oids"]
+        }
+        dependency_bindings = await _resolve_dependency_bindings(session, schema, prepared)
+        expected_geo = destination._validated_geo_preparation(prepared_stored["geo_assurance"], db_schema=schema)
+        actual_geo = await destination._capture_geo_preparation(
+            session,
+            db_schema=schema,
+            stage_table_oid=expected_geo.stage_table_oid,
+            projected_rows=expected_geo.projected_rows,
+            dependency_bindings=dependency_bindings,
+            publisher_selected_inputs_sha256=expected_geo.publisher_selected_inputs_sha256,
+        )
+        _require(actual_geo == expected_geo, "geo assurance changed")
+        published = await destination.adoption.adopt_prepared_entity_address_snapshot(prepared, callbacks=callbacks)
+        return await _publication_receipt(session, schema, owner, prepared, published)
+
+
+def _validated_set_prepared(validation):
+    """Reject mixed or open-ended validation envelopes before any database work."""
+    fields = {
+        "contract",
+        "prepared",
+        "input_sha256",
+        "stored_sha256",
+        "inventory_sha256",
+        "protected_owner_oid",
+        "builder_oid",
+        "catalog_sha256",
+        "alias",
+        "alias_catalog_sha256",
+    }
+    _require(
+        isinstance(validation, Mapping)
+        and set(validation) in (fields, fields | {"publisher_selected_inputs_sha256"})
+        and validation["contract"] == SET_CONTRACT,
+        "v2 seal differs",
+    )
+    prepared_stored = validation["prepared"]
+    _require(
+        isinstance(prepared_stored, Mapping) and prepared_stored.get("contract") == destination.SET_CONTRACT,
+        "prepared contract differs",
+    )
+    _require_selected_inputs_seal(prepared_stored, validation)
+    return prepared_stored
+
+
+def _require_selected_inputs_seal(prepared, validation):
+    """Bind the separate immutable selection to both native context and geo evidence."""
+    from process.entity_address_dependency_bindings import validate_publisher_selected_inputs
+
+    context = prepared.get("restored", {}).get("context", {})
+    geo = prepared.get("geo_assurance", {})
+    selected = context.get("publisher_selected_inputs")
+    if not any(
+        (
+            selected is not None,
+            "publisher_selected_inputs_sha256" in validation,
+            "publisher_selected_inputs_sha256" in geo,
+        )
+    ):
+        return
+    try:
+        selected = validate_publisher_selected_inputs(prepared["restored"]["db_schema"], selected)
+    except (ValueError, KeyError, TypeError) as error:
+        raise EntityAddressSnapshotDestinationError("entity-address selected input seal differs") from error
+    _require(
+        context.get("dependency_bindings") == selected["dependency_bindings"]
+        and validation.get("publisher_selected_inputs_sha256") == _digest(selected)
+        and geo.get("publisher_selected_inputs_sha256") == _digest(selected),
+        "selected input seal differs",
+    )
+
+
+def _require_set_input(stored, validation, prepared_stored, proof, owner):
+    """Bind completed authority to the unchanged approved input and local frozen inventory."""
+    from process.entity_address_snapshot_receipt import CONTRACT as archive_contract
+
+    _require_selected_inputs_seal(prepared_stored, validation)
+    _require(
+        _digest(prepared_stored) == validation["stored_sha256"]
+        and validation["inventory_sha256"] == proof["inventory_sha256"]
+        and validation["protected_owner_oid"] == proof["frozen_owner_oid"]
+        and validation["builder_oid"] == proof["builder_oid"]
+        and validation["alias"] == prepared_stored["destination_alias_receipt"],
+        "v2 seal differs",
+    )
+    _require(
+        isinstance(stored, Mapping)
+        and set(stored) == {"contract", "ownership", "semantic_receipt", "source_alias_receipt", "destination"}
+        and stored.get("contract") == archive_contract,
+        "input contract differs",
+    )
+    semantic = destination.validate_entity_address_archive_receipt(stored["semantic_receipt"])
+    source_alias = alias.validate_entity_address_alias_semantic_receipt(stored["source_alias_receipt"])
+    input_owner = destination.validate_entity_address_archive_stage_ownership(stored["ownership"])
+    _require(
+        input_owner == owner
+        and semantic.as_dict() == prepared_stored["source_semantic_receipt"]
+        and source_alias.as_dict() == prepared_stored["source_alias_receipt"]
+        and validation["input_sha256"] == _digest(_loaded_input(owner, semantic, source_alias, stored["destination"])),
+        "input seal differs",
+    )
+    context = prepared_stored.get("restored", {}).get("context", {})
+    if "publisher_selected_inputs" not in context:
+        _require(
+            context.get("dependency_bindings") == stored["destination"].get("dependency_bindings"),
+            "ordinary dependency bounds differ",
+        )
+
+
+async def _publication_receipt(session, schema, owner, prepared, result):
+    relations = []
+    for model in destination.restore._models():
+        oid = await session.scalar(
+            text("SELECT to_regclass(:relation)::oid"), {"relation": f'"{schema}"."{model.__tablename__}"'}
+        )
+        _require(oid == dict(owner.relation_oids)[model.__tablename__], "published OID differs")
+        relations.append({"table_name": model.__tablename__, "relation_oid": oid})
+    return {
+        **result,
+        "publication": {
+            "contract": "entity-address-table-publication.v2",
+            "schema_name": schema,
+            "relations": relations,
+            "retained_relations": prepared.context.get("retained_relations", []),
+            "alias_authority": {
+                "schema_name": owner.schema_name,
+                "schema_oid": owner.schema_oid,
+                "relation_oid": dict(owner.relation_oids)[alias.AUTHORITY_TABLE],
+            },
+        },
+    }
+
+
 __all__ = [
+    "prepare_loaded_entity_address_archive_destination",
     "EntityAddressSnapshotDestinationError",
     "require_entity_address_archive_publisher",
     "prepare_private_entity_address_archive_destination",

@@ -6,15 +6,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from api import plan_release_serving, ptg2_serving
+from api import plan_release_serving, ptg2_serving, ptg2_tables
 
 from .test_plan_release_serving import (
     PLAN_RELEASE_ID,
-    _Session,
     _binding_row,
     _install_single_snapshot_search,
     _network_binding,
     _release_selection,
+    _Session,
 )
 from .test_plan_release_serving_readiness import _serving_table_descriptor
 from .test_ptg2_serving import ConcurrentSessionFactory
@@ -23,18 +23,11 @@ from .test_ptg2_serving import ConcurrentSessionFactory
 @pytest.mark.asyncio
 @pytest.mark.parametrize("network_count", (1, 3))
 @pytest.mark.parametrize("has_descriptors", (False, True))
-async def test_reverse_release_reuses_descriptors_and_preserves_fallback(
-    monkeypatch, network_count, has_descriptors
-):
+async def test_reverse_release_reuses_descriptors_and_preserves_fallback(monkeypatch, network_count, has_descriptors):
     """Reuse exact release proof without changing legacy loads or rate output."""
-    bindings = tuple(
-        _network_binding(index, f"snapshot-{index}", f"source-{index}")
-        for index in range(network_count)
-    )
+    bindings = tuple(_network_binding(index, f"snapshot-{index}", f"source-{index}") for index in range(network_count))
     descriptor_by_snapshot_id = {
-        binding.snapshot_id: _serving_table_descriptor(
-            snapshot_id=binding.snapshot_id, source_key=binding.source_key
-        )
+        binding.snapshot_id: _serving_table_descriptor(snapshot_id=binding.snapshot_id, source_key=binding.source_key)
         for binding in bindings
     }
     selection = _release_selection(
@@ -55,18 +48,21 @@ async def test_reverse_release_reuses_descriptors_and_preserves_fallback(
         assert args["plan_id"] == bindings[0].plan_id
         searched_snapshot_ids.append(snapshot_id)
         return {
-            "items": [{"reported_code": "99213", "npi": npi,
-                       "prices": [{"negotiated_rate": "125.00"}]}],
+            "items": [{"reported_code": "99213", "npi": npi, "prices": [{"negotiated_rate": "125.00"}]}],
             "pagination": {"total": 1, "total_is_exact": True},
             "query": {"snapshot_id": snapshot_id},
         }
 
-    monkeypatch.setattr(ptg2_serving.sa_db, "session", sessions.session)
+    monkeypatch.setattr(ptg2_serving.sa_db, "reader_session", sessions.reader_session)
     monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", load_descriptor)
+    monkeypatch.setattr(ptg2_tables, "snapshot_serving_tables", load_descriptor)
     monkeypatch.setattr(ptg2_serving, "_search_ptg2_manifest_provider_procedures", search)
     response = await ptg2_serving._search_plan_release_provider_procedures(
-        object(), 1234567890, {"plan_release_id": PLAN_RELEASE_ID},
-        SimpleNamespace(limit=25, offset=0, page=1, source="page"), selection,
+        object(),
+        1234567890,
+        {"plan_release_id": PLAN_RELEASE_ID},
+        SimpleNamespace(limit=25, offset=0, page=1, source="page"),
+        selection,
     )
 
     assert sorted(searched_snapshot_ids) == sorted(descriptor_by_snapshot_id)
@@ -90,9 +86,7 @@ def test_release_resolver_retains_validated_serving_descriptor(monkeypatch):
         *,
         validated_serving_tables_by_snapshot_id,
     ):
-        validated_serving_tables_by_snapshot_id[
-            binding.snapshot_id
-        ] = descriptor
+        validated_serving_tables_by_snapshot_id[binding.snapshot_id] = descriptor
         return True
 
     monkeypatch.setattr(
@@ -282,8 +276,7 @@ def test_multi_release_query_reuses_every_validated_descriptor(monkeypatch):
     selection = _release_selection(
         *bindings,
         validated_serving_tables=tuple(
-            (binding.snapshot_id, descriptor)
-            for binding, descriptor in zip(bindings, descriptors, strict=True)
+            (binding.snapshot_id, descriptor) for binding, descriptor in zip(bindings, descriptors, strict=True)
         ),
     )
     search_calls = []
@@ -310,10 +303,7 @@ def test_multi_release_query_reuses_every_validated_descriptor(monkeypatch):
         )
         for binding, descriptor in zip(bindings, descriptors, strict=True)
     ]
-    assert responses == [
-        (binding.source_key, binding.snapshot_id, None)
-        for binding in bindings
-    ]
+    assert responses == [(binding.source_key, binding.snapshot_id, None) for binding in bindings]
 
 
 def _mixed_representation_release():
@@ -376,23 +366,14 @@ def test_multi_release_query_preserves_direct_and_pattern_payloads(monkeypatch):
         )
     )
 
-    assert [
-        (source_key, snapshot_id)
-        for source_key, snapshot_id, _payload in responses
-    ] == [
-        (binding.source_key, binding.snapshot_id)
-        for binding in bindings
+    assert [(source_key, snapshot_id) for source_key, snapshot_id, _payload in responses] == [
+        (binding.source_key, binding.snapshot_id) for binding in bindings
     ]
-    assert [
-        network_response["items"][0]["prices"]
-        for _, _, network_response in responses
-    ] == [[{"negotiated_rate": "125.00"}]] * 2
-    assert [
-        network_response["items"][0]["source_trace"]
-        for _, _, network_response in responses
-    ] == [
-        [{"snapshot_id": binding.snapshot_id}]
-        for binding in bindings
+    assert [network_response["items"][0]["prices"] for _, _, network_response in responses] == [
+        [{"negotiated_rate": "125.00"}]
+    ] * 2
+    assert [network_response["items"][0]["source_trace"] for _, _, network_response in responses] == [
+        [{"snapshot_id": binding.snapshot_id}] for binding in bindings
     ]
 
 

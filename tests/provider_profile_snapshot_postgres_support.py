@@ -22,6 +22,105 @@ TABLES = (
     *snapshot.address_generation.RELATION_NAMES,
 )
 
+READ_TABLES = tuple(
+    dict.fromkeys(
+        (
+            *snapshot._DOCTORS_TABLES,
+            *snapshot._PROFILE_TABLES,
+            *snapshot._DETAIL_TABLES,
+            snapshot._PROFILE_GENERATION_TABLE,
+            snapshot.reference_generation.TABLE_NAME,
+            snapshot.address_generation.TABLE_NAME,
+            snapshot._CMS_RECEIPT_TABLE,
+            "address_alias_state_v1",
+            "address_alias_artifact_state_v1",
+            "provider_directory_cms_candidate_coverage",
+            "provider_directory_cms_serving_coverage",
+            "provider_directory_cms_npd_relationship_receipt",
+            "cms_native_input_revision",
+        )
+    )
+)
+
+
+async def grant_profile_reader(database, schema, table_names):
+    """Grant only existing, explicitly declared current or successor fixture relations."""
+    role = database._reader_database._reader_login[0]
+    async with database.engine.begin() as connection:
+        for name in dict.fromkeys(table_names):
+            if await connection.scalar(text("SELECT to_regclass(:table)"), {"table": f'"{schema}"."{name}"'}):
+                await connection.execute(text(f'GRANT SELECT ON "{schema}"."{name}" TO "{role}"'))
+
+
+async def _cleanup_profile_reader(database, schema, role):
+    """Close the Reader before revoking its exact schema grants, including renamed heaps."""
+    reader = database._reader_database
+    if reader is not None:
+        await reader.disconnect()
+        database._reader_database = None
+    async with database.engine.begin() as connection:
+        if await connection.scalar(text("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=:role)"), {"role": role}):
+            rows = await connection.execute(
+                text(
+                    "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "CROSS JOIN LATERAL aclexplode(c.relacl) acl JOIN pg_roles r ON r.oid=acl.grantee "
+                    "WHERE n.nspname=:schema AND r.rolname=:role AND acl.privilege_type='SELECT'"
+                ),
+                {"schema": schema, "role": role},
+            )
+            for name in rows.scalars():
+                await connection.execute(text(f'REVOKE SELECT ON "{schema}"."{name}" FROM "{role}"'))
+            await connection.execute(text(f'REVOKE USAGE ON SCHEMA "{schema}" FROM "{role}"'))
+            await connection.execute(text(f'DROP ROLE "{role}"'))
+        assert not await connection.scalar(
+            text("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=:role)"), {"role": role}
+        )
+
+
+@asynccontextmanager
+async def profile_reader(database, schema, monkeypatch):
+    """Authenticate a distinct read-only login within the caller's guarded database lifecycle."""
+    role = "profile_reader_" + uuid4().hex
+    password = uuid4().hex
+    url = database.engine.url
+    has_cleanup_authority = False
+    assert database._reader_database is None
+    try:
+        async with database.engine.begin() as connection:
+            assert not await connection.scalar(
+                text("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=:role)"), {"role": role}
+            )
+            has_cleanup_authority = True
+            await connection.execute(
+                text(
+                    f'CREATE ROLE "{role}" LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS'
+                )
+            )
+            try:
+                await connection.execute(text(f"ALTER ROLE \"{role}\" PASSWORD '{password}'"))
+            except Exception:
+                raise RuntimeError("Reader fixture login provisioning failed") from None
+            await connection.execute(text(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role}"'))
+        settings_by_name = {
+            "DRIVER": "asyncpg",
+            "HOST": url.host,
+            "PORT": str(url.port or 5432),
+            "DATABASE": url.database,
+            "READER_USER": role,
+            "READER_PASSWORD": password,
+            "READER_POOL_MIN_SIZE": "1",
+            "READER_POOL_MAX_SIZE": "5",
+            "ECHO": "False",
+        }
+        for name, setting_value in settings_by_name.items():
+            monkeypatch.setenv("HLTHPRT_DB_" + name, setting_value)
+        await database._connect_reader()
+        await grant_profile_reader(database, schema, READ_TABLES)
+        yield
+    finally:
+        if has_cleanup_authority:
+            await _cleanup_profile_reader(database, schema, role)
+
 
 @asynccontextmanager
 async def snapshot_database(monkeypatch, *, populated=True):
@@ -45,7 +144,10 @@ async def snapshot_database(monkeypatch, *, populated=True):
         await database.status(f'CREATE SCHEMA "{schema}"')
         if populated:
             await create_families(database, schema)
-        yield database, schema
+        async with profile_reader(database, schema, monkeypatch):
+            if populated:
+                await grant_profile_reader(database, schema, (name + "_next" for name in TABLES))
+            yield database, schema
     finally:
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
@@ -95,6 +197,7 @@ async def create_composite_families(database, schema, *, install_receipt=True):
         await receipt_fixture._create_native_tables(connection, schema)
         if install_receipt:
             await connection.run_sync(lambda sync: receipt_fixture._apply(sync, "20260930100000"))
+    await grant_profile_reader(database, schema, READ_TABLES)
 
 
 def address_oids_sql(schema):

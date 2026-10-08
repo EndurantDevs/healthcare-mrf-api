@@ -10,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_physical_binding import require_legacy_physical_resolution
 
 COPY_MAX_ROWS = 4096
 COPY_MAX_BYTES = 32 * 1024 * 1024
@@ -102,6 +103,9 @@ async def snapshot_candidate_reads(session, schema_name, snapshot_key, build_tok
 def snapshot_candidate_relation(session, quoted_schema, table):
     """Choose an exact frozen heap inside an explicit builder read context."""
     info = getattr(session, "info", None)
+    require_legacy_physical_resolution(
+        info if isinstance(info, dict) and "ptg_snapshot_physical_binding" in info else None
+    )
     bindings = info.get("ptg_snapshot_candidate_reads", {}) if isinstance(info, dict) else {}
     relation = bindings.get(quoted_schema, {}).get(table, table)
     return f"{quoted_schema}.{_quote_ident(relation)}"

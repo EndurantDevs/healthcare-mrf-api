@@ -2,6 +2,9 @@
 """The historical payload exception is limited to the exact CMS two-table family."""
 
 from copy import deepcopy
+from dataclasses import replace
+from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
 
@@ -57,3 +60,43 @@ def test_legacy_stage_receipts_require_exact_payload_and_empty_third_relation():
     populated = archive.ReferenceTableReceipt(empty.model_name, empty.table_name, empty.schema_sha256, 1)
     assert not archive._has_matching_manifest_stage_tables(manifest, (*manifest.tables, populated))
     assert not archive._has_matching_manifest_stage_tables(manifest, (*reversed(manifest.tables), empty))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["empty", "populated", "invalid_schema", "current"])
+async def test_legacy_stage_observes_the_complete_owned_family_and_preserves_guards(monkeypatch, stage):
+    manifest = archive.validate_reference_family_manifest(_manifest())
+    group = archive.ReferenceTableReceipt(
+        "CMSDoctorGroupSite", "cms_doctor_group_site", "b" * 64, int(stage == "populated")
+    )
+    tables = (*manifest.tables, group)
+    if stage == "current":
+        manifest = replace(manifest, tables=tables, schema_sha256=archive._schema_digest(tables))
+    receipts_by_table = {table.table_name: table for table in tables}
+    read = AsyncMock(side_effect=lambda _session, **options: receipts_by_table[options["model_type"].__tablename__])
+    schema_guard = AsyncMock(
+        side_effect=archive.ReferenceFamilyArchiveError("synthetic group schema differs")
+        if stage == "invalid_schema"
+        else None
+    )
+    monkeypatch.setattr(archive, "_table_receipt", read)
+    monkeypatch.setattr(archive, "_require_legacy_cms_group_schema", schema_guard)
+    ownership = archive.ReferenceFamilyStageOwnership(
+        "cms-doctors",
+        uuid4(),
+        "synthetic_stage",
+        1,
+        tuple((table.table_name, index + 2) for index, table in enumerate(tables)),
+    )
+    if stage in {"populated", "invalid_schema"}:
+        reason = "restored stage differs" if stage == "populated" else "synthetic group schema differs"
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match=reason):
+            await archive._validate_stage_manifest(object(), ownership=ownership, manifest=manifest)
+    else:
+        assert await archive._validate_stage_manifest(object(), ownership=ownership, manifest=manifest) == tables
+    assert tuple(call.kwargs["model_type"].__tablename__ for call in read.await_args_list) == tuple(receipts_by_table)
+    if stage in {"empty", "invalid_schema"}:
+        schema_guard.assert_awaited_once()
+        assert schema_guard.await_args.args[1] == ownership.schema_name
+    else:
+        schema_guard.assert_not_awaited()

@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Flatten a completely writer-fenced TIGER graph without changing its parents."""
 
+import asyncio
 import hashlib
 import json
 import re
@@ -115,7 +116,15 @@ async def has_attested_inherited_tiger_source_capture(session, *, owner_oid):
         return True
 
 
-async def prepare_captured_tiger_epoch(source_sessions, publisher_sessions, *, epoch_id, on_prepared):
+async def prepare_captured_tiger_epoch(
+    source_sessions,
+    publisher_sessions,
+    *,
+    epoch_id,
+    on_prepared,
+    source_copy=None,
+    on_precreated=None,
+):
     """Copy under source fences; the caller protects and records the clone before commit.
 
     Source fencing and publisher custody use separate credentials. The callback
@@ -123,7 +132,12 @@ async def prepare_captured_tiger_epoch(source_sessions, publisher_sessions, *, e
     it must not commit. No canonical relation, extension or inheritance is edited.
     """
     epoch_id = UUID(str(epoch_id))
-    async with source_sessions() as source_session, source_session.begin():
+    archive._require_native_source_copy(source_copy, on_precreated)
+    async with (
+        asyncio.timeout(source_copy.timeout) as deadline,
+        source_sessions() as source_session,
+        source_session.begin(),
+    ):
         await source_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
         async with archive._bounded_capture(source_session):
             await archive._lock_family(
@@ -142,7 +156,6 @@ async def prepare_captured_tiger_epoch(source_sessions, publisher_sessions, *, e
             importer_id="tiger",
             schema_name="tiger",
             source_metadata=metadata_by_field,
-            configure_isolation=False,
             source_capture_contract=archive.CAPTURED_TIGER_CONTRACT,
         )
         return await _clone_captured_model(
@@ -152,17 +165,39 @@ async def prepare_captured_tiger_epoch(source_sessions, publisher_sessions, *, e
             graph,
             on_prepared,
             source_url=source_session.get_bind().url,
+            source_copy=source_copy,
+            on_precreated=on_precreated,
+            deadline=deadline.when(),
         )
 
 
-async def _clone_captured_model(publisher_sessions, capture, epoch_id, graph, on_prepared, *, source_url):
+async def _clone_captured_model(
+    publisher_sessions,
+    capture,
+    epoch_id,
+    graph,
+    on_prepared,
+    *,
+    source_url,
+    **source_options,
+):
     """Seal the completed native model while the source transaction keeps its writer fence."""
+    if set(source_options) - {"source_copy", "on_precreated", "deadline"}:
+        raise archive.ReferenceFamilyArchiveError("TIGER source options are invalid")
+    source_copy = source_options.get("source_copy")
     stage_schema = archive.reference_family_stage_schema(epoch_id)
     async with publisher_sessions() as session, session.begin():
         publisher_url = session.get_bind().url
         if any(getattr(source_url, field) != getattr(publisher_url, field) for field in ("host", "port", "database")):
             raise archive.ReferenceFamilyArchiveError("TIGER capture source and publisher databases differ")
-        await archive._clone_source(session, capture, stage_schema)
+        await archive._clone_source(
+            session,
+            capture,
+            stage_schema,
+            source_copy=source_copy,
+            on_precreated=source_options.get("on_precreated"),
+            deadline=source_options.get("deadline"),
+        )
         ownership = await archive.capture_reference_family_stage_ownership(
             session,
             importer_id="tiger",

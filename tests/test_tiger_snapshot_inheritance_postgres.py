@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from process import reference_family_archive as archive
 from process import tiger_snapshot_inheritance as inherited
 from process.tiger_captured_epoch import prepare_captured_tiger_epoch
+from tests.reference_family_generation_fixture import ReferenceSourceCustody
 from tests.test_cms_doctors_archive_postgres import _migration
 from tests.test_tiger_result_archive_postgres import _command, _database_url
 
@@ -92,19 +93,24 @@ async def _captured_stage(admin_sessions, publisher_sessions, owner, *, zip_code
             {"zip": zip_code},
         )
 
+    custody = ReferenceSourceCustody(owner, ())
+
     async def protect(session, prepared, _graph):
-        schema = prepared.ownership.schema_name
-        await session.execute(text(f'ALTER SCHEMA "{schema}" OWNER TO "{owner}"'))
-        for name in inherited.TABLES:
-            await session.execute(text(f'ALTER TABLE "{schema}"."{name}" OWNER TO "{owner}"'))
+        await custody.retain(session, prepared)
 
     prepared = await prepare_captured_tiger_epoch(
-        admin_sessions, publisher_sessions, epoch_id=uuid4(), on_prepared=protect
+        admin_sessions,
+        publisher_sessions,
+        epoch_id=uuid4(),
+        on_prepared=protect,
+        source_copy=custody.source_copy,
+        on_precreated=custody.precreate,
     )
     async with admin_sessions.begin() as session:
         await session.execute(text("DROP TABLE source_leaf.zip_state,source_leaf.zcta5"))
         await session.execute(text("DROP SCHEMA source_leaf"))
     async with publisher_sessions.begin() as session:
+        await custody.verify(session, prepared)
         owner_oid = await session.scalar(text("SELECT oid FROM pg_roles WHERE rolname=:owner"), {"owner": owner})
         validation = await archive.prepare_reference_family_activation(
             session,

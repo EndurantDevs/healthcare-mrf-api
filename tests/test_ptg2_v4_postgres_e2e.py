@@ -3,22 +3,22 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 import copy
-from dataclasses import dataclass
 import datetime
 import hashlib
 import importlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import statistics
 import struct
 import time
+import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Awaitable, Callable
-import uuid
 
 import asyncpg
 import pytest
@@ -27,10 +27,10 @@ import sqlalchemy as sa
 from api import ptg2_candidate_audit_v4 as candidate_v4
 from api import ptg2_serving as serving
 from api import ptg2_v4_graph as graph
-from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
 )
+from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.ptg2_types import PTG2ServingTables
 from db.connection import Database, db
 from db.migration_ptg2_frozen_source_file_binding import (
@@ -51,6 +51,7 @@ from process.ptg_parts import (
     source_download,
 )
 from process.ptg_parts import ptg2_shared_snapshot_publish as snapshot_publish
+from process.ptg_parts import ptg2_v4_failed_layout_recovery as recovery
 from process.ptg_parts.domain import (
     PTG2DownloadedJob,
     PTG2HeadMetadata,
@@ -75,30 +76,29 @@ from process.ptg_parts.frozen_rate_runtime import (
     build_frozen_rate_jobs,
     validate_frozen_processed_results,
 )
-from process.ptg_parts import ptg2_v4_failed_layout_recovery as recovery
-from process.ptg_parts.ptg2_shared_blocks import SharedBlock
-from process.ptg_parts.ptg2_shared_blocks import shared_semantic_fingerprint
-from process.ptg_parts.ptg2_shared_finalize import (
-    attach_v3_dictionary_contract,
-    attach_v3_source_run_contract,
-)
-from process.ptg_parts.ptg2_shared_reuse import (
-    SharedLogicalPlanScope,
-    SharedPhysicalArtifactIdentity,
-    SharedSnapshotSourceAssignment,
-    shared_source_set_metadata,
-)
-from process.ptg_parts.ptg2_shared_gc import (
-    PTG2_V3_MIGRATION_OWNED_TABLE_NAMES,
-    abandon_owned_v4_layout,
-    sweep_ptg2_shared_blocks,
-)
+from process.ptg_parts.import_rows import _ptg2_source_trace_rows
 from process.ptg_parts.ptg2_manifest_publish import (
     _copy_price_atom_file,
     _copy_price_atom_member_file,
     _copy_price_set_summary_file,
     _create_serving_stage_table,
     _ptg2_manifest_support_stage_table,
+)
+from process.ptg_parts.ptg2_shared_blocks import SharedBlock, shared_semantic_fingerprint
+from process.ptg_parts.ptg2_shared_finalize import (
+    attach_v3_dictionary_contract,
+    attach_v3_source_run_contract,
+)
+from process.ptg_parts.ptg2_shared_gc import (
+    PTG2_V3_MIGRATION_OWNED_TABLE_NAMES,
+    abandon_owned_v4_layout,
+    sweep_ptg2_shared_blocks,
+)
+from process.ptg_parts.ptg2_shared_reuse import (
+    SharedLogicalPlanScope,
+    SharedPhysicalArtifactIdentity,
+    SharedSnapshotSourceAssignment,
+    shared_source_set_metadata,
 )
 from process.ptg_parts.ptg2_shared_snapshot_publish import (
     publish_shared_v3_snapshot_sources,
@@ -109,10 +109,6 @@ from process.ptg_parts.ptg2_snapshot_candidates import (
     snapshot_candidate_reads,
     snapshot_candidate_relation,
 )
-from process.ptg_parts.import_rows import _ptg2_source_trace_rows
-from process.ptg_parts.snapshot_cleanup import _drop_ptg2_snapshot_table_names
-from process.ptg_parts.source_snapshot_control import remove_ptg2_source_snapshot
-from process.ptg_parts.source_pointers import _stage_ptg2_source_candidate
 from process.ptg_parts.ptg2_v4_graph_compiler import (
     V4GraphCompilationResult,
     compile_provider_graph_v4_rust,
@@ -122,24 +118,33 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     reserve_v4_shared_layout,
     seal_v4_shared_layout,
 )
+from process.ptg_parts.snapshot_cleanup import _drop_ptg2_snapshot_table_names
+from process.ptg_parts.source_pointers import _stage_ptg2_source_candidate
+from process.ptg_parts.source_snapshot_control import remove_ptg2_source_snapshot
 from scripts.validation.ptg_relation_storage import relation_size_rows
+from tests import test_ptg2_scanner_v3_runs as scanner_support
+from tests import test_ptg2_v3_migrated_lifecycle_postgres as lifecycle_support
 from tests.ptg2_layout_build_schema_support import (
     layout_build_candidate_and_pin_ddl,
+)
+from tests.ptg2_v4_graph_compiler_test_support import (
+    _write_membership as _write_compiler_membership,
+)
+from tests.ptg2_v4_graph_compiler_test_support import (
+    _write_npi_scope,
+    _write_tax_identity,
+)
+from tests.ptg2_v4_graph_compiler_test_support import (
+    compiler_fixture as _compiler_fixture,
+)
+from tests.ptg2_v4_graph_compiler_test_support import (
+    compiler_inputs as _compiler_inputs,
 )
 from tests.ptg2_v4_migration_catalog_support import (
     attempt_guard_prerequisite_ddl,
     v3_provider_set_prerequisite_ddl,
 )
-from tests.ptg2_v4_graph_compiler_test_support import (
-    _write_membership as _write_compiler_membership,
-    _write_npi_scope,
-    _write_tax_identity,
-    compiler_fixture as _compiler_fixture,
-    compiler_inputs as _compiler_inputs,
-)
 from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
-from tests import test_ptg2_scanner_v3_runs as scanner_support
-from tests import test_ptg2_v3_migrated_lifecycle_postgres as lifecycle_support
 
 ROOT = Path(__file__).resolve().parents[1]
 ptg_candidate_audit = importlib.import_module("process.ptg_candidate_audit")
@@ -1229,7 +1234,9 @@ async def _install_v4_source_evidence_schema(
 ) -> None:
     """Install the source-local evidence schema for one focused V4 proof."""
 
-    if await database.scalar("SELECT to_regclass(:relation)", relation=f"{schema_name}.ptg2_provider_group_tax_identity_source"):
+    if await database.scalar(
+        "SELECT to_regclass(:relation)", relation=f"{schema_name}.ptg2_provider_group_tax_identity_source"
+    ):
         return
 
     recorder = _OpRecorder()
@@ -1686,6 +1693,7 @@ async def _persist_frozen_source_version(
         descriptor=descriptor,
         source_identity_hash=source_identity_hash,
     )
+    await _persist_frozen_content_identity(schema=schema, descriptor=descriptor)
     await _persist_frozen_file_version(
         schema=schema,
         descriptor=descriptor,
@@ -1730,6 +1738,83 @@ async def _persist_frozen_source_identity(
         payload=json.dumps({"fixture_role": "retained_frozen_rate_source"}),
     )
     assert source_status == 1, "retained frozen source identity changed"
+
+
+async def _persist_frozen_content_identity(*, schema: str, descriptor: dict[str, object]) -> None:
+    """Retain the actual downloaded content before creating its file-version edge."""
+    from process.ptg_parts.domain import PTG2LogicalArtifact
+    from process.ptg_parts.source_versions import _content_identity_row
+
+    logical_hash = str(descriptor["logical_sha256"])
+    row = _content_identity_row(
+        "rates",
+        PTG2LogicalArtifact(logical_path="", logical_sha256=logical_hash, byte_count=descriptor["content_length"]),
+        False,
+        "logical_json_sha256_v1",
+        logical_hash,
+        datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+    )
+    row["canonical_payload"] = json.dumps(row["canonical_payload"], sort_keys=True)
+    status = await db.status(
+        f"""
+        INSERT INTO {schema}.ptg2_content_identity AS retained
+            (content_hash, hash_prefix, domain, logical_sha256, canonical_payload, created_at)
+        VALUES
+            (:content_hash, :hash_prefix, :domain, :logical_sha256, CAST(:canonical_payload AS jsonb), :created_at)
+        ON CONFLICT (content_hash) DO UPDATE SET content_hash = EXCLUDED.content_hash
+        WHERE ROW(retained.hash_prefix, retained.domain, retained.logical_sha256, retained.canonical_payload::jsonb)
+            IS NOT DISTINCT FROM
+            ROW(EXCLUDED.hash_prefix, EXCLUDED.domain, EXCLUDED.logical_sha256, EXCLUDED.canonical_payload::jsonb)
+        """,
+        **row,
+    )
+    assert status == 1, "retained frozen content identity changed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_status", (1, 0))
+async def test_frozen_source_version_requires_retained_content_identity(monkeypatch, content_status):
+    """A missing or changed content identity cannot become a retained provenance edge."""
+    relation_names = []
+    logical_hash = "a" * 64
+
+    async def status(query, **params):
+        relation = query.split("INSERT INTO ", 1)[1].split()[0]
+        relation_names.append(relation)
+        if relation.endswith("ptg2_content_identity"):
+            assert params["content_hash"] == params["logical_sha256"] == logical_hash
+            assert json.loads(params["canonical_payload"])["logical_sha256"] == logical_hash
+            return content_status
+        return 1
+
+    monkeypatch.setattr(db, "status", status)
+    descriptor_by_field = {
+        "engine_source_identity_hash": "b" * 16,
+        "engine_source_file_version_id": "c" * 16,
+        "source_type": "in_network",
+        "canonical_url": "https://rates.example.test/source.json",
+        "logical_sha256": logical_hash,
+        "raw_sha256": logical_hash,
+        "content_length": 42,
+        "logical_hash_deferred": False,
+        "etag": None,
+        "last_modified": None,
+    }
+    if content_status:
+        await _persist_frozen_source_version(
+            schema='"mrf"', descriptor=descriptor_by_field, scan={"artifact": "retained"}
+        )
+        assert relation_names == [
+            '"mrf".ptg2_source_identity',
+            '"mrf".ptg2_content_identity',
+            '"mrf".ptg2_source_file_version',
+        ]
+    else:
+        with pytest.raises(AssertionError, match="retained frozen content identity changed"):
+            await _persist_frozen_source_version(
+                schema='"mrf"', descriptor=descriptor_by_field, scan={"artifact": "retained"}
+            )
+        assert relation_names == ['"mrf".ptg2_source_identity', '"mrf".ptg2_content_identity']
 
 
 async def _persist_frozen_file_version(
@@ -3709,10 +3794,13 @@ def _install_post_source_failure(
                 groups=groups,
             )
         for table in ("ptg2_provider_group_tax_identity", "ptg2_provider_group_tax_identity_source"):
-            assert await session.scalar(
-                sa.text(f"SELECT COUNT(*) FROM {schema}.{table} WHERE snapshot_key = :snapshot_key"),
-                {"snapshot_key": snapshot_key},
-            ) == 0
+            assert (
+                await session.scalar(
+                    sa.text(f"SELECT COUNT(*) FROM {schema}.{table} WHERE snapshot_key = :snapshot_key"),
+                    {"snapshot_key": snapshot_key},
+                )
+                == 0
+            )
         publication_events.append("source")
         publication_events.append("later")
         raise _PostSourcePublicationFailure("synthetic post-source failure")
@@ -3745,10 +3833,13 @@ async def _assert_source_local_rollback(
         snapshot_key=snapshot_key,
     )
     assert provider_set_count == 1
-    assert await database.scalar(
-        f"SELECT COUNT(*) FROM {schema}.ptg2_snapshot_candidate WHERE snapshot_key = :snapshot_key",
-        snapshot_key=snapshot_key,
-    ) == 0
+    assert (
+        await database.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_snapshot_candidate WHERE snapshot_key = :snapshot_key",
+            snapshot_key=snapshot_key,
+        )
+        == 0
+    )
 
 
 async def _seed_source_local_logical_sources(

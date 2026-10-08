@@ -15,6 +15,7 @@ from process import entity_address_result_generation as address_generation
 from process import provider_directory_profile as profile
 from tests import test_provider_directory_cms_serving_receipt_postgres as receipt_fixture
 from tests.cms_doctors_preparation_postgres_support import doctors_database, native, preparation, stage_family
+from tests.provider_profile_snapshot_postgres_support import grant_profile_reader
 from tests.public_evidence_storage_postgres_support import connect
 from tests.test_npi_canonical_publication_rotation_postgres import (
     ATTEMPT_ID,
@@ -301,6 +302,11 @@ async def _enrollment_schema_alias(fixture):
         async with fixture.engine.begin() as connection:
             for name in ("provider_enrollment_ffs", "provider_enrollment_ffs_reassignment"):
                 await connection.execute(text(f'CREATE VIEW mrf.{name} AS SELECT * FROM "{fixture.schema}".{name}'))
+            role = fixture.database._reader_database._reader_login[0]
+            await connection.execute(text(f'GRANT USAGE ON SCHEMA mrf TO "{role}"'))
+        await grant_profile_reader(
+            fixture.database, "mrf", ("provider_enrollment_ffs", "provider_enrollment_ffs_reassignment")
+        )
         yield
     finally:
         async with fixture.engine.begin() as connection:

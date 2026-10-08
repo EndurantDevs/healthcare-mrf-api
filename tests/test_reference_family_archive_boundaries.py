@@ -10,7 +10,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import reference_family_archive as archive
-from tests.test_reference_family_archive import _incumbent, _manifest, _ownership, _serving_generation
+from tests.test_reference_family_archive import (
+    _incumbent,
+    _manifest,
+    _ownership,
+    _serving_generation,
+    _source_creation_options,
+)
 
 
 @pytest.mark.asyncio
@@ -188,7 +194,6 @@ async def test_capture_rejects_incomplete_or_drifted_source_generation(monkeypat
         importer_id="places-zcta",
         schema_name="synthetic",
         source_metadata={"release": "synthetic"},
-        configure_isolation=False,
     )
     if state == "untracked":
         capture = await archive._capture_reference_family_source(session, **capture_argument_map)
@@ -296,6 +301,7 @@ async def test_export_preparation_failure_does_not_claim_stage_cleanup(monkeypat
             source_metadata={"release": "synthetic"},
             dataset_id=_ownership().dataset_id,
             archive_copy=AsyncMock(),
+            **_source_creation_options(),
         )
     cleanup.assert_not_awaited()
 
@@ -344,3 +350,55 @@ async def test_mrf_activation_rechecks_table_receipts_after_rotation(monkeypatch
         await archive._activation_receipt(
             object(), archive.reference_family_spec("mrf"), owned, _incumbent("mrf"), _manifest(), (), None
         )
+
+
+@pytest.mark.parametrize("include_identity", [False, True])
+def test_owned_sequence_inventory_keeps_serials_and_optional_identities(monkeypatch, include_identity):
+    declared_serials = (("synthetic_id_seq", "synthetic", "id"),)
+    columns = (SimpleNamespace(name="id", identity=None), SimpleNamespace(name="other_id", identity=object()))
+    model = SimpleNamespace(__tablename__="synthetic", __table__=SimpleNamespace(columns=columns))
+    spec = SimpleNamespace(importer_id="synthetic", model_types=(model,))
+    monkeypatch.setattr(archive, "_OWNED_SEQUENCES", {"synthetic": declared_serials})
+    expected = declared_serials
+    if include_identity:
+        expected = (*declared_serials, ("synthetic_other_id_seq", "synthetic", "other_id"))
+    assert archive._expected_model_family_sequences(spec, include_identity=include_identity) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_identity", [False, True])
+@pytest.mark.parametrize("drift", [None, "extra", "wrong-owner"])
+async def test_captured_owned_sequence_set_still_rejects_drift(monkeypatch, include_identity, drift):
+    declared_serials = (("synthetic_id_seq", "synthetic", "id"),)
+    columns = (SimpleNamespace(name="id", identity=None), SimpleNamespace(name="other_id", identity=object()))
+    model = SimpleNamespace(__tablename__="synthetic", __table__=SimpleNamespace(columns=columns))
+    spec = SimpleNamespace(importer_id="synthetic", model_types=(model,), table_names=("synthetic",))
+    monkeypatch.setattr(archive, "_OWNED_SEQUENCES", {"synthetic": declared_serials})
+    expected = archive._expected_model_family_sequences(spec, include_identity=include_identity)
+    sequence_oids = tuple((name, 20 + index, owner, column) for index, (name, owner, column) in enumerate(expected))
+    if drift == "extra":
+        sequence_oids = (*sequence_oids, ("unexpected_seq", 30, "synthetic", "id"))
+    elif drift == "wrong-owner":
+        sequence_oids = ((sequence_oids[0][0], 20, "synthetic", "unrelated"), *sequence_oids[1:])
+    monkeypatch.setattr(archive, "_schema_oid", AsyncMock(return_value=10))
+    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(return_value=11))
+    owned_sequences = AsyncMock(return_value=sequence_oids)
+    monkeypatch.setattr(archive, "_owned_sequences", owned_sequences)
+    namespace_relations = [
+        {"relkind": b"r", "oid": 11},
+        *({"relkind": b"S", "oid": sequence_oid} for _name, sequence_oid, _owner, _column in sequence_oids),
+    ]
+    monkeypatch.setattr(archive, "_namespace_relations", AsyncMock(return_value=namespace_relations))
+    session = SimpleNamespace(in_transaction=lambda: True)
+    if drift is None:
+        captured = await archive._capture_model_family_ownership(
+            session, spec, _ownership().dataset_id, include_identity=include_identity
+        )
+        assert captured.sequence_oids == sequence_oids
+        assert captured.relation_oids == (("synthetic", 11),)
+    else:
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="owned sequence set is invalid"):
+            await archive._capture_model_family_ownership(
+                session, spec, _ownership().dataset_id, include_identity=include_identity
+            )
+    owned_sequences.assert_awaited_once_with(session, 10, include_identity=include_identity)

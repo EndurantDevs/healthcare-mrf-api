@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import reference_family_archive as archive
 from process import tiger_captured_epoch as captured
+from tests.reference_family_generation_fixture import ReferenceSourceCustody
 
 
 def _capture_admin_url(raw):
@@ -110,8 +111,10 @@ async def _seed_inherited_tiger(connection, name, role_by_kind):
 async def test_genuine_inherited_capture_fences_writes_and_keeps_an_immutable_epoch():
     async with owned_tiger_capture_database() as database:
         captured_graphs = []
+        custody = ReferenceSourceCustody(database.roles["owner"], (database.roles["reader"],))
 
         async def protect(session, prepared, graph):
+            await custody.retain(session, prepared)
             captured_graphs.append(graph)
             assert len(graph["relations"]) == 4
             async with database.admin.transaction():
@@ -119,18 +122,14 @@ async def test_genuine_inherited_capture_fences_writes_and_keeps_an_immutable_ep
                 with pytest.raises(asyncpg.LockNotAvailableError):
                     async with database.admin.transaction():
                         await database.admin.execute("UPDATE tiger_data.zip_state_synthetic SET zip='54321'")
-            schema = prepared.ownership.schema_name
-            await session.execute(text(f'ALTER SCHEMA "{schema}" OWNER TO "{database.roles["owner"]}"'))
-            for table, _oid in prepared.ownership.relation_oids:
-                await session.execute(text(f'ALTER TABLE "{schema}"."{table}" OWNER TO "{database.roles["owner"]}"'))
-                await session.execute(text(f'GRANT SELECT ON "{schema}"."{table}" TO "{database.roles["reader"]}"'))
-            await session.execute(text(f'GRANT USAGE ON SCHEMA "{schema}" TO "{database.roles["reader"]}"'))
 
         prepared = await captured.prepare_captured_tiger_epoch(
             database.sessions["source"],
             database.sessions["publisher"],
             epoch_id=uuid4(),
             on_prepared=protect,
+            source_copy=custody.source_copy,
+            on_precreated=custody.precreate,
         )
         manifest = prepared.manifest.as_dict()
         assert manifest["publication_authority"] == "captured-epoch"
@@ -152,6 +151,7 @@ async def test_genuine_inherited_capture_fences_writes_and_keeps_an_immutable_ep
             database.sessions["reader"],
             prepared=prepared,
             archive_copy=copied,
+            verify_custody=custody.verify,
         )
         assert len(copies) == 1 and copies[0].manifest == prepared.manifest
         assert await database.admin.fetchval(f'SELECT zip FROM "{schema}".zip_state') == "12345"
@@ -257,12 +257,15 @@ async def test_capture_refuses_different_publisher_database_before_clone():
 
     async with owned_tiger_capture_database() as source_database, owned_tiger_capture_database() as publisher_database:
         epoch_id = uuid4()
+        custody = ReferenceSourceCustody(publisher_database.roles["owner"], ())
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="databases differ"):
             await captured.prepare_captured_tiger_epoch(
                 source_database.sessions["source"],
                 publisher_database.sessions["publisher"],
                 epoch_id=epoch_id,
                 on_prepared=refuse_callback,
+                source_copy=custody.source_copy,
+                on_precreated=refuse_callback,
             )
         for database in (source_database, publisher_database):
             assert not await database.admin.fetchval(

@@ -246,8 +246,12 @@ async def test_runtime_observation_reads_migrated_postgres_snapshot(monkeypatch)
         pytest.skip(f"{_POSTGRES_DSN_ENV} is required")
     _configure_database(monkeypatch, dsn)
     monkeypatch.setattr(runtime, "build_baked_healthcare_source_commit", lambda: "d" * 40)
-    expected_heads = set(ScriptDirectory.from_config(Config("alembic.ini")).get_heads())
-    assert expected_heads == {"20261007000000_custom_import_rejection_anti_joins"}
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+    expected_heads = set(script.get_heads())
+    assert expected_heads == {"20261006010000_nucc_reference_result_generation"}
+    assert script.get_revision(next(iter(expected_heads))).down_revision == (
+        "20261007000000_custom_import_rejection_anti_joins"
+    )
     async with _delta_database(monkeypatch) as (database, schema):
         monkeypatch.setenv("DB_SCHEMA", schema)
         await _upgrade_disposable_schema_to_head(dsn, schema)

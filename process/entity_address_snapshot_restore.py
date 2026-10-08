@@ -14,6 +14,8 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
 from db.connection import db
+from process import entity_address_snapshot_alias as alias_authority
+from process import reference_family_archive as family_archive
 from process.entity_address_snapshot_ownership import (
     EntityAddressArchiveOwnershipError,
     EntityAddressArchiveStageOwnership,
@@ -24,6 +26,8 @@ from process.entity_address_snapshot_ownership import (
     verify_entity_address_archive_stage_ownership,
 )
 from process.entity_address_snapshot_receipt import (
+    CONTRACT,
+    LEGACY_CONTRACT,
     EntityAddressArchiveReceipt,
     EntityAddressArchiveReceiptError,
     EntityAddressStageIntegrityReceipt,
@@ -183,16 +187,20 @@ async def _create_model_relations(
     schema_name: str,
     stage_names: Mapping[str, str],
     import_date: str,
+    contract=LEGACY_CONTRACT,
 ) -> None:
     """Precreate ordinary stage columns and enabled indexes before data-only restore."""
 
     metadata = MetaData(schema=schema_name)
     for model in _models():
-        stage_model = entity_address_unified.make_class(model, import_date)
+        stage_model = model if contract == CONTRACT else entity_address_unified.make_class(model, import_date)
         table = stage_model.__table__.to_metadata(metadata, schema=schema_name, name=model.__tablename__)
+        if contract == CONTRACT:
+            for constraint in table.constraints:
+                constraint.ddl_if(callable_=lambda *_args, **_kwargs: False)
         statement = str(CreateTable(table).compile(dialect=postgresql.dialect()))
         await session.execute(text(statement))
-        for index in getattr(model, "__my_additional_indexes__", ()) or ():
+        for index in () if contract == CONTRACT else getattr(model, "__my_additional_indexes__", ()) or ():
             if not entity_address_unified._is_stage_index_enabled(stage_model, index):
                 continue
             await session.execute(
@@ -206,6 +214,41 @@ async def _create_model_relations(
                 )
             )
 
+    if contract == CONTRACT:
+        table = alias_authority.EntityAddressAliasAuthority.__table__.to_metadata(metadata, schema=schema_name)
+        for constraint in table.constraints:
+            constraint.ddl_if(callable_=lambda *_args, **_kwargs: False)
+        await session.execute(text(str(CreateTable(table).compile(dialect=postgresql.dialect()))))
+
+
+async def complete_entity_address_archive_restore(session, *, owner, db_schema, import_date):
+    """Finish model keys and indexes on the owning publisher session after COPY."""
+    _require_caller_transaction(session)
+    owner = await verify_entity_address_archive_stage_ownership(session, owner=owner)
+    expected = (*[model.__tablename__ for model in _models()], alias_authority.AUTHORITY_TABLE)
+    if tuple(name for name, _oid in owner.relation_oids) != tuple(sorted(expected)):
+        raise EntityAddressSnapshotRestoreError("entity-address v2 inventory differs")
+    _schema, date, names = _stage_plan(db_schema=db_schema, import_date=import_date)
+    metadata = MetaData(schema=owner.schema_name)
+    for model in _models():
+        table = model.__table__.to_metadata(metadata, schema=owner.schema_name, name=model.__tablename__)
+        await family_archive._create_table_constraints(session, table)
+        for index in getattr(model, "__my_additional_indexes__", ()) or ():
+            await session.execute(
+                text(
+                    _additional_index_sql(
+                        schema_name=owner.schema_name,
+                        table_name=model.__tablename__,
+                        stage_table_name=names[model.__tablename__],
+                        index=index,
+                    )
+                )
+            )
+        await family_archive._create_table_constraints(session, table, backing_indexes=False)
+    table = alias_authority.EntityAddressAliasAuthority.__table__.to_metadata(metadata, schema=owner.schema_name)
+    await family_archive._create_table_constraints(session, table)
+    await family_archive._validate_model_foreign_keys(session, metadata)
+
 
 async def precreate_entity_address_archive_restore(
     session: Any,
@@ -213,10 +256,13 @@ async def precreate_entity_address_archive_restore(
     dataset_id: UUID,
     db_schema: str,
     import_date: str,
+    contract=LEGACY_CONTRACT,
 ) -> EntityAddressArchiveStageOwnership:
     """Create one empty, UUID-owned seven-table target for a data-only restore."""
 
     _require_caller_transaction(session)
+    if contract not in (CONTRACT, LEGACY_CONTRACT):
+        raise EntityAddressSnapshotRestoreError("entity-address restore contract is unsupported")
     schema_name = entity_address_archive_stage_schema(dataset_id)
     _destination_schema, normalized_date, stage_names = _stage_plan(
         db_schema=db_schema,
@@ -225,7 +271,7 @@ async def precreate_entity_address_archive_restore(
     try:
         await session.execute(text(f"CREATE SCHEMA {_quoted(schema_name)}"))
         await _create_model_relations(
-            session, schema_name=schema_name, stage_names=stage_names, import_date=normalized_date
+            session, schema_name=schema_name, stage_names=stage_names, import_date=normalized_date, contract=contract
         )
         return await capture_created_entity_address_archive_stage(session, dataset_id=dataset_id)
     except EntityAddressArchiveOwnershipError as error:
@@ -240,7 +286,7 @@ async def _actual_receipt(
 ) -> None:
     """Compare the restored local rows and schema to the portable archive receipt."""
 
-    actual = await capture_entity_address_archive_receipt(session, schema_name=schema_name)
+    actual = await capture_entity_address_archive_receipt(session, schema_name=schema_name, contract=expected.contract)
     if actual.as_dict() != expected.as_dict():
         raise EntityAddressSnapshotRestoreError("entity-address restore semantic receipt differs")
 
@@ -293,13 +339,16 @@ def _stage_sequence_name(table_name: str, stage_table_name: str, sequence_name: 
     return expected_name
 
 
-async def _lock_owned_restore_relations(session: Any, owner: EntityAddressArchiveStageOwnership) -> None:
+async def _lock_owned_restore_relations(
+    session: Any, owner: EntityAddressArchiveStageOwnership, *, read_only: bool = False
+) -> None:
     """Pin the token-named owner tables before rechecking and changing their defaults."""
 
     table_names = ", ".join(
         f"{_quoted(owner.schema_name)}.{_quoted(table_name)}" for table_name, _ in owner.relation_oids
     )
-    await session.execute(text(f"LOCK TABLE {table_names} IN ACCESS EXCLUSIVE MODE"))
+    mode = "SHARE MODE NOWAIT" if read_only else "ACCESS EXCLUSIVE MODE"
+    await session.execute(text(f"LOCK TABLE {table_names} IN {mode}"))
 
 
 async def _reset_restored_evidence_sequence(session: Any, owner: EntityAddressArchiveStageOwnership) -> None:
@@ -332,13 +381,16 @@ async def _move_owned_relations(
     owner: EntityAddressArchiveStageOwnership,
     db_schema: str,
     stage_names: Mapping[str, str],
+    heaps=False,
 ) -> tuple[tuple[str, int], ...]:
     """Move only catalog-verified owned relations and retain their stable OIDs."""
 
     stage_oids = []
     for table_name, relation_oid in owner.relation_oids:
+        if table_name == alias_authority.AUTHORITY_TABLE:
+            continue
         stage_table_name = stage_names[table_name]
-        primary_index = await _primary_index_name(session, relation_oid)
+        primary_index = None if heaps else await _primary_index_name(session, relation_oid)
         sequence_names = await _owned_sequence_names(session, relation_oid)
         await session.execute(
             text(
@@ -346,9 +398,11 @@ async def _move_owned_relations(
             )
         )
         primary_name = entity_address_unified._stage_index_name(stage_table_name, "primary")
-        if primary_index != primary_name:
+        if primary_index is not None and primary_index != primary_name:
             await session.execute(
-                text(f"ALTER INDEX {_quoted(owner.schema_name)}.{_quoted(primary_index)} RENAME TO {_quoted(primary_name)}")
+                text(
+                    f"ALTER INDEX {_quoted(owner.schema_name)}.{_quoted(primary_index)} RENAME TO {_quoted(primary_name)}"
+                )
             )
         for sequence_name in sequence_names:
             await session.execute(
@@ -390,6 +444,21 @@ async def _require_empty_owned_schema(session: Any, owner: EntityAddressArchiveS
         text("SELECT COUNT(*) FROM pg_catalog.pg_class WHERE relnamespace = :schema_oid"),
         {"schema_oid": owner.schema_oid},
     )
+    if alias_authority.AUTHORITY_TABLE in dict(owner.relation_oids):
+        expected_oid = dict(owner.relation_oids)[alias_authority.AUTHORITY_TABLE]
+        actual_oid = await session.scalar(
+            text("SELECT to_regclass(:relation)::oid"),
+            {"relation": f'"{owner.schema_name}"."{alias_authority.AUTHORITY_TABLE}"'},
+        )
+        if actual_oid != expected_oid:
+            raise EntityAddressSnapshotRestoreError("entity-address alias authority OID differs")
+        remaining = await session.scalar(
+            text(
+                "SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace=:schema_oid AND oid<>:oid "
+                "AND oid NOT IN(SELECT indexrelid FROM pg_catalog.pg_index WHERE indrelid=:oid)"
+            ),
+            {"schema_oid": owner.schema_oid, "oid": expected_oid},
+        )
     if int(remaining or 0) != 0:
         raise EntityAddressSnapshotRestoreError("entity-address restore ownership namespace is not empty")
 
@@ -402,26 +471,30 @@ async def _drop_empty_owned_schema(session: Any, owner: EntityAddressArchiveStag
 async def _return_owned_relations(session, *, owner, db_schema, stage_names) -> None:
     """Return prepared heaps to the same private namespace without replacing OIDs."""
     await _require_empty_owned_schema(session, owner)
-    stage_oids = tuple(sorted((stage_names[name], oid) for name, oid in owner.relation_oids))
+    stage_oids = tuple(sorted((stage_names[name], oid) for name, oid in owner.relation_oids if name in stage_names))
     await _verify_moved_stage_oids(session, db_schema=db_schema, stage_oids=stage_oids)
     evidence_name = entity_address_unified.EntityAddressEvidence.__tablename__
     for table_name, relation_oid in owner.relation_oids:
+        if table_name == alias_authority.AUTHORITY_TABLE:
+            continue
         stage_name = stage_names[table_name]
         sequences = await _owned_sequence_names(session, relation_oid)
         expected = (stage_name + "_evidence_id_seq",) if table_name == evidence_name else ()
         if sequences != expected:
             raise EntityAddressSnapshotRestoreError("entity-address restore sequence ownership changed")
-        await session.execute(text(
-            f"ALTER TABLE {_quoted(db_schema)}.{_quoted(stage_name)} SET SCHEMA {_quoted(owner.schema_name)}"
-        ))
-        await session.execute(text(
-            f"ALTER TABLE {_quoted(owner.schema_name)}.{_quoted(stage_name)} RENAME TO {_quoted(table_name)}"
-        ))
+        await session.execute(
+            text(f"ALTER TABLE {_quoted(db_schema)}.{_quoted(stage_name)} SET SCHEMA {_quoted(owner.schema_name)}")
+        )
+        await session.execute(
+            text(f"ALTER TABLE {_quoted(owner.schema_name)}.{_quoted(stage_name)} RENAME TO {_quoted(table_name)}")
+        )
         for sequence_name in sequences:
-            await session.execute(text(
-                f"ALTER SEQUENCE {_quoted(owner.schema_name)}.{_quoted(sequence_name)} "
-                f"RENAME TO {_quoted(table_name + '_evidence_id_seq')}"
-            ))
+            await session.execute(
+                text(
+                    f"ALTER SEQUENCE {_quoted(owner.schema_name)}.{_quoted(sequence_name)} "
+                    f"RENAME TO {_quoted(table_name + '_evidence_id_seq')}"
+                )
+            )
     await verify_entity_address_archive_stage_ownership(session, owner=owner)
 
 
@@ -436,6 +509,8 @@ async def finalize_entity_address_archive_restore(
     """Validate, move, and natively prepare one restored local archive in one transaction."""
 
     _require_caller_transaction(session)
+    if validate_entity_address_archive_receipt(semantic_receipt).contract == CONTRACT:
+        raise EntityAddressSnapshotRestoreError("entity-address v2 requires protected loaded preparation")
     try:
         validated_owner = validate_entity_address_archive_stage_ownership(owner)
         validated_receipt = validate_entity_address_archive_receipt(semantic_receipt)
@@ -543,7 +618,15 @@ def _rehydrated_context(stored_context: Any, *, db_schema: str) -> dict[str, Any
     """Require the exact durable native preparation context before cutover."""
 
     context = _json_object(stored_context, "context")
-    allowed_context_fields = {"address_alias_generation", "stage_persistence", "phase_timings", "dependency_bindings"}
+    allowed_context_fields = {
+        "address_alias_generation",
+        "stage_persistence",
+        "phase_timings",
+        "dependency_bindings",
+        "snapshot_contract",
+        "protected_owner_oid",
+        "publisher_selected_inputs",
+    }
     allowed_generation_fields = {
         "result_generation_mode",
         "source_serving_generation",
@@ -554,6 +637,15 @@ def _rehydrated_context(stored_context: Any, *, db_schema: str) -> dict[str, Any
         or type(context["address_alias_generation"]) is not int
         or context["address_alias_generation"] < 0
         or context["stage_persistence"] != "p"
+        or ("snapshot_contract" in context and context["snapshot_contract"] != CONTRACT)
+        or (
+            "protected_owner_oid" in context
+            and (
+                context.get("snapshot_contract") != CONTRACT
+                or type(context["protected_owner_oid"]) is not int
+                or context["protected_owner_oid"] <= 0
+            )
+        )
     ):
         raise EntityAddressSnapshotRestoreError("entity-address restore context is invalid")
     generation_fields = set(context) & allowed_generation_fields
@@ -573,6 +665,12 @@ def _rehydrated_context(stored_context: Any, *, db_schema: str) -> dict[str, Any
             )
         except ValueError as error:
             raise EntityAddressSnapshotRestoreError("entity-address restore context is invalid") from error
+    _rehydrate_dependency_context(context, db_schema)
+    return context
+
+
+def _rehydrate_dependency_context(context, db_schema):
+    """Require selected metadata and the prepared physical map to agree exactly."""
     if "dependency_bindings" in context:
         try:
             context["dependency_bindings"] = (
@@ -582,7 +680,19 @@ def _rehydrated_context(stored_context: Any, *, db_schema: str) -> dict[str, Any
             )
         except ValueError as error:
             raise EntityAddressSnapshotRestoreError("entity-address restore dependency bindings are invalid") from error
-    return context
+    if "publisher_selected_inputs" in context:
+        from process.entity_address_dependency_bindings import validate_publisher_selected_inputs
+
+        try:
+            selected = validate_publisher_selected_inputs(db_schema, context["publisher_selected_inputs"])
+            if (
+                context.get("snapshot_contract") != CONTRACT
+                or context.get("dependency_bindings") != selected["dependency_bindings"]
+            ):
+                raise ValueError("selected inputs differ")
+            context["publisher_selected_inputs"] = selected
+        except ValueError as error:
+            raise EntityAddressSnapshotRestoreError("entity-address restore selected inputs are invalid") from error
 
 
 def _rehydrated_native_validation(value: Any, context: Mapping[str, Any]) -> dict[str, Any]:
@@ -619,18 +729,18 @@ def _validated_rehydration_state(
     }
     if not isinstance(stored, Mapping) or set(stored) != required_fields:
         raise EntityAddressSnapshotRestoreError("entity-address restore record is invalid")
-    try:
-        owner = validate_entity_address_archive_stage_ownership(stored["ownership"])
-        semantic_receipt = validate_entity_address_archive_receipt(stored["semantic_receipt"])
-    except (EntityAddressArchiveOwnershipError, EntityAddressArchiveReceiptError) as error:
-        raise EntityAddressSnapshotRestoreError(str(error)) from error
+    owner, semantic_receipt = _validated_restore_input(stored)
     normalized_schema, normalized_date, stage_names = _stage_plan(
         db_schema=stored["db_schema"],
         import_date=stored["import_date"],
     )
     stage_oids = _stored_stage_oids(stored["stage_relation_oids"], stage_names)
     expected_stage_oids = tuple(
-        sorted((stage_names[table_name], relation_oid) for table_name, relation_oid in owner.relation_oids)
+        sorted(
+            (stage_names[table_name], relation_oid)
+            for table_name, relation_oid in owner.relation_oids
+            if table_name in stage_names
+        )
     )
     if stage_oids != expected_stage_oids:
         raise EntityAddressSnapshotRestoreError("entity-address restore stage ownership is invalid")
@@ -646,8 +756,22 @@ def _validated_rehydration_state(
     except EntityAddressArchiveReceiptError as error:
         raise EntityAddressSnapshotRestoreError(str(error)) from error
     context = _rehydrated_context(stored["context"], db_schema=normalized_schema)
+    if (context.get("snapshot_contract") == CONTRACT) != (semantic_receipt.contract == CONTRACT):
+        raise EntityAddressSnapshotRestoreError("entity-address restore context contract differs")
     native_validation = _rehydrated_native_validation(stored["native_validation"], context)
     return normalized_schema, normalized_date, stage_names, stage_oids, stage_integrity, context, native_validation
+
+
+def _validated_restore_input(stored):
+    """Require the recorded contract to own exactly its supported seven or eight relations."""
+    try:
+        owner = validate_entity_address_archive_stage_ownership(stored["ownership"])
+        semantic_receipt = validate_entity_address_archive_receipt(stored["semantic_receipt"])
+        if len(owner.relation_oids) != (8 if semantic_receipt.contract == CONTRACT else 7):
+            raise EntityAddressArchiveOwnershipError("entity-address restore contract inventory differs")
+    except (EntityAddressArchiveOwnershipError, EntityAddressArchiveReceiptError) as error:
+        raise EntityAddressSnapshotRestoreError(str(error)) from error
+    return owner, semantic_receipt
 
 
 async def rehydrate_entity_address_archive_restore(
@@ -664,6 +788,9 @@ async def rehydrate_entity_address_archive_restore(
     """
 
     _require_caller_transaction(session)
+    semantic = stored.get("semantic_receipt") if isinstance(stored, Mapping) else None
+    if isinstance(semantic, Mapping) and semantic.get("contract") == CONTRACT:
+        raise EntityAddressSnapshotRestoreError("entity-address v2 requires authenticated sealed activation")
     (
         normalized_schema,
         normalized_date,
@@ -707,6 +834,7 @@ __all__ = [
     "EntityAddressSnapshotRestoreError",
     "PreparedEntityAddressSnapshotRestore",
     "cleanup_entity_address_archive_stage",
+    "complete_entity_address_archive_restore",
     "finalize_entity_address_archive_restore",
     "precreate_entity_address_archive_restore",
     "rehydrate_entity_address_archive_restore",

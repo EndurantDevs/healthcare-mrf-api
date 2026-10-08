@@ -1,12 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Real PostgreSQL checks for completion, stale inputs and crash reconciliation."""
 
+from contextlib import AsyncExitStack, asynccontextmanager
 from functools import partial
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import MetaData, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -14,7 +16,7 @@ from sqlalchemy.pool import NullPool
 from db.connection import Database
 from process import mrf_publication_receipt as receipt
 from process import reference_family_result_generation as generation
-from tests.reference_family_generation_fixture import install_source_generation_guards
+from tests.reference_family_generation_fixture import install_source_generation_guards, native_reference_source
 from tests.test_reference_family_result_generation_postgres import (
     _MRF_MIGRATION_PATH,
     _REFERENCE_MIGRATION_PATH,
@@ -59,10 +61,6 @@ def test_empty_downgrade_fences_receipt_before_check_and_drop(monkeypatch):
 
 async def _summary_database_ready(_test_mode):
     """Avoid external setup while the test uses a schema-bound database."""
-
-
-async def _retain_prepared_source(_session, _prepared):
-    """Leave cleanup to the test's finally block."""
 
 
 async def _configure_summary_tables(connection, monkeypatch, schema, *, drop_existing=False):
@@ -126,18 +124,25 @@ async def _assert_summary_failure_revokes_source_admission(
         await archive_prepare()
 
 
-async def _cleanup_prepared_mrf_stage(sessions, archive, prepared, engine, schema):
+async def _cleanup_prepared_mrf_stage(
+    sessions, custody, prepared, engine, schema, is_shared_schema_new, is_shared_type_new, cleanup
+):
     """Remove only the prepared stage and disposable schema created by this test."""
 
     if prepared is not None:
         async with sessions() as session, session.begin():
-            await archive.cleanup_reference_family_stage(session, prepared.ownership)
+            await custody.retire(session, prepared.ownership)
+    await cleanup.aclose()
     async with engine.begin() as connection:
         await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        if is_shared_type_new:
+            await connection.execute(text('DROP TYPE IF EXISTS "mrf"."address_archive_geo_source" RESTRICT'))
+        if is_shared_schema_new:
+            await connection.execute(text('DROP SCHEMA IF EXISTS "mrf" RESTRICT'))
     await engine.dispose()
 
 
-async def _prepare_native_mrf_source(sessions, archive, schema):
+async def _prepare_native_mrf_source(sessions, archive, schema, custody, source_sessions):
     async def dependencies(_session):
         return {"plan-attributes": "b" * 64}
 
@@ -147,8 +152,82 @@ async def _prepare_native_mrf_source(sessions, archive, schema):
         schema_name=schema,
         dataset_id=uuid4(),
         source_metadata={"source_release": "synthetic"},
-        on_prepared=_retain_prepared_source,
+        on_prepared=custody.retain,
+        source_copy=custody.source_copy,
+        on_precreated=custody.precreate,
+        source_sessions=source_sessions,
         dependency_factory=dependencies,
+    )
+
+
+async def _drop_mrf_source_role(sessions, role):
+    """Revoke only the registered disposable principal's grants after its engine closes."""
+    async with sessions.begin() as session:
+        if await session.scalar(text("SELECT 1 FROM pg_roles WHERE rolname=:role"), {"role": role}):
+            await session.execute(text(f'DROP OWNED BY "{role}"'))
+            await session.execute(text(f'DROP ROLE "{role}"'))
+
+
+@asynccontextmanager
+async def _native_mrf_source_sessions(sessions, schema, database_url):
+    """Read as a non-code-owner with native fence rights, never as the bootstrap superuser."""
+    role = "mrf_source_" + uuid4().hex
+    password = uuid4().hex
+    source_engine = create_async_engine(
+        make_url(database_url).set(username=role, password=password), poolclass=NullPool, hide_parameters=True
+    )
+    async with AsyncExitStack() as cleanup:
+        cleanup.push_async_callback(_drop_mrf_source_role, sessions, role)
+        cleanup.push_async_callback(source_engine.dispose)
+        async with sessions.begin() as session:
+            driver = (await (await session.connection()).get_raw_connection()).driver_connection
+            try:
+                await driver.execute(
+                    f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS"
+                )
+            except Exception:
+                raise RuntimeError("native source principal bootstrap failed") from None
+            await session.execute(text(f'GRANT USAGE ON SCHEMA "{schema}","mrf" TO "{role}"'))
+            await session.execute(text(f'GRANT SELECT,MAINTAIN ON ALL TABLES IN SCHEMA "{schema}" TO "{role}"'))
+            # Real summary/input replacement must inherit the same initial fence privileges.
+            await session.execute(
+                text(f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" GRANT SELECT,MAINTAIN ON TABLES TO "{role}"')
+            )
+        source_sessions = async_sessionmaker(source_engine, expire_on_commit=False)
+        async with source_sessions.begin() as source_session:
+            assert await source_session.scalar(text("SELECT current_user")) == role
+            assert await source_session.scalar(text("SELECT session_user")) == role
+            assert not await source_session.scalar(
+                text("SELECT rolsuper OR rolcreaterole OR rolbypassrls FROM pg_roles WHERE rolname=current_user")
+            )
+            assert not await source_session.scalar(
+                text(
+                    "SELECT pg_has_role(current_user,typowner,'MEMBER') FROM pg_type "
+                    "WHERE oid=to_regtype('mrf.address_archive_geo_source')"
+                )
+            )
+            assert not await source_session.scalar(
+                text("SELECT has_table_privilege(current_user,:table,'INSERT,UPDATE,DELETE,TRUNCATE')"),
+                {"table": f'"{schema}".address_archive_v2'},
+            )
+        yield source_sessions
+
+
+async def _create_canonical_address_source(connection, archive, schema):
+    """Use the genuine declared enum, model indexes and installed source self edge."""
+    from db.models import AddressArchiveV2
+    from process import mrf_address_publication as canonical
+
+    # The existing NPI canonical compiler preserves the shared source model's column order.
+    spec = archive.ReferenceFamilySpec("npi", (AddressArchiveV2,))
+    await archive._create_model_heaps(connection, spec, schema, create_indexes=False, ordinary_heaps=True)
+    await archive._create_model_indexes(connection, spec, schema, create_constraints=True)
+    await canonical.canonical_spatial_index(connection, schema, "address_archive_v2", canonical._qualified)
+    await connection.execute(
+        text(
+            f'ALTER TABLE "{schema}".address_archive_v2 ADD FOREIGN KEY (merged_into) '
+            f'REFERENCES "{schema}".address_archive_v2(address_key)'
+        )
     )
 
 
@@ -414,21 +493,34 @@ async def test_native_source_prepare_requires_matching_completed_finalizer(monke
     monkeypatch.setattr(receipt, "db", database)
     monkeypatch.setattr(plan_summary, "db", database)
     prepared = None
-    prepare = partial(_prepare_native_mrf_source, sessions, archive, schema)
+    custody = None
+    cleanup = AsyncExitStack()
+    is_shared_schema_new = is_shared_type_new = False
     monkeypatch.setattr(plan_summary, "ensure_database", _summary_database_ready)
     try:
+        custody = await cleanup.enter_async_context(native_reference_source(sessions))
         async with engine.begin() as connection:
             await connection.execute(text("CREATE EXTENSION IF NOT EXISTS btree_gin"))
             await connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-            await _create_live_family(connection, "mrf", schema)
-            await connection.execute(
-                text(
-                    f'CREATE TABLE "{schema}".address_archive_v2 ('
-                    "address_key uuid PRIMARY KEY, merged_into uuid, source_bits integer NOT NULL DEFAULT 0)"
-                )
+            from db.models import AddressArchiveV2
+
+            is_shared_schema_new = not await connection.scalar(text("SELECT to_regnamespace('mrf') IS NOT NULL"))
+            is_shared_type_new = not await connection.scalar(
+                text("SELECT to_regtype('mrf.address_archive_geo_source') IS NOT NULL")
             )
+            if is_shared_schema_new:
+                await connection.execute(text('CREATE SCHEMA "mrf"'))
+            await connection.run_sync(
+                lambda sync: AddressArchiveV2.__table__.c.geo_source.type.create(sync, checkfirst=True)
+            )
+            await _create_live_family(connection, "mrf", schema)
+            await _create_canonical_address_source(connection, archive, schema)
             await _run_migration(connection, _MIGRATION, "upgrade")
             await _configure_summary_tables(connection, monkeypatch, schema)
+        source_sessions = await cleanup.enter_async_context(
+            _native_mrf_source_sessions(sessions, schema, _database_url())
+        )
+        prepare = partial(_prepare_native_mrf_source, sessions, archive, schema, custody, source_sessions)
         prepared, authority = await _assert_completed_source_admission(
             database,
             plan_summary,
@@ -439,4 +531,6 @@ async def test_native_source_prepare_requires_matching_completed_finalizer(monke
         await _assert_completed_source_becomes_stale(engine, database, schema, prepare)
         await _assert_summary_failure_revokes_source_admission(monkeypatch, plan_summary, prepare, schema, authority)
     finally:
-        await _cleanup_prepared_mrf_stage(sessions, archive, prepared, engine, schema)
+        await _cleanup_prepared_mrf_stage(
+            sessions, custody, prepared, engine, schema, is_shared_schema_new, is_shared_type_new, cleanup
+        )

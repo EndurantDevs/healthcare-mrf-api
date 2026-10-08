@@ -14,6 +14,7 @@ from api.plan_pricing_projection_contract import (
     HEX_DIGEST,
     LEGACY_PROJECTION_CONTRACT,
     PROJECTION_CONTRACT,
+    ProjectionCandidateInputs,
     canonical_json,
     lock_provider_generation,
     normalized_bindings,
@@ -29,7 +30,6 @@ from api.plan_pricing_projection_v3 import (
 )
 from db.connection import db
 
-
 MAX_PROJECTION_BINDINGS = 16
 MAX_PROJECTION_CODE_ROWS = 262_144
 
@@ -41,9 +41,7 @@ def receipt(candidate_by_field: Mapping[str, Any]) -> dict[str, Any]:
     receipt_by_field = {
         "contract": contract,
         "projection_id": str(candidate_by_field["projection_id"]),
-        "binding_manifest_digest": str(
-            candidate_by_field["binding_manifest_digest"]
-        ),
+        "binding_manifest_digest": str(candidate_by_field["binding_manifest_digest"]),
         "provider_signature": str(candidate_by_field["provider_signature"]),
         "content_digest": str(candidate_by_field["content_digest"]),
         "build_seconds": float(candidate_by_field["build_seconds"]),
@@ -60,34 +58,20 @@ def receipt(candidate_by_field: Mapping[str, Any]) -> dict[str, Any]:
         PROJECTION_CONTRACT,
     }:
         receipt_by_field.update(
-            provider_membership_count=int(
-                candidate_by_field["provider_membership_count"]
-            ),
+            provider_membership_count=int(candidate_by_field["provider_membership_count"]),
             provider_cell_count=int(candidate_by_field["provider_cell_count"]),
-            provider_fragment_byte_count=int(
-                candidate_by_field["provider_fragment_byte_count"]
-            ),
+            provider_fragment_byte_count=int(candidate_by_field["provider_fragment_byte_count"]),
             rate_profile_count=int(candidate_by_field["rate_profile_count"]),
-            aggregate_entry_count=int(
-                candidate_by_field["aggregate_entry_count"]
-            ),
+            aggregate_entry_count=int(candidate_by_field["aggregate_entry_count"]),
             aggregate_pack_count=int(candidate_by_field["aggregate_pack_count"]),
-            aggregate_raw_byte_count=int(
-                candidate_by_field["aggregate_raw_byte_count"]
-            ),
-            aggregate_stored_byte_count=int(
-                candidate_by_field["aggregate_stored_byte_count"]
-            ),
+            aggregate_raw_byte_count=int(candidate_by_field["aggregate_raw_byte_count"]),
+            aggregate_stored_byte_count=int(candidate_by_field["aggregate_stored_byte_count"]),
             prewarm_shape_count=int(candidate_by_field["prewarm_shape_count"]),
         )
         if contract == PROJECTION_CONTRACT:
             receipt_by_field.update(
-                provider_state_count=int(
-                    candidate_by_field["provider_state_count"]
-                ),
-                rate_occurrence_count=int(
-                    candidate_by_field["rate_occurrence_count"]
-                ),
+                provider_state_count=int(candidate_by_field["provider_state_count"]),
+                rate_occurrence_count=int(candidate_by_field["rate_occurrence_count"]),
             )
     else:
         raise ValueError("pricing projection contract is unsupported")
@@ -105,7 +89,7 @@ async def _existing_candidate_receipt(
         text(
             f"""
             SELECT *
-              FROM {table('plan_pricing_projection_candidate')}
+              FROM {table("plan_pricing_projection_candidate")}
              WHERE projection_id = :projection_id
             """
         ),
@@ -117,10 +101,8 @@ async def _existing_candidate_receipt(
     if existing_candidate.get("state") == "ready":
         has_matching_identity = (
             existing_candidate.get("binding_manifest") == binding_manifest
-            and existing_candidate.get("binding_manifest_digest")
-            == binding_manifest_digest
-            and existing_candidate.get("provider_signature")
-            == provider_generation_signature
+            and existing_candidate.get("binding_manifest_digest") == binding_manifest_digest
+            and existing_candidate.get("provider_signature") == provider_generation_signature
         )
         if not has_matching_identity:
             raise ValueError("pricing projection identity collision")
@@ -129,7 +111,7 @@ async def _existing_candidate_receipt(
     await session.execute(
         text(
             f"""
-            DELETE FROM {table('plan_pricing_projection_candidate')}
+            DELETE FROM {table("plan_pricing_projection_candidate")}
              WHERE projection_id = :projection_id
             """
         ),
@@ -148,7 +130,7 @@ async def _insert_candidate(
     await session.execute(
         text(
             f"""
-            INSERT INTO {table('plan_pricing_projection_candidate')} (
+            INSERT INTO {table("plan_pricing_projection_candidate")} (
                 projection_id, contract_version, binding_manifest_digest,
                 binding_manifest, provider_signature, state
             ) VALUES (
@@ -167,11 +149,8 @@ async def _insert_candidate(
     )
 
 
-async def _materialize_all_codes(
-    session: Any,
-    candidate_id: str,
-    binding_manifest: list[dict[str, Any]],
-) -> tuple[Any, ProjectionV3Counts]:
+async def _binding_sources(session, binding_manifest, *, candidate_inputs=None):
+    """Authenticate every selected physical code read before building or reusing it."""
     in_network_bindings = [
         binding_by_field
         for binding_by_field in normalized_bindings(binding_manifest)
@@ -181,13 +160,38 @@ async def _materialize_all_codes(
         raise ValueError("pricing projection requires an in-network binding")
     if len(in_network_bindings) > MAX_PROJECTION_BINDINGS:
         raise ValueError("pricing projection binding bound exceeded")
-    binding_sources = [
-        (binding, await binding_source(session, binding))
+    return [
+        (
+            binding,
+            await binding_source(
+                session,
+                binding,
+                **(
+                    {}
+                    if candidate_inputs is None
+                    else {
+                        "candidate_audit_access": candidate_inputs.access_for(binding),
+                    }
+                ),
+            ),
+        )
         for binding in in_network_bindings
     ]
+
+
+async def _materialize_all_codes(
+    session: Any,
+    candidate_id: str,
+    binding_manifest: list[dict[str, Any]],
+    *,
+    candidate_inputs=None,
+    binding_sources=None,
+) -> tuple[Any, ProjectionV3Counts]:
+    if binding_sources is None:
+        binding_sources = await _binding_sources(session, binding_manifest, candidate_inputs=candidate_inputs)
     remaining_code_rows = MAX_PROJECTION_CODE_ROWS
     binding_projections = []
-    seen_reads: set[tuple[str, int, str, str, str]] = set()
+    seen_reads: set[tuple[Any, ...]] = set()
     for binding_by_field, (serving_tables, read_identity) in binding_sources:
         if read_identity in seen_reads:
             continue
@@ -199,6 +203,11 @@ async def _materialize_all_codes(
             binding_by_field,
             maximum_code_rows=remaining_code_rows,
             serving_tables=serving_tables,
+            **(
+                {}
+                if candidate_inputs is None
+                else {"candidate_audit_access": candidate_inputs.access_for(binding_by_field)}
+            ),
         )
         code_row_count = binding.raw_code_row_count
         if code_row_count > remaining_code_rows:
@@ -211,6 +220,7 @@ async def _materialize_all_codes(
         candidate_id,
         binding_projections,
         content_digest,
+        **({} if candidate_inputs is None else {"candidate_inputs": candidate_inputs}),
     )
     return content_digest, counts
 
@@ -225,7 +235,7 @@ async def _seal_candidate(
     ready_result = await session.execute(
         text(
             f"""
-            UPDATE {table('plan_pricing_projection_candidate')}
+            UPDATE {table("plan_pricing_projection_candidate")}
                SET state = 'ready',
                    content_digest = :content_digest,
                    provider_membership_count = :provider_membership_count,
@@ -248,20 +258,14 @@ async def _seal_candidate(
         {
             "projection_id": candidate_id,
             "content_digest": content_digest.hexdigest(),
-            "provider_membership_count": (
-                row_counts.provider_membership_count
-            ),
+            "provider_membership_count": (row_counts.provider_membership_count),
             "provider_cell_count": row_counts.provider_cell_count,
-            "provider_fragment_byte_count": (
-                row_counts.provider_fragment_byte_count
-            ),
+            "provider_fragment_byte_count": (row_counts.provider_fragment_byte_count),
             "rate_profile_count": row_counts.rate_profile_count,
             "aggregate_entry_count": row_counts.aggregate_entry_count,
             "aggregate_pack_count": row_counts.aggregate_pack_count,
             "aggregate_raw_byte_count": row_counts.aggregate_raw_byte_count,
-            "aggregate_stored_byte_count": (
-                row_counts.aggregate_stored_byte_count
-            ),
+            "aggregate_stored_byte_count": (row_counts.aggregate_stored_byte_count),
             "prewarm_shape_count": row_counts.prewarm_shape_count,
             "provider_state_count": row_counts.provider_state_count,
             "rate_occurrence_count": row_counts.rate_occurrence_count,
@@ -277,6 +281,7 @@ async def build_in_session(
     binding_manifest_digest: str,
     bindings: Any,
     projection_contract: str = PROJECTION_CONTRACT,
+    candidate_inputs: ProjectionCandidateInputs | None = None,
 ) -> dict[str, Any]:
     """Build or reuse one candidate inside the caller's transaction."""
 
@@ -285,7 +290,19 @@ async def build_in_session(
     if not HEX_DIGEST.fullmatch(binding_manifest_digest):
         raise ValueError("pricing projection binding digest is invalid")
     binding_manifest = normalized_bindings(bindings)
-    provider_generation_signature = await provider_signature(session)
+    if candidate_inputs is not None:
+        if type(candidate_inputs) is not ProjectionCandidateInputs:
+            raise ValueError("pricing projection candidate inputs are invalid")
+        for binding in binding_manifest:
+            candidate_inputs.access_for(binding)
+    provider_generation_signature = await provider_signature(
+        session, **({} if candidate_inputs is None else {"candidate_inputs": candidate_inputs})
+    )
+    binding_sources = (
+        None
+        if candidate_inputs is None
+        else await _binding_sources(session, binding_manifest, candidate_inputs=candidate_inputs)
+    )
     candidate_id = projection_id(
         binding_manifest_digest,
         provider_generation_signature,
@@ -303,6 +320,28 @@ async def build_in_session(
     )
     if existing_receipt is not None:
         return existing_receipt
+    return await _build_new_candidate(
+        session,
+        candidate_id,
+        binding_manifest,
+        binding_manifest_digest,
+        provider_generation_signature,
+        candidate_inputs=candidate_inputs,
+        binding_sources=binding_sources,
+    )
+
+
+async def _build_new_candidate(
+    session,
+    candidate_id,
+    binding_manifest,
+    binding_manifest_digest,
+    provider_generation_signature,
+    *,
+    candidate_inputs,
+    binding_sources,
+):
+    """Materialize and seal one new projection after authenticating every input."""
     await _insert_candidate(
         session,
         candidate_id,
@@ -315,6 +354,11 @@ async def build_in_session(
         session,
         candidate_id,
         binding_manifest,
+        **(
+            {}
+            if candidate_inputs is None
+            else {"candidate_inputs": candidate_inputs, "binding_sources": binding_sources}
+        ),
     )
     await validate_stored_aggregate_packs(
         session,

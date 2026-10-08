@@ -9,7 +9,7 @@ import datetime
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import ANY, AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -49,9 +49,12 @@ def _provenance() -> generation.NpiCanonicalProvenance:
     )
 
 
-def _manifest(*, tracked: bool = True) -> archive.NpiResultManifest:
+def _manifest(*, tracked: bool = True, canonical: bool = False) -> archive.NpiResultManifest:
     metadata, metadata_sha256 = archive._source_metadata({"release": "synthetic"})
     tables = _tables()
+    if canonical:
+        model = archive.npi_archive_models(canonical=True)[-1]
+        tables += (archive.NpiTableReceipt(model.__name__, model.__tablename__, "a" * 64, 0),)
     return archive.NpiResultManifest(
         tables,
         metadata,
@@ -60,16 +63,19 @@ def _manifest(*, tracked: bool = True) -> archive.NpiResultManifest:
         "tracked-generation" if tracked else "legacy-manual",
         _serving() if tracked else None,
         _provenance() if tracked else None,
+        archive.MODEL_CONTRACT if canonical else archive.CONTRACT,
     )
 
 
-def _ownership() -> archive.NpiStageOwnership:
+def _ownership(*, canonical: bool = False) -> archive.NpiStageOwnership:
     dataset_id = uuid4()
     return archive.NpiStageOwnership(
         dataset_id,
         archive.npi_stage_schema(dataset_id),
         90,
-        tuple((name, ordinal) for ordinal, name in enumerate(sorted(generation.RELATION_NAMES), 101)),
+        tuple(
+            (name, ordinal) for ordinal, name in enumerate(sorted(archive.npi_archive_names(canonical=canonical)), 101)
+        ),
         (("npi_id_seq", 201, "npi", "id"),),
         301,
         ((generation.RELATION_NAMES[0], 101, 401),),
@@ -84,7 +90,7 @@ def _validation(
     receipt_dict = {
         "contract": archive.VALIDATION_CONTRACT,
         "package_id": "c" * 64,
-        "profile_contract": archive.CONTRACT,
+        "profile_contract": manifest.contract,
         "stage_schema": ownership.schema_name,
         "stage_schema_oid": ownership.schema_oid,
         "relation_oids": [list(pair) for pair in ownership.relation_oids],
@@ -226,6 +232,69 @@ async def test_source_capture_rejects_ambiguous_metadata_before_catalog_work() -
                 source_metadata_factory=factory,
             )
     session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", (None, "read-catalog", "canonical-model"))
+async def test_canonical_source_checks_share_bounded_timeouts_and_restore_them(monkeypatch, failure):
+    from process import mrf_address_publication as canonical
+
+    settings_by_name = {"lock_timeout": "1500ms", "statement_timeout": "60s"}
+    original_settings_by_name = dict(settings_by_name)
+    locks = []
+    observed_checks = []
+
+    async def execute(statement, parameters=None):
+        sql = str(statement)
+        if "pg_catalog.set_config" in sql:
+            settings_by_name[parameters["setting"]] = parameters["value"]
+        elif sql.startswith("LOCK TABLE"):
+            locks.append((sql, dict(settings_by_name)))
+        return SimpleNamespace(scalar_one=lambda: "000001-1")
+
+    async def check_catalog(*_args):
+        assert settings_by_name == {
+            "lock_timeout": archive._LOCK_TIMEOUT,
+            "statement_timeout": archive._CAPTURE_TIMEOUT,
+        }
+        observed_checks.append("read-catalog")
+        if failure == "read-catalog":
+            raise RuntimeError("synthetic catalog refusal")
+
+    async def check_canonical(*_args):
+        assert settings_by_name == {
+            "lock_timeout": archive._LOCK_TIMEOUT,
+            "statement_timeout": archive._CAPTURE_TIMEOUT,
+        }
+        observed_checks.append("canonical-model")
+        if failure == "canonical-model":
+            raise RuntimeError("synthetic catalog refusal")
+
+    session = SimpleNamespace(
+        in_transaction=lambda: True,
+        execute=AsyncMock(side_effect=execute),
+        scalar=AsyncMock(side_effect=lambda statement: settings_by_name[str(statement).split()[-1]]),
+    )
+    oids = tuple(range(1, 7))
+    monkeypatch.setattr(archive, "_relation_pairs", AsyncMock(return_value=tuple(zip(generation.RELATION_NAMES, oids))))
+    monkeypatch.setattr(
+        archive,
+        "read_npi_result_generation_authority",
+        AsyncMock(return_value=_authority(serving=_serving(), relation_oids=oids)),
+    )
+    monkeypatch.setattr(canonical, "require_native_read_catalog", check_catalog)
+    monkeypatch.setattr(canonical, "require_canonical_source_model", check_canonical)
+    if failure is None:
+        captured = await archive.capture_npi_source(session, schema_name="mrf", source_metadata={}, canonical=True)
+        assert captured.canonical is True
+    else:
+        with pytest.raises(RuntimeError, match="synthetic catalog refusal"):
+            await archive.capture_npi_source(session, schema_name="mrf", source_metadata={}, canonical=True)
+    assert settings_by_name == original_settings_by_name
+    assert observed_checks == (["read-catalog"] if failure == "read-catalog" else ["read-catalog", "canonical-model"])
+    assert '"mrf"."address_archive_v2"' in locks[0][0]
+    assert "SHARE ROW EXCLUSIVE MODE NOWAIT" in locks[0][0]
+    assert locks[0][1] == {"lock_timeout": archive._LOCK_TIMEOUT, "statement_timeout": archive._CAPTURE_TIMEOUT}
 
 
 @pytest.mark.asyncio
@@ -406,6 +475,70 @@ async def test_public_activation_rejects_wrong_binding_before_mutation_or_callba
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("canonical", (False, True))
+@pytest.mark.parametrize("fault", ("other-contract", "duplicate", "foreign", "reordered"))
+async def test_activation_rejects_inexact_incumbent_inventory_before_locks(monkeypatch, canonical, fault):
+    ownership = _ownership(canonical=canonical)
+    manifest = _manifest(canonical=canonical)
+    names = archive.npi_archive_names(canonical=canonical)
+    if fault == "other-contract":
+        names = archive.npi_archive_names(canonical=not canonical)
+    elif fault == "duplicate":
+        names = (names[0], names[0], *names[2:])
+    elif fault == "foreign":
+        names = (*names[:-1], "other_table")
+    else:
+        names = tuple(reversed(names))
+    lock = AsyncMock()
+    activate = AsyncMock()
+    callback = AsyncMock()
+    monkeypatch.setattr(archive, "_lock_and_verify_activation", lock)
+    monkeypatch.setattr(archive, "_activate_npi_relations", activate)
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(), scalar=AsyncMock())
+    with pytest.raises(archive.NpiResultArchiveError, match="incumbent activation inventory differs"):
+        await archive.activate_validated_npi_stage(
+            session,
+            ownership=ownership,
+            manifest=manifest,
+            incumbent=archive.NpiIncumbent("mrf", tuple((name, None) for name in names)),
+            validation_receipt=_validation(ownership, manifest),
+            cutover=archive.NpiCutoverAuthority("c" * 64, 501, 501, "manual"),
+            on_activated=callback,
+        )
+    lock.assert_not_awaited()
+    activate.assert_not_awaited()
+    callback.assert_not_awaited()
+    session.execute.assert_not_awaited()
+    session.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("canonical", (False, True))
+async def test_matching_incumbent_inventory_reaches_activation_lock_boundary(monkeypatch, canonical):
+    ownership = _ownership(canonical=canonical)
+    manifest = _manifest(canonical=canonical)
+    incumbent = archive.NpiIncumbent(
+        "mrf", tuple((name, None) for name in archive.npi_archive_names(canonical=canonical))
+    )
+    lock = AsyncMock(side_effect=RuntimeError("synthetic lock boundary"))
+    callback = AsyncMock()
+    monkeypatch.setattr(archive, "_lock_and_verify_activation", lock)
+    session = SimpleNamespace(in_transaction=lambda: True)
+    with pytest.raises(RuntimeError, match="synthetic lock boundary"):
+        await archive.activate_validated_npi_stage(
+            session,
+            ownership=ownership,
+            manifest=manifest,
+            incumbent=incumbent,
+            validation_receipt=_validation(ownership, manifest),
+            cutover=archive.NpiCutoverAuthority("c" * 64, 501, 501, "manual"),
+            on_activated=callback,
+        )
+    lock.assert_awaited_once_with(session, ownership, incumbent)
+    callback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_automatic_cutover_rejects_missing_legacy_and_drifted_authority(monkeypatch) -> None:
     incumbent = archive.NpiIncumbent("mrf", tuple((name, oid) for oid, name in enumerate(generation.RELATION_NAMES, 1)))
     authority = _authority()
@@ -552,11 +685,23 @@ async def test_sequence_state_rejects_missing_minimum_and_post_setval_drift(monk
 
 @pytest.mark.asyncio
 async def test_clone_and_schema_identity_reject_invalid_catalog_tokens() -> None:
-    capture = archive.NpiSourceCapture({}, "a" * 64, "legacy-manual", None, None, "mrf", "invalid/snapshot")
+    capture = archive.NpiSourceCapture(
+        {}, "a" * 64, "legacy-manual", None, None, "mrf", "invalid/snapshot", canonical=True
+    )
     session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=True))
+    copy_rows, precreated = AsyncMock(), AsyncMock()
     with pytest.raises(archive.NpiResultArchiveError, match="snapshot is invalid"):
-        await archive._clone_source(session, capture, "stage")
+        await archive._clone_source(
+            session,
+            capture,
+            archive.npi_stage_schema(uuid4()),
+            source_copy=archive.native_archive.ReferenceFamilySourceCopy(copy_rows, 4096, 30),
+            on_precreated=precreated,
+            deadline=asyncio.get_running_loop().time() + 30,
+        )
     session.execute.assert_not_awaited()
+    copy_rows.assert_not_awaited()
+    precreated.assert_not_awaited()
     with pytest.raises(archive.NpiResultArchiveError, match="owned schema is unavailable"):
         await archive._schema_oid(session, "stage")
 
@@ -626,6 +771,44 @@ async def test_stage_guard_entry_points_reject_invalid_or_unfrozen_tokens(monkey
             on_prepared=None,
         )
     verify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("historical_freeze", (False, True))
+async def test_canonical_export_requires_custody_verifier_before_opening_archive_session(historical_freeze):
+    ownership = _ownership(canonical=True)
+    if not historical_freeze:
+        ownership = replace(ownership, freeze_function_oid=None, freeze_trigger_oids=(), freeze_catalog_versions=())
+    factory = Mock()
+    copy = AsyncMock()
+    with pytest.raises(archive.NpiResultArchiveError, match="canonical prepared source requires a custody verifier"):
+        await archive.export_prepared_npi_archive(
+            factory,
+            prepared=archive.NpiPreparedSource(_manifest(canonical=True), ownership),
+            archive_copy=copy,
+        )
+    factory.assert_not_called()
+    copy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_canonical_export_with_custody_verifier_does_not_require_historical_freeze():
+    ownership = replace(
+        _ownership(canonical=True), freeze_function_oid=None, freeze_trigger_oids=(), freeze_catalog_versions=()
+    )
+    factory = Mock(side_effect=RuntimeError("synthetic session boundary"))
+    copy = AsyncMock()
+    custody = AsyncMock()
+    with pytest.raises(RuntimeError, match="synthetic session boundary"):
+        await archive.export_prepared_npi_archive(
+            factory,
+            prepared=archive.NpiPreparedSource(_manifest(canonical=True), ownership),
+            archive_copy=copy,
+            verify_custody=custody,
+        )
+    factory.assert_called_once_with()
+    copy.assert_not_awaited()
+    custody.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1062,6 +1245,9 @@ async def test_export_copy_failure_still_cleans_exact_prepared_owner(monkeypatch
             source_metadata={"release": "synthetic"},
             dataset_id=ownership.dataset_id,
             archive_copy=AsyncMock(),
+            source_copy=archive.native_archive.ReferenceFamilySourceCopy(AsyncMock(), 4096, 30),
+            on_precreated=AsyncMock(),
+            verify_custody=AsyncMock(),
         )
     cleanup.assert_awaited_once_with(ANY, ownership)
 

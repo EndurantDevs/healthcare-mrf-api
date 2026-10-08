@@ -10,10 +10,12 @@ from unittest.mock import AsyncMock
 import pytest
 from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi
-from tests.provider_profile_snapshot_postgres_support import publish_family, snapshot_database
+from db.connection import current_session
+from tests.provider_profile_snapshot_postgres_support import grant_profile_reader, publish_family, snapshot_database
 
 NPI = 1000000004
 
@@ -64,6 +66,10 @@ async def test_profile_route_keeps_both_loaders_before_family_rename(monkeypatch
 async def test_snapshot_pins_rows_when_independent_updates_commit(monkeypatch):
     async with snapshot_database(monkeypatch) as (database, schema):
         async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True) as session:
+            assert tuple((await session.execute(text("SELECT session_user,current_user"))).one()) == (
+                database._reader_database._reader_login[0],
+                database._reader_database._reader_login[0],
+            )
             assert await session.scalar(text("SHOW transaction_read_only")) == "on"
             assert await session.scalar(text("SHOW transaction_isolation")) == "repeatable read"
             authority = session.info["provider_profile_native_authorities"]
@@ -114,9 +120,52 @@ async def test_drifted_native_family_cannot_enter_read_scope(monkeypatch):
     async with snapshot_database(monkeypatch) as (database, schema):
         await database.status(f'ALTER TABLE "{schema}".cms_doctor_education RENAME TO abandoned_education')
         await database.status(f'CREATE TABLE "{schema}".cms_doctor_education (marker text)')
+        await grant_profile_reader(database, schema, ("cms_doctor_education",))
         with pytest.raises(ServiceUnavailable):
             async with snapshot.provider_profile_read_snapshot(database, schema):
                 pytest.fail("A drifted native receipt cannot be read")
+
+
+async def test_lock_conflict_retries_a_fresh_snapshot_after_real_publication(monkeypatch):
+    """Only an owned setup retries after the failed Reader transaction releases its locks."""
+    async with snapshot_database(monkeypatch) as (database, schema):
+        entered, release = asyncio.Event(), asyncio.Event()
+        sessions = []
+        lock_relations = snapshot._lock_serving_relations
+
+        async def publish():
+            async with database.session_factory() as writer:
+                async with writer.begin():
+                    await writer.execute(text(f'LOCK TABLE "{schema}".cms_doctor_education IN ACCESS EXCLUSIVE MODE'))
+                    entered.set()
+                    await release.wait()
+                await publish_family(writer, schema)
+
+        publication = asyncio.create_task(publish())
+
+        async def lock(session, schema_name, **options):
+            sessions.append(session)
+            try:
+                return await lock_relations(session, schema_name, **options)
+            except DBAPIError as error:
+                assert snapshot.postgres_sqlstate(error) == "55P03" and len(sessions) == 1
+                release.set()
+                await asyncio.wait_for(publication, 3)
+                raise
+
+        monkeypatch.setattr(snapshot, "_lock_serving_relations", lock)
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            async with snapshot.provider_profile_read_snapshot(database, schema):
+                assert await database.scalar(f'SELECT marker FROM "{schema}".cms_doctor_education') == "new"
+                assert await database.scalar(f'SELECT marker FROM "{schema}".provider_directory_profile') == "new"
+            assert len(sessions) == 2 and sessions[0] is not sessions[1]
+            assert all(not session.in_transaction() for session in sessions)
+            assert database._transaction_binding() is None and snapshot._SNAPSHOT.get() is None
+        finally:
+            release.set()
+            publication.cancel()
+            await asyncio.gather(publication, return_exceptions=True)
 
 
 async def test_rename_setup_retries_only_a_fresh_owned_snapshot(monkeypatch):
@@ -142,12 +191,12 @@ async def test_rename_setup_retries_only_a_fresh_owned_snapshot(monkeypatch):
         assert database._transaction_binding() is None and snapshot._SNAPSHOT.get() is None
 
 
-async def test_borrowed_read_transaction_is_not_retried(monkeypatch):
+async def test_writer_transaction_cannot_enter_reader_snapshot(monkeypatch):
     async with snapshot_database(monkeypatch) as (database, schema):
         setup = AsyncMock(wraps=snapshot._lock_serving_relations)
         monkeypatch.setattr(snapshot, "_lock_serving_relations", setup)
         async with database.transaction():
-            with pytest.raises(ServiceUnavailable):
+            with pytest.raises(RuntimeError, match="Cannot open a Reader inside a Writer transaction"):
                 async with snapshot.provider_profile_read_snapshot(database, schema):
                     pytest.fail("A borrowed transaction cannot establish a fresh repeatable-read snapshot")
         setup.assert_not_awaited()
@@ -181,6 +230,7 @@ async def test_legacy_education_without_native_ledger_remains_available(monkeypa
         await database.status(f'''CREATE TABLE "{schema}".cms_doctor_education (
             npi bigint,education_key text,medical_school text,graduation_year integer,
             generation_id text,source_json jsonb)''')
+        await grant_profile_reader(database, schema, ("cms_doctor_education",))
         education_by_field = _education_row()
         await database.status(
             f'''INSERT INTO "{schema}".cms_doctor_education VALUES
@@ -212,7 +262,7 @@ def _detail_loaders(database, schema):
     marker_reads = []
 
     async def read_marker(table, session):
-        assert database._transaction_binding().session is session
+        assert database.has_reader_session() and current_session() is session
         value = await session.scalar(text(f'SELECT marker FROM "{schema}".{table}'))
         marker_reads.append(value)
         return value
@@ -253,12 +303,24 @@ def _detail_loaders(database, schema):
 
 async def test_detail_reads_finish_before_geocoding(monkeypatch):
     async with snapshot_database(monkeypatch) as (database, schema):
+        monkeypatch.setenv("HLTHPRT_API_READER_ENABLED", "true")
+        pin = AsyncMock()
+        monkeypatch.setattr("api.reference_family_reads.pin_claims_reader", pin)
+        callbacks_by_kind = {}
+        app = SimpleNamespace(
+            listener=lambda _name: lambda callback: callback,
+            middleware=lambda name: lambda callback: callbacks_by_kind.setdefault(name, callback),
+        )
+        database.init_app(app)
+        geocode_reader_scopes = []
         marker_reads, profile_loader, detail_loader, address_loader, enrichment_loader, hydrate = _detail_loaders(
             database, schema
         )
 
         async def geocode(*_args, **_options):
-            assert database._transaction_binding() is None and snapshot._SNAPSHOT.get() is None
+            geocode_reader_scopes.append(database.has_reader_session())
+            assert not database.has_reader_session() and database._transaction_binding() is None
+            assert snapshot._SNAPSHOT.get() is None
             async with database.session_factory() as writer:
                 await asyncio.wait_for(publish_family(writer, schema), 3)
             return json.dumps({"features": [{"geometry": {"coordinates": [-87, 41]}}]})
@@ -273,6 +335,8 @@ async def test_detail_reads_finish_before_geocoding(monkeypatch):
         monkeypatch.setattr(npi, "_fetch_provider_enrichment_detail", enrichment_loader)
         monkeypatch.setattr(npi, "download_it", geocode)
         request = SimpleNamespace(
+            path=f"/api/v1/npi/id/{NPI}",
+            ctx=SimpleNamespace(),
             args={"sync_geocode": "1"},
             app=SimpleNamespace(
                 config={
@@ -282,7 +346,13 @@ async def test_detail_reads_finish_before_geocoding(monkeypatch):
                 }
             ),
         )
-        operation_result = await npi.get_npi(request, str(NPI))
+        await callbacks_by_kind["request"](request)
+        try:
+            operation_result = await npi.get_npi(request, str(NPI))
+        finally:
+            await callbacks_by_kind["response"](request, SimpleNamespace(status=200))
+        pin.assert_not_awaited()
+        assert geocode_reader_scopes == [False]
         response_by_field = json.loads(operation_result.body)
         assert marker_reads == ["old"] * 4
         assert response_by_field["provider_directory_profile"]["generation_id"] == "old"
