@@ -477,9 +477,24 @@ async def _assert_grouped_order_parity(session, pinned_target):
     ordered = child_fixture._ordered_query()
     prepared_query, ordered_rows = await native._relation(session, pinned_target, ordered)
     assert set(map(tuple, ordered_rows)) == {(native._A, Decimal("2")), (native._B, Decimal("5"))}
-    for offset, expected_entity in enumerate((native._A, native._B, native._C, child_fixture._ABSENT)):
+    for offset, expected_entity in enumerate((native._A, native._B)):
         count, page = await child_fixture._native_rows(session, prepared_query, is_geo=False, offset=offset)
+        assert count == 2 and len(page) == 1 and page[0]["npi_code"] == expected_entity
+    assert (await child_fixture._native_rows(session, prepared_query, is_geo=False, offset=2))[1] == []
+    root_ordered = fixture.query(
+        context_filters=(child_fixture._PANEL,),
+        order_terms=(read_core.ReadOrderTerm("score", "asc", "last"),),
+        require_match=False,
+    )
+    root_prepared, root_rows = await native._relation(session, pinned_target, root_ordered)
+    assert set(map(tuple, root_rows)) == {(native._A, Decimal("10")), (native._B, Decimal("30"))}
+    for offset, (expected_entity, expected_score) in enumerate(
+        ((native._A, Decimal("10")), (native._B, Decimal("30")), (native._C, None), (child_fixture._ABSENT, None))
+    ):
+        count, page = await child_fixture._native_rows(session, root_prepared, is_geo=False, offset=offset)
         assert count == 4 and len(page) == 1 and page[0]["npi_code"] == expected_entity
+        assert page[0]["sort_0"] == expected_score
+    assert (await child_fixture._native_rows(session, root_prepared, is_geo=False, offset=4))[1] == []
 
 
 async def _assert_selected_family_details(session, pinned_target):

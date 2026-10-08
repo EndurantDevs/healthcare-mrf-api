@@ -174,8 +174,10 @@ def test_child_budget_counts_implicit_year_without_changing_root_or_legacy_limit
     assert (
         _plan(context_filters=(_PANEL, _KEY, ReadFilter("period", "eq", 2024)), filters=metrics).selected_value == 2024
     )
+    four = metrics + (ReadFilter("score", "gt", "1"), ReadFilter("score", "lt", "99"))
+    assert len(_plan(context_filters=(_PANEL, _KEY), filters=four).filters) == 4
     with pytest.raises(CustomImportReadRequestError, match="count"):
-        _plan(context_filters=(_PANEL, _KEY), filters=metrics + (ReadFilter("score", "gt", "1"),))
+        _plan(context_filters=(_PANEL, _KEY), filters=four + (ReadFilter("amount", "lt", "9"),))
     root_query = grouped.query(
         context_filters=(_PANEL,),
         filters=(
@@ -184,8 +186,7 @@ def test_child_budget_counts_implicit_year_without_changing_root_or_legacy_limit
             ReadFilter("npi", "eq", "1234567893"),
         ),
     )
-    with pytest.raises(CustomImportReadRequestError, match="count"):
-        grouped_read.normalize_plan(fixture.context(), root_query, _SCOPE)
+    assert len(grouped_read.normalize_plan(fixture.context(), root_query, _SCOPE).filters) == 3
     with pytest.raises(CustomImportReadRequestError, match="count"):
         read_core._validate_npi_entity_relation_request(metrics, None, context_filters=(_PANEL, _KEY))
 
@@ -199,7 +200,6 @@ def test_child_budget_counts_implicit_year_without_changing_root_or_legacy_limit
         {"context_filters": (_PANEL, _KEY, ReadFilter("child_alias", "eq", "different"))},
         {"context_filters": (_PANEL,), "filters": (ReadFilter("service_code", "gt", "chosen"),)},
         {"context_filters": (_PANEL,), "filters": (ReadFilter("quality", "gt", "1"),), "require_match": False},
-        {"require_exact_context": True},
     ],
 )
 def test_child_context_and_order_fail_closed(changes):

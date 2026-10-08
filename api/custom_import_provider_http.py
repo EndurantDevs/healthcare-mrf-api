@@ -18,10 +18,12 @@ from api.endpoint.pagination import _parse_non_negative_int
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     MAX_FILTER_TERMS,
-    MAX_GROUPED_PREDICATE_TERMS,
-    MAX_GROUPED_CHILD_PREDICATE_TERMS,
-    MAX_NPI_PAGE_SIZE,
     MAX_FULL_FAMILY_PAGE_SIZE,
+    MAX_GROUPED_CHILD_PREDICATE_TERMS,
+    MAX_GROUPED_PREDICATE_TERMS,
+    MAX_NPI_PAGE_SIZE,
+    MAX_PROVIDER_FILTER_TERMS,
+    MAX_PROVIDER_ORDER_TERMS,
     CustomImportReadRequestError,
     CustomImportReadUnavailableError,
     ExtensionReadAuthorization,
@@ -99,9 +101,7 @@ def _parse_native_query(document: object) -> RequestParameters:
     return args
 
 
-def _parse_provider_request(body: bytes, *, native_query_parser=_parse_native_query) -> _ParsedProviderRequest:
-    """Separate context selectors from whether imported membership is required."""
-
+def _provider_document(body):
     document = transport._strict_json(body)
     base_keys = {"target", "native_query", "context", "filters", "order", "require_match"}
     if (
@@ -117,14 +117,29 @@ def _parse_provider_request(body: bytes, *, native_query_parser=_parse_native_qu
         or transport._canonical_json_bytes(document) != body
     ):
         raise transport._fail()
+    return document
+
+
+def _parse_provider_request(body: bytes, *, native_query_parser=_parse_native_query) -> _ParsedProviderRequest:
+    """Separate context selectors from whether imported membership is required."""
+
+    document = _provider_document(body)
     if type(document["require_match"]) is not bool:
         raise CustomImportReadRequestError("imported membership mode is invalid")
-    order = None if document["order"] is None else transport._parse_order_documents(document["order"])
+    grouped = document.get("grouped_entity_selection")
+    order = (
+        None
+        if document["order"] is None
+        else transport._parse_order_documents(
+            document["order"], maximum_terms=MAX_PROVIDER_ORDER_TERMS if grouped is not None else 3
+        )
+    )
     if order is None and not document["require_match"]:
         raise CustomImportReadRequestError("order-only queries require imported ordering")
     context = transport._parse_filter_documents(document["context"])
-    filters = transport._parse_filter_documents(document["filters"])
-    grouped = document.get("grouped_entity_selection")
+    filters = transport._parse_filter_documents(
+        document["filters"], maximum_terms=MAX_PROVIDER_FILTER_TERMS if grouped is not None else 3
+    )
     if "grouped_entity_selection" in document and type(grouped) is not dict:
         raise transport._fail()
     child = transport._parse_grouped_child_descriptor(document)
@@ -143,7 +158,8 @@ def _parse_provider_request(body: bytes, *, native_query_parser=_parse_native_qu
     return _ParsedProviderRequest(
         target=transport._parse_target(document["target"]),
         native_args=_bounded_native_args(
-            document["native_query"], native_query_parser,
+            document["native_query"],
+            native_query_parser,
             complete_family=grouped is None or entitlement == "full_family",
         ),
         context=context,
@@ -237,6 +253,9 @@ async def _hydrate_provider_rows(
     """Hydrate each selected family once, including multiple addresses per NPI."""
 
     _provider_response_limit(parsed, len(provider_rows))
+    require_match = (
+        query.require_match if prepared.effective_require_match is None else prepared.effective_require_match
+    )
     imported_items = await service.hydrate_npi_page(
         session,
         authorization=authorization,
@@ -247,16 +266,15 @@ async def _hydrate_provider_rows(
     )
     payload_by_entity = {}
     for entity, imported_item in imported_items.items():
-        payload = transport._provider_import_payload(imported_item, parsed.target)
-        if (
-            (parsed.grouped_entity_selection is None or parsed.family_entitlement == "full_family")
-            and len(transport._canonical_json_bytes(payload)) > transport._MAX_RESPONSE_BYTES
-        ):
+        family_payload = transport._provider_import_payload(imported_item, parsed.target)
+        if (parsed.grouped_entity_selection is None or parsed.family_entitlement == "full_family") and len(
+            transport._canonical_json_bytes(family_payload)
+        ) > transport._MAX_RESPONSE_BYTES:
             raise CustomImportReadUnavailableError("provider import response is unavailable")
-        payload_by_entity[entity] = payload
+        payload_by_entity[entity] = family_payload
     for provider in provider_rows:
         imported_item = payload_by_entity.get(str(provider["npi"]))
-        if imported_item is None and query.require_match:
+        if imported_item is None and require_match:
             raise CustomImportReadUnavailableError("provider import match is unavailable")
         provider["custom_import"] = imported_item
 

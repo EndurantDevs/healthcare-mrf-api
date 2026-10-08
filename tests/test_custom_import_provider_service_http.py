@@ -6,11 +6,13 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sanic import response
 from sqlalchemy import literal, select
 
+from api import custom_import_plan_sql as plan_sql
 from api import custom_import_provider_service_http as service_http
 from api import custom_import_read_http as transport
 from process.custom_import.read_contracts import CustomImportReadRequestError, CustomImportReadUnavailableError
@@ -191,7 +193,9 @@ async def test_order_only_service_page_limit_accepts_fifty_with_unmatched_rows(m
     _install(monkeypatch, session, page_items=rows, imported=False, require_match=False)
     body = _body(
         native_query={"code_system": "CPT", "code": "99213", "limit": "50"},
-        filters=[], order=[{"field_id": "metric", "direction": "desc"}], require_match=False,
+        filters=[],
+        order=[{"field_id": "metric", "direction": "desc"}],
+        require_match=False,
     )
 
     reply = await service_http.serve_custom_import_provider_service(_request(body), session)
@@ -287,6 +291,37 @@ async def test_service_read_hydrates_canonical_npi_under_one_signed_snapshot(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_plan_release", [False, True])
+async def test_signed_plan_storage_precedes_read_only_snapshot(monkeypatch, has_plan_release):
+    session = SimpleNamespace()
+    events = []
+
+    async def execute(statement):
+        events.append(str(statement))
+
+    async def allocate(same_session):
+        assert same_session is session
+        events.append("allocate temporary plan tables")
+
+    session.execute = execute
+    allocation = AsyncMock(side_effect=allocate)
+    monkeypatch.setattr(plan_sql, "prepare_plan_query_tables", allocation)
+    await service_http._prepare_service_snapshot(
+        session, {"plan_release_id": "synthetic-release"} if has_plan_release else {}
+    )
+    if has_plan_release:
+        assert events == [
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            "allocate temporary plan tables",
+            "SET TRANSACTION READ ONLY",
+        ]
+        allocation.assert_awaited_once_with(session)
+    else:
+        assert events == ["SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"]
+        allocation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_order_only_service_page_keeps_unmatched_provider_with_null_import(monkeypatch):
     session = _Session()
     _install(
@@ -316,7 +351,7 @@ async def test_invalid_service_permit_does_not_touch_database(monkeypatch, failu
     elif failure == "query":
         request.query_string = "code=99213"
     else:
-        request = _request(_body(native_query={"code_system": "CPT", "code": "99213", "mode": "plan"}))
+        request = _request(_body(native_query={"code_system": "CPT", "code": "99213", "snapshot_id": "untrusted"}))
     session = _Session()
     reply = await service_http.serve_custom_import_provider_service(request, session)
     assert reply.status in {400, 403, 404} and session.events == []
@@ -344,3 +379,39 @@ async def test_generation_finality_failure_does_not_return_provider_data(monkeyp
     _install(monkeypatch, session, page_items=[{"npi": 1104212877}], finality_failure=True)
     reply = await service_http.serve_custom_import_provider_service(_request(), session)
     assert reply.status == 503 and session.rolled_back
+
+
+@pytest.mark.parametrize(
+    "changes,expected_release,valid",
+    (
+        ({}, "synthetic-plan-release", True),
+        ({}, None, False),
+        ({"plan_release_id": "other-release"}, "synthetic-plan-release", False),
+        ({"query": {"plan_release_id": "other-release"}}, "synthetic-plan-release", False),
+        ({"pricing_scope": "claims"}, "synthetic-plan-release", False),
+        ({"custom_import_native_entry_ids": None}, "synthetic-plan-release", False),
+        ({"custom_import_native_entry_ids": ["a" * 64] * 2}, "synthetic-plan-release", False),
+        ({"custom_import_native_entry_ids": ["a" * 64]}, "synthetic-plan-release", False),
+        ({"custom_import_native_entry_ids": ["bad", "b" * 64]}, "synthetic-plan-release", False),
+    ),
+)
+def test_plan_native_entry_identity_is_bound_to_signed_release(changes, expected_release, valid):
+    """Repeated NPI rows require one unique native identity per signed plan entry."""
+
+    plan_payload_by_field = {
+        "items": [{"npi": 1104212877}, {"npi": "1104212877"}],
+        "pagination": {"total": 2, "limit": 2, "offset": 0, "page": 1},
+        "query": {"plan_release_id": "synthetic-plan-release"},
+        "plan_release_id": "synthetic-plan-release",
+        "pricing_scope": "plan_scoped_ptg",
+        "custom_import_native_entry_ids": ["a" * 64, "b" * 64],
+        **changes,
+    }
+    body = transport._canonical_json_bytes(plan_payload_by_field)
+    if not valid:
+        with pytest.raises(CustomImportReadUnavailableError):
+            service_http._service_payload(body, plan_release_id=expected_release)
+        return
+    parsed_by_field = service_http._service_payload(body, plan_release_id=expected_release)
+    assert [provider_item["npi"] for provider_item in parsed_by_field["items"]] == ["1104212877"] * 2
+    assert parsed_by_field["custom_import_native_entry_ids"] == ["a" * 64, "b" * 64]

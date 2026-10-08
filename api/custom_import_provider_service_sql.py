@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sanic.exceptions import InvalidUsage
-from sqlalchemy import Float, String, case, cast, exists, func, select
+from sqlalchemy import Float, String, and_, case, cast, exists, func, or_, select
 from sqlalchemy.sql import Select
 
 from process.custom_import.read_contracts import CustomImportReadUnavailableError
@@ -33,6 +33,8 @@ class ProviderServiceImportQuery:
     def __post_init__(self) -> None:
         if type(self.prepared) is not PreparedNpiEntityRelation or type(self.require_match) is not bool:
             raise CustomImportReadUnavailableError("provider-service import query is invalid")
+        if self.prepared.effective_require_match is not None:
+            object.__setattr__(self, "require_match", self.prepared.effective_require_match)
         if not isinstance(self.prepared.statement, Select):
             raise CustomImportReadUnavailableError("provider-service import relation is invalid")
         _require_unpaged(self.prepared.statement, relation="provider-service import relation")
@@ -47,6 +49,36 @@ class ProviderServiceImportQuery:
         )
         if tuple(self.prepared.statement.selected_columns.keys()) != expected_columns:
             raise CustomImportReadUnavailableError("provider-service import relation is invalid")
+
+
+def provider_service_native_args(request_args, native_args, import_context):
+    """Keep native caller compatibility and reject unpaired imported arguments."""
+
+    if (native_args is None) != (import_context is None):
+        raise InvalidUsage("custom-import provider-service arguments are invalid")
+    if import_context is not None and type(import_context) is not ProviderServiceImportQuery:
+        raise InvalidUsage("custom-import provider-service context is invalid")
+    return request_args if native_args is None else native_args
+
+
+def provider_service_zip_filter(
+    provider_zip, geo_zip_table, zip5, nearby_zip_values, coordinate_scope, distance_expression
+):
+    """Keep claims ZIP eligibility and apply coordinates on its native centroid model."""
+
+    latitude, longitude, radius = coordinate_scope
+    if latitude is not None:
+        coordinate_filter = and_(
+            geo_zip_table.c.latitude.is_not(None),
+            geo_zip_table.c.longitude.is_not(None),
+            distance_expression(latitude, longitude) <= radius,
+        )
+        if zip5:
+            coordinate_filter = or_(geo_zip_table.c.zip_code == zip5, coordinate_filter)
+        return provider_zip.in_(select(geo_zip_table.c.zip_code).where(coordinate_filter))
+    if nearby_zip_values:
+        return provider_zip.in_(nearby_zip_values)
+    return provider_zip == zip5 if zip5 else None
 
 
 @dataclass(frozen=True, slots=True)

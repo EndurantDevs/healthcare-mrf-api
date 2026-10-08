@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 from sanic.exceptions import InvalidUsage
@@ -33,7 +34,10 @@ CUSTOM_IMPORT_PROVIDER_SERVICE_PATH = "/api/v1/extensions/custom-import/provider
 _NATIVE_FIELDS = frozenset(
     "code code_system year state city zip5 zip_radius_miles specialty classification taxonomy_codes "
     "provider_sex_code q min_claims min_total_cost page offset limit order order_by "
-    "include_legacy_fields include_sources include_evidence include_details include_debug".split()
+    "include_legacy_fields include_sources include_evidence include_details include_debug "
+    "plan_release_id npi lat long radius radius_miles mode include_providers include_code_details "
+    "include_allowed_amounts include_unverified_addresses pos place_of_service modifier modifiers "
+    "billing_code_modifier rate negotiated_rate rate_tolerance negotiated_rate_tolerance".split()
 )
 
 
@@ -43,12 +47,14 @@ def _parse_service_native_query(document: object) -> RequestParameters:
     if (
         type(document) is not dict
         or not {"code", "code_system"} <= set(document) <= _NATIVE_FIELDS
-        or any(type(value) is not str or len(value) > 2048 or "\x00" in value for value in document.values())
+        or any(
+            type(entry_id) is not str or len(entry_id) > 2048 or "\x00" in entry_id for entry_id in document.values()
+        )
         or not document["code"].strip()
         or not document["code_system"].strip()
     ):
         raise CustomImportReadRequestError("native provider-service query is invalid")
-    return RequestParameters({name: [value] for name, value in document.items()})
+    return RequestParameters({name: [entry_id] for name, entry_id in document.items()})
 
 
 async def serve_custom_import_provider_service(request: Any, session: Any):
@@ -76,7 +82,7 @@ async def serve_custom_import_provider_service(request: Any, session: Any):
         if session is None or session.in_transaction():
             raise CustomImportReadUnavailableError("fresh provider-service read session is required")
         async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), session.begin():
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            await _prepare_service_snapshot(session, parsed.native_args)
             async with _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS):
                 service_payload = await _read_service_payload(request, session, parsed, verified)
                 encoded = transport._canonical_json_bytes(service_payload)
@@ -89,11 +95,24 @@ async def serve_custom_import_provider_service(request: Any, session: Any):
         return transport._error(status)
 
 
+async def _prepare_service_snapshot(session, native_args):
+    """Allocate plan-only TEMP storage before entering the shared read-only snapshot."""
+
+    if native_args.get("plan_release_id"):
+        from api.custom_import_plan_sql import prepare_plan_query_tables
+
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        await prepare_plan_query_tables(session)
+        await session.execute(text("SET TRANSACTION READ ONLY"))
+    else:
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+
+
 async def _read_service_payload(request, session, parsed, verified):
     pinned_target = await transport._resolve_pinned_target(session, parsed.target)
     service = CustomImportReadService(authorizer=transport._TransportAuthorizer(verified, pinned_target))
     authorization = ExtensionReadAuthorization(verified.credential)
-    query = _provider_relation_query(parsed, require_exact_context=True)
+    query = _provider_relation_query(parsed, require_exact_context=parsed.grouped_entity_selection is None)
     prepared = await service.prepare_npi_entity_relation(
         session,
         authorization=authorization,
@@ -107,34 +126,57 @@ async def _read_service_payload(request, session, parsed, verified):
     )
     if reply.status != 200 or len(reply.body) > transport._MAX_RESPONSE_BYTES:
         raise CustomImportReadUnavailableError("provider-service response is unavailable")
-    payload = _service_payload(reply.body)
+    response_by_field = _service_payload(reply.body, plan_release_id=parsed.native_args.get("plan_release_id"))
     await _hydrate_provider_rows(
-        session, service, authorization, pinned_target, prepared, parsed, query, payload["items"]
+        session, service, authorization, pinned_target, prepared, parsed, query, response_by_field["items"]
     )
     await verify_published_generation(session, pinned_target)
-    return payload
+    return response_by_field
 
 
-def _service_payload(body: bytes) -> dict[str, Any]:
+def _service_payload(body: bytes, *, plan_release_id: str | None = None) -> dict[str, Any]:
     """Reject malformed native pages before collecting bounded hydration keys."""
 
-    payload = json.loads(body)
+    response_by_field = json.loads(body)
     if (
-        type(payload) is not dict
-        or type(payload.get("items")) is not list
-        or len(payload["items"]) > MAX_NPI_PAGE_SIZE
-        or type(payload.get("pagination")) is not dict
-        or type(payload.get("query")) is not dict
-        or any(type(item) is not dict or type(item.get("npi")) not in {int, str} for item in payload["items"])
+        type(response_by_field) is not dict
+        or type(response_by_field.get("items")) is not list
+        or len(response_by_field["items"]) > MAX_NPI_PAGE_SIZE
+        or type(response_by_field.get("pagination")) is not dict
+        or type(response_by_field.get("query")) is not dict
+        or any(
+            type(provider_item) is not dict or type(provider_item.get("npi")) not in {int, str}
+            for provider_item in response_by_field["items"]
+        )
     ):
         raise CustomImportReadUnavailableError("provider-service response is unavailable")
     try:
-        for item in payload["items"]:
-            item["npi"] = str(item["npi"])
-        _validate_npi_page(tuple(item["npi"] for item in payload["items"]))
+        for provider_item in response_by_field["items"]:
+            provider_item["npi"] = str(provider_item["npi"])
+        npis = tuple(provider_item["npi"] for provider_item in response_by_field["items"])
+        if plan_release_id:
+            identities = response_by_field.get("custom_import_native_entry_ids")
+            if (
+                response_by_field.get("plan_release_id") != plan_release_id
+                or response_by_field["query"].get("plan_release_id") != plan_release_id
+                or response_by_field.get("pricing_scope") != "plan_scoped_ptg"
+                or type(identities) is not list
+                or len(identities) != len(npis)
+                or any(
+                    type(entry_id) is not str or re.fullmatch(r"[0-9a-f]{64}", entry_id) is None
+                    for entry_id in identities
+                )
+                or len(set(identities)) != len(identities)
+            ):
+                raise CustomImportReadRequestError("provider-service native entry identity is invalid")
+            _validate_npi_page(tuple(dict.fromkeys(npis)))
+        else:
+            if "custom_import_native_entry_ids" in response_by_field:
+                raise CustomImportReadRequestError("provider-service native entry identity is invalid")
+            _validate_npi_page(npis)
     except CustomImportReadRequestError:
         raise CustomImportReadUnavailableError("provider-service response is unavailable") from None
-    return payload
+    return response_by_field
 
 
 async def _service_page(request: Any, **kwargs: Any):

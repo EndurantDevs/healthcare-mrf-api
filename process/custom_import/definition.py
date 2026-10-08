@@ -18,6 +18,7 @@ from typing import Any
 import yaml
 
 from process.custom_import._source_text import _SourceTextValidationError, validate_source_label
+from process.custom_import.derived_query import DerivedQueryField, parse_derived_fields
 
 CONTRACT_VERSION = "custom-import/v1"
 MAX_DEFINITION_BYTES = 1024 * 1024
@@ -29,6 +30,7 @@ MAX_SELECTION_PROFILES = 4
 MAX_CONTEXT_DIMENSIONS = 2
 MAX_SELECTION_TERMS = 3
 MAX_ORDER_TERMS = 3
+MAX_GROUPED_ORDER_TERMS = 4
 MAX_REVISION_NUMBER = 2_147_483_647
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
@@ -308,11 +310,19 @@ class QueryContract:
     aliases: tuple[QueryAlias, ...] = ()
     sortable_fields: tuple[str, ...] = ()
     entity_selection: EntitySelection | None = None
+    derived_fields: tuple[DerivedQueryField, ...] = ()
+    filterable_fields: tuple[str, ...] | None = None
+
+    @property
+    def derived_by_id(self) -> dict[str, DerivedQueryField]:
+        """Return definition-owned reducers separately from stored field slots."""
+
+        return {field.field_id: field for field in self.derived_fields}
 
     def resolve_field_id(self, name: str) -> str | None:
         """Resolve one canonical query field or immutable query alias."""
 
-        if name in self.root_fields or name in self.child_fields:
+        if name in self.root_fields or name in self.child_fields or name in self.derived_by_id:
             return name
         return next((alias.field_id for alias in self.aliases if alias.name == name), None)
 
@@ -846,6 +856,18 @@ def _parse_aliases(
     return tuple(sorted(parsed_aliases, key=lambda alias: (alias.stream_id, alias.source_label)))
 
 
+_QUERY_KEYS = {
+    "root_fields",
+    "child",
+    "order",
+    "aliases",
+    "sortable_fields",
+    "filterable_fields",
+    "entity_selection",
+    "derived_fields",
+}
+
+
 def _parse_query(
     raw: Any,
     root_fields: tuple[Field, ...],
@@ -854,11 +876,85 @@ def _parse_query(
 ) -> QueryContract:
     """Parse the projected query surface, aliases, and result ordering."""
 
-    query = _mapping(
-        raw,
-        "definition.query",
-        keys={"root_fields", "child", "order", "aliases", "sortable_fields", "entity_selection"},
+    query = _mapping(raw, "definition.query", keys=_QUERY_KEYS)
+    root_query_fields, child_collection, query_child_fields = _parse_query_exposure(
+        query, root_fields, child_fields, children
     )
+    selection = (
+        _parse_entity_selection(query["entity_selection"], root_fields, root_query_fields)
+        if "entity_selection" in query
+        else None
+    )
+    derived_fields = parse_derived_fields(
+        query.get("derived_fields", []),
+        root_fields,
+        child_fields,
+        children,
+        root_query_fields,
+        child_collection,
+        query_child_fields,
+        selection,
+    )
+    derived_ids = {field.field_id for field in derived_fields}
+    permitted_field_ids = set(root_query_fields) | set(query_child_fields) | derived_ids
+    order_terms, query_aliases, sortable_fields, filterable_fields = _parse_query_permissions(
+        query,
+        permitted_field_ids,
+        {field.field_id for field in (*root_fields, *child_fields)} | derived_ids,
+        selection is not None,
+    )
+    return QueryContract(
+        root_query_fields,
+        child_collection,
+        query_child_fields,
+        order_terms,
+        query_aliases,
+        sortable_fields,
+        selection,
+        derived_fields,
+        filterable_fields,
+    )
+
+
+def _parse_query_permissions(query, permitted_field_ids, canonical_field_ids, has_grouped_selection):
+    """Keep explicit filtering and result-order grants distinct from source exposure."""
+
+    order_terms = _parse_sort_terms(
+        query.get("order", []),
+        "definition.query.order",
+        maximum=MAX_GROUPED_ORDER_TERMS if has_grouped_selection else MAX_ORDER_TERMS,
+    )
+    if any(term.field_id not in permitted_field_ids for term in order_terms):
+        raise DefinitionError("query order terms must use permitted query fields")
+    sortable_fields = _parse_sortable_fields(query.get("sortable_fields", []), permitted_field_ids)
+    filterable_fields = (
+        _parse_filterable_fields(query.get("filterable_fields"), permitted_field_ids)
+        if "filterable_fields" in query
+        else None
+    )
+    if filterable_fields is not None and any(term.field_id not in sortable_fields for term in order_terms):
+        raise DefinitionError("explicit query ordering must use sortable fields")
+    aliases = _parse_query_aliases(
+        query.get("aliases", {}), permitted=permitted_field_ids, canonical_field_ids=canonical_field_ids
+    )
+    return order_terms, aliases, sortable_fields, filterable_fields
+
+
+def _parse_filterable_fields(raw, permitted_field_ids):
+    """Preserve legacy filtering unless an explicit canonical whitelist is set."""
+
+    identifiers = tuple(
+        _identifier(field_id, "definition.query.filterable_fields")
+        for field_id in _array(raw, "definition.query.filterable_fields")
+    )
+    if len(identifiers) != len(set(identifiers)) or not set(identifiers).issubset(permitted_field_ids):
+        raise DefinitionError("filterable fields must be unique permitted query fields")
+    return identifiers
+
+
+def _parse_query_exposure(query, root_fields, child_fields, children):
+    """Resolve only stored, projected fields before admitting numeric reducers."""
+
     root_ids = {field.field_id for field in root_fields if field.projection_slot is not None}
     child_by_collection: dict[str, set[str]] = {}
     for field in child_fields:
@@ -871,26 +967,7 @@ def _parse_query(
     if len(root_query_fields) != len(set(root_query_fields)) or not set(root_query_fields).issubset(root_ids):
         raise DefinitionError("query root fields must be unique projected root fields")
     child_collection, query_child_fields = _parse_query_child(query.get("child"), child_by_collection, children)
-    order_terms = _parse_sort_terms(query.get("order", []), "definition.query.order", maximum=MAX_ORDER_TERMS)
-    permitted_field_ids = set(root_query_fields) | set(query_child_fields)
-    if any(term.field_id not in permitted_field_ids for term in order_terms):
-        raise DefinitionError("query order terms must use permitted query fields")
-    query_aliases = _parse_query_aliases(
-        query.get("aliases", {}),
-        permitted=permitted_field_ids,
-        canonical_field_ids={field.field_id for field in (*root_fields, *child_fields)},
-    )
-    return QueryContract(
-        root_query_fields,
-        child_collection,
-        query_child_fields,
-        order_terms,
-        query_aliases,
-        _parse_sortable_fields(query.get("sortable_fields", []), permitted_field_ids),
-        _parse_entity_selection(query["entity_selection"], root_fields, root_query_fields)
-        if "entity_selection" in query
-        else None,
-    )
+    return root_query_fields, child_collection, query_child_fields
 
 
 def _parse_entity_selection(raw, root_fields, query_fields) -> EntitySelection:

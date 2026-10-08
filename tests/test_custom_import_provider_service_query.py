@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import literal, select
+from sqlalchemy import Column, Float, MetaData, String, Table, literal, select
 from sqlalchemy.dialects import postgresql
 
 from api import custom_import_provider_service_sql as service_sql
@@ -78,6 +78,7 @@ def _assert_imported_claims_sql(statements, direction: str) -> None:
     assert page_sql.index(") AS native_provider_service") < page_sql.index("LEFT OUTER JOIN")
     assert page_sql.index("LEFT OUTER JOIN") < page_sql.rindex("WHERE native_provider_service.total_services")
     assert "pricing_provider_procedure.total_services >=" not in page_sql
+    assert "pricing_provider_procedure.npi =" in count_sql and "pricing_provider_procedure.npi =" in page_sql
     assert "custom_import_provider_service.entity_value IS NULL ASC" in page_sql
     assert f"custom_import_provider_service.sort_0 {direction.upper()} NULLS LAST" in page_sql
     assert "native_provider_service.npi ASC" in page_sql
@@ -133,6 +134,7 @@ async def test_by_service_import_order_groups_then_joins_counts_and_pages(monkey
             "code_system": "CPT",
             "min_claims": "10",
             "min_total_cost": "20",
+            "npi": "1000000001",
             "limit": "1",
             "offset": "0",
         },
@@ -200,10 +202,72 @@ def test_claims_composition_rejects_paged_native_relation():
         )
 
 
+def test_claims_coordinate_eligibility_is_unpaged_and_preserves_exact_zip_union():
+    metadata = MetaData()
+    providers = Table("synthetic_providers", metadata, Column("zip5", String))
+    zips = Table(
+        "synthetic_zips", metadata, Column("zip_code", String), Column("latitude", Float), Column("longitude", Float)
+    )
+    clause = service_sql.provider_service_zip_filter(
+        providers.c.zip5,
+        zips,
+        "12345",
+        [],
+        (10, 20, 5),
+        lambda latitude, longitude: (zips.c.latitude - latitude) + (zips.c.longitude - longitude),
+    )
+    sql = _compiled(select(providers).where(clause))
+    assert "synthetic_zips.latitude IS NOT NULL" in sql
+    assert "synthetic_zips.longitude IS NOT NULL" in sql
+    assert "synthetic_zips.zip_code =" in sql and " OR " in sql
+    assert "LIMIT" not in sql and "OFFSET" not in sql
+
+
 @pytest.mark.asyncio
 async def test_by_service_import_context_requires_native_args_pair():
     with pytest.raises(pricing.InvalidUsage, match="arguments are invalid"):
         await pricing.list_providers_by_procedure(_request(_Session(())), native_args={})
+
+
+@pytest.mark.asyncio
+async def test_service_rejects_substituted_import_context():
+    session = _Session(())
+    with pytest.raises(pricing.InvalidUsage, match="context is invalid"):
+        await pricing.list_providers_by_procedure(
+            _request(session), native_args={"code": "99213", "code_system": "CPT"}, import_context=object()
+        )
+    assert session.statements == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordinate_args", [{"radius": "2"}, {"lat": "10"}])
+async def test_imported_service_rejects_incomplete_geography(coordinate_args):
+    session = _Session(())
+    with pytest.raises(pricing.InvalidUsage, match="requires|provided together"):
+        await pricing.list_providers_by_procedure(
+            _request(session),
+            native_args={"code": "99213", "code_system": "CPT", **coordinate_args},
+            import_context=service_sql.ProviderServiceImportQuery(_prepared(), require_match=True),
+        )
+    assert session.statements == []
+
+
+@pytest.mark.asyncio
+async def test_imported_service_rejects_mixed_evidence_card():
+    session = _Session(())
+    with pytest.raises(pricing.InvalidUsage, match="do not support include_allowed_amounts"):
+        await pricing.list_providers_by_procedure(
+            _request(session),
+            native_args={
+                "code": "27447",
+                "code_system": "CPT",
+                "plan_release_id": "hprelease_" + "1" * 26,
+                "view": "card",
+                "include_allowed_amounts": "true",
+            },
+            import_context=service_sql.ProviderServiceImportQuery(_prepared(), require_match=True),
+        )
+    assert session.statements == []
 
 
 @pytest.mark.parametrize("branch_args", ({"cursor": "opaque"}, {"plan_id": "TESTPLAN001"}))

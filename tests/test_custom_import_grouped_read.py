@@ -2,6 +2,7 @@
 
 """Closed definition, typed selector, and identity-bound grouped read checks."""
 
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -16,9 +17,72 @@ from process.custom_import.definition import CustomImportDefinition, DefinitionE
 from process.custom_import.read_core import CustomImportReadRequestError, ExtensionReadScope, ReadFilter, ReadOrderTerm
 from tests import custom_import_grouped_support as fixture
 from tests import test_custom_import_provider_http as provider_fixture
+from tests import test_custom_import_provider_query as query_fixture
 from tests import test_custom_import_read_http as http_fixture
 
 _SCOPE = ExtensionReadScope("synthetic:grouped")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["search", "winner_detail", "unselected_context"])
+async def test_grouped_context_rejects_legacy_entrypoints(monkeypatch, route):
+    context = fixture.context()
+    if route == "unselected_context":
+        definition_document = fixture.definition_document()
+        definition_document["query"].pop("entity_selection")
+        context = replace(context, definition=CustomImportDefinition.from_mapping(definition_document))
+
+    @asynccontextmanager
+    async def bounded_window(_session, **_kwargs):
+        yield
+
+    monkeypatch.setattr(read_core, "_bounded_read_window", bounded_window)
+    monkeypatch.setattr(read_core, "_load_read_context", AsyncMock(return_value=context))
+    lookup = AsyncMock(side_effect=AssertionError("invalid route must not select legacy winners"))
+    monkeypatch.setattr(read_core, "_entity_winner_locator", lookup)
+    monkeypatch.setattr(read_core, "_selected_winner_row", lookup)
+    service = read_core.CustomImportReadService(authorizer=query_fixture._Allow(), cursor_secret=b"s" * 32)
+    authorization = read_core.ExtensionReadAuthorization("synthetic")
+    with pytest.raises(CustomImportReadRequestError, match="generic search|entity selector|detail context"):
+        if route == "search":
+            await service.search(None, authorization=authorization, request=read_core.SearchRequest(context.target))
+        elif route == "winner_detail":
+            await service.root_detail(
+                None,
+                authorization=authorization,
+                target=context.target,
+                winner=read_core.WinnerLocator(1, 2, 3, b"w" * 32),
+            )
+        else:
+            request = read_core.RootDetailRequest(
+                context.target, read_core.EntityLocator("npi", "1234567893"), "full_family", ()
+            )
+            await service.root_detail_for_entity(None, authorization=authorization, request=request)
+    lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter_id,is_missing_family", [("synthetic", False), ("npi", True)])
+async def test_grouped_detail_rejects_incomplete_identity(monkeypatch, adapter_id, is_missing_family):
+    context = fixture.context()
+    request = read_core.RootDetailRequest(
+        context.target,
+        read_core.EntityLocator(adapter_id, "1234567893"),
+        "full_family",
+        (),
+        fixture.selection_document(),
+    )
+    session = SimpleNamespace(scalar=AsyncMock(return_value=1), execute=AsyncMock())
+    family_reader = AsyncMock(return_value=())
+    monkeypatch.setattr(grouped_read, "_selected_family_rows", family_reader)
+    error_type = read_core.CustomImportReadUnavailableError if is_missing_family else CustomImportReadRequestError
+    with pytest.raises(error_type, match="selected families|NPI adapter"):
+        await grouped_read.hydrate_detail(session, context, request, _SCOPE)
+    if is_missing_family:
+        family_reader.assert_awaited_once()
+    else:
+        session.scalar.assert_not_awaited()
+        family_reader.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -103,7 +167,6 @@ def test_selectors_reject_duplicate_aliases_metrics_and_child_fields(selectors):
 @pytest.mark.parametrize(
     "changes",
     [
-        {"require_exact_context": True},
         {"filters": (ReadFilter("score", "gt", "10"),)},
         {"order_terms": (ReadOrderTerm("score", "asc", "last"),)},
         {
@@ -117,12 +180,25 @@ def test_metrics_and_order_require_one_explicit_group(changes):
         grouped_read.normalize_plan(fixture.context(), fixture.query(**changes), _SCOPE)
 
 
-def test_four_logical_predicates_count_default_year_and_leave_legacy_cap_unchanged():
+def test_grouped_predicate_budget_counts_default_year_and_leaves_legacy_cap_unchanged():
     metrics = (ReadFilter("score", "gt", "1"), ReadFilter("score", "lt", "100"), ReadFilter("npi", "eq", "1234567893"))
     selectors = (ReadFilter("segment", "eq", "segment_a"),)
+    assert (
+        len(
+            grouped_read.normalize_plan(
+                fixture.context(), fixture.query(context_filters=selectors, filters=metrics), _SCOPE
+            ).filters
+        )
+        == 3
+    )
     with pytest.raises(CustomImportReadRequestError):
         grouped_read.normalize_plan(
-            fixture.context(), fixture.query(context_filters=selectors, filters=metrics), _SCOPE
+            fixture.context(),
+            fixture.query(
+                context_filters=selectors,
+                filters=metrics + (ReadFilter("score", "eq", "10"), ReadFilter("score", "eq", "20")),
+            ),
+            _SCOPE,
         )
     allowed = fixture.query(context_filters=selectors, filters=metrics[:2])
     assert grouped_read.normalize_plan(fixture.context(), allowed, _SCOPE).selected_value is None
@@ -593,7 +669,7 @@ async def test_unicode_detail_and_page_keep_their_wire_bounds(monkeypatch, child
 
     page_query = fixture.query(family_entitlement="full_family")
     page_plan = grouped_read.normalize_plan(context, page_query, _SCOPE)
-    prepared = read_core.PreparedNpiEntityRelation(None, (), page_plan.fingerprint, read_core._scope_digest(_SCOPE))
+    prepared = grouped_read.prepare_relation(context, page_query, _SCOPE)
     if children_per_group == 80:
         assert len(transport._canonical_json_bytes(detail_payload)) > transport._MAX_RESPONSE_BYTES
         with pytest.raises(read_core.CustomImportReadUnavailableError, match="family response exceeds"):

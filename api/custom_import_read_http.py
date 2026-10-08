@@ -573,10 +573,10 @@ def _parse_entity(value: object) -> EntityLocator:
         raise _fail() from None
 
 
-def _parse_filter_documents(filter_documents: object) -> tuple[ReadFilter, ...]:
+def _parse_filter_documents(filter_documents: object, *, maximum_terms: int = 3) -> tuple[ReadFilter, ...]:
     """Parse the bounded structured filter list."""
 
-    if type(filter_documents) is not list or len(filter_documents) > 3:
+    if type(filter_documents) is not list or len(filter_documents) > maximum_terms:
         raise _fail()
     read_filters: list[ReadFilter] = []
     for filter_document in filter_documents:
@@ -603,10 +603,10 @@ def _parse_filter_documents(filter_documents: object) -> tuple[ReadFilter, ...]:
     return tuple(read_filters)
 
 
-def _parse_order_documents(order_documents: object) -> tuple[ReadOrderTerm, ...]:
+def _parse_order_documents(order_documents: object, *, maximum_terms: int = 3) -> tuple[ReadOrderTerm, ...]:
     """Parse request-selected order terms with the fixed null policy."""
 
-    if type(order_documents) is not list or not 1 <= len(order_documents) <= 3:
+    if type(order_documents) is not list or not 1 <= len(order_documents) <= maximum_terms:
         raise _fail()
     order_terms: list[ReadOrderTerm] = []
     for order_document in order_documents:

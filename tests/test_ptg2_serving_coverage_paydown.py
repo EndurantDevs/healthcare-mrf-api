@@ -1,11 +1,15 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from api import ptg2_serving as serving
+from api.endpoint import npi as npi_module
+from api.endpoint import pricing
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from tests.ptg2_serving_coverage_paydown_support import (
     FakeResult,
     FakeSession,
@@ -44,12 +48,117 @@ def test_membership_location_sql_keeps_snapshot_scope_join_planner_visible(
 
     statement = serving._membership_location_sql(query, limit=2, offset=0)
 
-    assert (
-        "JOIN mrf.ptg2_v3_npi_scope npi_scope "
-        "ON npi_scope.npi = addr.npi"
-    ) in statement
+    assert ("JOIN mrf.ptg2_v3_npi_scope npi_scope ON npi_scope.npi = addr.npi") in statement
     assert "npi_scope.snapshot_key = :shared_snapshot_key" in statement
     assert "SELECT npi_scope.snapshot_key, npi_scope.npi" not in statement
+
+
+@pytest.mark.parametrize("is_assured", [False, True])
+def test_unpaged_location_keeps_complete_scope(is_assured):
+    query = replace(
+        _location_query(knn_order_sql="addr.location <-> :requested_location"),
+        address_assurance_sql="addr.geo_evidence_level IS NOT NULL" if is_assured else "TRUE",
+    )
+    original_parameter_map = dict(query.parameter_map)
+    statement = serving._unpaged_membership_location_sql(query)
+    assert "LIMIT :limit" not in statement and "OFFSET :offset" not in statement
+    assert "<->" not in statement
+    assert "npi_scope.snapshot_key = :shared_snapshot_key" in statement
+    assert ("WHERE classified.geo_evidence_level IS NOT NULL" in statement) is is_assured
+    assert query.knn_order_sql == "addr.location <-> :requested_location"
+    assert query.parameter_map == original_parameter_map
+
+
+@pytest.mark.asyncio
+async def test_native_sources_keep_valid_selected_address(monkeypatch):
+    address_key = "00000000-0000-0000-0000-000000000001"
+    addresses = [
+        dict(npi=1000000001, address_key=address_key, address_sources=["mrf"]),
+        dict(npi="invalid", address_key=address_key, address_sources=["mrf"]),
+    ]
+    source_rows = [
+        dict(npi="invalid", address_key=address_key, issuer_name="Synthetic Issuer"),
+        dict(
+            npi=1000000001,
+            address_key=address_key,
+            issuer_name="Synthetic Issuer",
+            issuer_ids=[None, "invalid", 7, "7"],
+            source_urls=[],
+        ),
+    ]
+    monkeypatch.setattr(npi_module, "_is_table_available", AsyncMock(return_value=True))
+    reader = AsyncMock(return_value=SimpleNamespace(all=lambda: source_rows))
+    monkeypatch.setattr(npi_module, "_execute_stmt", reader)
+    await npi_module._attach_mrf_source_details(addresses, session=object())
+    assert reader.await_args.kwargs["params"]["npis"] == [1000000001]
+    assert addresses[0][npi_module.MRF_SOURCE_DETAIL_KEY][0]["issuer_ids"] == [7]
+    assert addresses[0][npi_module.MRF_SOURCE_COUNT_KEY] == 1
+    assert npi_module.MRF_SOURCE_DETAIL_KEY not in addresses[1]
+
+
+@pytest.mark.parametrize("network_status", [pricing.ALLOWED_AMOUNT_NETWORK_STATUS_MIXED, "unknown"])
+def test_payment_evidence_keeps_unverified_fields_separate(network_status):
+    provider_by_field = dict(
+        network_statuses=[network_status],
+        address_payload="invalid JSON",
+        allowed_amount_min="invalid",
+        evidence_count="invalid",
+    )
+    provider_item = pricing._allowed_amount_provider_item(
+        npi=1000000001,
+        payment_rows=[{"network_status": network_status}],
+        provider_by_field=provider_by_field,
+        code="27447",
+        code_system="CPT",
+    )
+    assert provider_item["npi"] == 1000000001
+    expected_disclaimer = (
+        "Historical allowed amount with mixed network status; not a contracted negotiated rate."
+        if network_status == pricing.ALLOWED_AMOUNT_NETWORK_STATUS_MIXED
+        else "Historical out-of-network or not-confirmed-in-network allowed amount; not a negotiated rate."
+    )
+    assert provider_item["prices"][0]["disclaimer"] == expected_disclaimer
+    assert provider_item["prices"][0]["price_type"] == "historical_allowed_amount"
+    assert pricing._allowed_amount_sources("invalid JSON") == []
+    assert "address" not in provider_item
+    assert provider_item["allowed_amount_min"] is None
+    assert provider_item["evidence_count"] == 0
+
+
+def test_provider_totals_keep_native_legacy_aliases():
+    provider_by_field = dict(
+        total_services=3,
+        total_reported_service_codes=2,
+        total_submitted_charges=9,
+        total_beneficiaries=1,
+        total_allowed_amount="2.000000000001",
+    )
+    canonical_by_field = dict(provider_by_field)
+    pricing._add_legacy_provider_totals(provider_by_field)
+    assert all(provider_by_field[key] == value for key, value in canonical_by_field.items())
+    assert provider_by_field["total_claims"] == 3
+    assert provider_by_field["total_30day_fills"] == 2
+    assert provider_by_field["total_day_supply"] == 9
+    assert provider_by_field["total_benes"] == 1
+    assert provider_by_field["total_drug_cost"] == "2.000000000001"
+
+
+def test_unified_geo_retains_service_location_types(monkeypatch):
+    monkeypatch.setattr(npi_module, "_should_include_geo_service_locations", lambda: True)
+    clause = npi_module._nearby_geo_type_clause("mrf.entity_address_unified")
+    assert all(f"'{address_type}'" in clause for address_type in npi_module.GEO_SERVICE_LOCATION_TYPES)
+    assert npi_module._nearby_geo_type_clause("mrf.npi_address") == "AND (a.type = 'primary' OR a.type = 'secondary')"
+
+
+@pytest.mark.parametrize("window_count", [0, 2])
+def test_unpaged_location_rejects_ambiguous_window(monkeypatch, window_count):
+    monkeypatch.setattr(
+        serving,
+        "_membership_location_sql",
+        lambda *_args, **_kwargs: "SELECT 1 " + "LIMIT :limit OFFSET :offset " * window_count,
+    )
+    with pytest.raises(PTG2ManifestArtifactError, match="invalid page window"):
+        serving._unpaged_membership_location_sql(_location_query())
 
 
 def test_membership_filter_rejects_empty_scope_and_invalid_values():
@@ -179,12 +288,11 @@ def test_unified_geo_sql_requires_record_level_evidence():
 
 def test_unified_location_identity_uses_collision_resistant_location_key():
     assert "premise_key" in serving._PTG2_UNIFIED_ADDRESS_COLUMNS
-    assert serving._ptg2_address_location_hash_sql(
-        "addr", "mrf.entity_address_unified"
-    ) == "CONCAT('entity_address_unified:', addr.location_key)"
-    assert "checksum" in serving._ptg2_address_location_hash_sql(
-        "addr", "mrf.npi_address"
+    assert (
+        serving._ptg2_address_location_hash_sql("addr", "mrf.entity_address_unified")
+        == "CONCAT('entity_address_unified:', addr.location_key)"
     )
+    assert "checksum" in serving._ptg2_address_location_hash_sql("addr", "mrf.npi_address")
 
 
 def test_address_provenance_exposes_dataset_version_and_retrieval_time():
@@ -244,14 +352,10 @@ def test_include_evidence_exposes_truthful_location_confidence():
     }
 
     default_response = serving._shape_ptg2_response(payload, {})
-    evidence_response = serving._shape_ptg2_response(
-        payload, {"include_evidence": True}
-    )
+    evidence_response = serving._shape_ptg2_response(payload, {"include_evidence": True})
 
     assert "confidence" not in default_response["items"][0]
-    assert evidence_response["items"][0]["confidence"]["location"] == (
-        "nppes_provider_address"
-    )
+    assert evidence_response["items"][0]["confidence"]["location"] == ("nppes_provider_address")
 
 
 @pytest.mark.asyncio

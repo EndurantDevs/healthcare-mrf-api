@@ -7,15 +7,17 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, replace
 
-from sqlalchemy import literal
+from sqlalchemy import and_, inspect, literal
 
-from db.models.custom_import import CustomImportEntityBinding, CustomImportWinner
+from db.models.custom_import import CustomImportEntityBinding, CustomImportRootScalar, CustomImportWinner
 from process.custom_import import grouped_child_read as child
 from process.custom_import import read_core as core
 from process.custom_import.definition import canonical_json
 from process.custom_import.materialization import _context_digest
 from process.custom_import.read_contracts import (
     MAX_FAMILY_RESPONSE_BYTES as MAX_FAMILY_RESPONSE_BYTES,
+)
+from process.custom_import.read_contracts import (
     MAX_FULL_FAMILY_PAGE_SIZE,
     canonical_read_document,
 )
@@ -31,6 +33,7 @@ class GroupedReadPlan:
     order_terms: tuple
     fingerprint: str
     projection: str = "query_projection"
+    require_match: bool = True
 
 
 async def bind_default_profile(session, context):
@@ -58,14 +61,12 @@ def _verified_descriptor(context, supplied):
     return selection
 
 
-def normalize_plan(context, query, scope, *, projection="query_projection") -> GroupedReadPlan:
+def normalize_plan(context, query, scope, *, projection="query_projection", use_default_order=True) -> GroupedReadPlan:
     """Normalize aliases without allowing metrics to influence the selected value."""
 
     selection = _verified_descriptor(context, query.grouped_entity_selection)
     if type(query.require_match) is not bool or type(query.require_exact_context) is not bool:
         raise core.CustomImportReadRequestError("imported membership mode is invalid")
-    if query.require_exact_context:
-        raise core.CustomImportReadRequestError("grouped selection is unavailable for exact-context service reads")
     child_key = child.verified_child_key(context, query.grouped_child_query)
     child_collection = child_key.collection if child_key is not None else None
     maximum_terms = core._relation_predicate_limit(query)
@@ -81,32 +82,92 @@ def normalize_plan(context, query, scope, *, projection="query_projection") -> G
     dimensions = core._verify_context_filters(root_selectors, context)
     if child_key is not None:
         child.verify_child_selectors(child_selectors, child_key)
-    metrics = core._normalized_filters(query.filters, context, query_child_collection=child_collection)
-    core._verify_metric_filters(metrics, dimensions + ((child_key.field_id,) if child_key is not None else ()))
-    order = (
-        ()
-        if query.order_terms is None
-        else core._normalize_query_order_terms(
-            query.order_terms, context, explicit=True, query_child_collection=child_collection
-        )
-    )
-    if (
-        any(context.definition.fields_by_id[term.field_id].collection is not None for term in order)
-        and not child_selectors
-    ):
-        raise core.CustomImportReadRequestError("child ordering requires exact complete-key context")
+    metrics, order = _metric_terms(context, query, child_collection, dimensions, child_key, use_default_order)
+    _verify_metric_scope(context, metrics, order, selectors, child_selectors)
     selected_value = next(
         (predicate.value for predicate in selectors if predicate.field.field_id == selection.field_id), None
     )
     if len(selectors) + len(metrics) + (selected_value is None) > maximum_terms:
         raise core.CustomImportReadRequestError("grouped selection predicate count exceeds its limit")
-    if (metrics or order) and not any(predicate.field.field_id == selection.group_field_id for predicate in selectors):
-        raise core.CustomImportReadRequestError("grouped metrics and ordering require an explicit group selector")
     if metrics and not query.require_match:
         raise core.CustomImportReadRequestError("metric predicates require imported membership")
     projection = "full_family" if query.family_entitlement == "full_family" else projection
     fingerprint = _query_fingerprint(context, query, selectors, metrics, order, selected_value, projection, scope)
-    return GroupedReadPlan(selected_value, selectors, metrics, order, fingerprint, projection)
+    return GroupedReadPlan(
+        selected_value, selectors, metrics, order, fingerprint, projection, query.require_match or bool(child_selectors)
+    )
+
+
+def _metric_terms(context, query, child_collection, dimensions, child_key, use_default_order):
+    metrics = core._normalized_filters(
+        query.filters,
+        context,
+        query_child_collection=child_collection,
+        maximum_terms=core.MAX_PROVIDER_FILTER_TERMS,
+        allow_derived=True,
+    )
+    core._verify_metric_filters(metrics, dimensions + ((child_key.field_id,) if child_key is not None else ()))
+    order = (
+        ()
+        if query.order_terms is None and not use_default_order
+        else core._normalize_query_order_terms(
+            query.order_terms
+            if query.order_terms is not None
+            else tuple(
+                core.ReadOrderTerm(term.field_id, term.direction, term.nulls)
+                for term in context.definition.query.order_terms
+            ),
+            context,
+            explicit=query.order_terms is not None,
+            query_child_collection=child_collection,
+            maximum_terms=core.MAX_PROVIDER_ORDER_TERMS,
+            allow_derived=True,
+        )
+    )
+    return metrics, order
+
+
+def _verify_metric_scope(context, metrics, order, selectors, child_selectors):
+    filterable_fields = getattr(context.definition.query, "filterable_fields", None)
+    if filterable_fields is not None and any(
+        predicate.field.field_id not in filterable_fields for predicate in metrics
+    ):
+        raise core.CustomImportReadRequestError("filter field is not opted in by the query contract")
+    if (
+        any(_query_field(context, term.field_id).collection is not None for term in order)
+        or any(
+            predicate.field.field_id in context.definition.query.derived_by_id
+            and predicate.field.collection is not None
+            for predicate in metrics
+        )
+    ) and not child_selectors:
+        raise core.CustomImportReadRequestError("child ordering requires exact complete-key context")
+    raw_terms = [term.field.field_id for term in metrics] + [term.field_id for term in order]
+    raw_terms = [field_id for field_id in raw_terms if field_id not in context.definition.query.derived_by_id]
+    selection = context.definition.query.entity_selection
+    if raw_terms and not any(predicate.field.field_id == selection.group_field_id for predicate in selectors):
+        raise core.CustomImportReadRequestError("grouped metrics and ordering require an explicit group selector")
+
+
+def _query_field(context, field_id):
+    return context.definition.fields_by_id.get(field_id) or context.definition.query.derived_by_id[field_id]
+
+
+def _join_root_scalar(statement, context, field, *, prefix="root"):
+    family = context.model(core.CustomImportFamilyRevision)
+    scalar = inspect(context.model(CustomImportRootScalar)).selectable.alias(f"{prefix}_slot_{field.field_slot}")
+    statement = statement.outerjoin(
+        scalar,
+        and_(
+            scalar.c.root_revision_id == family.root_revision_id,
+            scalar.c.dataset_id == context.target.dataset_id,
+            scalar.c.schema_revision_id == context.target.schema_revision_id,
+            scalar.c.root_record_id == family.root_record_id,
+            scalar.c.field_slot == field.field_slot,
+            scalar.c.value_state == "value",
+        ),
+    )
+    return statement, getattr(scalar.c, core._SCALAR_COLUMNS[field.value_type])
 
 
 def _query_fingerprint(context, query, selectors, metrics, order, selected_value, projection, scope):
@@ -165,12 +226,16 @@ def _selected_value_relation(context):
         profile_slot=context.default_profile_slot,
     )
     field = context.definition.fields_by_id[selection.field_id]
+    statement, value = _join_root_scalar(
+        core._filtered_npi_winner_statement(helper, ()), helper, field, prefix="helper"
+    )
     return (
-        core._filtered_npi_winner_statement(helper, ())
-        .where(winner_model.context_key_sha256 == _profile_context_digest(context, selection.default_profile, {}))
+        statement.where(
+            winner_model.context_key_sha256 == _profile_context_digest(context, selection.default_profile, {})
+        )
         .with_only_columns(
             winner_model.entity_binding_id.label("entity_binding_id"),
-            core._order_scalar_expression(field, helper).label("selected_value"),
+            value.label("selected_value"),
             maintain_column_froms=True,
         )
         .subquery("selected_entity_value")
@@ -185,9 +250,9 @@ def selected_family_statement(context, plan, *, materialize_default=False):
 
     selection = context.definition.query.entity_selection
     fields = context.definition.fields_by_id
-    value_expression = core._order_scalar_expression(fields[selection.field_id], context)
-    group_expression = core._order_scalar_expression(fields[selection.group_field_id], context)
     statement = core._filtered_npi_winner_statement(context, ())
+    statement, value_expression = _join_root_scalar(statement, context, fields[selection.field_id])
+    statement, group_expression = _join_root_scalar(statement, context, fields[selection.group_field_id])
     selected_value = literal(plan.selected_value)
     if plan.selected_value is None:
         latest = _selected_value_relation(context)
@@ -227,24 +292,16 @@ def _child_predicates(plan):
 def prepare_relation(context, query, scope):
     """Return one deduplicated NPI and one explicit-group ordering tuple."""
 
-    entity_model = context.model(CustomImportEntityBinding)
+    from process.custom_import.grouped_query import relation_statement
 
     plan = normalize_plan(context, query, scope)
-    columns = [entity_model.canonical_value.label("entity_value")]
-    for ordinal, term in enumerate(plan.order_terms):
-        field = context.definition.fields_by_id[term.field_id]
-        expression = (
-            core._order_scalar_expression(field, context)
-            if field.collection is None
-            else child.child_order_expression(context, _child_predicates(plan), field)
-        )
-        columns.append(expression.label(f"sort_{ordinal}"))
-    statement = (
-        matching_family_statement(context, plan, materialize_default=True)
-        .with_only_columns(*columns, maintain_column_froms=True)
-        .distinct()
+    return core.PreparedNpiEntityRelation(
+        relation_statement(context, plan),
+        plan.order_terms,
+        plan.fingerprint,
+        core._scope_digest(scope),
+        plan.require_match,
     )
-    return core.PreparedNpiEntityRelation(statement, plan.order_terms, plan.fingerprint, core._scope_digest(scope))
 
 
 async def _selected_family_rows(session, context, plan, entity_values):
@@ -337,12 +394,9 @@ async def hydrate_page(session, context, query, prepared, entity_values, scope):
         or prepared.authorization_scope_sha256 != core._scope_digest(scope)
     ):
         raise core.CustomImportReadUnavailableError("provider page query identity is unavailable")
-    matching = (
-        matching_family_statement(context, plan)
-        .with_only_columns(entity_model.canonical_value, maintain_column_froms=True)
-        .where(entity_model.canonical_value.in_(entity_values))
-        .distinct()
-    )
+    from process.custom_import.grouped_query import relation_statement
+
+    matching = relation_statement(context, plan, entity_values)
     eligible = tuple((await session.execute(matching)).scalars().all()) if entity_values else ()
     selected_rows = await _selected_family_rows(session, context, plan, eligible)
     _validated_family_keys(context, selected_rows)
@@ -385,7 +439,7 @@ async def hydrate_detail(session, context, request, scope):
         grouped_entity_selection=request.grouped_entity_selection,
         grouped_child_query=request.grouped_child_query,
     )
-    plan = normalize_plan(context, query, scope, projection="full_family")
+    plan = normalize_plan(context, query, scope, projection="full_family", use_default_order=False)
     matching = matching_family_statement(context, plan).where(entity_model.canonical_value == request.entity.value)
     exists = await session.scalar(matching.with_only_columns(literal(1), maintain_column_froms=True).limit(1))
     if exists is None:

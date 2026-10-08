@@ -750,6 +750,23 @@ def aliased_query_context():
     return read_core._ReadContext(_target(), definition, 1, 1, {"rates": 1}, {1: "rates"})
 
 
+def _filter_grant_context(filterable_fields, *, integer_context=False):
+    """Build an ordinary definition with saved grants and canonical selector aliases."""
+
+    raw = load_json_definition((Path(__file__).with_name("fixtures") / "custom_import/v1_valid.json").read_text())
+    raw["query"].update(
+        aliases={"metric": "amount", "service": "service_code", "provider": "display_name"},
+        sortable_fields=["amount"],
+    )
+    if filterable_fields is not None:
+        raw["query"]["filterable_fields"] = list(filterable_fields)
+    if integer_context:
+        raw["schema"]["children"][0]["fields"][1]["type"] = "integer"
+    definition = CustomImportDefinition.from_mapping(raw)
+    target = replace(_target(), profile_id="default")
+    return read_core._ReadContext(target, definition, 1, 1, {"rates": 1}, {1: "rates"})
+
+
 def test_detail_projects_only_declared_root_and_child_fields(query_context):
     root_fields = read_core._detail_root_fields(query_context.definition)
     child_fields = read_core._detail_child_fields_by_slot(query_context)
@@ -878,6 +895,86 @@ def test_query_aliases_normalize_before_fingerprinting_and_duplicate_checks(alia
                 ),
             ),
             aliased_query_context,
+        )
+
+
+@pytest.mark.parametrize(
+    ("filterable_fields", "predicate", "permitted"),
+    (
+        (None, read_core.ReadFilter("metric", "gt", "1.25"), True),
+        ((), read_core.ReadFilter("amount", "gt", "1.25"), False),
+        ((), read_core.ReadFilter("metric", "gt", "1.25"), False),
+        (("display_name",), read_core.ReadFilter("metric", "gt", "1.25"), False),
+        (("amount",), read_core.ReadFilter("amount", "gt", "1.25"), True),
+        (("amount",), read_core.ReadFilter("metric", "gt", "1.25"), True),
+        (("amount",), read_core.ReadFilter("provider", "eq", "Example provider"), False),
+        (("display_name",), read_core.ReadFilter("provider", "eq", "Example provider"), True),
+        ((), read_core.ReadFilter("service_code", "eq", "99213"), True),
+        ((), read_core.ReadFilter("service", "eq", "99213"), True),
+        ((), read_core.ReadFilter("service", "is_null"), False),
+        ((), read_core.ReadFilter("npi", "eq", "1234567893"), False),
+    ),
+)
+def test_search_enforces_canonical_filter_grants_and_preserves_context_selectors(
+    filterable_fields, predicate, permitted
+):
+    context = _filter_grant_context(filterable_fields)
+    request = SearchRequest(context.target, filters=(predicate,))
+    if permitted:
+        plan = read_core._normalize_search_plan(request, context)
+        assert plan.filters[0].field.field_id == context.definition.query.resolve_field_id(predicate.field_id)
+    else:
+        with pytest.raises(CustomImportReadRequestError, match="not opted in"):
+            read_core._normalize_search_plan(request, context)
+
+
+def test_granted_filter_aliases_keep_the_canonical_search_fingerprint():
+    context = _filter_grant_context(("amount",))
+    request = SearchRequest(
+        context.target,
+        filters=(read_core.ReadFilter("service", "eq", "99213"), read_core.ReadFilter("metric", "gt", "1.25")),
+    )
+    canonical = replace(
+        request,
+        filters=(
+            read_core.ReadFilter("service_code", "eq", "99213"),
+            read_core.ReadFilter("amount", "gt", "1.25"),
+        ),
+    )
+
+    assert read_core._normalize_search_plan(request, context) == read_core._normalize_search_plan(canonical, context)
+
+
+@pytest.mark.parametrize("route", ("search", "provider_v1", "provider_v2"))
+@pytest.mark.parametrize("value", (1, {"decimal": "1.0"}, {"decimal": "1.5"}))
+def test_disabled_metric_filters_require_exact_integer_context_selectors(route, value):
+    context = _filter_grant_context((), integer_context=True)
+    selectors = (read_core.ReadFilter("service", "eq", value),)
+
+    def normalize():
+        if route == "search":
+            return read_core._normalize_search_plan(SearchRequest(context.target, filters=selectors), context)
+        return read_core._normalized_npi_query(
+            context,
+            selectors if route == "provider_v2" else None,
+            () if route == "provider_v2" else selectors,
+            None,
+        )
+
+    if value == {"decimal": "1.5"}:
+        with pytest.raises(CustomImportReadRequestError):
+            normalize()
+    else:
+        normalize()
+
+
+def test_context_selector_exemption_uses_the_selected_profile():
+    context = _filter_grant_context(())
+    invalid_context = replace(context, target=replace(context.target, profile_id="absent_profile"))
+    with pytest.raises(CustomImportReadUnavailableError, match="selection profile"):
+        read_core._normalize_search_plan(
+            SearchRequest(invalid_context.target, filters=(read_core.ReadFilter("service", "eq", "99213"),)),
+            invalid_context,
         )
 
 
