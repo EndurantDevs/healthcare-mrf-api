@@ -4,17 +4,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
-from datetime import datetime
 import hashlib
 import re
+from dataclasses import dataclass, fields
+from datetime import datetime
+from typing import TypedDict, cast
 
+from process.provider_directory_rooted_graph_contract import (
+    has_matching_rooted_graph_root_publication,
+)
 from process.provider_directory_rooted_graph_identity import (
     ROOTED_GRAPH_SCOPE_PATTERN,
     SHA256_PATTERN,
-)
-from process.provider_directory_rooted_graph_contract import (
-    has_matching_rooted_graph_root_publication,
 )
 from process.provider_directory_rooted_graph_request_coverage import (
     has_matching_rooted_request_coverage,
@@ -30,10 +31,7 @@ from process.provider_directory_rooted_graph_store_contract import (
     RUN_PATTERN,
 )
 
-
-PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ATTEMPT_CONTRACT_ID = (
-    "healthporta.provider-directory.rooted-graph-twin-attempt.v1"
-)
+PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ATTEMPT_CONTRACT_ID = "healthporta.provider-directory.rooted-graph-twin-attempt.v1"
 PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ADMISSION_CONTRACT_ID = (
     "healthporta.provider-directory.rooted-graph-matched-admission.v1"
 )
@@ -121,28 +119,22 @@ def _digest_identifier(prefix: str, values: tuple[object, ...]) -> str:
 def _has_invalid_variant_lineage(candidate: object) -> bool:
     variant = getattr(candidate, "root_dataset_variant", None)
     publication_contract_id = getattr(candidate, "root_publication_contract_id", None)
-    has_same_source = getattr(candidate, "root_source_id", None) == getattr(
-        candidate, "acquisition_source_id", None
-    )
+    has_same_source = getattr(candidate, "root_source_id", None) == getattr(candidate, "acquisition_source_id", None)
     has_same_endpoint = getattr(candidate, "root_endpoint_id", None) == getattr(
         candidate, "acquisition_endpoint_id", None
     )
     return bool(
         variant not in {"uhc_flex_practitioner", "rooted_combined"}
-        or not has_matching_rooted_graph_root_publication(
-            variant, publication_contract_id
-        )
-        or (
-            variant == "rooted_combined" and not (has_same_source and has_same_endpoint)
-        )
-        or (
-            variant == "uhc_flex_practitioner"
-            and (has_same_source or has_same_endpoint)
-        )
+        or not has_matching_rooted_graph_root_publication(variant, publication_contract_id)
+        or (variant == "rooted_combined" and not (has_same_source and has_same_endpoint))
+        or (variant == "uhc_flex_practitioner" and (has_same_source or has_same_endpoint))
     )
 
 
-def _has_valid_terminal_work(candidate: object, error_count: int) -> bool:
+def _has_valid_terminal_work(
+    candidate: ProviderDirectoryRootedGraphSealedRoot | ProviderDirectoryRootedGraphTwinAdmission,
+    error_count: int,
+) -> bool:
     coverage = candidate.request_failure_coverage
     if (
         not has_matching_rooted_request_coverage(
@@ -155,18 +147,8 @@ def _has_valid_terminal_work(candidate: object, error_count: int) -> bool:
     plan_count = candidate.insurance_plan_count
     page_count = candidate.insurance_plan_page_count
     if plan_count is None or page_count is None:
-        return bool(
-            coverage is not None
-            and error_count > 0
-            and plan_count is None
-            and page_count is None
-        )
-    return bool(
-        type(plan_count) is int
-        and plan_count >= 0
-        and type(page_count) is int
-        and page_count >= 1
-    )
+        return bool(coverage is not None and error_count > 0 and plan_count is None and page_count is None)
+    return bool(type(plan_count) is int and plan_count >= 0 and type(page_count) is int and page_count >= 1)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -226,8 +208,7 @@ class ProviderDirectoryRootedGraphSealedRoot:
         hashes = tuple(getattr(self, name) for name in _SEALED_HASH_FIELDS)
         if (
             ACQUISITION_PATTERN.fullmatch(self.acquisition_id) is None
-            or self.storage_contract_id
-            != PROVIDER_DIRECTORY_ROOTED_GRAPH_STORAGE_CONTRACT_ID
+            or self.storage_contract_id != PROVIDER_DIRECTORY_ROOTED_GRAPH_STORAGE_CONTRACT_ID
             or ROOTED_GRAPH_SCOPE_PATTERN.fullmatch(self.scope_id) is None
             or not _is_bounded_text(self.root_source_id, 64)
             or _ENDPOINT_PATTERN.fullmatch(self.root_endpoint_id) is None
@@ -249,18 +230,10 @@ class ProviderDirectoryRootedGraphSealedRoot:
             or self.acquisition_role not in {"baseline", "candidate"}
             or RUN_PATTERN.fullmatch(self.run_id) is None
             or INTENT_PATTERN.fullmatch(self.dataset_intent_id) is None
-            or not 1
-            <= self.max_work_items
-            <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_WORK_ITEMS
-            or not 1
-            <= self.max_resource_rows
-            <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RESOURCE_ROWS
-            or not 1
-            <= self.max_edge_rows
-            <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_EDGE_ROWS
-            or not 1
-            <= self.max_payload_bytes
-            <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_PAYLOAD_BYTES
+            or not 1 <= self.max_work_items <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_WORK_ITEMS
+            or not 1 <= self.max_resource_rows <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RESOURCE_ROWS
+            or not 1 <= self.max_edge_rows <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_EDGE_ROWS
+            or not 1 <= self.max_payload_bytes <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_PAYLOAD_BYTES
             or any(type(count) is not int or count < 0 for count in counts)
             or self.pending_count != 0
             or self.leased_count != 0
@@ -283,31 +256,26 @@ class ProviderDirectoryRootedGraphSealedRoot:
     def sealed_proof(self) -> tuple[object, ...]:
         """Return every sealed count and hash that must match exactly."""
 
-        return tuple(
-            getattr(self, name)
-            for name in (*_SEALED_COUNT_FIELDS, *_SEALED_HASH_FIELDS)
-        )
+        return tuple(getattr(self, name) for name in (*_SEALED_COUNT_FIELDS, *_SEALED_HASH_FIELDS))
 
 
 def _ordered_roots(
     first: ProviderDirectoryRootedGraphSealedRoot,
     second: ProviderDirectoryRootedGraphSealedRoot,
-) -> tuple[
-    ProviderDirectoryRootedGraphSealedRoot, ProviderDirectoryRootedGraphSealedRoot
-]:
+) -> tuple[ProviderDirectoryRootedGraphSealedRoot, ProviderDirectoryRootedGraphSealedRoot]:
     if (
         type(first) is not ProviderDirectoryRootedGraphSealedRoot
         or type(second) is not ProviderDirectoryRootedGraphSealedRoot
         or first.request_failure_coverage is not None
         or second.request_failure_coverage is not None
         or first.acquisition_id == second.acquisition_id
-        or {first.acquisition_role, second.acquisition_role}
-        != {"baseline", "candidate"}
+        or {first.acquisition_role, second.acquisition_role} != {"baseline", "candidate"}
         or first.run_id == second.run_id
         or first.shared_lineage() != second.shared_lineage()
     ):
         raise ValueError("provider_directory_rooted_graph_twin_lineage_invalid")
-    return tuple(sorted((first, second), key=lambda root: root.acquisition_id))
+    ordered_roots = sorted((first, second), key=lambda root: root.acquisition_id)
+    return ordered_roots[0], ordered_roots[1]
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -381,10 +349,8 @@ class ProviderDirectoryRootedGraphTwinAttempt:
 
         first_values, second_values, expected_id = _attempt_validation_values(self)
         if (
-            self.attempt_contract_id
-            != PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ATTEMPT_CONTRACT_ID
-            or self.storage_contract_id
-            != PROVIDER_DIRECTORY_ROOTED_GRAPH_STORAGE_CONTRACT_ID
+            self.attempt_contract_id != PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ATTEMPT_CONTRACT_ID
+            or self.storage_contract_id != PROVIDER_DIRECTORY_ROOTED_GRAPH_STORAGE_CONTRACT_ID
             or ATTEMPT_PATTERN.fullmatch(self.attempt_id) is None
             or self.attempt_id != expected_id
             or ACQUISITION_PATTERN.fullmatch(self.first_acquisition_id) is None
@@ -409,18 +375,10 @@ class ProviderDirectoryRootedGraphTwinAttempt:
             or not _is_bounded_text(self.connector_id, 64)
             or SHA256_PATTERN.fullmatch(self.graph_contract_sha256) is None
             or SHA256_PATTERN.fullmatch(self.query_contract_sha256) is None
-            or not 1
-            <= self.max_work_items
-            <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_WORK_ITEMS
-            or not 1
-            <= self.max_resource_rows
-            <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RESOURCE_ROWS
-            or not 1
-            <= self.max_edge_rows
-            <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_EDGE_ROWS
-            or not 1
-            <= self.max_payload_bytes
-            <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_PAYLOAD_BYTES
+            or not 1 <= self.max_work_items <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_WORK_ITEMS
+            or not 1 <= self.max_resource_rows <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RESOURCE_ROWS
+            or not 1 <= self.max_edge_rows <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_EDGE_ROWS
+            or not 1 <= self.max_payload_bytes <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_PAYLOAD_BYTES
             or self.matched is not (first_values == second_values)
             or type(self.attempted_at) is not datetime
             or self.attempted_at.tzinfo is None
@@ -431,22 +389,86 @@ class ProviderDirectoryRootedGraphTwinAttempt:
 def _attempt_validation_values(
     attempt: ProviderDirectoryRootedGraphTwinAttempt,
 ) -> tuple[tuple[object, ...], tuple[object, ...], str]:
-    first_values = tuple(
-        getattr(attempt, "first_" + name) for name in _SEALED_COUNT_FIELDS
-    ) + tuple(getattr(attempt, "first_" + name) for name in _SEALED_HASH_FIELDS)
-    second_values = tuple(
-        getattr(attempt, "second_" + name) for name in _SEALED_COUNT_FIELDS
-    ) + tuple(getattr(attempt, "second_" + name) for name in _SEALED_HASH_FIELDS)
+    first_values = tuple(getattr(attempt, "first_" + name) for name in _SEALED_COUNT_FIELDS) + tuple(
+        getattr(attempt, "first_" + name) for name in _SEALED_HASH_FIELDS
+    )
+    second_values = tuple(getattr(attempt, "second_" + name) for name in _SEALED_COUNT_FIELDS) + tuple(
+        getattr(attempt, "second_" + name) for name in _SEALED_HASH_FIELDS
+    )
     identity_values = tuple(
-        getattr(attempt, field.name)
-        for field in fields(attempt)
-        if field.name not in {"attempt_id", "attempted_at"}
+        getattr(attempt, field.name) for field in fields(attempt) if field.name not in {"attempt_id", "attempted_at"}
     )
     expected_id = _digest_identifier(
         "pdrgat_",
         (PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ATTEMPT_CONTRACT_ID, *identity_values),
     )
     return first_values, second_values, expected_id
+
+
+class _TwinAttemptFields(TypedDict):
+    """Constructor fields assembled from validated rooted-graph contracts."""
+
+    attempt_id: str
+    attempt_contract_id: str
+    storage_contract_id: str
+    first_acquisition_id: str
+    second_acquisition_id: str
+    dataset_intent_id: str
+    scope_id: str
+    root_source_id: str
+    root_endpoint_id: str
+    acquisition_source_id: str
+    acquisition_endpoint_id: str
+    source_authority_id: str
+    endpoint_signature_sha256: str
+    root_dataset_id: str
+    root_dataset_variant: str
+    root_publication_contract_id: str
+    root_dataset_hash: str
+    root_content_proof_sha256: str
+    root_cohort_id: str
+    root_resource_count: int
+    connector_id: str
+    graph_contract_sha256: str
+    query_contract_sha256: str
+    max_work_items: int
+    max_resource_rows: int
+    max_edge_rows: int
+    max_payload_bytes: int
+    first_pending_count: int
+    second_pending_count: int
+    first_leased_count: int
+    second_leased_count: int
+    first_completed_count: int
+    second_completed_count: int
+    first_error_count: int
+    second_error_count: int
+    first_resource_count: int
+    second_resource_count: int
+    first_edge_count: int
+    second_edge_count: int
+    first_insurance_plan_count: int
+    second_insurance_plan_count: int
+    first_insurance_plan_page_count: int
+    second_insurance_plan_page_count: int
+    first_used_work_items: int
+    second_used_work_items: int
+    first_used_resource_rows: int
+    second_used_resource_rows: int
+    first_used_edge_rows: int
+    second_used_edge_rows: int
+    first_used_payload_bytes: int
+    second_used_payload_bytes: int
+    first_terminal_set_sha256: str
+    second_terminal_set_sha256: str
+    first_resource_set_sha256: str
+    second_resource_set_sha256: str
+    first_edge_set_sha256: str
+    second_edge_set_sha256: str
+    first_rooted_graph_sha256: str
+    second_rooted_graph_sha256: str
+    matched: bool
+    attempted_at: datetime
 
 
 def build_rooted_graph_twin_attempt(
@@ -500,19 +522,18 @@ def build_rooted_graph_twin_attempt(
         "pdrgat_",
         (PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ATTEMPT_CONTRACT_ID, *identity_values),
     )
-    return ProviderDirectoryRootedGraphTwinAttempt(**attempt_by_field)
+    return ProviderDirectoryRootedGraphTwinAttempt(**cast(_TwinAttemptFields, attempt_by_field))
 
 
 build_provider_directory_rooted_graph_twin_attempt = build_rooted_graph_twin_attempt
 
 
 from process.provider_directory_rooted_graph_twin_admission_contract import (
-    build_rooted_graph_single_root_admission,
-    build_provider_directory_rooted_graph_twin_admission,
-    ProviderDirectoryRootedGraphTwinAdmission,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
+    ProviderDirectoryRootedGraphTwinAdmission,
+    build_provider_directory_rooted_graph_twin_admission,
+    build_rooted_graph_single_root_admission,
 )
-
 
 __all__ = (
     "build_rooted_graph_single_root_admission",
