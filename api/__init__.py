@@ -7,6 +7,7 @@ from sanic.exceptions import SanicException
 from api.control import blueprint as control_blueprint
 from api.control import control_error
 from api.control_admission_batch import blueprint as admission_batch_blueprint
+from api.control_admission_batch import register_batch_response_deadline
 from api.control_execution_evidence import blueprint as execution_evidence_blueprint
 from api.control_execution_stop import blueprint as execution_stop_blueprint
 from api.control_registration_authority import blueprint as registration_authority_blueprint
@@ -67,6 +68,7 @@ def init_api(api):
     """Register public API blueprints on the Sanic application."""
 
     register_server_timing(api)
+    register_batch_response_deadline(api)
     db.init_app(api)
     register_worker_memory_lifecycle(api)
     api.register_middleware(_capacity_process_request_guard, "request")
