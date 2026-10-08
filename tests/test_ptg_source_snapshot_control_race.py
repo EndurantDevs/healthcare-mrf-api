@@ -23,6 +23,7 @@ class _PromotionTransaction:
     def __init__(self, state):
         self.state = state
         self.locked = False
+        self.scalar = AsyncMock(side_effect=self._has_local_candidate_declaration)
 
     async def __aenter__(self):
         return self
@@ -31,6 +32,14 @@ class _PromotionTransaction:
         if self.locked:
             self.state.lock.release()
             self.state.events.append("promotion_committed")
+        return False
+
+    async def _has_local_candidate_declaration(self, statement, params):
+        assert str(statement) == (
+            "SELECT manifest::jsonb ? 'physical_binding_contract' OR manifest::jsonb ? 'local_data_preparation' "
+            'FROM "mrf".ptg2_snapshot WHERE snapshot_id=:snapshot_id'
+        )
+        assert params == {"snapshot_id": "snap_new"}
         return False
 
     async def execute(self, statement, params):
@@ -42,11 +51,9 @@ class _PromotionTransaction:
             await self._acquire_promotion_fence(params)
             return None
         if "hashtextextended" in sql:
-            assert params == {
-                "source_lock_key": "ptg2_source_lifecycle_v2:source_a"
-            }
+            assert params == {"source_lock_key": "ptg2_source_lifecycle_v2:source_a"}
             return None
-        if "INSERT INTO \"mrf\".ptg2_current_source_snapshot" in sql:
+        if 'INSERT INTO "mrf".ptg2_current_source_snapshot' in sql:
             await self._record_pointer_update(params)
             return None
         if "ptg2_v3_snapshot_plan_scope" in sql:
@@ -62,9 +69,7 @@ class _PromotionTransaction:
         }
 
     async def _acquire_promotion_fence(self, params):
-        assert params == {
-            "gc_lock_key": source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
-        }
+        assert params == {"gc_lock_key": source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY}
         await self.state.lock.acquire()
         self.locked = True
         self.state.events.append("promotion_locked")
@@ -176,18 +181,29 @@ async def _run_interleaving(state):
             expected_current_snapshot_id="snap_old",
         )
     )
-    await state.promotion_locked.wait()
-    await asyncio.wait_for(
-        snapshot_cleanup._cleanup_old_ptg2_source_tables(
-            "source_a",
-            {"snap_old"},
-            lock_pointer_state=True,
-        ),
-        timeout=0.5,
-    )
-    assert not promotion_task.done()
-    state.cleanup_waiting.set()
-    await asyncio.wait_for(promotion_task, timeout=1)
+    lock_waiter = asyncio.create_task(state.promotion_locked.wait())
+    try:
+        completed, _pending = await asyncio.wait(
+            (lock_waiter, promotion_task), timeout=1, return_when=asyncio.FIRST_COMPLETED
+        )
+        if promotion_task in completed:
+            await promotion_task
+        assert lock_waiter in completed, "promotion did not acquire its fence"
+        await asyncio.wait_for(
+            snapshot_cleanup._cleanup_old_ptg2_source_tables(
+                "source_a",
+                {"snap_old"},
+                lock_pointer_state=True,
+            ),
+            timeout=0.5,
+        )
+        assert not promotion_task.done()
+        state.cleanup_waiting.set()
+        await asyncio.wait_for(promotion_task, timeout=1)
+    finally:
+        promotion_task.cancel()
+        lock_waiter.cancel()
+        await asyncio.wait_for(asyncio.gather(promotion_task, lock_waiter, return_exceptions=True), timeout=1)
 
 
 def test_source_completion_cleanup_does_not_gate_promotion_or_scan_global_state(

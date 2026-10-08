@@ -261,9 +261,7 @@ async def test_candidate_scope_binds_exact_ordered_source_identity(monkeypatch):
         )
     )
     witness_scope = _candidate_witness_scope(persisted_occurrences)
-    sealed_witness = AsyncMock(
-        return_value=replace(witness_scope, persisted_audit_occurrences=())
-    )
+    sealed_witness = AsyncMock(return_value=replace(witness_scope, persisted_audit_occurrences=()))
     monkeypatch.setattr(
         integrity,
         "validate_persisted_audit_sample",
@@ -280,14 +278,19 @@ async def test_candidate_scope_binds_exact_ordered_source_identity(monkeypatch):
         sealed_witness,
     )
 
+    serving_tables = _source_scope_serving_tables(audit_request, source_set_by_field)
+    access = object()
     observed_scope = await integrity.validate_candidate_source_scope(
         object(),
-        _source_scope_serving_tables(audit_request, source_set_by_field),
+        serving_tables,
         audit_request,
+        candidate_audit_access=access,
     )
 
     persisted_sample.assert_awaited_once()
     source_identity.assert_awaited_once()
+    assert source_identity.await_args.kwargs["serving_tables"] is serving_tables
+    assert source_identity.await_args.kwargs["candidate_audit_access"] is access
     sealed_witness.assert_awaited_once()
     assert observed_scope == witness_scope
 
@@ -304,9 +307,7 @@ async def test_candidate_scope_rejects_swapped_source_ordinals(monkeypatch):
     monkeypatch.setattr(
         integrity,
         "fetch_snapshot_source_set_identity",
-        AsyncMock(
-            return_value=(source_set_by_field, "0" * 64, ("a" * 64,))
-        ),
+        AsyncMock(return_value=(source_set_by_field, "0" * 64, ("a" * 64,))),
     )
 
     with pytest.raises(PTG2ManifestArtifactError, match="source ordinals"):
@@ -419,9 +420,7 @@ async def test_candidate_scope_rejects_source_set_and_challenge_count(monkeypatc
         "validate_persisted_audit_sample",
         AsyncMock(return_value=()),
     )
-    source_identity = AsyncMock(
-        return_value=({"other": True}, audit_request.ordered_source_ordinal_digest, ())
-    )
+    source_identity = AsyncMock(return_value=({"other": True}, audit_request.ordered_source_ordinal_digest, ()))
     monkeypatch.setattr(integrity, "fetch_snapshot_source_set_identity", source_identity)
 
     with pytest.raises(PTG2ManifestArtifactError, match="source rows"):

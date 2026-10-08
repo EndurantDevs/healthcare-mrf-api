@@ -3,6 +3,7 @@
 
 import os
 import re
+from contextlib import AsyncExitStack
 from uuid import uuid4
 
 import pytest
@@ -13,7 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
 from process.tiger_result_generation import publish_tiger_generation
-from tests.reference_family_generation_fixture import install_source_generation_guards
+from tests.reference_family_generation_fixture import install_source_generation_guards, native_reference_source
 from tests.test_cms_doctors_archive_postgres import _command, _migration
 
 
@@ -97,17 +98,16 @@ async def _install_authority_as_app(session, schema, role):
     await session.execute(text("RESET ROLE"))
 
 
-async def _archive_restore(sessions, url, dataset_id, path):
-    async def retain(_session, _prepared):
-        return None
-
+async def _archive_restore(sessions, url, dataset_id, path, custody):
     prepared = await archive.prepare_reference_family_archive_source(
         sessions,
         importer_id="tiger",
         schema_name="tiger",
         source_metadata={"source_release": "reviewed-static-fixture"},
         dataset_id=dataset_id,
-        on_prepared=retain,
+        on_prepared=custody.retain,
+        source_copy=custody.source_copy,
+        on_precreated=custody.precreate,
     )
 
     async def dump(capture):
@@ -126,11 +126,13 @@ async def _archive_restore(sessions, url, dataset_id, path):
             str(path),
         )
 
-    await archive.export_prepared_reference_family_archive(sessions, prepared=prepared, archive_copy=dump)
+    await archive.export_prepared_reference_family_archive(
+        sessions, prepared=prepared, archive_copy=dump, verify_custody=custody.verify
+    )
     listing = await _command("pg_restore", "--list", str(path))
     assert "SEQUENCE SET" in listing and "zcta5_gid_seq" in listing
     async with sessions() as session, session.begin():
-        await archive.cleanup_reference_family_stage(session, prepared.ownership)
+        await custody.retire(session, prepared.ownership)
         restored = await archive.precreate_reference_family_restore(session, importer_id="tiger", dataset_id=dataset_id)
     await _command(
         "pg_restore",
@@ -274,24 +276,30 @@ async def test_tiger_native_postgis_archive_app_ledger_and_protected_publication
     monkeypatch.delenv("DB_SCHEMA", raising=False)
     engine = create_async_engine(url)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
+    cleanup = AsyncExitStack()
+    cleanup.push_async_callback(engine.dispose)
     try:
+        custody = await cleanup.enter_async_context(native_reference_source(sessions))
         async with sessions() as session, session.begin():
             assert await session.scalar(text("SELECT to_regnamespace('tiger')")) is None
             await _installed_tables(session)
             await _install_authority_as_app(session, schema, role)
-        prepared = await _archive_restore(sessions, url, dataset_id, tmp_path / "tiger.dump")
+        prepared = await _archive_restore(sessions, url, dataset_id, tmp_path / "tiger.dump", custody)
         await _assert_rollback_and_publish(sessions, prepared, role)
     finally:
-        async with engine.begin() as connection:
-            for owned_schema in (
-                archive.reference_family_stage_schema(dataset_id),
-                archive.reference_family_predecessor_schema(dataset_id),
-                "tiger",
-                schema,
-            ):
-                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{owned_schema}" CASCADE'))
-                assert (
-                    await connection.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": owned_schema}) is None
-                )
-            await connection.execute(text(f'DROP ROLE IF EXISTS "{role}"'))
-        await engine.dispose()
+        try:
+            async with engine.begin() as connection:
+                for owned_schema in (
+                    archive.reference_family_stage_schema(dataset_id),
+                    archive.reference_family_predecessor_schema(dataset_id),
+                    "tiger",
+                    schema,
+                ):
+                    await connection.execute(text(f'DROP SCHEMA IF EXISTS "{owned_schema}" CASCADE'))
+                    assert (
+                        await connection.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": owned_schema})
+                        is None
+                    )
+                await connection.execute(text(f'DROP ROLE IF EXISTS "{role}"'))
+        finally:
+            await cleanup.aclose()

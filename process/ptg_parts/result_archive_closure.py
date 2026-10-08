@@ -127,12 +127,26 @@ def _required_pin(retention_pin: Mapping[str, Any] | None) -> str:
     return pin_id
 
 
-async def _locked_layout(session: Any, *, schema: str, snapshot_id: str) -> dict[str, Any]:
+async def _locked_layout(
+    session: Any, *, schema: str, snapshot_id: str, payload_snapshot_key: int | None = None
+) -> dict[str, Any]:
+    """Read canonical binding or exact isolated payload roots; neither grants custody."""
+    if payload_snapshot_key is None:
+        layout_join = (
+            f"JOIN {schema}.ptg2_v3_snapshot_binding AS binding ON binding.snapshot_id = snapshot.snapshot_id "
+            f"JOIN {schema}.ptg2_v3_snapshot_layout AS layout ON layout.snapshot_key = binding.snapshot_key"
+        )
+        snapshot_key_column, locked_relations = "binding.snapshot_key", "snapshot, binding, layout"
+    else:
+        if type(payload_snapshot_key) is not int or not 0 < payload_snapshot_key < 2**63:
+            raise ResultArchiveClosureError("archive closure payload snapshot key is invalid")
+        layout_join = f"JOIN {schema}.ptg2_v3_snapshot_layout AS layout ON layout.snapshot_key = :payload_snapshot_key"
+        snapshot_key_column, locked_relations = "layout.snapshot_key", "snapshot, layout"
     layout_query = await session.execute(
         text(
             f"""
             SELECT snapshot.snapshot_id, snapshot.status, snapshot.manifest,
-                   binding.snapshot_key, layout.generation, layout.state,
+                   {snapshot_key_column}, layout.generation, layout.state,
                    layout.mapping_digest, layout.layout_manifest,
                    map_root.state AS map_root_state,
                    map_root.map_format, map_root.map_digest,
@@ -154,19 +168,19 @@ async def _locked_layout(session: Any, *, schema: str, snapshot_id: str) -> dict
                    finalizer_root.stored_map_byte_count AS finalizer_stored_map_byte_count,
                    finalizer_root.target_block_count AS finalizer_target_block_count
               FROM {schema}.ptg2_snapshot AS snapshot
-              JOIN {schema}.ptg2_v3_snapshot_binding AS binding
-                ON binding.snapshot_id = snapshot.snapshot_id
-              JOIN {schema}.ptg2_v3_snapshot_layout AS layout
-                ON layout.snapshot_key = binding.snapshot_key
+              {layout_join}
               LEFT JOIN {schema}.ptg2_v4_snapshot_map_root AS map_root
                 ON map_root.snapshot_key = layout.snapshot_key
               LEFT JOIN {schema}.ptg2_v4_finalizer_map_root AS finalizer_root
                 ON finalizer_root.snapshot_key = layout.snapshot_key
              WHERE snapshot.snapshot_id = :snapshot_id
-             FOR KEY SHARE OF snapshot, binding, layout
+             FOR KEY SHARE OF {locked_relations}
             """
         ),
-        {"snapshot_id": snapshot_id},
+        {
+            "snapshot_id": snapshot_id,
+            **({"payload_snapshot_key": payload_snapshot_key} if payload_snapshot_key is not None else {}),
+        },
     )
     return _single(layout_query, "snapshot layout")
 
@@ -753,6 +767,53 @@ def _validate_root_geometry(
             raise ResultArchiveClosureError(f"archive closure {prefix} root disagrees with decoded map packs")
     if target_count is not None and int(root_by_field.get(f"{prefix}_target_block_count") or -1) != target_count:
         raise ResultArchiveClosureError("archive closure finalizer root disagrees with decoded targets")
+
+
+def local_result_archive_closure(closure: ResultArchiveClosure) -> ResultArchiveClosure:
+    """Add the actual LOCAL price dictionary without changing historical archive selections."""
+    from dataclasses import replace
+
+    if closure.relations != _relations(closure.schema_name):
+        raise ResultArchiveClosureError("local archive source selection differs")
+    return replace(
+        closure,
+        relations=(
+            *closure.relations,
+            ArchiveRelation(
+                "ptg2_v3_price_attr",
+                "snapshot_key = :snapshot_key",
+                "snapshot-scoped price attribute dictionary",
+            ),
+        ),
+    )
+
+
+async def validate_local_price_attribute_dictionary(session: Any, *, schema_name: str, snapshot_key: int) -> None:
+    """Check indexed dictionary keys and native JSON-list shape with no per-record guards."""
+    table = f"{_quote_ident(schema_name)}.ptg2_v3_price_attr"
+    kinds = [
+        "negotiated_type",
+        "expiration_date",
+        "service_code",
+        "billing_class",
+        "setting",
+        "billing_code_modifier",
+        "additional_information",
+    ]
+    invalid = await session.scalar(
+        text(
+            f"SELECT EXISTS(SELECT 1 FROM {table} WHERE snapshot_key=:snapshot_key "
+            "AND (attribute_kind<>ALL(CAST(:kinds AS text[])) OR attribute_key<0)) "
+            f"OR EXISTS(SELECT 1 FROM {table} WHERE snapshot_key=:snapshot_key "
+            "GROUP BY attribute_kind HAVING min(attribute_key)<>0 OR max(attribute_key)<>count(*)-1) "
+            f"OR EXISTS(SELECT 1 FROM {table} WHERE snapshot_key=:snapshot_key "
+            "AND attribute_kind IN ('service_code','billing_code_modifier') "
+            "AND jsonb_typeof(COALESCE(NULLIF(value,''),'[]')::jsonb)<>'array')"
+        ),
+        {"snapshot_key": snapshot_key, "kinds": kinds},
+    )
+    if invalid is not False:
+        raise ResultArchiveClosureError("local archive price attribute dictionary differs")
 
 
 def _relations(schema_name: str) -> tuple[ArchiveRelation, ...]:

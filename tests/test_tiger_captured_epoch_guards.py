@@ -203,17 +203,27 @@ async def test_preparation_holds_recursive_share_until_publisher_clone_returns(m
     prepared = object()
     publisher_sessions, callback = object(), AsyncMock()
 
-    async def clone(sessions, observed, epoch, graph, protect, *, source_url):
+    source_copy = archive.ReferenceFamilySourceCopy(AsyncMock(), 4096, 30)
+    seal = AsyncMock()
+
+    async def clone(sessions, observed, epoch, graph, protect, *, source_url, **source_options):
         assert events == ["source-open", "source-open"]
         assert (sessions, observed, epoch, protect) == (publisher_sessions, native_capture, epoch_id, callback)
         assert graph["relations"] == _graph_rows() and source_url.database == "synthetic"
+        assert source_options["source_copy"] is source_copy and source_options["on_precreated"] is seal
+        assert source_options["deadline"] is not None
         return prepared
 
     monkeypatch.setattr(captured, "_clone_captured_model", clone)
     epoch_id = UUID("550e8400-e29b-41d4-a716-446655440000")
     assert (
         await captured.prepare_captured_tiger_epoch(
-            transaction, publisher_sessions, epoch_id=epoch_id, on_prepared=callback
+            transaction,
+            publisher_sessions,
+            epoch_id=epoch_id,
+            on_prepared=callback,
+            source_copy=source_copy,
+            on_precreated=seal,
         )
         is prepared
     )
@@ -225,7 +235,7 @@ async def test_preparation_holds_recursive_share_until_publisher_clone_returns(m
     assert events[-2:] == ["source-closed", "source-closed"]
     options = capture.await_args.kwargs
     assert options["source_capture_contract"] == archive.CAPTURED_TIGER_CONTRACT
-    assert options["configure_isolation"] is False
+    assert "configure_isolation" not in options
     assert captured.validate_captured_origin(options["source_metadata"])["epoch_id"] == str(epoch_id)
 
 

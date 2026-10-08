@@ -306,11 +306,17 @@ async def test_source_pointer_wrapper_uses_transactional_activation(monkeypatch)
     """Resolve the configured schema and delegate to transactional activation."""
 
     evidence = installed_source_activation_transaction(monkeypatch)
+    evidence.session.scalar = AsyncMock(return_value=False)
     activation_result = await source_pointers.activate_ptg2_source_candidate(
         source_key=" Source ",
         snapshot_id=" Snapshot ",
     )
     assert activation_result == {"status": "promoted"}
+    declaration_query, declaration_parameters = evidence.session.scalar.await_args.args
+    assert '"tenant".ptg2_snapshot' in str(declaration_query)
+    assert "physical_binding_contract" in str(declaration_query)
+    assert "local_data_preparation" in str(declaration_query)
+    assert declaration_parameters == {"snapshot_id": "Snapshot"}
     assert evidence.activation.await_args.args == (evidence.session,)
     assert evidence.activation.await_args.kwargs == {
         "schema_name": "tenant",

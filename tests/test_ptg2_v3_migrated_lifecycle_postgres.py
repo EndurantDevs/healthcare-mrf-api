@@ -47,9 +47,9 @@ from process.ptg_parts.ptg2_candidate_audit_contract import (
 from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 from process.ptg_parts.ptg2_manifest_artifacts import write_global_membership_sidecar
 from process.ptg_parts.ptg2_manifest_publish import (
+    _copy_price_atom_file,
     _copy_price_atom_member_file,
     _copy_price_set_summary_file,
-    _copy_price_atom_file,
     _create_serving_stage_table,
     _ptg2_manifest_support_stage_table,
 )
@@ -75,7 +75,6 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
 )
 from process.ptg_parts.snapshot_cleanup import _drop_ptg2_snapshot_table_names
 from process.ptg_parts.source_pointers import _stage_ptg2_source_candidate
-
 
 ROOT = Path(__file__).resolve().parents[1]
 OPT_IN_DSN_ENV = "HLTHPRT_PTG2_V3_LIFECYCLE_POSTGRES_DSN"
@@ -528,12 +527,27 @@ async def _release_report(
     )
 
 
-def _build_asgi_app() -> Sanic:
+def _build_asgi_app(*, database=None) -> Sanic:
     app = Sanic(f"ptg2-v3-migrated-lifecycle-{uuid.uuid4().hex}")
-    db.init_app(app)
+    (db if database is None else database).init_app(app)
     app.blueprint(control_blueprint)
     app.blueprint(Blueprint.group([pricing.blueprint], version_prefix="/api/v"))
     return app
+
+
+@pytest.mark.parametrize("is_custom_database", (False, True))
+def test_asgi_fixture_binds_only_its_selected_database(monkeypatch, is_custom_database):
+    """Audit readers must not inherit the concurrent worker's writer connection."""
+    from db.connection import Database
+
+    bindings = []
+    selected = Database() if is_custom_database else db
+    monkeypatch.setattr(selected, "init_app", lambda app: bindings.append((selected, app)))
+    app = _build_asgi_app(database=selected) if is_custom_database else _build_asgi_app()
+    try:
+        assert bindings == [(selected, app)]
+    finally:
+        Sanic.unregister_app(app)
 
 
 def _clear_or_disable_in_process_caches(monkeypatch: pytest.MonkeyPatch) -> None:

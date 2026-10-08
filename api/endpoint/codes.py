@@ -13,11 +13,12 @@ from sqlalchemy import and_, exists, func, or_, select
 
 from api.code_systems import (
     canonical_catalog_code,
+    is_restricted_terminology_public_enabled,
     is_restricted_terminology_system,
     normalize_code_system,
-    is_restricted_terminology_public_enabled,
 )
 from api.endpoint.pagination import parse_pagination
+from api.reference_family_reads import claims_dictionary_tables
 from db.models import CodeCatalog, CodeCrosswalk, CodeSynonym
 
 blueprint = Blueprint("codes", url_prefix="/codes", version=1)
@@ -80,6 +81,8 @@ def _build_code_catalog_queries(
     code_system: str,
     query_text: str,
     source_name: str,
+    *,
+    code_catalog_table=code_catalog_table,
 ):
     filters = []
     restricted_filter = _restricted_public_filter(code_catalog_table.c.code_system)
@@ -101,8 +104,7 @@ def _build_code_catalog_queries(
                         and_(
                             func.upper(code_synonym_table.c.code_system)
                             == func.upper(code_catalog_table.c.code_system),
-                            func.upper(code_synonym_table.c.code)
-                            == func.upper(code_catalog_table.c.code),
+                            func.upper(code_synonym_table.c.code) == func.upper(code_catalog_table.c.code),
                             func.lower(code_synonym_table.c.synonym).like(query_pattern),
                         )
                     )
@@ -123,6 +125,7 @@ async def list_codes(request):
     """List normalized reference codes with bounded filtering and paging."""
 
     session = _get_session(request)
+    code_catalog_table = claims_dictionary_tables(session)[0]
     args = request.args
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
 
@@ -133,7 +136,7 @@ async def list_codes(request):
     order_by = str(args.get("order_by") or "code").strip().lower()
 
     count_query, query = _build_code_catalog_queries(
-        code_system, query_text, source_name
+        code_system, query_text, source_name, code_catalog_table=code_catalog_table
     )
     count_result = await session.execute(count_query)
     total = int(count_result.scalar() or 0)
@@ -151,9 +154,7 @@ async def list_codes(request):
     query = query.limit(pagination.limit).offset(pagination.offset)
 
     code_result = await session.execute(query)
-    code_items = [
-        _json_safe_row(_row_to_dict(code_row)) for code_row in code_result
-    ]
+    code_items = [_json_safe_row(_row_to_dict(code_row)) for code_row in code_result]
 
     return response.json(
         {
@@ -180,6 +181,7 @@ async def get_code(request, code_system: str, code: str):
     """Return one normalized code-system entry when it exists."""
 
     session = _get_session(request)
+    code_catalog_table = claims_dictionary_tables(session)[0]
     normalized_system = _normalize_code_system(code_system)
     normalized_code = _canonical_code_for_system(normalized_system, code)
     if not normalized_system or not normalized_code:
@@ -205,6 +207,7 @@ async def get_related_codes(request, code_system: str, code: str):
     """Return bounded crosswalk relationships for one reference code."""
 
     session = _get_session(request)
+    code_crosswalk_table = claims_dictionary_tables(session)[1]
     normalized_system = _normalize_code_system(code_system)
     normalized_code = _canonical_code_for_system(normalized_system, code)
     if not normalized_system or not normalized_code:
@@ -231,14 +234,8 @@ async def get_related_codes(request, code_system: str, code: str):
     forward_result = await session.execute(forward_query)
     reverse_result = await session.execute(reverse_query)
 
-    forward_items = [
-        _json_safe_row(_row_to_dict(crosswalk_row))
-        for crosswalk_row in forward_result
-    ]
-    reverse_items = [
-        _json_safe_row(_row_to_dict(crosswalk_row))
-        for crosswalk_row in reverse_result
-    ]
+    forward_items = [_json_safe_row(_row_to_dict(crosswalk_row)) for crosswalk_row in forward_result]
+    reverse_items = [_json_safe_row(_row_to_dict(crosswalk_row)) for crosswalk_row in reverse_result]
 
     return response.json(
         {

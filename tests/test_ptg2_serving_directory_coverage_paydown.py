@@ -8,9 +8,9 @@ import pytest
 from api import ptg2_serving as serving
 from tests.ptg2_serving_coverage_paydown_support import (
     FakeResult,
-    FakeSession,
     strict_v3_tables,
 )
+from tests.test_ptg2_serving_boundary_contracts import SavepointSession as FakeSession
 
 
 @pytest.fixture(autouse=True)
@@ -71,10 +71,7 @@ def _provider_directory_corroboration_row(address_key):
 @pytest.mark.asyncio
 async def test_table_columns_handles_invalid_rows_and_optional_query_failure():
     invalid_session = FakeSession()
-    assert (
-        await serving._ptg2_table_columns(invalid_session, "unsafe table")
-        == frozenset()
-    )
+    assert await serving._ptg2_table_columns(invalid_session, "unsafe table") == frozenset()
     assert invalid_session.calls == []
 
     catalog_rows = [
@@ -83,16 +80,19 @@ async def test_table_columns_handles_invalid_rows_and_optional_query_failure():
         (None,),
     ]
     session = FakeSession([FakeResult(catalog_rows)])
-    assert await serving._ptg2_table_columns(session, "mrf.npi_address") == frozenset(
-        {"npi", "address_key"}
-    )
+    assert await serving._ptg2_table_columns(session, "mrf.npi_address") == frozenset({"npi", "address_key"})
+    assert session.savepoint_commit_count == 1
+    assert session.savepoint_errors == []
+    assert session.rollback_count == 0
 
-    failing_session = FakeSession([RuntimeError("catalog unavailable")])
-    assert (
-        await serving._ptg2_table_columns(failing_session, "mrf.npi_address")
-        == frozenset()
-    )
-    assert failing_session.rollback_count == 1
+    failure = RuntimeError("catalog unavailable")
+    failing_session = FakeSession([failure])
+    read_fence = failing_session.read_fence
+    assert await serving._ptg2_table_columns(failing_session, "mrf.npi_address") == frozenset()
+    assert failing_session.savepoint_errors == [failure]
+    assert failing_session.rollback_count == 0
+    assert failing_session.read_fence is read_fence
+    assert len(failing_session.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -203,18 +203,13 @@ async def test_membership_location_query_builds_bounded_context(monkeypatch, uni
         assert "WHERE addr.geo_evidence_level IS NOT NULL" in rendered_sql
         assert "addr.checksum,\n             addr.location_key" in rendered_sql
         assert "addr.checksum,\n                     addr.location_key" in rendered_sql
-        assert rendered_sql.count(
-            "addr.npi IN (SELECT membership_location_nt.npi"
-        ) == 3
+        assert rendered_sql.count("addr.npi IN (SELECT membership_location_nt.npi") == 3
         assert rendered_sql.count("n_entity.entity_type_code") == 3
     else:
         assert query.knn_order_sql is None
         assert query.knn_prefilter_sql == "TRUE"
         rendered_sql = serving._membership_location_sql(query, limit=1, offset=0)
-        assert (
-            "COALESCE(addr.address_key::text, ''), "
-            "COALESCE(addr.type, '')"
-        ) in rendered_sql
+        assert ("COALESCE(addr.address_key::text, ''), COALESCE(addr.type, '')") in rendered_sql
 
 
 @pytest.mark.asyncio
@@ -264,17 +259,17 @@ async def test_membership_location_query_does_not_let_exact_zip_bypass_assurance
     assert "ROW_NUMBER() OVER" in rendered_sql
     assert "addr.checksum,\n                     addr.location_key" in rendered_sql
     assert "geo_doctor_anchor" not in rendered_sql
-    exact_zip_sql = rendered_sql.split(
-        "exact_zip_candidates AS MATERIALIZED (", 1
-    )[1].split("), exact_zip_probe_stats", 1)[0]
+    exact_zip_sql = rendered_sql.split("exact_zip_candidates AS MATERIALIZED (", 1)[1].split(
+        "), exact_zip_probe_stats", 1
+    )[0]
     assert "source_issuer_names" not in exact_zip_sql
     assert "geo_nppes_anchor" not in exact_zip_sql
-    assert rendered_sql.index("candidate_keys AS MATERIALIZED") < rendered_sql.index(
-        "nearest_addresses AS MATERIALIZED"
-    ) < rendered_sql.index("ROW_NUMBER() OVER")
-    matched_sql = rendered_sql.split("matched AS MATERIALIZED (", 1)[1].split(
-        ")\nSELECT selected.*", 1
-    )[0]
+    assert (
+        rendered_sql.index("candidate_keys AS MATERIALIZED")
+        < rendered_sql.index("nearest_addresses AS MATERIALIZED")
+        < rendered_sql.index("ROW_NUMBER() OVER")
+    )
+    matched_sql = rendered_sql.split("matched AS MATERIALIZED (", 1)[1].split(")\nSELECT selected.*", 1)[0]
     assert "ROW_NUMBER() OVER" in matched_sql
     assert "WHERE addr.geo_evidence_level IS NOT NULL" in matched_sql
 
@@ -335,31 +330,17 @@ async def test_exact_npi_scope_skips_redundant_taxonomy_index_union(monkeypatch)
 async def test_overlay_corroboration_passthrough_paths(monkeypatch):
     provider_rows = [{"npi": 11, "provider_name": "Eleven"}]
 
-    assert (
-        await serving._overlay_provider_directory_corroboration(
-            object(), [], plan_id="plan-a"
-        )
-        == []
-    )
-    assert (
-        await serving._overlay_provider_directory_corroboration(object(), provider_rows)
-        is provider_rows
-    )
+    assert await serving._overlay_provider_directory_corroboration(object(), [], plan_id="plan-a") == []
+    assert await serving._overlay_provider_directory_corroboration(object(), provider_rows) is provider_rows
 
-    table_lookup = AsyncMock(
-        return_value="mrf.provider_directory_address_corroboration"
-    )
-    monkeypatch.setattr(
-        serving, "_ptg2_provider_directory_corroboration_table", table_lookup
-    )
+    table_lookup = AsyncMock(return_value="mrf.provider_directory_address_corroboration")
+    monkeypatch.setattr(serving, "_ptg2_provider_directory_corroboration_table", table_lookup)
     invalid_rows = [
         {"npi": "invalid", "address_key": "address-a"},
         {"npi": 12},
     ]
     assert (
-        await serving._overlay_provider_directory_corroboration(
-            object(), invalid_rows, plan_id="plan-a"
-        )
+        await serving._overlay_provider_directory_corroboration(object(), invalid_rows, plan_id="plan-a")
         is invalid_rows
     )
     table_lookup.assert_not_awaited()
@@ -371,33 +352,35 @@ async def test_overlay_corroboration_handles_missing_table_and_query_failure(
 ):
     provider_rows = [{"npi": 11, "address_key": "00000000-0000-0000-0000-000000000011"}]
     table_lookup = AsyncMock(return_value=None)
-    monkeypatch.setattr(
-        serving, "_ptg2_provider_directory_corroboration_table", table_lookup
-    )
+    monkeypatch.setattr(serving, "_ptg2_provider_directory_corroboration_table", table_lookup)
     assert (
-        await serving._overlay_provider_directory_corroboration(
-            object(), provider_rows, source_key="source-a"
-        )
+        await serving._overlay_provider_directory_corroboration(object(), provider_rows, source_key="source-a")
         is provider_rows
     )
 
     table_lookup.return_value = "mrf.provider_directory_address_corroboration"
-    session = FakeSession([RuntimeError("corroboration unavailable")])
+    failure = RuntimeError("corroboration unavailable")
+    reusable_result = FakeResult()
+    session = FakeSession([failure, reusable_result])
+    read_fence = session.read_fence
     assert (
-        await serving._overlay_provider_directory_corroboration(
-            session, provider_rows, source_key="source-a"
-        )
+        await serving._overlay_provider_directory_corroboration(session, provider_rows, source_key="source-a")
         is provider_rows
     )
-    assert session.rollback_count == 1
+    assert session.savepoint_errors == [failure]
+    assert session.savepoint_commit_count == 0
+    assert session.rollback_count == 0
+    assert session.read_fence is read_fence
+    assert len(session.calls) == 1
+    assert await session.execute("SELECT 1") is reusable_result
 
     session = FakeSession([FakeResult()])
     assert (
-        await serving._overlay_provider_directory_corroboration(
-            session, provider_rows, source_key="source-a"
-        )
+        await serving._overlay_provider_directory_corroboration(session, provider_rows, source_key="source-a")
         is provider_rows
     )
+    assert session.savepoint_commit_count == 1
+    assert session.savepoint_errors == []
 
 
 @pytest.mark.asyncio
@@ -432,6 +415,9 @@ async def test_overlay_corroboration_updates_contact_and_directory_evidence(
     )
 
     assert original_row_map["address_payload"] == ["malformed shape"]
+    assert session.savepoint_commit_count == 1
+    assert session.savepoint_errors == []
+    assert session.rollback_count == 0
     assert overlaid_rows[1] is unmatched_row_map
     updated_row_map = overlaid_rows[0]
     assert updated_row_map["location_source"] == "provider_directory_fhir"
@@ -442,9 +428,7 @@ async def test_overlay_corroboration_updates_contact_and_directory_evidence(
     assert updated_row_map["fax_number"] == "312-555-0199"
     assert updated_row_map["fax_number_digits"] == "3125550199"
     assert updated_row_map["fax_extension"] == "8"
-    assert updated_row_map["address_payload"]["address_sources"] == [
-        "provider_directory_fhir"
-    ]
+    assert updated_row_map["address_payload"]["address_sources"] == ["provider_directory_fhir"]
     assert updated_row_map["address_payload"]["phone_extension"] == "7"
     assert updated_row_map["address_payload"]["fax_extension"] == "8"
 
@@ -452,22 +436,10 @@ async def test_overlay_corroboration_updates_contact_and_directory_evidence(
 @pytest.mark.asyncio
 async def test_direct_group_ids_by_npi_respects_bounded_scope(monkeypatch):
     empty_scope = serving._ManifestRateScope((), frozenset(), 0)
-    assert (
-        await serving._direct_group_ids_by_npi(
-            object(), strict_v3_tables(), empty_scope
-        )
-        is None
-    )
+    assert await serving._direct_group_ids_by_npi(object(), strict_v3_tables(), empty_scope) is None
 
-    oversized_scope = serving._ManifestRateScope(
-        tuple(f"{index:032x}" for index in range(1025)), frozenset(), 1025
-    )
-    assert (
-        await serving._direct_group_ids_by_npi(
-            object(), strict_v3_tables(), oversized_scope
-        )
-        is None
-    )
+    oversized_scope = serving._ManifestRateScope(tuple(f"{index:032x}" for index in range(1025)), frozenset(), 1025)
+    assert await serving._direct_group_ids_by_npi(object(), strict_v3_tables(), oversized_scope) is None
 
     group_a = "01" * 16
     group_b = "02" * 16

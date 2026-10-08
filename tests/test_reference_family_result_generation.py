@@ -12,6 +12,73 @@ import pytest
 generation = importlib.import_module("process.reference_family_result_generation")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adopt", [False, True])
+async def test_immutable_nucc_counter_cas_keeps_zero_history_and_never_installs_hooks(monkeypatch, adopt):
+    original = generation.ReferenceFamilyResultGenerationAuthority(
+        "nucc", "c8f27af1-56ba-4cda-82d8-0fc67650918f", 0, None, None
+    )
+    source_generation_by_field = _serving("edfc559e-0067-43ed-b7fa-983fdb7077fe", 9)
+    monkeypatch.setattr(
+        generation, "read_reference_family_result_generation_authority", AsyncMock(return_value=original)
+    )
+    seal = AsyncMock()
+    monkeypatch.setattr(generation, "require_immutable_nucc_storage", seal)
+    monkeypatch.setattr("process.reference_family_archive.protected_publisher_owner", AsyncMock(return_value=42))
+    install = AsyncMock(side_effect=AssertionError("immutable publication cannot install hooks"))
+    monkeypatch.setattr("process.reference_source_generation.install_reference_revision_guards", install)
+    updated_by_field = {
+        "importer_id": "nucc",
+        "local_lineage_id": original.local_lineage_id,
+        "local_generation": 0 if adopt else 1,
+        "origin_lineage_id": source_generation_by_field["origin_lineage_id"] if adopt else original.local_lineage_id,
+        "origin_generation": 9 if adopt else 1,
+        "published_at": source_generation_by_field["published_at"],
+        "relation_oids": [99],
+    }
+    update = AsyncMock(return_value=updated_by_field)
+    monkeypatch.setattr(generation, "_first", update)
+    arguments_by_field = {"schema_name": "mrf", "expected_authority": original.as_dict(), "expected_relation_oid": 99}
+    if adopt:
+        published = await generation.adopt_immutable_nucc_generation(
+            object(), source_generation=source_generation_by_field, **arguments_by_field
+        )
+    else:
+        published = await generation.publish_immutable_nucc_generation(object(), **arguments_by_field)
+    assert published.local_generation == (0 if adopt else 1)
+    assert published.relation_oids == (99,)
+    seal.assert_awaited_once_with(update.await_args.args[0], schema_name="mrf", expected_relation_oid=99)
+    query = str(update.await_args.args[1])
+    assert "source_revision_tracked=FALSE" in query and "local_generation=:prior" in query
+    assert update.await_args.kwargs["prior"] == 0
+    assert "CREATE" not in query and "TRIGGER" not in query
+    install.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["mutable", "stale"])
+async def test_immutable_nucc_refuses_mutable_or_stale_before_counter_write(monkeypatch, failure):
+    original = generation.ReferenceFamilyResultGenerationAuthority(
+        "nucc", "c8f27af1-56ba-4cda-82d8-0fc67650918f", 0, None, None
+    )
+    monkeypatch.setattr("process.reference_family_archive.protected_publisher_owner", AsyncMock(return_value=42))
+    monkeypatch.setattr(
+        generation,
+        "require_immutable_nucc_storage",
+        AsyncMock(side_effect=RuntimeError("mutable") if failure == "mutable" else None),
+    )
+    monkeypatch.setattr(
+        generation, "read_reference_family_result_generation_authority", AsyncMock(return_value=original)
+    )
+    update = AsyncMock()
+    monkeypatch.setattr(generation, "_first", update)
+    with pytest.raises(RuntimeError, match="mutable|predecessor"):
+        await generation.publish_immutable_nucc_generation(
+            object(), schema_name="mrf", expected_authority={}, expected_relation_oid=99
+        )
+    update.assert_not_awaited()
+
+
 def _serving(lineage: str, value: int):
     return {
         "origin_lineage_id": lineage,
@@ -20,8 +87,84 @@ def _serving(lineage: str, value: int):
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger_count,guard_changed", [(0, False), (1, False), (1, True), (2, False)])
+async def test_nucc_predecessor_preserves_only_the_existing_authentic_guard(monkeypatch, trigger_count, guard_changed):
+    seal = AsyncMock()
+    immutable = AsyncMock(return_value={"relation_oid": 99})
+    tracking = AsyncMock(side_effect=RuntimeError("guard changed") if guard_changed else None)
+    install = AsyncMock(side_effect=AssertionError("predecessor cannot install hooks"))
+    monkeypatch.setattr(generation, "_require_sealed_nucc_storage", seal)
+    monkeypatch.setattr(generation, "require_immutable_nucc_storage", immutable)
+    monkeypatch.setattr("process.reference_source_generation.require_reference_revision_tracking", tracking)
+    monkeypatch.setattr("process.reference_source_generation.install_reference_revision_guards", install)
+    session = SimpleNamespace(scalar=AsyncMock(return_value=trigger_count))
+    if guard_changed or trigger_count > 1:
+        with pytest.raises(RuntimeError, match="guard changed|hooks differ"):
+            await generation.require_nucc_native_predecessor_storage(
+                session, schema_name="mrf", expected_relation_oid=99
+            )
+    else:
+        await generation.require_nucc_native_predecessor_storage(session, schema_name="mrf", expected_relation_oid=99)
+    seal.assert_awaited_once_with(session, "mrf", 99)
+    assert immutable.await_count == int(trigger_count == 0)
+    assert tracking.await_count == int(trigger_count == 1)
+    install.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nucc_sealed_attestation_requires_only_read_lock_and_exact_payload_denials(monkeypatch):
+    from process import reference_family_archive as archive
+
+    session = SimpleNamespace(
+        in_transaction=lambda: True,
+        scalar=AsyncMock(side_effect=[42, 99]),
+        execute=AsyncMock(),
+    )
+    columns = AsyncMock()
+    catalog = AsyncMock()
+    closure = AsyncMock()
+    monkeypatch.setattr(archive, "_require_nucc_native_columns", columns)
+    monkeypatch.setattr("process.mrf_address_publication.require_native_read_catalog", catalog)
+    monkeypatch.setattr("process.entity_address_snapshot_preparation._require_no_untrusted_mutation", closure)
+    assert await generation._require_sealed_nucc_storage(session, "mrf", 99) == 42
+    assert (
+        str(session.execute.await_args.args[0]) == 'LOCK TABLE ONLY "mrf"."nucc_taxonomy" IN ACCESS SHARE MODE NOWAIT'
+    )
+    columns.assert_awaited_once_with(session, 99)
+    catalog.assert_awaited_once_with(session, (99,))
+    closure.assert_awaited_once_with(session, [99], 42)
+    assert "NOT owner.rolcanlogin" in str(session.scalar.await_args_list[0].args[0])
+    assert session.scalar.await_args_list[1].args[1] == {"relation": '"mrf"."nucc_taxonomy"', "owner": 42}
+
+
+@pytest.mark.asyncio
+async def test_immutable_receive_authenticates_the_retained_predecessor_before_generation_order(monkeypatch):
+    from process import reference_family_archive as archive
+
+    incumbent = generation.ReferenceFamilyResultGenerationAuthority(
+        "nucc",
+        "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+        1,
+        generation.validate_reference_family_serving_generation(_serving("c8f27af1-56ba-4cda-82d8-0fc67650918f", 1)),
+        (99,),
+    )
+    monkeypatch.setattr(archive, "read_reference_family_result_generation_authority", AsyncMock(return_value=incumbent))
+    check_predecessor = AsyncMock()
+    monkeypatch.setattr(generation, "require_nucc_native_predecessor_storage", check_predecessor)
+    await archive._require_automatic_cutover_generation(
+        "session",
+        archive.reference_family_spec("nucc"),
+        SimpleNamespace(schema_name="mrf", relation_oids=(("nucc_taxonomy", 99),)),
+        _serving(incumbent.local_lineage_id, 2),
+        source_capture_contract=archive.IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT,
+    )
+    check_predecessor.assert_awaited_once_with("session", schema_name="mrf", expected_relation_oid=99)
+
+
 def test_closed_relation_families_are_ordered_and_distinct():
     assert generation.RELATION_NAMES_BY_IMPORTER == {
+        "nucc": ("nucc_taxonomy",),
         "label": ("label",),
         "mrf": (
             "issuer",

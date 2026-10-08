@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import ptg2_serving as serving
+from tests.ptg2_serving_coverage_paydown_support import FakeSession
 
 
 def _rate_row(**overrides):
@@ -41,9 +42,7 @@ def test_read_phase_normalizers_fail_closed_and_preserve_empty_filters(
     assert serving._coerce_int_payload("not-an-integer") is None
     monkeypatch.setattr(serving, "_ptg2_manifest_id", lambda _value: "z" * 32)
     assert serving._ptg2_manifest_id_bytes("malformed") == b""
-    assert serving._ptg2_reported_code_lookup_values(None, " 99213 ") == (
-        "99213",
-    )
+    assert serving._ptg2_reported_code_lookup_values(None, " 99213 ") == ("99213",)
 
     filters: list[str] = []
     parameters_by_name: dict[str, object] = {}
@@ -65,8 +64,7 @@ def test_read_phase_normalizers_fail_closed_and_preserve_empty_filters(
     assert serving._ptg2_npi_from_member_id("00") is None
 
 
-def test_address_and_optional_query_fallbacks_are_non_destructive(
-):
+def test_address_and_optional_query_fallbacks_are_non_destructive():
     """Absent address evidence cannot suppress otherwise valid fields."""
 
     provider_by_field = {"first_line": "1 Test Way"}
@@ -80,19 +78,14 @@ async def test_optional_query_and_directory_fallbacks_preserve_provider_rows(
 ):
     """Optional relation failures cannot discard otherwise valid providers."""
 
-    class FailingSession:
-        @staticmethod
-        def rollback():
-            raise RuntimeError("optional rollback unavailable")
-
-    await serving._rollback_optional_ptg2_query(SimpleNamespace())
-    await serving._rollback_optional_ptg2_query(FailingSession())
+    session = FakeSession([RuntimeError("optional query unavailable")])
+    with pytest.raises(RuntimeError, match="optional query unavailable"):
+        await serving._optional_ptg2_query(session, "SELECT 1", {})
+    assert session.rollback_count == 0
     monkeypatch.setattr(serving, "_is_relation_available", AsyncMock(return_value=False))
     assert await serving._ptg2_provider_directory_corroboration_table(object()) is None
 
-    provider_rows = [
-        {"npi": object(), "address_key": "11111111-1111-1111-1111-111111111111"}
-    ]
+    provider_rows = [{"npi": object(), "address_key": "11111111-1111-1111-1111-111111111111"}]
     monkeypatch.setattr(
         serving,
         "_ptg2_provider_directory_corroboration_table",
@@ -103,11 +96,14 @@ async def test_optional_query_and_directory_fallbacks_preserve_provider_rows(
         "_provider_directory_corroboration_by_key",
         AsyncMock(return_value={(1, "unused"): {"npi": 1}}),
     )
-    assert await serving._overlay_provider_directory_corroboration(
-        object(),
-        provider_rows,
-        plan_id="plan",
-    ) == provider_rows
+    assert (
+        await serving._overlay_provider_directory_corroboration(
+            object(),
+            provider_rows,
+            plan_id="plan",
+        )
+        == provider_rows
+    )
 
 
 @pytest.mark.asyncio
@@ -143,28 +139,40 @@ async def test_shared_graph_empty_and_cold_paths_keep_exact_ownership(
     """Empty owners stay empty and cold graph reads deduplicate in owner order."""
 
     serving_tables = SimpleNamespace(uses_shared_blocks=True)
-    assert await serving._shared_graph_members_by_id(
-        object(),
-        serving_tables,
-        "provider_forward",
-        (),
-    ) == {}
-    assert await serving._shared_provider_group_ids_for_keys(
-        object(),
-        object(),
-        (),
-    ) == {}
-    assert await serving._shared_provider_group_keys_for_ids(
-        object(),
-        object(),
-        (),
-    ) == {}
-    assert await serving._shared_graph_members_for_id(
-        object(),
-        object(),
-        "provider_forward",
-        "",
-    ) == ()
+    assert (
+        await serving._shared_graph_members_by_id(
+            object(),
+            serving_tables,
+            "provider_forward",
+            (),
+        )
+        == {}
+    )
+    assert (
+        await serving._shared_provider_group_ids_for_keys(
+            object(),
+            object(),
+            (),
+        )
+        == {}
+    )
+    assert (
+        await serving._shared_provider_group_keys_for_ids(
+            object(),
+            object(),
+            (),
+        )
+        == {}
+    )
+    assert (
+        await serving._shared_graph_members_for_id(
+            object(),
+            object(),
+            "provider_forward",
+            "",
+        )
+        == ()
+    )
     assert await serving._manifest_sets_by_group(object(), object(), []) == {}
 
     graph_reads = AsyncMock(
@@ -205,16 +213,22 @@ async def test_shared_metadata_empty_paths_avoid_io():
     )
     assert filters == ["code.snapshot_key = :shared_snapshot_key"]
     assert parameters_by_name == {"shared_snapshot_key": 7}
-    assert await serving._provider_set_ids_for_keys(
-        object(),
-        serving_tables,
-        (),
-    ) == {}
-    assert await serving._provider_set_metadata_for_ids(
-        object(),
-        serving_tables,
-        (),
-    ) == {}
+    assert (
+        await serving._provider_set_ids_for_keys(
+            object(),
+            serving_tables,
+            (),
+        )
+        == {}
+    )
+    assert (
+        await serving._provider_set_metadata_for_ids(
+            object(),
+            serving_tables,
+            (),
+        )
+        == {}
+    )
     await serving._hydrate_provider_set_network_names(
         object(),
         serving_tables,

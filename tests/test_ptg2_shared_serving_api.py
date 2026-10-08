@@ -7,8 +7,8 @@ import pytest
 
 from api import (
     ptg2_candidate_audit,
-    ptg2_db_sidecars,
     ptg2_db_serving_v3_pages,
+    ptg2_db_sidecars,
     ptg2_serving,
     ptg2_shared_blocks,
     ptg2_snapshot,
@@ -37,25 +37,13 @@ def _strict_source_identity_rows():
 
 
 def _strict_source_set():
-    return shared_source_set_metadata(
-        row["raw_container_sha256"]
-        for row in _strict_source_identity_rows()
-    )
+    return shared_source_set_metadata(row["raw_container_sha256"] for row in _strict_source_identity_rows())
 
 
 def test_shared_v3_object_kinds_and_block_format_are_fail_closed():
-    assert (
-        ptg2_db_sidecars._SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND
-        == "by_code_provider_shard_v1"
-    )
-    assert (
-        ptg2_db_serving_v3_pages.PTG2_SERVING_BINARY_V3_BY_CODE_PAGE_KIND
-        == "by_code_price_page_v4"
-    )
-    assert (
-        ptg2_db_serving_v3_pages.PTG2_SERVING_BINARY_V3_PROVIDER_SET_PAGE_KIND
-        == "provider_set_page_v3_s2"
-    )
+    assert ptg2_db_sidecars._SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND == "by_code_provider_shard_v1"
+    assert ptg2_db_serving_v3_pages.PTG2_SERVING_BINARY_V3_BY_CODE_PAGE_KIND == "by_code_price_page_v4"
+    assert ptg2_db_serving_v3_pages.PTG2_SERVING_BINARY_V3_PROVIDER_SET_PAGE_KIND == "provider_set_page_v3_s2"
     with pytest.raises(
         ptg2_shared_blocks.PTG2SharedBlockError,
         match="unsupported format version",
@@ -77,13 +65,9 @@ def _strict_source_witness():
         "format_version": 5,
         "selection_method": "bottom_k_independent_occurrence_provider_cohorts_v3",
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
-        "unqueryable_rate_policy": (
-            "count_but_exclude_from_npi_api_challenges_v1"
-        ),
+        "unqueryable_rate_policy": ("count_but_exclude_from_npi_api_challenges_v1"),
         "source_count": 1,
-        "source_set_digest": _strict_source_set()[
-            "raw_container_sha256_digest"
-        ],
+        "source_set_digest": _strict_source_set()["raw_container_sha256_digest"],
         "occurrence_target": 10_000,
         "total_target": 11_000,
         "provider_quota": 1_000,
@@ -243,33 +227,17 @@ def _candidate_descriptor_row(manifest_source_key: str):
         "snapshot_plan_id": "plan-a",
         "snapshot_plan_market_type": "group",
         "snapshot_coverage_scope_id": serving_index["coverage_scope_id"],
-        "persisted_witness_contract": serving_index["source_witness"][
-            "contract"
+        "persisted_witness_contract": serving_index["source_witness"]["contract"],
+        "persisted_witness_selection_method": serving_index["source_witness"]["selection_method"],
+        "persisted_witness_source_set_digest": serving_index["source_witness"]["source_set_digest"],
+        "persisted_witness_sample_digest": serving_index["source_witness"]["sample_digest"],
+        "persisted_witness_occurrence_population_count": serving_index["source_witness"][
+            "queryable_occurrence_population_count"
         ],
-        "persisted_witness_selection_method": serving_index["source_witness"][
-            "selection_method"
-        ],
-        "persisted_witness_source_set_digest": serving_index["source_witness"][
-            "source_set_digest"
-        ],
-        "persisted_witness_sample_digest": serving_index["source_witness"][
-            "sample_digest"
-        ],
-        "persisted_witness_occurrence_population_count": serving_index[
-            "source_witness"
-        ]["queryable_occurrence_population_count"],
-        "persisted_witness_provider_population_count": serving_index[
-            "source_witness"
-        ]["provider_population_count"],
-        "persisted_witness_occurrence_count": serving_index["source_witness"][
-            "occurrence_witness_count"
-        ],
-        "persisted_witness_provider_count": serving_index["source_witness"][
-            "provider_witness_count"
-        ],
-        "persisted_witness_payload_sha256": serving_index["source_witness"][
-            "payload_sha256"
-        ],
+        "persisted_witness_provider_population_count": serving_index["source_witness"]["provider_population_count"],
+        "persisted_witness_occurrence_count": serving_index["source_witness"]["occurrence_witness_count"],
+        "persisted_witness_provider_count": serving_index["source_witness"]["provider_witness_count"],
+        "persisted_witness_payload_sha256": serving_index["source_witness"]["payload_sha256"],
         "postgres_server_version_num": 160004,
         "database_selected": True,
         "backend_session_active": True,
@@ -322,10 +290,7 @@ async def test_provider_set_network_name_hydration_fails_closed_when_metadata_is
 @pytest.mark.asyncio
 async def test_shared_snapshot_metadata_is_never_process_cached():
     snapshot_id = "shared-snapshot-no-cache"
-    manifests = [
-        {"serving_index": _strict_serving_index(snapshot_key)}
-        for snapshot_key in (41, 42)
-    ]
+    manifests = [{"serving_index": _strict_serving_index(snapshot_key)} for snapshot_key in (41, 42)]
 
     class _ManifestResult:
         def __init__(self, value):
@@ -345,9 +310,7 @@ async def test_shared_snapshot_metadata_is_never_process_cached():
                 "snapshot_coverage_scope_id": "c" * 64,
                 "attested_source_key": "source-a",
                 "attested_coverage_scope_id": "c" * 64,
-                "attested_source_set_digest": snapshot_source_set[
-                    "raw_container_sha256_digest"
-                ],
+                "attested_source_set_digest": snapshot_source_set["raw_container_sha256_digest"],
                 "attested_audit_sample_digest": "a" * 64,
                 "source_row_count": 1,
                 "distinct_source_key_count": 1,
@@ -384,9 +347,7 @@ async def test_shared_snapshot_metadata_is_never_process_cached():
 @pytest.mark.asyncio
 async def test_candidate_snapshot_descriptor_requires_manifest_source_binding():
     access = _candidate_audit_access()
-    session = _RecordingOneRowSession(
-        _candidate_descriptor_row(access.source_key)
-    )
+    session = _RecordingOneRowSession(_candidate_descriptor_row(access.source_key))
     tables = await ptg2_tables.snapshot_serving_tables(
         session,
         access.snapshot_id,
@@ -403,9 +364,7 @@ async def test_candidate_snapshot_descriptor_requires_manifest_source_binding():
 @pytest.mark.asyncio
 async def test_candidate_snapshot_descriptor_rejects_mismatched_manifest_source():
     access = _candidate_audit_access()
-    session = _RecordingOneRowSession(
-        _candidate_descriptor_row("another-source")
-    )
+    session = _RecordingOneRowSession(_candidate_descriptor_row("another-source"))
     with pytest.raises(
         ptg2_tables.PTG2ManifestArtifactError,
         match="candidate source does not match",
@@ -449,9 +408,7 @@ async def test_candidate_search_reuses_one_validated_snapshot_descriptor(monkeyp
     }
     tables = _strict_tables(snapshot_id=access.snapshot_id)
     descriptor = AsyncMock(return_value=tables)
-    resolver = AsyncMock(
-        side_effect=AssertionError("candidate search must not resolve the snapshot twice")
-    )
+    resolver = AsyncMock(side_effect=AssertionError("candidate search must not resolve the snapshot twice"))
     one_snapshot_search = AsyncMock(return_value={"items": []})
     monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", descriptor)
     monkeypatch.setattr(
@@ -569,11 +526,12 @@ def test_snapshot_availability_branches_v3_to_binding_and_layout():
     assert "shared_attestation.activated_at IS NOT NULL" in sql
     assert "shared_attestation.contract" in sql
     assert " IN (" in sql
-    for supported_contract in (
-        ptg2_snapshot.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
-    ):
+    for supported_contract in ptg2_snapshot.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS:
         assert f"'{supported_contract}'" in sql
-    assert "manifest" not in sql
+    assert "published_snapshot.manifest::jsonb ? 'physical_binding_contract'" in sql
+    assert "shared_layout.layout_manifest ? 'physical_binding'" in sql
+    assert "local_data_preparation" in sql
+    assert "SELECT manifest" not in sql
     assert "<> 'postgres_binary_v3'" not in sql
     assert "to_regclass" not in sql
 
@@ -581,8 +539,8 @@ def test_snapshot_availability_branches_v3_to_binding_and_layout():
 @pytest.mark.asyncio
 async def test_explicit_snapshot_id_is_revalidated_as_published_sealed_v3():
     class _ScalarResult:
-        def scalar(self):
-            return "strict-v3-snapshot"
+        def one_or_none(self):
+            return "strict-v3-snapshot", False
 
     class _ExplicitSession:
         def __init__(self):
@@ -621,12 +579,8 @@ async def test_plan_and_source_resolution_never_fall_back_to_global(
 ):
     plan_lookup = AsyncMock(return_value=None)
     source_lookup = AsyncMock(return_value=None)
-    global_lookup = AsyncMock(
-        side_effect=AssertionError("scoped misses must fail closed")
-    )
-    monkeypatch.setattr(
-        ptg2_snapshot, "current_source_snapshot_id_for_plan", plan_lookup
-    )
+    global_lookup = AsyncMock(side_effect=AssertionError("scoped misses must fail closed"))
+    monkeypatch.setattr(ptg2_snapshot, "current_source_snapshot_id_for_plan", plan_lookup)
     monkeypatch.setattr(ptg2_snapshot, "current_source_snapshot_id", source_lookup)
     monkeypatch.setattr(ptg2_snapshot, "current_snapshot_id", global_lookup)
 
@@ -650,9 +604,7 @@ async def test_plan_and_source_resolution_never_fall_back_to_global(
         ("shared_snapshot_key", True, "positive shared_snapshot_key"),
     ],
 )
-def test_strict_v3_manifest_missing_contract_fails_closed(
-    field_name, field_value, error_text
-):
+def test_strict_v3_manifest_missing_contract_fails_closed(field_name, field_value, error_text):
     manifest = _strict_serving_index()
     manifest[field_name] = field_value
 
@@ -691,17 +643,12 @@ async def test_shared_payload_reads_have_no_binary_cache(monkeypatch):
 
     assert fetch.await_count == 2
     assert all(call.kwargs["snapshot_key"] == 41 for call in fetch.await_args_list)
-    assert all(
-        call.kwargs["object_kind"] == "by_code_provider_shard_v1"
-        for call in fetch.await_args_list
-    )
+    assert all(call.kwargs["object_kind"] == "by_code_provider_shard_v1" for call in fetch.await_args_list)
 
 
 @pytest.mark.asyncio
 async def test_shared_dictionary_read_passes_snapshot_key_and_never_caches(monkeypatch):
-    dictionary_bytes = bytes.fromhex("00" * 15 + "01") + bytes.fromhex(
-        "00" * 15 + "02"
-    )
+    dictionary_bytes = bytes.fromhex("00" * 15 + "01") + bytes.fromhex("00" * 15 + "02")
     fetch = AsyncMock(
         return_value={
             0: (
@@ -885,10 +832,7 @@ def _assert_forward_logical_plan_scope(
     assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in code_sql
     assert "physical_scope.snapshot_id = :logical_snapshot_id" in code_sql
     assert "plan_scope.snapshot_id = :logical_snapshot_id" in code_sql
-    assert (
-        "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id"
-        in code_sql
-    )
+    assert "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in code_sql
     assert "logical_scope.plan_id" in code_sql
     assert "logical_scope.plan_market_type" in code_sql
     assert "code_metadata.plan_id" not in code_sql
@@ -938,9 +882,7 @@ async def test_forward_search_scopes_shared_layout_rows_to_each_logical_plan(
                 "include_providers": "false",
             },
             SimpleNamespace(limit=10, offset=0),
-            _strict_tables(
-                snapshot_id=logical_snapshot_id, snapshot_key=shared_layout_key
-            ),
+            _strict_tables(snapshot_id=logical_snapshot_id, snapshot_key=shared_layout_key),
             "product_search",
         )
 
@@ -952,14 +894,12 @@ async def test_forward_search_scopes_shared_layout_rows_to_each_logical_plan(
             shared_layout_key,
         )
 
-    merged_plan_ids = [
-        call.kwargs["code_rows"][0]["plan_id"] for call in merge_rows.await_args_list
-    ]
+    merged_plan_ids = [call.kwargs["code_rows"][0]["plan_id"] for call in merge_rows.await_args_list]
     assert merged_plan_ids == ["plan-a", "plan-b"]
-    assert [
-        call.kwargs["code_rows"][0]["negotiation_arrangement"]
-        for call in merge_rows.await_args_list
-    ] == ["FFS", "FFS"]
+    assert [call.kwargs["code_rows"][0]["negotiation_arrangement"] for call in merge_rows.await_args_list] == [
+        "FFS",
+        "FFS",
+    ]
 
 
 def _exact_npi_graph_scope():
@@ -987,21 +927,11 @@ def _single_code_metadata_session():
 
 def _stub_exact_npi_graph(monkeypatch, provider_set_id):
     match_provider_locations = AsyncMock(
-        side_effect=AssertionError(
-            "exact NPI lookup must not run generic location traversal"
-        )
+        side_effect=AssertionError("exact NPI lookup must not run generic location traversal")
     )
-    expand_provider_members = AsyncMock(
-        side_effect=AssertionError("explicit NPI lookup must not expand all members")
-    )
-    selected_providers_by_set = {
-        provider_set_id: [
-            {"npi": 1234567890, "provider_name": "Selected provider"}
-        ]
-    }
-    enrich_selected_provider_rows = AsyncMock(
-        return_value=selected_providers_by_set
-    )
+    expand_provider_members = AsyncMock(side_effect=AssertionError("explicit NPI lookup must not expand all members"))
+    selected_providers_by_set = {provider_set_id: [{"npi": 1234567890, "provider_name": "Selected provider"}]}
+    enrich_selected_provider_rows = AsyncMock(return_value=selected_providers_by_set)
     monkeypatch.setattr(
         ptg2_serving,
         "_version_three_explicit_npi_graph_scope",
@@ -1118,11 +1048,7 @@ async def test_explicit_npi_search_intersects_provider_sets_before_reading_rows(
     monkeypatch.setattr(
         ptg2_serving,
         "_ptg2_manifest_location_provider_matches",
-        AsyncMock(
-            side_effect=AssertionError(
-                "exact NPI lookup must not run generic location traversal"
-            )
-        ),
+        AsyncMock(side_effect=AssertionError("exact NPI lookup must not run generic location traversal")),
     )
     session = _single_code_metadata_session()
 
@@ -1235,16 +1161,10 @@ async def test_exact_npi_provider_page_reads_every_rate_before_merging(
     )
 
     assert response is not None
-    assert [provider_record["npi"] for provider_record in response["items"]] == [
-        1234567890
-    ]
-    assert {
-        price["negotiated_rate"] for price in response["items"][0]["prices"]
-    } == {125, 150}
+    assert [provider_record["npi"] for provider_record in response["items"]] == [1234567890]
+    assert {price["negotiated_rate"] for price in response["items"][0]["prices"]} == {125, 150}
     assert response["items"][0]["rate_option_count"] == 2
-    assert {
-        option["price_set_ref"] for option in response["items"][0]["rate_options"]
-    } == set(price_set_ids)
+    assert {option["price_set_ref"] for option in response["items"][0]["rate_options"]} == set(price_set_ids)
     assert response["pagination"] == {
         "total": 1,
         "total_is_exact": True,
@@ -1336,9 +1256,7 @@ async def test_explicit_npi_search_does_not_expand_other_provider_set_members(
     )
 
     assert response is not None
-    assert [provider_record["npi"] for provider_record in response["items"]] == [
-        1234567890
-    ]
+    assert [provider_record["npi"] for provider_record in response["items"]] == [1234567890]
     assert merge_rows.await_args.kwargs["provider_set_keys"] == [3]
     location_matches.assert_not_awaited()
     broad_rows.assert_not_awaited()
@@ -1375,15 +1293,9 @@ def _stub_candidate_audit_npi_without_address(
         AsyncMock(return_value=_exact_npi_graph_scope()),
     )
     location_matches = AsyncMock(
-        side_effect=AssertionError(
-            "candidate audit must not require address-backed location matching"
-        )
+        side_effect=AssertionError("candidate audit must not require address-backed location matching")
     )
-    broad_rows = AsyncMock(
-        side_effect=AssertionError(
-            "candidate audit must not expand unrelated provider-set members"
-        )
-    )
+    broad_rows = AsyncMock(side_effect=AssertionError("candidate audit must not expand unrelated provider-set members"))
     monkeypatch.setattr(
         ptg2_serving,
         "_ptg2_manifest_location_provider_matches",
@@ -1394,11 +1306,7 @@ def _stub_candidate_audit_npi_without_address(
         "_provider_rows_for_sets",
         broad_rows,
     )
-    enrichment = AsyncMock(
-        side_effect=AssertionError(
-            "candidate audit must not query provider-directory enrichment"
-        )
-    )
+    enrichment = AsyncMock(side_effect=AssertionError("candidate audit must not query provider-directory enrichment"))
     monkeypatch.setattr(
         ptg2_serving,
         "_enriched_provider_rows_for_npis",
@@ -1469,9 +1377,7 @@ async def test_candidate_audit_exact_npi_does_not_require_an_address(
 
     assert response is not None
     assert response["items"][0]["npi"] == 1234567890
-    assert response["items"][0]["address_verification"][
-        "displayed_address_present"
-    ] is False
+    assert response["items"][0]["address_verification"]["displayed_address_present"] is False
     location_matches.assert_not_awaited()
     broad_rows.assert_not_awaited()
     enrichment.assert_not_awaited()
@@ -1525,27 +1431,13 @@ def _forward_source_provenance(
     return {
         "source_key": source_key,
         "source_type": "in_network",
-        "identity_kind": (
-            "logical_json_sha256_v1"
-            if logical_identity
-            else "raw_container_sha256_v1"
-        ),
+        "identity_kind": ("logical_json_sha256_v1" if logical_identity else "raw_container_sha256_v1"),
         "identity_sha256": str(source_key) * 64,
-        "raw_container_sha256": (
-            str(source_key + 1) * 64 if logical_identity else str(source_key) * 64
-        ),
+        "raw_container_sha256": (str(source_key + 1) * 64 if logical_identity else str(source_key) * 64),
         "logical_json_sha256": str(source_key + 2) * 64 if logical_identity else None,
         "logical_hash_deferred": not logical_identity,
-        "source_trace_set_hash": (
-            str(source_key + 3) * 64
-            if logical_identity
-            else str(source_key + 2) * 64
-        ),
-        "source_trace": (
-            []
-            if logical_identity
-            else [{"source_file_version_id": f"source-file-{source_key}"}]
-        ),
+        "source_trace_set_hash": (str(source_key + 3) * 64 if logical_identity else str(source_key + 2) * 64),
+        "source_trace": ([] if logical_identity else [{"source_file_version_id": f"source-file-{source_key}"}]),
     }
 
 
@@ -1619,9 +1511,7 @@ async def test_default_forward_response_skips_exact_provenance_query(monkeypatch
     """Ensure default forward responses neither query nor expose source provenance."""
 
     price_set_id = "01" * 16
-    provenance = AsyncMock(
-        side_effect=AssertionError("default responses must not query source provenance")
-    )
+    provenance = AsyncMock(side_effect=AssertionError("default responses must not query source provenance"))
     _install_forward_response_stubs(
         monkeypatch,
         [
@@ -1667,9 +1557,7 @@ async def test_source_enabled_forward_response_separates_logical_and_artifact_ke
             )
         ],
         (price_set_id,),
-        provenance_by_source={
-            1: _forward_source_provenance(1, logical_identity=True)
-        },
+        provenance_by_source={1: _forward_source_provenance(1, logical_identity=True)},
     )
     response = await _search_forward_response(
         _forward_code_session(1),
@@ -1689,10 +1577,7 @@ async def test_multi_file_forward_rows_keep_per_artifact_source_provenance(
     price_set_ids = ("01" * 16, "02" * 16)
     _install_forward_response_stubs(
         monkeypatch,
-        [
-            _forward_response_row(source_key, price_set_ids[source_key - 1])
-            for source_key in (1, 2)
-        ],
+        [_forward_response_row(source_key, price_set_ids[source_key - 1]) for source_key in (1, 2)],
         price_set_ids,
         provenance_by_source={
             source_key: _forward_source_provenance(
@@ -1745,12 +1630,7 @@ def test_shared_v3_response_rows_preserve_negotiation_arrangement():
     )
 
     assert response_row["negotiation_arrangement"] == "BUNDLE"
-    assert (
-        ptg2_serving._compact_item_from_row(response_row, {})[
-            "negotiation_arrangement"
-        ]
-        == "BUNDLE"
-    )
+    assert ptg2_serving._compact_item_from_row(response_row, {})["negotiation_arrangement"] == "BUNDLE"
 
     provider_item = ptg2_serving._ptg2_manifest_provider_procedure_item(
         npi=1234567890,
@@ -1796,9 +1676,7 @@ def test_reverse_provider_items_keep_exact_source_identity_and_do_not_premerge()
     assert provider_items[0]["source_key"] == "logical-source"
     assert provider_items[0]["source_artifact_key"] == 0
     assert provider_items[0]["identity_sha256"] == "1" * 64
-    assert provider_items[0]["source_trace"] == [
-        {"source_file_version_id": "source-file-1"}
-    ]
+    assert provider_items[0]["source_trace"] == [{"source_file_version_id": "source-file-1"}]
     assert len(ptg2_serving._merge_ptg2_provider_rate_items(provider_items)) == 2
 
 
@@ -1888,17 +1766,11 @@ async def test_location_rate_provider_lookup_uses_logical_plan_scope(monkeypatch
     monkeypatch.setattr(
         ptg2_serving,
         "_shared_group_ids_for_set_keys",
-        AsyncMock(
-            side_effect=AssertionError(
-                "location lookup must not expand provider sets to group IDs"
-            )
-        ),
+        AsyncMock(side_effect=AssertionError("location lookup must not expand provider sets to group IDs")),
     )
     expected_candidates = object()
     graph_candidates = AsyncMock(return_value=expected_candidates)
-    monkeypatch.setattr(
-        ptg2_serving, "_graph_candidates_for_rate_scope", graph_candidates
-    )
+    monkeypatch.setattr(ptg2_serving, "_graph_candidates_for_rate_scope", graph_candidates)
     session = _Session(
         [
             {
@@ -1988,9 +1860,7 @@ async def test_route_proof_joins_logical_scope_and_fails_closed_on_no_row():
     assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in proof_sql
     assert "physical_scope.snapshot_id = :logical_snapshot_id" in proof_sql
     assert "plan_scope.snapshot_id = :logical_snapshot_id" in proof_sql
-    assert (
-        "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in proof_sql
-    )
+    assert "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in proof_sql
     assert "plan_scope.plan_id = :plan_id" in proof_sql
     assert "plan_scope.plan_market_type = :plan_market_type" in proof_sql
     assert "code_metadata.plan_id" not in proof_sql
@@ -2055,9 +1925,7 @@ async def test_shared_page_call_site_passes_snapshot_key(monkeypatch):
 @pytest.mark.asyncio
 async def test_shared_dispatch_has_no_filesystem_manifest_loader(monkeypatch):
     db_search = AsyncMock(return_value={"items": []})
-    monkeypatch.setattr(
-        ptg2_serving, "_search_manifest_serving_table", db_search
-    )
+    monkeypatch.setattr(ptg2_serving, "_search_manifest_serving_table", db_search)
     assert not hasattr(ptg2_serving, "search_ptg2_manifest_serving_snapshot")
     assert not hasattr(ptg2_serving, "_resolve_ptg2_manifest_sidecar_path")
     session = object()
@@ -2086,9 +1954,7 @@ async def test_shared_dispatch_has_no_filesystem_manifest_loader(monkeypatch):
 @pytest.mark.asyncio
 async def test_exact_source_mode_uses_the_strict_shared_dispatch(monkeypatch):
     db_search = AsyncMock(return_value={"items": []})
-    monkeypatch.setattr(
-        ptg2_serving, "_search_manifest_serving_table", db_search
-    )
+    monkeypatch.setattr(ptg2_serving, "_search_manifest_serving_table", db_search)
     session = object()
     pagination = object()
     tables = _strict_tables()
@@ -2157,9 +2023,7 @@ async def test_all_four_serving_graph_directions_use_dense_keys(monkeypatch):
             {7: (9,)},
         ]
     )
-    monkeypatch.setattr(
-        ptg2_serving, "lookup_shared_graph_members_from_db", graph_fetch
-    )
+    monkeypatch.setattr(ptg2_serving, "lookup_shared_graph_members_from_db", graph_fetch)
     monkeypatch.setattr(
         ptg2_serving,
         "_provider_set_keys_for_ids",

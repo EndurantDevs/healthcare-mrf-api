@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import reference_family_archive as archive
+from tests.reference_family_generation_fixture import native_reference_source
 
 
 def _url():
@@ -129,7 +131,7 @@ async def _seed(sessions, source_schema, target_schema, monkeypatch, publication
     return source_authority, original
 
 
-async def _copy_archive(sessions, url, prepared, tmp_path):
+async def _copy_archive(sessions, url, prepared, tmp_path, custody):
     """Dump a pinned clone, then data-restore into reviewed model tables."""
     source_stage = prepared.ownership.schema_name
     identity = prepared.ownership.dataset_id
@@ -153,9 +155,11 @@ async def _copy_archive(sessions, url, prepared, tmp_path):
             capture_output=True,
         )
 
-    await archive.export_prepared_reference_family_archive(sessions, prepared=prepared, archive_copy=dump_archive)
+    await archive.export_prepared_reference_family_archive(
+        sessions, prepared=prepared, archive_copy=dump_archive, verify_custody=custody.verify
+    )
     async with sessions() as session, session.begin():
-        await archive.cleanup_reference_family_stage(session, prepared.ownership)
+        await custody.retire(session, prepared.ownership)
         ownership = await archive.precreate_reference_family_restore(session, importer_id="label", dataset_id=identity)
     await asyncio.to_thread(
         subprocess.run,
@@ -258,11 +262,11 @@ async def test_label_dump_restore_generation_cas_and_transaction_rollback(tmp_pa
     identity = uuid4()
     source_schema, target_schema = "label_source", "label_target"
     source_stage = archive.reference_family_stage_schema(identity)
+    cleanup = AsyncExitStack()
+    cleanup.push_async_callback(engine.dispose)
     try:
+        custody = await cleanup.enter_async_context(native_reference_source(sessions))
         source_authority, original = await _seed(sessions, source_schema, target_schema, monkeypatch, publication)
-
-        async def retained(_session, _prepared):
-            assert _prepared.manifest.importer_id == "label"
 
         prepared = await archive.prepare_reference_family_archive_source(
             sessions,
@@ -270,8 +274,11 @@ async def test_label_dump_restore_generation_cas_and_transaction_rollback(tmp_pa
             schema_name=source_schema,
             source_metadata={"release": "synthetic"},
             dataset_id=identity,
-            on_prepared=retained,
+            on_prepared=custody.retain,
+            source_copy=custody.source_copy,
+            on_precreated=custody.precreate,
         )
+        assert prepared.manifest.importer_id == "label"
         assert prepared.manifest.dependencies == {}
         assert prepared.manifest.source_serving_generation.as_dict() == source_authority.serving_generation.as_dict()
         generationless = prepared.manifest.as_dict()
@@ -280,18 +287,20 @@ async def test_label_dump_restore_generation_cas_and_transaction_rollback(tmp_pa
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="label source generation is required"):
             archive.validate_reference_family_manifest(generationless)
 
-        ownership = await _copy_archive(sessions, url, prepared, tmp_path)
+        ownership = await _copy_archive(sessions, url, prepared, tmp_path, custody)
         activate, cutover = await _cutover(sessions, ownership, prepared, target_schema, source_authority)
         await _check_activation(
             sessions, activate, cutover, ownership, publication, original, target_schema, source_authority
         )
     finally:
-        async with engine.begin() as connection:
-            for schema in (
-                source_stage,
-                archive.reference_family_predecessor_schema(identity),
-                source_schema,
-                target_schema,
-            ):
-                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
-        await engine.dispose()
+        try:
+            async with engine.begin() as connection:
+                for schema in (
+                    source_stage,
+                    archive.reference_family_predecessor_schema(identity),
+                    source_schema,
+                    target_schema,
+                ):
+                    await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        finally:
+            await cleanup.aclose()

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -132,6 +133,13 @@ class InitializedResultArchiveCandidate:
     requires_fresh_destination_attestation: bool = True
     authority_contract: str | None = None
     authority_sha256: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class InitializedLocalDataCandidate(InitializedResultArchiveCandidate):
+    """Local-only metadata coordinates; the historical initialization wire is unchanged."""
+
+    destination_layout_key: int
 
 
 @dataclass(frozen=True)
@@ -1336,9 +1344,437 @@ async def _initialize_published_result_candidate(
     )
 
 
+async def capture_local_candidate_policy(session, *, schema_name, snapshot_id, source_assignments):
+    """Capture canonical policy DATA in the pinned source transaction, not source run authority."""
+    from process.ptg_parts.ptg2_invalid_price_exclusion import validated_candidate_invalid_price_exclusion_policy
+
+    _require_transaction(session)
+    schema = _quote_ident(_required_schema(schema_name, field_name="source schema"))
+    snapshot_by_field = await _one(
+        session,
+        f"SELECT snapshot.manifest, run.options->'{INVALID_PRICE_EXCLUSION_POLICY_FIELD}' AS policy "
+        f"FROM {schema}.ptg2_snapshot snapshot JOIN {schema}.ptg2_import_run run "
+        "ON run.import_run_id=snapshot.import_run_id WHERE snapshot.snapshot_id=:snapshot_id "
+        "FOR KEY SHARE OF snapshot, run",
+        {"snapshot_id": snapshot_id},
+        "source candidate policy",
+    )
+    return validated_candidate_invalid_price_exclusion_policy(
+        snapshot_by_field["policy"],
+        _mapping(snapshot_by_field["manifest"]).get(FROZEN_RATE_FILE_BINDING_OPTION),
+        tuple(assignment["raw_container_sha256"] for assignment in source_assignments),
+    )
+
+
+async def _local_data_candidate_source(session, ownership, metadata):
+    """Rejoin immutable isolated roots and portable source records; never copy their authority."""
+    from process.ptg_parts.ptg2_invalid_price_exclusion import validated_candidate_invalid_price_exclusion_policy
+    from process.ptg_parts.ptg2_physical_binding import validate_local_serving_scope
+
+    scope = validate_local_serving_scope(metadata["closure_metadata"]["serving_scope"])
+    root_by_field = await _one(
+        session,
+        f"SELECT manifest FROM {_quote_ident(ownership.schema_name)}.ptg2_snapshot "
+        "WHERE snapshot_id=:snapshot_id FOR KEY SHARE",
+        {"snapshot_id": scope["snapshot_id"]},
+        "local data source root",
+    )
+    manifest_by_field = _mapping(root_by_field["manifest"])
+    receipt = validate_ptg_result_archive_source_authority(metadata["source_publication"])
+    identity = receipt.get("identity", receipt)
+    if (
+        scope["snapshot_id"] != metadata["source_snapshot_id"]
+        or scope["snapshot_id"] != identity["snapshot_id"]
+        or scope["source_key"] != receipt["source_key"]
+        or result_archive_manifest_sha256(manifest_by_field) != identity["snapshot_manifest_sha256"]
+    ):
+        raise ResultArchiveCandidateInitializationError("local data source manifest differs")
+    source_records = tuple(
+        await _rows(
+            session,
+            CANDIDATE_SOURCE_RECORDS_SQL.format(schema=_quote_ident(ownership.schema_name)),
+            {"snapshot_id": scope["snapshot_id"]},
+        )
+    )
+    policy = validated_candidate_invalid_price_exclusion_policy(
+        metadata["closure_metadata"][INVALID_PRICE_EXCLUSION_POLICY_FIELD],
+        manifest_by_field.get(FROZEN_RATE_FILE_BINDING_OPTION),
+        tuple(assignment["raw_container_sha256"] for assignment in scope["source_assignments"]),
+    )
+    return _AuthenticatedStagedCandidate(
+        scope["snapshot_id"],
+        manifest_by_field,
+        *scope["primary_plan"],
+        bytes.fromhex(scope["coverage_scope_id"]),
+        tuple(tuple(plan) for plan in scope["plan_scopes"]),
+        source_records,
+        policy,
+    ), receipt
+
+
+def _local_data_attempt_metadata(staged, receipt, destination, snapshot, source_key, ownership, metadata):
+    """Reuse published or frozen destination identity derivation without installing a source graph."""
+    from process.ptg_parts import result_archive_receive_binding as receive
+    from process.ptg_parts.result_archive_source_authority import PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT
+
+    if receipt["contract"] == PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT:
+        run_id = receive.published_result_run_id(destination, snapshot, receipt)
+        manifest, options = _published_candidate_metadata(staged, receipt, snapshot, source_key, run_id)
+        return run_id, manifest, options, None
+    context = receive._validated_receive_context(
+        schema_name=destination,
+        staging_schema_name=ownership.schema_name,
+        source_snapshot_key=metadata["source_snapshot_key"],
+        destination_snapshot_id=snapshot,
+        source_key=source_key,
+        authenticated_source_archive_metadata=receipt,
+    )
+    parameters, local_binding = receive._received_parameters(
+        staged={
+            "manifest": staged.source_manifest,
+            "binding_payload": staged.source_manifest.get(FROZEN_RATE_FILE_BINDING_OPTION),
+        },
+        destination_filing_id=context.destination_filing_id,
+        source_key=source_key,
+    )
+    if (
+        frozen_rate_binding_sha256(_source_binding_for_receipt(local_binding, receipt["source_file_import_id"]))
+        != receipt["frozen_binding_sha256"]
+    ):
+        raise ResultArchiveCandidateInitializationError("local data source frozen binding differs")
+    _assert_plan_scope(staged, local_binding)
+    receive._validate_received_source_evidence(
+        authenticated=staged, local_binding=local_binding, source_receipt=receipt
+    )
+    manifest = _local_candidate_manifest(
+        staged, destination_snapshot_id=snapshot, local_binding=local_binding, source_receipt=receipt
+    )
+    return (
+        frozen_internal_run_id(context.destination_filing_id),
+        manifest,
+        _local_run_options(parameters, local_binding, receipt),
+        parameters,
+    )
+
+
+async def initialize_local_data_candidate(
+    session, *, schema_name, ownership, metadata, destination_snapshot_id, reviewed_source_key
+):
+    """Create only fresh local control rows after publisher-owned native family validation.
+
+    The caller authenticates preparation and source grant in this transaction. Isolated DATA grants no audit,
+    permission, layout or serving authority. No canonical payload or source graph is copied, and this never commits.
+    """
+    from process.ptg_parts.ptg2_physical_binding import PHYSICAL_BINDING_CONTRACT, verify_local_data_family
+
+    _require_transaction(session)
+    destination = _required_schema(schema_name, field_name="schema_name")
+    snapshot = _required_snapshot_id(destination_snapshot_id, field_name="destination snapshot")
+    source_key = _required_source_key(reviewed_source_key)
+    if (
+        destination != resolve_ptg2_schema()
+        or destination == ownership.schema_name
+        or snapshot == metadata["source_snapshot_id"]
+    ):
+        raise ResultArchiveCandidateInitializationError("local data destination coordinates differ")
+    await verify_local_data_family(session, ownership)
+    staged, receipt = await _local_data_candidate_source(session, ownership, metadata)
+    if receipt["source_key"] != source_key:
+        raise ResultArchiveCandidateInitializationError("local data reviewed source differs")
+    run_id, manifest, options, frozen_parameters = _local_data_attempt_metadata(
+        staged, receipt, destination, snapshot, source_key, ownership, metadata
+    )
+    await _lock_local_candidate(session, snapshot)
+    layout_key = await _local_metadata_layout(
+        session, destination, ownership.schema_name, metadata["source_snapshot_key"]
+    )
+    manifest["physical_binding_contract"] = PHYSICAL_BINDING_CONTRACT
+    manifest["local_data_preparation"] = {
+        "dataset_id": str(ownership.dataset_id),
+        "payload_snapshot_id": staged.source_snapshot_id,
+        "payload_snapshot_key": metadata["source_snapshot_key"],
+        "destination_layout_key": layout_key,
+    }
+    if "result_archive_candidate_manifest_sha256" in options:
+        options["result_archive_candidate_manifest_sha256"] = result_archive_manifest_sha256(manifest)
+    is_new_snapshot = await _persist_local_data_controls(
+        session, destination, snapshot, run_id, manifest, options, staged, frozen_parameters
+    )
+    await _bind_local_metadata_layout(session, destination, snapshot, layout_key)
+    initialized = InitializedLocalDataCandidate(
+        RESULT_ARCHIVE_CANDIDATE_INITIALIZATION_CONTRACT,
+        snapshot,
+        run_id,
+        staged.source_snapshot_id,
+        len(metadata["closure_metadata"]["serving_scope"]["source_assignments"]),
+        len(staged.plan_scopes),
+        frozen_rate_binding_sha256(frozen_rate_binding_from_params(frozen_parameters))
+        if frozen_parameters is not None
+        else None,
+        not is_new_snapshot,
+        authority_contract=receipt["contract"],
+        authority_sha256=hashlib.sha256(canonical_json_dumps(receipt).encode()).hexdigest(),
+        destination_layout_key=layout_key,
+    )
+    return initialized, _local_control_sha256(manifest, options, staged.plan_scopes)
+
+
+async def _persist_local_data_controls(
+    session, destination, snapshot, run_id, manifest, options, staged, frozen_parameters
+):
+    """Insert or exactly replay control roots without copying the isolated payload."""
+    is_new_run = await _is_new_run_after_insert(
+        session,
+        schema_name=destination,
+        import_run_id=run_id,
+        import_month=manifest["import_month"],
+        options=options,
+    )
+    is_new_snapshot = await _is_new_snapshot_after_insert(
+        session,
+        schema_name=destination,
+        snapshot_id=snapshot,
+        import_run_id=run_id,
+        import_month=manifest["import_month"],
+        manifest=manifest,
+    )
+    await _insert_or_verify_scope(session, schema_name=destination, snapshot_id=snapshot, staged=staged)
+    if frozen_parameters is not None:
+        async with db.bind_existing_session(session):
+            if await insert_or_compare_frozen_binding(db, frozen_parameters) != frozen_rate_binding_from_params(
+                frozen_parameters
+            ):
+                raise ResultArchiveCandidateInitializationError("local data destination frozen binding differs")
+    await _assert_local_attempt_isolated(session, schema_name=destination, snapshot_id=snapshot, import_run_id=run_id)
+    if is_new_run != is_new_snapshot:
+        raise ResultArchiveCandidateInitializationError("local data destination attempt is incomplete")
+    return is_new_snapshot
+
+
+async def _local_metadata_layout(session, destination, staging, payload_key):
+    """Reuse only exact immutable metadata; canonical payload roots are not created."""
+    from uuid import uuid4
+
+    schema = _quote_ident(destination)
+    source_by_field = await _one(
+        session,
+        (
+            "SELECT generation,mapping_digest,support_digest,layout_manifest,logical_byte_count,storage_shard_id "
+            f"FROM {_quote_ident(staging)}.ptg2_v3_snapshot_layout "
+            "WHERE snapshot_key=:payload_key AND state='sealed' FOR KEY SHARE"
+        ),
+        {"payload_key": payload_key},
+        "local payload layout metadata",
+    )
+    if (
+        source_by_field["generation"] != _STORAGE_GENERATION
+        or any(len(bytes(source_by_field[field] or b"")) != 32 for field in ("mapping_digest", "support_digest"))
+        or not isinstance(source_by_field["layout_manifest"], Mapping)
+        or type(source_by_field["logical_byte_count"]) is not int
+        or source_by_field["logical_byte_count"] < 0
+    ):
+        raise ResultArchiveCandidateInitializationError("local payload layout metadata differs")
+    parameters_by_name = {
+        **source_by_field,
+        "layout_manifest": canonical_json_dumps(source_by_field["layout_manifest"]),
+        "build_token": str(uuid4()),
+    }
+    await session.execute(
+        text(
+            f"INSERT INTO {schema}.ptg2_v3_snapshot_layout "
+            "(build_token,generation,state,mapping_digest,support_digest,layout_manifest,logical_byte_count,storage_shard_id,published_at) "
+            "VALUES (:build_token,:generation,'sealed',:mapping_digest,:support_digest,CAST(:layout_manifest AS jsonb),"
+            ":logical_byte_count,:storage_shard_id,now()) "
+            "ON CONFLICT (generation,mapping_digest,support_digest) "
+            "WHERE state='sealed' AND mapping_digest IS NOT NULL AND support_digest IS NOT NULL DO NOTHING"
+        ),
+        parameters_by_name,
+    )
+    layout_by_field = await _one(
+        session,
+        (
+            f"SELECT snapshot_key,generation,mapping_digest,support_digest,layout_manifest,logical_byte_count,storage_shard_id "
+            f"FROM {schema}.ptg2_v3_snapshot_layout WHERE generation=:generation AND mapping_digest=:mapping_digest "
+            "AND support_digest=:support_digest AND state='sealed' FOR SHARE"
+        ),
+        {field: source_by_field[field] for field in ("generation", "mapping_digest", "support_digest")},
+        "local destination layout metadata",
+    )
+    if {field: layout_by_field[field] for field in source_by_field} != source_by_field:
+        raise ResultArchiveCandidateInitializationError("local destination sealed layout metadata differs")
+    layout_key = layout_by_field["snapshot_key"]
+    if type(layout_key) is not int or not 0 < layout_key < 2**63:
+        raise ResultArchiveCandidateInitializationError("local destination layout key is invalid")
+    return layout_key
+
+
+async def _bind_local_metadata_layout(session, destination, snapshot, layout_key):
+    """Bind destination metadata only; the protected native audit remains separate."""
+    schema = _quote_ident(destination)
+    parameters_by_name = {"snapshot_id": snapshot, "layout_key": layout_key}
+    await session.execute(
+        text(
+            f"INSERT INTO {schema}.ptg2_v3_snapshot_binding(snapshot_id,snapshot_key) "
+            "VALUES (:snapshot_id,:layout_key) ON CONFLICT (snapshot_id) DO NOTHING"
+        ),
+        parameters_by_name,
+    )
+    binding_by_field = await _one(
+        session,
+        (f"SELECT snapshot_key FROM {schema}.ptg2_v3_snapshot_binding WHERE snapshot_id=:snapshot_id FOR UPDATE"),
+        {"snapshot_id": snapshot},
+        "local destination metadata binding",
+    )
+    if binding_by_field["snapshot_key"] != layout_key:
+        raise ResultArchiveCandidateInitializationError("local destination metadata binding differs")
+
+
+def _local_control_sha256(manifest_by_field, options_by_field, plan_scopes):
+    """Bind low-volume local control preimages; this is not payload row validation."""
+    return hashlib.sha256(
+        canonical_json_dumps(
+            {
+                "manifest": manifest_by_field,
+                "options": options_by_field,
+                "plan_scopes": [list(plan) for plan in plan_scopes],
+            }
+        ).encode()
+    ).hexdigest()
+
+
+def _local_cleanup_marker(evidence, initialized):
+    """Read only the exact protected preparation preimage, including its metadata key."""
+    marker_by_field = {
+        "dataset_id": evidence["ownership"]["dataset_id"],
+        "payload_snapshot_id": evidence["data"]["payload_snapshot_id"],
+        "payload_snapshot_key": evidence["data"]["payload_snapshot_key"],
+    }
+    layout_key = initialized.get("destination_layout_key")
+    if layout_key is not None:
+        if type(layout_key) is not int or not 0 < layout_key < 2**63:
+            raise ResultArchiveCandidateInitializationError("local data cleanup layout key differs")
+        marker_by_field["destination_layout_key"] = layout_key
+    return marker_by_field, layout_key
+
+
+async def _delete_local_metadata_binding(session, schema, snapshot, layout_key):
+    """Retire only this exact control reference; shared layout GC owns metadata retention."""
+    bindings = await _rows(
+        session,
+        f"SELECT snapshot_key FROM {schema}.ptg2_v3_snapshot_binding WHERE snapshot_id=:snapshot_id FOR UPDATE",
+        {"snapshot_id": snapshot},
+    )
+    if bindings != ([] if layout_key is None else [{"snapshot_key": layout_key}]):
+        raise ResultArchiveCandidateInitializationError("local data cleanup metadata binding differs")
+    if bindings:
+        await session.execute(
+            text(
+                f"DELETE FROM {schema}.ptg2_v3_snapshot_binding WHERE snapshot_id=:snapshot_id AND snapshot_key=:layout_key"
+            ),
+            {"snapshot_id": snapshot, "layout_key": layout_key},
+        )
+
+
+async def cleanup_local_data_candidate(session, evidence, *, operation_id, source_key):
+    """Delete only exact unchanged BUILDING control roots under terminal publisher custody.
+
+    The caller authenticates its locked operation and ledger and owns commit/rollback. Frozen admissions remain history.
+    Publication, attestation, pins, payload, foreign or altered controls cause refusal.
+    """
+    from uuid import UUID
+
+    from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_source_lifecycle_lock
+
+    _require_transaction(session)
+    initialized = evidence["initialization"]
+    snapshot = "snapshot-archive-" + str(UUID(str(operation_id)))
+    run_id = initialized["destination_import_run_id"]
+    if initialized["destination_snapshot_id"] != snapshot:
+        raise ResultArchiveCandidateInitializationError("local data cleanup destination differs")
+    schema_name = resolve_ptg2_schema()
+    schema = _quote_ident(schema_name)
+    await acquire_ptg2_source_lifecycle_lock(session, source_key=source_key)
+    await _lock_local_candidate(session, snapshot)
+    controls = await _rows(
+        session,
+        f"SELECT snapshot.status,snapshot.import_run_id,snapshot.manifest,run.status AS run_status,run.options,run.report AS run_report "
+        f"FROM {schema}.ptg2_snapshot snapshot JOIN {schema}.ptg2_import_run run "
+        "ON run.import_run_id=snapshot.import_run_id WHERE snapshot.snapshot_id=:snapshot_id FOR UPDATE OF snapshot,run",
+        {"snapshot_id": snapshot},
+    )
+    if not controls:
+        if await session.scalar(
+            text(
+                f"SELECT EXISTS(SELECT 1 FROM {schema}.ptg2_import_run WHERE import_run_id=:run_id) "
+                f"OR EXISTS(SELECT 1 FROM {schema}.ptg2_snapshot WHERE snapshot_id=:snapshot_id)"
+            ),
+            {"run_id": run_id, "snapshot_id": snapshot},
+        ):
+            raise ResultArchiveCandidateInitializationError("local data cleanup has partial controls")
+        return
+    layout_key = await _require_local_cleanup_controls(
+        session, evidence, initialized, controls, source_key, schema_name
+    )
+    await _assert_local_attempt_isolated(session, schema_name=schema_name, snapshot_id=snapshot, import_run_id=run_id)
+    for table in (
+        "ptg2_snapshot_pin",
+        "ptg2_current_snapshot",
+        "ptg2_current_source_snapshot",
+        "ptg2_v3_snapshot_source",
+    ):
+        if await session.scalar(
+            text(f"SELECT EXISTS(SELECT 1 FROM {schema}.{_quote_ident(table)} WHERE snapshot_id=:snapshot_id)"),
+            {"snapshot_id": snapshot},
+        ):
+            raise ResultArchiveCandidateInitializationError("local data cleanup controls are referenced")
+    await _delete_local_metadata_binding(session, schema, snapshot, layout_key)
+    for table in ("ptg2_v3_snapshot_plan_scope", "ptg2_v3_snapshot_scope", "ptg2_snapshot"):
+        await session.execute(
+            text(f"DELETE FROM {schema}.{_quote_ident(table)} WHERE snapshot_id=:snapshot_id"),
+            {"snapshot_id": snapshot},
+        )
+    await session.execute(text(f"DELETE FROM {schema}.ptg2_import_run WHERE import_run_id=:run_id"), {"run_id": run_id})
+
+
+async def _require_local_cleanup_controls(session, evidence, initialized, controls, source_key, schema_name):
+    """Refuse retirement when any locked control differs from its protected preimage."""
+    from process.ptg_parts.ptg2_physical_binding import PHYSICAL_BINDING_CONTRACT
+
+    control = controls[0]
+    manifest = _mapping(control["manifest"])
+    plans = await _staged_plan_scopes(
+        session, staging_schema=schema_name, source_snapshot_id=initialized["destination_snapshot_id"]
+    )
+    marker_by_field, layout_key = _local_cleanup_marker(evidence, initialized)
+    staged = isinstance(evidence.get("activation_evidence"), Mapping)
+    expected_status = ("validated", "validated") if staged else ("building", "running")
+    if (
+        len(controls) != 1
+        or (control["status"], control["run_status"]) != expected_status
+        or (
+            staged
+            and (
+                _mapping(control.get("run_report")) != manifest
+                or evidence["activation_evidence"].get("control_sha256") != evidence["control_sha256"]
+            )
+        )
+        or control["import_run_id"] != initialized["destination_import_run_id"]
+        or _mapping(control["options"]).get("source_key") != source_key
+        or manifest.get("physical_binding_contract") != PHYSICAL_BINDING_CONTRACT
+        or manifest.get("local_data_preparation") != marker_by_field
+        or _local_control_sha256(manifest, _mapping(control["options"]), plans) != evidence["control_sha256"]
+    ):
+        raise ResultArchiveCandidateInitializationError("local data cleanup controls differ")
+    return layout_key
+
+
 __all__ = [
     "InitializedResultArchiveCandidate",
+    "InitializedLocalDataCandidate",
     "RESULT_ARCHIVE_CANDIDATE_INITIALIZATION_CONTRACT",
     "ResultArchiveCandidateInitializationError",
     "initialize_result_archive_candidate",
+    "capture_local_candidate_policy",
+    "initialize_local_data_candidate",
+    "cleanup_local_data_candidate",
 ]

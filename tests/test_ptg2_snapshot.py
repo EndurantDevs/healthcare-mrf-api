@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 
 from api import ptg2_snapshot
 
 
 class _Result:
-    def __init__(self, *, scalar_value=None, rows=()):
+    def __init__(self, *, scalar_value=None, rows=(), local_binding=False):
         self.scalar_value = scalar_value
         self.rows = list(rows)
+        self.local_binding = local_binding
 
     def scalar(self):
         return self.scalar_value
+
+    def one_or_none(self):
+        return (self.scalar_value, self.local_binding) if self.scalar_value is not None else None
 
     def __iter__(self):
         return iter(self.rows)
@@ -41,15 +48,8 @@ class _SnapshotSession:
         is_match = (
             query_params_by_name.get("snapshot_id") == self.snapshot_id
             and query_params_by_name.get("source_key") == self.source_key
-            and (
-                self.plan_ids is None
-                or query_params_by_name.get("plan_ids") == self.plan_ids
-            )
-            and (
-                self.plan_market_type is None
-                or query_params_by_name.get("plan_market_type")
-                == self.plan_market_type
-            )
+            and (self.plan_ids is None or query_params_by_name.get("plan_ids") == self.plan_ids)
+            and (self.plan_market_type is None or query_params_by_name.get("plan_market_type") == self.plan_market_type)
         )
         return _Result(scalar_value=self.snapshot_id if is_match else None)
 
@@ -199,25 +199,37 @@ class _RecordingSession:
 async def test_snapshot_resolvers_reject_empty_explicit_selectors():
     session = _RecordingSession(_Result(scalar_value="unused"))
 
-    assert await ptg2_snapshot.current_snapshot_id(
-        session,
-        requested_snapshot_id="snapshot",
-        requested_source_key="   ",
-    ) is None
-    assert await ptg2_snapshot.current_snapshot_id(
-        session,
-        requested_snapshot_id="snapshot",
-        requested_plan_id="   ",
-    ) is None
+    assert (
+        await ptg2_snapshot.current_snapshot_id(
+            session,
+            requested_snapshot_id="snapshot",
+            requested_source_key="   ",
+        )
+        is None
+    )
+    assert (
+        await ptg2_snapshot.current_snapshot_id(
+            session,
+            requested_snapshot_id="snapshot",
+            requested_plan_id="   ",
+        )
+        is None
+    )
     assert await ptg2_snapshot.current_source_snapshot_id(session, "   ") is None
-    assert await ptg2_snapshot.current_source_snapshot_id_for_plan(
-        session,
-        {},
-    ) is None
-    assert await ptg2_snapshot.current_network_snapshots_for_plan(
-        session,
-        {},
-    ) == []
+    assert (
+        await ptg2_snapshot.current_source_snapshot_id_for_plan(
+            session,
+            {},
+        )
+        is None
+    )
+    assert (
+        await ptg2_snapshot.current_network_snapshots_for_plan(
+            session,
+            {},
+        )
+        == []
+    )
     assert session.calls == []
 
 
@@ -227,28 +239,32 @@ async def test_global_snapshot_resolution_covers_found_and_missing_results():
     missing_session = _RecordingSession(_Result())
 
     assert await ptg2_snapshot.current_snapshot_id(found_session) == "global-snapshot"
-    assert await ptg2_snapshot.resolve_current_ptg2_snapshot_id(
-        missing_session,
-        {},
-    ) is None
+    assert (
+        await ptg2_snapshot.resolve_current_ptg2_snapshot_id(
+            missing_session,
+            {},
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
 async def test_plan_snapshot_resolvers_bind_optional_market_and_source_filters():
     plan_session = _RecordingSession(_Result(scalar_value="plan-snapshot"))
-    network_session = _RecordingSession(
-        _Result(rows=(("source-a", "network-snapshot"),))
-    )
+    network_session = _RecordingSession(_Result(rows=(("source-a", "network-snapshot", False),)))
     args_by_name = {
         "plan_id": "12-3456789",
         "plan_market_type": "GROUP",
         "source_key": " Source-A ",
     }
 
-    assert await ptg2_snapshot.current_source_snapshot_id_for_plan(
-        plan_session,
-        args_by_name,
-    ) == "plan-snapshot"
+    assert (
+        await ptg2_snapshot.current_source_snapshot_id_for_plan(
+            plan_session,
+            args_by_name,
+        )
+        == "plan-snapshot"
+    )
     assert await ptg2_snapshot.current_network_snapshots_for_plan(
         network_session,
         args_by_name,
@@ -259,3 +275,101 @@ async def test_plan_snapshot_resolvers_bind_optional_market_and_source_filters()
             "plan_market_type": "group",
             "source_key": "source-a",
         }
+
+
+_SELECTORS = [
+    (ptg2_snapshot.current_snapshot_id, (), {"requested_snapshot_id": "local-snapshot"}),
+    (ptg2_snapshot.current_snapshot_id, (), {}),
+    (ptg2_snapshot.current_source_snapshot_id, ("source-a",), {}),
+    (ptg2_snapshot.current_source_snapshot_id_for_plan, ({"plan_id": "plan-a"},), {}),
+    (ptg2_snapshot.current_network_snapshots_for_plan, ({"plan_id": "plan-a"},), {}),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("resolver", "args", "kwargs"), _SELECTORS)
+@pytest.mark.parametrize("declared", [False, True])
+async def test_every_selector_authenticates_local_binding_without_extra_legacy_reads(
+    monkeypatch,
+    resolver,
+    args,
+    kwargs,
+    declared,
+):
+    session = _RecordingSession(
+        _Result(
+            scalar_value="local-snapshot",
+            local_binding=declared,
+            rows=(("source-a", "local-snapshot", declared),),
+        )
+    )
+    physical_resolver = AsyncMock(
+        return_value=SimpleNamespace(
+            snapshot_id="local-snapshot",
+            physical_binding=object(),
+        )
+    )
+    monkeypatch.setattr(ptg2_snapshot, "snapshot_serving_tables", physical_resolver)
+
+    resolved_snapshot = await resolver(session, *args, **kwargs)
+
+    expected = (
+        [("source-a", "local-snapshot")]
+        if resolver is ptg2_snapshot.current_network_snapshots_for_plan
+        else "local-snapshot"
+    )
+    assert resolved_snapshot == expected
+    assert len(session.calls) == 1
+    if declared:
+        physical_resolver.assert_awaited_once_with(session, "local-snapshot", candidate_audit_access=None)
+    else:
+        physical_resolver.assert_not_awaited()
+    sql = session.calls[0][0]
+    assert "v4_root.state = 'complete'" in sql
+    assert "shared_layout.state = 'sealed'" in sql
+    assert "shared_attestation.activated_at IS NOT NULL" in sql
+    for marker in ("physical_binding", "physical_binding_contract", "local_data_preparation"):
+        assert f"? '{marker}'" in sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("resolver", "args", "kwargs"), _SELECTORS)
+async def test_local_declaration_without_authority_never_returns_or_falls_back(
+    monkeypatch,
+    resolver,
+    args,
+    kwargs,
+):
+    session = _RecordingSession(
+        _Result(
+            scalar_value="local-snapshot",
+            local_binding=True,
+            rows=(("source-a", "local-snapshot", True),),
+        )
+    )
+    physical_resolver = AsyncMock(side_effect=ptg2_snapshot.PTG2ManifestArtifactError("authority unavailable"))
+    monkeypatch.setattr(ptg2_snapshot, "snapshot_serving_tables", physical_resolver)
+
+    with pytest.raises(ptg2_snapshot.PTG2ManifestArtifactError, match="authority unavailable"):
+        await resolver(session, *args, **kwargs)
+    physical_resolver.assert_awaited_once_with(session, "local-snapshot", candidate_audit_access=None)
+    assert len(session.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("snapshot_id", "physical_binding"), [("other-snapshot", object()), ("local-snapshot", None)])
+async def test_local_selector_requires_exact_physical_result(monkeypatch, snapshot_id, physical_binding):
+    session = _RecordingSession(_Result(scalar_value="local-snapshot", local_binding=True))
+    monkeypatch.setattr(
+        ptg2_snapshot,
+        "snapshot_serving_tables",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                snapshot_id=snapshot_id,
+                physical_binding=physical_binding,
+            )
+        ),
+    )
+
+    with pytest.raises(ptg2_snapshot.PTG2ManifestArtifactError, match="binding is not available"):
+        await ptg2_snapshot.current_snapshot_id(session)

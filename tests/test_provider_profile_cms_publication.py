@@ -25,8 +25,22 @@ RELATIONS = generation.RELATION_NAMES_BY_IMPORTER["cms-doctors"]
 OIDS = (21001, 21002, 21003)
 
 
+@asynccontextmanager
+async def _reader_scope(session, state_by_field):
+    """Model the explicit Reader owner separately from mocked publication transactions."""
+    assert state_by_field.get("binding") is None
+    state_by_field["reader"] = True
+    session.info["api_reader_verified"] = True
+    try:
+        yield session
+    finally:
+        session.info.pop("api_reader_verified", None)
+        state_by_field.pop("reader", None)
+
+
 @pytest.fixture
 def runtime(monkeypatch):
+    """Keep Reader refusal proof and publication state under distinct mocked owners."""
     state_by_field = {
         "credentials": [],
         "authority": {
@@ -42,6 +56,7 @@ def runtime(monkeypatch):
     session = SimpleNamespace(info={}, execute=AsyncMock(), scalar=AsyncMock(return_value=True))
     database = SimpleNamespace(status=AsyncMock(), scalar=AsyncMock(return_value="installed"))
     database._transaction_binding = lambda: state_by_field.get("binding")
+    database.has_reader_session = lambda: state_by_field.get("reader", False)
 
     @asynccontextmanager
     async def transaction():
@@ -65,6 +80,7 @@ def runtime(monkeypatch):
         return state_by_field["authority"]
 
     database.transaction, database.all = transaction, rows
+    database.reader_session = lambda: _reader_scope(session, state_by_field)
     monkeypatch.setattr(cms, "db", database)
     monkeypatch.setattr(npi, "db", database)
     monkeypatch.setattr(native, "db", database)
@@ -145,6 +161,7 @@ async def test_republication_refuses_old_credential_page(runtime, monkeypatch, m
     assert (await npi.get_provider_profile(request, str(NPI))).status == 200
     assert snapshot.snapshot_cms_serving_generation("mrf") is None
     assert not runtime.session.info and runtime.database._transaction_binding() is None
+    assert not runtime.database.has_reader_session()
 
 
 @pytest.mark.asyncio

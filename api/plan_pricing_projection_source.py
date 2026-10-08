@@ -10,15 +10,17 @@ from typing import Any, Iterable, Mapping
 
 from sqlalchemy import text
 
+from api import ptg2_geo_projection as geo_projection
 from api.plan_pricing_projection_contract import (
     SCHEMA,
     ZIP5,
+    ProjectionCandidateInputs,
     projection_code_identity,
     row_mapping,
     table,
 )
-from api.ptg2_tables import snapshot_serving_tables
-
+from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
+from api.ptg2_tables import read_serving_tables, snapshot_serving_tables
 
 PROVIDER_BATCH_SIZE = 5_000
 MAX_PROVIDER_ROWS_PER_BATCH = 100_000
@@ -32,12 +34,8 @@ class BindingProjection:
     raw_code_row_count: int
 
 
-def _group_code_rows(code_result: Any, serving: Any) -> dict[
-    tuple[str, str], list[dict[str, Any]]
-]:
-    code_rows_by_identity: dict[
-        tuple[str, str], list[dict[str, Any]]
-    ] = defaultdict(list)
+def _group_code_rows(code_result: Any, serving: Any) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    code_rows_by_identity: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for raw_code_row in code_result:
         code_by_field = serving._canonical_code_metadata_row(raw_code_row)
         code_identity = projection_code_identity(
@@ -52,13 +50,25 @@ def _group_code_rows(code_result: Any, serving: Any) -> dict[
 async def binding_source(
     session: Any,
     binding: Mapping[str, Any],
-) -> tuple[Any, tuple[str, int, str, str, str]]:
+    *,
+    candidate_audit_access: PTG2CandidateAuditAccess | None = None,
+) -> tuple[Any, tuple[Any, ...]]:
     """Validate logical authority and identify its sealed physical read."""
 
     from api import ptg2_serving as serving
 
     snapshot_id = str(binding["snapshot_id"])
-    serving_tables = await snapshot_serving_tables(session, snapshot_id)
+    options_by_name = {}
+    if candidate_audit_access is not None:
+        if type(candidate_audit_access) is not PTG2CandidateAuditAccess or not candidate_audit_access.is_match(
+            snapshot_id=snapshot_id,
+            source_key=binding.get("source_key"),
+            plan_id=binding["plan_id"],
+            plan_market_type=binding.get("market_type") or binding.get("plan_market_type"),
+        ):
+            raise ValueError("pricing projection candidate binding authority differs")
+        options_by_name["candidate_audit_access"] = candidate_audit_access
+    serving_tables = await snapshot_serving_tables(session, snapshot_id, **options_by_name)
     serving._require_strict_shared_v3(serving_tables)
     source_key = str(binding.get("source_key") or "").strip().lower()
     if (
@@ -68,9 +78,7 @@ async def binding_source(
     ):
         raise ValueError("pricing projection binding source scope is invalid")
     plan_id = str(binding["plan_id"]).strip()
-    market_type = serving._normalized_plan_market_type(
-        binding.get("market_type") or binding.get("plan_market_type")
-    )
+    market_type = serving._normalized_plan_market_type(binding.get("market_type") or binding.get("plan_market_type"))
     scope_result = await session.execute(
         text(f"""
             SELECT plan_market_type
@@ -86,12 +94,27 @@ async def binding_source(
     effective_market_type = scope_result.scalar_one_or_none()
     if effective_market_type is None:
         raise ValueError("pricing projection binding plan scope is unavailable")
-    return serving_tables, (
+    read_identity = (
         serving_tables.storage_generation,
         serving._required_shared_snapshot_key(serving_tables),
         serving_tables.coverage_scope_id,
         plan_id,
         effective_market_type,
+    )
+    return serving_tables, _physical_read_identity(serving_tables, read_identity)
+
+
+def _physical_read_identity(serving_tables, legacy_identity):
+    """Source layout keys are only unique within their authenticated physical family."""
+    physical = getattr(serving_tables, "physical_binding", None)
+    if physical is None:
+        return legacy_identity
+    return (
+        *legacy_identity,
+        physical.dataset_id,
+        physical.schema_oid,
+        physical.payload_snapshot_id,
+        physical.relation_oids,
     )
 
 
@@ -101,13 +124,23 @@ async def binding_projection(
     *,
     maximum_code_rows: int | None = None,
     serving_tables: Any = None,
+    candidate_audit_access: PTG2CandidateAuditAccess | None = None,
 ) -> BindingProjection:
     """Read the sealed code scope for one release binding."""
 
     from api import ptg2_serving as serving
 
     if serving_tables is None:
-        serving_tables, _read_identity = await binding_source(session, binding)
+        serving_tables, _read_identity = await binding_source(
+            session, binding, candidate_audit_access=candidate_audit_access
+        )
+    elif getattr(serving_tables, "physical_binding", None) is not None:
+        serving_tables = await read_serving_tables(
+            session,
+            str(binding["snapshot_id"]),
+            serving_tables=serving_tables,
+            candidate_audit_access=candidate_audit_access,
+        )
     code_statement, parameters_by_name = _binding_code_query(
         serving,
         serving_tables,
@@ -116,10 +149,7 @@ async def binding_projection(
     )
     code_result = await session.execute(code_statement, parameters_by_name)
     raw_code_rows = list(code_result)
-    if (
-        maximum_code_rows is not None
-        and len(raw_code_rows) > maximum_code_rows
-    ):
+    if maximum_code_rows is not None and len(raw_code_rows) > maximum_code_rows:
         raise ValueError("pricing projection code-row bound exceeded")
     return BindingProjection(
         binding,
@@ -137,27 +167,21 @@ def _binding_code_query(
 ) -> tuple[Any, dict[str, Any]]:
     """Build the plan-scoped sealed-code query and its bound parameters."""
 
-    scope_join_sql, filters, parameters_by_name, plan_order = (
-        serving._shared_v3_code_scope_sql(
-            serving_tables,
-            requested_plan=str(binding["plan_id"]),
-            plan_market_type=str(
-                binding.get("market_type")
-                or binding.get("plan_market_type")
-                or ""
-            ),
-        )
+    scope_join_sql, filters, parameters_by_name, plan_order = serving._shared_v3_code_scope_sql(
+        serving_tables,
+        requested_plan=str(binding["plan_id"]),
+        plan_market_type=str(binding.get("market_type") or binding.get("plan_market_type") or ""),
     )
     filters.append("code_metadata.snapshot_key = :shared_snapshot_key")
-    parameters_by_name["shared_snapshot_key"] = (
-        serving._required_shared_snapshot_key(serving_tables)
-    )
+    parameters_by_name["shared_snapshot_key"] = serving._required_shared_snapshot_key(serving_tables)
     limit_sql = ""
     if maximum_code_rows is not None:
         if maximum_code_rows <= 0:
             raise ValueError("pricing projection code-row bound is invalid")
         parameters_by_name["projection_code_row_limit"] = maximum_code_rows + 1
         limit_sql = "LIMIT :projection_code_row_limit"
+    physical = getattr(serving_tables, "physical_binding", None)
+    code_relation = serving._shared_v3_code_table() if physical is None else physical.relation("ptg2_v3_code")
     return (
         text(
             f"""
@@ -171,9 +195,9 @@ def _binding_code_query(
                    code_metadata.source_name,
                    code_metadata.source_description,
                    code_metadata.rate_count
-             FROM {serving._shared_v3_code_table()} code_metadata
+             FROM {code_relation} code_metadata
               {scope_join_sql}
-             WHERE {' AND '.join(filters)}
+             WHERE {" AND ".join(filters)}
              ORDER BY {plan_order}, code_metadata.code_key
              {limit_sql}
             """
@@ -182,9 +206,13 @@ def _binding_code_query(
     )
 
 
-def _assured_addresses_sql(serving: Any) -> str:
-    assurance_sql = serving._ptg2_geo_assured_address_sql("addr")
+def _assured_addresses_sql(serving: Any, *, candidate_inputs=None) -> str:
+    address_relation = table("entity_address_unified")
     evidence_level_sql = serving._ptg2_geo_evidence_level_sql("addr")
+    if candidate_inputs is not None:
+        address_relation = candidate_inputs.relation("entity_address_unified")
+        evidence_level_sql = geo_projection.evidence_level_from_source_id_sql("addr.geo_evidence_source_id")
+    assurance_sql = f"({evidence_level_sql}) IS NOT NULL"
     return f"""
         WITH source_npis AS MATERIALIZED (
             SELECT UNNEST(CAST(:npis AS bigint[])) AS npi
@@ -201,7 +229,7 @@ def _assured_addresses_sql(serving: Any) -> str:
                      THEN UPPER(BTRIM(addr.state_code))
                    END AS projected_state,
                    {evidence_level_sql} AS geo_evidence_level
-              FROM {table('entity_address_unified')} addr
+              FROM {address_relation} addr
               JOIN source_npis ON source_npis.npi = addr.npi
              WHERE addr.type IN ('practice', 'primary', 'secondary', 'site')
                AND {assurance_sql}
@@ -286,14 +314,50 @@ def _address_payload_sql() -> str:
     )::text"""
 
 
-def _provider_selection_sql(serving: Any) -> str:
+def provider_taxonomy_summary_lateral_sql(
+    npi_sql: str,
+    alias: str = "tax",
+    *,
+    schema: str = SCHEMA,
+    candidate_inputs=None,
+) -> str:
+    """Render the existing ordered taxonomy summary against exact selected inputs."""
+    taxonomy_relation = f"{schema}.npi_taxonomy"
+    vocabulary_relation = f"{schema}.nucc_taxonomy"
+    if candidate_inputs is not None:
+        if type(candidate_inputs) is not ProjectionCandidateInputs:
+            raise ValueError("pricing projection candidate inputs are invalid")
+        taxonomy_relation = candidate_inputs.relation("npi_taxonomy")
+        vocabulary_relation = candidate_inputs.relation("nucc_taxonomy")
+    taxonomy_order_sql = "(UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum"
+    return f"""
+        LEFT JOIN LATERAL (
+            SELECT
+                array_agg(nt.healthcare_provider_taxonomy_code ORDER BY {taxonomy_order_sql}) AS taxonomy_codes,
+                array_agg(COALESCE(nucc.display_name, nucc.classification) ORDER BY {taxonomy_order_sql}) AS specialties,
+                array_remove(array_agg(NULLIF(nucc.classification, '') ORDER BY {taxonomy_order_sql}), NULL) AS classifications,
+                array_remove(array_agg(NULLIF(nucc.specialization, '') ORDER BY {taxonomy_order_sql}), NULL) AS specializations,
+                (array_agg(COALESCE(nucc.display_name, nucc.classification) ORDER BY {taxonomy_order_sql}))[1] AS primary_specialty,
+                (array_remove(array_agg(NULLIF(nucc.specialization, '') ORDER BY {taxonomy_order_sql}), NULL))[1] AS primary_specialization
+            FROM {taxonomy_relation} nt
+            LEFT JOIN {vocabulary_relation} nucc
+              ON nucc.code = nt.healthcare_provider_taxonomy_code
+            WHERE nt.npi = {npi_sql}
+        ) {alias} ON TRUE
+    """
+
+
+def _provider_selection_sql(serving: Any, *, candidate_inputs=None) -> str:
+    options_by_name = {} if candidate_inputs is None else {"candidate_inputs": candidate_inputs}
     taxonomy_sql = serving._provider_taxonomy_summary_lateral_sql(
-        "source_npis.npi"
+        "source_npis.npi",
+        **options_by_name,
     )
+    npi_relation = table("npi") if candidate_inputs is None else candidate_inputs.relation("npi")
     address_payload_sql = _address_payload_sql()
     return f"""
         SELECT source_npis.npi,
-               {serving._ptg2_provider_name_sql('n')} AS provider_name,
+               {serving._ptg2_provider_name_sql("n")} AS provider_name,
                n.entity_type_code,
                n.provider_credential_text AS credential,
                n.provider_sex_code,
@@ -312,11 +376,11 @@ def _provider_selection_sql(serving: Any) -> str:
                'entity_address_unified'::varchar AS location_confidence_code,
                addr.state_address_rank,
                addr.geo_evidence_level AS _geo_evidence_level,
-               {serving._geo_evidence_source_id_sql('addr.geo_evidence_level')}
+               {serving._geo_evidence_source_id_sql("addr.geo_evidence_level")}
                    AS _geo_evidence_source_id,
                {address_payload_sql} AS address_payload
          FROM source_npis
-          LEFT JOIN {table('npi')} n ON n.npi = source_npis.npi
+          LEFT JOIN {npi_relation} n ON n.npi = source_npis.npi
           JOIN ranked_addresses addr
             ON addr.npi = source_npis.npi
            AND addr.zip_address_rank = 1
@@ -326,14 +390,14 @@ def _provider_selection_sql(serving: Any) -> str:
     """
 
 
-def _provider_rows_sql() -> str:
+def _provider_rows_sql(*, candidate_inputs=None) -> str:
     from api import ptg2_serving as serving
 
     return "".join(
         (
-            _assured_addresses_sql(serving),
+            _assured_addresses_sql(serving, candidate_inputs=candidate_inputs),
             _ranked_addresses_sql(serving),
-            _provider_selection_sql(serving),
+            _provider_selection_sql(serving, candidate_inputs=candidate_inputs),
         )
     )
 
@@ -350,13 +414,9 @@ def _append_provider_rows(
         if not ZIP5.fullmatch(zip5):
             continue
         provider_by_field["zip5"] = zip5
-        provider_by_field["state"] = (
-            str(provider_by_field.get("state") or "").strip().upper() or None
-        )
+        provider_by_field["state"] = str(provider_by_field.get("state") or "").strip().upper() or None
         state_address_rank = provider_by_field.get("state_address_rank")
-        provider_by_field["state_address_rank"] = (
-            int(state_address_rank) if state_address_rank is not None else None
-        )
+        provider_by_field["state_address_rank"] = int(state_address_rank) if state_address_rank is not None else None
         provider_rows_by_npi[npi].append(provider_by_field)
         appended_rows.append(provider_by_field)
     return appended_rows
@@ -365,13 +425,13 @@ def _append_provider_rows(
 async def _hydrate_state_address_provenance(
     session: Any,
     provider_rows: list[dict[str, Any]],
+    *,
+    candidate_inputs=None,
 ) -> None:
     from api import ptg2_serving as serving
 
     witness_rows = [
-        provider_by_field
-        for provider_by_field in provider_rows
-        if provider_by_field.get("state_address_rank") == 1
+        provider_by_field for provider_by_field in provider_rows if provider_by_field.get("state_address_rank") == 1
     ]
     if not witness_rows:
         return
@@ -383,6 +443,7 @@ async def _hydrate_state_address_provenance(
         use_stored_only=False,
         strict_stored_identity=True,
         backfill_admitted_source_record_ids=True,
+        **({} if candidate_inputs is None else {"candidate_inputs": candidate_inputs}),
     )
     if status != "available" or len(witness_rows) != expected_count:
         raise ValueError("pricing projection provider-state provenance is incomplete")
@@ -391,12 +452,14 @@ async def _hydrate_state_address_provenance(
 async def projection_provider_rows_for_npis(
     session: Any,
     npis: Iterable[int],
+    *,
+    candidate_inputs=None,
 ) -> dict[int, tuple[dict[str, Any], ...]]:
     """Freeze one assured service-location card per NPI and ZIP cell."""
 
     normalized_npis = sorted({int(npi) for npi in npis if int(npi) > 0})
     provider_rows_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    provider_statement = text(_provider_rows_sql())
+    provider_statement = text(_provider_rows_sql(candidate_inputs=candidate_inputs))
     for start in range(0, len(normalized_npis), PROVIDER_BATCH_SIZE):
         npi_batch = normalized_npis[start : start + PROVIDER_BATCH_SIZE]
         provider_result = await session.execute(
@@ -410,11 +473,10 @@ async def projection_provider_rows_for_npis(
         if len(provider_rows) > MAX_PROVIDER_ROWS_PER_BATCH:
             raise ValueError("pricing projection provider-row bound exceeded")
         appended_rows = _append_provider_rows(provider_rows_by_npi, provider_rows)
-        await _hydrate_state_address_provenance(session, appended_rows)
-    return {
-        npi: tuple(provider_rows)
-        for npi, provider_rows in provider_rows_by_npi.items()
-    }
+        await _hydrate_state_address_provenance(
+            session, appended_rows, **({} if candidate_inputs is None else {"candidate_inputs": candidate_inputs})
+        )
+    return {npi: tuple(provider_rows) for npi, provider_rows in provider_rows_by_npi.items()}
 
 
 def numeric_rates(
@@ -427,7 +489,7 @@ def numeric_rates(
         raw_rate = price_by_field.get("negotiated_rate")
         try:
             rate = Decimal(str(raw_rate).strip())
-        except (InvalidOperation, TypeError, ValueError):
+        except InvalidOperation, TypeError, ValueError:
             continue
         if rate.is_finite() and rate >= 0:
             numeric_rates_list.append(rate)
@@ -443,9 +505,7 @@ def eligible_projection_providers(
     from api import ptg2_serving as serving
 
     code_system, code = code_identity
-    rule = serving._inferred_provider_taxonomy_rule(
-        {"code_system": code_system, "code": code}
-    )
+    rule = serving._inferred_provider_taxonomy_rule({"code_system": code_system, "code": code})
     provider_rows_list = list(providers)
     if rule is None:
         return provider_rows_list
@@ -455,7 +515,6 @@ def eligible_projection_providers(
         for provider_by_field in provider_rows_list
         if provider_by_field.get("entity_type_code") == 1
         and eligible_taxonomy_codes.intersection(
-            str(taxonomy_code or "").strip().upper()
-            for taxonomy_code in provider_by_field.get("taxonomy_codes") or ()
+            str(taxonomy_code or "").strip().upper() for taxonomy_code in provider_by_field.get("taxonomy_codes") or ()
         )
     ]

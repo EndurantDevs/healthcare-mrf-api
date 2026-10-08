@@ -136,9 +136,7 @@ DEFAULT_CUTOVER_RETRY_ATTEMPTS = 4
 DEFAULT_CUTOVER_RETRY_BACKOFF_MS = 25
 DEFAULT_CUTOVER_RETRY_MAX_BACKOFF_MS = 100
 DEFAULT_PROVIDER_DIRECTORY_PARTIAL_SCOPE = "latest-run"
-PROVIDER_DIRECTORY_PARTIAL_SCOPE_INDEX = (
-    "provider_directory_address_overlay_source_run_resource_idx"
-)
+PROVIDER_DIRECTORY_PARTIAL_SCOPE_INDEX = "provider_directory_address_overlay_source_run_resource_idx"
 DEFAULT_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE = 100
 ENTITY_ADDRESS_REFRESH_MODE_FULL = "full"
 ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL = "provider-directory-partial"
@@ -382,8 +380,7 @@ def _entity_address_provider_directory_source_ids(task: dict) -> list[str]:
 
 def _entity_address_provider_directory_run_id(task: dict) -> str | None:
     return _clean_optional(
-        task.get("provider_directory_run_id")
-        or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_RUN_ID")
+        task.get("provider_directory_run_id") or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_RUN_ID")
     )
 
 
@@ -463,33 +460,24 @@ async def _assert_current_provider_directory_dataset(
             db_schema, source_id, expected_dataset_id, expected_root_run_id
         )
 
-    dataset_row = await preparation_admission.read_first(db,
+    dataset_row = await preparation_admission.read_first(
+        db,
         _provider_directory_current_dataset_fence_query(db_schema),
         source_id=source_id,
         expected_dataset_id=expected_dataset_id,
         expected_root_run_id=expected_root_run_id,
     )
-    if dataset_row is None or _clean_optional(
-        _row_mapping(dataset_row).get("dataset_id")
-    ) != expected_dataset_id:
-        raise RuntimeError(
-            "entity-address-unified Provider Directory dataset fence changed"
-        )
-    provider_directory_fhir = importlib.import_module(
-        "process.provider_directory_fhir"
-    )
+    if dataset_row is None or _clean_optional(_row_mapping(dataset_row).get("dataset_id")) != expected_dataset_id:
+        raise RuntimeError("entity-address-unified Provider Directory dataset fence changed")
+    provider_directory_fhir = importlib.import_module("process.provider_directory_fhir")
     try:
-        await (
-            provider_directory_fhir.ensure_provider_directory_published_source_alias(
-                source_id=source_id,
-                expected_dataset_id=expected_dataset_id,
-                expected_root_run_id=expected_root_run_id,
-            )
+        await provider_directory_fhir.ensure_provider_directory_published_source_alias(
+            source_id=source_id,
+            expected_dataset_id=expected_dataset_id,
+            expected_root_run_id=expected_root_run_id,
         )
     except RuntimeError as exc:
-        raise RuntimeError(
-            "entity-address-unified Provider Directory dataset fence changed"
-        ) from exc
+        raise RuntimeError("entity-address-unified Provider Directory dataset fence changed") from exc
 
 
 def _provider_directory_source_batch_size(task: dict) -> int:
@@ -525,10 +513,7 @@ def _entity_address_provider_directory_partial_scope(task: dict) -> str:
         return "latest-run"
     if value in {"all", "full", "unscoped"}:
         return "all"
-    raise ValueError(
-        "Unsupported provider_directory_partial_scope "
-        f"{raw!r}; expected latest-run or all"
-    )
+    raise ValueError(f"Unsupported provider_directory_partial_scope {raw!r}; expected latest-run or all")
 
 
 def _is_publish_requested(task: dict, *, test_mode: bool) -> bool:
@@ -658,14 +643,14 @@ def _coerce_rowcount(value) -> int | None:
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
 def _int_context_metric(context: dict, name: str) -> int:
     try:
         return int(context.get(name) or 0)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
 
@@ -780,7 +765,8 @@ def _row_mapping(row) -> dict:
 
 
 async def _stage_summary_counts(db_schema: str, stage_table: str) -> dict[str, int]:
-    rows = await preparation_admission.read_all(db,
+    rows = await preparation_admission.read_all(
+        db,
         f"""
         SELECT
             COUNT(*)::bigint AS staged_rows,
@@ -788,7 +774,7 @@ async def _stage_summary_counts(db_schema: str, stage_table: str) -> dict[str, i
             COUNT(*) FILTER (WHERE inferred_npi IS NOT NULL)::bigint AS inferred_rows,
             COUNT(*) FILTER (WHERE multi_source_confirmed IS TRUE)::bigint AS multi_source_rows
           FROM {db_schema}.{stage_table};
-        """
+        """,
     )
     if not rows:
         return {
@@ -815,7 +801,7 @@ def _phase_timing_rows(context: dict, phase: str) -> int:
         return 0
     try:
         return int(timing.get("rows") or 0)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
 
@@ -848,7 +834,9 @@ async def _ensure_schema_exists(db_schema: str) -> None:
     try:
         await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
     except Exception as exc:
-        exists = bool(await preparation_admission.read_scalar(db, f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;"))
+        exists = bool(
+            await preparation_admission.read_scalar(db, f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;")
+        )
         if exists:
             logger.warning(
                 "Schema %s already exists but CREATE SCHEMA failed (%s); continuing",
@@ -898,7 +886,9 @@ def _stage_index_profile() -> str:
         return "all"
     if _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_ADDITIONAL_INDEXES", False):
         return "none"
-    raw = (os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE") or DEFAULT_STAGE_INDEX_PROFILE).strip().lower()
+    raw = (
+        (os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE") or DEFAULT_STAGE_INDEX_PROFILE).strip().lower()
+    )
     if raw in STAGE_INDEX_PROFILES:
         return raw
     logger.warning(
@@ -911,9 +901,10 @@ def _stage_index_profile() -> str:
 
 def _post_publish_index_profile() -> str:
     raw = (
-        os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE")
-        or DEFAULT_POST_PUBLISH_INDEX_PROFILE
-    ).strip().lower()
+        (os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE") or DEFAULT_POST_PUBLISH_INDEX_PROFILE)
+        .strip()
+        .lower()
+    )
     if raw in POST_PUBLISH_INDEX_PROFILES:
         return raw
     logger.warning(
@@ -982,9 +973,10 @@ def _should_keep_raw_stage() -> bool:
 
 def _raw_group_index_profile() -> str:
     raw = (
-        os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_RAW_GROUP_INDEX_PROFILE")
-        or DEFAULT_RAW_GROUP_INDEX_PROFILE
-    ).strip().lower()
+        (os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_RAW_GROUP_INDEX_PROFILE") or DEFAULT_RAW_GROUP_INDEX_PROFILE)
+        .strip()
+        .lower()
+    )
     if raw in RAW_GROUP_INDEX_PROFILES:
         return raw
     logger.warning(
@@ -1020,11 +1012,7 @@ def _post_publish_index_plan(
             skipped_indexes.append(f"{table_name}.{index_name}")
             continue
         using = f"USING {index.get('using')} " if index.get("using") else ""
-        include = (
-            f" INCLUDE ({', '.join(index.get('include') or ())})"
-            if index.get("include")
-            else ""
-        )
+        include = f" INCLUDE ({', '.join(index.get('include') or ())})" if index.get("include") else ""
         where = f" WHERE {index.get('where')}" if index.get("where") else ""
         live_index_name = f"{table_name}_idx_{index_name}"
         concurrently = "CONCURRENTLY " if build_concurrently else ""
@@ -1115,7 +1103,8 @@ async def _compact_record_ids_by_metadata_reset(
     """Compact identifiers in place and return the stage row estimate."""
 
     row_estimate = int(
-        await preparation_admission.read_scalar(db,
+        await preparation_admission.read_scalar(
+            db,
             f"""
             SELECT GREATEST(COALESCE(c.reltuples, 0), 0)::bigint
               FROM pg_class c
@@ -1123,7 +1112,7 @@ async def _compact_record_ids_by_metadata_reset(
                 ON n.oid = c.relnamespace
              WHERE n.nspname = {_sql_literal(db_schema)}
                AND c.relname = {_sql_literal(stage_table)};
-            """
+            """,
         )
         or 0
     )
@@ -1152,8 +1141,7 @@ async def _rewrite_compacted_source_record_ids_stage(
     await preparation_admission.create_stage_sql(
         db_schema,
         compact_table,
-        f"CREATE TABLE {db_schema}.{compact_table} "
-        f"(LIKE {db_schema}.{stage_table} INCLUDING ALL);",
+        f"CREATE TABLE {db_schema}.{compact_table} (LIKE {db_schema}.{stage_table} INCLUDING ALL);",
         context=phase_context,
         phase="entity-address-unified compacting hot rows setup",
     )
@@ -1206,16 +1194,12 @@ def _stage_index_statements(
     statements: list[tuple[str, str]] = []
     for index in indexes:
         index_name = index.get("name", "_".join(index.get("index_elements")))
-        if not _is_stage_index_enabled(stage_cls, index):
+        if not phase_context.get("complete_stage_indexes") and not _is_stage_index_enabled(stage_cls, index):
             skipped_indexes = phase_context.setdefault("skipped_stage_indexes", [])
             skipped_indexes.append(f"{stage_cls.__tablename__}.{index_name}")
             continue
         using = f"USING {index.get('using')} " if index.get("using") else ""
-        include = (
-            f" INCLUDE ({', '.join(index.get('include') or ())})"
-            if index.get("include")
-            else ""
-        )
+        include = f" INCLUDE ({', '.join(index.get('include') or ())})" if index.get("include") else ""
         where = f" WHERE {index.get('where')}" if index.get("where") else ""
         stmt = (
             f"CREATE INDEX IF NOT EXISTS "
@@ -1231,9 +1215,7 @@ def _is_postgis_unavailable_error(exc: Exception) -> bool:
     root_error = getattr(exc, "orig", None) or getattr(exc, "__cause__", None) or exc
     message = str(root_error).lower()
     sqlstate = postgres_sqlstate(exc)
-    mentions_postgis = any(
-        term in message for term in ("st_makepoint", "geography", "postgis")
-    )
+    mentions_postgis = any(term in message for term in ("st_makepoint", "geography", "postgis"))
     explicitly_missing = any(
         term in message
         for term in (
@@ -1244,9 +1226,7 @@ def _is_postgis_unavailable_error(exc: Exception) -> bool:
             "postgis unavailable",
         )
     )
-    return mentions_postgis and (
-        sqlstate in {"42704", "42883"} or explicitly_missing
-    )
+    return mentions_postgis and (sqlstate in {"42704", "42883"} or explicitly_missing)
 
 
 async def _build_stage_index(
@@ -1402,12 +1382,10 @@ async def _require_geo_taxonomy_stage_index(
         return
     if {"geo_idx", "geo_taxonomy"}.issubset(postgis_skipped_indexes):
         return
-    if not await preparation_admission.read_scalar(db,
-        _required_geo_taxonomy_stage_index_sql(db_schema, stage_cls.__tablename__)
+    if not await preparation_admission.read_scalar(
+        db, _required_geo_taxonomy_stage_index_sql(db_schema, stage_cls.__tablename__)
     ):
-        raise RuntimeError(
-            "entity-address-unified stage requires a valid geo_taxonomy GiST index"
-        )
+        raise RuntimeError("entity-address-unified stage requires a valid geo_taxonomy GiST index")
     phase_context["geo_taxonomy_stage_index_valid"] = True
 
 
@@ -1445,9 +1423,7 @@ async def _create_stage_indexes(
     )
     phase_context["stage_index_concurrency"] = index_concurrency
     postgis_skipped_indexes: list[str] = []
-    phase_context.setdefault("postgis_skipped_stage_indexes", {})[
-        stage_cls.__tablename__
-    ] = postgis_skipped_indexes
+    phase_context.setdefault("postgis_skipped_stage_indexes", {})[stage_cls.__tablename__] = postgis_skipped_indexes
     await _run_stage_index_statements(
         statements,
         phase_context,
@@ -1481,9 +1457,7 @@ async def _analyze_post_publish_table(build: _PostPublishIndexBuild) -> None:
         f"ANALYZE {build.db_schema}.{build.table_name};",
         "entity-address-unified post-publish analyze",
     )
-    build.phase_context["post_publish_analyze_seconds"] = round(
-        time.time() - started_at, 3
-    )
+    build.phase_context["post_publish_analyze_seconds"] = round(time.time() - started_at, 3)
     build.phase_context["post_publish_analyzed"] = True
 
 
@@ -1504,7 +1478,8 @@ async def _is_post_publish_index_invalid(
     build: _PostPublishIndexBuild,
     live_index_name: str,
 ) -> bool:
-    invalid = await preparation_admission.read_scalar(db,
+    invalid = await preparation_admission.read_scalar(
+        db,
         f"""
         SELECT 1
           FROM pg_class i
@@ -1516,7 +1491,7 @@ async def _is_post_publish_index_invalid(
            AND i.relname = {_sql_literal(live_index_name)}
            AND ix.indisvalid IS FALSE
          LIMIT 1;
-        """
+        """,
     )
     return bool(invalid)
 
@@ -1567,9 +1542,7 @@ async def _build_post_publish_index(
     started_at = time.time()
     is_completed = False
     try:
-        await _drop_invalid_post_publish_index(
-            build, f"{build.table_name}_idx_{index_name}"
-        )
+        await _drop_invalid_post_publish_index(build, f"{build.table_name}_idx_{index_name}")
         if build.should_build_concurrently and hasattr(db, "execute_ddl"):
             await db.execute_ddl(statement)
             _record_phase_timing(
@@ -1619,10 +1592,7 @@ async def _run_post_publish_indexes(
         return
     semaphore = asyncio.Semaphore(concurrency)
     index_results = await preparation_admission.gather(
-        *(
-            _guarded_post_publish_index(semaphore, build, index_name, statement)
-            for index_name, statement in statements
-        ),
+        *(_guarded_post_publish_index(semaphore, build, index_name, statement) for index_name, statement in statements),
         return_exceptions=True,
     )
     for index_result in index_results:
@@ -1682,11 +1652,7 @@ async def _create_post_publish_indexes(
         ),
         minimum=1,
     )
-    index_concurrency = (
-        1
-        if should_build_concurrently
-        else min(configured_concurrency, len(statements))
-    )
+    index_concurrency = 1 if should_build_concurrently else min(configured_concurrency, len(statements))
     phase_context["post_publish_index_concurrency"] = index_concurrency
     await _run_post_publish_indexes(build, statements, index_concurrency)
     await _analyze_post_publish_table(build)
@@ -1701,7 +1667,7 @@ async def _prepare_inference_stage_indexes(
     phase_context = context if context is not None else {}
     await _run_sql_phase(
         f"""
-        CREATE INDEX IF NOT EXISTS {_stage_index_name(stage_table, 'facility_unresolved_identity')}
+        CREATE INDEX IF NOT EXISTS {_stage_index_name(stage_table, "facility_unresolved_identity")}
         ON {db_schema}.{stage_table} (entity_subtype, entity_id, type, checksum)
         WHERE entity_type = 'facility_anchor'
           AND npi IS NULL
@@ -1712,7 +1678,7 @@ async def _prepare_inference_stage_indexes(
     )
     await _run_sql_phase(
         f"""
-        CREATE INDEX IF NOT EXISTS {_stage_index_name(stage_table, 'facility_unresolved_address')}
+        CREATE INDEX IF NOT EXISTS {_stage_index_name(stage_table, "facility_unresolved_address")}
         ON {db_schema}.{stage_table} (address_key, entity_subtype)
         WHERE entity_type = 'facility_anchor'
           AND npi IS NULL
@@ -1917,10 +1883,7 @@ async def _report_support_index_progress(
         message = (
             f"indexed support table {index}/{progress.total}: {table_name}"
             if is_completed
-            else (
-                f"indexing support table {index}/{progress.total}: {table_name} "
-                f"(concurrency {progress.concurrency})"
-            )
+            else (f"indexing support table {index}/{progress.total}: {table_name} (concurrency {progress.concurrency})")
         )
         enqueue_live_progress(
             run_id=progress.run_id,
@@ -1978,10 +1941,7 @@ async def _run_concurrent_support_indexes(
             await _index_support_stage(progress, index, stage_cls)
 
     index_results = await preparation_admission.gather(
-        *(
-            _guarded(index, stage_cls)
-            for index, stage_cls in enumerate(stage_table_classes, start=1)
-        ),
+        *(_guarded(index, stage_cls) for index, stage_cls in enumerate(stage_table_classes, start=1)),
         return_exceptions=True,
     )
     for index_result in index_results:
@@ -2037,8 +1997,7 @@ async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
     await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
     await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
     await db.status(
-        f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
-        f"RENAME TO {table}_idx_primary;"
+        f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
     )
 
     for index in getattr(stage_cls, "__my_additional_indexes__", []) or []:
@@ -2054,7 +2013,8 @@ async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
 
 
 async def _stage_table_persistence(db_schema: str, table_name: str) -> str | None:
-    value = await preparation_admission.read_scalar(db,
+    value = await preparation_admission.read_scalar(
+        db,
         """
         SELECT c.relpersistence::text
           FROM pg_class AS c
@@ -2110,7 +2070,8 @@ def _cutover_relation_sets(
 
 
 async def _existing_cutover_relations(db_schema: str, relation_names: list[str]) -> list[str]:
-    rows = await preparation_admission.read_all(db,
+    rows = await preparation_admission.read_all(
+        db,
         """
         SELECT c.relname
           FROM pg_class AS c
@@ -2138,7 +2099,8 @@ async def _assert_cutover_has_no_dependent_views(
             for relation_name in (live_table_name, f"{live_table_name}_old")
         }
     )
-    dependency_records = await preparation_admission.read_all(db,
+    dependency_records = await preparation_admission.read_all(
+        db,
         """
         SELECT DISTINCT
                format('%I.%I', target_namespace.nspname, target_relation.relname),
@@ -2165,15 +2127,9 @@ async def _assert_cutover_has_no_dependent_views(
         db_schema=db_schema,
         relation_names=relation_names,
     )
-    dependencies = [
-        f"{dependency_record[0]} -> {dependency_record[1]}"
-        for dependency_record in dependency_records
-    ]
+    dependencies = [f"{dependency_record[0]} -> {dependency_record[1]}" for dependency_record in dependency_records]
     if dependencies:
-        raise RuntimeError(
-            "entity-address-unified cutover has dependent views: "
-            + ", ".join(dependencies)
-        )
+        raise RuntimeError("entity-address-unified cutover has dependent views: " + ", ".join(dependencies))
 
 
 async def _acquire_cutover_locks(
@@ -2181,7 +2137,8 @@ async def _acquire_cutover_locks(
     relation_names: list[str],
     required_names: list[str],
 ) -> None:
-    publisher_lock = await preparation_admission.read_scalar(db,
+    publisher_lock = await preparation_admission.read_scalar(
+        db,
         "SELECT pg_try_advisory_xact_lock(hashtextextended(:lock_name, 0));",
         lock_name=f"entity-address-unified:{db_schema}",
     )
@@ -2191,18 +2148,13 @@ async def _acquire_cutover_locks(
     existing_names = await _existing_cutover_relations(db_schema, relation_names)
     missing_names = sorted(set(required_names) - set(existing_names))
     if missing_names:
-        raise RuntimeError(
-            "Entity-address cutover is missing required staged relations: "
-            + ", ".join(missing_names)
-        )
+        raise RuntimeError("Entity-address cutover is missing required staged relations: " + ", ".join(missing_names))
     if not existing_names:
         raise RuntimeError("Entity-address cutover found no relations to lock")
 
     schema = _validate_schema_name(db_schema)
     qualified_names = [f"{schema}.{_validate_schema_name(name)}" for name in existing_names]
-    await db.status(
-        f"LOCK TABLE {', '.join(qualified_names)} IN ACCESS EXCLUSIVE MODE NOWAIT;"
-    )
+    await db.status(f"LOCK TABLE {', '.join(qualified_names)} IN ACCESS EXCLUSIVE MODE NOWAIT;")
 
 
 def _is_retryable_cutover_lock_error(error: BaseException) -> bool:
@@ -2222,9 +2174,10 @@ async def _run_entity_address_cutover(
 ) -> None:
     """Atomically publish an address stage with local semantic fences."""
 
-    lock_timeout = _env_sql_setting(
-        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_LOCK_TIMEOUT", DEFAULT_CUTOVER_LOCK_TIMEOUT
-    ) or DEFAULT_CUTOVER_LOCK_TIMEOUT
+    lock_timeout = (
+        _env_sql_setting("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_LOCK_TIMEOUT", DEFAULT_CUTOVER_LOCK_TIMEOUT)
+        or DEFAULT_CUTOVER_LOCK_TIMEOUT
+    )
     if require_caller_owned_transaction:
         require_caller_owned_cutover_transaction(db)
     async with entity_address_cutover_transaction(db, lock_timeout, _sql_literal):
@@ -2232,16 +2185,16 @@ async def _run_entity_address_cutover(
         expected_alias_generation = int(context.get("address_alias_generation") or 0)
         current_alias_generation = await _address_alias_generation(db_schema)
         if current_alias_generation != expected_alias_generation:
-            raise RuntimeError(
-                "address alias generation changed during entity-address-unified build"
-            )
+            raise RuntimeError("address alias generation changed during entity-address-unified build")
         await _assert_provider_directory_overlay_alias_fence(db_schema, context)
         await _acquire_cutover_locks(db_schema, relation_names, required_names)
+        from process import entity_address_snapshot_adoption as adoption
+
+        await adoption._require_protected_cutover(db_schema, swaps, context)
         await _assert_cutover_has_no_dependent_views(db_schema, [swap.live_cls.__main_table__ for swap in swaps])
         if callbacks is not None and callbacks.before_cutover is not None:
             await callbacks.before_cutover()
-        for swap in swaps:
-            await _swap_stage_table(db_schema, swap.live_cls, swap.stage_cls)
+        await adoption._publish_result_swaps(db_schema, swaps, context)
         for label, statement in patch_statements:
             started = time.monotonic()
             rowcount = await db.status(statement)
@@ -2264,39 +2217,11 @@ async def _run_entity_address_cutover(
             await callbacks.after_publish()
 
 
-def _entity_address_cutover_plan(
-    db_schema: str,
-    stage_cls,
-    support_stage_class_map: dict[type, type],
-    *,
-    partial_support_patch: bool,
-    affected_group_table: str,
-    context: dict,
-) -> tuple[list[_StageTableSwap], list[tuple[str, str]], list[str], list[str]]:
-    swaps = [_StageTableSwap(EntityAddressUnified, stage_cls)]
-    patch_statements: list[tuple[str, str]] = []
-    if partial_support_patch:
-        patch_statements = _partial_support_patch_sql(
-            db_schema,
-            support_stage_class_map,
-            old_entity_table=f"{EntityAddressUnified.__main_table__}_old",
-            affected_group_table=affected_group_table,
-            build_network_bridge=bool(
-                context.get("build_network_bridge", DEFAULT_BUILD_NETWORK_BRIDGE)
-            ),
-        )
-    else:
-        swaps.extend(
-            _StageTableSwap(live_cls, support_stage_cls)
-            for live_cls, support_stage_cls in support_stage_class_map.items()
-        )
-    relation_names, required_names = _cutover_relation_sets(
-        swaps,
-        support_stage_class_map,
-        partial_support_patch=partial_support_patch,
-        affected_group_table=affected_group_table,
-    )
-    return swaps, patch_statements, relation_names, required_names
+def _entity_address_cutover_plan(*args, **kwargs):
+    """Keep the existing native planning seam in the snapshot adoption module."""
+    from process.entity_address_snapshot_adoption import _entity_address_cutover_plan as plan
+
+    return plan(*args, **kwargs)
 
 
 def _cutover_retry_settings() -> tuple[int, int, int]:
@@ -2342,6 +2267,9 @@ async def _publish_staged_entity_address_tables(
         phase="entity-address-unified analyzing staged main table",
     )
     context.update(stage_persistence="p", result_generation_mode="ordinary")
+    from process.entity_address_snapshot_adoption import _prepare_protected_ordinary_rotation
+
+    await _prepare_protected_ordinary_rotation(db_schema, stage_cls, partial_support_patch, context)
     callbacks = ordinary_address_receipt_callbacks(db, db_schema, _sql_literal)
     max_attempts, base_backoff_ms, max_backoff_ms = _cutover_retry_settings()
     for attempt in range(1, max_attempts + 1):
@@ -2387,13 +2315,16 @@ async def _drop_stage_artifacts(
 
 async def _has_table(db_schema: str, table_name: str) -> bool:
     table_name = candidate_preparation.table_name(table_name)
-    return bool(await preparation_admission.read_scalar(db, f"SELECT to_regclass('{db_schema}.{table_name}') IS NOT NULL;"))
+    return bool(
+        await preparation_admission.read_scalar(db, f"SELECT to_regclass('{db_schema}.{table_name}') IS NOT NULL;")
+    )
 
 
 async def _has_table_column(db_schema: str, table_name: str, column_name: str) -> bool:
     table_name = candidate_preparation.table_name(table_name)
     return bool(
-        await preparation_admission.read_scalar(db,
+        await preparation_admission.read_scalar(
+            db,
             """
             SELECT EXISTS (
                 SELECT 1
@@ -2416,7 +2347,8 @@ async def _ensure_entity_address_unified_live_columns(
 ) -> None:
     if not await _has_table(db_schema, table_name):
         return
-    existing_rows = await preparation_admission.read_all(db,
+    existing_rows = await preparation_admission.read_all(
+        db,
         """
         SELECT column_name
           FROM information_schema.columns
@@ -2427,17 +2359,14 @@ async def _ensure_entity_address_unified_live_columns(
         table_name=table_name,
     )
     existing_columns = {
-        str((row._mapping if hasattr(row, "_mapping") else row).get("column_name"))
-        for row in existing_rows
+        str((row._mapping if hasattr(row, "_mapping") else row).get("column_name")) for row in existing_rows
     }
     dialect = postgresql.dialect()
     for column in EntityAddressUnified.__table__.columns:
         if column.name in existing_columns:
             continue
         column_ddl = str(CreateColumn(column).compile(dialect=dialect)).strip()
-        await db.status(
-            f"ALTER TABLE {db_schema}.{table_name} ADD COLUMN IF NOT EXISTS {column_ddl};"
-        )
+        await db.status(f"ALTER TABLE {db_schema}.{table_name} ADD COLUMN IF NOT EXISTS {column_ddl};")
 
 
 async def _is_support_bridge_reuse_available(db_schema: str, *, build_network_bridge: bool) -> bool:
@@ -2509,14 +2438,12 @@ async def _promote_approved_facility_anchor_npi_candidates(db_schema: str) -> in
         and await _has_table(db_schema, "facility_anchor_npi_override")
     ):
         return 0
-    return int(
-        await db.status(_promote_facility_npi_candidates_sql(db_schema))
-        or 0
-    )
+    return int(await db.status(_promote_facility_npi_candidates_sql(db_schema)) or 0)
 
 
 async def _is_address_canon_available(db_schema: str) -> bool:
-    value = await preparation_admission.read_scalar(db,
+    value = await preparation_admission.read_scalar(
+        db,
         "SELECT to_regprocedure(:signature);",
         signature=f"{db_schema}.addr_key_v1(text,text,text,text,text,text)",
     )
@@ -2579,11 +2506,7 @@ def _address_checksum_expr(
 
 
 def _alnum_norm_expr(expr: str) -> str:
-    return (
-        "NULLIF("
-        f"regexp_replace(lower(COALESCE({expr}, '')), '[^a-z0-9]', '', 'g')"
-        ", '')"
-    )
+    return f"NULLIF(regexp_replace(lower(COALESCE({expr}, '')), '[^a-z0-9]', '', 'g'), '')"
 
 
 def _state_norm_expr(expr: str) -> str:
@@ -2591,20 +2514,13 @@ def _state_norm_expr(expr: str) -> str:
 
 
 def _zip5_norm_expr(expr: str) -> str:
-    return (
-        "NULLIF("
-        f"LEFT(regexp_replace(COALESCE({expr}, ''), '[^0-9]', '', 'g'), 5)"
-        ", '')"
-    )
+    return f"NULLIF(LEFT(regexp_replace(COALESCE({expr}, ''), '[^0-9]', '', 'g'), 5), '')"
 
 
 def _address_source_text_present_predicate(expr: str) -> str:
     cleaned = f"NULLIF(BTRIM(COALESCE({expr}, '')), '')"
     token = f"UPPER(REGEXP_REPLACE(BTRIM(COALESCE({expr}, '')), '[^A-Za-z0-9]+', '', 'g'))"
-    return (
-        f"{cleaned} IS NOT NULL "
-        f"AND {token} NOT IN ('NULL', 'NONE', 'NA', 'NAN', 'UNKNOWN', 'UNSPECIFIED')"
-    )
+    return f"{cleaned} IS NOT NULL AND {token} NOT IN ('NULL', 'NONE', 'NA', 'NAN', 'UNKNOWN', 'UNSPECIFIED')"
 
 
 def _address_source_state_present_predicate(expr: str) -> str:
@@ -2650,10 +2566,7 @@ def _phone_norm_expr(expr: str) -> str:
 
 
 def _contact_main_expr(expr: str) -> str:
-    extension_pattern = (
-        "'[[:space:]]*(extension|ext\\.?|;ext=|#|x)"
-        "[[:space:]]*[0-9]{1,16}[[:space:]]*$'"
-    )
+    extension_pattern = "'[[:space:]]*(extension|ext\\.?|;ext=|#|x)[[:space:]]*[0-9]{1,16}[[:space:]]*$'"
     return f"regexp_replace(COALESCE({expr}, ''), {extension_pattern}, '', 'i')"
 
 
@@ -2668,10 +2581,7 @@ def _contact_country_key_expr(expr: str) -> str:
 def _canonical_contact_number_expr(expr: str, country_expr: str = "country_code") -> str:
     digits = _contact_digits_expr(expr)
     country_key = _contact_country_key_expr(country_expr)
-    default_us = (
-        f"({country_key} = '' OR {country_key} IN "
-        "('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA'))"
-    )
+    default_us = f"({country_key} = '' OR {country_key} IN ('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA'))"
     main = _contact_main_expr(expr)
     return (
         "CASE "
@@ -2735,9 +2645,7 @@ def _coordinate_from_text_pair_sql(
     raw_value = raw_lat if axis == "lat" else raw_long
     scaled_1m_value = scaled_1m_lat if axis == "lat" else scaled_1m_long
     scaled_10m_value = scaled_10m_lat if axis == "lat" else scaled_10m_long
-    numeric_guard = (
-        f"({latitude_expr}) ~ '{numeric_re}' AND ({longitude_expr}) ~ '{numeric_re}'"
-    )
+    numeric_guard = f"({latitude_expr}) ~ '{numeric_re}' AND ({longitude_expr}) ~ '{numeric_re}'"
     return f"""
         CASE
             WHEN {numeric_guard}
@@ -2755,12 +2663,8 @@ def _coordinate_from_text_pair_sql(
 
 
 def _contact_extension_expr(expr: str) -> str:
-    extension_pattern = (
-        "'(extension|ext\\.?|;ext=|#|x)[[:space:]]*[0-9]{1,16}[[:space:]]*$'"
-    )
-    extract_pattern = (
-        "'^.*(extension|ext\\.?|;ext=|#|x)[[:space:]]*([0-9]{1,16})[[:space:]]*$'"
-    )
+    extension_pattern = "'(extension|ext\\.?|;ext=|#|x)[[:space:]]*[0-9]{1,16}[[:space:]]*$'"
+    extract_pattern = "'^.*(extension|ext\\.?|;ext=|#|x)[[:space:]]*([0-9]{1,16})[[:space:]]*$'"
     return (
         "CASE "
         f"WHEN COALESCE({expr}, '') ~* {extension_pattern} "
@@ -2958,9 +2862,7 @@ def _provider_directory_live_source_filter_sql(
 
 def _missing_provider_directory_fence_relations(available: dict[str, bool]) -> list[str]:
     return [
-        table_name
-        for table_name in PROVIDER_DIRECTORY_DATASET_FENCE_TABLES
-        if not available.get(table_name, False)
+        table_name for table_name in PROVIDER_DIRECTORY_DATASET_FENCE_TABLES if not available.get(table_name, False)
     ]
 
 
@@ -2975,8 +2877,7 @@ def _validate_provider_directory_fence(
         return
     raise RuntimeError(
         "entity-address-unified Provider Directory projection requires current "
-        "dataset fence relations: "
-        + ", ".join(missing_relations)
+        "dataset fence relations: " + ", ".join(missing_relations)
     )
 
 
@@ -2985,15 +2886,12 @@ async def _has_provider_directory_compatibility_data(
     available: dict[str, bool],
 ) -> bool:
     table_names = [
-        table_name
-        for table_name in PROVIDER_DIRECTORY_COMPATIBILITY_ADDRESS_TABLES
-        if available.get(table_name, False)
+        table_name for table_name in PROVIDER_DIRECTORY_COMPATIBILITY_ADDRESS_TABLES if available.get(table_name, False)
     ]
     if not table_names:
         return False
     existence_checks = " OR ".join(
-        f"EXISTS (SELECT 1 FROM {db_schema}.{table_name} LIMIT 1)"
-        for table_name in table_names
+        f"EXISTS (SELECT 1 FROM {db_schema}.{table_name} LIMIT 1)" for table_name in table_names
     )
     return bool(await preparation_admission.read_scalar(db, f"SELECT {existence_checks};"))
 
@@ -3020,11 +2918,7 @@ def _provider_directory_current_overlay_ctes_sql(
         if source_ids
         else "WHERE source.endpoint_id IS NOT NULL"
     )
-    run_filter = (
-        f"\n           AND overlay.last_seen_run_id = {_sql_literal(run_id)}"
-        if run_id
-        else ""
-    )
+    run_filter = f"\n           AND overlay.last_seen_run_id = {_sql_literal(run_id)}" if run_id else ""
     affected_overlay_ctes = ""
     current_overlay_ref = overlay_ref
     if affected_group_table:
@@ -3149,7 +3043,7 @@ def _provider_directory_resolved_networks_sql(
                 SELECT {network_resource_id}::varchar AS network_resource_id
                   FROM network_references AS network_ref
           ) AS network_ref
-          {' '.join(joins)}
+          {" ".join(joins)}
          WHERE network_ref.network_resource_id IS NOT NULL
            AND {network_name} IS NOT NULL
     """
@@ -3237,6 +3131,7 @@ def _source_selects(
         "provider_directory_location.address_key",
         has_provider_directory_location,
     )
+
     def source_address_key(table_name: str, alias: str) -> str:
         """Return a typed source address-key expression when available."""
         if available.get(f"{table_name}.address_key", available.get(table_name, False)):
@@ -3412,10 +3307,9 @@ def _source_selects(
         else ""
     )
     provider_directory_pa_from = (
-        "LEFT JOIN provider_directory_primary_npi_address AS pa ON pa.npi = pd.provider_npi"
-        if has_npi_address
-        else ""
+        "LEFT JOIN provider_directory_primary_npi_address AS pa ON pa.npi = pd.provider_npi" if has_npi_address else ""
     )
+
     def provider_directory_pa_cte(locations_cte_name: str) -> str:
         """Build the primary NPI-address CTE for provider-directory rows."""
         if not has_npi_address:
@@ -3439,6 +3333,7 @@ def _source_selects(
                  ORDER BY pa.npi, pa.checksum
             )
         """
+
     if has_npi_address:
         selects.append(
             f"""
@@ -3449,8 +3344,8 @@ def _source_selects(
                 NULL::bigint AS inferred_npi,
                 NULL::float8 AS inference_confidence,
                 NULL::varchar AS inference_method,
-                {(_npi_entity_name_expr('n') if has_npi else 'NULL::varchar')} AS entity_name,
-                {(_npi_entity_subtype_expr('n') if has_npi else 'NULL::varchar')} AS entity_subtype,
+                {(_npi_entity_name_expr("n") if has_npi else "NULL::varchar")} AS entity_name,
+                {(_npi_entity_subtype_expr("n") if has_npi else "NULL::varchar")} AS entity_subtype,
                 COALESCE(NULLIF(a.type, ''), 'primary')::varchar AS type,
                 COALESCE(a.taxonomy_array, ARRAY[0]::int[])::int[] AS taxonomy_array,
                 COALESCE(a.plans_network_array, ARRAY[0]::int[])::int[] AS plans_network_array,
@@ -3495,13 +3390,13 @@ def _source_selects(
                 NULL::bigint AS inferred_npi,
                 NULL::float8 AS inference_confidence,
                 NULL::varchar AS inference_method,
-                {(_npi_entity_name_expr('n') if has_npi else 'NULL::varchar')} AS entity_name,
-                {(_npi_entity_subtype_expr('n') if has_npi else 'NULL::varchar')} AS entity_subtype,
+                {(_npi_entity_name_expr("n") if has_npi else "NULL::varchar")} AS entity_name,
+                {(_npi_entity_subtype_expr("n") if has_npi else "NULL::varchar")} AS entity_subtype,
                 'practice'::varchar AS type,
-                {('COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS taxonomy_array,
-                {('COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS plans_network_array,
-                {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
-                {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
+                {("COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS taxonomy_array,
+                {("COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS plans_network_array,
+                {("COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS procedures_array,
+                {("COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS medications_array,
                 ARRAY[]::varchar[] AS aca_plan_array,
                 ARRAY[]::varchar[] AS aca_network_array,
                 ARRAY[]::varchar[] AS ptg_plan_array,
@@ -3542,13 +3437,13 @@ def _source_selects(
                 NULL::bigint AS inferred_npi,
                 NULL::float8 AS inference_confidence,
                 NULL::varchar AS inference_method,
-                {(_npi_entity_name_expr('n') if has_npi else 'NULL::varchar')} AS entity_name,
-                {(_npi_entity_subtype_expr('n') if has_npi else 'NULL::varchar')} AS entity_subtype,
+                {(_npi_entity_name_expr("n") if has_npi else "NULL::varchar")} AS entity_name,
+                {(_npi_entity_subtype_expr("n") if has_npi else "NULL::varchar")} AS entity_subtype,
                 'secondary'::varchar AS type,
-                {('COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS taxonomy_array,
-                {('COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS plans_network_array,
-                {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
-                {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
+                {("COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS taxonomy_array,
+                {("COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS plans_network_array,
+                {("COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS procedures_array,
+                {("COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS medications_array,
                 ARRAY[]::varchar[] AS aca_plan_array,
                 ARRAY[]::varchar[] AS aca_network_array,
                 ARRAY[]::varchar[] AS ptg_plan_array,
@@ -3696,9 +3591,7 @@ def _source_selects(
         # CCNs whose conflict is not broken this way stay unresolved and flow to review.
         has_npi_taxonomy = available.get("npi_taxonomy", False)
         if has_npi_taxonomy:
-            hospital_taxonomy_codes_sql = _hospital_facility_taxonomy_codes_sql(
-                "                                "
-            )
+            hospital_taxonomy_codes_sql = _hospital_facility_taxonomy_codes_sql("                                ")
             _facility_tax_cond = (
                 "(c.facility_type = 'FQHC' AND nt.healthcare_provider_taxonomy_code = '261QF0400X')\n"
                 "                                OR (c.facility_type = 'Hospital'\n"
@@ -3848,13 +3741,13 @@ def _source_selects(
                 NULL::bigint AS inferred_npi,
                 NULL::float8 AS inference_confidence,
                 NULL::varchar AS inference_method,
-                {(_npi_entity_name_expr('n') if has_npi else 'NULL::varchar')} AS entity_name,
-                {(_npi_entity_subtype_expr('n') if has_npi else 'NULL::varchar')} AS entity_subtype,
+                {(_npi_entity_name_expr("n") if has_npi else "NULL::varchar")} AS entity_name,
+                {(_npi_entity_subtype_expr("n") if has_npi else "NULL::varchar")} AS entity_subtype,
                 COALESCE(NULLIF(a.type, ''), 'practice')::varchar AS type,
-                {('COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS taxonomy_array,
-                {('COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS plans_network_array,
-                {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
-                {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
+                {("COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS taxonomy_array,
+                {("COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS plans_network_array,
+                {("COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS procedures_array,
+                {("COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS medications_array,
                 ARRAY[]::varchar[] AS aca_plan_array,
                 ARRAY[]::varchar[] AS aca_network_array,
                 ARRAY[]::varchar[] AS ptg_plan_array,
@@ -3959,10 +3852,10 @@ def _source_selects(
                 pd.provider_name::varchar AS entity_name,
                 'provider_directory_practitioner'::varchar AS entity_subtype,
                 'practice'::varchar AS type,
-                {('COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS taxonomy_array,
-                {('COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS plans_network_array,
-                {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
-                {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
+                {("COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS taxonomy_array,
+                {("COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS plans_network_array,
+                {("COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS procedures_array,
+                {("COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS medications_array,
                 COALESCE(pd.plan_identifiers, ARRAY[]::varchar[])::varchar[] AS aca_plan_array,
                 COALESCE(pd.network_names, ARRAY[]::varchar[])::varchar[] AS aca_network_array,
                 ARRAY[]::varchar[] AS ptg_plan_array,
@@ -4064,10 +3957,10 @@ def _source_selects(
                 pd.provider_name::varchar AS entity_name,
                 'provider_directory_organization'::varchar AS entity_subtype,
                 'practice'::varchar AS type,
-                {('COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS taxonomy_array,
-                {('COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS plans_network_array,
-                {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
-                {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
+                {("COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS taxonomy_array,
+                {("COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS plans_network_array,
+                {("COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS procedures_array,
+                {("COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS medications_array,
                 ARRAY[]::varchar[] AS aca_plan_array,
                 COALESCE(pd.network_names, ARRAY[]::varchar[])::varchar[] AS aca_network_array,
                 ARRAY[]::varchar[] AS ptg_plan_array,
@@ -4161,10 +4054,10 @@ def _source_selects(
                 pd.provider_name::varchar AS entity_name,
                 'provider_directory_organization'::varchar AS entity_subtype,
                 'practice'::varchar AS type,
-                {('COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS taxonomy_array,
-                {('COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS plans_network_array,
-                {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
-                {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
+                {("COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS taxonomy_array,
+                {("COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS plans_network_array,
+                {("COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS procedures_array,
+                {("COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]" if has_npi_address else "ARRAY[0]::int[]")} AS medications_array,
                 ARRAY[]::varchar[] AS aca_plan_array,
                 ARRAY[]::varchar[] AS aca_network_array,
                 ARRAY[]::varchar[] AS ptg_plan_array,
@@ -4199,9 +4092,7 @@ def _source_selects(
 
     if test_limit_per_source and test_limit_per_source > 0:
         return [
-            "(\n"
-            f"SELECT * FROM (\n{select.strip()}\n) AS src LIMIT {int(test_limit_per_source)}\n"
-            ")"
+            f"(\nSELECT * FROM (\n{select.strip()}\n) AS src LIMIT {int(test_limit_per_source)}\n)"
             for select in selects
         ]
     return selects
@@ -4213,11 +4104,7 @@ def _partial_overlay_npi_context_sql(
 ) -> tuple[str, str, tuple[str, str, str, str]]:
     """Return optional NPI joins and array expressions for overlay projection."""
 
-    npi_join = (
-        f"LEFT JOIN {db_schema}.npi AS n ON n.npi = overlay.npi"
-        if available.get("npi", False)
-        else ""
-    )
+    npi_join = f"LEFT JOIN {db_schema}.npi AS n ON n.npi = overlay.npi" if available.get("npi", False) else ""
     if not available.get("npi_address", False):
         return npi_join, "", ("ARRAY[0]::int[]",) * 4
     return (
@@ -4255,9 +4142,7 @@ def _provider_directory_partial_overlay_source_select(
 ) -> str:
     """Project only current, dataset-member Provider Directory overlay rows."""
 
-    npi_join, primary_npi_address_join, array_expressions = (
-        _partial_overlay_npi_context_sql(db_schema, available)
-    )
+    npi_join, primary_npi_address_join, array_expressions = _partial_overlay_npi_context_sql(db_schema, available)
     entity_name = _npi_entity_name_expr("n") if npi_join else "NULL::varchar"
     entity_subtype = _npi_entity_subtype_expr("n") if npi_join else "NULL::varchar"
     address_predicate = _address_source_keyable_predicate(
@@ -4291,11 +4176,7 @@ def _provider_directory_partial_overlay_source_select(
 def _bounded_source_select_sql(source_select: str, row_limit: int | None) -> str:
     if not row_limit or row_limit <= 0:
         return source_select
-    return (
-        "(\n"
-        f"SELECT * FROM (\n{source_select.strip()}\n) AS src LIMIT {int(row_limit)}\n"
-        ")"
-    )
+    return f"(\nSELECT * FROM (\n{source_select.strip()}\n) AS src LIMIT {int(row_limit)}\n)"
 
 
 def _current_provider_directory_source_selects(
@@ -4327,9 +4208,7 @@ def _current_provider_directory_source_selects(
         source_ids=source_ids,
         run_id=run_id,
     )
-    current_source_selects.append(
-        _bounded_source_select_sql(overlay_source_select, test_limit_per_source)
-    )
+    current_source_selects.append(_bounded_source_select_sql(overlay_source_select, test_limit_per_source))
     return [candidate_preparation.source_sql(db_schema, sql) for sql in current_source_selects]
 
 
@@ -4380,7 +4259,8 @@ def _is_provider_directory_source_select(db_schema: str, source_select: str) -> 
         f"FROM {db_schema}.provider_directory_practitioner_role AS role" in source_select
         or f"FROM {db_schema}.provider_directory_organization_affiliation AS affiliation" in source_select
         or f"FROM {db_schema}.provider_directory_organization AS organization" in source_select
-        or f"FROM {db_schema}.{candidate_preparation.table_name('provider_directory_address_overlay')} AS overlay" in source_select
+        or f"FROM {db_schema}.{candidate_preparation.table_name('provider_directory_address_overlay')} AS overlay"
+        in source_select
     )
 
 
@@ -4431,8 +4311,7 @@ def _prepare_partial_affected_groups_sql(
             "available Provider Directory source tables."
         )
     current_groups_sql = "\nUNION\n".join(
-        _provider_directory_current_group_select_sql(source_select)
-        for source_select in provider_selects
+        _provider_directory_current_group_select_sql(source_select) for source_select in provider_selects
     )
     live_source_filter = _provider_directory_live_source_filter_sql(
         db_schema,
@@ -4517,8 +4396,8 @@ def _partial_scope_index_preflight_sql(db_schema: str) -> str:
 
 
 async def _preflight_provider_directory_partial_scope_index(db_schema: str) -> None:
-    index_is_valid = await preparation_admission.read_scalar(db,
-        candidate_preparation.scope_index_sql(_partial_scope_index_preflight_sql(db_schema))
+    index_is_valid = await preparation_admission.read_scalar(
+        db, candidate_preparation.scope_index_sql(_partial_scope_index_preflight_sql(db_schema))
     )
     if index_is_valid:
         return
@@ -4599,9 +4478,7 @@ def _provider_directory_partial_source_selects(
             filtered_selects.append(source_select)
             provider_selects += 1
         else:
-            filtered_selects.append(
-                _affected_npi_source_select_sql(db_schema, source_select, affected_group_table)
-            )
+            filtered_selects.append(_affected_npi_source_select_sql(db_schema, source_select, affected_group_table))
     if not provider_selects:
         return []
     return filtered_selects
@@ -4633,9 +4510,7 @@ def _provider_directory_partial_replacement_source_selects(
         available,
         affected_group_table=affected_group_table,
     )
-    current_source_selects.append(
-        _bounded_source_select_sql(overlay_source_select, test_limit_per_source)
-    )
+    current_source_selects.append(_bounded_source_select_sql(overlay_source_select, test_limit_per_source))
     return _provider_directory_partial_source_selects(
         db_schema,
         [candidate_preparation.source_sql(db_schema, sql) for sql in current_source_selects],
@@ -4883,8 +4758,7 @@ def _expand_source_shards(
         return [
             select_sql.replace(
                 where_marker,
-                f"{where_marker}\n               AND {alias}.npi >= {low}"
-                f"\n               AND {alias}.npi < {high}",
+                f"{where_marker}\n               AND {alias}.npi >= {low}\n               AND {alias}.npi < {high}",
                 1,
             )
             for low, high in ranges
@@ -4919,9 +4793,10 @@ def _shard_source_selects(
 async def _npi_table_ranges(db_schema: str, table_name: str, shards: int) -> list[tuple[int, int]]:
     if shards <= 1:
         return []
-    row = await preparation_admission.read_first(db,
+    row = await preparation_admission.read_first(
+        db,
         f"SELECT MIN(npi)::bigint AS min_npi, MAX(npi)::bigint AS max_npi "
-        f"FROM {db_schema}.{candidate_preparation.table_name(table_name)} WHERE npi IS NOT NULL;"
+        f"FROM {db_schema}.{candidate_preparation.table_name(table_name)} WHERE npi IS NOT NULL;",
     )
     if not row:
         return []
@@ -5003,10 +4878,7 @@ _RAW_STAGE_COLUMNS_SQL = f"""
 def _prepare_raw_stage_sql(db_schema: str, raw_table: str, *, unlogged: bool = True) -> str:
     """Build SQL for the normalized raw entity-address staging table."""
     storage_mode = "UNLOGGED " if unlogged else ""
-    return (
-        f"CREATE {storage_mode}TABLE {db_schema}.{raw_table} ("
-        f"{_RAW_STAGE_COLUMNS_SQL});"
-    )
+    return f"CREATE {storage_mode}TABLE {db_schema}.{raw_table} ({_RAW_STAGE_COLUMNS_SQL});"
 
 
 def _address_key_expr(
@@ -5037,20 +4909,13 @@ def _address_key_expr(
 
 async def _address_alias_generation(db_schema: str) -> int:
     """Read the supported alias generation used by derived address artifacts."""
-    row = await preparation_admission.read_first(db,
-        address_alias_sql.active_alias_generation_sql(schema=db_schema)
-    )
+    row = await preparation_admission.read_first(db, address_alias_sql.active_alias_generation_sql(schema=db_schema))
     if row is None:
         raise RuntimeError("address alias singleton state is missing")
     if int(row.schema_version) != address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION:
         raise RuntimeError(f"unsupported address alias schema version: {row.schema_version}")
-    if (
-        int(row.active_ruleset_version)
-        != address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION
-    ):
-        raise RuntimeError(
-            f"unsupported address alias ruleset: {row.active_ruleset_version}"
-        )
+    if int(row.active_ruleset_version) != address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION:
+        raise RuntimeError(f"unsupported address alias ruleset: {row.active_ruleset_version}")
     return int(row.generation)
 
 
@@ -5058,7 +4923,9 @@ def _uses_provider_directory_overlay(
     db_schema: str,
     source_selects: list[str],
 ) -> bool:
-    overlay_from = f"FROM {db_schema}.{candidate_preparation.table_name('provider_directory_address_overlay')} AS overlay"
+    overlay_from = (
+        f"FROM {db_schema}.{candidate_preparation.table_name('provider_directory_address_overlay')} AS overlay"
+    )
     return any(overlay_from in source_select for source_select in source_selects)
 
 
@@ -5066,7 +4933,8 @@ async def _provider_directory_overlay_alias_fence(
     db_schema: str,
 ) -> tuple[int, int]:
     """Return the materialized alias generation and live overlay relation OID."""
-    row = await preparation_admission.read_first(db,
+    row = await preparation_admission.read_first(
+        db,
         f"""
         SELECT
             receipt.generation,
@@ -5078,9 +4946,7 @@ async def _provider_directory_overlay_alias_fence(
         artifact_name="provider_directory_address_overlay",
     )
     if row is None:
-        raise RuntimeError(
-            "Provider Directory address overlay alias-generation receipt is missing"
-        )
+        raise RuntimeError("Provider Directory address overlay alias-generation receipt is missing")
     if row.relation_oid is None:
         raise RuntimeError("Provider Directory address overlay relation is missing")
     return int(row.generation), int(row.relation_oid)
@@ -5117,15 +4983,10 @@ async def _assert_provider_directory_overlay_alias_fence(
     expected_oid = context.get("provider_directory_overlay_relation_oid")
     if expected_oid is None:
         return
-    expected_generation = int(
-        context.get("provider_directory_overlay_alias_generation") or 0
-    )
+    expected_generation = int(context.get("provider_directory_overlay_alias_generation") or 0)
     generation, relation_oid = await _provider_directory_overlay_alias_fence(db_schema)
     if generation != expected_generation or relation_oid != int(expected_oid):
-        raise RuntimeError(
-            "Provider Directory address overlay changed during "
-            "entity-address-unified build"
-        )
+        raise RuntimeError("Provider Directory address overlay changed during entity-address-unified build")
 
 
 _RAW_ALIAS_INTEGRITY_SQL = """
@@ -5247,10 +5108,7 @@ async def _report_raw_alias_integrity_progress(
         total=progress.total,
         elapsed_seconds=elapsed_seconds,
         eta_seconds=remaining_shards * elapsed_seconds / progress.completed,
-        message=(
-            f"validated {progress.completed}/{progress.total} "
-            "alias-integrity shards"
-        ),
+        message=(f"validated {progress.completed}/{progress.total} alias-integrity shards"),
     )
 
 
@@ -5266,12 +5124,10 @@ async def _raw_alias_integrity_violation_for_range(
     checksum_min, checksum_max = checksum_range
     checksum_where = ""
     if checksum_min is not None and checksum_max is not None:
-        checksum_where = (
-            f"WHERE raw.checksum >= {int(checksum_min)} "
-            f"AND raw.checksum < {int(checksum_max)}"
-        )
+        checksum_where = f"WHERE raw.checksum >= {int(checksum_min)} AND raw.checksum < {int(checksum_max)}"
     async with semaphore:
-        violation = await preparation_admission.read_first(db,
+        violation = await preparation_admission.read_first(
+            db,
             _RAW_ALIAS_INTEGRITY_SQL.format(
                 db_schema=db_schema,
                 raw_table=raw_table,
@@ -5279,7 +5135,7 @@ async def _raw_alias_integrity_violation_for_range(
                 archive_relation=candidate_preparation.table_name("address_archive_v2"),
                 computed_address_key=computed_address_key,
                 checksum_where=checksum_where,
-            )
+            ),
         )
     await _report_raw_alias_integrity_progress(progress, is_completed=True)
     return violation
@@ -5343,9 +5199,7 @@ async def _validate_raw_alias_integrity(
         table_alias="raw",
     )
     await _report_raw_alias_integrity_progress(progress, is_completed=False)
-    semaphore = asyncio.Semaphore(
-        max(1, min(int(concurrency), len(shard_ranges)))
-    )
+    semaphore = asyncio.Semaphore(max(1, min(int(concurrency), len(shard_ranges))))
     shard_outcomes = await preparation_admission.gather(
         *(
             _raw_alias_integrity_violation_for_range(
@@ -5428,7 +5282,7 @@ def _available_archive_enrichment_sql(
                 LEFT JOIN {db_schema}.address_alias_v1 AS active_alias
                   ON active_alias.source_address_key = candidate.address_key
                  AND active_alias.revoked_at IS NULL
-                JOIN {db_schema}.{candidate_preparation.table_name('address_archive_v2')} AS archive_row
+                JOIN {db_schema}.{candidate_preparation.table_name("address_archive_v2")} AS archive_row
                   ON archive_row.address_key = COALESCE(
                         active_alias.target_address_key,
                         candidate.address_key
@@ -5579,20 +5433,24 @@ def _enriched_raw_update_sql(
                     WHERE singleton = true
                )
            ),
-           location_key = {_location_key_expr({
-               'entity_type': 'r.entity_type',
-               'entity_id': 'r.entity_id',
-               'npi': 'r.npi',
-               'inferred_npi': 'r.inferred_npi',
-               'address_role_id': 'k.address_role_id',
-               'row_origin': 'k.row_origin',
-               'address_key': 'k.address_key',
-               'source_id': 'k.source_id',
-               'source_record_id': 'r.source_record_id',
-               'zip5': 'k.zip5',
-               'state_code': 'k.state_code',
-               'city_norm': 'k.city_norm',
-           })}
+           location_key = {
+        _location_key_expr(
+            {
+                "entity_type": "r.entity_type",
+                "entity_id": "r.entity_id",
+                "npi": "r.npi",
+                "inferred_npi": "r.inferred_npi",
+                "address_role_id": "k.address_role_id",
+                "row_origin": "k.row_origin",
+                "address_key": "k.address_key",
+                "source_id": "k.source_id",
+                "source_record_id": "r.source_record_id",
+                "zip5": "k.zip5",
+                "state_code": "k.state_code",
+                "city_norm": "k.city_norm",
+            }
+        )
+    }
       FROM keyed k
      WHERE r.ctid = k.row_id;
     """
@@ -5620,15 +5478,11 @@ def _enrich_raw_stage_sql(
         archive_join = ""
     checksum_where = ""
     if checksum_min is not None and checksum_max is not None:
-        checksum_where = (
-            f"WHERE r.checksum >= {int(checksum_min)} "
-            f"AND r.checksum < {int(checksum_max)}"
-        )
+        checksum_where = f"WHERE r.checksum >= {int(checksum_min)} AND r.checksum < {int(checksum_max)}"
     evidence_shard_set = ""
     if evidence_shards and int(evidence_shards) > 1:
         evidence_shard_set = (
-            "           evidence_shard = "
-            f"{_evidence_group_hash_expr_for_alias('k', int(evidence_shards))},\n"
+            f"           evidence_shard = {_evidence_group_hash_expr_for_alias('k', int(evidence_shards))},\n"
         )
     return "".join(
         (
@@ -5670,9 +5524,7 @@ def _raw_aggregate_group_index_sql(
     if aggregate_shards > 1:
         profile = _raw_group_index_profile()
         shard_expr = (
-            "evidence_shard"
-            if inline_source_evidence
-            else _aggregate_shard_expr(dedupe_key_expr, aggregate_shards)
+            "evidence_shard" if inline_source_evidence else _aggregate_shard_expr(dedupe_key_expr, aggregate_shards)
         )
         index_name = (
             _stage_index_name(raw_table, "evidence_shard_group")
@@ -5681,7 +5533,7 @@ def _raw_aggregate_group_index_sql(
         )
         if inline_source_evidence and profile == "shard":
             return f"""
-            CREATE INDEX IF NOT EXISTS {_stage_index_name(raw_table, 'evidence_shard')}
+            CREATE INDEX IF NOT EXISTS {_stage_index_name(raw_table, "evidence_shard")}
             ON {db_schema}.{raw_table} (evidence_shard);
             """
         return f"""
@@ -5690,7 +5542,7 @@ def _raw_aggregate_group_index_sql(
         (({shard_expr}), entity_type, entity_id, type, {dedupe_key_expr});
         """
     return f"""
-    CREATE INDEX {_stage_index_name(raw_table, 'group_key')}
+    CREATE INDEX {_stage_index_name(raw_table, "group_key")}
     ON {db_schema}.{raw_table} (entity_type, entity_id, type, {dedupe_key_expr});
     """
 
@@ -5789,14 +5641,10 @@ def _geo_projection_evidence_source_sql() -> str:
     """Build evidence precedence from the admitted set-wise keys."""
 
     return geo_projection.evidence_source_id_case_sql(
-        nppes_condition_sql=(
-            "(projection_target.address_source_mask & 1) <> 0 "
-            "AND projection_nppes.npi IS NOT NULL"
-        ),
+        nppes_condition_sql=("(projection_target.address_source_mask & 1) <> 0 AND projection_nppes.npi IS NOT NULL"),
         mrf_condition_sql="projection_mrf.npi IS NOT NULL",
         cms_condition_sql=(
-            "(projection_target.address_source_mask & 4) <> 0 "
-            "AND projection_cms.location_key IS NOT NULL"
+            "(projection_target.address_source_mask & 4) <> 0 AND projection_cms.location_key IS NOT NULL"
         ),
     )
 
@@ -5804,15 +5652,17 @@ def _geo_projection_evidence_source_sql() -> str:
 def _geo_projection_filter_sql(*, force: bool) -> str:
     """Select every row for reused stages, otherwise only stale projections."""
 
-    valid_source_ids = ", ".join(
-        str(source_id) for source_id in geo_projection.GEO_EVIDENCE_SOURCE_IDS
-    )
-    return "TRUE" if force else f"""(
+    valid_source_ids = ", ".join(str(source_id) for source_id in geo_projection.GEO_EVIDENCE_SOURCE_IDS)
+    return (
+        "TRUE"
+        if force
+        else f"""(
                 target.geo_assurance_version = {geo_projection.GEO_ASSURANCE_VERSION}
             AND target.geo_evidence_source_id IN ({valid_source_ids})
             AND target.geo_identity_coherent IS NOT NULL
             AND target.geo_point_coherent IS NOT NULL
          ) IS NOT TRUE"""
+    )
 
 
 def _geo_projection_target_ctes_sql(
@@ -5914,15 +5764,11 @@ def _materialize_geo_assurance_sql(
                 _geo_projection_filter_sql(force=force),
                 *reference_sql,
             ),
-            geo_projection.projection_external_evidence_ctes_sql(
-                db_schema, dependency_bindings=dependency_bindings
-            ),
+            geo_projection.projection_external_evidence_ctes_sql(db_schema, dependency_bindings=dependency_bindings),
             geo_projection.projection_cms_anchor_ctes_sql(
                 db_schema, stage_table, dependency_bindings=dependency_bindings
             ),
-            geo_projection.projection_cms_evidence_cte_sql(
-                db_schema, dependency_bindings=dependency_bindings
-            ),
+            geo_projection.projection_cms_evidence_cte_sql(db_schema, dependency_bindings=dependency_bindings),
             _geo_projection_update_sql(
                 db_schema,
                 stage_table,
@@ -5933,9 +5779,7 @@ def _materialize_geo_assurance_sql(
 
 
 def _invalid_geo_assurance_projection_sql(db_schema: str, stage_table: str) -> str:
-    valid_source_ids = ", ".join(
-        str(value) for value in geo_projection.GEO_EVIDENCE_SOURCE_IDS
-    )
+    valid_source_ids = ", ".join(str(value) for value in geo_projection.GEO_EVIDENCE_SOURCE_IDS)
     return f"""
     SELECT COUNT(*)
       FROM {db_schema}.{stage_table}
@@ -5952,15 +5796,10 @@ async def _validate_geo_assurance_projection(
     stage_table: str,
 ) -> int:
     invalid_rows = int(
-        await preparation_admission.read_scalar(db,
-            _invalid_geo_assurance_projection_sql(db_schema, stage_table)
-        )
-        or 0
+        await preparation_admission.read_scalar(db, _invalid_geo_assurance_projection_sql(db_schema, stage_table)) or 0
     )
     if invalid_rows:
-        raise RuntimeError(
-            f"{invalid_rows} staged rows have incomplete geo assurance"
-        )
+        raise RuntimeError(f"{invalid_rows} staged rows have incomplete geo assurance")
     return invalid_rows
 
 
@@ -6000,16 +5839,16 @@ async def _materialize_geo_assurance(
     run_id: str,
     stage_rows: int,
     dependency_bindings=None,
+    record_candidate: bool = True,
 ) -> int:
     _emit_geo_assurance_progress(run_id, stage_rows)
     started = time.monotonic()
-    projected_rows, invalid_rows, candidate_table_oid, effective_force = (
-        await _project_geo_assurance_transaction(
-            db_schema,
-            stage_table,
-            force=force,
-            **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}),
-        )
+    projected_rows, invalid_rows, candidate_table_oid, effective_force = await _project_geo_assurance_transaction(
+        db_schema,
+        stage_table,
+        force=force,
+        **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}),
+        **({} if record_candidate else {"record_candidate": False}),
     )
     elapsed = time.monotonic() - started
     _record_phase_timing(
@@ -6036,8 +5875,9 @@ async def _project_geo_assurance_transaction(
     *,
     force: bool,
     dependency_bindings=None,
+    record_candidate: bool = True,
 ) -> tuple[int, int, int, bool]:
-    """Project, validate, and receipt one source-stable stage atomically."""
+    """Project and validate one source-stable stage; only its publisher records authority."""
 
     if dependency_bindings is not None:
         dependency_bindings = geo_projection.validate_projection_dependency_bindings(db_schema, dependency_bindings)
@@ -6045,13 +5885,13 @@ async def _project_geo_assurance_transaction(
     async with preparation_admission.native_transaction():
         await _apply_entity_address_transaction_settings()
         await db.status(geo_projection.projection_dependency_lock_sql(db_schema, **binding_options))
-        if dependency_bindings is not None and not await preparation_admission.read_scalar(db,
-            f"SELECT {geo_projection.projection_dependency_bindings_match_sql(db_schema, dependency_bindings)}"
+        if dependency_bindings is not None and not await preparation_admission.read_scalar(
+            db, f"SELECT {geo_projection.projection_dependency_bindings_match_sql(db_schema, dependency_bindings)}"
         ):
             raise RuntimeError("geo assurance dependency binding changed")
         current_projection_available = dependency_bindings is None and bool(
-            await preparation_admission.read_scalar(db,
-                f"SELECT {geo_projection.projection_state_available_sql(db_schema)};"
+            await preparation_admission.read_scalar(
+                db, f"SELECT {geo_projection.projection_state_available_sql(db_schema)};"
             )
         )
         effective_force = force or not current_projection_available
@@ -6068,19 +5908,11 @@ async def _project_geo_assurance_transaction(
             )
             or 0
         )
-        invalid_rows = await _validate_geo_assurance_projection(
-            db_schema,
-            stage_table,
+        invalid_rows = await _validate_geo_assurance_projection(db_schema, stage_table)
+        candidate_sql = _geo_assurance_candidate_receipt_sql(
+            db_schema, stage_table, projected_rows, binding_options, record_candidate=record_candidate
         )
-        candidate_table_oid = await preparation_admission.read_scalar(db,
-            _record_geo_assurance_candidate_sql(
-                db_schema,
-                stage_table,
-                projected_rows,
-                require_canonical_publication=candidate_preparation.has_prepared_doctors(),
-                **binding_options,
-            )
-        )
+        candidate_table_oid = await preparation_admission.read_scalar(db, candidate_sql)
         if candidate_table_oid is None:
             raise RuntimeError("geo assurance stage disappeared before receipt")
     return (
@@ -6089,6 +5921,20 @@ async def _project_geo_assurance_transaction(
         int(candidate_table_oid),
         effective_force,
     )
+
+
+def _geo_assurance_candidate_receipt_sql(db_schema, stage_table, projected_rows, binding_options, *, record_candidate):
+    """Leave authority recording to the Publisher when preparing a protected handoff."""
+    if record_candidate:
+        return _record_geo_assurance_candidate_sql(
+            db_schema,
+            stage_table,
+            projected_rows,
+            require_canonical_publication=candidate_preparation.has_prepared_doctors(),
+            **binding_options,
+        )
+    relation = f"{_validate_schema_name(db_schema)}.{_validate_schema_name(stage_table)}"
+    return "SELECT to_regclass(" + _sql_literal(relation) + ")::oid::bigint;"
 
 
 async def _apply_entity_address_transaction_settings() -> None:
@@ -6101,8 +5947,7 @@ async def _drop_stage_secondary_indexes(stage_cls, db_schema: str) -> int:
     for index in getattr(stage_cls, "__my_additional_indexes__", []) or []:
         index_name = index.get("name", "_".join(index.get("index_elements")))
         await preparation_admission.stage_status(
-            f"DROP INDEX IF EXISTS {db_schema}."
-            f"{_stage_index_name(stage_cls.__tablename__, index_name)};"
+            f"DROP INDEX IF EXISTS {db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)};"
         )
         dropped += 1
     return dropped
@@ -6144,7 +5989,7 @@ def _backfill_archive_coordinates_sql(
            SET lat = a.lat,
                long = a.long
           FROM scoped_targets AS scoped
-          JOIN {db_schema}.{candidate_preparation.table_name('address_archive_v2')} AS a
+          JOIN {db_schema}.{candidate_preparation.table_name("address_archive_v2")} AS a
             ON a.address_key = scoped.address_key
          WHERE t.ctid = scoped.target_row_id
            AND a.merged_into IS NULL
@@ -6155,7 +6000,7 @@ def _backfill_archive_coordinates_sql(
     UPDATE {db_schema}.{table_name} AS t
        SET lat = a.lat,
            long = a.long
-      FROM {db_schema}.{candidate_preparation.table_name('address_archive_v2')} AS a
+      FROM {db_schema}.{candidate_preparation.table_name("address_archive_v2")} AS a
      WHERE t.address_key IS NOT NULL
        AND a.address_key = t.address_key
        AND a.merged_into IS NULL
@@ -6189,7 +6034,7 @@ def _archive_coordinate_eligible_targets_sql(
             current_archive.country_code
           FROM {db_schema}.{table_name} AS target
           {coordinate_scope_join}
-          JOIN {db_schema}.{candidate_preparation.table_name('address_archive_v2')} AS current_archive
+          JOIN {db_schema}.{candidate_preparation.table_name("address_archive_v2")} AS current_archive
             ON current_archive.address_key = target.address_key
            AND current_archive.merged_into IS NULL
          WHERE ({target_coordinate_missing})
@@ -6217,7 +6062,7 @@ def _archive_coordinate_candidate_groups_sql(
             MIN(legacy.long) AS long,
             COUNT(DISTINCT legacy.address_key)::bigint AS candidate_count
           FROM eligible_targets AS eligible
-          JOIN {db_schema}.{candidate_preparation.table_name('address_archive_v2')} AS legacy
+          JOIN {db_schema}.{candidate_preparation.table_name("address_archive_v2")} AS legacy
             ON legacy.identity_version < eligible.current_identity_version
            AND legacy.address_key <> eligible.current_address_key
            AND legacy.line1_norm = eligible.line1_norm
@@ -6282,12 +6127,13 @@ async def _inherit_archive_coordinates(
     *,
     coordinate_scope_table: str | None = None,
 ) -> dict[str, int]:
-    rows = await preparation_admission.read_all(db,
+    rows = await preparation_admission.read_all(
+        db,
         _inherit_archive_coordinates_sql(
             db_schema,
             table_name,
             coordinate_scope_table=coordinate_scope_table,
-        )
+        ),
     )
     if not rows:
         return {"inherited_rows": 0, "ambiguous_rows": 0}
@@ -6300,18 +6146,10 @@ async def _inherit_archive_coordinates(
 
 def _archive_coordinate_publish_metrics(context: dict) -> dict[str, int]:
     return {
-        "archive_coordinate_backfill_rows": int(
-            context.get("archive_coordinate_backfill_rows") or 0
-        ),
-        "archive_coordinate_same_key_backfill_rows": int(
-            context.get("archive_coordinate_same_key_backfill_rows") or 0
-        ),
-        "archive_coordinate_inherited_rows": int(
-            context.get("archive_coordinate_inherited_rows") or 0
-        ),
-        "archive_coordinate_ambiguous_rows": int(
-            context.get("archive_coordinate_ambiguous_rows") or 0
-        ),
+        "archive_coordinate_backfill_rows": int(context.get("archive_coordinate_backfill_rows") or 0),
+        "archive_coordinate_same_key_backfill_rows": int(context.get("archive_coordinate_same_key_backfill_rows") or 0),
+        "archive_coordinate_inherited_rows": int(context.get("archive_coordinate_inherited_rows") or 0),
+        "archive_coordinate_ambiguous_rows": int(context.get("archive_coordinate_ambiguous_rows") or 0),
     }
 
 
@@ -6468,10 +6306,12 @@ def _backfill_same_provider_address_fields_sql(
     )"""
         target_scope_filter = "\n       AND target_row.ctid = scoped_targets.target_row_id"
     return f"""
-    WITH {_same_provider_source_rows_sql(
-        db_schema,
-        table_name,
-    )},
+    WITH {
+        _same_provider_source_rows_sql(
+            db_schema,
+            table_name,
+        )
+    },
     {_same_provider_grouped_fields_sql()}{scoped_targets_sql}
     UPDATE {db_schema}.{table_name} AS target_row
        SET {_same_provider_set_clause_sql(target_coordinate_missing)}
@@ -6488,7 +6328,8 @@ def _backfill_same_provider_address_fields_sql(
 async def _is_location_primary_key_validated(db_schema: str, table_name: str) -> bool:
     """A valid PK on location_key proves both non-null and uniqueness."""
     return bool(
-        await preparation_admission.read_scalar(db,
+        await preparation_admission.read_scalar(
+            db,
             f"""
             SELECT 1
               FROM pg_constraint con
@@ -6509,7 +6350,7 @@ async def _is_location_primary_key_validated(db_schema: str, table_name: str) ->
             HAVING array_agg(att.attname::text ORDER BY cols.ord) = ARRAY['location_key']::text[]
                AND bool_and(att.attnotnull)
              LIMIT 1;
-            """
+            """,
         )
     )
 
@@ -6520,10 +6361,17 @@ async def _validate_publish_integrity(
     support_stage_class_map: dict[type, type],
     *,
     test_mode: bool,
+    archive_relation: tuple[str, str] | None = None,
 ) -> dict[str, int | dict[str, int]]:
     """Validate staged address and support-table publish invariants."""
     if test_mode:
         return {}
+
+    archive_schema, archive_table = (
+        (db_schema, candidate_preparation.table_name("address_archive_v2"))
+        if archive_relation is None
+        else tuple(_validate_schema_name(identifier) for identifier in archive_relation)
+    )
 
     failures: list[str] = []
     integrity_metric_map: dict[str, int | dict[str, int]] = {}
@@ -6557,13 +6405,9 @@ async def _validate_publish_integrity(
     integrity_metric_map["residual_alias_source_rows"] = residual_alias_source_rows
     integrity_metric_map["stale_alias_generation_rows"] = stale_alias_generation_rows
     if residual_alias_source_rows:
-        failures.append(
-            f"{residual_alias_source_rows} staged rows retain active alias source keys"
-        )
+        failures.append(f"{residual_alias_source_rows} staged rows retain active alias source keys")
     if stale_alias_generation_rows:
-        failures.append(
-            f"{stale_alias_generation_rows} staged rows use a stale address alias generation"
-        )
+        failures.append(f"{stale_alias_generation_rows} staged rows use a stale address alias generation")
 
     location_key_constraint_validated = await _is_location_primary_key_validated(db_schema, stage_table)
     integrity_metric_map["location_key_constraint_validated"] = location_key_constraint_validated
@@ -6572,14 +6416,17 @@ async def _validate_publish_integrity(
         duplicate_location_keys = 0
     else:
         null_location_keys = int(
-            await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{stage_table} WHERE location_key IS NULL;")
+            await preparation_admission.read_scalar(
+                db, f"SELECT COUNT(*) FROM {db_schema}.{stage_table} WHERE location_key IS NULL;"
+            )
             or 0
         )
         if null_location_keys:
             failures.append(f"{null_location_keys} staged rows have NULL location_key")
 
         duplicate_location_keys = int(
-            await preparation_admission.read_scalar(db,
+            await preparation_admission.read_scalar(
+                db,
                 f"""
                 SELECT COUNT(*)
                   FROM (
@@ -6588,7 +6435,7 @@ async def _validate_publish_integrity(
                          GROUP BY location_key
                         HAVING COUNT(*) > 1
                        ) AS duplicate_locations;
-                """
+                """,
             )
             or 0
         )
@@ -6602,7 +6449,7 @@ async def _validate_publish_integrity(
     archive_coordinate_mismatch_rows = 0
     archive_missing_coordinate_rows = 0
     archive_identity_mismatch_rows = 0
-    if await _has_table(db_schema, "address_archive_v2"):
+    if await _has_table(archive_schema, archive_table):
         (
             unresolved_merged_into_rows,
             archive_coordinate_mismatch_rows,
@@ -6617,7 +6464,7 @@ async def _validate_publish_integrity(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
-                  JOIN {db_schema}.{candidate_preparation.table_name('address_archive_v2')} AS a
+                  JOIN {archive_schema}.{archive_table} AS a
                     ON a.address_key = t.address_key
                  WHERE t.address_key IS NOT NULL
                    AND a.merged_into IS NOT NULL;
@@ -6627,7 +6474,7 @@ async def _validate_publish_integrity(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
-                  JOIN {db_schema}.{candidate_preparation.table_name('address_archive_v2')} AS a
+                  JOIN {archive_schema}.{archive_table} AS a
                     ON a.address_key = t.address_key
                    AND a.merged_into IS NULL
                  WHERE t.address_key IS NOT NULL
@@ -6645,7 +6492,7 @@ async def _validate_publish_integrity(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
-                  JOIN {db_schema}.{candidate_preparation.table_name('address_archive_v2')} AS a
+                  JOIN {archive_schema}.{archive_table} AS a
                     ON a.address_key = t.address_key
                    AND a.merged_into IS NULL
                  WHERE t.address_key IS NOT NULL
@@ -6659,7 +6506,7 @@ async def _validate_publish_integrity(
                  WHERE t.address_key IS NOT NULL
                    AND NOT EXISTS (
                        SELECT 1
-                         FROM {db_schema}.{candidate_preparation.table_name('address_archive_v2')} AS a
+                         FROM {archive_schema}.{archive_table} AS a
                         WHERE a.address_key = t.address_key
                           AND a.merged_into IS NULL
                    );
@@ -6669,7 +6516,7 @@ async def _validate_publish_integrity(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
-                  JOIN {db_schema}.{candidate_preparation.table_name('address_archive_v2')} AS a
+                  JOIN {archive_schema}.{archive_table} AS a
                     ON a.address_key = t.address_key
                    AND a.merged_into IS NULL
                  WHERE t.address_key IS NOT NULL
@@ -6681,9 +6528,7 @@ async def _validate_publish_integrity(
         )
     integrity_metric_map["unresolved_merged_into_rows"] = unresolved_merged_into_rows
     if unresolved_merged_into_rows:
-        failures.append(
-            f"{unresolved_merged_into_rows} staged rows point to address_archive_v2.merged_into redirects"
-        )
+        failures.append(f"{unresolved_merged_into_rows} staged rows point to address_archive_v2.merged_into redirects")
     integrity_metric_map["missing_archive_address_key_rows"] = missing_archive_address_key_rows
     if missing_archive_address_key_rows:
         failures.append(
@@ -6770,7 +6615,8 @@ async def _validate_publish_integrity(
             bridge_orphan_count_map[bridge_table] = -1
             continue
         orphan_count = int(
-            await preparation_admission.read_scalar(db,
+            await preparation_admission.read_scalar(
+                db,
                 f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{bridge_table} AS b
@@ -6779,7 +6625,7 @@ async def _validate_publish_integrity(
                          FROM {db_schema}.{stage_table} AS t
                         WHERE t.location_key = b.location_key
                  );
-                """
+                """,
             )
             or 0
         )
@@ -6910,6 +6756,17 @@ def _insert_raw_sanitized_cte_sql() -> str:
 def _insert_raw_normalized_cte_sql() -> str:
     """Build the normalized raw row and checksum CTE."""
 
+    checksum = _address_checksum_expr(
+        {
+            "first_line": _alnum_norm_expr("first_line"),
+            "second_line": _alnum_norm_expr("second_line"),
+            "city_name": _alnum_norm_expr("city_name"),
+            "state_name": _state_norm_expr("state_name"),
+            "postal_code": _zip5_norm_expr("postal_code"),
+            "country_code": _state_norm_expr("country_code"),
+            "telephone_number": _phone_norm_expr("telephone_number"),
+        }
+    )
     return f"""
     normalized AS (
         SELECT
@@ -6953,15 +6810,7 @@ def _insert_raw_normalized_cte_sql() -> str:
             source_record_id,
             updated_at,
             address_key,
-            {_address_checksum_expr({
-                "first_line": _alnum_norm_expr("first_line"),
-                "second_line": _alnum_norm_expr("second_line"),
-                "city_name": _alnum_norm_expr("city_name"),
-                "state_name": _state_norm_expr("state_name"),
-                "postal_code": _zip5_norm_expr("postal_code"),
-                "country_code": _state_norm_expr("country_code"),
-                "telephone_number": _phone_norm_expr("telephone_number"),
-            })} AS checksum
+            {checksum} AS checksum
           FROM sanitized
     )"""
 
@@ -7052,9 +6901,7 @@ def _raw_materialize_shard_filter_sql(
     if not checksum_modulo or checksum_modulo <= 1 or checksum_remainder is None:
         return ""
     shard_expr = (
-        "evidence_shard"
-        if inline_source_evidence
-        else _aggregate_shard_expr(dedupe_key_expr, int(checksum_modulo))
+        "evidence_shard" if inline_source_evidence else _aggregate_shard_expr(dedupe_key_expr, int(checksum_modulo))
     )
     return f" WHERE {shard_expr} = {int(checksum_remainder)}"
 
@@ -7210,9 +7057,7 @@ def _raw_array_aggregation_sql(
             _raw_split_array_join_sql(dedupe_key_expr),
             _raw_split_array_selects_sql(),
         )
-    raw_array_joins, aggregated_array_columns, array_selects = (
-        _raw_inline_array_aggregation_sql()
-    )
+    raw_array_joins, aggregated_array_columns, array_selects = _raw_inline_array_aggregation_sql()
     return raw_array_joins, aggregated_array_columns, "", "", array_selects
 
 
@@ -7486,9 +7331,7 @@ def _materialize_from_raw_sql(
             DEFAULT_SPLIT_ARRAY_AGGREGATES,
         ),
     )
-    raw_array_joins, aggregated_array_columns, array_cte, array_join, array_selects = (
-        array_fragments
-    )
+    raw_array_joins, aggregated_array_columns, array_cte, array_join, array_selects = array_fragments
     sql = "".join(
         (
             _raw_materialize_insert_header_sql(db_schema, stage_table),
@@ -7849,8 +7692,7 @@ def _evidence_group_key_exprs(alias: str) -> dict[str, str]:
     address_key = _alias_col(alias, "address_key")
     return {
         "street": (
-            f"CASE WHEN {address_key} IS NULL THEN "
-            f"{_street_soft_norm_expr(_alias_col(alias, 'first_line'))} END"
+            f"CASE WHEN {address_key} IS NULL THEN {_street_soft_norm_expr(_alias_col(alias, 'first_line'))} END"
         ),
         "city": (
             f"CASE WHEN {address_key} IS NULL THEN "
@@ -7867,10 +7709,7 @@ def _evidence_group_key_exprs(alias: str) -> dict[str, str]:
             f"COALESCE(NULLIF({_alias_col(alias, 'zip5')}, ''), "
             f"{_zip5_norm_expr(_alias_col(alias, 'postal_code'))}) END"
         ),
-        "country": (
-            f"CASE WHEN {address_key} IS NULL THEN "
-            f"{_state_norm_expr(_alias_col(alias, 'country_code'))} END"
-        ),
+        "country": (f"CASE WHEN {address_key} IS NULL THEN {_state_norm_expr(_alias_col(alias, 'country_code'))} END"),
     }
 
 
@@ -7880,14 +7719,14 @@ def _evidence_group_hash_expr_for_alias(alias: str, evidence_shards: int) -> str
     return f"""
         (((hashtext(CONCAT_WS(
             '|',
-            COALESCE({_alias_col(alias, 'entity_type')}, ''),
-            COALESCE({_alias_col(alias, 'entity_id')}, ''),
-            COALESCE({_alias_col(alias, 'address_key')}::text, ''),
-            COALESCE(({keys['street']})::varchar, ''),
-            COALESCE(({keys['city']})::varchar, ''),
-            COALESCE(({keys['state']})::varchar, ''),
-            COALESCE(({keys['zip']})::varchar, ''),
-            COALESCE(({keys['country']})::varchar, '')
+            COALESCE({_alias_col(alias, "entity_type")}, ''),
+            COALESCE({_alias_col(alias, "entity_id")}, ''),
+            COALESCE({_alias_col(alias, "address_key")}::text, ''),
+            COALESCE(({keys["street"]})::varchar, ''),
+            COALESCE(({keys["city"]})::varchar, ''),
+            COALESCE(({keys["state"]})::varchar, ''),
+            COALESCE(({keys["zip"]})::varchar, ''),
+            COALESCE(({keys["country"]})::varchar, '')
         )) % {shards}) + {shards}) % {shards})::int
     """
 
@@ -7902,11 +7741,11 @@ def _inline_source_evidence_sql(sql: str) -> str:
             agg.entity_type AS e_entity_type,
             agg.entity_id AS e_entity_id,
             agg.address_key AS e_address_key,
-            ({evidence_keys['street']})::varchar AS e_street_key,
-            ({evidence_keys['city']})::varchar AS e_city_key,
-            ({evidence_keys['state']})::varchar AS e_state_key,
-            ({evidence_keys['zip']})::varchar AS e_zip_key,
-            ({evidence_keys['country']})::varchar AS e_country_key,
+            ({evidence_keys["street"]})::varchar AS e_street_key,
+            ({evidence_keys["city"]})::varchar AS e_city_key,
+            ({evidence_keys["state"]})::varchar AS e_state_key,
+            ({evidence_keys["zip"]})::varchar AS e_zip_key,
+            ({evidence_keys["country"]})::varchar AS e_country_key,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT src.src ORDER BY src.src), NULL)::varchar[] AS evidence_sources,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT rid.rid ORDER BY rid.rid), NULL)::varchar[] AS evidence_record_ids
           FROM aggregated AS agg
@@ -7935,14 +7774,14 @@ def _inline_source_evidence_sql(sql: str) -> str:
         ON e.e_entity_type = aggregated.entity_type
        AND e.e_entity_id = aggregated.entity_id
        AND e.e_address_key IS NOT DISTINCT FROM aggregated.address_key
-       AND e.e_street_key IS NOT DISTINCT FROM ({joined_keys['street']})::varchar
-       AND e.e_city_key IS NOT DISTINCT FROM ({joined_keys['city']})::varchar
-       AND e.e_state_key IS NOT DISTINCT FROM ({joined_keys['state']})::varchar
-       AND e.e_zip_key IS NOT DISTINCT FROM ({joined_keys['zip']})::varchar
-       AND e.e_country_key IS NOT DISTINCT FROM ({joined_keys['country']})::varchar"""
+       AND e.e_street_key IS NOT DISTINCT FROM ({joined_keys["street"]})::varchar
+       AND e.e_city_key IS NOT DISTINCT FROM ({joined_keys["city"]})::varchar
+       AND e.e_state_key IS NOT DISTINCT FROM ({joined_keys["state"]})::varchar
+       AND e.e_zip_key IS NOT DISTINCT FROM ({joined_keys["zip"]})::varchar
+       AND e.e_country_key IS NOT DISTINCT FROM ({joined_keys["country"]})::varchar"""
     final_from = "\n      FROM aggregated"
     final_idx = sql.rindex(final_from)
-    return sql[:final_idx] + "\n      " + join_sql + sql[final_idx + len(final_from):]
+    return sql[:final_idx] + "\n      " + join_sql + sql[final_idx + len(final_from) :]
 
 
 def _prepare_multi_source_evidence_table_sql(
@@ -9080,9 +8919,9 @@ def _facility_anchor_npi_candidate_sql(
             ]
         )
 
-    if candidate_options_by_name.get(
-        "include_npi_address_key", False
-    ) and candidate_options_by_name.get("include_npi_taxonomy", False):
+    if candidate_options_by_name.get("include_npi_address_key", False) and candidate_options_by_name.get(
+        "include_npi_taxonomy", False
+    ):
         fragments.append(
             f"""
         SELECT
@@ -9303,9 +9142,9 @@ def _facility_anchor_npi_candidate_sql(
             """
             )
 
-    if candidate_options_by_name.get(
-        "include_npi_registry", False
-    ) and candidate_options_by_name.get("include_npi_taxonomy", False):
+    if candidate_options_by_name.get("include_npi_registry", False) and candidate_options_by_name.get(
+        "include_npi_taxonomy", False
+    ):
         fragments.extend(
             [
                 f"""
@@ -9648,9 +9487,7 @@ def _support_stage_evidence_sql(context: _SupportStageContext) -> str:
         context.stage_table,
         source_run_id=plan.source_run_id,
         node_id=plan.node_id,
-        affected_group_table=(
-            plan.affected_group_table if context.is_partial_support_patch else None
-        ),
+        affected_group_table=(plan.affected_group_table if context.is_partial_support_patch else None),
     )
 
 
@@ -9663,10 +9500,13 @@ def _support_bridge_specs(context: _SupportStageContext) -> list[_SupportBridgeS
             _plan_bridge_sql,
         )
     ]
-    if _is_env_enabled(
-        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_CODE_BRIDGES",
-        DEFAULT_BUILD_CODE_BRIDGES,
-    ) or context.is_partial_bridge_reuse:
+    if (
+        _is_env_enabled(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_CODE_BRIDGES",
+            DEFAULT_BUILD_CODE_BRIDGES,
+        )
+        or context.is_partial_bridge_reuse
+    ):
         specs.extend(
             (
                 _SupportBridgeSpec(
@@ -9719,39 +9559,22 @@ def _should_build_facility_candidates(context: _SupportStageContext) -> bool:
 
 def _facility_candidate_options(context: _SupportStageContext) -> dict[str, bool]:
     available = context.available
-    include_nppes = _is_env_enabled(
-        "HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES", False
-    )
-    include_other_identifier = _is_env_enabled(
-        "HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_OTHER_IDENTIFIER", False
-    )
+    include_nppes = _is_env_enabled("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES", False)
+    include_other_identifier = _is_env_enabled("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_OTHER_IDENTIFIER", False)
     return {
-        "include_hospital_enrollment": available.get(
-            "provider_enrollment_hospital", False
-        ),
+        "include_hospital_enrollment": available.get("provider_enrollment_hospital", False),
         "include_fqhc_enrollment": available.get("provider_enrollment_fqhc", False),
         "include_npi_address_key": (
             available.get("npi", False)
             and available.get("npi_address", False)
-            and available.get(
-                "npi_address.address_key", available.get("npi_address", False)
-            )
+            and available.get("npi_address.address_key", available.get("npi_address", False))
             and available.get("npi_taxonomy", False)
         ),
-        "include_npi_registry": (
-            include_nppes
-            and available.get("npi", False)
-            and available.get("npi_address", False)
-        ),
+        "include_npi_registry": (include_nppes and available.get("npi", False) and available.get("npi_address", False)),
         "include_npi_taxonomy": available.get("npi_taxonomy", False),
         "include_nucc_taxonomy": available.get("nucc_taxonomy", False),
-        "include_npi_other_identifier": (
-            include_other_identifier
-            and available.get("npi_other_identifier", False)
-        ),
-        "include_provider_additional_npi": available.get(
-            "provider_enrollment_ffs_additional_npi", False
-        ),
+        "include_npi_other_identifier": (include_other_identifier and available.get("npi_other_identifier", False)),
+        "include_provider_additional_npi": available.get("provider_enrollment_ffs_additional_npi", False),
         "include_facility_anchor": available.get("facility_anchor", False),
     }
 
@@ -9808,20 +9631,12 @@ def _support_bridge_stage_statements(
                 ),
             )
         )
-    shard_count = (
-        _env_int(spec.shard_env, spec.default_shards, minimum=1)
-        if spec.shard_env
-        else 1
-    )
+    shard_count = _env_int(spec.shard_env, spec.default_shards, minimum=1) if spec.shard_env else 1
     for shard in range(shard_count):
         label = spec.label
         if shard_count > 1:
             label = f"{label} shard {shard + 1}/{shard_count}"
-        option_map = {
-            "affected_group_table": (
-                plan.affected_group_table if context.is_partial_bridge_reuse else None
-            )
-        }
+        option_map = {"affected_group_table": (plan.affected_group_table if context.is_partial_bridge_reuse else None)}
         if spec.shard_env:
             option_map.update({"bridge_shards": shard_count, "bridge_shard": shard})
         statements.append(
@@ -9850,15 +9665,11 @@ def _support_stage_statements(
     context = _SupportStageContext(
         db_schema=db_schema,
         stage_table=stage_table,
-        stage_table_map={
-            model: stage_cls.__tablename__ for model, stage_cls in stage_classes.items()
-        },
+        stage_table_map={model: stage_cls.__tablename__ for model, stage_cls in stage_classes.items()},
         plan=plan,
         available=plan.available or {},
         is_partial_bridge_reuse=is_partial_bridge_reuse,
-        is_partial_support_patch=(
-            is_partial_bridge_reuse and not plan.copy_unaffected_bridges
-        ),
+        is_partial_support_patch=(is_partial_bridge_reuse and not plan.copy_unaffected_bridges),
     )
     statements = [
         _SupportStageStatement(
@@ -9925,10 +9736,7 @@ async def _report_support_stage_progress(
             done=progress.completed_steps,
             total=progress.total,
             pct=95 + (progress.completed_steps / max(progress.total, 1)) * 4,
-            message=(
-                f"{action} support table {index}/{progress.total}: "
-                f"{stage_statement.label}{concurrency}"
-            ),
+            message=(f"{action} support table {index}/{progress.total}: {stage_statement.label}{concurrency}"),
         )
 
 
@@ -9937,17 +9745,13 @@ async def _run_support_stage_item(
     index: int,
     stage_statement: _SupportStageStatement,
 ) -> None:
-    await _report_support_stage_progress(
-        progress, index, stage_statement, is_completed=False
-    )
+    await _report_support_stage_progress(progress, index, stage_statement, is_completed=False)
     await _run_sql_phase(
         stage_statement.statement,
         context=progress.phase_context,
         phase=f"entity-address-unified building {stage_statement.label}",
     )
-    await _report_support_stage_progress(
-        progress, index, stage_statement, is_completed=True
-    )
+    await _report_support_stage_progress(progress, index, stage_statement, is_completed=True)
 
 
 async def _guarded_support_stage_item(
@@ -9972,10 +9776,7 @@ async def _run_support_stage_batch(
         return
     semaphore = asyncio.Semaphore(progress.concurrency)
     results = await preparation_admission.gather(
-        *(
-            _guarded_support_stage_item(semaphore, progress, index, stage_statement)
-            for index, stage_statement in batch
-        ),
+        *(_guarded_support_stage_item(semaphore, progress, index, stage_statement) for index, stage_statement in batch),
         return_exceptions=True,
     )
     for result in results:
@@ -9994,9 +9795,7 @@ async def _populate_support_stage_tables(
 ) -> dict[str, int]:
     """Populate support stages with bounded parallel execution."""
     phase_context = context if context is not None else {}
-    statements = _support_stage_statements(
-        db_schema, stage_table, stage_classes, plan=plan
-    )
+    statements = _support_stage_statements(db_schema, stage_table, stage_classes, plan=plan)
     support_concurrency = min(
         _env_int(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CONCURRENCY",
@@ -10025,9 +9824,7 @@ async def _populate_support_stage_tables(
     row_count_map = {}
     for model, stage_cls in stage_classes.items():
         row_count_map[model.__tablename__] = int(
-            await preparation_admission.read_scalar(db,
-                f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
-            )
+            await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};")
             or 0
         )
     return row_count_map
@@ -10056,27 +9853,14 @@ def _inference_sql(
     inference_options_by_name: Mapping[str, bool],
 ) -> str:
     """Build deterministic facility NPI inference SQL."""
-    include_hospital_enrollment = inference_options_by_name.get(
-        "include_hospital_enrollment", False
-    )
-    include_fqhc_enrollment = inference_options_by_name.get(
-        "include_fqhc_enrollment", False
-    )
-    include_facility_override = inference_options_by_name.get(
-        "include_facility_override", False
-    )
-    include_npi_other_identifier = inference_options_by_name.get(
-        "include_npi_other_identifier", False
-    )
-    include_name_fallback = inference_options_by_name.get(
-        "include_name_fallback", False
-    )
-    include_nppes_name_inference = inference_options_by_name.get(
-        "include_nppes_name_inference", False
-    )
-    include_nppes_broad_inference = inference_options_by_name.get(
-        "include_nppes_broad_inference", False
-    )
+    include_hospital_enrollment = inference_options_by_name.get("include_hospital_enrollment", False)
+    include_fqhc_enrollment = inference_options_by_name.get("include_fqhc_enrollment", False)
+    include_facility_override = inference_options_by_name.get("include_facility_override", False)
+    include_npi_other_identifier = inference_options_by_name.get("include_npi_other_identifier", False)
+    include_name_fallback = inference_options_by_name.get("include_name_fallback", False)
+    include_nppes_name_inference = inference_options_by_name.get("include_nppes_name_inference", False)
+    include_nppes_broad_inference = inference_options_by_name.get("include_nppes_broad_inference", False)
+
     def norm_text_sql(expr: str) -> str:
         """Normalize text for generated SQL comparisons."""
         return f"regexp_replace(LOWER(COALESCE({expr}, '')), '[^a-z0-9]', '', 'g')"
@@ -11956,42 +11740,28 @@ async def process_entity_address_unified_data(ctx, task=None):
     test_mode = bool(context.get("test_mode", False))
     context["publish_requested"] = _is_publish_requested(task, test_mode=test_mode)
     refresh_mode = _entity_address_refresh_mode(task)
-    is_partial_provider_directory_refresh = (
-        refresh_mode == ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
-    )
+    is_partial_provider_directory_refresh = refresh_mode == ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
     partial_source_refresh = is_partial_provider_directory_refresh
     provider_directory_partial_scope = (
-        _entity_address_provider_directory_partial_scope(task)
-        if is_partial_provider_directory_refresh
-        else None
+        _entity_address_provider_directory_partial_scope(task) if is_partial_provider_directory_refresh else None
     )
     provider_directory_source_ids = (
-        _entity_address_provider_directory_source_ids(task)
-        if is_partial_provider_directory_refresh
-        else []
+        _entity_address_provider_directory_source_ids(task) if is_partial_provider_directory_refresh else []
     )
     provider_directory_run_id = (
-        _entity_address_provider_directory_run_id(task)
-        if is_partial_provider_directory_refresh
-        else None
+        _entity_address_provider_directory_run_id(task) if is_partial_provider_directory_refresh else None
     )
     provider_directory_dataset_id = (
-        _entity_address_provider_directory_dataset_id(task)
-        if is_partial_provider_directory_refresh
-        else None
+        _entity_address_provider_directory_dataset_id(task) if is_partial_provider_directory_refresh else None
     )
     provider_directory_source_batch_size = (
-        _provider_directory_source_batch_size(task)
-        if is_partial_provider_directory_refresh
-        else 0
+        _provider_directory_source_batch_size(task) if is_partial_provider_directory_refresh else 0
     )
     provider_directory_scope_sources: list[str] = []
     context["refresh_mode"] = refresh_mode
     context["partial_provider_directory_refresh"] = is_partial_provider_directory_refresh
     context["partial_provider_directory_scope"] = provider_directory_partial_scope
-    context["partial_provider_directory_dataset_id"] = (
-        provider_directory_dataset_id
-    )
+    context["partial_provider_directory_dataset_id"] = provider_directory_dataset_id
     _validate_provider_directory_dataset_fence_scope(
         dataset_id=provider_directory_dataset_id,
         source_ids=provider_directory_source_ids,
@@ -12011,6 +11781,10 @@ async def process_entity_address_unified_data(ctx, task=None):
     )
     context["serving_only_refresh"] = serving_only_refresh
     context["support_stage_skipped"] = False
+    if candidate_preparation.current() is None:
+        from process.entity_address_native_publication import bind_controlled_address_attempt
+
+        bind_controlled_address_attempt(ctx)
 
     await ensure_database(test_mode)
 
@@ -12025,14 +11799,8 @@ async def process_entity_address_unified_data(ctx, task=None):
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE."
         )
 
-    if context["publish_requested"] and not context.get(
-        "cutover_dependency_preflight"
-    ):
-        live_models = (
-            (EntityAddressUnified,)
-            if serving_only_refresh
-            else (EntityAddressUnified, *SUPPORT_TABLE_MODELS)
-        )
+    if context["publish_requested"] and not context.get("cutover_dependency_preflight"):
+        live_models = (EntityAddressUnified,) if serving_only_refresh else (EntityAddressUnified, *SUPPORT_TABLE_MODELS)
         await _assert_cutover_has_no_dependent_views(
             db_schema,
             [model.__main_table__ for model in live_models],
@@ -12041,12 +11809,9 @@ async def process_entity_address_unified_data(ctx, task=None):
 
     if not ctx["context"].get("stage_prepared"):
         await _ensure_schema_exists(db_schema)
-        should_use_unlogged_stage = (
-            not should_reuse_stage
-            and _is_env_enabled(
-                "HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_STAGE",
-                DEFAULT_UNLOGGED_STAGE,
-            )
+        should_use_unlogged_stage = not should_reuse_stage and _is_env_enabled(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_STAGE",
+            DEFAULT_UNLOGGED_STAGE,
         )
         context["unlogged_stage"] = should_use_unlogged_stage
         if should_reuse_stage:
@@ -12107,9 +11872,7 @@ async def process_entity_address_unified_data(ctx, task=None):
     ]
     available_relation_map = {table: await _has_table(db_schema, table) for table in required_checks}
     if not available_relation_map.get(geo_projection.GEO_ASSURANCE_STATE_TABLE):
-        raise RuntimeError(
-            "entity-address-unified requires migrated geo assurance schema"
-        )
+        raise RuntimeError("entity-address-unified requires migrated geo assurance schema")
     if not available_relation_map.get(address_alias_sql.ADDRESS_ALIAS_TABLE) or not (
         available_relation_map.get(address_alias_sql.ADDRESS_ALIAS_STATE_TABLE)
     ):
@@ -12129,13 +11892,10 @@ async def process_entity_address_unified_data(ctx, task=None):
         ("tiger", "zcta5"),
     ):
         if not await _has_table(relation_schema, table_name):
-            missing_geo_reference_relations.append(
-                f"{relation_schema}.{table_name}"
-            )
+            missing_geo_reference_relations.append(f"{relation_schema}.{table_name}")
     if missing_geo_reference_relations:
         raise RuntimeError(
-            "entity-address-unified requires geo assurance relations: "
-            f"{', '.join(missing_geo_reference_relations)}"
+            f"entity-address-unified requires geo assurance relations: {', '.join(missing_geo_reference_relations)}"
         )
     alias_generation = await _address_alias_generation(db_schema)
     alias_base_address_version = f"{ALIAS_BASE_ADDRESS_VERSION_PREFIX}{alias_generation}"
@@ -12145,11 +11905,10 @@ async def process_entity_address_unified_data(ctx, task=None):
         db_schema,
         stage_table if should_reuse_stage else EntityAddressUnified.__tablename__,
     ):
-        version_table = (
-            stage_table if should_reuse_stage else EntityAddressUnified.__tablename__
-        )
+        version_table = stage_table if should_reuse_stage else EntityAddressUnified.__tablename__
         stale_versions = int(
-            await preparation_admission.read_scalar(db,
+            await preparation_admission.read_scalar(
+                db,
                 f"""
                 SELECT count(*)
                 FROM {db_schema}.{version_table}
@@ -12160,10 +11919,7 @@ async def process_entity_address_unified_data(ctx, task=None):
             or 0
         )
         if stale_versions:
-            raise RuntimeError(
-                "address alias generation changed; a full entity-address-unified "
-                "rebuild is required"
-            )
+            raise RuntimeError("address alias generation changed; a full entity-address-unified rebuild is required")
     for table_name in (
         "npi_address",
         "doctor_clinician_address",
@@ -12183,7 +11939,11 @@ async def process_entity_address_unified_data(ctx, task=None):
         else False
     )
     approved_candidate_promotions = 0
-    if candidate_preparation.current() is None and available_relation_map.get("facility_anchor_npi_candidate") and available_relation_map.get("facility_anchor_npi_override"):
+    if (
+        candidate_preparation.current() is None
+        and available_relation_map.get("facility_anchor_npi_candidate")
+        and available_relation_map.get("facility_anchor_npi_override")
+    ):
         approved_candidate_promotions = await _promote_approved_facility_anchor_npi_candidates(db_schema)
         context["facility_anchor_npi_candidate_promotions"] = approved_candidate_promotions
         if run_id and approved_candidate_promotions:
@@ -12199,9 +11959,7 @@ async def process_entity_address_unified_data(ctx, task=None):
             )
     test_limit_per_source: int | None = None
     limit_any_mode_raw = (
-        task.get("limit_per_source")
-        if task.get("limit_per_source") not in (None, "")
-        else task.get("source_limit")
+        task.get("limit_per_source") if task.get("limit_per_source") not in (None, "") else task.get("source_limit")
     )
     if limit_any_mode_raw in (None, ""):
         limit_any_mode_raw = os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_LIMIT_PER_SOURCE")
@@ -12248,9 +12006,7 @@ async def process_entity_address_unified_data(ctx, task=None):
             provider_directory_run_id,
             provider_directory_source_ids,
             provider_directory_scope_sources,
-        ) = (
-            await _latest_provider_directory_partial_scope(db_schema)
-        )
+        ) = await _latest_provider_directory_partial_scope(db_schema)
     if is_partial_provider_directory_refresh and provider_directory_partial_scope == "latest-run":
         if not provider_directory_source_ids and not provider_directory_run_id:
             raise RuntimeError(
@@ -12348,7 +12104,8 @@ async def process_entity_address_unified_data(ctx, task=None):
             emit_done=True,
         )
         affected_group_rows = int(
-            await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{affected_group_table};") or 0
+            await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{affected_group_table};")
+            or 0
         )
         context["partial_provider_directory_affected_groups"] = affected_group_rows
         source_selects = _provider_directory_partial_replacement_source_selects(
@@ -12459,23 +12216,21 @@ async def process_entity_address_unified_data(ctx, task=None):
     should_use_chunked_load = _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CHUNKED_LOAD", True)
     if not should_use_chunked_load:
         active_alias_count = int(
-            await preparation_admission.read_scalar(db,
+            await preparation_admission.read_scalar(
+                db,
                 f"""
                 SELECT count(*)
                 FROM {db_schema}.{address_alias_sql.ADDRESS_ALIAS_TABLE}
                 WHERE revoked_at IS NULL;
-                """
+                """,
             )
             or 0
         )
         if active_alias_count:
-            raise RuntimeError(
-                "active address aliases require chunked entity-address-unified enrichment"
-            )
+            raise RuntimeError("active address aliases require chunked entity-address-unified enrichment")
     if partial_source_refresh and not should_use_chunked_load:
         raise RuntimeError(
-            f"entity-address-unified {refresh_mode} refresh requires "
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CHUNKED_LOAD=true."
+            f"entity-address-unified {refresh_mode} refresh requires HLTHPRT_ENTITY_ADDRESS_UNIFIED_CHUNKED_LOAD=true."
         )
     raw_table: str | None = None
     include_inline_source_evidence = False
@@ -12502,11 +12257,9 @@ async def process_entity_address_unified_data(ctx, task=None):
             aggregate_shards,
         )
         context["aggregate_concurrency"] = aggregate_concurrency
-        include_inline_source_evidence = (
-            _is_env_enabled(
-                "HLTHPRT_ENTITY_ADDRESS_UNIFIED_INLINE_SOURCE_EVIDENCE",
-                DEFAULT_INLINE_SOURCE_EVIDENCE,
-            )
+        include_inline_source_evidence = _is_env_enabled(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_INLINE_SOURCE_EVIDENCE",
+            DEFAULT_INLINE_SOURCE_EVIDENCE,
         )
         context["inline_source_evidence"] = include_inline_source_evidence
         if _should_require_inline_evidence() and not include_inline_source_evidence:
@@ -12536,11 +12289,7 @@ async def process_entity_address_unified_data(ctx, task=None):
             enrich_shards,
         )
         context["enrich_concurrency"] = enrich_concurrency
-        checksum_ranges = (
-            _integer_ranges(-(2**31), 2**31 - 1, enrich_shards)
-            if enrich_shards > 1
-            else []
-        )
+        checksum_ranges = _integer_ranges(-(2**31), 2**31 - 1, enrich_shards) if enrich_shards > 1 else []
         raw_table = _raw_stage_table_name(stage_table)
         use_unlogged_raw = _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_RAW_STAGE", True)
         should_reuse_raw_stage = _is_task_or_env_enabled(
@@ -12552,19 +12301,20 @@ async def process_entity_address_unified_data(ctx, task=None):
         if should_reuse_raw_stage:
             if not await _has_table(db_schema, raw_table):
                 raise RuntimeError(
-                    "entity-address-unified raw-stage reuse requested, "
-                    f"but {db_schema}.{raw_table} does not exist"
+                    f"entity-address-unified raw-stage reuse requested, but {db_schema}.{raw_table} does not exist"
                 )
-            raw_rows = int(await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{raw_table};") or 0)
+            raw_rows = int(
+                await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{raw_table};") or 0
+            )
             if raw_rows <= 0:
                 raise RuntimeError(
-                    "entity-address-unified raw-stage reuse requested, "
-                    f"but {db_schema}.{raw_table} is empty"
+                    f"entity-address-unified raw-stage reuse requested, but {db_schema}.{raw_table} is empty"
                 )
             context["raw_stage_reused"] = True
             context["raw_stage_reused_rows"] = raw_rows
             stale_raw_versions = int(
-                await preparation_admission.read_scalar(db,
+                await preparation_admission.read_scalar(
+                    db,
                     f"""
                     SELECT count(*)
                     FROM {db_schema}.{raw_table}
@@ -12679,6 +12429,7 @@ async def process_entity_address_unified_data(ctx, task=None):
                 enrich_sem = asyncio.Semaphore(enrich_concurrency)
                 enrich_progress_lock = asyncio.Lock()
                 enrich_progress_map = {"enriched_shards": 0}
+
                 async def _enrich_shard(checksum_min: int, checksum_max: int) -> None:
                     # Progress is held in enrich_progress_map to avoid nonlocal state.
                     async with enrich_sem:
@@ -12728,9 +12479,7 @@ async def process_entity_address_unified_data(ctx, task=None):
                         archive_available=available_relation_map.get("address_archive_v2", False),
                         is_address_canon_available=is_address_canon_available,
                         evidence_shards=(
-                            aggregate_shards
-                            if include_inline_source_evidence and aggregate_shards > 1
-                            else None
+                            aggregate_shards if include_inline_source_evidence and aggregate_shards > 1 else None
                         ),
                     ),
                     context=context,
@@ -12895,7 +12644,9 @@ async def process_entity_address_unified_data(ctx, task=None):
         if not await _has_table(db_schema, raw_table):
             raw_table = None
         if run_id:
-            stage_rows = int(await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)
+            stage_rows = int(
+                await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0
+            )
             enqueue_live_progress(
                 run_id=run_id,
                 importer="entity-address-unified",
@@ -12974,7 +12725,8 @@ async def process_entity_address_unified_data(ctx, task=None):
         include_facility_override = False
         if available_relation_map.get("facility_anchor_npi_override", False):
             include_facility_override = bool(
-                await preparation_admission.read_scalar(db,
+                await preparation_admission.read_scalar(
+                    db,
                     f"""
                     SELECT EXISTS (
                         SELECT 1
@@ -12983,32 +12735,23 @@ async def process_entity_address_unified_data(ctx, task=None):
                            AND LOWER(COALESCE(status, '')) = 'approved'
                          LIMIT 1
                     );
-                    """
+                    """,
                 )
             )
         context["facility_anchor_npi_override_inference_enabled"] = include_facility_override
-        include_npi_other_identifier = (
-            available_relation_map.get("npi_other_identifier", False)
-            and _is_env_enabled(
-                "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPI_OTHER_IDENTIFIER_INFERENCE",
-                False,
-            )
+        include_npi_other_identifier = available_relation_map.get("npi_other_identifier", False) and _is_env_enabled(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPI_OTHER_IDENTIFIER_INFERENCE",
+            False,
         )
-        context["facility_anchor_npi_other_identifier_inference_enabled"] = (
-            include_npi_other_identifier
-        )
+        context["facility_anchor_npi_other_identifier_inference_enabled"] = include_npi_other_identifier
         await _prepare_inference_stage_indexes(db_schema, stage_table, context=context)
         await _run_sql_phase(
             _inference_sql(
                 db_schema,
                 stage_table,
                 inference_options_by_name={
-                    "include_hospital_enrollment": available_relation_map.get(
-                        "provider_enrollment_hospital", False
-                    ),
-                    "include_fqhc_enrollment": available_relation_map.get(
-                        "provider_enrollment_fqhc", False
-                    ),
+                    "include_hospital_enrollment": available_relation_map.get("provider_enrollment_hospital", False),
+                    "include_fqhc_enrollment": available_relation_map.get("provider_enrollment_fqhc", False),
                     "include_facility_override": include_facility_override,
                     "include_npi_other_identifier": include_npi_other_identifier,
                     "include_name_fallback": _is_env_enabled(
@@ -13177,9 +12920,7 @@ async def process_entity_address_unified_data(ctx, task=None):
                 async with evidence_build_sem:
                     await _build_evidence_shard(remainder)
 
-            await preparation_admission.gather(
-                *(_guarded_build_evidence_shard(i) for i in range(evidence_shards))
-            )
+            await preparation_admission.gather(*(_guarded_build_evidence_shard(i) for i in range(evidence_shards)))
         else:
             await _build_evidence_shard(0)
         await _run_sql_phase(
@@ -13272,10 +13013,7 @@ async def process_entity_address_unified_data(ctx, task=None):
         context["support_stage_skipped"] = True
         context["support_counts"] = support_counts_by_kind
     elif context.get("support_stage_populated") and isinstance(cached_support_counts, dict):
-        support_counts_by_kind = {
-            str(key): int(cached_count)
-            for key, cached_count in cached_support_counts.items()
-        }
+        support_counts_by_kind = {str(key): int(cached_count) for key, cached_count in cached_support_counts.items()}
     else:
         support_raw_table = None if partial_source_refresh else raw_table
         support_affected_group_table = None
@@ -13458,7 +13196,10 @@ async def process_entity_address_unified_data(ctx, task=None):
             emit_done=True,
         )
         affected_live_locations = int(
-            await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{affected_live_location_table};") or 0
+            await preparation_admission.read_scalar(
+                db, f"SELECT COUNT(*) FROM {db_schema}.{affected_live_location_table};"
+            )
+            or 0
         )
         context["partial_provider_directory_affected_live_locations"] = affected_live_locations
         context["partial_provider_directory_coordinate_scope_table"] = affected_live_location_table
@@ -13498,12 +13239,8 @@ async def process_entity_address_unified_data(ctx, task=None):
             emit_start=True,
             emit_done=True,
         )
-        context["partial_provider_directory_affected_stage_rows_copied"] = int(
-            affected_stage_rows or 0
-        )
-        context["partial_provider_directory_replacement_rows"] = (
-            int(copied_rows or 0) + int(affected_stage_rows or 0)
-        )
+        context["partial_provider_directory_affected_stage_rows_copied"] = int(affected_stage_rows or 0)
+        context["partial_provider_directory_replacement_rows"] = int(copied_rows or 0) + int(affected_stage_rows or 0)
         await _run_sql_phase(
             f"DROP TABLE {db_schema}.{stage_table};",
             context=context,
@@ -13627,6 +13364,9 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
+    from process import entity_address_native_publication as native_publication
+
+    protected_publication = not prepare_only and native_publication.controlled_publication_enabled(ctx)
 
     if not context.get("run"):
         logger.info("No EntityAddressUnified jobs ran; skipping shutdown.")
@@ -13642,7 +13382,9 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             raise RuntimeError("entity-address desired dependency bindings differ")
         geo_dependency_options_dict = {"dependency_bindings": selected}
     elif not geo_dependency_options_dict and context.get("publish_requested", True):
-        async with selected_publication_dependencies(db, db_schema) as selected:
+        async with selected_publication_dependencies(
+            db, db_schema, **({"control_context": ctx} if protected_publication else {})
+        ) as selected:
             if selected is not None:
                 return await publish_entity_address_unified_generation(
                     ctx, prepare_only=prepare_only, dependency_bindings=selected
@@ -13658,32 +13400,27 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
     affected_live_location_table = str(
         context.get("partial_provider_directory_affected_live_location_table") or ""
     ).strip()
-    coordinate_scope_table = str(
-        context.get("partial_provider_directory_coordinate_scope_table") or ""
-    ).strip()
+    coordinate_scope_table = str(context.get("partial_provider_directory_coordinate_scope_table") or "").strip()
     partial_support_patch = bool(context.get("partial_support_patch_publish"))
+    if protected_publication and (serving_only_refresh or partial_support_patch):
+        raise RuntimeError("protected address publication requires a complete isolated seven-table generation")
     is_partial_provider_directory_refresh = (
         context.get("refresh_mode") == ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
     )
     partial_main_patch = bool(
-        context.get("partial_main_patch_publish")
-        or context.get("partial_provider_directory_main_patch_publish")
+        context.get("partial_main_patch_publish") or context.get("partial_provider_directory_main_patch_publish")
     )
     if partial_main_patch:
         raise RuntimeError(
             "entity-address-unified live main-table patch publishing is disabled; "
             "build a replacement stage table and publish through the table swap."
         )
-    if (
-        is_partial_provider_directory_refresh and partial_support_patch
-    ):
+    if is_partial_provider_directory_refresh and partial_support_patch:
         raise RuntimeError(
             "entity-address-unified provider-directory-partial refresh must publish "
             "through replacement-stage table swap; live support patch publishing is disabled."
         )
-    if is_partial_provider_directory_refresh and context.get(
-        "partial_provider_directory_replacement_publish"
-    ):
+    if is_partial_provider_directory_refresh and context.get("partial_provider_directory_replacement_publish"):
         if not coordinate_scope_table or not await _has_table(db_schema, coordinate_scope_table):
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial replacement publish requires "
@@ -13693,16 +13430,19 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
     cached_stage_rows = _int_context_metric(context, "staged_rows")
     stage_rows = cached_stage_rows
     if stage_rows <= 0:
-        stage_rows = int(await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
+        stage_rows = int(
+            await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};")
+            or 0
+        )
     context["staged_rows"] = stage_rows
-    min_rows_required = int(
-        os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS", str(DEFAULT_MIN_ROWS))
-    )
+    min_rows_required = int(os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS", str(DEFAULT_MIN_ROWS)))
     previous_rows = 0
     live_table_exists = await _has_table(db_schema, EntityAddressUnified.__main_table__)
     if live_table_exists:
         previous_rows = int(
-            await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{EntityAddressUnified.__main_table__};")
+            await preparation_admission.read_scalar(
+                db, f"SELECT COUNT(*) FROM {db_schema}.{EntityAddressUnified.__main_table__};"
+            )
             or 0
         )
     if context.get("test_mode"):
@@ -13798,9 +13538,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             emit_start=True,
             emit_done=True,
         )
-        context["archive_coordinate_same_key_backfill_rows"] = int(
-            archive_coordinate_same_key_backfill_rows or 0
-        )
+        context["archive_coordinate_same_key_backfill_rows"] = int(archive_coordinate_same_key_backfill_rows or 0)
         inheritance_phase = "entity-address-unified inheriting exact legacy archive coordinates"
         inheritance_started = time.monotonic()
         inheritance_metrics = await _inherit_archive_coordinates(
@@ -13817,8 +13555,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         context["archive_coordinate_inherited_rows"] = inheritance_metrics["inherited_rows"]
         context["archive_coordinate_ambiguous_rows"] = inheritance_metrics["ambiguous_rows"]
         context["archive_coordinate_backfill_rows"] = (
-            context["archive_coordinate_same_key_backfill_rows"]
-            + context["archive_coordinate_inherited_rows"]
+            context["archive_coordinate_same_key_backfill_rows"] + context["archive_coordinate_inherited_rows"]
         )
         logger.info(
             "EntityAddressUnified exact legacy coordinate inheritance: inherited=%d ambiguous=%d",
@@ -13866,9 +13603,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         emit_done=True,
     )
     context["invalid_coordinate_clear_rows"] = int(invalid_coordinate_clear_rows or 0)
-    context["geo_assurance_stage_index_drop_attempts"] = (
-        await _drop_stage_secondary_indexes(stage_cls, db_schema)
-    )
+    context["geo_assurance_stage_index_drop_attempts"] = await _drop_stage_secondary_indexes(stage_cls, db_schema)
     context["stage_indexes_prepared"] = False
     context["geo_assurance_projected_rows"] = await _materialize_geo_assurance(
         db_schema,
@@ -13878,6 +13613,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         run_id=run_id,
         stage_rows=stage_rows,
         **geo_dependency_options_dict,
+        **({"record_candidate": False} if protected_publication else {}),
     )
     compaction_started = time.monotonic()
     context["geo_assurance_compaction"] = await _compact_geo_assurance_stage(
@@ -13918,7 +13654,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             emit_done=True,
         )
     context["publish_validation_deferred"] = defer_publish_validation
-    if defer_publish_validation:
+    if defer_publish_validation or protected_publication:
         context["publish_validation"] = {
             "deferred": True,
             "status": "pending",
@@ -13932,30 +13668,20 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         )
         context["publish_validation"] = publish_validation
 
-    if partial_support_patch and (
-        not affected_group_table or not await _has_table(db_schema, affected_group_table)
-    ):
+    if partial_support_patch and (not affected_group_table or not await _has_table(db_schema, affected_group_table)):
         raise RuntimeError(
             "entity-address-unified support patch publish requires "
             "the affected group table to remain available through shutdown."
         )
-    expected_provider_directory_dataset_id = _clean_optional(
-        context.get("partial_provider_directory_dataset_id")
-    )
+    expected_provider_directory_dataset_id = _clean_optional(context.get("partial_provider_directory_dataset_id"))
     if expected_provider_directory_dataset_id is not None:
-        partial_source_ids = _coerce_str_list(
-            context.get("partial_provider_directory_source_ids")
-        )
-        expected_provider_directory_root_run_id = _clean_optional(
-            context.get("partial_provider_directory_run_id")
-        )
+        partial_source_ids = _coerce_str_list(context.get("partial_provider_directory_source_ids"))
+        expected_provider_directory_root_run_id = _clean_optional(context.get("partial_provider_directory_run_id"))
         _validate_provider_directory_dataset_fence_scope(
             dataset_id=expected_provider_directory_dataset_id,
             source_ids=partial_source_ids,
             run_id=expected_provider_directory_root_run_id,
-            partial_scope=_clean_optional(
-                context.get("partial_provider_directory_scope")
-            ),
+            partial_scope=_clean_optional(context.get("partial_provider_directory_scope")),
         )
         await _assert_current_provider_directory_dataset(
             db_schema,
@@ -13965,12 +13691,18 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         )
     current_alias_generation = await _address_alias_generation(db_schema)
     if current_alias_generation != int(context.get("address_alias_generation") or 0):
-        raise RuntimeError(
-            "address alias generation changed during entity-address-unified build"
-        )
+        raise RuntimeError("address alias generation changed during entity-address-unified build")
     if prepare_only:
         return await candidate_preparation.prepare_finalized_generation(
             db_schema, stage_cls, support_stage_class_map, context=context
+        )
+    if protected_publication:
+        return await native_publication.handoff_entity_address_generation(
+            ctx,
+            schema_name=db_schema,
+            import_date=import_date,
+            dependency_bindings=geo_dependency_options_dict.get("dependency_bindings"),
+            row_count=stage_rows,
         )
     await _publish_staged_entity_address_tables(
         db_schema,
@@ -13996,9 +13728,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             (datetime.datetime.utcnow() - started_at).total_seconds(),
             3,
         )
-    post_publish_profile = (
-        "none" if is_partial_provider_directory_refresh else _post_publish_index_profile()
-    )
+    post_publish_profile = "none" if is_partial_provider_directory_refresh else _post_publish_index_profile()
     should_build_post_publish_concurrently = _should_build_post_publish_concurrently()
     context["post_publish_index_profile"] = post_publish_profile
     context["post_publish_index_concurrently"] = should_build_post_publish_concurrently
@@ -14031,9 +13761,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             "partial_provider_directory_affected_groups": int(
                 context.get("partial_provider_directory_affected_groups") or 0
             ),
-            "partial_provider_directory_patched_rows": int(
-                context.get("partial_provider_directory_patched_rows") or 0
-            ),
+            "partial_provider_directory_patched_rows": int(context.get("partial_provider_directory_patched_rows") or 0),
             "partial_provider_directory_replacement_publish": bool(
                 context.get("partial_provider_directory_replacement_publish")
             ),
@@ -14048,15 +13776,9 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             ),
             "partial_provider_directory_scope": context.get("partial_provider_directory_scope"),
             "partial_provider_directory_run_id": context.get("partial_provider_directory_run_id"),
-            "partial_provider_directory_dataset_id": context.get(
-                "partial_provider_directory_dataset_id"
-            ),
-            "partial_provider_directory_source_count": int(
-                context.get("partial_provider_directory_source_count") or 0
-            ),
-            "partial_provider_directory_scope_sources": (
-                context.get("partial_provider_directory_scope_sources") or []
-            ),
+            "partial_provider_directory_dataset_id": context.get("partial_provider_directory_dataset_id"),
+            "partial_provider_directory_source_count": int(context.get("partial_provider_directory_source_count") or 0),
+            "partial_provider_directory_scope_sources": (context.get("partial_provider_directory_scope_sources") or []),
             "npi_rows": int(context.get("npi_rows") or 0),
             "inferred_rows": int(context.get("inferred_rows") or 0),
             "multi_source_rows": int(context.get("multi_source_rows") or 0),
@@ -14064,18 +13786,10 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             "serving_only_refresh": serving_only_refresh,
             "support_stage_skipped": bool(context.get("support_stage_skipped")),
             **_archive_coordinate_publish_metrics(context),
-            "same_provider_address_backfill_rows": int(
-                context.get("same_provider_address_backfill_rows") or 0
-            ),
-            "invalid_coordinate_clear_rows": int(
-                context.get("invalid_coordinate_clear_rows") or 0
-            ),
-            "geo_assurance_projected_rows": int(
-                context.get("geo_assurance_projected_rows") or 0
-            ),
-            "invalid_geo_assurance_rows": int(
-                context.get("invalid_geo_assurance_rows") or 0
-            ),
+            "same_provider_address_backfill_rows": int(context.get("same_provider_address_backfill_rows") or 0),
+            "invalid_coordinate_clear_rows": int(context.get("invalid_coordinate_clear_rows") or 0),
+            "geo_assurance_projected_rows": int(context.get("geo_assurance_projected_rows") or 0),
+            "invalid_geo_assurance_rows": int(context.get("invalid_geo_assurance_rows") or 0),
             **_runtime_config_metrics(context),
             "publish_validation": context.get("publish_validation") or {},
             "phase_timings": context.get("phase_timings") or {},
@@ -14256,15 +13970,11 @@ async def run_entity_address_unified_command(
     if source_ids:
         task_payload_map["provider_directory_source_ids"] = source_ids
     if provider_directory_dataset_id:
-        task_payload_map["provider_directory_dataset_id"] = (
-            provider_directory_dataset_id
-        )
+        task_payload_map["provider_directory_dataset_id"] = provider_directory_dataset_id
     if provider_directory_partial_scope:
         task_payload_map["provider_directory_partial_scope"] = provider_directory_partial_scope
     if provider_directory_source_batch_size is not None:
-        task_payload_map["provider_directory_source_batch_size"] = max(
-            int(provider_directory_source_batch_size), 0
-        )
+        task_payload_map["provider_directory_source_batch_size"] = max(int(provider_directory_source_batch_size), 0)
     await redis.enqueue_job(
         "process_data",
         task_payload_map,

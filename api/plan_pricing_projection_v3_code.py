@@ -13,16 +13,6 @@ from sqlalchemy import text
 from api.plan_pricing_projection_contract import row_mapping, table
 from api.plan_pricing_projection_materialize import digest_row, rate_fragment
 from api.plan_pricing_projection_source import BindingProjection
-from api.plan_pricing_projection_v4_occurrence import (
-    insert_rate_occurrences as _insert_rate_occurrences,
-    rate_occurrence_rows as _rate_occurrence_rows,
-    store_rate_occurrences as _store_rate_occurrences,
-)
-from api.plan_pricing_projection_v3_provider import (
-    MAX_PROVIDER_NPIS_PER_SET,
-    _binding_ordinal,
-    _stage_code_provider_sets,
-)
 from api.plan_pricing_projection_v3_price import (
     MAX_CODE_STAGED_PRICE_ATOMS,
     MAX_PRICE_HYDRATION_ATOMS,
@@ -30,10 +20,23 @@ from api.plan_pricing_projection_v3_price import (
     _insert_price_rates,
     _stage_binding_price_rates,
 )
+from api.plan_pricing_projection_v3_provider import (
+    MAX_PROVIDER_NPIS_PER_SET,
+    _binding_ordinal,
+    _stage_code_provider_sets,
+)
 from api.plan_pricing_projection_v3_types import _BuildState, _insert_batches
+from api.plan_pricing_projection_v4_occurrence import (
+    insert_rate_occurrences as _insert_rate_occurrences,
+)
+from api.plan_pricing_projection_v4_occurrence import (
+    rate_occurrence_rows as _rate_occurrence_rows,
+)
+from api.plan_pricing_projection_v4_occurrence import (
+    store_rate_occurrences as _store_rate_occurrences,
+)
 from api.ptg2_db_sidecars import _preflight_price_membership_aliases_from_db
 from process.ptg_parts.ptg2_manifest_artifacts import ManifestReadLimitError
-
 
 MAX_CODE_OCCURRENCES = 65_536
 MAX_RATE_PROFILE_RATES = 65_536
@@ -78,7 +81,7 @@ _PROFILE_RATE_LIMIT_SQL = """
 
 
 _STORE_RATE_PROFILES_SQL = f"""
-    INSERT INTO {table('plan_pricing_rate_profile')} (
+    INSERT INTO {table("plan_pricing_rate_profile")} (
         projection_id, code_system, code, binding_ordinal,
         provider_set_key, membership_count, minimum_negotiated_rate,
         maximum_negotiated_rate, rate_count, negotiated_rates,
@@ -315,12 +318,13 @@ async def _preflight_binding_price_memberships(
         binding.serving_tables.price_key_block_span,
         "price_key_block_span",
     )
+    physical = getattr(binding.serving_tables, "physical_binding", None)
     await preflight_price_membership_aliases(
         session,
         serving._required_shared_snapshot_key(binding.serving_tables),
         price_key_by_set_id.values(),
         block_span=block_span,
-        schema_name=serving.PTG2_SCHEMA,
+        schema_name=serving.PTG2_SCHEMA if physical is None else physical.schema_name,
         cache=state.price_membership_alias_cache,
     )
     return block_span
@@ -414,7 +418,7 @@ async def _store_rate_profiles(
             SELECT binding_ordinal, provider_set_key, membership_count,
                    minimum_negotiated_rate, maximum_negotiated_rate,
                    rate_count, negotiated_rates, rate_multiplicities
-              FROM {table('plan_pricing_rate_profile')}
+              FROM {table("plan_pricing_rate_profile")}
              WHERE projection_id = :projection_id
                AND code_system = :code_system
                AND code = :code

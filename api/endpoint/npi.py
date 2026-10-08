@@ -68,6 +68,7 @@ from api.provider_list_sql import (
     _provider_import_relation_cte,
     _provider_list_address_type_clause,
     _provider_list_connection,
+    _provider_list_count,
     _provider_list_parameters,
     _provider_list_phone_candidate_limit,
     _provider_list_statement,
@@ -115,6 +116,7 @@ from api.provider_specialty_filters import (
     ensure_specialty_resolution_cache,
     resolve_provider_specialty_filter,
 )
+from db.connection import gather_reader_calls, has_reader_session, run_as_writer
 from db.models import (
     AddressArchive,
     EntityAddressUnified,
@@ -666,7 +668,8 @@ async def _assert_npi_search_taxonomy_projection_ready() -> None:
 
 @blueprint.listener("before_server_start")
 async def _assert_npi_projection_before_start(_app, _loop):
-    await _assert_npi_search_taxonomy_projection_ready()
+    async with db.reader_session() if db.is_api_reader_enabled() else contextlib.nullcontext():
+        await _assert_npi_search_taxonomy_projection_ready()
 
 
 _NPI_SCHEMA_CACHE_TTL_SECONDS = 300.0
@@ -6285,21 +6288,9 @@ async def _resolve_internal_filter_codes(
     if not await _is_table_available("code_crosswalk", session=session):
         return [], "none"
 
-    sql = text(
-        """
-        SELECT DISTINCT to_code
-          FROM mrf.code_crosswalk
-         WHERE UPPER(from_system) = :from_system
-           AND UPPER(from_code) = ANY(:input_codes)
-           AND UPPER(to_system) = :target_system
-        UNION
-        SELECT DISTINCT from_code
-          FROM mrf.code_crosswalk
-        WHERE UPPER(to_system) = :from_system
-           AND UPPER(to_code) = ANY(:input_codes)
-           AND UPPER(from_system) = :target_system
-        """
-    )
+    from api.reference_family_reads import claims_filter_crosswalk_query
+
+    sql = claims_filter_crosswalk_query(session)
     crosswalk_query_result = await _execute_stmt(
         sql,
         session=session,
@@ -6349,7 +6340,7 @@ async def _compute_npi_counts():
         """Count imported NPI address identity rows."""
         return await db.scalar(select(func.count(tuple_(NPIAddress.npi, NPIAddress.checksum, NPIAddress.type))))
 
-    return await asyncio.gather(get_npi_count(), get_npi_address_count())
+    return await gather_reader_calls(db, get_npi_count(), get_npi_address_count())
 
 
 def _validate_section_filters(
@@ -7238,10 +7229,8 @@ async def _fetch_match_candidate_rows(params: dict[str, Any], *, session: Any = 
     address_table_sql = await _address_serving_table_sql(required_columns, session=session)
     query, query_params = _match_candidate_query(params, address_table_sql)
     try:
-        candidate_query_result = await asyncio.wait_for(
-            _execute_match_candidate_query(query, query_params, session),
-            timeout=max(0.1, _MATCH_CANDIDATES_TIMEOUT_SECONDS),
-        )
+        async with asyncio.timeout(max(0.1, _MATCH_CANDIDATES_TIMEOUT_SECONDS)):
+            candidate_query_result = await _execute_match_candidate_query(query, query_params, session)
     except asyncio.TimeoutError:
         await _rollback_match_candidate_session(session)
         raise
@@ -7872,7 +7861,8 @@ async def _run_match_candidate_stage_bounded(
         remaining_seconds = _MATCH_CANDIDATES_TIMEOUT_SECONDS - (time.monotonic() - started_at)
         if remaining_seconds <= 0:
             raise asyncio.TimeoutError()
-        return await asyncio.wait_for(operation(), timeout=remaining_seconds)
+        async with asyncio.timeout(remaining_seconds):
+            return await operation()
     except asyncio.CancelledError:
         raise
     except asyncio.TimeoutError as exc:
@@ -8551,7 +8541,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
         plan_release_id_raw,
     )
 
-    async def get_count(filters_by_name):
+    async def get_count(filters_by_name, *, deadline=None):
         """Count providers matching the normalized request filters."""
         classification = filters_by_name.get("classification")
         specialization = filters_by_name.get("specialization")
@@ -8804,13 +8794,9 @@ async def list_providers(request, *, native_args=None, import_context=None):
                 count_query=True,
             )
 
-        query_parameters_by_name = _provider_list_parameters(
-            query_parameters_by_name,
-            import_context,
-        )
+        query_parameters_by_name = _provider_list_parameters(query_parameters_by_name, import_context)
         async with _provider_list_connection(db, import_context, request_session) as conn:
-            count_records = await conn.all(query, **query_parameters_by_name)
-        return count_records[0][0] if count_records else 0
+            return await _provider_list_count(conn, query, query_parameters_by_name, request_session, deadline=deadline)
 
     async def get_formatted_count(response_format: str) -> dict:
         """
@@ -9572,13 +9558,13 @@ async def list_providers(request, *, native_args=None, import_context=None):
                 [],
             )
         ]
-        if import_context is not None:
+        if import_context is not None or has_reader_session(db):
             taxonomy_records = await _fetch_search_taxonomy_records()
             await _apply_location_statuses(
                 location_candidates,
                 session=request_session,
                 use_request_session=True,
-                fail_closed=True,
+                fail_closed=import_context is not None,
             )
             summary_map = await _fetch_search_enrichment_summary()
         else:
@@ -9788,10 +9774,12 @@ async def list_providers(request, *, native_args=None, import_context=None):
         if not simple_filter_present and not has_insurance and not city and not state:
             return await _fast_primary_npi_count()
         try:
-            return await asyncio.wait_for(
-                get_count(filters_by_name),
-                timeout=max(0.1, _NPI_ALL_TOTAL_TIMEOUT_SECONDS),
-            )
+            if has_reader_session(db):
+                deadline = time.monotonic() + max(0.1, _NPI_ALL_TOTAL_TIMEOUT_SECONDS)
+                async with provider_read_savepoint(request_session):
+                    return await get_count(filters_by_name, deadline=deadline)
+            async with asyncio.timeout(max(0.1, _NPI_ALL_TOTAL_TIMEOUT_SECONDS)):
+                return await get_count(filters_by_name)
         except asyncio.TimeoutError:
             logger.warning(
                 "NPI /all total count timed out; offset=%s limit=%s",
@@ -9856,7 +9844,8 @@ async def list_providers(request, *, native_args=None, import_context=None):
         if raw_total is None:
             raise RuntimeError("custom-import provider count is required")
     else:
-        raw_total, result_payload = await asyncio.gather(
+        raw_total, result_payload = await gather_reader_calls(
+            db,
             _count_with_timeout(),
             get_results(start, limit, filters_by_name),
         )
@@ -10880,10 +10869,7 @@ async def get_near_npi(request, *, native_args=None, import_context=None, prepar
             raise RuntimeError("custom-import geo count is required")
         total_count = int(total_mapping["_geo_total"])
     elif is_pagination_requested:
-        res_q, total_count = await asyncio.gather(
-            fetch_nearby_rows(),
-            fetch_exact_total(),
-        )
+        res_q, total_count = await gather_reader_calls(db, fetch_nearby_rows(), fetch_exact_total())
     else:
         res_q = await fetch_nearby_rows()
         total_count = None
@@ -12218,7 +12204,8 @@ async def get_npi(request, npi):
 
             if should_update_geo and address_by_field.get("lat"):
                 request.app.add_task(
-                    update_addr_coordinates(
+                    run_as_writer(
+                        update_addr_coordinates,
                         address_by_field,
                         address_by_field["long"],
                         address_by_field["lat"],
@@ -12429,7 +12416,7 @@ async def get_npi(request, npi):
             provider_enrichment_payload = None
     request_session = None
     update_address_tasks = [_update_address(address) for address in addresses if address]
-    updated_addresses = list(await asyncio.gather(*update_address_tasks)) if update_address_tasks else []
+    updated_addresses = list(await gather_reader_calls(db, *update_address_tasks)) if update_address_tasks else []
     if address_grouping == ADDRESS_GROUPING_PREMISE:
         provider_detail_by_field.pop("address_list", None)
         provider_detail_by_field.pop("address_pagination", None)

@@ -40,6 +40,68 @@ def _stage_names():
     return {model.__tablename__: f"{model.__tablename__}_20260914" for model in receipt._models()}
 
 
+def _set_receipt():
+    from process.entity_address_snapshot_alias import EntityAddressAliasAuthority
+
+    tables = tuple(
+        receipt.EntityAddressArchiveTableReceipt(model.__name__, model.__tablename__, "a" * 64, 1)
+        for model in (*receipt._models(), EntityAddressAliasAuthority)
+    )
+    return receipt.EntityAddressArchiveReceipt(
+        tables, receipt._table_schema_digest(tables), contract=receipt.CONTRACT
+    ).as_dict()
+
+
+def test_v2_descriptor_closed_inventory():
+    stored = _set_receipt()
+    validated = receipt.validate_entity_address_archive_receipt(stored)
+    assert validated.as_dict() == stored
+    assert set(stored) == {"contract", "receipt_version", "tables", "schema_sha256"}
+    assert len(stored["tables"]) == 8
+    assert all(set(entry) == {"model_name", "table_name", "schema_sha256", "row_count"} for entry in stored["tables"])
+
+
+async def test_v2_alias_requires_typed_content():
+    from process import entity_address_snapshot_alias as aliases
+
+    descriptor_by_field = {
+        "contract": aliases.SET_CONTRACT,
+        "receipt_version": aliases.SET_CONTRACT,
+        "alias_schema_version": 2,
+        "active_ruleset_version": 1,
+        "local_generation": 3,
+        "active_alias_count": 1,
+    }
+    validated = aliases.validate_entity_address_alias_semantic_receipt(descriptor_by_field)
+    assert validated.as_dict() == descriptor_by_field
+    with pytest.raises(aliases.EntityAddressSnapshotAliasError, match="actual alias set authority"):
+        aliases.require_matching_entity_address_alias_semantics(validated, validated)
+    session = SimpleNamespace(scalar=AsyncMock(return_value=False))
+    with pytest.raises(aliases.EntityAddressSnapshotAliasError, match="authority differs"):
+        await aliases.require_matching_entity_address_alias_authority(
+            session, authority_schema="isolated", alias_schema="example"
+        )
+    statement = str(session.scalar.await_args.args[0])
+    assert "FULL JOIN" in statement and "revoked_at IS NULL" in statement
+    assert all(f'a."{name}" IS DISTINCT FROM b."{name}"' in statement for name in aliases._SEMANTIC_COLUMNS)
+    assert "sha" not in statement.lower()
+
+
+@pytest.mark.parametrize("mutation", ["legacy_version", "payload_hash", "missing_auxiliary", "extra_auxiliary"])
+def test_v2_descriptor_rejects_mixed_versions_and_open_inventory(mutation):
+    stored = _set_receipt()
+    if mutation == "legacy_version":
+        stored["receipt_version"] = receipt.LEGACY_CONTRACT
+    elif mutation == "payload_hash":
+        stored["tables"][0]["row_sha256"] = "b" * 64
+    elif mutation == "missing_auxiliary":
+        stored["tables"].pop()
+    else:
+        stored["tables"].append(dict(stored["tables"][-1]))
+    with pytest.raises(receipt.EntityAddressArchiveReceiptError):
+        receipt.validate_entity_address_archive_receipt(stored)
+
+
 @pytest.mark.parametrize("entry", [None, {}, {"unexpected": True}])
 @pytest.mark.parametrize("stage", [False, True])
 def test_receipt_table_entries_must_be_closed_records(entry, stage):

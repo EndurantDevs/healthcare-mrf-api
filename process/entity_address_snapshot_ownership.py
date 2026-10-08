@@ -22,7 +22,7 @@ class EntityAddressArchiveOwnershipError(RuntimeError):
 
 @dataclass(frozen=True)
 class EntityAddressArchiveStageOwnership:
-    """Local catalog identity for exactly one isolated seven-table archive stage."""
+    """Local catalog identity for one closed legacy or set-based archive stage."""
 
     dataset_id: UUID
     schema_name: str
@@ -32,11 +32,16 @@ class EntityAddressArchiveStageOwnership:
     def as_dict(self) -> dict[str, Any]:
         """Return the bounded persisted representation without database handles."""
 
+        relations = (
+            [[table_name, oid] for table_name, oid in self.relation_oids]
+            if tuple(name for name, _ in self.relation_oids) == _supported_names()[1]
+            else [{"table_name": table_name, "oid": oid} for table_name, oid in self.relation_oids]
+        )
         return {
             "dataset_id": str(self.dataset_id),
             "schema_name": self.schema_name,
             "schema_oid": self.schema_oid,
-            "relation_oids": [{"table_name": table_name, "oid": oid} for table_name, oid in self.relation_oids],
+            "relation_oids": relations,
         }
 
 
@@ -59,6 +64,13 @@ def _models() -> tuple[type, ...]:
     if any(_IDENTIFIER.fullmatch(table_name) is None for table_name in table_names):
         raise EntityAddressArchiveOwnershipError("entity-address archive ownership model family is invalid")
     return models
+
+
+def _supported_names():
+    from process.entity_address_snapshot_alias import AUTHORITY_TABLE
+
+    names = tuple(sorted(model.__tablename__ for model in _models()))
+    return names, tuple(sorted((*names, AUTHORITY_TABLE)))
 
 
 def _quoted(value: str) -> str:
@@ -91,8 +103,9 @@ async def _table_oids(session: Any, schema_oid: int) -> tuple[tuple[str, int], .
         )
     ).mappings()
     observed_pairs = tuple((str(row["relname"]), int(row["oid"])) for row in rows)
-    expected_names = tuple(sorted(model.__tablename__ for model in _models()))
-    if tuple(name for name, _ in observed_pairs) != expected_names or any(oid <= 0 for _, oid in observed_pairs):
+    if tuple(name for name, _ in observed_pairs) not in _supported_names() or any(
+        oid <= 0 for _, oid in observed_pairs
+    ):
         raise EntityAddressArchiveOwnershipError("entity-address archive ownership relation family differs")
     return observed_pairs
 
@@ -172,6 +185,30 @@ async def capture_created_entity_address_archive_stage(
     )
 
 
+def _ownership_relations(raw_relations: list) -> tuple[tuple[str, int], ...]:
+    pair_format = bool(raw_relations) and all(isinstance(entry, list) for entry in raw_relations)
+    relations = []
+    for entry in raw_relations:
+        if pair_format and len(entry) == 2:
+            table_name, oid = entry
+        elif not pair_format and isinstance(entry, Mapping) and set(entry) == {"table_name", "oid"}:
+            table_name, oid = entry["table_name"], entry["oid"]
+        else:
+            raise EntityAddressArchiveOwnershipError("entity-address archive ownership token is invalid")
+        if not isinstance(table_name, str) or type(oid) is not int or oid <= 0:
+            raise EntityAddressArchiveOwnershipError("entity-address archive ownership token is invalid")
+        relations.append((table_name, oid))
+    supported_names = _supported_names()
+    names = tuple(name for name, _ in relations)
+    if (
+        names not in supported_names
+        or (pair_format and names != supported_names[1])
+        or len({oid for _, oid in relations}) != len(relations)
+    ):
+        raise EntityAddressArchiveOwnershipError("entity-address archive ownership token is invalid")
+    return tuple(relations)
+
+
 def validate_entity_address_archive_stage_ownership(
     owner_value: Mapping[str, Any] | EntityAddressArchiveStageOwnership,
 ) -> EntityAddressArchiveStageOwnership:
@@ -197,21 +234,7 @@ def validate_entity_address_archive_stage_ownership(
     raw_relations = owner_value["relation_oids"]
     if type(schema_oid) is not int or schema_oid <= 0 or not isinstance(raw_relations, list):
         raise EntityAddressArchiveOwnershipError("entity-address archive ownership token is invalid")
-    relations = []
-    for entry in raw_relations:
-        if (
-            not isinstance(entry, Mapping)
-            or set(entry) != {"table_name", "oid"}
-            or not isinstance(entry["table_name"], str)
-            or type(entry["oid"]) is not int
-            or entry["oid"] <= 0
-        ):
-            raise EntityAddressArchiveOwnershipError("entity-address archive ownership token is invalid")
-        relations.append((entry["table_name"], entry["oid"]))
-    expected_names = tuple(sorted(model.__tablename__ for model in _models()))
-    if tuple(name for name, _ in relations) != expected_names or len({oid for _, oid in relations}) != len(relations):
-        raise EntityAddressArchiveOwnershipError("entity-address archive ownership token is invalid")
-    return EntityAddressArchiveStageOwnership(dataset_id, schema_name, schema_oid, tuple(relations))
+    return EntityAddressArchiveStageOwnership(dataset_id, schema_name, schema_oid, _ownership_relations(raw_relations))
 
 
 async def _assert_owner_current(
@@ -276,11 +299,114 @@ async def cleanup_entity_address_archive_stage(
     await session.execute(text(f"DROP SCHEMA {_quoted(validated_owner.schema_name)}"))
 
 
+async def cleanup_entity_address_archive_publication(session, *, owner, publication, assert_unreferenced):
+    """Retire only authenticated non-serving physical OIDs after the local pin check."""
+    from process import entity_address_snapshot_preparation as protected
+    from process.entity_address_snapshot_alias import AUTHORITY_TABLE
+
+    _require_caller_transaction(session)
+    owner = validate_entity_address_archive_stage_ownership(owner)
+    protected_oid = await protected._publisher_authority(session)
+    schema, expected_relations, authority = _validated_publication_owner(owner, publication)
+    if not callable(assert_unreferenced) or await assert_unreferenced(session, owner, publication) is not True:
+        raise EntityAddressArchiveOwnershipError("entity-address publication remains referenced")
+    oids = [entry["relation_oid"] for entry in expected_relations] + [authority["relation_oid"]]
+    catalog_rows = await _retained_relation_catalog(session, oids)
+    _require_retained_catalog(catalog_rows, protected_oid, owner, schema, expected_relations)
+    tables = ",".join(f"{_quoted(entry['nspname'])}.{_quoted(entry['relname'])}" for entry in catalog_rows)
+    await session.execute(text(f"LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE NOWAIT"))
+    if await _retained_relation_catalog(session, oids) != catalog_rows:
+        raise EntityAddressArchiveOwnershipError("entity-address cleanup catalog changed")
+    if await _schema_oid(session, owner.schema_name) != owner.schema_oid:
+        raise EntityAddressArchiveOwnershipError("entity-address cleanup namespace changed")
+    await _assert_namespace_is_owned(
+        session, schema_oid=owner.schema_oid, relation_oids=((AUTHORITY_TABLE, authority["relation_oid"]),)
+    )
+    if await assert_unreferenced(session, owner, publication) is not True:
+        raise EntityAddressArchiveOwnershipError("entity-address publication remains referenced")
+    await session.execute(text(f"DROP TABLE {tables} RESTRICT"))
+    await session.execute(text(f"DROP SCHEMA {_quoted(owner.schema_name)} RESTRICT"))
+
+
+def _validated_publication_owner(owner, publication):
+    """Bind the local publication to exactly seven serving OIDs and one retained auxiliary OID."""
+    from process.entity_address_snapshot_alias import AUTHORITY_TABLE
+    from process.entity_address_snapshot_serving import _schema_name
+
+    table_names = tuple(model.__tablename__ for model in _models())
+    if (
+        not isinstance(publication, Mapping)
+        or set(publication) != {"contract", "schema_name", "relations", "retained_relations", "alias_authority"}
+        or publication["contract"] != "entity-address-table-publication.v2"
+    ):
+        raise EntityAddressArchiveOwnershipError("entity-address publication cleanup proof is invalid")
+    schema = _schema_name(publication["schema_name"])
+    expected_relations = [{"table_name": name, "relation_oid": dict(owner.relation_oids)[name]} for name in table_names]
+    authority_by_field = {
+        "schema_name": owner.schema_name,
+        "schema_oid": owner.schema_oid,
+        "relation_oid": dict(owner.relation_oids).get(AUTHORITY_TABLE),
+    }
+    if (
+        publication["relations"] != expected_relations
+        or publication["alias_authority"] != authority_by_field
+        or authority_by_field["relation_oid"] is None
+    ):
+        raise EntityAddressArchiveOwnershipError("entity-address publication cleanup ownership differs")
+    return schema, expected_relations, authority_by_field
+
+
+def _require_retained_catalog(catalog_rows, protected_oid, owner, schema, expected_relations):
+    """Admit only protected, unattached physical tables at their exact retired names."""
+    from process.entity_address_snapshot_alias import AUTHORITY_TABLE
+
+    if len(catalog_rows) != 8 or any(
+        catalog_row["relowner"] != protected_oid
+        or catalog_row["relkind"] != "r"
+        or catalog_row["relpersistence"] != "p"
+        or catalog_row["relrowsecurity"]
+        or catalog_row["relforcerowsecurity"]
+        or catalog_row["inherited"]
+        for catalog_row in catalog_rows
+    ):
+        raise EntityAddressArchiveOwnershipError("entity-address retained catalog differs")
+    for catalog_row in catalog_rows:
+        original = next(
+            (entry["table_name"] for entry in expected_relations if entry["relation_oid"] == catalog_row["oid"]), None
+        )
+        expected_name = (
+            entity_address_unified._archived_identifier(f"{original}_retained_{catalog_row['oid']:x}", suffix="")
+            if original
+            else AUTHORITY_TABLE
+        )
+        expected_schema = schema if original else owner.schema_name
+        if (catalog_row["nspname"], catalog_row["relname"]) != (expected_schema, expected_name):
+            raise EntityAddressArchiveOwnershipError("entity-address cleanup target is serving or substituted")
+
+
+async def _retained_relation_catalog(session, oids):
+    return (
+        (
+            await session.execute(
+                text(
+                    "SELECT c.oid,n.nspname,c.relname,c.relowner,c.relkind,c.relpersistence,c.relrowsecurity,c.relforcerowsecurity,"
+                    "EXISTS(SELECT 1 FROM pg_inherits i WHERE i.inhrelid=c.oid OR i.inhparent=c.oid) AS inherited "
+                    "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=ANY(:oids) ORDER BY c.oid"
+                ),
+                {"oids": oids},
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+
 __all__ = [
     "EntityAddressArchiveOwnershipError",
     "EntityAddressArchiveStageOwnership",
     "capture_created_entity_address_archive_stage",
     "cleanup_entity_address_archive_stage",
+    "cleanup_entity_address_archive_publication",
     "entity_address_archive_stage_schema",
     "validate_entity_address_archive_stage_ownership",
     "verify_entity_address_archive_stage_ownership",

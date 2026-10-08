@@ -36,12 +36,8 @@ from db.connection import db, init_db
 from db.json_mixin import JSONOutputMixin
 
 HTTP_CHUNK_SIZE = 1024 * 1024
-PARALLEL_DOWNLOAD_THRESHOLD_BYTES = int(
-    os.getenv("HLTHPRT_PARALLEL_DOWNLOAD_THRESHOLD_BYTES", str(100 * 1024 * 1024))
-)
-PARALLEL_DOWNLOAD_WORKERS = max(
-    int(os.getenv("HLTHPRT_PARALLEL_DOWNLOAD_WORKERS", "8")), 2
-)
+PARALLEL_DOWNLOAD_THRESHOLD_BYTES = int(os.getenv("HLTHPRT_PARALLEL_DOWNLOAD_THRESHOLD_BYTES", str(100 * 1024 * 1024)))
+PARALLEL_DOWNLOAD_WORKERS = max(int(os.getenv("HLTHPRT_PARALLEL_DOWNLOAD_WORKERS", "8")), 2)
 DEFAULT_PARALLEL_DOWNLOAD_DISABLED_HOSTS = "www22.elevancehealth.com"
 
 
@@ -77,12 +73,8 @@ PARALLEL_DOWNLOAD_RANGE_SIZE = max(
     ),
     HTTP_CHUNK_SIZE,
 )
-PROGRESS_INTERVAL_SECONDS = max(
-    float(os.getenv("HLTHPRT_DOWNLOAD_PROGRESS_INTERVAL_SECONDS", "2")), 0.5
-)
-PREFER_COMPRESSED_STREAM = os.getenv(
-    "HLTHPRT_PREFER_COMPRESSED_STREAM", "false"
-).lower() in {
+PROGRESS_INTERVAL_SECONDS = max(float(os.getenv("HLTHPRT_DOWNLOAD_PROGRESS_INTERVAL_SECONDS", "2")), 0.5)
+PREFER_COMPRESSED_STREAM = os.getenv("HLTHPRT_PREFER_COMPRESSED_STREAM", "false").lower() in {
     "1",
     "true",
     "yes",
@@ -97,16 +89,12 @@ SECONDS_PER_MEGABYTE = float(os.getenv("HLTHPRT_SECONDS_PER_MB", "3.0"))
 HEAD_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_HEAD_TIMEOUT_SECONDS", "20.0"))
 MIN_STREAM_TIMEOUT = float(os.getenv("HLTHPRT_MIN_STREAM_TIMEOUT", "120.0"))
 MAX_STREAM_TIMEOUT = float(os.getenv("HLTHPRT_MAX_STREAM_TIMEOUT", "14400.0"))
-DOWNLOAD_TIMEOUT_MULTIPLIER = float(
-    os.getenv("HLTHPRT_DOWNLOAD_TIMEOUT_MULTIPLIER", "1.0")
-)
+DOWNLOAD_TIMEOUT_MULTIPLIER = float(os.getenv("HLTHPRT_DOWNLOAD_TIMEOUT_MULTIPLIER", "1.0"))
 CONNECT_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_CONNECT_TIMEOUT_SECONDS", "120.0"))
 TEST_DATABASE_SUFFIX = os.getenv("HLTHPRT_TEST_DATABASE_SUFFIX")
 _PROGRESS_BAR_WIDTH = 28
 PARALLEL_CHUNK_RETRIES = max(int(os.getenv("HLTHPRT_PARALLEL_CHUNK_RETRIES", "4")), 1)
-PARALLEL_CHUNK_BACKOFF_SECONDS = max(
-    float(os.getenv("HLTHPRT_PARALLEL_CHUNK_BACKOFF_SECONDS", "1.0")), 0.1
-)
+PARALLEL_CHUNK_BACKOFF_SECONDS = max(float(os.getenv("HLTHPRT_PARALLEL_CHUNK_BACKOFF_SECONDS", "1.0")), 0.1)
 LARGE_FILE_TIMEOUT_LOG_THRESHOLD_BYTES = 1024 * 1024 * 1024
 
 
@@ -134,14 +122,11 @@ def _render_progress_line(downloaded: int, total: int | None, speed: float) -> s
             f"at {humanize.naturalsize(speed, binary=True)}/s"
         )
     return (
-        f"\r[download] {humanize.naturalsize(downloaded, binary=True)} "
-        f"at {humanize.naturalsize(speed, binary=True)}/s"
+        f"\r[download] {humanize.naturalsize(downloaded, binary=True)} at {humanize.naturalsize(speed, binary=True)}/s"
     )
 
 
-def _print_progress_line(
-    downloaded: int, total: int | None, speed: float, final: bool = False
-) -> None:
+def _print_progress_line(downloaded: int, total: int | None, speed: float, final: bool = False) -> None:
     print(
         _render_progress_line(downloaded, total, speed),
         end="\n" if final else "",
@@ -149,18 +134,14 @@ def _print_progress_line(
     )
 
 
-def _estimate_timeout_seconds(
-    size_bytes: int | None, chunk_size: int | None
-) -> float | None:
+def _estimate_timeout_seconds(size_bytes: int | None, chunk_size: int | None) -> float | None:
     if not size_bytes or size_bytes <= 0:
         return None
     chunk_bytes = chunk_size or HTTP_CHUNK_SIZE
     size_mb = size_bytes / (1024 * 1024)
     # Provide a base allowance proportional to the number of chunks and overall size.
     per_chunk_seconds = SECONDS_PER_MEGABYTE
-    estimated = max(
-        size_mb * SECONDS_PER_MEGABYTE, (size_bytes / chunk_bytes) * per_chunk_seconds
-    )
+    estimated = max(size_mb * SECONDS_PER_MEGABYTE, (size_bytes / chunk_bytes) * per_chunk_seconds)
     estimated = estimated * 3.0 * max(DOWNLOAD_TIMEOUT_MULTIPLIER, 0.1)
     estimated = max(MIN_STREAM_TIMEOUT, estimated)
     return min(estimated, MAX_STREAM_TIMEOUT)
@@ -183,18 +164,12 @@ async def _determine_request_timeout(
                 sock_read=seconds,
             )
 
-    fallback = max(
-        MIN_STREAM_TIMEOUT, (timeout.total or 0) * 10 if timeout.total else 600.0
-    )
+    fallback = max(MIN_STREAM_TIMEOUT, (timeout.total or 0) * 10 if timeout.total else 600.0)
     fallback = min(fallback * max(DOWNLOAD_TIMEOUT_MULTIPLIER, 0.1), MAX_STREAM_TIMEOUT)
-    return aiohttp.ClientTimeout(
-        total=fallback, connect=CONNECT_TIMEOUT_SECONDS, sock_read=fallback
-    )
+    return aiohttp.ClientTimeout(total=fallback, connect=CONNECT_TIMEOUT_SECONDS, sock_read=fallback)
 
 
-async def _head_download_info(
-    client: aiohttp.ClientSession, url: str
-) -> tuple[int | None, bool]:
+async def _head_download_info(client: aiohttp.ClientSession, url: str) -> tuple[int | None, bool]:
     is_range_download_disabled = _is_parallel_download_disabled_for_url(url)
 
     async def _probe_total_via_range() -> int | None:
@@ -216,7 +191,7 @@ async def _head_download_info(
                     total_str = content_range.rsplit("/", 1)[-1].strip()
                     if total_str.isdigit():
                         return int(total_str)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except aiohttp.ClientError, asyncio.TimeoutError:
             return None
         return None
 
@@ -242,7 +217,7 @@ async def _head_download_info(
                 if probed_total:
                     size_bytes = probed_total
             return size_bytes, supports_ranges
-    except (aiohttp.ClientError, asyncio.TimeoutError):
+    except aiohttp.ClientError, asyncio.TimeoutError:
         probed_total = await _probe_total_via_range()
         return probed_total, bool(probed_total)
 
@@ -252,15 +227,12 @@ def _is_parallel_download_disabled_for_url(url: str) -> bool:
         "HLTHPRT_PARALLEL_DOWNLOAD_DISABLED_HOSTS",
         DEFAULT_PARALLEL_DOWNLOAD_DISABLED_HOSTS,
     )
-    disabled_hosts = {
-        host.strip().lower() for host in raw_hosts.split(",") if host.strip()
-    }
+    disabled_hosts = {host.strip().lower() for host in raw_hosts.split(",") if host.strip()}
     if not disabled_hosts:
         return False
     hostname = (urlparse(url).hostname or "").lower()
     return any(
-        hostname == disabled
-        or (disabled.startswith(".") and hostname.endswith(disabled))
+        hostname == disabled or (disabled.startswith(".") and hostname.endswith(disabled))
         for disabled in disabled_hosts
     )
 
@@ -313,10 +285,7 @@ async def _record_range_download_progress(
         context.progress.downloaded_bytes += byte_count
         now = time.monotonic()
         is_complete = context.progress.downloaded_bytes >= context.size_bytes
-        if (
-            now - context.progress.last_progress_time < PROGRESS_INTERVAL_SECONDS
-            and not is_complete
-        ):
+        if now - context.progress.last_progress_time < PROGRESS_INTERVAL_SECONDS and not is_complete:
             return
         elapsed = max(now - context.progress.start_time, 0.001)
         speed = context.progress.downloaded_bytes / elapsed
@@ -380,8 +349,7 @@ async def _download_range(
                 backoff = PARALLEL_CHUNK_BACKOFF_SECONDS * (2 ** (attempt - 1))
                 await asyncio.sleep(min(backoff, 20.0))
     raise RuntimeError(
-        f"Failed to download range {start_byte}-{end_byte} after "
-        f"{PARALLEL_CHUNK_RETRIES} attempts: {last_error!r}"
+        f"Failed to download range {start_byte}-{end_byte} after {PARALLEL_CHUNK_RETRIES} attempts: {last_error!r}"
     )
 
 
@@ -426,10 +394,7 @@ async def _download_parallel_by_ranges(
     is_complete = False
     try:
         outcomes = await asyncio.gather(
-            *(
-                _download_range(context, range_start, range_end)
-                for range_start, range_end in ranges
-            ),
+            *(_download_range(context, range_start, range_end) for range_start, range_end in ranges),
             return_exceptions=True,
         )
         failure = next(
@@ -470,13 +435,9 @@ async def get_http_client(use_proxy: bool = True):
             proxy_url = choice(proxies)
             if proxy_url.startswith("socks"):
                 connector = ProxyConnector.from_url(proxy_url)
-                client = aiohttp.ClientSession(
-                    timeout=timeout, headers=headers, connector=connector
-                )
+                client = aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector)
             else:
-                client = aiohttp.ClientSession(
-                    timeout=timeout, headers=headers, proxy=proxy_url
-                )
+                client = aiohttp.ClientSession(timeout=timeout, headers=headers, proxy=proxy_url)
         else:
             client = aiohttp.ClientSession(timeout=timeout, headers=headers)
     else:
@@ -570,17 +531,12 @@ async def _stream_response_to_file(
 ):
     stream_total = download.size_bytes
     response_total = None
-    content_encoding = (
-        response.headers.get("Content-Encoding") or "identity"
-    ).lower()
+    content_encoding = (response.headers.get("Content-Encoding") or "identity").lower()
     if response.content_length is not None:
         response_total = response.content_length + start_offset
     # Prefer response-derived total when HEAD is missing/inaccurate.
     if response_total and (
-        not stream_total
-        or stream_total <= 0
-        or stream_total < response_total
-        or stream_total < 1024
+        not stream_total or stream_total <= 0 or stream_total < response_total or stream_total < 1024
     ):
         stream_total = response_total
     # With transparent decompression, byte counters are no longer comparable.
@@ -597,9 +553,7 @@ async def _stream_response_to_file(
             if now - stream_last >= PROGRESS_INTERVAL_SECONDS:
                 elapsed = max(now - stream_start, 0.001)
                 speed = (stream_downloaded - start_offset) / elapsed
-                _print_progress_line(
-                    stream_downloaded, stream_total, speed, final=False
-                )
+                _print_progress_line(stream_downloaded, stream_total, speed, final=False)
                 stream_last = now
     elapsed = max(time.monotonic() - stream_start, 0.001)
     speed = (stream_downloaded - start_offset) / elapsed
@@ -630,32 +584,17 @@ async def _is_parallel_download_complete(
         )
         return True
     except Exception as parallel_err:
-        print(
-            "[warn] parallel download failed, falling back to stream for "
-            f"{download.url}: {parallel_err!r}"
-        )
+        print(f"[warn] parallel download failed, falling back to stream for {download.url}: {parallel_err!r}")
         return False
 
 
 async def _resume_stream_if_possible(
     download: _StreamDownload,
 ) -> tuple[bool, bool]:
-    existing_size = (
-        os.path.getsize(download.filepath) if os.path.exists(download.filepath) else 0
-    )
-    can_resume_stream = (
-        bool(existing_size)
-        and bool(download.accept_ranges)
-        and not PREFER_COMPRESSED_STREAM
-    )
-    if (
-        can_resume_stream
-        and download.size_bytes
-        and existing_size < download.size_bytes
-    ):
-        print(
-            f"Resuming stream from {existing_size} / {download.size_bytes} bytes"
-        )
+    existing_size = os.path.getsize(download.filepath) if os.path.exists(download.filepath) else 0
+    can_resume_stream = bool(existing_size) and bool(download.accept_ranges) and not PREFER_COMPRESSED_STREAM
+    if can_resume_stream and download.size_bytes and existing_size < download.size_bytes:
+        print(f"Resuming stream from {existing_size} / {download.size_bytes} bytes")
         resume_headers_by_name = {
             "Range": f"bytes={existing_size}-",
             "Accept-Encoding": "identity",
@@ -666,16 +605,10 @@ async def _resume_stream_if_possible(
             headers=resume_headers_by_name,
         ) as response:
             if response.status != 206:
-                print(
-                    f"[warn] resume not supported for {download.url} "
-                    f"(status={response.status}), restarting"
-                )
+                print(f"[warn] resume not supported for {download.url} (status={response.status}), restarting")
                 return False, False
             encoding = response.headers.get("Content-Encoding") or "identity"
-            print(
-                f"Response size: {response.content_length} bytes "
-                f"(stream-resume, encoding={encoding})"
-            )
+            print(f"Response size: {response.content_length} bytes (stream-resume, encoding={encoding})")
             await _stream_response_to_file(
                 download,
                 response,
@@ -689,10 +622,7 @@ async def _resume_stream_if_possible(
         and download.size_bytes >= 1024
         and existing_size >= download.size_bytes
     ):
-        print(
-            f"Existing file already complete ({existing_size} bytes), "
-            "skipping download"
-        )
+        print(f"Existing file already complete ({existing_size} bytes), skipping download")
         return False, True
     return False, False
 
@@ -717,15 +647,11 @@ async def _download_full_stream(download: _StreamDownload) -> None:
     ) as response:
         try:
             encoding = response.headers.get("Content-Encoding") or "identity"
-            print(
-                f"Response size: {response.content_length} bytes "
-                f"(stream, encoding={encoding})"
-            )
+            print(f"Response size: {response.content_length} bytes (stream, encoding={encoding})")
         except aiohttp.ClientResponseError as exc:
             await _log_download_error(
                 download,
-                f"Error response {exc.status} while requesting "
-                f"{exc.request_info.real_url!r}.",
+                f"Error response {exc.status} while requesting {exc.request_info.real_url!r}.",
             )
             raise Retry(defer=60)
         await _stream_response_to_file(download, response, "wb+")
@@ -748,9 +674,7 @@ async def _should_cache_remote_download(
     try:
         if await _is_parallel_download_complete(download, prefer_stream):
             return False
-        is_resume_complete, is_existing_file_complete = (
-            await _resume_stream_if_possible(download)
-        )
+        is_resume_complete, is_existing_file_complete = await _resume_stream_if_possible(download)
         if is_existing_file_complete:
             return False
         if not is_resume_complete:
@@ -836,10 +760,7 @@ def make_class(model_cls, table_suffix, schema_override=None):
         new_table = metadata.tables[new_table_name]
     else:
         new_table = model_cls.__table__.tometadata(metadata, name=new_table_name)
-        if (
-            "address_key" in new_table.c
-            and list(new_table.c.keys())[-1] != "address_key"
-        ):
+        if "address_key" in new_table.c and list(new_table.c.keys())[-1] != "address_key":
             address_key_column = new_table.c.address_key
             new_table._columns.remove(address_key_column)
             new_table.append_column(address_key_column)
@@ -858,6 +779,7 @@ def make_class(model_cls, table_suffix, schema_override=None):
 
     for attr_name in (
         "__my_index_elements__",
+        "__my_initial_indexes__",
         "__my_additional_indexes__",
         "__main_table__",
     ):
@@ -892,9 +814,7 @@ def return_checksum(arr: list, crc=32):
 async def log_error(error_type, error, issuer_array, url, source, level, cls):
     """Buffer a deduplicated import error for each issuer."""
     for issuer_id in issuer_array:
-        checksum = return_checksum(
-            [error_type, str(error), str(issuer_id), str(url), source, level]
-        )
+        checksum = return_checksum([error_type, str(error), str(issuer_id), str(url), source, level])
         if checksum in err_obj_key:
             return
 
@@ -936,29 +856,22 @@ async def push_objects_slow(obj_list, cls):
         return
     try:
         if hasattr(cls, "__my_index_elements__"):
-            stmt = (
-                db.insert(cls)
-                .values(obj_list)
-                .on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
-            )
+            stmt = db.insert(cls).values(obj_list).on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
             await stmt.status()
         else:
             await db.insert(cls).values(obj_list).status()
-    except (SQLAlchemyError, UniqueViolationError, InterfaceError):
+    except SQLAlchemyError, UniqueViolationError, InterfaceError:
         for obj in obj_list:
             try:
                 stmt = db.insert(cls).values(obj)
                 if hasattr(cls, "__my_index_elements__"):
-                    stmt = stmt.on_conflict_do_nothing(
-                        index_elements=cls.__my_index_elements__
-                    )
+                    stmt = stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
                 await stmt.status()
             except (SQLAlchemyError, UniqueViolationError) as exc:
                 print(exc)
 
 
 class IterateList:
-
     def __init__(self, obj_list, order):
         self.end = len(obj_list)
         self.start = 0
@@ -1015,20 +928,17 @@ def deduplicate_dicts(dict_list, key_fields):
 
 def order_dicts_by_fields(dict_list, key_fields):
     """Sort dictionaries deterministically by selected fields."""
+
     def _stable_value(value):
         return (value is None, type(value).__name__, repr(value))
 
     return sorted(
         dict_list,
-        key=lambda entry: tuple(
-            _stable_value(entry.get(field)) for field in key_fields
-        ),
+        key=lambda entry: tuple(_stable_value(entry.get(field)) for field in key_fields),
     )
 
 
-async def push_objects(
-    obj_list, cls, rewrite=False, _missing_table_attempt: int = 0, use_copy: bool = True
-):
+async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int = 0, use_copy: bool = True):
     """Persist objects in bounded batches with retry safeguards."""
     if obj_list:
         max_missing_table_retries = 5
@@ -1036,9 +946,7 @@ async def push_objects(
 
         def _is_missing_table_error(err: BaseException) -> bool:
             err_text = str(err).lower()
-            return "undefinedtable" in err_text or (
-                "relation" in err_text and "does not exist" in err_text
-            )
+            return "undefinedtable" in err_text or ("relation" in err_text and "does not exist" in err_text)
 
         def _short_error(err: BaseException) -> str:
             message = str(getattr(err, "orig", err)).replace("\n", " ").strip()
@@ -1084,9 +992,7 @@ async def push_objects(
 
         async def _status_with_deadlock_retry(stmt):
             try:
-                max_retries = max(
-                    int(os.getenv("HLTHPRT_DB_DEADLOCK_RETRIES", "20")), 0
-                )
+                max_retries = max(int(os.getenv("HLTHPRT_DB_DEADLOCK_RETRIES", "20")), 0)
             except ValueError:
                 max_retries = 20
             attempt = 0
@@ -1099,10 +1005,7 @@ async def push_objects(
                         raise
                     attempt += 1
                     delay = min(0.5 * (2 ** (attempt - 1)), 8.0)
-                    print(
-                        f"{retry_label} retry {attempt}/{max_retries} for "
-                        f"{cls.__tablename__}: {_short_error(err)}"
-                    )
+                    print(f"{retry_label} retry {attempt}/{max_retries} for {cls.__tablename__}: {_short_error(err)}")
                     await asyncio.sleep(delay)
 
         async def _retry_after_missing_table(err: BaseException):
@@ -1118,17 +1021,11 @@ async def push_objects(
             except SQLAlchemyError as create_err:
                 create_err_text = str(create_err).lower()
                 is_concurrent_create_race = (
-                    "already exists" in create_err_text
-                    or "pg_type_typname_nsp_index" in create_err_text
+                    "already exists" in create_err_text or "pg_type_typname_nsp_index" in create_err_text
                 )
-                if not (
-                    is_concurrent_create_race or _is_missing_table_error(create_err)
-                ):
+                if not (is_concurrent_create_race or _is_missing_table_error(create_err)):
                     raise
-                print(
-                    f"Concurrent CREATE TABLE race detected for {cls.__tablename__}; "
-                    "retrying insert path."
-                )
+                print(f"Concurrent CREATE TABLE race detected for {cls.__tablename__}; retrying insert path.")
 
             await asyncio.sleep(min(0.05 * (_missing_table_attempt + 1), 0.25))
             return await push_objects(
@@ -1152,9 +1049,7 @@ async def push_objects(
 
         def _max_insert_parameters() -> int:
             try:
-                requested = int(
-                    os.getenv("HLTHPRT_MAX_INSERT_PARAMETERS", str(default_max_params))
-                )
+                requested = int(os.getenv("HLTHPRT_MAX_INSERT_PARAMETERS", str(default_max_params)))
             except ValueError:
                 requested = default_max_params
             try:
@@ -1175,11 +1070,7 @@ async def push_objects(
                 return table_args.get("schema")
             if isinstance(table_args, (tuple, list)):
                 return next(
-                    (
-                        arg["schema"]
-                        for arg in table_args
-                        if isinstance(arg, dict) and "schema" in arg
-                    ),
+                    (arg["schema"] for arg in table_args if isinstance(arg, dict) and "schema" in arg),
                     None,
                 )
             return None
@@ -1205,13 +1096,9 @@ async def push_objects(
                     async with db.acquire() as conn:
                         raw_conn = conn.raw_connection
                         driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
-                        copy_method = getattr(
-                            driver_conn, "copy_records_to_table", None
-                        )
+                        copy_method = getattr(driver_conn, "copy_records_to_table", None)
                         if copy_method is None:
-                            raise NotImplementedError(
-                                "Active database driver does not expose copy_records_to_table"
-                            )
+                            raise NotImplementedError("Active database driver does not expose copy_records_to_table")
 
                         await copy_method(
                             cls.__tablename__,
@@ -1251,9 +1138,7 @@ async def push_objects(
                             set_=set_dict,
                         )
                     else:
-                        stmt = stmt.on_conflict_do_nothing(
-                            index_elements=rewrite_conflict_targets
-                        )
+                        stmt = stmt.on_conflict_do_nothing(index_elements=rewrite_conflict_targets)
                 try:
                     await _status_with_deadlock_retry(stmt)
                 except (UndefinedTableError, SQLAlchemyError, InterfaceError) as err:
@@ -1284,22 +1169,16 @@ async def push_objects(
                             for column in cls.__table__.c
                             if column.name not in conflict_targets and not column.primary_key
                         ]
-                        set_dict = {
-                            col: getattr(stmt.excluded, col) for col in update_cols
-                        }
+                        set_dict = {col: getattr(stmt.excluded, col) for col in update_cols}
                         if set_dict:
                             stmt = stmt.on_conflict_do_update(
                                 index_elements=conflict_targets,
                                 set_=set_dict,
                             )
                         else:
-                            stmt = stmt.on_conflict_do_nothing(
-                                index_elements=conflict_targets
-                            )
+                            stmt = stmt.on_conflict_do_nothing(index_elements=conflict_targets)
                     else:
-                        stmt = stmt.on_conflict_do_nothing(
-                            index_elements=conflict_targets
-                        )
+                        stmt = stmt.on_conflict_do_nothing(index_elements=conflict_targets)
                 try:
                     await _status_with_deadlock_retry(stmt)
                 except (UndefinedTableError, SQLAlchemyError, InterfaceError) as err:
@@ -1315,9 +1194,7 @@ async def push_objects(
                 driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
                 copy_method = getattr(driver_conn, "copy_records_to_table", None)
                 if copy_method is None:
-                    raise NotImplementedError(
-                        "Active database driver does not expose copy_records_to_table"
-                    )
+                    raise NotImplementedError("Active database driver does not expose copy_records_to_table")
 
                 await copy_method(
                     cls.__tablename__,
@@ -1357,9 +1234,7 @@ async def push_objects(
                         try:
                             single_stmt = db.insert(cls.__table__).values(record_by_field)
                             if conflict_targets:
-                                single_stmt = single_stmt.on_conflict_do_nothing(
-                                    index_elements=conflict_targets
-                                )
+                                single_stmt = single_stmt.on_conflict_do_nothing(index_elements=conflict_targets)
                             await _status_with_deadlock_retry(single_stmt)
                         except (
                             SQLAlchemyError,
@@ -1383,7 +1258,7 @@ def _parse_datetime_text(datetime_text: str):
     except ValueError:
         try:
             return parse_date(datetime_text)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return None
 
 

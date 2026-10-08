@@ -1,5 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from contextlib import nullcontext
+
 from api import ptg2_serving as serving
 
 
@@ -27,6 +29,9 @@ class FakeSession:
         self._results = list(results)
         self.calls = []
         self.rollback_count = 0
+
+    def begin_nested(self):
+        return nullcontext()
 
     async def execute(self, *args, **kwargs):
         self.calls.append((args, kwargs))

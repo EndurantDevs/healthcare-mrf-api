@@ -34,6 +34,10 @@ from process.entity_address_snapshot_ownership import (
     verify_entity_address_archive_stage_ownership,
 )
 from process.entity_address_snapshot_receipt import (
+    CONTRACT as ARCHIVE_CONTRACT,
+)
+from process.entity_address_snapshot_receipt import (
+    STAGE_INTEGRITY_CONTRACT,
     EntityAddressArchiveReceipt,
     EntityAddressArchiveReceiptError,
     EntityAddressArchiveTableReceipt,
@@ -49,7 +53,9 @@ restore = importlib.import_module("process.entity_address_snapshot_restore")
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
 CONTRACT = "entity_address_snapshot_destination.postgres.v1"
+SET_CONTRACT = "entity_address_snapshot_destination.postgres.v2"
 BASE_VERSION_REMAP_CONTRACT = "entity_address_base_version_remap.postgres.v1"
+SET_BASE_VERSION_REMAP_CONTRACT = "entity_address_base_version_remap.postgres.v2"
 GEO_PREPARATION_CONTRACT = "entity_address_geo_assurance_preparation.postgres.v1"
 _LOCAL_GEO_DEPENDENCIES = (
     "npi_address",
@@ -83,13 +89,17 @@ class EntityAddressBaseVersionRemapEvidence:
     alias_rows_rewritten: int
     null_rows_preserved: int
     plain_base_rows_preserved: int
-    pre_remap_content_sha256: str
-    post_remap_content_sha256: str
+    pre_remap_content_sha256: str = ""
+    post_remap_content_sha256: str = ""
+    contract: str = BASE_VERSION_REMAP_CONTRACT
 
     def as_dict(self) -> dict[str, Any]:
         """Return the durable local remap receipt."""
 
-        return {"contract": BASE_VERSION_REMAP_CONTRACT, **self.__dict__}
+        fields_dict = {**self.__dict__}
+        if self.contract == SET_BASE_VERSION_REMAP_CONTRACT:
+            del fields_dict["pre_remap_content_sha256"], fields_dict["post_remap_content_sha256"]
+        return fields_dict
 
 
 @dataclass(frozen=True)
@@ -99,11 +109,12 @@ class EntityAddressGeoAssurancePreparation:
     stage_table_oid: int
     projected_rows: int
     relation_signature: tuple[tuple[str, int, int], ...]
+    publisher_selected_inputs_sha256: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the bounded local geo-assurance receipt."""
 
-        return {
+        receipt_by_field = {
             "contract": GEO_PREPARATION_CONTRACT,
             "geo_assurance_version": geo_projection.GEO_ASSURANCE_VERSION,
             "stage_table_oid": self.stage_table_oid,
@@ -113,6 +124,9 @@ class EntityAddressGeoAssurancePreparation:
                 for name, relation_oid, relation_filenode in self.relation_signature
             },
         }
+        if self.publisher_selected_inputs_sha256 is not None:
+            receipt_by_field["publisher_selected_inputs_sha256"] = self.publisher_selected_inputs_sha256
+        return receipt_by_field
 
 
 @dataclass(frozen=True)
@@ -130,7 +144,7 @@ class PreparedEntityAddressSnapshotDestination:
         """Return the complete destination-local activation contract."""
 
         return {
-            "contract": CONTRACT,
+            "contract": SET_CONTRACT if self.source_semantic_receipt.contract == ARCHIVE_CONTRACT else CONTRACT,
             "restored": self.restored.as_dict(),
             "source_semantic_receipt": self.source_semantic_receipt.as_dict(),
             "source_alias_receipt": self.source_alias_receipt.as_dict(),
@@ -183,7 +197,9 @@ async def _destination_alias_binding(
             entity_address_unified._sql_literal,
         ):
             if provisional:
-                destination_alias = await _capture_alias_semantic_receipt(session, schema_name=db_schema, provisional=True)
+                destination_alias = await _capture_alias_semantic_receipt(
+                    session, schema_name=db_schema, provisional=True
+                )
             else:
                 destination_alias = await capture_entity_address_alias_semantic_receipt(session, schema_name=db_schema)
         require_matching_entity_address_alias_semantics(source_alias, destination_alias)
@@ -266,6 +282,36 @@ async def _remap_base_versions(
         source_version != destination_version and rewritten_rows != alias_rows
     ):
         raise EntityAddressSnapshotDestinationError("entity-address base_address_version remap row count differs")
+    if pre_remap_receipt.contract == ARCHIVE_CONTRACT:
+        return EntityAddressBaseVersionRemapEvidence(
+            source_alias.local_generation,
+            destination_alias.local_generation,
+            alias_rows,
+            rewritten_rows,
+            null_rows,
+            plain_rows,
+            contract=SET_BASE_VERSION_REMAP_CONTRACT,
+        ), pre_remap_receipt
+    return await _capture_legacy_remap(
+        session,
+        schema_name,
+        source_alias,
+        destination_alias,
+        pre_remap_receipt,
+        (alias_rows, rewritten_rows, null_rows, plain_rows),
+    )
+
+
+async def _capture_legacy_remap(
+    session,
+    schema_name,
+    source_alias,
+    destination_alias,
+    pre_remap_receipt,
+    counts,
+):
+    """Preserve the recorded v1 full-content receipt after its historical remap."""
+    alias_rows, rewritten_rows, null_rows, plain_rows = counts
     async with _preserve_receipt_settings():
         post_remap_receipt = await capture_entity_address_archive_receipt(
             session,
@@ -316,6 +362,7 @@ async def _capture_geo_preparation(
     stage_table_oid: int,
     projected_rows: int,
     dependency_bindings=None,
+    publisher_selected_inputs_sha256=None,
 ) -> EntityAddressGeoAssurancePreparation:
     """Capture the candidate only when it matches the current local dependencies."""
 
@@ -324,7 +371,8 @@ async def _capture_geo_preparation(
         db_schema, **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings})
     )
     bindings_match_sql = (
-        "TRUE" if dependency_bindings is None
+        "TRUE"
+        if dependency_bindings is None
         else geo_projection.projection_dependency_bindings_match_sql(db_schema, dependency_bindings)
     )
     state = (
@@ -358,6 +406,7 @@ async def _capture_geo_preparation(
             state["candidate_relation_signature"],
             db_schema=db_schema,
         ),
+        publisher_selected_inputs_sha256=publisher_selected_inputs_sha256,
     )
 
 
@@ -508,11 +557,18 @@ async def prepare_entity_address_archive_destination(
     if dependency_bindings is not None:
         dependency_bindings = geo_projection.validate_projection_dependency_bindings(db_schema, dependency_bindings)
     async with db.bind_existing_session(session):
-        return await _prepare_bound_destination(session, {
-            "owner": owner, "semantic_receipt": semantic_receipt, "source_alias_receipt": source_alias_receipt,
-            "db_schema": db_schema, "import_date": import_date, "source_serving_generation": source_serving_generation,
-            "dependency_bindings": dependency_bindings,
-        })
+        return await _prepare_bound_destination(
+            session,
+            {
+                "owner": owner,
+                "semantic_receipt": semantic_receipt,
+                "source_alias_receipt": source_alias_receipt,
+                "db_schema": db_schema,
+                "import_date": import_date,
+                "source_serving_generation": source_serving_generation,
+                "dependency_bindings": dependency_bindings,
+            },
+        )
 
 
 def _validated_source_generation(
@@ -532,13 +588,17 @@ async def _prepare_bound_destination(session, destination_payload, *, preserve_p
     """Prepare while the module database uses the caller-owned session."""
     validated_source_generation = _validated_source_generation(destination_payload.get("source_serving_generation"))
     source_alias, destination_alias = await _destination_alias_binding(
-        session, db_schema=destination_payload["db_schema"], source_alias_receipt=destination_payload["source_alias_receipt"],
+        session,
+        db_schema=destination_payload["db_schema"],
+        source_alias_receipt=destination_payload["source_alias_receipt"],
         provisional=preserve_private_stage,
     )
     validated_owner, source_receipt, normalized_schema, normalized_date, stage_names = await _validate_owned_source(
         session,
-        owner=destination_payload["owner"], semantic_receipt=destination_payload["semantic_receipt"],
-        db_schema=destination_payload["db_schema"], import_date=destination_payload["import_date"],
+        owner=destination_payload["owner"],
+        semantic_receipt=destination_payload["semantic_receipt"],
+        db_schema=destination_payload["db_schema"],
+        import_date=destination_payload["import_date"],
     )
     remap_evidence, post_remap_receipt = await _remap_base_versions(
         session,
@@ -642,6 +702,9 @@ def _validated_remap_evidence(
         "pre_remap_content_sha256",
         "post_remap_content_sha256",
     }
+    is_set = source_receipt.contract == ARCHIVE_CONTRACT
+    if is_set:
+        fields -= {"pre_remap_content_sha256", "post_remap_content_sha256"}
     if not isinstance(remap_value, Mapping) or set(remap_value) != fields:
         raise EntityAddressSnapshotDestinationError("entity-address base_address_version remap receipt is invalid")
     count_fields = (
@@ -655,13 +718,13 @@ def _validated_remap_evidence(
     counts_valid = all(type(remap_value[field]) is int and remap_value[field] >= 0 for field in count_fields)
     expected_rewritten = remap_value["alias_rows_bound"] if source_generation != destination_generation else 0
     if (
-        remap_value["contract"] != BASE_VERSION_REMAP_CONTRACT
+        remap_value["contract"] != (SET_BASE_VERSION_REMAP_CONTRACT if is_set else BASE_VERSION_REMAP_CONTRACT)
         or source_generation != source_alias.local_generation
         or destination_generation != destination_alias.local_generation
         or not counts_valid
         or remap_value["alias_rows_rewritten"] != expected_rewritten
-        or remap_value["pre_remap_content_sha256"] != source_receipt.content_sha256
-        or remap_value["post_remap_content_sha256"] != restored_receipt.content_sha256
+        or (not is_set and remap_value["pre_remap_content_sha256"] != source_receipt.content_sha256)
+        or (not is_set and remap_value["post_remap_content_sha256"] != restored_receipt.content_sha256)
         or source_receipt.schema_sha256 != restored_receipt.schema_sha256
         or sum(remap_value[field] for field in count_fields if field != "alias_rows_rewritten")
         != _main_table_receipt(source_receipt).row_count
@@ -674,8 +737,9 @@ def _validated_remap_evidence(
         alias_rows_rewritten=remap_value["alias_rows_rewritten"],
         null_rows_preserved=remap_value["null_rows_preserved"],
         plain_base_rows_preserved=remap_value["plain_base_rows_preserved"],
-        pre_remap_content_sha256=remap_value["pre_remap_content_sha256"],
-        post_remap_content_sha256=remap_value["post_remap_content_sha256"],
+        pre_remap_content_sha256=remap_value.get("pre_remap_content_sha256", ""),
+        post_remap_content_sha256=remap_value.get("post_remap_content_sha256", ""),
+        contract=remap_value["contract"],
     )
 
 
@@ -695,7 +759,7 @@ def _validated_geo_preparation(
     }
     if (
         not isinstance(geo_value, Mapping)
-        or set(geo_value) != fields
+        or set(geo_value) not in (fields, fields | {"publisher_selected_inputs_sha256"})
         or geo_value["contract"] != GEO_PREPARATION_CONTRACT
         or geo_value["geo_assurance_version"] != geo_projection.GEO_ASSURANCE_VERSION
         or type(geo_value["stage_table_oid"]) is not int
@@ -704,6 +768,13 @@ def _validated_geo_preparation(
         or geo_value["projected_rows"] < 0
     ):
         raise EntityAddressSnapshotDestinationError("entity-address geo-assurance preparation receipt is invalid")
+    selected_digest = geo_value.get("publisher_selected_inputs_sha256")
+    if "publisher_selected_inputs_sha256" in geo_value and (
+        not isinstance(selected_digest, str)
+        or len(selected_digest) != 64
+        or any(character not in "0123456789abcdef" for character in selected_digest)
+    ):
+        raise EntityAddressSnapshotDestinationError("entity-address selected input digest is invalid")
     return EntityAddressGeoAssurancePreparation(
         stage_table_oid=geo_value["stage_table_oid"],
         projected_rows=geo_value["projected_rows"],
@@ -711,6 +782,7 @@ def _validated_geo_preparation(
             geo_value["relation_signature"],
             db_schema=db_schema,
         ),
+        publisher_selected_inputs_sha256=selected_digest,
     )
 
 
@@ -725,6 +797,20 @@ def _require_receipt_lineage(
     restored_by_model = {table.model_name: table for table in restored_receipt.tables}
     stage_by_model = {table.model_name: table for table in stage_integrity.tables}
     main_model = entity_address_unified.EntityAddressUnified.__name__
+    if source_receipt.contract == ARCHIVE_CONTRACT:
+        if restored_receipt.contract != ARCHIVE_CONTRACT or stage_integrity.contract != STAGE_INTEGRITY_CONTRACT:
+            raise EntityAddressSnapshotDestinationError("entity-address destination receipt contracts differ")
+        for model_name, stage_table in stage_by_model.items():
+            source_table, restored_table = source_by_model[model_name], restored_by_model[model_name]
+            if (source_table.row_count, source_table.schema_sha256) != (
+                restored_table.row_count,
+                restored_table.schema_sha256,
+            ) or (
+                source_table.row_count,
+                source_table.schema_sha256,
+            ) != (stage_table.row_count, stage_table.schema_sha256):
+                raise EntityAddressSnapshotDestinationError("entity-address destination set accounting differs")
+        return
     if not (
         source_receipt.main_input_sha256 == restored_receipt.main_input_sha256 == stage_integrity.main_input_sha256
     ):
@@ -763,14 +849,18 @@ def _validated_destination_metadata(
         "base_version_remap",
         "geo_assurance",
     }
-    if not isinstance(stored, Mapping) or set(stored) != fields or stored.get("contract") != CONTRACT:
+    if (
+        not isinstance(stored, Mapping)
+        or set(stored) != fields
+        or stored.get("contract") not in (CONTRACT, SET_CONTRACT)
+    ):
         raise EntityAddressSnapshotDestinationError("entity-address destination preparation is invalid")
     try:
         source_receipt = validate_entity_address_archive_receipt(stored["source_semantic_receipt"])
         restored_receipt = validate_entity_address_archive_receipt(stored["restored"]["semantic_receipt"])
         source_alias = validate_entity_address_alias_semantic_receipt(stored["source_alias_receipt"])
         destination_alias = validate_entity_address_alias_semantic_receipt(stored["destination_alias_receipt"])
-        require_matching_entity_address_alias_semantics(source_alias, destination_alias)
+        _require_destination_contracts(stored["contract"], source_receipt, source_alias, destination_alias)
         _normalized_schema, _normalized_date, stage_names = restore._stage_plan(
             db_schema=stored["restored"]["db_schema"],
             import_date=stored["restored"]["import_date"],
@@ -798,6 +888,23 @@ def _validated_destination_metadata(
         destination_alias=destination_alias,
     )
     return source_alias, destination_alias, remap
+
+
+def _require_destination_contracts(contract, source_receipt, source_alias, destination_alias):
+    """Keep legacy row receipts and v2 typed-set authority strictly separate."""
+    from process.entity_address_snapshot_alias import SET_CONTRACT as alias_set_contract
+
+    if contract == SET_CONTRACT:
+        if (
+            source_receipt.contract != ARCHIVE_CONTRACT
+            or source_alias.contract != alias_set_contract
+            or destination_alias.contract != alias_set_contract
+        ):
+            raise ValueError("entity-address destination contracts differ")
+    else:
+        if source_receipt.contract == ARCHIVE_CONTRACT:
+            raise ValueError("entity-address destination contracts differ")
+        require_matching_entity_address_alias_semantics(source_alias, destination_alias)
 
 
 def _prepared_main_stage_oid(
@@ -898,9 +1005,9 @@ async def _validated_bound_destination(session, *, stored):
         destination_alias=destination_alias,
     )
     dependency_bindings = prepared.context.get("dependency_bindings")
-    await session.execute(text(geo_projection.projection_dependency_lock_sql(
-        prepared.db_schema, dependency_bindings=dependency_bindings
-    )))
+    await session.execute(
+        text(geo_projection.projection_dependency_lock_sql(prepared.db_schema, dependency_bindings=dependency_bindings))
+    )
     expected_geo = _validated_geo_preparation(
         stored["geo_assurance"],
         db_schema=prepared.db_schema,

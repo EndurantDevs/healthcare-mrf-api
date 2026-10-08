@@ -24,7 +24,6 @@ from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import AuditBatchChallenge
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
-
 _CODE_INDEX_BYTES = 512
 _CODE_INDEX_RECORD_BYTES = 2048
 _CODE_INDEX_PAIR_MEMBERSHIP_BYTES = 256
@@ -49,9 +48,7 @@ class CandidateCodeIndex:
 def _requested_code_aliases(
     challenges: Sequence[AuditBatchChallenge],
 ) -> tuple[_RequestedCodeAlias, ...]:
-    requested_pairs = sorted(
-        {(challenge.code_system, challenge.code) for challenge in challenges}
-    )
+    requested_pairs = sorted({(challenge.code_system, challenge.code) for challenge in challenges})
     return tuple(
         _RequestedCodeAlias(
             canonical_system=canonical_system,
@@ -68,7 +65,9 @@ def _requested_code_aliases(
     )
 
 
-def _code_query_sql(scope_join_sql: str, code_filters: Sequence[str]) -> str:
+def _code_query_sql(
+    scope_join_sql: str, code_filters: Sequence[str], serving_tables: PTG2ServingTables | None = None
+) -> str:
     return f"""
         WITH requested_code AS (
             SELECT *
@@ -91,7 +90,7 @@ def _code_query_sql(scope_join_sql: str, code_filters: Sequence[str]) -> str:
                code_metadata.source_name,
                code_metadata.source_description,
                code_metadata.rate_count
-          FROM {_shared_v3_code_table()} code_metadata
+          FROM {_shared_v3_code_table(serving_tables)} code_metadata
           LEFT JOIN requested_code requested
             ON code_metadata.reported_code_system = requested.reported_system
            AND code_metadata.reported_code = requested.reported_code
@@ -110,9 +109,7 @@ def _code_query_sql(scope_join_sql: str, code_filters: Sequence[str]) -> str:
 
 def _index_candidate_code_record(
     raw_code_record: Any,
-    records_by_pair_and_key: dict[
-        tuple[str, str], dict[int, dict[str, Any]]
-    ],
+    records_by_pair_and_key: dict[tuple[str, str], dict[int, dict[str, Any]]],
     records_by_key: dict[int, dict[str, Any]],
     retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> None:
@@ -130,9 +127,7 @@ def _index_candidate_code_record(
         records_by_key[code_key] = code_record
         existing_by_key = code_record
     if existing_by_key != code_record:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate code aliases resolve inconsistently"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate code aliases resolve inconsistently")
     if canonical_system is None or canonical_code is None:
         return
     code_pair = (str(canonical_system), str(canonical_code))
@@ -174,24 +169,15 @@ def _indexed_candidate_code_records(
             records_by_key,
             retention_budget,
         )
-    requested_pairs = {
-        (challenge.code_system, challenge.code) for challenge in challenges
-    }
+    requested_pairs = {(challenge.code_system, challenge.code) for challenge in challenges}
     if set(records_by_pair_and_key) != requested_pairs:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate audit code is missing from the sealed layout"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate audit code is missing from the sealed layout")
     required_code_keys = {int(code_key) for code_key in persisted_code_keys}
     if not required_code_keys.issubset(records_by_key):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate persisted audit code is missing from the sealed layout"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate persisted audit code is missing from the sealed layout")
     return CandidateCodeIndex(
         by_pair={
-            code_pair: tuple(
-                pair_records_by_key[code_key]
-                for code_key in sorted(pair_records_by_key)
-            )
+            code_pair: tuple(pair_records_by_key[code_key] for code_key in sorted(pair_records_by_key))
             for code_pair, pair_records_by_key in records_by_pair_and_key.items()
         },
         by_key=records_by_key,
@@ -210,15 +196,11 @@ async def candidate_code_records_by_pair(
     """Return every exact plan-scoped code record in one database query."""
 
     aliases = _requested_code_aliases(challenges)
-    normalized_persisted_code_keys = tuple(
-        sorted({int(code_key) for code_key in persisted_code_keys})
-    )
-    scope_join_sql, code_filters, params_by_name, _order_sql = (
-        _shared_v3_code_scope_sql(
-            serving_tables,
-            requested_plan=access.plan_id,
-            plan_market_type=access.plan_market_type,
-        )
+    normalized_persisted_code_keys = tuple(sorted({int(code_key) for code_key in persisted_code_keys}))
+    scope_join_sql, code_filters, params_by_name, _order_sql = _shared_v3_code_scope_sql(
+        serving_tables,
+        requested_plan=access.plan_id,
+        plan_market_type=access.plan_market_type,
     )
     code_filters.append("code_metadata.snapshot_key = :shared_snapshot_key")
     params_by_name.update(
@@ -232,7 +214,7 @@ async def candidate_code_records_by_pair(
         }
     )
     code_query = await session.execute(
-        text(_code_query_sql(scope_join_sql, code_filters)),
+        text(_code_query_sql(scope_join_sql, code_filters, serving_tables)),
         params_by_name,
     )
     return _indexed_candidate_code_records(

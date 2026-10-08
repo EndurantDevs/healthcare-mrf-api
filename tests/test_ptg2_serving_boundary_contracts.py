@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,9 +15,32 @@ from tests.ptg2_serving_coverage_paydown_support import (
     strict_v3_tables,
 )
 
-
 _PROVIDER_SET_ID = "01" * 16
 _NPI = 1234567890
+
+
+class SavepointSession(FakeSession):
+    """Record inner transaction outcomes separately from the owning read fence."""
+
+    def __init__(self, results=()):
+        super().__init__(results)
+        self.savepoint_errors = []
+        self.savepoint_commit_count = 0
+        self.read_fence = object()
+
+    @asynccontextmanager
+    async def begin_nested(self):
+        try:
+            yield
+        except BaseException as error:
+            self.savepoint_errors.append(error)
+            raise
+        else:
+            self.savepoint_commit_count += 1
+
+    async def rollback(self):
+        self.read_fence = None
+        await super().rollback()
 
 
 def _rate_row(provider_set_id=_PROVIDER_SET_ID):
@@ -158,9 +182,7 @@ async def test_provider_expansion_propagates_completion_unavailability(
     """Return unavailable when either exact completion dependency is unavailable."""
 
     completion_rows = None if unavailable_stage == "completion" else [_rate_row()]
-    provider_rows = None if unavailable_stage == "provider" else {
-        _PROVIDER_SET_ID: [{"npi": _NPI}]
-    }
+    provider_rows = None if unavailable_stage == "provider" else {_PROVIDER_SET_ID: [{"npi": _NPI}]}
     _install_ranked_selection(
         monkeypatch,
         completion_rows=completion_rows,
@@ -214,9 +236,7 @@ def _install_v4_filtered_selection_dependencies(monkeypatch, scope_keys):
     monkeypatch.setattr(
         serving,
         "_shared_forward_entries_for_code_rows",
-        AsyncMock(
-            return_value=[SimpleNamespace(provider_set_key=key) for key in scope_keys]
-        ),
+        AsyncMock(return_value=[SimpleNamespace(provider_set_key=key) for key in scope_keys]),
     )
     reverse_memberships = AsyncMock(return_value={_NPI: (_PROVIDER_SET_ID,)})
     monkeypatch.setattr(
@@ -259,24 +279,30 @@ async def test_v4_filtered_expansion_uses_exact_code_scope(monkeypatch, scope_ke
 
     selection = await _select(monkeypatch, tables=tables)
     assert selection is not None
-    assert reverse_memberships.await_args.kwargs["allowed_provider_set_keys"] == frozenset(
-        scope_keys
-    )
+    assert reverse_memberships.await_args.kwargs["allowed_provider_set_keys"] == frozenset(scope_keys)
 
 
 @pytest.mark.asyncio
 async def test_optional_procedure_lookup_rolls_back_without_hiding_rates():
-    """Keep serving data usable when optional catalog enrichment fails."""
+    """Roll back catalog failure inside its savepoint without releasing the read fence."""
 
     assert await serving._procedure_details_for_rows(object(), []) == {}
-    session = FakeSession([RuntimeError("catalog unavailable")])
+    failure = RuntimeError("catalog unavailable")
+    reusable_result = FakeResult(scalar="pinned reader remains usable")
+    session = SavepointSession([failure, reusable_result])
+    read_fence = session.read_fence
     details = await serving._procedure_details_for_rows(
         session,
         [{"reported_code_system": "CPT", "reported_code": "99213"}],
     )
 
     assert details == {}
-    assert session.rollback_count == 1
+    assert session.savepoint_errors == [failure]
+    assert session.savepoint_commit_count == 0
+    assert session.rollback_count == 0
+    assert session.read_fence is read_fence
+    assert len(session.calls) == 1
+    assert await session.execute("SELECT 1") is reusable_result
 
 
 @pytest.mark.asyncio
@@ -289,14 +315,12 @@ async def test_source_provenance_accepts_fallback_key_and_translates_reader_erro
     monkeypatch.setattr(serving, "fetch_snapshot_source_provenance", fetch)
     tables = strict_v3_tables()
 
-    assert await serving._ptg2_source_provenance_for_rows(
-        object(), tables, [{"source_key": "3"}]
-    ) == {3: {"source_key": 3}}
+    assert await serving._ptg2_source_provenance_for_rows(object(), tables, [{"source_key": "3"}]) == {
+        3: {"source_key": 3}
+    }
     fetch.side_effect = PTG2SharedBlockError("sealed source unavailable")
     with pytest.raises(PTG2ManifestArtifactError, match="sealed source unavailable"):
-        await serving._ptg2_source_provenance_for_rows(
-            object(), tables, [{"source_artifact_key": 3}]
-        )
+        await serving._ptg2_source_provenance_for_rows(object(), tables, [{"source_artifact_key": 3}])
 
 
 @pytest.mark.asyncio
@@ -355,8 +379,7 @@ async def test_current_plan_route_never_falls_back_to_another_plan(
     """Select all, one, or no current plan networks without global fallback."""
 
     snapshots = [
-        (f"source-{index}", network_snapshot_id)
-        for index, network_snapshot_id in enumerate(network_snapshots)
+        (f"source-{index}", network_snapshot_id) for index, network_snapshot_id in enumerate(network_snapshots)
     ]
     monkeypatch.setattr(
         serving,
@@ -371,9 +394,7 @@ async def test_current_plan_route_never_falls_back_to_another_plan(
     monkeypatch.setattr(
         serving,
         "_search_one_ptg2_snapshot",
-        AsyncMock(
-            side_effect=lambda _session, snapshot_id, *_args: {"route": snapshot_id}
-        ),
+        AsyncMock(side_effect=lambda _session, snapshot_id, *_args: {"route": snapshot_id}),
     )
 
     response = await serving.search_current_ptg2_index(
@@ -394,11 +415,14 @@ async def test_current_explicit_route_requires_a_resolved_snapshot(monkeypatch):
         "resolve_current_ptg2_snapshot_id",
         AsyncMock(return_value=None),
     )
-    assert await serving.search_current_ptg2_index(
-        object(),
-        {"source_key": "synthetic-source"},
-        SimpleNamespace(limit=10, offset=0),
-    ) is None
+    assert (
+        await serving.search_current_ptg2_index(
+            object(),
+            {"source_key": "synthetic-source"},
+            SimpleNamespace(limit=10, offset=0),
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -406,18 +430,21 @@ async def test_reverse_code_query_bounds_selected_keys_and_window():
     """Bind selected code keys and a nonnegative reverse-query window."""
 
     session = FakeSession([FakeResult([])])
-    assert await serving._manifest_reverse_code_rows(
-        session,
-        strict_v3_tables(),
-        requested_plan="synthetic-plan",
-        code_value="99213",
-        code_system="CPT",
-        q_text="",
-        code_context=None,
-        code_keys=(9, 7, 9),
-        limit_rows=-1,
-        offset_rows=-2,
-    ) == []
+    assert (
+        await serving._manifest_reverse_code_rows(
+            session,
+            strict_v3_tables(),
+            requested_plan="synthetic-plan",
+            code_value="99213",
+            code_system="CPT",
+            q_text="",
+            code_context=None,
+            code_keys=(9, 7, 9),
+            limit_rows=-1,
+            offset_rows=-2,
+        )
+        == []
+    )
     params = session.calls[0][0][1]
     assert params["code_keys"] == [7, 9]
     assert params["code_row_limit"] == 0

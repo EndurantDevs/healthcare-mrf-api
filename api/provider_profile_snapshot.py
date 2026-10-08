@@ -13,6 +13,7 @@ from sqlalchemy.exc import DBAPIError
 from process import entity_address_result_generation as address_generation
 from process import provider_directory_cms_serving_receipt as cms_serving_receipt
 from process import reference_family_result_generation as reference_generation
+from process.entity_address_cutover_contract import postgres_sqlstate
 from process.npi_canonical_publication import NPI_CANONICAL_TABLES
 
 _SNAPSHOT = ContextVar("provider_profile_read_snapshot", default=None)
@@ -221,11 +222,11 @@ async def provider_profile_read_snapshot(database, schema, *, include_detail=Fal
     """Bind sequential loader calls to one bounded, read-only serving snapshot."""
     if not isinstance(schema, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", schema):
         raise ValueError("provider_profile_schema_invalid")
-    max_attempts = 1 if database._transaction_binding() is not None else 3
+    max_attempts = 1 if database.has_reader_session() or database._transaction_binding() is not None else 3
     for attempt in range(1, max_attempts + 1):
         has_yielded = False
         try:
-            async with database.transaction() as session:
+            async with database.reader_session() as session:
                 async with _read_snapshot_scope(session, schema, include_detail=include_detail):
                     has_yielded = True
                     yield session
@@ -234,13 +235,16 @@ async def provider_profile_read_snapshot(database, schema, *, include_detail=Fal
             if has_yielded or attempt == max_attempts:
                 raise
         except DBAPIError as error:
+            if not has_yielded and attempt < max_attempts and postgres_sqlstate(error) == "55P03":
+                continue
             raise ServiceUnavailable("Provider data is temporarily unavailable.") from error
 
 
 @asynccontextmanager
 async def _read_snapshot_scope(session, schema, *, include_detail):
     """Finish setup before yielding; loader failures never replay a response."""
-    await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+    if not session.info.get("api_reader_verified"):
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
     await session.execute(text("SET LOCAL lock_timeout = '250ms'"))
     await session.execute(text("SET LOCAL statement_timeout = '5s'"))
     relation_oids = await _lock_serving_relations(session, schema, include_detail=include_detail)

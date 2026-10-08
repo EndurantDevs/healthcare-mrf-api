@@ -129,7 +129,7 @@ async def complete_publication(
         raise RuntimeError("MRF publication claim changed")
 
 
-async def require_completed_publication(session, schema: str) -> dict:
+async def require_completed_publication(session, schema: str, *, native_set=False) -> dict:
     """Admit a captured MRF family only after its ordinary finalizer completed.
 
     The caller must hold the family locks in its capture snapshot. Source-local
@@ -164,8 +164,10 @@ async def require_completed_publication(session, schema: str) -> dict:
     summary_oid = (await session.execute(text("SELECT to_regclass(:name)::oid"), {"name": summary})).scalar_one()
     if publication_receipt["summary_inputs"] != inputs or publication_receipt["summary_oid"] != summary_oid:
         raise RuntimeError("MRF publication completion summary identity differs")
-    address_content = await capture_address_content(session, schema, qualified)
+    address_content = await capture_address_content(session, schema, qualified, native_set=native_set)
     require_address_coverage(address_content)
-    if publication_receipt["address_content"] != address_content:
+    if not native_set and publication_receipt["address_content"] != address_content:
         raise RuntimeError("MRF publication address content differs")
-    return dict(publication_receipt)
+    # The explicit v2 source proof captures current covered canonical content
+    # under these locks. It does not claim equality to the legacy row-hash proof.
+    return {**dict(publication_receipt), **({"native_address_coverage": address_content} if native_set else {})}

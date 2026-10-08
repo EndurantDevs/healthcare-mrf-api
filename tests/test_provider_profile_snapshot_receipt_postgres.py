@@ -12,7 +12,11 @@ from sqlalchemy import text
 from api import provider_profile_snapshot as snapshot
 from process import provider_directory_cms_serving_receipt as receipts
 from tests import test_provider_directory_cms_serving_receipt_postgres as receipt_fixture
-from tests.provider_profile_snapshot_postgres_support import create_composite_families, snapshot_database
+from tests.provider_profile_snapshot_postgres_support import (
+    create_composite_families,
+    grant_profile_reader,
+    snapshot_database,
+)
 
 
 async def _publish_dependency(database, schema, prior):
@@ -90,6 +94,7 @@ async def test_replaced_projection_cannot_reuse_common_proof(monkeypatch, table,
         await receipt_fixture._publish_initial(database.engine, schema)
         await database.status(f"ALTER TABLE {schema}.{table} RENAME TO abandoned_projection")
         await database.status(f"CREATE TABLE {schema}.{table} (synthetic_id int)")
+        await grant_profile_reader(database, schema, (table,))
         with pytest.raises(ServiceUnavailable):
             async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=include_detail):
                 pytest.fail("A different physical projection cannot inherit the accepted proof")
@@ -111,6 +116,7 @@ async def test_withdrawal_still_requires_its_common_proof(monkeypatch):
             assert session.info["provider_profile_cms_serving_receipt"]["receipt_id"] == receipt_id
         await database.status(f"ALTER TABLE {schema}.provider_directory_address_overlay RENAME TO abandoned_overlay")
         await database.status(f"CREATE TABLE {schema}.provider_directory_address_overlay (synthetic_id int)")
+        await grant_profile_reader(database, schema, ("provider_directory_address_overlay",))
         with pytest.raises(ServiceUnavailable):
             async with snapshot.provider_profile_read_snapshot(database, schema):
                 pytest.fail("Removing CMS from Profile does not remove the accepted address proof")
@@ -134,6 +140,7 @@ async def test_common_proof_and_projection_cross_cutover_together(monkeypatch):
         await create_composite_families(database, schema)
         initial = await receipt_fixture._publish_initial(database.engine, schema)
         await database.status(f"CREATE TABLE {schema}.next_overlay (synthetic_id int)")
+        await grant_profile_reader(database, schema, ("next_overlay",))
         started = asyncio.Event()
         publication = None
         try:

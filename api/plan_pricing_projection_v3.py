@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 from typing import Any
 
 from api import plan_pricing_projection_v3_aggregate as _aggregate
@@ -26,7 +27,11 @@ from api.plan_pricing_projection_v3_code import (
     _code_occurrences,
     _exact_numeric_rates,
     _manifest_id,
+)
+from api.plan_pricing_projection_v3_code import (
     _store_rate_occurrences as _store_rate_occurrences_impl,
+)
+from api.plan_pricing_projection_v3_code import (
     _store_rate_profiles as _store_rate_profiles_impl,
 )
 from api.plan_pricing_projection_v3_provider import (
@@ -55,11 +60,10 @@ from api.plan_pricing_projection_v3_types import (
     MAX_PREWARM_SHAPES,
     ProjectionV3Counts,
     _BuildState,
+    _insert_batches,
     _PrewarmHeapItem,
     _PrewarmShape,
-    _insert_batches,
 )
-
 
 _AGGREGATE_STATS_SQL = _aggregate._AGGREGATE_STATS_SQL
 
@@ -68,13 +72,19 @@ async def _materialize_provider_cells(
     session: Any,
     projection_id: str,
     state: _BuildState,
+    *,
+    candidate_inputs=None,
 ) -> None:
     await _provider_cells._materialize_provider_cells(
         session,
         projection_id,
         state,
         next_provider_npis=_next_provider_npis,
-        provider_rows_for_npis=projection_provider_rows_for_npis,
+        provider_rows_for_npis=(
+            projection_provider_rows_for_npis
+            if candidate_inputs is None
+            else partial(projection_provider_rows_for_npis, candidate_inputs=candidate_inputs)
+        ),
         provider_cell_rows=_provider_cell_rows,
         insert_batches=_insert_batches,
     )
@@ -242,13 +252,18 @@ async def _preflight_code_work(
     code_identities: list[tuple[str, str]],
     bindings: list[BindingProjection],
     state: _BuildState,
+    *,
+    candidate_inputs=None,
 ) -> dict[tuple[str, str], Any]:
     admitted_work_by_code: dict[tuple[str, str], Any] = {}
     for code_identity in code_identities:
-        if await _has_staged_code_inputs(
-            session, state, code_identity, bindings
-        ):
-            await _materialize_provider_cells(session, projection_id, state)
+        if await _has_staged_code_inputs(session, state, code_identity, bindings):
+            await _materialize_provider_cells(
+                session,
+                projection_id,
+                state,
+                **({} if candidate_inputs is None else {"candidate_inputs": candidate_inputs}),
+            )
             admitted_work_by_code[code_identity] = await _prepare_code_work(
                 session, projection_id, code_identity, state
             )
@@ -270,9 +285,7 @@ async def _store_admitted_codes(
         state.provider_fragment_byte_count,
     )
     for code_identity, admitted_work in admitted_work_by_code.items():
-        if not await _has_staged_code_inputs(
-            session, state, code_identity, bindings
-        ):
+        if not await _has_staged_code_inputs(session, state, code_identity, bindings):
             raise ValueError("pricing projection code admission changed")
         actual_work = await _stage_code_work(
             session,
@@ -289,15 +302,9 @@ async def _store_admitted_codes(
             state.provider_fragment_byte_count,
         ):
             raise ValueError("pricing projection code admission changed")
-        await _store_rate_occurrences(
-            session, projection_id, code_identity, state
-        )
-        await _store_rate_profiles(
-            session, projection_id, code_identity, state
-        )
-        aggregate_records = await _aggregate_records(
-            session, projection_id, code_identity, state
-        )
+        await _store_rate_occurrences(session, projection_id, code_identity, state)
+        await _store_rate_profiles(session, projection_id, code_identity, state)
+        aggregate_records = await _aggregate_records(session, projection_id, code_identity, state)
         await _store_aggregate_packs(
             session,
             projection_id,
@@ -313,6 +320,8 @@ async def materialize_factorized_projection(
     projection_id: str,
     bindings: list[BindingProjection],
     content_digest: Any,
+    *,
+    candidate_inputs=None,
 ) -> ProjectionV3Counts:
     """Build provider cells and exact aggregate packs with bounded app memory."""
 
@@ -320,23 +329,18 @@ async def materialize_factorized_projection(
     state = _BuildState(content_digest)
     _work._work_limits(state)
     await _create_stage_tables(session)
-    code_identities = sorted(
-        {
-            code_identity
-            for binding in bindings
-            for code_identity in binding.code_rows_by_identity
-        }
-    )
+    code_identities = sorted({code_identity for binding in bindings for code_identity in binding.code_rows_by_identity})
     admitted_work_by_code = await _preflight_code_work(
-        session, projection_id, code_identities, bindings, state
+        session,
+        projection_id,
+        code_identities,
+        bindings,
+        state,
+        **({} if candidate_inputs is None else {"candidate_inputs": candidate_inputs}),
     )
     await _persist_provider_projection(session, projection_id, state)
-    await _store_admitted_codes(
-        session, projection_id, bindings, admitted_work_by_code, state
-    )
-    prewarm_shape_count = await _store_prewarm_shapes(
-        session, projection_id, state
-    )
+    await _store_admitted_codes(session, projection_id, bindings, admitted_work_by_code, state)
+    prewarm_shape_count = await _store_prewarm_shapes(session, projection_id, state)
     return ProjectionV3Counts(
         state.provider_membership_count,
         state.provider_cell_count,
