@@ -11,7 +11,15 @@ from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
-from process.custom_import.definition import MAX_DEFINITION_BYTES, CustomImportDefinition, Field, canonical_json
+from process.custom_import.definition import (
+    MAX_DEFINITION_BYTES,
+    MAX_DEFINITION_DEPTH,
+    MAX_DEFINITION_NODES,
+    CustomImportDefinition,
+    Field,
+    _validate_wire_value,
+    canonical_json,
+)
 from process.custom_import.family import RootFamily, normalize_source_decimal
 from process.custom_import.runner_types import CandidateRunnerError, StoredCandidateFamily
 
@@ -392,26 +400,45 @@ def key_document(
         ]
     except KeyError as exc:
         raise CandidateRunnerError("family key is incomplete") from exc
-    return canonical({"contract": "custom-import-key/v1", "fields": encoded_fields})
+    return _canonical_fields("custom-import-key/v1", encoded_fields)
 
 
 def record_payload(fields: Sequence[Field], values_by_field: Mapping[str, Any]) -> str:
     """Encode a full typed source record, preserving missing versus null."""
 
-    return canonical(
-        {
-            "contract": "custom-import-record/v1",
-            "fields": [
-                {
-                    "field": field.field_id,
-                    "value": {"state": "missing"}
-                    if field.field_id not in values_by_field
-                    else value_document(field, values_by_field[field.field_id]),
-                }
-                for field in fields
-            ],
-        }
+    return _canonical_fields(
+        "custom-import-record/v1",
+        [
+            {
+                "field": field.field_id,
+                "value": {"state": "missing"}
+                if field.field_id not in values_by_field
+                else value_document(field, values_by_field[field.field_id]),
+            }
+            for field in fields
+        ],
     )
+
+
+def _canonical_fields(contract: str, encoded_fields: list[dict]) -> str:
+    """Serialize the fixed generated grammar without copying every container."""
+
+    document_by_key = {"contract": contract, "fields": encoded_fields}
+    if 3 > MAX_DEFINITION_NODES or (4 if encoded_fields else 1) > MAX_DEFINITION_DEPTH:
+        return canonical(document_by_key)
+    nodes = 3  # The outer object, contract string, and field array.
+    for encoded_field in encoded_fields:
+        encoded_value = encoded_field["value"]
+        nodes += 3 + len(encoded_value)  # Field object, identity, value object, and scalar leaves.
+        if nodes > MAX_DEFINITION_NODES or any(
+            value is not None and type(value) not in (str, bool, int)
+            for value in (encoded_field["field"], *encoded_value.values())
+        ):
+            return canonical(document_by_key)
+    try:
+        return json.dumps(document_by_key, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise CandidateRunnerError("candidate canonical value is malformed") from exc
 
 
 def value_document(field: Field, scalar_value: object) -> Mapping[str, object]:
@@ -505,7 +532,16 @@ def parse_canonical_payload(canonical_payload: object, label: str) -> Mapping[st
         raise CandidateRunnerError(f"{label} is not canonical text")
     try:
         parsed_payload = json.loads(canonical_payload)
-        if canonical_json(parsed_payload) != canonical_payload:
+        if (
+            json.dumps(
+                _validate_wire_value(parsed_payload, copy_containers=False),
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            != canonical_payload
+        ):
             raise ValueError("not canonical")
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise CandidateRunnerError(f"{label} is malformed") from exc
