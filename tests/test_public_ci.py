@@ -9,6 +9,16 @@ METADATA_ONLY = (
     "github.event_name == 'pull_request' && github.event.action == 'edited' "
     "&& !github.event.changes.title && !github.event.changes.base"
 )
+PYTHON_DEPENDENCY_JOBS = {
+    "python-tests",
+    "capacity-evidence",
+    "api-contract",
+    "rust-scanner",
+    "security",
+    "worker-queue-smoke",
+    "address-canonical-db-tests",
+}
+PYTHON_SETUP_ACTION = "EndurantDevs/endurant-ci/scripts/healthcare/setup@"
 JOB_LABELS = {
     "smoke": "portable import checks",
     "public-hygiene": "Repository checks",
@@ -70,6 +80,13 @@ def _assert_job_actions(job_id, job, revision) -> None:
             continue
         if action == "./ci/scripts/healthcare/setup":
             assert has_pinned_checkout
+            assert job_id not in PYTHON_DEPENDENCY_JOBS
+            continue
+        if action.startswith(PYTHON_SETUP_ACTION):
+            assert has_pinned_checkout
+            assert job_id in PYTHON_DEPENDENCY_JOBS
+            assert re.fullmatch(r"[0-9a-f]{40}", action.removeprefix(PYTHON_SETUP_ACTION))
+            assert step["with"]["dependencies"] == "true"
             continue
         assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", action)
         if not action.startswith("actions/checkout@"):
@@ -118,10 +135,10 @@ def _assert_smoke_job(workflow, workflow_text) -> None:
     assert "python -m pip install" not in "\n".join(step.get("run", "") for step in job["steps"])
     assert "test_process_" in commands or "tests/process/" in commands
     assert workflow["env"]["PYTEST_BOORST"] == "1"
-    assert workflow["env"]["UV_FIND_LINKS"] == (
-        "https://github.com/dnikolayev/pytest-boorst/releases/download/v0.1.0a4/wheels.html"
-    )
-    assert "pytest pytest-asyncio pytest-boorst" in commands
+    assert "UV_FIND_LINKS" not in workflow["env"]
+    assert "pytest pytest-asyncio 'pytest-boorst>=0.1.0a5,<1.0'" in commands
+    assert "--upgrade-package pytest-boorst" in commands
+    assert "--prerelease allow" not in commands
     assert all(
         token not in workflow_text for token in ("secrets.", "vars.", "ghcr.io", "workflow_dispatch", "self-hosted")
     )
@@ -225,6 +242,28 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
         _assert_job_actions(job_id, job, revision)
     _assert_smoke_job(workflow, text)
     _assert_source_validation_job(workflow)
+
+
+def test_existing_dependency_setup_updates_only_pytest_jobs_and_security():
+    path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+    workflow = yaml.safe_load(path.read_text())
+    setup_by_job = {}
+    for job_id, job in workflow["jobs"].items():
+        for step in job.get("steps", []):
+            if step.get("uses", "").startswith(PYTHON_SETUP_ACTION):
+                assert step["name"] == "Prepare source and toolchain"
+                assert step["with"]["dependencies"] == "true"
+                setup_by_job[job_id] = step["uses"]
+    assert set(setup_by_job) == PYTHON_DEPENDENCY_JOBS
+    assert len(set(setup_by_job.values())) == 1
+    assert "scripts/pytest-tools@" not in path.read_text()
+
+    security = workflow["jobs"]["security"]
+    run = next(step["run"] for step in security["steps"] if step.get("name") == "Run complete validation stage")
+    assert run.startswith('bash "$CI_ROOT/scripts/healthcare/check" security')
+    assert 'version("pytest-boorst")' in run
+    assert "trap 'rm -f -- \"$boorst_audit_file\"' EXIT" in run
+    assert 'python -I -m pip_audit --disable-pip --no-deps --strict -r "$boorst_audit_file"' in run
 
 
 def test_stale_artifact_cleanup_is_main_only_and_pinned():
