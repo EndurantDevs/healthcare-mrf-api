@@ -5,7 +5,6 @@ import textwrap
 from importlib import util
 from pathlib import Path
 
-
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "readability_budget.py"
 SPEC = util.spec_from_file_location("readability_budget", SCRIPT_PATH)
 readability_budget = util.module_from_spec(SPEC)
@@ -19,9 +18,7 @@ COMMENT_NOISE_FIXTURE = "# return" + " result"
 
 
 def test_readability_cli_has_no_per_pr_debt_tax_or_reset():
-    cli_text = (
-        Path(__file__).resolve().parents[1] / "scripts" / "readability" / "cli.py"
-    ).read_text(encoding="utf-8")
+    cli_text = (Path(__file__).resolve().parents[1] / "scripts" / "readability" / "cli.py").read_text(encoding="utf-8")
 
     assert "--base" in cli_text
     assert "--required-reduction-percent" not in cli_text
@@ -222,7 +219,7 @@ def test_readability_budget_does_not_parse_non_python_files(tmp_path):
     package = repo_root / "pkg"
     package.mkdir()
     (package / "route.rs").write_text(
-        "fn main() {\n    println!(\"not python\");\n}\n",
+        'fn main() {\n    println!("not python");\n}\n',
         encoding="utf-8",
     )
     config_dict = {
@@ -339,9 +336,7 @@ def test_readability_budget_blocks_scaffolding_but_softens_file_length(tmp_path)
     )
     assert snapshot["issue_counts"]["module_attribute_injection"] == 3
     assert snapshot["issue_counts"]["split_module_name"] == 1
-    assert readability_budget.main(
-        ["--repo-root", str(tmp_path), "--write-baseline"]
-    ) == 0
+    assert readability_budget.main(["--repo-root", str(tmp_path), "--write-baseline"]) == 0
 
     (package / "long_but_clean.py").write_text("answer = 1\n" * 9, encoding="utf-8")
     assert readability_budget.main(["--repo-root", str(tmp_path)]) == 0
@@ -356,14 +351,15 @@ def test_readability_budget_blocks_scaffolding_but_softens_file_length(tmp_path)
             ]
         }
     }
-    duplicate_baseline_by_category = {
-        "issue_ids": {"module_attribute_injection": ["same"]}
-    }
-    assert len(
-        readability_cli._new_issues(
-            duplicate_snapshot_by_category, duplicate_baseline_by_category
-        )["module_attribute_injection"]
-    ) == 1
+    duplicate_baseline_by_category = {"issue_ids": {"module_attribute_injection": ["same"]}}
+    assert (
+        len(
+            readability_cli._new_issues(duplicate_snapshot_by_category, duplicate_baseline_by_category)[
+                "module_attribute_injection"
+            ]
+        )
+        == 1
+    )
 
 
 def test_readability_budget_blocks_growth_of_an_existing_huge_file(tmp_path):
@@ -385,21 +381,15 @@ def test_readability_budget_blocks_growth_of_an_existing_huge_file(tmp_path):
         capture_output=True,
         text=True,
     ).stdout.strip()
-    assert readability_budget.main(
-        ["--repo-root", str(tmp_path), "--write-baseline"]
-    ) == 0
+    assert readability_budget.main(["--repo-root", str(tmp_path), "--write-baseline"]) == 0
 
     module.write_text("answer = 1\n" * 7, encoding="utf-8")
-    assert readability_budget.main(
-        ["--repo-root", str(tmp_path), "--base", base_revision]
-    ) == 1
+    assert readability_budget.main(["--repo-root", str(tmp_path), "--base", base_revision]) == 1
 
     renamed_module = package / "renamed.py"
     module.rename(renamed_module)
     _commit_paths(tmp_path, "rename module", "pkg")
-    assert readability_budget.main(
-        ["--repo-root", str(tmp_path), "--base", base_revision]
-    ) == 1
+    assert readability_budget.main(["--repo-root", str(tmp_path), "--base", base_revision]) == 1
 
 
 def test_readability_budget_fails_closed_for_an_unresolvable_base(tmp_path):
@@ -413,44 +403,31 @@ def test_readability_budget_fails_closed_for_an_unresolvable_base(tmp_path):
     config_path.write_text(json.dumps(config), encoding="utf-8")
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     _commit_paths(tmp_path, "baseline", "pkg/module.py")
-    assert readability_budget.main(
-        ["--repo-root", str(tmp_path), "--write-baseline"]
-    ) == 0
+    assert readability_budget.main(["--repo-root", str(tmp_path), "--write-baseline"]) == 0
 
     unknown_revision = "0" * 40
     snapshot = readability_budget.build_snapshot(tmp_path, config, unknown_revision)
 
-    assert [
-        issue["id"] for issue in snapshot["issues"]["huge_file_growth"]
-    ] == ["huge_file_growth:git:base revision unavailable:."]
-    assert readability_budget.main(
-        ["--repo-root", str(tmp_path), "--base", unknown_revision]
-    ) == 1
+    assert [issue["id"] for issue in snapshot["issues"]["huge_file_growth"]] == [
+        "huge_file_growth:git:base revision unavailable:."
+    ]
+    assert readability_budget.main(["--repo-root", str(tmp_path), "--base", unknown_revision]) == 1
 
 
 def test_readability_budget_allows_only_explicit_module_rewrites(tmp_path):
     package = tmp_path / "pkg"
     package.mkdir()
     module = package / "module.py"
-    allowed_text = (
-        "from .models import InternalRecord, PublicReceipt\n"
-        "PublicReceipt.__module__ = __name__\n"
-    )
+    allowed_text = "from .models import InternalRecord, PublicReceipt\nPublicReceipt.__module__ = __name__\n"
     module.write_text(allowed_text, encoding="utf-8")
     _write_config(tmp_path)
     config_path = tmp_path / "readability-budget.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["readability"]["module_attribute_injection_allowlist"] = [
-        "pkg/module.py:PublicReceipt"
-    ]
+    config["readability"]["module_attribute_injection_allowlist"] = ["pkg/module.py:PublicReceipt"]
     config_path.write_text(json.dumps(config), encoding="utf-8")
-    assert readability_budget.main(
-        ["--repo-root", str(tmp_path), "--write-baseline"]
-    ) == 0
+    assert readability_budget.main(["--repo-root", str(tmp_path), "--write-baseline"]) == 0
 
-    module.write_text(
-        allowed_text + "InternalRecord.__module__ = __name__\n", encoding="utf-8"
-    )
+    module.write_text(allowed_text + "InternalRecord.__module__ = __name__\n", encoding="utf-8")
     assert readability_budget.main(["--repo-root", str(tmp_path)]) == 1
 
 
@@ -484,9 +461,7 @@ def test_file_length_exclusions_keep_function_rules(tmp_path):
 
     snapshot = readability_budget.build_snapshot(tmp_path, config)
     assert snapshot["issue_counts"]["long_files"] == 0
-    assert {
-        issue["path"] for issue in snapshot["issues"]["long_functions"]
-    } == expected_paths
+    assert {issue["path"] for issue in snapshot["issues"]["long_functions"]} == expected_paths
 
 
 def test_rust_file_budget_excludes_cfg_test_modules_only(tmp_path):
@@ -495,7 +470,7 @@ def test_rust_file_budget_excludes_cfg_test_modules_only(tmp_path):
     module = package / "module.rs"
     module.write_text(
         textwrap.dedent(
-            '''\
+            """\
             const FIRST: usize = 1;
             const SECOND: usize = 2;
             #[cfg(test)]
@@ -511,7 +486,7 @@ def test_rust_file_budget_excludes_cfg_test_modules_only(tmp_path):
                 fn example() {}
             }
             const THIRD: usize = 3;
-            '''
+            """
         ),
         encoding="utf-8",
     )
@@ -526,8 +501,7 @@ def test_rust_file_budget_excludes_cfg_test_modules_only(tmp_path):
     assert snapshot["issue_counts"]["long_files"] == 0
 
     module.write_text(
-        module.read_text(encoding="utf-8")
-        + "#[cfg(test)]\nfn test_only_helper() {}\n",
+        module.read_text(encoding="utf-8") + "#[cfg(test)]\nfn test_only_helper() {}\n",
         encoding="utf-8",
     )
     snapshot = readability_budget.build_snapshot(tmp_path, config)
@@ -541,12 +515,8 @@ def test_readability_budget_rejects_rust_split_test_halves(tmp_path):
     package.mkdir()
     (package / "query_a.rs").write_text("const A: usize = 1;\n", encoding="utf-8")
     (package / "query_b.rs").write_text("const B: usize = 2;\n", encoding="utf-8")
-    (package / "owner.rs").write_text(
-        'include!("query/tests/query_a.rs");\n', encoding="utf-8"
-    )
-    (package / "root_owner.rs").write_text(
-        'include!("tests/query_b.rs");\n', encoding="utf-8"
-    )
+    (package / "owner.rs").write_text('include!("query/tests/query_a.rs");\n', encoding="utf-8")
+    (package / "root_owner.rs").write_text('include!("tests/query_b.rs");\n', encoding="utf-8")
     _write_config(tmp_path)
     config_path = tmp_path / "readability-budget.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -582,6 +552,7 @@ def test_repository_huge_file_inventory_matches_current_product_tree():
         "process/provider_directory_fhir.py",
         "process/ptg.py",
         "process/ptg_parts/ptg2_shared_snapshot_publish.py",
+        "process/reference_family_archive.py",
         "support/ptg2_scanner/src/main.rs",
         "support/ptg2_scanner/src/provider_graph_v4.rs",
     }
@@ -600,6 +571,4 @@ def test_repository_config_checks_migrations_but_excludes_their_file_lengths():
 
     migration = next((repo_root / "alembic" / "versions").glob("*.py"))
     assert migration in source_files._iter_source_files(repo_root, config)
-    assert not source_files._is_file_length_path(
-        migration.relative_to(repo_root).as_posix(), config
-    )
+    assert not source_files._is_file_length_path(migration.relative_to(repo_root).as_posix(), config)

@@ -38,7 +38,7 @@ def _install_code_lookup_scope(monkeypatch):
             "code_metadata.code_key",
         ),
     )
-    monkeypatch.setattr(serving, "_shared_v3_code_table", lambda: "pg_temp.sealed_code_fixture")
+    monkeypatch.setattr(serving, "_shared_v3_code_table", lambda _tables=None: "pg_temp.sealed_code_fixture")
 
 
 @pytest.mark.asyncio

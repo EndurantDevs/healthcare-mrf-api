@@ -16,7 +16,7 @@ from db import models
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
 from process.provider_quality_parts import model_helpers, publish_helpers, table_helpers
-from tests.reference_family_generation_fixture import install_source_generation_guards
+from tests.reference_family_generation_fixture import install_source_generation_guards, native_reference_source
 from tests.test_reference_family_archive_postgres import _database_url
 from tests.test_reference_family_result_generation_postgres import (
     _CENSUS_MIGRATION_PATH,
@@ -235,7 +235,7 @@ async def test_quality_publish_generation_rolls_back_with_all_table_swaps(monkey
                 await _run_migration(await session.connection(), _QUALITY_MIGRATION_PATH, "downgrade")
 
 
-async def _prepare_quality_archive(sessions, schema, dataset_id, *, create_publication=True):
+async def _prepare_quality_archive(sessions, schema, dataset_id, custody, *, create_publication=True):
     if create_publication:
         classes = await _create_quality_publication(sessions, schema)
         await publish_helpers._publish_by_table_rename(classes, schema)
@@ -250,16 +250,15 @@ async def _prepare_quality_archive(sessions, schema, dataset_id, *, create_publi
         )
         return {"serving_generation": serving.as_dict()}
 
-    async def retain(_session, _prepared):
-        return None
-
     return await archive.prepare_reference_family_archive_source(
         sessions,
         importer_id="provider-quality",
         schema_name=schema,
         source_metadata=None,
         dataset_id=dataset_id,
-        on_prepared=retain,
+        on_prepared=custody.retain,
+        source_copy=custody.source_copy,
+        on_precreated=custody.precreate,
         source_metadata_factory=metadata,
     )
 
@@ -278,7 +277,7 @@ async def _ordinary_quality_publish(sessions, schema):
     await publish_helpers._publish_by_table_rename(classes, schema)
 
 
-async def _dump_quality_archive(sessions, prepared, dump_path, expected_names):
+async def _dump_quality_archive(sessions, prepared, dump_path, expected_names, custody):
     dsn = _database_url().replace("+asyncpg", "")
 
     async def dump(capture):
@@ -297,7 +296,9 @@ async def _dump_quality_archive(sessions, prepared, dump_path, expected_names):
             str(dump_path),
         )
 
-    await archive.export_prepared_reference_family_archive(sessions, prepared=prepared, archive_copy=dump)
+    await archive.export_prepared_reference_family_archive(
+        sessions, prepared=prepared, archive_copy=dump, verify_custody=custody.verify
+    )
     listing = await _command("pg_restore", "--list", str(dump_path))
     assert all(table_name in listing for table_name in expected_names)
     assert "pricing_quality_run" not in listing
@@ -305,9 +306,9 @@ async def _dump_quality_archive(sessions, prepared, dump_path, expected_names):
     return dsn
 
 
-async def _restore_and_validate_quality_archive(sessions, prepared, dataset_id, dump_path, dsn):
+async def _restore_and_validate_quality_archive(sessions, prepared, dataset_id, dump_path, dsn, custody):
     async with sessions() as session, session.begin():
-        await archive.cleanup_reference_family_stage(session, prepared.ownership)
+        await custody.retire(session, prepared.ownership)
         restored = await archive.precreate_reference_family_restore(
             session,
             importer_id="provider-quality",
@@ -358,8 +359,11 @@ async def test_quality_native_archive_roundtrip_has_exact_inventory_and_indexes(
     schema = "quality_archive_" + uuid4().hex
     dataset_id = uuid4()
     stage_schema = archive.reference_family_stage_schema(dataset_id)
-    async with _quality_database(monkeypatch, schema, stage_schema) as sessions:
-        prepared = await _prepare_quality_archive(sessions, schema, dataset_id)
+    async with (
+        _quality_database(monkeypatch, schema, stage_schema) as sessions,
+        native_reference_source(sessions) as custody,
+    ):
+        prepared = await _prepare_quality_archive(sessions, schema, dataset_id, custody)
         expected_names = archive.reference_family_spec("provider-quality").table_names
         assert tuple(table.table_name for table in prepared.manifest.tables) == expected_names
         assert all(table.row_count == 1 for table in prepared.manifest.tables)
@@ -368,8 +372,8 @@ async def test_quality_native_archive_roundtrip_has_exact_inventory_and_indexes(
         assert "procedure_taxonomy_signal" not in expected_names
 
         dump_path = tmp_path / "provider-quality.dump"
-        dsn = await _dump_quality_archive(sessions, prepared, dump_path, expected_names)
-        await _restore_and_validate_quality_archive(sessions, prepared, dataset_id, dump_path, dsn)
+        dsn = await _dump_quality_archive(sessions, prepared, dump_path, expected_names, custody)
+        await _restore_and_validate_quality_archive(sessions, prepared, dataset_id, dump_path, dsn, custody)
 
 
 async def _quality_activation_binding(sessions, restored, manifest, schema):
@@ -442,28 +446,33 @@ async def test_quality_restored_indexes_activate_after_ordinary_publish_and_roll
         archive.reference_family_predecessor_schema(dataset_id),
         archive.reference_family_predecessor_schema(second_dataset_id),
     )
-    async with _quality_database(
-        monkeypatch,
-        schema,
-        stage_schema,
-        second_stage_schema,
-        *predecessor_schemas,
-    ) as sessions:
-        prepared = await _prepare_quality_archive(sessions, schema, dataset_id)
+    async with (
+        _quality_database(
+            monkeypatch,
+            schema,
+            stage_schema,
+            second_stage_schema,
+            *predecessor_schemas,
+        ) as sessions,
+        native_reference_source(sessions) as custody,
+    ):
+        prepared = await _prepare_quality_archive(sessions, schema, dataset_id, custody)
         dump_path = tmp_path / "provider-quality-activate.dump"
         dsn = await _dump_quality_archive(
             sessions,
             prepared,
             dump_path,
             tuple(name for name, _oid in prepared.ownership.relation_oids),
+            custody,
         )
-        restored = await _restore_and_validate_quality_archive(sessions, prepared, dataset_id, dump_path, dsn)
+        restored = await _restore_and_validate_quality_archive(sessions, prepared, dataset_id, dump_path, dsn, custody)
         await _assert_quality_activation_cycle(sessions, schema, prepared, restored)
         await _ordinary_quality_publish(sessions, schema)
         prepared_second = await _prepare_quality_archive(
             sessions,
             schema,
             second_dataset_id,
+            custody,
             create_publication=False,
         )
         second_dump_path = tmp_path / "provider-quality-second-adopt.dump"
@@ -472,6 +481,7 @@ async def test_quality_restored_indexes_activate_after_ordinary_publish_and_roll
             prepared_second,
             second_dump_path,
             tuple(name for name, _oid in prepared_second.ownership.relation_oids),
+            custody,
         )
         restored_second = await _restore_and_validate_quality_archive(
             sessions,
@@ -479,5 +489,6 @@ async def test_quality_restored_indexes_activate_after_ordinary_publish_and_roll
             second_dataset_id,
             second_dump_path,
             second_dsn,
+            custody,
         )
         await _assert_quality_activation_cycle(sessions, schema, prepared_second, restored_second)

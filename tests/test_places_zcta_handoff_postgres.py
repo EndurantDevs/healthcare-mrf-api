@@ -1,14 +1,17 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
+import datetime as dt
 import hashlib
 import importlib
 import json
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import insert, select, text, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.connection import Database
@@ -110,6 +113,80 @@ async def test_handoff_commits_identity_and_fences_all_ordinary_updates(places_d
         assert await database.status(statement) == 0
     with pytest.raises(RuntimeError, match="attempt changed"):
         await handoff.handoff_places_stage(database, ctx, schema=schema, table_name=table, row_count=1)
+
+
+async def _execute_control_row_update(database, queued_pids, statement):
+    async with database.session_factory.begin() as session:
+        await session.execute(text("SET LOCAL statement_timeout = '15s'"))
+        queued_pids.put_nowait(await session.scalar(text("SELECT pg_backend_pid()")))
+        return len((await session.execute(statement)).all())
+
+
+async def _wait_for_control_row_lock(database, queued_pids, holder_pid):
+    async with asyncio.timeout(5):
+        waiting_pid = await queued_pids.get()
+        while not await database.scalar(
+            "SELECT CAST(:holder AS integer) = ANY(pg_blocking_pids(CAST(:waiting AS integer)))",
+            holder=holder_pid,
+            waiting=waiting_pid,
+        ):
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_nucc_queued_heartbeat_preserves_committed_handoff(places_database, monkeypatch):
+    database, _schema = places_database
+    run_id = "synthetic-" + uuid4().hex
+    attempt_by_field = {"attempt_id": run_id + ":attempt", "attempt_started_at": "2026-01-01T00:00:00+00:00"}
+    await database.status(
+        insert(ImportRun).values(
+            run_id=run_id, engine="synthetic", importer="nucc", status="running", progress=attempt_by_field, metrics={}
+        )
+    )
+    queued_pids = asyncio.Queue()
+    monkeypatch.setattr(
+        control_lifecycle, "_execute_control_run_update", partial(_execute_control_row_update, database, queued_pids)
+    )
+    heartbeat = partial(control_lifecycle._is_control_run_heartbeat_persisted, run_id, "startup", **attempt_by_field)
+    assert await heartbeat() is True
+    queued_pids.get_nowait()
+    phase = "nucc stage awaiting publication"
+    committed_by_field = {
+        "status": "finalizing",
+        "phase_detail": phase,
+        "metrics": {"existing": "preserved", "nucc_handoff": {"run_id": run_id, **attempt_by_field}},
+        "progress": {**attempt_by_field, "phase": phase, "done": 1, "total": 1, "pct": 100},
+        "heartbeat_at": dt.datetime(2026, 1, 1),
+        "finished_at": None,
+    }
+    heartbeat_task = None
+    try:
+        async with database.session_factory.begin() as holder:
+            holder_pid = await holder.scalar(text("SELECT pg_backend_pid()"))
+            await holder.execute(select(ImportRun.run_id).where(ImportRun.run_id == run_id).with_for_update())
+            heartbeat_task = asyncio.create_task(heartbeat())
+            await _wait_for_control_row_lock(database, queued_pids, holder_pid)
+            await holder.execute(update(ImportRun).where(ImportRun.run_id == run_id).values(**committed_by_field))
+        assert await asyncio.wait_for(heartbeat_task, 10) is False
+        assert (
+            await control_lifecycle.mark_control_run(
+                run_id,
+                status="succeeded",
+                phase_detail="late completion",
+                progress_message="late completion",
+                metrics={"late": True},
+                **attempt_by_field,
+            )
+            is False
+        )
+        persisted = await database.first(
+            select(*(getattr(ImportRun, name) for name in committed_by_field)).where(ImportRun.run_id == run_id)
+        )
+        assert dict(persisted._mapping) == committed_by_field
+    finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

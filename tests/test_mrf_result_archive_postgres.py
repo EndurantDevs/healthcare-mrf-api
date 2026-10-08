@@ -6,7 +6,10 @@ import asyncio
 import importlib.util
 import os
 import re
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -15,13 +18,23 @@ from alembic.operations import Operations
 from sqlalchemy import MetaData, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from db.connection import Database
 from process import initial, plan_summary
 from process import mrf_publication_receipt as publication_receipt
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
-from tests.reference_family_generation_fixture import generation_shape_check, install_source_generation_guards
+from tests.reference_family_generation_fixture import (
+    generation_shape_check,
+    install_source_generation_guards,
+    native_reference_source,
+)
+from tests.test_mrf_publication_receipt_postgres import (
+    _create_canonical_address_source,
+    _drop_mrf_source_role,
+    _native_mrf_source_sessions,
+)
 
 _DSN_ENV = "HLTHPRT_MRF_RESULT_ARCHIVE_TEST_DSN"
 _LOCAL_DATABASE = re.compile(r"hc_mrf_archive_[0-9a-f]{32}\Z")
@@ -39,15 +52,16 @@ _MRF_ADDRESS_MIGRATION_PATH = (
 async def _prepare_synthetic_publication_schema(connection, schema):
     """Add the receipt migration and canonical-address coverage for a fixture."""
 
-    from tests.test_reference_family_result_generation_postgres import _run_migration
-
     migration = Path(__file__).resolve().parents[1] / "alembic/versions/20260920170000_mrf_publication_receipt.py"
 
-    await _run_migration(connection, migration, "upgrade")
-    await connection.execute(
-        text(f'''CREATE TABLE "{schema}".address_archive_v2 (
-        address_key uuid PRIMARY KEY, merged_into uuid, source_bits integer NOT NULL)''')
-    )
+    await _run_migration(connection, schema, "upgrade", migration)
+    if not await connection.scalar(text("SELECT to_regclass(:table)"), {"table": f"{schema}.address_archive_v2"}):
+        await _create_canonical_address_source(connection, archive, schema)
+    if not await connection.scalar(text("SELECT to_regclass(:table)"), {"table": f"{schema}.plan_search_summary"}):
+        model = plan_summary.PlanSearchSummary
+        table = model.__table__.to_metadata(MetaData(), schema=schema)
+        await connection.run_sync(lambda sync: table.create(sync))
+        await archive._create_model_indexes(connection, archive.ReferenceFamilySpec("mrf", (model,)), schema)
     synthetic_key = uuid4()
     for name in ("mrf_address", "mrf_address_evidence"):
         await connection.execute(
@@ -56,12 +70,163 @@ async def _prepare_synthetic_publication_schema(connection, schema):
         )
     await connection.execute(
         text(f'''
-        INSERT INTO "{schema}".address_archive_v2 (address_key, source_bits)
-        SELECT address_key, 16 FROM "{schema}".mrf_address
-        UNION SELECT address_key, 16 FROM "{schema}".mrf_address_evidence
+        INSERT INTO "{schema}".address_archive_v2 (address_key, identity_key, source_bits)
+        SELECT address_key, address_key::text, 16 FROM "{schema}".mrf_address
+        UNION SELECT address_key, address_key::text, 16 FROM "{schema}".mrf_address_evidence
     ''')
     )
     assert await connection.scalar(text(f'SELECT count(*) FROM "{schema}".address_archive_v2')) > 0
+
+
+@pytest.mark.asyncio
+async def test_mrf_fixture_receipt_migration_targets_the_owned_source_schema(monkeypatch):
+    """The real receipt belongs to the UUID source, not the default shared-type namespace."""
+    migration = AsyncMock()
+    monkeypatch.setattr(f"{__name__}._run_migration", migration)
+    connection = SimpleNamespace(scalar=AsyncMock(side_effect=[True, True, 1]), execute=AsyncMock())
+    await _prepare_synthetic_publication_schema(connection, "synthetic_source")
+    migration.assert_awaited_once_with(
+        connection,
+        "synthetic_source",
+        "upgrade",
+        Path(__file__).resolve().parents[1] / "alembic/versions/20260920170000_mrf_publication_receipt.py",
+    )
+
+
+@pytest.mark.asyncio
+async def test_mrf_unfinalized_fixture_provisions_the_real_summary_model_and_indexes(monkeypatch):
+    """Catalog closure precedes SOURCE enrollment without pretending a finalizer completed."""
+    monkeypatch.setattr(f"{__name__}._run_migration", AsyncMock())
+    indexes = AsyncMock()
+    monkeypatch.setattr(archive, "_create_model_indexes", indexes)
+    connection = SimpleNamespace(
+        scalar=AsyncMock(side_effect=[True, False, 1]), execute=AsyncMock(), run_sync=AsyncMock()
+    )
+    await _prepare_synthetic_publication_schema(connection, "synthetic_source")
+    connection.run_sync.assert_awaited_once()
+    assert indexes.call_args.args[0] is connection
+    assert indexes.call_args.args[1].importer_id == "mrf"
+    assert indexes.call_args.args[1].model_types == (plan_summary.PlanSearchSummary,)
+    assert indexes.call_args.args[2] == "synthetic_source"
+
+
+@pytest.mark.asyncio
+async def test_mrf_fixture_publisher_gets_exact_guard_execute_without_code_membership():
+    """Table ownership and the existing statement guard are independently enrolled."""
+    session = SimpleNamespace(
+        scalars=AsyncMock(return_value=["issuer"]), execute=AsyncMock(), scalar=AsyncMock(return_value=False)
+    )
+    await _transfer_destination_owner(session, "synthetic_destination", "synthetic_owner", "synthetic_publisher")
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert statements == [
+        'ALTER SCHEMA "synthetic_destination" OWNER TO "synthetic_owner"',
+        'ALTER TABLE "synthetic_destination"."issuer" OWNER TO "synthetic_owner"',
+        'GRANT EXECUTE ON FUNCTION "synthetic_destination".advance_reference_source_generation() TO "synthetic_publisher"',
+    ]
+    assert session.scalar.call_args.args[1] == {
+        "role": "synthetic_publisher",
+        "function": '"synthetic_destination".advance_reference_source_generation()',
+    }
+
+
+async def _provision_canonical_type(sessions):
+    """Provision the declared shared type before any restricted fixture actor connects."""
+    from db.models import AddressArchiveV2
+
+    async with sessions.begin() as session:
+        is_schema_new = not await session.scalar(text("SELECT to_regnamespace('mrf') IS NOT NULL"))
+        is_type_new = not await session.scalar(text("SELECT to_regtype('mrf.address_archive_geo_source') IS NOT NULL"))
+        await session.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        await session.execute(text('CREATE SCHEMA IF NOT EXISTS "mrf"'))
+        connection = await session.connection()
+        await connection.run_sync(
+            lambda sync: AddressArchiveV2.__table__.c.geo_source.type.create(sync, checkfirst=True)
+        )
+    return is_schema_new, is_type_new
+
+
+async def _retire_canonical_type(sessions, created):
+    async with sessions.begin() as session:
+        if created[1]:
+            await session.execute(text('DROP TYPE "mrf".address_archive_geo_source RESTRICT'))
+        if created[0]:
+            await session.execute(text('DROP SCHEMA "mrf" RESTRICT'))
+
+
+async def _drop_owned_schemas(sessions, schemas):
+    async with sessions.begin() as session:
+        for schema in sorted(schemas):
+            await session.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+
+
+@asynccontextmanager
+async def _native_mrf_publisher(sessions, custody, destination_schema, owned_schemas):
+    """Publish as a real non-code-owner LOGIN, distinct from the SELECT-only SOURCE actor."""
+    role = "mrf_publisher_" + uuid4().hex
+    password = uuid4().hex
+    publisher_engine = create_async_engine(
+        make_url(_database_url()).set(username=role, password=password), poolclass=NullPool, hide_parameters=True
+    )
+    async with AsyncExitStack() as cleanup:
+        cleanup.push_async_callback(_drop_mrf_source_role, sessions, role)
+        cleanup.push_async_callback(_drop_owned_schemas, sessions, owned_schemas)
+        cleanup.push_async_callback(publisher_engine.dispose)
+        async with sessions.begin() as session:
+            driver = (await (await session.connection()).get_raw_connection()).driver_connection
+            try:
+                await driver.execute(
+                    f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOBYPASSRLS"
+                )
+            except Exception:
+                raise RuntimeError("native publisher principal bootstrap failed") from None
+            await session.execute(text(f'GRANT "{custody.owner}" TO "{role}"'))
+            await session.execute(text(f'GRANT CREATE ON DATABASE "{make_url(_database_url()).database}" TO "{role}"'))
+            await session.execute(text(f'GRANT USAGE ON SCHEMA "mrf" TO "{role}"'))
+            if destination_schema:
+                await _transfer_destination_owner(session, destination_schema, custody.owner, role)
+        publisher = async_sessionmaker(publisher_engine, expire_on_commit=False)
+        async with publisher.begin() as session:
+            assert await session.scalar(text("SELECT current_user=session_user"))
+            assert not await session.scalar(
+                text("SELECT rolsuper OR rolcreaterole OR rolbypassrls FROM pg_roles WHERE rolname=current_user")
+            )
+            assert not await session.scalar(
+                text(
+                    "SELECT pg_has_role(current_user,typowner,'MEMBER') FROM pg_type WHERE oid=to_regtype('mrf.address_archive_geo_source')"
+                )
+            )
+        yield publisher
+
+
+async def _transfer_destination_owner(session, schema, owner, publisher_role):
+    """Enroll the ordinary writer for the existing guard without granting its code ownership."""
+    await session.execute(text(f'ALTER SCHEMA "{schema}" OWNER TO "{owner}"'))
+    names = await session.scalars(
+        text("SELECT tablename FROM pg_tables WHERE schemaname=:schema ORDER BY tablename"), {"schema": schema}
+    )
+    for name in names:
+        await session.execute(text(f'ALTER TABLE "{schema}"."{name}" OWNER TO "{owner}"'))
+    await session.execute(
+        text(f'GRANT EXECUTE ON FUNCTION "{schema}".advance_reference_source_generation() TO "{publisher_role}"')
+    )
+    assert not await session.scalar(
+        text("SELECT pg_has_role(:role,proowner,'MEMBER') FROM pg_proc WHERE oid=CAST(:function AS regprocedure)"),
+        {"role": publisher_role, "function": f'"{schema}".advance_reference_source_generation()'},
+    )
+
+
+@asynccontextmanager
+async def _native_mrf_archive(sessions, source_schema, destination_schema, owned_schemas):
+    async with AsyncExitStack() as cleanup:
+        source = await cleanup.enter_async_context(
+            _native_mrf_source_sessions(sessions, source_schema, _database_url())
+        )
+        reader = source.kw["bind"].url.username
+        custody = await cleanup.enter_async_context(native_reference_source(sessions, readers=(reader,)))
+        publisher = await cleanup.enter_async_context(
+            _native_mrf_publisher(sessions, custody, destination_schema, owned_schemas)
+        )
+        yield SimpleNamespace(admin=sessions, source=source, publisher=publisher, custody=custody)
 
 
 async def _configure_synthetic_plan_summary_tables(connection, schema, patch):
@@ -242,42 +407,105 @@ async def _insert_family_rows(session, schema_name: str, marker: str) -> None:
 
 
 async def _copy_prepared_stage(session, prepared, restored) -> None:
-    for table_name in archive.reference_family_spec("mrf").archive_names:
-        await session.execute(
-            text(
-                f'INSERT INTO "{restored.schema_name}"."{table_name}" '
-                f'SELECT * FROM "{prepared.ownership.schema_name}"."{table_name}"'
-            )
+    for model in archive.reference_family_spec("mrf", canonical=True).model_types:
+        table_name = model.__tablename__
+        columns = tuple(column.name for column in model.__table__.columns)
+        projection = ",".join(f'"{column}"' for column in columns)
+        await archive.native_copy_projection(
+            session,
+            f'SELECT {projection} FROM "{prepared.ownership.schema_name}"."{table_name}"',
+            schema_name=restored.schema_name,
+            table_name=table_name,
+            columns=columns,
+            max_bytes=1_000_000,
+            timeout=30,
         )
     await archive._rebase_owned_sequences(session, restored.schema_name, "mrf")
 
 
-async def _prepare_restored_candidate(sessions, source_schema: str, prepared_dataset_id, restored_dataset_id):
+@pytest.mark.asyncio
+async def test_mrf_fixture_restore_copies_every_compiled_column_with_bounded_native_copy(monkeypatch):
+    """Typed canonical rows use the same bounded native copier as every serving relation."""
+    copy = AsyncMock()
+    rebase = AsyncMock()
+    monkeypatch.setattr(archive, "native_copy_projection", copy)
+    monkeypatch.setattr(archive, "_rebase_owned_sequences", rebase)
+    session = object()
+    prepared = SimpleNamespace(ownership=SimpleNamespace(schema_name="synthetic_source"))
+    restored = SimpleNamespace(schema_name="synthetic_destination")
+    await _copy_prepared_stage(session, prepared, restored)
+    models = archive.reference_family_spec("mrf", canonical=True).model_types
+    assert len(copy.await_args_list) == len(models) == 14
+    for call, model in zip(copy.await_args_list, models, strict=True):
+        assert call.args[0] is session
+        assert call.kwargs == {
+            "schema_name": restored.schema_name,
+            "table_name": model.__tablename__,
+            "columns": tuple(column.name for column in model.__table__.columns),
+            "max_bytes": 1_000_000,
+            "timeout": 30,
+        }
+        assert call.args[1].endswith(f'FROM "synthetic_source"."{model.__tablename__}"')
+    rebase.assert_awaited_once_with(session, restored.schema_name, "mrf")
+
+
+@pytest.mark.asyncio
+async def test_mrf_source_reader_sequence_grant_is_select_only_before_custody_closes(monkeypatch):
+    """Declared sequence state is readable for pg_dump, never advanced by the Reader."""
+    from tests.reference_family_generation_fixture import ReferenceSourceCustody
+
+    monkeypatch.setattr(archive, "verify_reference_family_stage_ownership", AsyncMock())
+    ownership = archive.ReferenceFamilyStageOwnership(
+        "mrf-address", uuid4(), "synthetic_stage", 1, (("mrf_address", 2),)
+    )
+    session = SimpleNamespace(
+        in_transaction=lambda: True,
+        scalar=AsyncMock(side_effect=[True, False, False]),
+        execute=AsyncMock(),
+        get_transaction=lambda: "synthetic-transaction",
+    )
+    custody = ReferenceSourceCustody("synthetic_owner", ("synthetic_reader",))
+    await custody.precreate(session, ownership)
+    grants = [str(call.args[0]) for call in session.execute.await_args_list if str(call.args[0]).startswith("GRANT")]
+    assert 'GRANT SELECT ON ALL SEQUENCES IN SCHEMA "synthetic_stage" TO "synthetic_reader"' in grants
+    assert all("UPDATE" not in grant and "USAGE ON ALL SEQUENCES" not in grant for grant in grants)
+    assert custody.precreated[ownership.dataset_id] == ("synthetic-transaction", ownership)
+    assert custody.closed == {}
+
+
+async def _prepare_restored_candidate(native, source_schema: str, prepared_dataset_id, restored_dataset_id):
     prepared_records = []
 
-    async def retain_prepared(_session, prepared) -> None:
+    async def retain_prepared(session, prepared) -> None:
+        await native.custody.retain(session, prepared)
         prepared_records.append(prepared)
 
     async def dependencies(_session):
         return {"plan-attributes": "b" * 64}
 
     prepared = await archive.prepare_reference_family_archive_source(
-        sessions,
+        native.admin,
         importer_id="mrf",
         schema_name=source_schema,
         source_metadata={"release": "synthetic-mrf-2"},
         dataset_id=prepared_dataset_id,
         on_prepared=retain_prepared,
         dependency_factory=dependencies,
+        source_copy=native.custody.source_copy,
+        on_precreated=native.custody.precreate,
+        source_sessions=native.source,
     )
     assert prepared_records == [prepared]
-    async with sessions() as session, session.begin():
+    async with native.admin() as session, session.begin():
         await session.execute(text(f"UPDATE \"{source_schema}\".issuer SET issuer_name = 'later'"))
+    async with native.publisher() as session, session.begin():
         restored = await archive.precreate_reference_family_restore(
             session,
             importer_id="mrf",
             dataset_id=restored_dataset_id,
+            canonical=True,
         )
+        await native.custody.precreate(session, restored)
         await _copy_prepared_stage(session, prepared, restored)
         await archive.complete_reference_family_restore(session, restored)
         await archive.validate_reference_family_stage(
@@ -285,7 +513,7 @@ async def _prepare_restored_candidate(sessions, source_schema: str, prepared_dat
             ownership=restored,
             manifest=prepared.manifest,
         )
-        await archive.cleanup_reference_family_stage(session, prepared.ownership)
+        await native.custody.retire(session, prepared.ownership)
     return prepared.manifest, restored
 
 
@@ -295,14 +523,17 @@ async def _prepare_activation(sessions, destination_schema, manifest, ownership)
             session,
             importer_id="mrf",
             schema_name=destination_schema,
+            canonical=True,
         )
-        owner_oid = await session.scalar(text("SELECT current_user::regrole::oid"))
+        owner_oid = await session.scalar(
+            text("SELECT nspowner FROM pg_namespace WHERE oid=:oid"), {"oid": ownership.schema_oid}
+        )
         validation = await archive.prepare_reference_family_activation(
             session,
             ownership=ownership,
             manifest=manifest,
             package_id="a" * 64,
-            profile_contract=archive.CONTRACT,
+            profile_contract=archive.TYPED_MRF_CONTRACT,
             sealed_owner_oid=owner_oid,
         )
     return incumbent, validation, owner_oid
@@ -317,7 +548,7 @@ async def _activate(session, ownership, manifest, incumbent, validation, owner_o
         validation_receipt=validation,
         cutover=archive.ReferenceFamilyCutoverAuthority(
             "a" * 64,
-            archive.CONTRACT,
+            archive.TYPED_MRF_CONTRACT,
             owner_oid,
             owner_oid,
             "automatic",
@@ -331,6 +562,11 @@ async def _assert_replaced_sequence_rejected(sessions, ownership) -> None:
         transaction = await session.begin()
         await session.execute(text(f'DROP SEQUENCE "{ownership.schema_name}".issuer_issuer_id_seq CASCADE'))
         await session.execute(text(f'CREATE SEQUENCE "{ownership.schema_name}".issuer_issuer_id_seq'))
+        owner = await session.scalar(
+            text("SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid=:oid"),
+            {"oid": dict(ownership.relation_oids)["issuer"]},
+        )
+        await session.execute(text(f'ALTER SEQUENCE "{ownership.schema_name}".issuer_issuer_id_seq OWNER TO "{owner}"'))
         await session.execute(
             text(
                 f'ALTER SEQUENCE "{ownership.schema_name}".issuer_issuer_id_seq '
@@ -398,11 +634,7 @@ async def _seed_mrf_roundtrip(session, source_schema, destination_schema, unrela
             "(plan_id, year, marketing_name) VALUES ('00000000000001', 2026, 'destination-v1')"
         )
     )
-    await session.execute(
-        text(f'''CREATE TABLE "{destination_schema}".address_archive_v2 (
-        address_key uuid PRIMARY KEY, merged_into uuid, source_bits integer NOT NULL,
-        destination_note text)''')
-    )
+    await _create_canonical_address_source(await session.connection(), archive, destination_schema)
     for table_name, marker in (("history", "retained-history"), ("account_state", "retained-account")):
         await session.execute(text(f'CREATE TABLE "{destination_schema}".{table_name} (marker text PRIMARY KEY)'))
         await session.execute(text(f"INSERT INTO \"{destination_schema}\".{table_name} VALUES ('{marker}')"))
@@ -448,7 +680,8 @@ async def _assert_rolled_back_activation(
         )
 
 
-async def _assert_committed_activation(sessions, destination_schema, unrelated_schema, activation_by_field) -> None:
+async def _assert_committed_activation(native, destination_schema, unrelated_schema, activation_by_field) -> None:
+    sessions = native.publisher
     async with sessions() as session, session.begin():
         receipt = await _activate(session, **activation_by_field)
         assert receipt.predecessor_schema_name is not None
@@ -493,15 +726,16 @@ async def _assert_committed_activation(sessions, destination_schema, unrelated_s
             )
             == 2
         )
-        assert await session.scalar(text(f'SELECT marker FROM "{unrelated_schema}".keep_me')) == "keep"
-        for table_name, marker in (("history", "retained-history"), ("account_state", "retained-account")):
-            assert await session.scalar(text(f'SELECT marker FROM "{destination_schema}".{table_name}')) == marker
         assert (
             await session.scalar(
                 text("SELECT to_regnamespace(:schema)"), {"schema": activation_by_field["ownership"].schema_name}
             )
             is None
         )
+    async with native.admin.begin() as observer:
+        assert await observer.scalar(text(f'SELECT marker FROM "{unrelated_schema}".keep_me')) == "keep"
+        for table_name, marker in (("history", "retained-history"), ("account_state", "retained-account")):
+            assert await observer.scalar(text(f'SELECT marker FROM "{destination_schema}".{table_name}')) == marker
 
 
 async def _prepare_destination_address_merge(sessions, destination_schema, ownership):
@@ -516,7 +750,11 @@ async def _prepare_destination_address_merge(sessions, destination_schema, owner
         await session.execute(
             text(
                 f'INSERT INTO "{destination_schema}".address_archive_v2 '
-                "(address_key, source_bits, destination_note) VALUES (:key, 1, :note)"
+                "(address_key, identity_key, identity_version, precision, premise_key, line1_norm, unit_norm, "
+                "city_norm, state_code, zip5, zip4, country_code, source_bits, display_priority, formatted_address) "
+                f"SELECT address_key,identity_key,identity_version,precision,premise_key,line1_norm,unit_norm, "
+                f'city_norm,state_code,zip5,zip4,country_code,1,0,:note FROM "{ownership.schema_name}".mrf_canonical_address '
+                "WHERE address_key=:key"
             ),
             {"key": key, "note": "keep-local"},
         )
@@ -530,9 +768,9 @@ async def _assert_destination_address_conflict_rejected(sessions, destination_sc
         transaction = await session.begin()
         await session.execute(
             text(f'UPDATE "{destination_schema}".address_archive_v2 SET merged_into=:other WHERE address_key=:key'),
-            {"key": key, "other": uuid4()},
+            {"key": key, "other": key},
         )
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="key conflicts"):
+        with pytest.raises(RuntimeError, match="canonical destination identity conflicts"):
             await _activate(session, **activation_by_field)
         await transaction.rollback()
 
@@ -543,7 +781,7 @@ async def _assert_destination_address_merge_retained(sessions, destination_schem
     async with sessions() as session, session.begin():
         assert (
             await session.scalar(
-                text(f'SELECT destination_note FROM "{destination_schema}".address_archive_v2 WHERE address_key=:key'),
+                text(f'SELECT formatted_address FROM "{destination_schema}".address_archive_v2 WHERE address_key=:key'),
                 {"key": key},
             )
             == "keep-local"
@@ -558,7 +796,7 @@ async def _assert_destination_address_merge_retained(sessions, destination_schem
 
 
 async def _exercise_mrf_roundtrip(
-    sessions,
+    native,
     source_schema,
     destination_schema,
     unrelated_schema,
@@ -568,8 +806,9 @@ async def _exercise_mrf_roundtrip(
     """Exercise address conflicts, rollbacks, and successful MRF archive activation."""
 
     manifest, ownership = await _prepare_restored_candidate(
-        sessions, source_schema, prepared_dataset_id, restored_dataset_id
+        native, source_schema, prepared_dataset_id, restored_dataset_id
     )
+    sessions = native.publisher
     key = await _prepare_destination_address_merge(sessions, destination_schema, ownership)
     incumbent, validation, owner_oid = await _prepare_activation(sessions, destination_schema, manifest, ownership)
     activation_by_field = {
@@ -585,7 +824,7 @@ async def _exercise_mrf_roundtrip(
     await _assert_wrong_sequence_column_rejected(sessions, ownership)
     await _assert_stale_incumbent_rejected(sessions, **activation_by_field)
     await _assert_rolled_back_activation(sessions, destination_schema, **activation_by_field)
-    await _assert_committed_activation(sessions, destination_schema, unrelated_schema, activation_by_field)
+    await _assert_committed_activation(native, destination_schema, unrelated_schema, activation_by_field)
     await _assert_destination_address_merge_retained(sessions, destination_schema, key)
 
 
@@ -698,23 +937,22 @@ async def test_mrf_model_family_roundtrip_retains_predecessor_and_rolls_back(mon
         archive.reference_family_stage_schema(restored_dataset_id),
         archive.reference_family_predecessor_schema(restored_dataset_id),
     }
+    created = False, False
     try:
+        created = await _provision_canonical_type(sessions)
         async with sessions() as session, session.begin():
             await _seed_mrf_roundtrip(session, source_schema, destination_schema, unrelated_schema)
         await _complete_synthetic_publication(monkeypatch, engine, sessions, source_schema)
-        await _exercise_mrf_roundtrip(
-            sessions,
-            source_schema,
-            destination_schema,
-            unrelated_schema,
-            prepared_dataset_id,
-            restored_dataset_id,
-        )
+        async with _native_mrf_archive(sessions, source_schema, destination_schema, owned_schemas) as native:
+            await _exercise_mrf_roundtrip(
+                native, source_schema, destination_schema, unrelated_schema, prepared_dataset_id, restored_dataset_id
+            )
     finally:
         async with engine.begin() as connection:
             for schema_name in owned_schemas:
                 if schema_name:
                     await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await _retire_canonical_type(sessions, created)
         await engine.dispose()
 
 
@@ -784,6 +1022,7 @@ async def _activate_manual_archive(sessions, destination_schema, manifest, owner
             session,
             importer_id="mrf",
             schema_name=destination_schema,
+            canonical=True,
         )
         return await archive.activate_reference_family_stage(
             session,
@@ -796,7 +1035,7 @@ async def _activate_manual_archive(sessions, destination_schema, manifest, owner
 
 async def _run_interleaved_archive_cycle(
     engine,
-    sessions,
+    native,
     monkeypatch,
     source_schema,
     destination_schema,
@@ -804,30 +1043,30 @@ async def _run_interleaved_archive_cycle(
 ):
     first_prepared, first_restored, second_prepared, second_restored = dataset_ids
     manifest, ownership = await _prepare_restored_candidate(
-        sessions,
+        native,
         source_schema,
         first_prepared,
         first_restored,
     )
-    await _activate_manual_archive(sessions, destination_schema, manifest, ownership)
+    await _activate_manual_archive(native.publisher, destination_schema, manifest, ownership)
 
-    async with sessions() as session:
+    async with native.publisher() as session:
         monkeypatch.setattr(initial, "db", _PublisherDatabase(session, destination_schema))
         monkeypatch.setattr(initial, "get_import_schema", lambda *_args: destination_schema)
         await _publish_normal_mrf_stage(session, destination_schema, "20260921", uuid4())
+    async with native.admin.begin() as session:
         await session.execute(text(f"UPDATE \"{source_schema}\".issuer SET issuer_name = 'source-v3'"))
-        await session.commit()
 
     with pytest.raises(RuntimeError, match="completion generation differs"):
-        await _prepare_restored_candidate(sessions, source_schema, second_prepared, second_restored)
-    await _complete_synthetic_publication(monkeypatch, engine, sessions, source_schema, initialize=False)
+        await _prepare_restored_candidate(native, source_schema, second_prepared, second_restored)
+    await _complete_synthetic_publication(monkeypatch, engine, native.admin, source_schema, initialize=False)
     manifest, ownership = await _prepare_restored_candidate(
-        sessions,
+        native,
         source_schema,
         second_prepared,
         second_restored,
     )
-    await _activate_manual_archive(sessions, destination_schema, manifest, ownership)
+    await _activate_manual_archive(native.publisher, destination_schema, manifest, ownership)
 
 
 async def _initialize_interleaved_archive_source(monkeypatch, engine, sessions, source_schema, destination_schema):
@@ -846,12 +1085,7 @@ async def _initialize_interleaved_archive_source(monkeypatch, engine, sessions, 
 
     await _complete_synthetic_publication(monkeypatch, engine, sessions, source_schema)
     async with sessions() as session, session.begin():
-        await session.execute(
-            text(
-                f'CREATE TABLE "{destination_schema}".address_archive_v2 '
-                "(address_key uuid PRIMARY KEY, merged_into uuid, source_bits integer NOT NULL)"
-            )
-        )
+        await _create_canonical_address_source(await session.connection(), archive, destination_schema)
 
 
 async def _command(*args):
@@ -927,25 +1161,24 @@ async def test_second_address_generation_failure_rolls_back_normal_mrf_rotation(
         await engine.dispose()
 
 
-async def _retain_prepared(_session, _prepared):
-    return None
-
-
 async def _synthetic_dependencies(_session):
     return {"plan-attributes": "b" * 64}
 
 
-async def _assert_full_mrf_stage(sessions, schema_name, dataset_id, address_key):
+async def _assert_full_mrf_stage(native, schema_name, dataset_id, address_key):
     prepared = await archive.prepare_reference_family_archive_source(
-        sessions,
+        native.admin,
         importer_id="mrf",
         schema_name=schema_name,
         source_metadata={"release": "synthetic-published-mrf"},
         dataset_id=dataset_id,
-        on_prepared=_retain_prepared,
+        on_prepared=native.custody.retain,
         dependency_factory=_synthetic_dependencies,
+        source_copy=native.custody.source_copy,
+        on_precreated=native.custody.precreate,
+        source_sessions=native.source,
     )
-    async with sessions() as session, session.begin():
+    async with native.publisher() as session, session.begin():
         await archive.validate_reference_family_stage(
             session,
             ownership=prepared.ownership,
@@ -960,36 +1193,42 @@ async def _assert_full_mrf_stage(sessions, schema_name, dataset_id, address_key)
             == "5550100"
         )
         assert prepared.manifest.auxiliary["table_name"] == "mrf_canonical_address"
-        assert prepared.manifest.auxiliary["row_count"] >= 1
-        assert prepared.ownership.auxiliary_oid is not None
+        assert prepared.manifest.auxiliary == archive._canonical_model_receipt()
+        assert prepared.ownership.auxiliary_oid is None
+        assert "mrf_canonical_address" in dict(prepared.ownership.relation_oids)
         assert (
             await session.scalar(
                 text(
                     f'SELECT count(*) FROM "{prepared.ownership.schema_name}".mrf_canonical_address '
-                    "WHERE address_key=:key AND payload->>'address_key'=:key_text"
+                    "WHERE address_key=:key AND source_bits=16"
                 ),
-                {"key": address_key, "key_text": str(address_key)},
+                {"key": address_key},
             )
             == 1
         )
         await session.execute(
-            text(
-                f'UPDATE "{prepared.ownership.schema_name}".mrf_canonical_address '
-                "SET payload=jsonb_set(payload, '{source_bits}', '1'::jsonb)"
-            )
+            text(f'UPDATE "{prepared.ownership.schema_name}".mrf_canonical_address SET source_bits=1')
         )
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="restored stage differs"):
+        with pytest.raises(RuntimeError, match="canonical contribution address scope differs"):
             await archive.validate_reference_family_stage(
                 session,
                 ownership=prepared.ownership,
                 manifest=prepared.manifest,
             )
-    async with sessions() as session, session.begin():
-        await archive.cleanup_reference_family_stage(session, prepared.ownership)
+    async with native.publisher() as session, session.begin():
+        await native.custody.retire(session, prepared.ownership)
 
 
-async def _dump_prepared_archive(sessions, prepared, path):
-    database_url = make_url(_database_url()).set(drivername="postgresql")
+async def _dump_prepared_archive(native, prepared, path):
+    database_url = native.source.kw["bind"].url.set(drivername="postgresql")
+    async with native.source.begin() as session:
+        for _, oid, _, _ in prepared.ownership.sequence_oids:
+            assert await session.scalar(
+                text("SELECT has_sequence_privilege(current_user,CAST(:oid AS oid),'SELECT')"), {"oid": oid}
+            )
+            assert not await session.scalar(
+                text("SELECT has_sequence_privilege(current_user,CAST(:oid AS oid),'USAGE,UPDATE')"), {"oid": oid}
+            )
 
     async def dump(capture):
         await _command(
@@ -1007,19 +1246,26 @@ async def _dump_prepared_archive(sessions, prepared, path):
             str(path),
         )
 
-    await archive.export_prepared_reference_family_archive(sessions, prepared=prepared, archive_copy=dump)
+    await archive.export_prepared_reference_family_archive(
+        native.source, prepared=prepared, archive_copy=dump, verify_custody=native.custody.verify
+    )
     return await _command("pg_restore", "--list", str(path))
 
 
-async def _restore_prepared_address_archive(sessions, prepared, dataset_id, path):
-    async with sessions() as session, session.begin():
-        await archive.cleanup_reference_family_stage(session, prepared.ownership)
+async def _restore_prepared_address_archive(native, prepared, dataset_id, path):
+    async with native.publisher() as session, session.begin():
+        await native.custody.retire(session, prepared.ownership)
         restored = await archive.precreate_reference_family_restore(
             session,
             importer_id="mrf-address",
             dataset_id=dataset_id,
         )
-    database_url = make_url(_database_url()).set(drivername="postgresql")
+        await session.execute(text(f'ALTER SCHEMA "{restored.schema_name}" OWNER TO "{native.custody.owner}"'))
+        for name, _ in restored.relation_oids:
+            await session.execute(
+                text(f'ALTER TABLE "{restored.schema_name}"."{name}" OWNER TO "{native.custody.owner}"')
+            )
+    database_url = native.publisher.kw["bind"].url.set(drivername="postgresql")
     await _command(
         "pg_restore",
         "--dbname",
@@ -1079,9 +1325,9 @@ async def _publish_synthetic_mrf_family(monkeypatch, sessions, schema_name, addr
         assert address.relation_oids == mrf.relation_oids[-2:]
 
 
-async def _assert_unfinished_mrf_source_rejected(sessions, schema_name, dataset_id):
+async def _assert_unfinished_mrf_source_rejected(native, schema_name, dataset_id):
     with pytest.raises(RuntimeError, match="completion is unavailable"):
-        async with sessions() as session, session.begin():
+        async with native.source() as session, session.begin():
             await archive.capture_reference_family_source(
                 session,
                 importer_id="mrf",
@@ -1091,31 +1337,37 @@ async def _assert_unfinished_mrf_source_rejected(sessions, schema_name, dataset_
             )
     with pytest.raises(RuntimeError, match="completion is unavailable"):
         await archive.prepare_reference_family_archive_source(
-            sessions,
+            native.admin,
             importer_id="mrf",
             schema_name=schema_name,
             source_metadata={"release": "synthetic-rotation-only"},
             dataset_id=dataset_id,
-            on_prepared=_retain_prepared,
+            on_prepared=native.custody.retain,
             dependency_factory=_synthetic_dependencies,
+            source_copy=native.custody.source_copy,
+            on_precreated=native.custody.precreate,
+            source_sessions=native.source,
         )
 
 
-async def _assert_address_archive_round_trip(sessions, schema_name, dataset_id, address_key, archive_path):
+async def _assert_address_archive_round_trip(native, schema_name, dataset_id, address_key, archive_path):
     prepared = await archive.prepare_reference_family_archive_source(
-        sessions,
+        native.admin,
         importer_id="mrf-address",
         schema_name=schema_name,
         source_metadata={"release": "synthetic-published-mrf-address"},
         dataset_id=dataset_id,
-        on_prepared=_retain_prepared,
+        on_prepared=native.custody.retain,
+        source_copy=native.custody.source_copy,
+        on_precreated=native.custody.precreate,
+        source_sessions=native.source,
     )
-    listing = await _dump_prepared_archive(sessions, prepared, archive_path)
+    listing = await _dump_prepared_archive(native, prepared, archive_path)
     assert "mrf_address" in listing and "mrf_address_evidence" in listing
     assert f" {prepared.ownership.schema_name} issuer " not in listing
     assert f" {prepared.ownership.schema_name} plan_npi_raw " not in listing
-    restored = await _restore_prepared_address_archive(sessions, prepared, dataset_id, archive_path)
-    await _assert_restored_address_archive(sessions, prepared, restored, address_key)
+    restored = await _restore_prepared_address_archive(native, prepared, dataset_id, archive_path)
+    await _assert_restored_address_archive(native.publisher, prepared, restored, address_key)
 
 
 @pytest.mark.asyncio
@@ -1131,22 +1383,24 @@ async def test_mrf_archive_accepts_normal_published_staging_tables(monkeypatch, 
         archive.reference_family_stage_schema(address_dataset_id),
         schema_name,
     )
+    created = False, False
     try:
+        created = await _provision_canonical_type(sessions)
         await _publish_synthetic_mrf_family(monkeypatch, sessions, schema_name, address_key)
-        await _assert_unfinished_mrf_source_rejected(sessions, schema_name, dataset_id)
-        await _complete_synthetic_publication(monkeypatch, engine, sessions, schema_name)
-        await _assert_full_mrf_stage(sessions, schema_name, dataset_id, address_key)
-        await _assert_address_archive_round_trip(
-            sessions,
-            schema_name,
-            address_dataset_id,
-            address_key,
-            tmp_path / "mrf-address.dump",
-        )
+        async with engine.begin() as connection:
+            await _prepare_synthetic_publication_schema(connection, schema_name)
+        async with _native_mrf_archive(sessions, schema_name, None, owned_schemas) as native:
+            await _assert_unfinished_mrf_source_rejected(native, schema_name, dataset_id)
+            await _complete_synthetic_publication(monkeypatch, engine, sessions, schema_name, initialize=False)
+            await _assert_full_mrf_stage(native, schema_name, dataset_id, address_key)
+            await _assert_address_archive_round_trip(
+                native, schema_name, address_dataset_id, address_key, tmp_path / "mrf-address.dump"
+            )
     finally:
         async with engine.begin() as connection:
             for owned_schema in owned_schemas:
                 await connection.execute(text(f'DROP SCHEMA IF EXISTS "{owned_schema}" CASCADE'))
+        await _retire_canonical_type(sessions, created)
         await engine.dispose()
 
 
@@ -1172,7 +1426,9 @@ async def test_mrf_archive_rotation_survives_an_interleaved_ordinary_import(monk
         archive.reference_family_stage_schema(second_restored),
         archive.reference_family_predecessor_schema(second_restored),
     }
+    created = False, False
     try:
+        created = await _provision_canonical_type(sessions)
         await _initialize_interleaved_archive_source(
             monkeypatch,
             engine,
@@ -1181,32 +1437,33 @@ async def test_mrf_archive_rotation_survives_an_interleaved_ordinary_import(monk
             destination_schema,
         )
 
-        await _run_interleaved_archive_cycle(
-            engine,
-            sessions,
-            monkeypatch,
-            source_schema,
-            destination_schema,
-            dataset_ids,
-        )
+        async with _native_mrf_archive(sessions, source_schema, destination_schema, owned_schemas) as native:
+            await _run_interleaved_archive_cycle(
+                engine, native, monkeypatch, source_schema, destination_schema, dataset_ids
+            )
+            await _assert_interleaved_result(sessions, destination_schema)
 
-        async with sessions() as session, session.begin():
-            assert await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "source-v3"
-            assert list(
-                await session.scalars(
-                    text(
-                        "SELECT relation.relname FROM pg_catalog.pg_class AS relation "
-                        "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
-                        "WHERE namespace.nspname=:schema_name AND relation.relname LIKE '%\\_old' ESCAPE '\\'"
-                    ),
-                    {"schema_name": destination_schema},
-                )
-            ) == ["log_old"]
     finally:
         async with engine.begin() as connection:
             for schema_name in owned_schemas:
                 await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await _retire_canonical_type(sessions, created)
         await engine.dispose()
+
+
+async def _assert_interleaved_result(sessions, destination_schema):
+    async with sessions.begin() as session:
+        assert await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "source-v3"
+        assert list(
+            await session.scalars(
+                text(
+                    "SELECT relation.relname FROM pg_catalog.pg_class AS relation "
+                    "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
+                    "WHERE namespace.nspname=:schema_name AND relation.relname LIKE '%\\_old' ESCAPE '\\'"
+                ),
+                {"schema_name": destination_schema},
+            )
+        ) == ["log_old"]
 
 
 def _migration_module(path=_MIGRATION_PATH):

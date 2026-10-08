@@ -91,6 +91,8 @@ def test_unserializable_seals_are_typed_refusals(value):
 
 @pytest.mark.parametrize("bindings", [None, {"synthetic": [1, 2]}])
 async def test_private_prepare_preserves_inventory_and_dependency_binding(monkeypatch, bindings):
+    from tests.test_entity_address_snapshot_stage import _receipt
+
     owner, _proof = _inventory()
     session = _session()
     prepared = object()
@@ -102,7 +104,7 @@ async def test_private_prepare_preserves_inventory_and_dependency_binding(monkey
     destination_by_field = {"db_schema": "example", "import_date": "20260913", "dependency_bindings": bindings}
     assert (
         await preparation.prepare_private_entity_address_archive_destination(
-            session, owner=owner, semantic_receipt={}, source_alias_receipt={}, destination=destination_by_field
+            session, owner=owner, semantic_receipt=_receipt(), source_alias_receipt={}, destination=destination_by_field
         )
         is prepared
     )
@@ -115,10 +117,12 @@ async def test_private_prepare_preserves_inventory_and_dependency_binding(monkey
 
 @pytest.mark.parametrize("destination", [None, {}, {"db_schema": "example", "import_date": "20260913", "extra": True}])
 async def test_private_prepare_rejects_unbounded_destination(destination):
+    from tests.test_entity_address_snapshot_stage import _receipt
+
     session = _session()
     with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="destination is invalid"):
         await preparation.prepare_private_entity_address_archive_destination(
-            session, owner=None, semantic_receipt={}, source_alias_receipt={}, destination=destination
+            session, owner=None, semantic_receipt=_receipt(), source_alias_receipt={}, destination=destination
         )
     session.execute.assert_not_awaited()
 
@@ -145,10 +149,15 @@ async def test_relocation_requires_exact_persisted_stage_oids(monkeypatch, chang
 
 
 @pytest.mark.parametrize("changed", [None, "catalog", "generation"])
-async def test_alias_fence_binds_catalog_and_local_generation(monkeypatch, changed):
+@pytest.mark.parametrize("contract", [preparation.CONTRACT, preparation.SET_CONTRACT])
+async def test_alias_fence_binds_catalog_and_local_generation(monkeypatch, changed, contract):
     _owner, proof = _inventory()
     alias = preparation.alias.EntityAddressAliasSemanticReceipt(2, 1, 7, 0, "a" * 64)
-    validation_by_field = {"alias": alias.as_dict(), "alias_catalog_sha256": "b" * 64}
+    validation_by_field = {
+        "contract": contract,
+        "alias": alias.as_dict(),
+        "alias_catalog_sha256": "b" * 64,
+    }
     monkeypatch.setattr(preparation.alias, "_lock_alias_relations", AsyncMock())
     monkeypatch.setattr(
         preparation, "_require_alias_authority", AsyncMock(return_value="c" * 64 if changed == "catalog" else "b" * 64)
@@ -161,6 +170,7 @@ async def test_alias_fence_binds_catalog_and_local_generation(monkeypatch, chang
         assert state.await_count == (0 if changed == "catalog" else 1)
     else:
         await preparation._require_alias_fence(object(), "example", proof, validation_by_field)
+    assert preparation._require_alias_authority.await_args.kwargs == {}
 
 
 def test_adoption_rehydrates_sealed_context_without_rescanning(monkeypatch):

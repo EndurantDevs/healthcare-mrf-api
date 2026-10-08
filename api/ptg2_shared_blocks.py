@@ -16,8 +16,8 @@ from sqlalchemy import text
 
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_shared_blocks import (
-    PTG2_V3_SHARED_GENERATION,
     PTG2_V3_SHARED_FORMAT_VERSION,
+    PTG2_V3_SHARED_GENERATION,
     shared_block_hash,
 )
 from process.ptg_parts.ptg2_shared_reuse import shared_source_set_metadata
@@ -30,7 +30,6 @@ from process.ptg_parts.ptg2_v4_finalizer_maps import (
     load_v4_finalizer_mapping_records,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import PTG2_V4_SHARED_GENERATION
-
 
 PTG2_V3_GRAPH_CHUNK_BYTES = 64 * 1024
 PTG2_V3_GRAPH_NPI_TO_GROUP = 1
@@ -122,9 +121,7 @@ def read_strict_uvarint(
         value |= (byte & 0x7F) << shift
         if byte < 0x80:
             if cursor - start > 1 and byte == 0:
-                raise PTG2SharedBlockError(
-                    "shared PTG payload contains a non-canonical uvarint"
-                )
+                raise PTG2SharedBlockError("shared PTG payload contains a non-canonical uvarint")
             return value, cursor
         shift += 7
         if shift > 63:
@@ -151,22 +148,16 @@ def decode_dense_source_header(
 
     cursor = int(offset)
     if cursor >= len(payload) or int(payload[cursor]) != int(format_version):
-        raise PTG2SharedBlockError(
-            "shared PTG payload has an unsupported format version"
-        )
+        raise PTG2SharedBlockError("shared PTG payload has an unsupported format version")
     source_count, cursor = read_strict_uvarint(payload, cursor + 1)
     if cursor >= len(payload):
         raise PTG2SharedBlockError("shared PTG payload is missing source_bits")
     source_bits = int(payload[cursor])
     cursor += 1
     if source_bits != dense_source_key_bits(source_count):
-        raise PTG2SharedBlockError(
-            "shared PTG payload source_bits does not match source_count"
-        )
+        raise PTG2SharedBlockError("shared PTG payload source_bits does not match source_count")
     if expected_source_count is not None and source_count != int(expected_source_count):
-        raise PTG2SharedBlockError(
-            "shared PTG payload source_count does not match the snapshot manifest"
-        )
+        raise PTG2SharedBlockError("shared PTG payload source_count does not match the snapshot manifest")
     return source_count, source_bits, cursor
 
 
@@ -193,9 +184,7 @@ def decode_dense_source_vector(
         raise PTG2SharedBlockError("shared PTG source vector is truncated")
     encoded = encoded_payload[cursor:end]
     if total_bits % 8 and encoded and int(encoded[-1]) >> (total_bits % 8):
-        raise PTG2SharedBlockError(
-            "shared PTG source vector has non-zero padding bits"
-        )
+        raise PTG2SharedBlockError("shared PTG source vector has non-zero padding bits")
     source_keys: list[int] = []
     bit_offset = 0
     for _ in range(normalized_entry_count):
@@ -205,9 +194,7 @@ def decode_dense_source_vector(
                 source_key |= 1 << source_bit
             bit_offset += 1
         if source_key >= int(source_count):
-            raise PTG2SharedBlockError(
-                "shared PTG source vector contains an out-of-range key"
-            )
+            raise PTG2SharedBlockError("shared PTG source vector contains an out-of-range key")
         source_keys.append(source_key)
     return tuple(source_keys), end
 
@@ -231,10 +218,7 @@ def decode_shared_block_payload(
     """Decode one independently compressed block without retaining it globally."""
 
     expected_raw_bytes = int(raw_byte_count)
-    if expected_raw_bytes < 0 or (
-        maximum_raw_bytes is not None
-        and expected_raw_bytes > int(maximum_raw_bytes)
-    ):
+    if expected_raw_bytes < 0 or (maximum_raw_bytes is not None and expected_raw_bytes > int(maximum_raw_bytes)):
         raise PTG2SharedBlockError("shared PTG raw block exceeds its byte limit")
     normalized_codec = str(codec or "").strip().lower()
     if normalized_codec == "none":
@@ -254,9 +238,7 @@ def decode_shared_block_payload(
             or decompressor.unconsumed_tail
             or len(raw_payload) > expected_raw_bytes
         ):
-            raise PTG2SharedBlockError(
-                "invalid shared PTG zlib block framing or trailing bytes"
-            )
+            raise PTG2SharedBlockError("invalid shared PTG zlib block framing or trailing bytes")
     else:
         raise PTG2SharedBlockError(f"unsupported shared PTG block codec: {codec!r}")
     if len(raw_payload) != expected_raw_bytes:
@@ -296,9 +278,7 @@ def _validated_physical_block(
     stored_byte_value = block_row.get("stored_byte_count")
     block_hash = bytes(block_row.get("block_hash") or b"")
     if format_version != PTG2_V3_SHARED_FORMAT_VERSION:
-        raise PTG2SharedBlockError(
-            "shared PTG block has an unsupported format version"
-        )
+        raise PTG2SharedBlockError("shared PTG block has an unsupported format version")
     try:
         expected_hash = shared_block_hash(
             format_version=format_version,
@@ -311,16 +291,11 @@ def _validated_physical_block(
     if (
         object_kind != expected_kind
         or block_hash != expected_hash
-        or (
-            stored_byte_value is not None
-            and int(stored_byte_value) != len(stored_payload)
-        )
+        or (stored_byte_value is not None and int(stored_byte_value) != len(stored_payload))
     ):
         raise PTG2SharedBlockError("shared PTG block identity validation failed")
     block_entry_value = block_row.get("block_entry_count")
-    block_entry_count = (
-        None if block_entry_value is None else int(block_entry_value)
-    )
+    block_entry_count = None if block_entry_value is None else int(block_entry_value)
     if block_entry_count is not None and block_entry_count < 0:
         raise PTG2SharedBlockError("shared PTG block entry count validation failed")
     raw_payload = decode_shared_block_payload(
@@ -347,12 +322,8 @@ def _validated_payload(
         expected_kind=expected_kind,
     )
     mapping_entry_count = int(block_row.get("mapping_entry_count") or 0)
-    if (
-        mapping_entry_count < 0
-        or (
-            physical_block.entry_count is not None
-            and mapping_entry_count != physical_block.entry_count
-        )
+    if mapping_entry_count < 0 or (
+        physical_block.entry_count is not None and mapping_entry_count != physical_block.entry_count
     ):
         raise PTG2SharedBlockError("shared PTG block entry count validation failed")
     return SharedBlockPayload(
@@ -396,9 +367,7 @@ def _shared_block_read_request(
     require_all: bool,
 ) -> _SharedBlockReadRequest:
     requested_fragments = (
-        tuple(sorted({int(fragment_no) for fragment_no in fragment_nos}))
-        if fragment_nos is not None
-        else ()
+        tuple(sorted({int(fragment_no) for fragment_no in fragment_nos})) if fragment_nos is not None else ()
     )
     if any(fragment_no < 0 for fragment_no in requested_fragments):
         raise ValueError("shared PTG fragment numbers must be non-negative")
@@ -429,9 +398,7 @@ async def _packed_finalizer_mapping_records(
             snapshot_key=request.snapshot_key,
             object_kind=request.object_kind,
             block_keys=request.block_keys,
-            fragment_nos=(
-                request.fragment_nos if request.has_fragment_filter else None
-            ),
+            fragment_nos=(request.fragment_nos if request.has_fragment_filter else None),
             row_limit=row_limit,
         )
     except FinalizerMapReadLimitError as exc:
@@ -457,9 +424,7 @@ async def _stream_shared_mapping_records(
         return
     schema = _quote_ident(request.schema_name)
     fragment_filter = (
-        "AND mapping.fragment_no = ANY(CAST(:fragment_nos AS integer[]))"
-        if request.has_fragment_filter
-        else ""
+        "AND mapping.fragment_no = ANY(CAST(:fragment_nos AS integer[]))" if request.has_fragment_filter else ""
     )
     statement = text(
         f"""
@@ -514,16 +479,11 @@ def _validated_mapping_coordinate(
         mapping_kind != request.object_kind
         or coordinate[0] not in request.block_key_set
         or coordinate[1] < 0
-        or (
-            request.has_fragment_filter
-            and coordinate[1] not in request.fragment_no_set
-        )
+        or (request.has_fragment_filter and coordinate[1] not in request.fragment_no_set)
         or (previous_coordinate is not None and coordinate <= previous_coordinate)
         or len(physical_hash) != 32
     ):
-        raise PTG2SharedBlockError(
-            "shared PTG query returned an unexpected or unordered fragment"
-        )
+        raise PTG2SharedBlockError("shared PTG query returned an unexpected or unordered fragment")
     return coordinate, physical_hash
 
 
@@ -557,8 +517,7 @@ class _SharedMappingAccumulator:
 
         if len(self.mapping_records) >= maximum_records:
             raise SharedMappingReadLimitError(
-                "shared PTG snapshot fragment metadata exceeds its "
-                "bounded count or byte limit"
+                "shared PTG snapshot fragment metadata exceeds its bounded count or byte limit"
             )
         if self.retention_budget is not None:
             self.retention_budget.claim(
@@ -574,14 +533,10 @@ class _SharedMappingAccumulator:
         )
         delivery_key = _shared_delivery_key(self.request, coordinate)
         if delivery_key in self.delivered_coordinates:
-            raise PTG2SharedBlockError(
-                "shared PTG logical block was requested more than once"
-            )
+            raise PTG2SharedBlockError("shared PTG logical block was requested more than once")
         self.previous_coordinate = coordinate
         self.observed_block_keys.add(coordinate[0])
-        self.fragment_nos_by_block_key.setdefault(coordinate[0], set()).add(
-            coordinate[1]
-        )
+        self.fragment_nos_by_block_key.setdefault(coordinate[0], set()).add(coordinate[1])
         self.physical_hashes.add(physical_hash)
         self.mapping_records.append(mapping_record)
 
@@ -599,8 +554,7 @@ class _SharedMappingAccumulator:
             mapping_records=tuple(self.mapping_records),
             observed_block_keys=frozenset(self.observed_block_keys),
             fragment_nos_by_block_key={
-                block_key: frozenset(fragment_nos)
-                for block_key, fragment_nos in self.fragment_nos_by_block_key.items()
+                block_key: frozenset(fragment_nos) for block_key, fragment_nos in self.fragment_nos_by_block_key.items()
             },
             physical_hashes=frozenset(self.physical_hashes),
             retained_metadata_bytes=self.retained_metadata_bytes,
@@ -613,25 +567,17 @@ def _require_complete_shared_mapping(
 ) -> None:
     if not request.requires_all:
         return
-    missing_block_keys = sorted(
-        request.block_key_set - selection.observed_block_keys
-    )
+    missing_block_keys = sorted(request.block_key_set - selection.observed_block_keys)
     if missing_block_keys:
-        raise PTG2SharedBlockError(
-            f"shared PTG layout is missing block keys: {missing_block_keys[:8]}"
-        )
+        raise PTG2SharedBlockError(f"shared PTG layout is missing block keys: {missing_block_keys[:8]}")
     if not request.has_fragment_filter:
         return
     for block_key in request.block_keys:
         missing_fragment_nos = sorted(
-            request.fragment_no_set
-            - selection.fragment_nos_by_block_key.get(block_key, frozenset())
+            request.fragment_no_set - selection.fragment_nos_by_block_key.get(block_key, frozenset())
         )
         if missing_fragment_nos:
-            raise PTG2SharedBlockError(
-                "shared PTG layout is missing fragments: "
-                f"{missing_fragment_nos[:8]}"
-            )
+            raise PTG2SharedBlockError(f"shared PTG layout is missing fragments: {missing_fragment_nos[:8]}")
 
 
 async def _stream_shared_physical_records(
@@ -680,9 +626,7 @@ class SharedBlockReadOnceScope:
         if retained_mapping_limit < _SHARED_MAPPING_RECORD_RETAINED_BYTES:
             raise ValueError("shared PTG mapping-metadata byte limit is too small")
         self._max_retained_raw_bytes = retained_limit
-        self._max_mapping_records = (
-            retained_mapping_limit // _SHARED_MAPPING_RECORD_RETAINED_BYTES
-        )
+        self._max_mapping_records = retained_mapping_limit // _SHARED_MAPPING_RECORD_RETAINED_BYTES
         self._decoded_retention_budget: GraphDecodedRetentionBudget | None = None
         self._seen_physical_identities: set[tuple[str, bytes]] = set()
         self._delivered_coordinates: set[tuple[str, int, str, int, int]] = set()
@@ -702,8 +646,7 @@ class SharedBlockReadOnceScope:
         logical_deliveries = len(self._delivered_coordinates)
         unique_physical_blocks = len(self._seen_physical_identities)
         logical_fragment_references = sum(
-            len(physical_hashes)
-            for _schema_name, physical_hashes in self._processed_logical_identities
+            len(physical_hashes) for _schema_name, physical_hashes in self._processed_logical_identities
         )
         logically_referenced_physical_blocks = {
             (schema_name, block_hash)
@@ -718,20 +661,14 @@ class SharedBlockReadOnceScope:
             "physical_block_reads": self._physical_rows_read,
             "physical_block_decodes": self._payload_decode_count,
             "physical_payload_preparations": len(self._prepared_physical_identities),
-            "expected_logical_payload_processes": len(
-                self._registered_logical_identities
-            ),
+            "expected_logical_payload_processes": len(self._registered_logical_identities),
             "logical_payload_processes": len(self._processed_logical_identities),
             "logical_payload_fragment_references": logical_fragment_references,
             "logical_payload_fragment_aliases": (
                 logical_fragment_references - len(logically_referenced_physical_blocks)
             ),
-            "repeated_physical_reads": (
-                self._physical_rows_read - unique_physical_blocks
-            ),
-            "repeated_physical_decodes": (
-                self._payload_decode_count - unique_physical_blocks
-            ),
+            "repeated_physical_reads": (self._physical_rows_read - unique_physical_blocks),
+            "repeated_physical_decodes": (self._payload_decode_count - unique_physical_blocks),
             "repeated_physical_preparations": 0,
             "repeated_logical_payload_processes": 0,
             "peak_raw_bytes": self._peak_raw_bytes,
@@ -749,43 +686,27 @@ class SharedBlockReadOnceScope:
     ) -> None:
         """Bind mapping metadata to the candidate's single decoded budget."""
 
-        if (
-            self._decoded_retention_budget is not None
-            and self._decoded_retention_budget is not retention_budget
-        ):
-            raise PTG2SharedBlockError(
-                "shared PTG read-once scope has conflicting decoded budgets"
-            )
+        if self._decoded_retention_budget is not None and self._decoded_retention_budget is not retention_budget:
+            raise PTG2SharedBlockError("shared PTG read-once scope has conflicting decoded budgets")
         self._decoded_retention_budget = retention_budget
 
     def assert_read_once(self) -> None:
         """Fail unless every unique physical hash had one row and one decode."""
 
         if self._poisoned_reason is not None:
-            raise PTG2SharedBlockError(
-                f"shared PTG read-once scope is poisoned: {self._poisoned_reason}"
-            )
+            raise PTG2SharedBlockError(f"shared PTG read-once scope is poisoned: {self._poisoned_reason}")
         unique_count = len(self._seen_physical_identities)
-        if (
-            unique_count != self._physical_rows_read
-            or unique_count != self._payload_decode_count
-        ):
-            raise PTG2SharedBlockError(
-                "shared PTG read-once ledger does not prove one read and decode per block"
-            )
+        if unique_count != self._physical_rows_read or unique_count != self._payload_decode_count:
+            raise PTG2SharedBlockError("shared PTG read-once ledger does not prove one read and decode per block")
 
     def prepare_payload(self, schema_name: str, block_hash: bytes) -> None:
         """Claim one physical payload after its sole decode and validation."""
 
         identity = (str(schema_name), bytes(block_hash))
         if identity not in self._seen_physical_identities:
-            raise PTG2SharedBlockError(
-                "shared PTG payload preparation has no physical read"
-            )
+            raise PTG2SharedBlockError("shared PTG payload preparation has no physical read")
         if identity in self._prepared_physical_identities:
-            raise PTG2SharedBlockError(
-                "shared PTG physical payload would be prepared more than once"
-            )
+            raise PTG2SharedBlockError("shared PTG physical payload would be prepared more than once")
         self._prepared_physical_identities.add(identity)
 
     def register_logical_payload(
@@ -798,13 +719,9 @@ class SharedBlockReadOnceScope:
         normalized_hashes = tuple(bytes(block_hash) for block_hash in physical_hashes)
         if not normalized_hashes:
             raise PTG2SharedBlockError("shared PTG logical payload is empty")
-        physical_identities = {
-            (str(schema_name), block_hash) for block_hash in normalized_hashes
-        }
+        physical_identities = {(str(schema_name), block_hash) for block_hash in normalized_hashes}
         if not physical_identities.issubset(self._seen_physical_identities):
-            raise PTG2SharedBlockError(
-                "shared PTG logical payload registration has an unread fragment"
-            )
+            raise PTG2SharedBlockError("shared PTG logical payload registration has an unread fragment")
         self._registered_logical_identities.add((str(schema_name), normalized_hashes))
 
     def claim_logical_payload_processing(
@@ -817,22 +734,14 @@ class SharedBlockReadOnceScope:
         normalized_hashes = tuple(bytes(block_hash) for block_hash in physical_hashes)
         if not normalized_hashes:
             raise PTG2SharedBlockError("shared PTG logical payload is empty")
-        physical_identities = {
-            (str(schema_name), block_hash) for block_hash in normalized_hashes
-        }
+        physical_identities = {(str(schema_name), block_hash) for block_hash in normalized_hashes}
         if not physical_identities.issubset(self._prepared_physical_identities):
-            raise PTG2SharedBlockError(
-                "shared PTG logical payload processing has an unprepared fragment"
-            )
+            raise PTG2SharedBlockError("shared PTG logical payload processing has an unprepared fragment")
         logical_identity = (str(schema_name), normalized_hashes)
         if logical_identity not in self._registered_logical_identities:
-            raise PTG2SharedBlockError(
-                "shared PTG logical payload processing was not registered"
-            )
+            raise PTG2SharedBlockError("shared PTG logical payload processing was not registered")
         if logical_identity in self._processed_logical_identities:
-            raise PTG2SharedBlockError(
-                "shared PTG logical payload would be processed more than once"
-            )
+            raise PTG2SharedBlockError("shared PTG logical payload would be processed more than once")
         self._processed_logical_identities.add(logical_identity)
 
     def claim_payload_processing(self, schema_name: str, block_hash: bytes) -> None:
@@ -860,16 +769,12 @@ class SharedBlockReadOnceScope:
 
     def _raise_if_poisoned(self) -> None:
         if self._poisoned_reason is not None:
-            raise PTG2SharedBlockError(
-                f"shared PTG read-once scope is poisoned: {self._poisoned_reason}"
-            )
+            raise PTG2SharedBlockError(f"shared PTG read-once scope is poisoned: {self._poisoned_reason}")
 
     def _poison(self, exc: BaseException) -> None:
         if self._poisoned_reason is None:
             self._poisoned_reason = (
-                "request cancelled"
-                if isinstance(exc, asyncio.CancelledError)
-                else str(exc) or type(exc).__name__
+                "request cancelled" if isinstance(exc, asyncio.CancelledError) else str(exc) or type(exc).__name__
             )
 
     async def fetch(
@@ -929,13 +834,8 @@ class SharedBlockReadOnceScope:
             self.assert_read_once()
             return deliveries
         except BaseException:
-            if (
-                self._decoded_retention_budget is not None
-                and selection.retained_metadata_bytes
-            ):
-                self._decoded_retention_budget.release(
-                    selection.retained_metadata_bytes
-                )
+            if self._decoded_retention_budget is not None and selection.retained_metadata_bytes:
+                self._decoded_retention_budget.release(selection.retained_metadata_bytes)
             raise
 
     async def _validated_mapping_selection(
@@ -981,9 +881,7 @@ class SharedBlockReadOnceScope:
             if (request.schema_name, physical_hash) in self._seen_physical_identities
         )
         if repeated_hashes:
-            raise PTG2SharedBlockError(
-                "shared PTG physical block was requested more than once"
-            )
+            raise PTG2SharedBlockError("shared PTG physical block was requested more than once")
         physical_blocks_by_hash: dict[bytes, _SharedPhysicalBlock] = {}
         raw_bytes_in_fetch = 0
         async for physical_record in _stream_shared_physical_records(
@@ -992,13 +890,8 @@ class SharedBlockReadOnceScope:
             physical_hashes,
         ):
             returned_hash = bytes(physical_record.get("block_hash") or b"")
-            if (
-                returned_hash not in physical_hashes
-                or returned_hash in physical_blocks_by_hash
-            ):
-                raise PTG2SharedBlockError(
-                    "shared PTG physical block query returned an unexpected row"
-                )
+            if returned_hash not in physical_hashes or returned_hash in physical_blocks_by_hash:
+                raise PTG2SharedBlockError("shared PTG physical block query returned an unexpected row")
             self._physical_rows_read += 1
             remaining_raw_bytes = self._max_retained_raw_bytes - raw_bytes_in_fetch
             physical_block = _validated_physical_block(
@@ -1009,13 +902,9 @@ class SharedBlockReadOnceScope:
             self._payload_decode_count += 1
             raw_bytes_in_fetch += len(physical_block.payload)
             physical_blocks_by_hash[physical_block.block_hash] = physical_block
-            self._seen_physical_identities.add(
-                (request.schema_name, physical_block.block_hash)
-            )
+            self._seen_physical_identities.add((request.schema_name, physical_block.block_hash))
         if set(physical_hashes) != set(physical_blocks_by_hash):
-            raise PTG2SharedBlockError(
-                "shared PTG layout references a missing physical block"
-            )
+            raise PTG2SharedBlockError("shared PTG layout references a missing physical block")
         self._peak_raw_bytes = max(self._peak_raw_bytes, raw_bytes_in_fetch)
         return physical_blocks_by_hash
 
@@ -1031,12 +920,9 @@ class SharedBlockReadOnceScope:
             physical_block = physical_blocks_by_hash[physical_hash]
             mapping_entry_count = int(mapping_record.get("mapping_entry_count") or 0)
             if mapping_entry_count < 0 or (
-                physical_block.entry_count is not None
-                and mapping_entry_count != physical_block.entry_count
+                physical_block.entry_count is not None and mapping_entry_count != physical_block.entry_count
             ):
-                raise PTG2SharedBlockError(
-                    "shared PTG block entry count validation failed"
-                )
+                raise PTG2SharedBlockError("shared PTG block entry count validation failed")
             coordinate = (
                 int(mapping_record.get("block_key") or 0),
                 int(mapping_record.get("fragment_no") or 0),
@@ -1054,9 +940,9 @@ class SharedBlockReadOnceScope:
         return tuple(deliveries)
 
 
-_ACTIVE_SHARED_BLOCK_READ_ONCE_SCOPE: ContextVar[
-    SharedBlockReadOnceScope | None
-] = ContextVar("active_shared_block_read_once_scope", default=None)
+_ACTIVE_SHARED_BLOCK_READ_ONCE_SCOPE: ContextVar[SharedBlockReadOnceScope | None] = ContextVar(
+    "active_shared_block_read_once_scope", default=None
+)
 
 
 @contextmanager
@@ -1156,10 +1042,7 @@ async def fetch_shared_blocks(
         require_all=require_all,
     ):
         payloads_by_key.setdefault(payload.block_key, []).append(payload)
-    return {
-        block_key: tuple(payloads)
-        for block_key, payloads in payloads_by_key.items()
-    }
+    return {block_key: tuple(payloads) for block_key, payloads in payloads_by_key.items()}
 
 
 async def stream_shared_blocks(
@@ -1219,23 +1102,13 @@ async def _stream_shared_blocks_direct(
         if (
             block_payload.block_key not in request.block_key_set
             or block_payload.fragment_no < 0
-            or (
-                request.has_fragment_filter
-                and block_payload.fragment_no not in request.fragment_no_set
-            )
-            or (
-                previous_mapping_key is not None
-                and mapping_key <= previous_mapping_key
-            )
+            or (request.has_fragment_filter and block_payload.fragment_no not in request.fragment_no_set)
+            or (previous_mapping_key is not None and mapping_key <= previous_mapping_key)
         ):
-            raise PTG2SharedBlockError(
-                "shared PTG query returned an unexpected or unordered fragment"
-            )
+            raise PTG2SharedBlockError("shared PTG query returned an unexpected or unordered fragment")
         previous_mapping_key = mapping_key
         observed_keys.add(block_payload.block_key)
-        observed_fragments_by_key.setdefault(block_payload.block_key, set()).add(
-            block_payload.fragment_no
-        )
+        observed_fragments_by_key.setdefault(block_payload.block_key, set()).add(block_payload.fragment_no)
         yield block_payload
     _require_complete_direct_stream(
         request,
@@ -1251,17 +1124,11 @@ async def _packed_direct_query_result(
     packed_records = await _packed_finalizer_mapping_records(
         session,
         request,
-        row_limit=(
-            _SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES
-            // _SHARED_MAPPING_RECORD_RETAINED_BYTES
-        ),
+        row_limit=(_SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES // _SHARED_MAPPING_RECORD_RETAINED_BYTES),
     )
     if packed_records is None:
         return None
-    physical_hashes = frozenset(
-        bytes(mapping_record["block_hash"])
-        for mapping_record in packed_records
-    )
+    physical_hashes = frozenset(bytes(mapping_record["block_hash"]) for mapping_record in packed_records)
     physical_by_hash: dict[bytes, dict[str, Any]] = {}
     async for physical_by_field in _stream_shared_physical_records(
         session,
@@ -1270,19 +1137,13 @@ async def _packed_direct_query_result(
     ):
         physical_hash = bytes(physical_by_field.get("block_hash") or b"")
         if physical_hash not in physical_hashes or physical_hash in physical_by_hash:
-            raise PTG2SharedBlockError(
-                "shared PTG physical block query returned an unexpected row"
-            )
+            raise PTG2SharedBlockError("shared PTG physical block query returned an unexpected row")
         physical_by_hash[physical_hash] = physical_by_field
     if set(physical_by_hash) != set(physical_hashes):
-        raise PTG2SharedBlockError(
-            "shared PTG layout references a missing physical block"
-        )
+        raise PTG2SharedBlockError("shared PTG layout references a missing physical block")
     combined_rows: list[dict[str, Any]] = []
     for mapping_record in packed_records:
-        physical_by_field = dict(
-            physical_by_hash[bytes(mapping_record["block_hash"])]
-        )
+        physical_by_field = dict(physical_by_hash[bytes(mapping_record["block_hash"])])
         physical_by_field.update(
             block_key=mapping_record["block_key"],
             fragment_no=mapping_record["fragment_no"],
@@ -1300,9 +1161,7 @@ async def _shared_direct_query_result(
     if packed_query is not None:
         return packed_query
     fragment_filter = (
-        "AND mapping.fragment_no = ANY(CAST(:fragment_nos AS integer[]))"
-        if request.has_fragment_filter
-        else ""
+        "AND mapping.fragment_no = ANY(CAST(:fragment_nos AS integer[]))" if request.has_fragment_filter else ""
     )
     schema = _quote_ident(request.schema_name)
     statement = text(
@@ -1361,21 +1220,13 @@ def _require_complete_direct_stream(
         return
     missing_block_keys = sorted(request.block_key_set - observed_block_keys)
     if missing_block_keys:
-        raise PTG2SharedBlockError(
-            f"shared PTG layout is missing block keys: {missing_block_keys[:8]}"
-        )
+        raise PTG2SharedBlockError(f"shared PTG layout is missing block keys: {missing_block_keys[:8]}")
     if not request.has_fragment_filter:
         return
     for block_key in request.block_keys:
-        missing_fragment_nos = sorted(
-            request.fragment_no_set
-            - fragment_nos_by_block_key.get(block_key, set())
-        )
+        missing_fragment_nos = sorted(request.fragment_no_set - fragment_nos_by_block_key.get(block_key, set()))
         if missing_fragment_nos:
-            raise PTG2SharedBlockError(
-                "shared PTG layout is missing fragments: "
-                f"{missing_fragment_nos[:8]}"
-            )
+            raise PTG2SharedBlockError(f"shared PTG layout is missing fragments: {missing_fragment_nos[:8]}")
 
 
 async def fetch_snapshot_source_set_metadata(
@@ -1384,6 +1235,8 @@ async def fetch_snapshot_source_set_metadata(
     schema_name: str,
     logical_snapshot_id: str,
     expected_source_count: int,
+    serving_tables=None,
+    candidate_audit_access=None,
 ) -> dict[str, Any]:
     """Recompute one bounded logical snapshot source-set seal from PostgreSQL."""
 
@@ -1392,6 +1245,8 @@ async def fetch_snapshot_source_set_metadata(
         schema_name=schema_name,
         logical_snapshot_id=logical_snapshot_id,
         expected_source_count=expected_source_count,
+        serving_tables=serving_tables,
+        candidate_audit_access=candidate_audit_access,
     )
     return source_set
 
@@ -1422,16 +1277,13 @@ def _snapshot_source_identity(
     metadata_rows: list[dict[str, Any]],
     source_count: int,
 ) -> tuple[dict[str, Any], str, tuple[str, ...]]:
-    if len(metadata_rows) != source_count or [
-        metadata_row.get("source_key") for metadata_row in metadata_rows
-    ] != list(range(source_count)):
-        raise PTG2SharedBlockError(
-            "shared PTG source metadata is not complete and dense"
-        )
+    if len(metadata_rows) != source_count or [metadata_row.get("source_key") for metadata_row in metadata_rows] != list(
+        range(source_count)
+    ):
+        raise PTG2SharedBlockError("shared PTG source metadata is not complete and dense")
     try:
         raw_hashes = tuple(
-            str(metadata_row.get("raw_container_sha256") or "").strip().lower()
-            for metadata_row in metadata_rows
+            str(metadata_row.get("raw_container_sha256") or "").strip().lower() for metadata_row in metadata_rows
         )
         return (
             shared_source_set_metadata(raw_hashes),
@@ -1439,9 +1291,30 @@ def _snapshot_source_identity(
             raw_hashes,
         )
     except ValueError as exc:
-        raise PTG2SharedBlockError(
-            "shared PTG source-set identity metadata is invalid"
-        ) from exc
+        raise PTG2SharedBlockError("shared PTG source-set identity metadata is invalid") from exc
+
+
+async def _snapshot_source_read_binding(
+    session: Any,
+    snapshot_id: str,
+    *,
+    serving_tables,
+    candidate_audit_access,
+):
+    """Reacquire the owning read proof before selecting a local source payload."""
+    physical_binding = getattr(serving_tables, "physical_binding", None)
+    if physical_binding is None:
+        return snapshot_id, None
+    from api.ptg2_tables import read_serving_tables
+
+    authenticated_tables = await read_serving_tables(
+        session,
+        snapshot_id,
+        serving_tables=serving_tables,
+        candidate_audit_access=candidate_audit_access,
+    )
+    physical_binding = authenticated_tables.physical_binding
+    return physical_binding.payload_snapshot_id, physical_binding
 
 
 async def fetch_snapshot_source_set_identity(
@@ -1451,23 +1324,34 @@ async def fetch_snapshot_source_set_identity(
     logical_snapshot_id: str,
     expected_source_count: int,
     retention_budget: GraphDecodedRetentionBudget | None = None,
+    serving_tables=None,
+    candidate_audit_access=None,
 ) -> tuple[dict[str, Any], str, tuple[str, ...]]:
     """Return set, ordered identity, and raw hashes from one source-row read."""
 
     source_count = int(expected_source_count)
     dense_source_key_bits(source_count)
     if source_count > PTG2_V3_MAX_AUDIT_SOURCE_FILES:
-        raise PTG2SharedBlockError(
-            "shared PTG audit source set exceeds the bounded verification limit"
-        )
+        raise PTG2SharedBlockError("shared PTG audit source set exceeds the bounded verification limit")
     snapshot_id = str(logical_snapshot_id or "").strip()
     if not snapshot_id:
         raise PTG2SharedBlockError("shared PTG logical snapshot id is missing")
+    snapshot_id, physical_binding = await _snapshot_source_read_binding(
+        session,
+        snapshot_id,
+        serving_tables=serving_tables,
+        candidate_audit_access=candidate_audit_access,
+    )
     schema = _quote_ident(schema_name)
+    source_table = (
+        f"{schema}.ptg2_v3_snapshot_source"
+        if physical_binding is None
+        else physical_binding.relation("ptg2_v3_snapshot_source")
+    )
     statement = text(
         f"""
             SELECT source_key, raw_container_sha256
-              FROM {schema}.ptg2_v3_snapshot_source
+              FROM {source_table}
              WHERE snapshot_id = :snapshot_id
              ORDER BY source_key
              LIMIT :row_limit
@@ -1501,13 +1385,13 @@ _SNAPSHOT_SOURCE_PROVENANCE_SQL = """
                        COUNT(DISTINCT source_key)::bigint AS distinct_source_count,
                        MIN(source_key) AS minimum_source_key,
                        MAX(source_key) AS maximum_source_key
-                  FROM {schema}.ptg2_v3_snapshot_source
+                  FROM {source_table}
                  WHERE snapshot_id = :snapshot_id
             ), selected_source AS MATERIALIZED (
                 SELECT source_key, source_type, identity_kind, identity_sha256,
                        raw_container_sha256, logical_json_sha256,
                        logical_hash_deferred, source_trace_set_hash
-                  FROM {schema}.ptg2_v3_snapshot_source
+                  FROM {source_table}
                  WHERE snapshot_id = :snapshot_id
                    AND source_key = ANY(CAST(:source_keys AS integer[]))
             )
@@ -1536,12 +1420,12 @@ _SNAPSHOT_SOURCE_PROVENANCE_SQL = """
                    ) AS source_trace
               FROM selected_source source
              CROSS JOIN source_summary summary
-              JOIN {schema}.ptg2_source_trace_set trace_set
+              JOIN {trace_set_table} trace_set
                 ON trace_set.source_trace_set_hash = source.source_trace_set_hash
               LEFT JOIN LATERAL unnest(
                    COALESCE(trace_set.source_trace_hashes, ARRAY[]::varchar[])
               ) WITH ORDINALITY trace_ref(source_trace_hash, ordinality) ON TRUE
-              LEFT JOIN {schema}.ptg2_source_trace trace
+              LEFT JOIN {trace_table} trace
                 ON trace.source_trace_hash = trace_ref.source_trace_hash
              GROUP BY source.source_key, source.source_type, source.identity_kind,
                       source.identity_sha256, source.raw_container_sha256,
@@ -1567,9 +1451,7 @@ def _validate_source_provenance_summary(
         or maximum_source_key is None
         or int(maximum_source_key) != source_count - 1
     ):
-        raise PTG2SharedBlockError(
-            "shared PTG source metadata is not complete and dense"
-        )
+        raise PTG2SharedBlockError("shared PTG source metadata is not complete and dense")
 
 
 def _source_provenance_traces(
@@ -1580,15 +1462,9 @@ def _source_provenance_traces(
         try:
             source_traces = json.loads(source_traces)
         except json.JSONDecodeError as exc:
-            raise PTG2SharedBlockError(
-                "shared PTG source trace payload is malformed"
-            ) from exc
-    if not isinstance(source_traces, list) or not all(
-        isinstance(trace, Mapping) for trace in source_traces
-    ):
-        raise PTG2SharedBlockError(
-            "shared PTG source trace payload is malformed"
-        )
+            raise PTG2SharedBlockError("shared PTG source trace payload is malformed") from exc
+    if not isinstance(source_traces, list) or not all(isinstance(trace, Mapping) for trace in source_traces):
+        raise PTG2SharedBlockError("shared PTG source trace payload is malformed")
     return source_traces
 
 
@@ -1603,9 +1479,7 @@ def _source_provenance_payload(
     identity_sha256 = str(provenance_row.get("identity_sha256") or "")
     raw_sha256 = str(provenance_row.get("raw_container_sha256") or "")
     logical_sha256_value = provenance_row.get("logical_json_sha256")
-    logical_sha256 = (
-        str(logical_sha256_value) if logical_sha256_value is not None else None
-    )
+    logical_sha256 = str(logical_sha256_value) if logical_sha256_value is not None else None
     trace_set_hash = str(provenance_row.get("source_trace_set_hash") or "")
     deferred = bool(provenance_row.get("logical_hash_deferred"))
     if (
@@ -1616,17 +1490,12 @@ def _source_provenance_payload(
         or not _SHA256_RE.fullmatch(trace_set_hash)
         or (deferred and logical_sha256 is not None)
         or (not deferred and not _SHA256_RE.fullmatch(logical_sha256 or ""))
-        or int(provenance_row.get("resolved_trace_count") or 0)
-        != int(provenance_row.get("trace_hash_count") or 0)
+        or int(provenance_row.get("resolved_trace_count") or 0) != int(provenance_row.get("trace_hash_count") or 0)
     ):
-        raise PTG2SharedBlockError(
-            "shared PTG source identity or trace mapping is invalid"
-        )
+        raise PTG2SharedBlockError("shared PTG source identity or trace mapping is invalid")
     source_traces = _source_provenance_traces(provenance_row)
     if source_key in existing_provenance_by_key:
-        raise PTG2SharedBlockError(
-            "shared PTG source metadata contains a duplicate source key"
-        )
+        raise PTG2SharedBlockError("shared PTG source metadata contains a duplicate source key")
     return source_key, {
         "source_key": source_key,
         "source_type": str(provenance_row["source_type"]),
@@ -1647,6 +1516,8 @@ async def fetch_snapshot_source_provenance(
     logical_snapshot_id: str,
     source_keys: Iterable[int],
     expected_source_count: int,
+    serving_tables=None,
+    candidate_audit_access=None,
 ) -> dict[int, dict[str, Any]]:
     """Load exact source identities and traces for selected dense source keys."""
 
@@ -1656,15 +1527,27 @@ async def fetch_snapshot_source_provenance(
     if not requested_keys:
         return {}
     if requested_keys[0] < 0 or requested_keys[-1] >= source_count:
-        raise PTG2SharedBlockError(
-            "shared PTG response contains a source key outside the manifest dictionary"
-        )
+        raise PTG2SharedBlockError("shared PTG response contains a source key outside the manifest dictionary")
     snapshot_id = str(logical_snapshot_id or "").strip()
     if not snapshot_id:
         raise PTG2SharedBlockError("shared PTG logical snapshot id is missing")
+    snapshot_id, physical_binding = await _snapshot_source_read_binding(
+        session,
+        snapshot_id,
+        serving_tables=serving_tables,
+        candidate_audit_access=candidate_audit_access,
+    )
     schema = _quote_ident(schema_name)
+    relations_by_role = {
+        role: f"{schema}.{_quote_ident(table)}" if physical_binding is None else physical_binding.relation(table)
+        for role, table in (
+            ("source_table", "ptg2_v3_snapshot_source"),
+            ("trace_set_table", "ptg2_source_trace_set"),
+            ("trace_table", "ptg2_source_trace"),
+        )
+    }
     query_result = await session.execute(
-        text(_SNAPSHOT_SOURCE_PROVENANCE_SQL.format(schema=schema)),
+        text(_SNAPSHOT_SOURCE_PROVENANCE_SQL.format(**relations_by_role)),
         {
             "snapshot_id": snapshot_id,
             "source_keys": requested_keys,
@@ -1680,9 +1563,7 @@ async def fetch_snapshot_source_provenance(
         )
         provenance_by_key[source_key] = provenance_payload
     if set(provenance_by_key) != set(requested_keys):
-        raise PTG2SharedBlockError(
-            "shared PTG source mapping is missing a selected source key"
-        )
+        raise PTG2SharedBlockError("shared PTG source mapping is missing a selected source key")
     return provenance_by_key
 
 
@@ -1726,9 +1607,7 @@ def _iter_selected_graph_members(
         while remaining_member_bytes:
             chunk = raw_chunks_by_key.get(chunk_key)
             if chunk is None or chunk_offset < 0 or chunk_offset >= len(chunk):
-                raise PTG2SharedBlockError(
-                    "shared PTG graph member stream is truncated"
-                )
+                raise PTG2SharedBlockError("shared PTG graph member stream is truncated")
             selected_count = min(
                 remaining_member_bytes,
                 len(chunk) - chunk_offset,
@@ -1809,14 +1688,8 @@ class _GraphPreflightClaim:
     ) -> None:
         """Reject aggregate members before retaining their chunk coordinates."""
 
-        if (
-            max_total_members is not None
-            and selected_member_count
-            > max_total_members - self.selected_member_count
-        ):
-            raise SharedGraphReadLimitError(
-                "shared PTG graph selection exceeds max_total_members"
-            )
+        if max_total_members is not None and selected_member_count > max_total_members - self.selected_member_count:
+            raise SharedGraphReadLimitError("shared PTG graph selection exceeds max_total_members")
         self.selected_member_count += selected_member_count
 
 
@@ -1888,10 +1761,7 @@ def _claim_graph_result_retention(
         for owner_key in request.owner_keys:
             locator = locator_by_owner.get(owner_key)
             selected_member_count = 0 if locator is None else locator[3]
-            owner_bytes = (
-                _GRAPH_RESULT_OWNER_BYTES
-                + selected_member_count * _GRAPH_RESULT_MEMBERSHIP_BYTES
-            )
+            owner_bytes = _GRAPH_RESULT_OWNER_BYTES + selected_member_count * _GRAPH_RESULT_MEMBERSHIP_BYTES
             retention_budget.claim(
                 owner_bytes,
                 category="a decoded shared graph result owner",
@@ -1959,9 +1829,7 @@ def _normalized_graph_total_member_limit(
     if max_total_members is None:
         return None
     if type(max_total_members) is not int or max_total_members < 0:
-        raise ValueError(
-            "shared PTG graph max_total_members must be a non-negative integer"
-        )
+        raise ValueError("shared PTG graph max_total_members must be a non-negative integer")
     return max_total_members
 
 
@@ -2021,13 +1889,8 @@ def _validated_graph_owner_selection(
         selected_byte_count = selected_member_count * request.member_width
         if selected_byte_count:
             range_start = first_chunk * PTG2_V3_GRAPH_CHUNK_BYTES + member_offset
-            selected_byte_ranges.append(
-                (range_start, range_start + selected_byte_count)
-            )
-            last_chunk = first_chunk + (
-                (member_offset + selected_byte_count - 1)
-                // PTG2_V3_GRAPH_CHUNK_BYTES
-            )
+            selected_byte_ranges.append((range_start, range_start + selected_byte_count))
+            last_chunk = first_chunk + ((member_offset + selected_byte_count - 1) // PTG2_V3_GRAPH_CHUNK_BYTES)
             _retain_graph_chunk_range(
                 required_chunk_keys,
                 first_chunk,
@@ -2044,9 +1907,7 @@ def _validated_graph_owner_selection(
             selected_byte_ranges[1:],
         )
     ):
-        raise PTG2SharedBlockError(
-            "shared PTG graph owner ranges overlap"
-        )
+        raise PTG2SharedBlockError("shared PTG graph owner ranges overlap")
     return _GraphOwnerSelection(
         locator_by_owner=locator_by_owner,
         required_chunk_keys=required_chunk_keys,
@@ -2060,8 +1921,7 @@ def _maximum_graph_chunk_count(maximum_raw_bytes: int | None) -> int | None:
         return None
     return max(
         1,
-        (int(maximum_raw_bytes) + PTG2_V3_GRAPH_CHUNK_BYTES - 1)
-        // PTG2_V3_GRAPH_CHUNK_BYTES,
+        (int(maximum_raw_bytes) + PTG2_V3_GRAPH_CHUNK_BYTES - 1) // PTG2_V3_GRAPH_CHUNK_BYTES,
     )
 
 
@@ -2075,23 +1935,13 @@ def _retain_graph_chunk_range(
 ) -> None:
     """Retain unique chunk keys after both raw and decoded limit checks."""
 
-    if (
-        maximum_chunk_count is not None
-        and last_chunk - first_chunk + 1 > maximum_chunk_count
-    ):
-        raise SharedGraphReadLimitError(
-            "shared PTG graph owner exceeds the read-once byte limit"
-        )
+    if maximum_chunk_count is not None and last_chunk - first_chunk + 1 > maximum_chunk_count:
+        raise SharedGraphReadLimitError("shared PTG graph owner exceeds the read-once byte limit")
     for chunk_key in range(first_chunk, last_chunk + 1):
         if chunk_key in required_chunk_keys:
             continue
-        if (
-            maximum_chunk_count is not None
-            and len(required_chunk_keys) >= maximum_chunk_count
-        ):
-            raise SharedGraphReadLimitError(
-                "shared PTG graph chunks exceed the read-once byte limit"
-            )
+        if maximum_chunk_count is not None and len(required_chunk_keys) >= maximum_chunk_count:
+            raise SharedGraphReadLimitError("shared PTG graph chunks exceed the read-once byte limit")
         preflight_claim.reserve(
             retention_budget,
             _GRAPH_PREFLIGHT_CHUNK_MEMBERSHIP_BYTES,
@@ -2123,9 +1973,7 @@ def _validated_graph_owner_locator(
         or selected_member_count < 0
         or selected_member_count > member_count
     ):
-        raise PTG2SharedBlockError(
-            "shared PTG graph owner locator is invalid or unordered"
-        )
+        raise PTG2SharedBlockError("shared PTG graph owner locator is invalid or unordered")
     return owner_key, locator
 
 
@@ -2140,9 +1988,7 @@ def _validated_graph_chunks(
     validated_by_hash: dict[bytes, bytes] = {}
     for block_key, fragments in chunks_by_key.items():
         if len(fragments) != 1 or fragments[0].fragment_no != 0:
-            raise PTG2SharedBlockError(
-                "shared PTG graph chunk has an invalid fragment layout"
-            )
+            raise PTG2SharedBlockError("shared PTG graph chunk has an invalid fragment layout")
         fragment = fragments[0]
         raw_chunk = validated_by_hash.get(fragment.block_hash)
         if raw_chunk is None:
@@ -2157,20 +2003,12 @@ def _validated_graph_chunks(
                 or len(raw_chunk) % request.member_width
                 or fragment.entry_count * request.member_width != len(raw_chunk)
             ):
-                raise PTG2SharedBlockError(
-                    "shared PTG graph chunk has invalid member framing"
-                )
+                raise PTG2SharedBlockError("shared PTG graph chunk has invalid member framing")
             validated_by_hash[fragment.block_hash] = raw_chunk
-        if (
-            fragment.entry_count * request.member_width != len(raw_chunk)
-            or (
-                block_key != last_chunk_key
-                and len(raw_chunk) != PTG2_V3_GRAPH_CHUNK_BYTES
-            )
+        if fragment.entry_count * request.member_width != len(raw_chunk) or (
+            block_key != last_chunk_key and len(raw_chunk) != PTG2_V3_GRAPH_CHUNK_BYTES
         ):
-            raise PTG2SharedBlockError(
-                "shared PTG graph chunk has invalid member framing"
-            )
+            raise PTG2SharedBlockError("shared PTG graph chunk has invalid member framing")
         raw_chunks_by_key[block_key] = raw_chunk
     return raw_chunks_by_key
 
@@ -2224,18 +2062,13 @@ def _budgeted_graph_owner_keys(
             retained_set_bytes += _GRAPH_OWNER_SET_MEMBERSHIP_BYTES
             owner_key_set.add(owner_key)
         owner_count = len(owner_key_set)
-        ordering_bytes = (
-            _GRAPH_OWNER_ORDERING_BYTES
-            + owner_count * _GRAPH_OWNER_ORDERING_MEMBERSHIP_BYTES
-        )
+        ordering_bytes = _GRAPH_OWNER_ORDERING_BYTES + owner_count * _GRAPH_OWNER_ORDERING_MEMBERSHIP_BYTES
         retention_budget.claim(
             ordering_bytes,
             category="the ordered shared graph owner keys",
         )
         requested_owner_keys = tuple(sorted(owner_key_set))
-        retained_tuple_bytes = (
-            _GRAPH_OWNER_TUPLE_BYTES + owner_count * _GRAPH_OWNER_TUPLE_MEMBERSHIP_BYTES
-        )
+        retained_tuple_bytes = _GRAPH_OWNER_TUPLE_BYTES + owner_count * _GRAPH_OWNER_TUPLE_MEMBERSHIP_BYTES
         retention_budget.release(ordering_bytes - retained_tuple_bytes)
         ordering_bytes = retained_tuple_bytes
     except BaseException:
@@ -2263,14 +2096,12 @@ async def fetch_shared_graph_members(
 
     max_total_members = _normalized_graph_total_member_limit(max_total_members)
     if retention_budget is None:
-        requested_owner_key_set = {
-            int(owner_key) for owner_key in owner_keys
-        }
+        requested_owner_key_set = {int(owner_key) for owner_key in owner_keys}
         requested_owner_keys = tuple(sorted(requested_owner_key_set))
         retained_owner_key_bytes = 0
     else:
-        requested_owner_keys, requested_owner_key_set, retained_owner_key_bytes = (
-            _budgeted_graph_owner_keys(owner_keys, retention_budget)
+        requested_owner_keys, requested_owner_key_set, retained_owner_key_bytes = _budgeted_graph_owner_keys(
+            owner_keys, retention_budget
         )
     if not requested_owner_keys:
         if retention_budget is not None:
@@ -2388,9 +2219,7 @@ def _indexed_direct_graph_records(
             ),
         )
         if locator[1] < 0 or locator[2] < 0 or locator[2] > locator[1]:
-            raise PTG2SharedBlockError(
-                "shared PTG graph owner member count is invalid"
-            )
+            raise PTG2SharedBlockError("shared PTG graph owner member count is invalid")
         previous_locator = locator_by_owner.get(owner_key)
         if previous_locator is None:
             locator_by_owner[owner_key] = locator

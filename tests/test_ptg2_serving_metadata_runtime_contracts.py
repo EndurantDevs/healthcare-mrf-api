@@ -12,7 +12,6 @@ from tests.ptg2_serving_coverage_paydown_support import (
     strict_v3_tables,
 )
 
-
 _PROVIDER_SET_ID = "01" * 16
 _ADDRESS_KEY = "00000000-0000-0000-0000-000000000001"
 
@@ -52,11 +51,10 @@ async def test_sparse_directory_corroboration_preserves_absent_contacts(
     )
 
     assert overlaid[0]["location_source"] == "provider_directory_fhir"
-    assert overlaid[0]["address_payload"]["address_sources"] == [
-        "provider_directory_fhir"
-    ]
+    assert overlaid[0]["address_payload"]["address_sources"] == ["provider_directory_fhir"]
     assert "telephone_number" not in overlaid[0]
     assert "phone_number" not in overlaid[0]["address_payload"]
+    assert session.rollback_count == 0
 
 
 @pytest.mark.asyncio
@@ -71,18 +69,14 @@ async def test_address_table_selection_prefers_unified_and_guards_legacy(
     relation_available = AsyncMock(return_value=False)
     monkeypatch.setattr(serving, "_is_relation_available", relation_available)
 
-    unified = await serving._ptg2_address_serving_table(
-        object(), {"npi", "address_payload"}
-    )
+    unified = await serving._ptg2_address_serving_table(object(), {"npi", "address_payload"})
     unavailable = await serving._ptg2_address_serving_table(
         object(),
         {"npi", "address_payload"},
         require_legacy_available=True,
     )
     monkeypatch.setattr(serving, "_is_unified_address_requested", lambda: False)
-    legacy = await serving._ptg2_address_serving_table(
-        object(), {"npi", "address_payload"}
-    )
+    legacy = await serving._ptg2_address_serving_table(object(), {"npi", "address_payload"})
 
     assert unified == f"{serving.PTG2_SCHEMA}.entity_address_unified"
     assert unavailable is None
@@ -196,6 +190,18 @@ def test_rate_scope_membership_handles_absent_unknown_and_known_groups():
     assert serving._has_rate_scope_group(rate_scope, group_id) is True
 
 
+async def _has_probe_matches(probe_state, *, taxonomy_filter_requested=False):
+    return await probe_state.has_enough_after_append(
+        object(),
+        strict_v3_tables(),
+        {},
+        frozenset({7}),
+        [],
+        taxonomy_filter_requested=taxonomy_filter_requested,
+        candidate_limit=1,
+    )
+
+
 @pytest.mark.asyncio
 async def test_graph_probe_state_distinguishes_no_match_and_bounded_matches(
     monkeypatch,
@@ -205,21 +211,13 @@ async def test_graph_probe_state_distinguishes_no_match_and_bounded_matches(
     append_matches = AsyncMock(side_effect=(0, 1, 1))
     monkeypatch.setattr(serving, "_append_rate_matched_locations", append_matches)
     empty_state = serving._GraphLocationProbeState()
-    assert await empty_state.has_enough_after_append(
-        object(), strict_v3_tables(), {}, frozenset({7}), [],
-        taxonomy_filter_requested=False,
-        candidate_limit=1,
-    ) is False
+    assert await _has_probe_matches(empty_state) is False
 
     direct_state = serving._GraphLocationProbeState(
         matched_location_rows=[{"npi": 1234567890}],
         provider_set_keys_by_npi={1234567890: {7}},
     )
-    assert await direct_state.has_enough_after_append(
-        object(), strict_v3_tables(), {}, frozenset({7}), [],
-        taxonomy_filter_requested=False,
-        candidate_limit=1,
-    ) is True
+    assert await _has_probe_matches(direct_state) is True
 
     filtered = serving._GraphLocationCandidates(
         [{"npi": 1234567890}],
@@ -232,11 +230,7 @@ async def test_graph_probe_state_distinguishes_no_match_and_bounded_matches(
         AsyncMock(return_value=filtered),
     )
     taxonomy_state = serving._GraphLocationProbeState()
-    assert await taxonomy_state.has_enough_after_append(
-        object(), strict_v3_tables(), {}, frozenset({7}), [],
-        taxonomy_filter_requested=True,
-        candidate_limit=1,
-    ) is True
+    assert await _has_probe_matches(taxonomy_state, taxonomy_filter_requested=True) is True
     assert taxonomy_state.observed_match_count(taxonomy_filter_requested=True) == 1
     assert taxonomy_state.result(taxonomy_filter_requested=True) is filtered
 
@@ -261,7 +255,5 @@ def test_graph_probe_growth_and_exhaustion_are_explicit():
 
     assert no_match_growth == 40
     assert density_growth >= 20
-    assert serving._is_graph_location_source_exhausted(
-        [{"_ptg_source_exhausted": False}], 10
-    ) is False
+    assert serving._is_graph_location_source_exhausted([{"_ptg_source_exhausted": False}], 10) is False
     assert serving._is_graph_location_source_exhausted([{"npi": 1}], 10) is True

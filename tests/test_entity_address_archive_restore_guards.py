@@ -14,6 +14,18 @@ from tests.test_entity_address_snapshot_stage import _receipt
 from tests.test_geo_assurance_dependency_bindings import _example_bindings
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", (False, True))
+async def test_owned_catalog_read_keeps_share_nowait_and_mutations_keep_exclusive(read_only):
+    owner = _owner()
+    session = SimpleNamespace(execute=AsyncMock())
+    await restore._lock_owned_restore_relations(session, owner, read_only=read_only)
+    mode = "SHARE MODE NOWAIT" if read_only else "ACCESS EXCLUSIVE MODE"
+    targets = ", ".join(f'"{owner.schema_name}"."{name}"' for name, _oid in owner.relation_oids)
+    session.execute.assert_awaited_once()
+    assert str(session.execute.await_args.args[0]) == f"LOCK TABLE {targets} IN {mode}"
+
+
 def _stored_restore():
     owner = _owner()
     semantic = receipt.validate_entity_address_archive_receipt(_receipt())

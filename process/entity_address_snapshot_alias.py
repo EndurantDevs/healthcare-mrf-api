@@ -10,12 +10,15 @@ import struct
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from sqlalchemy import text
+from sqlalchemy import Column, Integer, MetaData, SmallInteger, String, Table, Text, text
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.exc import SQLAlchemyError
 
 from process.ext import address_alias_sql
 
 CONTRACT = "entity_address_alias_semantic_receipt.v1"
+SET_CONTRACT = "entity_address_alias_authority.v2"
+AUTHORITY_TABLE = "entity_address_alias_authority"
 RECEIPT_VERSION = "entity_address_alias_semantic_receipt.v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -34,6 +37,91 @@ _SEMANTIC_COLUMNS = (
     "target_strict_source_count",
     "candidate_count",
 )
+
+
+class EntityAddressAliasAuthority:
+    """The portable active set, not alias IDs, audit history or a row codec."""
+
+    __tablename__ = AUTHORITY_TABLE
+    __table__ = Table(
+        AUTHORITY_TABLE,
+        MetaData(),
+        Column("source_address_key", UUID, primary_key=True),
+        Column("source_identity_key", Text, nullable=False),
+        Column("target_address_key", UUID, nullable=False),
+        Column("target_identity_key", Text, nullable=False),
+        Column("alias_kind", String(64), nullable=False),
+        Column("ruleset_version", SmallInteger, nullable=False),
+        Column("target_strict_source_bits", Integer, nullable=False),
+        Column("target_strict_source_count", SmallInteger, nullable=False),
+        Column("candidate_count", Integer, nullable=False),
+    )
+
+
+async def require_matching_entity_address_alias_authority(session, *, authority_schema, alias_schema):
+    """Compare all nine typed values; counters and digests cannot stand in for rows."""
+    authority_schema, alias_schema = _schema_name(authority_schema), _schema_name(alias_schema)
+    columns = ", ".join(_quoted(name) for name in _SEMANTIC_COLUMNS)
+    authority = f"{_quoted(authority_schema)}.{_quoted(AUTHORITY_TABLE)}"
+    active = f"(SELECT {columns} FROM {_quoted(alias_schema)}.{_quoted(_ALIAS_TABLE)} WHERE revoked_at IS NULL)"
+    differences = " OR ".join(f"a.{_quoted(name)} IS DISTINCT FROM b.{_quoted(name)}" for name in _SEMANTIC_COLUMNS)
+    equal = await session.scalar(
+        text(
+            f"SELECT NOT EXISTS(SELECT 1 FROM {authority} a FULL JOIN {active} b USING (source_address_key) "
+            f"WHERE a.source_address_key IS NULL OR b.source_address_key IS NULL OR {differences})"
+        )
+    )
+    if equal is not True:
+        raise EntityAddressSnapshotAliasError("entity-address active alias authority differs")
+
+
+async def capture_entity_address_alias_authority_receipt(session, *, schema_name):
+    """Describe a locked active set; approved archive rows supply content authority."""
+    schema = _schema_name(schema_name)
+    _require_caller_transaction(session)
+    await _lock_alias_relations(session, schema)
+    schema_version, ruleset_version, generation = await _alias_state(session, schema)
+    await _require_supported_active_aliases(session, schema, ruleset_version)
+    count = await session.scalar(
+        text(f"SELECT count(*) FROM {_quoted(schema)}.{_quoted(_ALIAS_TABLE)} WHERE revoked_at IS NULL")
+    )
+    return validate_entity_address_alias_semantic_receipt(
+        {
+            "contract": SET_CONTRACT,
+            "receipt_version": SET_CONTRACT,
+            "alias_schema_version": schema_version,
+            "active_ruleset_version": ruleset_version,
+            "local_generation": generation,
+            "active_alias_count": count,
+        }
+    )
+
+
+def validate_entity_address_alias_authority_receipt(value):
+    """Validate the recorded bounded descriptor without claiming alias payload equality."""
+    fields = {
+        "contract",
+        "receipt_version",
+        "alias_schema_version",
+        "active_ruleset_version",
+        "local_generation",
+        "active_alias_count",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != fields
+        or value["contract"] != SET_CONTRACT
+        or value["receipt_version"] != SET_CONTRACT
+        or type(value["alias_schema_version"]) is not int
+        or value["alias_schema_version"] != address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION
+        or type(value["active_ruleset_version"]) is not int
+        or value["active_ruleset_version"] != address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION
+        or any(type(value[key]) is not int or value[key] < 0 for key in ("local_generation", "active_alias_count"))
+    ):
+        raise EntityAddressSnapshotAliasError("entity-address alias authority receipt is invalid")
+    return dict(value)
+
+
 _SUPPORTED_ALIAS_KINDS = (
     address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND,
     address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
@@ -81,18 +169,19 @@ class EntityAddressAliasSemanticReceipt:
     active_ruleset_version: int
     local_generation: int
     active_alias_count: int
-    active_alias_sha256: str
+    active_alias_sha256: str = ""
+    contract: str = CONTRACT
 
     def portable_identity(self) -> dict[str, Any]:
         """Return only fields whose equality has cross-cluster meaning."""
 
         return {
-            "contract": CONTRACT,
-            "receipt_version": RECEIPT_VERSION,
+            "contract": self.contract,
+            "receipt_version": self.contract,
             "alias_schema_version": self.alias_schema_version,
             "active_ruleset_version": self.active_ruleset_version,
             "active_alias_count": self.active_alias_count,
-            "active_alias_sha256": self.active_alias_sha256,
+            **({"active_alias_sha256": self.active_alias_sha256} if self.contract == CONTRACT else {}),
         }
 
     def as_dict(self) -> dict[str, Any]:
@@ -397,6 +486,15 @@ def validate_entity_address_alias_semantic_receipt(
     """Validate persisted alias evidence without treating its local counter as identity."""
 
     receipt = receipt_value.as_dict() if isinstance(receipt_value, EntityAddressAliasSemanticReceipt) else receipt_value
+    if isinstance(receipt, Mapping) and receipt.get("contract") == SET_CONTRACT:
+        validated = validate_entity_address_alias_authority_receipt(receipt)
+        return EntityAddressAliasSemanticReceipt(
+            **{
+                key: validated[key]
+                for key in ("alias_schema_version", "active_ruleset_version", "local_generation", "active_alias_count")
+            },
+            contract=SET_CONTRACT,
+        )
     expected_fields = {
         "contract",
         "receipt_version",
@@ -440,6 +538,8 @@ def require_matching_entity_address_alias_semantics(
 
     expected_receipt = validate_entity_address_alias_semantic_receipt(expected)
     actual_receipt = validate_entity_address_alias_semantic_receipt(actual)
+    if SET_CONTRACT in (expected_receipt.contract, actual_receipt.contract):
+        raise EntityAddressSnapshotAliasError("entity-address v2 requires actual alias set authority")
     if expected_receipt.portable_identity() != actual_receipt.portable_identity():
         raise EntityAddressSnapshotAliasError("entity-address active alias semantics differ")
     return actual_receipt

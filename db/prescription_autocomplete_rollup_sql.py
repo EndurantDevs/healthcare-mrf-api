@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-
 _ROLLUP_INSERT_SQL = """
     WITH variants AS (
         SELECT
@@ -37,19 +36,7 @@ _ROLLUP_INSERT_SQL = """
             )::bigint AS variant_id
         FROM variants
     )
-    INSERT INTO {target_relation} (
-        year,
-        rx_code_system,
-        rx_code,
-        variant_id,
-        rx_name,
-        generic_name,
-        brand_name,
-        total_claims,
-        total_drug_cost,
-        total_benes,
-        source_relation_fingerprint
-    )
+    {insert_clause}
     SELECT
         year,
         rx_code_system,
@@ -90,6 +77,7 @@ def prescription_autocomplete_rollup_insert_sql(
     schema: str,
     rollup_table: str,
     provider_table: str,
+    select_only: bool = False,
 ) -> str:
     """Aggregate exact provider name variants into the autocomplete rollup."""
 
@@ -101,6 +89,11 @@ def prescription_autocomplete_rollup_insert_sql(
     )
     return _ROLLUP_INSERT_SQL.format(
         source_relation=source_relation,
-        target_relation=target_relation,
+        insert_clause=""
+        if select_only
+        else (
+            f"INSERT INTO {target_relation} (year,rx_code_system,rx_code,variant_id,"
+            "rx_name,generic_name,brand_name,total_claims,total_drug_cost,total_benes,source_relation_fingerprint)"
+        ),
         fingerprint=fingerprint,
     )

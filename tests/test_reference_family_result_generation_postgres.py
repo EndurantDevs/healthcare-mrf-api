@@ -26,6 +26,9 @@ _LOCAL_DATABASE = re.compile(r"^hc_reference_family_[0-9a-f]{32}$")
 _REFERENCE_MIGRATION_PATH = (
     Path(__file__).resolve().parents[1] / "alembic/versions/20260914110000_reference_family_result_generation.py"
 )
+_NUCC_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1] / "alembic/versions/20261006010000_nucc_reference_result_generation.py"
+)
 _MRF_MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260914130000_mrf_result_generation.py"
 _CMS_MIGRATION_PATH = (
     Path(__file__).resolve().parents[1] / "alembic/versions/20260920100000_cms_doctors_result_generation.py"
@@ -313,6 +316,8 @@ async def test_closed_family_generation_publication_adoption_and_rollback(monkey
             for table_name in table_names - {"facility_address_contribution", "cms_doctor_group_site"}:
                 await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))
             await install_source_generation_guards(connection, schema)
+
+            await _run_migration(connection, _NUCC_MIGRATION_PATH, "upgrade")
 
         authority_by_importer = await _publish_initial_generations(engine, schema)
         incumbent_authority = authority_by_importer["places-zcta"]

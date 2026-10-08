@@ -9,7 +9,6 @@ from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
     validate_v4_inferred_taxonomy_projection_manifest,
 )
 
-
 PTG2_CANDIDATE_ARCH_VERSION = "postgres_binary_v3"
 PTG2_CANDIDATE_V3_GENERATION = "shared_blocks_v3"
 PTG2_CANDIDATE_V4_GENERATION = "shared_blocks_v4"
@@ -36,12 +35,7 @@ def _canonical_snapshot_key(value: Any) -> int:
         raise ValueError("candidate V4 shared snapshot key is invalid")
     if isinstance(value, int):
         snapshot_key = value
-    elif (
-        isinstance(value, str)
-        and value.isascii()
-        and value.isdecimal()
-        and not value.startswith("0")
-    ):
+    elif isinstance(value, str) and value.isascii() and value.isdecimal() and not value.startswith("0"):
         snapshot_key = int(value)
     else:
         raise ValueError("candidate V4 shared snapshot key is invalid")
@@ -76,8 +70,7 @@ def _has_exact_v4_markers(serving_index: Mapping[str, Any]) -> bool:
         "shared_block_layout": "packed_snapshot_maps_v4",
     }
     return all(
-        serving_index.get(field_name) == expected_value
-        for field_name, expected_value in expected_by_field.items()
+        serving_index.get(field_name) == expected_value for field_name, expected_value in expected_by_field.items()
     )
 
 
@@ -86,22 +79,16 @@ def _validate_common_layout_identity(
     serving_index: Mapping[str, Any],
     layout_serving_index: Mapping[str, Any],
 ) -> str:
-    generation = normalize_candidate_storage_generation(
-        database_row.get("layout_generation")
-    )
+    generation = normalize_candidate_storage_generation(database_row.get("layout_generation"))
     is_exact_shared_layout = (
         str(database_row.get("layout_state") or "").strip() == "sealed"
-        and serving_index.get("arch_version")
-        == PTG2_CANDIDATE_ARCH_VERSION
-        and layout_serving_index.get("arch_version")
-        == PTG2_CANDIDATE_ARCH_VERSION
+        and serving_index.get("arch_version") == PTG2_CANDIDATE_ARCH_VERSION
+        and layout_serving_index.get("arch_version") == PTG2_CANDIDATE_ARCH_VERSION
         and serving_index.get("storage_generation") == generation
         and layout_serving_index.get("storage_generation") == generation
     )
     if not is_exact_shared_layout:
-        raise ValueError(
-            "candidate is not an exact strict postgres_binary_v3 snapshot"
-        )
+        raise ValueError("candidate is not an exact strict postgres_binary_v3 snapshot")
     return generation
 
 
@@ -109,26 +96,27 @@ def _validate_v4_snapshot_binding(
     database_row: Mapping[str, Any],
     serving_index: Mapping[str, Any],
     layout_serving_index: Mapping[str, Any],
+    *,
+    physical_binding=None,
 ) -> None:
-    if not (
-        _has_exact_v4_markers(serving_index)
-        and _has_exact_v4_markers(layout_serving_index)
-    ):
+    if not (_has_exact_v4_markers(serving_index) and _has_exact_v4_markers(layout_serving_index)):
         raise ValueError("candidate V4 packed-layout markers are inconsistent")
     snapshot_key = _canonical_snapshot_key(database_row.get("snapshot_key"))
-    manifest_snapshot_key = _canonical_snapshot_key(
-        serving_index.get("shared_snapshot_key")
-    )
-    layout_manifest_snapshot_key = _canonical_snapshot_key(
-        layout_serving_index.get("shared_snapshot_key")
-    )
-    if (
-        manifest_snapshot_key != snapshot_key
-        or layout_manifest_snapshot_key != snapshot_key
-    ):
-        raise ValueError(
-            "candidate V4 manifest does not match its shared layout binding"
-        )
+    payload_key = snapshot_key
+    if physical_binding is not None:
+        from process.ptg_parts.ptg2_physical_binding import PTG2PhysicalBinding
+
+        if (
+            not isinstance(physical_binding, PTG2PhysicalBinding)
+            or snapshot_key != physical_binding.destination_layout_key
+            or ("snapshot_id" in database_row and database_row["snapshot_id"] != physical_binding.snapshot_id)
+        ):
+            raise ValueError("candidate V4 local metadata binding differs")
+        payload_key = physical_binding.payload_snapshot_key
+    manifest_snapshot_key = _canonical_snapshot_key(serving_index.get("shared_snapshot_key"))
+    layout_manifest_snapshot_key = _canonical_snapshot_key(layout_serving_index.get("shared_snapshot_key"))
+    if manifest_snapshot_key != payload_key or layout_manifest_snapshot_key != payload_key:
+        raise ValueError("candidate V4 manifest does not match its shared layout binding")
 
 
 def _validate_v4_map_root(
@@ -143,9 +131,7 @@ def _validate_v4_map_root(
         or not snapshot_map
         or dict(snapshot_map) != dict(layout_snapshot_map or {})
     ):
-        raise ValueError(
-            "candidate V4 packed-map manifest changed after layout sealing"
-        )
+        raise ValueError("candidate V4 packed-map manifest changed after layout sealing")
     manifest_digest = _digest_bytes(
         snapshot_map.get("map_digest"),
         field="candidate V4 manifest map digest",
@@ -164,9 +150,7 @@ def _validate_v4_map_root(
         and root_digest == layout_digest
     )
     if not has_complete_matching_root:
-        raise ValueError(
-            "candidate V4 packed-map root is incomplete or inconsistent"
-        )
+        raise ValueError("candidate V4 packed-map root is incomplete or inconsistent")
 
 
 def _optional_projection(
@@ -181,9 +165,7 @@ def _optional_projection(
         if serving_binary is None:
             return _MISSING
         if not isinstance(serving_binary, Mapping):
-            raise ValueError(
-                "candidate V4 sealed serving binary is invalid"
-            )
+            raise ValueError("candidate V4 sealed serving binary is invalid")
         provider_graph = serving_binary.get("provider_graph_v4")
     else:
         provider_graph = serving_index.get("provider_graph")
@@ -206,50 +188,37 @@ def _validate_v4_inferred_taxonomy_projection(
         _optional_projection(layout_serving_index, sealed_layout=False),
         _optional_projection(layout_serving_index, sealed_layout=True),
     )
-    present_projections = tuple(
-        projection for projection in projections if projection is not _MISSING
-    )
+    present_projections = tuple(projection for projection in projections if projection is not _MISSING)
     if not present_projections:
         # Compatibility path for V4 layouts sealed before the optional
         # snapshot-local taxonomy projection existed.
         return
     if len(present_projections) != len(projections):
         raise ValueError(
-            "candidate V4 inferred-taxonomy projection is missing from "
-            "its serving or sealed layout manifest"
+            "candidate V4 inferred-taxonomy projection is missing from its serving or sealed layout manifest"
         )
     first_projection = present_projections[0]
     if not isinstance(first_projection, Mapping) or any(
-        not isinstance(projection, Mapping)
-        or dict(projection) != dict(first_projection)
+        not isinstance(projection, Mapping) or dict(projection) != dict(first_projection)
         for projection in present_projections[1:]
     ):
-        raise ValueError(
-            "candidate V4 inferred-taxonomy projection changed after "
-            "layout sealing"
-        )
+        raise ValueError("candidate V4 inferred-taxonomy projection changed after layout sealing")
     try:
-        canonical_projection = (
-            validate_v4_inferred_taxonomy_projection_manifest(
-                first_projection
-            )
-        )
+        canonical_projection = validate_v4_inferred_taxonomy_projection_manifest(first_projection)
     except ValueError as exc:
-        raise ValueError(
-            "candidate V4 inferred-taxonomy projection is invalid"
-        ) from exc
+        raise ValueError("candidate V4 inferred-taxonomy projection is invalid") from exc
     if dict(first_projection) != canonical_projection:
-        raise ValueError(
-            "candidate V4 inferred-taxonomy projection is not canonical"
-        )
+        raise ValueError("candidate V4 inferred-taxonomy projection is not canonical")
 
 
 def validate_candidate_layout_identity(
     database_row: Mapping[str, Any],
     serving_index: Mapping[str, Any],
     layout_serving_index: Mapping[str, Any],
+    *,
+    physical_binding=None,
 ) -> str:
-    """Bind a candidate manifest to one sealed V3 or complete V4 layout."""
+    """Check identity only; a local carrier must already be authenticated by its caller."""
 
     generation = _validate_common_layout_identity(
         database_row,
@@ -257,11 +226,14 @@ def validate_candidate_layout_identity(
         layout_serving_index,
     )
     if generation == PTG2_CANDIDATE_V3_GENERATION:
+        if physical_binding is not None:
+            raise ValueError("candidate local physical binding requires V4")
         return generation
     _validate_v4_snapshot_binding(
         database_row,
         serving_index,
         layout_serving_index,
+        physical_binding=physical_binding,
     )
     _validate_v4_map_root(
         database_row,

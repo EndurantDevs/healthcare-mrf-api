@@ -13,6 +13,7 @@ from sqlalchemy import text
 
 from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
 from api.ptg2_serving_utils import ein_plan_id_variants
+from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
 from process.ptg_parts.ptg2_candidate_attestation import (
     PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS,
@@ -23,30 +24,6 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS,
     PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
     PTG2_V3_SHARED_GENERATION,
-)
-from process.ptg_parts.ptg2_v4_snapshot_maps import (
-    PTG2_V4_COMPONENT_TABLE,
-    PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
-    PTG2_V4_GRAPH_DIAGNOSTIC_TABLE,
-    PTG2_V4_GRAPH_RESOURCE_FIELDS,
-    PTG2_V4_HEAVY_OWNER_TABLE,
-    PTG2_V4_MAP_FORMAT,
-    PTG2_V4_MEMBER_PAGE_CONTRACT,
-    PTG2_V4_NPI_TABLE,
-    PTG2_V4_NPI_PREFIX_TABLE,
-    PTG2_V4_OWNER_LOCATOR_PAGE_CONTRACT,
-    PTG2_V4_PATTERN_TABLE,
-    PTG2_V4_PROJECTION_ID_SCOPE,
-    PTG2_V4_PROVIDER_GRAPH_CONTRACT,
-    PTG2_V4_RELATION_MANIFEST_TABLE,
-    PTG2_V4_SHARED_GENERATION,
-)
-from process.ptg_parts.ptg2_v4_finalizer_maps import (
-    FinalizerMapError,
-    has_complete_v4_finalizer_map,
-)
-from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
-    validate_v4_inferred_taxonomy_projection_manifest,
 )
 from process.ptg_parts.ptg2_shared_source_set import (
     PTG2_V3_SOURCE_SET_CONTRACT,
@@ -60,10 +37,44 @@ from process.ptg_parts.ptg2_tax_identity_source_projection import (
     TaxIdentitySourcePublication,
     tax_identity_source_publication_from_metadata,
 )
-
-from api.ptg2_types import PTG2ServingTables
+from process.ptg_parts.ptg2_v4_finalizer_maps import (
+    FinalizerMapError,
+    has_complete_v4_finalizer_map,
+)
+from process.ptg_parts.ptg2_v4_snapshot_maps import (
+    PTG2_V4_COMPONENT_TABLE,
+    PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
+    PTG2_V4_GRAPH_DIAGNOSTIC_TABLE,
+    PTG2_V4_GRAPH_RESOURCE_FIELDS,
+    PTG2_V4_HEAVY_OWNER_TABLE,
+    PTG2_V4_MAP_FORMAT,
+    PTG2_V4_MEMBER_PAGE_CONTRACT,
+    PTG2_V4_NPI_PREFIX_TABLE,
+    PTG2_V4_NPI_TABLE,
+    PTG2_V4_OWNER_LOCATOR_PAGE_CONTRACT,
+    PTG2_V4_PATTERN_TABLE,
+    PTG2_V4_PROJECTION_ID_SCOPE,
+    PTG2_V4_PROVIDER_GRAPH_CONTRACT,
+    PTG2_V4_RELATION_MANIFEST_TABLE,
+    PTG2_V4_SHARED_GENERATION,
+)
+from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
+    validate_v4_inferred_taxonomy_projection_manifest,
+)
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+
+
+def local_physical_binding_declared_sql(snapshot_alias: str, layout_alias: str) -> str:
+    """Detect local declarations; only the authenticated resolver can admit them."""
+
+    return f"""(
+        {layout_alias}.layout_manifest ? 'physical_binding'
+        OR {snapshot_alias}.manifest::jsonb ? 'physical_binding_contract'
+        OR {snapshot_alias}.manifest::jsonb ? 'local_data_preparation'
+    )"""
+
+
 PTG2_V3_ARCH_VERSION = "postgres_binary_v3"
 PTG2_V3_STORAGE_TYPE = "ptg2_shared_blocks_v3"
 PTG2_V3_SERVING_LAYOUT = "lean_provider_key_v1"
@@ -151,7 +162,7 @@ def _optional_integer(value: Any) -> int | None:
         return None
     try:
         return int(value) if value is not None else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -164,33 +175,23 @@ def _v4_tax_identity_source_publication(
 
     provider_graph = serving_index.get("provider_graph")
     raw_publication = (
-        provider_graph.get("provider_tax_identity_source")
-        if isinstance(provider_graph, Mapping)
-        else None
+        provider_graph.get("provider_tax_identity_source") if isinstance(provider_graph, Mapping) else None
     )
     if raw_publication in (None, {}):
         return None
     if not isinstance(raw_publication, Mapping):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 tax identity source publication is malformed"
-        )
+        raise PTG2ManifestArtifactError("PTG2 V4 tax identity source publication is malformed")
     try:
         publication = tax_identity_source_publication_from_metadata(raw_publication)
     except TaxIdentitySourceProjectionError as exc:
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 tax identity source publication is malformed"
-        ) from exc
+        raise PTG2ManifestArtifactError("PTG2 V4 tax identity source publication is malformed") from exc
     if publication.source_count != source_count:
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 tax identity source publication has the wrong source count"
-        )
+        raise PTG2ManifestArtifactError("PTG2 V4 tax identity source publication has the wrong source count")
     return publication
 
 
 def _has_valid_v4_fields(manifest: Any) -> bool:
-    if not isinstance(manifest, dict) or set(manifest) != set(
-        PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS
-    ):
+    if not isinstance(manifest, dict) or set(manifest) != set(PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS):
         return False
     optional_keys = {
         "worst_provider_set_key",
@@ -221,9 +222,7 @@ def _has_valid_v4_fields(manifest: Any) -> bool:
                 return False
             continue
         if field_name in digest_fields:
-            if field_value is not None and not _COVERAGE_SCOPE_ID_RE.fullmatch(
-                str(field_value)
-            ):
+            if field_value is not None and not _COVERAGE_SCOPE_ID_RE.fullmatch(str(field_value)):
                 return False
             continue
         if field_name in boolean_fields:
@@ -246,10 +245,7 @@ def _has_empty_v4_online_owner(manifest: dict[str, Any]) -> bool:
         and manifest["worst_online_member_digest"] is None
         and manifest["worst_online_groups_to_target_exact"] is False
         and manifest["worst_online_uses_component_fallback"] is False
-        and not any(
-            int(manifest[field_name])
-            for field_name in _V4_ONLINE_OWNER_INTEGER_FIELDS
-        )
+        and not any(int(manifest[field_name]) for field_name in _V4_ONLINE_OWNER_INTEGER_FIELDS)
     )
 
 
@@ -265,27 +261,16 @@ def _has_valid_v4_direct_prefix(
     has_worst_owner = manifest["worst_provider_set_key"] is not None
     has_worst_digest = manifest["worst_member_digest"] is not None
     if has_simulated_sets:
-        has_valid_worst_owner = (
-            has_worst_owner
-            and has_worst_digest
-            and manifest["worst_uses_override"] is True
-        )
+        has_valid_worst_owner = has_worst_owner and has_worst_digest and manifest["worst_uses_override"] is True
     else:
         has_valid_worst_owner = (
             not has_worst_owner
             and not has_worst_digest
             and manifest["worst_uses_override"] is False
             and manifest["worst_uses_component_fallback"] is False
-            and not any(
-                int(manifest[field_name])
-                for field_name in _V4_WORST_OWNER_INTEGER_FIELDS
-            )
+            and not any(int(manifest[field_name]) for field_name in _V4_WORST_OWNER_INTEGER_FIELDS)
         )
-    return (
-        owner_count == simulated_set_count
-        and has_valid_worst_owner
-        and _has_empty_v4_online_owner(manifest)
-    )
+    return owner_count == simulated_set_count and has_valid_worst_owner and _has_empty_v4_online_owner(manifest)
 
 
 def _has_valid_v4_prefix_owners(
@@ -317,13 +302,8 @@ def _has_valid_v4_prefix_owners(
         )
     if representation != "pattern_v1":
         return False
-    return (
-        owner_count >= unsafe_set_lower_bound
-        and owner_count
-        <= (
-            int(manifest["group_unsafe_set_count"])
-            + int(manifest["physical_unsafe_set_count"])
-        )
+    return owner_count >= unsafe_set_lower_bound and owner_count <= (
+        int(manifest["group_unsafe_set_count"]) + int(manifest["physical_unsafe_set_count"])
     )
 
 
@@ -339,9 +319,7 @@ def _has_valid_v4_relations(
         return False
     if (worst_key is None) != (manifest.get("worst_member_digest") is None):
         return False
-    if (online_key is None) != (
-        manifest.get("worst_online_member_digest") is None
-    ):
+    if (online_key is None) != (manifest.get("worst_online_member_digest") is None):
         return False
     return (
         int(manifest["worst_member_count"]) <= prefix_target
@@ -363,20 +341,14 @@ def _has_valid_v4_relations(
         and int(manifest["max_online_provider_expansion_rate_rows"]) > 0
         and int(manifest["max_online_provider_expansion_provider_sets"]) > 0
         and int(manifest["max_online_provider_expansion_graph_batches"]) > 0
-        and int(manifest["worst_online_group_npi_member_work"])
-        <= int(manifest["max_online_group_npi_members_per_set"])
+        and int(manifest["worst_online_group_npi_member_work"]) <= int(manifest["max_online_group_npi_members_per_set"])
         and int(manifest["worst_online_group_npi_locator_page_work"])
         <= int(manifest["max_online_group_npi_locator_pages_per_set"])
         and int(manifest["worst_online_group_npi_member_page_work"])
         <= int(manifest["max_online_group_npi_member_pages_per_set"])
-        and int(manifest["worst_online_group_npi_byte_work"])
-        <= int(manifest["max_online_group_npi_bytes_per_set"])
-        and int(manifest["worst_online_group_npi_batch_work"])
-        <= int(manifest["max_online_group_npi_batches_per_set"])
-        and (
-            not bool(manifest["worst_uses_override"])
-            or int(manifest["override_owner_count"]) > 0
-        )
+        and int(manifest["worst_online_group_npi_byte_work"]) <= int(manifest["max_online_group_npi_bytes_per_set"])
+        and int(manifest["worst_online_group_npi_batch_work"]) <= int(manifest["max_online_group_npi_batches_per_set"])
+        and (not bool(manifest["worst_uses_override"]) or int(manifest["override_owner_count"]) > 0)
         and _has_valid_v4_prefix_owners(
             manifest,
             representation=representation,
@@ -398,13 +370,10 @@ def _has_valid_v4_manifest(
 
 
 def _has_valid_v4_resources(manifest: Any) -> bool:
-    if not isinstance(manifest, dict) or set(manifest) != set(
-        PTG2_V4_GRAPH_RESOURCE_FIELDS
-    ):
+    if not isinstance(manifest, dict) or set(manifest) != set(PTG2_V4_GRAPH_RESOURCE_FIELDS):
         return False
     resources_by_field = {
-        field_name: _optional_integer(manifest.get(field_name))
-        for field_name in PTG2_V4_GRAPH_RESOURCE_FIELDS
+        field_name: _optional_integer(manifest.get(field_name)) for field_name in PTG2_V4_GRAPH_RESOURCE_FIELDS
     }
     return (
         resources_by_field["compressed_acquisition_bytes"] is not None
@@ -413,10 +382,8 @@ def _has_valid_v4_resources(manifest: Any) -> bool:
         and int(resources_by_field["input_factor_bytes"]) >= 0
         and resources_by_field["factor_edge_count"] is not None
         and int(resources_by_field["factor_edge_count"]) >= 0
-        and resources_by_field["empty_npi_tin_only_normalization_count"]
-        is not None
-        and int(resources_by_field["empty_npi_tin_only_normalization_count"])
-        >= 0
+        and resources_by_field["empty_npi_tin_only_normalization_count"] is not None
+        and int(resources_by_field["empty_npi_tin_only_normalization_count"]) >= 0
     )
 
 
@@ -465,8 +432,7 @@ def _strict_v3_audit_sample(
     audit_sample = serving_index.get("audit_sample")
     if not isinstance(audit_sample, dict):
         raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 snapshot is missing its persisted audit sample; "
-            "reimport the snapshot"
+            "PTG2 postgres_binary_v3 snapshot is missing its persisted audit sample; reimport the snapshot"
         )
     expected_values_by_field = {
         "contract": PTG2_V3_AUDIT_CONTRACT,
@@ -476,8 +442,7 @@ def _strict_v3_audit_sample(
     for field_name, expected_value in expected_values_by_field.items():
         if str(audit_sample.get(field_name) or "").strip().lower() != expected_value:
             raise PTG2ManifestArtifactError(
-                f"PTG2 postgres_binary_v3 audit sample has invalid {field_name}; "
-                "reimport the snapshot"
+                f"PTG2 postgres_binary_v3 audit sample has invalid {field_name}; reimport the snapshot"
             )
     sample_count = _optional_integer(audit_sample.get("sample_count"))
     maximum_rows = _optional_integer(audit_sample.get("maximum_rows"))
@@ -497,9 +462,7 @@ def _strict_v3_audit_sample(
         )
     sample_digest = str(audit_sample.get("sample_digest") or "").strip().lower()
     if not _COVERAGE_SCOPE_ID_RE.fullmatch(sample_digest):
-        raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 audit sample digest is invalid; reimport the snapshot"
-        )
+        raise PTG2ManifestArtifactError("PTG2 postgres_binary_v3 audit sample digest is invalid; reimport the snapshot")
     return dict(audit_sample)
 
 
@@ -517,8 +480,7 @@ def _strict_v3_source_witness(
         )
     except ValueError as exc:
         raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 snapshot has an invalid source witness; "
-            "reimport the snapshot"
+            "PTG2 postgres_binary_v3 snapshot has an invalid source witness; reimport the snapshot"
         ) from exc
 
 
@@ -527,30 +489,16 @@ def _persisted_source_witness_identity(row_fields: Any) -> dict[str, Any]:
 
     return {
         "contract": str(row_fields.get("persisted_witness_contract") or ""),
-        "selection_method": str(
-            row_fields.get("persisted_witness_selection_method") or ""
-        ),
-        "source_set_digest": str(
-            row_fields.get("persisted_witness_source_set_digest") or ""
-        ),
-        "sample_digest": str(
-            row_fields.get("persisted_witness_sample_digest") or ""
-        ),
+        "selection_method": str(row_fields.get("persisted_witness_selection_method") or ""),
+        "source_set_digest": str(row_fields.get("persisted_witness_source_set_digest") or ""),
+        "sample_digest": str(row_fields.get("persisted_witness_sample_digest") or ""),
         "queryable_occurrence_population_count": _optional_integer(
             row_fields.get("persisted_witness_occurrence_population_count")
         ),
-        "provider_population_count": _optional_integer(
-            row_fields.get("persisted_witness_provider_population_count")
-        ),
-        "occurrence_witness_count": _optional_integer(
-            row_fields.get("persisted_witness_occurrence_count")
-        ),
-        "provider_witness_count": _optional_integer(
-            row_fields.get("persisted_witness_provider_count")
-        ),
-        "payload_sha256": str(
-            row_fields.get("persisted_witness_payload_sha256") or ""
-        ),
+        "provider_population_count": _optional_integer(row_fields.get("persisted_witness_provider_population_count")),
+        "occurrence_witness_count": _optional_integer(row_fields.get("persisted_witness_occurrence_count")),
+        "provider_witness_count": _optional_integer(row_fields.get("persisted_witness_provider_count")),
+        "payload_sha256": str(row_fields.get("persisted_witness_payload_sha256") or ""),
     }
 
 
@@ -570,16 +518,12 @@ def _strict_v3_source_set(
         )
     digest = str(source_set.get("raw_container_sha256_digest") or "").strip()
     if (
-        set(source_set)
-        != {"contract", "source_count", "raw_container_sha256_digest"}
-        or str(source_set.get("contract") or "").strip().lower()
-        != PTG2_V3_SOURCE_SET_CONTRACT
+        set(source_set) != {"contract", "source_count", "raw_container_sha256_digest"}
+        or str(source_set.get("contract") or "").strip().lower() != PTG2_V3_SOURCE_SET_CONTRACT
         or _optional_integer(source_set.get("source_count")) != source_count
         or not _COVERAGE_SCOPE_ID_RE.fullmatch(digest)
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 snapshot source_set is invalid; reimport the snapshot"
-        )
+        raise PTG2ManifestArtifactError("PTG2 postgres_binary_v3 snapshot source_set is invalid; reimport the snapshot")
     return {
         "contract": PTG2_V3_SOURCE_SET_CONTRACT,
         "source_count": source_count,
@@ -593,9 +537,7 @@ def _validated_published_source_identity(
     """Validate one persisted source identity used by a published layout."""
 
     if not isinstance(raw_source_row, Mapping):
-        raise PTG2ManifestArtifactError(
-            "PTG2 published source identity row is malformed"
-        )
+        raise PTG2ManifestArtifactError("PTG2 published source identity row is malformed")
     source_key = _optional_integer(raw_source_row.get("source_key"))
     source_type = raw_source_row.get("source_type")
     identity_kind = raw_source_row.get("identity_kind")
@@ -617,9 +559,7 @@ def _validated_published_source_identity(
         or not isinstance(source_trace_set_hash, str)
         or not _COVERAGE_SCOPE_ID_RE.fullmatch(source_trace_set_hash)
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 published source identity row is invalid"
-        )
+        raise PTG2ManifestArtifactError("PTG2 published source identity row is invalid")
     if logical_hash_deferred:
         has_consistent_identity = (
             identity_kind == "raw_container_sha256_v1"
@@ -634,9 +574,7 @@ def _validated_published_source_identity(
             and identity_sha256 == logical_json_sha256
         )
     if not has_consistent_identity:
-        raise PTG2ManifestArtifactError(
-            "PTG2 published source identity evidence is inconsistent"
-        )
+        raise PTG2ManifestArtifactError("PTG2 published source identity evidence is inconsistent")
     return source_key, raw_container_sha256
 
 
@@ -651,52 +589,35 @@ def _validated_published_source_set(
         try:
             raw_source_rows = json.loads(raw_source_rows)
         except json.JSONDecodeError as exc:
-            raise PTG2ManifestArtifactError(
-                "PTG2 published source identity rows are malformed"
-            ) from exc
-    if (
-        not isinstance(raw_source_rows, list)
-        or len(raw_source_rows) != expected_source_count
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 published source identity rows are incomplete"
-        )
+            raise PTG2ManifestArtifactError("PTG2 published source identity rows are malformed") from exc
+    if not isinstance(raw_source_rows, list) or len(raw_source_rows) != expected_source_count:
+        raise PTG2ManifestArtifactError("PTG2 published source identity rows are incomplete")
 
     source_keys: set[int] = set()
     raw_container_hashes: list[str] = []
     for raw_source_row in raw_source_rows:
-        source_key, raw_container_sha256 = (
-            _validated_published_source_identity(raw_source_row)
-        )
+        source_key, raw_container_sha256 = _validated_published_source_identity(raw_source_row)
         source_keys.add(source_key)
         raw_container_hashes.append(raw_container_sha256)
 
     if source_keys != set(range(expected_source_count)):
-        raise PTG2ManifestArtifactError(
-            "PTG2 published source identity ordinals are not complete and dense"
-        )
+        raise PTG2ManifestArtifactError("PTG2 published source identity ordinals are not complete and dense")
     try:
         return shared_source_set_metadata(raw_container_hashes)
     except ValueError as exc:
-        raise PTG2ManifestArtifactError(
-            "PTG2 published source-set identity is invalid"
-        ) from exc
+        raise PTG2ManifestArtifactError("PTG2 published source-set identity is invalid") from exc
 
 
 def _database_execution_evidence(row_fields: Any) -> dict[str, Any]:
     """Return non-sensitive evidence read from the active PostgreSQL session."""
 
-    server_version_num = _optional_integer(
-        row_fields.get("postgres_server_version_num")
-    )
+    server_version_num = _optional_integer(row_fields.get("postgres_server_version_num"))
     database_evidence_by_field = {
         "contract": PTG2_DATABASE_EVIDENCE_CONTRACT,
         "server_version_num": server_version_num,
         "database_selected": row_fields.get("database_selected"),
         "backend_session_active": row_fields.get("backend_session_active"),
-        "transaction_snapshot_observed": row_fields.get(
-            "transaction_snapshot_observed"
-        ),
+        "transaction_snapshot_observed": row_fields.get("transaction_snapshot_observed"),
     }
     if (
         server_version_num is None
@@ -705,9 +626,7 @@ def _database_execution_evidence(row_fields: Any) -> dict[str, Any]:
         or database_evidence_by_field["backend_session_active"] is not True
         or database_evidence_by_field["transaction_snapshot_observed"] is not True
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 snapshot query did not return valid PostgreSQL execution evidence"
-        )
+        raise PTG2ManifestArtifactError("PTG2 snapshot query did not return valid PostgreSQL execution evidence")
     return database_evidence_by_field
 
 
@@ -725,22 +644,14 @@ def _strict_v3_contract_fields(
 
     arch_version = _normalized_manifest_field(serving_index, "arch_version")
     storage_generation = _normalized_manifest_field(serving_index, "storage_generation")
-    cold_lookup_contract = _normalized_manifest_field(
-        serving_index, "cold_lookup_contract"
-    )
-    price_membership_semantics = _normalized_manifest_field(
-        serving_index, "price_membership_semantics"
-    )
-    serving_multiplicity_semantics = _normalized_manifest_field(
-        serving_index, "serving_multiplicity_semantics"
-    )
+    cold_lookup_contract = _normalized_manifest_field(serving_index, "cold_lookup_contract")
+    price_membership_semantics = _normalized_manifest_field(serving_index, "price_membership_semantics")
+    serving_multiplicity_semantics = _normalized_manifest_field(serving_index, "serving_multiplicity_semantics")
     shared_snapshot_key = _optional_integer(serving_index.get("shared_snapshot_key"))
     source_count = _optional_integer(serving_index.get("source_count"))
 
     if arch_version != PTG2_V3_ARCH_VERSION:
-        raise PTG2ManifestArtifactError(
-            "only postgres_binary_v3 snapshots are supported; reimport the snapshot"
-        )
+        raise PTG2ManifestArtifactError("only postgres_binary_v3 snapshots are supported; reimport the snapshot")
     if storage_generation not in {
         PTG2_V3_SHARED_GENERATION,
         PTG2_V4_SHARED_GENERATION,
@@ -752,13 +663,11 @@ def _strict_v3_contract_fields(
         )
     if cold_lookup_contract != PTG2_V3_COLD_LOOKUP_CONTRACT:
         raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 snapshot is missing cold_lookup_contract=ptg_v3_cold_v2; "
-            "reimport the snapshot"
+            "PTG2 postgres_binary_v3 snapshot is missing cold_lookup_contract=ptg_v3_cold_v2; reimport the snapshot"
         )
     if price_membership_semantics != PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS:
         raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 snapshot is missing "
-            "price_membership_semantics=multiset_v1; reimport the snapshot"
+            "PTG2 postgres_binary_v3 snapshot is missing price_membership_semantics=multiset_v1; reimport the snapshot"
         )
     if serving_multiplicity_semantics != PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS:
         raise PTG2ManifestArtifactError(
@@ -767,13 +676,11 @@ def _strict_v3_contract_fields(
         )
     if shared_snapshot_key is None or shared_snapshot_key <= 0:
         raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 snapshot is missing a positive shared_snapshot_key; "
-            "reimport the snapshot"
+            "PTG2 postgres_binary_v3 snapshot is missing a positive shared_snapshot_key; reimport the snapshot"
         )
     if source_count is None or source_count <= 0 or source_count > 2**31:
         raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 snapshot is missing a valid source_count; "
-            "reimport the snapshot"
+            "PTG2 postgres_binary_v3 snapshot is missing a valid source_count; reimport the snapshot"
         )
     _strict_coverage_scope_id(serving_index)
     return shared_snapshot_key, storage_generation, cold_lookup_contract, source_count
@@ -804,8 +711,7 @@ def _validate_v3_storage_markers(
     for field_name, expected_value in required_marker_values_by_field.items():
         if _normalized_manifest_field(serving_index, field_name) != expected_value:
             raise PTG2ManifestArtifactError(
-                f"PTG2 postgres_binary_v3 snapshot is missing {field_name}={expected_value}; "
-                "reimport the snapshot"
+                f"PTG2 postgres_binary_v3 snapshot is missing {field_name}={expected_value}; reimport the snapshot"
             )
     if serving_index.get("snapshot_scoped") is not True:
         raise PTG2ManifestArtifactError(
@@ -813,21 +719,15 @@ def _validate_v3_storage_markers(
         )
 
     materialized_tables = serving_index.get("materialized_tables")
-    if any(
-        serving_index.get(field_name) for field_name in _V3_LEGACY_TABLE_FIELDS
-    ) or (isinstance(materialized_tables, dict) and bool(materialized_tables)):
-        raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 manifests must not declare legacy materialized tables; "
-            "reimport the snapshot"
-        )
-    if (
-        serving_index.get("artifacts")
-        or serving_index.get("artifact_uri")
-        or serving_index.get("storage_uri")
+    if any(serving_index.get(field_name) for field_name in _V3_LEGACY_TABLE_FIELDS) or (
+        isinstance(materialized_tables, dict) and bool(materialized_tables)
     ):
         raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 manifests must not declare filesystem or sidecar artifacts; "
-            "reimport the snapshot"
+            "PTG2 postgres_binary_v3 manifests must not declare legacy materialized tables; reimport the snapshot"
+        )
+    if serving_index.get("artifacts") or serving_index.get("artifact_uri") or serving_index.get("storage_uri"):
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 manifests must not declare filesystem or sidecar artifacts; reimport the snapshot"
         )
 
 
@@ -837,19 +737,14 @@ def _has_valid_v4_provider_graph(provider_graph: dict[str, Any]) -> bool:
     return not (
         provider_graph.get("contract") != PTG2_V4_PROVIDER_GRAPH_CONTRACT
         or representation not in {"direct_v1", "pattern_v1"}
-        or _normalized_manifest_field(provider_graph, "map_format")
-        != PTG2_V4_MAP_FORMAT
-        or _normalized_manifest_field(provider_graph, "projection_id_scope")
-        != PTG2_V4_PROJECTION_ID_SCOPE
-        or provider_graph.get("locator_page_contract")
-        != PTG2_V4_OWNER_LOCATOR_PAGE_CONTRACT
-        or provider_graph.get("member_page_contract")
-        != PTG2_V4_MEMBER_PAGE_CONTRACT
+        or _normalized_manifest_field(provider_graph, "map_format") != PTG2_V4_MAP_FORMAT
+        or _normalized_manifest_field(provider_graph, "projection_id_scope") != PTG2_V4_PROJECTION_ID_SCOPE
+        or provider_graph.get("locator_page_contract") != PTG2_V4_OWNER_LOCATOR_PAGE_CONTRACT
+        or provider_graph.get("member_page_contract") != PTG2_V4_MEMBER_PAGE_CONTRACT
         or provider_graph.get("npi_table") != PTG2_V4_NPI_TABLE
         or provider_graph.get("component_table") != PTG2_V4_COMPONENT_TABLE
         or provider_graph.get("pattern_table") != PTG2_V4_PATTERN_TABLE
-        or provider_graph.get("relation_manifest_table")
-        != PTG2_V4_RELATION_MANIFEST_TABLE
+        or provider_graph.get("relation_manifest_table") != PTG2_V4_RELATION_MANIFEST_TABLE
         or provider_graph.get("heavy_owner_table") != PTG2_V4_HEAVY_OWNER_TABLE
         or provider_graph.get("npi_prefix_table") != PTG2_V4_NPI_PREFIX_TABLE
         or provider_graph.get("diagnostic_table") != PTG2_V4_GRAPH_DIAGNOSTIC_TABLE
@@ -865,20 +760,12 @@ def _has_valid_v4_provider_graph(provider_graph: dict[str, Any]) -> bool:
 def _validate_v4_provider_graph_manifest(serving_binary: dict[str, Any]) -> None:
     provider_graph = serving_binary.get("provider_graph_v4")
     if not isinstance(provider_graph, dict):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 snapshot is missing provider_graph_v4 metadata; reimport the snapshot"
-        )
+        raise PTG2ManifestArtifactError("PTG2 V4 snapshot is missing provider_graph_v4 metadata; reimport the snapshot")
     if not _has_valid_v4_provider_graph(provider_graph):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 provider graph metadata is invalid; reimport the snapshot"
-        )
-    inferred_taxonomy_projection = provider_graph.get(
-        "inferred_taxonomy_candidates"
-    )
+        raise PTG2ManifestArtifactError("PTG2 V4 provider graph metadata is invalid; reimport the snapshot")
+    inferred_taxonomy_projection = provider_graph.get("inferred_taxonomy_candidates")
     if inferred_taxonomy_projection is not None:
-        validate_v4_inferred_taxonomy_projection_manifest(
-            inferred_taxonomy_projection
-        )
+        validate_v4_inferred_taxonomy_projection_manifest(inferred_taxonomy_projection)
 
 
 def _strict_v3_serving_binary(
@@ -892,17 +779,14 @@ def _strict_v3_serving_binary(
         "price_atoms_v3",
     )
     if not isinstance(serving_binary, dict) or any(
-        not isinstance(serving_binary.get(section_name), dict)
-        for section_name in required_sections
+        not isinstance(serving_binary.get(section_name), dict) for section_name in required_sections
     ):
         raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 snapshot is missing strict serving_binary metadata; "
-            "reimport the snapshot"
+            "PTG2 postgres_binary_v3 snapshot is missing strict serving_binary metadata; reimport the snapshot"
         )
     if _normalized_manifest_field(serving_binary, "format") != PTG2_V3_ARCH_VERSION:
         raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 snapshot has an invalid serving_binary format; "
-            "reimport the snapshot"
+            "PTG2 postgres_binary_v3 snapshot has an invalid serving_binary format; reimport the snapshot"
         )
     if storage_generation == PTG2_V4_SHARED_GENERATION:
         _validate_v4_provider_graph_manifest(serving_binary)
@@ -952,6 +836,9 @@ def _strict_v3_manifest_fields(
 ) -> tuple[int | None, str | None, str | None, dict[str, Any]]:
     """Validate the only serving contract accepted by the API."""
 
+    if "physical_binding" in serving_index or "physical_binding_contract" in serving_index:
+        raise PTG2ManifestArtifactError("PTG snapshot-local physical binding is not available")
+
     (
         shared_snapshot_key,
         storage_generation,
@@ -973,7 +860,9 @@ async def _load_v4_provider_graph_root(
     session: Any,
     *,
     snapshot_key: int,
+    physical_binding=None,
 ) -> dict[str, Any]:
+    schema_name = PTG2_SCHEMA if physical_binding is None else physical_binding.schema_name
     persisted_columns = ", ".join(
         f"diagnostic.{field_name}"
         for field_name in (
@@ -988,10 +877,10 @@ async def _load_v4_provider_graph_root(
                    root.projection_id_scope,
                    encode(root.map_digest, 'hex') AS map_digest,
                    {persisted_columns}
-              FROM {PTG2_SCHEMA}.ptg2_v4_snapshot_map_root AS root
-              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_layout AS layout
+              FROM {schema_name}.ptg2_v4_snapshot_map_root AS root
+              JOIN {schema_name}.ptg2_v3_snapshot_layout AS layout
                 ON layout.snapshot_key = root.snapshot_key
-              JOIN {PTG2_SCHEMA}.{PTG2_V4_GRAPH_DIAGNOSTIC_TABLE}
+              JOIN {schema_name}.{PTG2_V4_GRAPH_DIAGNOSTIC_TABLE}
                     AS diagnostic
                 ON diagnostic.snapshot_key = root.snapshot_key
              WHERE root.snapshot_key = :snapshot_key
@@ -1014,53 +903,30 @@ def _validate_v4_provider_graph_fields(
     provider_graph: dict[str, Any],
 ) -> None:
     expected_by_field = {
-        "representation": str(provider_graph.get("representation") or "")
-        .strip()
-        .lower(),
-        "map_format": str(provider_graph.get("map_format") or "")
-        .strip()
-        .lower(),
-        "projection_id_scope": str(
-            provider_graph.get("projection_id_scope") or ""
-        )
-        .strip()
-        .lower(),
-        "map_digest": str(provider_graph.get("map_digest") or "")
-        .strip()
-        .lower(),
+        "representation": str(provider_graph.get("representation") or "").strip().lower(),
+        "map_format": str(provider_graph.get("map_format") or "").strip().lower(),
+        "projection_id_scope": str(provider_graph.get("projection_id_scope") or "").strip().lower(),
+        "map_digest": str(provider_graph.get("map_digest") or "").strip().lower(),
     }
     if any(
         str(fields.get(name) or "").strip().lower() != expected_value
         for name, expected_value in expected_by_field.items()
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 sealed map root does not match its manifest; reimport the snapshot"
-        )
+        raise PTG2ManifestArtifactError("PTG2 V4 sealed map root does not match its manifest; reimport the snapshot")
     observed_hot_prefix_by_field = {
-        field_name: fields.get(field_name)
-        for field_name in PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS
+        field_name: fields.get(field_name) for field_name in PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS
     }
     for digest_field in (
         "worst_member_digest",
         "worst_online_member_digest",
     ):
         digest = observed_hot_prefix_by_field.get(digest_field)
-        observed_hot_prefix_by_field[digest_field] = (
-            bytes(digest).hex() if digest is not None else None
-        )
+        observed_hot_prefix_by_field[digest_field] = bytes(digest).hex() if digest is not None else None
     if observed_hot_prefix_by_field != dict(provider_graph.get("hot_prefix") or {}):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 provider diagnostics do not match its manifest; reimport the snapshot"
-        )
-    observed_resources_by_field = {
-        field_name: fields.get(field_name)
-        for field_name in PTG2_V4_GRAPH_RESOURCE_FIELDS
-    }
+        raise PTG2ManifestArtifactError("PTG2 V4 provider diagnostics do not match its manifest; reimport the snapshot")
+    observed_resources_by_field = {field_name: fields.get(field_name) for field_name in PTG2_V4_GRAPH_RESOURCE_FIELDS}
     if observed_resources_by_field != dict(provider_graph.get("resource_admission") or {}):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 graph resources do not match its manifest; "
-            "reimport the snapshot"
-        )
+        raise PTG2ManifestArtifactError("PTG2 V4 graph resources do not match its manifest; reimport the snapshot")
 
 
 async def _validate_v4_provider_graph_root(
@@ -1068,22 +934,18 @@ async def _validate_v4_provider_graph_root(
     *,
     snapshot_key: int,
     serving_index: dict[str, Any],
+    physical_binding=None,
 ) -> None:
     """Bind V4 manifest metadata to the authoritative completed map root."""
 
     serving_binary = serving_index.get("serving_binary")
-    provider_graph = (
-        serving_binary.get("provider_graph_v4")
-        if isinstance(serving_binary, dict)
-        else None
-    )
+    provider_graph = serving_binary.get("provider_graph_v4") if isinstance(serving_binary, dict) else None
     if not isinstance(provider_graph, dict):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 snapshot is missing provider graph metadata"
-        )
+        raise PTG2ManifestArtifactError("PTG2 V4 snapshot is missing provider graph metadata")
     fields = await _load_v4_provider_graph_root(
         session,
         snapshot_key=snapshot_key,
+        **({"physical_binding": physical_binding} if physical_binding is not None else {}),
     )
     _validate_v4_provider_graph_fields(fields, provider_graph)
 
@@ -1092,17 +954,43 @@ async def _validate_v4_finalizer_map_root(
     session: Any,
     *,
     snapshot_key: int,
+    physical_binding=None,
 ) -> None:
     """Authenticate an explicit packed-finalizer root or legacy absence."""
 
     try:
         await has_complete_v4_finalizer_map(
             session,
-            schema_name=PTG2_SCHEMA,
+            schema_name=PTG2_SCHEMA if physical_binding is None else physical_binding.schema_name,
             snapshot_key=snapshot_key,
         )
     except FinalizerMapError as exc:
         raise PTG2ManifestArtifactError(str(exc)) from exc
+
+
+async def read_serving_tables(
+    session: Any,
+    snapshot_id: str,
+    *,
+    serving_tables: PTG2ServingTables | None = None,
+    candidate_audit_access: PTG2CandidateAuditAccess | None = None,
+) -> PTG2ServingTables:
+    """Reacquire a local family's native read fence in the caller transaction."""
+
+    physical_binding = getattr(serving_tables, "physical_binding", None)
+    if serving_tables is not None and physical_binding is None:
+        return serving_tables
+    if serving_tables is not None and serving_tables.snapshot_id != snapshot_id:
+        raise PTG2ManifestArtifactError("PTG snapshot-local physical read identity differs")
+    options_by_name: dict[str, Any] = {"candidate_audit_access": candidate_audit_access}
+    if getattr(serving_tables, "provider_tax_identity_source_publication", None) is not None:
+        options_by_name["include_billing_tax_identity_source"] = True
+    resolved = await snapshot_serving_tables(session, snapshot_id, **options_by_name)
+    if physical_binding is not None and (
+        resolved.snapshot_id != snapshot_id or resolved.physical_binding != physical_binding
+    ):
+        raise PTG2ManifestArtifactError("PTG snapshot-local physical read changed")
+    return resolved
 
 
 async def snapshot_serving_tables(
@@ -1132,6 +1020,8 @@ async def snapshot_serving_tables(
         )
         query_sql = f"""
             SELECT snapshot.manifest->'serving_index' AS candidate_serving_index,
+                   {local_physical_binding_declared_sql("snapshot", "layout")}
+                       AS has_local_physical_binding,
                    layout.layout_manifest->'serving_index'->'audit_sample'
                        AS layout_audit_sample,
                    layout.layout_manifest->'serving_index'->'source_witness'
@@ -1199,23 +1089,24 @@ async def snapshot_serving_tables(
                       AND candidate_plan_scope.plan_market_type
                           = :candidate_plan_market_type
                )
-               AND binding.snapshot_key = CASE
+               AND (snapshot.manifest::jsonb ? 'physical_binding_contract'
+                    OR binding.snapshot_key = CASE
                    WHEN snapshot.manifest->'serving_index'->>'shared_snapshot_key'
                         ~ '^[1-9][0-9]*$'
                    THEN (
                        snapshot.manifest->'serving_index'->>'shared_snapshot_key'
                    )::bigint
                    ELSE NULL
-               END
+               END)
              LIMIT 1
         """
     else:
-        query_params_by_name["attestation_contracts"] = list(
-            PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
-        )
+        query_params_by_name["attestation_contracts"] = list(PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS)
         query_sql = f"""
             SELECT layout.layout_manifest->'serving_index'
                        AS layout_serving_index,
+                   {local_physical_binding_declared_sql("snapshot", "layout")}
+                       AS has_local_physical_binding,
                    snapshot.manifest->'serving_index'->'source_set'
                        AS snapshot_source_set,
                    binding.snapshot_key AS bound_snapshot_key,
@@ -1298,36 +1189,35 @@ async def snapshot_serving_tables(
     )
     snapshot_record = snapshot_query.one_or_none()
     if snapshot_record is None:
-        raise PTG2ManifestArtifactError(
-            "PTG2 snapshot is not published and bound to a sealed shared V3 layout"
-        )
-    row_fields = (
-        snapshot_record
-        if isinstance(snapshot_record, dict)
-        else snapshot_record._mapping
-    )
+        raise PTG2ManifestArtifactError("PTG2 snapshot is not published and bound to a sealed shared V3 layout")
+    row_fields = snapshot_record if isinstance(snapshot_record, dict) else snapshot_record._mapping
+    physical_binding = None
+    if row_fields.get("has_local_physical_binding"):
+        from process.ptg_parts.ptg2_physical_binding import PTG2PhysicalBindingError
+        from process.ptg_parts.result_archive_candidate_validation import local_data_serving_row
+
+        try:
+            row_fields, physical_binding = await local_data_serving_row(
+                session, str(snapshot_id), dict(row_fields), is_prepared=candidate_audit_access is not None
+            )
+        except PTG2PhysicalBindingError as error:
+            raise PTG2ManifestArtifactError("PTG snapshot-local physical binding is not available") from error
     if candidate_audit_access is not None:
         serving_index = row_fields.get("candidate_serving_index")
         if isinstance(serving_index, str):
             try:
                 serving_index = json.loads(serving_index)
             except json.JSONDecodeError as exc:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 serving_index manifest is malformed"
-                ) from exc
+                raise PTG2ManifestArtifactError("PTG2 serving_index manifest is malformed") from exc
     else:
         serving_index = row_fields.get("layout_serving_index")
     if isinstance(serving_index, str):
         try:
             serving_index = json.loads(serving_index)
         except json.JSONDecodeError as exc:
-            raise PTG2ManifestArtifactError(
-                "PTG2 serving_index manifest is malformed"
-            ) from exc
+            raise PTG2ManifestArtifactError("PTG2 serving_index manifest is malformed") from exc
     if not isinstance(serving_index, dict):
-        raise PTG2ManifestArtifactError(
-            "PTG2 snapshot is missing a strict serving_index; reimport the snapshot"
-        )
+        raise PTG2ManifestArtifactError("PTG2 snapshot is missing a strict serving_index; reimport the snapshot")
 
     (
         shared_snapshot_key,
@@ -1340,10 +1230,12 @@ async def snapshot_serving_tables(
             session,
             snapshot_key=int(shared_snapshot_key or 0),
             serving_index=serving_index,
+            **({"physical_binding": physical_binding} if physical_binding is not None else {}),
         )
         await _validate_v4_finalizer_map_root(
             session,
             snapshot_key=int(shared_snapshot_key or 0),
+            **({"physical_binding": physical_binding} if physical_binding is not None else {}),
         )
     coverage_scope_id = _strict_coverage_scope_id(serving_index)
     code_count = _optional_integer(serving_index.get("code_count"))
@@ -1355,37 +1247,22 @@ async def snapshot_serving_tables(
             try:
                 layout_audit_sample = json.loads(layout_audit_sample)
             except json.JSONDecodeError as exc:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 sealed layout audit sample is malformed"
-                ) from exc
-        if (
-            not isinstance(layout_audit_sample, dict)
-            or layout_audit_sample != audit_sample
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 sealed layout audit sample does not match its snapshot manifest"
-            )
+                raise PTG2ManifestArtifactError("PTG2 sealed layout audit sample is malformed") from exc
+        if not isinstance(layout_audit_sample, dict) or layout_audit_sample != audit_sample:
+            raise PTG2ManifestArtifactError("PTG2 sealed layout audit sample does not match its snapshot manifest")
         if str(row_fields.get("layout_coverage_scope_id") or "") != coverage_scope_id:
-            raise PTG2ManifestArtifactError(
-                "PTG2 sealed layout coverage scope does not match its snapshot manifest"
-            )
+            raise PTG2ManifestArtifactError("PTG2 sealed layout coverage scope does not match its snapshot manifest")
         if str(row_fields.get("snapshot_coverage_scope_id") or "") != coverage_scope_id:
-            raise PTG2ManifestArtifactError(
-                "PTG2 snapshot coverage scope binding does not match its manifest"
-            )
+            raise PTG2ManifestArtifactError("PTG2 snapshot coverage scope binding does not match its manifest")
         layout_code_count = _optional_integer(row_fields.get("layout_code_count"))
         if code_count is None or code_count < 0 or layout_code_count != code_count:
-            raise PTG2ManifestArtifactError(
-                "PTG2 sealed layout code count does not match its snapshot manifest"
-            )
+            raise PTG2ManifestArtifactError("PTG2 sealed layout code count does not match its snapshot manifest")
         source_set_by_field = _strict_v3_source_set(
             serving_index,
             source_count=int(source_count or 0),
         )
         if source_set_by_field is None:
-            raise PTG2ManifestArtifactError(
-                "PTG2 candidate source set is missing from its snapshot manifest"
-            )
+            raise PTG2ManifestArtifactError("PTG2 candidate source set is missing from its snapshot manifest")
         if serving_index.get("source_witness") is not None:
             source_witness_by_field = _strict_v3_source_witness(
                 serving_index,
@@ -1396,13 +1273,10 @@ async def snapshot_serving_tables(
                 try:
                     layout_source_witness = json.loads(layout_source_witness)
                 except json.JSONDecodeError as exc:
-                    raise PTG2ManifestArtifactError(
-                        "PTG2 sealed layout source witness is malformed"
-                    ) from exc
+                    raise PTG2ManifestArtifactError("PTG2 sealed layout source witness is malformed") from exc
             persisted_witness_identity = _persisted_source_witness_identity(row_fields)
             sealed_witness_identity_by_field = {
-                field_name: source_witness_by_field.get(field_name)
-                for field_name in persisted_witness_identity
+                field_name: source_witness_by_field.get(field_name) for field_name in persisted_witness_identity
             }
             if (
                 layout_source_witness != source_witness_by_field
@@ -1410,47 +1284,27 @@ async def snapshot_serving_tables(
                 or source_witness_by_field.get("source_set_digest")
                 != source_set_by_field.get("raw_container_sha256_digest")
             ):
-                raise PTG2ManifestArtifactError(
-                    "PTG2 sealed source witness does not match its persisted identity"
-                )
-        source_key = (
-            str(serving_index.get("source_key") or "").strip().lower() or None
-        )
+                raise PTG2ManifestArtifactError("PTG2 sealed source witness does not match its persisted identity")
+        source_key = str(serving_index.get("source_key") or "").strip().lower() or None
         if source_key != candidate_audit_access.source_key:
-            raise PTG2ManifestArtifactError(
-                "PTG2 candidate source does not match its snapshot manifest"
-            )
+            raise PTG2ManifestArtifactError("PTG2 candidate source does not match its snapshot manifest")
     else:
         bound_snapshot_key = _optional_integer(row_fields.get("bound_snapshot_key"))
-        if bound_snapshot_key != shared_snapshot_key:
-            raise PTG2ManifestArtifactError(
-                "PTG2 sealed layout binding does not match its metadata"
-            )
+        if bound_snapshot_key != (
+            shared_snapshot_key if physical_binding is None else physical_binding.destination_layout_key
+        ):
+            raise PTG2ManifestArtifactError("PTG2 sealed layout binding does not match its metadata")
         if (
-            str(row_fields.get("snapshot_coverage_scope_id") or "")
-            != coverage_scope_id
-            or str(row_fields.get("attested_coverage_scope_id") or "")
-            != coverage_scope_id
+            str(row_fields.get("snapshot_coverage_scope_id") or "") != coverage_scope_id
+            or str(row_fields.get("attested_coverage_scope_id") or "") != coverage_scope_id
         ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 published scope does not match its sealed layout"
-            )
-        if str(row_fields.get("attested_audit_sample_digest") or "") != str(
-            audit_sample.get("sample_digest") or ""
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 published audit attestation does not match its sealed sample"
-            )
+            raise PTG2ManifestArtifactError("PTG2 published scope does not match its sealed layout")
+        if str(row_fields.get("attested_audit_sample_digest") or "") != str(audit_sample.get("sample_digest") or ""):
+            raise PTG2ManifestArtifactError("PTG2 published audit attestation does not match its sealed sample")
         source_row_count = _optional_integer(row_fields.get("source_row_count"))
-        distinct_source_key_count = _optional_integer(
-            row_fields.get("distinct_source_key_count")
-        )
-        minimum_source_key = _optional_integer(
-            row_fields.get("minimum_source_key")
-        )
-        maximum_source_key = _optional_integer(
-            row_fields.get("maximum_source_key")
-        )
+        distinct_source_key_count = _optional_integer(row_fields.get("distinct_source_key_count"))
+        minimum_source_key = _optional_integer(row_fields.get("minimum_source_key"))
+        maximum_source_key = _optional_integer(row_fields.get("maximum_source_key"))
         if (
             source_count is None
             or source_count <= 0
@@ -1459,105 +1313,67 @@ async def snapshot_serving_tables(
             or minimum_source_key != 0
             or maximum_source_key != source_count - 1
         ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 published source dictionary is not complete and dense"
-            )
+            raise PTG2ManifestArtifactError("PTG2 published source dictionary is not complete and dense")
         snapshot_source_set = row_fields.get("snapshot_source_set")
         if isinstance(snapshot_source_set, str):
             try:
                 snapshot_source_set = json.loads(snapshot_source_set)
             except json.JSONDecodeError as exc:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 published snapshot source set is malformed"
-                ) from exc
+                raise PTG2ManifestArtifactError("PTG2 published snapshot source set is malformed") from exc
         manifest_source_set = _strict_v3_source_set(
             {"source_set": snapshot_source_set},
             source_count=source_count,
         )
         if manifest_source_set is None:
-            raise PTG2ManifestArtifactError(
-                "PTG2 published source set is missing from its snapshot manifest"
-            )
+            raise PTG2ManifestArtifactError("PTG2 published source set is missing from its snapshot manifest")
         source_set_by_field = _validated_published_source_set(
             row_fields.get("source_identity_rows"),
             expected_source_count=source_count,
         )
-        attested_source_set_digest = str(
-            row_fields.get("attested_source_set_digest") or ""
-        )
+        attested_source_set_digest = str(row_fields.get("attested_source_set_digest") or "")
         if (
             manifest_source_set != source_set_by_field
-            or attested_source_set_digest
-            != source_set_by_field["raw_container_sha256_digest"]
+            or attested_source_set_digest != source_set_by_field["raw_container_sha256_digest"]
         ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 published source set does not match its manifest and attestation"
-            )
-        source_key = (
-            str(row_fields.get("attested_source_key") or "").strip() or None
-        )
+            raise PTG2ManifestArtifactError("PTG2 published source set does not match its manifest and attestation")
+        source_key = str(row_fields.get("attested_source_key") or "").strip() or None
         if source_key is None:
-            raise PTG2ManifestArtifactError(
-                "PTG2 published source key is missing from its attestation"
-            )
+            raise PTG2ManifestArtifactError("PTG2 published source key is missing from its attestation")
         if code_count is None or code_count < 0:
-            raise PTG2ManifestArtifactError(
-                "PTG2 sealed layout code count is invalid"
-            )
+            raise PTG2ManifestArtifactError("PTG2 sealed layout code count is invalid")
     serving_rate_count = _optional_integer(serving_index.get("serving_rates"))
     if code_count == 0 and serving_rate_count is not None and serving_rate_count > 0:
-        raise PTG2ManifestArtifactError(
-            "PTG2 shared layout is missing code metadata for a non-empty snapshot"
-        )
+        raise PTG2ManifestArtifactError("PTG2 shared layout is missing code metadata for a non-empty snapshot")
     network_names = serving_index.get("network_names")
     provider_graph_v4_hot_prefix_by_field: dict[str, Any] | None = None
     provider_graph_v4_inferred_taxonomy_candidates: dict[str, Any] | None = None
     provider_tax_identity_source_publication = None
     if storage_generation == PTG2_V4_SHARED_GENERATION:
         serving_binary = serving_index.get("serving_binary")
-        provider_graph = (
-            serving_binary.get("provider_graph_v4")
-            if isinstance(serving_binary, dict)
-            else None
-        )
-        raw_hot_prefix = (
-            provider_graph.get("hot_prefix")
-            if isinstance(provider_graph, dict)
-            else None
-        )
+        provider_graph = serving_binary.get("provider_graph_v4") if isinstance(serving_binary, dict) else None
+        raw_hot_prefix = provider_graph.get("hot_prefix") if isinstance(provider_graph, dict) else None
         if not _has_valid_v4_manifest(
             raw_hot_prefix,
-            representation=str(provider_graph.get("representation") or "")
-            .strip()
-            .lower(),
+            representation=str(provider_graph.get("representation") or "").strip().lower(),
         ):
             raise PTG2ManifestArtifactError(
-                "PTG2 V4 snapshot is missing sealed hot-prefix limits; "
-                "reimport the snapshot"
+                "PTG2 V4 snapshot is missing sealed hot-prefix limits; reimport the snapshot"
             )
         provider_graph_v4_hot_prefix_by_field = dict(raw_hot_prefix)
         raw_inferred_taxonomy_candidates = (
-            provider_graph.get("inferred_taxonomy_candidates")
-            if isinstance(provider_graph, dict)
-            else None
+            provider_graph.get("inferred_taxonomy_candidates") if isinstance(provider_graph, dict) else None
         )
         if raw_inferred_taxonomy_candidates is not None:
-            provider_graph_v4_inferred_taxonomy_candidates = (
-                validate_v4_inferred_taxonomy_projection_manifest(
-                    raw_inferred_taxonomy_candidates
-                )
+            provider_graph_v4_inferred_taxonomy_candidates = validate_v4_inferred_taxonomy_projection_manifest(
+                raw_inferred_taxonomy_candidates
             )
-        if (
-            candidate_audit_access is None
-            and include_billing_tax_identity_source is True
-        ):
-            provider_tax_identity_source_publication = (
-                _v4_tax_identity_source_publication(
-                    serving_index,
-                    source_count=int(source_count or 0),
-                )
+        if candidate_audit_access is None and include_billing_tax_identity_source is True:
+            provider_tax_identity_source_publication = _v4_tax_identity_source_publication(
+                serving_index,
+                source_count=int(source_count or 0),
             )
     return PTG2ServingTables(
+        physical_binding=physical_binding,
         snapshot_id=str(snapshot_id),
         arch_version=PTG2_V3_ARCH_VERSION,
         storage="manifest_snapshot",
@@ -1574,29 +1390,18 @@ async def snapshot_serving_tables(
         code_count=code_count,
         coverage_scope_id=coverage_scope_id,
         plan_id=str(row_fields.get("snapshot_plan_id") or "").strip() or None,
-        plan_market_type=(
-            str(row_fields.get("snapshot_plan_market_type") or "").strip() or None
-        ),
+        plan_market_type=(str(row_fields.get("snapshot_plan_market_type") or "").strip() or None),
         source_key=source_key,
         audit_sample=audit_sample,
         source_witness=source_witness_by_field,
         source_set=source_set_by_field,
         database_evidence=_database_execution_evidence(row_fields),
         provider_graph_v4_hot_prefix=provider_graph_v4_hot_prefix_by_field,
-        provider_graph_v4_inferred_taxonomy_candidates=(
-            provider_graph_v4_inferred_taxonomy_candidates
-        ),
-        provider_tax_identity_source_publication=(
-            provider_tax_identity_source_publication
-        ),
-        source_trace_set_hash=str(
-            serving_index.get("source_trace_set_hash") or ""
-        ).strip()
-        or None,
+        provider_graph_v4_inferred_taxonomy_candidates=(provider_graph_v4_inferred_taxonomy_candidates),
+        provider_tax_identity_source_publication=(provider_tax_identity_source_publication),
+        source_trace_set_hash=str(serving_index.get("source_trace_set_hash") or "").strip() or None,
         network_names=(
-            [str(network_name) for network_name in network_names]
-            if isinstance(network_names, list)
-            else None
+            [str(network_name) for network_name in network_names] if isinstance(network_names, list) else None
         ),
         price_atom_constant_values=(
             dict(serving_index.get("price_atom_constant_values") or {})

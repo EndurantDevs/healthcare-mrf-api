@@ -85,7 +85,7 @@ def _shutdown_callbacks(events: list[tuple[str, str]]) -> dict[str, object]:
 
 def _mock_shutdown_dependencies(monkeypatch, events: list[tuple[str, str]]) -> None:
     @asynccontextmanager
-    async def canonical_dependencies(_database, _schema):
+    async def canonical_dependencies(_database, _schema, *, control_context=None):
         yield None
 
     monkeypatch.setattr(entity_address_unified, "selected_publication_dependencies", canonical_dependencies)
@@ -97,9 +97,7 @@ def _mock_shutdown_dependencies(monkeypatch, events: list[tuple[str, str]]) -> N
         "_drop_stage_secondary_indexes": AsyncMock(return_value=0),
         "_compact_geo_assurance_stage": AsyncMock(return_value="set_logged"),
         "_create_stage_indexes": AsyncMock(),
-        "_inherit_archive_coordinates": AsyncMock(
-            return_value={"inherited_rows": 0, "ambiguous_rows": 0}
-        ),
+        "_inherit_archive_coordinates": AsyncMock(return_value={"inherited_rows": 0, "ambiguous_rows": 0}),
         "print_time_info": lambda _started_at: None,
         **_shutdown_callbacks(events),
     }
@@ -107,13 +105,36 @@ def _mock_shutdown_dependencies(monkeypatch, events: list[tuple[str, str]]) -> N
         monkeypatch.setattr(entity_address_unified, name, replacement)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled,test_mode", ((False, False), (True, True), (True, False)))
+async def test_finalizer_passes_control_context_only_for_protected_dependency_selection(
+    monkeypatch, enabled, test_mode
+):
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROTECTED_PUBLICATION", str(enabled).lower())
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
+    monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    ctx = _shutdown_context(refresh_mode=entity_address_unified.ENTITY_ADDRESS_REFRESH_MODE_FULL)
+    ctx["control_run_id"] = "synthetic_address"
+    ctx["context"]["test_mode"] = test_mode
+    observed_options = []
+
+    @asynccontextmanager
+    async def select(_database, _schema, **options):
+        observed_options.append(options)
+        raise RuntimeError("synthetic selection boundary")
+        yield
+
+    monkeypatch.setattr(entity_address_unified, "selected_publication_dependencies", select)
+    with pytest.raises(RuntimeError, match="synthetic selection boundary"):
+        await entity_address_unified.publish_entity_address_unified_generation(ctx)
+    assert observed_options == ([{"control_context": ctx}] if enabled and not test_mode else [{}])
+
+
 def _provider_directory_partial_context() -> dict:
     """Build a fenced partial-refresh shutdown context."""
 
     shutdown_payload = _shutdown_context(
-        refresh_mode=(
-            entity_address_unified.ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
-        )
+        refresh_mode=(entity_address_unified.ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL)
     )
     shutdown_payload["context"].update(
         {
@@ -131,9 +152,7 @@ def _assert_partial_projection_cutover_order(events: list[tuple[str, str]]) -> N
 
     publish_index = events.index(("publish", "cutover"))
     validation_events = [
-        (index, event_detail)
-        for index, (kind, event_detail) in enumerate(events)
-        if kind == "validate"
+        (index, event_detail) for index, (kind, event_detail) in enumerate(events) if kind == "validate"
     ]
     assert len(validation_events) == 1
     validation_index, validation_table = validation_events[0]
@@ -143,26 +162,15 @@ def _assert_partial_projection_cutover_order(events: list[tuple[str, str]]) -> N
         if kind == "sql" and "WITH projection_targets AS MATERIALIZED" in statement
     )
     coordinate_clear_index = next(
-        index
-        for index, (kind, statement) in enumerate(events)
-        if kind == "sql" and "SET lat = NULL" in statement
+        index for index, (kind, statement) in enumerate(events) if kind == "sql" and "SET lat = NULL" in statement
     )
-    geo_validation_index = next(
-        index
-        for index, (kind, _event_detail) in enumerate(events)
-        if kind == "validate_geo"
-    )
+    geo_validation_index = next(index for index, (kind, _event_detail) in enumerate(events) if kind == "validate_geo")
     assert coordinate_clear_index < projection_index < geo_validation_index
     assert geo_validation_index < validation_index < publish_index
     assert validation_table != entity_address_unified.EntityAddressUnified.__main_table__
     assert validation_table.startswith("entity_address_unified_")
-    assert all(
-        kind not in {"sql", "ddl"}
-        for kind, _event_detail in events[publish_index + 1 :]
-    )
-    assert [
-        event_detail for kind, event_detail in events if kind == "status"
-    ] == ["succeeded"]
+    assert all(kind not in {"sql", "ddl"} for kind, _event_detail in events[publish_index + 1 :])
+    assert [event_detail for kind, event_detail in events if kind == "status"] == ["succeeded"]
 
 
 @pytest.mark.asyncio
@@ -207,9 +215,7 @@ async def test_deferred_validation_is_read_only_and_precedes_terminal_success(mo
     await entity_address_unified.shutdown(ctx)
 
     publish_index = events.index(("publish", "cutover"))
-    validation_index = events.index(
-        ("validate", entity_address_unified.EntityAddressUnified.__main_table__)
-    )
+    validation_index = events.index(("validate", entity_address_unified.EntityAddressUnified.__main_table__))
     running_index = events.index(("status", "running"))
     succeeded_index = events.index(("status", "succeeded"))
 
@@ -217,11 +223,57 @@ async def test_deferred_validation_is_read_only_and_precedes_terminal_success(mo
     assert all(kind != "sql" for kind, _value in events[publish_index + 1 :])
     assert ctx["context"]["publish_validation"]["status"] == "complete"
     assert any(
-        kind == "sql"
-        and "WITH projection_targets AS MATERIALIZED" in statement
-        and "WHERE TRUE" in statement
+        kind == "sql" and "WITH projection_targets AS MATERIALIZED" in statement and "WHERE TRUE" in statement
         for kind, statement in events
     )
+
+
+@pytest.mark.asyncio
+async def test_protected_address_handoff_follows_indexes_without_ordinary_cutover(monkeypatch):
+    from process import entity_address_native_publication as native
+
+    events = []
+    _mock_shutdown_dependencies(monkeypatch, events)
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROTECTED_PUBLICATION", "true")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS", "100")
+    ctx = _shutdown_context(refresh_mode=entity_address_unified.ENTITY_ADDRESS_REFRESH_MODE_FULL)
+    ctx["control_run_id"] = "synthetic_address"
+    ctx["context"].update(test_mode=False, serving_only_refresh=False)
+
+    async def handoff(current, **options):
+        assert current is ctx
+        entity_address_unified._create_stage_indexes.assert_awaited_once()
+        assert options == {
+            "schema_name": "mrf",
+            "import_date": "20260712",
+            "dependency_bindings": None,
+            "row_count": 100,
+        }
+        events.append(("handoff", "sealed"))
+        return {"address_handoff": "synthetic"}
+
+    monkeypatch.setattr(native, "handoff_entity_address_generation", handoff)
+    projection = AsyncMock(wraps=entity_address_unified._materialize_geo_assurance)
+    monkeypatch.setattr(entity_address_unified, "_materialize_geo_assurance", projection)
+    assert await entity_address_unified.shutdown(ctx) == {"address_handoff": "synthetic"}
+    assert projection.await_args.kwargs["record_candidate"] is False
+    assert ctx["context"]["publish_validation"] == {"deferred": True, "status": "pending"}
+    assert not any(kind in {"publish", "validate", "status"} for kind, _detail in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["serving_only_refresh", "partial_support_patch_publish"])
+async def test_protected_address_publication_requires_the_complete_isolated_family(monkeypatch, field):
+    events = []
+    _mock_shutdown_dependencies(monkeypatch, events)
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROTECTED_PUBLICATION", "true")
+    ctx = _shutdown_context(refresh_mode=entity_address_unified.ENTITY_ADDRESS_REFRESH_MODE_FULL)
+    ctx["control_run_id"] = "synthetic_address"
+    ctx["context"].update(test_mode=False, serving_only_refresh=False)
+    ctx["context"][field] = True
+    with pytest.raises(RuntimeError, match="complete isolated seven-table"):
+        await entity_address_unified.shutdown(ctx)
+    assert not events
 
 
 @pytest.mark.asyncio

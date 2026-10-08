@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import gc
 import json
 import logging
@@ -157,9 +156,9 @@ from api.ptg2_shared_blocks import (
 )
 from api.ptg2_snapshot import current_network_snapshots_for_plan, current_source_snapshot_id_for_plan
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
+from api.reference_family_reads import _query_catalog_neighbors, claims_dictionary_tables
+from db.connection import db, gather_reader_calls
 from db.models import (
-    CodeCatalog,
-    CodeCrosswalk,
     DoctorClinicianAddress,
     EntityAddressUnified,
     GeoZipLookup,
@@ -282,8 +281,6 @@ procedure_taxonomy_signal_table = PricingProcedureTaxonomySignal.__table__
 prescription_table = PricingPrescription.__table__
 provider_prescription_table = PricingProviderPrescription.__table__
 provider_prescription_autocomplete_table = PricingProviderPrescriptionAutocomplete.__table__
-code_catalog_table = CodeCatalog.__table__
-code_crosswalk_table = CodeCrosswalk.__table__
 terminology_synonym_table = TerminologySynonym.__table__
 geo_zip_table = GeoZipLookup.__table__
 provider_enrichment_summary_table = ProviderEnrichmentSummary.__table__
@@ -2544,6 +2541,7 @@ async def _internal_procedure_codes_from_terminology(session, rows: list[dict[st
 
 
 async def _internal_rx_codes_from_terminology(session, rows: list[dict[str, Any]]) -> list[str]:
+    code_crosswalk_table = claims_dictionary_tables(session)[1]
     internal_codes: set[str] = set()
     external_clauses = []
     for row in rows[:60]:
@@ -4863,6 +4861,7 @@ def _single_procedure_provider_page_query(
 
 
 async def _query_crosswalk_edges(session, pairs: set[tuple[str, str]]) -> list[dict[str, Any]]:
+    code_crosswalk_table = claims_dictionary_tables(session)[1]
     if not pairs:
         return []
     clauses = []
@@ -4881,37 +4880,6 @@ async def _query_crosswalk_edges(session, pairs: set[tuple[str, str]]) -> list[d
         )
     result = await session.execute(select(code_crosswalk_table).where(or_(*clauses)))
     return [_row_to_dict(row) for row in result]
-
-
-async def _query_catalog_neighbors(session, pairs: set[tuple[str, str]]) -> set[tuple[str, str]]:
-    if not pairs:
-        return set()
-
-    named_pairs = set()
-    for system, code in pairs:
-        lookup = await session.execute(
-            select(code_catalog_table.c.display_name)
-            .where(
-                and_(
-                    func.upper(code_catalog_table.c.code_system) == system,
-                    func.upper(code_catalog_table.c.code) == code,
-                )
-            )
-            .limit(1)
-        )
-        display_name = lookup.scalar()
-        if not display_name:
-            continue
-        named_pairs.add((system, code))
-        neighbors = await session.execute(
-            select(code_catalog_table.c.code_system, code_catalog_table.c.code).where(
-                func.lower(code_catalog_table.c.display_name) == str(display_name).strip().lower()
-            )
-        )
-        for row in neighbors:
-            pair = (str(row[0]).upper(), str(row[1]).upper())
-            named_pairs.add(pair)
-    return named_pairs
 
 
 async def _expand_code_crosswalk(
@@ -5682,6 +5650,7 @@ async def _resolve_internal_rx_codes_for_request(
     default_system: str = INTERNAL_RX_CODE_SYSTEM,
 ) -> tuple[list[str], dict[str, Any]]:
     """Resolve an input prescription code to internal codes and crosswalk match metadata."""
+    code_crosswalk_table = claims_dictionary_tables(session)[1]
     code_system = _normalize_code_system(args.get("rx_code_system") or args.get("code_system") or default_system)
     code = _normalize_code(rx_code_value, "rx_code")
     expand_codes = _parse_bool(args.get("expand_codes"), "expand_codes", default=False)
@@ -5735,6 +5704,8 @@ async def _resolve_external_rx_codes_for_internal(
     session,
     internal_codes: list[str],
 ) -> dict[str, dict[str, list[str]]]:
+    """Resolve internal prescription codes through the request's pinned dictionary."""
+    code_crosswalk_table = claims_dictionary_tables(session)[1]
     normalized_codes = sorted({str(code or "").strip().upper() for code in internal_codes if str(code or "").strip()})
     if not normalized_codes:
         return {}
@@ -8253,7 +8224,6 @@ async def group_plan_providers(request):
 async def pricing_statistics(request):
     """Return aggregate provider and pricing statistics for the selected dataset."""
     session = _get_session(request)
-
     medicare_individuals_stmt = (
         select(func.count())
         .select_from(
@@ -8278,7 +8248,8 @@ async def pricing_statistics(request):
         providers_with_procedures_result,
         procedure_codes_result,
         procedure_zip_codes_result,
-    ) = await asyncio.gather(
+    ) = await gather_reader_calls(
+        db,
         session.execute(medicare_individuals_stmt),
         session.execute(providers_with_procedures_stmt),
         session.execute(procedure_codes_stmt),
@@ -9263,6 +9234,7 @@ async def _provider_procedure_cost_level(
 ):
     """Build the provider procedure estimated cost-level response from peer cost profiles."""
     session = _get_session(request)
+    code_catalog_table = claims_dictionary_tables(session)[0]
     args = request.args
 
     provider_npi = _parse_int(npi, "npi", minimum=1)

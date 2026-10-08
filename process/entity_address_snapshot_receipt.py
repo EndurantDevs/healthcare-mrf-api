@@ -16,9 +16,11 @@ from sqlalchemy import text
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
-CONTRACT = "entity_address_unified.postgres.v1"
+LEGACY_CONTRACT = "entity_address_unified.postgres.v1"
+CONTRACT = "entity_address_unified.postgres.v2"
 RECEIPT_VERSION = "entity_address_archive_receipt.v2"
-STAGE_INTEGRITY_CONTRACT = "entity_address_unified.stage.postgres.v1"
+LEGACY_STAGE_INTEGRITY_CONTRACT = "entity_address_unified.stage.postgres.v1"
+STAGE_INTEGRITY_CONTRACT = "entity_address_unified.stage.postgres.v2"
 STAGE_INTEGRITY_RECEIPT_VERSION = "entity_address_stage_integrity_receipt.v2"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -37,7 +39,7 @@ class EntityAddressArchiveTableReceipt:
     table_name: str
     schema_sha256: str
     row_count: int
-    row_sha256: str
+    row_sha256: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         """Return the stable JSON representation consumed by the archive profile."""
@@ -46,7 +48,7 @@ class EntityAddressArchiveTableReceipt:
             "table_name": self.table_name,
             "schema_sha256": self.schema_sha256,
             "row_count": self.row_count,
-            "row_sha256": self.row_sha256,
+            **({"row_sha256": self.row_sha256} if self.row_sha256 else {}),
         }
 
 
@@ -56,18 +58,22 @@ class EntityAddressArchiveReceipt:
 
     tables: tuple[EntityAddressArchiveTableReceipt, ...]
     schema_sha256: str
-    content_sha256: str
-    main_input_sha256: str
+    content_sha256: str = ""
+    main_input_sha256: str = ""
+    contract: str = LEGACY_CONTRACT
 
     def as_dict(self) -> dict[str, Any]:
         """Return a bounded receipt without OIDs, schema names, or publication claims."""
         return {
-            "contract": CONTRACT,
-            "receipt_version": RECEIPT_VERSION,
+            "contract": self.contract,
+            "receipt_version": CONTRACT if self.contract == CONTRACT else RECEIPT_VERSION,
             "tables": [table.as_dict() for table in self.tables],
             "schema_sha256": self.schema_sha256,
-            "content_sha256": self.content_sha256,
-            "main_input_sha256": self.main_input_sha256,
+            **(
+                {"content_sha256": self.content_sha256, "main_input_sha256": self.main_input_sha256}
+                if self.contract == LEGACY_CONTRACT
+                else {}
+            ),
         }
 
 
@@ -77,19 +83,25 @@ class EntityAddressStageIntegrityReceipt:
 
     tables: tuple[EntityAddressArchiveTableReceipt, ...]
     schema_sha256: str
-    content_sha256: str
-    main_input_sha256: str
+    content_sha256: str = ""
+    main_input_sha256: str = ""
+    contract: str = LEGACY_STAGE_INTEGRITY_CONTRACT
 
     def as_dict(self) -> dict[str, Any]:
         """Return the durable local receipt bound to derived stage names."""
 
         return {
-            "contract": STAGE_INTEGRITY_CONTRACT,
-            "receipt_version": STAGE_INTEGRITY_RECEIPT_VERSION,
+            "contract": self.contract,
+            "receipt_version": STAGE_INTEGRITY_CONTRACT
+            if self.contract == STAGE_INTEGRITY_CONTRACT
+            else STAGE_INTEGRITY_RECEIPT_VERSION,
             "tables": [table.as_dict() for table in self.tables],
             "schema_sha256": self.schema_sha256,
-            "content_sha256": self.content_sha256,
-            "main_input_sha256": self.main_input_sha256,
+            **(
+                {"content_sha256": self.content_sha256, "main_input_sha256": self.main_input_sha256}
+                if self.contract == LEGACY_STAGE_INTEGRITY_CONTRACT
+                else {}
+            ),
         }
 
 
@@ -234,14 +246,22 @@ async def _catalog_constraints(session, relation_oid: int, schema_name: str) -> 
     ]
 
 
-async def _catalog_indexes(session, relation_oid: int) -> list[dict[str, Any]]:
+async def _catalog_indexes(session, relation_oid: int, *, admission=False) -> list[dict[str, Any]]:
     """Read index shape with named collation and operator-class identities."""
+    native_state = (
+        "index_relation.relname AS index_name, index_row.indisready, index_row.indislive, "
+        "index_row.indnullsnotdistinct, "
+        if admission
+        else ""
+    )
     indexes = [
         dict(catalog_row)
         for catalog_row in (
             await session.execute(
                 text(
-                    "SELECT index_row.indisunique, index_row.indisprimary, index_row.indimmediate, index_row.indisvalid, index_row.indnkeyatts, index_row.indnatts, "
+                    "SELECT index_row.indisunique, index_row.indisprimary, "
+                    + native_state
+                    + "index_row.indimmediate, index_row.indisvalid, index_row.indnkeyatts, index_row.indnatts, "
                     "access_method.amname AS method, pg_catalog.pg_get_expr(index_row.indpred, index_row.indrelid, true) AS predicate, "
                     "pg_catalog.pg_get_expr(index_row.indexprs, index_row.indrelid, true) AS expressions, "
                     "index_row.indkey::text AS keys, index_row.indoption::text AS options, "
@@ -418,9 +438,18 @@ def _content_identity(tables: tuple[EntityAddressArchiveTableReceipt, ...], main
     )
 
 
-async def capture_entity_address_archive_receipt(session, *, schema_name: str) -> EntityAddressArchiveReceipt:
+async def capture_entity_address_archive_receipt(
+    session, *, schema_name: str, contract=LEGACY_CONTRACT
+) -> EntityAddressArchiveReceipt:
     """Capture a semantic receipt for exactly the reviewed seven-table family."""
     schema = _schema_name(schema_name)
+    if contract == CONTRACT:
+        from process.entity_address_snapshot_alias import EntityAddressAliasAuthority
+
+        tables = await _capture_set_tables(session, schema, (*_models(), EntityAddressAliasAuthority))
+        return EntityAddressArchiveReceipt(tables, _table_schema_digest(tables), contract=CONTRACT)
+    if contract != LEGACY_CONTRACT:
+        raise EntityAddressArchiveReceiptError("entity-address archive contract is unsupported")
     await _normalize_receipt_session(session, schema)
     models = _models()
     await _lock_model_family(session, schema, models)
@@ -470,11 +499,17 @@ async def capture_entity_address_stage_integrity_receipt(
     *,
     schema_name: str,
     stage_table_names: Mapping[str, str],
+    contract=LEGACY_STAGE_INTEGRITY_CONTRACT,
 ) -> EntityAddressStageIntegrityReceipt:
     """Capture the prepared destination family under its physical stage names."""
 
     schema = _schema_name(schema_name)
     table_names = _validated_stage_table_names_by_source(stage_table_names)
+    if contract == STAGE_INTEGRITY_CONTRACT:
+        tables = await _capture_set_tables(session, schema, _models(), table_names)
+        return EntityAddressStageIntegrityReceipt(tables, _table_schema_digest(tables), contract=contract)
+    if contract != LEGACY_STAGE_INTEGRITY_CONTRACT:
+        raise EntityAddressArchiveReceiptError("entity-address stage contract is unsupported")
     await _normalize_receipt_session(session, schema)
     models = _models()
     await _lock_relation_family(
@@ -525,11 +560,17 @@ def validate_entity_address_stage_integrity_receipt(
 
     table_names = _validated_stage_table_names_by_source(stage_table_names)
     receipt_value = receipt.as_dict() if isinstance(receipt, EntityAddressStageIntegrityReceipt) else receipt
+    if isinstance(receipt_value, Mapping) and receipt_value.get("contract") == STAGE_INTEGRITY_CONTRACT:
+        identities = tuple((model.__name__, table_names[model.__tablename__]) for model in _models())
+        tables = _validated_set_tables(receipt_value, STAGE_INTEGRITY_CONTRACT, identities)
+        return EntityAddressStageIntegrityReceipt(
+            tables, _table_schema_digest(tables), contract=STAGE_INTEGRITY_CONTRACT
+        )
     if (
         not isinstance(receipt_value, Mapping)
         or set(receipt_value)
         != {"contract", "receipt_version", "tables", "schema_sha256", "content_sha256", "main_input_sha256"}
-        or receipt_value["contract"] != STAGE_INTEGRITY_CONTRACT
+        or receipt_value["contract"] != LEGACY_STAGE_INTEGRITY_CONTRACT
         or receipt_value["receipt_version"] != STAGE_INTEGRITY_RECEIPT_VERSION
         or not isinstance(receipt_value["tables"], list)
         or not isinstance(receipt_value["main_input_sha256"], str)
@@ -575,11 +616,17 @@ def validate_entity_address_archive_receipt(
 ) -> EntityAddressArchiveReceipt:
     """Reject malformed or model-drifting persisted receipt data before activation."""
     receipt_value = receipt.as_dict() if isinstance(receipt, EntityAddressArchiveReceipt) else receipt
+    if isinstance(receipt_value, Mapping) and receipt_value.get("contract") == CONTRACT:
+        from process.entity_address_snapshot_alias import EntityAddressAliasAuthority
+
+        identities = tuple((model.__name__, model.__tablename__) for model in (*_models(), EntityAddressAliasAuthority))
+        tables = _validated_set_tables(receipt_value, CONTRACT, identities)
+        return EntityAddressArchiveReceipt(tables, _table_schema_digest(tables), contract=CONTRACT)
     if (
         not isinstance(receipt_value, Mapping)
         or set(receipt_value)
         != {"contract", "receipt_version", "tables", "schema_sha256", "content_sha256", "main_input_sha256"}
-        or receipt_value["contract"] != CONTRACT
+        or receipt_value["contract"] != LEGACY_CONTRACT
         or receipt_value["receipt_version"] != RECEIPT_VERSION
         or not isinstance(receipt_value["tables"], list)
         or not isinstance(receipt_value["main_input_sha256"], str)
@@ -618,3 +665,52 @@ def validate_entity_address_archive_receipt(
     ):
         raise EntityAddressArchiveReceiptError("entity-address archive receipt is invalid")
     return validated
+
+
+def _table_schema_digest(tables):
+    return _canonical_digest(
+        [{key: table.as_dict()[key] for key in ("model_name", "table_name", "schema_sha256")} for table in tables]
+    )
+
+
+async def _capture_set_tables(session, schema, models, names=None):
+    """Bounded accounting and catalog identity; payload equality is a separate set check."""
+    names = names or {model.__tablename__: model.__tablename__ for model in models}
+    await _normalize_receipt_session(session, schema)
+    await _lock_relation_family(session, schema, tuple(names.values()))
+    logical_by_name = {physical: name for name, physical in names.items()}
+    tables = []
+    for model in models:
+        name = names[model.__tablename__]
+        oid = await _relation_oid(session, schema, name)
+        shape = await _schema_identity(session, oid, schema, model.__tablename__, names_by_stage=logical_by_name)
+        count = await session.scalar(text(f"SELECT count(*) FROM {_quoted(schema)}.{_quoted(name)}"))
+        tables.append(EntityAddressArchiveTableReceipt(model.__name__, name, shape, int(count)))
+    return tuple(tables)
+
+
+def _validated_set_tables(value, contract, identities):
+    if (
+        set(value) != {"contract", "receipt_version", "tables", "schema_sha256"}
+        or value["contract"] != contract
+        or value["receipt_version"] != contract
+        or not isinstance(value["tables"], list)
+        or len(value["tables"]) != len(identities)
+    ):
+        raise EntityAddressArchiveReceiptError("entity-address set receipt is invalid")
+    tables = []
+    for entry, identity in zip(value["tables"], identities, strict=True):
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"model_name", "table_name", "schema_sha256", "row_count"}
+            or (entry["model_name"], entry["table_name"]) != identity
+            or type(entry["row_count"]) is not int
+            or entry["row_count"] < 0
+            or not isinstance(entry["schema_sha256"], str)
+            or _SHA256.fullmatch(entry["schema_sha256"]) is None
+        ):
+            raise EntityAddressArchiveReceiptError("entity-address set table receipt is invalid")
+        tables.append(EntityAddressArchiveTableReceipt(**dict(entry)))
+    if value["schema_sha256"] != _table_schema_digest(tables):
+        raise EntityAddressArchiveReceiptError("entity-address set schema receipt differs")
+    return tuple(tables)

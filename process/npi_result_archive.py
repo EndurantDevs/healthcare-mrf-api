@@ -1,9 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Native archive mechanics for the exact six-table NPI serving family.
+"""Native archive mechanics for the NPI serving family and its canonical closure.
 
-Source capture uses a PostgreSQL MVCC snapshot and ``ACCESS SHARE`` locks, so
-ordinary coordinate updates are not held behind the potentially long clone.
+Historical six-table capture uses an MVCC snapshot and ``ACCESS SHARE`` locks.
+Canonical capture retains ``SHARE ROW EXCLUSIVE`` source locks until the caller
+ends its transaction; without a canonical fence this includes the address archive.
 Generation-less captures are explicitly manual legacy snapshots.  Establishing
 generation authority is a separate bootstrap operation and never happens here.
 """
@@ -13,19 +14,33 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.schema import CreateTable, MetaData
+from sqlalchemy.schema import CreateIndex, CreateTable, MetaData
 
 from db import models
 from process import entity_address_snapshot_receipt as catalog_identity
+from process import reference_family_archive as native_archive
+from process.mrf_address_publication import (
+    CanonicalSourceFence,
+    canonical_contribution_model,
+    canonical_reference_filter,
+    canonical_schema_identity,
+    canonical_spatial_index,
+    merge_canonical_contribution,
+    require_canonical_source_fence,
+    validate_canonical_closure,
+)
 from process.npi_result_generation import (
     RELATION_NAMES,
     NpiCanonicalProvenance,
@@ -40,6 +55,8 @@ from process.npi_result_generation import (
 )
 
 CONTRACT = "npi-result-family.postgres.v1"
+MODEL_CONTRACT = "npi-result-family.postgres.v2"
+CANONICAL_TABLE = "npi_canonical_address"
 VALIDATION_CONTRACT = "npi-result-family.validation.v1"
 _STAGE_PREFIX = "npi_result_archive_"
 _PREDECESSOR_PREFIX = "npi_result_predecessor_"
@@ -63,6 +80,20 @@ _MODEL_TYPES = (
 )
 if tuple(model.__tablename__ for model in _MODEL_TYPES) != RELATION_NAMES:
     raise RuntimeError("NPI archive model declaration differs")
+
+
+def npi_archive_models(*, canonical=False):
+    """Return only the native models recorded by this exact archive version."""
+    return (*_MODEL_TYPES, canonical_contribution_model("npi")) if canonical else _MODEL_TYPES
+
+
+def npi_archive_names(*, canonical=False):
+    """Preserve historical six-table receipts and the new typed seven-table closure."""
+    return (*RELATION_NAMES, CANONICAL_TABLE) if canonical else RELATION_NAMES
+
+
+def _has_canonical(ownership):
+    return CANONICAL_TABLE in dict(ownership.relation_oids)
 
 
 class NpiResultArchiveError(RuntimeError):
@@ -100,12 +131,13 @@ class NpiResultManifest:
     capture_authority: str
     source_serving_generation: NpiServingGeneration | None
     canonical_provenance: NpiCanonicalProvenance | None
+    contract: str = CONTRACT
 
     def as_dict(self) -> dict[str, Any]:
         """Return the strict portable archive manifest."""
 
         return {
-            "contract": CONTRACT,
+            "contract": self.contract,
             "tables": [table.as_dict() for table in self.tables],
             "source_metadata": dict(self.source_metadata),
             "source_metadata_sha256": self.source_metadata_sha256,
@@ -131,6 +163,8 @@ class NpiSourceCapture:
     canonical_provenance: NpiCanonicalProvenance | None
     schema_name: str
     postgres_snapshot: str
+    canonical: bool = False
+    canonical_source_fence: CanonicalSourceFence | None = None
 
 
 @dataclass(frozen=True)
@@ -198,6 +232,7 @@ class NpiValidationReceipt:
     manifest_sha256: str
     tables: tuple[NpiTableReceipt, ...]
     validation_sha256: str
+    profile_contract: str = CONTRACT
 
     def as_dict(self) -> dict[str, Any]:
         """Return the closed durable validation representation."""
@@ -205,7 +240,7 @@ class NpiValidationReceipt:
         return {
             "contract": VALIDATION_CONTRACT,
             "package_id": self.package_id,
-            "profile_contract": CONTRACT,
+            "profile_contract": self.profile_contract,
             "stage_schema": self.stage_schema,
             "stage_schema_oid": self.stage_schema_oid,
             "relation_oids": [list(pair) for pair in self.relation_oids],
@@ -235,6 +270,7 @@ class NpiActivationReceipt:
     predecessor_schema_name: str | None
     tables: tuple[NpiTableReceipt, ...]
     adopted_authority: NpiResultGenerationAuthority
+    canonical_publication: Mapping[str, Any] | None = None
 
 
 def npi_stage_schema(dataset_id: UUID) -> str:
@@ -350,8 +386,10 @@ async def _bounded_catalog_work(session: Any):
         await _set_local_timeout(session, "statement_timeout", previous_statement)
 
 
-async def _lock_family(session: Any, schema_name: str, mode: str, *, nowait: bool = False) -> None:
-    relations = ", ".join(f"{_quoted(schema_name)}.{_quoted(table_name)}" for table_name in RELATION_NAMES)
+async def _lock_family(
+    session: Any, schema_name: str, mode: str, *, nowait: bool = False, names=RELATION_NAMES
+) -> None:
+    relations = ", ".join(f"{_quoted(schema_name)}.{_quoted(table_name)}" for table_name in names)
     suffix = " NOWAIT" if nowait else ""
     await session.execute(text(f"LOCK TABLE {relations} IN {mode} MODE{suffix}"))
 
@@ -377,9 +415,10 @@ async def _relation_oid(session: Any, schema_name: str, table_name: str) -> int 
 async def _relation_pairs(
     session: Any,
     schema_name: str,
+    names=RELATION_NAMES,
 ) -> tuple[tuple[str, int | None], ...]:
     relation_pairs = []
-    for table_name in RELATION_NAMES:
+    for table_name in names:
         relation_pairs.append((table_name, await _relation_oid(session, schema_name, table_name)))
     return tuple(relation_pairs)
 
@@ -415,13 +454,24 @@ async def _npi_schema_identity(
     schema_name: str,
     table_name: str,
 ) -> str:
-    columns = await catalog_identity._catalog_columns(session, relation_oid)
+    if table_name == CANONICAL_TABLE:
+        return await canonical_schema_identity(session, relation_oid, schema_name)
+    columns = await _npi_columns(session, relation_oid, schema_name, table_name)
     constraints = await catalog_identity._catalog_constraints(
         session,
         relation_oid,
         schema_name,
     )
     indexes = await catalog_identity._catalog_indexes(session, relation_oid)
+    catalog_identity._reject_schema_qualified_expressions(schema_name, columns, constraints, indexes)
+    return catalog_identity._canonical_digest(
+        {"table_name": table_name, "columns": columns, "constraints": constraints, "indexes": indexes}
+    )
+
+
+async def _npi_columns(session, relation_oid, schema_name, table_name):
+    """Normalize only exact owned-sequence defaults without changing historical schema meanings."""
+    columns = await catalog_identity._catalog_columns(session, relation_oid)
     schema_oid = await _schema_oid(session, schema_name)
     owned_sequence_columns = {
         owner_column
@@ -450,33 +500,24 @@ async def _npi_schema_identity(
         normalized_sequence_columns.add(column["attname"])
     if normalized_sequence_columns != owned_sequence_columns:
         raise NpiResultArchiveError("NPI owned sequence column is unavailable")
-    catalog_identity._reject_schema_qualified_expressions(
-        schema_name,
-        columns,
-        constraints,
-        indexes,
-    )
-    return catalog_identity._canonical_digest(
-        {
-            "table_name": table_name,
-            "columns": columns,
-            "constraints": constraints,
-            "indexes": indexes,
-        }
-    )
+    return columns
 
 
-async def _manifest_tables(session: Any, schema_name: str) -> tuple[NpiTableReceipt, ...]:
+async def _manifest_tables(session: Any, schema_name: str, *, canonical=False) -> tuple[NpiTableReceipt, ...]:
     return tuple(
-        [await _table_receipt(session, schema_name=schema_name, model_type=model_type) for model_type in _MODEL_TYPES]
+        [
+            await _table_receipt(session, schema_name=schema_name, model_type=model_type)
+            for model_type in npi_archive_models(canonical=canonical)
+        ]
     )
 
 
-def _validate_tables(value: object) -> tuple[NpiTableReceipt, ...]:
-    if not isinstance(value, list) or len(value) != len(_MODEL_TYPES):
+def _validate_tables(value: object, *, canonical=False) -> tuple[NpiTableReceipt, ...]:
+    model_types = npi_archive_models(canonical=canonical)
+    if not isinstance(value, list) or len(value) != len(model_types):
         raise NpiResultArchiveError("NPI archive table set is invalid")
     receipts = []
-    for raw_table, model_type in zip(value, _MODEL_TYPES, strict=True):
+    for raw_table, model_type in zip(value, model_types, strict=True):
         if not isinstance(raw_table, Mapping) or set(raw_table) != {
             "model_name",
             "table_name",
@@ -513,13 +554,13 @@ def validate_npi_result_manifest(manifest_value: object) -> NpiResultManifest:
     }
     if not isinstance(manifest_value, Mapping) or set(manifest_value) != expected_fields:
         raise NpiResultArchiveError("NPI archive manifest is invalid")
-    if manifest_value["contract"] != CONTRACT or manifest_value["capture_authority"] not in {
+    if manifest_value["contract"] not in (CONTRACT, MODEL_CONTRACT) or manifest_value["capture_authority"] not in {
         "tracked-generation",
         "legacy-manual",
     }:
         raise NpiResultArchiveError("NPI archive authority classification is invalid")
     metadata, metadata_sha256 = _source_metadata(manifest_value["source_metadata"])
-    tables = _validate_tables(manifest_value["tables"])
+    tables = _validate_tables(manifest_value["tables"], canonical=manifest_value["contract"] == MODEL_CONTRACT)
     try:
         serving_generation = (
             None
@@ -546,6 +587,7 @@ def validate_npi_result_manifest(manifest_value: object) -> NpiResultManifest:
         manifest_value["capture_authority"],
         serving_generation,
         provenance,
+        manifest_value["contract"],
     )
 
 
@@ -555,8 +597,10 @@ async def capture_npi_source(
     schema_name: str,
     source_metadata: Mapping[str, Any] | None,
     source_metadata_factory: Callable[[Any], Awaitable[Mapping[str, Any]]] | None = None,
+    canonical: bool = False,
+    canonical_source_fence: CanonicalSourceFence | None = None,
 ) -> NpiSourceCapture:
-    """Capture one coherent live family without blocking routine DML."""
+    """Capture one coherent live family while retaining its required source fences."""
 
     _require_transaction(session)
     if (source_metadata is None) == (source_metadata_factory is None):
@@ -564,6 +608,8 @@ async def capture_npi_source(
     schema = _schema_name(schema_name)
     await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     async with _bounded_catalog_work(session):
+        if canonical:
+            await _lock_npi_canonical_source(session, schema, canonical_source_fence)
         await _lock_family(session, schema, "ACCESS SHARE")
         authority = await read_npi_result_generation_authority(
             session,
@@ -596,7 +642,26 @@ async def capture_npi_source(
         authority.canonical_provenance,
         schema,
         snapshot,
+        canonical,
+        canonical_source_fence,
     )
+
+
+async def _lock_npi_canonical_source(session, schema, canonical_source_fence):
+    """Fence and attest the complete canonical model before its SOURCE capture."""
+    await _lock_family(
+        session,
+        schema,
+        "SHARE ROW EXCLUSIVE",
+        nowait=True,
+        names=RELATION_NAMES if canonical_source_fence is not None else (*RELATION_NAMES, "address_archive_v2"),
+    )
+    if canonical_source_fence is not None:
+        await require_canonical_source_fence(session, canonical_source_fence, schema)
+    from process.mrf_address_publication import require_canonical_source_model, require_native_read_catalog
+
+    await require_native_read_catalog(session, tuple(oid for _name, oid in await _relation_pairs(session, schema)))
+    await require_canonical_source_model(session, schema, lambda s, n: f"{_quoted(s)}.{_quoted(n)}")
 
 
 async def _bind_independent_stage_sequences(
@@ -750,22 +815,118 @@ async def _verify_stage_sequence_owners(
         raise NpiResultArchiveError("NPI archive stage sequence ownership differs")
 
 
-async def _clone_source(session: Any, capture: NpiSourceCapture, stage_schema: str) -> None:
+async def _clone_source(
+    session: Any,
+    capture: NpiSourceCapture,
+    stage_schema: str,
+    *,
+    source_copy: native_archive.ReferenceFamilySourceCopy | None = None,
+    deadline: float | None = None,
+    on_precreated: Callable[..., Awaitable[None]] | None = None,
+) -> None:
+    """Load all six protected empty heaps before constructing native indexes."""
+    _require_source_copy(source_copy, on_precreated)
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise NpiResultArchiveError("NPI source COPY deadline is unavailable")
+    if deadline <= asyncio.get_running_loop().time():
+        raise TimeoutError("NPI source COPY deadline expired")
     if _SNAPSHOT.fullmatch(capture.postgres_snapshot) is None:
         raise NpiResultArchiveError("NPI source snapshot is invalid")
+    if capture.canonical is not True:
+        raise NpiResultArchiveError("new NPI source requires the canonical model contract")
+    try:
+        dataset_id = UUID(stage_schema.removeprefix(_STAGE_PREFIX))
+    except AttributeError, TypeError, ValueError:
+        raise NpiResultArchiveError("NPI source clone scope differs") from None
+    if stage_schema != npi_stage_schema(dataset_id):
+        raise NpiResultArchiveError("NPI source clone scope differs")
     await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     await session.execute(text(f"SET TRANSACTION SNAPSHOT '{capture.postgres_snapshot}'"))
-    await session.execute(text(f"CREATE SCHEMA {_quoted(stage_schema)}"))
-    for table_name in RELATION_NAMES:
-        source = f"{_quoted(capture.schema_name)}.{_quoted(table_name)}"
-        stage = f"{_quoted(stage_schema)}.{_quoted(table_name)}"
-        await session.execute(text(f"CREATE TABLE {stage} (LIKE {source} INCLUDING ALL)"))
-        await session.execute(text(f"INSERT INTO {stage} SELECT * FROM {source}"))
-    await _bind_independent_stage_sequences(
-        session,
-        source_schema=capture.schema_name,
-        stage_schema=stage_schema,
+    if capture.canonical_source_fence is not None:
+        await require_canonical_source_fence(session, capture.canonical_source_fence, capture.schema_name)
+    ownership = await precreate_npi_restore(session, dataset_id=dataset_id, canonical=True)
+    if ownership.schema_name != stage_schema:
+        raise NpiResultArchiveError("NPI source clone scope differs")
+    await _verify_stage_sequence_owners(
+        session, ownership.schema_oid, await _source_family_sequences(session, capture.schema_name)
     )
+    await on_precreated(session, ownership)
+    await _copy_source_family(session, capture, ownership, source_copy, deadline)
+
+
+async def _copy_source_family(session, capture, ownership, source_copy, deadline):
+    """Debit one family-wide raw budget and validate indexed payload equality."""
+    stage_schema = ownership.schema_name
+    remaining_bytes = source_copy.max_bytes
+    for model in npi_archive_models(canonical=capture.canonical):
+        columns = tuple(column.name for column in model.__table__.columns)
+        query = (
+            f"SELECT {', '.join(_quoted(name) for name in columns)} "
+            f"FROM {_quoted(capture.schema_name)}.{_quoted('address_archive_v2' if model.__tablename__ == CANONICAL_TABLE else model.__tablename__)} canonical "
+            + (
+                canonical_reference_filter(
+                    "npi", capture.schema_name, lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}"
+                )
+                if model.__tablename__ == CANONICAL_TABLE
+                else ""
+            )
+        )
+        remaining_bytes = await native_archive._copy_source_projection(
+            session, source_copy, query, stage_schema, model.__tablename__, columns, remaining_bytes, deadline
+        )
+    await complete_npi_restore(session, ownership)
+    await _advance_and_verify_stage_sequences(session, ownership)
+    for model in npi_archive_models(canonical=capture.canonical):
+        if model.__tablename__ == CANONICAL_TABLE:
+            source_oid = await _relation_oid(session, capture.schema_name, "address_archive_v2")
+            stage_oid = dict(ownership.relation_oids)[CANONICAL_TABLE]
+            if await canonical_schema_identity(
+                session, source_oid, capture.schema_name
+            ) != await canonical_schema_identity(session, stage_oid, stage_schema):
+                raise NpiResultArchiveError("NPI canonical source schema is unsupported")
+        else:
+            await _require_source_column_shape(session, capture.schema_name, stage_schema, model.__tablename__)
+        if not await native_archive._is_model_table_equal(
+            session,
+            model,
+            left_schema=capture.schema_name,
+            left_name="address_archive_v2" if model.__tablename__ == CANONICAL_TABLE else model.__tablename__,
+            right_schema=stage_schema,
+            right_name=model.__tablename__,
+            left_predicate=(
+                canonical_reference_filter(
+                    "npi", capture.schema_name, lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}"
+                )
+                if model.__tablename__ == CANONICAL_TABLE
+                else None
+            ),
+        ):
+            raise NpiResultArchiveError("NPI source clone content differs")
+
+
+async def _require_source_column_shape(session, source_schema, stage_schema, table_name):
+    """Never silently discard source columns, structural constraints or index semantics."""
+    source_oid = await _relation_oid(session, source_schema, table_name)
+    stage_oid = await _relation_oid(session, stage_schema, table_name)
+    if (
+        source_oid is None
+        or stage_oid is None
+        or (
+            await _npi_columns(session, source_oid, source_schema, table_name)
+            != await _npi_columns(session, stage_oid, stage_schema, table_name)
+        )
+    ):
+        raise NpiResultArchiveError("NPI source column catalog is unsupported")
+    if await _npi_schema_identity(session, source_oid, source_schema, table_name) != await _npi_schema_identity(
+        session, stage_oid, stage_schema, table_name
+    ):
+        raise NpiResultArchiveError("NPI source schema catalog is unsupported")
+
+
+def _require_source_copy(source_copy, on_precreated):
+    """Retain historical readers, but never create a new unprotected clone."""
+    if not isinstance(source_copy, native_archive.ReferenceFamilySourceCopy) or not callable(on_precreated):
+        raise NpiResultArchiveError("NPI protected source COPY capability is unavailable")
 
 
 async def _schema_oid(session: Any, schema_name: str) -> int:
@@ -1002,6 +1163,7 @@ async def capture_npi_stage_ownership(
     session: Any,
     *,
     dataset_id: UUID,
+    canonical: bool = False,
 ) -> NpiStageOwnership:
     """Capture exact identities for a complete, otherwise closed stage."""
 
@@ -1009,7 +1171,7 @@ async def capture_npi_stage_ownership(
     schema_name = npi_stage_schema(dataset_id)
     schema_oid = await _schema_oid(session, schema_name)
     relation_oids = []
-    for table_name in sorted(RELATION_NAMES):
+    for table_name in sorted(npi_archive_names(canonical=canonical)):
         relation_oid = await _relation_oid(session, schema_name, table_name)
         if relation_oid is None:
             raise NpiResultArchiveError("NPI archive owned relation is missing")
@@ -1152,7 +1314,9 @@ async def verify_npi_stage_ownership(
 
     if not isinstance(ownership, NpiStageOwnership):
         raise NpiResultArchiveError("NPI archive stage ownership is invalid")
-    observed = await capture_npi_stage_ownership(session, dataset_id=ownership.dataset_id)
+    observed = await capture_npi_stage_ownership(
+        session, dataset_id=ownership.dataset_id, canonical=_has_canonical(ownership)
+    )
     if observed != ownership:
         raise NpiResultArchiveError("NPI archive stage ownership differs")
     return observed
@@ -1167,9 +1331,15 @@ async def _validate_stage_manifest(
 ) -> tuple[NpiTableReceipt, ...]:
     if not ownership_verified:
         await verify_npi_stage_ownership(session, ownership)
-    observed_tables = await _manifest_tables(session, ownership.schema_name)
+    observed_tables = await _manifest_tables(
+        session, ownership.schema_name, canonical=manifest.contract == MODEL_CONTRACT
+    )
     if observed_tables != manifest.tables:
         raise NpiResultArchiveError("NPI restored stage differs")
+    if manifest.contract == MODEL_CONTRACT:
+        await validate_canonical_closure(
+            session, "npi", ownership.schema_name, lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}"
+        )
     return observed_tables
 
 
@@ -1184,7 +1354,13 @@ async def cleanup_npi_stage(session: Any, ownership: NpiStageOwnership) -> None:
     if current_schema_oid is None:
         return
     async with _bounded_catalog_work(session):
-        await _lock_family(session, ownership.schema_name, "ACCESS EXCLUSIVE", nowait=True)
+        await _lock_family(
+            session,
+            ownership.schema_name,
+            "ACCESS EXCLUSIVE",
+            nowait=True,
+            names=npi_archive_names(canonical=_has_canonical(ownership)),
+        )
         await verify_npi_stage_ownership(session, ownership)
     relations = ", ".join(
         f"{_quoted(ownership.schema_name)}.{_quoted(table_name)}" for table_name, _ in ownership.relation_oids
@@ -1228,39 +1404,65 @@ async def prepare_npi_archive_source(
     dataset_id: UUID,
     on_prepared: Callable[[Any, NpiPreparedSource], Awaitable[None]],
     source_metadata_factory: Callable[[Any], Awaitable[Mapping[str, Any]]] | None = None,
+    **source_options,
 ) -> NpiPreparedSource:
     """Clone once and persist its exact owner before clone commit."""
 
     if not callable(on_prepared):
         raise NpiResultArchiveError("NPI prepared-source callback is required")
+    if set(source_options) - {"source_copy", "on_precreated", "source_sessions", "canonical_source_fence"}:
+        raise NpiResultArchiveError("NPI protected source COPY capability is unavailable")
+    source_copy, on_precreated = source_options.get("source_copy"), source_options.get("on_precreated")
+    _require_source_copy(source_copy, on_precreated)
+    source_sessions = source_options.get("source_sessions", session_factory)
+    if not callable(source_sessions):
+        raise NpiResultArchiveError("NPI source owning session is unavailable")
     stage_schema = npi_stage_schema(dataset_id)
-    async with session_factory() as source_session, source_session.begin():
+    deadline = asyncio.get_running_loop().time() + source_copy.timeout
+    async with asyncio.timeout_at(deadline), source_sessions() as source_session, source_session.begin():
         capture = await capture_npi_source(
             source_session,
             schema_name=schema_name,
             source_metadata=source_metadata,
             source_metadata_factory=source_metadata_factory,
+            canonical=True,
+            canonical_source_fence=source_options.get("canonical_source_fence"),
         )
         async with session_factory() as clone_session, clone_session.begin():
-            await _clone_source(clone_session, capture, stage_schema)
+            await _clone_source(
+                clone_session,
+                capture,
+                stage_schema,
+                source_copy=source_copy,
+                deadline=deadline,
+                on_precreated=on_precreated,
+            )
             ownership = await capture_npi_stage_ownership(
                 clone_session,
                 dataset_id=dataset_id,
+                canonical=True,
             )
-            tables = await _manifest_tables(clone_session, stage_schema)
-            manifest = NpiResultManifest(
-                tables,
-                capture.source_metadata,
-                capture.source_metadata_sha256,
-                _schema_digest(tables),
-                capture.capture_authority,
-                capture.source_serving_generation,
-                capture.canonical_provenance,
-            )
-            ownership = await freeze_npi_stage(clone_session, ownership=ownership)
+            manifest = await _prepared_npi_source_manifest(clone_session, capture, stage_schema)
             prepared = NpiPreparedSource(manifest, ownership)
+            if capture.canonical_source_fence is not None:
+                await require_canonical_source_fence(clone_session, capture.canonical_source_fence, capture.schema_name)
             await on_prepared(clone_session, prepared)
     return prepared
+
+
+async def _prepared_npi_source_manifest(session, capture, stage_schema):
+    """Bind the copied model inventory to its unchanged, pinned source authority."""
+    tables = await _manifest_tables(session, stage_schema, canonical=True)
+    return NpiResultManifest(
+        tables,
+        capture.source_metadata,
+        capture.source_metadata_sha256,
+        _schema_digest(tables),
+        capture.capture_authority,
+        capture.source_serving_generation,
+        capture.canonical_provenance,
+        MODEL_CONTRACT,
+    )
 
 
 async def export_prepared_npi_archive(
@@ -1268,19 +1470,33 @@ async def export_prepared_npi_archive(
     *,
     prepared: NpiPreparedSource,
     archive_copy: Callable[[NpiStageCapture], Awaitable[None]],
+    verify_custody: Callable[..., Awaitable[None]] | None = None,
 ) -> NpiResultManifest:
-    """Dump one committed frozen clone without recapturing live content."""
+    """Dump one committed protected clone; only historical v1 may use freeze-only custody."""
 
     if not isinstance(prepared, NpiPreparedSource) or not callable(archive_copy):
         raise NpiResultArchiveError("NPI prepared source is invalid")
-    if prepared.ownership.freeze_function_oid is None or not prepared.ownership.freeze_trigger_oids:
-        raise NpiResultArchiveError("NPI prepared source is not frozen")
+    if verify_custody is not None and not callable(verify_custody):
+        raise NpiResultArchiveError("NPI prepared source custody verifier is invalid")
     manifest = validate_npi_result_manifest(prepared.manifest)
+    if manifest.contract == MODEL_CONTRACT and verify_custody is None:
+        raise NpiResultArchiveError("NPI canonical prepared source requires a custody verifier")
+    if verify_custody is None and (
+        prepared.ownership.freeze_function_oid is None or not prepared.ownership.freeze_trigger_oids
+    ):
+        raise NpiResultArchiveError("NPI prepared source is not frozen")
     async with session_factory() as stage_session, stage_session.begin():
         await stage_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
         async with _bounded_catalog_work(stage_session):
-            await _lock_family(stage_session, prepared.ownership.schema_name, "ACCESS SHARE")
+            await _lock_family(
+                stage_session,
+                prepared.ownership.schema_name,
+                "ACCESS SHARE",
+                names=npi_archive_names(canonical=_has_canonical(prepared.ownership)),
+            )
             await verify_npi_stage_ownership(stage_session, prepared.ownership)
+        if verify_custody is not None:
+            await verify_custody(stage_session, prepared)
         await _validate_stage_manifest(
             stage_session,
             prepared.ownership,
@@ -1300,16 +1516,22 @@ async def export_npi_archive(
     source_metadata: Mapping[str, Any],
     dataset_id: UUID,
     archive_copy: Callable[[NpiStageCapture], Awaitable[None]],
+    **source_options,
 ) -> NpiResultManifest:
     """Convenience clone/dump flow with cancellation-safe exact cleanup."""
 
+    if set(source_options) != {"source_copy", "on_precreated", "verify_custody"}:
+        raise NpiResultArchiveError("NPI protected source COPY capability is unavailable")
+    _require_source_copy(source_options["source_copy"], source_options["on_precreated"])
+    if not callable(source_options["verify_custody"]):
+        raise NpiResultArchiveError("NPI protected source custody verifier is unavailable")
     ownership = None
     try:
 
-        async def retain_locally(_session: Any, _prepared: NpiPreparedSource) -> None:
+        async def retain_locally(session: Any, prepared: NpiPreparedSource) -> None:
             """Keep convenience-wrapper cleanup ownership local."""
 
-            return None
+            await source_options["verify_custody"](session, prepared)
 
         prepared = await prepare_npi_archive_source(
             session_factory,
@@ -1317,12 +1539,15 @@ async def export_npi_archive(
             source_metadata=source_metadata,
             dataset_id=dataset_id,
             on_prepared=retain_locally,
+            source_copy=source_options["source_copy"],
+            on_precreated=source_options["on_precreated"],
         )
         ownership = prepared.ownership
         return await export_prepared_npi_archive(
             session_factory,
             prepared=prepared,
             archive_copy=archive_copy,
+            verify_custody=source_options["verify_custody"],
         )
     finally:
         if ownership is not None:
@@ -1394,24 +1619,52 @@ async def precreate_npi_restore(
     session: Any,
     *,
     dataset_id: UUID,
+    canonical: bool = False,
 ) -> NpiStageOwnership:
-    """Create an empty model-complete target for a native data-only restore."""
+    """Create six empty unindexed heaps for a native data-only restore."""
 
     _require_transaction(session)
     schema_name = npi_stage_schema(dataset_id)
     await session.execute(text(f"CREATE SCHEMA {_quoted(schema_name)}"))
     metadata = MetaData(schema=schema_name)
-    has_postgis = await _has_postgis(session)
-    for model_type in _MODEL_TYPES:
-        table = model_type.__table__.to_metadata(metadata, schema=schema_name)
+    for model_type in npi_archive_models(canonical=canonical):
+        table = native_archive._clone_model_table(model_type.__table__, metadata, schema=schema_name)
+        for column in table.columns:
+            for constraint in tuple(column.constraints):
+                column.constraints.remove(constraint)
+                table.append_constraint(constraint)
+        for constraint in table.constraints:
+            constraint.ddl_if(callable_=lambda *_args, **_kwargs: False)
         statement = str(CreateTable(table).compile(dialect=postgresql.dialect()))
         await session.execute(text(statement))
+    return await capture_npi_stage_ownership(session, dataset_id=dataset_id, canonical=canonical)
+
+
+async def complete_npi_restore(session: Any, ownership: NpiStageOwnership) -> None:
+    """Finish native keys, checks and all model indexes before stage validation."""
+
+    _require_transaction(session)
+    await verify_npi_stage_ownership(session, ownership)
+    metadata = MetaData(schema=ownership.schema_name)
+    has_postgis = await _has_postgis(session)
+    for model_type in npi_archive_models(canonical=_has_canonical(ownership)):
+        table = native_archive._clone_model_table(model_type.__table__, metadata, schema=ownership.schema_name)
+        await native_archive._create_table_constraints(session, table)
+        for index in sorted(table.indexes, key=lambda item: item.name):
+            await session.execute(CreateIndex(index))
+        if model_type.__tablename__ == CANONICAL_TABLE:
+            await canonical_spatial_index(
+                session,
+                ownership.schema_name,
+                CANONICAL_TABLE,
+                lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}",
+            )
         primary_elements = tuple(getattr(model_type, "__my_index_elements__", ()) or ())
         if primary_elements:
             await session.execute(
                 text(
                     f"CREATE UNIQUE INDEX {_quoted(model_type.__tablename__ + '_idx_primary')} "
-                    f"ON {_quoted(schema_name)}.{_quoted(model_type.__tablename__)} "
+                    f"ON {_quoted(ownership.schema_name)}.{_quoted(model_type.__tablename__)} "
                     f"({', '.join(primary_elements)})"
                 )
             )
@@ -1421,8 +1674,21 @@ async def precreate_npi_restore(
         for index in indexes:
             if _uses_postgis_index(index) and not has_postgis:
                 continue
-            await session.execute(text(_additional_index_sql(schema_name, model_type, index)))
-    return await capture_npi_stage_ownership(session, dataset_id=dataset_id)
+            await session.execute(text(_additional_index_sql(ownership.schema_name, model_type, index)))
+    for table in metadata.tables.values():
+        await native_archive._create_table_constraints(session, table, backing_indexes=False)
+    if _has_canonical(ownership):
+        await validate_canonical_closure(
+            session, "npi", ownership.schema_name, lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}"
+        )
+    for child_name in ("npi_address", "npi_taxonomy", "npi_taxonomy_group", "npi_other_identifier"):
+        child = f"{_quoted(ownership.schema_name)}.{_quoted(child_name)}"
+        parent = f"{_quoted(ownership.schema_name)}.npi"
+        orphan = await session.scalar(
+            text(f"SELECT EXISTS(SELECT 1 FROM {child} c WHERE NOT EXISTS(SELECT 1 FROM {parent} p WHERE p.npi=c.npi))")
+        )
+        if orphan is not False:
+            raise NpiResultArchiveError("NPI restored child relationship differs")
 
 
 async def validate_npi_stage(
@@ -1436,7 +1702,9 @@ async def validate_npi_stage(
     _require_transaction(session)
     validated = validate_npi_result_manifest(manifest)
     async with _bounded_catalog_work(session):
-        await _lock_family(session, ownership.schema_name, "ACCESS SHARE")
+        await _lock_family(
+            session, ownership.schema_name, "ACCESS SHARE", names=npi_archive_names(canonical=_has_canonical(ownership))
+        )
         await verify_npi_stage_ownership(session, ownership)
     return await _validate_stage_manifest(
         session,
@@ -1489,11 +1757,12 @@ async def _verify_stage_owner(
         raise NpiResultArchiveError("NPI archive stage owner differs")
 
 
-def _validation_inventory(value: object) -> tuple[tuple[str, int], ...]:
-    if not isinstance(value, list) or len(value) != len(RELATION_NAMES):
+def _validation_inventory(value: object, *, canonical=False) -> tuple[tuple[str, int], ...]:
+    names = npi_archive_names(canonical=canonical)
+    if not isinstance(value, list) or len(value) != len(names):
         raise NpiResultArchiveError("NPI validation inventory is invalid")
     pairs = []
-    for raw_pair, expected_name in zip(value, sorted(RELATION_NAMES), strict=True):
+    for raw_pair, expected_name in zip(value, sorted(names), strict=True):
         if (
             not isinstance(raw_pair, list)
             or len(raw_pair) != 2
@@ -1527,7 +1796,7 @@ def validate_npi_validation_receipt(receipt_value: object) -> NpiValidationRecei
         raise NpiResultArchiveError("NPI validation receipt is invalid")
     if (
         receipt_value["contract"] != VALIDATION_CONTRACT
-        or receipt_value["profile_contract"] != CONTRACT
+        or receipt_value["profile_contract"] not in (CONTRACT, MODEL_CONTRACT)
         or _SHA256.fullmatch(str(receipt_value["package_id"])) is None
         or _SHA256.fullmatch(str(receipt_value["manifest_sha256"])) is None
         or type(receipt_value["stage_schema_oid"]) is not int
@@ -1537,8 +1806,9 @@ def validate_npi_validation_receipt(receipt_value: object) -> NpiValidationRecei
     ):
         raise NpiResultArchiveError("NPI validation receipt is invalid")
     schema_name = _schema_name(receipt_value["stage_schema"])
-    relation_oids = _validation_inventory(receipt_value["relation_oids"])
-    tables = _validate_tables(receipt_value["tables"])
+    has_canonical = receipt_value["profile_contract"] == MODEL_CONTRACT
+    relation_oids = _validation_inventory(receipt_value["relation_oids"], canonical=has_canonical)
+    tables = _validate_tables(receipt_value["tables"], canonical=has_canonical)
     digest_by_field = {key: receipt_value[key] for key in expected_fields - {"validation_sha256"}}
     if receipt_value["validation_sha256"] != _validation_digest(digest_by_field):
         raise NpiResultArchiveError("NPI validation digest differs")
@@ -1551,6 +1821,7 @@ def validate_npi_validation_receipt(receipt_value: object) -> NpiValidationRecei
         receipt_value["manifest_sha256"],
         tables,
         receipt_value["validation_sha256"],
+        receipt_value["profile_contract"],
     )
 
 
@@ -1575,7 +1846,7 @@ async def prepare_npi_activation(
     digest_by_field = {
         "contract": VALIDATION_CONTRACT,
         "package_id": package_id,
-        "profile_contract": CONTRACT,
+        "profile_contract": validated.contract,
         "stage_schema": ownership.schema_name,
         "stage_schema_oid": ownership.schema_oid,
         "relation_oids": [list(pair) for pair in ownership.relation_oids],
@@ -1588,19 +1859,19 @@ async def prepare_npi_activation(
     )
 
 
-async def capture_npi_incumbent(session: Any, *, schema_name: str) -> NpiIncumbent:
+async def capture_npi_incumbent(session: Any, *, schema_name: str, canonical=False) -> NpiIncumbent:
     """Capture all-present or all-absent live relation OIDs for later CAS."""
 
     _require_transaction(session)
     schema = _schema_name(schema_name)
     async with _bounded_catalog_work(session):
-        pairs = await _relation_pairs(session, schema)
-        presence_flags = [relation_oid is not None for _, relation_oid in pairs]
+        pairs = await _relation_pairs(session, schema, npi_archive_names(canonical=canonical))
+        presence_flags = [relation_oid is not None for name, relation_oid in pairs if name != CANONICAL_TABLE]
         if any(presence_flags) and not all(presence_flags):
             raise NpiResultArchiveError("NPI incumbent is incomplete")
         if all(presence_flags):
             await _lock_family(session, schema, "ACCESS SHARE")
-            if await _relation_pairs(session, schema) != pairs:
+            if await _relation_pairs(session, schema, npi_archive_names(canonical=canonical)) != pairs:
                 raise NpiResultArchiveError("NPI incumbent changed during capture")
     return NpiIncumbent(schema, pairs)
 
@@ -1611,16 +1882,25 @@ async def _lock_and_verify_activation(
     incumbent: NpiIncumbent,
 ) -> None:
     async with _bounded_catalog_work(session):
-        await _lock_family(session, ownership.schema_name, "ACCESS EXCLUSIVE")
-        if all(relation_oid is not None for _, relation_oid in incumbent.relation_oids):
-            await _lock_family(session, incumbent.schema_name, "ACCESS EXCLUSIVE")
+        await _lock_family(
+            session,
+            ownership.schema_name,
+            "ACCESS EXCLUSIVE",
+            names=npi_archive_names(canonical=_has_canonical(ownership)),
+        )
+        present_names = tuple(name for name, oid in incumbent.relation_oids if oid is not None)
+        if present_names:
+            await _lock_family(session, incumbent.schema_name, "ACCESS EXCLUSIVE", names=present_names)
         await verify_npi_stage_ownership(session, ownership)
-        if await _relation_pairs(session, incumbent.schema_name) != incumbent.relation_oids:
+        if (
+            await _relation_pairs(session, incumbent.schema_name, tuple(name for name, _ in incumbent.relation_oids))
+            != incumbent.relation_oids
+        ):
             raise NpiResultArchiveError("NPI incumbent changed")
 
 
 async def _has_populated_incumbent(session: Any, incumbent: NpiIncumbent) -> bool:
-    if not all(relation_oid is not None for _, relation_oid in incumbent.relation_oids):
+    if not all(relation_oid is not None for name, relation_oid in incumbent.relation_oids if name != CANONICAL_TABLE):
         return False
     for table_name in RELATION_NAMES:
         populated = await session.scalar(
@@ -1641,7 +1921,7 @@ async def _rotate_relations(
     if any(relation_oid is not None for relation_oid in incumbent_by_name.values()):
         predecessor_schema = npi_predecessor_schema(ownership.dataset_id)
         await session.execute(text(f"CREATE SCHEMA {_quoted(predecessor_schema)}"))
-    for table_name in RELATION_NAMES:
+    for table_name, _oid in ownership.relation_oids:
         if incumbent_by_name[table_name] is not None:
             await session.execute(
                 text(
@@ -1695,6 +1975,7 @@ def _validate_cutover_bindings(
         or validation.relation_oids != ownership.relation_oids
         or validation.manifest_sha256 != _manifest_digest(manifest)
         or validation.tables != manifest.tables
+        or validation.profile_contract != manifest.contract
     ):
         raise NpiResultArchiveError("NPI validation authority differs")
 
@@ -1708,7 +1989,13 @@ async def _admit_automatic_cutover(
 ) -> None:
     if source_generation is None:
         raise NpiResultArchiveError("NPI automatic source generation is unavailable")
-    incumbent_oids = tuple(relation_oid for _, relation_oid in incumbent.relation_oids)
+    if tuple(name for name, _oid in incumbent.relation_oids) not in (
+        RELATION_NAMES,
+        npi_archive_names(canonical=True),
+    ):
+        raise NpiResultArchiveError("NPI incumbent generation inventory is invalid")
+    incumbent_by_name = dict(incumbent.relation_oids)
+    incumbent_oids = tuple(incumbent_by_name[name] for name in RELATION_NAMES)
     if current_authority.serving_generation is None:
         if await _has_populated_incumbent(session, incumbent):
             raise NpiResultArchiveError("NPI legacy incumbent requires manual adoption")
@@ -1740,16 +2027,26 @@ async def _activate_npi_relations(
         function_schema_name=incumbent.schema_name,
     )
     predecessor_schema = await _rotate_relations(session, ownership, incumbent)
-    live_pairs = await _relation_pairs(session, incumbent.schema_name)
+    live_pairs = await _relation_pairs(
+        session, incumbent.schema_name, npi_archive_names(canonical=_has_canonical(ownership))
+    )
     if tuple(sorted(live_pairs)) != ownership.relation_oids or any(
         relation_oid is None for _, relation_oid in live_pairs
     ):
         raise NpiResultArchiveError("NPI activated relation identity differs")
+    canonical_publication = None
+    if manifest.contract == MODEL_CONTRACT:
+        canonical_publication = await merge_canonical_contribution(
+            session,
+            "npi",
+            f"{_quoted(incumbent.schema_name)}.{_quoted(CANONICAL_TABLE)}",
+            f"{_quoted(incumbent.schema_name)}.{_quoted('address_archive_v2')}",
+        )
     adopted = await publish_adopted_npi_result_generation(
         session,
         schema_name=incumbent.schema_name,
         source_generation=manifest.source_serving_generation,
-        canonical_provenance=manifest.canonical_provenance,
+        canonical_provenance=None if manifest.contract == MODEL_CONTRACT else manifest.canonical_provenance,
     )
     ordered_oids = tuple(int(dict(live_pairs)[name]) for name in RELATION_NAMES)
     if manifest.source_serving_generation is None:
@@ -1763,6 +2060,7 @@ async def _activate_npi_relations(
         predecessor_schema,
         validation.tables,
         adopted,
+        canonical_publication,
     )
 
 
@@ -1791,6 +2089,10 @@ async def activate_validated_npi_stage(
     validated_manifest = validate_npi_result_manifest(manifest)
     validation = validate_npi_validation_receipt(validation_receipt)
     _validate_cutover_bindings(ownership, validated_manifest, validation, cutover)
+    if tuple(name for name, _oid in incumbent.relation_oids) != npi_archive_names(
+        canonical=validated_manifest.contract == MODEL_CONTRACT
+    ):
+        raise NpiResultArchiveError("NPI incumbent activation inventory differs")
     await _lock_and_verify_activation(session, ownership, incumbent)
     await _verify_stage_owner(session, ownership, cutover.expected_stage_owner_oid)
     await _advance_and_verify_stage_sequences(session, ownership)
@@ -1837,6 +2139,7 @@ __all__ = [
     "capture_npi_source",
     "capture_npi_stage_ownership",
     "cleanup_npi_stage",
+    "complete_npi_restore",
     "export_npi_archive",
     "export_prepared_npi_archive",
     "freeze_npi_stage",

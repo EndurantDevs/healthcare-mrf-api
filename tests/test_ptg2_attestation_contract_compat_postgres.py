@@ -21,17 +21,25 @@ from process.ptg_parts.ptg2_provider_quarantine import (
 )
 from tests.ptg2_attestation_compat_test_support import (
     create_writer_attestation_table as _create_writer_attestation_table,
+)
+from tests.ptg2_attestation_compat_test_support import (
     quoted_identifier as _quoted,
+)
+from tests.ptg2_attestation_compat_test_support import (
     writer_evidence_by_field as _writer_evidence,
+)
+from tests.ptg2_attestation_compat_test_support import (
     writer_identity_by_field as _writer_identity,
+)
+from tests.ptg2_attestation_compat_test_support import (
     writer_report_by_field as _writer_report,
 )
-
 
 _ATTESTATION_COMPAT_TABLE_DDL = (
     """CREATE TABLE {schema}.ptg2_snapshot (
         snapshot_id text PRIMARY KEY,
-        status text NOT NULL
+        status text NOT NULL,
+        manifest json NOT NULL DEFAULT '{{}}'::json
     )""",
     """CREATE TABLE {schema}.ptg2_v3_snapshot_binding (
         snapshot_id text PRIMARY KEY,
@@ -40,7 +48,8 @@ _ATTESTATION_COMPAT_TABLE_DDL = (
     """CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
         snapshot_key bigint PRIMARY KEY,
         state text NOT NULL,
-        generation text NOT NULL
+        generation text NOT NULL,
+        layout_manifest jsonb NOT NULL DEFAULT '{{}}'::jsonb
     )""",
     """CREATE TABLE {schema}.ptg2_v4_snapshot_map_root (
         snapshot_key bigint PRIMARY KEY,
@@ -96,9 +105,7 @@ def _attestation_compat_fixture() -> _AttestationCompatFixture:
             "witness": {"payload_sha256": source_witness_digest.hex()},
         }
     }
-    report_digest = hashlib.sha256(
-        ptg2_candidate_attestation._canonical_report_bytes(report_by_field)
-    ).digest()
+    report_digest = hashlib.sha256(ptg2_candidate_attestation._canonical_report_bytes(report_by_field)).digest()
     schema_name = f"ptg2_attestation_compat_{uuid.uuid4().hex[:16]}"
     return _AttestationCompatFixture(
         schema_name=schema_name,
@@ -192,13 +199,10 @@ async def _assert_supported_attestation(
 ) -> None:
     supported_report = (
         _writer_report(4)
-        if contract
-        == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
+        if contract == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
         else fixture.report_by_field
     )
-    supported_digest = hashlib.sha256(
-        ptg2_candidate_attestation._canonical_report_bytes(supported_report)
-    ).digest()
+    supported_digest = hashlib.sha256(ptg2_candidate_attestation._canonical_report_bytes(supported_report)).digest()
     await db.status(
         f"""
         UPDATE {fixture.quoted_schema}.ptg2_v3_candidate_audit_attestation
@@ -237,11 +241,14 @@ async def _assert_supported_attestation(
         snapshot_id=fixture.snapshot_id,
     )
     async with db.transaction() as session:
-        assert await ptg2_snapshot.current_snapshot_id(
-            session,
-            requested_snapshot_id=fixture.snapshot_id,
-            requested_source_key="source-a",
-        ) == fixture.snapshot_id
+        assert (
+            await ptg2_snapshot.current_snapshot_id(
+                session,
+                requested_snapshot_id=fixture.snapshot_id,
+                requested_source_key="source-a",
+            )
+            == fixture.snapshot_id
+        )
 
 
 async def _assert_unsupported_attestation(
@@ -272,19 +279,20 @@ async def _assert_unsupported_attestation(
         snapshot_id=fixture.snapshot_id,
     )
     async with db.transaction() as session:
-        assert await ptg2_snapshot.current_snapshot_id(
-            session,
-            requested_snapshot_id=fixture.snapshot_id,
-            requested_source_key="source-a",
-        ) is None
+        assert (
+            await ptg2_snapshot.current_snapshot_id(
+                session,
+                requested_snapshot_id=fixture.snapshot_id,
+                requested_source_key="source-a",
+            )
+            is None
+        )
 
 
 async def _seed_writer_v3_attestation(quoted_schema: str) -> None:
     identity_by_field = _writer_identity()
     report_by_field = _writer_report(3)
-    report_bytes = ptg2_candidate_attestation._canonical_report_bytes(
-        report_by_field
-    )
+    report_bytes = ptg2_candidate_attestation._canonical_report_bytes(report_by_field)
     report_digest = hashlib.sha256(report_bytes).digest()
     activation_intent = "audit_and_activate"
     await db.status(
@@ -305,9 +313,7 @@ async def _seed_writer_v3_attestation(quoted_schema: str) -> None:
         source_set_digest=identity_by_field["source_set_digest"],
         audit_sample_digest=identity_by_field["audit_sample_digest"],
         source_witness_digest=identity_by_field["source_witness_digest"],
-        contract=(
-            ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
-        ),
+        contract=(ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3),
         tool_name=ptg2_candidate_attestation.PTG2_FAST_AUDIT_TOOL,
         report_digest=report_digest,
         report_json=report_bytes.decode("utf-8"),
@@ -347,9 +353,7 @@ async def _assert_writer_upgrade_and_guards(
 ) -> None:
     v4_result = await _record_writer_report(4)
     upgraded_row = await _writer_attestation_row(quoted_schema)
-    assert v4_result["contract"] == (
-        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
-    )
+    assert v4_result["contract"] == (ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4)
     assert upgraded_row[0] == v4_result["contract"]
     assert upgraded_row[1] == ptg2_candidate_attestation.PTG2_BATCH_AUDIT_TOOL
     assert upgraded_row[2] == "4.0.0"
@@ -364,17 +368,15 @@ async def _assert_writer_upgrade_and_guards(
     assert await _writer_attestation_row(quoted_schema) == upgraded_row
 
     async with db.transaction() as session:
-        report_digest = await (
-            ptg2_candidate_attestation.verify_candidate_audit_attestation_in_transaction(
-                session,
-                schema_name=schema_name,
-                snapshot_id="writer-snapshot",
-                snapshot_key=17,
-                source_key="source-a",
-                plan_id="12-3456789",
-                plan_market_type="group",
-                coverage_scope_id=b"c" * 32,
-            )
+        report_digest = await ptg2_candidate_attestation.verify_candidate_audit_attestation_in_transaction(
+            session,
+            schema_name=schema_name,
+            snapshot_id="writer-snapshot",
+            snapshot_key=17,
+            source_key="source-a",
+            plan_id="12-3456789",
+            plan_market_type="group",
+            coverage_scope_id=b"c" * 32,
         )
         await ptg2_candidate_attestation.consume_candidate_audit_attestation_in_transaction(
             session,
@@ -403,10 +405,7 @@ async def test_real_postgres_writer_upgrade_is_monotonic_and_activation_safe(
     """Prove the default V4 writer upgrades V3 and rejects downgrade writes."""
 
     if os.getenv("HLTHPRT_PTG2_ATTESTATION_COMPAT_POSTGRES_TEST") != "1":
-        pytest.skip(
-            "set HLTHPRT_PTG2_ATTESTATION_COMPAT_POSTGRES_TEST=1 for the "
-            "isolated PostgreSQL test"
-        )
+        pytest.skip("set HLTHPRT_PTG2_ATTESTATION_COMPAT_POSTGRES_TEST=1 for the isolated PostgreSQL test")
     schema_name = f"ptg2_attestation_writer_{uuid.uuid4().hex[:16]}"
     quoted_schema = _quoted(schema_name)
     completed_at = datetime.datetime.now(datetime.timezone.utc)
@@ -445,10 +444,7 @@ async def test_real_postgres_published_snapshot_accepts_v3_and_v4_attestations(
 ):
     """Prove both rolling-deploy contracts resolve through real PostgreSQL readers."""
     if os.getenv("HLTHPRT_PTG2_ATTESTATION_COMPAT_POSTGRES_TEST") != "1":
-        pytest.skip(
-            "set HLTHPRT_PTG2_ATTESTATION_COMPAT_POSTGRES_TEST=1 for the "
-            "isolated PostgreSQL test"
-        )
+        pytest.skip("set HLTHPRT_PTG2_ATTESTATION_COMPAT_POSTGRES_TEST=1 for the isolated PostgreSQL test")
 
     fixture = _attestation_compat_fixture()
     monkeypatch.setattr(ptg2_snapshot, "PTG2_SCHEMA", fixture.schema_name)
@@ -471,20 +467,12 @@ async def test_real_postgres_published_snapshot_accepts_v3_and_v4_attestations(
 
         await _seed_attestation_compat_snapshot(fixture)
 
-        await _assert_supported_attestation(
-            fixture,
-            ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
-        )
-        await _assert_supported_attestation(
-            fixture,
-            ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
-        )
+        await _assert_supported_attestation(fixture, ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3)
+        await _assert_supported_attestation(fixture, ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4)
 
         await _assert_unsupported_attestation(fixture)
     finally:
         try:
-            await db.execute_ddl(
-                f"DROP SCHEMA IF EXISTS {fixture.quoted_schema} CASCADE"
-            )
+            await db.execute_ddl(f"DROP SCHEMA IF EXISTS {fixture.quoted_schema} CASCADE")
         finally:
             await db.disconnect()

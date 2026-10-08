@@ -244,7 +244,7 @@ async def test_request_session_middleware_failure_and_empty_paths(monkeypatch) -
     bind_session = app.middleware_by_name["request"]
     cleanup_session = app.middleware_by_name["response"]
 
-    request = SimpleNamespace(ctx=SimpleNamespace())
+    request = SimpleNamespace(path="/control", ctx=SimpleNamespace())
     await bind_session(request)
     await cleanup_session(request, SimpleNamespace(status=500))
     assert transaction_session.rolled_back is True
@@ -279,9 +279,7 @@ class _ExpressionConnection:
 def test_migration_expression_fallback_generated_and_missing_paths(monkeypatch) -> None:
     """Cover defensive expression adoption paths used by migration helpers."""
 
-    assert expression_adoption._fallback_column_expression(
-        sa.Column("plain_value", sa.Integer)
-    ) == ""
+    assert expression_adoption._fallback_column_expression(sa.Column("plain_value", sa.Integer)) == ""
 
     database_connection = _ExpressionConnection()
     generated_column = Column(

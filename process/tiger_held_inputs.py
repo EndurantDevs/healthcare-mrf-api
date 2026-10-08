@@ -17,6 +17,112 @@ _CURRENT = "hp_snapshot_retention.current_generation"
 _GENERATION = "hp_snapshot_retention.generation"
 _CAPTURE = "hp_snapshot_retention.tiger_captured_epoch"
 _CUSTODY = "hp_snapshot_retention.tiger_snapshot_inheritance"
+_CAPTURE_FAMILIES = ("npi", "mrf-address", "cms-doctors", "geo", "tiger")
+
+
+async def selected_captured_inventories(session, *, node_id=None):
+    """Hold complete sealed model families selected by the existing source catalog pair."""
+    relations = _source_selection_relations()
+    if relations is None:
+        return {}
+    archive._require_transaction(session)
+    owner = await _protected_relation(session, _GENERATION, catalog=True)
+    binding, package = relations
+    selected = (
+        (
+            await session.execute(
+                text(f"""
+        SELECT g.*,p.manifest AS selected_manifest,p.package_id AS selected_package_id
+        FROM {binding} b JOIN {package} p USING(package_id)
+        JOIN {_GENERATION} g ON g.generation_id::text=p.manifest#>>'{{adapter_metadata,dataset_id}}'
+          AND g.node_id=b.node_id AND g.importer_id=b.importer_id AND g.dataset_key=b.dataset_key
+        WHERE b.is_current AND b.importer_id=ANY(CAST(:families AS text[]))
+          AND (CAST(:node_id AS text) IS NULL OR b.node_id=:node_id)
+          AND g.origin_kind='captured'
+          AND NOT EXISTS(SELECT 1 FROM {_CURRENT} c JOIN {_GENERATION} installed USING(generation_id)
+            WHERE c.node_id=g.node_id AND c.importer_id=g.importer_id AND c.dataset_key=g.dataset_key
+              AND installed.origin_kind='installed')
+        ORDER BY g.generation_id
+    """),
+                {"families": list(_CAPTURE_FAMILIES), "node_id": node_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    _require(len({generation_row["importer_id"] for generation_row in selected}) == len(selected))
+    return {
+        generation_row["importer_id"]: await _require_model_capture(session, generation_row, owner["owner_oid"])
+        for generation_row in selected
+    }
+
+
+async def _require_model_capture(session, generation, owner_oid):
+    """A catalog hint never replaces protected registration or same-transaction heap locks."""
+    capture = generation["source_capture"]
+    _require(isinstance(capture, dict) and capture.get("contract") == "snapshot-captured-source.v1")
+    registration_by_field = {
+        "generation_id": str(generation["generation_id"]),
+        "origin_kind": "captured",
+        **{key: generation[key] for key in ("node_id", "importer_id", "dataset_key", "validation_sha256", "inventory")},
+        "source_operation_id": str(generation["source_operation_id"]),
+        "source_capture": capture,
+    }
+    authority, manifest = capture["source_authority"], generation["selected_manifest"]
+    _require(
+        _digest(registration_by_field) == generation["registration_sha256"]
+        and _digest(authority) == generation["validation_sha256"]
+        and _digest(manifest) == generation["selected_package_id"]
+        and manifest["producer_node_id"] == generation["node_id"]
+        and manifest["importer_id"] == manifest["dataset_key"] == generation["importer_id"] == generation["dataset_key"]
+        and manifest["contract_version"] == authority["contract"]
+        and manifest["adapter_metadata"]["family"] == authority["manifest"]
+        and authority["ownership"]["dataset_id"]
+        == str(generation["source_operation_id"])
+        == str(generation["generation_id"])
+        and generation["current_location_fence"] is None
+        and generation["state"] == "retained"
+    )
+    inventory = generation["inventory"]
+    _require(
+        inventory["database_oid"]
+        == await session.scalar(text("SELECT oid::bigint FROM pg_database WHERE datname=current_database()"))
+    )
+    ownership = authority["ownership"]
+    _require(
+        sorted((relation_row["relation_name"], relation_row["relation_oid"]) for relation_row in inventory["relations"])
+        == sorted(map(tuple, ownership["relation_oids"]))
+    )
+    schema_identities = []
+    for relation in sorted(inventory["relations"], key=lambda relation_row: relation_row["relation_name"]):
+        _require(
+            relation["schema_name"] == ownership["schema_name"] and relation["schema_oid"] == ownership["schema_oid"]
+        )
+        _require(
+            await _protected_relation(
+                session, f'"{relation["schema_name"]}"."{relation["relation_name"]}"', expected_owner=owner_oid
+            )
+            == relation
+        )
+        schema_identities.append(await _captured_schema_identity(session, generation["importer_id"], relation))
+    if "custody" in authority:
+        _require(_digest(schema_identities) == authority["custody"]["catalog_sha256"])
+    else:
+        _require(generation["importer_id"] == "tiger")
+        await _require_captured_selection(
+            session, {"node_id": generation["node_id"], "inventory": inventory}, authority["manifest"]
+        )
+    return inventory
+
+
+async def _captured_schema_identity(session, importer_id, relation):
+    """Reuse the model family's existing schema semantics, not payload revalidation."""
+    arguments = (relation["relation_oid"], relation["schema_name"], relation["relation_name"])
+    if importer_id == "npi":
+        from process import npi_result_archive
+
+        return await npi_result_archive._npi_schema_identity(session, *arguments)
+    return await archive._family_schema_identity(session, importer_id, *arguments)
 
 
 def _require(condition):
@@ -94,7 +200,7 @@ async def _protected_relation(session, qualified, *, expected_owner=None, catalo
     return {key: attribute for key, attribute in relation.items() if key != "protected"}
 
 
-async def selected_tiger_inventory(session):
+async def selected_tiger_inventory(session, *, node_id=None):
     """Select one actual local current installation or source-bound captured epoch.
 
     Ordinary package rows select a capture; only its protected catalog provides
@@ -110,7 +216,9 @@ async def selected_tiger_inventory(session):
                     text(f"""
             SELECT g.* FROM {_CURRENT} c JOIN {_GENERATION} g USING(generation_id)
             WHERE c.importer_id='tiger' AND c.dataset_key='tiger'
-        """)
+              AND (CAST(:node_id AS text) IS NULL OR c.node_id=:node_id)
+        """),
+                    {"node_id": node_id},
                 )
             )
             .mappings()
@@ -136,7 +244,9 @@ async def selected_tiger_inventory(session):
         SELECT b.node_id,b.inventory,p.manifest FROM {binding_relation} b
         JOIN {package_relation} p USING(package_id)
         WHERE b.importer_id='tiger' AND b.dataset_key='tiger' AND b.is_current
-    """)
+          AND (CAST(:node_id AS text) IS NULL OR b.node_id=:node_id)
+    """),
+                {"node_id": node_id},
             )
         )
         .mappings()

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import importlib
 import datetime
+import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -47,8 +47,10 @@ def _install_observation_results(monkeypatch: pytest.MonkeyPatch, schema_name: s
         AsyncMock(return_value=(1, 10, _geo_signature(schema_name))),
     )
     monkeypatch.setattr(serving, "_result_generation_state", AsyncMock(return_value=None))
+
     async def lock_dependencies(session, schema, **_options):
         await session.execute(serving.text(serving.geo_projection.projection_dependency_lock_sql(schema)))
+
     monkeypatch.setattr(serving, "lock_active_dependencies", lock_dependencies)
 
 
@@ -227,6 +229,56 @@ async def test_receive_final_comparison_uses_writer_order_and_rejects_changed_to
     _install_observation_results(monkeypatch, "mrf")
     expected["alias_state"]["generation"] += 1
     with pytest.raises(RuntimeError, match="receive incumbent changed"):
+        await serving.require_entity_address_receive_incumbent(session, schema_name="mrf", expected=expected)
+
+
+def _install_empty_receive_results(monkeypatch):
+    _install_observation_results(monkeypatch, "mrf")
+    monkeypatch.setattr(serving, "_geo_assurance_state", AsyncMock(return_value=(None, None, None)))
+    authority = SimpleNamespace(local_generation=0, serving_generation=None, relation_oids=None)
+    monkeypatch.setattr(
+        generation, "read_entity_address_result_generation_authority", AsyncMock(return_value=authority)
+    )
+    return authority
+
+
+@pytest.mark.asyncio
+async def test_empty_receive_roundtrips_null_geo_and_rechecks_before_publication(monkeypatch):
+    session = _session()
+    session.scalar.side_effect = lambda sql: "read committed" if str(sql) == "SHOW transaction_isolation" else False
+    _install_empty_receive_results(monkeypatch)
+    captured = await serving.capture_entity_address_receive_admission(session, schema_name="mrf")
+    assert captured.as_dict()["geo_assurance"] == dict.fromkeys(
+        ("version", "active_table_oid", "active_relation_signature")
+    )
+    assert serving.validate_entity_address_observed_serving_capture(captured, allow_unpublished_geo=True) == captured
+    with pytest.raises(ValueError):
+        serving.validate_entity_address_observed_serving_capture(captured)
+    _install_empty_receive_results(monkeypatch)
+    await serving.require_entity_address_receive_incumbent(session, schema_name="mrf", expected=captured)
+    assert len([call for call in session.scalar.await_args_list if str(call.args[0]).startswith("SELECT EXISTS")]) == 2
+    _install_empty_receive_results(monkeypatch)
+    with pytest.raises(RuntimeError, match="not serving authority"):
+        await serving.capture_entity_address_observed_serving(session, schema_name="mrf")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ("generation", "populated", "alias", "relation"))
+async def test_empty_receive_final_recheck_rejects_changed_state(monkeypatch, invalid):
+    session = _session()
+    session.scalar.side_effect = lambda sql: "read committed" if str(sql) == "SHOW transaction_isolation" else False
+    _install_empty_receive_results(monkeypatch)
+    expected = (await serving.capture_entity_address_receive_admission(session, schema_name="mrf")).as_dict()
+    authority = _install_empty_receive_results(monkeypatch)
+    if invalid == "generation":
+        authority.local_generation = 1
+    elif invalid == "populated":
+        session.scalar.side_effect = lambda sql: "read committed" if str(sql) == "SHOW transaction_isolation" else True
+    elif invalid == "alias":
+        monkeypatch.setattr(serving, "_alias_state", AsyncMock(return_value=(2, 1, 5)))
+    else:
+        monkeypatch.setattr(serving, "_relation_oid", AsyncMock(side_effect=range(20, 27)))
+    with pytest.raises(RuntimeError):
         await serving.require_entity_address_receive_incumbent(session, schema_name="mrf", expected=expected)
 
 

@@ -18,6 +18,7 @@ from db.connection import Database
 from process import cms_doctors_preparation as preparation
 from process import reference_family_result_generation as generation
 from tests import test_provider_directory_cms_serving_receipt_postgres as receipt_fixture
+from tests.provider_profile_snapshot_postgres_support import grant_profile_reader, profile_reader
 
 native = importlib.import_module("process.cms_doctors")
 
@@ -47,12 +48,15 @@ async def _insert_marker(session, model, marker):
 async def stage_family(database, schema):
     """Create three populated, unlogged stage tables without their serving indexes."""
     import_date = uuid4().hex
+    stage_names = []
     async with database.transaction() as session:
         for model in preparation._models():
             stage = native.make_class(model, import_date)
+            stage_names.append(stage.__tablename__)
             await session.execute(CreateTable(stage.__table__))
             await session.execute(text(f'ALTER TABLE "{schema}"."{stage.__tablename__}" SET UNLOGGED'))
             await _insert_marker(session, stage, "prepared")
+    await grant_profile_reader(database, schema, stage_names)
     return {
         "import_date": import_date,
         "context": {"run": True, "education_stage_owned": True, "group_site_stage_owned": True},
@@ -87,7 +91,8 @@ async def doctors_database(monkeypatch, *, cms_active=True):
                 await generation.publish_local_reference_family_generation(
                     session, importer_id="cms-doctors", schema_name=schema
                 )
-        yield SimpleNamespace(engine=engine, schema=schema, database=database, initial=initial)
+        async with profile_reader(database, schema, monkeypatch):
+            yield SimpleNamespace(engine=engine, schema=schema, database=database, initial=initial)
 
 
 async def authority(fixture):

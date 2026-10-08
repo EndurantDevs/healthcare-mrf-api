@@ -151,7 +151,11 @@ def test_repository_has_single_alembic_head():
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
 
-    assert ScriptDirectory.from_config(config).get_heads() == ["20261007000000_custom_import_rejection_anti_joins"]
+    script = ScriptDirectory.from_config(config)
+    assert script.get_heads() == ["20261006010000_nucc_reference_result_generation"]
+    assert (
+        script.get_revision(script.get_heads()[0]).down_revision == "20261007000000_custom_import_rejection_anti_joins"
+    )
 
 
 def test_candidate_audit_hold_migration_matches_runtime_digest():

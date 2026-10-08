@@ -87,6 +87,92 @@ async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shut
     )
 
 
+def _publisher_reimport_callbacks(session, stage, selected, events, failure):
+    """Observe the exact protected seal, projection and validation order."""
+
+    async def seal(actual, oid, owner):
+        assert actual is session and (oid, owner) == (42, 31)
+        events.append("seal")
+
+    async def state_lock(actual, schema, owner):
+        assert actual is session and (schema, owner) == ("mrf", 31)
+        events.append("state lock")
+
+    async def mutation(actual, oids, owner):
+        assert actual is session and (oids, owner) == ([99], 31)
+        events.append("ordinary denial")
+
+    async def project(schema, table, **options):
+        assert (schema, table) == ("mrf", stage.__tablename__)
+        assert options["force"] is True and options["dependency_bindings"] == selected
+        assert native.db._transaction_binding().session is session
+        events.append("projection")
+        if failure == "projection":
+            raise RuntimeError("projection failed")
+        options["context"]["geo_assurance_candidate_table_oid"] = 43 if failure == "oid" else 42
+        return 7
+
+    return seal, state_lock, mutation, project
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", (None, "owner", "projection", "oid"))
+async def test_publisher_reimport_seals_before_projection_and_receipt(monkeypatch, failure):
+    """Only the authenticated Publisher may receipt the exact sealed, selected stage."""
+    from process import entity_address_snapshot_preparation as protected
+    from tests.test_geo_assurance_dependency_bindings import _example_bindings
+
+    events, selected = [], _example_bindings()
+    stage = SimpleNamespace(__tablename__="entity_address_unified_synthetic")
+    swaps = [SimpleNamespace(stage_cls=stage)]
+    swaps.extend(SimpleNamespace(stage_cls=SimpleNamespace(__tablename__=f"support_{i}")) for i in range(6))
+
+    async def scalar(statement, parameters):
+        if "relowner=:owner" in str(statement):
+            assert parameters == {"relation": '"mrf"."entity_address_geo_assurance_state"', "owner": 31}
+            events.append("owner")
+            return None if failure == "owner" else 99
+        return 42
+
+    session = SimpleNamespace(execute=AsyncMock(), scalar=scalar)
+    monkeypatch.setattr(native.db, "_transaction_binding", lambda: SimpleNamespace(session=session))
+    monkeypatch.setattr(protected, "_publisher_authority", AsyncMock(return_value=31))
+    monkeypatch.setattr(protected, "_require_alias_authority", AsyncMock())
+    monkeypatch.setattr(adoption, "_prepared_full_result_stage", lambda **_: (stage, {}, swaps, [], [], []))
+    seal, state_lock, mutation, project = _publisher_reimport_callbacks(session, stage, selected, events, failure)
+    prepared = SimpleNamespace(context={})
+
+    async def validate(**options):
+        assert options == {"db_schema": "mrf", "import_date": "synthetic"}
+        events.append("validation")
+        return prepared
+
+    monkeypatch.setattr(protected, "_seal_published_relation", seal)
+    monkeypatch.setattr(protected, "_lock_publication_state", state_lock)
+    monkeypatch.setattr(protected, "_require_no_untrusted_mutation", mutation)
+    monkeypatch.setattr(native, "_materialize_geo_assurance", project)
+    monkeypatch.setattr(adoption, "prepare_completed_entity_address_snapshot_adoption", validate)
+    if failure:
+        with pytest.raises(
+            RuntimeError,
+            match={"owner": "geo state owner", "projection": "projection failed", "oid": "projection stage"}[failure],
+        ):
+            await adoption.prepare_entity_address_publisher_reimport(
+                session, db_schema="mrf", import_date="synthetic", dependency_bindings=selected
+            )
+        assert "validation" not in events
+        if failure == "owner":
+            assert "projection" not in events
+    else:
+        actual = await adoption.prepare_entity_address_publisher_reimport(
+            session, db_schema="mrf", import_date="synthetic", dependency_bindings=selected
+        )
+        assert actual is prepared
+        assert events == ["seal"] * 7 + ["state lock", "owner", "ordinary denial", "projection", "validation"]
+        assert actual.context["geo_assurance_projected_rows"] == 7
+        assert actual.context["geo_assurance_candidate_table_oid"] == 42
+
+
 @pytest.mark.asyncio
 async def test_bound_sql_phase_preserves_settings_without_opening_an_engine_connection(monkeypatch):
     events: list[str] = []

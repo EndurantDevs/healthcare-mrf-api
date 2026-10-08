@@ -40,7 +40,7 @@ async def load_sealed_code_rows(session, serving_tables, args):
                code_metadata.reported_code_system, code_metadata.reported_code,
                code_metadata.negotiation_arrangement, code_metadata.billing_code_type_version,
                code_metadata.source_name, code_metadata.source_description, code_metadata.rate_count
-          FROM {serving._shared_v3_code_table()} code_metadata {scope_join}
+          FROM {serving._shared_v3_code_table(serving_tables)} code_metadata {scope_join}
          WHERE {" AND ".join(predicates)}
          ORDER BY {plan_order}, CASE WHEN code_metadata.reported_code = :reported_code THEN 0 ELSE 1 END,
                   code_metadata.code_key

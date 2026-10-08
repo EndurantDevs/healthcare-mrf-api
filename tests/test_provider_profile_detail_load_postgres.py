@@ -165,7 +165,8 @@ async def test_full_detail_reads_during_native_doctors_publication(monkeypatch, 
         monkeypatch.setattr(npi_api, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 300 if cache_enabled else 0)
         measurements = _Measurements()
         measurements.install(monkeypatch)
-        event.listen(fixture.engine.sync_engine, "before_cursor_execute", measurements.before_query)
+        reader_engine = fixture.database._reader_database.engine
+        event.listen(reader_engine.sync_engine, "before_cursor_execute", measurements.before_query)
         workers = []
         publisher = None
         publication_by_field = {}
@@ -210,7 +211,7 @@ async def test_full_detail_reads_during_native_doctors_publication(monkeypatch, 
                 if task is not None and not task.done():
                     task.cancel()
             await asyncio.gather(*(task for task in [publisher, *workers] if task is not None), return_exceptions=True)
-            event.remove(fixture.engine.sync_engine, "before_cursor_execute", measurements.before_query)
+            event.remove(reader_engine.sync_engine, "before_cursor_execute", measurements.before_query)
             _write_receipt(tmp_path, fixture, measurements, before, publication_by_field, cache_enabled)
 
 
