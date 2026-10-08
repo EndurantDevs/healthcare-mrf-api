@@ -15,6 +15,7 @@ from db.models.custom_import import CustomImportChildScalar, CustomImportRootSca
 from process.custom_import import build_graph as graph
 from process.custom_import import build_output as output
 from process.custom_import import publication, scalar_digest
+from process.custom_import.runner_codec import record_payload
 from process.custom_import.runner_types import CancellationRequested, CandidateRunnerError, LeaseAuthorityLost
 from tests.test_custom_import_build_graph import _registry
 from tests.test_custom_import_build_output import _generation
@@ -594,3 +595,153 @@ def test_verified_decimal_positive_exponent_zero_uses_bounded_exact_frame(native
     actual = native_verifier(False, (1, 2), layouts, groups)
     records[5][0].decimal_value = Decimal("-0")
     assert actual == _reference_frames(records, child=False)
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_verification_revisions_preserve_missing_and_null_cells(child):
+    request, family = _twenty_projection_family(child=child)
+    revision = _projection_records(request, [family], child=child)[0][1]
+    _layouts, contexts = scalar_digest.verification_layouts(
+        request.definition, _registry(request.definition).child_collection_slots, child=child
+    )
+    fields, hot_fields = contexts[int(child)]
+    values_by_field = dict(scalar_digest.payload_values(fields, revision.canonical_payload, label="test"))
+    missing, null = [field.field_id for field in fields if field.field_id.startswith("extra_")][:2]
+    del values_by_field[missing]
+    values_by_field[null] = None
+    revision.canonical_payload = record_payload(fields, values_by_field)
+    records = _projection_records(request, [family], child=child)
+    groups = list(scalar_digest.verification_revisions((record for record in records), contexts, child=child))
+    assert len(groups) == 1 and len(groups[0][3]) == 19
+    expected_by_field = dict(zip((field.field_id for field in hot_fields), groups[0][2], strict=True))
+    assert expected_by_field[missing] == ("missing", None)
+    assert expected_by_field[null] == ("null", None)
+    assert sum(cell[0] == "value" for cell in expected_by_field.values()) == 18
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_verification_revisions_keep_empty_groups_and_close_on_exhaustion(child):
+    closed_flags = []
+
+    def records():
+        try:
+            for identity in (7, 8):
+                revision = SimpleNamespace(
+                    root_record_id=3,
+                    root_revision_id=identity,
+                    child_revision_id=identity,
+                    collection_slot=1,
+                    child_key_sha256=b"c" * 32,
+                    canonical_payload=record_payload((), {}),
+                )
+                yield None, revision, b"r" * 32
+        finally:
+            closed_flags.append(True)
+
+    groups = list(scalar_digest.verification_revisions(records(), {int(child): ((), ())}, child=child))
+    assert [group[0] for group in groups] == [(3, 7, int(child)), (3, 8, int(child))]
+    assert [group[2:] for group in groups] == [((), []), ((), [])]
+    assert closed_flags == [True]
+
+
+@pytest.mark.parametrize("corruption", ["empty_first", "empty_last", "duplicate_empty", "overflow"])
+def test_verification_revisions_reject_malformed_groups_and_close(corruption):
+    request, family = _twenty_projection_family(child=False)
+    record = _projection_records(request, [family], child=False)[0]
+    _layouts, contexts = scalar_digest.verification_layouts(request.definition, {}, child=False)
+    empty = (None, *record[1:])
+    malformed = {
+        "empty_first": [empty, record],
+        "empty_last": [record, empty],
+        "duplicate_empty": [empty, empty],
+        "overflow": [record] * (scalar_digest.VERIFY_PENDING_ROWS + 1),
+    }[corruption]
+    closed_flags = []
+
+    def records():
+        try:
+            yield from malformed
+        finally:
+            closed_flags.append(True)
+
+    with pytest.raises(CandidateRunnerError, match="differs from the frozen payload"):
+        list(scalar_digest.verification_revisions(records(), contexts, child=False))
+    assert closed_flags == [True]
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [("string_value", "x" * 2049), ("field_type", 1), ("value_state", "x" * 9)],
+)
+def test_verification_row_rejects_unbounded_or_untyped_text(column, value):
+    scalar = _typed_records(child=False)[0][0]
+    setattr(scalar, column, value)
+    with pytest.raises(CandidateRunnerError, match="differs from the frozen payload"):
+        scalar_digest._verification_row(scalar, child=False)
+
+
+def test_scalar_adapters_leave_empty_streams_unhashed():
+    native, budget = Mock(), Mock()
+    digests = _digests()
+    assert list(scalar_digest.verification_revisions((record for record in ()), {}, child=False)) == []
+    assert (
+        scalar_digest.verified_material(
+            native, (group for group in ()), (1, 2), [], digests, child=False, check_budget=budget
+        )
+        == 0
+    )
+    assert (
+        scalar_digest.scalar_material(native, (record for record in ()), digests, child=False, check_budget=budget) == 0
+    )
+    native.assert_not_called()
+    budget.assert_not_called()
+    assert [digest.digest() for digest in digests] == [digest.digest() for digest in _digests()]
+
+
+def test_verified_material_hashes_each_complete_bounded_batch():
+    layouts, groups, _records = _verification_fixture(child=False)
+    batches = []
+
+    def verifier(child, owner, actual_layouts, batch):
+        assert child is False and owner == (1, 2) and actual_layouts == layouts
+        batches.append(tuple(batch))
+        return b"verified"
+
+    digests, expected = _digests(), _digests()
+    budget = Mock()
+    assert (
+        scalar_digest.verified_material(
+            verifier, (groups[0] for _ in range(9)), (1, 2), layouts, digests, child=False, check_budget=budget
+        )
+        == 144
+    )
+    assert [len(batch) for batch in batches] == [8, 1]
+    for digest in expected:
+        digest.update(b"verified" * 2)
+    assert [digest.digest() for digest in digests] == [digest.digest() for digest in expected]
+    assert budget.call_count == 4
+
+
+def test_scalar_material_hashes_each_complete_bounded_batch():
+    records = _typed_records(child=False)
+    batches = []
+
+    def encoder(child, batch):
+        assert child is False
+        batches.append(tuple(batch))
+        return b"encoded"
+
+    digests, expected = _digests(), _digests()
+    budget = Mock()
+    count = scalar_digest.BATCH_ROWS + 1
+    assert (
+        scalar_digest.scalar_material(
+            encoder, (records[0] for _ in range(count)), digests, child=False, check_budget=budget
+        )
+        == count
+    )
+    assert [len(batch) for batch in batches] == [scalar_digest.BATCH_ROWS, 1]
+    for digest in expected:
+        digest.update(b"encoded" * 2)
+    assert [digest.digest() for digest in digests] == [digest.digest() for digest in expected]
+    assert budget.call_count == 4
