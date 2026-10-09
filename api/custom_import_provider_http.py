@@ -60,12 +60,16 @@ class _ParsedProviderRequest:
     grouped_entity_selection: dict[str, object] | None = None
     family_entitlement: str | None = None
     grouped_child_query: dict[str, object] | None = None
+    # Missing preserves enrichment for deployed signed-v2 callers.
+    include_filter: bool = True
+    maximum_family_rows: int = MAX_FULL_FAMILY_PAGE_SIZE
 
 
 def _provider_relation_query(
     parsed: _ParsedProviderRequest,
     *,
     require_exact_context: bool = False,
+    native_npi: int | None = None,
 ) -> NpiEntityRelationQuery:
     """Bind one provider body to the read-core relation input."""
 
@@ -78,6 +82,7 @@ def _provider_relation_query(
         grouped_entity_selection=parsed.grouped_entity_selection,
         family_entitlement=parsed.family_entitlement,
         grouped_child_query=parsed.grouped_child_query,
+        entity_values=None if native_npi is None else ((str(native_npi),) if len(str(native_npi)) == 10 else ()),
     )
 
 
@@ -106,7 +111,7 @@ def _provider_document(body):
     base_keys = {"target", "native_query", "context", "filters", "order", "require_match"}
     if (
         type(document) is not dict
-        or set(document)
+        or (set(document) - {"include_filter"})
         not in (
             base_keys,
             base_keys | {"grouped_entity_selection"},
@@ -120,12 +125,17 @@ def _provider_document(body):
     return document
 
 
-def _parse_provider_request(body: bytes, *, native_query_parser=_parse_native_query) -> _ParsedProviderRequest:
+def _parse_provider_request(
+    body: bytes, *, native_query_parser=_parse_native_query, maximum_family_rows=MAX_FULL_FAMILY_PAGE_SIZE
+) -> _ParsedProviderRequest:
     """Separate context selectors from whether imported membership is required."""
 
     document = _provider_document(body)
     if type(document["require_match"]) is not bool:
         raise CustomImportReadRequestError("imported membership mode is invalid")
+    include_filter = document.get("include_filter", True)
+    if type(include_filter) is not bool:
+        raise CustomImportReadRequestError("imported payload mode is invalid")
     grouped = document.get("grouped_entity_selection")
     order = (
         None
@@ -153,14 +163,17 @@ def _parse_provider_request(body: bytes, *, native_query_parser=_parse_native_qu
         raise CustomImportReadRequestError("filter count exceeds the read-core limit")
     if any(predicate.operator != "eq" or predicate.value is None for predicate in context):
         raise CustomImportReadRequestError("context selectors are invalid")
-    if any(predicate.operator not in {"eq", "gt", "lt"} or predicate.value is None for predicate in filters):
+    if any(
+        predicate.operator not in {"eq", "gt", "gte", "lt", "lte"} or predicate.value is None for predicate in filters
+    ):
         raise CustomImportReadRequestError("metric filters are invalid")
     return _ParsedProviderRequest(
         target=transport._parse_target(document["target"]),
         native_args=_bounded_native_args(
             document["native_query"],
             native_query_parser,
-            complete_family=grouped is None or entitlement == "full_family",
+            complete_family=include_filter and (grouped is None or entitlement == "full_family"),
+            maximum_rows=maximum_family_rows,
         ),
         context=context,
         filters=filters,
@@ -169,17 +182,19 @@ def _parse_provider_request(body: bytes, *, native_query_parser=_parse_native_qu
         grouped_entity_selection=grouped,
         family_entitlement=entitlement,
         grouped_child_query=child,
+        include_filter=include_filter,
+        maximum_family_rows=maximum_family_rows,
     )
 
 
-def _bounded_native_args(document, parser, *, complete_family):
+def _bounded_native_args(document, parser, *, complete_family, maximum_rows=MAX_FULL_FAMILY_PAGE_SIZE):
     """Reject oversized complete-family requests before reading any provider rows."""
 
     args = parser(document)
     if complete_family:
         for name in ("limit", "page_size"):
             limit = _parse_non_negative_int(args.get(name), name)
-            if limit is not None and limit > MAX_FULL_FAMILY_PAGE_SIZE:
+            if limit is not None and limit > maximum_rows:
                 raise CustomImportReadRequestError("full-family provider page size exceeds its bound")
     return args
 
@@ -228,7 +243,9 @@ async def _read_provider_payload(request, session, parsed, verified):
     pinned_target = await transport._resolve_pinned_target(session, parsed.target)
     service = CustomImportReadService(authorizer=transport._TransportAuthorizer(verified, pinned_target))
     authorization = ExtensionReadAuthorization(verified.credential)
-    query = _provider_relation_query(parsed)
+    from api.endpoint.npi import _normalize_exact_npi
+
+    query = _provider_relation_query(parsed, native_npi=_normalize_exact_npi(parsed.native_args.get("npi")))
     prepared = await service.prepare_npi_entity_relation(
         session,
         authorization=authorization,
@@ -248,24 +265,38 @@ async def _read_provider_payload(request, session, parsed, verified):
 
 
 async def _hydrate_provider_rows(
-    session, service, authorization, pinned_target, prepared, parsed, query, provider_rows
+    session,
+    service,
+    authorization,
+    pinned_target,
+    prepared,
+    parsed,
+    query,
+    provider_rows,
 ):
     """Hydrate each selected family once, including multiple addresses per NPI."""
 
-    _provider_response_limit(parsed, len(provider_rows))
+    _provider_response_limit(parsed, len(provider_rows), maximum_rows=parsed.maximum_family_rows)
+    if not parsed.include_filter:
+        return
     require_match = (
         query.require_match if prepared.effective_require_match is None else prepared.effective_require_match
     )
-    imported_items = await service.hydrate_npi_page(
-        session,
-        authorization=authorization,
-        pinned_target=pinned_target,
-        prepared=prepared,
-        entity_values=tuple(dict.fromkeys(str(provider["npi"]) for provider in provider_rows)),
-        query=query,
-    )
+    entity_values = tuple(dict.fromkeys(str(provider["npi"]) for provider in provider_rows))
+    imported_items_by_entity = {}
+    for start in range(0, max(len(entity_values), 1), MAX_FULL_FAMILY_PAGE_SIZE):
+        imported_items_by_entity.update(
+            await service.hydrate_npi_page(
+                session,
+                authorization=authorization,
+                pinned_target=pinned_target,
+                prepared=prepared,
+                entity_values=entity_values[start : start + MAX_FULL_FAMILY_PAGE_SIZE],
+                query=query,
+            )
+        )
     payload_by_entity = {}
-    for entity, imported_item in imported_items.items():
+    for entity, imported_item in imported_items_by_entity.items():
         family_payload = transport._provider_import_payload(imported_item, parsed.target)
         if (parsed.grouped_entity_selection is None or parsed.family_entitlement == "full_family") and len(
             transport._canonical_json_bytes(family_payload)
@@ -279,12 +310,16 @@ async def _hydrate_provider_rows(
         provider["custom_import"] = imported_item
 
 
-def _provider_response_limit(parsed, row_count):
+def _provider_response_limit(parsed, row_count, *, maximum_rows=MAX_FULL_FAMILY_PAGE_SIZE):
     """One bounded native envelope plus one unchanged bound per full-family row."""
 
-    if parsed.grouped_entity_selection is not None and parsed.family_entitlement != "full_family":
+    if not 0 <= row_count <= MAX_NPI_PAGE_SIZE:
+        raise CustomImportReadUnavailableError("provider page exceeds its bound")
+    if not parsed.include_filter or (
+        parsed.grouped_entity_selection is not None and parsed.family_entitlement != "full_family"
+    ):
         return transport._MAX_RESPONSE_BYTES
-    if not 0 <= row_count <= MAX_FULL_FAMILY_PAGE_SIZE:
+    if row_count > maximum_rows:
         raise CustomImportReadUnavailableError("full-family provider page exceeds its bound")
     return (row_count + 1) * transport._MAX_RESPONSE_BYTES
 
@@ -298,7 +333,8 @@ def _provider_payload(body: bytes) -> dict[str, Any]:
         or type(payload.get("rows")) is not list
         or len(payload["rows"]) > MAX_NPI_PAGE_SIZE
         or any(
-            type(provider) is not dict or type(provider.get("npi")) not in {int, str} for provider in payload["rows"]
+            type(provider) is not dict or type(provider.get("npi")) not in {int, str} or "custom_import" in provider
+            for provider in payload["rows"]
         )
     ):
         raise CustomImportReadUnavailableError("provider response is unavailable")

@@ -373,6 +373,7 @@ class NpiEntityRelationQuery:
     grouped_entity_selection: dict[str, object] | None = None
     family_entitlement: str | None = None
     grouped_child_query: dict[str, object] | None = None
+    entity_values: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.family_entitlement is not None and (
@@ -542,6 +543,8 @@ class CustomImportReadService:
         )
         if type(query.require_match) is not bool or type(query.require_exact_context) is not bool:
             raise CustomImportReadRequestError("imported membership mode is invalid")
+        if query.entity_values is not None:
+            _validate_npi_page(query.entity_values)
         async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
             context = await _load_read_context(session, pinned_target)
             if context.definition.query.entity_selection is not None or query.grouped_entity_selection is not None:
@@ -565,6 +568,7 @@ class CustomImportReadService:
                 normalized_filters,
                 normalized_order_terms,
                 context_filters=normalized_context_filters,
+                entity_values=query.entity_values,
             )
             return PreparedNpiEntityRelation(
                 statement=_npi_entity_relation_statement(
@@ -572,6 +576,7 @@ class CustomImportReadService:
                     normalized_filters,
                     normalized_order_terms,
                     context_filters=normalized_context_filters,
+                    entity_values=query.entity_values,
                 ),
                 normalized_order_terms=normalized_order_terms,
                 query_fingerprint=query_sha256,
@@ -605,6 +610,10 @@ class CustomImportReadService:
             maximum_terms=_relation_predicate_limit(query),
         )
         _validate_npi_page(entity_values)
+        if query.entity_values is not None:
+            _validate_npi_page(query.entity_values)
+            if not set(entity_values) <= set(query.entity_values):
+                raise CustomImportReadUnavailableError("provider page identities exceed the native query scope")
         if full_family and len(entity_values) > MAX_FULL_FAMILY_PAGE_SIZE:
             raise CustomImportReadRequestError("full-family provider page exceeds its bound")
         async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
@@ -635,6 +644,7 @@ class CustomImportReadService:
                 normalized_filters,
                 normalized_order,
                 context_filters=normalized_context_filters,
+                entity_values=query.entity_values,
             )
             or prepared.authorization_scope_sha256 != _scope_digest(authorization_scope)
         ):
@@ -1440,7 +1450,7 @@ def _verify_metric_filters(filters: tuple[_NormalizedFilter, ...], context_dimen
     """Limit v2 metric predicates to the metric comparison operators."""
 
     if any(
-        predicate.operator not in {"eq", "gt", "lt"} or predicate.field.field_id in context_dimensions
+        predicate.operator not in {"eq", "gt", "gte", "lt", "lte"} or predicate.field.field_id in context_dimensions
         for predicate in filters
     ):
         raise CustomImportReadRequestError("metric filters are invalid")
@@ -1707,6 +1717,7 @@ def _npi_entity_relation_fingerprint(
     order_terms: tuple[ReadOrderTerm, ...],
     *,
     context_filters: tuple[_NormalizedFilter, ...] = (),
+    entity_values: tuple[str, ...] | None = None,
 ) -> str:
     """Bind normalized imported query shape to the NPI relation domain."""
 
@@ -1717,6 +1728,8 @@ def _npi_entity_relation_fingerprint(
         "filters": [normalized_filter.descriptor for normalized_filter in filters],
         "order": [{"field": term.field_id, "direction": term.direction, "nulls": term.nulls} for term in order_terms],
     }
+    if entity_values is not None:
+        query_shape_map["entity_values"] = sorted(entity_values)
     return hashlib.sha256(_NPI_ENTITY_RELATION_FINGERPRINT_DOMAIN + _canonical_bytes(query_shape_map)).hexdigest()
 
 
@@ -1726,12 +1739,15 @@ def _npi_entity_relation_statement(
     order_terms: tuple[ReadOrderTerm, ...],
     *,
     context_filters: tuple[_NormalizedFilter, ...] = (),
+    entity_values: tuple[str, ...] | None = None,
 ) -> Select:
     """Project exact NPI bindings and optional winner-local typed sort values."""
 
     entity_model = context.model(CustomImportEntityBinding)
 
     statement = _filtered_npi_winner_statement(context, filters, context_filters=context_filters)
+    if entity_values is not None:
+        statement = statement.where(entity_model.canonical_value.in_(entity_values))
     columns: list[object] = [entity_model.canonical_value.label("entity_value")]
     for ordinal, term in enumerate(order_terms):
         field = context.definition.fields_by_id[term.field_id]

@@ -17,9 +17,7 @@ def selected_identities(context, plan, entity_values=None):
     family = context.model(core.CustomImportFamilyRevision)
     winner = context.model(core.CustomImportWinner)
     entity = context.model(core.CustomImportEntityBinding)
-    statement = selected_family_statement(context, plan, materialize_default=True)
-    if entity_values is not None:
-        statement = statement.where(entity.canonical_value.in_(entity_values))
+    statement = selected_family_statement(context, plan, materialize_default=True, entity_values=entity_values)
     return statement.with_only_columns(
         winner.family_revision_id,
         family.root_record_id,

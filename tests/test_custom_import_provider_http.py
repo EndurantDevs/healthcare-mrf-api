@@ -6,6 +6,7 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,7 @@ from process.custom_import.read_contracts import CustomImportReadRequestError, C
 from process.custom_import.read_core import EntityFamilySet, PreparedNpiEntityRelation, ReadChild, ReadFieldValue
 from tests import custom_import_grouped_support as grouped_fixture
 from tests import test_custom_import_read_http as fixtures
+from tests.openapi_route_contract_support import load_openapi_document
 
 
 def _body(**changes):
@@ -30,6 +32,7 @@ def _body(**changes):
         "filters": [],
         "order": [{"field_id": "metric", "direction": "desc"}],
         "require_match": False,
+        "include_filter": True,
     }
     body_map.update(changes)
     return transport._canonical_json_bytes(body_map)
@@ -164,6 +167,84 @@ def test_context_selection_does_not_require_imported_membership():
     assert filtered.order_terms is None and filtered.require_match is True
 
 
+@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
+def test_payload_inclusion_requires_an_actual_boolean(value):
+    with pytest.raises(CustomImportReadRequestError, match="payload mode"):
+        provider_http._parse_provider_request(_body(include_filter=value))
+
+
+def test_rolling_provider_body_retains_import_payload_when_flag_is_missing():
+    document = json.loads(_body())
+    del document["include_filter"]
+    parsed = provider_http._parse_provider_request(transport._canonical_json_bytes(document))
+    assert parsed.include_filter is True
+
+
+@pytest.mark.asyncio
+async def test_rolling_provider_body_still_hydrates_the_legacy_import_payload(monkeypatch):
+    session = _Session()
+    imported = SimpleNamespace(root_fields=(), context_fields=(), children=())
+    _install(monkeypatch, session, page_rows=[{"npi": 1104212877}], imported_items={"1104212877": imported})
+    document_map = json.loads(_body())
+    document_map.pop("include_filter")
+    reply = await provider_http.serve_custom_import_providers(
+        _request(transport._canonical_json_bytes(document_map)), session
+    )
+    assert reply.status == 200 and "hydrate" in session.events
+    assert json.loads(reply.body)["rows"][0]["custom_import"] is not None
+
+
+@pytest.mark.asyncio
+async def test_filter_only_page_does_not_hydrate_or_render_imports(monkeypatch):
+    session = _Session()
+    _install(monkeypatch, session, page_rows=[{"npi": 1104212877}], require_match=True)
+
+    def forbidden_render(*args):
+        pytest.fail("filter-only reads must not render imported fields")
+
+    monkeypatch.setattr(transport, "_provider_import_payload", forbidden_render)
+    reply = await provider_http.serve_custom_import_providers(
+        _request(_body(include_filter=False, require_match=True)), session
+    )
+    assert reply.status == 200
+    assert json.loads(reply.body)["rows"] == [{"npi": 1104212877}]
+    assert "prepare" in session.events and "hydrate" not in session.events
+    assert session.events[-2:] == ["finality", "end"]
+
+
+@pytest.mark.asyncio
+async def test_filter_only_page_rejects_unexpected_native_import_payload(monkeypatch):
+    session = _Session()
+    _install(monkeypatch, session, page_rows=[{"npi": 1104212877, "custom_import": {"fields": []}}])
+    reply = await provider_http.serve_custom_import_providers(_request(_body(include_filter=False)), session)
+    assert reply.status == 503 and session.rolled_back
+    assert "hydrate" not in session.events
+
+
+@pytest.mark.parametrize("operator", ("gte", "lte"))
+def test_provider_transport_accepts_inclusive_metric_comparisons(operator):
+    parsed = provider_http._parse_provider_request(
+        _body(filters=[{"field_id": "metric", "operator": operator, "value": "5"}], require_match=True)
+    )
+    assert parsed.filters[0].operator == operator and parsed.filters[0].value == "5"
+    assert parsed.context[0].operator == "eq" and parsed.require_match is True
+
+
+def test_provider_inclusive_metric_openapi_contract():
+    schemas = load_openapi_document(Path("doc/openapi.yaml"))["components"]["schemas"]
+    properties = schemas["CustomImportProviderRequest"]["properties"]
+    predicate_map = {"$ref": "#/components/schemas/CustomImportProviderPredicate"}
+    assert properties["context"]["items"] == {"allOf": [predicate_map, {"properties": {"operator": {"enum": ["eq"]}}}]}
+    assert properties["filters"]["items"] == predicate_map
+    assert schemas["CustomImportProviderPredicate"]["properties"]["operator"]["enum"] == [
+        "eq",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+    ]
+
+
 def test_provider_v1_body_is_not_a_provider_v2_body():
     body_document = json.loads(_body())
     del body_document["context"]
@@ -189,7 +270,11 @@ def test_provider_v1_body_is_not_a_provider_v2_body():
         {"native_query": {"page": 1}},
         {"filters": [{"field_id": "metric", "operator": "eq", "value": "5"}] * 3},
         {"context": [{"field_id": "region", "operator": "neq", "value": "north"}]},
-        {"filters": [{"field_id": "metric", "operator": "gte", "value": "5"}]},
+        {"context": [{"field_id": "region", "operator": "gte", "value": "north"}]},
+        {"context": [{"field_id": "region", "operator": "lte", "value": "north"}]},
+        {"filters": [{"field_id": "metric", "operator": "neq", "value": "5"}]},
+        {"filters": [{"field_id": "metric", "operator": "gte", "value": None}]},
+        {"filters": [{"field_id": "metric", "operator": "lte", "value": None}]},
         {"filters": [{"field_id": "metric", "operator": "eq", "value": None}]},
     ],
 )
@@ -279,6 +364,35 @@ async def test_normalized_episode_membership_rejects_missing_hydrated_family(mon
     reply = await provider_http.serve_custom_import_providers(_request(), session)
     assert reply.status == 503 and session.rolled_back
     assert b'"rows"' not in reply.body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", ("9000000000", " 9000000000 "))
+async def test_native_exact_npi_scopes_import_preparation(monkeypatch, raw):
+    session = _Session()
+    _install(monkeypatch, session)
+    observed_scopes = []
+    original = provider_http._provider_relation_query
+
+    def relation_query(parsed, **arguments):
+        query = original(parsed, **arguments)
+        observed_scopes.append(query.entity_values)
+        return query
+
+    monkeypatch.setattr(provider_http, "_provider_relation_query", relation_query)
+    reply = await provider_http.serve_custom_import_providers(
+        _request(_body(native_query={"name_like": ["Synthetic", "Example"], "npi": raw})), session
+    )
+    assert reply.status == 200 and observed_scopes == [("9000000000",)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", ("short", "0110421287", "9000000000,1000000000"))
+async def test_native_invalid_npi_cannot_prepare_import_candidates(monkeypatch, raw):
+    session = _Session()
+    _install(monkeypatch, session)
+    reply = await provider_http.serve_custom_import_providers(_request(_body(native_query={"npi": raw})), session)
+    assert reply.status == 400 and "prepare" not in session.events and session.rolled_back
 
 
 @pytest.mark.asyncio

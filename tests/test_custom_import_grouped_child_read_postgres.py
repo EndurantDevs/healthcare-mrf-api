@@ -161,6 +161,39 @@ async def test_year_and_panel_are_selected_before_child_metrics_without_fallback
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("derived", (False, True))
+async def test_inclusive_scores_keep_equal_bounds_and_exclude_null_children(monkeypatch, derived):
+    if derived:
+        monkeypatch.setattr(native.fixture, "definition", scores._definition)
+        root_rows = native._roots()
+        monkeypatch.setattr(native, "_roots", lambda: [dict(source_row, weight=2) for source_row in root_rows])
+    root_field, child_field = ("root_cost", "child_cost") if derived else ("score", "amount")
+    selectors = () if derived else (_PANEL,)
+    query = fixture.query(
+        context_filters=selectors + (ReadFilter("service_code", "eq", "nullable"),),
+        filters=(ReadFilter(child_field, "gte", "2"), ReadFilter(child_field, "lte", "2")),
+        order_terms=(ReadOrderTerm(child_field, "asc", "last"),),
+    )
+    async with native._case(children=_children()) as (case, pinned_target), case.sessions() as session:
+        assert [tuple(provider_row) for provider_row in (await native._relation(session, pinned_target, query))[1]] == [
+            (native._A, Decimal("2"))
+        ]
+        for operator in ("gt", "lt"):
+            strict = replace(query, filters=(ReadFilter(child_field, operator, "2"),))
+            assert (await native._relation(session, pinned_target, strict))[1] == []
+        boundary = "15" if derived else "10"
+        root_query = replace(
+            query,
+            context_filters=selectors,
+            filters=(ReadFilter(root_field, "gte", boundary), ReadFilter(root_field, "lte", boundary)),
+            order_terms=(ReadOrderTerm(root_field, "asc", "last"),),
+        )
+        assert [
+            tuple(provider_row) for provider_row in (await native._relation(session, pinned_target, root_query))[1]
+        ] == [(native._A, Decimal(boundary))]
+
+
+@pytest.mark.asyncio
 async def test_child_eligibility_keeps_complete_sibling_families_and_page_bound(monkeypatch):
     async with native._case(children=_children()) as (case, target), case.sessions() as session:
         query = fixture.query(
@@ -701,6 +734,44 @@ async def test_missing_group_child_preserves_root_reduction_and_same_family_memb
         assert [tuple(selected_row) for selected_row in (await native._relation(session, pinned_target, mixed))[1]] == [
             (native._A, Decimal("15"), Decimal("2"))
         ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("period", (None, 2024))
+async def test_native_npi_scope_preserves_group_scores_and_families(monkeypatch, period):
+    monkeypatch.setattr(native.fixture, "definition", scores._definition)
+    roots = native._roots()
+    monkeypatch.setattr(native, "_roots", lambda: [dict(source_row, weight=2) for source_row in roots])
+    fields = ("root_cost", "root_quality", "child_cost", "child_quality")
+    selectors = (_KEY,) if period is None else (_KEY, ReadFilter("period", "eq", period))
+    query = fixture.query(
+        context_filters=selectors,
+        order_terms=tuple(ReadOrderTerm(field, "asc", "last") for field in fields),
+        family_entitlement="full_family",
+    )
+    async with native._case(children=_children()) as (case, pinned_target), case.sessions() as session:
+        broad, broad_rows = await native._relation(session, pinned_target, query)
+        broad_families_by_npi = await native._page(session, pinned_target, query)
+        for values_in_scope in ((native._A,), (native._A, native._B), (_ABSENT,), ()):
+            scoped_query = replace(query, entity_values=values_in_scope)
+            prepared, provider_rows = await native._relation(session, pinned_target, scoped_query)
+            assert [tuple(provider_row) for provider_row in provider_rows] == [
+                tuple(provider_row) for provider_row in broad_rows if provider_row.entity_value in values_in_scope
+            ]
+            assert prepared.query_fingerprint != broad.query_fingerprint
+            families_by_npi = await native._service(pinned_target).hydrate_npi_page(
+                session,
+                authorization=native._AUTHORIZATION,
+                pinned_target=pinned_target,
+                query=scoped_query,
+                prepared=prepared,
+                entity_values=values_in_scope,
+            )
+            assert set(families_by_npi) == set(broad_families_by_npi) & set(values_in_scope)
+            for entity_value, family in families_by_npi.items():
+                assert family.selection_value == broad_families_by_npi[entity_value].selection_value
+                assert family.families == broad_families_by_npi[entity_value].families
+                assert family.missing_group_values == broad_families_by_npi[entity_value].missing_group_values
 
 
 @pytest.mark.asyncio

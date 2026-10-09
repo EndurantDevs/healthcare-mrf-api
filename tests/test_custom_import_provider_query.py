@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -179,6 +180,10 @@ def test_provider_v2_query_normalizes_roles_before_binding_and_fingerprinting():
         (("display_name",), "metric", "gt", "5", False),
         (("amount",), "amount", "gt", "5", True),
         (("amount",), "metric", "gt", "5", True),
+        (("amount",), "metric", "gte", "5", True),
+        (("amount",), "metric", "lte", "5", True),
+        ((), "metric", "gte", "5", False),
+        ((), "metric", "lte", "5", False),
         (("amount",), "display_name", "eq", "Example provider", False),
         (("display_name",), "display_name", "eq", "Example provider", True),
     ),
@@ -267,12 +272,26 @@ async def test_provider_query_rejects_disabled_metric_before_relation_constructi
         ((ReadFilter("metric", "eq", "5"),), ()),
         ((ReadFilter("service", "neq", "99213"),), ()),
         ((), (ReadFilter("service", "eq", "99213"),)),
-        ((), (ReadFilter("metric", "gte", "5"),)),
+        ((ReadFilter("service", "gte", "99213"),), ()),
+        ((ReadFilter("service", "lte", "99213"),), ()),
+        ((), (ReadFilter("metric", "neq", "5"),)),
     ),
 )
 def test_provider_v2_query_rejects_crossed_context_and_metric_roles(context_filters, filters):
     with pytest.raises(CustomImportReadRequestError):
         read_core._normalized_npi_query(_context(aliases=True), context_filters, filters, None)
+
+
+@pytest.mark.parametrize("operator", ("gte", "lte"))
+@pytest.mark.parametrize("value", (None, True, "NaN", "Infinity", "not-a-number"))
+def test_inclusive_provider_metrics_reject_invalid_numeric_values(operator, value):
+    with pytest.raises(CustomImportReadRequestError):
+        read_core._normalized_npi_query(
+            _context(aliases=True),
+            (ReadFilter("service", "eq", "99213"),),
+            (ReadFilter("metric", operator, value),),
+            None,
+        )
 
 
 def test_provider_v2_relation_applies_metric_predicates_after_context_winner_selection(monkeypatch):
@@ -508,4 +527,50 @@ async def test_provider_v2_root_rollup_sort_keeps_the_child_context_guard(monkey
                 context_filters=(),
                 order_terms=(ReadOrderTerm("npi", "asc", "last"),),
             ),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entity_values", (["1234567893"], ("short",), ("1234567893",) * 2, (1234567893,)))
+async def test_native_scope_is_validated_before_storage(monkeypatch, entity_values):
+    load_context = AsyncMock()
+    monkeypatch.setattr(read_core, "_load_read_context", load_context)
+    with pytest.raises(CustomImportReadRequestError, match="identities are invalid"):
+        await CustomImportReadService(authorizer=_Allow()).prepare_npi_entity_relation(
+            object(),
+            authorization=ExtensionReadAuthorization("synthetic"),
+            target=_target(),
+            query=NpiEntityRelationQuery(entity_values=entity_values),
+        )
+    load_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_scope_is_bound_to_prepared_relation_and_hydration(monkeypatch):
+    @asynccontextmanager
+    async def window(session, *, timeout_ms):
+        yield
+
+    monkeypatch.setattr(read_core, "_bounded_read_window", window)
+    monkeypatch.setattr(read_core, "_load_read_context", AsyncMock(return_value=_context()))
+    service = CustomImportReadService(authorizer=_Allow())
+    arguments_by_name = {"authorization": ExtensionReadAuthorization("synthetic"), "target": _target()}
+    query = NpiEntityRelationQuery(entity_values=("1234567893", "1234567802"))
+    prepared = await service.prepare_npi_entity_relation(object(), query=query, **arguments_by_name)
+    reversed_scope = await service.prepare_npi_entity_relation(
+        object(), query=replace(query, entity_values=tuple(reversed(query.entity_values))), **arguments_by_name
+    )
+    broad = await service.prepare_npi_entity_relation(object(), **arguments_by_name)
+    assert prepared.query_fingerprint == reversed_scope.query_fingerprint != broad.query_fingerprint
+    compiled = prepared.statement.compile(dialect=postgresql.dialect())
+    assert list(query.entity_values) in compiled.params.values()
+    assert "LIMIT" not in str(compiled)
+    with pytest.raises(read_core.CustomImportReadUnavailableError, match="exceed the native query scope"):
+        await service.hydrate_npi_page(
+            object(),
+            authorization=arguments_by_name["authorization"],
+            pinned_target=_target(),
+            query=query,
+            prepared=prepared,
+            entity_values=("1000000000",),
         )
