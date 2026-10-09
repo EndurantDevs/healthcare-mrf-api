@@ -112,7 +112,7 @@ def _install_snapshot(monkeypatch, session):
     monkeypatch.setattr(transport, "_resolve_pinned_target", resolve)
 
 
-def _install_geo_service(monkeypatch, session, *, imported_items=None, finality_failure=False):
+def _install_geo_service(monkeypatch, session, *, imported_items=None, finality_failure=False, filters=()):
     """Bind the synthetic import preparation and hydration to one session."""
 
     _install_snapshot(monkeypatch, session)
@@ -127,7 +127,8 @@ def _install_geo_service(monkeypatch, session, *, imported_items=None, finality_
             assert isinstance(authorization, ExtensionReadAuthorization)
             assert type(query.require_match) is bool
             assert self.authorizer.authorize(authorization, target=target) is not None
-            assert query.context_filters[0].value == "north" and query.filters == ()
+            assert query.context_filters[0].value == "north"
+            assert tuple((term.field_id, term.operator, term.value) for term in query.filters) == filters
             session.events.append("prepare")
             prepared = PreparedNpiEntityRelation(
                 select(literal("1104212877").label("entity_value"), literal(5).label("sort_0")),
@@ -192,6 +193,34 @@ def _cursor_binding(*, scope="a" * 64, native_args=None, trusted_now=100):
     return session, binding
 
 
+def _assert_geo_inclusion(response_document, native_rows, observed_calls_by_name, include_filter, require_match):
+    assert [
+        {
+            field_name: field_value
+            for field_name, field_value in provider_document.items()
+            if field_name != "custom_import"
+        }
+        for provider_document in response_document["items"]
+    ] == native_rows
+    assert response_document["total_count"] == 4 and response_document["has_more"] is True
+    assert response_document["result_identity"] == ["npi", "address_key"]
+    if include_filter:
+        assert response_document["items"][0]["custom_import"]["target"] == fixtures._TARGET
+        assert response_document["items"][1]["custom_import"]["root_fields"][0]["value"] == 7
+        assert response_document["items"][0]["custom_import"] == response_document["items"][1]["custom_import"]
+        assert response_document["items"][0]["custom_import"]["children"][0]["fields"][0]["value"] == 3
+        if not require_match:
+            assert response_document["items"][2]["custom_import"] is None
+        hydration_by_name = observed_calls_by_name["hydration"][0]
+        assert hydration_by_name["entity_values"] == tuple(
+            dict.fromkeys(str(provider_document["npi"]) for provider_document in native_rows)
+        )
+        assert hydration_by_name["prepared"] is observed_calls_by_name["prepared"][0]
+    else:
+        assert response_document["items"] == native_rows
+        assert observed_calls_by_name["hydration"] == []
+
+
 async def _bind_cursor(binding, session, *, geo_precision_clause="precision-v1", geo_type_clause="type-v1"):
     return await binding.prepare(
         session=session,
@@ -223,9 +252,10 @@ def test_geo_native_query_is_closed_bounded_and_forces_exact_total():
 
 
 @pytest.mark.asyncio
-async def test_geo_transport_rejects_before_storage(monkeypatch):
+@pytest.mark.parametrize("include_filter", [False, True])
+async def test_geo_transport_rejects_before_storage(monkeypatch, include_filter):
     fixtures._install_keyring(monkeypatch)
-    request = _request()
+    request = _request(_body(include_filter=include_filter))
     request.headers[transport.CUSTOM_IMPORT_READ_SIGNATURE_HEADER] = "A" * 43
 
     class NoStorage:
@@ -258,57 +288,62 @@ async def test_geo_rejects_closed_body_route_and_query_before_storage(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_geo_hydrates_unique_npis_in_one_snapshot_and_issues_private_anchor(monkeypatch):
+@pytest.mark.parametrize("include_filter", [False, True])
+@pytest.mark.parametrize("require_match", [False, True])
+async def test_geo_inclusion_keeps_native_page_and_private_anchor(monkeypatch, include_filter, require_match):
     session = _Session()
     imported_item = SimpleNamespace(
         root_fields=(ReadFieldValue("metric", "integer", "value", 7),),
         context_fields=(ReadFieldValue("region", "string", "value", "north"),),
         children=(SimpleNamespace(collection="facts", fields=(ReadFieldValue("score", "integer", "value", 3),)),),
     )
-    observed_calls_by_name = _install_geo_service(monkeypatch, session, imported_items={"1104212877": imported_item})
+    observed_calls_by_name = _install_geo_service(
+        monkeypatch,
+        session,
+        imported_items={"1104212877": imported_item},
+        filters=(("metric", "gt", "5"),) if require_match else (),
+    )
     observed_bindings = []
+    native_rows = [_provider(1104212877, _ADDRESS_A), _provider(1104212877, _ADDRESS_B)]
+    if not require_match:
+        native_rows.append(_provider("1000000000", _ADDRESS_C))
+    anchor_parts = [str(native_rows[-1]["npi"]), native_rows[-1]["address_key"]]
 
     async def page(request, *, native_args, import_context, prepare_cursor):
         assert request.path == geo.CUSTOM_IMPORT_PROVIDER_GEO_PATH
         assert native_args.get("include_total") == "true"
         assert import_context.prepared is observed_calls_by_name["prepared"][0]
+        assert import_context.require_match is require_match
         assert await _prepare_geo_cursor(prepare_cursor, session, native_args) is None
         observed_bindings.append(prepare_cursor.__self__)
-        return _geo_reply(
-            [
-                _provider(1104212877, _ADDRESS_A),
-                _provider(1104212877, _ADDRESS_B),
-                _provider("1000000000", _ADDRESS_C),
-            ],
-            has_more=True,
-            anchor=["1000000000", _ADDRESS_C],
-            total_count=4,
-        )
+        return _geo_reply(native_rows, has_more=True, anchor=anchor_parts, total_count=4)
 
     monkeypatch.setattr(geo, "_geo_page", page)
-    reply = await geo.serve_custom_import_provider_geo(_request(), session)
+    body = _body(
+        include_filter=include_filter,
+        require_match=require_match,
+        filters=[{"field_id": "metric", "operator": "gt", "value": "5"}] if require_match else [],
+    )
+    reply = await geo.serve_custom_import_provider_geo(_request(body), session)
 
     assert reply.status == 200
     response_document = json.loads(reply.body)
-    assert [provider_document["npi"] for provider_document in response_document["items"]] == [
-        1104212877,
-        1104212877,
-        "1000000000",
-    ]
-    assert response_document["items"][0]["custom_import"]["target"] == fixtures._TARGET
-    assert response_document["items"][1]["custom_import"]["root_fields"][0]["value"] == 7
-    assert (
-        response_document["items"][0]["custom_import"]["children"]
-        == response_document["items"][1]["custom_import"]["children"]
-    )
-    assert response_document["items"][0]["custom_import"]["children"][0]["fields"][0]["value"] == 3
-    assert response_document["items"][2]["custom_import"] is None
+    _assert_geo_inclusion(response_document, native_rows, observed_calls_by_name, include_filter, require_match)
     assert "_custom_import_next_anchor" not in response_document
-    assert isinstance(response_document["next_cursor"], str)
-    assert observed_calls_by_name["hydration"][0]["entity_values"] == ("1104212877", "1000000000")
-    assert observed_calls_by_name["hydration"][0]["prepared"] is observed_calls_by_name["prepared"][0]
-    assert observed_bindings[0].session is session
-    assert session.events == ["begin", "snapshot", "bounded", "resolve", "prepare", "hydrate", "finality", "end"]
+    binding = observed_bindings[0]
+    cursor = geo_cursor.open_geo_cursor(
+        response_document["next_cursor"],
+        secret=binding.secret,
+        pinned_target=_PINNED_TARGET,
+        query_fingerprint=binding.query_fingerprint,
+        authorization_scope_sha256=binding.import_context.prepared.authorization_scope_sha256,
+        trusted_now=binding.trusted_now,
+    )
+    assert [cursor.anchor_npi, cursor.anchor_address_key] == anchor_parts
+    assert cursor.expires_at == binding.trusted_now + MAX_CURSOR_TTL_SECONDS
+    assert binding.session is session
+    expected_events = ["begin", "snapshot", "bounded", "resolve", "prepare"]
+    assert session.events == expected_events + (["hydrate"] if include_filter else []) + ["finality", "end"]
 
 
 @pytest.mark.asyncio
@@ -486,7 +521,8 @@ async def test_geo_rejects_mismatched_or_malformed_private_anchor_as_unavailable
 
 
 @pytest.mark.asyncio
-async def test_geo_finality_failure_never_exposes_native_page(monkeypatch):
+@pytest.mark.parametrize("include_filter", [False, True])
+async def test_geo_finality_failure_never_exposes_native_page(monkeypatch, include_filter):
     session = _Session()
     _install_geo_service(monkeypatch, session, finality_failure=True)
 
@@ -495,7 +531,7 @@ async def test_geo_finality_failure_never_exposes_native_page(monkeypatch):
         return _geo_reply([])
 
     monkeypatch.setattr(geo, "_geo_page", page)
-    reply = await geo.serve_custom_import_provider_geo(_request(), session)
+    reply = await geo.serve_custom_import_provider_geo(_request(_body(include_filter=include_filter)), session)
 
     assert reply.status == 503 and session.rolled_back
     assert b'"items"' not in reply.body

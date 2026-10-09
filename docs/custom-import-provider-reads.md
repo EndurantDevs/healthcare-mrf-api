@@ -272,3 +272,29 @@ thresholds, count, ordering, and pagination. The native service response keeps
 its `items`, `pagination`, and `query` envelope; each item receives the same
 nullable `custom_import` field described above when `include_filter` is true;
 otherwise the field is absent.
+
+## Exact billing pages
+
+`POST /api/v1/extensions/custom-import/providers/billing-search` composes the
+provider-v2 query with exact billing-reference pricing. The body retains
+`include_filter` and adds `billing_transport_context_sha256`; `native_query`
+contains the canonical string parameters of the existing billing-search GET.
+The request carries both existing signed header families. The provider-v2 proof
+authenticates the complete POST body, and its context digest binds the separately
+verified billing GET authorization. Neither proof alone authorizes this route.
+
+Configured membership and typed ordering apply to the complete native
+provider-location candidate scope before native price eligibility and
+pagination. Missing optional imports sort last; configured null handling and
+directions are preserved, with native identity breaking ties. The opaque cursor
+binds the normalized imported query, verified authority and immutable import
+generation together with the native request and generation. Fresh transport
+timestamps and metering identifiers do not invalidate a continuation.
+
+The direct response retains native `items` and `pagination`, including nested
+rate occurrences. `include_filter: true` adds the normal internal
+`custom_import` payload, or explicit null for an optional unmatched import, to
+each item; false leaves that field absent. The existing 100-item billing page
+remains supported. Native response budgets are checked before import hydration;
+full-family hydration reuses the same prepared query in batches of at most 50
+unique NPIs within the same read snapshot.

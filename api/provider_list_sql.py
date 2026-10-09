@@ -317,6 +317,14 @@ def _provider_import_membership_clause(
     if native_npis is not None:
         predicates.append(f"({provider_npi_sql}) = ANY(:__native_batch_npis)")
     if import_context is not None and import_context.require_match:
+        if native_npis is None:
+            # Keep native NPI indexes usable without changing canonical text membership.
+            predicates.append(
+                f"({provider_npi_sql})::bigint IN ("
+                "SELECT CASE WHEN imported.entity_value ~ '^[0-9]{10}$' "
+                "THEN imported.entity_value::bigint END "
+                "FROM custom_import_provider_relation AS imported)"
+            )
         predicates.append(
             "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported "
             f"WHERE imported.entity_value = ({provider_npi_sql})::text)"
@@ -330,12 +338,8 @@ def _provider_import_match_clause(
     *,
     native_npis=None,
 ) -> str | None:
-    """Return the one correlated predicate used by filter-only requests."""
+    """Scope native eligibility before deduplication, including imported ordering."""
 
-    if import_context is not None and (
-        import_context.prepared.normalized_order_terms and import_context.native_npis is None and native_npis is None
-    ):
-        return None
     return _provider_import_membership_clause(import_context, provider_npi_sql, native_npis=native_npis)
 
 
