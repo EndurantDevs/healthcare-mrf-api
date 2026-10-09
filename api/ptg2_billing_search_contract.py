@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from api.billing_search_cursor import BillingSearchSealedPageCursor
+from api.billing_search_import_contract import (
+    BillingSearchComposedOrder,
+    BillingSearchImportCursorScope,
+    validate_billing_search_composed_order,
+)
 from api.billing_search_pagination import BillingSearchCursorBinding
 from api.billing_search_selector_contract import (
     BillingSearchSelectorNotFoundError,
@@ -57,9 +62,7 @@ def resource_not_found() -> BillingSearchResourceNotFoundError:
 def serving_unavailable() -> BillingSearchServingUnavailableError:
     """Return the generic API-safe serving failure."""
 
-    return BillingSearchServingUnavailableError(
-        "billing_search_serving_generation_unavailable"
-    )
+    return BillingSearchServingUnavailableError("billing_search_serving_generation_unavailable")
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -91,24 +94,19 @@ class BillingSearchProviderCandidate:
             type(witness) is not BillingProviderGeoWitness
             or witness.address != self.address
             or witness.provider_rate.npi != self.address.npi
-            or witness.provider_rate.snapshot_key
-            != self.serving_tables.shared_snapshot_key
+            or witness.provider_rate.snapshot_key != self.serving_tables.shared_snapshot_key
             for witness in self.geo_witnesses
         ):
             raise serving_unavailable()
         geo_sort_keys = tuple(witness.stable_sort_key for witness in self.geo_witnesses)
         code_keys = tuple(key for key, _witness in self.code_witnesses_by_key)
-        referenced_code_keys = {
-            witness.provider_rate.code_key for witness in self.geo_witnesses
-        }
+        referenced_code_keys = {witness.provider_rate.code_key for witness in self.geo_witnesses}
         if (
             geo_sort_keys != tuple(sorted(geo_sort_keys))
             or len(geo_sort_keys) != len(set(geo_sort_keys))
             or code_keys != tuple(sorted(set(code_keys)))
             or any(
-                type(key) is not int
-                or type(witness) is not BillingCodeWitness
-                or witness.code_key != key
+                type(key) is not int or type(witness) is not BillingCodeWitness or witness.code_key != key
                 for key, witness in self.code_witnesses_by_key
             )
             or set(code_keys) != referenced_code_keys
@@ -134,9 +132,7 @@ class BillingSearchProviderCandidate:
     def price_keys(self) -> tuple[int, ...]:
         """Return the bounded distinct price dictionary coordinates."""
 
-        return tuple(
-            sorted({witness.provider_rate.price_key for witness in self.geo_witnesses})
-        )
+        return tuple(sorted({witness.provider_rate.price_key for witness in self.geo_witnesses}))
 
     def __repr__(self) -> str:
         return (
@@ -161,17 +157,14 @@ class BillingSearchMatchedProvider:
         ):
             raise serving_unavailable()
         candidate_position_by_witness_id = {
-            id(witness): position
-            for position, witness in enumerate(self.candidate.geo_witnesses)
+            id(witness): position for position, witness in enumerate(self.candidate.geo_witnesses)
         }
         retained_positions = tuple(
-            candidate_position_by_witness_id.get(id(witness.geo_witness))
-            for witness in self.price_witnesses
+            candidate_position_by_witness_id.get(id(witness.geo_witness)) for witness in self.price_witnesses
         )
         if (
             any(
-                type(witness) is not BillingProviderGeoPriceWitness
-                or not witness.prices
+                type(witness) is not BillingProviderGeoPriceWitness or not witness.prices
                 for witness in self.price_witnesses
             )
             or any(position is None for position in retained_positions)
@@ -200,35 +193,26 @@ class BillingSearchProviderPage:
     providers: tuple[BillingSearchMatchedProvider, ...]
     has_more: bool
     next_sort_key: tuple[int | float | str, ...] | None
+    composed_order: BillingSearchComposedOrder | None = None
 
     def __post_init__(self) -> None:
         if (
             type(self.providers) is not tuple
-            or any(
-                type(provider) is not BillingSearchMatchedProvider
-                for provider in self.providers
-            )
+            or any(type(provider) is not BillingSearchMatchedProvider for provider in self.providers)
             or type(self.has_more) is not bool
         ):
             raise serving_unavailable()
-        provider_keys = tuple(
-            provider.candidate.sort_key for provider in self.providers
-        )
-        expected_next_key = (
-            provider_keys[-1] if self.has_more and provider_keys else None
-        )
-        if (
-            provider_keys != tuple(sorted(set(provider_keys)))
-            or (self.has_more and not provider_keys)
-            or self.next_sort_key != expected_next_key
-        ):
+        provider_keys = tuple(provider.candidate.sort_key for provider in self.providers)
+        expected_next_key = provider_keys[-1] if self.has_more and provider_keys else None
+        if (self.has_more and not provider_keys) or self.next_sort_key != expected_next_key:
             raise serving_unavailable()
+        try:
+            validate_billing_search_composed_order(provider_keys, self.composed_order)
+        except PTG2ManifestArtifactError:
+            raise serving_unavailable() from None
 
     def __repr__(self) -> str:
-        return (
-            "<billing-search-provider-page "
-            f"provider_count={len(self.providers)} has_more={self.has_more}>"
-        )
+        return f"<billing-search-provider-page provider_count={len(self.providers)} has_more={self.has_more}>"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -243,6 +227,8 @@ class BillingSearchServiceResult:
     endpoint_access_state_sha256: str
     selector_resolution: BillingSearchSelectorResolution | None = None
     cursor_binding: BillingSearchCursorBinding | None = None
+    import_scope: BillingSearchImportCursorScope | None = None
+    composed_order: BillingSearchComposedOrder | None = None
 
     def __post_init__(self) -> None:
         is_match = self.state == BILLING_SEARCH_RESULT_MATCHED
@@ -251,23 +237,13 @@ class BillingSearchServiceResult:
         if (
             self.state not in BILLING_SEARCH_RESULT_STATES
             or type(self.providers) is not tuple
-            or any(
-                type(provider) is not BillingSearchMatchedProvider
-                for provider in self.providers
-            )
+            or any(type(provider) is not BillingSearchMatchedProvider for provider in self.providers)
             or type(self.has_more) is not bool
-            or (
-                self.next_cursor is not None
-                and type(self.next_cursor) is not BillingSearchSealedPageCursor
-            )
-            or (
-                self.cursor_binding is not None
-                and type(self.cursor_binding) is not BillingSearchCursorBinding
-            )
+            or (self.next_cursor is not None and type(self.next_cursor) is not BillingSearchSealedPageCursor)
+            or (self.cursor_binding is not None and type(self.cursor_binding) is not BillingSearchCursorBinding)
             or (
                 self.selector_resolution is not None
-                and type(self.selector_resolution)
-                is not BillingSearchSelectorResolution
+                and type(self.selector_resolution) is not BillingSearchSelectorResolution
             )
             or type(self.endpoint_access_state_sha256) is not str
             or len(self.endpoint_access_state_sha256) != 64
@@ -287,22 +263,33 @@ class BillingSearchServiceResult:
                 self.cursor_binding.__post_init__()
             except PTG2ManifestArtifactError:
                 raise serving_unavailable() from None
+            if self.cursor_binding.import_scope != self.import_scope:
+                raise serving_unavailable()
+        if self.import_scope is not None:
+            if type(self.import_scope) is not BillingSearchImportCursorScope:
+                raise serving_unavailable()
+            self.import_scope.__post_init__()
+            if is_match and self.composed_order is None:
+                raise serving_unavailable()
+        if self.composed_order is not None and (
+            type(self.composed_order) is not BillingSearchComposedOrder
+            or self.import_scope is None
+            or self.composed_order.import_scope != self.import_scope
+        ):
+            raise serving_unavailable()
         if self.selector_resolution is not None:
             try:
                 self.selector_resolution.__post_init__()
             except PTG2ManifestArtifactError:
                 raise serving_unavailable() from None
-        provider_keys = tuple(
-            provider.candidate.sort_key for provider in self.providers
-        )
-        if provider_keys != tuple(sorted(set(provider_keys))):
-            raise serving_unavailable()
+        provider_keys = tuple(provider.candidate.sort_key for provider in self.providers)
+        try:
+            validate_billing_search_composed_order(provider_keys, self.composed_order)
+        except PTG2ManifestArtifactError:
+            raise serving_unavailable() from None
 
     def __repr__(self) -> str:
-        return (
-            "<billing-search-service-result "
-            f"state={self.state} provider_count={len(self.providers)}>"
-        )
+        return f"<billing-search-service-result state={self.state} provider_count={len(self.providers)}>"
 
 
 def validate_service_result(result: Any) -> BillingSearchServiceResult:

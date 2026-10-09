@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -21,7 +22,9 @@ from tests.billing_search_http_support import (
     SUCCESS_TRANSACTION_EVENTS,
     TRUSTED_NOW,
     RecordingSession,
+    RetainedReaderSession,
     assert_private_response,
+    bound_reader,
     install_authorized_boundary,
     install_success_pipeline,
     make_request,
@@ -55,10 +58,7 @@ def test_keyrings_cache_only_the_current_raw_environment_document(monkeypatch) -
     )
     try:
         first_transport = billing_http._transport_keyring_for_document("document-a")
-        assert (
-            billing_http._transport_keyring_for_document("document-a")
-            is first_transport
-        )
+        assert billing_http._transport_keyring_for_document("document-a") is first_transport
         second_transport = billing_http._transport_keyring_for_document("document-b")
         assert second_transport is not first_transport
 
@@ -155,6 +155,90 @@ async def test_success_uses_one_read_only_snapshot_and_encodes_inside_it(
 
 
 @pytest.mark.asyncio
+async def test_retained_reader_serializes_in_owned_snapshot(monkeypatch):
+    session = RetainedReaderSession()
+    access, keyring = install_authorized_boundary(monkeypatch, session.events)
+    install_success_pipeline(monkeypatch, session, access, keyring, object())
+
+    async with session, session.begin(), bound_reader(session):
+        reply = await billing_http.serve_billing_search_get(make_request(), session)
+        assert reply.status == 200 and session.in_transaction()
+        assert response_payload(reply) == {"result_state": "matched", "items": []}
+        assert session.events == [
+            "load_transport_keyring",
+            "load_cursor_keyring",
+            "authorize",
+            "service",
+            "shape",
+            "encode",
+        ]
+    assert not session.in_transaction()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ("service", "shape"))
+async def test_retained_reader_failure_keeps_owner_snapshot(monkeypatch, failure_stage):
+    session = RetainedReaderSession()
+    access, keyring = install_authorized_boundary(monkeypatch, session.events)
+    install_success_pipeline(monkeypatch, session, access, keyring, object())
+
+    async def fail_service(*_args, **_kwargs):
+        assert session.in_transaction()
+        session.events.append("service_failure")
+        raise serving_unavailable()
+
+    def fail_shape(*_args, **_kwargs):
+        assert session.in_transaction()
+        session.events.append("shape_failure")
+        raise serving_unavailable()
+
+    monkeypatch.setattr(
+        billing_http,
+        "search_exact_billing_provider_page" if failure_stage == "service" else "shape_billing_search_response",
+        fail_service if failure_stage == "service" else fail_shape,
+    )
+    async with session, session.begin(), bound_reader(session):
+        reply = await billing_http.serve_billing_search_get(make_request(), session)
+        assert_private_response(reply, status=503, code="billing_search_serving_unavailable")
+        assert f"{failure_stage}_failure" in session.events
+        assert "items" not in response_payload(reply)
+        assert session.in_transaction()
+    assert not session.in_transaction()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verified_marker", (False, True))
+async def test_active_unowned_session_fails_closed(monkeypatch, verified_marker):
+    session = RetainedReaderSession()
+    session.info["api_reader_verified"] = verified_marker
+    access, keyring = install_authorized_boundary(monkeypatch, session.events)
+    install_success_pipeline(monkeypatch, session, access, keyring, object())
+    async with session, session.begin():
+        reply = await billing_http.serve_billing_search_get(make_request(), session)
+        assert_private_response(reply, status=503, code="billing_search_serving_unavailable")
+        assert "service" not in session.events and session.in_transaction()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("foreign_owner", ("different_session", "child_task"))
+async def test_retained_reader_requires_exact_task_session(monkeypatch, foreign_owner):
+    session = RetainedReaderSession()
+    other_session = RetainedReaderSession()
+    access, keyring = install_authorized_boundary(monkeypatch, session.events)
+    install_success_pipeline(monkeypatch, session, access, keyring, object())
+    async with session, other_session, session.begin(), bound_reader(session):
+        if foreign_owner == "different_session":
+            async with other_session.begin():
+                other_session.info["api_reader_verified"] = True
+                reply = await billing_http.serve_billing_search_get(make_request(), other_session)
+                assert other_session.in_transaction()
+        else:
+            reply = await asyncio.create_task(billing_http.serve_billing_search_get(make_request(), session))
+        assert_private_response(reply, status=503, code="billing_search_serving_unavailable")
+        assert "service" not in session.events and session.in_transaction()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method", "path"),
     (
@@ -234,9 +318,7 @@ async def test_key_configuration_fails_closed_before_sql(
         code="billing_search_serving_unavailable",
     )
     assert "private-key-material" not in caplog.text
-    assert caplog.records[-1].billing_search_failure_class == (
-        "BillingSearchCursorKeyringError"
-    )
+    assert caplog.records[-1].billing_search_failure_class == ("BillingSearchCursorKeyringError")
     assert session.begin_count == 0
 
 
@@ -263,9 +345,7 @@ async def test_access_denial_fails_closed_before_sql(monkeypatch, caplog) -> Non
         code="resource_not_found",
     )
     assert "private-authorization-context" not in caplog.text
-    assert caplog.records[-1].billing_search_failure_class == (
-        "BillingSearchEndpointAccessError"
-    )
+    assert caplog.records[-1].billing_search_failure_class == ("BillingSearchEndpointAccessError")
     assert session.begin_count == 0
 
 
@@ -412,9 +492,7 @@ async def test_outgoing_cursor_or_shape_failure_is_503_not_client_cursor_error(
         code="billing_search_serving_unavailable",
     )
     assert "private-outgoing-cursor" not in caplog.text
-    assert caplog.records[-1].billing_search_failure_class == (
-        "BillingSearchCursorGenerationExpired"
-    )
+    assert caplog.records[-1].billing_search_failure_class == ("BillingSearchCursorGenerationExpired")
     assert session.events[-1] == (
         "transaction_exit",
         "_BillingSearchResponseFailure",
@@ -449,9 +527,7 @@ async def test_oversized_success_body_is_rejected_inside_the_transaction(
         status=503,
         code="billing_search_serving_unavailable",
     )
-    assert caplog.records[-1].billing_search_failure_class == (
-        "BillingSearchServingUnavailableError"
-    )
+    assert caplog.records[-1].billing_search_failure_class == ("BillingSearchServingUnavailableError")
     assert session.events[-1] == (
         "transaction_exit",
         "_BillingSearchResponseFailure",

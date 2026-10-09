@@ -420,11 +420,9 @@ def _derived_child_values(context, plan, entity_values, fields, selectors, deriv
         typed_value.label(f"root_value_{index}") for index, typed_value in enumerate(root_values_by_field.values())
     )
     columns.extend(state.label(f"root_state_{index}") for index, state in enumerate(root_states_by_field.values()))
-    roots = (
-        statement.with_only_columns(*columns, maintain_column_froms=True)
-        .cte("derived_root_score_values")
-        .prefix_with("MATERIALIZED")
-    )
+    roots = statement.with_only_columns(*columns, maintain_column_froms=True).cte("derived_root_score_values")
+    if entity_values is not None or not _derived_only(context, plan):
+        roots = roots.prefix_with("MATERIALIZED")
     retained_columns = [roots.c.entity_value, roots.c.group_value]
     retained_columns.extend(roots.c[f"root_value_{index}"] for index in range(len(root_values_by_field)))
     retained_columns.extend(roots.c[f"root_state_{index}"] for index in range(len(root_states_by_field)))

@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from functools import lru_cache
 import logging
 import os
+from contextlib import nullcontext
+from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any
 
 import orjson
@@ -37,13 +38,12 @@ from api.ptg2_billing_search_contract import (
     BillingSearchServingUnavailableError,
 )
 from api.ptg2_billing_search_service import search_exact_billing_provider_page
+from db.connection import current_session, db, has_reader_session
 
 logger = logging.getLogger(__name__)
 
 _MAX_SUCCESS_BODY_BYTES = 256 * 1024
-_READ_TRANSACTION_SQL = text(
-    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
-)
+_READ_TRANSACTION_SQL = text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
 _ERRORS_BY_STATUS = {
     400: (
         "billing_search_cursor_invalid",
@@ -70,30 +70,22 @@ class _BillingSearchResponseFailure(RuntimeError):
 
 @lru_cache(maxsize=1)
 def _transport_keyring_for_document(document: str | None):
-    environment_map = (
-        {} if document is None else {BILLING_SEARCH_TRANSPORT_KEYRING_ENV: document}
-    )
+    environment_map = {} if document is None else {BILLING_SEARCH_TRANSPORT_KEYRING_ENV: document}
     return load_billing_search_transport_keyring(environment_map)
 
 
 @lru_cache(maxsize=1)
 def _cursor_keyring_for_document(document: str | None):
-    environment_map = (
-        {} if document is None else {BILLING_SEARCH_CURSOR_KEYRING_ENV: document}
-    )
+    environment_map = {} if document is None else {BILLING_SEARCH_CURSOR_KEYRING_ENV: document}
     return load_billing_search_cursor_keyring(environment_map)
 
 
 def _transport_keyring():
-    return _transport_keyring_for_document(
-        os.environ.get(BILLING_SEARCH_TRANSPORT_KEYRING_ENV)
-    )
+    return _transport_keyring_for_document(os.environ.get(BILLING_SEARCH_TRANSPORT_KEYRING_ENV))
 
 
 def _cursor_keyring():
-    return _cursor_keyring_for_document(
-        os.environ.get(BILLING_SEARCH_CURSOR_KEYRING_ENV)
-    )
+    return _cursor_keyring_for_document(os.environ.get(BILLING_SEARCH_CURSOR_KEYRING_ENV))
 
 
 def _trusted_now() -> str:
@@ -131,8 +123,17 @@ async def _encoded_service_response(
     cursor_keyring: Any,
     trusted_now: str,
 ) -> bytes:
-    async with session.begin():
-        await session.execute(_READ_TRANSACTION_SQL)
+    has_transaction = session.in_transaction()
+    if has_transaction and (
+        not has_reader_session(db)
+        or current_session() is not session
+        or session.info.get("api_reader_verified") is not True
+    ):
+        raise BillingSearchServingUnavailableError("billing_search_serving_generation_unavailable")
+    snapshot = nullcontext() if has_transaction else session.begin()
+    async with snapshot:
+        if not has_transaction:
+            await session.execute(_READ_TRANSACTION_SQL)
         service_result = await search_exact_billing_provider_page(
             session,
             access=access,
@@ -148,9 +149,7 @@ async def _encoded_service_response(
             )
             encoded_body = orjson.dumps(response_payload_by_field)
             if len(encoded_body) > _MAX_SUCCESS_BODY_BYTES:
-                raise BillingSearchServingUnavailableError(
-                    "billing_search_serving_generation_unavailable"
-                )
+                raise BillingSearchServingUnavailableError("billing_search_serving_generation_unavailable")
             return encoded_body
         except Exception as exc:
             _log_failure(exc)
@@ -179,10 +178,7 @@ def _failure_response(failure: Exception):
 async def serve_billing_search_get(request: Any, session: Any):
     """Serve the canonical authenticated GET mode without legacy fallbacks."""
 
-    if (
-        getattr(request, "method", None) != "GET"
-        or getattr(request, "path", None) != BILLING_SEARCH_TRANSPORT_PATH
-    ):
+    if getattr(request, "method", None) != "GET" or getattr(request, "path", None) != BILLING_SEARCH_TRANSPORT_PATH:
         return _error_response(404)
 
     trusted_now = _trusted_now()
