@@ -417,17 +417,27 @@ def record_payload(fields: Sequence[Field], values_by_field: Mapping[str, Any]) 
 def value_document(field: Field, scalar_value: object) -> Mapping[str, object]:
     """Encode one accepted typed scalar in a canonical retained payload."""
 
+    state, encoded_value = _value_parts(field, scalar_value)
+    document_by_key = {"state": state, "type": field.value_type}
+    if state == "value":
+        document_by_key["value"] = encoded_value
+    return document_by_key
+
+
+def _value_parts(field: Field, scalar_value: object) -> tuple[str, object]:
+    """Share scalar normalization without allocating a canonical field object."""
+
     if scalar_value is None:
-        return {"state": "null", "type": field.value_type}
+        return "null", None
     if field.value_type == "decimal":
         decimal_value = normalize_source_decimal(scalar_value)
         if decimal_value is None:
             raise CandidateRunnerError("accepted decimal value is not canonical")
-        return {"state": "value", "type": "decimal", "value": format(decimal_value, "f")}
+        return "value", format(decimal_value, "f")
     if field.value_type == "date":
         if not isinstance(scalar_value, dt.date) or isinstance(scalar_value, dt.datetime):
             raise CandidateRunnerError("accepted date value is malformed")
-        return {"state": "value", "type": "date", "value": scalar_value.isoformat()}
+        return "value", scalar_value.isoformat()
     if field.value_type == "timestamp":
         if not isinstance(scalar_value, dt.datetime) or scalar_value.tzinfo is None or scalar_value.utcoffset() is None:
             raise CandidateRunnerError("accepted timestamp value is malformed")
@@ -435,18 +445,14 @@ def value_document(field: Field, scalar_value: object) -> Mapping[str, object]:
             timestamp_value = scalar_value.astimezone(dt.UTC)
         except OverflowError as exc:
             raise CandidateRunnerError("accepted timestamp value is malformed") from exc
-        return {
-            "state": "value",
-            "type": "timestamp",
-            "value": timestamp_value.isoformat().replace("+00:00", "Z"),
-        }
+        return "value", timestamp_value.isoformat().replace("+00:00", "Z")
     if field.value_type == "integer" and (isinstance(scalar_value, bool) or not isinstance(scalar_value, int)):
         raise CandidateRunnerError("accepted integer value is malformed")
     if field.value_type == "boolean" and not isinstance(scalar_value, bool):
         raise CandidateRunnerError("accepted boolean value is malformed")
     if field.value_type == "string" and not isinstance(scalar_value, str):
         raise CandidateRunnerError("accepted string value is malformed")
-    return {"state": "value", "type": field.value_type, "value": scalar_value}
+    return "value", scalar_value
 
 
 def canonical(document: Mapping[str, object]) -> str:
