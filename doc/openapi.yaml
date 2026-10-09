@@ -527,6 +527,99 @@ paths:
           $ref: '#/components/responses/CustomImportProviderNotFound'
         '503':
           $ref: '#/components/responses/CustomImportProviderUnavailable'
+  /extensions/custom-import/providers/billing-search:
+    post:
+      operationId: searchBillingProvidersWithCustomImport
+      summary: Compose a signed, pinned import with exact billing-reference pricing
+      description: Provider-v2 signing authenticates the canonical POST body and binds the separately
+        verified billing GET context through billing_transport_context_sha256. Both signed header
+        families are required; query parameters are rejected. Native query values are canonical
+        strings from the exact billing-search GET. Imported membership and ordering precede
+        native price eligibility, exact totals, and pagination. include_filter controls only
+        imported payload hydration.
+      parameters:
+      - $ref: '#/components/parameters/CustomImportProviderReadContext'
+      - $ref: '#/components/parameters/CustomImportProviderReadKeyId'
+      - $ref: '#/components/parameters/CustomImportProviderReadSignature'
+      - name: X-HealthPorta-Billing-Search-Context
+        in: header
+        required: true
+        description: Existing signed authorization for the subordinate canonical billing-search
+          GET.
+        schema:
+          $ref: '#/components/parameters/CustomImportProviderReadContext/schema'
+      - name: X-HealthPorta-Billing-Search-Key-Id
+        in: header
+        required: true
+        description: Existing signed authorization for the subordinate canonical billing-search
+          GET.
+        schema:
+          $ref: '#/components/parameters/CustomImportProviderReadKeyId/schema'
+      - name: X-HealthPorta-Billing-Search-Signature
+        in: header
+        required: true
+        description: Existing signed authorization for the subordinate canonical billing-search
+          GET.
+        schema:
+          $ref: '#/components/parameters/CustomImportProviderReadSignature/schema'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomImportBillingSearchRequest'
+      responses:
+        '200':
+          description: Exact native billing envelope; imported payloads are optional on each
+            provider item.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportBillingSearchResponse'
+        '400':
+          description: The signed imported query or native billing cursor is invalid.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/CustomImportReadErrorResponse'
+                - $ref: '#/components/schemas/BillingSearchErrorResponse'
+        '404':
+          description: Transport, import permit, and exact billing authority failures remain
+            opaque.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingSearchErrorResponse'
+        '409':
+          description: The pinned native billing generation required by the cursor has expired.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingSearchErrorResponse'
+        '503':
+          description: The complete pinned billing and imported read cannot be served within
+            its bounded window.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingSearchErrorResponse'
+
   /plan/:
     get:
       operationId: getPlan
@@ -7532,6 +7625,110 @@ components:
         details:
           type: string
       additionalProperties: true
+    CustomImportBillingSearchRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - target
+      - native_query
+      - context
+      - filters
+      - order
+      - require_match
+      - include_filter
+      - billing_transport_context_sha256
+      properties:
+        target:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/target'
+        native_query:
+          type: object
+          description: Canonical exact billing-search GET parameters; every value is a string.
+          additionalProperties:
+            type: string
+            maxLength: 2048
+        context:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/context'
+        filters:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/filters'
+        order:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/order'
+        require_match:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/require_match'
+        include_filter:
+          type: boolean
+          description: Required explicit choice; true adds each pinned imported payload, false
+            leaves it absent.
+        grouped_entity_selection:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/grouped_entity_selection'
+        grouped_child_query:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/grouped_child_query'
+        family_entitlement:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/family_entitlement'
+        billing_transport_context_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: SHA-256 of the separately verified signed billing GET context, bound by
+            the outer provider-v2 signature.
+    CustomImportBillingSearchResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - result_state
+      - pricing_scope
+      - billing_association_scope
+      - geo_match_scope
+      - plan_release_id
+      - billing_entity_ref
+      - procedure
+      - items
+      - pagination
+      properties:
+        result_state:
+          $ref: '#/components/schemas/BillingSearchResponse/properties/result_state'
+        pricing_scope:
+          $ref: '#/components/schemas/BillingSearchResponse/properties/pricing_scope'
+        billing_association_scope:
+          $ref: '#/components/schemas/BillingSearchResponse/properties/billing_association_scope'
+        geo_match_scope:
+          $ref: '#/components/schemas/BillingSearchResponse/properties/geo_match_scope'
+        plan_release_id:
+          $ref: '#/components/schemas/BillingSearchResponse/properties/plan_release_id'
+        billing_entity_ref:
+          $ref: '#/components/schemas/BillingSearchResponse/properties/billing_entity_ref'
+        procedure:
+          $ref: '#/components/schemas/BillingSearchResponse/properties/procedure'
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/CustomImportBillingSearchProvider'
+        pagination:
+          $ref: '#/components/schemas/BillingSearchResponse/properties/pagination'
+    CustomImportBillingSearchProvider:
+      type: object
+      additionalProperties: false
+      required:
+      - npi
+      - billing_entity_ref
+      - address
+      - distance_miles
+      - rate_occurrences
+      properties:
+        npi:
+          $ref: '#/components/schemas/BillingSearchProvider/properties/npi'
+        billing_entity_ref:
+          $ref: '#/components/schemas/BillingSearchProvider/properties/billing_entity_ref'
+        address:
+          $ref: '#/components/schemas/BillingSearchProvider/properties/address'
+        distance_miles:
+          $ref: '#/components/schemas/BillingSearchProvider/properties/distance_miles'
+        rate_occurrences:
+          $ref: '#/components/schemas/BillingSearchProvider/properties/rate_occurrences'
+        address_evidence:
+          $ref: '#/components/schemas/BillingSearchProvider/properties/address_evidence'
+        custom_import:
+          $ref: '#/components/schemas/CustomImportProviderResult/properties/custom_import'
+
     CustomImportProviderRequest:
       type: object
       additionalProperties: false
@@ -7719,6 +7916,7 @@ components:
           description: Present only when include_filter is true; null denotes an absent optional imported family.
           oneOf:
             - $ref: '#/components/schemas/CustomImportGroupedFullFamilySet'
+            - $ref: '#/components/schemas/CustomImportGroupedQueryProjectionSet'
             - type: object
               additionalProperties: false
               required: [target, root_fields, context_fields]
@@ -7963,6 +8161,38 @@ components:
                   - type: object
                     nullable: true
                     enum: [null]
+    CustomImportGroupedQueryProjectionSet:
+      type: object
+      additionalProperties: false
+      required: [contract, target, projection, selection, families, missing_group_values]
+      properties:
+        contract:
+          $ref: '#/components/schemas/CustomImportGroupedFullFamilySet/properties/contract'
+        target:
+          $ref: '#/components/schemas/CustomImportGroupedFullFamilySet/properties/target'
+        projection:
+          type: string
+          enum: [query_projection]
+        selection:
+          $ref: '#/components/schemas/CustomImportGroupedFullFamilySet/properties/selection'
+        families:
+          type: array
+          minItems: 1
+          maxItems: 2
+          description: Existing families in configured group order, with selected root and context projections.
+          items:
+            type: object
+            additionalProperties: false
+            required: [group_value, root_fields, context_fields]
+            properties:
+              group_value:
+                $ref: '#/components/schemas/CustomImportGroupedFullFamilySet/properties/families/items/properties/group_value'
+              root_fields:
+                $ref: '#/components/schemas/CustomImportReadItem/properties/root_fields'
+              context_fields:
+                $ref: '#/components/schemas/CustomImportReadItem/properties/context_fields'
+        missing_group_values:
+          $ref: '#/components/schemas/CustomImportGroupedFullFamilySet/properties/missing_group_values'
     CustomImportGroupedFullFamilySet:
       type: object
       additionalProperties: false

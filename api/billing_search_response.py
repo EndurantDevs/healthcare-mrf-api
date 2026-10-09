@@ -12,6 +12,7 @@ from api.billing_search_endpoint_access import (
     BillingSearchEndpointAccess,
     validate_billing_search_endpoint_access_state,
 )
+from api.billing_search_import_contract import BillingSearchImportCursorScope
 from api.billing_search_request import BillingSearchRequest
 from api.billing_search_response_fields import (
     SourceGroupOrdinals,
@@ -57,9 +58,7 @@ def _is_selector_state_coherent(
     service_result: BillingSearchServiceResult,
     selector_states: tuple[str, ...],
 ) -> bool:
-    if any(
-        state == BILLING_SELECTOR_PROJECTION_UNAVAILABLE for state in selector_states
-    ):
+    if any(state == BILLING_SELECTOR_PROJECTION_UNAVAILABLE for state in selector_states):
         return service_result.state == BILLING_SEARCH_RESULT_TAX_IDENTITY_UNAVAILABLE
     if all(state == BILLING_SELECTOR_NO_MATCH for state in selector_states):
         return service_result.state == BILLING_SEARCH_RESULT_NO_MATCHING_TAX_IDENTITY
@@ -83,12 +82,9 @@ def _validated_selector_bindings(
         raise serving_unavailable() from None
     selector_bindings = selector_resolution.selector_scope.bindings
     expected_coordinates = tuple(
-        (binding.binding_ordinal, binding.snapshot_id)
-        for binding in selection.in_network_bindings
+        (binding.binding_ordinal, binding.snapshot_id) for binding in selection.in_network_bindings
     )
-    selector_coordinates = tuple(
-        (binding.binding_ordinal, binding.snapshot_id) for binding in selector_bindings
-    )
+    selector_coordinates = tuple((binding.binding_ordinal, binding.snapshot_id) for binding in selector_bindings)
     if expected_coordinates != selector_coordinates:
         raise serving_unavailable()
     return selector_bindings
@@ -122,9 +118,7 @@ def _binding_source_groups(
             selector_binding.source_scope,
             snapshot_key=ptg2_serving._required_shared_snapshot_key(serving_tables),
             source_count=ptg2_serving._required_source_count(serving_tables),
-            source_publication=(
-                serving_tables.provider_tax_identity_source_publication
-            ),
+            source_publication=(serving_tables.provider_tax_identity_source_publication),
         )
     except Exception:
         raise serving_unavailable() from None
@@ -141,10 +135,7 @@ def _validated_selector_source_groups(
         if service_result.state != BILLING_SEARCH_RESULT_NO_SNAPSHOT:
             raise serving_unavailable()
         return {}
-    if (
-        type(selection) is not PlanReleaseServingSelection
-        or not selection.includes_billing_tax_identity_source
-    ):
+    if type(selection) is not PlanReleaseServingSelection or not selection.includes_billing_tax_identity_source:
         raise serving_unavailable()
     selector_bindings = _validated_selector_bindings(selection, service_result)
     groups_by_binding: SourceGroupsByBinding = {}
@@ -231,17 +222,16 @@ def _validated_response_inputs(
     cursor_keyring: BillingSearchCursorKeyring | None,
     *,
     trusted_now: object,
+    import_scope: BillingSearchImportCursorScope | None = None,
 ) -> tuple[
     BillingSearchEndpointAccess,
     BillingSearchServiceResult,
     SourceGroupsByBinding,
     str | None,
 ]:
-    validated_access, endpoint_access_state_sha256 = (
-        validate_billing_search_endpoint_access_state(
-            endpoint_access,
-            trusted_now=trusted_now,
-        )
+    validated_access, endpoint_access_state_sha256 = validate_billing_search_endpoint_access_state(
+        endpoint_access,
+        trusted_now=trusted_now,
     )
     validated_result = validate_service_result(service_result)
     if not hmac.compare_digest(
@@ -263,6 +253,7 @@ def _validated_response_inputs(
         validated_result,
         cursor_keyring=cursor_keyring,
         trusted_now=trusted_now,
+        import_scope=import_scope,
     )
     return (
         validated_access,
@@ -320,6 +311,7 @@ def shape_billing_search_response(
     *,
     cursor_keyring: BillingSearchCursorKeyring | None = None,
     trusted_now: object,
+    import_scope: BillingSearchImportCursorScope | None = None,
 ) -> dict[str, Any]:
     """Return an allowlisted response after exact source and cursor proof."""
 
@@ -329,6 +321,7 @@ def shape_billing_search_response(
             service_result,
             cursor_keyring,
             trusted_now=trusted_now,
+            import_scope=import_scope,
         )
         response_by_field = _public_response_payload(*validated_inputs)
         _validate_total_text_budget(response_by_field)

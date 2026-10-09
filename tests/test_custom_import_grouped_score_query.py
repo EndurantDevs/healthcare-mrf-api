@@ -126,22 +126,25 @@ def test_native_scope_precedes_default_year_helper_and_all_group_reducers():
     compiled = prepared.statement.compile(dialect=postgresql.dialect())
     assert list(query.entity_values) in compiled.params.values()
     assert list(compiled.params.values()).count(list(query.entity_values)) == 2
-    assert "selected_entity_value AS MATERIALIZED" in str(compiled)
+    assert "selected_entity_value AS MATERIALIZED" not in str(compiled)
+    assert "WHERE selected_entity_value.entity_binding_id = mrf.custom_import_winner.entity_binding_id" in str(compiled)
     assert "derived_score_values" in str(compiled) and "LIMIT" not in str(compiled)
     broad = grouped_read.prepare_relation(_context(), replace(query, entity_values=None), scope)
     assert prepared.query_fingerprint != broad.query_fingerprint
 
 
-def test_derived_child_relation_retains_roots_and_validates_before_reduction():
+@pytest.mark.parametrize("entity_values", (None, ("1234567893",)))
+def test_derived_child_relation_retains_roots_and_validates_before_reduction(entity_values):
     query = fixture.query(
         context_filters=(read_core.ReadFilter("service_code", "eq", "chosen"),),
         filters=(read_core.ReadFilter("child_cost", "gt", 0),),
         order_terms=(read_core.ReadOrderTerm("root_cost", "asc", "last"),),
+        entity_values=entity_values,
     )
     prepared = grouped_read.prepare_relation(_context(), query, read_core.ExtensionReadScope("synthetic"))
     sql = str(prepared.statement.compile(dialect=postgresql.dialect()))
     assert "complete_score_child_keys AS MATERIALIZED" not in sql
-    assert "derived_root_score_values AS MATERIALIZED" in sql
+    assert ("derived_root_score_values AS MATERIALIZED" in sql) is (entity_values is not None)
     assert "FROM derived_root_score_values LEFT OUTER JOIN (mrf.custom_import_family_child" in sql
     for identity in ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot"):
         assert f"complete_score_child_keys.{identity} = mrf.custom_import_family_child.{identity}" in sql

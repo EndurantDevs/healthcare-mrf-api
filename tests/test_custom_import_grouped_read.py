@@ -9,6 +9,10 @@ from unittest.mock import AsyncMock
 
 import orjson
 import pytest
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.sql import operators, visitors
+from sqlalchemy.sql.elements import BinaryExpression
+from sqlalchemy.sql.selectable import ScalarSelect, Subquery
 
 from api import custom_import_provider_http as provider_http
 from api import custom_import_read_http as transport
@@ -21,6 +25,89 @@ from tests import test_custom_import_provider_query as query_fixture
 from tests import test_custom_import_read_http as http_fixture
 
 _SCOPE = ExtensionReadScope("synthetic:grouped")
+
+
+@pytest.mark.parametrize("entity_values", [None, ("1234567893", "1000000012")])
+def test_unpaged_default_selection_looks_up_the_guarded_helper_for_each_entity(entity_values):
+    context = fixture.context()
+    plan = grouped_read.normalize_plan(context, fixture.query(), _SCOPE)
+    statement = grouped_read.selected_family_statement(
+        context, plan, materialize_default=True, entity_values=entity_values
+    )
+    lookups_by_identity = {
+        id(element): element for element in visitors.iterate(statement) if isinstance(element, ScalarSelect)
+    }
+    assert len(lookups_by_identity) == 1
+    lookup = next(iter(lookups_by_identity.values())).element
+    helper = lookup.get_final_froms()[0]
+    assert isinstance(helper, Subquery) and helper.name == "selected_entity_value"
+    assert tuple(lookup.selected_columns) == (helper.c.selected_value,)
+    assert lookup._where_criteria[0].compare(
+        helper.c.entity_binding_id == context.model(read_core.CustomImportWinner).entity_binding_id
+    )
+    assert lookup._correlate
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+    assert "selected_entity_value AS MATERIALIZED" not in sql
+    assert "WHERE selected_entity_value.entity_binding_id = mrf.custom_import_winner.entity_binding_id" in sql
+    for model in (
+        "custom_import_generation_family",
+        "custom_import_family_revision",
+        "custom_import_root_revision",
+        "custom_import_entity_binding",
+        "custom_import_generation",
+        "custom_import_generation_seal",
+    ):
+        assert f"JOIN mrf.{model}" in str(helper.element)
+    assert "helper_slot_6.root_record_id = mrf.custom_import_family_revision.root_record_id" in sql
+    assert "LIMIT" not in sql
+
+
+def _helper_entity_scopes(statement):
+    helpers_by_identity = {
+        id(element): element
+        for element in visitors.iterate(statement)
+        if isinstance(element, Subquery) and element.name == "selected_entity_value"
+    }
+    assert len(helpers_by_identity) == 1
+    return [
+        tuple(element.right.value)
+        for element in visitors.iterate(next(iter(helpers_by_identity.values())).element)
+        if isinstance(element, BinaryExpression)
+        and element.operator is operators.in_op
+        and getattr(element.left, "name", None) == "canonical_value"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_selected_family_read_scopes_default_helper_to_page_entities():
+    context = fixture.context()
+    plan = grouped_read.normalize_plan(context, fixture.query(), _SCOPE)
+    entity_values = ("1234567893", "1000000012")
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(all=lambda: [])))
+    assert await grouped_read._selected_family_rows(session, context, plan, entity_values) == ()
+    statement = session.execute.await_args.args[0]
+    assert _helper_entity_scopes(statement) == [entity_values]
+
+
+@pytest.mark.asyncio
+async def test_grouped_detail_scopes_default_eligibility_helper_to_requested_entity(monkeypatch):
+    context = fixture.context()
+    entity_value = "1234567893"
+    request = read_core.RootDetailRequest(
+        context.target,
+        read_core.EntityLocator("npi", entity_value),
+        "full_family",
+        (),
+        fixture.selection_document(),
+    )
+    session = SimpleNamespace(scalar=AsyncMock(return_value=None))
+    finality = AsyncMock()
+    monkeypatch.setattr(read_core, "verify_published_generation", finality)
+    with pytest.raises(read_core.CustomImportReadEntityAbsentError):
+        await grouped_read.hydrate_detail(session, context, request, _SCOPE)
+    statement = session.scalar.await_args.args[0]
+    assert _helper_entity_scopes(statement) == [(entity_value,)]
+    finality.assert_awaited_once_with(session, context.target)
 
 
 @pytest.mark.asyncio

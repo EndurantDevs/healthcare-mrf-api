@@ -7,6 +7,7 @@ from typing import Any
 
 from sanic import Blueprint
 
+from api.custom_import_billing_http import serve_custom_import_billing_search
 from api.custom_import_detail_batch import serve_custom_import_detail_batch
 from api.custom_import_provider_batch import serve_custom_import_provider_batch
 from api.custom_import_provider_geo import serve_custom_import_provider_geo
@@ -68,3 +69,10 @@ async def providers_by_service(request: Any):
     """Compose imported fields with one authorized provider-service claims page."""
 
     return await serve_custom_import_provider_service(request, _session(request))
+
+
+@blueprint.post("/providers/billing-search", name="custom_import.providers_billing_search")
+async def providers_billing_search(request: Any):
+    """Compose configured fields while preserving exact billing authority."""
+
+    return await serve_custom_import_billing_search(request, _session(request))

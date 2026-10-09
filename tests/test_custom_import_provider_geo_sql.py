@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import replace
+from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -61,6 +64,7 @@ def _imported_geo_query(
     *,
     anchor: tuple[str, str] | None = None,
     native_parameters: dict[str, object] | None = None,
+    address_table_sql: str = "mrf.npi_address",
 ) -> geo_sql.ImportedGeoQuery:
     return geo_sql.ImportedGeoQuery(
         nearby=geo_sql.NearbySqlQuery(
@@ -69,7 +73,7 @@ def _imported_geo_query(
             ilike_clause="",
             use_taxonomy_filter=False,
             primary_only=False,
-            address_table_sql="mrf.npi_address",
+            address_table_sql=address_table_sql,
             geo_precision_clause="",
             geo_type_clause="AND (a.type = 'primary' OR a.type = 'secondary')",
         ),
@@ -103,6 +107,9 @@ def test_imported_geo_builder_dedupes_before_ordering_and_uses_typed_binds(direc
     assert "cursor_distance_meters ASC, selected_geo.npi_code ASC, selected_geo.address_key ASC" in page_sql
     assert "candidate_limit" not in page_sql
     assert "LIMIT" not in count_sql
+    assert "a.*, d.*" not in count_sql and "ST_Distance(" not in count_sql
+    assert page_sql.index("LIMIT") < page_sql.index("hydrated_geo AS MATERIALIZED") < page_sql.index("a.*, d.*")
+    assert page_sql.index("hydrated_geo AS MATERIALIZED") < page_sql.index("ST_Distance(")
     assert set(context.compiled.values) <= set(statements.parameters)
     assert set(context.compiled.values) <= set(statements.page._bindparams)
 
@@ -207,10 +214,10 @@ def _geo_row(npi: int, address_key: str, distance: float):
     )
 
 
-async def _legacy_address_table(required_columns, *, session=None):
+async def _legacy_address_table(required_columns, *, session=None, address_table_sql="mrf.npi_address"):
     assert required_columns == npi_module._public_address_serving_column_keys()
     assert session is not None
-    return "mrf.npi_address"
+    return address_table_sql
 
 
 async def _empty_plan_scope(session, release_id):
@@ -350,14 +357,30 @@ class _PostgresGeoProxy:
         return (await self._session.execute(statement, parameters)).all()
 
 
-async def _seed_geo_tables(session) -> None:
-    await session.execute(text("CREATE SCHEMA mrf"))
-    await session.execute(text("CREATE TABLE mrf.npi (npi bigint PRIMARY KEY)"))
+async def _seed_geo_tables(session, *, address_table_sql: str = "mrf.npi_address") -> None:
     await session.execute(
         text(
-            "CREATE TABLE mrf.npi_address ("
-            "npi bigint NOT NULL, type text NOT NULL, lat double precision, "
-            "long double precision, address_key uuid)"
+            "SELECT set_config('search_path', quote_ident(n.nspname) || ', public', true) "
+            "FROM pg_extension AS e JOIN pg_namespace AS n ON n.oid = e.extnamespace WHERE e.extname = 'postgis'"
+        )
+    )
+    await session.execute(text("CREATE SCHEMA mrf"))
+    await session.execute(
+        text("CREATE TABLE mrf.npi (npi bigint PRIMARY KEY, provider_first_name text DEFAULT 'Synthetic')")
+    )
+    is_unified = address_table_sql.endswith(".entity_address_unified")
+    extra_columns = (
+        ", location_key text NOT NULL, address_sources text[] NOT NULL, address_precision text DEFAULT 'rooftop'"
+        if is_unified
+        else ""
+    )
+    primary_key = "location_key" if is_unified else "checksum, npi, type"
+    await session.execute(
+        text(
+            f"CREATE TABLE {address_table_sql} ("
+            "npi bigint NOT NULL, type text NOT NULL, checksum bigint NOT NULL, lat double precision, "
+            "long double precision, address_key uuid, first_line text, telephone_number text, "
+            f"taxonomy_array integer[] NOT NULL DEFAULT '{{0}}'{extra_columns}, PRIMARY KEY ({primary_key}))"
         )
     )
     await session.execute(text("CREATE TABLE mrf.npi_taxonomy (npi bigint, healthcare_provider_taxonomy_code text)"))
@@ -365,18 +388,44 @@ async def _seed_geo_tables(session) -> None:
     await session.execute(
         text("INSERT INTO mrf.npi (npi) VALUES (1000000001), (1000000002), (1000000003), (1000000004), (1000000005)")
     )
+    await _seed_geo_addresses(session, address_table_sql, is_unified=is_unified)
+    await session.execute(text("INSERT INTO mrf.npi_taxonomy VALUES (1000000004, '111'), (1000000004, '222')"))
+    await session.execute(text("INSERT INTO mrf.nucc_taxonomy VALUES ('111', 'One', 1), ('222', 'Two', 2)"))
+
+
+async def _seed_geo_addresses(session, address_table_sql: str, *, is_unified: bool) -> None:
+    address_rows = [
+        (1000000001, "primary", 1, 0, _FIRST_ADDRESS_KEY),
+        (1000000002, "primary", 1, 0, _SECOND_ADDRESS_KEY),
+        (1000000003, "primary", 3, 0, _THIRD_ADDRESS_KEY),
+        (1000000003, "secondary", 6, 0, _FIFTH_ADDRESS_KEY),
+        (1000000004, "primary", 4, 0.02, _FOURTH_ADDRESS_KEY),
+        (1000000004, "secondary", 4, 0, _FOURTH_ADDRESS_KEY),
+        (1000000005, "primary", 5, 0, _FIFTH_ADDRESS_KEY),
+        (1000000005, "secondary", 5, 0, _FIFTH_ADDRESS_KEY),
+        (1000000004, "secondary", 444, 0 if is_unified else 0.04, _FOURTH_ADDRESS_KEY),
+    ]
+    address_parameters = [
+        {
+            "npi": npi,
+            "type": address_type,
+            "checksum": checksum,
+            "lat": latitude,
+            "address_key": address_key,
+            "first_line": f"{checksum} {address_type} Example Street",
+            "location_key": f"location-{ordinal:02}",
+        }
+        for ordinal, (npi, address_type, checksum, latitude, address_key) in enumerate(address_rows)
+    ]
+    extra_columns = ", location_key, address_sources" if is_unified else ""
+    extra_values = ", :location_key, ARRAY['synthetic']" if is_unified else ""
     await session.execute(
         text(
-            "INSERT INTO mrf.npi_address (npi, type, lat, long, address_key) VALUES "
-            f"(1000000001, 'primary', 0, 0, '{_FIRST_ADDRESS_KEY}'), "
-            f"(1000000002, 'primary', 0, 0, '{_SECOND_ADDRESS_KEY}'), "
-            f"(1000000003, 'primary', 0, 0, '{_THIRD_ADDRESS_KEY}'), "
-            f"(1000000003, 'secondary', 0, 0, '{_FIFTH_ADDRESS_KEY}'), "
-            f"(1000000004, 'primary', 0.02, 0, '{_FOURTH_ADDRESS_KEY}'), "
-            f"(1000000004, 'secondary', 0, 0, '{_FOURTH_ADDRESS_KEY}'), "
-            f"(1000000005, 'primary', 0, 0, '{_FIFTH_ADDRESS_KEY}'), "
-            f"(1000000005, 'secondary', 0, 0, '{_FIFTH_ADDRESS_KEY}')"
-        )
+            f"INSERT INTO {address_table_sql} "
+            f"(npi, type, checksum, lat, long, address_key, first_line, telephone_number{extra_columns}) "
+            f"VALUES (:npi, :type, :checksum, :lat, 0, CAST(:address_key AS uuid), :first_line, '555-0100'{extra_values})"
+        ),
+        address_parameters,
     )
 
 
@@ -422,6 +471,7 @@ def _provider_identities(page_body: Mapping[str, Any]) -> list[tuple[int, str]]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("address_table_sql", ("mrf.npi_address", "mrf.entity_address_unified"))
 @pytest.mark.parametrize(
     ("direction", "expected_first", "expected_second"),
     (
@@ -442,15 +492,20 @@ async def test_postgres_imported_geo_handler_executes_count_page_and_cursor(
     direction,
     expected_first,
     expected_second,
+    address_table_sql,
 ):
     async with transaction_session() as session:
         try:
             await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
         except DBAPIError:
             pytest.skip("PostGIS is unavailable for the native geo execution proof")
-        await _seed_geo_tables(session)
+        await _seed_geo_tables(session, address_table_sql=address_table_sql)
         monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _PostgresGeoProxy)
-        monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)
+        monkeypatch.setattr(
+            npi_module,
+            "_address_serving_table_sql",
+            partial(_legacy_address_table, address_table_sql=address_table_sql),
+        )
         monkeypatch.setattr(npi_module, "_plan_release_npi_scope", _empty_plan_scope)
         monkeypatch.setattr(
             npi_module.db,
@@ -492,6 +547,7 @@ async def test_postgres_imported_geo_handler_executes_count_page_and_cursor(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("address_table_sql", ("mrf.npi_address", "mrf.entity_address_unified"))
 @pytest.mark.parametrize(
     ("direction", "expected_first", "expected_second"),
     (
@@ -508,16 +564,20 @@ async def test_postgres_imported_geo_handler_executes_count_page_and_cursor(
     ),
 )
 async def test_postgres_required_geo_order_keeps_null_score_and_exact_address_pages(
-    monkeypatch, direction, expected_first, expected_second
+    monkeypatch, direction, expected_first, expected_second, address_table_sql
 ):
     async with transaction_session() as session:
         try:
             await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
         except DBAPIError:
             pytest.skip("PostGIS is unavailable for the native geo execution proof")
-        await _seed_geo_tables(session)
+        await _seed_geo_tables(session, address_table_sql=address_table_sql)
         monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _PostgresGeoProxy)
-        monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)
+        monkeypatch.setattr(
+            npi_module,
+            "_address_serving_table_sql",
+            partial(_legacy_address_table, address_table_sql=address_table_sql),
+        )
         monkeypatch.setattr(npi_module, "_plan_release_npi_scope", _empty_plan_scope)
         monkeypatch.setattr(npi_module.db, "acquire", lambda: (_ for _ in ()).throw(AssertionError("native pool used")))
         first_body = await _read_postgres_geo_page(session, direction, require_match=True)
@@ -538,3 +598,139 @@ async def test_postgres_required_geo_order_keeps_null_score_and_exact_address_pa
     assert next(provider["type"] for provider in providers if provider["npi"] == 1000000004) == "secondary"
     assert providers[-1]["npi"] == 1000000002
     assert len(calls) == 3 and all("AS _geo_total" in sql for sql, _ in calls)
+
+
+def _wide_geo_page_statement(context, address_table_sql: str, direction: str):
+    sql = (Path(__file__).parent / "fixtures" / "custom_import_provider_geo_wide_page.sql").read_text()
+    return text(
+        sql.format(
+            address_table=address_table_sql,
+            address_tiebreaker=geo_sql.nearby_row_tiebreaker(address_table_sql),
+            direction=direction.upper(),
+            membership_clause=(
+                "\n       AND EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported "
+                "WHERE imported.entity_value = d.npi::text)"
+                if context.require_match
+                else ""
+            ),
+            require_match_clause="\n     WHERE imported.entity_value IS NOT NULL" if context.require_match else "",
+        )
+    ).bindparams(*context.compiled.typed_binds)
+
+
+def _ordered_geo_payload_rows(result):
+    return [
+        tuple(row)
+        for row in sorted(
+            result.all(),
+            key=lambda row: (
+                row._mapping["_geo_page_position"] or 0,
+                row._mapping["healthcare_provider_taxonomy_code"] or "",
+            ),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("address_table_sql", ("mrf.npi_address", "mrf.entity_address_unified"))
+@pytest.mark.parametrize("direction", ("asc", "desc"))
+@pytest.mark.parametrize("require_match", (False, True))
+async def test_postgres_imported_geo_page_preserves_wide_payload(address_table_sql, direction, require_match):
+    async with transaction_session() as session:
+        try:
+            await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        except DBAPIError:
+            pytest.skip("PostGIS is unavailable for the native geo execution proof")
+        await _seed_geo_tables(session, address_table_sql=address_table_sql)
+        context = _context(direction=direction, require_match=require_match)
+        query = _imported_geo_query(address_table_sql=address_table_sql)
+        for limit in (2, 50):
+            statements = geo_sql.build_imported_geo_statements(context, replace(query, limit=limit))
+            wide_result = await session.execute(
+                _wide_geo_page_statement(context, address_table_sql, direction), statements.parameters
+            )
+            hydrated_result = await session.execute(statements.page, statements.parameters)
+            assert list(hydrated_result.keys()) == list(wide_result.keys())
+            assert _ordered_geo_payload_rows(hydrated_result) == _ordered_geo_payload_rows(wide_result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("address_table_sql", ("mrf.npi_address", "mrf.entity_address_unified"))
+async def test_postgres_imported_geo_without_order_preserves_empty_total_and_hydration(address_table_sql):
+    async with transaction_session() as session:
+        try:
+            await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        except DBAPIError:
+            pytest.skip("PostGIS is unavailable for the native geo execution proof")
+        await _seed_geo_tables(session, address_table_sql=address_table_sql)
+        context = _context(direction=None, require_match=True)
+        query = _imported_geo_query(address_table_sql=address_table_sql)
+        statements = geo_sql.build_imported_geo_statements(context, query)
+        rows = (await session.execute(statements.page, statements.parameters)).all()
+        assert len(rows) == 1 and rows[0]._mapping["npi_code"] == 1000000002
+        assert rows[0]._mapping["first_line"] == "1 primary Example Street"
+        assert rows[0]._mapping["_geo_total"] == 1
+        exhausted = geo_sql.build_imported_geo_statements(
+            context, replace(query, cursor_anchor=("1000000002", _SECOND_ADDRESS_KEY))
+        )
+        empty_rows = (await session.execute(exhausted.page, exhausted.parameters)).all()
+        assert len(empty_rows) == 1 and empty_rows[0]._mapping["npi_code"] is None
+        assert empty_rows[0]._mapping["_geo_total"] == 1 and empty_rows[0]._mapping["_geo_anchor_count"] == 1
+        absent = geo_sql.build_imported_geo_statements(
+            context, replace(query, native_parameters={"in_long": 90.0, "in_lat": 0.0, "radius": 1.0})
+        )
+        absent_rows = (await session.execute(absent.page, absent.parameters)).all()
+        assert len(absent_rows) == 1 and absent_rows[0]._mapping["npi_code"] is None
+        assert absent_rows[0]._mapping["_geo_total"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("address_table_sql", ("mrf.npi_address", "mrf.entity_address_unified"))
+async def test_postgres_imported_geo_hydrates_mixed_sort_fields_across_null_cursor(address_table_sql):
+    relation_queries = [
+        select(
+            literal(npi).label("entity_value"),
+            literal(first_rank, type_=Integer()).label("sort_0"),
+            literal(second_rank, type_=Integer()).label("sort_1"),
+        )
+        for npi, first_rank, second_rank in (("1000000002", None, 9), ("1000000003", 7, 2), ("1000000004", 7, 8))
+    ]
+    relation = relation_queries[0].union_all(*relation_queries[1:])
+    order_terms = (
+        ReadOrderTerm("synthetic_rank", "asc", "last"),
+        ReadOrderTerm("synthetic_secondary_rank", "desc", "last"),
+    )
+    prepared = PreparedNpiEntityRelation(relation, order_terms, "a" * 64, "b" * 64)
+    context = ProviderImportQuery(prepared, compile_npi_entity_relation(relation), True)
+    async with transaction_session() as session:
+        try:
+            await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        except DBAPIError:
+            pytest.skip("PostGIS is unavailable for the native geo execution proof")
+        await _seed_geo_tables(session, address_table_sql=address_table_sql)
+        query = _imported_geo_query(address_table_sql=address_table_sql)
+        first = geo_sql.build_imported_geo_statements(context, query)
+        first_rows = (await session.execute(first.page, first.parameters)).all()
+        assert list(
+            dict.fromkeys(
+                (geo_row._mapping["npi_code"], str(geo_row._mapping["address_key"])) for geo_row in first_rows
+            )
+        ) == [
+            (1000000004, _FOURTH_ADDRESS_KEY),
+            (1000000003, _THIRD_ADDRESS_KEY),
+            (1000000003, _FIFTH_ADDRESS_KEY),
+        ]
+        assert [geo_row._mapping["sort_1"] for geo_row in first_rows] == [8, 8, 2, 2]
+        second = geo_sql.build_imported_geo_statements(
+            context, replace(query, cursor_anchor=("1000000003", _THIRD_ADDRESS_KEY))
+        )
+        second_rows = (await session.execute(second.page, second.parameters)).all()
+        assert [(geo_row._mapping["npi_code"], str(geo_row._mapping["address_key"])) for geo_row in second_rows] == [
+            (1000000003, _FIFTH_ADDRESS_KEY),
+            (1000000002, _SECOND_ADDRESS_KEY),
+        ]
+        assert second_rows[-1]._mapping["sort_0"] is None and second_rows[-1]._mapping["sort_1"] == 9
+        assert all(
+            geo_row._mapping["_geo_total"] == 4 and geo_row._mapping["_geo_anchor_count"] == 1
+            for geo_row in second_rows
+        )

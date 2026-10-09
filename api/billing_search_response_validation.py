@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
 import hmac
 import re
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 from api.billing_search_cursor import (
     BILLING_SEARCH_CURSOR_MAX_TTL_SECONDS,
@@ -17,9 +17,14 @@ from api.billing_search_cursor_authentication import (
     authenticate_billing_search_sealed_page_cursor,
 )
 from api.billing_search_endpoint_access import BillingSearchEndpointAccess
+from api.billing_search_import_contract import (
+    BillingSearchImportCursorScope,
+    validate_billing_search_composed_order,
+)
 from api.billing_search_pagination import (
     BillingSearchCursorBinding,
-    billing_search_authorization_scope_sha256,
+    billing_search_cursor_authorization_sha256,
+    billing_search_cursor_request_sha256,
     billing_search_snapshot_set_sha256,
 )
 from api.billing_search_transport_contract import _canonical_utc
@@ -29,6 +34,7 @@ from api.ptg2_billing_search_contract import (
     serving_unavailable,
 )
 from api.ptg2_billing_search_page import validate_billing_search_sort_key
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 _MAX_PUBLIC_PRICE_ATOMS = 256
 _MAX_PUBLIC_TOTAL_TEXT_BYTES = 64 * 1024
@@ -65,10 +71,7 @@ class _PublicResponseBudget:
 
         encoded_size = len(value.encode("utf-8"))
         self.source_text_bytes += encoded_size
-        if (
-            encoded_size > maximum_bytes
-            or self.source_text_bytes > _MAX_PUBLIC_TOTAL_TEXT_BYTES
-        ):
+        if encoded_size > maximum_bytes or self.source_text_bytes > _MAX_PUBLIC_TOTAL_TEXT_BYTES:
             raise serving_unavailable()
 
 
@@ -125,9 +128,7 @@ def _projected_plain_decimal_characters(decimal_rate: Decimal) -> int:
 def _validate_public_rate_value(rate_value: object) -> None:
     """Reject rates that cannot become one bounded exact JSON number."""
 
-    if type(rate_value) not in {Decimal, float, int, str} or isinstance(
-        rate_value, bool
-    ):
+    if type(rate_value) not in {Decimal, float, int, str} or isinstance(rate_value, bool):
         raise serving_unavailable()
     if type(rate_value) is int and abs(rate_value).bit_length() > 512:
         raise serving_unavailable()
@@ -136,15 +137,12 @@ def _validate_public_rate_value(rate_value: object) -> None:
         not encoded_rate
         or not encoded_rate.isascii()
         or len(encoded_rate) > _MAX_PUBLIC_NUMERIC_BYTES
-        or (
-            type(rate_value) is str
-            and _PLAIN_DECIMAL_PATTERN.fullmatch(encoded_rate) is None
-        )
+        or (type(rate_value) is str and _PLAIN_DECIMAL_PATTERN.fullmatch(encoded_rate) is None)
     ):
         raise serving_unavailable()
     try:
         decimal_rate = Decimal(encoded_rate)
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         raise serving_unavailable() from None
     if not decimal_rate.is_finite():
         raise serving_unavailable()
@@ -162,16 +160,9 @@ def _public_timestamp(
         optional=False,
         maximum_bytes=64,
     )
-    if (
-        retained_timestamp is None
-        or _RFC3339_TIMESTAMP_PATTERN.fullmatch(retained_timestamp) is None
-    ):
+    if retained_timestamp is None or _RFC3339_TIMESTAMP_PATTERN.fullmatch(retained_timestamp) is None:
         raise serving_unavailable()
-    parsed_value = (
-        retained_timestamp[:-1] + "+00:00"
-        if retained_timestamp.endswith("Z")
-        else retained_timestamp
-    )
+    parsed_value = retained_timestamp[:-1] + "+00:00" if retained_timestamp.endswith("Z") else retained_timestamp
     try:
         retrieval_time = datetime.fromisoformat(parsed_value)
     except ValueError:
@@ -201,28 +192,28 @@ def _validated_expected_cursor_coordinates(
     service_result: BillingSearchServiceResult,
     *,
     trusted_now: object,
+    import_scope: BillingSearchImportCursorScope | None = None,
 ) -> tuple[BillingSearchCursorBinding, int, str, str]:
     request = endpoint_access.request
     _, trusted_time = _canonical_utc(trusted_now)
     trusted_timestamp = int(trusted_time.timestamp())
     cursor_binding = service_result.cursor_binding
     selection = service_result.selection
-    if (
-        type(cursor_binding) is not BillingSearchCursorBinding
-        or type(selection) is not PlanReleaseServingSelection
-    ):
+    if type(cursor_binding) is not BillingSearchCursorBinding or type(selection) is not PlanReleaseServingSelection:
         raise serving_unavailable()
     cursor_binding.__post_init__()
-    authorization_scope_sha256 = billing_search_authorization_scope_sha256(
+    authorization_scope_sha256 = billing_search_cursor_authorization_sha256(
         endpoint_access.authorization_context,
         trusted_now=trusted_now,
+        import_scope=import_scope,
     )
     snapshot_set_sha256 = billing_search_snapshot_set_sha256(selection)
     if (
         cursor_binding.trusted_now != trusted_timestamp
+        or cursor_binding.import_scope != import_scope
         or not hmac.compare_digest(
             cursor_binding.request_fingerprint_sha256,
-            request.request_fingerprint_sha256,
+            billing_search_cursor_request_sha256(request, import_scope=import_scope),
         )
         or not hmac.compare_digest(
             cursor_binding.authorization_scope_sha256,
@@ -248,6 +239,7 @@ def _authenticated_public_cursor(
     cursor_keyring: BillingSearchCursorKeyring,
     *,
     trusted_now: object,
+    import_scope: BillingSearchImportCursorScope | None = None,
 ) -> str:
     next_cursor = service_result.next_cursor
     if type(next_cursor) is not BillingSearchSealedPageCursor:
@@ -262,28 +254,23 @@ def _authenticated_public_cursor(
             endpoint_access,
             service_result,
             trusted_now=trusted_now,
+            import_scope=import_scope,
         )
-        authenticated_state, authenticated_token = (
-            authenticate_billing_search_sealed_page_cursor(
-                next_cursor,
-                keyring=cursor_keyring,
-                trusted_now=trusted_timestamp,
-                request_fingerprint_sha256=(
-                    endpoint_access.request.request_fingerprint_sha256
-                ),
-                authorization_context_sha256=authorization_scope_sha256,
-                generation_bundle_sha256=(cursor_binding.generation_bundle_sha256),
-                snapshot_set_sha256=snapshot_set_sha256,
-            )
+        authenticated_state, authenticated_token = authenticate_billing_search_sealed_page_cursor(
+            next_cursor,
+            keyring=cursor_keyring,
+            trusted_now=trusted_timestamp,
+            request_fingerprint_sha256=(cursor_binding.request_fingerprint_sha256),
+            authorization_context_sha256=authorization_scope_sha256,
+            generation_bundle_sha256=(cursor_binding.generation_bundle_sha256),
+            snapshot_set_sha256=snapshot_set_sha256,
         )
     except Exception:
         raise serving_unavailable() from None
     if (
         authenticated_state.issued_at != trusted_timestamp
-        or authenticated_state.expires_at
-        != trusted_timestamp + BILLING_SEARCH_CURSOR_MAX_TTL_SECONDS
-        or authenticated_state.sort_key
-        != service_result.providers[-1].candidate.sort_key
+        or authenticated_state.expires_at != trusted_timestamp + BILLING_SEARCH_CURSOR_MAX_TTL_SECONDS
+        or authenticated_state.sort_key != service_result.providers[-1].candidate.sort_key
     ):
         raise serving_unavailable()
     return authenticated_token
@@ -292,16 +279,14 @@ def _authenticated_public_cursor(
 def _validate_provider_page_order(
     service_result: BillingSearchServiceResult,
 ) -> None:
-    provider_keys = tuple(
-        provider.candidate.sort_key for provider in service_result.providers
-    )
-    validated_keys = tuple(
-        validate_billing_search_sort_key(provider_key) for provider_key in provider_keys
-    )
-    if provider_keys != validated_keys or provider_keys != tuple(
-        sorted(set(provider_keys))
-    ):
+    provider_keys = tuple(provider.candidate.sort_key for provider in service_result.providers)
+    validated_keys = tuple(validate_billing_search_sort_key(provider_key) for provider_key in provider_keys)
+    if provider_keys != validated_keys:
         raise serving_unavailable()
+    try:
+        validate_billing_search_composed_order(provider_keys, service_result.composed_order)
+    except PTG2ManifestArtifactError:
+        raise serving_unavailable() from None
 
 
 def _validate_public_page(
@@ -310,9 +295,16 @@ def _validate_public_page(
     *,
     cursor_keyring: BillingSearchCursorKeyring | None,
     trusted_now: object,
+    import_scope: BillingSearchImportCursorScope | None = None,
 ) -> str | None:
     """Validate one bounded page and authenticate its optional cursor."""
 
+    if service_result.import_scope != import_scope:
+        raise serving_unavailable()
+    if import_scope is not None:
+        if type(import_scope) is not BillingSearchImportCursorScope:
+            raise serving_unavailable()
+        import_scope.__post_init__()
     provider_count = len(service_result.providers)
     if provider_count > endpoint_access.request.limit or (
         service_result.has_more and provider_count != endpoint_access.request.limit
@@ -328,6 +320,7 @@ def _validate_public_page(
         service_result,
         cursor_keyring,
         trusted_now=trusted_now,
+        import_scope=import_scope,
     )
 
 

@@ -91,7 +91,7 @@ def build_imported_geo_statements(
     if normalized_anchor is None:
         return ImportedGeoStatements(
             count=count,
-            page=_page_statement(common_ctes, import_context, has_anchor=False),
+            page=_page_statement(common_ctes, import_context, imported_query.nearby, has_anchor=False),
             anchor=None,
             parameters=MappingProxyType(parameters_by_name),
         )
@@ -106,6 +106,7 @@ def build_imported_geo_statements(
         page=_page_statement(
             f"{common_ctes},\n{anchor_ctes},\ncursor_anchor AS MATERIALIZED (\n    SELECT * FROM cursor_anchor_rows\n)",
             import_context,
+            imported_query.nearby,
             has_anchor=True,
         ),
         anchor=anchor,
@@ -133,22 +134,17 @@ def _eligible_geo_cte(
 ) -> str:
     taxonomy_from, taxonomy_where = _taxonomy_filter_parts(nearby)
     membership_clause = _membership_clause(import_context)
+    address_key_columns = ",\n           ".join(
+        f"a.{column} AS _geo_address_{column}" for column in _address_row_key_columns(nearby.address_table_sql)
+    )
     return f"""eligible_geo AS MATERIALIZED (
     SELECT DISTINCT ON (d.npi, a.address_key)
            d.npi AS npi_code,
-           ROUND(
-               CAST(
-                   ST_Distance(
-                       Geography(ST_MakePoint((a.long)::double precision, (a.lat)::double precision)),
-                       Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision)))
-                   ) / 1609.34 AS NUMERIC
-               ),
-               2
-           ) AS distance,
+           a.address_key,
            Geography(ST_MakePoint((a.long)::double precision, (a.lat)::double precision))
                <-> Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision)))
                AS cursor_distance_meters,
-           a.*, d.*
+           {address_key_columns}
       FROM {nearby.address_table_sql} AS a
       JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
      WHERE ST_DWithin(
@@ -175,6 +171,12 @@ def _eligible_geo_cte(
               END ASC,
               {nearby_row_tiebreaker(nearby.address_table_sql)}
 )"""
+
+
+def _address_row_key_columns(address_table_sql: str) -> tuple[str, ...]:
+    if address_table_sql.endswith(".entity_address_unified"):
+        return ("location_key",)
+    return ("checksum", "type")
 
 
 def _selected_geo_cte(import_context: ProviderImportQuery) -> str:
@@ -469,6 +471,7 @@ def _anchor_ctes() -> str:
 def _page_statement(
     common_ctes: str,
     import_context: ProviderImportQuery,
+    nearby: NearbySqlQuery,
     *,
     has_anchor: bool,
 ):
@@ -485,18 +488,51 @@ page_geo AS MATERIALIZED (
       FROM selected_geo{anchor_join}{keyset_clause}
      ORDER BY {order_clause}
      LIMIT :{_PAGE_LIMIT_PARAMETER}
-)
-SELECT page_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display, geo_totals.*
+),
+{_hydrated_geo_cte(import_context, nearby)}
+SELECT hydrated_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display, geo_totals.*
   FROM geo_totals
-  LEFT JOIN page_geo ON TRUE
-  LEFT JOIN mrf.npi_taxonomy AS taxonomy ON page_geo.npi_code = taxonomy.npi
+  LEFT JOIN hydrated_geo ON TRUE
+  LEFT JOIN mrf.npi_taxonomy AS taxonomy ON hydrated_geo.npi_code = taxonomy.npi
   LEFT JOIN mrf.nucc_taxonomy AS nucc
     ON nucc.code = taxonomy.healthcare_provider_taxonomy_code
- ORDER BY page_geo._geo_page_position ASC,
-          page_geo.npi_code ASC,
-          page_geo.address_key ASC""",
+ ORDER BY hydrated_geo._geo_page_position ASC,
+          hydrated_geo.npi_code ASC,
+          hydrated_geo.address_key ASC""",
         import_context,
     )
+
+
+def _hydrated_geo_cte(import_context: ProviderImportQuery, nearby: NearbySqlQuery) -> str:
+    address_key_join = "".join(
+        f"\n       AND a.{column} = page_geo._geo_address_{column}"
+        for column in _address_row_key_columns(nearby.address_table_sql)
+    )
+    import_columns = ""
+    if import_context.prepared.normalized_order_terms:
+        import_columns = ",\n           page_geo._custom_import_entity_value" + "".join(
+            f",\n           page_geo.sort_{ordinal}"
+            for ordinal, _term in enumerate(import_context.prepared.normalized_order_terms)
+        )
+    return f"""hydrated_geo AS MATERIALIZED (
+    SELECT page_geo.npi_code,
+           ROUND(
+               CAST(
+                   ST_Distance(
+                       Geography(ST_MakePoint((a.long)::double precision, (a.lat)::double precision)),
+                       Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision)))
+                   ) / 1609.34 AS NUMERIC
+               ),
+               2
+           ) AS distance,
+           page_geo.cursor_distance_meters,
+           a.*, d.*{import_columns},
+           page_geo._geo_page_position
+      FROM page_geo
+      JOIN {nearby.address_table_sql} AS a
+        ON a.npi = page_geo.npi_code{address_key_join}
+      JOIN mrf.npi AS d ON d.npi = page_geo.npi_code
+)"""
 
 
 def _order_clause(import_context: ProviderImportQuery, alias: str) -> str:

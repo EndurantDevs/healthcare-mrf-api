@@ -7,7 +7,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, replace
 
-from sqlalchemy import and_, inspect, literal
+from sqlalchemy import and_, inspect, literal, select
 
 from db.models.custom_import import CustomImportEntityBinding, CustomImportRootScalar, CustomImportWinner
 from process.custom_import import grouped_child_read as child
@@ -265,10 +265,16 @@ def selected_family_statement(context, plan, *, materialize_default=False, entit
     if plan.selected_value is None:
         latest = _selected_value_relation(context, entity_values)
         if materialize_default:
-            # Bound the unpaged helper join without fencing entity-scoped detail reads.
-            latest = latest.element.cte("selected_entity_value").prefix_with("MATERIALIZED")
-        statement = statement.join(latest, latest.c.entity_binding_id == winner_model.entity_binding_id)
-        selected_value = latest.c.selected_value
+            # Address the guarded helper by its indexed entity key instead of rescanning all entities.
+            selected_value = (
+                select(latest.c.selected_value)
+                .where(latest.c.entity_binding_id == winner_model.entity_binding_id)
+                .correlate(winner_model)
+                .scalar_subquery()
+            )
+        else:
+            statement = statement.join(latest, latest.c.entity_binding_id == winner_model.entity_binding_id)
+            selected_value = latest.c.selected_value
     return statement.where(
         value_expression == selected_value, group_expression.in_(selection.group_values)
     ).add_columns(
@@ -278,10 +284,12 @@ def selected_family_statement(context, plan, *, materialize_default=False, entit
     )
 
 
-def matching_family_statement(context, plan, *, materialize_default=False):
+def matching_family_statement(context, plan, *, materialize_default=False, entity_values=None):
     """Apply predicates to the fixed family set, never to helper selection."""
 
-    statement = selected_family_statement(context, plan, materialize_default=materialize_default)
+    statement = selected_family_statement(
+        context, plan, materialize_default=materialize_default, entity_values=entity_values
+    )
     for predicate in (*plan.context_filters, *plan.filters):
         if predicate.field.collection is None:
             statement = statement.where(core._predicate_condition(predicate, context))
@@ -319,7 +327,9 @@ async def _selected_family_rows(session, context, plan, entity_values):
 
     if not entity_values:
         return ()
-    statement = selected_family_statement(context, plan).where(entity_model.canonical_value.in_(entity_values))
+    statement = selected_family_statement(context, plan, entity_values=entity_values).where(
+        entity_model.canonical_value.in_(entity_values)
+    )
     selected_rows = (await session.execute(statement.limit(len(entity_values) * 2 + 1))).all()
     if len(selected_rows) > len(entity_values) * 2:
         raise core.CustomImportReadUnavailableError("grouped family count exceeds its bound")
@@ -448,7 +458,9 @@ async def hydrate_detail(session, context, request, scope):
         grouped_child_query=request.grouped_child_query,
     )
     plan = normalize_plan(context, query, scope, projection="full_family", use_default_order=False)
-    matching = matching_family_statement(context, plan).where(entity_model.canonical_value == request.entity.value)
+    matching = matching_family_statement(context, plan, entity_values=(request.entity.value,)).where(
+        entity_model.canonical_value == request.entity.value
+    )
     exists = await session.scalar(matching.with_only_columns(literal(1), maintain_column_froms=True).limit(1))
     if exists is None:
         await core.verify_published_generation(session, context.target)

@@ -3,11 +3,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from api import billing_search_http as billing_http
 from api.billing_search_transport_contract import BILLING_SEARCH_TRANSPORT_PATH
+from db import connection
 
 TRUSTED_NOW = "2026-08-07T12:34:56Z"
 SUCCESS_TRANSACTION_EVENTS = [
@@ -38,9 +43,7 @@ class RecordingTransaction:
         return self.session
 
     async def __aexit__(self, exc_type, _exc, _traceback):
-        self.session.events.append(
-            ("transaction_exit", None if exc_type is None else exc_type.__name__)
-        )
+        self.session.events.append(("transaction_exit", None if exc_type is None else exc_type.__name__))
         self.session.active = False
         return False
 
@@ -56,10 +59,38 @@ class RecordingSession:
         self.events.append("transaction_begin")
         return RecordingTransaction(self)
 
+    def in_transaction(self):
+        return self.active
+
     async def execute(self, statement):
         assert self.active
         self.events.append(("execute", str(statement)))
         return object()
+
+
+class RetainedReaderSession(AsyncSession):
+    """Use real transaction state without an engine or database connection."""
+
+    def __init__(self):
+        super().__init__()
+        self.events: list[object] = []
+
+
+@asynccontextmanager
+async def bound_reader(session):
+    """Mirror the current-task ownership established by the Reader middleware."""
+
+    session.info["api_reader_verified"] = True
+    reader_token = connection._READER.set(
+        connection._TransactionBinding(id(connection.db), session, asyncio.current_task())
+    )
+    session_token = connection._SESSION.set(session)
+    try:
+        yield
+    finally:
+        connection._SESSION.reset(session_token)
+        connection._READER.reset(reader_token)
+        session.info.pop("api_reader_verified", None)
 
 
 def make_request(
@@ -119,14 +150,14 @@ def install_authorized_boundary(monkeypatch, events: list[object]):
 
 def install_success_pipeline(
     monkeypatch,
-    session: RecordingSession,
+    session: RecordingSession | RetainedReaderSession,
     endpoint_access: object,
     cursor_keyring: object,
     service_result: object,
 ) -> None:
     async def search(call_session, **kwargs):
         assert call_session is session
-        assert session.active
+        assert session.in_transaction()
         session.events.append("service")
         assert kwargs == {
             "access": endpoint_access,
@@ -136,7 +167,7 @@ def install_success_pipeline(
         return service_result
 
     def shape(call_endpoint_access, call_service_result, **kwargs):
-        assert session.active
+        assert session.in_transaction()
         session.events.append("shape")
         assert call_endpoint_access is endpoint_access
         assert call_service_result is service_result
@@ -149,7 +180,7 @@ def install_success_pipeline(
     original_dumps = billing_http.orjson.dumps
 
     def encode(response_payload_by_field):
-        assert session.active
+        assert session.in_transaction()
         session.events.append("encode")
         return original_dumps(response_payload_by_field)
 

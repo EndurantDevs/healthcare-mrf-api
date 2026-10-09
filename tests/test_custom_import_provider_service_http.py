@@ -288,15 +288,19 @@ async def test_complete_service_page_keeps_per_provider_and_final_wire_bounds(
 
 
 @pytest.mark.asyncio
-async def test_service_read_hydrates_canonical_npi_under_one_signed_snapshot(monkeypatch):
+@pytest.mark.parametrize("include_filter", [False, True])
+async def test_service_inclusion_keeps_native_page_under_one_signed_snapshot(monkeypatch, include_filter):
     session = _Session()
-    _install(monkeypatch, session, page_items=[{"npi": 1104212877, "provider_name": "Synthetic Provider"}])
-    reply = await service_http.serve_custom_import_provider_service(_request(), session)
+    native_provider_by_field = {"npi": 1104212877, "provider_name": "Synthetic Provider", "claims": {"count": 12}}
+    _install(monkeypatch, session, page_items=[native_provider_by_field])
+    reply = await service_http.serve_custom_import_provider_service(
+        _request(_body(include_filter=include_filter)), session
+    )
 
     assert reply.status == 200 and reply.headers["cache-control"] == "private, no-store"
     provider_payload = json.loads(reply.body)
-    assert provider_payload["items"][0]["npi"] == "1104212877"
-    assert provider_payload["items"][0]["custom_import"] == {
+    expected_provider_by_field = {**native_provider_by_field, "npi": "1104212877"}
+    expected_import_by_field = {
         "target": fixtures._TARGET,
         "root_fields": [{"field_id": "metric", "field_type": "integer", "state": "value", "value": 7}],
         "context_fields": [],
@@ -307,6 +311,13 @@ async def test_service_read_hydrates_canonical_npi_under_one_signed_snapshot(mon
             }
         ],
     }
+    if include_filter:
+        expected_provider_by_field["custom_import"] = expected_import_by_field
+    assert provider_payload == {
+        "items": [expected_provider_by_field],
+        "pagination": {"total": 1, "page": 1, "limit": 2, "offset": 0},
+        "query": {"code_system": "CPT", "code": "99213"},
+    }
     assert session.events == [
         "begin",
         "snapshot",
@@ -314,7 +325,7 @@ async def test_service_read_hydrates_canonical_npi_under_one_signed_snapshot(mon
         "resolve",
         "prepare",
         "page",
-        "hydrate",
+        *(["hydrate"] if include_filter else []),
         "finality",
         "end",
     ]
@@ -371,9 +382,10 @@ async def test_order_only_service_page_keeps_unmatched_provider_with_null_import
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["signature", "path", "query", "unknown_native"])
-async def test_invalid_service_permit_does_not_touch_database(monkeypatch, failure):
+@pytest.mark.parametrize("include_filter", [False, True])
+async def test_invalid_service_permit_does_not_touch_database(monkeypatch, failure, include_filter):
     fixtures._install_keyring(monkeypatch)
-    request = _request()
+    request = _request(_body(include_filter=include_filter))
     if failure == "signature":
         request.headers[transport.CUSTOM_IMPORT_READ_SIGNATURE_HEADER] = "A" * 43
     elif failure == "path":
@@ -381,7 +393,12 @@ async def test_invalid_service_permit_does_not_touch_database(monkeypatch, failu
     elif failure == "query":
         request.query_string = "code=99213"
     else:
-        request = _request(_body(native_query={"code_system": "CPT", "code": "99213", "snapshot_id": "untrusted"}))
+        request = _request(
+            _body(
+                native_query={"code_system": "CPT", "code": "99213", "snapshot_id": "untrusted"},
+                include_filter=include_filter,
+            )
+        )
     session = _Session()
     reply = await service_http.serve_custom_import_provider_service(request, session)
     assert reply.status in {400, 403, 404} and session.events == []
@@ -404,11 +421,16 @@ async def test_missing_import_or_bad_native_identity_fails_closed(monkeypatch, i
 
 
 @pytest.mark.asyncio
-async def test_generation_finality_failure_does_not_return_provider_data(monkeypatch):
+@pytest.mark.parametrize("include_filter", [False, True])
+async def test_generation_finality_failure_does_not_return_provider_data(monkeypatch, include_filter):
     session = _Session()
     _install(monkeypatch, session, page_items=[{"npi": 1104212877}], finality_failure=True)
-    reply = await service_http.serve_custom_import_provider_service(_request(), session)
+    reply = await service_http.serve_custom_import_provider_service(
+        _request(_body(include_filter=include_filter)), session
+    )
     assert reply.status == 503 and session.rolled_back
+    assert b'"items"' not in reply.body
+    assert session.events[-2:] == ["finality", "end"]
 
 
 @pytest.mark.parametrize(

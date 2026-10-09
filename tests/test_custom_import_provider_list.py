@@ -212,6 +212,9 @@ async def test_imported_order_page_keeps_native_rows_and_uses_one_transaction(
     assert "LEFT JOIN custom_import_provider_relation AS imported" in page_sql
     assert page_sql.index("LEFT JOIN custom_import_provider_relation AS imported") < page_sql.index("LIMIT :limit")
     assert ("WHERE imported.entity_value IS NOT NULL" in page_sql) is require_match
+    native_eligibility = page_sql.split("SELECT DISTINCT c.npi AS npi", 1)[1].split("AS eligible_npi", 1)[0]
+    assert ("(c.npi)::bigint IN (SELECT CASE" in native_eligibility) is require_match
+    assert ("EXISTS (SELECT 1 FROM custom_import_provider_relation" in native_eligibility) is require_match
     assert "ROW_NUMBER() OVER" in page_sql
     assert "_provider_page_position" in page_sql
     assert "candidate_limit" not in count_parameters
@@ -242,6 +245,7 @@ async def test_imported_filter_page_uses_one_correlated_membership_predicate(
     predicate = "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported"
     assert count_sql.count(predicate) == 1
     assert page_sql.count(predicate) == 1
+    assert "(c.npi)::bigint IN (SELECT CASE" in page_sql
     assert "matching_npis AS MATERIALIZED" in page_sql
     assert set(context.compiled.values) <= set(connection.calls[0][1])
     assert not any("SELECT COUNT(DISTINCT" in call[0] for call in connection.calls)
@@ -419,6 +423,83 @@ async def test_postgres_imported_order_keeps_matched_null_before_absent_native(
 
     assert page == expected_page
     assert matching_total == 3
+
+
+def _postgres_membership_context(direction, require_match, native_npis):
+    values = (
+        ("1000000002", None),
+        ("1000000003", 7),
+        ("1000000004", 7),
+        ("1000000005", 2),
+        ("1000000006", 9),
+        ("1000000010", 10),
+        ("0123456789", 20),
+        ("0000000000", 20),
+        ("malformed", 20),
+        ("9999999999999999999999999", 20),
+    )
+    statements = [
+        select(literal(entity).label("entity_value"), literal(score, type_=Integer()).label("sort_0"))
+        for entity, score in values
+    ]
+    relation = statements[0].union_all(*statements[1:])
+    prepared = PreparedNpiEntityRelation(
+        relation, (ReadOrderTerm("synthetic_rank", direction, "last"),), "a" * 64, "b" * 64
+    )
+    return ProviderImportQuery(prepared, compile_npi_entity_relation(relation), require_match, native_npis)
+
+
+def _postgres_membership_statements(context, predicate):
+    native = """native(npi, inferred_npi, visible) AS (VALUES
+        (1000000001::bigint, NULL::bigint, TRUE), (NULL, 1000000002, TRUE),
+        (1000000002, NULL, TRUE), (1000000003, NULL, TRUE),
+        (1000000004, NULL, TRUE), (1000000005, NULL, TRUE),
+        (1000000006, NULL, FALSE), (123456789, NULL, TRUE), (0, NULL, TRUE)
+    )"""
+    eligible = "SELECT DISTINCT COALESCE(c.npi, c.inferred_npi) AS npi FROM native AS c WHERE c.visible"
+    if predicate:
+        eligible += f" AND {predicate}"
+    count_page, page = provider_list_sql_module._provider_import_count_page(eligible, context)
+    prefix = f"WITH {npi_module._provider_import_relation_cte(context)}, {native}, "
+    page_statement = npi_module._provider_list_statement(
+        prefix + count_page + f", page_npis AS ({page}) "
+        "SELECT page_npis.npi, provider_totals._provider_total "
+        "FROM provider_totals LEFT JOIN page_npis ON TRUE ORDER BY page_npis._provider_page_position",
+        context,
+    )
+    count_statement = npi_module._provider_list_statement(
+        prefix + f"eligible_npis AS ({eligible}) SELECT COUNT(*) FROM eligible_npis", context
+    )
+    return page_statement, count_statement
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ("asc", "desc"))
+async def test_postgres_required_membership_pushdown_preserves_exact_count_and_pages(direction):
+    native_npi_sql = "COALESCE(c.npi, c.inferred_npi)"
+    matched_npis = [1000000005, 1000000003, 1000000004, 1000000002]
+    if direction == "desc":
+        matched_npis = [1000000003, 1000000004, 1000000005, 1000000002]
+    async with transaction_session() as session:
+        for require_match in (False, True):
+            for native_npis in (None, (1000000001, 1000000002, 1000000004, 1000000006)):
+                context = _postgres_membership_context(direction, require_match, native_npis)
+                expected_npis = matched_npis + ([] if require_match else [0, 123456789, 1000000001])
+                if native_npis is not None:
+                    expected_npis = [npi for npi in expected_npis if npi in native_npis]
+                predicate = npi_module._provider_import_match_clause(context, native_npi_sql)
+                page, direct_count = _postgres_membership_statements(context, predicate)
+                legacy_scope = None if native_npis is None else f"({native_npi_sql}) = ANY(:__native_batch_npis)"
+                legacy_page, _ = _postgres_membership_statements(context, legacy_scope)
+                assert await session.scalar(direct_count, npi_module._provider_list_parameters({}, context)) == len(
+                    expected_npis
+                )
+                for start in (0, 2, 50):
+                    parameters = npi_module._provider_list_parameters({"start": start, "limit": 2}, context)
+                    rows = (await session.execute(page, parameters)).all()
+                    assert rows == (await session.execute(legacy_page, parameters)).all()
+                    assert [row.npi for row in rows if row.npi is not None] == expected_npis[start : start + 2]
+                    assert all(row._provider_total == len(expected_npis) for row in rows)
 
 
 class _PostgresConnectionProxy:

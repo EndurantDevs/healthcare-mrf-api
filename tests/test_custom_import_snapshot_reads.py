@@ -100,7 +100,10 @@ def test_grouped_helper_child_predicates_and_order_keep_the_pinned_family(family
     prepared = grouped_read.prepare_relation(context, query, _SCOPE)
     sql = _assert_routing(prepared.statement, family_id)
     schema = "mrf" if family_id is None else snapshot_schema(family_id)
-    assert ("selected_entity_value AS MATERIALIZED" in sql) is (period is None)
+    assert "selected_entity_value AS MATERIALIZED" not in sql
+    assert (
+        f"WHERE selected_entity_value.entity_binding_id = {schema}.custom_import_winner.entity_binding_id" in sql
+    ) is (period is None)
     plan = grouped_read.normalize_plan(context, query, _SCOPE)
     detail_sql = _assert_routing(grouped_read.selected_family_statement(context, plan), family_id)
     assert "MATERIALIZED" not in detail_sql

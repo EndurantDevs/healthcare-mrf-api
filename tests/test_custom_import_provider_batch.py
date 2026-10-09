@@ -196,7 +196,8 @@ def test_signed_batch_retains_original_native_bounds():
             batch._parse_batch_request(_body(native_batch={**native_batch, field: value}))
 
 
-def test_requested_npi_scope_is_typed_and_keeps_optional_imports():
+@pytest.mark.parametrize("require_match", (False, True))
+def test_requested_npi_scope_is_typed_and_keeps_optional_imports(require_match):
     prepared = PreparedNpiEntityRelation(
         select(literal("9000000000").label("entity_value"), literal(3).label("sort_0")),
         (ReadOrderTerm("score", "desc", "last"),),
@@ -204,10 +205,12 @@ def test_requested_npi_scope_is_typed_and_keeps_optional_imports():
         "c" * 64,
     )
     context = ProviderImportQuery(
-        prepared, compile_npi_entity_relation(prepared.statement), False, (9000000000, 9000000001)
+        prepared, compile_npi_entity_relation(prepared.statement), require_match, (9000000000, 9000000001)
     )
     clause = provider_list_sql._provider_import_match_clause(context, "c.npi")
-    assert clause == "(c.npi) = ANY(:__native_batch_npis)" and "EXISTS" not in clause
+    assert clause.startswith("(c.npi) = ANY(:__native_batch_npis)")
+    assert "IN (SELECT CASE" not in clause
+    assert ("EXISTS" in clause) is require_match
     statement = provider_list_sql._provider_list_statement(
         "SELECT 1 WHERE " + clause, None, native_npis=context.native_npis
     )
