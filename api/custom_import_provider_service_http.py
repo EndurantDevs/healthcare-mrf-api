@@ -109,10 +109,16 @@ async def _prepare_service_snapshot(session, native_args):
 
 
 async def _read_service_payload(request, session, parsed, verified):
+    from api.endpoint.pricing import _parse_int
+
     pinned_target = await transport._resolve_pinned_target(session, parsed.target)
     service = CustomImportReadService(authorizer=transport._TransportAuthorizer(verified, pinned_target))
     authorization = ExtensionReadAuthorization(verified.credential)
-    query = _provider_relation_query(parsed, require_exact_context=parsed.grouped_entity_selection is None)
+    query = _provider_relation_query(
+        parsed,
+        require_exact_context=parsed.grouped_entity_selection is None,
+        native_npi=_parse_int(parsed.native_args.get("npi") or None, "npi", minimum=1),
+    )
     prepared = await service.prepare_npi_entity_relation(
         session,
         authorization=authorization,

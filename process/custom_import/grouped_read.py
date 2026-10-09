@@ -65,6 +65,8 @@ def normalize_plan(context, query, scope, *, projection="query_projection", use_
     """Normalize aliases without allowing metrics to influence the selected value."""
 
     selection = _verified_descriptor(context, query.grouped_entity_selection)
+    if query.entity_values is not None:
+        core._validate_npi_page(query.entity_values)
     if type(query.require_match) is not bool or type(query.require_exact_context) is not bool:
         raise core.CustomImportReadRequestError("imported membership mode is invalid")
     child_key = child.verified_child_key(context, query.grouped_child_query)
@@ -184,6 +186,8 @@ def _query_fingerprint(context, query, selectors, metrics, order, selected_value
         "authorization_scope_sha256": core._scope_digest(scope),
     }
     domain = b"custom-import-grouped-read/v1\0"
+    if query.entity_values is not None:
+        descriptor_map["entity_values"] = sorted(query.entity_values)
     if query.grouped_child_query is not None:
         descriptor_map["grouped_child_query"] = query.grouped_child_query
         domain = b"custom-import-grouped-child-read/v1\0"
@@ -214,7 +218,7 @@ def _profile_context_digest(context, profile_id, scalar_values):
     )
 
 
-def _selected_value_relation(context):
+def _selected_value_relation(context, entity_values=None):
     """Address the helper's empty-context winner without panel or metric filters."""
 
     winner_model = context.model(CustomImportWinner)
@@ -229,6 +233,8 @@ def _selected_value_relation(context):
     statement, value = _join_root_scalar(
         core._filtered_npi_winner_statement(helper, ()), helper, field, prefix="helper"
     )
+    if entity_values is not None:
+        statement = statement.where(context.model(CustomImportEntityBinding).canonical_value.in_(entity_values))
     return (
         statement.where(
             winner_model.context_key_sha256 == _profile_context_digest(context, selection.default_profile, {})
@@ -242,7 +248,7 @@ def _selected_value_relation(context):
     )
 
 
-def selected_family_statement(context, plan, *, materialize_default=False):
+def selected_family_statement(context, plan, *, materialize_default=False, entity_values=None):
     """Retain all configured groups at one independently resolved entity value."""
 
     winner_model = context.model(CustomImportWinner)
@@ -251,11 +257,13 @@ def selected_family_statement(context, plan, *, materialize_default=False):
     selection = context.definition.query.entity_selection
     fields = context.definition.fields_by_id
     statement = core._filtered_npi_winner_statement(context, ())
+    if entity_values is not None:
+        statement = statement.where(entity_model.canonical_value.in_(entity_values))
     statement, value_expression = _join_root_scalar(statement, context, fields[selection.field_id])
     statement, group_expression = _join_root_scalar(statement, context, fields[selection.group_field_id])
     selected_value = literal(plan.selected_value)
     if plan.selected_value is None:
-        latest = _selected_value_relation(context)
+        latest = _selected_value_relation(context, entity_values)
         if materialize_default:
             # Bound the unpaged helper join without fencing entity-scoped detail reads.
             latest = latest.element.cte("selected_entity_value").prefix_with("MATERIALIZED")
@@ -296,7 +304,7 @@ def prepare_relation(context, query, scope):
 
     plan = normalize_plan(context, query, scope)
     return core.PreparedNpiEntityRelation(
-        relation_statement(context, plan),
+        relation_statement(context, plan, query.entity_values),
         plan.order_terms,
         plan.fingerprint,
         core._scope_digest(scope),

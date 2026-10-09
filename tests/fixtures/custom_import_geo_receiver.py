@@ -27,8 +27,11 @@ def _guard(event, args):
 sys.addaudithook(_guard)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from sqlalchemy.dialects import postgresql
+
 from api import custom_import_provider_geo as geo
 from api import custom_import_read_http as transport
+from db.models.custom_import import CustomImportGeneration
 from process.custom_import import publication, read_core
 from process.custom_import.definition import CustomImportDefinition, canonical_json, canonical_sha256
 from tests.test_custom_import_provider_geo_sql import _geo_row
@@ -53,6 +56,7 @@ def _result(rows):
     return SimpleNamespace(
         all=lambda: rows,
         one_or_none=lambda: rows[0] if rows else None,
+        scalar_one=lambda: scalars[0],
         scalar_one_or_none=lambda: scalars[0] if scalars else None,
         scalars=lambda: SimpleNamespace(all=lambda: scalars, first=lambda: scalars[0] if scalars else None),
     )
@@ -65,6 +69,12 @@ class SyntheticSession(_Session):
         super().__init__()
         self.target = target
 
+    async def connection(self):
+        return SimpleNamespace(
+            dialect=postgresql.dialect(),
+            sync_connection=SimpleNamespace(get_execution_options=lambda: {}),
+        )
+
     async def execute(self, statement, parameters=None):
         """Implement the session protocol with synthetic persisted result rows."""
         query_sql = str(statement)
@@ -72,6 +82,8 @@ class SyntheticSession(_Session):
             return SimpleNamespace(one_or_none=lambda: SimpleNamespace(timeout_text="0", timeout_milliseconds=0))
         if query_sql == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY":
             return _result([])
+        if ".resolve_custom_import_generation_snapshot(" in query_sql:
+            return self._generation_snapshot_result(query_sql, parameters)
         if "SELECT COUNT(*) AS anchor_count" in query_sql:
             return SimpleNamespace(all=lambda: [SimpleNamespace(_mapping={"anchor_count": 1})])
         if "SELECT COUNT(*) AS total_count" in query_sql:
@@ -85,9 +97,26 @@ class SyntheticSession(_Session):
                 for index, npi in enumerate(_NPIS)
                 if index >= start
             ]
+            for row in rows:
+                row._mapping.update(_geo_total=len(_NPIS), _geo_anchor_count=1)
             return SimpleNamespace(all=lambda: rows[: parameters["__custom_import_geo_page_limit"]])
 
         return self._persisted_result_rows(statement)
+
+    def _generation_snapshot_result(self, query_sql, parameters):
+        schema = postgresql.dialect().identifier_preparer.quote_schema(CustomImportGeneration.__table__.schema)
+        assert query_sql == (
+            f"SELECT {schema}.resolve_custom_import_generation_snapshot("
+            "CAST(:generation_id AS bigint), CAST(:dataset_id AS bigint), "
+            "CAST(:definition_revision_id AS bigint), CAST(:schema_revision_id AS bigint))"
+        )
+        assert parameters == {
+            "generation_id": self.target["generation_id"],
+            "dataset_id": 11,
+            "definition_revision_id": self.target["definition_revision_id"],
+            "schema_revision_id": self.target["schema_revision_id"],
+        }
+        return _result([(None,)])
 
     def _persisted_result_rows(self, statement):
         """Return synthetic metadata or identity rows for the requested query."""

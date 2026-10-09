@@ -57,6 +57,7 @@ def _body(**changes):
         "filters": [],
         "order": [{"field_id": "metric", "direction": "desc"}],
         "require_match": False,
+        "include_filter": True,
     }
     request_document_by_name.update(changes)
     return transport._canonical_json_bytes(request_document_by_name)

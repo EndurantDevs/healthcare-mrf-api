@@ -10,7 +10,8 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import BigInteger, bindparam, text
+from sqlalchemy.dialects.postgresql import ARRAY
 
 from api.custom_import_provider_sql import ProviderImportQuery, merge_native_params
 from db.connection import ConnectionProxy
@@ -265,10 +266,12 @@ async def _provider_list_connection(
     database: Any,
     import_context: ProviderImportQuery | None,
     request_session: Any,
+    *,
+    native_npis=None,
 ):
     """Reuse the signed request transaction only for imported provider reads."""
 
-    if import_context is None:
+    if import_context is None and native_npis is None:
         async with database.acquire() as connection:
             yield connection
         return
@@ -303,26 +306,37 @@ def _provider_import_relation_cte(
 def _provider_import_membership_clause(
     import_context: ProviderImportQuery | None,
     provider_npi_sql: str,
+    *,
+    native_npis=None,
 ) -> str | None:
     """Return the imported-membership predicate for exact matching counts."""
 
-    if import_context is None or not import_context.require_match:
-        return None
-    return (
-        "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported "
-        f"WHERE imported.entity_value = ({provider_npi_sql})::text)"
-    )
+    if native_npis is None and import_context is not None:
+        native_npis = import_context.native_npis
+    predicates = []
+    if native_npis is not None:
+        predicates.append(f"({provider_npi_sql}) = ANY(:__native_batch_npis)")
+    if import_context is not None and import_context.require_match:
+        predicates.append(
+            "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported "
+            f"WHERE imported.entity_value = ({provider_npi_sql})::text)"
+        )
+    return " AND ".join(predicates) or None
 
 
 def _provider_import_match_clause(
     import_context: ProviderImportQuery | None,
     provider_npi_sql: str,
+    *,
+    native_npis=None,
 ) -> str | None:
     """Return the one correlated predicate used by filter-only requests."""
 
-    if import_context is None or import_context.prepared.normalized_order_terms:
+    if import_context is not None and (
+        import_context.prepared.normalized_order_terms and import_context.native_npis is None and native_npis is None
+    ):
         return None
-    return _provider_import_membership_clause(import_context, provider_npi_sql)
+    return _provider_import_membership_clause(import_context, provider_npi_sql, native_npis=native_npis)
 
 
 def _provider_import_order_clause(
@@ -362,20 +376,35 @@ def _provider_import_count_page(eligible_sql, import_context, *, native_order="O
     return ctes, page
 
 
-def _provider_list_statement(sql: str, import_context: ProviderImportQuery | None):
+def _provider_list_statement(sql: str, import_context: ProviderImportQuery | None, *, native_npis=None):
     statement = text(sql)
     if import_context is not None:
         statement = statement.bindparams(*import_context.compiled.typed_binds)
+        if native_npis is None:
+            native_npis = import_context.native_npis
+    if native_npis is not None and ":__native_batch_npis" in sql:
+        statement = statement.bindparams(bindparam("__native_batch_npis", type_=ARRAY(BigInteger)))
     return statement
 
 
 def _provider_list_parameters(
     parameters_by_name: Mapping[str, object],
     import_context: ProviderImportQuery | None,
+    *,
+    native_npis=None,
 ) -> dict[str, object]:
-    if import_context is None:
-        return dict(parameters_by_name)
-    return merge_native_params(parameters_by_name, import_context.compiled)
+    merged = (
+        dict(parameters_by_name)
+        if import_context is None
+        else merge_native_params(parameters_by_name, import_context.compiled)
+    )
+    if native_npis is None and import_context is not None:
+        native_npis = import_context.native_npis
+    if native_npis is not None:
+        if "__native_batch_npis" in merged:
+            raise ValueError("native batch SQL parameters collide")
+        merged["__native_batch_npis"] = list(native_npis)
+    return merged
 
 
 def _extract_name_filters(request, *, args=None) -> list[str]:
