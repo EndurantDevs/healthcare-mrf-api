@@ -21,9 +21,6 @@ from db.models.custom_import import (
     CustomImportBuildAttempt as Build,
 )
 from db.models.custom_import import (
-    CustomImportBuildCandidateContext as Context,
-)
-from db.models.custom_import import (
     CustomImportBuildFamily as Plan,
 )
 from db.models.custom_import import (
@@ -34,9 +31,6 @@ from db.models.custom_import import (
 )
 from db.models.custom_import import (
     CustomImportChildRevision as Child,
-)
-from db.models.custom_import import (
-    CustomImportChildScalar as Scalar,
 )
 from db.models.custom_import import (
     CustomImportFamilyChild as Member,
@@ -510,26 +504,27 @@ def _logical_child_groups(rows, states):
 def _source_projections(request, registry, group):
     collection_names_by_slot = {slot: name for name, slot in registry.child_collection_slots.items()}
     fields = fields_by_collection(request.definition)
-    projections = []
+    edges, scalars, contexts = [], [], []
     for child in group.children:
         collection = collection_names_by_slot[child.collection_slot]
         values = payload_values(fields[collection], child.canonical_payload, label="build child payload")
         verify_stored_child(request, group.state.source.record, StoredCandidateChild(collection, child, values))
         if digest_text("child-payload", child.canonical_payload) != bytes(child.payload_sha256):
             raise CandidateRunnerError("build child payload digest differs")
-        projections.extend(
-            graph._child_models(
-                request,
-                registry,
-                group.state.current.build_id,
-                group.state.family,
-                group.state.source.values,
-                child,
-                values,
-                collection,
-            )
+        edge, child_scalars, child_contexts = graph._child_projection_values(
+            request,
+            registry,
+            group.state.current.build_id,
+            group.state.family,
+            group.state.source.values,
+            child,
+            values,
+            collection,
         )
-    return projections
+        edges.append(edge)
+        scalars.extend(child_scalars)
+        contexts.extend(child_contexts)
+    return edges, scalars, contexts
 
 
 def _child_arguments(request, registry, groups):
@@ -554,12 +549,13 @@ def _child_arguments(request, registry, groups):
             *_transpose(encoded_rows, 9, 13, arrays=True),
             ("integer[]", (len(child_roots),)),
         )
-    projections = [
-        projection_model for group in groups for projection_model in _source_projections(request, registry, group)
-    ]
-    graph._page_cost(request, projections, reserved_rows=2 * len(child_roots))
-    scalars = [projection_model for projection_model in projections if isinstance(projection_model, Scalar)]
-    contexts = [projection_model for projection_model in projections if isinstance(projection_model, Context)]
+    edges, scalars, contexts = [], [], []
+    for group in groups:
+        group_edges, group_scalars, group_contexts = _source_projections(request, registry, group)
+        edges.extend(group_edges)
+        scalars.extend(group_scalars)
+        contexts.extend(group_contexts)
+    graph._page_cost(request, (), reserved_rows=2 * len(child_roots), projection_values=(*edges, *scalars, *contexts))
     return "append_custom_import_build_source_families_page", (
         ("bigint", current.build_id),
         ("bigint", request.execution_id),
@@ -578,13 +574,10 @@ def _child_arguments(request, registry, groups):
         ),
         ("bigint[]", child_roots),
         ("bigint[]", tuple(child.child_revision_id for group in groups for child in group.children)),
-        *(
-            (kind, tuple(getattr(projection_model, field) for projection_model in scalars))
-            for kind, field in _SCALAR_COLUMNS
-        ),
-        ("bigint[]", tuple(projection_model.context_child_revision_id for projection_model in contexts)),
-        ("smallint[]", tuple(projection_model.profile_slot for projection_model in contexts)),
-        ("text[]", tuple(projection_model.canonical_context_key for projection_model in contexts)),
+        *((kind, tuple(projection[field] for projection in scalars)) for kind, field in _SCALAR_COLUMNS),
+        ("bigint[]", tuple(context["context_child_revision_id"] for context in contexts)),
+        ("smallint[]", tuple(context["profile_slot"] for context in contexts)),
+        ("text[]", tuple(context["canonical_context_key"] for context in contexts)),
         ("integer[]", (len(child_roots),)),
     )
 

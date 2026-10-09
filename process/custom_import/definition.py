@@ -144,7 +144,9 @@ def _json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return object_by_key
 
 
-def _validate_wire_value(value: Any, *, depth: int = 0, nodes: list[int] | None = None) -> Any:
+def _validate_wire_value(
+    value: Any, *, depth: int = 0, nodes: list[int] | None = None, copy_containers: bool = True
+) -> Any:
     if nodes is None:
         nodes = [0]
     nodes[0] += 1
@@ -155,10 +157,18 @@ def _validate_wire_value(value: Any, *, depth: int = 0, nodes: list[int] | None 
     if isinstance(value, float):
         raise DefinitionError("definitions cannot contain floating-point values")
     if isinstance(value, list):
+        if not copy_containers:
+            for item in value:
+                _validate_wire_value(item, depth=depth + 1, nodes=nodes, copy_containers=False)
+            return value
         return [_validate_wire_value(item, depth=depth + 1, nodes=nodes) for item in value]
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise DefinitionError("definition object keys must be strings")
+        if not copy_containers:
+            for item in value.values():
+                _validate_wire_value(item, depth=depth + 1, nodes=nodes, copy_containers=False)
+            return value
         return {key: _validate_wire_value(item, depth=depth + 1, nodes=nodes) for key, item in value.items()}
     raise DefinitionError("definitions must contain JSON-compatible values only")
 
