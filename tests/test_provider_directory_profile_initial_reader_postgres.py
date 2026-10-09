@@ -50,7 +50,11 @@ async def _reader_fixture(engine, monkeypatch):
         )
         await database.status(f'CREATE TABLE "{_SCHEMA}".callback_marker (marker integer)')
         initial_targets = await initial.capture_targets(fhir, _SCHEMA)
-    admission = replace(cutover["admission"], admitted_identity=SimpleNamespace(initial_targets=initial_targets))
+    admission = replace(
+        cutover["admission"],
+        admitted_identity=SimpleNamespace(initial_targets=initial_targets),
+        initial_wal_lsn=await database.scalar("SELECT pg_current_wal_insert_lsn()::text"),
+    )
     # The existing fixture seeds authority and ready checkpoints, without runtime admission.
     monkeypatch.setattr(fhir, "_admission_database_guard", AsyncMock())
     monkeypatch.setattr(fhir, "_assert_provider_directory_profile_checkpoint_ready", AsyncMock())
