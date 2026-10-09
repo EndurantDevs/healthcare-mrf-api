@@ -169,6 +169,15 @@ def test_projection_preserves_scalar_states_and_native_columns(definition):
     assert isinstance(models[-1], CustomImportChildScalar)
     assert models[-1].value_state == "null"
     assert models[-1].decimal_value is None
+    projection_rows = materialization_module._scalar_projection_values(
+        definition,
+        root_scalars=root_scalars,
+        child_scalars=child_scalars,
+        child_collection_slots={"rates": 7},
+    )
+    assert projection_rows == tuple(
+        {column.name: getattr(model, column.name) for column in model.__table__.columns} for model in models
+    )
     for projection, model in zip((*root_scalars, *child_scalars), models, strict=True):
         to_values = (
             materialization_module._root_scalar_values
@@ -1022,8 +1031,12 @@ def test_projection_row_validation_rejects_invalid_rows_and_owners(definition):
     )
 
     for invalid in invalid_cases:
-        with pytest.raises(ScalarProjectionError):
-            scalar_projection_models(definition, **invalid)
+        failures = []
+        for encode in (scalar_projection_models, materialization_module._scalar_projection_values):
+            with pytest.raises(ScalarProjectionError) as failure:
+                encode(definition, **invalid)
+            failures.append((type(failure.value), str(failure.value)))
+        assert failures[0] == failures[1]
 
 
 def test_projection_validation_rejects_each_binding_mismatch(definition):

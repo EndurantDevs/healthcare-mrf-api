@@ -27,6 +27,7 @@ pytestmark = [
 ]
 _PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20261005080000_custom_import_writer_cutover.py"
 _REFRESH_PATH = _PATH.with_name("20261007000000_custom_import_rejection_anti_joins.py")
+_CHILD_PRESENCE_PATH = _PATH.with_name("20261009000000_custom_import_child_presence_decode.py")
 
 
 def _record_role(name, schema, phase):
@@ -46,6 +47,13 @@ def _install(connection, schema):
 
 def _refresh(connection, schema):
     migration = _migration(_REFRESH_PATH, "rejection_anti_join_native")
+    migration._schema = lambda: schema
+    migration.op = Operations(MigrationContext.configure(connection))
+    migration.upgrade()
+
+
+def _refresh_child_presence(connection, schema):
+    migration = _migration(_CHILD_PRESENCE_PATH, "child_presence_independent_native")
     migration._schema = lambda: schema
     migration.op = Operations(MigrationContext.configure(connection))
     migration.upgrade()
@@ -388,13 +396,76 @@ async def _assert_cross_schema_writers_rejected(connection, control_schema, inde
         assert await _function_acls(connection, independent_schema) == previous_acls
 
 
-@pytest.mark.parametrize("corrected", (False, True), ids=("historical", "corrected"))
-async def test_native_cutover_preserves_independent_schema_and_closes_cross_schema_callers(corrected):
+async def _assert_independent_installer_drift_closed(
+    connection, control_schema, independent_schema, worker, previous_acls
+):
+    """Unknown bodies may be blocked callers, but never remain callable by nonowners."""
+    migration = _migration(_CHILD_PRESENCE_PATH, "child_presence_independent_drift")
+    statement = migration._installer(migration._bulk(), independent_schema, corrected=True)
+    header, body, suffix = statement.split("$bulk_snapshot$")
+    changed = header.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION", 1)
+    changed += "$bulk_snapshot$" + body + "\n-- synthetic body drift\n$bulk_snapshot$" + suffix
+    identity = f'"{independent_schema}".install_custom_import_snapshot_writers(bigint)'
+    anchor = (
+        f'"{independent_schema}".begin_custom_import_build('
+        "bigint,bigint,bytea,bigint,bigint,boolean,integer,bigint,integer,timestamptz)"
+    )
+    before = await _validator_state(connection, identity)
+    anchor_before = await _validator_state(connection, anchor)
+    control_owner = await connection.scalar(
+        text("SELECT proowner FROM pg_proc WHERE oid=to_regprocedure(:identity)"),
+        {"identity": anchor.replace(independent_schema, control_schema, 1)},
+    )
+    assert before.proowner == anchor_before.proowner != control_owner
+    async with connection.begin_nested() as transaction:
+        await connection.execute(text(changed))
+        await connection.execute(text(f'GRANT EXECUTE ON FUNCTION {identity} TO "{worker}"'))
+        assert await connection.scalar(
+            text("SELECT has_function_privilege(:role,:identity,'EXECUTE')"),
+            dict(role=worker, identity=identity),
+        )
+        await connection.run_sync(_install, control_schema)
+        closed = await _validator_state(connection, identity)
+        assert closed.prosrc == body + "\n-- synthetic body drift\n"
+        assert closed.prosrc != before.prosrc
+        assert closed[:2] == before[:2] and closed[4:] == before[4:]
+        assert not await connection.scalar(
+            text(
+                "SELECT EXISTS(SELECT 1 FROM pg_proc p,"
+                "LATERAL aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) acl "
+                "WHERE p.oid=to_regprocedure(:identity) AND acl.grantee<>p.proowner)"
+            ),
+            {"identity": identity},
+        )
+        assert not await connection.scalar(
+            text("SELECT has_function_privilege(:role,:identity,'EXECUTE')"),
+            dict(role=worker, identity=identity),
+        )
+        anchor_after = await _validator_state(connection, anchor)
+        assert anchor_after[:2] == anchor_before[:2] and anchor_after[3:] == anchor_before[3:]
+        async with connection.begin_nested() as role_transaction:
+            await connection.execute(text(f'SET LOCAL ROLE "{worker}"'))
+            await _assert_denied(connection, f"SELECT {identity.replace('(bigint)', '(1)')}")
+            await role_transaction.rollback()
+        await transaction.rollback()
+    assert await _validator_state(connection, identity) == before
+    assert await _validator_state(connection, anchor) == anchor_before
+    assert await _function_acls(connection, independent_schema) == previous_acls
+
+
+@pytest.mark.parametrize(
+    "corrected,decoded",
+    ((False, False), (True, False), (True, True)),
+    ids=("historical", "corrected", "child-presence"),
+)
+async def test_native_cutover_preserves_independent_schema_and_closes_cross_schema_callers(corrected, decoded):
     async with _before_cutover(roles=True) as (case, (independent_owner, worker)), _before_cutover() as (other, _roles):
         async with case.engine.begin() as connection:
             if corrected:
                 await connection.run_sync(_install, other.schema_name)
                 await connection.run_sync(_refresh, other.schema_name)
+            if decoded:
+                await connection.run_sync(_refresh_child_presence, other.schema_name)
             preserved, blocked = await _independent_surface(
                 connection, case.schema_name, other.schema_name, corrected=corrected
             )
@@ -409,6 +480,10 @@ async def test_native_cutover_preserves_independent_schema_and_closes_cross_sche
             }
             await _assert_independent_anchor_drift_rejected(connection, case.schema_name, other.schema_name, before)
             await _assert_cross_schema_writers_rejected(connection, case.schema_name, other.schema_name, before)
+            if decoded:
+                await _assert_independent_installer_drift_closed(
+                    connection, case.schema_name, other.schema_name, worker, before
+                )
             await connection.run_sync(_install, case.schema_name)
             after = await _function_acls(connection, other.schema_name)
             assert after.keys() == before.keys()

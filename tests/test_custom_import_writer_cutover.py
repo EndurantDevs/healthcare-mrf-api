@@ -156,7 +156,7 @@ def test_independent_receipts_render_exact_current_and_retained_definitions(monk
     monkeypatch.setattr(migration.op, "get_bind", lambda: connection)
     receipts = migration._independent_reviewed_functions("synthetic_control")
     previous = migration._reviewed_functions("synthetic_other", include_obsolete=True)
-    assert receipts[:-1] == previous
+    assert receipts[:-2] == previous
     correction = migration._previous("20261007000000_custom_import_rejection_anti_joins")
     body = " " + correction._body(correction._finality(), "synthetic_other", corrected=True) + " "
     validator = next(
@@ -164,8 +164,20 @@ def test_independent_receipts_render_exact_current_and_retained_definitions(monk
         for receipt in previous
         if receipt["identity"].endswith(".verify_custom_import_snapshot_structure(bigint)")
     )
-    assert receipts[-1] == {**validator, "body_sha256": migration.hashlib.sha256(body.encode()).hexdigest()}
-    assert receipts[-1]["body_sha256"] != validator["body_sha256"]
+    assert receipts[-2] == {**validator, "body_sha256": migration.hashlib.sha256(body.encode()).hexdigest()}
+    assert receipts[-2]["body_sha256"] != validator["body_sha256"]
+    child_presence = migration._previous("20261009000000_custom_import_child_presence_decode")
+    installer = next(
+        receipt
+        for receipt in previous
+        if receipt["identity"].endswith(".install_custom_import_snapshot_writers(bigint)")
+    )
+    body = child_presence._installer(child_presence._bulk(), "synthetic_other", corrected=True).split(
+        "$bulk_snapshot$"
+    )[1]
+    assert receipts[-1] == {**installer, "body_sha256": migration.hashlib.sha256(body.encode()).hexdigest()}
+    assert receipts[-1]["body_sha256"] != installer["body_sha256"]
+    assert installer in receipts
     by_identity = {receipt["identity"]: receipt for receipt in receipts}
     assert all(f'"synthetic_other".{signature}' in by_identity for signature in migration._OBSOLETE)
     assert all(receipt["language"] in ("sql", "plpgsql") for receipt in receipts)

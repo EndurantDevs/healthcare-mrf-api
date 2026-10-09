@@ -459,6 +459,32 @@ class _PreparedRow:
 
 def _prepare_row(request: SourceBuildRequest, stream: SourceStream, record_values: Mapping) -> _PreparedRow:
     definition = request.definition
+    fields, root_key, code = _source_row_shape(definition, stream, record_values)
+    raw = raw_family_key_evidence(root_key, maximum_canonical_bytes=request.page_byte_limit)
+    typed = root_key_evidence_from_tuple(definition, root_key)
+    if code is None and typed is None:
+        code = "field_type_invalid"
+    canonical_payload = payload_hash = child_key = child_hash = rejection = None
+    if code is None:
+        canonical_payload = record_payload(fields, record_values)
+        payload_hash = digest_text(f"{stream.record_kind}-payload", canonical_payload)
+        if stream.record_kind == "child":
+            child_key = child_key_document(definition, stream.child_collection, record_values)
+            child_hash = digest_text("child-key", child_key)
+    else:
+        rejection = rejection_model(
+            request,
+            LeaseGrant(request.execution_id, request.fence, request.build_deadline_at, "running"),
+            0,
+            FamilyRejection(root_key, code),
+        )
+    return _finish_prepared_row(
+        request, stream, raw, typed, (canonical_payload, payload_hash, child_key, child_hash), rejection
+    )
+
+
+def _source_row_shape(definition, stream, record_values):
+    """Keep the complete record/key rejection order shared by both encoders."""
     fields = tuple(field for field in definition.fields if field.collection == stream.child_collection)
     fields_by_id = {field.field_id: field for field in fields}
     root_key = None
@@ -481,26 +507,14 @@ def _prepare_row(request: SourceBuildRequest, stream: SourceStream, record_value
             code = "child_key_missing"
         if code is None and _canonical_child_key(collection, key, fields_by_id) is None:
             code = "field_type_invalid"
-    raw = raw_family_key_evidence(root_key, maximum_canonical_bytes=request.page_byte_limit)
-    typed = root_key_evidence_from_tuple(definition, root_key)
-    if code is None and typed is None:
-        code = "field_type_invalid"
-    canonical_payload = payload_hash = child_key = child_hash = rejection = None
-    if code is None:
-        canonical_payload = record_payload(fields, record_values)
-        payload_hash = digest_text(f"{stream.record_kind}-payload", canonical_payload)
-        if stream.record_kind == "child":
-            child_key = child_key_document(definition, stream.child_collection, record_values)
-            child_hash = digest_text("child-key", child_key)
-    else:
-        rejection = rejection_model(
-            request,
-            LeaseGrant(request.execution_id, request.fence, request.build_deadline_at, "running"),
-            0,
-            FamilyRejection(root_key, code),
-        )
+    return fields, root_key, code
+
+
+def _finish_prepared_row(request, stream, raw, typed, documents, rejection):
+    """Charge the same complete canonical documents after either serializer."""
+    canonical_payload, payload_hash, child_key, child_hash = documents
     texts = [None if raw is None else raw[0], None if typed is None else typed[0], canonical_payload, child_key]
-    if code is None and stream.record_kind == "child":
+    if rejection is None and stream.record_kind == "child":
         texts.append(typed[0])  # canonical parent key is retained again on the child.
     if rejection is not None:
         texts.extend((rejection.canonical_root_key, rejection.canonical_evidence))
@@ -842,30 +856,19 @@ def _iter_source_pages(context, part, policy, cursor):
     request, stream = context.request, context.stream
     fields = _stream_fields(request.definition, stream)
     committed_rows = part.record_count if part.ordinal < cursor[0] else cursor[1] if part.ordinal == cursor[0] else 0
-    prepared_records = []
-    byte_count = first_row = count = 0
+    reducer = _SourcePageReducer(context, part.ordinal, committed_rows, cursor[2])
     decoded = iter_records(part.capture, stream, limits=policy.part_limits)
     primary = None
     try:
         for decoded_record in decoded:
-            if tuple(decoded_record.values) != tuple(field.field_id for field in fields):
-                raise CandidateRunnerError("replayed fields differ from the retained stream")
-            prepared = _prepare_row(
-                request, stream, _normalized_integer_replay_values(dict(decoded_record.values), fields)
-            )
-            if prepared_records and (
-                len(prepared_records) == request.page_row_limit
-                or byte_count + prepared.byte_count > request.page_byte_limit
-                or count == committed_rows
-            ):
-                yield _SourcePage(part.ordinal, first_row, cursor[2] + first_row, tuple(prepared_records))
-                prepared_records, byte_count, first_row = [], 0, count
-            prepared_records.append(prepared)
-            byte_count += prepared.byte_count
-            count += 1
-        if prepared_records:
-            yield _SourcePage(part.ordinal, first_row, cursor[2] + first_row, tuple(prepared_records))
-        if count != part.record_count:
+            prepared = _prepare_decoded_row(request, stream, fields, decoded_record.values)
+            page = reducer.before_append(prepared)
+            if page is not None:
+                yield page
+            reducer.append(prepared)
+        if reducer.records:
+            yield reducer.page()
+        if reducer.count != part.record_count:
             raise CandidateRunnerError("decoded part record count differs from the sealed receipt")
     except BaseException as exc:
         primary = exc
@@ -874,15 +877,91 @@ def _iter_source_pages(context, part, policy, cursor):
         raise primary
 
 
+def _prepare_decoded_row(request, stream, fields, values):
+    if tuple(values) != tuple(field.field_id for field in fields):
+        raise CandidateRunnerError("replayed fields differ from the retained stream")
+    return _prepare_row(request, stream, _normalized_integer_replay_values(dict(values), fields))
+
+
+class _SourcePageReducer:
+    """Prepare a successful lookahead before yielding the previous full page."""
+
+    def __init__(self, context, part_ordinal, committed_rows, source_start):
+        self.request, self.part_ordinal = context.request, part_ordinal
+        self.committed_rows, self.source_start = committed_rows, source_start
+        self.records = []
+        self.byte_count = self.first_row = self.count = 0
+
+    def page(self):
+        """Return the current prefix without advancing its source position."""
+        return _SourcePage(self.part_ordinal, self.first_row, self.source_start + self.first_row, tuple(self.records))
+
+    def before_append(self, prepared):
+        """Expose a full prefix only after the next record prepared successfully."""
+        return self.page() if self._should_split(prepared) else None
+
+    def _should_split(self, prepared):
+        return bool(self.records) and (
+            len(self.records) == self.request.page_row_limit
+            or self.byte_count + prepared.byte_count > self.request.page_byte_limit
+            or self.count == self.committed_rows
+        )
+
+    def append(self, prepared):
+        """Admit the already prepared record after a yielded prefix resumes."""
+        if self._should_split(prepared):
+            self.records, self.byte_count, self.first_row = [], 0, self.count
+        self.records.append(prepared)
+        self.byte_count += prepared.byte_count
+        self.count += 1
+
+
+def _source_pages(context, part, policy, cursor):
+    # Compare a resumed prefix through the unchanged serial oracle.
+    if part.ordinal >= cursor[0] and (part.ordinal != cursor[0] or not cursor[1]):
+        from process.custom_import.source_preparation import iter_source_pages, native_encoder, native_layout
+
+        encoder = native_encoder()
+        layout = native_layout(context.request.definition, context.stream)
+        if encoder is not None and layout is not None:
+            return iter_source_pages(encoder, layout, context, part, policy, cursor)
+    return _iter_source_pages(context, part, policy, cursor)
+
+
+async def _next_source_page(pages):
+    return await anext(pages, None) if hasattr(pages, "__anext__") else next(pages, None)
+
+
+async def _close_source_pages(pages, primary):
+    if not hasattr(pages, "aclose"):
+        return _close_iterator(pages, primary)
+    failures = []
+
+    async def close():
+        """Record close failures after the iterator drains its pending work."""
+        try:
+            await pages.aclose()
+        except BaseException as error:
+            failures.append(error)
+
+    primary = await _drain_cleanup(close(), primary)
+    return _source_cleanup_failure(primary, failures[0]) if failures else primary
+
+
+def _source_cleanup_failure(primary, failure):
+    if primary is None or isinstance(primary, GeneratorExit):
+        return failure
+    if primary is not failure:
+        primary.add_note(f"source decoder cleanup also failed: {type(failure).__name__}")
+        primary.__cause__ = failure
+    return primary
+
+
 def _close_iterator(iterator, primary):
     try:
         iterator.close()
     except BaseException as exc:
-        if primary is None:
-            primary = exc
-        else:
-            primary.add_note(f"source decoder cleanup also failed: {type(exc).__name__}")
-            primary.__cause__ = exc
+        primary = _source_cleanup_failure(primary, exc)
     return primary
 
 
@@ -892,17 +971,17 @@ async def _replay_part(session_factory, context, part, policy, cursor, *, store_
     fields = _stream_fields(context.request.definition, context.stream)
     _validate_replay_partition_schema(part.capture, fields=fields, limits=policy.part_limits)
     committed_rows = part.record_count if part.ordinal < cursor[0] else cursor[1] if part.ordinal == cursor[0] else 0
-    pages = _iter_source_pages(context, part, policy, cursor)
+    pages = _source_pages(context, part, policy, cursor)
     primary = None
     try:
-        for page in pages:
+        while (page := await _next_source_page(pages)) is not None:
             operation = (
                 _compare_committed_page if page.first_row < committed_rows else (store_page or _store_single_page)
             )
             await operation(session_factory, context, page)
     except BaseException as exc:
         primary = exc
-    primary = _close_iterator(pages, primary)
+    primary = await _close_source_pages(pages, primary)
     if primary is not None:
         raise primary
     arrow_limits = replace(

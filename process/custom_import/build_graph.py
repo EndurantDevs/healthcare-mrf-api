@@ -23,6 +23,7 @@ from db.models.custom_import import (
     CustomImportCapture,
     CustomImportCaptureBundle,
     CustomImportChildRevision,
+    CustomImportChildScalar,
     CustomImportEntityBinding,
     CustomImportExecution,
     CustomImportFamilyChild,
@@ -32,6 +33,7 @@ from db.models.custom_import import (
     CustomImportPack,
     CustomImportRootRecord,
     CustomImportRootRevision,
+    CustomImportRootScalar,
     CustomImportSourceStream,
 )
 from process.custom_import import materialization as material
@@ -443,10 +445,16 @@ def _model_bytes(models):
     )
 
 
-def _page_cost(request, models, *, reserved_rows=0):
-    if len(models) + reserved_rows > request.page_row_limit:
+def _page_cost(request, models, *, reserved_rows=0, projection_values=()):
+    if len(models) + len(projection_values) + reserved_rows > request.page_row_limit:
         raise CandidateRunnerError("record projection fanout exceeds the admitted row page")
-    if _model_bytes(models) > request.page_byte_limit:
+    projection_bytes = sum(
+        len(value.encode("utf-8")) if isinstance(value, str) else len(value)
+        for row in projection_values
+        for value in row.values()
+        if isinstance(value, (str, bytes, bytearray, memoryview))
+    )
+    if _model_bytes(models) + projection_bytes > request.page_byte_limit:
         raise CandidateRunnerError("record projection fanout exceeds the admitted byte page")
 
 
@@ -465,7 +473,7 @@ def _candidate(definition, family, root_values, child=None, child_values=None):
     )
 
 
-def _contexts(request, registry, build_id, candidate):
+def _context_values(request, registry, build_id, candidate):
     scopes = material._profile_scopes(request.definition, registry.child_collection_slots)
     if not any(scope.collection_slot == candidate.context_collection_slot for scope in scopes):
         return
@@ -476,7 +484,7 @@ def _contexts(request, registry, build_id, candidate):
             continue
         material._validate_selection_values(profile, normalized, contract.fields_by_id)
         canonical, digest = material._context_key(profile, normalized, contract.fields_by_id)
-        yield CustomImportBuildCandidateContext(
+        yield dict(
             build_id=build_id,
             profile_slot=slot,
             entity_binding_id=candidate.entity_binding_id,
@@ -489,6 +497,14 @@ def _contexts(request, registry, build_id, candidate):
 
 
 def _root_models(request, registry, build_id, family, root_values):
+    scalars, contexts = _root_projection_values(request, registry, build_id, family, root_values)
+    return [
+        *(CustomImportRootScalar(**row) for row in scalars),
+        *(CustomImportBuildCandidateContext(**row) for row in contexts),
+    ]
+
+
+def _root_projection_values(request, registry, build_id, family, root_values):
     scalars = material.project_root_scalars(
         request.definition,
         root_target=material.RootScalarTarget(
@@ -496,14 +512,25 @@ def _root_models(request, registry, build_id, family, root_values):
         ),
         root_values=root_values,
     )
-    return [
-        *material.scalar_projection_models(request.definition, root_scalars=scalars),
-        *_contexts(request, registry, build_id, _candidate(request.definition, family, root_values)),
-    ]
+    return (
+        material._scalar_projection_values(request.definition, root_scalars=scalars),
+        tuple(_context_values(request, registry, build_id, _candidate(request.definition, family, root_values))),
+    )
 
 
 def _child_models(request, registry, build_id, family, root_values, child, child_values, collection):
-    edge = CustomImportFamilyChild(
+    edge_by_column, scalars, contexts = _child_projection_values(
+        request, registry, build_id, family, root_values, child, child_values, collection
+    )
+    return [
+        CustomImportFamilyChild(**edge_by_column),
+        *(CustomImportChildScalar(**row) for row in scalars),
+        *(CustomImportBuildCandidateContext(**row) for row in contexts),
+    ]
+
+
+def _child_projection_values(request, registry, build_id, family, root_values, child, child_values, collection):
+    edge_by_column = dict(
         family_revision_id=family.family_revision_id,
         dataset_id=request.dataset_id,
         schema_revision_id=request.schema_revision_id,
@@ -524,19 +551,17 @@ def _child_models(request, registry, build_id, family, root_values, child, child
         child_values=child_values,
         child_collection_slots=registry.child_collection_slots,
     )
-    projections = [
-        edge,
-        *material.scalar_projection_models(
-            request.definition, child_scalars=scalars, child_collection_slots=registry.child_collection_slots
-        ),
-    ]
+    scalar_values = material._scalar_projection_values(
+        request.definition, child_scalars=scalars, child_collection_slots=registry.child_collection_slots
+    )
+    contexts = ()
     if collection == request.definition.query.child_collection:
-        projections.extend(
-            _contexts(
+        contexts = tuple(
+            _context_values(
                 request, registry, build_id, _candidate(request.definition, family, root_values, child, child_values)
             )
         )
-    return projections
+    return edge_by_column, scalar_values, contexts
 
 
 @dataclass(frozen=True)
@@ -785,10 +810,10 @@ def _retained_page_models(request, registry, family_input, current, family, chil
     """Reuse canonical child validation and account for one retained pack."""
 
     collection, stream_slot = _retained_page_scope(request, registry, current, children)
-    token_hash = lease_token_sha256(request.lease_token)
-    pack = CustomImportPack(stream_slot=stream_slot, producing_token_sha256=token_hash)
+    pack = CustomImportPack(stream_slot=stream_slot, producing_token_sha256=lease_token_sha256(request.lease_token))
     fields = fields_by_collection(request.definition).get(collection)
     child_ids, context_child_ids, profile_slots, context_keys, copied_models, payload_hashes = [], [], [], [], [], []
+    projection_values = []
     for child in children:
         child_values = payload_values(fields, child.canonical_payload, label="retained child payload")
         verify_stored_child(request, family_input.record, StoredCandidateChild(collection, child, child_values))
@@ -796,21 +821,22 @@ def _retained_page_models(request, registry, family_input, current, family, chil
             raise CandidateRunnerError("retained child payload digest differs")
         payload_hashes.append(bytes(child.payload_sha256))
         revision = _copy_record(request, family_input, child, pack, collection)
-        occurrence = _copy_occurrence(current, family_input.plan, child, revision, pack, collection)
-        projections = _child_models(
+        copied_models.extend(
+            (revision, _copy_occurrence(current, family_input.plan, child, revision, pack, collection))
+        )
+        edge_by_column, scalars, contexts = _child_projection_values(
             request, registry, current.build_id, family, family_input.values, child, child_values, collection
         )
         child_ids.append(child.child_revision_id)
-        for context in projections:
-            if isinstance(context, CustomImportBuildCandidateContext):
-                context_child_ids.append(child.child_revision_id)
-                profile_slots.append(context.profile_slot)
-                context_keys.append(context.canonical_context_key)
-        copied_models.extend((revision, occurrence, *projections))
+        for context in contexts:
+            context_child_ids.append(child.child_revision_id)
+            profile_slots.append(context["profile_slot"])
+            context_keys.append(context["canonical_context_key"])
+        projection_values.extend((edge_by_column, *scalars, *contexts))
     if children:
         pack.pack_sha256 = pack_hash(collection, payload_hashes)
         copied_models.append(pack)
-    _page_cost(request, copied_models)
+    _page_cost(request, copied_models, projection_values=projection_values)
     return child_ids, context_child_ids, profile_slots, context_keys
 
 
@@ -885,11 +911,12 @@ def _retained_root_arguments(request, registry, family_input):
     )
     revision = _copy_record(request, family_input, root, pack, None)
     occurrence = _copy_occurrence(plan, plan, root, revision, pack, None)
-    projections = _root_models(request, registry, plan.build_id, family, family_input.values)
+    scalars, contexts = _root_projection_values(request, registry, plan.build_id, family, family_input.values)
     _page_cost(
-        request, [pack, revision, occurrence, family, *_root_identity_models(request, family_input), *projections]
+        request,
+        [pack, revision, occurrence, family, *_root_identity_models(request, family_input)],
+        projection_values=(*scalars, *contexts),
     )
-    contexts = [projection for projection in projections if isinstance(projection, CustomImportBuildCandidateContext)]
     return (
         ("bigint", plan.build_id),
         ("bigint", request.execution_id),
@@ -901,12 +928,12 @@ def _retained_root_arguments(request, registry, family_input):
         ("bigint", family_input.entity_binding_id),
         ("bytea", family_input.family_sha256),
         ("bigint", family_input.child_count),
-        ("smallint[]", tuple(context.profile_slot for context in contexts)),
-        ("text[]", tuple(context.canonical_context_key for context in contexts)),
+        ("smallint[]", tuple(context["profile_slot"] for context in contexts)),
+        ("text[]", tuple(context["canonical_context_key"] for context in contexts)),
     )
 
 
-def _source_root_models(request, registry, family_input):
+def _source_root_values(request, registry, family_input):
     """Validate canonical SOURCE values before deriving current projections."""
 
     plan, root = family_input.plan, family_input.root
@@ -936,22 +963,18 @@ def _source_root_models(request, registry, family_input):
         producing_fence=request.fence,
         producing_token_sha256=token_hash,
     )
-    projections = _root_models(request, registry, plan.build_id, family, root_values)
+    scalars, contexts = _root_projection_values(request, registry, plan.build_id, family, root_values)
     root_record, entity = _root_identity_models(request, family_input)
     # Reserve a possible canonical interner INSERT as well as both snapshot copies.
-    _page_cost(request, [family, root_record, entity, entity, *projections], reserved_rows=2)
-    return projections, root_values[request.definition.entity_field]
+    _page_cost(request, [family, root_record, entity, entity], reserved_rows=2, projection_values=(*scalars, *contexts))
+    return scalars, contexts, root_values[request.definition.entity_field]
 
 
 def _source_root_arguments(request, registry, family_input):
     """Encode native projection arrays for one protected SOURCE root call."""
 
     plan, root = family_input.plan, family_input.root
-    projections, entity_value = _source_root_models(request, registry, family_input)
-    scalars = [
-        projection for projection in projections if not isinstance(projection, CustomImportBuildCandidateContext)
-    ]
-    contexts = [projection for projection in projections if isinstance(projection, CustomImportBuildCandidateContext)]
+    scalars, contexts, entity_value = _source_root_values(request, registry, family_input)
     columns = (
         ("smallint[]", "field_slot"),
         ("text[]", "field_type"),
@@ -976,9 +999,9 @@ def _source_root_arguments(request, registry, family_input):
         ("bigint", family_input.child_count),
         ("text", entity_value),
         ("bytea", entity_value_digest(entity_value)),
-        *((kind, tuple(getattr(scalar, column) for scalar in scalars)) for kind, column in columns),
-        ("smallint[]", tuple(context.profile_slot for context in contexts)),
-        ("text[]", tuple(context.canonical_context_key for context in contexts)),
+        *((kind, tuple(scalar[column] for scalar in scalars)) for kind, column in columns),
+        ("smallint[]", tuple(context["profile_slot"] for context in contexts)),
+        ("text[]", tuple(context["canonical_context_key"] for context in contexts)),
     )
 
 

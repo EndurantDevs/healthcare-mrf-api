@@ -385,6 +385,7 @@ def test_retained_cursor_cannot_exceed_part_or_absolute_source_progress(cursor):
 
 @pytest.mark.parametrize("before_prefix", [False, True])
 async def test_preparation_deadline_closes_iterator_without_returning_rows(monkeypatch, before_prefix):
+    monkeypatch.setattr("process.custom_import.source_preparation.native_encoder", lambda: None)
     definition, part = _nullable_integer_part()
     context = replace(_bulk_context(), request=_request(definition=definition), stream=definition.source_streams[0])
     times = iter((60,) if before_prefix else (59, 60))
@@ -416,7 +417,7 @@ async def test_late_part_cursor_compares_current_prefix_and_bounds_new_batch(mon
             close_events.append(True)
 
     monkeypatch.setattr(step, "_verify_part", lambda *_: None)
-    monkeypatch.setattr(staging, "_iter_source_pages", pages)
+    monkeypatch.setattr(staging, "_source_pages", pages)
     clock = SimpleNamespace(elapsed=0.0)
 
     async def compare(*_args):
@@ -596,7 +597,7 @@ async def test_prefix_failure_closes_iterator(monkeypatch):
     compared = AsyncMock(side_effect=CandidateRunnerError("synthetic prefix mismatch"))
     monkeypatch.setattr(step, "_compare_prefix", compared)
     monkeypatch.setattr(step, "_verify_part", lambda *_: None)
-    monkeypatch.setattr(staging, "_iter_source_pages", pages)
+    monkeypatch.setattr(staging, "_source_pages", pages)
     with pytest.raises(CandidateRunnerError, match="prefix mismatch"):
         await step._prepare_part(
             None, context, object(), _policy(), step.SourceCursor(1, 2, 2, 2), _PERMIT, time.monotonic() + 60
@@ -626,7 +627,7 @@ async def test_prefix_expiry_prevents_progress(monkeypatch, has_uncommitted_page
     monkeypatch.setattr(step, "time", SimpleNamespace(monotonic=lambda: clock.elapsed))
     monkeypatch.setattr(step, "_compare_prefix", compared)
     monkeypatch.setattr(step, "_verify_part", lambda *_: None)
-    monkeypatch.setattr(staging, "_iter_source_pages", pages)
+    monkeypatch.setattr(staging, "_source_pages", pages)
     with pytest.raises(LeaseAuthorityLost, match="deadline elapsed"):
         await step._prepare_part(None, context, object(), _policy(), step.SourceCursor(1, 1, 1, 1), _PERMIT, 60)
     assert closed == [True] and compared.await_count == 1
@@ -988,7 +989,7 @@ def _coalesced_reader(monkeypatch, *, part_count=100, rows_per_part=1024, failur
             )
 
     monkeypatch.setattr(staging, "_set_timeout", AsyncMock())
-    monkeypatch.setattr(staging, "_iter_source_pages", pages)
+    monkeypatch.setattr(staging, "_source_pages", pages)
     monkeypatch.setattr(step, "_verify_part", lambda *_: None)
     monkeypatch.setattr(step, "open_segmented_cursor_part", reader)
     monkeypatch.setattr(step, "verify_segmented_stream_metadata", AsyncMock())
@@ -1053,7 +1054,7 @@ async def test_slow_page_reserves_commit_time_without_relaxing_hard_expiry(monke
     harness = _CommitHarness(monkeypatch)
     sessions, context, events = _coalesced_reader(monkeypatch, part_count=2)
     clock = SimpleNamespace(now=0.0)
-    source_pages = staging._iter_source_pages
+    source_pages = staging._source_pages
     closed = Mock(wraps=staging._close_iterator)
 
     def slow_pages(*arguments):
@@ -1062,7 +1063,7 @@ async def test_slow_page_reserves_commit_time_without_relaxing_hard_expiry(monke
             yield page
 
     monkeypatch.setattr(step, "time", SimpleNamespace(monotonic=lambda: clock.now))
-    monkeypatch.setattr(staging, "_iter_source_pages", slow_pages)
+    monkeypatch.setattr(staging, "_source_pages", slow_pages)
     monkeypatch.setattr(staging, "_close_iterator", closed)
     if expires:
         with pytest.raises(LeaseAuthorityLost, match="read deadline elapsed"):
@@ -1095,7 +1096,7 @@ async def test_partial_large_part_resume_coalesces_only_current_and_next_part(mo
                     part.ordinal, offset, position[2] + offset, (prepared,) * min(256, stop - offset)
                 )
 
-    monkeypatch.setattr(staging, "_iter_source_pages", pages)
+    monkeypatch.setattr(staging, "_source_pages", pages)
     pages, closed = await step._read_parts(sessions, context, _policy(), 9, cursor, _PERMIT, time.monotonic() + 60)
     assert closed == (3,) and 99_000 < sum(len(page.records) for page in pages) <= 100_000
     assert pages[0].first_row == 90_000 and pages[0].first_source == 290_000

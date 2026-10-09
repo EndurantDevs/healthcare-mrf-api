@@ -78,6 +78,37 @@ def _checks(query):
     return re.findall(r"IF ([\s\S]+?) THEN\s*RAISE EXCEPTION '([^']+)'; END IF;", query)
 
 
+def _fused_dictionary_checks(checks):
+    """Normalize one fused guard only after matching its complete historical scope."""
+    dictionary_checks = [
+        (predicate, code)
+        for predicate, code in checks
+        if code == "source_bulk_root_collision" and "LEFT JOIN __CONTROL__.custom_import_root_record r" in predicate
+    ]
+    assert len(dictionary_checks) == 1
+    dictionary_predicate, _ = dictionary_checks[0]
+    scope, mismatch = re.fullmatch(
+        r"EXISTS\(SELECT 1 (FROM .+) AND \((.+)\)\)", _compact(dictionary_predicate)
+    ).groups()
+    redundant_identity = (
+        " OR ROW(r.dataset_id,r.key_contract_sha256,r.logical_key_sha256) "
+        "IS DISTINCT FROM ROW(b.dataset_id,key_contract,l.typed_hash)"
+    )
+    assert mismatch.count(redundant_identity) == 1
+    # The full equality join already proves the historical identity-row comparison.
+    mismatch = mismatch.replace(redundant_identity, "", 1)
+    assert _unbound(finalizer._load_sql()["global_key_reads"]) == _compact(
+        "SELECT count(r.root_record_id) AS dictionary_read_n, "
+        f"count(*) FILTER (WHERE {mismatch}) AS dictionary_collision_n, "
+        "coalesce(sum(octet_length(r.canonical_logical_key)::bigint+88),0) AS dictionary_bytes "
+        f"{scope};"
+    )
+    return [
+        ("dictionary_collision_n>0", code) if predicate == dictionary_predicate else (predicate, code)
+        for predicate, code in checks
+    ]
+
+
 def test_error_predicates_preserve_canonical_provenance_null_positions_and_bounds():
     # Exclude the non-error ANALYZE conditional before extracting later checks.
     historical = re.sub(r"IF a.first_source=0[\s\S]+?END IF;", "", _leaf())
@@ -97,7 +128,7 @@ def test_error_predicates_preserve_canonical_provenance_null_positions_and_bound
         "(SELECT count(DISTINCT root_id) FROM __CANDIDATE__.source_bulk_landing WHERE batch_id=p_batch)",
         "(SELECT count(DISTINCT r.root_record_id) FROM __CANDIDATE__.source_bulk_landing l JOIN __CONTROL__.custom_import_root_record r ON r.dataset_id=b.dataset_id AND r.key_contract_sha256=key_contract AND r.logical_key_sha256=l.typed_hash WHERE l.batch_id=p_batch)",
     )
-    checks = _checks(historical)
+    checks = _fused_dictionary_checks(_checks(historical))
     ordinary_checks = [
         re.fullmatch(r"SELECT CASE WHEN ([\s\S]+) THEN '([^']+)' END problem;\s*", _unbound(query)).groups()
         for name, query in finalizer._load_sql().items()
@@ -337,7 +368,7 @@ def _row(name, close_copy, role):
         "last_row": dict(last_row=1),
         "dictionary_counts": dict(dictionary_n=1, dictionary_bytes=100, dictionary_reference_n=1),
         "insert_global_keys": dict(dictionary_written_n=1),
-        "global_key_reads": dict(dictionary_read_n=1, dictionary_bytes=100),
+        "global_key_reads": dict(dictionary_read_n=1, dictionary_collision_n=0, dictionary_bytes=100),
         "insert_candidate_keys": dict(dictionary_written_n=1),
         "candidate_key_reads": dict(dictionary_read_n=1, dictionary_bytes=100),
         "insert_roots": dict(root_written_n=1),
@@ -389,6 +420,12 @@ async def test_full_fixed_stage_order_closure_and_outer_fresh_lease(monkeypatch)
     assert await _finalize(session) == 1
     assert session.events[-4:] == ["lock_custom_import_build", "verify_before_commit", "commit", "close"]
     assert session.events.index("completion") < session.events.index("homes") < session.events.index("delete_landing")
+    assert (
+        next(parameters for name, _, parameters in session.executed if name == "global_key_collision")[
+            "dictionary_collision_n"
+        ]
+        == 0
+    )
     assert next(parameters for name, _, parameters in session.executed if name == "homes")["family_id"] == 7
     assert (
         session.events.index("close_authorization")

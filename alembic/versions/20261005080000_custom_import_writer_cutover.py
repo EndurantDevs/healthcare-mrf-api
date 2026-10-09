@@ -215,6 +215,7 @@ def _independent_reviewed_functions(schema: str) -> list[dict]:
     )
     receipts = []
     correction = _previous("20261007000000_custom_import_rejection_anti_joins")
+    child_presence = _previous("20261009000000_custom_import_child_presence_decode")
     for namespace in namespaces.scalars():
         previous = _reviewed_functions(namespace, include_obsolete=True)
         receipts.extend(previous)
@@ -225,6 +226,13 @@ def _independent_reviewed_functions(schema: str) -> list[dict]:
         )
         body = " " + correction._body(correction._finality(), namespace, corrected=True) + " "
         receipts.append({**validator, "body_sha256": hashlib.sha256(body.encode()).hexdigest()})
+        installer = next(
+            receipt
+            for receipt in previous
+            if receipt["identity"].endswith(".install_custom_import_snapshot_writers(bigint)")
+        )
+        body = child_presence._installer(child_presence._bulk(), namespace, corrected=True).split("$bulk_snapshot$")[1]
+        receipts.append({**installer, "body_sha256": hashlib.sha256(body.encode()).hexdigest()})
     return receipts
 
 

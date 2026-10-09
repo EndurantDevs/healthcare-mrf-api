@@ -269,9 +269,11 @@ SELECT count(*) AS dictionary_written_n FROM written;
 SELECT CASE WHEN :dictionary_written_n>:dictionary_n THEN 'source_set_dictionary_count_mismatch' END problem;
 
 -- query: global_key_reads
-SELECT count(*) AS dictionary_read_n,
+SELECT count(r.root_record_id) AS dictionary_read_n,
+    count(*) FILTER (WHERE r.root_record_id IS NULL OR convert_to(r.canonical_logical_key,'UTF8')
+        IS DISTINCT FROM convert_to(l.typed_key,'UTF8')) AS dictionary_collision_n,
     coalesce(sum(octet_length(r.canonical_logical_key)::bigint+88),0) AS dictionary_bytes FROM __CANDIDATE__.source_bulk_landing l
-        JOIN __CONTROL__.custom_import_root_record r ON r.dataset_id=:b_dataset_id AND r.key_contract_sha256=:key_contract
+        LEFT JOIN __CONTROL__.custom_import_root_record r ON r.dataset_id=:b_dataset_id AND r.key_contract_sha256=:key_contract
             AND r.logical_key_sha256=l.typed_hash
         WHERE l.batch_id=:p_batch AND l.typed_key IS NOT NULL;
 
@@ -279,13 +281,7 @@ SELECT count(*) AS dictionary_read_n,
 SELECT CASE WHEN :dictionary_read_n<>:dictionary_reference_n OR :dictionary_bytes>:a_source_byte_limit+88::bigint*:n THEN 'source_set_dictionary_bounds' END problem;
 
 -- query: global_key_collision
-SELECT CASE WHEN EXISTS(SELECT 1 FROM __CANDIDATE__.source_bulk_landing l
-        LEFT JOIN __CONTROL__.custom_import_root_record r ON r.dataset_id=:b_dataset_id AND r.key_contract_sha256=:key_contract
-            AND r.logical_key_sha256=l.typed_hash
-        WHERE l.batch_id=:p_batch AND l.typed_key IS NOT NULL AND (r.root_record_id IS NULL
-            OR ROW(r.dataset_id,r.key_contract_sha256,r.logical_key_sha256)
-                IS DISTINCT FROM ROW(:b_dataset_id,:key_contract,l.typed_hash)
-            OR convert_to(r.canonical_logical_key,'UTF8') IS DISTINCT FROM convert_to(l.typed_key,'UTF8'))) THEN 'source_bulk_root_collision' END problem;
+SELECT CASE WHEN :dictionary_collision_n>0 THEN 'source_bulk_root_collision' END problem;
 
 -- query: insert_candidate_keys
 WITH written AS (INSERT INTO __CANDIDATE__.custom_import_root_record(root_record_id,dataset_id,key_contract_sha256,

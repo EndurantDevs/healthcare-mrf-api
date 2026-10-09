@@ -635,7 +635,7 @@ async def test_resume_compares_committed_prefix_before_buffering_suffix(monkeypa
         events.append(("suffix", args[-1]))
 
     monkeypatch.setattr(staging, "_validate_replay_partition_schema", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(staging, "_iter_source_pages", lambda *_args: (item for item in (prefix, suffix)))
+    monkeypatch.setattr(staging, "_source_pages", lambda *_args: (item for item in (prefix, suffix)))
     monkeypatch.setattr(staging, "_compare_committed_page", compare)
     monkeypatch.setattr(staging, "_aggregate_parquet_arrow_bytes", lambda *_args, **_kwargs: 0)
     assert (

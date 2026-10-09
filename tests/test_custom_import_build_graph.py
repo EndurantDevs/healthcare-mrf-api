@@ -752,6 +752,13 @@ def test_retained_root_arguments_reuse_current_contexts_and_exact_budget(monkeyp
     assert arguments[-2] == ("smallint[]", (1,) if root_profile else ())
     assert len(arguments[-1][1]) == int(root_profile)
     models = cost.call_args.args[1]
+    models = [
+        *models,
+        *(
+            (graph.CustomImportRootScalar if "field_slot" in row else CustomImportBuildCandidateContext)(**row)
+            for row in cost.call_args.kwargs["projection_values"]
+        ),
+    ]
     rows, size = len(models), graph._model_bytes(models)
     assert sum(isinstance(model, CustomImportPack) for model in models) == 1
     graph._retained_root_arguments(replace(request, page_row_limit=rows, page_byte_limit=size), registry, family_input)

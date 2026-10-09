@@ -7,6 +7,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from contextlib import nullcontext
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -206,6 +207,62 @@ def _typed_child_definition():
         )
     raw["selection_profiles"][0]["context_dimensions"].append("amount")
     return CustomImportDefinition.from_mapping(raw)
+
+
+@pytest.mark.parametrize("child_scope", [False, True])
+def test_plain_projection_values_preserve_native_columns_and_exact_page_cost(child_scope):
+    request, registry, family_input, _progress, family = _input(definition=_typed_child_definition())
+    if child_scope:
+        child_values_by_field = dict(
+            rate_npi="1234567893",
+            service_code="A100",
+            amount=Decimal("123456789012345678.123456789012"),
+            note="é😀",
+            visits=(1 << 63) - 1,
+            enabled=False,
+            day=dt.date(2024, 2, 29),
+            instant=dt.datetime(2024, 2, 29, 1, 2, 3, 456789, tzinfo=dt.UTC),
+        )
+        arguments = (
+            request,
+            registry,
+            7,
+            family,
+            family_input.values,
+            _child(request, family_input, child_values_by_field),
+            child_values_by_field,
+            "rates",
+        )
+        models = graph._child_models(*arguments)
+        edge_by_column, scalars, contexts = graph._child_projection_values(*arguments)
+        plain = (edge_by_column, *scalars, *contexts)
+    else:
+        arguments = (request, registry, 7, family, family_input.values)
+        models = graph._root_models(*arguments)
+        scalars, contexts = graph._root_projection_values(*arguments)
+        plain = (*scalars, *contexts)
+    assert len(models) == len(plain)
+    for model, projection_by_column in zip(models, plain, strict=True):
+        stored_by_column = {column.name: getattr(model, column.name) for column in model.__table__.columns}
+        assert projection_by_column == {
+            key: stored_value for key, stored_value in stored_by_column.items() if key in projection_by_column
+        }
+        assert all(
+            stored_value is None for key, stored_value in stored_by_column.items() if key not in projection_by_column
+        )
+    request = replace(request, page_row_limit=len(models) + 2, page_byte_limit=graph._model_bytes(models))
+    graph._page_cost(request, models, reserved_rows=2)
+    graph._page_cost(request, (), reserved_rows=2, projection_values=plain)
+    for changed in (
+        replace(request, page_row_limit=len(models) + 1),
+        replace(request, page_byte_limit=request.page_byte_limit - 1),
+    ):
+        errors = []
+        for existing, projections in ((models, ()), ((), plain)):
+            with pytest.raises(CandidateRunnerError) as error:
+                graph._page_cost(changed, existing, reserved_rows=2, projection_values=projections)
+            errors.append(str(error.value))
+        assert errors[0] == errors[1]
 
 
 async def test_native_typed_arrays_preserve_precision_states_and_current_context(monkeypatch):

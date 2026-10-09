@@ -332,7 +332,7 @@ async def _verify_prefix(session_factory, context, pages, cursor, source_permit,
     while True:
         if time.monotonic() >= deadline:
             raise LeaseAuthorityLost("SOURCE read deadline elapsed")
-        page = next(pages, None)
+        page = await staging._next_source_page(pages)
         page_rows = 0 if page is None else len(page.records)
         page_bytes = 0 if page is None else sum(prepared_row.byte_count for prepared_row in page.records)
         is_prefix = page is not None and page.first_row < cursor.next_part_row_ordinal
@@ -379,7 +379,7 @@ async def _prepare_part(session_factory, context, part, policy, cursor, source_p
     if budget is None:
         budget = MAX_BATCH_ROWS, MAX_BATCH_BYTES, deadline
     _verify_part(context, part, policy, cursor)
-    pages = staging._iter_source_pages(
+    pages = staging._source_pages(
         context,
         part,
         policy,
@@ -405,7 +405,7 @@ async def _prepare_part(session_factory, context, part, policy, cursor, source_p
                 or byte_count + context.request.page_byte_limit > budget[1]
             ):
                 break
-            page = first_page if not prepared_pages else next(pages, None)
+            page = first_page if not prepared_pages else await staging._next_source_page(pages)
             if page is None:
                 has_eof = True
                 break
@@ -415,7 +415,7 @@ async def _prepare_part(session_factory, context, part, policy, cursor, source_p
             await asyncio.sleep(0)
     except BaseException as exc:
         primary = exc
-    primary = staging._close_iterator(pages, primary)
+    primary = await staging._close_source_pages(pages, primary)
     if primary is not None:
         raise primary
     return tuple(prepared_pages), has_eof

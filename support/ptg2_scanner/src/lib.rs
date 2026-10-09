@@ -6,6 +6,7 @@ pub mod config;
 pub mod contact_canon;
 pub mod copy_format;
 pub mod custom_import_scalar;
+pub mod custom_import_source;
 pub mod dedupe;
 pub mod hashing;
 pub mod hospital_mrf;
@@ -253,6 +254,7 @@ mod python_api {
         m.add_function(wrap_pyfunction!(hospital_price_decode_service_block, m)?)?;
         m.add_function(wrap_pyfunction!(hospital_price_decode_fact_block, m)?)?;
         m.add_function(wrap_pyfunction!(custom_import_scalar_frames_v1, m)?)?;
+        m.add_function(wrap_pyfunction!(custom_import_source_documents_v1, m)?)?;
         m.add_function(wrap_pyfunction!(
             custom_import_verified_scalar_frames_v1,
             m
@@ -320,6 +322,7 @@ mod python_api {
                 assert!(module.hasattr("canonicalize_batch").unwrap());
                 assert!(module.hasattr("canonicalize_location_batch").unwrap());
                 assert!(module.hasattr("canonicalize_contact_batch").unwrap());
+                assert!(module.hasattr("custom_import_source_documents_v1").unwrap());
                 assert!(module.hasattr("canon_version").unwrap());
                 assert!(module.hasattr("intersect_sorted_u32").unwrap());
                 assert!(module.hasattr("ptg2_decode_u32_le").unwrap());

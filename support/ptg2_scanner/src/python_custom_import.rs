@@ -3,6 +3,11 @@ use crate::custom_import_scalar::{
     VerificationLayout, VerificationRevision, VerificationRow, VerificationValue,
     MAX_SCALAR_DIGEST_ROWS, MAX_VERIFICATION_REVISIONS, MAX_VERIFICATION_ROWS, SCALAR_TYPES,
 };
+use crate::custom_import_source::{
+    source_documents, source_output_bound, source_value_bytes, SourceLayout, SourceValue,
+    MAX_SOURCE_FIELDS, MAX_SOURCE_INPUT_BYTES, MAX_SOURCE_OUTPUT_BYTES, MAX_SOURCE_ROWS,
+    MAX_SOURCE_TEXT_BYTES,
+};
 use pyo3::types::{PyBool, PyInt, PyString, PyTuple};
 
 type ScalarDigestBinding = (i16, i16, i16, Option<i16>, String, String);
@@ -409,4 +414,277 @@ fn custom_import_verified_scalar_frames_v1<'py>(
         .detach(move || verified_scalar_frames(child, owner, &layouts, prepared))
         .map_err(PyValueError::new_err)?;
     Ok(PyBytes::new(py, &frames))
+}
+
+static SOURCE_DOCUMENT_POOL: OnceLock<Result<ThreadPool, String>> = OnceLock::new();
+static SOURCE_ENCODING_SLOT: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+struct SourceEncodingSlot;
+
+fn source_encoding_slot() -> Result<SourceEncodingSlot, String> {
+    let (active, ready) = &SOURCE_ENCODING_SLOT;
+    let mut occupied = active
+        .lock()
+        .map_err(|_| "source encoding slot is unavailable")?;
+    while *occupied {
+        occupied = ready
+            .wait(occupied)
+            .map_err(|_| "source encoding slot is unavailable")?;
+    }
+    *occupied = true;
+    Ok(SourceEncodingSlot)
+}
+
+impl Drop for SourceEncodingSlot {
+    fn drop(&mut self) {
+        let (active, ready) = &SOURCE_ENCODING_SLOT;
+        *active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        ready.notify_one();
+    }
+}
+
+fn source_document_pool() -> Result<&'static ThreadPool, String> {
+    SOURCE_DOCUMENT_POOL
+        .get_or_init(|| {
+            ThreadPoolBuilder::new()
+                .num_threads(2)
+                .stack_size(1_048_576)
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn source_identifier(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    bounded_scalar_text(value, 63)?;
+    let name: String = value.extract()?;
+    if name.is_empty()
+        || !name.as_bytes()[0].is_ascii_lowercase()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(PyValueError::new_err("source field identity differs"));
+    }
+    Ok(name)
+}
+
+fn source_index(value: &Bound<'_, PyAny>, fields: usize) -> PyResult<usize> {
+    let index = verification_integer(value)?;
+    if index < 0 || index as usize >= fields {
+        return Err(PyValueError::new_err("source key index differs"));
+    }
+    Ok(index as usize)
+}
+
+fn source_layout_input(value: &Bound<'_, PyTuple>) -> PyResult<SourceLayout> {
+    let value = verification_tuple(value.as_any(), 4)?;
+    if !value.get_item(0)?.is_exact_instance_of::<PyBool>() {
+        return Err(PyValueError::new_err("source record kind differs"));
+    }
+    let child: bool = value.get_item(0)?.extract()?;
+    let field_values = value.get_item(1)?;
+    let field_values = field_values.cast::<PyTuple>()?;
+    if field_values.is_empty() || field_values.len() > MAX_SOURCE_FIELDS {
+        return Err(PyValueError::new_err("source field bound exceeded"));
+    }
+    let mut fields = Vec::with_capacity(field_values.len());
+    for field in field_values.iter() {
+        let field = verification_tuple(&field, 2)?;
+        let name = source_identifier(&field.get_item(0)?)?;
+        bounded_scalar_text(&field.get_item(1)?, 16)?;
+        let kind: String = field.get_item(1)?.extract()?;
+        if !SCALAR_TYPES.contains(&kind.as_str()) || fields.iter().any(|(prior, _)| prior == &name)
+        {
+            return Err(PyValueError::new_err("source field declaration differs"));
+        }
+        fields.push((name, kind));
+    }
+    let root_values = value.get_item(2)?;
+    let root_values = root_values.cast::<PyTuple>()?;
+    if !(1..=3).contains(&root_values.len()) {
+        return Err(PyValueError::new_err("source root key bound exceeded"));
+    }
+    let mut root_key = Vec::with_capacity(root_values.len());
+    for key in root_values.iter() {
+        let key = verification_tuple(&key, 2)?;
+        let name = source_identifier(&key.get_item(0)?)?;
+        let index = source_index(&key.get_item(1)?, fields.len())?;
+        if root_key.iter().any(|(prior, _)| prior == &name) {
+            return Err(PyValueError::new_err("source root key differs"));
+        }
+        root_key.push((name, index));
+    }
+    let child_values = value.get_item(3)?;
+    let child_values = child_values.cast::<PyTuple>()?;
+    if (child && !(1..=3).contains(&child_values.len())) || (!child && !child_values.is_empty()) {
+        return Err(PyValueError::new_err("source child key bound exceeded"));
+    }
+    let mut child_key = Vec::with_capacity(child_values.len());
+    for key in child_values.iter() {
+        let index = source_index(&key, fields.len())?;
+        if child_key.contains(&index) {
+            return Err(PyValueError::new_err("source child key differs"));
+        }
+        child_key.push(index);
+    }
+    Ok(SourceLayout {
+        child,
+        fields,
+        root_key,
+        child_key,
+    })
+}
+
+fn source_cell_input(value: &Bound<'_, PyAny>, kind: &str) -> PyResult<SourceValue> {
+    let value = verification_tuple(value, 2)?;
+    bounded_scalar_text(&value.get_item(0)?, 8)?;
+    let state: String = value.get_item(0)?.extract()?;
+    let scalar = value.get_item(1)?;
+    match state.as_str() {
+        "missing" if scalar.is_none() => Ok(SourceValue::Missing),
+        "null" if scalar.is_none() => Ok(SourceValue::Null),
+        "value" => match kind {
+            "integer" => Ok(SourceValue::Integer(verification_integer(&scalar)?)),
+            "boolean" if scalar.is_exact_instance_of::<PyBool>() => {
+                Ok(SourceValue::Boolean(scalar.extract()?))
+            }
+            "string" | "decimal" | "date" | "timestamp" => {
+                if scalar.is_none() {
+                    return Err(PyValueError::new_err("source scalar type differs"));
+                }
+                bounded_scalar_text(&scalar, MAX_SOURCE_TEXT_BYTES)?;
+                Ok(SourceValue::Text(scalar.extract()?))
+            }
+            _ => Err(PyValueError::new_err("source scalar type differs")),
+        },
+        _ => Err(PyValueError::new_err("source scalar state differs")),
+    }
+}
+
+fn source_rows_input(
+    layout: &SourceLayout,
+    rows: &Bound<'_, PyList>,
+) -> PyResult<Vec<Vec<SourceValue>>> {
+    if rows.is_empty() || rows.len() > MAX_SOURCE_ROWS {
+        return Err(PyValueError::new_err("source row bound exceeded"));
+    }
+    let mut input_bytes = layout
+        .fields
+        .iter()
+        .map(|(name, kind)| 128 + name.len() + kind.len())
+        .sum::<usize>()
+        + layout
+            .root_key
+            .iter()
+            .map(|(name, _)| 64 + name.len())
+            .sum::<usize>()
+        + 8 * layout.child_key.len();
+    let mut output_bytes = 0;
+    let mut prepared = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        let row = verification_tuple(&row, layout.fields.len())?;
+        let mut cells = Vec::with_capacity(row.len());
+        input_bytes += 64;
+        for (cell, (_, kind)) in row.iter().zip(&layout.fields) {
+            let cell = source_cell_input(&cell, kind)?;
+            input_bytes += 64 + source_value_bytes(&cell);
+            if input_bytes > MAX_SOURCE_INPUT_BYTES {
+                return Err(PyValueError::new_err("source input byte bound exceeded"));
+            }
+            cells.push(cell);
+        }
+        if layout
+            .root_key
+            .iter()
+            .map(|(_, index)| index)
+            .chain(&layout.child_key)
+            .any(|index| matches!(cells[*index], SourceValue::Missing | SourceValue::Null))
+        {
+            return Err(PyValueError::new_err("source key value is absent"));
+        }
+        output_bytes += source_output_bound(layout, &cells);
+        if output_bytes > MAX_SOURCE_OUTPUT_BYTES {
+            return Err(PyValueError::new_err("source output byte bound exceeded"));
+        }
+        prepared.push(cells);
+    }
+    Ok(prepared)
+}
+
+#[pyfunction]
+fn custom_import_source_documents_v1<'py>(
+    py: Python<'py>,
+    layout: &Bound<'py, PyTuple>,
+    rows: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyList>> {
+    // Only the owned RAII token crosses detach; no GIL or mutex guard waits.
+    let _slot = py
+        .detach(source_encoding_slot)
+        .map_err(PyValueError::new_err)?;
+    // Caller lists may change during admission. Inspect all shapes and bounds
+    // afresh here, with the GIL held, before copying any Rust-owned values.
+    let layout = source_layout_input(layout)?;
+    let rows = source_rows_input(&layout, rows)?;
+    let documents = py
+        .detach(move || {
+            let pool = source_document_pool()?;
+            // Collect indexed outcomes before propagating the first ordered failure.
+            pool.install(|| {
+                rows.par_iter()
+                    .map(|cells| source_documents(&layout, cells))
+                    .collect::<Vec<_>>()
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(str::to_owned)
+        })
+        .map_err(PyValueError::new_err)?;
+    let output_bytes: usize = documents
+        .iter()
+        .map(|row| {
+            row.root_key.len() + row.payload.len() + row.child_key.as_ref().map_or(0, String::len)
+        })
+        .sum();
+    if output_bytes > MAX_SOURCE_OUTPUT_BYTES {
+        return Err(PyValueError::new_err("source output byte bound exceeded"));
+    }
+    let result = PyList::empty(py);
+    for row in documents {
+        result.append((
+            row.root_key,
+            PyBytes::new(py, &row.root_hash),
+            row.payload,
+            PyBytes::new(py, &row.payload_hash),
+            row.child_key,
+            row.child_hash.map(|value| PyBytes::new(py, &value)),
+        ))?;
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod source_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn source_pool_is_shared_and_bounded_to_two_workers() {
+        let first = source_document_pool().unwrap();
+        assert!(std::ptr::eq(first, source_document_pool().unwrap()));
+        assert_eq!(first.current_num_threads(), 2);
+    }
+
+    #[test]
+    fn source_encoding_slot_releases_on_error() {
+        let failed = || -> Result<(), &'static str> {
+            let _slot = source_encoding_slot().unwrap();
+            Err("synthetic extraction failure")
+        };
+        assert!(failed().is_err());
+        let _slot = source_encoding_slot().unwrap();
+    }
 }
