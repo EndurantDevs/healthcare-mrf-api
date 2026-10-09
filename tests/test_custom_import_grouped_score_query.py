@@ -49,6 +49,18 @@ def test_output_metric_allowlist_preserves_raw_context_and_normalizes_aliases():
             )
 
 
+@pytest.mark.parametrize("operator", ("gte", "lte"))
+def test_grouped_inclusive_comparisons_resolve_output_aliases(operator):
+    query = fixture.query(
+        context_filters=(read_core.ReadFilter("year_alias", "eq", 2024),),
+        filters=(read_core.ReadFilter("output_cost", operator, "15"),),
+    )
+    plan = grouped_read.normalize_plan(_context(), query, read_core.ExtensionReadScope("synthetic"))
+    assert plan.filters[0].field.field_id == "root_cost"
+    assert plan.filters[0].operator == operator and str(plan.filters[0].value) == "15"
+    assert plan.selected_value == 2024
+
+
 def test_grouped_transport_allows_four_scores_and_closes_fifth_term():
     predicates = [
         {"field_id": field, "operator": "gt", "value": 0}
@@ -92,6 +104,7 @@ def test_configured_output_default_order_preserves_explicit_override_and_detail_
     assert grouped_read.normalize_plan(context, query, scope).order_terms == (
         read_core.ReadOrderTerm("root_cost", "desc", "last"),
     )
+
     explicit = replace(query, order_terms=(read_core.ReadOrderTerm("root_quality", "asc", "last"),))
     assert grouped_read.normalize_plan(context, explicit, scope).order_terms == explicit.order_terms
     document["query"]["order"][0]["field"] = "child_cost"
@@ -100,6 +113,23 @@ def test_configured_output_default_order_preserves_explicit_override_and_detail_
         grouped_read.normalize_plan(context, query, scope)
     detail = grouped_read.normalize_plan(context, query, scope, projection="full_family", use_default_order=False)
     assert detail.order_terms == () and detail.selected_value == 2024
+
+
+def test_native_scope_precedes_default_year_helper_and_all_group_reducers():
+    query = fixture.query(
+        context_filters=(read_core.ReadFilter("service_code", "eq", "chosen"),),
+        order_terms=(read_core.ReadOrderTerm("root_cost", "asc", "last"),),
+        entity_values=("1234567893", "1234567802"),
+    )
+    scope = read_core.ExtensionReadScope("synthetic")
+    prepared = grouped_read.prepare_relation(_context(), query, scope)
+    compiled = prepared.statement.compile(dialect=postgresql.dialect())
+    assert list(query.entity_values) in compiled.params.values()
+    assert list(compiled.params.values()).count(list(query.entity_values)) == 2
+    assert "selected_entity_value AS MATERIALIZED" in str(compiled)
+    assert "derived_score_values" in str(compiled) and "LIMIT" not in str(compiled)
+    broad = grouped_read.prepare_relation(_context(), replace(query, entity_values=None), scope)
+    assert prepared.query_fingerprint != broad.query_fingerprint
 
 
 def test_derived_child_relation_retains_roots_and_validates_before_reduction():

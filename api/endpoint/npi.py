@@ -8079,12 +8079,13 @@ def _append_unique_search_taxonomy(
 
 
 @blueprint.get("/all")
-async def list_providers(request, *, native_args=None, import_context=None):
+async def list_providers(request, *, native_args=None, import_context=None, native_npis=None):
     """Search, count, or page through public NPI provider records."""
-    if (native_args is None) != (import_context is None):
+    if (native_args is None) != (import_context is None) and native_npis is None:
         raise sanic.exceptions.InvalidUsage("custom-import provider arguments are invalid")
     if import_context is not None and type(import_context) is not ProviderImportQuery:
         raise sanic.exceptions.InvalidUsage("custom-import provider context is invalid")
+    native_npis = None if native_npis is None else tuple(_normalize_npi_batch_npis(list(native_npis)))
     args = request.args if native_args is None else native_args
     is_count_only = str(args.get("count_only", "0")).strip() == "1"
     include_chain_enrichment = _include_chain_provider_enrichment(args.get("show"))
@@ -8418,6 +8419,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
     )
     broad_name_total_deferred = (
         import_context is None
+        and native_npis is None
         and bool(name_like_values)
         and not any(
             [
@@ -8447,13 +8449,17 @@ async def list_providers(request, *, native_args=None, import_context=None):
             ]
         )
     )
-    inline_name_taxonomy_total = import_context is None and bool(
-        include_total
-        and order_by == "npi"
-        and name_like_values
-        and codes
-        and not phone_digits
-        and not any((classification, specialization, section, display_name))
+    inline_name_taxonomy_total = (
+        import_context is None
+        and native_npis is None
+        and bool(
+            include_total
+            and order_by == "npi"
+            and name_like_values
+            and codes
+            and not phone_digits
+            and not any((classification, specialization, section, display_name))
+        )
     )
 
     def _append_available_filter(
@@ -8611,7 +8617,9 @@ async def list_providers(request, *, native_args=None, import_context=None):
                 include_service_locations=include_service_locations,
             )
         ]
-        if import_context is not None and (procedure_filter_unresolved or medication_filter_unresolved):
+        if (import_context is not None or native_npis is not None) and (
+            procedure_filter_unresolved or medication_filter_unresolved
+        ):
             address_clauses.append("1=0")
         phone_candidates_cte = None
         phone_candidates_join = ""
@@ -8630,7 +8638,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
         if phone_digits:
             phone_candidates_cte = _address_phone_candidates_cte(
                 address_table_sql,
-                is_bounded=import_context is None,
+                is_bounded=import_context is None and native_npis is None,
             )
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c")
@@ -8657,6 +8665,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
         import_membership_clause = _provider_import_membership_clause(
             import_context,
             provider_npi_sql,
+            native_npis=native_npis,
         )
         if import_membership_clause is not None:
             address_clauses.append(import_membership_clause)
@@ -8725,6 +8734,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
                  WHERE {" AND ".join(address_clauses)}
                 """,
                 import_context,
+                native_npis=native_npis,
             )
         elif npi_where:
             query = _provider_list_statement(
@@ -8738,6 +8748,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
                  WHERE {" AND ".join(address_clauses)}
                 """,
                 import_context,
+                native_npis=native_npis,
             )
         elif use_taxonomy_filter:
             query = _provider_list_statement(
@@ -8750,6 +8761,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
                  WHERE {" AND ".join(address_clauses)}
                 """,
                 import_context,
+                native_npis=native_npis,
             )
         else:
             query = _provider_list_statement(
@@ -8761,6 +8773,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
                  WHERE {" AND ".join(address_clauses)}
                 """,
                 import_context,
+                native_npis=native_npis,
             )
 
         query_parameters_by_name = {
@@ -8788,14 +8801,16 @@ async def list_providers(request, *, native_args=None, import_context=None):
         query_parameters_by_name.update(npi_params)
         query_parameters_by_name.update(taxonomy_parameters_by_name)
         query_parameters_by_name.update(plan_scope_parameters)
-        if phone_candidates_cte and import_context is None:
+        if phone_candidates_cte and import_context is None and native_npis is None:
             query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                 limit,
                 count_query=True,
             )
 
-        query_parameters_by_name = _provider_list_parameters(query_parameters_by_name, import_context)
-        async with _provider_list_connection(db, import_context, request_session) as conn:
+        query_parameters_by_name = _provider_list_parameters(
+            query_parameters_by_name, import_context, native_npis=native_npis
+        )
+        async with _provider_list_connection(db, import_context, request_session, native_npis=native_npis) as conn:
             return await _provider_list_count(conn, query, query_parameters_by_name, request_session, deadline=deadline)
 
     async def get_formatted_count(response_format: str) -> dict:
@@ -8985,7 +9000,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
 
     procedure_filter_unresolved = bool(requested_procedure_codes) and not bool(procedure_internal_codes)
     medication_filter_unresolved = bool(requested_medication_codes) and not bool(medication_internal_codes)
-    if import_context is None and (procedure_filter_unresolved or medication_filter_unresolved):
+    if import_context is None and native_npis is None and (procedure_filter_unresolved or medication_filter_unresolved):
         if is_count_only and response_format in {"all", "full_taxonomy", "classification"}:
             return response.json({"rows": {}}, default=str)
         if is_count_only:
@@ -9119,7 +9134,9 @@ async def list_providers(request, *, native_args=None, import_context=None):
                 include_service_locations=include_service_locations,
             )
         ]
-        if import_context is not None and (procedure_filter_unresolved or medication_filter_unresolved):
+        if (import_context is not None or native_npis is not None) and (
+            procedure_filter_unresolved or medication_filter_unresolved
+        ):
             address_clauses.append("1=0")
         phone_candidates_cte = None
         phone_candidates_join = ""
@@ -9162,7 +9179,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
         if phone_digits:
             phone_candidates_cte = _address_phone_candidates_cte(
                 address_table_sql,
-                is_bounded=import_context is None,
+                is_bounded=import_context is None and native_npis is None,
             )
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c")
@@ -9189,6 +9206,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
         import_match_clause = _provider_import_match_clause(
             import_context,
             provider_npi_sql,
+            native_npis=native_npis,
         )
         eligible_address_clauses = list(address_clauses)
         if import_match_clause is not None:
@@ -9235,7 +9253,9 @@ async def list_providers(request, *, native_args=None, import_context=None):
             )
         filtered_npi_cte = None
         taxonomy_matched_npi_cte = None
-        use_bounded_broad_name_page = import_context is None and broad_name_total_deferred and order_by == "npi"
+        use_bounded_broad_name_page = (
+            import_context is None and native_npis is None and broad_name_total_deferred and order_by == "npi"
+        )
         if npi_where:
             filtered_npi_projection = "b.npi"
             if order_by == "relevance":
@@ -9403,6 +9423,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
     SELECT {final_projection} FROM {final_source} {result_order_sql};
     """,
             import_context,
+            native_npis=native_npis,
         )
 
         def _search_location_from_mapping(
@@ -9459,7 +9480,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
         }
         if order_by == "relevance":
             query_parameters_by_name["relevance_q"] = relevance_q
-        if phone_candidates_cte and import_context is None:
+        if phone_candidates_cte and import_context is None and native_npis is None:
             query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                 limit,
                 start,
@@ -9467,8 +9488,9 @@ async def list_providers(request, *, native_args=None, import_context=None):
         query_parameters_by_name = _provider_list_parameters(
             query_parameters_by_name,
             import_context,
+            native_npis=native_npis,
         )
-        async with _provider_list_connection(db, import_context, request_session) as conn:
+        async with _provider_list_connection(db, import_context, request_session, native_npis=native_npis) as conn:
             rows_iter = await conn.all(
                 provider_page_query,
                 **query_parameters_by_name,
@@ -9522,6 +9544,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
                 db,
                 import_context,
                 request_session,
+                native_npis=native_npis,
             ) as taxonomy_conn:
                 return await taxonomy_conn.all(
                     text(
@@ -9542,7 +9565,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
                 return await _fetch_provider_enrichment_summary_map(
                     [provider_result.get("npi") for provider_result in provider_results],
                     include_chain=include_chain_enrichment,
-                    session=request_session if import_context is not None else None,
+                    session=request_session if import_context is not None or native_npis is not None else None,
                 )
             except Exception as exc:
                 if import_context is not None:
@@ -9558,13 +9581,13 @@ async def list_providers(request, *, native_args=None, import_context=None):
                 [],
             )
         ]
-        if import_context is not None or has_reader_session(db):
+        if import_context is not None or native_npis is not None or has_reader_session(db):
             taxonomy_records = await _fetch_search_taxonomy_records()
             await _apply_location_statuses(
                 location_candidates,
                 session=request_session,
                 use_request_session=True,
-                fail_closed=import_context is not None,
+                fail_closed=import_context is not None or native_npis is not None,
             )
             summary_map = await _fetch_search_enrichment_summary()
         else:
@@ -9647,6 +9670,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
                     db,
                     import_context,
                     request_session,
+                    native_npis=native_npis,
                 ) as hydration_conn:
                     hydrated_rows = await hydration_conn.all(
                         text(f"SELECT c.* FROM {address_table_sql} AS c WHERE c.location_key = ANY(:location_keys)"),
@@ -9759,7 +9783,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
     async def _count_with_timeout(*, allow_inline_total: bool = True) -> Optional[int]:
         if not include_total:
             return None
-        if import_context is not None:
+        if import_context is not None or native_npis is not None:
             return await get_count(filters_by_name)
         if allow_inline_total and inline_name_taxonomy_total:
             return None
@@ -9798,6 +9822,7 @@ async def list_providers(request, *, native_args=None, import_context=None):
 
     use_sitemap_fast_path = (
         import_context is None
+        and native_npis is None
         and view_mode == "sitemap"
         and not is_count_only
         and str(classification or "").strip().lower() == "pharmacy"
@@ -9834,15 +9859,16 @@ async def list_providers(request, *, native_args=None, import_context=None):
     if use_sitemap_fast_path:
         result_rows = await get_sitemap_results(start, limit, "Pharmacy")
         raw_total = None if not include_total else await _count_with_timeout()
-    elif import_context is not None:
-        result_rows, inline_total, summary_map = await get_results(
-            start,
-            limit,
-            filters_by_name,
-        )
-        raw_total = inline_total
+    elif import_context is not None or native_npis is not None:
+        raw_total = await _count_with_timeout() if import_context is None else None
+        result_rows, inline_total, summary_map = await get_results(start, limit, filters_by_name)
+        raw_total = inline_total if import_context is not None else raw_total
         if raw_total is None:
-            raise RuntimeError("custom-import provider count is required")
+            raise RuntimeError(
+                "custom-import provider count is required"
+                if import_context
+                else "native batch provider count is required"
+            )
     else:
         raw_total, result_payload = await gather_reader_calls(
             db,
@@ -11421,37 +11447,10 @@ def _npi_batch_boolean_map(raw_body: Mapping[str, Any]) -> dict[str, bool]:
 
 
 def _normalize_npi_batch_request(raw_body: Any) -> dict[str, Any]:
-    """Validate the bounded, shared-option provider batch contract."""
-    if not isinstance(raw_body, Mapping):
-        raise sanic.exceptions.InvalidUsage("request body must be a JSON object")
-    allowed_fields = {
-        "npis",
-        "address_limit",
-        "address_offset",
-        "include_sources",
-        "include_evidence",
-    }
-    unknown_fields = sorted(set(raw_body) - allowed_fields)
-    if unknown_fields:
-        raise sanic.exceptions.InvalidUsage(f"unsupported batch field: {unknown_fields[0]}")
-    return {
-        "npis": _normalize_npi_batch_npis(raw_body.get("npis")),
-        "address_limit": _bounded_npi_batch_integer(
-            raw_body,
-            "address_limit",
-            default=NPI_BATCH_ADDRESS_DEFAULT_LIMIT,
-            minimum=1,
-            maximum=NPI_BATCH_ADDRESS_MAX_LIMIT,
-        ),
-        "address_offset": _bounded_npi_batch_integer(
-            raw_body,
-            "address_offset",
-            default=0,
-            minimum=0,
-            maximum=1_000_000,
-        ),
-        **_npi_batch_boolean_map(raw_body),
-    }
+    """Validate the shared finite native batch request."""
+    from api.provider_batch import normalize_native_batch_request
+
+    return normalize_native_batch_request(raw_body)
 
 
 async def _rank_npi_batch_addresses(
@@ -11600,63 +11599,19 @@ def _npi_batch_provider_result(
     return {"npi": npi, "status": 200, "provider": public_provider_map}, True
 
 
-async def _build_npi_batch_payload(
-    batch_params: Mapping[str, Any],
-    *,
-    session: Any = None,
-) -> dict[str, Any]:
-    """Assemble ordered provider summaries with set-based database reads."""
-    npis = list(batch_params["npis"])
-    detail_by_npi = await _build_npi_identity_details_map(npis, session=session)
-    ranked_addresses_by_npi = await _rank_npi_batch_addresses(npis, session=session)
-    selected_addresses_by_npi = await _hydrate_npi_batch_addresses(
-        npis,
-        ranked_addresses_by_npi,
-        address_limit=int(batch_params["address_limit"]),
-        address_offset=int(batch_params["address_offset"]),
-        include_sources=bool(batch_params["include_sources"]),
-        include_evidence=bool(batch_params["include_evidence"]),
-        session=session,
-    )
-    other_names_by_npi = await _fetch_other_names_map(npis, session=session)
-    enrichment_by_npi = await _fetch_provider_enrichment_summary_map(npis, session=session)
-    response_items: list[dict[str, Any]] = []
-    found_count = 0
-    for npi in npis:
-        provider_result_map, was_found = _npi_batch_provider_result(
-            npi,
-            detail_by_npi.get(npi),
-            ranked_addresses_by_npi[npi],
-            selected_addresses_by_npi[npi],
-            other_names_by_npi.get(npi, []),
-            enrichment_by_npi.get(npi),
-            batch_params,
-        )
-        response_items.append(provider_result_map)
-        found_count += int(was_found)
-    return {
-        "items": response_items,
-        "requested": len(npis),
-        "found": found_count,
-        "not_found": len(npis) - found_count,
-    }
+async def _build_npi_batch_payload(batch_params: Mapping[str, Any], *, session: Any = None) -> dict[str, Any]:
+    """Assemble summaries through the existing set-based native pipeline."""
+    from api.provider_batch import build_native_batch_payload
+
+    return await build_native_batch_payload(batch_params, session=session)
 
 
 @blueprint.post("/id/batch")
 async def get_npi_batch(request):
-    """Return up to 100 provider summaries from one bounded database pipeline."""
-    started = time.monotonic()
-    batch_params = _normalize_npi_batch_request(request.json)
-    payload = await _build_npi_batch_payload(
-        batch_params,
-        session=_request_session(request),
-    )
-    payload["meta"] = {
-        "elapsed_ms": round((time.monotonic() - started) * 1000.0, 2),
-        "max_batch_size": NPI_BATCH_MAX_SIZE,
-        "view": "summary",
-    }
-    return response.json(payload, default=str)
+    """Return a finite native provider batch using shared eligibility and shaping."""
+    from api.provider_batch import serve_native_batch
+
+    return await serve_native_batch(request)
 
 
 @blueprint.get("/id/<npi>")

@@ -28,6 +28,7 @@ def _body(**changes):
         "filters": [{"field_id": "metric", "operator": "gt", "value": "5"}],
         "order": None,
         "require_match": True,
+        "include_filter": True,
     }
     document_map.update(changes)
     return transport._canonical_json_bytes(document_map)
@@ -154,6 +155,35 @@ def _install(monkeypatch, session, *, page_items=None, imported=True, require_ma
     )
     monkeypatch.setattr(service_http, "_service_page", page)
     monkeypatch.setattr(service_http, "verify_published_generation", finality)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    (
+        ("9000000000", ("9000000000",)),
+        ("[9000000000]", ("9000000000",)),
+        ("0009000000000", ("9000000000",)),
+        ("23", ()),
+        ("null", None),
+    ),
+)
+async def test_native_service_npi_normalization_scopes_imports_without_changing_native_args(monkeypatch, raw, expected):
+    session = _Session()
+    _install(monkeypatch, session)
+    observed_scopes = []
+    original = service_http._provider_relation_query
+
+    def relation_query(parsed, **arguments):
+        query = original(parsed, **arguments)
+        observed_scopes.append((query.entity_values, parsed.native_args.get("npi")))
+        return query
+
+    monkeypatch.setattr(service_http, "_provider_relation_query", relation_query)
+    reply = await service_http.serve_custom_import_provider_service(
+        _request(_body(native_query={"code_system": "CPT", "code": "99213", "npi": raw, "limit": "2"})), session
+    )
+    assert reply.status == 200 and observed_scopes == [(expected, raw)]
 
 
 @pytest.mark.parametrize(

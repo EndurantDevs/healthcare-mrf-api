@@ -9,7 +9,14 @@ a permit for one cannot authorize the other. The host must authorize the
 extension scope before signing a request. These routes do not accept unsigned
 requests or URL query parameters.
 
-The canonical JSON body has exactly these six properties:
+Public gateways use `ext_filter` to select filtering and ordering. GET routes
+accept its JSON-encoded object; provider batch POST accepts an object. The
+independent `include` string selects payload enrichment and may name the same
+import, another authorized import, or multiple imports. Filtering alone does
+not imply enrichment. A gateway signs `include_filter: true` only when the
+included name selects the filter's same current attachment.
+
+The canonical signed JSON body contains these properties:
 
 ```json
 {
@@ -24,7 +31,8 @@ The canonical JSON body has exactly these six properties:
   "context": [{"field_id": "service_code", "operator": "eq", "value": "example"}],
   "filters": [{"field_id": "amount", "operator": "gt", "value": "12.50"}],
   "order": [{"field_id": "amount", "direction": "desc"}],
-  "require_match": true
+  "require_match": true,
+  "include_filter": true
 }
 ```
 
@@ -32,8 +40,9 @@ The example illustrates the document shape; the transport signer must produce
 canonical JSON and bind its exact bytes, target, route, authorization scope, and
 the provider-v2 signing domain. Fields and aliases must be declared by the
 pinned definition. `context` contains only non-null equality selectors for
-declared context dimensions. `filters` contains only non-null `eq`, `gt`, or
-`lt` metric predicates and cannot name a context dimension. Ungrouped requests
+declared context dimensions. `filters` contains only non-null `eq`, `gt`, `gte`,
+`lt`, or `lte` metric predicates and cannot name a context dimension. `gte` and
+`lte` include values equal to the threshold; `gt` and `lt` exclude them. Ungrouped requests
 accept up to three context and metric terms combined, and three order terms.
 Imported ordering requires an equality selector for every declared
 selection-context dimension.
@@ -59,8 +68,11 @@ native relation. Complete-family composition pages admit at most 50 returned
 provider rows and retain the native NPI tie-break order. Generic search and
 grouped query-projection reads keep their existing page limits.
 
-The native response envelope and provider fields remain unchanged. Each returned
-provider gains `custom_import`, either null for an absent order-only match or:
+The native response envelope and provider fields remain unchanged. With
+`include_filter: false`, rows omit `custom_import` entirely and no imported
+family payload is hydrated or rendered. An omitted flag defaults to true to preserve deployed signed-v2 callers; new gateways always send an explicit Boolean. With `include_filter: true`, the same prepared
+query and pinned target supply `custom_import`, either null for an absent
+order-only match or:
 
 ```json
 {
@@ -127,16 +139,18 @@ response exceeding the applicable per-provider or page bound fails closed; the
 route does not return a partial or unextended fallback. Requests without extension
 composition retain the ordinary provider endpoints and their existing behavior.
 
-Opted-in grouped list and geo requests with `family_entitlement: "full_family"`
+Included grouped list and geo requests with `include_filter: true` and
+`family_entitlement: "full_family"`
 return `custom_import` as a `custom-import/entity-family-set/v1` document with
 `target`, `projection`, `selection`, `families`, and `missing_group_values`.
 `projection` is `full_family`; each selected family includes its root fields and
 complete child collections, not only the query-context child. Grouped requests
-accept four combined context and metric predicates, or five with the declared
-grouped child query. An implicit default selection value counts as one predicate.
-The limit of three order terms is unchanged.
+accept four metric predicates and four order terms, with up to seven combined
+context and metric predicates when selecting a declared child. An implicit
+default selection value counts as one predicate. Ungrouped reads retain their
+existing three-term limits.
 
-Ordinary complete-family pages and opted-in grouped full-family pages allow at
+Included ordinary complete-family pages and included grouped full-family pages allow at
 most 50 native rows. List pages accept `limit` or `page_size`; service pages accept
 `limit`. A value above 50 is rejected with HTTP 400 before storage reads, even if
 fewer providers would match. Each provider's complete
@@ -185,14 +199,48 @@ the 256 KiB limit; the batch envelope is bounded by `(requested identities + 1)
 * 256 KiB`. Reads use one bounded read-only snapshot and fail closed without
 partial results when authorization, hydration, finality, or a limit fails.
 
+## Filtered native batches
+
+`POST /api/v1/extensions/custom-import/providers/batch` uses the same signed
+provider-v2 body plus `native_batch`. This object has exactly `npis`,
+`address_limit`, `address_offset`, `include_sources`, and `include_evidence`.
+NPIs are 1–100 unique normalized ten-digit strings. Flat address pages retain
+the native 1–20 limit and offset bound; premise grouping returns 1–5 groups
+with at most five members per group. Normalized list eligibility and shaping
+options live in `native_query`, independently of the import selectors.
+
+One query is prepared for all requested identities. Native eligibility and
+imported membership/order cover that complete finite set before successful
+results are paged. Complete imported families are hydrated only when included,
+in chunks of at most 50 using the same prepared query and target. The final
+complete-family bound is `(successful returned rows + 1) * 256 KiB`.
+
+The response retains native `items` with `npi`, `status`, and `provider` or
+`error`, plus `requested`, `found`, `not_found`, and `meta`. Counts describe
+all inputs before pagination; `pagination` carries successful `total`, `page`,
+`offset`, `limit`, and `has_more`. Its default limit is the requested count.
+Without effective ordering or explicit paging, items retain input order.
+Configured default imported ordering counts as effective ordering. With
+ordering or paging, successful page entries precede failures in input order.
+Successful inputs outside the page are omitted and never become 404 entries.
+
+The ordinary `POST /api/v1/npi/id/batch` retains its original five-field
+request and summary response. An optional `native_query` uses the same normal
+list eligibility, paging, card, and address-shaping path without an import pin.
+An identity-only native provider remains a success when no native eligibility
+filter requires an address. `extra_info`, card view, and premise grouping are
+applied through the existing native projections; no per-NPI HTTP or query loop
+is introduced. The native reader resolves all requested identities together.
+
 ## Geo pages
 
-`POST /api/v1/extensions/custom-import/providers/geo` uses the same six-property
+`POST /api/v1/extensions/custom-import/providers/geo` uses the same provider-v2
 signed body with native geo parameters such as `lat`, `long`, `radius`, `limit`,
 and `cursor`. Native values are strings; the page limit is 50. It returns
 `items`, an exact `total_count`, `has_more`, `next_cursor`, and
 `result_identity: ["npi", "address_key"]`. Full and card views both include the
-same nullable `custom_import` field described above.
+same nullable `custom_import` field described above when `include_filter` is true;
+otherwise the field is absent.
 
 Native eligibility and provider-address deduplication precede imported ordering
 and pagination. Absent imports remain last in either direction. Equal imported
@@ -216,10 +264,11 @@ invalidated anchor.
 ## Service pages
 
 `POST /api/v1/extensions/custom-import/providers/by-service` uses the same
-six-property provider-v2 body. Its `native_query` must include `code` and
+provider-v2 body. Its `native_query` must include `code` and
 `code_system`; other accepted native service parameters remain strings. The
 route requires an exact declared context when the selected profile has context
 dimensions, then applies imported membership and ordering before native claim
 thresholds, count, ordering, and pagination. The native service response keeps
 its `items`, `pagination`, and `query` envelope; each item receives the same
-nullable `custom_import` field described above.
+nullable `custom_import` field described above when `include_filter` is true;
+otherwise the field is absent.

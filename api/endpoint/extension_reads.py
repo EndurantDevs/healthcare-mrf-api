@@ -8,6 +8,7 @@ from typing import Any
 from sanic import Blueprint
 
 from api.custom_import_detail_batch import serve_custom_import_detail_batch
+from api.custom_import_provider_batch import serve_custom_import_provider_batch
 from api.custom_import_provider_geo import serve_custom_import_provider_geo
 from api.custom_import_provider_http import serve_custom_import_providers
 from api.custom_import_provider_service_http import serve_custom_import_provider_service
@@ -53,6 +54,13 @@ async def providers_geo(request: Any):
     """Compose a pinned import with a live native geo page."""
 
     return await serve_custom_import_provider_geo(request, _session(request))
+
+
+@blueprint.post("/providers/batch", name="custom_import.providers_batch")
+async def providers_batch(request: Any):
+    """Filter and page a finite native batch using one pinned import query."""
+
+    return await serve_custom_import_provider_batch(request, _session(request))
 
 
 @blueprint.post("/providers/by-service", name="custom_import.providers_by_service")

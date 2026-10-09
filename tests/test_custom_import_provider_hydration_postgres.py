@@ -7,18 +7,23 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sanic import response
 from sanic.request.parameters import RequestParameters
-from sqlalchemy import func, literal, select, text
+from sqlalchemy import BigInteger, cast, func, literal, select, text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from api import custom_import_detail_batch as batch_http
+from api import custom_import_provider_batch as provider_batch_http
 from api import custom_import_provider_geo as geo_http
 from api import custom_import_provider_http as provider_http
 from api import custom_import_provider_service_http as service_http
 from api import custom_import_read_http as transport
-from api.custom_import_provider_sql import compile_npi_entity_relation
+from api import provider_list_sql
+from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
+from api.endpoint import npi as native_npi
 from api.endpoint import pricing
 from process.custom_import import read_core
 from process.custom_import.definition import CustomImportDefinition
@@ -41,6 +46,7 @@ from tests import test_custom_import_read_core_postgres as read_fixture
 from tests import test_custom_import_read_http as http_fixture
 from tests import test_custom_import_runner_postgres as runner_fixture
 from tests.custom_import_postgres_support import (
+    _database_url,
     _quoted_publication_schema,
     digest,
     isolated_publication_case,
@@ -597,6 +603,7 @@ def _grouped_service_request(session, pinned_target, entitlement, *, is_native=F
         "order": None,
         "require_match": True,
         "grouped_entity_selection": fixture.selection_document(),
+        "include_filter": True,
     }
     if entitlement is not None:
         request_map["family_entitlement"] = entitlement
@@ -765,6 +772,7 @@ def _page_request(target, path, *, full_family):
         "order": [{"field_id": "score", "direction": "desc"}],
         "require_match": False,
         "grouped_entity_selection": fixture.selection_document(),
+        "include_filter": True,
     }
     if full_family:
         request_map["family_entitlement"] = "full_family"
@@ -865,3 +873,122 @@ async def test_signed_page_entitlement_cannot_be_added_after_signing(monkeypatch
         reply = await provider_http.serve_custom_import_providers(request, session)
         assert reply.status == 404
         assert not session.in_transaction()
+
+
+def _filtered_provider_batch_request(target, *, include_filter, offset):
+    target_map = transport._target_document(_external_target(target))
+    request_map = {
+        "target": target_map,
+        "native_query": {"limit": "1", "offset": str(offset)},
+        "context": [{"field_id": "segment", "operator": "eq", "value": "segment_a"}],
+        "filters": [{"field_id": "score", "operator": "gte", "value": "10"}],
+        "order": [{"field_id": "score", "direction": "desc"}],
+        "require_match": True,
+        "include_filter": include_filter,
+        "grouped_entity_selection": fixture.selection_document(),
+        "family_entitlement": "full_family",
+        "native_batch": {
+            "npis": [_A, _C, _B, "1999999999"],
+            "address_limit": 5,
+            "address_offset": 0,
+            "include_sources": False,
+            "include_evidence": False,
+        },
+    }
+    body = transport._canonical_json_bytes(request_map)
+    path = provider_batch_http.CUSTOM_IMPORT_PROVIDER_BATCH_PATH
+    return http_fixture._Request(
+        body, http_fixture._resigned_provider_headers(body=body, path=path, target=target_map), path=path
+    )
+
+
+@pytest.mark.asyncio
+async def test_signed_provider_batch_filters_counts_and_pages_before_optional_full_hydration(monkeypatch):
+    http_fixture._install_keyring(monkeypatch)
+    identities = [int(canonical_npi) for canonical_npi in (_A, _B, _C)]
+    monkeypatch.setattr(
+        native_npi,
+        "_build_npi_identity_details_map",
+        AsyncMock(return_value={identity: {"npi": identity} for identity in identities}),
+    )
+    monkeypatch.setattr(
+        native_npi,
+        "_rank_npi_batch_addresses",
+        AsyncMock(return_value={identity: [] for identity in (*identities, 1999999999)}),
+    )
+    monkeypatch.setattr(native_npi, "_fetch_other_names_map", AsyncMock(return_value={}))
+    monkeypatch.setattr(native_npi, "_fetch_provider_enrichment_summary_map", AsyncMock(return_value={}))
+    async with _case(children=_page_children()) as (case, pinned_target):
+        for include_filter, offset in ((False, 0), (True, 0), (True, 1), (False, 2)):
+            async with case.sessions() as session:
+                reply = await provider_batch_http.serve_custom_import_provider_batch(
+                    _filtered_provider_batch_request(pinned_target, include_filter=include_filter, offset=offset),
+                    session,
+                )
+                assert not session.in_transaction()
+            assert reply.status == 200, reply.body
+            payload_by_field = json.loads(reply.body)
+            assert (payload_by_field["requested"], payload_by_field["found"], payload_by_field["not_found"]) == (
+                4,
+                2,
+                2,
+            )
+            assert payload_by_field["pagination"] == {
+                "total": 2,
+                "page": offset + 1,
+                "offset": offset,
+                "limit": 1,
+                "has_more": offset == 0,
+            }
+            successes = [provider_item for provider_item in payload_by_field["items"] if provider_item["status"] == 200]
+            assert [provider_item["npi"] for provider_item in successes] == (
+                [] if offset == 2 else [int((_B, _A)[offset])]
+            )
+            assert [
+                provider_item["npi"] for provider_item in payload_by_field["items"] if provider_item["status"] == 404
+            ] == [int(_C), 1999999999]
+            assert all(("custom_import" in provider_item["provider"]) is include_filter for provider_item in successes)
+            if include_filter:
+                family_set = successes[0]["provider"]["custom_import"]
+                assert family_set["projection"] == "full_family" and family_set["target"] == transport._target_document(
+                    _external_target(pinned_target)
+                )
+                assert family_set["selection"]["value"] == (2025 if offset == 0 else 2024)
+                assert sum(len(family["children"]) for family in family_set["families"]) == (1 if offset == 0 else 3)
+
+
+@pytest.mark.asyncio
+async def test_finite_native_batch_sql_scope_counts_and_orders_before_list_paging():
+    prepared = read_core.PreparedNpiEntityRelation(
+        select(literal("9000000000").label("entity_value"), literal(3).label("sort_0")).union_all(
+            select(literal("9000000001"), cast(literal(None), BigInteger)),
+            select(literal("9000000003"), literal(100)),
+        ),
+        (ReadOrderTerm("score", "desc", "last"),),
+        "b" * 64,
+        "c" * 64,
+    )
+    scoped_npis = (9000000000, 9000000001, 9000000002)
+    compiled = compile_npi_entity_relation(prepared.statement)
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.connect() as connection, connection.begin():
+            await connection.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            for require_match, expected in ((True, list(scoped_npis[:2])), (False, list(scoped_npis))):
+                context = ProviderImportQuery(prepared, compiled, require_match, scoped_npis)
+                membership = provider_list_sql._provider_import_membership_clause(context, "native.npi")
+                eligible_sql = (
+                    "SELECT native.npi FROM (VALUES (9000000000::bigint), (9000000001), (9000000002), (9000000003)) AS native(npi) WHERE "
+                    + membership
+                )
+                count_ctes, page_sql = provider_list_sql._provider_import_count_page(eligible_sql, context)
+                statement = provider_list_sql._provider_list_statement(
+                    f"WITH custom_import_provider_relation AS ({compiled.sql}), {count_ctes}, scoped_page AS ({page_sql}) SELECT provider_totals._provider_total, scoped_page.npi FROM provider_totals LEFT JOIN scoped_page ON TRUE",
+                    context,
+                )
+                for offset in range(len(expected) + 1):
+                    params_by_name = provider_list_sql._provider_list_parameters({"start": offset, "limit": 1}, context)
+                    result_rows = (await connection.execute(statement, params_by_name)).all()
+                    assert result_rows == [(len(expected), expected[offset] if offset < len(expected) else None)]
+    finally:
+        await engine.dispose()

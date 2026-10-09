@@ -424,6 +424,41 @@ paths:
           $ref: '#/components/responses/CustomImportProviderNotFound'
         '503':
           $ref: '#/components/responses/CustomImportProviderUnavailable'
+  /extensions/custom-import/providers/batch:
+    post:
+      operationId: batchProvidersWithCustomImport
+      summary: Filter and page a signed finite native provider batch
+      description: |
+        Provider-v2 signing is bound to this exact route and canonical body.
+        Eligibility and ordering cover every requested NPI before successful
+        matches are paginated. Excluded page matches are omitted, not reported
+        as missing. Imported payloads are returned only when include_filter is true.
+      parameters:
+        - $ref: '#/components/parameters/CustomImportProviderReadContext'
+        - $ref: '#/components/parameters/CustomImportProviderReadKeyId'
+        - $ref: '#/components/parameters/CustomImportProviderReadSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomImportProviderBatchRequest'
+      responses:
+        '200':
+          description: Native batch envelope with exact pre-page counts and optional imported payloads.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportProviderBatchResponse'
+        '400':
+          $ref: '#/components/responses/CustomImportProviderInvalidRequest'
+        '404':
+          $ref: '#/components/responses/CustomImportProviderNotFound'
+        '503':
+          $ref: '#/components/responses/CustomImportProviderUnavailable'
   /extensions/custom-import/providers/geo:
     post:
       operationId: listGeoProvidersWithCustomImport
@@ -3916,6 +3951,9 @@ paths:
         represented by per-item 404 results while the batch remains HTTP 200.
         A Provider Directory profile without either an NPPES identity row or a
         published address does not by itself establish batch-v1 existence.
+        An optional native_query adds normal list eligibility and successful-result
+        pagination. Explicit card, extra_info, and premise address grouping reuse
+        native provider projections; the original five-field request is unchanged.
       requestBody:
         required: true
         content:
@@ -3958,6 +3996,8 @@ paths:
                 include_evidence:
                   type: boolean
                   default: false
+                native_query:
+                  $ref: '#/components/schemas/NativeProviderBatchQuery'
       responses:
         '200':
           description: Ordered provider results with per-item status
@@ -7517,18 +7557,23 @@ components:
           maxItems: 3
           description: Non-null equality selectors for declared selection-context dimensions.
           items:
-            $ref: '#/components/schemas/CustomImportProviderPredicate'
+            allOf:
+              - $ref: '#/components/schemas/CustomImportProviderPredicate'
+              - properties:
+                  operator:
+                    enum: [eq]
         filters:
           type: array
-          maxItems: 3
-          description: Non-null metric predicates; context and filters together are limited to three terms.
+          maxItems: 4
+          description: Ungrouped reads allow three combined predicates. Grouped reads allow four metric predicates and up to seven combined terms with a selected child.
           items:
             $ref: '#/components/schemas/CustomImportProviderPredicate'
         order:
           type: array
           nullable: true
           minItems: 1
-          maxItems: 3
+          maxItems: 4
+          description: Grouped reads allow four order terms; ungrouped reads retain three.
           items:
             type: object
             additionalProperties: false
@@ -7543,6 +7588,106 @@ components:
         require_match:
           type: boolean
           description: False requires imported ordering and retains absent imports last.
+        include_filter:
+          type: boolean
+          default: true
+          description: Include the same pinned filter import payload. False omits custom_import and skips its hydration. Missing retains legacy signed-v2 enrichment.
+        grouped_entity_selection:
+          $ref: '#/components/schemas/CustomImportGroupedEntitySelection'
+        grouped_child_query:
+          $ref: '#/components/schemas/CustomImportGroupedChildQuery'
+        family_entitlement:
+          type: string
+          enum: [full_family]
+    NativeProviderBatchQuery:
+      type: object
+      description: |
+        Normalized native list values are strings, except name_like may be a
+        string array. Supports existing list eligibility, ordering, and paging;
+        extra_info and address_grouping use exact-provider shape semantics.
+        Full means the normal collection projection, not enrollment-rich detail.
+        Count-only, sitemap, unknown names, and conflicting shape options are rejected.
+      additionalProperties:
+        oneOf:
+          - type: string
+            maxLength: 2048
+          - type: array
+            minItems: 1
+            maxItems: 16
+            items: {type: string, maxLength: 2048}
+    CustomImportProviderBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [target, native_query, native_batch, context, filters, order, require_match]
+      properties:
+        target:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/target'
+        native_query:
+          $ref: '#/components/schemas/NativeProviderBatchQuery'
+        context:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/context'
+        filters:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/filters'
+        order:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/order'
+        require_match:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/require_match'
+        include_filter:
+          $ref: '#/components/schemas/CustomImportProviderRequest/properties/include_filter'
+        grouped_entity_selection:
+          $ref: '#/components/schemas/CustomImportGroupedEntitySelection'
+        grouped_child_query:
+          $ref: '#/components/schemas/CustomImportGroupedChildQuery'
+        family_entitlement:
+          type: string
+          enum: [full_family]
+        native_batch:
+          type: object
+          additionalProperties: false
+          required: [npis, address_limit, address_offset, include_sources, include_evidence]
+          properties:
+            npis:
+              type: array
+              minItems: 1
+              maxItems: 100
+              uniqueItems: true
+              items: {$ref: '#/components/schemas/CustomImportNpiValue'}
+            address_limit: {type: integer, minimum: 1, maximum: 20}
+            address_offset: {type: integer, minimum: 0, maximum: 1000000}
+            include_sources: {type: boolean}
+            include_evidence: {type: boolean}
+    CustomImportProviderBatchResponse:
+      type: object
+      additionalProperties: false
+      required: [items, requested, found, not_found, pagination, meta]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: false
+            required: [npi, status]
+            properties:
+              npi: {type: integer, format: int64}
+              status: {type: integer, enum: [200, 404]}
+              provider: {$ref: '#/components/schemas/CustomImportProviderResult'}
+              error: {type: object}
+        requested: {type: integer, minimum: 1, maximum: 100}
+        found: {type: integer, minimum: 0, maximum: 100}
+        not_found: {type: integer, minimum: 0, maximum: 100}
+        pagination:
+          type: object
+          additionalProperties: false
+          required: [total, page, offset, limit, has_more]
+          properties:
+            total: {type: integer, minimum: 0, maximum: 100}
+            page: {type: integer, minimum: 1}
+            offset: {type: integer, minimum: 0}
+            limit: {type: integer, minimum: 1, maximum: 100}
+            has_more: {type: boolean}
+        meta:
+          $ref: '#/paths/~1npi~1id~1batch/post/responses/200/content/application~1json/schema/properties/meta'
     CustomImportProviderPredicate:
       type: object
       additionalProperties: false
@@ -7553,7 +7698,7 @@ components:
           pattern: '^[a-z][a-z0-9_]{0,62}$'
         operator:
           type: string
-          enum: [eq, gt, lt]
+          enum: [eq, gt, gte, lt, lte]
         value:
           oneOf:
             - type: string
@@ -7563,7 +7708,7 @@ components:
             - type: boolean
     CustomImportProviderResult:
       type: object
-      required: [npi, custom_import]
+      required: [npi]
       properties:
         npi:
           oneOf:
@@ -7571,21 +7716,31 @@ components:
             - type: integer
               format: int64
         custom_import:
-          type: object
-          nullable: true
-          additionalProperties: false
-          required: [target, root_fields, context_fields]
-          properties:
-            target:
-              $ref: '#/components/schemas/CustomImportReadTarget'
-            root_fields:
-              type: array
-              items:
-                $ref: '#/components/schemas/CustomImportReadFieldValue'
-            context_fields:
-              type: array
-              items:
-                $ref: '#/components/schemas/CustomImportReadFieldValue'
+          description: Present only when include_filter is true; null denotes an absent optional imported family.
+          oneOf:
+            - $ref: '#/components/schemas/CustomImportGroupedFullFamilySet'
+            - type: object
+              additionalProperties: false
+              required: [target, root_fields, context_fields]
+              properties:
+                target:
+                  $ref: '#/components/schemas/CustomImportReadTarget'
+                root_fields:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/CustomImportReadFieldValue'
+                context_fields:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/CustomImportReadFieldValue'
+                children:
+                  type: array
+                  maxItems: 1000
+                  items:
+                    $ref: '#/components/schemas/CustomImportRootDetailChild'
+            - type: object
+              nullable: true
+              enum: [null]
       additionalProperties: true
     CustomImportProviderListPage:
       type: object

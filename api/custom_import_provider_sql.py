@@ -36,6 +36,7 @@ class ProviderImportQuery:
     prepared: PreparedNpiEntityRelation
     compiled: CompiledNpiEntityRelation
     require_match: bool
+    native_npis: tuple[int, ...] | None = None
 
     def __post_init__(self):
         # A complete child selector narrows membership even for ordering-only requests.
