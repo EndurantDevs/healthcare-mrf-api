@@ -198,11 +198,13 @@ def iter_records(
     stream: SourceStream,
     *,
     limits: CaptureLimits = _DEFAULT_CAPTURE_LIMITS,
+    _cleanup_failures: list[BaseException] | None = None,
 ) -> Iterator[DecodedRecord]:
     """Yield validated source-label records from a verified sealed capture."""
 
     verify_capture(capture, stream, limits=limits)
-    yield from _iter_verified_records(capture, stream, limits=limits)
+    cleanup_options_by_name = {} if _cleanup_failures is None else {"_cleanup_failures": _cleanup_failures}
+    yield from _iter_verified_records(capture, stream, limits=limits, **cleanup_options_by_name)
 
 
 def _iter_verified_records(
@@ -210,6 +212,7 @@ def _iter_verified_records(
     stream: SourceStream,
     *,
     limits: CaptureLimits,
+    _cleanup_failures: list[BaseException] | None = None,
 ) -> Iterator[DecodedRecord]:
     """Decode one capture only after an internal caller has verified its sealed bytes."""
 
@@ -226,12 +229,14 @@ def _iter_verified_records(
         yield from _iter_xml_records(capture.payload, stream, limits)
         return
     if stream.format == "parquet":
+        cleanup_options_by_name = {} if _cleanup_failures is None else {"_cleanup_failures": _cleanup_failures}
         yield from _iter_parquet_records(
             capture.payload,
             stream,
             limits,
             expected_decoded_bytes=capture.manifest.decoded_bytes,
             expected_decoded_sha256=capture.manifest.decoded_sha256,
+            **cleanup_options_by_name,
         )
         return
     raise CaptureError("capture manifest declares an unsupported source format")
@@ -753,6 +758,7 @@ def _iter_parquet_records(
     *,
     expected_decoded_bytes: int,
     expected_decoded_sha256: str,
+    _cleanup_failures: list[BaseException] | None = None,
 ) -> Iterator[DecodedRecord]:
     """Decode bounded, flat Parquet rows without permitting external file references."""
 
@@ -764,7 +770,8 @@ def _iter_parquet_records(
         expected_decoded_sha256=expected_decoded_sha256,
     )
     _validate_parquet_envelope(decoded_payload)
-    with _open_parquet_reader(decoded_payload, limits) as parquet_reader:
+    cleanup_options_by_name = {} if _cleanup_failures is None else {"_cleanup_failures": _cleanup_failures}
+    with _open_parquet_reader(decoded_payload, limits, **cleanup_options_by_name) as parquet_reader:
         schema = parquet_reader.schema_arrow
         source_labels = _validated_parquet_schema(schema, limits)
         expected_record_count = _validated_parquet_metadata(
@@ -790,6 +797,8 @@ def _iter_parquet_records(
 def _open_parquet_reader(
     decoded_payload: bytes | memoryview,
     limits: CaptureLimits,
+    *,
+    _cleanup_failures: list[BaseException] | None = None,
 ) -> Iterator[pq.ParquetFile]:
     """Open one in-memory Parquet reader with bounded native parser metadata."""
 
@@ -813,10 +822,15 @@ def _open_parquet_reader(
     except (pa.ArrowException, EOFError, OSError, OverflowError, ValueError) as exc:
         raise CaptureError("Parquet source payload is invalid") from exc
     finally:
-        if parquet_reader is not None:
-            parquet_reader.close()
-        if native_buffer is not None:
-            native_buffer.close()
+        try:
+            if parquet_reader is not None:
+                parquet_reader.close()
+            if native_buffer is not None:
+                native_buffer.close()
+        except BaseException as error:
+            if _cleanup_failures is not None:
+                _cleanup_failures.append(error)
+            raise
 
 
 def _iter_parquet_batch_records(

@@ -412,12 +412,24 @@ def scalar_projection_models(
 ) -> tuple[CustomImportRootScalar | CustomImportChildScalar, ...]:
     """Build definition-verified immutable ORM rows for scalar persistence."""
 
+    root_rows, child_rows = _scalar_projection_rows(definition, root_scalars, child_scalars, child_collection_slots)
+    return tuple(_root_scalar_model(row) for row in root_rows) + tuple(_child_scalar_model(row) for row in child_rows)
+
+
+def _scalar_projection_values(definition, *, root_scalars=(), child_scalars=(), child_collection_slots=None):
+    """Apply the same complete row validation before native array encoding."""
+
+    root_rows, child_rows = _scalar_projection_rows(definition, root_scalars, child_scalars, child_collection_slots)
+    return tuple(_root_scalar_values(row) for row in root_rows) + tuple(_child_scalar_values(row) for row in child_rows)
+
+
+def _scalar_projection_rows(definition, root_scalars, child_scalars, child_collection_slots):
     _validated_definition(definition)
     root_rows = tuple(root_scalars)
     child_rows = tuple(child_scalars)
     slots = _validated_child_collection_slots(definition, child_collection_slots) if child_rows else {}
     _validate_scalar_projection_rows(definition, root_rows, child_rows, slots)
-    return tuple(_root_scalar_model(row) for row in root_rows) + tuple(_child_scalar_model(row) for row in child_rows)
+    return root_rows, child_rows
 
 
 async def persist_scalar_projections(

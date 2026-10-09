@@ -427,6 +427,33 @@ async def test_dispatch_and_read_queries_scale_with_pages(monkeypatch, count, re
     assert not db.async_session.get.called and not db.async_session.add.called and not db.async_session.flush.called
 
 
+@pytest.mark.parametrize("retained", [False, True])
+@pytest.mark.parametrize("root_profile", [False, True])
+async def test_set_arrays_do_not_construct_scalar_relationship_or_context_models(monkeypatch, retained, root_profile):
+    raw = _raw_definition()
+    if root_profile:
+        raw["selection_profiles"][0]["selection"] = [{"field": "display_name", "direction": "asc", "nulls": "last"}]
+        raw["selection_profiles"][0]["context_dimensions"] = ["display_name"]
+    request = _request(definition=CustomImportDefinition.from_mapping(raw), page_row_limit=128)
+    registry = _registry(request.definition)
+    families = [family_input(request, root_id, retained=retained, count=2) for root_id in (1, 2)]
+    db = CallerDatabase(monkeypatch, request, families)
+    constructors = []
+    for model in (
+        graph.CustomImportRootScalar,
+        graph.CustomImportChildScalar,
+        graph.CustomImportFamilyChild,
+        graph.CustomImportBuildCandidateContext,
+    ):
+        constructor = Mock(side_effect=AssertionError("transient projection model"))
+        monkeypatch.setattr(model, "__init__", constructor)
+        constructors.append(constructor)
+    await sets.consume_family_page(None, request, registry, tuple(item for item, _ in families))
+    assert len(db.calls) == 2 and len(db.seen) == 4
+    assert all(row.complete for row in db.progress.values())
+    assert not any(constructor.called for constructor in constructors)
+
+
 async def test_mixed_empty_and_nonempty_families_keep_real_ids(monkeypatch):
     request = _request(page_row_limit=128)
     families = [family_input(request, index + 1, retained=bool(index % 2), count=index // 2) for index in range(6)]
@@ -561,9 +588,27 @@ def test_source_child_arrays_keep_decimal_precision_and_legacy_projection_bytes(
     groups = tuple(sets._ChildGroup(state, children) for state, (_item, children) in zip(states, families, strict=True))
     name, args = sets._child_arguments(request, registry, groups)
     projections = [
-        projection_model for group in groups for projection_model in sets._source_projections(request, registry, group)
+        projection_model
+        for group in groups
+        for child in group.children
+        for projection_model in graph._child_models(
+            request,
+            registry,
+            group.state.current.build_id,
+            group.state.family,
+            group.state.source.values,
+            child,
+            graph.payload_values(
+                graph.fields_by_collection(request.definition)["rates"], child.canonical_payload, label="child"
+            ),
+            "rates",
+        )
     ]
-    scalars = [projection_model for projection_model in projections if isinstance(projection_model, sets.Scalar)]
+    scalars = [
+        projection_model
+        for projection_model in projections
+        if isinstance(projection_model, graph.CustomImportChildScalar)
+    ]
     for index, (kind, field) in enumerate(sets._SCALAR_COLUMNS, 12):
         assert args[index] == (kind, tuple(getattr(projection_model, field) for projection_model in scalars))
     assert [array_value for array_value in args[18][1] if array_value is not None] == [Decimal("1.000000000001")] * 2
