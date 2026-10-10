@@ -43,7 +43,7 @@ from tests import test_custom_import_runner_postgres as runner_fixture
 from tests.custom_import_postgres_support import _migration, isolated_publication_case
 from tests.test_custom_import_build_output_postgres import (
     _activate,
-    _assert_legacy_parity,
+    _assert_sealed_materialization,
     _complete,
     _definition,
     _records,
@@ -99,7 +99,7 @@ async def test_identical_children_resume_with_final_occurrence(monkeypatch):
         await build_graph.build_graph(case.sessions, request, staged.build_id)
         sealed = await build_output.build_output(case.sessions, request, staged.build_id)
         assert sealed.seal.family_child_count == 2 and sealed.seal.winner_count == 1
-        await _assert_legacy_parity(case, request, sealed)
+        await _assert_sealed_materialization(case, request, sealed)
         replay = await build_output.build_output(case.sessions, request, staged.build_id)
         assert replay.seal.replayed
         eager = assemble_root_families(
@@ -150,7 +150,7 @@ async def test_policy_revision_preserves_previous_family_when_payloads_conflict(
         assert request.schema_revision_id == initial.schema_revision_id
         build_id, completed = await _complete(case, request)
         assert completed.seal.family_count == completed.seal.family_child_count == 2
-        await _assert_legacy_parity(case, request, completed)
+        await _assert_sealed_materialization(case, request, completed)
         async with case.sessions() as session:
             models = await session.run_sync(_candidate_models, request)
             plans = (
@@ -360,7 +360,7 @@ async def test_membership_admission_is_typed_root_scoped_and_independent_of_pack
         await build_graph.build_graph(case.sessions, request, staged.build_id)
         sealed = await build_output.build_output(case.sessions, request, staged.build_id)
         assert sealed.seal.family_count == counts.accepted_family_count
-        await _assert_legacy_parity(case, request, sealed)
+        await _assert_sealed_materialization(case, request, sealed)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -410,7 +410,7 @@ async def test_duplicate_inner_key_keeps_native_primary_rejection_before_members
         await build_graph.build_graph(case.sessions, request, staged.build_id)
         sealed = await build_output.build_output(case.sessions, request, staged.build_id)
         assert sealed.seal.family_count == 1
-        await _assert_legacy_parity(case, request, sealed)
+        await _assert_sealed_materialization(case, request, sealed)
 
 
 async def _plan_membership_page(case, request, build_id):
@@ -467,7 +467,7 @@ async def test_new_memberships_revalidate_and_resume_compatible_retained_familie
         await build_graph.build_graph(case.sessions, request, staged.build_id)
         sealed = await build_output.build_output(case.sessions, request, staged.build_id)
         assert sealed.seal.family_count == 2
-        await _assert_legacy_parity(case, request, sealed)
+        await _assert_sealed_materialization(case, request, sealed)
         completed = await _membership_progress(case, staged.build_id)
         assert completed.plan_page_sequence > progress.plan_page_sequence + 1
         assert completed.plan_membership_after_child_revision_id == completed.plan_membership_after_collection_slot == 0
@@ -575,7 +575,7 @@ async def test_membership_schema_check_applies_only_to_actually_retained_familie
         else:
             _, sealed = await _complete(case, request)
             assert sealed.seal.family_count == 2
-            await _assert_legacy_parity(case, request, sealed)
+            await _assert_sealed_materialization(case, request, sealed)
         async with case.sessions() as session:
             pointer = await session.get(CustomImportCurrentGeneration, request.dataset_id)
             assert (pointer.generation_id, pointer.pointer_version) == (base.generation_id, 1)

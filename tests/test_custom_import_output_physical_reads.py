@@ -19,6 +19,74 @@ def _query():
     return select(root.root_revision_id, root.canonical_payload), (root.root_revision_id,), (root,)
 
 
+def _composite_query():
+    root = CustomImportRootRevision
+    return (
+        select(root.root_record_id, root.root_revision_id, root.canonical_payload),
+        (root.root_record_id, root.root_revision_id),
+        (root,),
+    )
+
+
+def test_composite_physical_ranges_preserve_same_root_continuation(monkeypatch):
+    """Keep exact tuple cursors across byte cuts while exposing inclusive root ranges."""
+    statement, keys, models = _composite_query()
+    metadata_bytes = graph._physical_key_bytes(keys)
+    fixed_bytes = metadata_bytes + 64 + 16 * (len(statement.selected_columns) + 1)
+    monkeypatch.setattr(graph, "MAX_BATCH_BYTES", 6 * metadata_bytes + 2 * (1000 + fixed_bytes))
+    session = _read_session(
+        monkeypatch,
+        [
+            [(1, 2, 1000), (1, 3, 1000), (1, 4, 1000)],
+            [(1, 2, "two", 1, 2, 2), (1, 3, "three", 1, 3, 2)],
+            [(1, 4, 1000), (2, 1, 1000)],
+            [(1, 4, "four", 1, 4, 1)],
+            [(2, 1, 1000)],
+            [(2, 1, "next", 2, 1, 1)],
+            [],
+        ],
+    )
+    page_records = graph._read_query_pages(
+        session,
+        _request(),
+        7,
+        lambda _session: (statement, keys, models),
+        after=(1, 1),
+        bounds=graph._ReadPage(physical=True),
+    )
+    assert list(page_records) == [(1, 2, "two"), (1, 3, "three"), (1, 4, "four"), (2, 1, "next")]
+    statements = [
+        str(call.args[0].compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+        for call in session.execute.call_args_list
+    ]
+    tuple_sql = str(graph.tuple_(*keys).compile(dialect=postgresql.dialect()))
+    for index, lower in ((0, (1, 1)), (2, (1, 3)), (4, (1, 4)), (6, (2, 1))):
+        assert f"root_record_id >= {lower[0]}" in statements[index]
+        assert f"{tuple_sql} > {lower}" in statements[index]
+    for index, lower, upper in ((1, (1, 1), (1, 3)), (3, (1, 3), (1, 4)), (5, (1, 4), (2, 1))):
+        assert statements[index].count(f"root_record_id <= {upper[0]}") == 2
+        assert statements[index].count(f"{tuple_sql} > {lower}") == 2
+        assert statements[index].count(f"{tuple_sql} <= {upper}") == 2
+        assert list(session.execute.call_args_list[index].args[0].selected_columns)[-1].element._limit_clause is None
+        assert "count(*)" in statements[index] and " IN " not in statements[index]
+    assert session.execute.call_count == 7
+
+
+def test_composite_physical_prefix_count_rejects_unfetched_duplicate(monkeypatch):
+    """A leading-key range must not hide duplicate complete keys beyond the limit."""
+    session = _read_session(
+        monkeypatch,
+        [[(1, 1, 1), (1, 2, 1)], [(1, 1, "one", 1, 1, 3), (1, 2, "two", 1, 2, 3)]],
+    )
+    with pytest.raises(CandidateRunnerError, match="changed during its read"):
+        next(
+            graph._read_query_pages(
+                session, _request(), 7, lambda _session: _composite_query(), bounds=graph._ReadPage(physical=True)
+            )
+        )
+    assert session.execute.call_args_list[1].args[0]._limit_clause.value == 2
+
+
 def test_physical_byte_cutoff_preserves_range_cursor(monkeypatch):
     statement, keys, models = _query()
     metadata_bytes = graph._physical_key_bytes(keys)

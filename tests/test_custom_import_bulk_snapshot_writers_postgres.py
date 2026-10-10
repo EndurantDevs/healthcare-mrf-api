@@ -24,17 +24,28 @@ from db.models.custom_import import (
     CustomImportFamilyChild,
     CustomImportField,
     CustomImportPack,
+    CustomImportRootRevision,
+    CustomImportRootScalar,
 )
 from db.models.custom_import_storage import CustomImportSnapshotFamily
 from process.custom_import import build_graph as graph
 from process.custom_import import build_output as output
 from process.custom_import import build_source as source
+from process.custom_import import materialization_store as store
 from process.custom_import.bulk_page_codec import encode_landing_batch
+from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.execution import lease_token_sha256
 from process.custom_import.storage_layout import snapshot_models, snapshot_schema
+from tests import test_custom_import_build_output_postgres as output_fixture
 from tests.custom_import_postgres_support import _migration, isolated_publication_case
-from tests.test_custom_import_build_output_postgres import _assert_legacy_parity, _complete, _records, _request_for
+from tests.test_custom_import_build_output_postgres import (
+    _assert_sealed_materialization,
+    _complete,
+    _records,
+    _request_for,
+)
 from tests.test_custom_import_build_source_postgres import _candidate_models, _retained_request, _root
+from tests.test_custom_import_materialization_set_postgres import _header_count
 from tests.test_custom_import_writer_cutover_postgres import _before_cutover, _record_role
 from tests.test_custom_import_writer_cutover_postgres import _install as _install_cutover
 from tests.test_custom_import_writer_cutover_postgres import _refresh as _refresh_rejections
@@ -583,9 +594,9 @@ async def test_native_refresh_reaches_frozen_writable_and_future_leaves_without_
             await _assert_partial_refresh_rollback(
                 connection, case.schema_name, storage_before, storage_query, before_by_identity, after_by_identity
             )
-        await _assert_legacy_parity(case, frozen_request, sealed)
+        await _assert_sealed_materialization(case, frozen_request, sealed)
         _, writable_sealed = await _complete(case, writable_request)
-        await _assert_legacy_parity(case, writable_request, writable_sealed)
+        await _assert_sealed_materialization(case, writable_request, writable_sealed)
         future_request = await _request_for(case, _records(1, 1), page_rows=32)
         await source.stage_segmented_source(case.sessions, future_request)
         async with case.engine.begin() as connection:
@@ -598,11 +609,13 @@ class _PageCaptured(Exception):
     pass
 
 
-async def _capture_child_arguments(case, request, build_id, monkeypatch, original):
+async def _capture_source_arguments(
+    case, request, build_id, monkeypatch, original, *, writer="append_custom_import_build_source_families_page"
+):
     captured_arguments = []
 
     async def capture(session, name, arguments):
-        if name == "append_custom_import_build_source_families_page":
+        if name == writer:
             captured_arguments.append(arguments)
             raise _PageCaptured
         return await original(session, name, arguments)
@@ -611,6 +624,185 @@ async def _capture_child_arguments(case, request, build_id, monkeypatch, origina
     with pytest.raises(_PageCaptured):
         await graph.build_graph(case.sessions, request, build_id)
     return captured_arguments[0]
+
+
+def _null_projection_definition():
+    """Declare optional hot fields represented by explicit nulls in sealed Parquet."""
+    document = json.loads(output_fixture._definition().canonical)
+    for scope, name, slot, projection in (
+        (document["schema"]["root"], "optional_root", 7, 5),
+        (document["schema"]["children"][0], "optional_child", 8, 6),
+    ):
+        scope["fields"].append(
+            {"id": name, "slot": slot, "type": "string", "nullable": True, "projection_slot": projection}
+        )
+    return CustomImportDefinition.from_mapping(document)
+
+
+async def _changed_null_source_scalar(case, request, *, child):
+    """Target a declared null cell with an unexpected value through ordinary persistence."""
+    async with case.sessions() as session:
+        models = await session.run_sync(_candidate_models, request)
+        revision_model = models[CustomImportChildRevision if child else CustomImportRootRevision]
+        revision = (await session.scalars(select(revision_model))).one()
+        name = "optional_child" if child else "optional_root"
+        field = (
+            await session.scalars(
+                select(CustomImportField).where(
+                    CustomImportField.dataset_id == request.dataset_id,
+                    CustomImportField.schema_revision_id == request.schema_revision_id,
+                    CustomImportField.field_name == name,
+                )
+            )
+        ).one()
+        assert {cell["field"]: cell["value"]["state"] for cell in json.loads(revision.canonical_payload)["fields"]}[
+            name
+        ] == "null"
+        scalar_values_by_name = dict(
+            dataset_id=request.dataset_id,
+            schema_revision_id=request.schema_revision_id,
+            root_record_id=revision.root_record_id,
+            field_slot=field.field_slot,
+            field_collection_slot=field.collection_slot,
+            projection_slot=field.projection_slot,
+            field_type=field.field_type,
+            value_state="value",
+            string_value="unexpected",
+        )
+        if child:
+            return models, CustomImportChildScalar(
+                child_revision_id=revision.child_revision_id,
+                collection_slot=revision.collection_slot,
+                **scalar_values_by_name,
+            )
+        return models, CustomImportRootScalar(root_revision_id=revision.root_revision_id, **scalar_values_by_name)
+
+
+async def _grant_scalar_guard_dispatchers(case, worker, writer, namespace):
+    """Grant only the public entry points; candidate tables retain their closed ACLs."""
+    names = {"custom_import_materialization_budget", "persist_custom_import_scalar_set", writer}
+    async with case.engine.begin() as connection:
+        await connection.execute(text(f'GRANT USAGE ON SCHEMA "{case.schema_name}" TO "{worker}"'))
+        functions = (
+            await connection.execute(
+                text(
+                    "SELECT p.proname,format('%I.%I(%s)',n.nspname,p.proname,pg_get_function_identity_arguments(p.oid)) "
+                    "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+                    "WHERE n.nspname=:schema AND p.proname=ANY(CAST(:names AS text[]))"
+                ),
+                dict(schema=case.schema_name, names=sorted(names)),
+            )
+        ).all()
+        assert len(functions) == len(names) and {name for name, _signature in functions} == names
+        for _name, signature in functions:
+            await connection.execute(text(f'GRANT EXECUTE ON FUNCTION {signature} TO "{worker}"'))
+        for relation in ("custom_import_root_scalar", "custom_import_child_scalar"):
+            assert not await connection.scalar(
+                text("SELECT has_any_column_privilege(:role,:relation,'INSERT')"),
+                dict(role=worker, relation=f'"{namespace}"."{relation}"'),
+            )
+
+
+async def _scalar_guard_state(case, models, build_id, *, child):
+    """Compare scalar rows, deferred receipts and complete graph progress after rollback."""
+    scalar = models[CustomImportChildScalar if child else CustomImportRootScalar]
+    plan = models[CustomImportBuildFamily]
+    async with case.sessions() as session:
+        progress = (
+            await session.execute(
+                select(
+                    plan.family_revision_id,
+                    plan.attached_child_count,
+                    plan.last_child_collection_slot,
+                    plan.last_child_key_sha256,
+                    plan.last_input_child_revision_id,
+                    plan.complete_at,
+                ).where(plan.build_id == build_id)
+            )
+        ).all()
+        build = await session.get(CustomImportBuildAttempt, build_id)
+        assert build.phase == "graph"
+        return await session.scalar(select(func.count()).select_from(scalar)), await _header_count(session), progress
+
+
+async def _reject_changed_null_scalar(case, request, build_id, scalar, namespace, source_call, role, *, before):
+    """Reject preexisting work or a changed null replay and retain caller-owned rollback."""
+    message = (
+        ("graph_children_uncommitted_work" if scalar.field_collection_slot else "graph_roots_uncommitted_work")
+        if before
+        else "custom_import_scalar_set_replay_mismatch"
+    )
+    with pytest.raises(DBAPIError, match=message):
+        async with graph._page_session(case.sessions, request, build_id) as (session, _build):
+            if role:
+                await session.execute(text(f'SET LOCAL ROLE "{role}"'))
+            assert await store.persist_scalar_models(session, (scalar,)) == 1
+            assert before, "a committed graph page accepted a changed null scalar replay"
+            if role:
+                privileges = (
+                    await session.execute(
+                        text(
+                            "SELECT count(*),bool_or(has_function_privilege(:role,p.oid,'EXECUTE')) "
+                            "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+                            "WHERE n.nspname=:namespace AND p.proname='persist_custom_import_scalar_models'"
+                        ),
+                        dict(role=role, namespace=namespace),
+                    )
+                ).one()
+                assert tuple(privileges) == (1, False)
+            await graph._source_call(session, *source_call)
+
+
+@pytest.mark.parametrize("child", [False, True], ids=["root", "child"])
+async def test_current_source_pages_reject_exported_scalar_preinsert_and_changed_null_replay(monkeypatch, child):
+    """Check current SOURCE preinsert closure and immutable null replay for both callers."""
+    original = graph._source_call
+    writer = (
+        "append_custom_import_build_source_families_page" if child else "start_custom_import_build_source_roots_page"
+    )
+    async with _before_cutover(roles=True) as (case, (_other_owner, worker)):
+        async with case.engine.begin() as connection:
+            await connection.run_sync(_install_cutover, case.schema_name)
+            await connection.run_sync(_refresh_rejections, case.schema_name)
+            await connection.run_sync(_refresh, case.schema_name)
+        request = await _request_for(case, _records(1, 1), definition=_null_projection_definition(), page_rows=32)
+        staged = await source.stage_segmented_source(case.sessions, request)
+        arguments = await _capture_source_arguments(
+            case, request, staged.build_id, monkeypatch, original, writer=writer
+        )
+        monkeypatch.setattr(graph, "_source_call", original)
+        models, scalar = await _changed_null_source_scalar(case, request, child=child)
+        scalar_model = models[type(scalar)]
+        namespace = inspect(scalar_model).selectable.schema
+        await _grant_scalar_guard_dispatchers(case, worker, writer, namespace)
+        before = await _scalar_guard_state(case, models, staged.build_id, child=child)
+        assert before[:2] == (0, 0)
+        for role in (None, worker):
+            await _reject_changed_null_scalar(
+                case, request, staged.build_id, scalar, namespace, (writer, arguments), role, before=True
+            )
+            assert await _scalar_guard_state(case, models, staged.build_id, child=child) == before
+        async with graph._page_session(case.sessions, request, staged.build_id) as (session, _build):
+            await original(session, writer, arguments)
+        committed = await _scalar_guard_state(case, models, staged.build_id, child=child)
+        assert committed[0] > 0 and committed[1] == 0
+        async with case.sessions() as session:
+            assert (
+                await session.execute(
+                    select(scalar_model.value_state, scalar_model.string_value).where(
+                        scalar_model.field_slot == scalar.field_slot,
+                        scalar_model.root_record_id == scalar.root_record_id,
+                    )
+                )
+            ).one() == ("null", None)
+        for role in (None, worker):
+            await _reject_changed_null_scalar(
+                case, request, staged.build_id, scalar, namespace, (writer, arguments), role, before=False
+            )
+            assert await _scalar_guard_state(case, models, staged.build_id, child=child) == committed
+        await graph.build_graph(case.sessions, request, staged.build_id)
+        sealed = await output.build_output(case.sessions, request, staged.build_id)
+        await _assert_sealed_materialization(case, request, sealed)
 
 
 async def _duplicate_child_payload(case, request, arguments):
@@ -713,7 +905,7 @@ async def test_native_leaf_error_order_rollback_and_restricted_dispatcher_match(
             await connection.run_sync(_refresh_rejections, case.schema_name)
         request = await _request_for(case, _records(1, 1), page_rows=32)
         staged = await source.stage_segmented_source(case.sessions, request)
-        arguments = await _capture_child_arguments(case, request, staged.build_id, monkeypatch, original)
+        arguments = await _capture_source_arguments(case, request, staged.build_id, monkeypatch, original)
         models, duplicate_payload = await _duplicate_child_payload(case, request, arguments)
         migration = _migration(_PATH, "child_presence_dispatch_native")
         await _grant_child_dispatcher(case, worker, models[CustomImportChildRevision], migration)
@@ -729,4 +921,4 @@ async def test_native_leaf_error_order_rollback_and_restricted_dispatcher_match(
         await graph.build_graph(case.sessions, request, staged.build_id)
         sealed = await output.build_output(case.sessions, request, staged.build_id)
         assert sealed.seal.family_count == sealed.seal.family_child_count == 1
-        await _assert_legacy_parity(case, request, sealed)
+        await _assert_sealed_materialization(case, request, sealed)
