@@ -15,11 +15,11 @@
         "status": "not_recorded",
         "checked_at": null
       },
-      "reviewed_at": "2026-08-25",
+      "reviewed_at": "2026-10-10",
       "source_detail": "blocked Provider Directory endpoint discovery",
       "source_url": "https://appconnect.chorushealthplans.org/developers/providerapi",
-      "reason": "Official public base is documented but not reachable as an importable FHIR service.",
-      "note": "Official client code identifies https://cchp.healthlx.com:9091/fhir, but its capability endpoint still returns no usable response; the official portal page is reachable but does not expose an importable FHIR base."
+      "reason": "No importable FHIR base or CapabilityStatement was confirmed from the reviewed portal and metadata request.",
+      "note": "The official portal returned HTTP 200 as a JavaScript shell. A request to the previously recorded metadata URL timed out from this client. The linked script did not reaffirm the historical base attribution. The unreachable classification reflects that limited observation; it does not establish a general outage or a current canonical base. Portal access does not establish anonymous FHIR access."
     },
     {
       "id": "provider-directory-blocked-first-medical-pr",
@@ -39,11 +39,11 @@
         "status": "not_recorded",
         "checked_at": null
       },
-      "reviewed_at": "2026-08-25",
+      "reviewed_at": "2026-10-10",
       "source_detail": "blocked Provider Directory endpoint discovery",
       "source_url": "https://devportal.firstmedicalpr.com/ApiLibrary",
-      "reason": "Official portal requires a user token and no open public FHIR base is confirmed.",
-      "note": "Indexed official First Medical developer documentation lists Practitioner, PractitionerRole, and Location APIs with registration, client credentials, user-token access, and production approval required; the current portal fetch is WAF-blocked."
+      "reason": "Indexed official documentation describes registered-developer, user-token APIs, but no open, importable Provider Directory base is confirmed.",
+      "note": "The API library and portal returned HTTP 403 to unauthenticated requests. Indexed official documentation lists Practitioner, PractitionerRole and Location with user-token security and developer registration for member/US Core APIs. These documentary requirements do not establish a Provider Directory access contract; no open production base or CapabilityStatement was confirmed."
     },
     {
       "id": "provider-directory-blocked-territory-of-puerto-rico",
@@ -59,11 +59,11 @@
         "status": "not_recorded",
         "checked_at": null
       },
-      "reviewed_at": "2026-08-25",
+      "reviewed_at": "2026-10-10",
       "source_detail": "CMS SMA Endpoint Directory Provider Directory implementation date TBD",
       "source_url": "https://raw.githubusercontent.com/CMSgov/SMA-Endpoint-Directory/main/SMAEndpointDirectory.csv",
       "reason": "CMS SMA Endpoint Directory provides no Puerto Rico Provider Directory production base and lists implementation date as TBD.",
-      "note": "CMS SMA Endpoint Directory leaves Puerto Rico Provider Directory base, status, capability, FHIR version, and resource list blank while implementation date remains TBD."
+      "note": "The cited CMS directory's Puerto Rico row leaves Provider Directory production base, status, capability link and FHIR version blank and lists implementation date TBD. This is a statement about the directory listing, not a current statewide service census. No separate resource-list field was identified."
     }
   ]
 }

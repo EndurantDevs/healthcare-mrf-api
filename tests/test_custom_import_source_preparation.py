@@ -410,9 +410,44 @@ async def test_cancellation_drains_the_native_call_before_decoder_cleanup(monkey
     assert events == ["native-settled", "closed"]
 
 
-async def _exercise_source_route(monkeypatch, hosted, encoder):
-    context = _bulk_context()
-    _decoded(monkeypatch, [_root()] * 4)
+def _reordered_source_case(stream, same_type):
+    context = _bulk_context(stream)
+    document = json.loads(context.request.definition.canonical)
+    root, child = document["schema"]["root"], document["schema"]["children"][0]
+    root["fields"].reverse()
+    child["fields"].reverse()
+    record_values = (
+        [_root(score=Decimal("7")), _root(score=None), _root(npi=None), _root(npi="invalid")]
+        if stream == 0
+        else [_child(key='Ω\n"\\'), _child(amount=None), _child(npi=None), _child(key=None)]
+    )
+    if same_type:
+        for field in (*root["fields"], *child["fields"]):
+            field["type"] = "string"
+        root["logical_key"] = ["enabled", "npi", "score"]
+        child["parent_key"] = [
+            {"child": "detail_id", "root": "enabled"},
+            {"child": "detail_npi", "root": "npi"},
+            {"child": "amount", "root": "score"},
+        ]
+        child["child_key"] = ["amount", "detail_id"]
+        record_values = [
+            {name: None if scalar is None else str(scalar) for name, scalar in values_by_field.items()}
+            for values_by_field in record_values
+        ]
+    else:
+        next(field for field in root["fields"] if field["id"] == "score")["type"] = "integer"
+    definition = CustomImportDefinition.from_mapping(document)
+    context = replace(
+        context, request=replace(context.request, definition=definition), stream=definition.source_streams[stream]
+    )
+    return context, record_values
+
+
+async def _exercise_source_route(monkeypatch, hosted, encoder, *, stream=0, same_type=False):
+    context, record_values = _reordered_source_case(stream, same_type)
+    _decoded(monkeypatch, record_values)
+    expected_pages = await _pages(context, _part(4), serial=True)
     calls = _native_double(monkeypatch, encoder)
     monkeypatch.setattr(multiprocessing.current_process(), "daemon", True)
 
@@ -441,26 +476,29 @@ async def _exercise_source_route(monkeypatch, hosted, encoder):
                 execution_id=4,
                 build_id=11,
                 fence=1,
-                stream_slot=1,
+                stream_slot=stream + 1,
                 expected_cursor=_CURSOR,
                 lease_token=context.request.lease_token,
                 source_permit=_PERMIT,
             )
             == "complete"
         )
-        assert len(commit.await_args.args[2][0].records) == 4
+        actual_pages = commit.await_args.args[2]
     else:
         monkeypatch.setattr(staging, "_validate_replay_partition_schema", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(staging, "_aggregate_parquet_arrow_bytes", lambda *_args, **_kwargs: 0)
         store = AsyncMock()
         assert await staging._replay_part(None, context, _part(4), _policy(), (1, 0, 0), store_page=store) == 4
-        assert len(store.await_args.args[2].records) == 4
-    assert calls and sum(len(cell_rows) for _layout, cell_rows in calls) == 4
+        actual_pages = tuple(call.args[2] for call in store.await_args_list)
+    assert calls and sum(len(cell_rows) for _layout, cell_rows in calls) == 1
+    assert _landing(context, actual_pages) == _landing(context, expected_pages)
 
 
 @pytest.mark.parametrize("hosted", [False, True])
-async def test_both_normal_source_routes_reach_native_without_process_creation(monkeypatch, hosted):
-    await _exercise_source_route(monkeypatch, hosted, _reference_encoder)
+@pytest.mark.parametrize("stream", [0, 1])
+@pytest.mark.parametrize("same_type", [False, True])
+async def test_both_normal_source_routes_reach_native_without_process_creation(monkeypatch, hosted, stream, same_type):
+    await _exercise_source_route(monkeypatch, hosted, _reference_encoder, stream=stream, same_type=same_type)
 
 
 @pytest.mark.parametrize("native", [False, True])

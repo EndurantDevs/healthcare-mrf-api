@@ -150,8 +150,10 @@ def test_native_parent_key_can_reuse_one_source_cell(native):
 
 
 @pytest.mark.parametrize("hosted", [False, True])
-async def test_native_capability_reaches_both_daemon_source_routes(native, monkeypatch, hosted):
-    await _exercise_source_route(monkeypatch, hosted, native)
+@pytest.mark.parametrize("stream", [0, 1])
+@pytest.mark.parametrize("same_type", [False, True])
+async def test_native_capability_reaches_both_daemon_source_routes(native, monkeypatch, hosted, stream, same_type):
+    await _exercise_source_route(monkeypatch, hosted, native, stream=stream, same_type=same_type)
 
 
 @pytest.mark.parametrize(
