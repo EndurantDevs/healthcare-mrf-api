@@ -2,6 +2,8 @@
 """Small preparation preconditions and shared source-validation contracts."""
 
 import importlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -9,6 +11,16 @@ from process import cms_doctors_preparation as preparation
 from tests.test_cms_doctors_organizations import _mock_publication, _publication_context
 
 native = importlib.import_module("process.cms_doctors")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["_apply_cms_doctors_stage", "_apply_locked_cms_doctors_stage"])
+async def test_publication_refuses_missing_owner_transaction(monkeypatch, entrypoint):
+    database = SimpleNamespace(_transaction_binding=lambda: None, status=AsyncMock())
+    monkeypatch.setattr(native, "db", database)
+    with pytest.raises(RuntimeError, match="^cms_doctors_publication_requires_transaction$"):
+        await getattr(native, entrypoint)(object(), "mrf", "synthetic")
+    database.status.assert_not_awaited()
 
 
 def test_uuid_length_stage_indexes_are_distinct_and_bounded():
