@@ -4071,9 +4071,13 @@ paths:
                         minimum: 1000000000
                         maximum: 9999999999
                 address_limit:
-                  type: integer
-                  minimum: 1
-                  maximum: 20
+                  description: Maximum addresses per provider. Use 0 or 'all' for every address.
+                  oneOf:
+                    - type: integer
+                      minimum: 0
+                      maximum: 1000
+                    - type: string
+                      enum: [all]
                   default: 5
                 address_offset:
                   type: integer
@@ -7849,7 +7853,11 @@ components:
               maxItems: 100
               uniqueItems: true
               items: {$ref: '#/components/schemas/CustomImportNpiValue'}
-            address_limit: {type: integer, minimum: 1, maximum: 20}
+            address_limit:
+              type: integer
+              minimum: 0
+              maximum: 1000
+              description: Canonical per-provider address limit; 0 selects every address.
             address_offset: {type: integer, minimum: 0, maximum: 1000000}
             include_sources: {type: boolean}
             include_evidence: {type: boolean}
