@@ -7,9 +7,12 @@ from __future__ import annotations
 import json
 from collections import Counter
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
-from sqlalchemy import event
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy import event, text
 
 from process.custom_import import build_counts, build_graph, build_source
 from process.custom_import.definition import CustomImportDefinition
@@ -17,6 +20,7 @@ from process.custom_import.family import assemble_root_families
 from process.custom_import.runner import reject_duplicate_canonical_root_keys
 from process.custom_import.segmented_capture_policy import SegmentedCapturePolicy
 from tests import test_custom_import_build_output_postgres as output_fixture
+from tests.custom_import_postgres_support import _migration
 from tests.test_custom_import_build_source_postgres import _source_case
 from tests.test_custom_import_identical_children_postgres import _membership_definition, _membership_records
 from tests.test_custom_import_segmented_capture_postgres import _POLICY
@@ -140,3 +144,139 @@ async def test_native_retained_copies_do_not_change_source_outcomes():
         await build_graph.build_graph(case.sessions, request, staged.build_id)
         after = await build_counts.count_source_outcomes(case.sessions, request, staged.build_id)
         assert before == after == build_counts.SourceOutcomeCounts(0, 0)
+
+
+_ADMISSION_INDEX_PATH = (
+    Path(__file__).resolve().parents[1] / "alembic/versions/20261010000000_custom_import_admission_indexes.py"
+)
+
+
+def _install_admission_indexes(connection, schema, *, downgrade=False):
+    migration = _migration(_ADMISSION_INDEX_PATH, "admission_index_native")
+    migration._schema = lambda: schema
+    migration.op = Operations(MigrationContext.configure(connection))
+    (migration.downgrade if downgrade else migration.upgrade)()
+
+
+async def _index_function_catalog(case):
+    async with case.sessions() as session:
+        return (
+            (
+                await session.execute(
+                    text("""
+                    SELECT to_jsonb(p)-'prosrc' metadata FROM pg_proc p
+                    JOIN pg_namespace n ON n.oid=p.pronamespace
+                    WHERE n.nspname=:schema AND p.proname IN (
+                        'prepare_custom_import_snapshot_indexes','verify_custom_import_snapshot_indexes')
+                    ORDER BY p.proname
+                """),
+                    {"schema": case.schema_name},
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+@pytest.mark.parametrize("grant_worker", (False, True))
+async def test_index_schedule_preserves_function_oids_and_acls_through_reversal(grant_worker):
+    async with _source_case() as case:
+        if grant_worker:
+            async with case.engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        f'GRANT EXECUTE ON FUNCTION "{case.schema_name}".'
+                        "prepare_custom_import_snapshot_indexes(bigint,text) TO pg_monitor"
+                    )
+                )
+        original = await _index_function_catalog(case)
+        assert len(original) == 2
+        if grant_worker:
+            assert any(any(acl.startswith("pg_monitor=X/") for acl in row["proacl"] or ()) for row in original)
+        for downgrade in (False, False, True, False):
+            async with case.engine.begin() as connection:
+                await connection.run_sync(_install_admission_indexes, case.schema_name, downgrade=downgrade)
+            assert await _index_function_catalog(case) == original
+
+
+@pytest.mark.parametrize(
+    "name,grantee",
+    (
+        ("prepare_custom_import_snapshot_indexes", "PUBLIC"),
+        ("verify_custom_import_snapshot_indexes", "pg_monitor"),
+    ),
+)
+@pytest.mark.parametrize("downgrade", (False, True))
+async def test_index_schedule_rejects_unexpected_grants_without_catalog_changes(name, grantee, downgrade):
+    async with _source_case() as case:
+        async with case.engine.begin() as connection:
+            await connection.execute(
+                text(f'GRANT EXECUTE ON FUNCTION "{case.schema_name}".{name}(bigint,text) TO {grantee}')
+            )
+        original = await _index_function_catalog(case)
+        with pytest.raises(RuntimeError, match="custom_import_child_presence_identity_mismatch"):
+            async with case.engine.begin() as connection:
+                await connection.run_sync(_install_admission_indexes, case.schema_name, downgrade=downgrade)
+        assert await _index_function_catalog(case) == original
+
+
+async def test_candidate_admitted_before_upgrade_can_complete_after_upgrade():
+    async with _source_case() as case:
+        async with case.engine.begin() as connection:
+            await connection.run_sync(_install_admission_indexes, case.schema_name, downgrade=True)
+        request = await output_fixture._request_for(
+            case, _membership_records(), definition=_membership_definition(), page_rows=32
+        )
+        staged = await build_source.stage_segmented_source(case.sessions, request)
+        assert staged.phase == "graph"
+        async with case.sessions() as session:
+            assert (
+                await session.scalar(
+                    text(f"""
+                    SELECT count(*) FROM "{case.schema_name}".custom_import_snapshot_family f
+                    JOIN pg_namespace n ON n.nspname='ci_snapshot_'||f.family_id::text
+                    JOIN pg_class c ON c.relnamespace=n.oid AND c.relname='custom_import_build_graph_child_idx'
+                    WHERE f.execution_id=:execution_id
+                """),
+                    {"execution_id": request.execution_id},
+                )
+                == 0
+            )
+        async with case.engine.begin() as connection:
+            await connection.run_sync(_install_admission_indexes, case.schema_name)
+        _, completed = await output_fixture._complete(case, request)
+        await output_fixture._assert_legacy_parity(case, request, completed)
+
+
+@pytest.mark.parametrize("reverse", (False, True))
+async def test_configured_membership_uses_early_slot_index_and_candidate_statistics(reverse):
+    document = json.loads(_membership_definition(reverse=reverse).canonical)
+    if reverse:
+        document["schema"]["children"].reverse()
+    definition_json = json.dumps(document).replace('"details"', '"visits"').replace('"other"', '"results"')
+    definition = CustomImportDefinition.from_mapping(json.loads(definition_json))
+    assert {collection.name for collection in definition.child_collections} == {"visits", "results"}
+    records_by_stream = _membership_records(inner_count=25)
+    async with _source_case() as case:
+        async with case.engine.begin() as connection:
+            await connection.run_sync(_install_admission_indexes, case.schema_name)
+        request = await output_fixture._request_for(case, records_by_stream, definition=definition, page_rows=32)
+        staged = await build_source.stage_segmented_source(case.sessions, request)
+        assert staged.candidate_error_count == 0
+        async with case.sessions() as session:
+            statistics = (
+                await session.execute(
+                    text(f"""
+                        SELECT i.indisvalid,c.reltuples FROM "{case.schema_name}".custom_import_snapshot_family f
+                        JOIN pg_namespace n ON n.nspname='ci_snapshot_'||f.family_id::text
+                        JOIN pg_class idx ON idx.relnamespace=n.oid AND idx.relname='custom_import_build_graph_child_idx'
+                        JOIN pg_index i ON i.indexrelid=idx.oid
+                        JOIN pg_class c ON c.oid=i.indrelid
+                        WHERE f.execution_id=:execution_id
+                    """),
+                    {"execution_id": request.execution_id},
+                )
+            ).one()
+            assert statistics.indisvalid and statistics.reltuples == staged.source_occurrence_count
+        _, completed = await output_fixture._complete(case, request)
+        await output_fixture._assert_legacy_parity(case, request, completed)

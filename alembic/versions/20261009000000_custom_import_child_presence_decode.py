@@ -105,7 +105,7 @@ def _installer(bulk, schema: str, *, corrected: bool) -> str:
     )
 
 
-def _installed(bind, identity: str, owner_table: str, result: str, *, returns_set: bool):
+def _installed(bind, identity: str, owner_table: str, result: str, *, returns_set: bool, preserve_execute_grants=False):
     """Reject drift and retain every non-body catalog attribute for comparison."""
     return bind.execute(
         text(r"""
@@ -121,15 +121,32 @@ def _installed(bind, identity: str, owner_table: str, result: str, *, returns_se
               AND p.proconfig=ARRAY['search_path=pg_catalog']::text[]
               AND p.proowner=owner_table.relowner AND NOT EXISTS (
                 SELECT 1 FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) privilege
-                WHERE privilege.grantee<>p.proowner)
+                WHERE (privilege.grantee<>p.proowner AND NOT :preserve_execute_grants)
+                  OR privilege.grantee=0 OR privilege.privilege_type<>'EXECUTE')
         """),
-        dict(identity=identity, owner_table=owner_table, result=result, returns_set=returns_set),
+        dict(
+            identity=identity,
+            owner_table=owner_table,
+            result=result,
+            returns_set=returns_set,
+            preserve_execute_grants=preserve_execute_grants,
+        ),
     ).first()
 
 
-def _refresh(bind, identity: str, owner_table: str, result: str, previous: str, corrected: str, delimiter: str):
+def _refresh(
+    bind,
+    identity: str,
+    owner_table: str,
+    result: str,
+    previous: str,
+    corrected: str,
+    delimiter: str,
+    *,
+    preserve_execute_grants=False,
+):
     old_body, new_body = previous.split(delimiter)[1], corrected.split(delimiter)[1]
-    options_by_name = dict(returns_set=result.startswith("TABLE("))
+    options_by_name = dict(returns_set=result.startswith("TABLE("), preserve_execute_grants=preserve_execute_grants)
     before = _installed(bind, identity, owner_table, result, **options_by_name)
     if before is None or before.prosrc not in (old_body, new_body):
         raise RuntimeError("custom_import_child_presence_identity_mismatch")

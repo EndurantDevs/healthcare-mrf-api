@@ -53,10 +53,32 @@ def test_decision_ctes_keep_canonical_null_duplicate_membership_and_error_order(
     assert _compact(new_start) == _compact(old_start)
     old_end = historical.split("    primary_codes AS MATERIALIZED (", 1)[1].split("    SELECT (SELECT f.problem", 1)[0]
     new_end = ordinary.split("primary_codes AS MATERIALIZED (", 1)[1].split("SELECT (SELECT f.problem", 1)[0]
-    assert _compact(new_end) == _compact(old_end)
-    # Full equality above covers first_child_rejection and earliest failure occurrence/stage.
+    assert _compact(new_end.split("membership_checks AS MATERIALIZED (", 1)[0]) == _compact(
+        old_end.split("requested_memberships AS MATERIALIZED (", 1)[0]
+    )
+    assert _compact(new_end.split("first_membership_problem AS MATERIALIZED (", 1)[1]) == _compact(
+        old_end.split("first_membership_problem AS MATERIALIZED (", 1)[1]
+    )
     assert "first_child_rejection AS MATERIALIZED" in ordinary
     assert "ORDER BY f.occurrence_id,f.stage LIMIT 1" in ordinary
+
+
+def test_membership_lookup_keeps_first_source_revision_and_canonical_collision_check():
+    query = admission._queries()[1]
+    lookup = query.split("membership_checks AS MATERIALIZED (", 1)[1].split(
+        "first_membership_problem AS MATERIALIZED (", 1
+    )[0]
+    assert "LEFT JOIN LATERAL (" in lookup
+    assert "ORDER BY x.child_revision_id LIMIT 1" in lookup
+    assert "peer ON NOT m.malformed_key" in lookup
+    for predicate in (
+        "x.build_id=:build_id AND x.origin='source' AND x.root_record_id=m.root_record_id",
+        "x.collection_slot=m.outer_slot AND x.child_key_sha256=m.expected_hash",
+        "x.child_revision_id IS NOT NULL",
+        'peer.canonical_child_key COLLATE "C" IS DISTINCT FROM m.expected_key COLLATE "C"',
+    ):
+        assert predicate in lookup
+    assert "requested_memberships AS" not in query and "membership_peers AS" not in query
 
 
 def test_physical_prefix_uses_ordinal_groups_real_eof_and_first_group_fallback():

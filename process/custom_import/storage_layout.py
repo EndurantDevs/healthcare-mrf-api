@@ -46,6 +46,7 @@ _PHASE_INDEX_NAMES = {
             "custom_import_build_source_child_idx",
             "custom_import_build_final_child_idx",
             "custom_import_build_typed_root_idx",
+            "custom_import_build_graph_child_idx",
         }
     ),
     "graph": frozenset(
