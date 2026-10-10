@@ -675,7 +675,7 @@ jobs:
     - worker-queue-smoke
     - address-canonical-db-tests
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (always()) }}
+      && (!cancelled()) }}
     steps:
     - name: Require all validation jobs
       env:
@@ -730,7 +730,7 @@ jobs:
     name: Validation complete
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     needs:
     - measurement
     permissions:
