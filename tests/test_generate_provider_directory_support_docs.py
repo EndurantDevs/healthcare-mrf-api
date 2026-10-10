@@ -11,7 +11,7 @@ from tests.provider_directory_endpoint_acquisition_test_support import synthetic
 
 
 def test_rendered_support_matrix_represents_each_manifest_entry_once():
-    """The configured support table includes each tracked source exactly once."""
+    """The generated inventory and live-proof tables cover every tracked source."""
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
 
     rendered_document = generator.render_markdown(manifest)
@@ -59,8 +59,35 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "Exhaustive equivalence with plan-code bases" in rendered_document
 
 
-def test_rendered_support_matrix_preserves_inventory_access_and_live_metadata():
-    """Generated summary, access and verification tables preserve their source metadata."""
+def test_rendered_support_matrix_separates_live_evidence_and_blockers():
+    """Configured access and observed publication remain distinct."""
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    rendered_document = generator.render_markdown(manifest)
+
+    assert "## Observed Live Verification" in rendered_document
+    assert (
+        "| Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at |"
+        in rendered_document
+    )
+    assert (
+        "| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |"
+        in rendered_document
+    )
+    assert (
+        "| Idaho (`idaho`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |"
+        in rendered_document
+    )
+    assert "scripts/update_provider_directory_verification.py" in rendered_document
+    assert "## Known Not Importable" in rendered_document
+    assert "Chorus Community Health Plans" in rendered_document
+    assert "First Medical Health Plan, Inc." in rendered_document
+    assert "Territory of Puerto Rico" in rendered_document
+    assert "User token | Required" in rendered_document
+    assert "[campaign report]" not in rendered_document
+
+
+def test_rendered_inventory_summary_and_access_requirements():
+    """Inventory totals and access requirements remain separate from live proof."""
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
     rendered_document = generator.render_markdown(manifest)
 
@@ -82,30 +109,21 @@ def test_rendered_support_matrix_preserves_inventory_access_and_live_metadata():
         in rendered_document
     )
     assert "| Registration | Reviewed at | Review valid through |" in rendered_document
-    assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`)" in rendered_document
-    assert "Required | 2026-08-26 | 2026-10-10 | OAuth2 client credentials and Bulk" in rendered_document
-    assert "Cigna (`cigna`)" in rendered_document
-    assert "Not required | 2026-08-26 | 2026-10-10 | Sequential REST pagination" in rendered_document
-    assert "## Observed Live Verification" in rendered_document
-    assert (
-        "| Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at |"
-        in rendered_document
+    aetna_row = next(
+        candidate_line
+        for candidate_line in rendered_document.splitlines()
+        if candidate_line.startswith("| Aetna Commercial/Medicare (`aetna-commercial-medicare`) |")
+        and "| Bulk |" in candidate_line
     )
-    assert (
-        "| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |"
-        in rendered_document
+    assert "| Required |" in aetna_row
+    assert "OAuth2 client credentials and Bulk" in aetna_row
+    cigna_row = next(
+        candidate_line
+        for candidate_line in rendered_document.splitlines()
+        if candidate_line.startswith("| Cigna (`cigna`) |")
     )
-    assert (
-        "| Idaho (`idaho`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |"
-        in rendered_document
-    )
-    assert "scripts/update_provider_directory_verification.py" in rendered_document
-    assert "## Known Not Importable" in rendered_document
-    assert "Chorus Community Health Plans" in rendered_document
-    assert "First Medical Health Plan, Inc." in rendered_document
-    assert "Territory of Puerto Rico" in rendered_document
-    assert "User token | Required" in rendered_document
-    assert "[campaign report]" not in rendered_document
+    assert "| Not required |" in cigna_row
+    assert "Sequential REST pagination" in cigna_row
 
 
 def test_caresource_manifest_entry_is_public_carrier_level_r8_rest_support():
@@ -347,6 +365,7 @@ def test_blocker_registry_is_complete_and_shared_with_generated_docs():
         rows = [line for line in blocked_section.splitlines() if f"`{entry['id']}`" in line]
         assert len(rows) == 1
         assert rows[0].split("|")[10].strip() == entry["reviewed_at"]
+    assert "Reachable Unverified" in rendered
 
 
 def test_validate_blocker_registry_rejects_unknown_access_requirement():

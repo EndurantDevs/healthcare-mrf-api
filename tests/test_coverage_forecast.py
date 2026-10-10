@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import importlib
 import json
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
-
 
 SCRIPTS_DIRECTORY = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIRECTORY) not in sys.path:
@@ -136,9 +135,7 @@ def _write_rust_report(root: Path, covered_count: int) -> Path:
                             {
                                 "filename": str(source_path),
                                 "segments": [],
-                                "summary": {
-                                    "lines": {"covered": covered_count, "count": 100}
-                                },
+                                "summary": {"lines": {"covered": covered_count, "count": 100}},
                             }
                         ]
                     }
@@ -176,9 +173,7 @@ def _write_shard_artifacts(
         coverage_name, provenance_name = artifacts.shard_file_names(kind, shard)
         coverage_path = artifact_directory / coverage_name
         _write_coverage_data(root, coverage_path)
-        provenance = artifacts._expected_shard_provenance(
-            root, kind, shard, coverage_path, base_sha, head_sha
-        )
+        provenance = artifacts._expected_shard_provenance(root, kind, shard, coverage_path, base_sha, head_sha)
         (artifact_directory / provenance_name).write_text(json.dumps(provenance), encoding="utf-8")
 
 
@@ -194,9 +189,7 @@ def _staged_gate(
     candidate = ratchet._load_baseline(candidate_path)
     reference = ratchet._load_baseline(reference_path)
     errors = ratchet._compare_baselines(candidate, reference)
-    errors.extend(
-        ratchet._check_current_report(root, "python", candidate["reports"]["python"])
-    )
+    errors.extend(ratchet._check_current_report(root, "python", candidate["reports"]["python"]))
     stdout = "".join(f"ERROR: {error}\n" for error in errors)
     return subprocess.CompletedProcess(["coverage_ratchet"], int(bool(errors)), stdout, "")
 
@@ -264,9 +257,7 @@ def test_forecast_stages_report_metrics_and_files_for_the_ratio_ratchet(
     }
 
 
-def test_forecast_keeps_a_true_ratio_regression_red(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_forecast_keeps_a_true_ratio_regression_red(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Staging live metrics does not weaken the base ratio floor."""
 
     exit_code, output = _run_python_forecast(tmp_path, monkeypatch, covered_count=79)
@@ -285,9 +276,7 @@ def test_policy_projection_preserves_the_machine_artifact_marker(tmp_path: Path)
     candidate["machine_artifact_required"] = True
     reference["machine_artifact_required"] = True
 
-    projected_candidate, projected_reference = forecast._policy_projection(
-        candidate, reference, "python"
-    )
+    projected_candidate, projected_reference = forecast._policy_projection(candidate, reference, "python")
 
     assert projected_candidate["machine_artifact_required"] is True
     assert ratchet._compare_baselines(projected_candidate, projected_reference) == []
@@ -303,9 +292,7 @@ def test_machine_artifact_transition_allows_only_the_coverage_tool_upgrade() -> 
 
     assert ratchet._compare_baselines(candidate, reference) == []
     reference["machine_artifact_required"] = True
-    assert "python: measurement policy changed coverage" in ratchet._compare_baselines(
-        candidate, reference
-    )
+    assert "python: measurement policy changed coverage" in ratchet._compare_baselines(candidate, reference)
 
 
 def test_rust_toolchain_transition_allows_only_the_exact_upgrade() -> None:
@@ -320,14 +307,10 @@ def test_rust_toolchain_transition_allows_only_the_exact_upgrade() -> None:
 
     invalid_version = json.loads(json.dumps(candidate))
     invalid_version["reports"]["rust"]["scope"]["policy"]["rust"] = "1.98.2"
-    assert "rust: measurement policy changed rust" in ratchet._compare_baselines(
-        invalid_version, reference
-    )
+    assert "rust: measurement policy changed rust" in ratchet._compare_baselines(invalid_version, reference)
 
     downgrade = json.loads(json.dumps(reference))
-    assert "rust: measurement policy changed rust" in ratchet._compare_baselines(
-        downgrade, candidate
-    )
+    assert "rust: measurement policy changed rust" in ratchet._compare_baselines(downgrade, candidate)
 
     changed_coverage_tool = json.loads(json.dumps(candidate))
     changed_coverage_tool["reports"]["rust"]["scope"]["policy"]["cargo_llvm_cov"] = "0.8.8"
@@ -337,9 +320,7 @@ def test_rust_toolchain_transition_allows_only_the_exact_upgrade() -> None:
 
     narrowed_scope = json.loads(json.dumps(candidate))
     narrowed_scope["reports"]["rust"]["scope"]["include"] = []
-    assert "rust: baseline source scope was narrowed" in ratchet._compare_baselines(
-        narrowed_scope, reference
-    )
+    assert "rust: baseline source scope was narrowed" in ratchet._compare_baselines(narrowed_scope, reference)
 
     lower_coverage = json.loads(json.dumps(candidate))
     lower_coverage["reports"]["rust"]["metrics"]["lines"]["covered"] -= 4
@@ -368,9 +349,7 @@ def test_python_artifact_inventory_rejects_an_extra_producer_file(tmp_path: Path
         coverage_name, provenance_name = artifacts.shard_file_names("main", shard)
         coverage_path = artifact_directory / coverage_name
         coverage_path.write_bytes(b"coverage")
-        provenance = artifacts._expected_shard_provenance(
-            tmp_path, "main", shard, coverage_path, BASE_SHA, HEAD_SHA
-        )
+        provenance = artifacts._expected_shard_provenance(tmp_path, "main", shard, coverage_path, BASE_SHA, HEAD_SHA)
         (artifact_directory / provenance_name).write_text(json.dumps(provenance), encoding="utf-8")
     (artifact_directory / "unexpected").write_text("x", encoding="utf-8")
 
@@ -387,26 +366,18 @@ def test_rust_artifact_inventory_rejects_a_mixed_report_set(tmp_path: Path) -> N
     artifact_directory.mkdir()
     report_path = artifact_directory / "test-coverage-rust.json"
     report_path.write_text("{}", encoding="utf-8")
-    provenance = artifacts._report_provenance(
-        tmp_path, "rust", report_path, BASE_SHA, HEAD_SHA
-    )
-    (artifact_directory / artifacts.report_provenance_name("rust")).write_text(
-        json.dumps(provenance), encoding="utf-8"
-    )
+    provenance = artifacts._report_provenance(tmp_path, "rust", report_path, BASE_SHA, HEAD_SHA)
+    (artifact_directory / artifacts.report_provenance_name("rust")).write_text(json.dumps(provenance), encoding="utf-8")
     (artifact_directory / "other.json").write_text("{}", encoding="utf-8")
 
     with pytest.raises(artifacts.CoverageForecastError, match="exact report set"):
         artifacts.verify_report_artifact(tmp_path, artifact_directory, "rust", BASE_SHA, HEAD_SHA)
 
 
-def test_rust_provenance_refuses_a_producer_tool_version_drift(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_rust_provenance_refuses_a_producer_tool_version_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A scanner run on a changed toolchain cannot create an accepted sidecar."""
 
-    (tmp_path / artifacts.BASELINE_NAME).write_text(
-        json.dumps(_artifact_baseline()), encoding="utf-8"
-    )
+    (tmp_path / artifacts.BASELINE_NAME).write_text(json.dumps(_artifact_baseline()), encoding="utf-8")
     report_path = tmp_path / "test-coverage-rust.json"
     report_path.write_text("{}", encoding="utf-8")
     output_path = tmp_path / artifacts.report_provenance_name("rust")
@@ -424,25 +395,28 @@ def test_rust_provenance_refuses_a_producer_tool_version_drift(
         )
 
 
-def test_cli_writes_shard_provenance_without_rust_versions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cli_writes_shard_provenance_without_rust_versions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A Python shard producer sends only the arguments its writer accepts."""
 
     shard_calls: list[tuple[object, ...]] = []
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(
-        forecast, "write_shard_provenance", lambda *values: shard_calls.append(values)
-    )
+    monkeypatch.setattr(forecast, "write_shard_provenance", lambda *values: shard_calls.append(values))
     arguments = [
-        "write-shard-provenance", "--base", BASE_SHA, "--kind", "main", "--shard", "0",
-        "--coverage", "main.coverage", "--output", "main.provenance.json",
+        "write-shard-provenance",
+        "--base",
+        BASE_SHA,
+        "--kind",
+        "main",
+        "--shard",
+        "0",
+        "--coverage",
+        "main.coverage",
+        "--output",
+        "main.provenance.json",
     ]
 
     assert forecast.run_coverage_forecast_cli(arguments) == 0
-    assert shard_calls == [
-        (tmp_path, "main", "0", Path("main.coverage"), BASE_SHA, Path("main.provenance.json"))
-    ]
+    assert shard_calls == [(tmp_path, "main", "0", Path("main.coverage"), BASE_SHA, Path("main.provenance.json"))]
 
 
 def test_cli_writes_rust_provenance_with_actual_producer_versions(
@@ -452,13 +426,21 @@ def test_cli_writes_rust_provenance_with_actual_producer_versions(
 
     report_calls: list[tuple[object, ...]] = []
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(
-        forecast, "write_report_provenance", lambda *values: report_calls.append(values)
-    )
+    monkeypatch.setattr(forecast, "write_report_provenance", lambda *values: report_calls.append(values))
     arguments = [
-        "write-report-provenance", "--base", BASE_SHA, "--report-name", "rust", "--report",
-        "rust.json", "--output", "rust.provenance.json", "--cargo-llvm-cov-version", "0.8.7",
-        "--rust-version", "1.97.1",
+        "write-report-provenance",
+        "--base",
+        BASE_SHA,
+        "--report-name",
+        "rust",
+        "--report",
+        "rust.json",
+        "--output",
+        "rust.provenance.json",
+        "--cargo-llvm-cov-version",
+        "0.8.7",
+        "--rust-version",
+        "1.97.1",
     ]
     assert forecast.run_coverage_forecast_cli(arguments) == 0
     assert report_calls == [
@@ -466,20 +448,16 @@ def test_cli_writes_rust_provenance_with_actual_producer_versions(
     ]
 
 
-def test_python_forecast_combines_only_the_thirteen_bound_coverage_files(tmp_path: Path) -> None:
+def test_python_forecast_combines_only_the_twenty_one_bound_coverage_files(tmp_path: Path) -> None:
     """The healthcare topology replays all four main, capacity, and PG producers."""
 
-    (tmp_path / artifacts.BASELINE_NAME).write_text(
-        json.dumps(_artifact_baseline()), encoding="utf-8"
-    )
+    (tmp_path / artifacts.BASELINE_NAME).write_text(json.dumps(_artifact_baseline()), encoding="utf-8")
     (tmp_path / "test-coverage.ini").write_text(
         "[run]\nbranch = True\nsource_dirs =\n    api\n\n[report]\ninclude =\n    api/*.py\n",
         encoding="utf-8",
     )
     _write_shard_artifacts(tmp_path, tmp_path / "main", "main", BASE_SHA, HEAD_SHA)
-    _write_shard_artifacts(
-        tmp_path, tmp_path / "capacity", "capacity", BASE_SHA, HEAD_SHA
-    )
+    _write_shard_artifacts(tmp_path, tmp_path / "capacity", "capacity", BASE_SHA, HEAD_SHA)
     _write_shard_artifacts(tmp_path, tmp_path / "postgres", "postgres", BASE_SHA, HEAD_SHA)
 
     report_path, producer_files = combine.combine_python_coverage(
@@ -500,6 +478,14 @@ def test_python_forecast_combines_only_the_thirteen_bound_coverage_files(tmp_pat
             ".coverage.postgres.core-services",
             ".coverage.postgres.core-imports",
             ".coverage.postgres.core-ptg",
+            ".coverage.postgres.registry-0",
+            ".coverage.postgres.registry-1",
+            ".coverage.postgres.registry-2",
+            ".coverage.postgres.registry-3",
+            ".coverage.postgres.registry-4",
+            ".coverage.postgres.registry-5",
+            ".coverage.postgres.registry-6",
+            ".coverage.postgres.registry-7",
             ".coverage.postgres.directory-source",
             ".coverage.postgres.directory-storage",
             ".coverage.postgres.directory-address",
@@ -630,20 +616,25 @@ def test_python_diff_coverage_excludes_executed_excluded_lines(tmp_path: Path) -
     source_path = tmp_path / "api" / "sample.py"
     source_path.parent.mkdir()
     source_path.write_text(
-        "if flag:  # pragma: no cover\n    excluded = 1\ncovered = 2\n"
-        "if not flag:\n    missing = 3\n",
+        "if flag:  # pragma: no cover\n    excluded = 1\ncovered = 2\nif not flag:\n    missing = 3\n",
         encoding="utf-8",
     )
     report_path = tmp_path / "coverage.json"
     subprocess.run(
-        [sys.executable, "-c",
-         "import runpy, sys\nfrom coverage import Coverage\n"
-         "measurement = Coverage(data_file=None, branch=True, config_file=False)\n"
-         "measurement.start()\nrunpy.run_path(sys.argv[1], init_globals={'flag': True})\n"
-         "measurement.stop()\n"
-         "measurement.json_report(morfs=[sys.argv[1]], outfile=sys.argv[2])\n",
-         str(source_path), str(report_path)],
-        check=True, capture_output=True, text=True,
+        [
+            sys.executable,
+            "-c",
+            "import runpy, sys\nfrom coverage import Coverage\n"
+            "measurement = Coverage(data_file=None, branch=True, config_file=False)\n"
+            "measurement.start()\nrunpy.run_path(sys.argv[1], init_globals={'flag': True})\n"
+            "measurement.stop()\n"
+            "measurement.json_report(morfs=[sys.argv[1]], outfile=sys.argv[2])\n",
+            str(source_path),
+            str(report_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
     )
     document = json.loads(report_path.read_text(encoding="utf-8"))
     file_report = next(iter(document["files"].values()))
@@ -653,15 +644,21 @@ def test_python_diff_coverage_excludes_executed_excluded_lines(tmp_path: Path) -
         file_report["executed_lines"] = executed_lines
         report_path.write_text(json.dumps(document), encoding="utf-8")
         diff_coverage = growth._report_diff_coverage(
-            tmp_path, "python", config, {"api/sample.py": {2, 3, 5}},
+            tmp_path,
+            "python",
+            config,
+            {"api/sample.py": {2, 3, 5}},
         )
         assert (diff_coverage["covered"], diff_coverage["total"], diff_coverage["uncovered_lines"]) == (
-            1, 2, ["api/sample.py:5"],
+            1,
+            2,
+            ["api/sample.py:5"],
         )
     assert growth.find_added_exclusion_directives_in_diff(
         "diff --git a/api/sample.py b/api/sample.py\n+++ b/api/sample.py\n"
         "@@ -0,0 +1 @@\n+if flag:  # pragma: no cover\n",
-        {"reports": {"python": config}}, ["python"],
+        {"reports": {"python": config}},
+        ["python"],
     )
 
 
@@ -857,9 +854,7 @@ def test_machine_baseline_bootstraps_once_then_requires_the_exact_base_artifact(
         json.dumps({**required, "source_sha": BASE_SHA}),
         encoding="utf-8",
     )
-    assert artifacts.reference_baseline(tmp_path, BASE_SHA, artifact_path)[
-        "source_sha"
-    ] == BASE_SHA
+    assert artifacts.reference_baseline(tmp_path, BASE_SHA, artifact_path)["source_sha"] == BASE_SHA
 
 
 def test_measured_machine_baseline_restores_canonical_report_paths(tmp_path: Path) -> None:

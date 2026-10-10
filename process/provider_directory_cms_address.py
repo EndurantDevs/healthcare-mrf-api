@@ -45,6 +45,8 @@ _MODULES = (
     "process.provider_directory_address_overlay_components",
     "process.provider_directory_cms_overlay_projection",
     "process.provider_directory_cms_native_projection",
+    "process.provider_directory_cms_typed_offices",
+    "process.network_cms_provider_identity",
     "process.provider_directory_cms_native_inputs",
     "process.provider_directory_cms_archive",
     "process.provider_directory_cms_desired_fence",
@@ -69,6 +71,31 @@ _MODULES = (
     "api.ptg2_geo_projection",
     "api.ptg2_geo_policy",
 )
+_REGISTRY_SOURCE_MODULES = (
+    "process.provider_directory_cms_address",
+    "process.provider_directory_cms_source_runtime",
+    "process.provider_directory_cms_preparation",
+    "process.provider_directory_cms_publication",
+    "process.network_registry_cms_prepared_pair",
+    "process.network_registry_cms_prepared_cleanup",
+    "process.network_registry_cms_capture_lock",
+    "process.network_registry_cms_source_attempt",
+    "process.network_registry_cms_prepared_address",
+    "process.network_cms_registry_source_pair",
+    "process.network_cms_registry_address_capture",
+    "process.network_cms_registry_address_equivalence",
+    "process.network_fhir_source_epoch",
+    "process.network_fhir_source_custody",
+    "process.network_fhir_membership_source",
+    "process.network_cms_provider_identity",
+    "process.network_membership_writer_closure",
+    "process.network_address_projection",
+    "process.network_custom_address_source",
+    "process.registry_source_recipe_store",
+    "process.entity_address_snapshot_ownership",
+    "process.entity_address_snapshot_receipt",
+    "process.entity_address_snapshot_source",
+)
 _SEMANTIC_OPTIONS = frozenset(
     {
         "HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_LIMIT",
@@ -87,7 +114,7 @@ def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
-def _mapping_digest() -> str:
+def _mapping_digest(*, registry_source=False) -> str:
     """Bind mapper code and serving model definitions without local paths in the identity."""
     native = _native()
     modules = set(_MODULES) | {
@@ -98,6 +125,8 @@ def _mapping_digest() -> str:
             *source_dependencies._doctors_preparation()._models(),
         )
     }
+    if registry_source:
+        modules.update(_REGISTRY_SOURCE_MODULES)
     hashes_by_module = {}
     for name in sorted(modules):
         source_path = importlib.import_module(name).__file__
@@ -237,6 +266,28 @@ def _with_doctors_input(fhir, input_json, doctors, dependency_bindings):
     return _json(input_by_field)
 
 
+def _with_registry_source_retention_input(input_json, execution, raw_policy):
+    """Bind a closed retention request to this factory's actual fence and selection."""
+    from process.provider_directory_cms_capacity_contract import validated_registry_source_retention_policy
+
+    policy = validated_registry_source_retention_policy(raw_policy)
+    inputs = json.loads(input_json)
+    pin = policy["source_pin"]
+    cms_pins = [item for item in inputs["dataset_pins"] if item["source_id"] == "cms-npd"]
+    if (
+        len(cms_pins) != 1
+        or pin["schema_name"] != inputs["database_schema"]
+        or pin["as_of"] != inputs["profile_as_of"]
+        or policy["selection_proof_id"] != getattr(execution.attestation, "proof_id", None)
+        or any(pin[name] != cms_pins[0][name] for name in ("source_id", "endpoint_id", "dataset_id"))
+        or pin["dataset_sha256"] != cms_pins[0]["dataset_hash"]
+    ):
+        raise ValueError("cms_address_retention_scope_changed")
+    inputs["registry_source_retention"] = policy
+    inputs["mapper_digest"] = _mapping_digest(registry_source=True)
+    return _json(inputs)
+
+
 @dataclass(frozen=True)
 class CMSAddressPreparation:
     """Internal factory consumed by the full serving preparation context."""
@@ -273,6 +324,16 @@ class CMSAddressPreparation:
             doctors,
         )
 
+    def with_registry_source_retention(self, policy) -> CMSAddressPreparation:
+        """Include the validated source policy before capacity input hashing and signing."""
+        return CMSAddressPreparation(
+            self.fhir,
+            self.execution,
+            self.run_id,
+            _with_registry_source_retention_input(self.input_json, self.execution, policy),
+            self.doctors,
+        )
+
     def _current_input(self, fence, expected):
         """Recompute semantic inputs and the desired physical source without changing its incumbent fence."""
         input_json = _build_input(
@@ -286,16 +347,24 @@ class CMSAddressPreparation:
         )
         if self.doctors is not None:
             input_json = _with_doctors_input(self.fhir, input_json, self.doctors, expected["desired_geo_bindings"])
+        if "registry_source_retention" in expected:
+            input_json = _with_registry_source_retention_input(
+                input_json, self.execution, expected["registry_source_retention"]
+            )
         return input_json
 
     def _assert_inputs(self, fence, admission):
         expected = json.loads(self.input_json)
+        try:
+            current_input = self._current_input(fence, expected)
+        except ValueError:
+            raise RuntimeError("cms_address_admitted_inputs_changed") from None
         if (
             admission.plan.native_address_input_hash != self.input_hash
             or admission.plan.native_address_targets != self.native_targets
             or admission.plan.worker_count != expected["worker_count"]
             or admission.plan.temp_file_limit_bytes_per_backend != expected["temp_file_limit_bytes_per_backend"]
-            or self._current_input(fence, expected) != self.input_json
+            or current_input != self.input_json
         ):
             raise RuntimeError("cms_address_admitted_inputs_changed")
         return expected

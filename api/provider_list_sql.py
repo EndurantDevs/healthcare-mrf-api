@@ -14,6 +14,11 @@ from sqlalchemy import BigInteger, bindparam, text
 from sqlalchemy.dialects.postgresql import ARRAY
 
 from api.custom_import_provider_sql import ProviderImportQuery, merge_native_params
+from api.network_address_scope import (
+    current_network_address_scope,
+    is_scoped_address_relation,
+    scoped_address_parameters,
+)
 from db.connection import ConnectionProxy
 from db.models import EntityAddressUnified
 from process.custom_import.read_core import _local_statement_timeout
@@ -127,7 +132,9 @@ phone_candidates_unranked AS MATERIALIZED (
 
 
 def _is_unified_address_table(address_table_sql: str) -> bool:
-    return address_table_sql.endswith(f".{EntityAddressUnified.__tablename__}")
+    return address_table_sql.endswith(f".{EntityAddressUnified.__tablename__}") or is_scoped_address_relation(
+        address_table_sql
+    )
 
 
 def _address_zip5_filter(
@@ -177,7 +184,7 @@ def _address_phone_candidates_cte(
 ) -> str | None:
     """Return indexed phone candidates, including current directory evidence."""
 
-    if not _is_unified_address_table(address_table_sql):
+    if not _is_unified_address_table(address_table_sql) or is_scoped_address_relation(address_table_sql):
         return None
     direct_phone = _address_phone_digits_filter("phone_address", address_table_sql)
     service_types = ", ".join(f"'{location_type}'" for location_type in GEO_SERVICE_LOCATION_TYPES)
@@ -269,14 +276,16 @@ async def _provider_list_connection(
     *,
     native_npis=None,
 ):
-    """Reuse the signed request transaction only for imported provider reads."""
+    """Reuse the request transaction for imported or scoped provider reads."""
 
-    if import_context is None and native_npis is None:
+    if import_context is None and native_npis is None and current_network_address_scope() is None:
         async with database.acquire() as connection:
             yield connection
         return
     if request_session is None:
-        raise RuntimeError("custom-import provider query requires a request session")
+        if import_context is not None:
+            raise RuntimeError("custom-import provider query requires a request session")
+        raise RuntimeError("canonical provider query requires a request session")
     yield ConnectionProxy(database, request_session, None)
 
 
@@ -408,7 +417,7 @@ def _provider_list_parameters(
         if "__native_batch_npis" in merged:
             raise ValueError("native batch SQL parameters collide")
         merged["__native_batch_npis"] = list(native_npis)
-    return merged
+    return scoped_address_parameters(merged)
 
 
 def _extract_name_filters(request, *, args=None) -> list[str]:

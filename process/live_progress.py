@@ -19,6 +19,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 from process.import_status_events import bind_status_event_loop, enqueue_status_event
 from process.redis_config import build_redis_settings
@@ -40,16 +42,10 @@ IMPORT_LIVE_PROGRESS_STALE_SECONDS = int(
 
 _context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("import_live_progress_context", default={})
 _PROGRESS_WRITE_LOCK_COUNT = 64
-_progress_write_locks = tuple(
-    threading.Lock() for _ in range(_PROGRESS_WRITE_LOCK_COUNT)
-)
+_progress_write_locks = tuple(threading.Lock() for _ in range(_PROGRESS_WRITE_LOCK_COUNT))
 _SEQUENCE_CACHE_MAX_PER_STRIPE = 128
-_event_sequences = tuple(
-    OrderedDict() for _ in range(_PROGRESS_WRITE_LOCK_COUNT)
-)
-_progress_sequences = tuple(
-    OrderedDict() for _ in range(_PROGRESS_WRITE_LOCK_COUNT)
-)
+_event_sequences = tuple(OrderedDict() for _ in range(_PROGRESS_WRITE_LOCK_COUNT))
+_progress_sequences = tuple(OrderedDict() for _ in range(_PROGRESS_WRITE_LOCK_COUNT))
 _HEARTBEAT_SOURCE = "engine-heartbeat"
 _PROGRESS_FIELDS = (
     "unit",
@@ -92,11 +88,7 @@ _RICH_PROGRESS_FIELDS = (
     "progressed_at",
 )
 _CARRY_FORWARD_FIELDS = (*_PROGRESS_FIELDS, *_RICH_PROGRESS_FIELDS)
-_PROGRESS_SNAPSHOT_FIELDS = tuple(
-    key
-    for key in _CARRY_FORWARD_FIELDS
-    if key not in {"event_seq", "observed_at"}
-)
+_PROGRESS_SNAPSHOT_FIELDS = tuple(key for key in _CARRY_FORWARD_FIELDS if key not in {"event_seq", "observed_at"})
 _ATTEMPT_CURRENT = "current"
 _ATTEMPT_NEWER = "newer"
 _ATTEMPT_REJECT = "reject"
@@ -141,11 +133,7 @@ def set_live_progress_context(**payload: Any) -> contextvars.Token:
 
     data = {
         **current_live_progress_context(),
-        **{
-            key: value
-            for key, value in payload.items()
-            if value not in (None, "")
-        },
+        **{key: value for key, value in payload.items() if value not in (None, "")},
     }
     return _context.set(data)
 
@@ -166,9 +154,7 @@ def is_live_progress_written(**progress_by_field: Any) -> bool:
     """Atomically persist progress and enqueue its event in attempt order."""
 
     context = current_live_progress_context()
-    run_id = str(
-        progress_by_field.get("run_id") or context.get("run_id") or ""
-    ).strip()
+    run_id = str(progress_by_field.get("run_id") or context.get("run_id") or "").strip()
     if not run_id:
         return False
 
@@ -198,11 +184,7 @@ def is_live_progress_written(**progress_by_field: Any) -> bool:
                 progress_by_field=progress_by_field,
                 observed_at=observed_at,
                 now=now,
-                status_event_payload=(
-                    status_event_payload
-                    if isinstance(status_event_payload, dict)
-                    else None
-                ),
+                status_event_payload=(status_event_payload if isinstance(status_event_payload, dict) else None),
             )
         finally:
             _release_progress_publication_lock(
@@ -340,9 +322,7 @@ def _merged_live_progress_candidate(
         succeeded=has_succeeded,
     )
     if "label" in candidate_by_field:
-        candidate_by_field["label"] = _safe_label(
-            str(candidate_by_field["label"])
-        )
+        candidate_by_field["label"] = _safe_label(str(candidate_by_field["label"]))
     return candidate_by_field
 
 
@@ -351,18 +331,9 @@ def _clear_indeterminate_semantic_progress_fields(
 ) -> None:
     """Prevent stale bounded fields from masking current lower-bound work."""
 
-    progress_basis = str(
-        candidate_by_field.get("basis")
-        or candidate_by_field.get("unit")
-        or ""
-    ).strip().lower()
-    denominator_state = str(
-        candidate_by_field.get("denominator_state") or ""
-    ).strip().lower()
-    if (
-        progress_basis != "semantic_work"
-        or denominator_state not in {"unknown", "lower_bound"}
-    ):
+    progress_basis = str(candidate_by_field.get("basis") or candidate_by_field.get("unit") or "").strip().lower()
+    denominator_state = str(candidate_by_field.get("denominator_state") or "").strip().lower()
+    if progress_basis != "semantic_work" or denominator_state not in {"unknown", "lower_bound"}:
         return
     for field_name in (
         "pct",
@@ -385,51 +356,22 @@ def _new_live_progress_candidate_by_field(
 ) -> dict[str, Any]:
     candidate_by_field = {
         "run_id": run_id,
-        "attempt_id": (
-            progress_by_field.get("attempt_id")
-            or context.get("attempt_id")
-            or run_id
-        ),
-        "importer": (
-            progress_by_field.get("importer")
-            or context.get("importer")
-            or "unknown"
-        ),
-        "status": (
-            progress_by_field.get("status")
-            or context.get("status")
-            or "running"
-        ),
-        "source": (
-            progress_by_field.get("source")
-            or context.get("source")
-            or "import-live-progress"
-        ),
-        "confidence": (
-            progress_by_field.get("confidence")
-            or context.get("confidence")
-            or "live"
-        ),
+        "attempt_id": (progress_by_field.get("attempt_id") or context.get("attempt_id") or run_id),
+        "importer": (progress_by_field.get("importer") or context.get("importer") or "unknown"),
+        "status": (progress_by_field.get("status") or context.get("status") or "running"),
+        "source": (progress_by_field.get("source") or context.get("source") or "import-live-progress"),
+        "confidence": (progress_by_field.get("confidence") or context.get("confidence") or "live"),
         "updated_at": observed_at,
         "observed_at": observed_at,
-        **{
-            field_name: field_value
-            for field_name, field_value in context.items()
-            if field_name != "run_id"
-        },
+        **{field_name: field_value for field_name, field_value in context.items() if field_name != "run_id"},
         **{
             field_name: field_value
             for field_name, field_value in progress_by_field.items()
             if field_value is not None and field_name != "publish_event"
         },
     }
-    if (
-        not candidate_by_field.get("attempt_started_at")
-        and candidate_by_field.get("started_at")
-    ):
-        candidate_by_field["attempt_started_at"] = candidate_by_field[
-            "started_at"
-        ]
+    if not candidate_by_field.get("attempt_started_at") and candidate_by_field.get("started_at"):
+        candidate_by_field["attempt_started_at"] = candidate_by_field["started_at"]
     return candidate_by_field
 
 
@@ -459,17 +401,12 @@ def _status_event_for_accepted_progress(
     event_by_field["progress"] = progress_by_field
     supplied_heartbeat_at = event_by_field.get("heartbeat_at")
     if (
-        event_by_field.get("status")
-        in {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
+        event_by_field.get("status") in {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
         and supplied_heartbeat_at is not None
     ):
         event_by_field["heartbeat_at"] = supplied_heartbeat_at
     else:
-        event_by_field["heartbeat_at"] = (
-            merged.get("observed_at")
-            or merged.get("updated_at")
-            or supplied_heartbeat_at
-        )
+        event_by_field["heartbeat_at"] = merged.get("observed_at") or merged.get("updated_at") or supplied_heartbeat_at
     return event_by_field
 
 
@@ -558,7 +495,7 @@ def _decode_live_progress_payload(raw: Any) -> dict[str, Any] | None:
         return None
     try:
         payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else str(raw))
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except TypeError, ValueError, json.JSONDecodeError:
         return None
     if not isinstance(payload, dict):
         return None
@@ -605,6 +542,7 @@ def _redis() -> redis.Redis:
         db=settings.database,
         socket_connect_timeout=1.0,
         socket_timeout=1.0,
+        retry=Retry(NoBackoff(), 0),
     )
 
 
@@ -677,11 +615,7 @@ def _attempt_disposition(
         # A timestamped attempt may supersede a legacy row that had only the
         # run-id fallback. A malformed timestamp on a named attempt is not
         # enough evidence to let a different attempt replace it.
-        return (
-            _ATTEMPT_NEWER
-            if not previous_attempt or previous_attempt == run_id
-            else _ATTEMPT_REJECT
-        )
+        return _ATTEMPT_NEWER if not previous_attempt or previous_attempt == run_id else _ATTEMPT_REJECT
     if incoming_started_at > previous_started_at:
         return _ATTEMPT_NEWER
     if incoming_started_at < previous_started_at:
@@ -713,9 +647,7 @@ def _carry_forward_run_metadata(
             merged[key] = previous.get(key) or merged.get(key)
     previous_started_at = _parse_datetime(previous.get("started_at"))
     current_started_at = _parse_datetime(merged.get("started_at"))
-    if previous_started_at is not None and (
-        current_started_at is None or previous_started_at <= current_started_at
-    ):
+    if previous_started_at is not None and (current_started_at is None or previous_started_at <= current_started_at):
         merged["started_at"] = previous.get("started_at")
 
 
@@ -727,11 +659,7 @@ def _is_incoming_progress_older(
 
     incoming_stage = _coerce_int(incoming.get("stage_ordinal"))
     previous_stage = _coerce_int(previous.get("stage_ordinal"))
-    if (
-        incoming_stage is not None
-        and previous_stage is not None
-        and incoming_stage != previous_stage
-    ):
+    if incoming_stage is not None and previous_stage is not None and incoming_stage != previous_stage:
         return incoming_stage < previous_stage
     incoming_progress_seq = _coerce_int(incoming.get("progress_seq"))
     previous_progress_seq = _coerce_int(previous.get("progress_seq"))
@@ -743,18 +671,12 @@ def _is_incoming_progress_older(
         return incoming_progress_seq < previous_progress_seq
     incoming_pct = _coerce_float(incoming.get("pct"))
     previous_pct = _coerce_float(previous.get("pct"))
-    if (
-        incoming_pct is not None
-        and previous_pct is not None
-        and incoming_pct < previous_pct
-    ):
+    if incoming_pct is not None and previous_pct is not None and incoming_pct < previous_pct:
         return True
     incoming_stage_pct = _coerce_float(incoming.get("stage_pct"))
     previous_stage_pct = _coerce_float(previous.get("stage_pct"))
     return bool(
-        incoming_stage_pct is not None
-        and previous_stage_pct is not None
-        and incoming_stage_pct < previous_stage_pct
+        incoming_stage_pct is not None and previous_stage_pct is not None and incoming_stage_pct < previous_stage_pct
     )
 
 
@@ -889,7 +811,7 @@ def _safe_label(value: str) -> str:
 def _coerce_float(value: Any) -> float | None:
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return result if math.isfinite(result) else None
 
@@ -897,7 +819,7 @@ def _coerce_float(value: Any) -> float | None:
 def _coerce_int(value: Any) -> int | None:
     try:
         return int(value)
-    except (TypeError, ValueError, OverflowError):
+    except TypeError, ValueError, OverflowError:
         return None
 
 

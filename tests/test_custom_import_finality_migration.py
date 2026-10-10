@@ -158,7 +158,7 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
     revision = _plans_migration().revision
-    assert script.get_heads() == ["20261009000000_custom_import_child_presence_decode"]
+    assert script.get_heads() == ["20261010020000_registry_ptg_office_retention"]
     assert tuple(
         step.revision.revision for step in script._upgrade_revs("head", "20261001110000_profile_initial_publication")
     ) == (
@@ -177,6 +177,27 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
         "20261007000000_custom_import_rejection_anti_joins",
         "20261006010000_nucc_reference_result_generation",
         "20261009000000_custom_import_child_presence_decode",
+        "20261007010000_managed_network_registry",
+        "20261007020000_registry_revision_history",
+        "20261007030000_network_serving_control",
+        "20261007040000_registry_source_evidence",
+        "20261007050000_canonical_address_network_ids",
+        "20261007060000_registry_approved_selection",
+        "20261007070000_registry_company_links",
+        "20261007080000_manual_directory_registry",
+        "20261007090000_network_membership_drafts",
+        "20261007100000_registry_publication_requests",
+        "20261007110000_registry_site_bindings",
+        "20261007120000_company_network_assertions",
+        "20261007130000_registry_network_bindings",
+        "20261007140000_registry_source_recipes",
+        "20261007150000_provider_directory_content_cursor_index",
+        "20261009010000_registry_ptg_producer_scope",
+        "20261009020000_company_registry_assertions",
+        "20261009030000_network_catalog_evidence",
+        "20261009040000_registry_ptg_published_plan_scope",
+        "20261010010000_registry_ptg_office_approval",
+        "20261010020000_registry_ptg_office_retention",
     )
 
 

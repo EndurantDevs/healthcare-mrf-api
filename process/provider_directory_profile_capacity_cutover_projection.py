@@ -166,10 +166,7 @@ def _assert_metadata_formula(
         _metadata_mutation_batch(forecast, layouts),
         pending_commit_items=pending_commit_items,
     )
-    if (
-        metadata_evidence.projection_by_field
-        != dataclasses.asdict(recomputed_metadata)
-    ):
+    if metadata_evidence.projection_by_field != dataclasses.asdict(recomputed_metadata):
         raise _error("cutover_metadata_projection_formula_changed")
 
 
@@ -224,20 +221,22 @@ def _assert_actual_within_forecast(
     bounded = geometry is not None and geometry.bounded_admission
     caps = {cap.relation_name: cap for cap in geometry.relation_byte_caps} if bounded else {}
     if (
-        actual_values_by_name["cutover_wal_bytes"]
-        > (sum(caps[name].max_wal_bytes for name in ("evidence_target", "profile_target"))
-           if bounded else target_evidence.wal_bytes)
+        (not bounded and actual_values_by_name["cutover_wal_bytes"] > target_evidence.wal_bytes)
         or actual_values_by_name["evidence_target_growth_bytes"]
-        > (caps["evidence_target"].max_target_growth_bytes if bounded else recomputed_target.targets[0].target_growth_bytes)
+        > (
+            caps["evidence_target"].max_target_growth_bytes
+            if bounded
+            else recomputed_target.targets[0].target_growth_bytes
+        )
         or actual_values_by_name["profile_target_growth_bytes"]
-        > (caps["profile_target"].max_target_growth_bytes if bounded else recomputed_target.targets[1].target_growth_bytes)
-        or actual_values_by_name["metadata_wal_forecast_bytes"]
-        != metadata_evidence.wal_bytes
-        or actual_values_by_name["commit_envelope_bytes"]
-        != metadata_evidence.commit_envelope_bytes
-        or actual_values_by_name["evidence_target_bytes_before"]
-        != forecast.get("evidence_target_bytes_before")
-        or actual_values_by_name["profile_target_bytes_before"]
-        != forecast.get("profile_target_bytes_before")
+        > (
+            caps["profile_target"].max_target_growth_bytes
+            if bounded
+            else recomputed_target.targets[1].target_growth_bytes
+        )
+        or actual_values_by_name["metadata_wal_forecast_bytes"] != metadata_evidence.wal_bytes
+        or actual_values_by_name["commit_envelope_bytes"] != metadata_evidence.commit_envelope_bytes
+        or actual_values_by_name["evidence_target_bytes_before"] != forecast.get("evidence_target_bytes_before")
+        or actual_values_by_name["profile_target_bytes_before"] != forecast.get("profile_target_bytes_before")
     ):
         raise _error("cutover_actual_exceeded_forecast")

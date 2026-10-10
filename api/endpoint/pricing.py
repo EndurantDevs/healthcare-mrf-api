@@ -54,6 +54,7 @@ from api.custom_import_provider_service_sql import (
     provider_service_zip_filter,
 )
 from api.endpoint.pagination import PaginationParams, parse_pagination
+from api.network_address_scope import canonical_network_read
 from api.plan_pricing_em_distance import (
     _request_code_index as _em_distance_request_code_index,
 )
@@ -89,6 +90,10 @@ from api.provider_demographic_filters import (
     provider_sex_exists_sql,
 )
 from api.provider_service_code_coverage import add_provider_service_summary
+from api.provider_service_scope import (
+    _canonical_network_procedure_clause,
+    _reject_resolver_only_procedure_search_params,
+)
 from api.provider_specialty_filters import (
     ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
     PRIMARY_CARE_TAXONOMY_CODES,
@@ -11636,24 +11641,6 @@ async def audit_ptg2_source_witness_batch(request):
 # After the route was renamed to /by-procedure, that path fell through to
 # /providers/<npi> -> "Parameter 'npi' must be an integer", 500-ing every
 # plan-scoped pricing search. Keep the old path pointed at this handler.
-def _reject_resolver_only_procedure_search_params(args) -> None:
-    """Direct callers must resolve clinical intent before pricing search."""
-
-    resolver_only_param = next(
-        (param_name for param_name in ("clinical_intent", "intent") if args.get(param_name) is not None),
-        None,
-    )
-    if resolver_only_param is None:
-        return
-    raise InvalidUsage(
-        f"Parameter '{resolver_only_param}' is resolver-only. Call "
-        "/pricing/procedure-taxonomy/resolve first. When "
-        "recommended_mode=hard_filter, copy provider_filter.taxonomy_codes, "
-        "provider_filter.primary_only, and "
-        "provider_filter.include_subspecialties into the pricing search."
-    )
-
-
 @blueprint.get("/providers/search-by-procedure", name="pricing.providers.search_by_procedure")
 @blueprint.get(
     "/providers/audit-search-by-procedure",
@@ -11662,10 +11649,14 @@ def _reject_resolver_only_procedure_search_params(args) -> None:
 @blueprint.get("/providers/by-procedure", name="pricing.providers.by_procedure")
 @blueprint.get("/providers/by-service", name="pricing.providers.by_service")
 @blueprint.get("/physicians/by-service", name="pricing.physicians.by_service")
+@canonical_network_read
 async def list_providers_by_procedure(request, *, native_args=None, import_context=None):
     """List providers with pricing records matching a procedure or service code."""
     args = request.args
     args = provider_service_native_args(args, native_args, import_context)
+    canonical_network_clause = _canonical_network_procedure_clause(
+        args, import_context, provider_procedure_table.c.npi, query_string=getattr(request, "query_string", None)
+    )
     if "billing_entity_ref" in args:
         if import_context is not None:
             raise InvalidUsage("custom-import provider-service queries cannot use billing search")
@@ -12241,6 +12232,8 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
         provider_table.c.year == year,
         provider_table.c.npi == provider_procedure_table.c.npi,
     ]
+    if canonical_network_clause is not None:
+        filters.append(canonical_network_clause)
     if npi is not None:
         filters.append(provider_procedure_table.c.npi == npi)
     if state:
@@ -12321,6 +12314,7 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
     total = None
     if (
         import_context is None
+        and canonical_network_clause is None
         and len(internal_codes) == 1
         and not query_text
         and not state

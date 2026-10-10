@@ -147,7 +147,7 @@ async def test_native_batch_endpoint_reuses_extended_shared_path_only_when_reque
     original = AsyncMock(side_effect=AssertionError("extended list query must not be dropped"))
     monkeypatch.setattr(provider_batch, "read_native_batch", shared)
     monkeypatch.setattr(npi_module, "_build_npi_batch_payload", original)
-    request = SimpleNamespace(json=params_by_field, ctx=SimpleNamespace(sa_session=object()))
+    request = SimpleNamespace(args={}, json=params_by_field, ctx=SimpleNamespace(sa_session=object()))
     reply = await npi_module.get_npi_batch(request)
     assert reply.status == 200 and shared.await_count == 1 and original.await_count == 0
     assert shared.await_args.kwargs["native_args"].get("q") == "Synthetic"
@@ -454,11 +454,12 @@ async def test_batch_uses_set_maps_once_and_preserves_partial_result_order(monke
     monkeypatch.setattr(npi_module, "_request_session", lambda _request: None)
 
     request = SimpleNamespace(
+        args={},
         json={
             "npis": [str(found_npi), str(missing_npi)],
             "include_sources": True,
             "address_limit": 5,
-        }
+        },
     )
     operation_response = await npi_module.get_npi_batch(request)
     response_map = json.loads(operation_response.body)

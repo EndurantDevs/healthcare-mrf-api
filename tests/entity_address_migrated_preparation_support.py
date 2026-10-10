@@ -30,9 +30,22 @@ async def _migrated_tables(resources, monkeypatch):
     database = Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
     try:
         script = ScriptDirectory.from_config(Config("alembic.ini"))
-        assert script.get_heads() == ["20261009000000_custom_import_child_presence_decode"]
-        assert script.get_revision(script.get_heads()[0]).down_revision == (
+        assert script.get_heads() == ["20261010020000_registry_ptg_office_retention"]
+        assert script.get_revision(script.get_heads()[0]).down_revision == "20261010010000_registry_ptg_office_approval"
+        assert script.get_revision("20261010010000_registry_ptg_office_approval").down_revision == (
+            "20261009040000_registry_ptg_published_plan_scope"
+        )
+        assert script.get_revision("20261009040000_registry_ptg_published_plan_scope").down_revision == (
+            "20261009030000_network_catalog_evidence"
+        )
+        assert script.get_revision("20261006010000_nucc_reference_result_generation").down_revision == (
+            "20261007000000_custom_import_rejection_anti_joins"
+        )
+        assert script.get_revision("20261009000000_custom_import_child_presence_decode").down_revision == (
             "20261006010000_nucc_reference_result_generation"
+        )
+        assert script.get_revision("20261007010000_managed_network_registry").down_revision == (
+            "20261009000000_custom_import_child_presence_decode"
         )
         await fixture._install_destination_extensions(database)
         await database.status(f'CREATE SCHEMA "{_SCHEMA}"')
@@ -40,7 +53,7 @@ async def _migrated_tables(resources, monkeypatch):
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", _SCHEMA)
         await _upgrade_disposable_schema_to_head(url.render_as_string(hide_password=False), _SCHEMA)
         assert await database.scalar(f'SELECT version_num FROM "{_SCHEMA}".alembic_version') == (
-            "20261009000000_custom_import_child_presence_decode"
+            "20261010020000_registry_ptg_office_retention"
         )
         metadata = MetaData(schema=_SCHEMA)
         for model in preparation.destination.restore._models():

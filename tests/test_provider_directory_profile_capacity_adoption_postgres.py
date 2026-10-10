@@ -248,9 +248,18 @@ async def test_runtime_observation_reads_migrated_postgres_snapshot(monkeypatch)
     monkeypatch.setattr(runtime, "build_baked_healthcare_source_commit", lambda: "d" * 40)
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     expected_heads = set(script.get_heads())
-    assert expected_heads == {"20261009000000_custom_import_child_presence_decode"}
-    assert script.get_revision(next(iter(expected_heads))).down_revision == (
-        "20261006010000_nucc_reference_result_generation"
+    assert expected_heads == {"20261010020000_registry_ptg_office_retention"}
+    assert (
+        script.get_revision(next(iter(expected_heads))).down_revision == "20261010010000_registry_ptg_office_approval"
+    )
+    assert script.get_revision("20261010010000_registry_ptg_office_approval").down_revision == (
+        "20261009040000_registry_ptg_published_plan_scope"
+    )
+    assert script.get_revision("20261009040000_registry_ptg_published_plan_scope").down_revision == (
+        "20261009030000_network_catalog_evidence"
+    )
+    assert script.get_revision("20261006010000_nucc_reference_result_generation").down_revision == (
+        "20261007000000_custom_import_rejection_anti_joins"
     )
     async with _delta_database(monkeypatch) as (database, schema):
         monkeypatch.setenv("DB_SCHEMA", schema)

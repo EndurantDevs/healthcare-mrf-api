@@ -10,41 +10,19 @@ from typing import Any, Mapping
 
 CAPACITY_GEOMETRY_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-geometry.v5"
 PROFILE_MATERIALIZATION_MODE = "source_delta"
-PROFILE_STRATEGY_VERSION = (
-    "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"
-)
+PROFILE_STRATEGY_VERSION = "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"
 
 _GEOMETRY_HASH_DOMAIN = "provider_directory_profile_capacity_geometry.v5"
-_CONTROL_WAL_PLAN_INPUT_HASH_DOMAIN = (
-    "provider_directory_profile_control_wal_plan_input.v3"
-)
-_CONTROL_WAL_HASH_DOMAIN = (
-    "provider_directory_profile_control_wal_projection.v4"
-)
-PHYSICAL_PROJECTION_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-delta-physical-projection.v1"
-)
-BOUNDED_ADMISSION_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-bounded-admission.v2"
-)
-BOUNDED_CUTOVER_FORECAST_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-cutover-forecast.v2"
-)
-BOUNDED_CUTOVER_ACTUAL_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-cutover-actual.v2"
-)
-CUTOVER_FORECAST_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-cutover-forecast.v1"
-)
-CUTOVER_ACTUAL_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-cutover-actual.v1"
-)
-CONTROL_WAL_PROJECTION_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-control-wal-projection.v4"
-)
-ARTIFACT_SCOPE_RECOVERY_CONTRACT_ID = (
-    "provider-directory-artifact-scope-recovery-v1"
-)
+_CONTROL_WAL_PLAN_INPUT_HASH_DOMAIN = "provider_directory_profile_control_wal_plan_input.v3"
+_CONTROL_WAL_HASH_DOMAIN = "provider_directory_profile_control_wal_projection.v4"
+PHYSICAL_PROJECTION_CONTRACT_ID = "healthporta.provider-directory-profile-delta-physical-projection.v1"
+BOUNDED_ADMISSION_CONTRACT_ID = "healthporta.provider-directory-profile-bounded-admission.v2"
+BOUNDED_CUTOVER_FORECAST_CONTRACT_ID = "healthporta.provider-directory-profile-cutover-forecast.v2"
+BOUNDED_CUTOVER_ACTUAL_CONTRACT_ID = "healthporta.provider-directory-profile-cutover-actual.v2"
+CUTOVER_FORECAST_CONTRACT_ID = "healthporta.provider-directory-profile-cutover-forecast.v1"
+CUTOVER_ACTUAL_CONTRACT_ID = "healthporta.provider-directory-profile-cutover-actual.v1"
+CONTROL_WAL_PROJECTION_CONTRACT_ID = "healthporta.provider-directory-profile-control-wal-projection.v4"
+ARTIFACT_SCOPE_RECOVERY_CONTRACT_ID = "provider-directory-artifact-scope-recovery-v1"
 POSTGRES_SUPPORTED_MAJOR = 18
 POSTGRES_BLOCK_SIZE_BYTES = 8192
 POSTGRES_TOAST_MAX_CHUNK_SIZE_BYTES = 1996
@@ -68,27 +46,22 @@ CONTROL_WAL_ARTIFACT_SCOPE_NAMES = (
     "OrganizationAffiliation",
     "Endpoint",
 )
-CONTROL_WAL_ARTIFACT_SCOPE_TABLE_COUNT = len(
-    CONTROL_WAL_ARTIFACT_SCOPE_NAMES
-)
+CONTROL_WAL_ARTIFACT_SCOPE_TABLE_COUNT = len(CONTROL_WAL_ARTIFACT_SCOPE_NAMES)
 CONTROL_WAL_ARTIFACT_PK_STATEMENTS_PER_TABLE = 2
 CONTROL_WAL_ARTIFACT_BUCKET_INDEX_STATEMENT_COUNT = 2
 CONTROL_WAL_ARTIFACT_LAYOUT_STATEMENT_COUNT = (
-    CONTROL_WAL_ARTIFACT_SCOPE_TABLE_COUNT
-    * (1 + CONTROL_WAL_ARTIFACT_PK_STATEMENTS_PER_TABLE)
+    CONTROL_WAL_ARTIFACT_SCOPE_TABLE_COUNT * (1 + CONTROL_WAL_ARTIFACT_PK_STATEMENTS_PER_TABLE)
     + CONTROL_WAL_ARTIFACT_BUCKET_INDEX_STATEMENT_COUNT
 )
 CONTROL_WAL_PROFILE_STAGE_CREATE_STATEMENT_COUNT = 3
 CONTROL_WAL_EVIDENCE_STAGE_INDEX_STATEMENT_COUNT = 4
 CONTROL_WAL_COMPACT_STAGE_INDEX_STATEMENT_COUNT = 1
 CONTROL_WAL_PROFILE_STAGE_INDEX_STATEMENT_COUNT = (
-    CONTROL_WAL_EVIDENCE_STAGE_INDEX_STATEMENT_COUNT
-    + CONTROL_WAL_COMPACT_STAGE_INDEX_STATEMENT_COUNT
+    CONTROL_WAL_EVIDENCE_STAGE_INDEX_STATEMENT_COUNT + CONTROL_WAL_COMPACT_STAGE_INDEX_STATEMENT_COUNT
 )
 CONTROL_WAL_PROFILE_STAGE_REINITIALIZE_DROP_STATEMENT_COUNT = 3
 CONTROL_WAL_PROFILE_STAGE_LAYOUT_STATEMENT_COUNT = (
-    CONTROL_WAL_PROFILE_STAGE_CREATE_STATEMENT_COUNT
-    + CONTROL_WAL_PROFILE_STAGE_INDEX_STATEMENT_COUNT
+    CONTROL_WAL_PROFILE_STAGE_CREATE_STATEMENT_COUNT + CONTROL_WAL_PROFILE_STAGE_INDEX_STATEMENT_COUNT
 )
 CONTROL_WAL_PROFILE_STAGE_ANALYZE_STATEMENT_COUNT = 3
 CONTROL_WAL_PROFILE_STAGE_DROP_STATEMENT_COUNT = 3
@@ -108,12 +81,10 @@ _MAX_UNSIGNED_BIGINT = (1 << 64) - 1
 _MAX_OID = (1 << 32) - 1
 _MAX_POOL_SIZE = 256
 _MAX_WORKERS = 2
+CONTROL_MAINTENANCE_FENCE_CONTRACT_ID = "provider-directory-profile-control-maintenance.v1"
 PROFILE_DEDICATED_ADVISORY_LOCK_CONNECTIONS = 3
 PROFILE_CONTROL_CONNECTION_RESERVE = 1
-PROFILE_MINIMUM_POOL_RESERVE = (
-    PROFILE_DEDICATED_ADVISORY_LOCK_CONNECTIONS
-    + PROFILE_CONTROL_CONNECTION_RESERVE
-)
+PROFILE_MINIMUM_POOL_RESERVE = PROFILE_DEDICATED_ADVISORY_LOCK_CONNECTIONS + PROFILE_CONTROL_CONNECTION_RESERVE
 
 _RELATION_NAMES = (
     "artifact_scope",
@@ -128,6 +99,7 @@ _TARGET_RELATION_NAMES = frozenset(_RELATION_NAMES[4:])
 _CONTROL_WAL_OPERATION_ORDER = (
     ("pre_cutover", "admission_row_lock"),
     ("pre_cutover", "capacity_consumption_insert"),
+    ("pre_cutover", "control_maintenance_acquire"),
     ("pre_cutover", "artifact_scope_recovery_drop"),
     ("pre_cutover", "artifact_scope_layout"),
     ("pre_cutover", "artifact_scope_payload"),
@@ -148,6 +120,7 @@ _CONTROL_WAL_OPERATION_ORDER = (
     ("pre_cutover", "profile_import_run_progress"),
     ("pre_cutover", "profile_stage_analyze"),
     ("pre_cutover", "profile_checkpoint_ready"),
+    ("pre_cutover", "control_maintenance_release"),
     ("pre_cutover", "cutover_row_lock"),
     ("post_cutover", "profile_checkpoint_retire"),
     ("post_cutover", "profile_stage_drop"),
@@ -230,12 +203,15 @@ _POSITIVE_ROW_CAP_FIELDS = frozenset(
     }
 )
 
+
 class ProviderDirectoryProfileCapacityError(ValueError):
     """Report malformed or unsafe executable Profile geometry."""
+
 
 @dataclass(frozen=True)
 class ProviderDirectoryProfileRelationByteCaps:
     """Hard byte ceilings for one executable-plan relation class."""
+
     relation_name: str
     max_scratch_bytes: int
     max_target_growth_bytes: int
@@ -347,9 +323,7 @@ class ProfileControlWalPlanInput:
     build_checkpoint_insert: ProviderDirectoryProfileMetadataMutationInput
     build_checkpoint_update: ProviderDirectoryProfileMetadataMutationInput
     import_run_update: ProviderDirectoryProfileMetadataMutationInput
-    capacity_consumption_insert: (
-        ProviderDirectoryProfileMetadataMutationInput
-    )
+    capacity_consumption_insert: ProviderDirectoryProfileMetadataMutationInput
 
 
 @dataclass(frozen=True)
@@ -390,6 +364,7 @@ class ProviderDirectoryProfileControlWalProjection:
 @dataclass(frozen=True)
 class ProviderDirectoryProfileCapacityGeometry:
     """Proof-bound limits and execution identity for one delta build."""
+
     contract_id: str
     selection_proof_id: str
     profile_input_digest: str
@@ -468,6 +443,7 @@ class ProviderDirectoryProfileCapacityGeometry:
     max_affected_npis: int
     max_profile_rows: int
     relation_byte_caps: tuple[ProviderDirectoryProfileRelationByteCaps, ...]
+
     @property
     def is_bounded_admission(self) -> bool:
         """Keep observed window admission distinct from immutable v1 forecasts."""
@@ -478,40 +454,33 @@ class ProviderDirectoryProfileCapacityGeometry:
     @property
     def cutover_forecast_contract_id(self) -> str:
         """Return the forecast wire contract for this admission model."""
-        return (BOUNDED_CUTOVER_FORECAST_CONTRACT_ID if self.bounded_admission
-                else CUTOVER_FORECAST_CONTRACT_ID)
+        return BOUNDED_CUTOVER_FORECAST_CONTRACT_ID if self.bounded_admission else CUTOVER_FORECAST_CONTRACT_ID
 
     @property
     def cutover_actual_contract_id(self) -> str:
         """Return the actual wire contract for this admission model."""
-        return (BOUNDED_CUTOVER_ACTUAL_CONTRACT_ID if self.bounded_admission
-                else CUTOVER_ACTUAL_CONTRACT_ID)
+        return BOUNDED_CUTOVER_ACTUAL_CONTRACT_ID if self.bounded_admission else CUTOVER_ACTUAL_CONTRACT_ID
 
     @property
     def maximum_worker_count(self) -> int:
         """Return maximum concurrent Python workers in any frozen wave."""
         return max(
             self.artifact_scope_worker_count,
-            self.evidence_worker_count, self.compact_worker_count,
+            self.evidence_worker_count,
+            self.compact_worker_count,
         )
+
     @property
     def reservation_bytes_by_storage_class(self) -> dict[str, int]:
         """Return exact data, temp, and WAL upper bounds for signed leases."""
         relation_caps = self.relation_byte_caps
         return {
             "data": (
-                sum(
-                    relation.max_scratch_bytes
-                    + relation.max_target_growth_bytes
-                    for relation in relation_caps
-                )
+                sum(relation.max_scratch_bytes + relation.max_target_growth_bytes for relation in relation_caps)
                 + self.metadata_data_upper_bound_bytes
                 + self.control_metadata_data_upper_bound_bytes
             ),
-            "temp": (
-                max(1, self.maximum_worker_count)
-                * self.temp_file_limit_bytes
-            ),
+            "temp": (max(1, self.maximum_worker_count) * self.temp_file_limit_bytes),
             "wal": (
                 sum(relation.max_wal_bytes for relation in relation_caps)
                 + self.metadata_wal_upper_bound_bytes

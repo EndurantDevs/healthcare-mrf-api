@@ -48,9 +48,7 @@ async def test_capacity_settings_and_transaction_edges(monkeypatch):
         AsyncMock(return_value={}),
     )
     with pytest.raises(RuntimeError, match="settings_changed"):
-        await importer._apply_provider_directory_profile_capacity_settings(
-            admission
-        )
+        await importer._apply_provider_directory_profile_capacity_settings(admission)
 
     applied = AsyncMock()
     monkeypatch.setattr(
@@ -64,9 +62,7 @@ async def test_capacity_settings_and_transaction_edges(monkeypatch):
         yield
 
     monkeypatch.setattr(importer.db, "transaction", transaction)
-    token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
-        admission
-    )
+    token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(admission)
     transaction_events = []
     try:
         async with importer._provider_directory_profile_capacity_transaction():
@@ -75,6 +71,63 @@ async def test_capacity_settings_and_transaction_edges(monkeypatch):
         importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(token)
     assert transaction_events == ["entered"]
     applied.assert_awaited_once_with(admission)
+
+
+@pytest.mark.asyncio
+async def test_capacity_progress_reuses_borrowed_owner_and_retains_gate_and_limits(monkeypatch):
+    events = []
+    session = SimpleNamespace(
+        bind=SimpleNamespace(url=SimpleNamespace(database="synthetic_capacity")),
+        in_transaction=Mock(return_value=True),
+        in_nested_transaction=Mock(return_value=False),
+    )
+    binding = SimpleNamespace(session=session)
+    admission = SimpleNamespace(
+        geometry=SimpleNamespace(bounded_admission=True),
+        wal_tracker=SimpleNamespace(pending_control_wal_bytes={importer.asyncio.current_task(): 1}),
+    )
+    monkeypatch.setattr(importer.db, "_database_override", "synthetic_capacity")
+    monkeypatch.setattr(importer.db, "_transaction_binding", Mock(return_value=binding))
+    monkeypatch.setattr(importer.db, "transaction", Mock(side_effect=AssertionError("caller owns transaction")))
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_admission", lambda: admission)
+    applied = AsyncMock(side_effect=lambda _: events.append("limits"))
+    monkeypatch.setattr(importer, "_apply_provider_directory_profile_capacity_settings", applied)
+
+    @contextlib.asynccontextmanager
+    async def gate(relation):
+        assert relation is None
+        events.append("gate.enter")
+        yield
+        events.append("gate.exit")
+
+    monkeypatch.setattr(importer, "_profile_capacity_mutation_window", gate)
+    token = importer._PROFILE_CAPACITY_MUTATION_WINDOW.set(None)
+    try:
+        async with importer._provider_directory_profile_capacity_transaction(reuse_borrowed=True):
+            assert session.in_transaction() and not session.in_nested_transaction()
+            events.append("entered")
+    finally:
+        importer._PROFILE_CAPACITY_MUTATION_WINDOW.reset(token)
+    assert events == ["gate.enter", "limits", "entered", "gate.exit"]
+    applied.assert_awaited_once_with(admission)
+
+
+@pytest.mark.asyncio
+async def test_capacity_progress_without_borrowed_owner_retains_original_transaction(monkeypatch):
+    events = []
+    monkeypatch.setattr(importer.db, "_transaction_binding", Mock(return_value=None))
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_admission", lambda: None)
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        events.append("transaction.enter")
+        yield
+        events.append("transaction.exit")
+
+    monkeypatch.setattr(importer.db, "transaction", transaction)
+    async with importer._provider_directory_profile_capacity_transaction(reuse_borrowed=True):
+        events.append("entered")
+    assert events == ["transaction.enter", "entered", "transaction.exit"]
 
 
 @pytest.mark.asyncio
@@ -147,13 +200,16 @@ async def test_capacity_target_projection_edges(monkeypatch):
         "_provider_directory_profile_capacity_admission",
         lambda: None,
     )
-    assert await importer._assert_provider_directory_profile_capacity_target(
-        "profile_target",
-        '"mrf"."profile"',
-        bytes_before=10,
-        deleted_logical_bytes=0,
-        projected_growth_bytes=0,
-    ) == 10
+    assert (
+        await importer._assert_provider_directory_profile_capacity_target(
+            "profile_target",
+            '"mrf"."profile"',
+            bytes_before=10,
+            deleted_logical_bytes=0,
+            projected_growth_bytes=0,
+        )
+        == 10
+    )
 
     monkeypatch.setattr(
         importer,
@@ -169,9 +225,7 @@ async def test_capacity_target_projection_edges(monkeypatch):
             "profile_target",
             '"mrf"."profile"',
             bytes_before=10,
-            deleted_logical_bytes=(
-                target_cap.max_deleted_logical_bytes + 1
-            ),
+            deleted_logical_bytes=(target_cap.max_deleted_logical_bytes + 1),
             projected_growth_bytes=0,
         )
 
@@ -199,9 +253,7 @@ def test_affected_projection_value_edges():
     ):
         with pytest.raises(RuntimeError, match="affected_projection"):
             importer._affected_npi_projection_values(projection_row)
-    assert importer._affected_npi_projection_values(
-        {"projected_rows": 2, "projected_logical_bytes": 16}
-    ) == (2, 16)
+    assert importer._affected_npi_projection_values({"projected_rows": 2, "projected_logical_bytes": 16}) == (2, 16)
 
 
 def _affected_stage_build():
@@ -241,17 +293,23 @@ async def test_affected_npi_insert_without_capacity_edges(monkeypatch):
         lambda: None,
     )
     monkeypatch.setattr(importer.db, "status", AsyncMock(return_value="INSERT 0 2"))
-    assert await importer._execute_affected_npi_insert(
-        build,
-        projection_sql="SELECT projection",
-        insert_sql="INSERT",
-        params={},
-    ) == 2
+    assert (
+        await importer._execute_affected_npi_insert(
+            build,
+            projection_sql="SELECT projection",
+            insert_sql="INSERT",
+            params={},
+        )
+        == 2
+    )
 
 
 @pytest.mark.asyncio
 async def test_affected_npi_projection_limit_edges(monkeypatch):
     admission = _wal_tracker_admission()
+    events = []
+    reserve = AsyncMock(side_effect=lambda *args, **kwargs: events.append("reserve"))
+    monkeypatch.setattr(importer, "_reserve_provider_directory_profile_wal_budget", reserve)
     source_delta = dataclasses.replace(
         _affected_stage_build(),
         materialization_mode="source_delta",
@@ -260,6 +318,7 @@ async def test_affected_npi_projection_limit_edges(monkeypatch):
 
     @contextlib.asynccontextmanager
     async def transaction():
+        events.append("transaction")
         yield
 
     monkeypatch.setattr(
@@ -275,7 +334,7 @@ async def test_affected_npi_projection_limit_edges(monkeypatch):
     monkeypatch.setattr(
         importer,
         "_assert_provider_directory_profile_stage_storage_identity",
-        AsyncMock(),
+        AsyncMock(side_effect=lambda *args, **kwargs: events.append("checkpoint_lock")),
     )
     monkeypatch.setattr(
         importer.db,
@@ -300,6 +359,9 @@ async def test_affected_npi_projection_limit_edges(monkeypatch):
             insert_sql="INSERT",
             params={},
         )
+
+    assert events == ["reserve", "transaction", "checkpoint_lock"]
+    reserve.assert_awaited_once_with(admission, control_operation_counts={"affected_npi_payload": 1})
 
 
 @pytest.mark.asyncio
@@ -345,37 +407,13 @@ def test_profile_window_and_progress_edges():
     copy_batch = importer._ProviderDirectoryProfileEvidenceBatch(kind="copy")
     fact_batch = importer._ProviderDirectoryProfileEvidenceBatch(kind="fact")
     batches = (copy_batch, fact_batch)
-    assert importer._provider_directory_profile_window_end(
-        batches,
-        2,
-        2,
-    ) == 2
-    assert importer._provider_directory_profile_window_end(
-        batches,
-        0,
-        2,
-    ) == 1
-    assert importer._provider_directory_profile_window_end(
-        batches,
-        1,
-        2,
-    ) == 2
-    assert importer._provider_directory_profile_frozen_wave_end(
-        ((0, 1), (1, 2)),
-        start_batch=0,
-        total_batches=2,
-    ) == 1
-    assert importer._provider_directory_profile_frozen_wave_end(
-        ((0, 1), (1, 2)),
-        start_batch=2,
-        total_batches=2,
-    ) == 2
+    assert importer._provider_directory_profile_window_end(batches, 2, 2) == 2
+    assert importer._provider_directory_profile_window_end(batches, 0, 2) == 1
+    assert importer._provider_directory_profile_window_end(batches, 1, 2) == 2
+    assert importer._provider_directory_profile_frozen_wave_end(((0, 1), (1, 2)), start_batch=0, total_batches=2) == 1
+    assert importer._provider_directory_profile_frozen_wave_end(((0, 1), (1, 2)), start_batch=2, total_batches=2) == 2
     with pytest.raises(RuntimeError, match="checkpoint_wave_invalid"):
-        importer._provider_directory_profile_frozen_wave_end(
-            ((0, 1),),
-            start_batch=1,
-            total_batches=2,
-        )
+        importer._provider_directory_profile_frozen_wave_end(((0, 1),), start_batch=1, total_batches=2)
 
     build = importer._ProviderDirectoryProfileBuild(
         schema="mrf",
@@ -387,16 +425,9 @@ def test_profile_window_and_progress_edges():
         evidence_stage="e",
         profile_stage="p",
     )
-    assert importer._provider_directory_profile_overall_pct(
-        build,
-        phase="profile",
-        completed_batches=1,
-        total_batches=2,
-    ) > 50
+    assert (
+        importer._provider_directory_profile_overall_pct(build, phase="profile", completed_batches=1, total_batches=2)
+        > 50
+    )
     with pytest.raises(ValueError, match="unsupported profile progress"):
-        importer._provider_directory_profile_overall_pct(
-            build,
-            phase="invalid",
-            completed_batches=0,
-            total_batches=1,
-        )
+        importer._provider_directory_profile_overall_pct(build, phase="invalid", completed_batches=0, total_batches=1)

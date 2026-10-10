@@ -1,5 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from process.registry_required_target_cli_preflight import preflight_module_arguments
+
+preflight_module_arguments()
+
 import asyncio
 import json
 import os
@@ -31,110 +35,83 @@ async def _ptg_candidate_audit_startup(ctx):
     await db_startup(ctx)
 
 
+from process.address_archive_migration import main as initiate_address_archive_migration
+from process.address_archive_migration import process_data as process_address_archive_migration_data
+from process.address_formatted_address import (
+    process_address_formatted_address,
+    run_address_formatted_address_command,
+)
+from process.address_numeric_grid_alias_worker import main as initiate_address_numeric_grid_alias
+from process.address_numeric_grid_alias_worker import (
+    process_address_numeric_grid_alias_revoke,
+    process_address_strict_source_backfill,
+    run_address_alias_revoke_command,
+    run_address_strict_source_backfill_command,
+)
+from process.address_numeric_grid_alias_worker import process_data as process_address_numeric_grid_alias_data
 from process.attributes import main as initiate_plan_attributes
-from process.attributes import (process_attributes, process_benefits,
-                                plan_attributes_control_start,
-                                process_prices, process_state_attributes,
-                                save_attributes)
+from process.attributes import (
+    plan_attributes_control_start,
+    process_attributes,
+    process_benefits,
+    process_prices,
+    process_state_attributes,
+    save_attributes,
+)
 from process.attributes import shutdown as attr_shutdown
 from process.attributes import startup as attr_startup
+from process.claims_pricing import claims_pricing_finalize, claims_pricing_process_chunk, claims_pricing_start
+from process.claims_pricing import finish_main as finish_claims_pricing
+from process.claims_pricing import main as initiate_claims_pricing
+from process.clinical_reference import main as initiate_clinical_reference
+from process.cms_doctors import main as initiate_cms_doctors
+from process.cms_doctors import process_data as process_cms_doctors_data
+from process.cms_doctors import shutdown as cms_doctors_shutdown
+from process.cms_doctors import startup as cms_doctors_startup
+from process.code_sets import main as initiate_code_sets
 from process.control_lifecycle import (
     _flush_terminal_status_events,
-    control_single_job_start as _control_single_job_start,
     mark_control_run,
 )
+from process.control_lifecycle import (
+    control_single_job_start as _control_single_job_start,
+)
+from process.drug_claims import drug_claims_finalize, drug_claims_process_chunk, drug_claims_start
+from process.drug_claims import finish_main as finish_drug_claims
+from process.drug_claims import main as initiate_drug_claims
+from process.entity_address_unified import main as initiate_entity_address_unified
+from process.entity_address_unified import process_data as process_entity_address_unified_data
+from process.entity_address_unified import shutdown as entity_address_unified_shutdown
+from process.entity_address_unified import startup as entity_address_unified_startup
 from process.ext.utils import db_startup
+from process.facility_anchors import main as initiate_facility_anchors
+from process.facility_anchors import process_data as process_facility_anchors_data
+from process.facility_anchors import shutdown as facility_anchors_shutdown
+from process.facility_anchors import startup as facility_anchors_startup
+from process.florida_mqa_profile import florida_mqa_profile
 from process.geo_census_import import geo_census_lookup
 from process.geo_import import geo_lookup
+from process.hospital_prices import main as initiate_hospital_prices
+from process.hospital_prices import process_data as process_hospital_prices_data
 from process.initial import finish_main as finish_mrf
-from process.initial import init_file
+from process.initial import (
+    init_file,
+    mrf_worker_shutdown,
+    process_formulary,
+    process_json_index,
+    process_plan,
+    process_provider,
+    save_mrf_data,
+)
 from process.initial import main as initiate_mrf
-from process.initial import (process_formulary, process_json_index,
-                             process_plan, process_provider, save_mrf_data)
 from process.initial import shutdown as shutdown_mrf
-from process.initial import mrf_worker_shutdown
 from process.initial import startup as initial_startup
-from process.npi import main as initiate_npi
-from process.npi import shutdown as npi_shutdown
-from process.npi import startup as npi_startup
-from process.nucc import main as initiate_nucc
-from process.nucc import process_data as process_nucc_data
-from process.nucc import shutdown as nucc_shutdown
-from process.nucc import startup as nucc_startup
-from process.ptg import main as initiate_ptg
-from process.ptg_candidate_audit import main as initiate_ptg_candidate_audit
-from process.ptg_control import ptg_control_start
-from process.claims_pricing import (claims_pricing_finalize,
-                                    claims_pricing_process_chunk,
-                                    claims_pricing_start,
-                                    finish_main as finish_claims_pricing,
-                                    main as initiate_claims_pricing)
-from process.clinical_reference import main as initiate_clinical_reference
-from process.code_sets import main as initiate_code_sets
-from process.terminology_synonyms import main as initiate_terminology_synonyms
-from process.ms_drg import main as initiate_ms_drg
-from process.drug_claims import (drug_claims_finalize,
-                                 drug_claims_process_chunk,
-                                 drug_claims_start,
-                                 finish_main as finish_drug_claims,
-                                 main as initiate_drug_claims)
-from process.provider_quality import (finish_main as finish_provider_quality,
-                                      main as initiate_provider_quality,
-                                      provider_quality_finalize,
-                                      provider_quality_materialize_domain_shard,
-                                      provider_quality_materialize_lsh_shard,
-                                      provider_quality_materialize_measure_shard,
-                                      provider_quality_materialize_score_shard,
-                                      provider_quality_process_chunk,
-                                      provider_quality_start)
-from process.provider_enrichment import (main as initiate_provider_enrichment,
-                                         process_data as process_provider_enrichment_data,
-                                         save_provider_enrichment_data,
-                                         shutdown as provider_enrichment_shutdown,
-                                         startup as provider_enrichment_startup)
-from process.provider_directory_fhir import (
-    main as initiate_provider_directory_fhir,
-    process_data as process_provider_directory_fhir_data,
-    PROVIDER_DIRECTORY_REFRESH_PRESETS,
-    shutdown as provider_directory_fhir_shutdown,
-    startup as provider_directory_fhir_startup,
-)
-from process.provider_directory_admission_seal import (
-    backfill_provider_directory_admission_seal,
-)
-from process.provider_directory_selection_receipt_backfill import (
-    backfill_provider_directory_selection_receipt,
-)
-from process.provider_directory_fhir_census_contract import (
-    acquisition_strategy_values as provider_directory_acquisition_strategy_values,
-)
-from process.partd_formulary_network import (
-    finish_main as finish_partd_formulary_network,
-    main as initiate_partd_formulary_network,
-    partd_formulary_network_finalize,
-    partd_formulary_network_process_chunk,
-    partd_formulary_network_start,
-)
-from process.pharmacy_license import (
-    finish_main as finish_pharmacy_license,
-    main as initiate_pharmacy_license,
-    pharmacy_license_finalize,
-    pharmacy_license_start,
-)
-from process.florida_mqa_profile import florida_mqa_profile
-from process.massachusetts_profile import massachusetts_borim_profile
 from process.kentucky_profile import kentucky_kbml_profile
-from process.tennessee_profile import tennessee_tdh_profile
-from process.rhode_island_profile import rhode_island_doh_profile
-from process.new_york_profile import new_york_nypp_profile
-from process.places_zcta import main as initiate_places_zcta
-from process.places_zcta import process_data as process_places_zcta_data
-from process.places_zcta import shutdown as places_zcta_shutdown
-from process.places_zcta import startup as places_zcta_startup
 from process.lodes import main as initiate_lodes
 from process.lodes import process_data as process_lodes_data
 from process.lodes import shutdown as lodes_shutdown
 from process.lodes import startup as lodes_startup
+from process.massachusetts_profile import massachusetts_borim_profile
 from process.medicare_enrollment import main as initiate_medicare_enrollment
 from process.medicare_enrollment import process_data as process_medicare_enrollment_data
 from process.medicare_enrollment import shutdown as medicare_enrollment_shutdown
@@ -143,45 +120,96 @@ from process.mrf_source_discovery import main as initiate_mrf_source_discovery
 from process.mrf_source_discovery import process_data as process_mrf_source_discovery_data
 from process.mrf_source_discovery import shutdown as mrf_source_discovery_shutdown
 from process.mrf_source_discovery import startup as mrf_source_discovery_startup
-from process.hospital_prices import main as initiate_hospital_prices
-from process.hospital_prices import process_data as process_hospital_prices_data
-from process.cms_doctors import main as initiate_cms_doctors
-from process.cms_doctors import process_data as process_cms_doctors_data
-from process.cms_doctors import shutdown as cms_doctors_shutdown
-from process.cms_doctors import startup as cms_doctors_startup
-from process.facility_anchors import main as initiate_facility_anchors
-from process.facility_anchors import process_data as process_facility_anchors_data
-from process.facility_anchors import shutdown as facility_anchors_shutdown
-from process.facility_anchors import startup as facility_anchors_startup
-from process.pharmacy_economics import main as initiate_pharmacy_economics
-from process.pharmacy_economics import process_data as process_pharmacy_economics_data
-from process.pharmacy_economics import shutdown as pharmacy_economics_shutdown
-from process.pharmacy_economics import startup as pharmacy_economics_startup
-from process.entity_address_unified import main as initiate_entity_address_unified
-from process.entity_address_unified import process_data as process_entity_address_unified_data
-from process.entity_address_unified import shutdown as entity_address_unified_shutdown
-from process.entity_address_unified import startup as entity_address_unified_startup
-from process.address_archive_migration import main as initiate_address_archive_migration
-from process.address_archive_migration import process_data as process_address_archive_migration_data
-from process.address_formatted_address import (
-    process_address_formatted_address,
-    run_address_formatted_address_command,
-)
-from process.address_numeric_grid_alias_worker import main as initiate_address_numeric_grid_alias
-from process.address_numeric_grid_alias_worker import process_data as process_address_numeric_grid_alias_data
-from process.address_numeric_grid_alias_worker import (
-    process_address_numeric_grid_alias_revoke,
-    process_address_strict_source_backfill,
-    run_address_alias_revoke_command,
-    run_address_strict_source_backfill_command,
-)
+from process.ms_drg import main as initiate_ms_drg
+from process.new_york_profile import new_york_nypp_profile
+from process.npi import main as initiate_npi
+from process.npi import shutdown as npi_shutdown
+from process.npi import startup as npi_startup
+from process.nucc import main as initiate_nucc
+from process.nucc import process_data as process_nucc_data
+from process.nucc import shutdown as nucc_shutdown
+from process.nucc import startup as nucc_startup
 from process.openaddresses import main as initiate_openaddresses
 from process.openaddresses import process_data as process_openaddresses_data
 from process.openaddresses import shutdown as openaddresses_shutdown
 from process.openaddresses import startup as openaddresses_startup
+from process.partd_formulary_network import (
+    finish_main as finish_partd_formulary_network,
+)
+from process.partd_formulary_network import (
+    main as initiate_partd_formulary_network,
+)
+from process.partd_formulary_network import (
+    partd_formulary_network_finalize,
+    partd_formulary_network_process_chunk,
+    partd_formulary_network_start,
+)
+from process.pharmacy_economics import main as initiate_pharmacy_economics
+from process.pharmacy_economics import process_data as process_pharmacy_economics_data
+from process.pharmacy_economics import shutdown as pharmacy_economics_shutdown
+from process.pharmacy_economics import startup as pharmacy_economics_startup
+from process.pharmacy_license import (
+    finish_main as finish_pharmacy_license,
+)
+from process.pharmacy_license import (
+    main as initiate_pharmacy_license,
+)
+from process.pharmacy_license import (
+    pharmacy_license_finalize,
+    pharmacy_license_start,
+)
+from process.places_zcta import main as initiate_places_zcta
+from process.places_zcta import process_data as process_places_zcta_data
+from process.places_zcta import shutdown as places_zcta_shutdown
+from process.places_zcta import startup as places_zcta_startup
+from process.provider_directory_admission_seal import (
+    backfill_provider_directory_admission_seal,
+)
+from process.provider_directory_fhir import (
+    PROVIDER_DIRECTORY_REFRESH_PRESETS,
+)
+from process.provider_directory_fhir import (
+    main as initiate_provider_directory_fhir,
+)
+from process.provider_directory_fhir import (
+    process_data as process_provider_directory_fhir_data,
+)
+from process.provider_directory_fhir import (
+    shutdown as provider_directory_fhir_shutdown,
+)
+from process.provider_directory_fhir import (
+    startup as provider_directory_fhir_startup,
+)
+from process.provider_directory_fhir_census_contract import (
+    acquisition_strategy_values as provider_directory_acquisition_strategy_values,
+)
+from process.provider_directory_selection_receipt_backfill import (
+    backfill_provider_directory_selection_receipt,
+)
+from process.provider_enrichment import main as initiate_provider_enrichment
+from process.provider_enrichment import process_data as process_provider_enrichment_data
+from process.provider_enrichment import save_provider_enrichment_data
+from process.provider_enrichment import shutdown as provider_enrichment_shutdown
+from process.provider_enrichment import startup as provider_enrichment_startup
+from process.provider_quality import finish_main as finish_provider_quality
+from process.provider_quality import main as initiate_provider_quality
+from process.provider_quality import (
+    provider_quality_finalize,
+    provider_quality_materialize_domain_shard,
+    provider_quality_materialize_lsh_shard,
+    provider_quality_materialize_measure_shard,
+    provider_quality_materialize_score_shard,
+    provider_quality_process_chunk,
+    provider_quality_start,
+)
+from process.ptg import main as initiate_ptg
+from process.ptg_candidate_audit import main as initiate_ptg_candidate_audit
+from process.ptg_control import ptg_control_start
 from process.redis_config import build_redis_settings
+from process.rhode_island_profile import rhode_island_doh_profile
 from process.serialization import deserialize_job, serialize_job
-
+from process.tennessee_profile import tennessee_tdh_profile
+from process.terminology_synonyms import main as initiate_terminology_synonyms
 
 control_single_job_start = arq_func(_control_single_job_start, max_tries=1)
 
@@ -220,7 +248,7 @@ class MRF:
     functions = [init_file, save_mrf_data, process_plan, process_json_index, process_provider, process_formulary]
     on_startup = initial_startup
     on_shutdown = mrf_worker_shutdown
-    max_jobs = int(os.environ.get('HLTHPRT_MAX_MRF_JOBS')) if os.environ.get('HLTHPRT_MAX_MRF_JOBS') else 20
+    max_jobs = int(os.environ.get("HLTHPRT_MAX_MRF_JOBS")) if os.environ.get("HLTHPRT_MAX_MRF_JOBS") else 20
     queue_read_limit = (
         int(os.environ.get("HLTHPRT_MRF_QUEUE_READ_LIMIT"))
         if os.environ.get("HLTHPRT_MRF_QUEUE_READ_LIMIT")
@@ -228,7 +256,7 @@ class MRF:
     )
     job_timeout = int(os.environ.get("HLTHPRT_MRF_JOB_TIMEOUT")) if os.environ.get("HLTHPRT_MRF_JOB_TIMEOUT") else 7200
     burst = True
-    queue_name = 'arq:MRF'
+    queue_name = "arq:MRF"
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job
@@ -373,7 +401,7 @@ class MRF_start:
     queue_read_limit = 10
     job_timeout = 3600
     burst = True
-    queue_name = 'arq:MRF_start'
+    queue_name = "arq:MRF_start"
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job
@@ -383,14 +411,12 @@ class MRF_finish:
     functions = [shutdown_mrf]
     on_startup = db_startup
     max_jobs = (
-        int(os.environ.get("HLTHPRT_MAX_MRF_FINISH_JOBS"))
-        if os.environ.get("HLTHPRT_MAX_MRF_FINISH_JOBS")
-        else 1
+        int(os.environ.get("HLTHPRT_MAX_MRF_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_MRF_FINISH_JOBS") else 1
     )
     queue_read_limit = max_jobs
     job_timeout = 14400
     burst = True
-    queue_name = 'arq:MRF_finish'
+    queue_name = "arq:MRF_finish"
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job
@@ -505,7 +531,7 @@ class NPI:
         if os.environ.get("HLTHPRT_NPI_QUEUE_READ_LIMIT")
         else 2 * max_jobs
     )
-    queue_name = 'arq:NPI'
+    queue_name = "arq:NPI"
     job_timeout = _npi_job_timeout()
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
@@ -518,7 +544,7 @@ class NUCC:
     on_shutdown = nucc_shutdown
     max_jobs = 20
     queue_read_limit = 5
-    queue_name = 'arq:NUCC'
+    queue_name = "arq:NUCC"
     job_timeout = 86400
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
@@ -528,9 +554,9 @@ class NUCC:
 class ClaimsPricing:
     functions = [claims_pricing_start, claims_pricing_process_chunk]
     on_startup = db_startup
-    max_jobs = int(os.environ.get('HLTHPRT_MAX_CLAIMS_JOBS')) if os.environ.get('HLTHPRT_MAX_CLAIMS_JOBS') else 20
+    max_jobs = int(os.environ.get("HLTHPRT_MAX_CLAIMS_JOBS")) if os.environ.get("HLTHPRT_MAX_CLAIMS_JOBS") else 20
     queue_read_limit = 2 * max_jobs
-    queue_name = 'arq:ClaimsPricing'
+    queue_name = "arq:ClaimsPricing"
     job_timeout = 86400
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
@@ -538,19 +564,21 @@ class ClaimsPricing:
 
 
 class ClaimsProcedures(ClaimsPricing):
-    queue_name = 'arq:ClaimsPricing'
+    queue_name = "arq:ClaimsPricing"
 
 
 class ClaimsPricing_finish:
     functions = [claims_pricing_finalize]
     on_startup = db_startup
-    max_jobs = int(os.environ.get('HLTHPRT_MAX_CLAIMS_FINISH_JOBS')) if os.environ.get('HLTHPRT_MAX_CLAIMS_FINISH_JOBS') else 5
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_CLAIMS_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_CLAIMS_FINISH_JOBS") else 5
+    )
     queue_read_limit = 2 * max_jobs
-    queue_name = 'arq:ClaimsPricing_finish'
+    queue_name = "arq:ClaimsPricing_finish"
     job_timeout = 86400
     max_tries = (
-        int(os.environ.get('HLTHPRT_CLAIMS_FINALIZE_MAX_TRIES'))
-        if os.environ.get('HLTHPRT_CLAIMS_FINALIZE_MAX_TRIES')
+        int(os.environ.get("HLTHPRT_CLAIMS_FINALIZE_MAX_TRIES"))
+        if os.environ.get("HLTHPRT_CLAIMS_FINALIZE_MAX_TRIES")
         else 720
     )
     burst = True
@@ -560,15 +588,17 @@ class ClaimsPricing_finish:
 
 
 class ClaimsProcedures_finish(ClaimsPricing_finish):
-    queue_name = 'arq:ClaimsPricing_finish'
+    queue_name = "arq:ClaimsPricing_finish"
 
 
 class DrugClaims:
     functions = [drug_claims_start, drug_claims_process_chunk]
     on_startup = db_startup
-    max_jobs = int(os.environ.get('HLTHPRT_MAX_DRUG_CLAIMS_JOBS')) if os.environ.get('HLTHPRT_MAX_DRUG_CLAIMS_JOBS') else 20
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_DRUG_CLAIMS_JOBS")) if os.environ.get("HLTHPRT_MAX_DRUG_CLAIMS_JOBS") else 20
+    )
     queue_read_limit = 2 * max_jobs
-    queue_name = 'arq:DrugClaims'
+    queue_name = "arq:DrugClaims"
     job_timeout = 86400
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
@@ -578,14 +608,18 @@ class DrugClaims:
 class DrugClaims_finish:
     functions = [drug_claims_finalize]
     on_startup = db_startup
-    max_jobs = int(os.environ.get('HLTHPRT_MAX_DRUG_CLAIMS_FINISH_JOBS')) if os.environ.get('HLTHPRT_MAX_DRUG_CLAIMS_FINISH_JOBS') else 5
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_DRUG_CLAIMS_FINISH_JOBS"))
+        if os.environ.get("HLTHPRT_MAX_DRUG_CLAIMS_FINISH_JOBS")
+        else 5
+    )
     queue_read_limit = 2 * max_jobs
-    queue_name = 'arq:DrugClaims_finish'
+    queue_name = "arq:DrugClaims_finish"
     job_timeout = 86400
     max_tries = (
-        int(os.environ.get('HLTHPRT_DRUG_CLAIMS_FINALIZE_MAX_TRIES'))
-        if os.environ.get('HLTHPRT_DRUG_CLAIMS_FINALIZE_MAX_TRIES')
-        else int(os.environ.get('HLTHPRT_CLAIMS_FINALIZE_MAX_TRIES', 720))
+        int(os.environ.get("HLTHPRT_DRUG_CLAIMS_FINALIZE_MAX_TRIES"))
+        if os.environ.get("HLTHPRT_DRUG_CLAIMS_FINALIZE_MAX_TRIES")
+        else int(os.environ.get("HLTHPRT_CLAIMS_FINALIZE_MAX_TRIES", 720))
     )
     burst = True
     redis_settings = build_redis_settings()
@@ -604,16 +638,16 @@ class ProviderQuality:
     ]
     on_startup = db_startup
     max_jobs = (
-        int(os.environ.get('HLTHPRT_MAX_PROVIDER_QUALITY_JOBS'))
-        if os.environ.get('HLTHPRT_MAX_PROVIDER_QUALITY_JOBS')
-        else int(os.environ.get('HLTHPRT_PROVIDER_QUALITY_SHARD_PARALLELISM', 8))
+        int(os.environ.get("HLTHPRT_MAX_PROVIDER_QUALITY_JOBS"))
+        if os.environ.get("HLTHPRT_MAX_PROVIDER_QUALITY_JOBS")
+        else int(os.environ.get("HLTHPRT_PROVIDER_QUALITY_SHARD_PARALLELISM", 8))
     )
     queue_read_limit = 2 * max_jobs
-    queue_name = 'arq:ProviderQuality'
+    queue_name = "arq:ProviderQuality"
     job_timeout = 86400
     max_tries = (
-        int(os.environ.get('HLTHPRT_PROVIDER_QUALITY_MATERIALIZE_SHARD_MAX_TRIES'))
-        if os.environ.get('HLTHPRT_PROVIDER_QUALITY_MATERIALIZE_SHARD_MAX_TRIES')
+        int(os.environ.get("HLTHPRT_PROVIDER_QUALITY_MATERIALIZE_SHARD_MAX_TRIES"))
+        if os.environ.get("HLTHPRT_PROVIDER_QUALITY_MATERIALIZE_SHARD_MAX_TRIES")
         else 20
     )
     redis_settings = build_redis_settings()
@@ -630,13 +664,17 @@ class ProviderQuality_finish:
         provider_quality_materialize_score_shard,
     ]
     on_startup = db_startup
-    max_jobs = int(os.environ.get('HLTHPRT_MAX_PROVIDER_QUALITY_FINISH_JOBS')) if os.environ.get('HLTHPRT_MAX_PROVIDER_QUALITY_FINISH_JOBS') else 5
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_PROVIDER_QUALITY_FINISH_JOBS"))
+        if os.environ.get("HLTHPRT_MAX_PROVIDER_QUALITY_FINISH_JOBS")
+        else 5
+    )
     queue_read_limit = 2 * max_jobs
-    queue_name = 'arq:ProviderQuality_finish'
+    queue_name = "arq:ProviderQuality_finish"
     job_timeout = 86400
     max_tries = (
-        int(os.environ.get('HLTHPRT_PROVIDER_QUALITY_FINALIZE_MAX_TRIES'))
-        if os.environ.get('HLTHPRT_PROVIDER_QUALITY_FINALIZE_MAX_TRIES')
+        int(os.environ.get("HLTHPRT_PROVIDER_QUALITY_FINALIZE_MAX_TRIES"))
+        if os.environ.get("HLTHPRT_PROVIDER_QUALITY_FINALIZE_MAX_TRIES")
         else 720
     )
     burst = True
@@ -649,9 +687,13 @@ class ProviderEnrichment:
     functions = [process_provider_enrichment_data, save_provider_enrichment_data, control_single_job_start]
     on_startup = provider_enrichment_startup
     on_shutdown = provider_enrichment_shutdown
-    max_jobs = int(os.environ.get('HLTHPRT_MAX_PROVIDER_ENRICHMENT_JOBS')) if os.environ.get('HLTHPRT_MAX_PROVIDER_ENRICHMENT_JOBS') else 20
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_PROVIDER_ENRICHMENT_JOBS"))
+        if os.environ.get("HLTHPRT_MAX_PROVIDER_ENRICHMENT_JOBS")
+        else 20
+    )
     queue_read_limit = 2 * max_jobs
-    queue_name = 'arq:ProviderEnrichment'
+    queue_name = "arq:ProviderEnrichment"
     job_timeout = 86400
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
@@ -661,9 +703,13 @@ class ProviderEnrichment:
 class ProviderEnrichment_finish:
     functions = [provider_enrichment_shutdown]
     on_startup = db_startup
-    max_jobs = int(os.environ.get('HLTHPRT_MAX_PROVIDER_ENRICHMENT_FINISH_JOBS')) if os.environ.get('HLTHPRT_MAX_PROVIDER_ENRICHMENT_FINISH_JOBS') else 5
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_PROVIDER_ENRICHMENT_FINISH_JOBS"))
+        if os.environ.get("HLTHPRT_MAX_PROVIDER_ENRICHMENT_FINISH_JOBS")
+        else 5
+    )
     queue_read_limit = 2 * max_jobs
-    queue_name = 'arq:ProviderEnrichment_finish'
+    queue_name = "arq:ProviderEnrichment_finish"
     job_timeout = 86400
     burst = True
     redis_settings = build_redis_settings()
@@ -784,7 +830,9 @@ class PartDFormularyNetwork:
 class PartDFormularyNetwork_finish:
     functions = [partd_formulary_network_finalize]
     on_startup = db_startup
-    max_jobs = int(os.environ.get("HLTHPRT_MAX_PARTD_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_PARTD_FINISH_JOBS") else 4
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_PARTD_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_PARTD_FINISH_JOBS") else 4
+    )
     queue_read_limit = 2 * max_jobs
     queue_name = "arq:PartDFormularyNetwork_finish"
     job_timeout = 3600
@@ -797,7 +845,9 @@ class PartDFormularyNetwork_finish:
 class PharmacyLicense:
     functions = [pharmacy_license_start]
     on_startup = db_startup
-    max_jobs = int(os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_JOBS")) if os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_JOBS") else 4
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_JOBS")) if os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_JOBS") else 4
+    )
     queue_read_limit = 2 * max_jobs
     queue_name = "arq:PharmacyLicense"
     job_timeout = 86400
@@ -809,7 +859,11 @@ class PharmacyLicense:
 class PharmacyLicense_finish:
     functions = [pharmacy_license_finalize]
     on_startup = db_startup
-    max_jobs = int(os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_FINISH_JOBS") else 4
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_FINISH_JOBS"))
+        if os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_FINISH_JOBS")
+        else 4
+    )
     queue_read_limit = 2 * max_jobs
     queue_name = "arq:PharmacyLicense_finish"
     job_timeout = 3600
@@ -823,7 +877,9 @@ class PlacesZcta:
     functions = [process_places_zcta_data, control_single_job_start]
     on_startup = places_zcta_startup
     on_shutdown = places_zcta_shutdown
-    max_jobs = int(os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_JOBS")) if os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_JOBS") else 4
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_JOBS")) if os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_JOBS") else 4
+    )
     queue_read_limit = 2 * max_jobs
     queue_name = "arq:PlacesZcta"
     job_timeout = 86400
@@ -835,7 +891,11 @@ class PlacesZcta:
 class PlacesZcta_finish:
     functions = [places_zcta_shutdown]
     on_startup = db_startup
-    max_jobs = int(os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_FINISH_JOBS") else 4
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_FINISH_JOBS"))
+        if os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_FINISH_JOBS")
+        else 4
+    )
     queue_read_limit = 2 * max_jobs
     queue_name = "arq:PlacesZcta_finish"
     job_timeout = 3600
@@ -1030,7 +1090,11 @@ class OpenAddresses:
     max_jobs = 1
     queue_read_limit = 2
     queue_name = "arq:OpenAddresses"
-    job_timeout = int(os.environ.get("HLTHPRT_OPENADDRESSES_JOB_TIMEOUT")) if os.environ.get("HLTHPRT_OPENADDRESSES_JOB_TIMEOUT") else 86400
+    job_timeout = (
+        int(os.environ.get("HLTHPRT_OPENADDRESSES_JOB_TIMEOUT"))
+        if os.environ.get("HLTHPRT_OPENADDRESSES_JOB_TIMEOUT")
+        else 86400
+    )
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job
@@ -1062,9 +1126,7 @@ class HospitalPrices:
     max_jobs = 1
     queue_read_limit = 2
     queue_name = "arq:HospitalPrices"
-    job_timeout = max(
-        _worker_int_env("HLTHPRT_HOSPITAL_PRICE_JOB_TIMEOUT", 604800), 1
-    )
+    job_timeout = max(_worker_int_env("HLTHPRT_HOSPITAL_PRICE_JOB_TIMEOUT", 604800), 1)
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job
@@ -1073,14 +1135,14 @@ class HospitalPrices:
 @click.group()
 def process_group():
     """
-       Initiate run of importers
+    Initiate run of importers
     """
 
 
 @click.group()
 def process_group_end():
     """
-       Finalize run of importers
+    Finalize run of importers
     """
 
 
@@ -1089,6 +1151,7 @@ def process_group_end():
 def mrf(test: bool):
     """Run the CMS machine-readable-file importer."""
     _run(initiate_mrf(test_mode=test))
+
 
 @click.command(help="Finish CMSGOV MRF Import")
 @click.option("--test", is_flag=True, help="Finalize the test-schema import.")
@@ -1104,16 +1167,22 @@ def plan_attributes(test: bool):
     """Run the CMS plan-attribute importer."""
     _run(initiate_plan_attributes(test_mode=test))
 
+
 @click.command(help="Run NPPES Import with Weekly updates")
 def npi():
     """Run the weekly NPPES provider import."""
     _run(initiate_npi())
 
+
 @click.command(help="Run Transparency in Coverage (PTG) Import")
 @click.option("--toc-url", multiple=True, help="URL of a table-of-contents file to seed jobs (repeatable).")
-@click.option("--toc-list", type=click.Path(exists=True), help="Path to file containing TOC URLs (newline or JSON list).")
+@click.option(
+    "--toc-list", type=click.Path(exists=True), help="Path to file containing TOC URLs (newline or JSON list)."
+)
 @click.option("--in-network-url", help="URL of a single in-network rates file.")
-@click.option("--in-network-urls", multiple=True, help="Complete explicit in-network rate URL set (repeatable; no truncation).")
+@click.option(
+    "--in-network-urls", multiple=True, help="Complete explicit in-network rate URL set (repeatable; no truncation)."
+)
 @click.option("--allowed-url", help="URL of a single allowed-amounts file.")
 @click.option("--provider-ref-url", help="URL of a provider-reference file.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
@@ -1157,9 +1226,7 @@ def npi():
 def ptg(**options):
     """Run a filtered Transparency in Coverage import."""
     if options.pop("_full_rebuild_token", None) is not None:
-        raise click.UsageError(
-            "controlled PTG rebuilds must be requested through import control"
-        )
+        raise click.UsageError("controlled PTG rebuilds must be requested through import control")
     if options.pop("keep_artifacts_on_failure", False):
         options["keep_partial_artifacts"] = True
     options["test_mode"] = options.pop("test")
@@ -1205,12 +1272,8 @@ def ptg_candidate_audit(
         "import_id": import_id,
     }
     if candidate_audit_mode == "audit_only":
-        audit_parameters_by_name["candidate_audit_mode"] = (
-            candidate_audit_mode
-        )
-    _run(
-        initiate_ptg_candidate_audit(**audit_parameters_by_name)
-    )
+        audit_parameters_by_name["candidate_audit_mode"] = candidate_audit_mode
+    _run(initiate_ptg_candidate_audit(**audit_parameters_by_name))
 
 
 @click.command(help="Run NUCC Taxonomy Import")
@@ -1268,7 +1331,9 @@ def ms_drg(
 @click.option("--sources", help="Comma-separated sources: icd10cm,mesh,rxnorm,snomed,medrt.")
 @click.option("--artifact-root", help="Directory for retained terminology source artifacts.")
 @click.option("--force-download", is_flag=True, help="Redownload source artifacts even when retained files exist.")
-def clinical_reference(test: bool, import_id: str | None, sources: str | None, artifact_root: str | None, force_download: bool):
+def clinical_reference(
+    test: bool, import_id: str | None, sources: str | None, artifact_root: str | None, force_download: bool
+):
     """Import configured clinical terminology reference sources."""
     _run(
         initiate_clinical_reference(
@@ -1366,8 +1431,12 @@ def provider_enrichment(test: bool):
 @click.option("--test", is_flag=True, help="Use a tiny built-in source fixture for a quick smoke run.")
 @click.option("--seed-db-path", help="Path to provider-directory-db SQLite seed file.")
 @click.option("--seed-db-url", help="URL for provider-directory-db SQLite seed file.")
-@click.option("--retest-results-path", help="Path to provider-directory-db retest_results.json supplemental source file.")
-@click.option("--retest-results-url", help="URL for provider-directory-db retest_results.json supplemental source file.")
+@click.option(
+    "--retest-results-path", help="Path to provider-directory-db retest_results.json supplemental source file."
+)
+@click.option(
+    "--retest-results-url", help="URL for provider-directory-db retest_results.json supplemental source file."
+)
 @click.option("--credential-config-file", help="Path to secret-backed Provider Directory credentials JSON file.")
 @click.option("--run-id", help="Existing Provider Directory FHIR run id to scope artifact publishing.")
 @click.option("--retry-of-run-id", help="Immediate failed run whose exact census checkpoint is resumed.")
@@ -1433,15 +1502,22 @@ def provider_enrichment(test: bool):
 @click.option("--cms-npd-rollback-vector-sha256", help="Replay one previously published retained CMS release vector.")
 @click.option("--cms-npd-rollback-root-run-id", help="Stable root run id when retrying the same CMS rollback.")
 @click.option(
-    "--cms-npd-retained-operation", type=click.Choice(("baseline", "rollback")),
+    "--cms-npd-retained-operation",
+    type=click.Choice(("baseline", "rollback")),
     help="Select an approved retained CMS baseline or rollback.",
 )
 @click.option("--cms-npd-retained-vector-sha256", help="Exact approved retained CMS release vector.")
 @click.option("--cms-npd-retained-receipt-sha256", help="SHA-256 of the approved complete retained CMS receipt bytes.")
-@click.option("--dataset-rehydrate-only", is_flag=True, help="Rebuild typed rows from one retained current dataset without network calls.")
+@click.option(
+    "--dataset-rehydrate-only",
+    is_flag=True,
+    help="Rebuild typed rows from one retained current dataset without network calls.",
+)
 @click.option("--rehydrate-dataset-id", help="Exact current immutable dataset id to rehydrate.")
 @click.option("--rehydrate-acquisition-root-run-id", help="Exact acquisition root run id recorded by the dataset.")
-@click.option("--rehydrate-resource", multiple=True, help="Typed resource to rehydrate; defaults to the dataset profile.")
+@click.option(
+    "--rehydrate-resource", multiple=True, help="Typed resource to rehydrate; defaults to the dataset profile."
+)
 @click.option("--rehydrate-batch-size", type=int, help="Retained payload rows per transactional rehydration batch.")
 @click.option(
     "--canonical-backfill-only",
@@ -1512,18 +1588,32 @@ def provider_enrichment(test: bool):
         "unless explicitly including credentialed endpoints."
     ),
 )
-@click.option("--include-auth-required", is_flag=True, help="Attempt resources from seed rows last marked auth_required.")
+@click.option(
+    "--include-auth-required", is_flag=True, help="Attempt resources from seed rows last marked auth_required."
+)
 @click.option(
     "--resources",
     help="Resources to fetch as comma-separated text or a JSON array. Defaults to the full supported resource set.",
 )
 @click.option("--resource-limit", type=int, help="Rows per source/resource to retain.")
-@click.option("--resource-deadline-seconds", type=int, help="Maximum seconds to spend fetching one regular resource endpoint.")
-@click.option("--linked-resource-limit", type=int, help="Referenced FHIR resources per source to fetch after paged resources.")
-@click.option("--linked-resource-deadline-seconds", type=int, help="Maximum seconds to spend fetching linked resources per source.")
+@click.option(
+    "--resource-deadline-seconds", type=int, help="Maximum seconds to spend fetching one regular resource endpoint."
+)
+@click.option(
+    "--linked-resource-limit", type=int, help="Referenced FHIR resources per source to fetch after paged resources."
+)
+@click.option(
+    "--linked-resource-deadline-seconds",
+    type=int,
+    help="Maximum seconds to spend fetching linked resources per source.",
+)
 @click.option("--page-limit", type=int, help="Maximum FHIR pages per source/resource.")
 @click.option("--page-count", type=int, help="FHIR _count page size.")
-@click.option("--stream-batch-size", type=int, help="Rows per streaming upsert batch. Use 0 to retain rows and upsert after each resource scan.")
+@click.option(
+    "--stream-batch-size",
+    type=int,
+    help="Rows per streaming upsert batch. Use 0 to retain rows and upsert after each resource scan.",
+)
 @click.option(
     "--defer-typed-materialization/--no-defer-typed-materialization",
     default=False,
@@ -1572,9 +1662,7 @@ def provider_directory_admission_backfill(dataset_id: str):
     )
 
 
-@click.command(
-    help="Validate or store one compact Provider Directory selection receipt"
-)
+@click.command(help="Validate or store one compact Provider Directory selection receipt")
 @click.option(
     "--dataset-id",
     required=True,
@@ -1661,7 +1749,8 @@ def medicare_enrollment(test: bool):
 @click.command(help="Run CMS Doctors and Clinicians import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 @click.option(
-    "--retained-source-manifest", type=click.Path(exists=True, dir_okay=False, readable=True),
+    "--retained-source-manifest",
+    type=click.Path(exists=True, dir_okay=False, readable=True),
     help="Replay retained bytes using their original closed source manifest.",
 )
 def cms_doctors(test: bool, retained_source_manifest: str | None = None):
@@ -1735,9 +1824,7 @@ def pharmacy_economics(test: bool):
 def entity_address_unified(**options):
     """Materialize the unified entity-address dataset."""
     options["test_mode"] = options.pop("test")
-    options["provider_directory_source_ids"] = list(
-        options.pop("provider_directory_source_id")
-    )
+    options["provider_directory_source_ids"] = list(options.pop("provider_directory_source_id"))
     if options["reuse_raw_stage"] is None:
         options.pop("reuse_raw_stage")
     if options["provider_directory_dataset_id"] is None:
@@ -1747,12 +1834,18 @@ def entity_address_unified(**options):
 
 @click.command(help="Run OpenAddresses US geocode cache refresh and address archive backfill")
 @click.option("--test", is_flag=True, help="Process a small OpenAddresses subset for a quick smoke run.")
-@click.option("--backfill-only", is_flag=True, help="Backfill archive coordinates from the existing local OpenAddresses cache.")
-@click.option("--load-only", is_flag=True, help="Load OpenAddresses data into the stage table without publish/backfill.")
+@click.option(
+    "--backfill-only", is_flag=True, help="Backfill archive coordinates from the existing local OpenAddresses cache."
+)
+@click.option(
+    "--load-only", is_flag=True, help="Load OpenAddresses data into the stage table without publish/backfill."
+)
 @click.option("--publish-only", is_flag=True, help="Publish/backfill from an existing OpenAddresses stage table.")
 @click.option("--resume-stage", is_flag=True, help="Reuse an existing stage table instead of dropping it before load.")
 @click.option("--import-id", help="Override import id/date suffix for OpenAddresses stage tables.")
-@click.option("--local-file", "local_files", multiple=True, help="Local GeoJSON/GeoJSON.gz source file; may be repeated.")
+@click.option(
+    "--local-file", "local_files", multiple=True, help="Local GeoJSON/GeoJSON.gz source file; may be repeated."
+)
 @click.option("--batch-size", type=int, help="Rows per OpenAddresses flush batch.")
 @click.option("--source-concurrency", type=int, help="Number of OpenAddresses source files to load concurrently.")
 @click.option("--max-files", type=int, help="Maximum OpenAddresses remote sources to process.")
@@ -1767,7 +1860,9 @@ def entity_address_unified(**options):
 @click.option("--backfill-concurrency", type=int, help="Number of archive backfill shards to process concurrently.")
 @click.option("--backfill-zip-prefix-length", type=int, help="ZIP prefix length for automatic archive backfill shards.")
 @click.option("--backfill-match-modes", help="Comma-separated archive backfill phases: exact,fuzzy,relaxed.")
-@click.option("--zip-restore-concurrency", type=int, help="Number of OpenAddresses ZIP restore shards to process concurrently.")
+@click.option(
+    "--zip-restore-concurrency", type=int, help="Number of OpenAddresses ZIP restore shards to process concurrently."
+)
 @click.option("--zip-restore-shards", type=int, help="Number of OpenAddresses ZIP recovery buckets to stage.")
 def openaddresses(**options):
     """Refresh the US OpenAddresses cache and archive coordinates."""
@@ -1779,9 +1874,15 @@ def openaddresses(**options):
 @click.option("--dry-run", is_flag=True, help="Compute counts and verification queries without writing.")
 @click.option("--legacy-table", default="address_archive", show_default=True, help="Legacy archive table name.")
 @click.option("--archive-table", default="address_archive_v2", show_default=True, help="Canonical archive table name.")
-@click.option("--work-mem", default="512MB", show_default=True, help="PostgreSQL work_mem for the migration transaction.")
-@click.option("--timeout", default="30min", show_default=True, help="PostgreSQL statement_timeout for migration statements.")
-@click.option("--sample-limit", type=int, default=20, show_default=True, help="Sample rows retained in migration metrics.")
+@click.option(
+    "--work-mem", default="512MB", show_default=True, help="PostgreSQL work_mem for the migration transaction."
+)
+@click.option(
+    "--timeout", default="30min", show_default=True, help="PostgreSQL statement_timeout for migration statements."
+)
+@click.option(
+    "--sample-limit", type=int, default=20, show_default=True, help="Sample rows retained in migration metrics."
+)
 @click.option("--enqueue", is_flag=True, help="Enqueue the migration on arq:AddressArchive instead of running inline.")
 @click.option("--test", is_flag=True, help="Pass test mode through the controlled importer payload.")
 def address_archive_v2_migrate(
@@ -1955,15 +2056,23 @@ def address_numeric_grid_alias_revoke(
 @click.option("--dry-run", is_flag=True, help="Collect and dedupe candidates without writing catalog tables.")
 @click.option("--check-urls", is_flag=True, help="Run lightweight HEAD checks for discovered URLs.")
 @click.option("--crawl", is_flag=True, help="Fetch and parse TOC/index metadata only; never download full rate bodies.")
-@click.option("--probe-files", is_flag=True, help="Run HEAD probes for stored MRF body files and cache size/ETag/Last-Modified.")
+@click.option(
+    "--probe-files", is_flag=True, help="Run HEAD probes for stored MRF body files and cache size/ETag/Last-Modified."
+)
 @click.option("--file-probe-limit", type=int, help="Maximum stored MRF body-file URLs to probe.")
 @click.option("--file-probe-types", help="Comma-separated file types to probe. Defaults to in-network,allowed-amounts.")
-@click.option("--file-probe-entity-types", help="Comma-separated payer entity types to probe, for example tpa or network/tpa.")
+@click.option(
+    "--file-probe-entity-types", help="Comma-separated payer entity types to probe, for example tpa or network/tpa."
+)
 @click.option("--file-probe-payer-query", help="Case-insensitive payer-name substring for file probes.")
 @click.option("--max-toc-bytes", type=int, help="Maximum TOC/index response bytes to fetch during discovery.")
-@click.option("--concurrency", type=int, default=None, help="Maximum concurrent URL checks/TOC fetches. Defaults to 10.")
+@click.option(
+    "--concurrency", type=int, default=None, help="Maximum concurrent URL checks/TOC fetches. Defaults to 10."
+)
 @click.option("--crawl-target-limit", type=int, help="Maximum resolved TOC targets to crawl after platform expansion.")
-@click.option("--test", is_flag=True, help="Use the local curated master list sample and avoid external network checks.")
+@click.option(
+    "--test", is_flag=True, help="Use the local curated master list sample and avoid external network checks."
+)
 def mrf_source_discovery_command(**options):
     """Discover, crawl, and synchronize configured MRF sources."""
     options["test_mode"] = options.pop("test")
@@ -1985,7 +2094,8 @@ def mrf_source_discovery_command(**options):
     help="Stable hospital identifier to refresh; repeat for a selected batch.",
 )
 @click.option(
-    "--all-hospitals", is_flag=True,
+    "--all-hospitals",
+    is_flag=True,
     help="Refresh every hospital in the checked-in registry.",
 )
 def hospital_prices(hospital_ids: tuple[str, ...], all_hospitals: bool):
@@ -2034,11 +2144,11 @@ def pharmacy_license_end(import_id: str, run_id: str, test: bool, manifest_path:
 
 
 process_group.add_command(mrf)
-process_group_end.add_command(mrf_end, 'mrf')
-process_group_end.add_command(claims_pricing_end, 'claims-pricing')
-process_group_end.add_command(claims_pricing_end, 'claims-procedures')
-process_group_end.add_command(drug_claims_end, 'drug-claims')
-process_group_end.add_command(provider_quality_end, 'provider-quality')
+process_group_end.add_command(mrf_end, "mrf")
+process_group_end.add_command(claims_pricing_end, "claims-pricing")
+process_group_end.add_command(claims_pricing_end, "claims-procedures")
+process_group_end.add_command(drug_claims_end, "drug-claims")
+process_group_end.add_command(provider_quality_end, "provider-quality")
 process_group_end.add_command(partd_formulary_network_end, "partd-formulary-network")
 process_group_end.add_command(pharmacy_license_end, "pharmacy-license")
 process_group.add_command(plan_attributes)

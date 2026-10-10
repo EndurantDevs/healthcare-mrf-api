@@ -2,13 +2,19 @@
 
 import sanic.exceptions
 from sanic import Blueprint, response
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from api.endpoint.pagination import parse_pagination
 from api.tier_utils import normalize_drug_tier_slug
 from db.connection import db as sa_db
-from db.models import (ImportLog, Issuer, Plan, PlanDrugStats,
-                       PlanDrugTierStats, PlanNetworkTierRaw)
+from db.models import ImportLog, Issuer, Plan, PlanDrugStats, PlanDrugTierStats, PlanNetworkTierRaw
+from process.registry_issuer_resolution import (
+    RegistryIssuerResolutionError,
+    RegistryIssuerResolutionUnavailable,
+    _selectors,
+    read_registry_issuer_resolutions,
+)
 
 import_log_table = ImportLog.__table__
 issuer_table = Issuer.__table__
@@ -21,19 +27,67 @@ plan_drug_tier_table = PlanDrugTierStats.__table__
 blueprint = Blueprint("issuer", url_prefix="/issuer", version=1)
 
 
+def _registry_issuer_query(request):
+    if request.body or set(request.args) - {"issuer_ids", "reporting_year"}:
+        raise ValueError("invalid issuer registry query")
+    if len(request.args.getlist("issuer_ids")) != 1 or len(request.args.getlist("reporting_year")) > 1:
+        raise ValueError("invalid issuer registry selector")
+    raw_ids = request.args.get("issuer_ids", "").split(",")
+    if not 1 <= len(raw_ids) <= 200:
+        raise ValueError("invalid issuer registry batch")
+    issuer_ids = []
+    for issuer_id in raw_ids:
+        if not issuer_id.isascii() or not issuer_id.isdecimal() or not 1 <= len(issuer_id) <= 5:
+            raise ValueError("invalid issuer registry identity")
+        if len(issuer_id) != 5 and str(int(issuer_id)) != issuer_id:
+            raise ValueError("invalid issuer registry identity")
+        issuer_ids.append(issuer_id if len(issuer_id) == 5 else int(issuer_id))
+    raw_year = request.args.get("reporting_year")
+    if raw_year is not None and (len(raw_year) != 4 or not raw_year.isascii() or not raw_year.isdecimal()):
+        raise ValueError("invalid issuer registry reporting period")
+    year = int(raw_year) if raw_year is not None else None
+    try:
+        return _selectors(issuer_ids, year), year
+    except RegistryIssuerResolutionError as error:
+        raise ValueError("invalid issuer registry selector") from error
+
+
+@blueprint.get("/registry", ignore_body=False)
+async def issuer_registry(request):
+    """Return dated company/group evidence for a bounded issuer batch."""
+    headers_by_name = {"Cache-Control": "private, no-store"}
+    try:
+        issuer_ids, reporting_year = _registry_issuer_query(request)
+        async with request.ctx.sa_session.begin():
+            await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            connection = await request.ctx.sa_session.connection()
+            driver = (await connection.get_raw_connection()).driver_connection
+            issuers = await read_registry_issuer_resolutions(driver, issuer_ids, reporting_year=reporting_year)
+        result = response.json({"issuers": issuers}, headers=headers_by_name)
+        if len(result.body) > 8 * 1024 * 1024:
+            raise RegistryIssuerResolutionUnavailable("Issuer response exceeds its complete bound")
+        return result
+    except RegistryIssuerResolutionError, RegistryIssuerResolutionUnavailable, SQLAlchemyError:
+        return response.json({"error": {"code": "issuer_registry_unavailable"}}, status=503, headers=headers_by_name)
+    except ValueError:
+        return response.json(
+            {"error": {"code": "issuer_registry_request_invalid"}}, status=400, headers=headers_by_name
+        )
+
+
 def _row_to_dict(row):
     mapping = getattr(row, "_mapping", None)
     if mapping is not None:
         try:
             row_by_field = dict(mapping)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             row_by_field = None
         if row_by_field is not None:
             return row_by_field
     if hasattr(row, "keys") and hasattr(row, "__getitem__"):
         try:
             row_by_field = {key: row[key] for key in row.keys()}
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             row_by_field = None
         if row_by_field is not None:
             return row_by_field
@@ -41,7 +95,7 @@ def _row_to_dict(row):
         return dict(row)
     try:
         return dict(row)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return {}
 
 
@@ -72,13 +126,8 @@ async def _load_issuer_plans(session, issuer_id):
         plan_key = (row_dict.get("plan_id"), row_dict.get("year"))
         plan_data_by_field = plan_by_key.get(plan_key)
         if plan_data_by_field is None:
-            plan_data_by_field = {
-                column.name: row_dict.get(column.name)
-                for column in plan_table.c
-            }
-            plan_data_by_field["network"] = {
-                "cmsgov_network": plan_data_by_field.get("network")
-            }
+            plan_data_by_field = {column.name: row_dict.get(column.name) for column in plan_table.c}
+            plan_data_by_field["network"] = {"cmsgov_network": plan_data_by_field.get("network")}
             plan_by_key[plan_key] = plan_data_by_field
             plans.append(plan_data_by_field)
         checksum_network = row_dict.get("network_checksum")
@@ -136,11 +185,7 @@ async def _load_issuer_drug_summary(session, issuer_id):
             func.coalesce(func.sum(plan_drug_stats_table.c.quantity_limit), 0).label("quantity_limit"),
             func.coalesce(func.sum(plan_drug_stats_table.c.quantity_no_limit), 0).label("quantity_no_limit"),
         )
-        .select_from(
-            plan_drug_stats_table.join(
-                plan_table, plan_drug_stats_table.c.plan_id == plan_table.c.plan_id
-            )
-        )
+        .select_from(plan_drug_stats_table.join(plan_table, plan_drug_stats_table.c.plan_id == plan_table.c.plan_id))
         .where(plan_table.c.issuer_id == issuer_id)
     )
     stats_row = (await session.execute(stats_stmt)).first()
@@ -150,11 +195,7 @@ async def _load_issuer_drug_summary(session, issuer_id):
             plan_drug_tier_table.c.drug_tier,
             func.coalesce(func.sum(plan_drug_tier_table.c.drug_count), 0).label("drug_count"),
         )
-        .select_from(
-            plan_drug_tier_table.join(
-                plan_table, plan_drug_tier_table.c.plan_id == plan_table.c.plan_id
-            )
-        )
+        .select_from(plan_drug_tier_table.join(plan_table, plan_drug_tier_table.c.plan_id == plan_table.c.plan_id))
         .where(plan_table.c.issuer_id == issuer_id)
         .group_by(plan_drug_tier_table.c.drug_tier)
     )
@@ -175,10 +216,7 @@ def _parse_issuer_list_args(args, state):
     args.get("start")
     args.get("page_size")
     pagination = None
-    if any(
-        args.get(name) not in (None, "", "null")
-        for name in ("page", "limit", "offset", "start", "page_size")
-    ):
+    if any(args.get(name) not in (None, "", "null") for name in ("page", "limit", "offset", "start", "page_size")):
         pagination = parse_pagination(
             args,
             default_limit=50,
@@ -198,30 +236,20 @@ async def _load_issuer_count_maps(session, state_filter):
     ).group_by(import_log_table.c.issuer_id)
     if state_filter:
         error_stmt = error_stmt.select_from(
-            import_log_table.join(
-                issuer_table, import_log_table.c.issuer_id == issuer_table.c.issuer_id
-            )
+            import_log_table.join(issuer_table, import_log_table.c.issuer_id == issuer_table.c.issuer_id)
         ).where(issuer_table.c.state == state_filter)
     error_rows = await session.execute(error_stmt)
-    error_count_by_issuer = {
-        error_count_row[0]: error_count_row[1]
-        for error_count_row in error_rows
-    }
+    error_count_by_issuer = {error_count_row[0]: error_count_row[1] for error_count_row in error_rows}
     plan_stmt = select(
         plan_table.c.issuer_id,
         sa_db.func.count(plan_table.c.issuer_id),
     ).group_by(plan_table.c.issuer_id)
     if state_filter:
         plan_stmt = plan_stmt.select_from(
-            plan_table.join(
-                issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id
-            )
+            plan_table.join(issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id)
         ).where(issuer_table.c.state == state_filter)
     plan_rows = await session.execute(plan_stmt)
-    plan_count_by_issuer = {
-        plan_count_row[0]: plan_count_row[1]
-        for plan_count_row in plan_rows
-    }
+    plan_count_by_issuer = {plan_count_row[0]: plan_count_row[1] for plan_count_row in plan_rows}
     return error_count_by_issuer, plan_count_by_issuer
 
 
@@ -234,9 +262,7 @@ async def get_issuer_data(request, issuer_id):
 
     issuer_id = int(issuer_id)
 
-    issuer_result = await session.execute(
-        select(issuer_table).where(issuer_table.c.issuer_id == issuer_id)
-    )
+    issuer_result = await session.execute(select(issuer_table).where(issuer_table.c.issuer_id == issuer_id))
     issuer_row = issuer_result.first()
     if issuer_row is None:
         raise sanic.exceptions.NotFound
@@ -244,9 +270,7 @@ async def get_issuer_data(request, issuer_id):
     issuer_data = _row_to_dict(issuer_row)
 
     error_result = await session.execute(
-        select(sa_db.func.count(import_log_table.c.checksum)).where(
-            import_log_table.c.issuer_id == issuer_id
-        )
+        select(sa_db.func.count(import_log_table.c.checksum)).where(import_log_table.c.issuer_id == issuer_id)
     )
     issuer_data["import_errors"] = error_result.scalar() or 0
 
@@ -278,15 +302,10 @@ async def get_issuers(request, state=None):
     issuer_stmt = select(issuer_table)
     if state_filter:
         issuer_stmt = issuer_stmt.where(issuer_table.c.state == state_filter)
-    issuer_stmt = issuer_stmt.order_by(
-        issuer_table.c.state.asc(), issuer_table.c.issuer_name.asc()
-    )
+    issuer_stmt = issuer_stmt.order_by(issuer_table.c.state.asc(), issuer_table.c.issuer_name.asc())
 
     issuer_rows = await session.execute(issuer_stmt)
-    issuers = [
-        _row_to_dict(issuer_result_row)
-        for issuer_result_row in issuer_rows
-    ]
+    issuers = [_row_to_dict(issuer_result_row) for issuer_result_row in issuer_rows]
 
     if not issuers:
         raise sanic.exceptions.NotFound
@@ -301,9 +320,7 @@ async def get_issuers(request, state=None):
         if not issuers:
             raise sanic.exceptions.NotFound
 
-    error_count_by_issuer, plan_count_by_issuer = await _load_issuer_count_maps(
-        session, state_filter
-    )
+    error_count_by_issuer, plan_count_by_issuer = await _load_issuer_count_maps(session, state_filter)
 
     for issuer in issuers:
         issuer_id = issuer.get("issuer_id")

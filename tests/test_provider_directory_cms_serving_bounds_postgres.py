@@ -80,7 +80,7 @@ async def test_retained_capture_bounds_same_readonly_backend_and_releases_on_tim
                 await operation
             assert len(observed) == 1
         else:
-            assert vars(await operation) == outputs
+            assert vars(await operation) == {**outputs, "capacity_lease": limits.lease}
             assert len(observed) == 5
         assert all(
             observation_row["read_only"] == "on" and observation_row["isolation"] == "repeatable read"

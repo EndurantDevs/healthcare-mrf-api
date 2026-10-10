@@ -5,8 +5,8 @@
 from __future__ import annotations
 
 import asyncio
-import datetime
 import dataclasses
+import datetime
 import importlib
 import json
 from types import SimpleNamespace
@@ -16,7 +16,6 @@ import pytest
 from db.connection import Database
 from process import provider_directory_profile_capacity as capacity
 from process import provider_directory_profile_capacity_runtime as runtime
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -145,9 +144,7 @@ def _geometry_inputs(
         "artifact_scope_projected_logical_bytes": 7_500_000,
         "artifact_scope_projection_hash": "e" * 64,
     }
-    return runtime.ProviderDirectoryProfileCapacityGeometryInputs(
-        **{**geometry_by_field, **overrides}
-    )
+    return runtime.ProviderDirectoryProfileCapacityGeometryInputs(**{**geometry_by_field, **overrides})
 
 
 def test_configured_limits_have_no_implicit_defaults(monkeypatch):
@@ -158,9 +155,7 @@ def test_configured_limits_have_no_implicit_defaults(monkeypatch):
     ):
         runtime.configured_capacity_limits()
 
-    limits = runtime.configured_capacity_limits(
-        json.dumps(_limits_payload())
-    )
+    limits = runtime.configured_capacity_limits(json.dumps(_limits_payload()))
     assert limits.artifact_scope_batch_size == 100_000
     assert len(limits.relation_byte_caps) == 6
 
@@ -196,22 +191,11 @@ def _assert_capacity_reservation_totals(geometry) -> None:
     assert geometry.control_wal_plan_input_hash == "1" * 64
     assert geometry.control_wal_upper_bound_bytes == 50_000
     assert geometry.control_metadata_data_upper_bound_bytes == 60_000
-    assert (
-        geometry.reservation_bytes_by_storage_class
-        == {
-            "data": (
-                80_000
-                + capacity.METADATA_DATA_UPPER_BOUND_BYTES
-                + 60_000
-            ),
-            "temp": 2_048,
-            "wal": (
-                240_000
-                + capacity.METADATA_WAL_UPPER_BOUND_BYTES
-                + 50_000
-            ),
-        }
-    )
+    assert geometry.reservation_bytes_by_storage_class == {
+        "data": (80_000 + capacity.METADATA_DATA_UPPER_BOUND_BYTES + 60_000),
+        "temp": 2_048,
+        "wal": (240_000 + capacity.METADATA_WAL_UPPER_BOUND_BYTES + 50_000),
+    }
 
 
 def test_geometry_binds_runtime_limits_and_exact_artifact_projection():
@@ -233,24 +217,16 @@ def test_geometry_binds_runtime_limits_and_exact_artifact_projection():
         limits,
         _geometry_inputs(control_wal_upper_bound_bytes=50_001),
     )
-    assert capacity.capacity_geometry_hash(changed_control_geometry) != (
-        original_hash
-    )
+    assert capacity.capacity_geometry_hash(changed_control_geometry) != (original_hash)
     changed_control_data_geometry = runtime.build_capacity_geometry(
         limits,
-        _geometry_inputs(
-            control_metadata_data_upper_bound_bytes=60_001
-        ),
+        _geometry_inputs(control_metadata_data_upper_bound_bytes=60_001),
     )
-    assert capacity.capacity_geometry_hash(
-        changed_control_data_geometry
-    ) != original_hash
+    assert capacity.capacity_geometry_hash(changed_control_data_geometry) != original_hash
 
 
 def test_geometry_rejects_artifact_projection_above_deployment_cap():
-    limits = runtime.validated_capacity_limits(
-        _limits_payload(max_artifact_scope_rows=249_999)
-    )
+    limits = runtime.validated_capacity_limits(_limits_payload(max_artifact_scope_rows=249_999))
     with pytest.raises(
         runtime.ProviderDirectoryProfileCapacityConfigurationError,
         match="artifact_scope_rows_exceeded",
@@ -277,18 +253,9 @@ async def test_postgres_applies_exact_finite_capacity_settings(monkeypatch):
     except Exception:
         await database.disconnect()
         pytest.skip("capacity runtime proof needs PostgreSQL")
-    if (
-        await database.scalar(
-            "SELECT has_parameter_privilege("
-            "current_user, 'temp_file_limit', 'SET'"
-            ");"
-        )
-        is not True
-    ):
+    if await database.scalar("SELECT has_parameter_privilege(current_user, 'temp_file_limit', 'SET');") is not True:
         await database.disconnect()
-        pytest.skip(
-            "capacity runtime proof needs temp_file_limit SET privilege"
-        )
+        pytest.skip("capacity runtime proof needs temp_file_limit SET privilege")
     geometry = runtime.build_capacity_geometry(
         runtime.validated_capacity_limits(_limits_payload()),
         _geometry_inputs(),
@@ -296,18 +263,13 @@ async def test_postgres_applies_exact_finite_capacity_settings(monkeypatch):
     admission = SimpleNamespace(
         geometry=geometry,
         lease=SimpleNamespace(
-            max_build_deadline=(
-                datetime.datetime.now(datetime.timezone.utc)
-                + datetime.timedelta(minutes=30)
-            )
+            max_build_deadline=(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=30))
         ),
     )
     monkeypatch.setattr(importer, "db", database)
     try:
         async with database.transaction():
-            await importer._apply_provider_directory_profile_capacity_settings(
-                admission
-            )
+            await importer._apply_provider_directory_profile_capacity_settings(admission)
     finally:
         await database.disconnect()
 
@@ -319,9 +281,9 @@ async def test_capacity_settings_fail_before_mutation_without_temp_privilege(
     """An unprivileged runtime must not silently lose the signed temp cap."""
 
     class MissingPrivilegeDatabase:
-        async def scalar(self, statement):
+        async def first(self, statement, **_params):
             assert "has_parameter_privilege" in statement
-            return json.loads("false")
+            return SimpleNamespace(_mapping={"can_set_temp": False, "remaining_ms": None})
 
         async def all(self, statement):
             assert "pg_catalog.pg_proc" in statement
@@ -337,10 +299,7 @@ async def test_capacity_settings_fail_before_mutation_without_temp_privilege(
     admission = SimpleNamespace(
         geometry=geometry,
         lease=SimpleNamespace(
-            max_build_deadline=(
-                datetime.datetime.now(datetime.timezone.utc)
-                + datetime.timedelta(minutes=30)
-            )
+            max_build_deadline=(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=30))
         ),
     )
     monkeypatch.setattr(importer, "db", MissingPrivilegeDatabase())
@@ -349,9 +308,7 @@ async def test_capacity_settings_fail_before_mutation_without_temp_privilege(
         RuntimeError,
         match="capacity_temp_file_limit_privilege_missing",
     ):
-        await importer._apply_provider_directory_profile_capacity_settings(
-            admission
-        )
+        await importer._apply_provider_directory_profile_capacity_settings(admission)
 
 
 @pytest.mark.asyncio
@@ -367,7 +324,7 @@ async def test_capacity_settings_refuse_database_clock_deadline_reserve(
 
         async def first(self, statement, **_params):
             assert "clock_timestamp()" in statement
-            return SimpleNamespace(_mapping={"remaining_ms": 1_000})
+            return SimpleNamespace(_mapping={"can_set_temp": True, "remaining_ms": 1_000})
 
         async def status(self, _statement):
             raise AssertionError("expired capacity settings must not mutate")
@@ -379,10 +336,7 @@ async def test_capacity_settings_refuse_database_clock_deadline_reserve(
     admission = SimpleNamespace(
         geometry=geometry,
         lease=SimpleNamespace(
-            max_build_deadline=(
-                datetime.datetime.now(datetime.timezone.utc)
-                + datetime.timedelta(seconds=1)
-            )
+            max_build_deadline=(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1))
         ),
     )
     monkeypatch.setattr(importer, "db", DeadlineDatabase())
@@ -391,9 +345,7 @@ async def test_capacity_settings_refuse_database_clock_deadline_reserve(
         importer.ProviderDirectoryCapacityLeaseError,
         match="deadline_reached",
     ):
-        await importer._apply_provider_directory_profile_capacity_settings(
-            admission
-        )
+        await importer._apply_provider_directory_profile_capacity_settings(admission)
 
 
 @pytest.mark.asyncio
@@ -406,18 +358,14 @@ async def test_two_postgres_workers_each_receive_the_signed_temp_cap(
     try:
         await database.connect()
         can_set_temp_limit = await database.scalar(
-            "SELECT has_parameter_privilege("
-            "current_user, 'temp_file_limit', 'SET'"
-            ");"
+            "SELECT has_parameter_privilege(current_user, 'temp_file_limit', 'SET');"
         )
     except Exception:
         await database.disconnect()
         pytest.skip("two-worker capacity proof needs PostgreSQL")
     if can_set_temp_limit is not True:
         await database.disconnect()
-        pytest.skip(
-            "two-worker capacity proof needs temp_file_limit SET privilege"
-        )
+        pytest.skip("two-worker capacity proof needs temp_file_limit SET privilege")
     geometry = runtime.build_capacity_geometry(
         runtime.validated_capacity_limits(_limits_payload()),
         _geometry_inputs(
@@ -432,16 +380,8 @@ async def test_two_postgres_workers_each_receive_the_signed_temp_cap(
 
     async def bounded_worker():
         async with database.transaction():
-            await importer._apply_provider_directory_profile_capacity_settings(
-                admission
-            )
-            return int(
-                await database.scalar(
-                    "SELECT pg_size_bytes("
-                    "current_setting('temp_file_limit')"
-                    ")::bigint;"
-                )
-            )
+            await importer._apply_provider_directory_profile_capacity_settings(admission)
+            return int(await database.scalar("SELECT pg_size_bytes(current_setting('temp_file_limit'))::bigint;"))
 
     try:
         observed_limits = await asyncio.gather(
@@ -464,9 +404,6 @@ def _capacity_admission(geometry):
     return SimpleNamespace(
         geometry=geometry,
         lease=SimpleNamespace(
-            max_build_deadline=(
-                datetime.datetime.now(datetime.timezone.utc)
-                + datetime.timedelta(minutes=30)
-            )
+            max_build_deadline=(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=30))
         ),
     )

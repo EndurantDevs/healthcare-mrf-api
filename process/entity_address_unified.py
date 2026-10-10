@@ -35,6 +35,7 @@ from db.models import (
     FacilityAnchorNPICandidate,
     db,
 )
+from db.models.entity_address_unified import ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES
 from process import entity_address_candidate_preparation as candidate_preparation
 from process import entity_address_preparation_admission as preparation_admission
 from process import entity_address_result_generation as result_generation
@@ -170,33 +171,6 @@ PROVIDER_DIRECTORY_COMPATIBILITY_ADDRESS_TABLES = (
     "provider_directory_organization_affiliation",
 )
 
-ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
-    "npi",
-    "primary_npi",
-    "coalesced_npi",
-    "primary_state_city_npi",
-    "primary_zip5_npi",
-    "serving_zip5_npi",
-    "serving_zip5_taxonomy",
-    "primary_phone_npi",
-    "service_phone_lookup_npi",
-    "service_phone_digits_npi",
-    "service_phone_number_npi",
-    "service_address_key_npi",
-    "service_premise_key_npi",
-    "address_sources",
-    # The phone fallback filters "address_key = ANY(..) OR premise_key = ANY(..)";
-    # without a premise_key index the OR scans the serving table.
-    "premise_key",
-    "taxonomy_plans_network",
-    "service_plans_network_array",
-    "procedures_array",
-    "medications_array",
-    "geo_idx",
-    "geo_taxonomy",
-    "geo_bbox",
-    "address_key",
-}
 STAGE_INDEX_PROFILES = {"all", "serving", "none"}
 POST_PUBLISH_INDEX_PROFILES = {"all", "serving", "none"}
 RAW_GROUP_INDEX_PROFILES = {"group", "shard"}
@@ -4209,6 +4183,18 @@ def _current_provider_directory_source_selects(
         run_id=run_id,
     )
     current_source_selects.append(_bounded_source_select_sql(overlay_source_select, test_limit_per_source))
+    from process.provider_directory_cms_typed_offices import cms_typed_office_source
+
+    typed_source = cms_typed_office_source(
+        importlib.import_module(__name__),
+        db_schema,
+        available,
+        source_ids=source_ids,
+        run_id=run_id,
+        partial_refresh=partial_refresh,
+    )
+    if typed_source is not None:
+        current_source_selects.append(_bounded_source_select_sql(typed_source, test_limit_per_source))
     return [candidate_preparation.source_sql(db_schema, sql) for sql in current_source_selects]
 
 
@@ -11865,6 +11851,9 @@ async def process_entity_address_unified_data(ctx, task=None):
         "provider_directory_address_overlay",
         "provider_directory_endpoint_dataset",
         "provider_directory_dataset_resource",
+        "provider_directory_cms_npd_resource_witness",
+        "provider_directory_cms_candidate_coverage",
+        "provider_directory_entity_source_binding",
         "address_archive_v2",
         address_alias_sql.ADDRESS_ALIAS_TABLE,
         address_alias_sql.ADDRESS_ALIAS_STATE_TABLE,
