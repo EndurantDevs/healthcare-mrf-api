@@ -288,8 +288,10 @@ async def import_profiles(ctx, task):
         artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         completed = await _run_claimed(ctx, task, run_by_field, snapshot, artifact_root / run_id)
     except BaseException as exc:
-        await store.mark_run_failed(run_id, exc)
+        await store.mark_run_failed(run_id, exc, ctx=ctx)
         raise
+    if (ctx.get("context") or {}).get("control_run_handoff_committed") is True:
+        return completed
     try:
         await store.retain_source_history(artifact_root)
     except Exception:

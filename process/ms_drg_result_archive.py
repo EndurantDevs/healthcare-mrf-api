@@ -3,15 +3,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
 from datetime import datetime
+from types import SimpleNamespace
 from uuid import UUID
 
 from sqlalchemy import text
 
 from db.models import CodeCatalog, CodeRelationship, CodeSynonym
+from process import reference_family_archive as native
 from process.entity_address_snapshot_receipt import _projected_row_identity
 from process.ms_drg_result_generation import (
     _SCOPES,
@@ -26,6 +29,7 @@ from process.ms_drg_result_generation import (
 from process.ms_drg_result_generation import (
     TABLE as GENERATION_TABLE,
 )
+from process.scoped_catalog_binding import match_catalog_text_columns
 
 CONTRACT = "ms-drg-scoped.postgres.v1"
 MODELS = (CodeCatalog, CodeSynonym, CodeRelationship)
@@ -193,35 +197,65 @@ async def _strict_stage(session, stage: dict, manifest: dict, *, receiving: bool
     )
 
 
-async def _copy_slice(session, source: str, target: str, source_name: str, target_name: str, model, sources) -> None:
-    columns = ",".join(_quoted(column.name) for column in model.__table__.columns)
-    await session.execute(
-        text(
-            f"INSERT INTO {_quoted(target)}.{_quoted(target_name)} ({columns}) "
-            f"SELECT {columns} FROM {_quoted(source)}.{_quoted(source_name)} "
-            "WHERE source=ANY(CAST(:sources AS text[]))"
-        ),
-        {"sources": list(sources)},
+def _require_copy(source_copy) -> None:
+    require(isinstance(source_copy, native.ReferenceFamilySourceCopy), "MS-DRG native COPY capability is required")
+
+
+async def _copy_slice(
+    session,
+    source_schema: str,
+    target_schema: str,
+    target_name: str,
+    model,
+    *,
+    source_copy,
+    remaining: int,
+    deadline: float,
+) -> int:
+    _require_copy(source_copy)
+    require(model in MODELS, "MS-DRG COPY model differs")
+    source_name = model.__tablename__
+    scope_sources = dict(_SCOPES)[source_name]
+    require(
+        target_name in (source_name, source_name + "_predecessor"),
+        "MS-DRG COPY source scope differs",
     )
+    columns = tuple(column.name for column in model.__table__.columns)
+    literals = ",".join("'" + name + "'" for name in scope_sources)
+    query = (
+        "SELECT "
+        + ",".join(_quoted(column) for column in columns)
+        + f" FROM {_quoted(source_schema)}.{_quoted(source_name)}"
+        + f" WHERE source=ANY(ARRAY[{literals}]::text[])"
+    )
+    return await native._copy_source_projection(
+        session, source_copy, query, target_schema, target_name, columns, remaining, deadline
+    )
+
+
+def _spec(*, predecessors: bool = False) -> native.ReferenceFamilySpec:
+    if not predecessors:
+        return native.ReferenceFamilySpec("ms-drg", MODELS)
+    aliases = []
+    for model, name in zip(MODELS, PREDECESSORS, strict=True):
+        table = native._clone_model_table(model.__table__, native.MetaData(), schema=None, name=name)
+        aliases.append(
+            SimpleNamespace(
+                __tablename__=name, __table__=table, __my_additional_indexes__=model.__my_additional_indexes__
+            )
+        )
+    return native.ReferenceFamilySpec("ms-drg", tuple(aliases))
 
 
 async def _create_stage(session, source: str, dataset_id: UUID, *, predecessors: bool) -> dict:
     schema = stage_schema(dataset_id)
+    _quoted(source)
     await session.execute(text(f"CREATE SCHEMA {_quoted(schema)}"))
-    for model in MODELS:
-        name = model.__tablename__
-        await session.execute(
-            text(
-                f"CREATE TABLE {_quoted(schema)}.{_quoted(name)} (LIKE {_quoted(source)}.{_quoted(name)} INCLUDING ALL)"
-            )
-        )
-        if predecessors:
-            await session.execute(
-                text(
-                    f"CREATE TABLE {_quoted(schema)}.{_quoted(name + '_predecessor')} "
-                    f"(LIKE {_quoted(source)}.{_quoted(name)} INCLUDING ALL)"
-                )
-            )
+    await native._create_model_heaps(session, _spec(), schema, create_indexes=False)
+    await match_catalog_text_columns(session, source, schema, "code_catalog")
+    if predecessors:
+        await native._create_model_heaps(session, _spec(predecessors=True), schema, create_indexes=False)
+        await match_catalog_text_columns(session, source, schema, "code_catalog_predecessor")
     names = TABLES + PREDECESSORS if predecessors else TABLES
     return {
         "dataset_id": str(dataset_id),
@@ -231,19 +265,27 @@ async def _create_stage(session, source: str, dataset_id: UUID, *, predecessors:
     }
 
 
-async def prepare_source(session, schema: str, dataset_id: UUID) -> tuple[dict, dict]:
-    """Freeze the exact published source slices under the ordinary writer's table locks."""
+async def prepare_source(session, schema: str, dataset_id: UUID, *, source_copy=None) -> tuple[dict, dict]:
+    """Freeze exact published slices under authenticated native source pins."""
     require(session.in_transaction(), "MS-DRG source transaction is required")
-    await session.execute(
-        text("LOCK TABLE " + ",".join(f"{_quoted(schema)}.{_quoted(name)}" for name in TABLES) + " IN SHARE MODE")
-    )
+    _require_copy(source_copy)
     generation = await read_current_generation(session, schema)
     manifest = validate_manifest(source_manifest(generation))
     stage = await _create_stage(session, schema, dataset_id, predecessors=False)
-    for model, (_, sources) in zip(MODELS, _SCOPES, strict=True):
-        await _copy_slice(
-            session, schema, stage["schema_name"], model.__tablename__, model.__tablename__, model, sources
+    remaining = source_copy.max_bytes
+    deadline = asyncio.get_running_loop().time() + source_copy.timeout
+    for model in MODELS:
+        remaining = await _copy_slice(
+            session,
+            schema,
+            stage["schema_name"],
+            model.__tablename__,
+            model,
+            source_copy=source_copy,
+            remaining=remaining,
+            deadline=deadline,
         )
+    await native._create_model_indexes(session, _spec(), stage["schema_name"], create_constraints=True)
     await _strict_stage(session, stage, manifest, receiving=False)
     return stage, manifest
 
@@ -261,15 +303,39 @@ async def precreate_restore(session, destination: str, dataset_id: UUID, manifes
     validate_manifest(manifest)
     stage = await _create_stage(session, destination, dataset_id, predecessors=True)
     # Empty candidates cannot validate row hashes yet, but must match source shape.
-    actual = await capture_result(session, stage["schema_name"])
-    require(
-        all(
-            row["schema_sha256"] == expected["schema_sha256"]
-            for row, expected in zip(actual["tables"], manifest["tables"], strict=True)
-        ),
-        "MS-DRG restore shape differs",
-    )
+    for model, oid, expected in zip(MODELS, stage["relation_oids"][: len(TABLES)], manifest["tables"], strict=True):
+        require(
+            await _table_shape(session, oid, model, pending_primary=True) == expected["schema_sha256"],
+            "MS-DRG restore shape differs",
+        )
     return stage
+
+
+async def complete_restore(session, stage: dict, manifest: dict) -> None:
+    """Complete restored candidate indexes before its registered namespace is frozen."""
+    require(session.in_transaction(), "MS-DRG restore transaction is required")
+    validate_manifest(manifest)
+    schema = stage_schema(UUID(stage["dataset_id"]))
+    require(
+        stage["schema_name"] == schema
+        and tuple(stage["relation_oids"]) == await _oids(session, schema, TABLES + PREDECESSORS),
+        "MS-DRG stage identity changed",
+    )
+    await session.execute(
+        text(
+            "LOCK TABLE "
+            + ",".join(f"{_quoted(schema)}.{_quoted(name)}" for name in TABLES)
+            + " IN ACCESS EXCLUSIVE MODE"
+        )
+    )
+    await _verify_namespace(session, schema, stage["schema_oid"], tuple(stage["relation_oids"]))
+    for model, oid, expected in zip(MODELS, stage["relation_oids"][: len(TABLES)], manifest["tables"], strict=True):
+        require(
+            await _table_shape(session, oid, model, pending_primary=True) == expected["schema_sha256"],
+            "MS-DRG restore shape differs",
+        )
+    await native._create_model_indexes(session, _spec(), schema, create_constraints=True)
+    await verify_stage(session, stage, manifest, receiving=True)
 
 
 async def verify_stage(session, stage: dict, manifest: dict, *, receiving: bool) -> None:
@@ -310,14 +376,14 @@ async def _lock_live(session, destination: str) -> None:
     )
 
 
-async def _current(session, destination: str) -> tuple[dict, dict]:
+async def _current(session, destination: str, *, lock=True) -> tuple[dict, dict]:
     row = (
         (
             await session.execute(
                 text(
                     f"SELECT local_lineage_id,local_generation,origin_lineage_id,origin_generation,"
                     f"published_at,include_relationships,receipt FROM {_quoted(destination)}.{GENERATION_TABLE} "
-                    "WHERE id=1 FOR UPDATE"
+                    f"WHERE id=1{' FOR UPDATE' if lock else ''}"
                 )
             )
         )
@@ -373,19 +439,32 @@ async def _predecessor_content(session, stage: dict) -> list[dict]:
     return table_receipts
 
 
-async def prepare_predecessor(session, destination: str, stage: dict, manifest: dict) -> dict:
+async def prepare_predecessor(session, destination: str, stage: dict, manifest: dict, *, source_copy=None) -> dict:
     """Copy the before-image inside the registered six-table stage before freeze."""
     require(session.in_transaction(), "MS-DRG predecessor transaction is required")
+    _require_copy(source_copy)
     await _lock_live(session, destination)
     previous, before = await _current(session, destination)
     await verify_stage(session, stage, manifest, receiving=True)
     schema = stage["schema_name"]
-    for model, (name, sources), predecessor in zip(MODELS, _SCOPES, PREDECESSORS, strict=True):
+    remaining = source_copy.max_bytes
+    deadline = asyncio.get_running_loop().time() + source_copy.timeout
+    for model, predecessor in zip(MODELS, PREDECESSORS, strict=True):
         require(
             not await session.scalar(text(f"SELECT EXISTS(SELECT 1 FROM {_quoted(schema)}.{_quoted(predecessor)})")),
             "MS-DRG predecessor is not empty",
         )
-        await _copy_slice(session, destination, schema, name, predecessor, model, sources)
+        remaining = await _copy_slice(
+            session,
+            destination,
+            schema,
+            predecessor,
+            model,
+            source_copy=source_copy,
+            remaining=remaining,
+            deadline=deadline,
+        )
+    await native._create_model_indexes(session, _spec(predecessors=True), schema, create_constraints=True)
     require(await _predecessor_content(session, stage) == _content(before), "MS-DRG predecessor differs")
     return {"previous": previous, "before": _content(before)}
 
@@ -419,20 +498,37 @@ async def _has_foreign_key_collision(session, destination: str, stage: dict, nam
     return False
 
 
-async def _replace(session, destination: str, stage: dict, names: tuple[str, ...]) -> None:
-    schema = stage["schema_name"]
-    for model, (name, sources), candidate in zip(MODELS, _SCOPES, names, strict=True):
-        await session.execute(
-            text(f"DELETE FROM {_quoted(destination)}.{_quoted(name)} WHERE source=ANY(CAST(:sources AS text[]))"),
-            {"sources": list(sources)},
-        )
-        columns = ",".join(_quoted(column.name) for column in model.__table__.columns)
-        await session.execute(
-            text(
-                f"INSERT INTO {_quoted(destination)}.{_quoted(name)} ({columns}) "
-                f"SELECT {columns} FROM {_quoted(schema)}.{_quoted(candidate)}"
+async def _publish_source_slices(session, destination, stage, names, *, previous, manifest, source_copy):
+    """Compose frozen source slices while retaining every other producer's current rows."""
+    from process import scoped_catalog_publication as publication
+
+    incoming = await publication.copy_received_input(
+        session, "ms-drg", destination, stage["schema_name"], names, source_copy
+    )
+    composed = await publication.compose_catalog_family(
+        session, destination, "ms-drg", incoming, publication.contributions("ms-drg"), source_copy
+    )
+    require(composed.generations["ms-drg"] == previous, "MS-DRG publication generation changed")
+
+    async def _publish_generation():
+        current_receipt = await capture_result(session, destination)
+        if manifest is None:
+            require(
+                all(entry["row_count"] == 0 for entry in current_receipt["tables"]), "MS-DRG rollback result differs"
             )
+        else:
+            require(
+                _content(current_receipt) == manifest["tables"]
+                and current_receipt["content_sha256"] == manifest["content_sha256"],
+                "MS-DRG activation result differs",
+            )
+        return await _write_generation(
+            session, destination, previous, manifest=manifest, receipt=None if manifest is None else current_receipt
         )
+
+    current, retained = await publication.activate_catalog_family(session, composed, _publish_generation)
+    await native.cleanup_model_family_stage(session, incoming.spec, incoming.ownership)
+    return current, retained
 
 
 async def _write_generation(
@@ -466,9 +562,12 @@ async def _write_generation(
     return dict(row)
 
 
-async def activate_stage(session, destination: str, stage: dict, manifest: dict, prepared: dict) -> dict:
+async def activate_stage(
+    session, destination: str, stage: dict, manifest: dict, prepared: dict, *, source_copy=None
+) -> dict:
     """CAS all owned slices and source origin in one destination transaction."""
     require(session.in_transaction(), "MS-DRG activation transaction is required")
+    _require_copy(source_copy)
     await _lock_live(session, destination)
     previous, before = await _current(session, destination)
     require(
@@ -481,26 +580,29 @@ async def activate_stage(session, destination: str, stage: dict, manifest: dict,
         not await _has_foreign_key_collision(session, destination, stage, TABLES),
         "MS-DRG candidate key belongs to another source",
     )
-    await _replace(session, destination, stage, TABLES)
-    current_receipt = await capture_result(session, destination)
-    require(
-        _content(current_receipt) == manifest["tables"]
-        and current_receipt["content_sha256"] == manifest["content_sha256"],
-        "MS-DRG activation result differs",
+    current, retained = await _publish_source_slices(
+        session,
+        destination,
+        stage,
+        TABLES,
+        previous=previous,
+        manifest=manifest,
+        source_copy=source_copy,
     )
-    current = await _write_generation(session, destination, previous, manifest=manifest, receipt=current_receipt)
     return {
         "previous": previous,
         "current": current,
         "before": prepared["before"],
         "stage": stage,
         "manifest": manifest,
+        "retained_family": retained,
     }
 
 
-async def rollback_activation(session, destination: str, activation: dict) -> dict:
+async def rollback_activation(session, destination: str, activation: dict, *, source_copy=None) -> dict:
     """Restore only this installation's frozen predecessor under an exact CAS."""
     require(session.in_transaction(), "MS-DRG rollback transaction is required")
+    _require_copy(source_copy)
     stage = activation["stage"]
     await _lock_live(session, destination)
     current, _receipt = await _current(session, destination)
@@ -511,9 +613,6 @@ async def rollback_activation(session, destination: str, activation: dict) -> di
         not await _has_foreign_key_collision(session, destination, stage, PREDECESSORS),
         "MS-DRG rollback key belongs to another source",
     )
-    await _replace(session, destination, stage, PREDECESSORS)
-    restored_receipt = await capture_result(session, destination)
-    require(_content(restored_receipt) == activation["before"], "MS-DRG rollback result differs")
     previous = activation["previous"]
     prior_manifest = (
         None
@@ -523,12 +622,20 @@ async def rollback_activation(session, destination: str, activation: dict) -> di
             "origin_generation": previous["origin_generation"],
             "published_at": previous["published_at"].isoformat(),
             "include_relationships": previous["include_relationships"],
+            "tables": activation["before"],
+            "content_sha256": _digest(activation["before"]),
         }
     )
-    return await _write_generation(
+    restored, retained = await _publish_source_slices(
         session,
         destination,
-        current,
+        stage,
+        PREDECESSORS,
+        previous=current,
         manifest=prior_manifest,
-        receipt=None if prior_manifest is None else restored_receipt,
+        source_copy=source_copy,
     )
+    from process.scoped_catalog_retention import cleanup_retained_catalog
+
+    await cleanup_retained_catalog(session, retained)
+    return restored

@@ -99,9 +99,9 @@ async def test_effect_capture_records_absence_original_baseline_and_exact_extern
         current_present,
     )
     statements = [str(call.args[0]) for call in session.scalar.await_args_list]
-    collision = statements[1]
+    collision = statements[2 if current_present else 1]
     assert "to_jsonb(live) IS DISTINCT FROM to_jsonb(incoming)" in collision
-    assert session.scalar.await_args_list[1].args[1] == {"oid": 201}
+    assert session.scalar.await_args_list[2 if current_present else 1].args[1] == {"oid": 201}
     insertion = str(session.execute.await_args.args[0])
     assert insertion.lstrip().startswith('INSERT INTO "candidate"."drug_claims_catalog_effect"')
     assert "to_jsonb(live)" in insertion and "baseline_image,before_image,after_image,destination_oid" in insertion
@@ -110,7 +110,8 @@ async def test_effect_capture_records_absence_original_baseline_and_exact_extern
     if current_present:
         assert "UNION SELECT" in insertion
         assert "current_row.baseline_image" in insertion
-        assert "current_row.destination_oid<>:oid" in collision
+        assert 'FROM "mrf"."drug_claims_catalog_effect" WHERE destination_oid IS DISTINCT FROM :oid' in statements[1]
+        assert session.scalar.await_args_list[1].args[1] == {"oid": 201}
         assert "current_row.after_image IS DISTINCT FROM to_jsonb(live)" in collision
     else:
         assert "current_row" not in insertion
@@ -119,8 +120,9 @@ async def test_effect_capture_records_absence_original_baseline_and_exact_extern
 @pytest.mark.asyncio
 @pytest.mark.parametrize("check", range(2))
 async def test_effect_capture_refuses_existing_stage_or_foreign_preimage_before_any_insert(check):
+    """Keep the independent destination fence clear before testing either capture refusal."""
     session = _session()
-    session.scalar.side_effect = [False] * check + [True]
+    session.scalar.side_effect = [False] * (2 * check) + [True]
     with pytest.raises(archive.ReferenceFamilyArchiveError):
         await dictionary._capture_dictionary_effect_table(
             session, "candidate", "mrf", dictionary._DRUG_SCOPED_MODELS[0], dictionary._DRUG_EFFECT_MODELS[0], 201, True
@@ -129,43 +131,94 @@ async def test_effect_capture_refuses_existing_stage_or_foreign_preimage_before_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rollback", (False, True))
-@pytest.mark.parametrize("check", (0, 1))
-async def test_all_dictionary_cas_checks_precede_shared_mutation(monkeypatch, rollback, check):
+@pytest.mark.parametrize(
+    "rollback,failure",
+    [
+        (False, "binding"),
+        (False, "preimage"),
+        (True, "binding"),
+        (True, "preimage"),
+        (True, "incoming-binding"),
+        (True, "baseline"),
+    ],
+)
+async def test_all_dictionary_cas_checks_precede_shared_mutation(monkeypatch, rollback, failure):
+    """A late crosswalk fence refusal cannot follow an earlier catalog publication."""
     session = _session()
     monkeypatch.setattr(dictionary, "_lock_reference_dictionary", AsyncMock(return_value=(201, 202)))
     writer = AsyncMock()
     monkeypatch.setattr(dictionary, "_write_dictionary_effects", writer)
-    session.scalar.side_effect = [False] * check + [True]
-    with pytest.raises(archive.ReferenceFamilyArchiveError):
+    queries = []
+
+    async def has_drift(statement, parameters):
+        query = str(statement)
+        queries.append((query, parameters))
+        if '"drug_claims_crosswalk_effect"' not in query:
+            return False
+        if failure in {"binding", "incoming-binding"}:
+            schema = "candidate" if not rollback or failure == "incoming-binding" else "mrf"
+            return f'FROM "{schema}"."drug_claims_crosswalk_effect" WHERE destination_oid IS DISTINCT' in query
+        image = "baseline_image" if failure == "baseline" else "after_image" if rollback else "before_image"
+        return f"effect.{image} IS DISTINCT FROM to_jsonb(live)" in query
+
+    session.scalar.side_effect = has_drift
+    reason = "rollback key changed" if failure == "baseline" else "destination changed"
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match=reason):
         await dictionary.apply_reference_dictionary_effects(
             session, incoming_schema="candidate", current_schema="mrf", rollback=rollback
         )
     writer.assert_not_awaited()
-    first = str(session.scalar.await_args_list[0].args[0])
-    assert "destination_oid<>:oid" in first and "IS DISTINCT FROM to_jsonb(live)" in first
-    assert ("after_image" if rollback else "before_image") in first
-    if rollback and check == 1:
-        assert "baseline_image IS DISTINCT FROM to_jsonb(live)" in str(session.scalar.await_args.args[0])
+    assert '"drug_claims_catalog_effect"' in queries[0][0]
+    assert '"drug_claims_crosswalk_effect"' in queries[-1][0]
+    assert queries[-1][1] == {"oid": 202}
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_both_dictionary_fences_finish_before_publication(monkeypatch):
+@pytest.mark.parametrize("rollback", (False, True))
+async def test_both_dictionary_fences_finish_before_publication(monkeypatch, rollback):
+    """Both destination bindings and complete image sets are fenced before either write."""
     session = _session()
     monkeypatch.setattr(dictionary, "_lock_reference_dictionary", AsyncMock(return_value=(201, 202)))
     events = []
 
-    async def has_cas_drift(statement, _parameters):
-        events.append(("check", str(statement)))
+    async def has_cas_drift(statement, parameters):
+        events.append(("check", str(statement), parameters))
         return False
 
     async def write(_session, mirror, *_args):
-        events.append(("write", mirror.__tablename__))
+        events.append(("write", mirror.__tablename__, None))
 
     session.scalar = has_cas_drift
     monkeypatch.setattr(dictionary, "_write_dictionary_effects", write)
-    await dictionary.apply_reference_dictionary_effects(session, incoming_schema="candidate", current_schema="mrf")
-    assert [kind for kind, _value in events] == ["check", "check", "write", "write"]
+    await dictionary.apply_reference_dictionary_effects(
+        session, incoming_schema="candidate", current_schema="mrf", rollback=rollback
+    )
+    expected_checks = []
+    for effect, oid in zip(dictionary._DRUG_EFFECT_MODELS, (201, 202), strict=True):
+        fence = f'"{"mrf" if rollback else "candidate"}"."{effect.__tablename__}"'
+        image = "after_image" if rollback else "before_image"
+        expected_checks.extend(
+            [
+                (f"FROM {fence} WHERE destination_oid IS DISTINCT FROM :oid", oid),
+                (f"FROM {fence} effect LEFT JOIN", oid),
+            ]
+        )
+        if rollback:
+            expected_checks.extend(
+                [
+                    (f'FROM "candidate"."{effect.__tablename__}" WHERE destination_oid IS DISTINCT', oid),
+                    ("effect.baseline_image IS DISTINCT FROM to_jsonb(live)", oid),
+                ]
+            )
+        assert (
+            f"effect.{image} IS DISTINCT FROM to_jsonb(live)"
+            in events[len(expected_checks) - (3 if rollback else 1)][1]
+        )
+    assert [event[0] for event in events] == ["check"] * len(expected_checks) + ["write", "write"]
+    for (kind, query, parameters), (fragment, oid) in zip(events[:-2], expected_checks, strict=True):
+        assert kind == "check" and fragment in query and parameters == {"oid": oid}
+    assert [event[1] for event in events[-2:]] == [model.__tablename__ for model in dictionary._DRUG_SCOPED_MODELS]
 
 
 @pytest.mark.asyncio

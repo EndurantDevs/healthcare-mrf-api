@@ -43,6 +43,21 @@ from process.redis_config import build_redis_settings
 _TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
 _CONTROL_RUN_MARKED = True
 _CONTROL_RUN_NOT_MARKED = False
+_SOURCE_PROFILE_IMPORTERS_BY_MODULE = {
+    "process.massachusetts_profile": "massachusetts-borim-profile",
+    "process.kentucky_profile": "kentucky-kbml-profile",
+    "process.tennessee_profile": "tennessee-tdh-profile",
+    "process.rhode_island_profile": "rhode-island-doh-profile",
+    "process.new_york_profile": "new-york-nypp-profile",
+    "process.florida_mqa_profile": "florida-mqa-profile",
+}
+_HANDOFF_MODULES = {
+    "process.places_zcta",
+    "process.entity_address_unified",
+    "process.nucc",
+    "process.code_sets",
+    "process.ms_drg",
+} | _SOURCE_PROFILE_IMPORTERS_BY_MODULE.keys()
 logger = logging.getLogger(__name__)
 
 
@@ -70,7 +85,7 @@ def _committed_target_result(
 
     context = control_context.get("context")
     if (
-        target_module in {"process.places_zcta", "process.entity_address_unified", "process.nucc"}
+        target_module in _HANDOFF_MODULES
         and isinstance(context, dict)
         and context.get("control_run_handoff_committed") is True
     ):
@@ -347,7 +362,7 @@ async def control_single_job_start(
                 target_result = shutdown_result
             ctx.setdefault("context", {})["run"] = 0
     except ImportCancelledError:
-        if target_module == "process.nucc" and ctx["context"].get("nucc_native_commit_unknown") is True:
+        if _has_unknown_native_commit(ctx, target_module):
             raise
         committed_result = _committed_target_result(
             ctx,
@@ -366,7 +381,7 @@ async def control_single_job_start(
             return {"status": "canceled", "run_id": run_id}
         target_result = committed_result
     except asyncio.CancelledError as exc:
-        if target_module == "process.nucc" and ctx["context"].get("nucc_native_commit_unknown") is True:
+        if _has_unknown_native_commit(ctx, target_module):
             raise
         committed_result = _committed_target_result(
             ctx,
@@ -392,7 +407,7 @@ async def control_single_job_start(
         while current_task is not None and current_task.cancelling():
             current_task.uncancel()
     except Exception as exc:
-        if target_module == "process.nucc" and ctx["context"].get("nucc_native_commit_unknown") is True:
+        if _has_unknown_native_commit(ctx, target_module):
             raise
         committed_result = _committed_target_result(
             ctx,
@@ -419,10 +434,7 @@ async def control_single_job_start(
     committed_result = _committed_target_result(ctx, target_module=target_module)
     if committed_result is not None:
         target_result = committed_result
-    if (
-        target_module in {"process.places_zcta", "process.entity_address_unified", "process.nucc"}
-        and ctx["context"].get("control_run_handoff_committed") is True
-    ):
+    if target_module in _HANDOFF_MODULES and ctx["context"].get("control_run_handoff_committed") is True:
         return {"status": "finalizing", "run_id": run_id, "result": target_result}
     await _project_control_target_success(
         run_id,
@@ -459,7 +471,21 @@ async def _invoke_control_target(
         for field_name, field_value in target_task_by_field.items()
         if field_name in accepted_parameters
     }
+    if "_control_context" in accepted_parameters:
+        accepted_kwargs_by_name["_control_context"] = control_context
     return await target_callable(**accepted_kwargs_by_name)
+
+
+def _has_unknown_native_commit(ctx, target_module):
+    context = ctx.get("context") or {}
+    return (
+        target_module == "process.nucc"
+        and context.get("nucc_native_commit_unknown") is True
+        or target_module in _SOURCE_PROFILE_IMPORTERS_BY_MODULE
+        and context.get("source_profile_commit_unknown") is True
+        or target_module in {"process.code_sets", "process.ms_drg"}
+        and context.get("scoped_catalog_commit_unknown") is True
+    )
 
 
 async def _live_progress_heartbeat(
@@ -555,7 +581,7 @@ _persist_control_run_heartbeat = _is_control_run_heartbeat_persisted
 
 def _where_no_places_handoff(stmt):
     """Leave durable native handoffs exclusively with their trusted publishers."""
-    return stmt.where(
+    return _where_no_profile_handoff(stmt).where(
         or_(
             ImportRun.importer != "places-zcta",
             ImportRun.metrics["places_handoff"].as_string().is_(None),
@@ -567,6 +593,20 @@ def _where_no_places_handoff(stmt):
         or_(
             ImportRun.importer != "nucc",
             ImportRun.metrics["nucc_handoff"].as_string().is_(None),
+        ),
+    )
+
+
+def _where_no_profile_handoff(stmt):
+    """Fence profile publisher handoffs shared by worker and cancellation updates."""
+    return stmt.where(
+        or_(
+            ImportRun.importer.not_in(tuple(_SOURCE_PROFILE_IMPORTERS_BY_MODULE.values())),
+            ImportRun.metrics["source_profile_handoff"].as_string().is_(None),
+        ),
+        or_(
+            ImportRun.importer.not_in(("code-sets", "ms-drg")),
+            ImportRun.metrics["scoped_catalog_handoff"].as_string().is_(None),
         ),
     )
 
@@ -1270,6 +1310,8 @@ def _isolated_control_job_context(ctx: dict[str, Any], run_id: str) -> dict[str,
         "nucc_native_stage",
         "nucc_native_predecessor",
         "nucc_native_commit_unknown",
+        "source_profile_commit_unknown",
+        "scoped_catalog_commit_unknown",
     ):
         job_context_map.pop(key, None)
     if run_id:

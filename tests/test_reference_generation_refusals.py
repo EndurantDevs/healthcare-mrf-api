@@ -664,7 +664,7 @@ async def test_existing_dictionary_effects_require_registered_predecessor_before
 @pytest.mark.parametrize("current_present", (True, False))
 async def test_dictionary_effect_capture_refuses_aggregate_row_bound(current_present):
     session = _session()
-    session.scalar.side_effect = [False, False, True]
+    session.scalar.side_effect = [False] * (3 if current_present else 2) + [True]
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="publication bound is exceeded"):
         await dictionary._capture_dictionary_effect_table(
             session,
@@ -716,7 +716,7 @@ async def test_dictionary_effect_closure_refuses_either_set_without_mutation(mon
 async def test_dictionary_readback_failure_stops_publication_and_rollback(monkeypatch, rollback, failed_model):
     session = _session()
     monkeypatch.setattr(dictionary, "_lock_reference_dictionary", AsyncMock(return_value=(201, 202)))
-    fence_count = 4 if rollback else 2
+    fence_count = 8 if rollback else 4
     session.scalar.side_effect = [False] * (fence_count + failed_model) + [True]
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="dictionary publication differs"):
         await dictionary.apply_reference_dictionary_effects(

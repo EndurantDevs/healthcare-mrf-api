@@ -13,6 +13,33 @@ from process import code_sets_result_archive as archive
 from process import reference_family_archive
 
 
+@pytest.fixture(autouse=True)
+def catalog_shape_boundary(monkeypatch):
+    monkeypatch.setattr(archive, "match_catalog_text_columns", AsyncMock())
+
+
+def _copy():
+    return reference_family_archive.ReferenceFamilySourceCopy(AsyncMock(return_value=1), 4096, 30)
+
+
+def _native_publication_boundary(monkeypatch, expected):
+    from process import scoped_catalog_publication as publication
+
+    incoming = SimpleNamespace(spec=object(), ownership=object())
+    monkeypatch.setattr(publication, "copy_received_input", AsyncMock(return_value=incoming))
+    monkeypatch.setattr(
+        publication,
+        "compose_catalog_family",
+        AsyncMock(return_value=SimpleNamespace(generations={"code-sets": expected})),
+    )
+
+    async def activate(_session, _prepared, callback):
+        return await callback(), {"retained": True}
+
+    monkeypatch.setattr(publication, "activate_catalog_family", activate)
+    monkeypatch.setattr(reference_family_archive, "cleanup_model_family_stage", AsyncMock())
+
+
 class _Result:
     def __init__(self, *, mapping=None, rows=()):
         self.mapping = mapping
@@ -160,7 +187,7 @@ async def test_publish_and_slice_reject_exhausted_or_missing_catalogs(monkeypatc
 @pytest.mark.asyncio
 async def test_clone_and_ownership_checks_reject_changed_relations(monkeypatch):
     with pytest.raises(archive.CodeSetsArchiveError, match="clone is unavailable"):
-        await archive._clone_slice(_session(scalar_values=[None, 2]), "source", "target")
+        await archive._clone_slice(_session(scalar_values=[None, 2]), "source", "target", source_copy=_copy())
     with pytest.raises(archive.CodeSetsArchiveError, match="ownership changed"):
         await archive._verify_clone(_session(scalar_values=[2, 3]), "target", 1, 3)
     with pytest.raises(archive.CodeSetsArchiveError, match="predecessor ownership changed"):
@@ -177,13 +204,14 @@ async def test_clone_and_ownership_checks_reject_changed_relations(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_prepare_source_rejects_drift_clone_difference_and_incomplete_authority(monkeypatch):
+    monkeypatch.setattr("process.scoped_catalog_binding.pin_catalog_source", AsyncMock(return_value=False))
     source = _source()
     generation = _generation(source=source, catalog_oid=9)
     session = _session()
     monkeypatch.setattr(archive, "read_generation", AsyncMock(return_value=generation))
     monkeypatch.setattr(archive, "scope_receipt", AsyncMock(return_value=(source.row_count, source.row_sha256, 8)))
     with pytest.raises(archive.CodeSetsArchiveError, match="generation drifted"):
-        await archive.prepare_source(session, "source", uuid4())
+        await archive.prepare_source(session, "source", uuid4(), source_copy=_copy())
 
     monkeypatch.setattr(
         archive,
@@ -192,7 +220,7 @@ async def test_prepare_source_rejects_drift_clone_difference_and_incomplete_auth
     )
     monkeypatch.setattr(archive, "_clone_slice", AsyncMock(return_value=(12, 13)))
     with pytest.raises(archive.CodeSetsArchiveError, match="clone differs"):
-        await archive.prepare_source(session, "source", uuid4())
+        await archive.prepare_source(session, "source", uuid4(), source_copy=_copy())
 
 
 @pytest.mark.asyncio
@@ -247,26 +275,34 @@ async def test_prepare_predecessor_rejects_changed_rows_and_stage_shape(monkeypa
     read_generation = AsyncMock(return_value=_generation(source=stage.source_generation))
     monkeypatch.setattr(archive, "read_generation", read_generation)
     with pytest.raises(archive.CodeSetsArchiveError, match="destination generation changed"):
-        await archive.prepare_predecessor(session, destination="destination", stage=stage, expected=expected)
+        await archive.prepare_predecessor(
+            session, destination="destination", stage=stage, expected=expected, source_copy=_copy()
+        )
 
     untracked = _generation()
     read_generation.return_value = untracked
     monkeypatch.setattr(archive, "_slice_identity", AsyncMock(return_value=(1, "a" * 64, 99)))
     with pytest.raises(archive.CodeSetsArchiveError, match="untracked"):
-        await archive.prepare_predecessor(session, destination="destination", stage=stage, expected=untracked)
+        await archive.prepare_predecessor(
+            session, destination="destination", stage=stage, expected=untracked, source_copy=_copy()
+        )
 
     read_generation.return_value = expected
     slice_identity = AsyncMock(return_value=(stage.row_count, "c" * 64, 99))
     monkeypatch.setattr(archive, "_slice_identity", slice_identity)
     with pytest.raises(archive.CodeSetsArchiveError, match="source rows changed"):
-        await archive.prepare_predecessor(session, destination="destination", stage=stage, expected=expected)
+        await archive.prepare_predecessor(
+            session, destination="destination", stage=stage, expected=expected, source_copy=_copy()
+        )
 
     slice_identity.return_value = (stage.row_count, stage.row_sha256, 99)
     monkeypatch.setattr(archive, "verify_stage", AsyncMock())
     column_signature = AsyncMock(side_effect=[("stage",), ("destination",)])
     monkeypatch.setattr(archive, "_column_signature", column_signature)
     with pytest.raises(archive.CodeSetsArchiveError, match="table shape differs"):
-        await archive.prepare_predecessor(session, destination="destination", stage=stage, expected=expected)
+        await archive.prepare_predecessor(
+            session, destination="destination", stage=stage, expected=expected, source_copy=_copy()
+        )
 
 
 @pytest.mark.asyncio
@@ -286,6 +322,7 @@ async def test_prepare_predecessor_rejects_nonempty_or_changed_clone(monkeypatch
             stage=stage,
             expected=expected,
             precreated_predecessor_oid=13,
+            source_copy=_copy(),
         )
 
     slice_identity.side_effect = [
@@ -294,7 +331,9 @@ async def test_prepare_predecessor_rejects_nonempty_or_changed_clone(monkeypatch
     ]
     monkeypatch.setattr(archive, "_clone_slice", AsyncMock(return_value=(stage.schema_oid, 13)))
     with pytest.raises(archive.CodeSetsArchiveError, match="predecessor clone differs"):
-        await archive.prepare_predecessor(_session(), destination="destination", stage=stage, expected=expected)
+        await archive.prepare_predecessor(
+            _session(), destination="destination", stage=stage, expected=expected, source_copy=_copy()
+        )
 
 
 @pytest.mark.asyncio
@@ -339,7 +378,7 @@ async def test_activate_stage_rejects_changed_generation_and_untracked_rows(monk
     read_generation = AsyncMock(return_value=_generation(source=stage.source_generation))
     monkeypatch.setattr(archive, "read_generation", read_generation)
     with pytest.raises(archive.CodeSetsArchiveError, match="destination generation changed"):
-        await archive.activate_stage(_session(), destination="destination", prepared=prepared)
+        await archive.activate_stage(_session(), destination="destination", prepared=prepared, source_copy=_copy())
 
     untracked = _generation()
     read_generation.return_value = untracked
@@ -349,6 +388,7 @@ async def test_activate_stage_rejects_changed_generation_and_untracked_rows(monk
             _session(),
             destination="destination",
             prepared=archive.CodeSetsPreparedStage(stage, untracked, 13, stage.row_count, stage.row_sha256),
+            source_copy=_copy(),
         )
 
 
@@ -364,16 +404,14 @@ async def test_activate_stage_rejects_changed_predecessor_content_and_authority(
     column_signature = AsyncMock()
     monkeypatch.setattr(archive, "_column_signature", column_signature)
     monkeypatch.setattr(archive, "_has_collision", AsyncMock(return_value=False))
-    monkeypatch.setattr(archive, "_replace_slice", AsyncMock())
-    scope_receipt = AsyncMock()
-    monkeypatch.setattr(archive, "scope_receipt", scope_receipt)
+    _native_publication_boundary(monkeypatch, expected)
     set_generation = AsyncMock()
     monkeypatch.setattr(archive, "_set_generation", set_generation)
 
     slice_identity.side_effect = [(stage.row_count, stage.row_sha256, 99)]
     column_signature.side_effect = [("stage",), ("destination",)]
     with pytest.raises(archive.CodeSetsArchiveError, match="destination table shape differs"):
-        await archive.activate_stage(_session(), destination="destination", prepared=prepared)
+        await archive.activate_stage(_session(), destination="destination", prepared=prepared, source_copy=_copy())
 
     slice_identity.side_effect = [
         (stage.row_count, stage.row_sha256, 99),
@@ -381,35 +419,34 @@ async def test_activate_stage_rejects_changed_predecessor_content_and_authority(
     ]
     column_signature.side_effect = [("same",), ("same",)]
     with pytest.raises(archive.CodeSetsArchiveError, match="predecessor changed"):
-        await archive.activate_stage(_session(), destination="destination", prepared=prepared)
+        await archive.activate_stage(_session(), destination="destination", prepared=prepared, source_copy=_copy())
 
     slice_identity.side_effect = [
         (stage.row_count, stage.row_sha256, 99),
         (stage.row_count, stage.row_sha256, 13),
+        (2, "c" * 64, 99),
     ]
     column_signature.side_effect = [("same",), ("same",)]
-    scope_receipt.return_value = (2, "c" * 64, 99)
     with pytest.raises(archive.CodeSetsArchiveError, match="activation result differs"):
-        await archive.activate_stage(_session(), destination="destination", prepared=prepared)
+        await archive.activate_stage(_session(), destination="destination", prepared=prepared, source_copy=_copy())
 
-    scope_receipt.return_value = (stage.row_count, stage.row_sha256, 99)
     slice_identity.side_effect = [
         (stage.row_count, stage.row_sha256, 99),
         (stage.row_count, stage.row_sha256, 13),
+        (stage.row_count, stage.row_sha256, 99),
     ]
     column_signature.side_effect = [("same",), ("same",)]
     set_generation.return_value = expected
     with pytest.raises(archive.CodeSetsArchiveError, match="activation authority differs"):
-        await archive.activate_stage(_session(), destination="destination", prepared=prepared)
+        await archive.activate_stage(_session(), destination="destination", prepared=prepared, source_copy=_copy())
 
 
-@pytest.mark.asyncio
-async def test_rollback_rejects_changed_state(monkeypatch):
+def _activation():
     stage = _stage()
     source_generation = stage.source_generation
     previous = _generation(local_generation=4, source=source_generation)
     current = _generation(local_generation=5, source=source_generation)
-    activation = archive.CodeSetsActivation(
+    return archive.CodeSetsActivation(
         stage.dataset_id,
         previous,
         current,
@@ -420,9 +457,21 @@ async def test_rollback_rejects_changed_state(monkeypatch):
         source_generation.row_count,
         source_generation.row_sha256,
     )
-    with pytest.raises(archive.CodeSetsArchiveError, match="rollback authority is invalid"):
-        await archive.rollback_activation(_session(), destination="destination", activation=object())
 
+
+@pytest.mark.asyncio
+async def test_rollback_rejects_invalid_authority():
+    with pytest.raises(archive.CodeSetsArchiveError, match="rollback authority is invalid"):
+        await archive.rollback_activation(
+            _session(), destination="destination", activation=object(), source_copy=_copy()
+        )
+
+
+@pytest.mark.asyncio
+async def test_rollback_rejects_changed_state(monkeypatch):
+    activation = _activation()
+    current = activation.current
+    source_generation = current
     monkeypatch.setattr(archive, "read_generation", AsyncMock(return_value=current))
     monkeypatch.setattr(
         archive,
@@ -433,13 +482,17 @@ async def test_rollback_rejects_changed_state(monkeypatch):
     column_signature = AsyncMock(side_effect=[("predecessor",), ("destination",)])
     monkeypatch.setattr(archive, "_column_signature", column_signature)
     with pytest.raises(archive.CodeSetsArchiveError, match="rollback table shape differs"):
-        await archive.rollback_activation(_session(), destination="destination", activation=activation)
+        await archive.rollback_activation(
+            _session(), destination="destination", activation=activation, source_copy=_copy()
+        )
 
     column_signature.side_effect = [("same",), ("same",)]
     slice_identity = AsyncMock(return_value=(2, "c" * 64, 13))
     monkeypatch.setattr(archive, "_slice_identity", slice_identity)
     with pytest.raises(archive.CodeSetsArchiveError, match="rollback predecessor differs"):
-        await archive.rollback_activation(_session(), destination="destination", activation=activation)
+        await archive.rollback_activation(
+            _session(), destination="destination", activation=activation, source_copy=_copy()
+        )
 
     slice_identity.side_effect = [
         (source_generation.row_count, source_generation.row_sha256, 13),
@@ -447,9 +500,11 @@ async def test_rollback_rejects_changed_state(monkeypatch):
     ]
     column_signature.side_effect = [("same",), ("same",)]
     monkeypatch.setattr(archive, "_has_collision", AsyncMock(return_value=False))
-    monkeypatch.setattr(archive, "_replace_slice", AsyncMock())
-    with pytest.raises(archive.CodeSetsArchiveError, match="rollback result differs"):
-        await archive.rollback_activation(_session(), destination="destination", activation=activation)
+    _native_publication_boundary(monkeypatch, current)
+    with pytest.raises(archive.CodeSetsArchiveError, match="activation result differs"):
+        await archive.rollback_activation(
+            _session(), destination="destination", activation=activation, source_copy=_copy()
+        )
 
     slice_identity.side_effect = [
         (source_generation.row_count, source_generation.row_sha256, 13),
@@ -457,8 +512,10 @@ async def test_rollback_rejects_changed_state(monkeypatch):
     ]
     column_signature.side_effect = [("same",), ("same",)]
     monkeypatch.setattr(archive, "_set_generation", AsyncMock(return_value=current))
-    with pytest.raises(archive.CodeSetsArchiveError, match="rollback authority differs"):
-        await archive.rollback_activation(_session(), destination="destination", activation=activation)
+    with pytest.raises(archive.CodeSetsArchiveError, match="activation authority differs"):
+        await archive.rollback_activation(
+            _session(), destination="destination", activation=activation, source_copy=_copy()
+        )
 
 
 @pytest.mark.asyncio

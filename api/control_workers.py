@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from db.models import db
-from process.control_lifecycle import acquire_control_run_worker_action_lock
+from process.control_lifecycle import _SOURCE_PROFILE_IMPORTERS_BY_MODULE, acquire_control_run_worker_action_lock
 from process.ptg_parts.ptg_source_attempt_actions import (
     PTGSourceAttemptIdentityError,
     PTGWorkerActionSelection,
@@ -118,11 +118,27 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
 )
 
 _FINISH_WORKERS: tuple[WorkerSpec, ...] = (
+    WorkerSpec(
+        "arq:SourceProfile_finish",
+        "process.SourceProfile_finish",
+        tuple(_SOURCE_PROFILE_IMPORTERS_BY_MODULE.values()),
+        role="finish",
+    ),
     WorkerSpec("arq:MRF_finish", "process.MRF_finish", ("mrf",), role="finish"),
-    WorkerSpec("arq:ClaimsPricing_finish", "process.ClaimsPricing_finish", ("claims-pricing", "claims-procedures"), role="finish"),
+    WorkerSpec(
+        "arq:ClaimsPricing_finish",
+        "process.ClaimsPricing_finish",
+        ("claims-pricing", "claims-procedures"),
+        role="finish",
+    ),
     WorkerSpec("arq:DrugClaims_finish", "process.DrugClaims_finish", ("drug-claims",), role="finish"),
     WorkerSpec("arq:ProviderQuality_finish", "process.ProviderQuality_finish", ("provider-quality",), role="finish"),
-    WorkerSpec("arq:PartDFormularyNetwork_finish", "process.PartDFormularyNetwork_finish", ("partd-formulary-network",), role="finish"),
+    WorkerSpec(
+        "arq:PartDFormularyNetwork_finish",
+        "process.PartDFormularyNetwork_finish",
+        ("partd-formulary-network",),
+        role="finish",
+    ),
     WorkerSpec("arq:PharmacyLicense_finish", "process.PharmacyLicense_finish", ("pharmacy-license",), role="finish"),
 )
 
@@ -137,12 +153,8 @@ _ENGINE_LABEL = "mrf"
 _K8S_API_TOKEN = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 _K8S_API_CA = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 _K8S_API_NAMESPACE = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-_NON_LAUNCHABLE_CONTROL_RUN_STATUSES = frozenset(
-    {"canceling", "succeeded", "failed", "canceled", "dead_letter"}
-)
-WORKER_ENSURE_RUN_IDENTITY_CONTRACT = (
-    "healthporta.worker-ensure-run-identity.v1"
-)
+_NON_LAUNCHABLE_CONTROL_RUN_STATUSES = frozenset({"canceling", "succeeded", "failed", "canceled", "dead_letter"})
+WORKER_ENSURE_RUN_IDENTITY_CONTRACT = "healthporta.worker-ensure-run-identity.v1"
 
 
 async def _await_worker_launch(task: asyncio.Task[dict[str, Any]]) -> dict[str, Any]:
@@ -177,10 +189,7 @@ def ensure_worker(payload: dict[str, Any]) -> dict[str, Any]:
             payload,
             status="unsupported",
             items=[],
-            message=(
-                "no worker is registered for "
-                f"{queue or importer or 'request'}"
-            ),
+            message=(f"no worker is registered for {queue or importer or 'request'}"),
         )
 
     items = [_ensure_spec(spec, payload) for spec in specs]
@@ -203,13 +212,9 @@ def _worker_action_selection(
     return PTGWorkerActionSelection(
         request_importer=importer or None,
         allowed_importers=frozenset(
-            selected_importer
-            for worker_spec in selected_specs
-            for selected_importer in worker_spec.importers
+            selected_importer for worker_spec in selected_specs for selected_importer in worker_spec.importers
         ),
-        allowed_roles=frozenset(
-            worker_spec.role for worker_spec in selected_specs
-        ),
+        allowed_roles=frozenset(worker_spec.role for worker_spec in selected_specs),
     )
 
 
@@ -246,7 +251,7 @@ async def _admit_worker_ensure(
                 selected_specs,
             ),
         )
-    except (PTGSourceAttemptIdentityError, ValueError):
+    except PTGSourceAttemptIdentityError, ValueError:
         return _failed_worker_admission(
             worker_payload,
             "PTG source-attempt identity is invalid or changed",
@@ -264,10 +269,7 @@ async def _admit_worker_ensure(
             worker_payload,
             f"control run is not launchable: {admitted_status}",
         )
-    if (
-        str(admitted_run.get("importer") or "") != "ptg"
-        and requested_source_id is not None
-    ):
+    if str(admitted_run.get("importer") or "") != "ptg" and requested_source_id is not None:
         return _failed_worker_admission(
             worker_payload,
             "source-attempt identity requires a PTG import",
@@ -284,9 +286,9 @@ def _bind_admitted_job(payload: dict[str, Any], admitted_run: dict[str, Any]) ->
     metrics = admitted_run.get("metrics")
     if not isinstance(metrics, dict):
         return
-    identity = tuple(
-        admitted_run.get(name) for name in ("run_id", "importer")
-    ) + tuple(metrics.get(name) for name in ("queue", "function", "job_id"))
+    identity = tuple(admitted_run.get(name) for name in ("run_id", "importer")) + tuple(
+        metrics.get(name) for name in ("queue", "function", "job_id")
+    )
     if all(isinstance(value, str) and value and value == value.strip() for value in identity):
         payload.admitted_job = identity
 
@@ -300,13 +302,8 @@ async def guarded_ensure_worker(
     run_id = str(worker_payload.get("run_id") or "").strip()
     selected_specs = _resolve_specs(worker_payload)
     selects_ptg = any("ptg" in spec.importers for spec in selected_specs)
-    selects_ptg_family = any(
-        PTG_WAVE_FENCED_IMPORTERS.intersection(spec.importers)
-        for spec in selected_specs
-    )
-    if (selects_ptg and importer and importer != "ptg") or (
-        importer == "ptg" and selected_specs and not selects_ptg
-    ):
+    selects_ptg_family = any(PTG_WAVE_FENCED_IMPORTERS.intersection(spec.importers) for spec in selected_specs)
+    if (selects_ptg and importer and importer != "ptg") or (importer == "ptg" and selected_specs and not selects_ptg):
         return _failed_worker_admission(
             worker_payload,
             "PTG worker selector conflicts with importer",
@@ -374,9 +371,7 @@ async def _guarded_ptg_family_ensure(
         )
         if admission_failure is not None:
             return admission_failure
-        launch_task = asyncio.create_task(
-            asyncio.to_thread(ensure_worker, worker_payload)
-        )
+        launch_task = asyncio.create_task(asyncio.to_thread(ensure_worker, worker_payload))
         return await _await_worker_launch(launch_task)
 
 
@@ -481,9 +476,7 @@ def _exact_worker_spec(payload: dict[str, Any]) -> WorkerSpec:
     if not run_id or spec is None or importer not in spec.importers or spec.role != "start":
         raise RuntimeError("exact worker identity is unavailable")
     worker_class = str(payload.get("worker_class") or "").strip()
-    if (queue and queue != spec.queue) or (
-        worker_class and worker_class != spec.worker_class
-    ):
+    if (queue and queue != spec.queue) or (worker_class and worker_class != spec.worker_class):
         raise ValueError("exact worker selector conflicts with importer")
     return spec
 
@@ -491,6 +484,14 @@ def _exact_worker_spec(payload: dict[str, Any]) -> WorkerSpec:
 def _resolve_specs(launch_request: dict[str, Any]) -> list[WorkerSpec]:
     worker_class = str(launch_request.get("worker_class") or "").strip()
     queue = str(launch_request.get("queue") or "").strip()
+    importer = str(launch_request.get("importer") or "").strip()
+    if importer in _SOURCE_PROFILE_IMPORTERS_BY_MODULE.values() and (
+        launch_request.get("role") == "finish" or launch_request.get("status") == "finalizing"
+    ):
+        selected = _BY_WORKER_CLASS.get(worker_class) if worker_class else None
+        if worker_class and (selected is None or importer not in selected.importers):
+            return []
+        return [_BY_IMPORTER_ROLE[(importer, "finish")]]
     if worker_class:
         spec = _BY_WORKER_CLASS.get(worker_class)
         if spec is None:
@@ -499,7 +500,6 @@ def _resolve_specs(launch_request: dict[str, Any]) -> list[WorkerSpec]:
             return []
         return [spec]
 
-    importer = str(launch_request.get("importer") or "").strip()
     role = str(launch_request.get("role") or "").strip().lower()
     explicit_role = bool(role)
     status = str(launch_request.get("status") or "").strip().lower()
@@ -544,9 +544,15 @@ def _ensure_spec(spec: WorkerSpec, payload: dict[str, Any]) -> dict[str, Any]:
     if _launcher_mode() == "kubernetes":
         return _ensure_kubernetes_job(spec, payload, state)
 
-    if spec.worker_class == "process.DrugClaims_finish" and _worker_state(_BY_QUEUE["arq:ClaimsPricing_finish"])["running"]:
+    if (
+        spec.worker_class == "process.DrugClaims_finish"
+        and _worker_state(_BY_QUEUE["arq:ClaimsPricing_finish"])["running"]
+    ):
         return {**state, "status": "blocked", "message": "ClaimsPricing_finish is already running"}
-    if spec.worker_class == "process.ClaimsPricing_finish" and _worker_state(_BY_QUEUE["arq:DrugClaims_finish"])["running"]:
+    if (
+        spec.worker_class == "process.ClaimsPricing_finish"
+        and _worker_state(_BY_QUEUE["arq:DrugClaims_finish"])["running"]
+    ):
         return {**state, "status": "blocked", "message": "DrugClaims_finish is already running"}
 
     try:
@@ -773,7 +779,12 @@ def _delete_kubernetes_worker_job_record(
     except _KubernetesApiError as exc:
         if exc.status == 404:
             return _kubernetes_delete_record(job_name, worker_spec, deleted=False, reason="not_found"), None
-        return None, {"job_name": job_name, "worker_class": worker_spec.worker_class, "status": exc.status, "error": str(exc)}
+        return None, {
+            "job_name": job_name,
+            "worker_class": worker_spec.worker_class,
+            "status": exc.status,
+            "error": str(exc),
+        }
     return _kubernetes_delete_record(job_name, worker_spec, deleted=True), None
 
 
@@ -795,9 +806,9 @@ def _kubernetes_delete_record(
     return deletion_summary_dict
 
 
-def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Summarize Kubernetes jobs matching a worker spec and optional run."""
-    state_base_dict = {
+def _kubernetes_worker_base(spec: WorkerSpec) -> dict[str, Any]:
+    """Build the common state fields before querying Kubernetes jobs."""
+    return {
         "queue": spec.queue,
         "worker_class": spec.worker_class,
         "importers": list(spec.importers),
@@ -807,8 +818,17 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
         "launcher": "kubernetes",
         "command": " ".join(_worker_command(_worker_python(), spec)),
     }
+
+
+def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Summarize Kubernetes jobs matching a worker spec and optional run."""
+    state_base_dict = _kubernetes_worker_base(spec)
     if not _is_kubernetes_configured():
-        return {**state_base_dict, "job_name": _worker_job_name(spec, launch_request or {}), "job_status": "unconfigured"}
+        return {
+            **state_base_dict,
+            "job_name": _worker_job_name(spec, launch_request or {}),
+            "job_status": "unconfigured",
+        }
 
     selector = _kubernetes_label_selector(spec, launch_request or {})
     namespace = _kubernetes_namespace()
@@ -816,7 +836,12 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
     try:
         body = _kubernetes_request("GET", path)
     except _KubernetesApiError as exc:
-        return {**state_base_dict, "job_name": _worker_job_name(spec, launch_request or {}), "job_status": "error", "message": str(exc)}
+        return {
+            **state_base_dict,
+            "job_name": _worker_job_name(spec, launch_request or {}),
+            "job_status": "error",
+            "message": str(exc),
+        }
 
     raw_job_records = body.get("items") if isinstance(body, dict) else []
     jobs = [job_record for job_record in raw_job_records if isinstance(job_record, dict)]
@@ -824,7 +849,9 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
     succeeded = sum(int((job.get("status") or {}).get("succeeded") or 0) for job in jobs)
     failed = sum(int((job.get("status") or {}).get("failed") or 0) for job in jobs)
     latest = jobs[-1] if jobs else {}
-    latest_name = ((latest.get("metadata") or {}).get("name") if isinstance(latest, dict) else None) or _worker_job_name(spec, launch_request or {})
+    latest_name = (
+        (latest.get("metadata") or {}).get("name") if isinstance(latest, dict) else None
+    ) or _worker_job_name(spec, launch_request or {})
     if active:
         job_status = "active"
     elif failed:
@@ -943,6 +970,10 @@ def _worker_job_environment(
     run_id = str(launch_request.get("run_id") or "").strip()
     if run_id:
         env_list.append({"name": "HLTHPRT_CONTROL_RUN_ID", "value": run_id})
+    if set(spec.importers).intersection(_SOURCE_PROFILE_IMPORTERS_BY_MODULE.values()):
+        policy_setting = "HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE"
+        if policy_path := os.environ.get(policy_setting):
+            env_list.append({"name": policy_setting, "value": policy_path})
     target_job_id = _single_job_worker_target(spec, launch_request)
     if target_job_id:
         env_list.append(
@@ -1051,10 +1082,7 @@ def _worker_job_spec(
         },
     }
     active_deadline_seconds = int(os.getenv("HLTHPRT_WORKER_JOB_ACTIVE_DEADLINE_SECONDS", "0") or "0")
-    if (
-        active_deadline_seconds > 0
-        and spec.worker_class == _PROVIDER_DIRECTORY_WORKER_CLASS
-    ):
+    if active_deadline_seconds > 0 and spec.worker_class == _PROVIDER_DIRECTORY_WORKER_CLASS:
         active_deadline_seconds = max(
             active_deadline_seconds,
             _PROVIDER_DIRECTORY_MIN_ACTIVE_DEADLINE_SECONDS,
@@ -1147,11 +1175,7 @@ def _worker_job_secret_env(
         if not _is_admitted_importer_selected(secret_env_spec, worker_class, launch_request):
             continue
         environment_name = str(secret_env_spec.get("name") or "").strip()
-        secret_name = str(
-            secret_env_spec.get("secretName")
-            or secret_env_spec.get("secret_name")
-            or ""
-        ).strip()
+        secret_name = str(secret_env_spec.get("secretName") or secret_env_spec.get("secret_name") or "").strip()
         secret_key = str(secret_env_spec.get("key") or "").strip()
         if not environment_name or not secret_name or not secret_key:
             continue
@@ -1163,9 +1187,7 @@ def _worker_job_secret_env(
             secret_key_reference_by_field["optional"] = True
         environment_by_name[environment_name] = {
             "name": environment_name,
-            "valueFrom": {
-                "secretKeyRef": secret_key_reference_by_field
-            },
+            "valueFrom": {"secretKeyRef": secret_key_reference_by_field},
         }
     return list(environment_by_name.values())
 
@@ -1185,11 +1207,7 @@ def _is_admitted_importer_selected(selection_spec, worker_class, launch_request)
         raise ValueError("importer-scoped worker secret selector is invalid")
     if launch_request is None:
         return False
-    admission = (
-        launch_request.admitted_job
-        if isinstance(launch_request, _AdmittedWorkerRequest)
-        else None
-    )
+    admission = launch_request.admitted_job if isinstance(launch_request, _AdmittedWorkerRequest) else None
     importer = admission[1] if admission else launch_request.get("importer")
     if importer not in selected:
         return False
@@ -1242,11 +1260,13 @@ def _worker_job_resources(spec: WorkerSpec, payload_by_field: dict[str, Any] | N
     if profile:
         return profile
     if spec.worker_class == "process.TennesseeTDHProfile":
-        return {"requests": {"cpu": "1", "memory": "4Gi"},
-                "limits": {"cpu": "4", "memory": "8Gi"}}
-    if spec.worker_class in {"process.MassachusettsBORIMProfile", "process.KentuckyKBMLProfile", "process.RhodeIslandDOHProfile"}:
-        return {"requests": {"cpu": "500m", "memory": "512Mi"},
-                "limits": {"cpu": "4", "memory": "4Gi"}}
+        return {"requests": {"cpu": "1", "memory": "4Gi"}, "limits": {"cpu": "4", "memory": "8Gi"}}
+    if spec.worker_class in {
+        "process.MassachusettsBORIMProfile",
+        "process.KentuckyKBMLProfile",
+        "process.RhodeIslandDOHProfile",
+    }:
+        return {"requests": {"cpu": "500m", "memory": "512Mi"}, "limits": {"cpu": "4", "memory": "4Gi"}}
     requests_dict = {
         key: resource_value
         for key, resource_value in {
@@ -1306,9 +1326,7 @@ def _normalize_resource_profile(profile: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(values, dict):
             continue
         normalized_resource_dict = {
-            key: str(value).strip()
-            for key, value in values.items()
-            if key in {"cpu", "memory"} and str(value).strip()
+            key: str(value).strip() for key, value in values.items() if key in {"cpu", "memory"} and str(value).strip()
         }
         if normalized_resource_dict:
             resources_by_section[section] = normalized_resource_dict
@@ -1346,9 +1364,7 @@ def _is_worker_class_selected(
         return False
     if not has_worker_classes and not has_worker_classes_alias:
         return True
-    selected_worker_classes = selection_spec[
-        "workerClasses" if has_worker_classes else "worker_classes"
-    ]
+    selected_worker_classes = selection_spec["workerClasses" if has_worker_classes else "worker_classes"]
     if (
         not isinstance(selected_worker_classes, list)
         or not selected_worker_classes
@@ -1358,9 +1374,7 @@ def _is_worker_class_selected(
         )
     ):
         return False
-    return bool(worker_class) and worker_class in {
-        selected_class.strip() for selected_class in selected_worker_classes
-    }
+    return bool(worker_class) and worker_class in {selected_class.strip() for selected_class in selected_worker_classes}
 
 
 def _worker_job_secret_source(
@@ -1376,14 +1390,8 @@ def _worker_job_secret_source(
         return None
     if not has_default_mode and not has_default_mode_alias:
         return secret_source_by_field
-    default_mode = mount_spec[
-        "defaultMode" if has_default_mode else "default_mode"
-    ]
-    if (
-        isinstance(default_mode, bool)
-        or not isinstance(default_mode, int)
-        or not 0 <= default_mode <= 0o777
-    ):
+    default_mode = mount_spec["defaultMode" if has_default_mode else "default_mode"]
+    if isinstance(default_mode, bool) or not isinstance(default_mode, int) or not 0 <= default_mode <= 0o777:
         return None
     secret_source_by_field["defaultMode"] = default_mode
     return secret_source_by_field
@@ -1454,7 +1462,8 @@ def _uses_single_job_worker(spec: WorkerSpec) -> bool:
         spec.worker_class.startswith("process.PTG")
         or spec.worker_class
         in {
-            "process.HospitalPrices", "process.MRFSourceDiscovery",
+            "process.HospitalPrices",
+            "process.MRFSourceDiscovery",
             "process.NPI",
             "process.ProviderDirectoryFHIR",
         }
@@ -1521,9 +1530,7 @@ def _kubernetes_request(method: str, path: str, body: dict[str, Any] | None = No
         token = _K8S_API_TOKEN.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise _KubernetesApiError(0, f"cannot read Kubernetes service account token: {exc}") from exc
-    request_body_bytes = (
-        None if body is None else json.dumps(body).encode("utf-8")
-    )
+    request_body_bytes = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
         f"https://{host}:{port}{path}",
         data=request_body_bytes,
@@ -1534,7 +1541,9 @@ def _kubernetes_request(method: str, path: str, body: dict[str, Any] | None = No
             "Content-Type": "application/json",
         },
     )
-    context = ssl.create_default_context(cafile=str(_K8S_API_CA)) if _K8S_API_CA.exists() else ssl.create_default_context()
+    context = (
+        ssl.create_default_context(cafile=str(_K8S_API_CA)) if _K8S_API_CA.exists() else ssl.create_default_context()
+    )
     try:
         with urllib.request.urlopen(request, context=context, timeout=10) as response:  # nosec B310 - in-cluster API URL
             raw = response.read()
@@ -1649,7 +1658,11 @@ def _is_process_worker_spec_match(process_text: str, spec: WorkerSpec) -> bool:
         return False
     parts = process_text.split()
     for index, part in enumerate(parts[:-2]):
-        if part.endswith("main.py") and parts[index + 1] in {"worker", "worker-once"} and parts[index + 2] == spec.worker_class:
+        if (
+            part.endswith("main.py")
+            and parts[index + 1] in {"worker", "worker-once"}
+            and parts[index + 2] == spec.worker_class
+        ):
             return True
     return False
 

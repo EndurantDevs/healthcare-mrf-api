@@ -92,16 +92,31 @@ def _install_store(monkeypatch, state):
         state.run = copy.deepcopy(run)
         state.claimed = True
 
-    async def upsert(model, rows, identifier):
-        assert state.claimed
-        assert len(rows) <= worker.BATCH_SIZE
-        state.writes.append((model, copy.deepcopy(rows), identifier))
+    def insert(table):
+        assert table is worker.ProviderProfileArtifact.__table__, "Payload must be loaded only by the Publisher"
+
+        def values(**artifact):
+            raw = artifact["metadata_json"].clause.value.encode("utf-8")
+
+            async def status():
+                assert state.claimed
+                assert raw == (state.directory / "manifest.json").read_bytes()
+                assert hashlib.sha256(raw).hexdigest() == artifact["content_sha256"]
+                retained_by_field = {**artifact, "metadata_json": json.loads(raw)}
+                state.writes.append((worker.ProviderProfileArtifact, [retained_by_field], "artifact_id"))
+
+            return SimpleNamespace(status=status)
+
+        return SimpleNamespace(values=values)
 
     async def complete(ctx, task, run, metrics):
         assert state.claimed and not state.failed
         artifacts = [row for model, rows, _ in state.writes if model == worker.ProviderProfileArtifact for row in rows]
         bundle = profile_store.store._bundle(run, artifacts)
-        assert bundle["acquisition"] == metrics
+        assert {key: value for key, value in bundle["acquisition"].items() if key != "nysed_support"} == {
+            key: value for key, value in metrics.items() if key != "bundle"
+        }
+        assert metrics["bundle"] == profile_store.bundle_reference(artifacts[0])
         state.published = run["run_id"]
         return {"published": True, **metrics}
 
@@ -109,7 +124,8 @@ def _install_store(monkeypatch, state):
     async def transaction():
         yield
 
-    async def failed(run_id, error):
+    async def failed(run_id, error, *, ctx):
+        assert isinstance(ctx, dict)
         state.failed.append((run_id, type(error).__name__))
 
     monkeypatch.setattr(
@@ -126,8 +142,19 @@ def _install_store(monkeypatch, state):
     monkeypatch.setattr(
         worker, "completion", SimpleNamespace(reconcile_failed_control_runs=AsyncMock(), complete_run=complete)
     )
-    monkeypatch.setattr(worker, "_upsert_rows", upsert)
+    monkeypatch.setattr(worker.db, "insert", insert)
     monkeypatch.setattr(worker.db, "transaction", transaction)
+
+
+def _witness_rows(state, kind):
+    """Inspect producer values in the bundle, never pretend they were ordinary database writes."""
+    assert len(state.writes) == 1 and state.writes[0][0] is worker.ProviderProfileArtifact
+    bundle = state.writes[0][1][0]["metadata_json"]
+    if kind == "records":
+        return [
+            profile["record_values"] for profile in bundle["profiles"].values() if profile["record_values"] is not None
+        ]
+    return [fact for profile in bundle["profiles"].values() for fact in profile["fact_values"]]
 
 
 @pytest.fixture
@@ -139,6 +166,7 @@ def managed_case(tmp_path, monkeypatch):
     monkeypatch.setenv("HLTHPRT_NYPP_DEADLINE_SECONDS", "120")
     monkeypatch.setenv("HLTHPRT_NYPP_MAX_BUNDLE_BYTES", str(512 * 1024 * 1024))
     monkeypatch.setattr(worker, "ensure_tables", AsyncMock())
+    monkeypatch.setattr(worker, "load_role_policy", lambda: {})
     monkeypatch.setattr(worker, "enqueue_live_progress", lambda **kwargs: None)
     monkeypatch.setattr(worker.acquisition, "REQUEST_INTERVAL_SECONDS", 0)
     state = SimpleNamespace(claimed=False, failed=[], writes=[], published=None, cancel=False, run=None)
@@ -173,7 +201,7 @@ async def test_full_mixed_cohort_preserves_sources_holds_and_support(managed_cas
     assert result["published"] is True and result["responses"] == 6
     assert result["acquired_profiles"] == 4 and result["held_attempts"] == 2 and result["facts"] == 4
     assert not state.pending and all(session.closed for session in state.sessions)
-    records = [row for model, rows, _ in state.writes if model == worker.ProviderProfileSourceRecord for row in rows]
+    records = _witness_rows(state, "records")
     by_license = {row["license_number"]: row for row in records}
     assert set(by_license) == {"111111", "222222", "333333", "555555"}
     assert by_license["111111"]["matched_npi"] == by_license["222222"]["matched_npi"] == 1000000004
@@ -205,7 +233,9 @@ async def test_invalid_nysed_payload_does_not_abort_the_primary_profile_cohort(m
     )
     completion_metrics = await worker.import_profiles({}, TASK)
 
-    assert completion_metrics["responses"] == completion_metrics["acquired_profiles"] == completion_metrics["facts"] == 2
+    assert (
+        completion_metrics["responses"] == completion_metrics["acquired_profiles"] == completion_metrics["facts"] == 2
+    )
     assert completion_metrics["invalid_nysed_supports"] == 1
     assert not state.pending and not state.failed and state.published == state.run["run_id"]
     assert all(session.closed for session in state.sessions)
@@ -222,12 +252,7 @@ async def test_invalid_nysed_payload_does_not_abort_the_primary_profile_cohort(m
         "fact_count": 0,
     }
     assert invalid_support["source_identity"] is None
-    source_records = [
-        source_record
-        for model, retained_rows, _ in state.writes
-        if model == worker.ProviderProfileSourceRecord
-        for source_record in retained_rows
-    ]
+    source_records = _witness_rows(state, "records")
     by_license = {source_record["license_number"]: source_record for source_record in source_records}
     invalid_binding = by_license["111111"]["match_evidence"]["registry_binding"]
     assert invalid_binding["method"] == "exact_ny_license_name_components"
@@ -266,19 +291,9 @@ async def test_unreported_support_fields_preserve_identity_guards(
     assert acquisition_by_field["source_record"]["raw_payload"] == profile_by_field
     assert [fact["category"] for fact in acquisition_by_field["facts"]] == ["licenses"]
     assert support_by_field["source_identity"]["legal_name"] == legal_name
-    source_records = [
-        retained_row
-        for model, retained_rows, _ in state.writes
-        if model == worker.ProviderProfileSourceRecord
-        for retained_row in retained_rows
-    ]
+    source_records = _witness_rows(state, "records")
     assert len(source_records) == 1 and source_records[0]["matched_npi"] == expected_npi
-    facts = [
-        retained_row
-        for model, retained_rows, _ in state.writes
-        if model == worker.ProviderProfileFact
-        for retained_row in retained_rows
-    ]
+    facts = _witness_rows(state, "facts")
     assert len(facts) == 1 and facts[0]["npi"] == expected_npi
     binding_by_field = source_records[0]["match_evidence"]["registry_binding"]
     assert binding_by_field["reason"] == expected_reason
@@ -314,12 +329,14 @@ async def test_held_search_continues_without_nysed_or_provider_rows(managed_case
     assert not (state.directory / "nysed" / "111111").exists()
     bundle = json.loads((state.directory / "manifest.json").read_bytes())
     descriptor = bundle["profiles"]["111111"]
-    assert descriptor["acquisition_outcome"] == "held" and descriptor["reported_total"] == (1 if incomplete_identity else 0)
+    assert descriptor["acquisition_outcome"] == "held" and descriptor["reported_total"] == (
+        1 if incomplete_identity else 0
+    )
     assert descriptor["record_id"] is None and descriptor["facts"] == {}
     assert set(bundle["acquisition"]["nysed_support"]) == {"222222"}
-    records = [row for model, rows, _ in state.writes if model == worker.ProviderProfileSourceRecord for row in rows]
+    records = _witness_rows(state, "records")
     assert len(records) == 1 and records[0]["license_number"] == "222222"
-    facts = [row for model, rows, _ in state.writes if model == worker.ProviderProfileFact for row in rows]
+    facts = _witness_rows(state, "facts")
     assert len(facts) == 1 and facts[0]["source_record_id"] == records[0]["record_id"]
     captured = json.loads((state.directory / "profiles" / "111111" / "search.response.json").read_bytes())
     assert captured["content_sha256"] == hashlib.sha256(worker.encoded_json(response)).hexdigest()
@@ -357,26 +374,25 @@ async def test_budget_counts_all_retained_files(managed_case, monkeypatch):
     )
 
 
-async def test_fact_writes_are_bounded_and_cancelable(managed_case, monkeypatch):
+async def test_large_witness_is_cancelable_before_database_write(managed_case, monkeypatch):
     state = managed_case(_cases()[:1])
     body = _education("111111", middleName="Morgan", nationalProviderId="")
     body["data"]["medSchools"] = [
         {"schoolName": f"Example Medical School {index}", "gradDate": "2001"} for index in range(301)
     ]
     state.sessions[0].responses[1] = SourceResponse(body)
-    original = worker._upsert_rows
+    original = worker._append_profile
 
-    async def upsert(model, rows, identifier):
-        await original(model, rows, identifier)
-        if model == worker.ProviderProfileFact:
-            state.cancel = True
+    def append(*args):
+        original(*args)
+        state.cancel = True
 
-    monkeypatch.setattr(worker, "_upsert_rows", upsert)
+    monkeypatch.setattr(worker, "_append_profile", append)
     with pytest.raises(ImportCancelledError):
         await worker.import_profiles({}, TASK)
-    fact_writes = [rows for model, rows, _ in state.writes if model == worker.ProviderProfileFact]
-    assert len(fact_writes) == 1 and len(fact_writes[0]) == 250
-    assert state.failed and not state.published
+    bundle = json.loads((state.directory / "manifest.json").read_bytes())
+    assert len(bundle["profiles"]["111111"]["fact_values"]) == 301
+    assert state.failed and not state.published and not state.writes
 
 
 @pytest.mark.parametrize("field", ["max_providers", "resume_from", "sources", "professions", "license_types"])
@@ -405,6 +421,18 @@ async def test_resource_and_header_validation_precedes_claim(managed_case, monke
     with pytest.raises(ValueError):
         await worker.import_profiles({}, TASK)
     assert not state.claimed and not state.published
+
+
+async def test_witness_requires_independent_publisher_policy_before_acquisition(managed_case, monkeypatch):
+    state = managed_case(_cases())
+
+    def unavailable():
+        raise ValueError("source role policy is unavailable")
+
+    monkeypatch.setattr(worker, "load_role_policy", unavailable)
+    with pytest.raises(ValueError, match="role policy is unavailable"):
+        await worker.import_profiles({}, TASK)
+    assert not state.claimed and not state.writes and all(not session.requests for session in state.sessions)
 
 
 async def test_cancel_between_sources_preserves_captured_files(managed_case, monkeypatch):
@@ -451,7 +479,11 @@ async def test_uncertainty_or_write_failure_never_publishes(managed_case, monkey
     elif failure == "support_transport":
         state.sessions[1].response = OSError("Synthetic support failure")
     elif failure == "database":
-        monkeypatch.setattr(worker, "_upsert_rows", AsyncMock(side_effect=OSError("Synthetic database failure")))
+
+        def failed_insert(_table):
+            raise OSError("Synthetic database failure")
+
+        monkeypatch.setattr(worker.db, "insert", failed_insert)
     else:
         original = worker._write_json
 

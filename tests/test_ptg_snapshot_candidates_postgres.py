@@ -658,8 +658,33 @@ async def _assert_metadata_set_rejections(session, schema):
                 )
 
 
+async def _seed_archive_npi_scope(engine, schema, writer, row_count):
+    """Keep selected and unrelated native rows in an indexed disposable restore."""
+    async with engine.begin() as connection:
+        await connection.execute(text(f"CREATE SCHEMA {schema}_archive"))
+        await connection.execute(
+            text(
+                f"CREATE TABLE {schema}_archive.ptg2_v4_npi_scope (LIKE {schema}.ptg2_v4_npi_scope INCLUDING DEFAULTS)"
+            )
+        )
+        await connection.execute(
+            text(f"ALTER TABLE {schema}_archive.ptg2_v4_npi_scope ADD PRIMARY KEY(snapshot_key,npi_key)")
+        )
+        await connection.execute(
+            text(
+                f"INSERT INTO {schema}_archive.ptg2_v4_npi_scope SELECT 71,n,1234567890+n "
+                "FROM generate_series(0,:last_key) AS n"
+            ),
+            {"last_key": row_count - 1},
+        )
+        await connection.execute(text(f"INSERT INTO {schema}_archive.ptg2_v4_npi_scope VALUES(72,0,1234567891)"))
+        await connection.execute(text(f'GRANT USAGE ON SCHEMA {schema}_archive TO "{writer}"'))
+        await connection.execute(text(f'GRANT SELECT ON ALL TABLES IN SCHEMA {schema}_archive TO "{writer}"'))
+
+
 @pytest.mark.asyncio
-async def test_metadata_set_validation_and_archive_copy_fail_closed(monkeypatch):
+@pytest.mark.parametrize("row_count", (0, 1, 4096, 4097))
+async def test_metadata_set_validation_and_archive_copy_fail_closed(monkeypatch, row_count):
     """Reject gaps and missing native references; archive replay uses protected COPY."""
     from process.ptg_parts import result_archive_adoption as adoption
 
@@ -668,19 +693,8 @@ async def test_metadata_set_validation_and_archive_copy_fail_closed(monkeypatch)
         async with sessions.begin() as session:
             await session.execute(text(f'SET LOCAL ROLE "{writer}"'))
             await _assert_metadata_set_rejections(session, schema)
-        async with engine.begin() as connection:
-            await connection.execute(text(f"CREATE SCHEMA {schema}_archive"))
-            await connection.execute(
-                text(
-                    f"CREATE TABLE {schema}_archive.ptg2_v4_npi_scope (LIKE {schema}.ptg2_v4_npi_scope INCLUDING DEFAULTS)"
-                )
-            )
-            await connection.execute(
-                text(f"INSERT INTO {schema}_archive.ptg2_v4_npi_scope VALUES(71,0,1234567890),(72,0,1234567891)")
-            )
-            await connection.execute(text(f'GRANT USAGE ON SCHEMA {schema}_archive TO "{writer}"'))
-            await connection.execute(text(f'GRANT SELECT ON ALL TABLES IN SCHEMA {schema}_archive TO "{writer}"'))
         try:
+            await _seed_archive_npi_scope(engine, schema, writer, row_count)
             async with sessions.begin() as session:
                 await session.execute(text(f'SET LOCAL ROLE "{writer}"'))
                 for _ in range(2):
@@ -694,13 +708,29 @@ async def test_metadata_set_validation_and_archive_copy_fail_closed(monkeypatch)
                         build_token="owned",
                     )
                 await attach_snapshot_candidates(session, schema, 10, "owned")
-                assert (
-                    await session.scalar(text(f"SELECT npi FROM {schema}.ptg2_v4_npi_scope WHERE snapshot_key=10"))
-                    == 1234567890
+                actual = (
+                    await session.execute(
+                        text(f"SELECT count(*),min(npi),max(npi) FROM {schema}.ptg2_v4_npi_scope WHERE snapshot_key=10")
+                    )
+                ).one()
+                assert tuple(actual) == (
+                    row_count,
+                    1234567890 if row_count else None,
+                    1234567889 + row_count if row_count else None,
                 )
+                assert (
+                    await session.scalar(
+                        text("SELECT count(*) FROM pg_cursors WHERE position(:restore IN statement)>0"),
+                        {"restore": schema + "_archive"},
+                    )
+                    == 0
+                )
+                await session.execute(text("SET LOCAL ROLE NONE"))
+                await session.execute(text(f"DROP TABLE {schema}_archive.ptg2_v4_npi_scope"))
+                await session.execute(text(f"DROP SCHEMA {schema}_archive"))
         finally:
             async with engine.begin() as connection:
-                await connection.execute(text(f"DROP SCHEMA {schema}_archive CASCADE"))
+                await connection.execute(text(f"DROP SCHEMA IF EXISTS {schema}_archive CASCADE"))
 
 
 @asynccontextmanager

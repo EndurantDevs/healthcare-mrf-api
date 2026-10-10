@@ -8,7 +8,6 @@ import datetime
 from typing import Any
 
 from db.models import CodeCatalog, CodeRelationship, CodeSynonym, db
-from process.ext.utils import push_objects
 from process.ms_drg_sources import DEFAULT_CMS_MS_DRG_PAGE_URL, MsDrgCatalogRow
 
 SOURCE_MS_DRG = "cms_ms_drg_definitions_manual"
@@ -128,9 +127,7 @@ def _build_catalog_and_synonym_rows(
             )
         )
 
-    for procedure_code, procedure_category in sorted(
-        procedure_category_by_code.items()
-    ):
+    for procedure_code, procedure_category in sorted(procedure_category_by_code.items()):
         catalog_payloads.append(
             _catalog_row(
                 code_system="ICD10PCS",
@@ -150,111 +147,3 @@ async def _ensure_tables(schema: str) -> None:
     await db.create_table(CodeCatalog.__table__, checkfirst=True)
     await db.create_table(CodeSynonym.__table__, checkfirst=True)
     await db.create_table(CodeRelationship.__table__, checkfirst=True)
-    await db.status(
-        f"""
-        ALTER TABLE {schema}.{CodeCatalog.__tablename__}
-            ALTER COLUMN code_system TYPE VARCHAR(32),
-            ALTER COLUMN code TYPE VARCHAR(128),
-            ALTER COLUMN display_name TYPE TEXT,
-            ALTER COLUMN short_description TYPE TEXT,
-            ALTER COLUMN long_description TYPE TEXT,
-            ALTER COLUMN source TYPE VARCHAR(128);
-        """
-    )
-
-
-async def _push(stage_class: Any, row_maps: list[dict[str, Any]]) -> int:
-    pushed_count = 0
-    for start_index in range(0, len(row_maps), BATCH_SIZE):
-        row_chunk = row_maps[start_index : start_index + BATCH_SIZE]
-        await push_objects(row_chunk, stage_class)
-        pushed_count += len(row_chunk)
-    return pushed_count
-
-
-def _source_sql_list(source_names: tuple[str, ...]) -> str:
-    return ", ".join(f"'{source_name}'" for source_name in source_names)
-
-
-async def _merge_catalog_stage(
-    stage_class: Any,
-    schema: str,
-    sources_to_replace: tuple[str, ...],
-) -> None:
-    source_sql = _source_sql_list(sources_to_replace)
-    await db.status(
-        f"DELETE FROM {schema}.{CodeCatalog.__tablename__} WHERE source IN ({source_sql});"
-    )
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{CodeCatalog.__tablename__}
-            (code_system, code, code_type, display_name, short_description, long_description,
-             is_active, source, source_release, source_attribution, updated_at)
-        SELECT code_system, code, code_type, display_name, short_description, long_description,
-               is_active, source, source_release, source_attribution, updated_at
-          FROM {schema}.{stage_class.__tablename__}
-        ON CONFLICT (code_system, code) DO UPDATE SET
-            code_type = EXCLUDED.code_type,
-            display_name = EXCLUDED.display_name,
-            short_description = EXCLUDED.short_description,
-            long_description = EXCLUDED.long_description,
-            is_active = EXCLUDED.is_active,
-            source = EXCLUDED.source,
-            source_release = EXCLUDED.source_release,
-            source_attribution = EXCLUDED.source_attribution,
-            updated_at = EXCLUDED.updated_at;
-        """
-    )
-
-
-async def _merge_synonym_stage(
-    stage_class: Any,
-    schema: str,
-    sources_to_replace: tuple[str, ...],
-) -> None:
-    source_sql = _source_sql_list(sources_to_replace)
-    await db.status(
-        f"DELETE FROM {schema}.{CodeSynonym.__tablename__} WHERE source IN ({source_sql});"
-    )
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{CodeSynonym.__tablename__}
-            (code_system, code, synonym, term_type, language,
-             source, source_attribution, updated_at)
-        SELECT code_system, code, synonym, term_type, language,
-               source, source_attribution, updated_at
-          FROM {schema}.{stage_class.__tablename__}
-        ON CONFLICT (code_system, code, synonym, term_type) DO UPDATE SET
-            language = EXCLUDED.language,
-            source = EXCLUDED.source,
-            source_attribution = EXCLUDED.source_attribution,
-            updated_at = EXCLUDED.updated_at;
-        """
-    )
-
-
-async def _merge_relationship_stage(
-    stage_class: Any,
-    schema: str,
-    sources_to_replace: tuple[str, ...],
-) -> None:
-    source_sql = _source_sql_list(sources_to_replace)
-    await db.status(
-        f"DELETE FROM {schema}.{CodeRelationship.__tablename__} "
-        f"WHERE source IN ({source_sql});"
-    )
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{CodeRelationship.__tablename__}
-            (from_system, from_code, relationship, to_system, to_code,
-             source, source_attribution, updated_at)
-        SELECT from_system, from_code, relationship, to_system, to_code,
-               source, source_attribution, updated_at
-          FROM {schema}.{stage_class.__tablename__}
-        ON CONFLICT (from_system, from_code, relationship, to_system, to_code)
-        DO UPDATE SET
-            source = EXCLUDED.source,
-            source_attribution = EXCLUDED.source_attribution,
-            updated_at = EXCLUDED.updated_at;
-        """
-    )

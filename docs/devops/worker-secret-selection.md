@@ -47,3 +47,36 @@ audit-only, while canonical candidates retain their existing mode and
 activation checks. Qualify both paths and the independent API reader with
 real roles before enabling these references. Secret selection is not proof
 of publisher readiness, a passing audit or successful activation.
+
+## Protected source-profile maintenance
+
+Set `HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE` to an independently managed,
+read-only JSON policy file for the API and source-profile workers. Process
+workers inherit the setting; the Kubernetes launcher forwards it to both the
+source workers and `process.SourceProfile_finish`. Use the existing read-only
+worker volume configuration to make the file available at that configured path.
+Do not place it in writable import artifacts or supply its contents through run
+parameters, launch requests, or publication receipts.
+
+The policy is limited to 8 KiB and uses the shared namespace-policy fields:
+`owner_role`, `migration_role`, `preparation_owner_role`, and `runtime_roles`.
+The complete `runtime_roles` list must match the publication policy and contain
+1–16 distinct ordinary roles. Existing optional credential, control-role and
+schema-creation fields remain accepted. No credentials belong in this file.
+
+Protected handoff refuses a missing or invalid policy before committing the
+handoff. Finishing rechecks the configured role closure, actual worker identity,
+RLS policies, owners, privileges and installed guard definitions before cleanup.
+An unavailable or changed authority leaves the attempt finalizing for safe retry;
+it does not authorize grants, metadata repair, or replacement policy from a receipt.
+Legacy unprotected imports keep their existing completion path. New NY profile
+acquisitions always require this policy and the configured native publisher,
+including the first publication: their canonical bundle carries model-valued
+witnesses and the ordinary worker writes no source-record or fact payload rows.
+The publisher builds isolated model heaps with bounded binary COPY, validates the
+complete indexed candidate, and atomically publishes it with retained custody.
+The configured bundle and COPY byte limits remain unchanged.
+
+Sealed legacy bundles retain their original contract. A digest-only bundle does
+not supply missing canonical preimages or authorize a witness upgrade; replay
+must authenticate the original retained captures and their encoding first.

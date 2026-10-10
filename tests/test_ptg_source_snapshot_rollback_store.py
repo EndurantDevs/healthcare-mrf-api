@@ -24,6 +24,33 @@ class _RecordingSession:
         return _ChangedRowResult()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_readonly", [False, True])
+@pytest.mark.parametrize("loader", ["target", "pin", "scope", "attestation"])
+async def test_discovery_selects_omit_row_update_privilege_but_rollback_keeps_locks(is_readonly, loader):
+    session = _RecordingSession()
+    arguments = (session, '"mrf"', "snapshot_a")
+    match loader:
+        case "target":
+            await rollback_store._load_target_snapshot(*arguments, is_readonly=is_readonly)
+        case "pin":
+            await rollback_store._load_rollback_pin(
+                *arguments[:2],
+                owner_type="ptg_v4_rollback",
+                owner_id="owner",
+                snapshot_id="snapshot_a",
+                is_readonly=is_readonly,
+            )
+        case "scope":
+            await rollback_store.load_target_snapshot_scope(*arguments, is_readonly=is_readonly)
+        case "attestation":
+            await rollback_store.load_target_attestation(*arguments, is_readonly=is_readonly)
+    statement, parameters = session.executed_statements[0]
+    assert ("FOR SHARE" in statement) is not is_readonly
+    assert parameters["snapshot_id"] == "snapshot_a" and "SELECT" in statement
+    assert not any(command in statement for command in ("UPDATE ", "DELETE ", "INSERT "))
+
+
 def _plan_pointer_entry() -> dict:
     return {
         "plan_source_key": "plan-source-key",

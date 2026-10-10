@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from db.connection import init_db
 from db.models import CodeCatalog, CodeRelationship, CodeSynonym, db
-from process.ext.utils import ensure_database, make_class
+from process.ext.utils import ensure_database
 from process.ms_drg_contracts import (
     MsDrgImportRequest,
     MsDrgManualSource,
@@ -30,15 +30,9 @@ from process.ms_drg_publication import (
     _build_catalog_and_synonym_rows,
     _catalog_row,
     _ensure_tables,
-    _merge_catalog_stage,
-    _merge_relationship_stage,
-    _merge_synonym_stage,
-    _push,
     _relationship_row,
-    _source_sql_list,
     _synonym_row,
 )
-from process.ms_drg_result_generation import publish_local_generation
 from process.ms_drg_sources import (
     DEFAULT_CMS_MS_DRG_PAGE_URL,
     DEFAULT_MANUAL_TOC_URL,
@@ -61,7 +55,8 @@ from process.ms_drg_sources import (
     _raise_if_cancelled,
     _TableParser,
 )
-from process.reference_stage import _drop_stage_tables, build_reference_stage_suffix
+from process.reference_stage import build_reference_stage_suffix
+from process.scoped_catalog_handoff import prepare_catalog_handoff
 
 DEFAULT_CONCURRENCY = 10
 TEST_INDEX_PAGE_LIMIT = 2
@@ -88,14 +83,14 @@ def _ms_drg_stage_suffix(import_suffix: str, run_id: str | None = None) -> str:
 
 
 def _build_request(
-    test_mode: bool,
-    include_relationships: bool,
-    relationship_page_limit: int | None,
-    concurrency: int | None,
-    source_url: str | None,
-    manual_toc_url: str | None,
-    import_id: str | None,
-    run_id: str | None,
+    test_mode: bool = False,
+    include_relationships: bool = True,
+    relationship_page_limit: int | None = None,
+    concurrency: int | None = None,
+    source_url: str | None = None,
+    manual_toc_url: str | None = None,
+    import_id: str | None = None,
+    run_id: str | None = None,
 ) -> MsDrgImportRequest:
     page_limit = relationship_page_limit
     if test_mode and page_limit is None:
@@ -318,61 +313,26 @@ async def _stage_and_publish(
     schema: str,
     request: MsDrgImportRequest,
     import_payloads: MsDrgPayloads,
-) -> MsDrgPublishCounts:
-    """Stage source rows, publish them atomically, and always remove staging tables."""
-    stage_suffix = _ms_drg_stage_suffix(request.import_suffix, request.run_id)
-    stage_by_model = {
-        CodeCatalog: make_class(CodeCatalog, stage_suffix),
-        CodeSynonym: make_class(CodeSynonym, stage_suffix),
-        CodeRelationship: make_class(CodeRelationship, stage_suffix),
-    }
-    await _drop_stage_tables(db, schema, stage_by_model.values())
-    try:
-        for stage_class in stage_by_model.values():
-            await db.create_table(stage_class.__table__, checkfirst=True)
-        catalog_count = await _push(
-            stage_by_model[CodeCatalog],
-            import_payloads.catalog_payloads,
-        )
-        synonym_count = await _push(
-            stage_by_model[CodeSynonym],
-            import_payloads.synonym_payloads,
-        )
-        relationship_count = 0
-        if request.include_relationships:
-            relationship_count = await _push(
-                stage_by_model[CodeRelationship],
-                import_payloads.relationship_payloads,
-            )
-        await _publish_stage(schema, request, stage_by_model)
-        return MsDrgPublishCounts(
-            catalog_count,
-            synonym_count,
-            relationship_count,
-        )
-    finally:
-        await _drop_stage_tables(db, schema, stage_by_model.values())
-
-
-async def _publish_stage(schema: str, request: MsDrgImportRequest, stage_by_model: dict) -> None:
-    catalog_sources = SOURCES if request.include_relationships else (SOURCE_MS_DRG,)
+    summary: dict,
+    control_context=None,
+) -> dict:
+    """Keep isolated candidate custody with a truthful prepared/finalizing result."""
     _raise_if_cancelled(request.run_id)
-    async with db.transaction() as session:
-        # Serialize shared-table publication before reading its serving receipt.
-        await db.status(
-            f"LOCK TABLE {schema}.{CodeCatalog.__tablename__}, "
-            f"{schema}.{CodeSynonym.__tablename__}, "
-            f"{schema}.{CodeRelationship.__tablename__} "
-            "IN SHARE ROW EXCLUSIVE MODE"
-        )
-        await _merge_catalog_stage(stage_by_model[CodeCatalog], schema, catalog_sources)
-        await _merge_synonym_stage(stage_by_model[CodeSynonym], schema, (SOURCE_MS_DRG,))
-        if request.include_relationships:
-            await _merge_relationship_stage(
-                stage_by_model[CodeRelationship], schema, (SOURCE_ICD10CM_INDEX, SOURCE_ICD10PCS_INDEX)
-            )
-        if not request.test_mode:
-            await publish_local_generation(session, schema, include_relationships=request.include_relationships)
+    return await prepare_catalog_handoff(
+        db,
+        control_context,
+        importer="ms-drg",
+        schema=schema,
+        payloads={
+            CodeCatalog.__tablename__: import_payloads.catalog_payloads,
+            CodeSynonym.__tablename__: import_payloads.synonym_payloads,
+            CodeRelationship.__tablename__: import_payloads.relationship_payloads
+            if request.include_relationships
+            else [],
+        },
+        options={"include_relationships": request.include_relationships, "test_mode": request.test_mode},
+        metrics=summary,
+    )
 
 
 def _build_summary(
@@ -409,10 +369,7 @@ async def import_ms_drg(
     import_id: str | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Download, normalize, and persist MS-DRG reference data."""
-    await ensure_database(test_mode)
-    schema = _schema()
-    await _ensure_tables(schema)
+    """Prepare a standalone MS-DRG contribution without claiming publication."""
     request = _build_request(
         test_mode,
         include_relationships,
@@ -423,18 +380,31 @@ async def import_ms_drg(
         import_id,
         run_id,
     )
+    return await _import_request(request)
+
+
+async def _import_request(request, control_context=None):
+    """Normalize ordinary input and hand its complete candidate to the admitted publisher."""
+    await ensure_database(request.test_mode)
+    schema = _schema()
+    await _ensure_tables(schema)
     manual_source = await _load_manual_source(request)
     relationship_rows = await _load_relationship_rows(manual_source, request)
     import_payloads = _build_payloads(manual_source, relationship_rows)
-    publish_counts = await _stage_and_publish(schema, request, import_payloads)
+    publish_counts = MsDrgPublishCounts(
+        len(import_payloads.catalog_payloads),
+        len(import_payloads.synonym_payloads),
+        len(import_payloads.relationship_payloads) if request.include_relationships else 0,
+    )
     summary_map = _build_summary(
         request,
         manual_source,
         relationship_rows,
         publish_counts,
     )
+    outcome = await _stage_and_publish(schema, request, import_payloads, summary_map, control_context)
     print(
-        "MS-DRG import done: "
+        f"MS-DRG import {outcome['status']}: "
         f"MS_DRG={len(manual_source.catalog_rows):,} "
         f"catalog={publish_counts.catalog_count:,} "
         f"synonyms={publish_counts.synonym_count:,} "
@@ -442,7 +412,7 @@ async def import_ms_drg(
         f"ICD10PCS={len(relationship_rows.procedure_category_by_code):,} "
         f"release={manual_source.release} at {_now().isoformat()}Z"
     )
-    return summary_map
+    return outcome
 
 
 async def main(
@@ -468,5 +438,25 @@ async def main(
             import_id=import_id,
             run_id=run_id,
         )
+    finally:
+        await db.disconnect()
+
+
+async def managed_main(ctx, task):
+    """Use the managed ctx/task convention while preserving the standalone entrypoint."""
+    names = (
+        "test_mode",
+        "include_relationships",
+        "relationship_page_limit",
+        "concurrency",
+        "source_url",
+        "manual_toc_url",
+        "import_id",
+        "run_id",
+    )
+    request = _build_request(**{name: task[name] for name in names if name in task})
+    await init_db(db)
+    try:
+        return await _import_request(request, ctx)
     finally:
         await db.disconnect()

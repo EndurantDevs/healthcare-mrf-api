@@ -547,6 +547,7 @@ async def _capture_dictionary_effect_table(
     keys = ",".join(native._quoted(column.name) for column in mirror.__table__.primary_key.columns)
     current_ref = f"{destination}.{native._quoted(effect.__tablename__)}"
     if current_present:
+        await _require_effect_destination(session, mirror, current_ref, destination_schema, oid)
         key_query = f"SELECT {keys} FROM {incoming} UNION SELECT {keys} FROM {current_ref}"
         baseline = (
             "CASE WHEN current_row.destination_oid IS NULL THEN to_jsonb(live) ELSE current_row.baseline_image END"
@@ -556,7 +557,7 @@ async def _capture_dictionary_effect_table(
         key_query, baseline, current_join = f"SELECT {keys} FROM {incoming}", "to_jsonb(live)", ""
     collision = (
         (
-            "current_row.destination_oid IS NOT NULL AND (current_row.destination_oid<>:oid OR current_row.after_image IS DISTINCT FROM to_jsonb(live)) OR "
+            "current_row.destination_oid IS NOT NULL AND current_row.after_image IS DISTINCT FROM to_jsonb(live) OR "
             "current_row.destination_oid IS NULL AND "
             if current_present
             else ""
@@ -628,16 +629,19 @@ async def apply_reference_dictionary_effects(
         live = f"{native._quoted(destination_schema)}.{native._quoted(mirror.__source_table__)}"
         fence = f"{native._quoted(current_schema)}.{native._quoted(effect.__tablename__)}" if rollback else effects
         image = "after_image" if rollback else "before_image"
+        await _require_effect_destination(session, mirror, fence, destination_schema, oid)
         if await session.scalar(
             text(
-                f"SELECT EXISTS(SELECT 1 FROM {fence} effect LEFT JOIN {live} live ON {_dictionary_key_join(mirror, 'effect', 'live')} WHERE effect.destination_oid<>:oid OR effect.{image} IS DISTINCT FROM to_jsonb(live))"
+                f"SELECT EXISTS(SELECT 1 FROM {fence} effect LEFT JOIN {live} live ON {_dictionary_key_join(mirror, 'effect', 'live')} WHERE effect.{image} IS DISTINCT FROM to_jsonb(live))"
             ),
             {"oid": oid},
         ):
             raise native.ReferenceFamilyArchiveError("reference dictionary destination changed")
+        if rollback:
+            await _require_effect_destination(session, mirror, effects, destination_schema, oid)
         if rollback and await session.scalar(
             text(
-                f"SELECT EXISTS(SELECT 1 FROM {effects} effect LEFT JOIN {live} live ON {_dictionary_key_join(mirror, 'effect', 'live')} WHERE effect.destination_oid<>:oid OR (NOT EXISTS(SELECT 1 FROM {fence} current_row WHERE {_dictionary_key_join(mirror, 'effect', 'current_row')}) AND effect.baseline_image IS DISTINCT FROM to_jsonb(live)))"
+                f"SELECT EXISTS(SELECT 1 FROM {effects} effect LEFT JOIN {live} live ON {_dictionary_key_join(mirror, 'effect', 'live')} WHERE NOT EXISTS(SELECT 1 FROM {fence} current_row WHERE {_dictionary_key_join(mirror, 'effect', 'current_row')}) AND effect.baseline_image IS DISTINCT FROM to_jsonb(live))"
             ),
             {"oid": oid},
         ):
@@ -646,6 +650,21 @@ async def apply_reference_dictionary_effects(
         await _write_dictionary_effects(
             session, mirror, effect, incoming_schema, current_schema, destination_schema, rollback
         )
+
+
+async def _require_effect_destination(session, mirror, effects, destination_schema, oid):
+    """Keep the original fence unless a current source receipt authenticates a catalog rebind."""
+    from process import reference_family_archive as native
+    from process.scoped_catalog_binding import require_current_catalog_rebinding
+
+    changed = await session.scalar(
+        text(f"SELECT EXISTS(SELECT 1 FROM {effects} WHERE destination_oid IS DISTINCT FROM :oid)"), {"oid": oid}
+    )
+    if changed is False:
+        return
+    if changed is not True or mirror.__source_table__ != "code_catalog":
+        raise native.ReferenceFamilyArchiveError("reference dictionary destination changed")
+    await require_current_catalog_rebinding(session, destination_schema, oid)
 
 
 async def _write_dictionary_effects(

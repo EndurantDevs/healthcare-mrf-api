@@ -14,8 +14,8 @@ from typing import Any
 
 from db.connection import init_db
 from db.models import CodeCatalog, db
-from process.code_sets_result_archive import _schema, publish_local_generation
 from process.ext.utils import ensure_database
+from process.scoped_catalog_handoff import prepare_catalog_handoff
 
 DEFAULT_POS_URL = "https://www.cms.gov/medicare/coding-billing/place-of-service-codes/code-sets"
 DEFAULT_RC_URL = "https://bluebutton.cms.gov/fhir/CodeSystem/CLM-REV-CNTR-CD/"
@@ -221,54 +221,34 @@ def modifier_code_rows() -> list[CodeSetRow]:
 
 async def _ensure_code_catalog(schema: str) -> None:
     await db.create_table(CodeCatalog.__table__, checkfirst=True)
-    await db.status(
-        f"""
-        ALTER TABLE {schema}.{CodeCatalog.__tablename__}
-            ALTER COLUMN code_system TYPE VARCHAR(32),
-            ALTER COLUMN code TYPE VARCHAR(128),
-            ALTER COLUMN display_name TYPE TEXT,
-            ALTER COLUMN short_description TYPE TEXT,
-            ALTER COLUMN long_description TYPE TEXT,
-            ALTER COLUMN source TYPE VARCHAR(128);
-        """
-    )
 
 
-async def _upsert_code_rows(schema: str, code_rows: list[CodeSetRow]) -> int:
+def _code_payloads(code_rows: list[CodeSetRow]) -> list[dict]:
+    """Preserve first-key semantics while preparing complete model records for COPY."""
     seen_code_keys: set[tuple[str, str]] = set()
-    inserted_count = 0
+    payloads = []
+    systems_by_source = {SOURCE_POS: "POS", SOURCE_RC: "RC", SOURCE_MODIFIER: "MODIFIER"}
+    updated_at = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     for code_row in code_rows:
+        if systems_by_source.get(code_row.source) != code_row.code_system:
+            raise RuntimeError("code-set source system differs")
         code_key = (code_row.code_system, code_row.code)
         if code_key in seen_code_keys:
             continue
         seen_code_keys.add(code_key)
-        affected = await db.status(
-            f"""
-            INSERT INTO {schema}.{CodeCatalog.__tablename__}
-                (code_system, code, display_name, short_description, long_description, is_active, source, updated_at)
-            VALUES
-                (:code_system, :code, :display_name, :short_description, :long_description, TRUE, :source, NOW())
-            ON CONFLICT (code_system, code) DO UPDATE
-            SET
-                display_name = excluded.display_name,
-                short_description = excluded.short_description,
-                long_description = excluded.long_description,
-                is_active = excluded.is_active,
-                source = excluded.source,
-                updated_at = excluded.updated_at
-            WHERE {CodeCatalog.__tablename__}.source = excluded.source;
-            """,
-            code_system=code_row.code_system,
-            code=code_row.code,
-            display_name=code_row.display_name,
-            short_description=code_row.short_description,
-            long_description=code_row.long_description,
-            source=code_row.source,
+        payloads.append(
+            {
+                "code_system": code_row.code_system,
+                "code": code_row.code,
+                "display_name": code_row.display_name,
+                "short_description": code_row.short_description,
+                "long_description": code_row.long_description,
+                "is_active": True,
+                "source": code_row.source,
+                "updated_at": updated_at,
+            }
         )
-        if affected != 1:
-            raise RuntimeError("code-set catalog key is owned by another source")
-        inserted_count += 1
-    return inserted_count
+    return payloads
 
 
 def _select_test_rows(
@@ -280,8 +260,8 @@ def _select_test_rows(
     return preferred_rows or code_rows[:10]
 
 
-async def import_code_sets(test_mode: bool = False) -> dict[str, Any]:
-    """Fetch, validate, and upsert POS, revenue, and modifier code sets."""
+async def import_code_sets(test_mode: bool = False, *, _control_context=None) -> dict[str, Any]:
+    """Fetch and prepare source-owned catalog contributions for native publication."""
     await ensure_database(test_mode)
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
 
@@ -303,32 +283,36 @@ async def import_code_sets(test_mode: bool = False) -> dict[str, Any]:
 
     modifier_rows = modifier_code_rows()
     await _ensure_code_catalog(schema)
-    async with db.transaction() as session:
-        # ponytail: one short catalog lock; revisit keyed claims if concurrent writer throughput matters.
-        await db.status(f"LOCK TABLE {_schema(schema)}.{CodeCatalog.__tablename__} IN SHARE ROW EXCLUSIVE MODE")
-        pos_count = await _upsert_code_rows(schema, pos_rows)
-        rc_count = await _upsert_code_rows(schema, rc_rows)
-        modifier_count = await _upsert_code_rows(schema, modifier_rows)
-        if not test_mode:
-            await publish_local_generation(session, schema)
-    print(
-        "Code set import done: "
-        f"POS={pos_count:,} RC={rc_count:,} MODIFIER={modifier_count:,} "
-        f"at {datetime.datetime.utcnow().isoformat()}Z"
-    )
-    return {
+    pos_payloads, rc_payloads, modifier_payloads = map(_code_payloads, (pos_rows, rc_rows, modifier_rows))
+    pos_count, rc_count, modifier_count = map(len, (pos_payloads, rc_payloads, modifier_payloads))
+    summary_map = {
         "pos_rows": pos_count,
         "rc_rows": rc_count,
         "modifier_rows": modifier_count,
         "pos_url": pos_url,
         "rc_url": rc_url,
     }
+    outcome = await prepare_catalog_handoff(
+        db,
+        _control_context,
+        importer="code-sets",
+        schema=schema,
+        payloads={"code_catalog": pos_payloads + rc_payloads + modifier_payloads},
+        options={"include_relationships": False, "test_mode": test_mode},
+        metrics=summary_map,
+    )
+    print(
+        f"Code set import {outcome['status']}: "
+        f"POS={pos_count:,} RC={rc_count:,} MODIFIER={modifier_count:,} "
+        f"at {datetime.datetime.utcnow().isoformat()}Z"
+    )
+    return outcome
 
 
-async def main(test_mode: bool = False) -> dict[str, Any]:
+async def main(test_mode: bool = False, *, _control_context=None) -> dict[str, Any]:
     """Run code-set import with standalone database lifecycle handling."""
     await init_db(db)
     try:
-        return await import_code_sets(test_mode=test_mode)
+        return await import_code_sets(test_mode=test_mode, _control_context=_control_context)
     finally:
         await db.disconnect()

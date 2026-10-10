@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import re
 from unittest.mock import AsyncMock
@@ -12,10 +13,16 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.schema import MetaData
 
-from db.models import CodeCatalog
+from db.connection import Database
+from db.models import CodeCatalog, ImportRun
+from process import reference_family_archive as native
+from process import scoped_catalog_handoff as handoff
+from process.scoped_catalog_retention import cleanup_retained_catalog
+from tests.scoped_catalog_native_fixture import catalog_actors, seal_catalog
 
 code_sets = importlib.import_module("process.code_sets")
 
@@ -42,8 +49,9 @@ def _dsn() -> str:
 async def _seed_catalog(engine):
     metadata = MetaData(schema="mrf")
     CodeCatalog.__table__.to_metadata(metadata, schema="mrf")
+    ImportRun.__table__.to_metadata(metadata, schema="mrf")
     async with engine.begin() as connection:
-        await connection.execute(text("DROP SCHEMA IF EXISTS mrf CASCADE"))
+        assert await connection.scalar(text("SELECT to_regnamespace('mrf')")) is None
         await connection.execute(text("CREATE SCHEMA mrf"))
         await connection.run_sync(metadata.create_all)
         await connection.execute(
@@ -71,7 +79,6 @@ async def _seed_catalog(engine):
 
 def _stub_feeds(monkeypatch):
     monkeypatch.setattr(code_sets, "ensure_database", AsyncMock())
-    monkeypatch.setattr(code_sets, "_ensure_code_catalog", AsyncMock())
     monkeypatch.setattr(
         code_sets,
         "modifier_code_rows",
@@ -84,60 +91,120 @@ def _stub_feeds(monkeypatch):
     )
 
 
-async def _assert_late_failure_rolls_back(sessions, monkeypatch):
-    original_upsert = code_sets._upsert_code_rows
+def _copy():
+    return native.ReferenceFamilySourceCopy(native.native_copy_projection, 1024**2, 30)
 
-    async def fail_after_revenue(schema, code_rows):
-        count = await original_upsert(schema, code_rows)
-        if code_rows and code_rows[0].source == code_sets.SOURCE_RC:
-            raise RuntimeError("synthetic late failure")
-        return count
 
-    monkeypatch.setattr(code_sets, "_upsert_code_rows", fail_after_revenue)
-    async with sessions() as session, session.begin():
-        async with code_sets.db.bind_existing_session(session):
-            with pytest.raises(RuntimeError, match="synthetic late failure"):
-                await code_sets.import_code_sets()
-            catalog_sources = (
-                (await session.execute(text("SELECT source FROM mrf.code_catalog ORDER BY source"))).scalars().all()
+async def _ordinary_preparation(actors):
+    context_by_field = {
+        "control_run_id": uuid4().hex,
+        "_control_attempt_id": uuid4().hex,
+        "_control_attempt_started_at": "2026-01-01T00:00:00+00:00",
+    }
+    async with actors.builder.begin() as session:
+        await session.execute(
+            text(
+                "INSERT INTO mrf.import_run (run_id,engine,importer,node_id,status,progress,params) "
+                "VALUES (:run_id,'healthcare-mrf-api','code-sets','synthetic-node','running',CAST(:progress AS json),'{}')"
+            ),
+            {
+                "run_id": context_by_field["control_run_id"],
+                "progress": json.dumps(
+                    {
+                        "attempt_id": context_by_field["_control_attempt_id"],
+                        "attempt_started_at": context_by_field["_control_attempt_started_at"],
+                    }
+                ),
+            },
+        )
+    result = await code_sets.import_code_sets(_control_context={"context": context_by_field})
+    assert result["status"] == "finalizing"
+    assert context_by_field["control_run_handoff_committed"] is True
+    return result
+
+
+async def _cancel_preparation(actors, candidate):
+    async with actors.builder.begin() as session:
+        current = (
+            (
+                await session.execute(
+                    text("SELECT * FROM mrf.import_run WHERE run_id=:run_id"), {"run_id": candidate["run_id"]}
+                )
             )
-            assert catalog_sources == [code_sets.SOURCE_POS, "synthetic-unrelated"]
-            assert await session.scalar(text("SELECT local_generation FROM mrf.code_sets_result_generation")) == 0
+            .mappings()
+            .one()
+        )
+        await handoff.request_catalog_cancel(session, current)
+    async with actors.publisher.begin() as session:
+        receipt = await handoff.cancel_catalog_handoff(session, candidate)
+        assert receipt == {"handoff": candidate, "status": "canceled"}
+    async with actors.publisher.begin() as session:
+        assert await handoff.read_catalog_handoff_outcome(session, candidate) == receipt
 
-    monkeypatch.setattr(code_sets, "_upsert_code_rows", original_upsert)
+
+async def _assert_late_failure_rolls_back(actors):
+    result = await _ordinary_preparation(actors)
+    candidate = result[handoff.METRIC]
+    with pytest.raises(RuntimeError, match="synthetic late failure"):
+        async with actors.publisher.begin() as session:
+            await handoff.publish_catalog_handoff(session, candidate, source_copy=_copy())
+            raise RuntimeError("synthetic late failure")
+    async with actors.builder.begin() as session:
+        catalog_sources = (
+            (await session.execute(text("SELECT source FROM mrf.code_catalog ORDER BY source"))).scalars().all()
+        )
+        assert catalog_sources == [code_sets.SOURCE_POS, "synthetic-unrelated"]
+        assert await session.scalar(text("SELECT local_generation FROM mrf.code_sets_result_generation")) == 0
+    async with actors.publisher.begin() as session:
+        assert await handoff.read_catalog_handoff_outcome(session, candidate) is None
+    await _cancel_preparation(actors, candidate)
 
 
-async def _assert_foreign_conflict_rolls_back(sessions):
-    async with sessions() as session, session.begin():
+async def _assert_foreign_conflict_rolls_back(actors):
+    async with actors.publisher.begin() as session:
         await session.execute(
             text(
                 "INSERT INTO mrf.code_catalog (code_system, code, display_name, source) "
                 "VALUES ('RC', '0450', 'Foreign revenue', 'synthetic-foreign')"
             )
         )
-        async with code_sets.db.bind_existing_session(session):
-            with pytest.raises(RuntimeError, match="owned by another source"):
-                await code_sets.import_code_sets()
-            catalog_entries = (
-                await session.execute(
-                    text("SELECT code_system, code, display_name, source FROM mrf.code_catalog ORDER BY code_system")
-                )
-            ).all()
-            assert [tuple(entry) for entry in catalog_entries] == [
-                ("OTHER", "1", None, "synthetic-unrelated"),
-                ("POS", "99", None, code_sets.SOURCE_POS),
-                ("RC", "0450", "Foreign revenue", "synthetic-foreign"),
-            ]
-            assert await session.scalar(text("SELECT local_generation FROM mrf.code_sets_result_generation")) == 0
+    candidate = (await _ordinary_preparation(actors))[handoff.METRIC]
+    with pytest.raises(RuntimeError, match="foreign key ownership"):
+        async with actors.publisher.begin() as session:
+            await handoff.publish_catalog_handoff(session, candidate, source_copy=_copy())
+    async with actors.publisher.begin() as session:
+        catalog_entries = (
+            await session.execute(
+                text("SELECT code_system, code, display_name, source FROM mrf.code_catalog ORDER BY code_system")
+            )
+        ).all()
+        assert [tuple(entry) for entry in catalog_entries] == [
+            ("OTHER", "1", None, "synthetic-unrelated"),
+            ("POS", "99", None, code_sets.SOURCE_POS),
+            ("RC", "0450", "Foreign revenue", "synthetic-foreign"),
+        ]
+        assert await session.scalar(text("SELECT local_generation FROM mrf.code_sets_result_generation")) == 0
         await session.execute(text("DELETE FROM mrf.code_catalog WHERE source='synthetic-foreign'"))
+    await _cancel_preparation(actors, candidate)
 
 
-async def _assert_partial_feed_retains_prior_code(sessions):
-    async with sessions() as session, session.begin():
-        async with code_sets.db.bind_existing_session(session):
-            import_counts = await code_sets.import_code_sets()
-            assert (import_counts["pos_rows"], import_counts["rc_rows"], import_counts["modifier_rows"]) == (1, 1, 1)
-    async with sessions() as session:
+async def _assert_partial_feed_retains_prior_code(actors):
+    import_counts = await _ordinary_preparation(actors)
+    assert (import_counts["pos_rows"], import_counts["rc_rows"], import_counts["modifier_rows"]) == (1, 1, 1)
+    candidate = import_counts[handoff.METRIC]
+    async with actors.builder.begin() as reader:
+        await reader.execute(text("LOCK TABLE mrf.code_catalog IN ACCESS SHARE MODE"))
+        before_oid = await reader.scalar(text("SELECT 'mrf.code_catalog'::regclass::oid"))
+        with pytest.raises(DBAPIError, match="lock"):
+            async with actors.publisher.begin() as publisher:
+                await handoff.publish_catalog_handoff(publisher, candidate, source_copy=_copy())
+        assert await reader.scalar(text("SELECT 'mrf.code_catalog'::regclass::oid")) == before_oid
+        assert await reader.scalar(text("SELECT count(*) FROM mrf.code_catalog")) == 2
+    async with actors.publisher.begin() as session:
+        receipt = await handoff.publish_catalog_handoff(session, candidate, source_copy=_copy())
+    async with actors.publisher.begin() as session:
+        assert await handoff.read_catalog_handoff_outcome(session, candidate) == receipt
+    async with actors.builder.begin() as session:
         catalog_sources = (
             (await session.execute(text("SELECT source FROM mrf.code_catalog ORDER BY source"))).scalars().all()
         )
@@ -159,6 +226,9 @@ async def _assert_partial_feed_retains_prior_code(sessions):
         ).one()
         assert generation[0:3] == (1, 1, 4)
         assert len(generation[3]) == 64
+        assert await session.scalar(text("SELECT 'mrf.code_catalog'::regclass::oid")) != before_oid
+    async with actors.publisher.begin() as session:
+        await cleanup_retained_catalog(session, receipt["retained"])
 
 
 @pytest.mark.asyncio
@@ -167,14 +237,19 @@ async def test_code_sets_rolls_back_late_failure_and_foreign_key_conflict(monkey
     dsn = _dsn()
     monkeypatch.setenv("HLTHPRT_DB_DATABASE", make_url(dsn).database)
     engine = create_async_engine(dsn)
-    sessions = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        await _seed_catalog(engine)
-        _stub_feeds(monkeypatch)
-        await _assert_late_failure_rolls_back(sessions, monkeypatch)
-        await _assert_foreign_conflict_rolls_back(sessions)
-        await _assert_partial_feed_retains_prior_code(sessions)
+        async with catalog_actors(engine, ["mrf"]) as actors:
+            await _seed_catalog(engine)
+            await seal_catalog(actors, "mrf", (CodeCatalog,), "code_sets_result_generation")
+            async with engine.begin() as connection:
+                await connection.execute(text(f'ALTER TABLE mrf.import_run OWNER TO "{actors.roles["builder"]}"'))
+            monkeypatch.setattr(
+                code_sets, "db", Database(engine=actors.builder.kw["bind"], session_factory=actors.builder)
+            )
+            monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
+            _stub_feeds(monkeypatch)
+            await _assert_late_failure_rolls_back(actors)
+            await _assert_foreign_conflict_rolls_back(actors)
+            await _assert_partial_feed_retains_prior_code(actors)
     finally:
-        async with engine.begin() as connection:
-            await connection.execute(text("DROP SCHEMA IF EXISTS mrf CASCADE"))
         await engine.dispose()
