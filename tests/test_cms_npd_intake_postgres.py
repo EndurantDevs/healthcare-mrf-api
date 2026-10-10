@@ -340,6 +340,61 @@ async def test_single_connection_pool_rejects_before_guard_or_staging(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("workers", [1, 2])
+async def test_complete_source_intake_uses_bounded_distinct_native_workers(monkeypatch, cms_artifact_root, workers):
+    """Hold actual batch transactions together, then execute their COPY, proof and witness writes."""
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MIN_SIZE", "1")
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", str(workers + 1))
+    directory, receipt = support.retained_release(cms_artifact_root)
+    original_persist = cms.persist_cms_dataset_rows
+    active_backends = set()
+    first_backends = set()
+    reached = asyncio.Event()
+    worker_counts_by_metric = {"peak": 0}
+
+    async def persist(fhir_module, session, model, batch_rows, candidate):
+        assert fhir_module.db._transaction_binding().session is session
+        connection = await session.connection()
+        backend = await connection.scalar(text("SELECT pg_backend_pid()"))
+        assert backend not in active_backends
+        active_backends.add(backend)
+        worker_counts_by_metric["peak"] = max(worker_counts_by_metric["peak"], len(active_backends))
+        assert worker_counts_by_metric["peak"] <= workers
+        try:
+            if not reached.is_set():
+                first_backends.add(backend)
+                if len(first_backends) == workers:
+                    reached.set()
+                async with asyncio.timeout(5):
+                    await reached.wait()
+            return await original_persist(fhir_module, session, model, batch_rows, candidate)
+        finally:
+            active_backends.remove(backend)
+
+    monkeypatch.setattr(cms, "persist_cms_dataset_rows", persist)
+    async with support.admission_database(monkeypatch) as database:
+        assert cms._source_stage_workers(fhir) == workers
+        async with asyncio.timeout(30):
+            admission_result = await _admit(directory, receipt, "bounded-native-owner")
+        assert worker_counts_by_metric["peak"] == len(first_backends) == workers and not active_backends
+        await _assert_unpublished(database, admission_result)
+        state = await fhir._endpoint_dataset_state(admission_result["dataset_id"])
+        assert state["status"] == fhir.ENDPOINT_DATASET_VALIDATED
+        assert state["import_run_id"] == state["acquisition_root_run_id"] == "bounded-native-owner"
+        expected_counts_by_type = {
+            kind: receipt["files"][name]["distinct_count"] for name, kind in cms.source.RESOURCE_FILES
+        }
+        resource_counts = await database.all(
+            "SELECT resource_type,count(*) AS rows FROM mrf.provider_directory_dataset_resource "
+            "WHERE dataset_id=:dataset GROUP BY resource_type",
+            dataset=admission_result["dataset_id"],
+        )
+        assert {
+            resource_count.resource_type: resource_count.rows for resource_count in resource_counts
+        } == expected_counts_by_type
+
+
+@pytest.mark.asyncio
 async def test_complete_intake_and_retry_preserve_owner_and_never_publish(monkeypatch, cms_artifact_root):
     """Use real migrations, admission, coverage and catalog SQL through retry and changed-vector recovery."""
     directory, receipt = support.retained_release(cms_artifact_root)

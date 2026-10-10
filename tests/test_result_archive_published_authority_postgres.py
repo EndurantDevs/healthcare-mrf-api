@@ -29,6 +29,29 @@ from process.ptg_parts.result_archive_source_authority import PtgResultArchiveSo
 from tests.test_result_archive_published_identity import _published_row
 
 
+def _is_guarded_test_service(url):
+    if url.host in {"127.0.0.1", "localhost"}:
+        return url.port is None or 1 <= url.port <= 65535
+    return url.host == "postgres" and url.port in {5432, 5440, None}
+
+
+@pytest.mark.parametrize(
+    "endpoint, expected",
+    [
+        ("127.0.0.1:16432", True),
+        ("localhost:16432", True),
+        ("localhost", True),
+        ("localhost:0", False),
+        ("localhost:65536", False),
+        ("postgres:5440", True),
+        ("postgres:16432", False),
+        ("example.invalid:5432", False),
+    ],
+)
+def test_guarded_native_test_service(endpoint, expected):
+    assert _is_guarded_test_service(make_url(f"postgresql://{endpoint}/synthetic_test")) is expected
+
+
 @asynccontextmanager
 async def _database():
     if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
@@ -37,7 +60,7 @@ async def _database():
     if not raw:
         pytest.skip("set the native PostgreSQL test DSN")
     url = make_url(raw).set(drivername="postgresql+asyncpg")
-    if url.host not in {"127.0.0.1", "localhost", "postgres"} or url.port not in {5432, 5440, None}:
+    if not _is_guarded_test_service(url):
         pytest.fail("published authority tests require a guarded PostgreSQL test service")
     engine = create_async_engine(url)
     name = "published_authority_" + uuid.uuid4().hex

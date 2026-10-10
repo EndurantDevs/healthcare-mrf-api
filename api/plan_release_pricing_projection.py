@@ -7,7 +7,6 @@ from typing import Any
 
 from sqlalchemy import text
 
-
 _PRICING_PROJECTION_SQL_TEMPLATE = """
        CASE
            WHEN pricing_projection.state = 'ready'
@@ -64,7 +63,7 @@ SELECT revision.serving_revision_id,
        EXISTS (
            SELECT 1
              FROM {schema}.ptg2_snapshot_pin pin
-            WHERE pin.owner_type = :pin_owner_type
+            WHERE pin.owner_type = {pin_owner_parameter}
               AND pin.owner_id = revision.serving_revision_id
               AND pin.snapshot_id = binding.snapshot_id
        ) AS is_pinned
@@ -74,7 +73,7 @@ SELECT revision.serving_revision_id,
   LEFT JOIN {schema}.ptg2_snapshot snapshot
     ON snapshot.snapshot_id = binding.snapshot_id
 {pricing_projection_join_sql}
- WHERE revision.plan_release_id = :plan_release_id
+ WHERE {release_predicate}
    AND revision.serving_status = 'published'
    AND revision.release_status = 'published'
    AND revision.is_current
@@ -89,10 +88,12 @@ def pricing_projection_relation(schema: str) -> str:
     return f"{schema}.plan_pricing_projection_candidate"
 
 
-def plan_release_serving_sql(
+def _plan_release_serving_sql(
     schema: str,
     *,
     include_pricing_projection: bool,
+    release_predicate: str,
+    pin_owner_parameter: str,
 ) -> str:
     """Build release resolution SQL with an optional projection binding."""
 
@@ -106,21 +107,37 @@ def plan_release_serving_sql(
         if include_pricing_projection
         else ""
     )
-    projection_id_sql = (
-        _PRICING_PROJECTION_ID_SQL
-        if include_pricing_projection
-        else "       NULL::varchar(64)"
-    )
+    projection_id_sql = _PRICING_PROJECTION_ID_SQL if include_pricing_projection else "       NULL::varchar(64)"
     projection_contract_sql = (
-        _PRICING_PROJECTION_CONTRACT_SQL
-        if include_pricing_projection
-        else "       NULL::varchar(64)"
+        _PRICING_PROJECTION_CONTRACT_SQL if include_pricing_projection else "       NULL::varchar(64)"
     )
     return _PLAN_RELEASE_SERVING_SQL_TEMPLATE.format(
         schema=schema,
         pricing_projection_id_sql=projection_id_sql,
         pricing_projection_contract_sql=projection_contract_sql,
         pricing_projection_join_sql=projection_join_sql,
+        release_predicate=release_predicate,
+        pin_owner_parameter=pin_owner_parameter,
+    )
+
+
+def plan_release_serving_sql(schema: str, *, include_pricing_projection: bool) -> str:
+    """Build the original singleton query without changing its predicates."""
+    return _plan_release_serving_sql(
+        schema,
+        include_pricing_projection=include_pricing_projection,
+        release_predicate="revision.plan_release_id = :plan_release_id",
+        pin_owner_parameter=":pin_owner_type",
+    )
+
+
+def plan_release_binding_set_sql(schema: str, *, include_pricing_projection: bool) -> str:
+    """Build complete native-driver binding metadata for one bound release set."""
+    return _plan_release_serving_sql(
+        schema,
+        include_pricing_projection=include_pricing_projection,
+        release_predicate="revision.plan_release_id = ANY($1::text[])",
+        pin_owner_parameter="$2",
     )
 
 

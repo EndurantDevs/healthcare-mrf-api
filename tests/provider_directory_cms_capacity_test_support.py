@@ -2,6 +2,7 @@
 """Real signed Profile pairs and closed CMS receipts using the existing synthetic key."""
 
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 
 from process import provider_directory_cms_capacity_contract as contract
@@ -14,6 +15,7 @@ from tests.test_provider_directory_profile_capacity_attestation import (
     VALIDATION_TIME,
     _golden_body,
     _signed_envelope,
+    _trust,
     _verify,
 )
 from tests.test_provider_directory_profile_selection_desired import _desired, _selection_rows
@@ -118,7 +120,7 @@ def rehash_guard(guard):
     )
 
 
-def sign_guard(guard, *, cms=False):
+def sign_guard(guard, *, cms=False, database_identity=None):
     """Sign all changed content with the golden Ed25519 key, preserving runtime witness fields."""
 
     def mutate(body):
@@ -132,6 +134,9 @@ def sign_guard(guard, *, cms=False):
                 guard,
             ),
         )
+        if database_identity is not None:
+            assert set(database_identity) == {"database_oid", "database_name", "database_system_identifier"}
+            body.update(database_identity)
         if cms:
             body["reservation_id"] = "synthetic-nonprofile"
             for volume in body["volumes"]:
@@ -142,9 +147,9 @@ def sign_guard(guard, *, cms=False):
     return _signed_envelope(body_mutator=mutate)
 
 
-def paired_profile_envelope(execution=None):
+def paired_profile_envelope(execution=None, *, database_identity=None):
     """Return a current signed Profile-purpose lease for the exact desired CMS execution."""
-    return sign_guard(_profile_guard(execution or cms_execution()))
+    return sign_guard(_profile_guard(execution or cms_execution()), database_identity=database_identity)
 
 
 def cms_plan():
@@ -199,11 +204,11 @@ def cms_limits(plan):
     }
 
 
-def cms_guard(plan=None, *, execution=None, paired_envelope=None):
+def cms_guard(plan=None, *, execution=None, paired_envelope=None, retention_policy=None, database_identity=None):
     """Build explicit CMS v4/Control v2 receipts over a complete nonprofile plan."""
     execution = execution or cms_execution()
     plan = plan or cms_plan()[0]
-    pair = paired_envelope or paired_profile_envelope(execution)
+    pair = paired_envelope or paired_profile_envelope(execution, database_identity=database_identity)
     guard = _profile_guard(execution)
     admission_by_field = {
         "contract_id": contract.CMS_ADMISSION_REQUEST_CONTRACT,
@@ -211,6 +216,10 @@ def cms_guard(plan=None, *, execution=None, paired_envelope=None):
         "paired_profile_lease": pair,
         "limits": cms_limits(plan),
     }
+    if retention_policy is not None:
+        admission_by_field["registry_source_retention"] = contract.validated_registry_source_retention_policy(
+            retention_policy
+        )
     guard["control_plane_request"].update(
         contract_id=contract.CMS_CONTROL_REQUEST_CONTRACT,
         **{contract.CMS_ADMISSION_FIELD: deepcopy(admission_by_field)},
@@ -248,9 +257,20 @@ def cms_guard(plan=None, *, execution=None, paired_envelope=None):
     return guard
 
 
-def signed_cms_plan(plan):
+def signed_cms_plan(plan, *, retention_policy=None, execution=None, database_identity=None):
     """Return actual CMS signature verification, never a Profile-only guard stand-in."""
-    return _verify(sign_guard(cms_guard(plan), cms=True), expected_capacity_geometry_hash=plan.capacity_geometry_hash)
+    return _verify(
+        sign_guard(
+            cms_guard(
+                plan, retention_policy=retention_policy, execution=execution, database_identity=database_identity
+            ),
+            cms=True,
+            database_identity=database_identity,
+        ),
+        expected_capacity_geometry_hash=plan.capacity_geometry_hash,
+        **({"trust": replace(_trust(), **database_identity)} if database_identity else {}),
+        **({"expected_" + field: value for field, value in database_identity.items()} if database_identity else {}),
+    )
 
 
 def cms_request(*, projection=False):

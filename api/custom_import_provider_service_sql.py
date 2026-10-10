@@ -165,9 +165,7 @@ def _native_claims_statements(
 ) -> ProviderServiceClaimsStatements:
     native_relation = native_grouped_statement.subquery()
     count_statement = select(func.count()).select_from(native_relation)
-    page_statement = _ordered_provider_service_statement(
-        select(native_relation), native_relation, order_by, order, include_npi_tiebreak=False
-    )
+    page_statement = _ordered_provider_service_statement(select(native_relation), native_relation, order_by, order)
     return ProviderServiceClaimsStatements(count_statement, page_statement)
 
 
@@ -194,7 +192,6 @@ def _imported_claims_statements(
             claims_relation.native_relation,
             order_by,
             order,
-            include_npi_tiebreak=True,
         )
     return ProviderServiceClaimsStatements(count_statement, page_statement)
 
@@ -204,8 +201,6 @@ def _ordered_provider_service_statement(
     native_relation: object,
     order_by: str,
     order: str,
-    *,
-    include_npi_tiebreak: bool,
 ) -> Select:
     cost_index_expr = case(
         (
@@ -222,7 +217,7 @@ def _ordered_provider_service_statement(
         allowed = ", ".join(sorted(order_fields))
         raise InvalidUsage(f"Unsupported order_by '{order_by}'. Allowed: {allowed}")
     ordered_statement = statement.order_by(order_column.asc() if order == "asc" else order_column.desc())
-    return ordered_statement.order_by(native_relation.c.npi.asc()) if include_npi_tiebreak else ordered_statement
+    return ordered_statement.order_by(native_relation.c.npi.asc())
 
 
 def _provider_service_order_fields(native_relation: object, cost_index_expr: object) -> dict[str, object]:

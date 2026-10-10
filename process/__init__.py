@@ -1,5 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from process.registry_required_target_cli_preflight import preflight_module_arguments
+
+preflight_module_arguments()
+
 import asyncio
 import json
 import os
@@ -56,17 +60,9 @@ from process.attributes import (
 )
 from process.attributes import shutdown as attr_shutdown
 from process.attributes import startup as attr_startup
-from process.claims_pricing import (
-    claims_pricing_finalize,
-    claims_pricing_process_chunk,
-    claims_pricing_start,
-)
-from process.claims_pricing import (
-    finish_main as finish_claims_pricing,
-)
-from process.claims_pricing import (
-    main as initiate_claims_pricing,
-)
+from process.claims_pricing import claims_pricing_finalize, claims_pricing_process_chunk, claims_pricing_start
+from process.claims_pricing import finish_main as finish_claims_pricing
+from process.claims_pricing import main as initiate_claims_pricing
 from process.clinical_reference import main as initiate_clinical_reference
 from process.cms_doctors import main as initiate_cms_doctors
 from process.cms_doctors import process_data as process_cms_doctors_data
@@ -80,17 +76,9 @@ from process.control_lifecycle import (
 from process.control_lifecycle import (
     control_single_job_start as _control_single_job_start,
 )
-from process.drug_claims import (
-    drug_claims_finalize,
-    drug_claims_process_chunk,
-    drug_claims_start,
-)
-from process.drug_claims import (
-    finish_main as finish_drug_claims,
-)
-from process.drug_claims import (
-    main as initiate_drug_claims,
-)
+from process.drug_claims import drug_claims_finalize, drug_claims_process_chunk, drug_claims_start
+from process.drug_claims import finish_main as finish_drug_claims
+from process.drug_claims import main as initiate_drug_claims
 from process.entity_address_unified import main as initiate_entity_address_unified
 from process.entity_address_unified import process_data as process_entity_address_unified_data
 from process.entity_address_unified import shutdown as entity_address_unified_shutdown
@@ -198,27 +186,13 @@ from process.provider_directory_fhir_census_contract import (
 from process.provider_directory_selection_receipt_backfill import (
     backfill_provider_directory_selection_receipt,
 )
-from process.provider_enrichment import (
-    main as initiate_provider_enrichment,
-)
-from process.provider_enrichment import (
-    process_data as process_provider_enrichment_data,
-)
-from process.provider_enrichment import (
-    save_provider_enrichment_data,
-)
-from process.provider_enrichment import (
-    shutdown as provider_enrichment_shutdown,
-)
-from process.provider_enrichment import (
-    startup as provider_enrichment_startup,
-)
-from process.provider_quality import (
-    finish_main as finish_provider_quality,
-)
-from process.provider_quality import (
-    main as initiate_provider_quality,
-)
+from process.provider_enrichment import main as initiate_provider_enrichment
+from process.provider_enrichment import process_data as process_provider_enrichment_data
+from process.provider_enrichment import save_provider_enrichment_data
+from process.provider_enrichment import shutdown as provider_enrichment_shutdown
+from process.provider_enrichment import startup as provider_enrichment_startup
+from process.provider_quality import finish_main as finish_provider_quality
+from process.provider_quality import main as initiate_provider_quality
 from process.provider_quality import (
     provider_quality_finalize,
     provider_quality_materialize_domain_shard,

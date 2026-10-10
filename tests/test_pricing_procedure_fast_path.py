@@ -58,10 +58,7 @@ def test_single_code_consecutive_pages_break_amount_ties_by_npi(
     )
 
     for query in queries:
-        assert tuple(
-            str(clause).rsplit(".", 1)[-1]
-            for clause in query._order_by_clauses
-        ) == expected_order
+        assert tuple(str(clause).rsplit(".", 1)[-1] for clause in query._order_by_clauses) == expected_order
 
 
 @pytest.mark.asyncio
@@ -94,20 +91,10 @@ async def test_single_code_taxonomy_uses_precomputed_signal():
     )
 
     assert evidence == [pricing_module._taxonomy_evidence_item(evidence_by_field)]
-    statements = [
-        str(execution_args[0])
-        for execution_args, _execution_kwargs in session.executions
-    ]
+    statements = [str(execution_args[0]) for execution_args, _execution_kwargs in session.executions]
     assert any("procedure_taxonomy_signal" in statement for statement in statements)
-    assert any(
-        "source_relation_fingerprint" in statement
-        and "to_regclass" in statement
-        for statement in statements
-    )
-    assert not any(
-        "FROM mrf.pricing_provider_procedure" in statement
-        for statement in statements
-    )
+    assert any("source_relation_fingerprint" in statement and "to_regclass" in statement for statement in statements)
+    assert not any("FROM mrf.pricing_provider_procedure" in statement for statement in statements)
 
 
 @pytest.mark.asyncio
@@ -149,12 +136,8 @@ async def test_taxonomy_signal_unavailable_keeps_existing_query():
 async def test_single_code_default_search_avoids_repeated_grouping(monkeypatch):
     """Use precomputed totals and one ordered provider-page query."""
 
-    monkeypatch.setattr(
-        pricing_module, "_resolve_internal_codes_for_request", _resolve_single_internal_code
-    )
-    monkeypatch.setattr(
-        pricing_module, "_enrich_provider_service_cost_indices", _skip_cost_enrichment
-    )
+    monkeypatch.setattr(pricing_module, "_resolve_internal_codes_for_request", _resolve_single_internal_code)
+    monkeypatch.setattr(pricing_module, "_enrich_provider_service_cost_indices", _skip_cost_enrichment)
     provider_by_field = {
         "npi": 1000000001,
         "provider_name": "Synthetic Provider",
@@ -188,21 +171,11 @@ async def test_single_code_default_search_avoids_repeated_grouping(monkeypatch):
             False,
         )
     ]
-    statements = [
-        str(execution_args[0])
-        for execution_args, _execution_kwargs in request.ctx.sa_session.executions
-    ]
-    provider_statements = [
-        statement
-        for statement in statements
-        if "pricing_provider_procedure" in statement
-    ]
+    statements = [str(execution_args[0]) for execution_args, _execution_kwargs in request.ctx.sa_session.executions]
+    provider_statements = [statement for statement in statements if "pricing_provider_procedure" in statement]
     assert len(provider_statements) == 1
     assert "GROUP BY" not in provider_statements[0]
-    assert any(
-        "pricing_procedure.provider_count" in statement
-        for statement in statements
-    )
+    assert any("pricing_procedure.provider_count" in statement for statement in statements)
 
 
 @pytest.mark.asyncio
@@ -211,14 +184,17 @@ async def test_single_code_default_search_avoids_repeated_grouping(monkeypatch):
     ({"min_claims": "12"}, {"min_total_cost": "120"}, {"min_claims": "12", "min_total_cost": "120"}),
 )
 async def test_native_claims_thresholds_filter_rows_before_count_and_page(monkeypatch, thresholds):
-    monkeypatch.setattr(
-        pricing_module, "_resolve_internal_codes_for_request", _resolve_single_internal_code
-    )
+    monkeypatch.setattr(pricing_module, "_resolve_internal_codes_for_request", _resolve_single_internal_code)
     request = make_request(
         [FakeResult(scalar=0), FakeResult(rows=[])],
         args={
-            "code": "99213", "code_system": "CPT", "year": "2023",
-            "limit": "2", "offset": "4", "order": "asc", **thresholds,
+            "code": "99213",
+            "code_system": "CPT",
+            "year": "2023",
+            "limit": "2",
+            "offset": "4",
+            "order": "asc",
+            **thresholds,
         },
     )
 
@@ -243,5 +219,8 @@ async def test_native_claims_thresholds_filter_rows_before_count_and_page(monkey
         assert "custom_import" not in statement
     assert "LIMIT" not in statements[0] and "OFFSET" not in statements[0]
     page_query = request.ctx.sa_session.executions[-1][0][0]
-    assert tuple(str(clause).rsplit(".", 1)[-1] for clause in page_query._order_by_clauses) == ("total_allowed_amount ASC",)
+    assert tuple(str(clause).rsplit(".", 1)[-1] for clause in page_query._order_by_clauses) == (
+        "total_allowed_amount ASC",
+        "npi ASC",
+    )
     assert "LIMIT 2 OFFSET 4" in statements[1]

@@ -43,6 +43,7 @@ from process.provider_directory_profile_runtime_observation import (
     assert_capacity_lease_matches_runtime_observation,
     observe_profile_runtime,
 )
+from process.provider_directory_profile_temp_limit import apply_temp_file_limit
 
 
 @dataclass(frozen=True)
@@ -63,9 +64,9 @@ def _error(reason):
     return RuntimeError("provider_directory_cms_capacity_" + reason)
 
 
-async def _runtime_settings(session, limits):
+async def _runtime_settings(session, limits, database):
     """Bound every preflight backend; these reads never inherit unbounded temp."""
-    await session.execute(text(f"SET LOCAL temp_file_limit='{limits['temp_file_limit_bytes_per_backend'] // 1024}kB'"))
+    await apply_temp_file_limit(database, limits["temp_file_limit_bytes_per_backend"])
     await session.execute(text("SET LOCAL max_parallel_workers_per_gather=0"))
     await session.execute(text("SET LOCAL max_parallel_maintenance_workers=0"))
     await session.execute(text("SET LOCAL lock_timeout='5s'"))
@@ -156,7 +157,7 @@ async def _read_inputs(fhir, request, profile_lease):
     resource_types = fhir._provider_directory_artifact_resource_types(artifact_targets, publish_corroboration=False)
     async with fhir.db.transaction() as session:
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-        await _runtime_settings(session, limits)
+        await _runtime_settings(session, limits, fhir.db)
         await fhir.assert_profile_selection_current_in_transaction(
             execution.attestation, fhir._provider_directory_profile_selection_catalog()
         )
@@ -179,6 +180,10 @@ async def _read_inputs(fhir, request, profile_lease):
             worker_count=limits["worker_count"],
             temp_file_limit_bytes_per_backend=limits["temp_file_limit_bytes_per_backend"],
         )
+        if "registry_source_retention" in request.cms_nonprofile_admission:
+            address = address.with_registry_source_retention(
+                request.cms_nonprofile_admission["registry_source_retention"]
+            )
         plan = _monitored_plan(request, profile_lease, fence, projection, address, artifact_targets, resource_types)
         observed = await _database_observation(fhir, plan)
         _assert_runtime_storage(plan, profile_lease, observed)
@@ -286,7 +291,7 @@ async def _issue_receipt(fhir, request, inputs, profile_lease):
         # Existing admission/table locks serialize every ledger read and write.
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
         await session.execute(text("SET LOCAL statement_timeout='5s'"))
-        await _runtime_settings(session, request.cms_nonprofile_admission["limits"])
+        await _runtime_settings(session, request.cms_nonprofile_admission["limits"], fhir.db)
         await _assert_current_inputs(fhir, request, inputs, profile_lease, session)
         await fhir._lock_profile_capacity_preflight_state(schema)
         if (await _verified_pair(fhir, request)).lease_digest != profile_lease.lease_digest:

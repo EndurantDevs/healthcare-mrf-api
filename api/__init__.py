@@ -11,6 +11,7 @@ from api.control_admission_batch import register_batch_response_deadline
 from api.control_execution_evidence import blueprint as execution_evidence_blueprint
 from api.control_execution_stop import blueprint as execution_stop_blueprint
 from api.control_registration_authority import blueprint as registration_authority_blueprint
+from api.control_registry_ptg_scope import blueprint as registry_ptg_scope_control_blueprint
 from api.control_source_batch import blueprint as source_batch_blueprint
 from api.endpoint.clinical import blueprint as v1_clinical
 from api.endpoint.codes import blueprint as v1_codes
@@ -23,6 +24,10 @@ from api.endpoint.healthcheck import blueprint as v1_healthcheck
 from api.endpoint.hospital_prices import blueprint as v1_hospital_prices
 from api.endpoint.importer import blueprint as v1_import
 from api.endpoint.issuer import blueprint as v1_issuer
+from api.endpoint.network_catalog import blueprint as v1_network_catalog
+from api.endpoint.network_catalog import register_network_catalog_private_responses
+from api.endpoint.network_providers import blueprint as v1_network_providers
+from api.endpoint.network_serving import blueprint as v1_network_serving
 from api.endpoint.npi import blueprint as v1_npi
 from api.endpoint.nucc import blueprint as v1_nucc
 from api.endpoint.partd_formulary import blueprint as v1_partd_formulary
@@ -30,6 +35,8 @@ from api.endpoint.pharmacy_license import blueprint as v1_pharmacy_license
 from api.endpoint.plan import blueprint as v1_plan
 from api.endpoint.pricing import blueprint as v1_pricing
 from api.endpoint.provider_directory_entities import blueprint as v1_provider_directory_entities
+from api.endpoint.registry_management import blueprint as v1_registry_management
+from api.endpoint.registry_publication import blueprint as v1_registry_publication
 from api.endpoint.reports import blueprint as v1_reports
 from api.endpoint.site_intelligence import blueprint as v1_site_intelligence
 from api.metrics import blueprint as metrics_blueprint
@@ -45,6 +52,7 @@ from api.runtime_identity import add_runtime_identity_headers
 from api.server_timing import register_server_timing
 from api.worker_memory import register_worker_memory_lifecycle
 from db.connection import db
+from process.registry_ptg_scope_runtime import register_registry_ptg_scope_runtime
 
 profile_capacity_blueprint = Blueprint("profile_capacity_control", url_prefix="/control")
 register_profile_capacity_preflight_route(profile_capacity_blueprint)
@@ -69,16 +77,19 @@ def init_api(api):
 
     register_server_timing(api)
     register_batch_response_deadline(api)
+    register_registry_ptg_scope_runtime(api)
     db.init_app(api)
     register_worker_memory_lifecycle(api)
     api.register_middleware(_capacity_process_request_guard, "request")
     api.register_middleware(require_internal_plan_release_read, "request")
     api.register_middleware(add_runtime_identity_headers, "response")
+    register_network_catalog_private_responses(api)
     api.blueprint(control_blueprint)
     api.blueprint(admission_batch_blueprint)
     api.blueprint(source_batch_blueprint)
     api.blueprint(execution_evidence_blueprint)
     api.blueprint(execution_stop_blueprint)
+    api.blueprint(registry_ptg_scope_control_blueprint, url_prefix="/control/v1/registry/ptg-source-scopes")
     api.blueprint(registration_authority_blueprint)
     api.blueprint(profile_capacity_blueprint)
     api.blueprint(metrics_blueprint)
@@ -102,6 +113,11 @@ def init_api(api):
             v1_partd_formulary,
             v1_pharmacy_license,
             v1_reports,
+            v1_registry_management,
+            v1_network_serving,
+            v1_network_catalog,
+            v1_network_providers,
+            v1_registry_publication,
             v1_provider_directory_entities,
             v1_site_intelligence,
         ],

@@ -43,7 +43,7 @@ def staged_rows(monkeypatch):
 
     monkeypatch.setattr(education.db, "create_table", AsyncMock())
     monkeypatch.setattr(education.db, "status", AsyncMock())
-    monkeypatch.setattr(education, "push_objects", retain_batch)
+    monkeypatch.setattr(education, "_copy_sidecar_rows", retain_batch)
     monkeypatch.setattr(education, "raise_if_cancelled", AsyncMock())
     return rows
 
@@ -61,7 +61,9 @@ def staged_rows(monkeypatch):
 )
 def test_education_keeps_source_partials_without_inventing_experience(school, year, expected):
     row = education.doctor_education_row(
-        {"npi": NPI, "med_sch": school, "grd_yr": year}, 12, MANIFEST,
+        {"npi": NPI, "med_sch": school, "grd_yr": year},
+        12,
+        MANIFEST,
     )
     if expected is None:
         assert row is None
@@ -152,7 +154,10 @@ async def test_configured_dataset_identity_is_retained_in_rows_and_receipt(tmp_p
     source_path = tmp_path / "national.csv"
     source_path.write_text(f"NPI,Med_sch,Grd_yr\n{NPI},Example School,2001\n")
     receipt = await education.import_doctor_education(
-        source_path, SOURCE_URL, {"import_date": "educationtests", "context": {}}, {},
+        source_path,
+        SOURCE_URL,
+        {"import_date": "educationtests", "context": {}},
+        {},
         "synthetic-cms-dataset",
     )
     assert receipt["dataset_id"] == "synthetic-cms-dataset"
@@ -171,7 +176,10 @@ async def test_csv_and_zip_preserve_bom_quoted_fields_and_artifact_identity(tmp_
     else:
         source_path.write_bytes(payload)
     receipt = await education.import_doctor_education(
-        source_path, SOURCE_URL, {"import_date": "educationtests", "context": {}}, {},
+        source_path,
+        SOURCE_URL,
+        {"import_date": "educationtests", "context": {}},
+        {},
     )
     assert receipt["source_rows"] == receipt["education_rows"] == 1
     assert receipt["content_sha256"] == hashlib.sha256(source_path.read_bytes()).hexdigest()
@@ -207,7 +215,10 @@ async def test_import_rejects_changed_or_malformed_csv(tmp_path, staged_rows, pa
     source_path.write_text(payload, encoding="utf-8")
     with pytest.raises(error, match=match):
         await education.import_doctor_education(
-            source_path, SOURCE_URL, {"import_date": "educationtests", "context": {}}, {},
+            source_path,
+            SOURCE_URL,
+            {"import_date": "educationtests", "context": {}},
+            {},
         )
     assert staged_rows == []
     education.db.status.assert_awaited_once()
@@ -222,8 +233,10 @@ async def test_test_mode_limits_physical_input_rows(tmp_path, staged_rows, monke
         encoding="utf-8",
     )
     receipt = await education.import_doctor_education(
-        source_path, SOURCE_URL,
-        {"import_date": "educationtests", "context": {"test_mode": True}}, {},
+        source_path,
+        SOURCE_URL,
+        {"import_date": "educationtests", "context": {"test_mode": True}},
+        {},
     )
     assert receipt["source_rows"] == 2
     assert receipt["education_rows"] == len(staged_rows) == 1
@@ -235,7 +248,10 @@ async def test_existing_stage_creation_failure_never_drops_unowned_table(tmp_pat
     education.db.create_table.side_effect = RuntimeError("stage already exists")
     with pytest.raises(RuntimeError, match="stage already exists"):
         await education.import_doctor_education(
-            source_path, SOURCE_URL, {"import_date": "educationtests", "context": {}}, {},
+            source_path,
+            SOURCE_URL,
+            {"import_date": "educationtests", "context": {}},
+            {},
         )
     education.db.status.assert_not_awaited()
     assert staged_rows == []
@@ -244,7 +260,8 @@ async def test_existing_stage_creation_failure_never_drops_unowned_table(tmp_pat
 @pytest.mark.parametrize("is_owned", [False, True])
 async def test_discard_only_removes_owned_stage_once(staged_rows, is_owned):
     worker_context_by_key = {
-        "import_date": "educationtests", "context": {"education_stage_owned": is_owned},
+        "import_date": "educationtests",
+        "context": {"education_stage_owned": is_owned},
     }
     await education.discard_education_stage(worker_context_by_key)
     await education.discard_education_stage(worker_context_by_key)
@@ -256,6 +273,7 @@ async def test_discard_only_removes_owned_stage_once(staged_rows, is_owned):
 
 async def test_address_failure_discards_completed_education_stage(tmp_path, staged_rows, monkeypatch):
     import aiohttp
+
     cms_doctors = importlib.import_module("process.cms_doctors")
 
     async def download_source(_client, _url, source_path):
@@ -270,7 +288,8 @@ async def test_address_failure_discards_completed_education_stage(tmp_path, stag
     monkeypatch.setattr(cms_doctors, "_fetch_doctors_download_url", AsyncMock(return_value=SOURCE_URL))
     monkeypatch.setattr(cms_doctors, "_download_doctors_source", download_source)
     monkeypatch.setattr(
-        cms_doctors, "retain_doctors_artifact",
+        cms_doctors,
+        "retain_doctors_artifact",
         lambda path, _url: {"content_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()},
     )
     monkeypatch.setattr(cms_doctors, "import_group_site_rows", AsyncMock(return_value={"source_rows": 1}))
@@ -292,7 +311,10 @@ async def test_publication_validation_failure_discards_owned_stage(tmp_path, sta
     source_path.write_text(f"NPI,Med_sch,Grd_yr\n{NPI},Example School,2001\n")
     worker_context_by_key = {"import_date": "educationtests", "context": {"run": 1}}
     worker_context_by_key["context"]["education"] = await education.import_doctor_education(
-        source_path, SOURCE_URL, worker_context_by_key, {},
+        source_path,
+        SOURCE_URL,
+        worker_context_by_key,
+        {},
     )
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
     monkeypatch.setattr(cms_doctors.db, "scalar", AsyncMock(return_value=20_000))
@@ -316,7 +338,10 @@ async def test_import_retains_addressless_conflicts_and_deduplicates_across_batc
         writer.writerow([NPI, "Second Example School", "2001", ""])
         writer.writerow([NPI, "", "", ""])
     receipt = await education.import_doctor_education(
-        source_path, SOURCE_URL, {"import_date": "educationtests", "context": {}}, {},
+        source_path,
+        SOURCE_URL,
+        {"import_date": "educationtests", "context": {}},
+        {},
     )
     assert receipt["source_rows"] == 5_003
     assert receipt["education_rows"] == 2
@@ -391,7 +416,8 @@ async def _create_generation_fixture(connection, schema, dsn):
     )
     await connection.execute(
         f"INSERT INTO {schema}.reference_family_result_generation "
-        "(importer_id, local_lineage_id, local_generation) VALUES ('cms-doctors', $1, 0)", uuid.uuid4(),
+        "(importer_id, local_lineage_id, local_generation) VALUES ('cms-doctors', $1, 0)",
+        uuid.uuid4(),
     )
     await install_source_generation_guards_from_dsn(dsn, schema)
     return await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation")
@@ -400,18 +426,43 @@ async def _create_generation_fixture(connection, schema, dsn):
 async def _assert_published_generation(connection, database, schema, generation_before):
     generation = importlib.import_module("process.reference_family_result_generation")
     authority = await generation.read_reference_family_result_generation_authority(
-        database, importer_id="cms-doctors", schema_name=schema,
+        database,
+        importer_id="cms-doctors",
+        schema_name=schema,
     )
     assert authority.local_generation == 1
     assert authority.serving_generation.origin_lineage_id == str(generation_before["local_lineage_id"])
     assert authority.serving_generation.origin_generation == 1
-    assert authority.relation_oids == tuple([
-        await connection.fetchval("SELECT $1::regclass::oid::bigint", f"{schema}.{name}")
-        for name in ("doctor_clinician_address", "cms_doctor_education", "cms_doctor_group_site")
-    ])
-    assert await generation.capture_reference_family_serving_generation(
-        database, importer_id="cms-doctors", schema_name=schema,
-    ) == authority.serving_generation
+    assert authority.relation_oids == tuple(
+        [
+            await connection.fetchval("SELECT $1::regclass::oid::bigint", f"{schema}.{name}")
+            for name in ("doctor_clinician_address", "cms_doctor_education", "cms_doctor_group_site")
+        ]
+    )
+    assert (
+        await generation.capture_reference_family_serving_generation(
+            database,
+            importer_id="cms-doctors",
+            schema_name=schema,
+        )
+        == authority.serving_generation
+    )
+
+
+async def _assert_swapped_doctors_markers(connection, schema):
+    """Check all current and retained markers after the genuine atomic swap."""
+    await _assert_publication_markers(
+        connection,
+        schema,
+        {
+            "doctor_clinician_address": "new_address",
+            "cms_doctor_education": "new_education",
+            "cms_doctor_group_site": "new_group",
+            "doctor_clinician_address_old": "live_address",
+            "cms_doctor_education_old": "live_education",
+            "cms_doctor_group_site_old": "live_group",
+        },
+    )
 
 
 async def test_native_postgres_publication_rolls_back_both_tables_on_education_failure(monkeypatch):
@@ -420,6 +471,7 @@ async def test_native_postgres_publication_rolls_back_both_tables_on_education_f
     if not dsn:
         pytest.skip("set HLTHPRT_CMS_EDUCATION_POSTGRES_DSN for the PostgreSQL proof")
     import asyncpg
+
     cms_doctors = importlib.import_module("process.cms_doctors")
     groups = importlib.import_module("process.cms_doctors_groups")
 
@@ -442,7 +494,9 @@ async def test_native_postgres_publication_rolls_back_both_tables_on_education_f
             await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
         assert postgres_sqlstate(missing_stage.value) == "42P01"
         await _assert_publication_markers(connection, schema, marker_by_table)
-        assert await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation") == generation_before
+        assert (
+            await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation") == generation_before
+        )
         await connection.execute(f"CREATE TABLE {schema}.cms_doctor_education_educationtests (marker text)")
         await connection.execute(f"INSERT INTO {schema}.cms_doctor_education_educationtests VALUES ('new_education')")
         await connection.execute(f"CREATE TABLE {schema}.cms_doctor_group_site_educationtests (marker text)")
@@ -456,17 +510,14 @@ async def test_native_postgres_publication_rolls_back_both_tables_on_education_f
             await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
         assert postgres_sqlstate(rejected_generation.value) == "23514"
         await _assert_publication_markers(connection, schema, marker_by_table)
-        assert await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation") == generation_before
-        await connection.execute(f"ALTER TABLE {schema}.reference_family_result_generation DROP CONSTRAINT reject_advance")
+        assert (
+            await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation") == generation_before
+        )
+        await connection.execute(
+            f"ALTER TABLE {schema}.reference_family_result_generation DROP CONSTRAINT reject_advance"
+        )
         await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
-        await _assert_publication_markers(connection, schema, {
-            "doctor_clinician_address": "new_address",
-            "cms_doctor_education": "new_education",
-            "cms_doctor_group_site": "new_group",
-            "doctor_clinician_address_old": "live_address",
-            "cms_doctor_education_old": "live_education",
-            "cms_doctor_group_site_old": "live_group",
-        })
+        await _assert_swapped_doctors_markers(connection, schema)
         await _assert_published_generation(connection, database, schema, generation_before)
     finally:
         await database.disconnect()

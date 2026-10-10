@@ -110,6 +110,8 @@ def test_diagnostic_projection_cannot_reinterpret_legacy_admission():
 @pytest.mark.asyncio
 async def test_settled_actual_allows_next_window_when_cumulative_forecasts_do_not(admitted_window):
     admission, state = admitted_window
+    # This isolated window schedules no profile-target replacement.
+    await fhir._complete_profile_capacity_relation_class("profile_target")
     for _ in range(2):
         async with fhir._profile_capacity_mutation_window("evidence_stage", ("stage",)):
             await _reserve(admission)
@@ -131,7 +133,7 @@ async def test_uncertain_or_overrun_window_retains_every_charge(admitted_window,
             await _reserve(admission)
             if failure == "cancel":
                 raise asyncio.CancelledError()
-            state.wal = 701 if failure == "wal" else 100
+            state.wal = 1001 if failure == "wal" else 100
             state.sizes["stage"] = 151 if failure == "data" else 110
             state.expired = failure == "deadline"
             if failure == "observe":
@@ -175,7 +177,7 @@ async def test_all_nine_artifact_relations_and_pending_growth_share_the_cap(admi
 
 
 @pytest.mark.asyncio
-async def test_reservation_includes_other_relation_control_and_metadata_pending(admitted_window, monkeypatch):
+async def test_reservation_keeps_control_metadata_and_full_unfinished_relation_caps(admitted_window, monkeypatch):
     admission, _ = admitted_window
     tracker = admission.wal_tracker
     tracker.pending_relation_wal_bytes["profile_stage"] = 20
@@ -189,12 +191,16 @@ async def test_reservation_includes_other_relation_control_and_metadata_pending(
         await fhir._reserve_provider_directory_profile_wal_budget(admission, relation_wal_bytes={"evidence_stage": 400})
     finally:
         fhir._PROFILE_CAPACITY_MUTATION_WINDOW.reset(token)
-    assert validate.call_args.args[1] == 20 + 70 + 100 + 400
+    assert validate.call_args.args[1] == 70 + 100
+    assert validate.call_args.args[2] >= fhir._profile_relation_wal_candidate(admission, {})[2]
+    assert tracker.pending_relation_wal_bytes == {"profile_stage": 20, "evidence_stage": 400}
 
 
 @pytest.mark.asyncio
 async def test_worker_barrier_precedes_settlement(admitted_window):
     admission, state = admitted_window
+    # This isolated window schedules no profile-target replacement.
+    await fhir._complete_profile_capacity_relation_class("profile_target")
     release, first_done = asyncio.Event(), asyncio.Event()
 
     async def worker(wait):
@@ -224,6 +230,8 @@ async def test_worker_barrier_precedes_settlement(admitted_window):
 @pytest.mark.asyncio
 async def test_target_growth_uses_the_original_baseline(admitted_window):
     admission, state = admitted_window
+    # This isolated window schedules no profile-target replacement.
+    await fhir._complete_profile_capacity_relation_class("profile_target")
     tracker = admission.wal_tracker
     state.sizes["target"] = 10_000
     tracker.target_bytes_before["evidence_target"] = 10_000
@@ -330,16 +338,19 @@ def _final_metadata_state(admission, state):
         }
     )
     tracker.accounted_metadata_wal_bytes = tracker.pending_metadata_wal_bytes = 100
-    state.wal = (
-        admission.geometry.reservation_bytes_by_storage_class["wal"]
-        - admission.geometry.metadata_wal_upper_bound_bytes
-        - 37
-    )
-    return SimpleNamespace(
+    forecast = SimpleNamespace(
         target_projection=SimpleNamespace(wal_bytes=0),
         metadata_projection=SimpleNamespace(wal_bytes=80, commit_envelope_bytes=20),
         wal_start_lsn="0/1",
     )
+    state.wal = (
+        admission.geometry.reservation_bytes_by_storage_class["wal"]
+        - (admission.geometry.metadata_wal_upper_bound_bytes - tracker.accounted_metadata_wal_bytes)
+        - fhir._profile_relation_wal_candidate(admission, {})[2]
+        - sum(tracker.pending_control_wal_bytes.values())
+        - forecast.metadata_projection.commit_envelope_bytes
+    )
+    return forecast
 
 
 @pytest.mark.asyncio
@@ -368,13 +379,14 @@ async def test_final_metadata_validates_candidate_before_releasing_body(admitted
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "failure", ["metadata", "observe", "total_observe", "deadline", "final_deadline", "total", "cancel", "reserve"]
+    "failure",
+    ["negative_sample", "observe", "total_observe", "deadline", "final_deadline", "total", "cancel", "reserve"],
 )
 async def test_final_metadata_failure_retains_charges_and_poison(admitted_window, monkeypatch, failure):
     admission, state = admitted_window
     forecast = _final_metadata_state(admission, state)
     tracker = admission.wal_tracker
-    observe = AsyncMock(return_value=81 if failure == "metadata" else 50)
+    observe = AsyncMock(return_value=-1 if failure == "negative_sample" else 50)
     if failure in {"observe", "cancel"}:
         observe.side_effect = asyncio.CancelledError() if failure == "cancel" else RuntimeError("observation_missing")
     monkeypatch.setattr(fhir.db, "scalar", observe)
@@ -474,3 +486,104 @@ def test_new_authorized_selection_has_a_fresh_build_without_changing_retained_by
     original_build, renewed_build = _authorized_recovery_build_ids()
     assert original_build != renewed_build
     assert (original_build, renewed_build) == _authorized_recovery_build_ids()
+
+
+def _affected_payload_setup(admitted_window, monkeypatch, wal_cap):
+    """Seed this payload-only proof; leave the ordinary 1,000-byte fixture intact."""
+    from contextlib import asynccontextmanager
+
+    from tests.test_provider_directory_profile_delta_coverage_edges_05 import _affected_stage_build
+
+    admission, state = admitted_window
+    geometry, projection = _bounded_geometry(wal_cap=wal_cap)
+    admission = replace(admission, geometry=geometry, control_wal_projection=projection)
+    monkeypatch.setattr(fhir, "_provider_directory_profile_capacity_admission", lambda: admission)
+    build = replace(_affected_stage_build(), materialization_mode="source_delta", affected_npi_stage="affected_stage")
+    relation = fhir._provider_directory_profile_build_ref(build, build.affected_npi_stage)
+    state.sizes[relation] = 100
+    events = []
+
+    @asynccontextmanager
+    async def transaction(**kwargs):
+        events.append("transaction")
+        yield
+
+    monkeypatch.setattr(fhir, "_provider_directory_profile_capacity_transaction", transaction)
+    monkeypatch.setattr(fhir.db, "first", AsyncMock(return_value={"projected_rows": 0, "projected_logical_bytes": 0}))
+    monkeypatch.setattr(fhir.db, "status", AsyncMock(return_value="INSERT 0 0"))
+
+    async def payload(module, custody):
+        return module._coerce_rowcount(await module.db.status(custody["statement"], **custody["params"]))
+
+    monkeypatch.setattr(fhir.profile_payload_custody, "execute", payload)
+    return admission, state, build, events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wal_cap", [1000, 73727])
+async def test_affected_lock_envelope_refuses_before_transaction(admitted_window, monkeypatch, wal_cap):
+    admission, _, build, events = _affected_payload_setup(admitted_window, monkeypatch, wal_cap)
+    storage = AsyncMock()
+    monkeypatch.setattr(fhir, "_assert_provider_directory_profile_stage_storage_identity", storage)
+    with pytest.raises(RuntimeError, match="window_wal_projected"):
+        await fhir._execute_affected_npi_insert(
+            build, projection_sql="SELECT projection", insert_sql="INSERT", params={}
+        )
+    assert events == []
+    storage.assert_not_awaited()
+    fhir.db.status.assert_not_awaited()
+    assert not admission.wal_tracker.accounted_control_operation_counts
+    assert not admission.wal_tracker.pending_control_wal_bytes
+    assert admission.wal_tracker.unresolved_window
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "storage", "projection", "insert", "cancel", "deadline"])
+async def test_affected_reserve_precedes_lock_and_retains_failure_charge(admitted_window, monkeypatch, failure):
+    admission, state, build, events = _affected_payload_setup(admitted_window, monkeypatch, 73728)
+
+    async def checkpoint_first(sql, **parameters):
+        if "FOR SHARE" in sql:
+            assert sum(admission.wal_tracker.pending_control_wal_bytes.values()) == 73728
+            events.append("checkpoint_lock")
+            return {"affected_npi_stage_oid": 17, "affected_npi_stage_storage_fingerprint": "f" * 64}
+        return {"projected_rows": 0, "projected_logical_bytes": 0}
+
+    monkeypatch.setattr(fhir.db, "first", checkpoint_first)
+    monkeypatch.setattr(fhir, "_provider_directory_profile_stage_storage_fingerprint", AsyncMock(return_value="f" * 64))
+
+    async def storage(*args, **kwargs):
+        assert fhir._PROFILE_CAPACITY_MUTATION_WINDOW.get()[1] == "affected_npi_stage"
+        assert sum(admission.wal_tracker.pending_control_wal_bytes.values()) == 73728
+        assert admission.wal_tracker.accounted_control_operation_counts == {"affected_npi_payload": 1}
+        await fhir._assert_profile_stage_storage(*args, **kwargs)
+        if failure == "storage":
+            raise RuntimeError("storage_failed")
+        if failure == "cancel":
+            raise asyncio.CancelledError()
+        if failure == "deadline":
+            state.expired = True
+
+    async def projection(*args):
+        events.append("projection")
+        if failure == "projection":
+            raise RuntimeError("projection_failed")
+
+    monkeypatch.setattr(fhir, "_assert_provider_directory_profile_stage_storage_identity", storage)
+    monkeypatch.setattr(fhir, "_admit_affected_npi_projection", projection)
+    if failure == "insert":
+        monkeypatch.setattr(fhir.db, "status", AsyncMock(side_effect=RuntimeError("insert_failed")))
+    invocation = fhir._execute_affected_npi_insert(
+        build, projection_sql="SELECT projection", insert_sql="INSERT", params={}
+    )
+    if failure:
+        with pytest.raises(asyncio.CancelledError if failure == "cancel" else RuntimeError):
+            await invocation
+        assert sum(admission.wal_tracker.pending_control_wal_bytes.values()) == 73728
+        assert admission.wal_tracker.unresolved_window
+    else:
+        assert await invocation == 0
+        assert not admission.wal_tracker.pending_control_wal_bytes
+        assert not admission.wal_tracker.unresolved_window
+    assert events[:2] == ["transaction", "checkpoint_lock"]
+    assert admission.wal_tracker.accounted_control_operation_counts == {"affected_npi_payload": 1}

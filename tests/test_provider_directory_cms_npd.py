@@ -7,7 +7,7 @@ import hashlib
 import importlib
 import sys
 from compression import zstd
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from functools import partial
 from itertools import count
 from pathlib import Path
@@ -15,13 +15,13 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from api.control_imports import importer_registry
 from api.provider_directory_sources import provider_directory_source_catalog
 from process import provider_directory_cms_npd as cms
 from process import provider_directory_cms_observation as cms_observation
 from process.cms_npd_source import RESOURCE_FILES, CmsNpdSourceError
-from process.provider_directory_insurance_network_identity import has_source_declared_network_role
 from process.provider_directory_profile_source_spec_contract import (
     validated_profile_source_spec,
 )
@@ -31,6 +31,265 @@ from process.provider_directory_source_local_publication import (
 from tests.test_cms_npd_source import _client, _source
 
 fhir = importlib.import_module("process.provider_directory_fhir")
+
+
+def _dispatch_retained_release(tmp_path):
+    """Acquire the same synthetic thousand-row release for all eight families."""
+    resource_bytes_by_name = {
+        name: b"".join(f'{{"resourceType":"{kind}","id":"synthetic-{index}"}}\n'.encode() for index in range(1000))
+        for name, kind in RESOURCE_FILES
+    }
+    manifest, payloads = _source(resource_bytes_by_name)
+    client, _calls = _client(manifest, payloads)
+    with client:
+        return cms.source.acquire_release(tmp_path, client=client)
+
+
+def _dispatch_file_tracking(monkeypatch):
+    """Track open readers separately from active source writers."""
+    opened_files = set()
+    writing_types = set()
+    peaks_by_phase = {"opened": 0, "writing": 0}
+    original_open = cms.zstd.open
+
+    @contextmanager
+    def tracked_open(path, mode):
+        with original_open(path, mode) as reader:
+            opened_files.add(Path(path).name)
+            peaks_by_phase["opened"] = max(peaks_by_phase["opened"], len(opened_files))
+            try:
+                yield reader
+            finally:
+                opened_files.remove(Path(path).name)
+
+    monkeypatch.setattr(cms.zstd, "open", tracked_open)
+    return SimpleNamespace(opened=opened_files, writing=writing_types, peaks=peaks_by_phase, events=[])
+
+
+def _dispatch_validation_fences(monkeypatch, fixture):
+    """Require drained readers and writers before every finalization step."""
+
+    async def checked_step(phase, *_args):
+        assert not fixture.opened and not fixture.writing, "validation started before source workers drained"
+        fixture.events.append(phase)
+        return {kind: 1000 for _, kind in RESOURCE_FILES} if phase == "counts" else {"validated": True}
+
+    for name, phase in (
+        ("_assert_counts", "counts"),
+        ("_assert_witness_counts", "witnesses"),
+        ("_materialize_identity_evidence", "identity"),
+        ("_validate_candidate", "validate"),
+    ):
+        monkeypatch.setattr(cms, name, partial(checked_step, phase))
+    monkeypatch.setattr(cms.relationships, "materialize", partial(checked_step, "relationships"))
+    monkeypatch.setattr(cms.recovery, "dispose_changed_vector", AsyncMock())
+    fixture.publisher = AsyncMock()
+    monkeypatch.setattr(
+        importlib.import_module("process.provider_directory_source_local_publication"),
+        "publish_validated_source_local_dataset",
+        fixture.publisher,
+    )
+
+
+def _source_dispatch_fixture(monkeypatch, tmp_path, *, configured=5, size=2, overflow=1):
+    """Install the connected pool geometry and retained source-stage fences."""
+    directory, receipt = _dispatch_retained_release(tmp_path)
+    models_by_type = {kind: object() for _, kind in RESOURCE_FILES}
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", str(configured))
+    pool = AsyncAdaptedQueuePool(
+        lambda: pytest.fail("source dispatch connected to a database"), pool_size=size, max_overflow=overflow
+    )
+    fixture = _dispatch_file_tracking(monkeypatch)
+    fixture.fhir = SimpleNamespace(
+        db=SimpleNamespace(engine=SimpleNamespace(pool=pool)),
+        RESOURCE_MODELS_BY_TYPE=models_by_type,
+        _provider_directory_database_pool_capacity=fhir._provider_directory_database_pool_capacity,
+        _gather_provider_directory_profile_tasks=fhir._gather_provider_directory_profile_tasks,
+        _raise_if_resource_import_cancelled=AsyncMock(),
+    )
+    fixture.candidate = SimpleNamespace(
+        dataset_id="source-dispatch-synthetic", already_validated=False, already_published=False
+    )
+    fixture.directory = directory
+    fixture.receipt = receipt
+    fixture.identity = cms.release_identity(receipt)
+    monkeypatch.setattr(
+        cms,
+        "_parse_batch_row",
+        lambda _fhir, resource, _candidate: (models_by_type[resource["resourceType"]], {"resource_id": resource["id"]}),
+    )
+    _dispatch_validation_fences(monkeypatch, fixture)
+    return fixture
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "configured,size,overflow,expected", [(5, 2, 1, 2), (2, 1, 1, 1), (5, 1, 1, 1), (2, 5, 0, 1), (9, 7, 0, 2)]
+)
+async def test_source_dispatch_overlaps_only_connected_admitted_file_slots(
+    monkeypatch, tmp_path, configured, size, overflow, expected
+):
+    fixture = _source_dispatch_fixture(monkeypatch, tmp_path, configured=configured, size=size, overflow=overflow)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    staged_types = []
+
+    async def persist(_fhir, _model, rows, raw, _candidate, kind):
+        assert len(rows) == len(raw) == 1000
+        fixture.writing.add(kind)
+        fixture.peaks["writing"] = max(fixture.peaks["writing"], len(fixture.writing))
+        assert len(fixture.opened) <= expected and len(fixture.writing) <= expected
+        if len(fixture.writing) == expected:
+            started.set()
+        try:
+            await release.wait()
+            staged_types.append(kind)
+        finally:
+            fixture.writing.remove(kind)
+
+    monkeypatch.setattr(cms, "_persist_source_batch", persist)
+    staging = asyncio.create_task(
+        cms._stage_and_validate_candidate(
+            fixture.fhir, fixture.directory, fixture.candidate, fixture.identity, fixture.receipt, {}, {}
+        )
+    )
+    try:
+        async with asyncio.timeout(2):
+            await started.wait()
+        assert len(fixture.opened) == expected
+        assert fixture.events == []
+        release.set()
+        assert await staging == {"validated": True}
+    finally:
+        release.set()
+        if not staging.done():
+            staging.cancel()
+        await asyncio.gather(staging, return_exceptions=True)
+    assert sorted(staged_types) == sorted(cms.RESOURCE_TYPES)
+    assert fixture.peaks == {"opened": expected, "writing": expected}
+    assert fixture.events == ["counts", "witnesses", "identity", "relationships", "validate"]
+    fixture.publisher.assert_not_awaited()
+
+
+def _dispatch_failure_writer(fixture, failure_mode, both_started, drain, failure):
+    """Hold both active writers until the test releases their cancellation cleanup."""
+    first_kind = RESOURCE_FILES[0][1]
+
+    async def persist(_fhir, _model, _rows, _raw, _candidate, kind):
+        fixture.writing.add(kind)
+        if len(fixture.writing) == 2:
+            both_started.set()
+        try:
+            await both_started.wait()
+            if kind == first_kind and failure_mode not in {"caller_cancel", "repeated_cancel"}:
+                if failure_mode in {"first_failure", "cleanup_failure"}:
+                    raise failure
+                return
+            await asyncio.Event().wait()
+        finally:
+            await drain.wait()
+            fixture.writing.remove(kind)
+            if failure_mode == "cleanup_failure" and kind != first_kind:
+                raise RuntimeError("synthetic-peer-cleanup-failed")
+
+    return persist
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_mode", ["first_failure", "cleanup_failure", "caller_cancel", "repeated_cancel", "row_count"]
+)
+async def test_source_dispatch_drains_every_reader_and_writer_before_failure_returns(
+    monkeypatch, tmp_path, failure_mode
+):
+    """Preserve the first failure while every reader and writer drains before validation."""
+    fixture = _source_dispatch_fixture(monkeypatch, tmp_path)
+    both_started = asyncio.Event()
+    drain = asyncio.Event()
+    failure = RuntimeError("synthetic-source-write-failed")
+    if failure_mode == "row_count":
+        fixture.identity["files"][RESOURCE_FILES[0][0]]["row_count"] = 999
+
+    persist = _dispatch_failure_writer(fixture, failure_mode, both_started, drain, failure)
+
+    monkeypatch.setattr(cms, "_persist_source_batch", persist)
+    staging = asyncio.create_task(
+        cms._stage_and_validate_candidate(
+            fixture.fhir, fixture.directory, fixture.candidate, fixture.identity, fixture.receipt, {}, {}
+        )
+    )
+    try:
+        async with asyncio.timeout(2):
+            await both_started.wait()
+        if failure_mode in {"caller_cancel", "repeated_cancel"}:
+            staging.cancel()
+        await asyncio.sleep(0)
+        assert not staging.done() and fixture.writing and fixture.opened
+        assert fixture.events == []
+        if failure_mode == "repeated_cancel":
+            for _ in range(4):
+                staging.cancel()
+                await asyncio.sleep(0)
+                assert not staging.done() and len(fixture.writing) == len(fixture.opened) == 2
+        drain.set()
+        if failure_mode in {"caller_cancel", "repeated_cancel"}:
+            with pytest.raises(asyncio.CancelledError):
+                await staging
+        else:
+            with pytest.raises(RuntimeError) as caught:
+                await staging
+            if failure_mode in {"first_failure", "cleanup_failure"}:
+                assert caught.value is failure
+            else:
+                assert str(caught.value) == "cms_npd_file_row_count_changed"
+    finally:
+        drain.set()
+        if not staging.done():
+            staging.cancel()
+        await asyncio.gather(staging, return_exceptions=True)
+    assert not fixture.opened and not fixture.writing and fixture.events == []
+    fixture.publisher.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("validated,published", [(True, False), (False, True)])
+async def test_source_dispatch_replay_verifies_retained_bytes_without_source_writes(
+    monkeypatch, tmp_path, validated, published
+):
+    fixture = _source_dispatch_fixture(monkeypatch, tmp_path)
+    fixture.candidate.already_validated = validated
+    fixture.candidate.already_published = published
+    writer = AsyncMock(side_effect=AssertionError("finalized candidate attempted a source write"))
+    monkeypatch.setattr(cms, "_persist_source_batch", writer)
+    assert await cms._stage_and_validate_candidate(
+        fixture.fhir, fixture.directory, fixture.candidate, fixture.identity, fixture.receipt, {}, {}
+    ) == {"validated": True}
+    writer.assert_not_awaited()
+    (fixture.directory / f"{RESOURCE_FILES[0][0]}.zst").unlink()
+    with pytest.raises(CmsNpdSourceError, match="retained_file_missing"):
+        await cms._stage_and_validate_candidate(
+            fixture.fhir, fixture.directory, fixture.candidate, fixture.identity, fixture.receipt, {}, {}
+        )
+    writer.assert_not_awaited()
+    fixture.publisher.assert_not_awaited()
+
+
+def test_source_dispatch_uses_serial_unknown_pools_and_rejects_no_writer_capacity():
+    capacity = Mock(return_value=5)
+    for pool in (None, object(), AsyncAdaptedQueuePool(lambda: None, pool_size=2, max_overflow=-1)):
+        fake = SimpleNamespace(
+            db=SimpleNamespace(engine=SimpleNamespace(pool=pool)), _provider_directory_database_pool_capacity=capacity
+        )
+        assert cms._source_stage_workers(fake) == 1
+    capacity.assert_not_called()
+    pool = AsyncAdaptedQueuePool(lambda: None, pool_size=1, max_overflow=0)
+    with pytest.raises(RuntimeError, match="cms_npd_intake_pool_capacity_exceeded"):
+        cms._source_stage_workers(
+            SimpleNamespace(
+                db=SimpleNamespace(engine=SimpleNamespace(pool=pool)),
+                _provider_directory_database_pool_capacity=capacity,
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -222,8 +481,11 @@ async def test_unchanged_run_skips_acquisition_and_preserves_required_followup(m
     recheck.assert_called_once()
     acquire.assert_not_called()
     assert [call.kwargs["phase"] for call in reporter.call_args_list] == [
-        "cms-npd-source_probe", "cms-npd-release_validation", "cms-npd-intake_guard",
-        "cms-npd-coverage", "cms-npd-complete",
+        "cms-npd-source_probe",
+        "cms-npd-release_validation",
+        "cms-npd-intake_guard",
+        "cms-npd-coverage",
+        "cms-npd-complete",
     ]
 
 
@@ -618,16 +880,19 @@ def test_cms_npi_uses_source_parser_without_overwriting_valid_identifier():
 
 
 @pytest.mark.asyncio
-async def test_identity_batches_bind_only_explicit_same_source_networks():
-    """Bind exact source facts without inferring unresolved or external network targets."""
+async def test_identity_batches_delegate_complete_source_facts_to_bulk_writer():
+    """Native extraction and set validation receive every bounded source row."""
+    from sqlalchemy.ext.asyncio import AsyncSession
 
     writer_calls = []
 
     @asynccontextmanager
     async def session():
-        yield object()
+        async with AsyncSession() as writer_session:
+            yield writer_session
 
     async def capture(kind, _session, **kwargs):
+        assert kind != "network" or kwargs["resource_type"] != "InsurancePlan" or _session.in_transaction()
         writer_calls.append((kind, kwargs))
 
     fake_fhir = SimpleNamespace(
@@ -639,11 +904,7 @@ async def test_identity_batches_bind_only_explicit_same_source_networks():
         ],
     )
     entity_writer = SimpleNamespace(bind_entity_batch=partial(capture, "entity"))
-    network_writer = SimpleNamespace(
-        has_source_declared_network_role=has_source_declared_network_role,
-        record_insurance_network_organization=partial(capture, "network"),
-        record_insurance_network_plan=partial(capture, "network"),
-    )
+    network_writer = SimpleNamespace(record_insurance_network_batch=partial(capture, "network"))
     resource_writer = SimpleNamespace(bind_resource_identity_batch=partial(capture, "resource"))
     identity = cms.release_identity(_receipt())
     organization_resources = [
@@ -672,17 +933,20 @@ async def test_identity_batches_bind_only_explicit_same_source_networks():
         )
     assert [kind for kind, _ in writer_calls] == ["entity", "network", "resource", "network", "resource"]
     assert writer_calls[0][1]["resources"] == organization_resources
-    assert writer_calls[1][1]["organization"]["id"] == "network-2"
+    assert writer_calls[1][1]["resources"] == organization_resources
+    assert writer_calls[1][1]["resource_type"] == "Organization"
     assert writer_calls[2][1]["resource_ids"] == ["plan-1"]
-    assert writer_calls[3][1]["network_resource_id"] == "network-1"
+    assert writer_calls[3][1]["resources"] == plan_resources
+    assert writer_calls[3][1]["resource_type"] == "InsurancePlan"
     assert writer_calls[4][1]["resource_ids"] == ["role-1"]
-    assert set(fake_fhir.db.all.await_args.kwargs["resource_ids"]) == {"network-1", "unresolved"}
+    fake_fhir.db.all.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_identity_batch_uses_one_thousand_row_writer_call():
     sessions = []
     sizes = []
+    network_sizes = []
 
     @asynccontextmanager
     async def session():
@@ -692,17 +956,22 @@ async def test_identity_batch_uses_one_thousand_row_writer_call():
     async def bind(_session, **kwargs):
         sizes.append(len(kwargs["resources"]))
 
+    async def bind_network(_session, **kwargs):
+        assert _session is sessions[-1]
+        network_sizes.append(len(kwargs["resources"]))
+
     resources = [{"resourceType": "Organization", "id": f"org-{index}"} for index in range(1_000)]
     await cms._write_identity_batch(
         SimpleNamespace(db=SimpleNamespace(session=session)),
         SimpleNamespace(bind_entity_batch=bind),
-        SimpleNamespace(has_source_declared_network_role=has_source_declared_network_role),
+        SimpleNamespace(record_insurance_network_batch=bind_network),
         None,
         "Organization",
         resources,
         cms.release_identity(_receipt()),
     )
     assert sizes == [1_000]
+    assert network_sizes == [1_000]
     assert len(sessions) == 1
 
 
@@ -1656,7 +1925,8 @@ async def test_intake_failure_preserves_terminal_guard_cause_without_exception_t
     assert observed["phase"] == "identity" and observed["family"] == "InsurancePlan"
     assert observed["completed_input_rows"] == 123
     assert observed["exception_chain"] == [
-        {"class": "RuntimeError"}, {"class": "ConnectionLostError", "sqlstate": "08006"},
+        {"class": "RuntimeError"},
+        {"class": "ConnectionLostError", "sqlstate": "08006"},
     ]
     assert "synthetic-private-text" not in str(observed)
     assert _control_failure_error(guard) == {"code": "import_failed", "message": "cms_npd_intake_guard_lost"}
@@ -1689,7 +1959,9 @@ def test_intake_progress_reports_only_real_bounded_safe_observations(monkeypatch
     assert ctx_by_field["context"]["audit"]["cms_intake"]["completed_input_rows"] == 2_000
     cms_observation.observe_intake(ctx_by_field, phase="staging", family="Organization", completed_rows=3_000)
     assert len(events) == 2
-    cms_observation.observe_intake(ctx_by_field, phase="staging", family="Organization", completed_rows=3_000, force=True)
+    cms_observation.observe_intake(
+        ctx_by_field, phase="staging", family="Organization", completed_rows=3_000, force=True
+    )
     assert len(events) == 3
     assert events[-1]["counters"] == {"completed_input_rows": 3_000}
     assert events[-1]["elapsed_seconds"] == 15.1
@@ -1720,7 +1992,9 @@ async def test_intake_cancellation_is_not_reclassified_or_consumed(monkeypatch):
 
 @pytest.mark.parametrize("context", [None, {}, {"context": None}])
 def test_intake_observation_tolerates_missing_context_and_reporting_failure(monkeypatch, context):
-    monkeypatch.setattr(cms_observation, "enqueue_live_progress", Mock(side_effect=RuntimeError("synthetic-private-text")))
+    monkeypatch.setattr(
+        cms_observation, "enqueue_live_progress", Mock(side_effect=RuntimeError("synthetic-private-text"))
+    )
     cms_observation.observe_intake(context, phase="staging", family="Location", completed_rows=1)
 
 
