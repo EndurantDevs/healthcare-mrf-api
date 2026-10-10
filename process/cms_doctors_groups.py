@@ -9,10 +9,10 @@ from datetime import datetime
 from sqlalchemy import text
 
 from db.models import CMSDoctorGroupSite, db
-from process.cms_doctors_education import open_doctors_csv
+from process.cms_doctors_education import _copy_sidecar_rows, open_doctors_csv
 from process.cms_doctors_rows import doctor_address_row
 from process.control_cancel import raise_if_cancelled
-from process.ext.utils import make_class, push_objects
+from process.ext.utils import make_class
 from process.provider_directory_profile import is_valid_npi
 
 REQUIRED_HEADERS = {
@@ -89,12 +89,12 @@ async def import_group_site_rows(source_path, ctx, task, manifest: dict) -> dict
                 batch_rows.append(doctor_group_site_row(source_row, source_rows, manifest))
                 if len(batch_rows) >= 5_000:
                     await raise_if_cancelled(ctx, task)
-                    await push_objects(batch_rows, stage)
+                    await _copy_sidecar_rows(batch_rows, stage)
                     batch_rows.clear()
                 if row_limit is not None and source_rows >= row_limit:
                     break
             await raise_if_cancelled(ctx, task)
-            await push_objects(batch_rows, stage)
+            await _copy_sidecar_rows(batch_rows, stage)
         return {"source_rows": source_rows, "generation_id": manifest["generation_id"]}
     except BaseException:
         await discard_group_site_stage(ctx)

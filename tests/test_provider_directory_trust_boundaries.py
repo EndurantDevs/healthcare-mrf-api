@@ -121,9 +121,7 @@ def test_source_catalog_rejects_invalid_or_profile_drifted_manifests(
     )
 
     with pytest.raises(RuntimeError, match=error):
-        provider_directory_sources.provider_directory_source_catalog(
-            manifest_path
-        )
+        provider_directory_sources.provider_directory_source_catalog(manifest_path)
 
 
 @pytest.mark.parametrize(
@@ -184,9 +182,7 @@ def test_profile_helpers_cover_incremental_and_bounded_identifier_paths():
         rebuild_all=False,
     )
     assert 'FROM "fixture"."old_evidence"' in incremental_sql
-    assert "source_id <> ALL(CAST(:retained_source_ids AS varchar[]))" in (
-        incremental_sql
-    )
+    assert "source_id <> ALL(CAST(:retained_source_ids AS varchar[]))" in (incremental_sql)
     assert "OR NOT" in incremental_sql
 
 
@@ -237,9 +233,7 @@ async def test_retry_state_cleanup_only_clears_all_finalized_datasets(
     monkeypatch.setattr(importer.db, "status", status)
     monkeypatch.setattr(importer.db, "transaction", _transaction)
 
-    cleared = await importer._clear_promoted_endpoint_dataset_retry_state(
-        [" dataset_b ", "dataset_a", "", None]
-    )
+    cleared = await importer._clear_promoted_endpoint_dataset_retry_state([" dataset_b ", "dataset_a", "", None])
 
     assert cleared == ["dataset_a", "dataset_b"]
     assert all_rows.await_args.kwargs["dataset_ids"] == [
@@ -263,15 +257,8 @@ async def test_retry_state_cleanup_keeps_partial_or_empty_selections(
     monkeypatch.setattr(importer.db, "transaction", _transaction)
 
     assert await importer._clear_promoted_endpoint_dataset_retry_state([]) == []
-    assert (
-        await importer._clear_promoted_endpoint_dataset_retry_state(
-            ["dataset_a", "dataset_b"]
-        )
-        == []
-    )
-    assert "DELETE FROM" not in "\n".join(
-        call.args[0] for call in status.await_args_list
-    )
+    assert await importer._clear_promoted_endpoint_dataset_retry_state(["dataset_a", "dataset_b"]) == []
+    assert "DELETE FROM" not in "\n".join(call.args[0] for call in status.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -285,12 +272,7 @@ async def test_retry_state_cleanup_is_best_effort_on_lock_failure(monkeypatch):
 
     monkeypatch.setattr(importer.db, "transaction", failed_transaction)
 
-    assert (
-        await importer._clear_promoted_endpoint_dataset_retry_state(
-            ["dataset_a"]
-        )
-        == []
-    )
+    assert await importer._clear_promoted_endpoint_dataset_retry_state(["dataset_a"]) == []
 
 
 @pytest.mark.asyncio
@@ -358,9 +340,7 @@ def _profile_stage_storage_fingerprint(
         build.profile_stage: _PROFILE_STAGE_STORAGE_FINGERPRINT,
     }
     if build.affected_npi_stage is not None:
-        fingerprints_by_stage[build.affected_npi_stage] = (
-            _AFFECTED_NPI_STAGE_STORAGE_FINGERPRINT
-        )
+        fingerprints_by_stage[build.affected_npi_stage] = _AFFECTED_NPI_STAGE_STORAGE_FINGERPRINT
     return fingerprints_by_stage[stage_table]
 
 
@@ -369,9 +349,7 @@ def _profile_stage_storage_fingerprint_mock(
 ) -> AsyncMock:
     """Return a strict async stage-layout fixture."""
     return AsyncMock(
-        side_effect=lambda _schema, stage_table, **_params: (
-            _profile_stage_storage_fingerprint(build, stage_table)
-        )
+        side_effect=lambda _schema, stage_table, **_params: _profile_stage_storage_fingerprint(build, stage_table)
     )
 
 
@@ -387,11 +365,7 @@ def _artifact_stage(
     target_oid: int | None = None,
     fenced: bool = False,
 ) -> importer.ProviderDirectoryPreparedArtifactStage:
-    build_fence = (
-        importer.ProviderDirectoryArtifactBuildFence(target_oid=target_oid)
-        if fenced
-        else None
-    )
+    build_fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=target_oid) if fenced else None
     return importer.ProviderDirectoryPreparedArtifactStage(
         schema=schema,
         stage_table=stage_table,
@@ -503,14 +477,10 @@ def _profile_checkpoint_by_name(
         "desired_source_vector_hash": build.desired_source_vector_hash,
         "current_source_context_vector_hash": build.current_source_context_vector_hash,
         "desired_source_context_vector_hash": build.desired_source_context_vector_hash,
-        "refresh_source_ids": list(build.source_ids)
-        if build.materialization_mode == "source_delta"
-        else [],
+        "refresh_source_ids": list(build.source_ids) if build.materialization_mode == "source_delta" else [],
         "removed_source_ids": list(build.removed_source_ids),
         "affected_npi_stage": build.affected_npi_stage,
-        "affected_npi_stage_oid": 13
-        if build.affected_npi_stage is not None
-        else None,
+        "affected_npi_stage_oid": 13 if build.affected_npi_stage is not None else None,
         "affected_npi_stage_storage_fingerprint": _AFFECTED_NPI_STAGE_STORAGE_FINGERPRINT
         if build.affected_npi_stage is not None
         else None,
@@ -529,12 +499,8 @@ def _profile_checkpoint_by_name(
 
 def _assert_profile_checkpoint_value_contracts(build):
     """Assert strict checkpoint array and state decoding."""
-    assert importer._provider_directory_profile_checkpoint_array(
-        '["source_a", "source_b"]'
-    ) == ("source_a", "source_b")
-    assert importer._provider_directory_profile_checkpoint_array(
-        ("source_a",)
-    ) == ()
+    assert importer._provider_directory_profile_checkpoint_array('["source_a", "source_b"]') == ("source_a", "source_b")
+    assert importer._provider_directory_profile_checkpoint_array(("source_a",)) == ()
     checkpoint_state = importer._provider_directory_profile_checkpoint_state(
         {
             "evidence_next_batch": 2,
@@ -563,19 +529,11 @@ def _assert_single_source_profile_evidence_batches(evidence_batches):
     assert {batch.kind for batch in fact_batches} == {"fact"}
     assert {batch.source_id for batch in fact_batches} == {"source_a"}
     assert {batch.dataset_id for batch in fact_batches} == {"dataset_a"}
-    assert {batch.fact_type for batch in fact_batches} == set(
-        profile.PROFILE_EVIDENCE_FACT_TYPES
-    )
-    affiliation_batches = [
-        batch for batch in fact_batches if batch.fact_type == "affiliation"
-    ]
+    assert {batch.fact_type for batch in fact_batches} == set(profile.PROFILE_EVIDENCE_FACT_TYPES)
+    affiliation_batches = [batch for batch in fact_batches if batch.fact_type == "affiliation"]
     assert len(affiliation_batches) == profile.PROFILE_AFFILIATION_ROLE_BUCKETS
-    assert [batch.role_bucket for batch in affiliation_batches] == list(
-        range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS)
-    )
-    organization_batches = [
-        batch for batch in fact_batches if batch.fact_type == "organization"
-    ]
+    assert [batch.role_bucket for batch in affiliation_batches] == list(range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS))
+    organization_batches = [batch for batch in fact_batches if batch.fact_type == "organization"]
     assert len(organization_batches) == profile.PROFILE_AFFILIATION_ROLE_BUCKETS
     assert [batch.role_bucket for batch in organization_batches] == list(
         range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS)
@@ -589,9 +547,7 @@ def _assert_global_profile_batch_plan(build):
         build,
         source_ids=source_ids,
         retained_source_ids=source_ids,
-        dataset_ids=tuple(
-            f"dataset_{index:02d}" for index in range(19)
-        ),
+        dataset_ids=tuple(f"dataset_{index:02d}" for index in range(19)),
     )
     evidence_batches = importer._provider_directory_profile_evidence_batches(
         global_build,
@@ -613,13 +569,9 @@ def _assert_global_profile_batch_plan(build):
 def test_profile_batch_and_checkpoint_value_contracts():
     """Cover bounded batch construction and strict checkpoint decoding."""
     build = _profile_build()
-    assert importer._provider_directory_profile_build_id(build) == (
-        build.generation_id
-    )
+    assert importer._provider_directory_profile_build_id(build) == (build.generation_id)
     explicit_build = importer.replace(build, build_id="profile-build")
-    assert importer._provider_directory_profile_build_id(explicit_build) == (
-        "profile-build"
-    )
+    assert importer._provider_directory_profile_build_id(explicit_build) == ("profile-build")
     partial_build = importer.replace(
         build,
         retained_source_ids=("source_a", "source_b"),
@@ -658,49 +610,28 @@ def test_profile_batch_and_checkpoint_value_contracts():
 
 
 def _assert_membership_bucket_geometry(batch_plan, legacy_plan) -> None:
-    membership_batches = [
-        batch
-        for batch in batch_plan.evidence_batches
-        if batch.fact_type == "plan_membership"
-    ]
+    membership_batches = [batch for batch in batch_plan.evidence_batches if batch.fact_type == "plan_membership"]
 
     assert len(batch_plan.evidence_batches) == 115
     assert batch_plan.fingerprint != legacy_plan.fingerprint
-    assert len(membership_batches) == (
-        profile.PROFILE_AFFILIATION_ROLE_BUCKETS
-    )
-    assert [batch.role_bucket for batch in membership_batches] == list(
-        range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS)
-    )
-    assert importer._provider_directory_profile_bucket_relations(
-        "plan_membership"
-    ) == (
+    assert len(membership_batches) == (profile.PROFILE_AFFILIATION_ROLE_BUCKETS)
+    assert [batch.role_bucket for batch in membership_batches] == list(range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS))
+    assert importer._provider_directory_profile_bucket_relations("plan_membership") == (
         importer.ProviderDirectoryOrganizationAffiliation.__tablename__,
     )
-    assert (
-        importer._PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE
-        == {
-            "affiliation": (
-                "hashtextextended-role-resource-id-seed0-positive-mod-v1",
-            ),
-            "organization": (
-                "hashtextextended-role-resource-id-seed0-positive-mod-v1",
-                "hashtextextended-affiliation-resource-id-seed0-positive-mod-v1",
-            ),
-            "plan_membership": (
-                "hashtextextended-affiliation-resource-id-seed0-positive-mod-v1",
-            ),
-        }
-    )
+    assert importer._PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE == {
+        "affiliation": ("hashtextextended-role-resource-id-seed0-positive-mod-v1",),
+        "organization": (
+            "hashtextextended-role-resource-id-seed0-positive-mod-v1",
+            "hashtextextended-affiliation-resource-id-seed0-positive-mod-v1",
+        ),
+        "plan_membership": ("hashtextextended-affiliation-resource-id-seed0-positive-mod-v1",),
+    }
 
 
 def _membership_scheme_drift_plan(monkeypatch, build):
-    bucket_schemes_by_fact_type = dict(
-        importer._PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE
-    )
-    bucket_schemes_by_fact_type["plan_membership"] = (
-        "hashtextextended-role-resource-id-seed0-positive-mod-v1",
-    )
+    bucket_schemes_by_fact_type = dict(importer._PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE)
+    bucket_schemes_by_fact_type["plan_membership"] = ("hashtextextended-role-resource-id-seed0-positive-mod-v1",)
     monkeypatch.setattr(
         importer,
         "_PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE",
@@ -726,9 +657,7 @@ def test_profile_batch_plan_reserves_plan_membership_bucket_geometry(
         has_existing_artifacts=False,
     )
     legacy_fact_types = tuple(
-        fact_type
-        for fact_type in profile.PROFILE_EVIDENCE_FACT_TYPES
-        if fact_type != "plan_membership"
+        fact_type for fact_type in profile.PROFILE_EVIDENCE_FACT_TYPES if fact_type != "plan_membership"
     )
     monkeypatch.setattr(
         profile,
@@ -862,21 +791,15 @@ def _patch_profile_finalize_retry(monkeypatch, build):
     prepared_stages = (SimpleNamespace(), SimpleNamespace())
     batch_plan = _profile_finalize_retry_batch_plan(fact_batch)
     patches_by_name = {
-        "_provider_directory_profile_build_plan": (
-            lambda *_args, **_params: batch_plan
-        ),
+        "_provider_directory_profile_build_plan": (lambda *_args, **_params: batch_plan),
         "_claim_provider_directory_profile_build_checkpoint": AsyncMock(
             side_effect=_profile_finalize_retry_checkpoint_states()
         ),
         "_has_provider_directory_profile_artifacts": AsyncMock(return_value=False),
         "_advance_provider_directory_profile_build_checkpoint": advance,
         "_populate_provider_directory_profile_compact_stage": compact,
-        "_provider_directory_profile_metrics": AsyncMock(
-            return_value={"profile_rows": 1}
-        ),
-        "_prepare_provider_directory_profile_stages": AsyncMock(
-            return_value=prepared_stages
-        ),
+        "_provider_directory_profile_metrics": AsyncMock(return_value={"profile_rows": 1}),
+        "_prepare_provider_directory_profile_stages": AsyncMock(return_value=prepared_stages),
         "_mark_profile_build_checkpoint_failed": mark_failed,
         "_mark_profile_build_checkpoint_state": mark_state,
     }
@@ -886,9 +809,7 @@ def _patch_profile_finalize_retry(monkeypatch, build):
 
     async def status(sql, **_params):
         statement = str(sql)
-        attempts.inserts += int(
-            "ON CONFLICT (evidence_key) DO NOTHING" in statement
-        )
+        attempts.inserts += int("ON CONFLICT (evidence_key) DO NOTHING" in statement)
         if statement.startswith("ANALYZE "):
             attempts.analyzes += 1
             if attempts.analyzes == 1:
@@ -908,29 +829,21 @@ def _patch_profile_finalize_retry(monkeypatch, build):
 
 def _assert_high_fanout_profile_calls(evidence_calls, profile_calls):
     """Require 19-source fact fanout and complete 5M NPI geometry."""
-    materialization_calls = [
-        call for call in evidence_calls if not call.get("count_only", False)
-    ]
-    projection_calls = [
-        call for call in evidence_calls if call.get("count_only", False)
-    ]
+    materialization_calls = [call for call in evidence_calls if not call.get("count_only", False)]
+    projection_calls = [call for call in evidence_calls if call.get("count_only", False)]
     assert len(materialization_calls) == 2185
     assert len(projection_calls) == 44
     for fact_type in ("affiliation", "organization", "plan_membership"):
-        assert sum(
-            call["fact_type"] == fact_type
-            for call in materialization_calls
-        ) == 19 * profile.PROFILE_AFFILIATION_ROLE_BUCKETS
+        assert (
+            sum(call["fact_type"] == fact_type for call in materialization_calls)
+            == 19 * profile.PROFILE_AFFILIATION_ROLE_BUCKETS
+        )
     assert len(profile_calls) == 400
     assert (
         profile_calls[0]["npi_start"],
         profile_calls[-1]["npi_end"],
     ) == (profile.NPI_MIN, profile.NPI_MAX + 1)
-    assert all(
-        call["npi_end"] - call["npi_start"]
-        == profile.PROFILE_NPI_BATCH_SIZE
-        for call in profile_calls
-    )
+    assert all(call["npi_end"] - call["npi_start"] == profile.PROFILE_NPI_BATCH_SIZE for call in profile_calls)
 
 
 @pytest.mark.asyncio
@@ -938,9 +851,7 @@ async def test_profile_bucket_index_is_limited_to_artifact_scope(
     monkeypatch,
 ):
     """Never create the build-local expression index on a serving table."""
-    relation_name = (
-        importer.ProviderDirectoryPractitionerRole.__tablename__
-    )
+    relation_name = importer.ProviderDirectoryPractitionerRole.__tablename__
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
 
@@ -953,9 +864,7 @@ async def test_profile_bucket_index_is_limited_to_artifact_scope(
     )
     status.assert_not_awaited()
 
-    with importer._provider_directory_artifact_relation_scope(
-        {relation_name: f"{relation_name}_serving"}
-    ):
+    with importer._provider_directory_artifact_relation_scope({relation_name: f"{relation_name}_serving"}):
         with pytest.raises(
             RuntimeError,
             match="provider_directory_profile_bucket_scope_relation_invalid",
@@ -966,26 +875,20 @@ async def test_profile_bucket_index_is_limited_to_artifact_scope(
             )
     status.assert_not_awaited()
 
-    scope_table = (
-        importer._provider_directory_artifact_scope_table_name(
-            relation_name,
-            "bucket-index-contract",
-        )
+    scope_table = importer._provider_directory_artifact_scope_table_name(
+        relation_name,
+        "bucket-index-contract",
     )
-    index_name, index_sql = (
-        importer._provider_directory_profile_bucket_index_sql(
-            "mrf",
-            scope_table,
-        )
+    index_name, index_sql = importer._provider_directory_profile_bucket_index_sql(
+        "mrf",
+        scope_table,
     )
     assert len(index_name) <= 63
     assert index_sql.startswith("CREATE INDEX ")
     assert "IF NOT EXISTS" not in index_sql
     assert '"source_id"' in index_sql
-    assert "hashtextextended(\"resource_id\", 0)" in index_sql
-    assert (
-        f", {profile.PROFILE_AFFILIATION_ROLE_BUCKETS})" in index_sql
-    )
+    assert 'hashtextextended("resource_id", 0)' in index_sql
+    assert f", {profile.PROFILE_AFFILIATION_ROLE_BUCKETS})" in index_sql
 
 
 @pytest.mark.asyncio
@@ -1031,6 +934,7 @@ async def test_last_evidence_batch_failure_retries_only_finalization(
 
 def _bounded_evidence_sql_spy(evidence_calls):
     """Return a strict bounded-evidence SQL spy."""
+
     def bounded_evidence_sql(**params):
         assert params["fact_type"] in profile.PROFILE_EVIDENCE_FACT_TYPES
         assert params["role_bucket_count"] >= 1
@@ -1043,6 +947,7 @@ def _bounded_evidence_sql_spy(evidence_calls):
 
 def _bounded_profile_sql_spy(profile_calls):
     """Return a strict bounded-profile SQL spy."""
+
     def bounded_profile_sql(**params):
         assert params["npi_start"] is not None
         assert params["npi_end"] is not None
@@ -1069,9 +974,7 @@ def _install_high_fanout_profile_spies(
     profile_patches_by_name = {
         "copy_existing_evidence_sql": lambda **_params: "COPY EVIDENCE",
         "copy_unaffected_profiles_sql": lambda **_params: "COPY PROFILE",
-        "profile_evidence_insert_sql": _bounded_evidence_sql_spy(
-            evidence_calls
-        ),
+        "profile_evidence_insert_sql": _bounded_evidence_sql_spy(evidence_calls),
         "profile_insert_sql": _bounded_profile_sql_spy(profile_calls),
     }
     for name, replacement in profile_patches_by_name.items():
@@ -1115,9 +1018,7 @@ async def test_profile_high_fanout_plan_never_builds_unbounded_statements(
     )
 
     _assert_high_fanout_profile_calls(evidence_calls, profile_calls)
-    assert [
-        call.args for call in spies.prepare_bucket_index.await_args_list
-    ] == [
+    assert [call.args for call in spies.prepare_bucket_index.await_args_list] == [
         (
             "mrf",
             importer.ProviderDirectoryPractitionerRole.__tablename__,
@@ -1127,14 +1028,8 @@ async def test_profile_high_fanout_plan_never_builds_unbounded_statements(
             importer.ProviderDirectoryOrganizationAffiliation.__tablename__,
         ),
     ]
-    assert all(
-        call.args[0] != "COPY EVIDENCE"
-        for call in spies.status.await_args_list
-    )
-    assert all(
-        call.args[0] != "COPY PROFILE"
-        for call in spies.status.await_args_list
-    )
+    assert all(call.args[0] != "COPY EVIDENCE" for call in spies.status.await_args_list)
+    assert all(call.args[0] != "COPY PROFILE" for call in spies.status.await_args_list)
 
 
 async def _assert_logged_profile_retry_lineage(
@@ -1145,9 +1040,7 @@ async def _assert_logged_profile_retry_lineage(
     monkeypatch,
 ):
     """Assert logged profile retry lineage."""
-    stage_identity = AsyncMock(
-        side_effect=[(11, "r", "p"), (12, "r", "p")]
-    )
+    stage_identity = AsyncMock(side_effect=[(11, "r", "p"), (12, "r", "p")])
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_stage_relation_identity",
@@ -1171,14 +1064,12 @@ async def _assert_logged_profile_retry_lineage(
 
     checkpoint_by_name["profile_as_of"] = "not-a-date"
     stage_identity.reset_mock()
-    invalid_date_build = (
-        await importer._resolve_provider_directory_profile_build(
-            "mrf",
-            None,
-            dataset_fence,
-            fence,
-            fence,
-        )
+    invalid_date_build = await importer._resolve_provider_directory_profile_build(
+        "mrf",
+        None,
+        dataset_fence,
+        fence,
+        fence,
     )
     assert invalid_date_build.profile_as_of != "not-a-date"
     stage_identity.assert_not_awaited()
@@ -1363,13 +1254,9 @@ async def test_profile_batch_total_mismatch_reinitializes_logged_stages(
     status = AsyncMock(return_value=1)
     drop_stages = AsyncMock()
     monkeypatch.setattr(importer.db, "transaction", transaction)
-    monkeypatch.setattr(
-        importer.db, "first", AsyncMock(return_value=checkpoint_by_name)
-    )
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=checkpoint_by_name))
     monkeypatch.setattr(importer.db, "status", status)
-    monkeypatch.setattr(
-        importer, "_drop_profile_stages_for_reinitialize", drop_stages
-    )
+    monkeypatch.setattr(importer, "_drop_profile_stages_for_reinitialize", drop_stages)
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_stage_relation_identity",
@@ -1381,17 +1268,11 @@ async def test_profile_batch_total_mismatch_reinitializes_logged_stages(
         _profile_stage_storage_fingerprint_mock(build),
     )
 
-    initialized = (
-        await importer._claim_provider_directory_profile_build_checkpoint(
-            build,
-            has_existing_artifacts=False,
-            evidence_build_fence=(
-                importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
-            ),
-            profile_build_fence=(
-                importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
-            ),
-        )
+    initialized = await importer._claim_provider_directory_profile_build_checkpoint(
+        build,
+        has_existing_artifacts=False,
+        evidence_build_fence=(importer.ProviderDirectoryArtifactBuildFence(target_oid=None)),
+        profile_build_fence=(importer.ProviderDirectoryArtifactBuildFence(target_oid=None)),
     )
 
     drop_stages.assert_awaited_once_with(build, checkpoint_by_name)
@@ -1431,9 +1312,7 @@ def _patch_global_profile_resolution(monkeypatch):
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_scope_source_ids",
-        AsyncMock(
-            return_value=(list(source_ids), list(source_ids), source_contexts)
-        ),
+        AsyncMock(return_value=(list(source_ids), list(source_ids), source_contexts)),
     )
     monkeypatch.setattr(
         importer,
@@ -1446,12 +1325,8 @@ def _patch_global_profile_resolution(monkeypatch):
         source_ids=source_ids,
         datasets=datasets,
         dataset_fence=importer.ProviderDirectoryArtifactDatasetFence(datasets),
-        evidence_fence=importer.ProviderDirectoryArtifactBuildFence(
-            target_oid=101
-        ),
-        profile_fence=importer.ProviderDirectoryArtifactBuildFence(
-            target_oid=102
-        ),
+        evidence_fence=importer.ProviderDirectoryArtifactBuildFence(target_oid=101),
+        profile_fence=importer.ProviderDirectoryArtifactBuildFence(target_oid=102),
         first=first,
     )
 
@@ -1490,6 +1365,7 @@ async def _assert_global_profile_reinitialized(
     profile_fence,
 ):
     """Require reinitialization with fresh as-of and restored totals."""
+
     @contextlib.asynccontextmanager
     async def transaction():
         yield
@@ -1513,13 +1389,11 @@ async def _assert_global_profile_reinitialized(
         "_provider_directory_profile_stage_storage_fingerprint",
         _profile_stage_storage_fingerprint_mock(resolved_build),
     )
-    initialized = (
-        await importer._claim_provider_directory_profile_build_checkpoint(
-            resolved_build,
-            has_existing_artifacts=True,
-            evidence_build_fence=evidence_fence,
-            profile_build_fence=profile_fence,
-        )
+    initialized = await importer._claim_provider_directory_profile_build_checkpoint(
+        resolved_build,
+        has_existing_artifacts=True,
+        evidence_build_fence=evidence_fence,
+        profile_build_fence=profile_fence,
     )
     drop_stages.assert_awaited_once_with(resolved_build, checkpoint_map)
     assert initialized.evidence_total_batches == 2185
@@ -1527,8 +1401,7 @@ async def _assert_global_profile_reinitialized(
     insert_call = next(
         call
         for call in status.await_args_list
-        if "profile_build_checkpoint" in str(call.args[0])
-        and "INSERT INTO" in str(call.args[0])
+        if "profile_build_checkpoint" in str(call.args[0]) and "INSERT INTO" in str(call.args[0])
     )
     assert insert_call.kwargs["profile_as_of"] == "2026-07-29"
     assert insert_call.kwargs["evidence_total_batches"] == 2185
@@ -1652,13 +1525,11 @@ async def _assert_reclaimed_profile_checkpoint_states(
         (11, "r", "p"),
         (12, "r", "p"),
     ]
-    reclaimed_state = (
-        await importer._claim_provider_directory_profile_build_checkpoint(
-            build,
-            has_existing_artifacts=False,
-            evidence_build_fence=fence,
-            profile_build_fence=fence,
-        )
+    reclaimed_state = await importer._claim_provider_directory_profile_build_checkpoint(
+        build,
+        has_existing_artifacts=False,
+        evidence_build_fence=fence,
+        profile_build_fence=fence,
     )
     assert reclaimed_state.state == "building_profile"
     assert reclaimed_state.profile_next_batch == 0
@@ -1670,13 +1541,11 @@ async def _assert_reclaimed_profile_checkpoint_states(
             "profile_next_batch": 400,
         }
     )
-    ready_state = (
-        await importer._claim_provider_directory_profile_build_checkpoint(
-            build,
-            has_existing_artifacts=False,
-            evidence_build_fence=fence,
-            profile_build_fence=fence,
-        )
+    ready_state = await importer._claim_provider_directory_profile_build_checkpoint(
+        build,
+        has_existing_artifacts=False,
+        evidence_build_fence=fence,
+        profile_build_fence=fence,
     )
     assert ready_state.state == "ready"
 
@@ -1708,9 +1577,7 @@ async def test_profile_checkpoint_claim_initializes_and_reclaims_logged_stages(
     monkeypatch.setattr(importer.db, "transaction", transaction)
     first = AsyncMock(return_value=None)
     status = AsyncMock(return_value=1)
-    stage_identity = AsyncMock(
-        side_effect=[None, None, (21, "r", "p"), (22, "r", "p")]
-    )
+    stage_identity = AsyncMock(side_effect=[None, None, (21, "r", "p"), (22, "r", "p")])
     monkeypatch.setattr(importer.db, "first", first)
     monkeypatch.setattr(importer.db, "status", status)
     monkeypatch.setattr(
@@ -1723,20 +1590,17 @@ async def test_profile_checkpoint_claim_initializes_and_reclaims_logged_stages(
         "_provider_directory_profile_stage_storage_fingerprint",
         _profile_stage_storage_fingerprint_mock(build),
     )
-    fresh_state = (
-        await importer._claim_provider_directory_profile_build_checkpoint(
-            build,
-            has_existing_artifacts=False,
-            evidence_build_fence=fence,
-            profile_build_fence=fence,
-        )
+    fresh_state = await importer._claim_provider_directory_profile_build_checkpoint(
+        build,
+        has_existing_artifacts=False,
+        evidence_build_fence=fence,
+        profile_build_fence=fence,
     )
     assert fresh_state.state == "building_evidence"
     assert fresh_state.evidence_next_batch == 0
     assert fresh_state.profile_next_batch == 0
     assert any(
-        "INSERT INTO" in str(call.args[0])
-        and "profile_build_checkpoint" in str(call.args[0])
+        "INSERT INTO" in str(call.args[0]) and "profile_build_checkpoint" in str(call.args[0])
         for call in status.await_args_list
     )
 
@@ -1758,15 +1622,10 @@ def _failed_profile_checkpoint_maps(build):
         build,
         state="failed",
     )
-    unfinalized_checkpoint_map["last_error"] = (
-        "RuntimeError: analyze failed [checkpoint_state=building_evidence]"
-    )
+    unfinalized_checkpoint_map["last_error"] = "RuntimeError: analyze failed [checkpoint_state=building_evidence]"
     finalized_checkpoint_map = {
         **unfinalized_checkpoint_map,
-        "last_error": (
-            "RuntimeError: compact failed "
-            "[checkpoint_state=evidence_complete]"
-        ),
+        "last_error": ("RuntimeError: compact failed [checkpoint_state=evidence_complete]"),
     }
     return unfinalized_checkpoint_map, finalized_checkpoint_map
 
@@ -1809,21 +1668,17 @@ async def test_profile_claim_reopens_only_unfinalized_failed_evidence(
     )
     fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
 
-    unfinalized_claim = (
-        await importer._claim_provider_directory_profile_build_checkpoint(
-            build,
-            has_existing_artifacts=False,
-            evidence_build_fence=fence,
-            profile_build_fence=fence,
-        )
+    unfinalized_claim = await importer._claim_provider_directory_profile_build_checkpoint(
+        build,
+        has_existing_artifacts=False,
+        evidence_build_fence=fence,
+        profile_build_fence=fence,
     )
-    finalized_claim = (
-        await importer._claim_provider_directory_profile_build_checkpoint(
-            build,
-            has_existing_artifacts=False,
-            evidence_build_fence=fence,
-            profile_build_fence=fence,
-        )
+    finalized_claim = await importer._claim_provider_directory_profile_build_checkpoint(
+        build,
+        has_existing_artifacts=False,
+        evidence_build_fence=fence,
+        profile_build_fence=fence,
     )
 
     assert unfinalized_claim.state == "building_evidence"
@@ -1890,9 +1745,7 @@ async def test_profile_checkpoint_mutations_fail_closed(monkeypatch):
         build.schema,
         build.generation_id,
     )
-    assert "RuntimeError: forced failure" in str(
-        status.await_args_list[-2].kwargs["last_error"]
-    )
+    assert "RuntimeError: forced failure" in str(status.await_args_list[-2].kwargs["last_error"])
 
     status.return_value = 0
     with pytest.raises(
@@ -1928,9 +1781,7 @@ async def test_existing_profile_stages_receive_retention_and_currentness_params(
 
     parameter_sets = [call.kwargs for call in status.await_args_list]
     retained_calls = [
-        params
-        for params in parameter_sets
-        if params.get("retained_source_ids") == ["source_a", "source_b"]
+        params for params in parameter_sets if params.get("retained_source_ids") == ["source_a", "source_b"]
     ]
     assert len(retained_calls) == 3
     assert all(params["profile_as_of"] == "2026-07-19" for params in retained_calls)
@@ -1979,9 +1830,7 @@ async def test_profile_bounded_population_rejects_invalid_resume_batches(
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_evidence_batches",
-        lambda *_args, **_params: (
-            importer._ProviderDirectoryProfileEvidenceBatch(kind="fact"),
-        ),
+        lambda *_args, **_params: (importer._ProviderDirectoryProfileEvidenceBatch(kind="fact"),),
     )
     with pytest.raises(
         RuntimeError,
@@ -2002,9 +1851,7 @@ async def test_profile_bounded_population_rejects_invalid_resume_batches(
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_compact_batches",
-        lambda **_params: (
-            importer._ProviderDirectoryProfileCompactBatch(kind="npi"),
-        ),
+        lambda **_params: (importer._ProviderDirectoryProfileCompactBatch(kind="npi"),),
     )
     await _assert_invalid_profile_resume_batches(build)
 
@@ -2126,24 +1973,28 @@ async def test_profile_stage_finalization_supports_deferred_and_immediate_cutove
         stages,
         defer_cutover=True,
     ) == (metric_map, stages)
-    assert await importer._finalize_provider_directory_profile_stages(
-        metric_map,
-        stages,
-        defer_cutover=False,
-    ) == metric_map
-    promote.assert_awaited_once_with(stages)
-    assert [call.args[0] for call in remove.await_args_list] == list(
-        reversed(stages)
+    assert (
+        await importer._finalize_provider_directory_profile_stages(
+            metric_map,
+            stages,
+            defer_cutover=False,
+        )
+        == metric_map
     )
+    promote.assert_awaited_once_with(stages)
+    assert [call.args[0] for call in remove.await_args_list] == list(reversed(stages))
 
     initial_stages = _initial_profile_stages()
     promote.reset_mock()
     remove.reset_mock()
-    assert await importer._finalize_provider_directory_profile_stages(
-        metric_map,
-        initial_stages,
-        defer_cutover=False,
-    ) == metric_map
+    assert (
+        await importer._finalize_provider_directory_profile_stages(
+            metric_map,
+            initial_stages,
+            defer_cutover=False,
+        )
+        == metric_map
+    )
     promote.assert_awaited_once_with(initial_stages)
     remove.assert_not_awaited()
 
@@ -2181,9 +2032,7 @@ async def _assert_resumable_artifact_cleanup(
     assert bundle.promoted is True
     promotion.assert_awaited_once_with(tuple(bundle.stages))
     delete_checkpoint.assert_awaited_once_with(*checkpoint)
-    assert [call.args[0] for call in remove.await_args_list] == list(
-        reversed(bundle.stages)
-    )
+    assert [call.args[0] for call in remove.await_args_list] == list(reversed(bundle.stages))
 
 
 @pytest.mark.asyncio
@@ -2216,9 +2065,7 @@ async def test_artifact_bundle_retains_resumable_stages_until_cutover_succeeds(
         target_relation="other_target",
         rename_stage_indexes=rename_indexes,
     )
-    bundle = importer.ProviderDirectoryArtifactBundle(
-        stages=[*retained_stages, disposable_stage]
-    )
+    bundle = importer.ProviderDirectoryArtifactBundle(stages=[*retained_stages, disposable_stage])
     promotion = AsyncMock(side_effect=RuntimeError("cutover failed"))
     remove = AsyncMock()
     delete_checkpoint = AsyncMock()
@@ -2282,10 +2129,13 @@ async def _assert_oid_fenced_stale_profile_cleanup(checkpoint_by_name, first, mo
     )
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
-    assert await importer._reap_stale_provider_directory_profile_builds(
-        "mrf",
-        current_build_id=f"pdpb_{'b' * 32}",
-    ) == 1
+    assert (
+        await importer._reap_stale_provider_directory_profile_builds(
+            "mrf",
+            current_build_id=f"pdpb_{'b' * 32}",
+        )
+        == 1
+    )
     statements = [str(call.args[0]) for call in status.await_args_list]
     assert sum(statement.startswith("LOCK TABLE") for statement in statements) == 2
     assert sum(statement.startswith("DROP TABLE") for statement in statements) == 2
@@ -2324,10 +2174,13 @@ async def test_profile_stage_identity_and_stale_reaper_are_oid_fenced(
     profile_stage = profile.profile_stage_table_name(build_id)
     first = AsyncMock(return_value=None)
     monkeypatch.setattr(importer.db, "first", first)
-    assert await importer._provider_directory_profile_stage_relation_identity(
-        "mrf",
-        evidence_stage,
-    ) is None
+    assert (
+        await importer._provider_directory_profile_stage_relation_identity(
+            "mrf",
+            evidence_stage,
+        )
+        is None
+    )
     first.return_value = {
         "relation_oid": 11,
         "relation_kind": "r",
@@ -2343,7 +2196,7 @@ async def test_profile_stage_identity_and_stale_reaper_are_oid_fenced(
             "evidence_stage": evidence_stage,
             "profile_stage": profile_stage,
         }
-        ) == (evidence_stage, profile_stage, None)
+    ) == (evidence_stage, profile_stage, None)
     with pytest.raises(
         RuntimeError,
         match="stale_checkpoint_identity_invalid",
@@ -2422,18 +2275,13 @@ async def test_profile_stage_preparation_metrics_and_pair_contract(
         "_assert_provider_directory_profile_checkpoint_ready",
         assert_ready,
     )
-    stages = await importer._prepare_provider_directory_profile_stages(
-        build, fence, fence
-    )
+    stages = await importer._prepare_provider_directory_profile_stages(build, fence, fence)
     assert [stage.stage_table for stage in stages] == [
         build.evidence_stage,
         build.profile_stage,
     ]
     assert all(stage.retain_on_failed_bundle for stage in stages)
-    assert all(
-        stage.resume_checkpoint == (build.schema, build.generation_id)
-        for stage in stages
-    )
+    assert all(stage.resume_checkpoint == (build.schema, build.generation_id) for stage in stages)
     assert assert_logged.await_count == 2
     assert_ready.assert_awaited_once_with(build, fence, fence)
     monkeypatch.setattr(
@@ -2441,9 +2289,7 @@ async def test_profile_stage_preparation_metrics_and_pair_contract(
         "_provider_directory_profile_stage_metrics",
         AsyncMock(return_value={"profile_rows": 4}),
     )
-    metrics = await importer._provider_directory_profile_metrics(
-        build, should_rebuild_all_profiles=False
-    )
+    metrics = await importer._provider_directory_profile_metrics(build, should_rebuild_all_profiles=False)
     assert metrics["generation_id"] == build.generation_id
     assert metrics["dataset_ids"] == ["dataset_a"]
     assert metrics["incremental"] is True
@@ -2465,17 +2311,11 @@ async def _assert_exact_artifact_cutover_recovery(
     ):
         relation_oid.side_effect = relation_values
         relation_attribute.return_value = persistence
-        assert not (
-            await importer._is_provider_directory_artifact_promotion_committed(
-                (identity,)
-            )
-        )
+        assert not (await importer._is_provider_directory_artifact_promotion_committed((identity,)))
 
     relation_oid.side_effect = [11, None, None]
     relation_attribute.return_value = "p"
-    assert await importer._is_provider_directory_artifact_promotion_committed(
-        (identity,)
-    )
+    assert await importer._is_provider_directory_artifact_promotion_committed((identity,))
     dataset_committed = AsyncMock(return_value=True)
     monkeypatch.setattr(
         importer,
@@ -2512,11 +2352,7 @@ async def test_artifact_promotion_identity_recovers_only_exact_cutover(
         "_provider_directory_relation_oid",
         relation_oid,
     )
-    identities = (
-        await importer._capture_provider_directory_artifact_promotion_identities(
-            (stage,)
-        )
-    )
+    identities = await importer._capture_provider_directory_artifact_promotion_identities((stage,))
     assert identities == (
         importer.ProviderDirectoryArtifactPromotionIdentity(
             stage=stage,
@@ -2524,15 +2360,8 @@ async def test_artifact_promotion_identity_recovers_only_exact_cutover(
         ),
     )
     relation_oid.side_effect = [None]
-    assert (
-        await importer._capture_provider_directory_artifact_promotion_identities(
-            (stage,)
-        )
-        == ()
-    )
-    assert not await importer._is_provider_directory_artifact_promotion_committed(
-        ()
-    )
+    assert await importer._capture_provider_directory_artifact_promotion_identities((stage,)) == ()
+    assert not await importer._is_provider_directory_artifact_promotion_committed(())
 
     identity = identities[0]
     relation_attribute = AsyncMock(return_value="p")
@@ -2562,26 +2391,14 @@ async def _assert_dataset_cutover_row_contract(
         "_is_artifact_incumbent_superseded",
         incumbent_superseded,
     )
-    assert not await importer._is_provider_directory_dataset_cutover_committed(
-        fence
-    )
+    assert not await importer._is_provider_directory_dataset_cutover_committed(fence)
     incumbent_superseded.return_value = True
-    selected_row_by_field["fence_source_endpoint_tuples"] = [
-        ["source_b", "endpoint_a"]
-    ]
-    assert not await importer._is_provider_directory_dataset_cutover_committed(
-        fence
-    )
-    selected_row_by_field["fence_source_endpoint_tuples"] = [
-        ["source_a", "endpoint_a"]
-    ]
-    assert await importer._is_provider_directory_dataset_cutover_committed(
-        fence
-    )
+    selected_row_by_field["fence_source_endpoint_tuples"] = [["source_b", "endpoint_a"]]
+    assert not await importer._is_provider_directory_dataset_cutover_committed(fence)
+    selected_row_by_field["fence_source_endpoint_tuples"] = [["source_a", "endpoint_a"]]
+    assert await importer._is_provider_directory_dataset_cutover_committed(fence)
 
-    source_rows = AsyncMock(
-        return_value=[{"source_id": "source_a", "endpoint_id": "endpoint_a"}]
-    )
+    source_rows = AsyncMock(return_value=[{"source_id": "source_a", "endpoint_id": "endpoint_a"}])
     monkeypatch.setattr(importer.db, "all", source_rows)
     ordinary_fence = importer.ProviderDirectoryArtifactDatasetFence(
         (
@@ -2594,21 +2411,15 @@ async def _assert_dataset_cutover_row_contract(
             ),
         )
     )
-    assert await importer._is_artifact_source_endpoint_cutover_committed(
-        ordinary_fence
-    )
+    assert await importer._is_artifact_source_endpoint_cutover_committed(ordinary_fence)
     source_rows.return_value = []
-    assert not await importer._is_artifact_source_endpoint_cutover_committed(
-        ordinary_fence
-    )
+    assert not await importer._is_artifact_source_endpoint_cutover_committed(ordinary_fence)
 
 
 def test_fence_source_endpoint_tuples_rejects_missing_or_malformed_rows():
     assert importer._fence_source_endpoint_tuples([]) == ()
     assert importer._fence_source_endpoint_tuples([{}]) == ()
-    assert importer._fence_source_endpoint_tuples(
-        [{"fence_source_endpoint_tuples": [["source_a"]]}]
-    ) == ()
+    assert importer._fence_source_endpoint_tuples([{"fence_source_endpoint_tuples": [["source_a"]]}]) == ()
 
 
 @pytest.mark.asyncio
@@ -2633,9 +2444,7 @@ async def test_dataset_cutover_commit_requires_exact_rows_and_aliases(
         "_artifact_fence_dataset_rows",
         dataset_rows,
     )
-    assert not await importer._is_provider_directory_dataset_cutover_committed(
-        fence
-    )
+    assert not await importer._is_provider_directory_dataset_cutover_committed(fence)
 
     selected_row_by_field = {
         "dataset_id": dataset.dataset_id,
@@ -2648,9 +2457,7 @@ async def test_dataset_cutover_commit_requires_exact_rows_and_aliases(
         "_is_artifact_fence_dataset_row_exact",
         row_exact,
     )
-    assert not await importer._is_provider_directory_dataset_cutover_committed(
-        fence
-    )
+    assert not await importer._is_provider_directory_dataset_cutover_committed(fence)
     expected_dataset = row_exact.call_args.args[0]
     assert expected_dataset.status == importer.ENDPOINT_DATASET_PUBLISHED
     assert expected_dataset.is_current is True
@@ -2662,14 +2469,10 @@ async def test_dataset_cutover_commit_requires_exact_rows_and_aliases(
         "_current_published_artifact_dataset_ids",
         current_ids,
     )
-    assert not await importer._is_provider_directory_dataset_cutover_committed(
-        fence
-    )
+    assert not await importer._is_provider_directory_dataset_cutover_committed(fence)
     current_ids.return_value = [dataset.dataset_id]
     incumbent_superseded = Mock(return_value=False)
-    await _assert_dataset_cutover_row_contract(
-        dataset, fence, incumbent_superseded, selected_row_by_field, monkeypatch
-    )
+    await _assert_dataset_cutover_row_contract(dataset, fence, incumbent_superseded, selected_row_by_field, monkeypatch)
 
 
 def test_artifact_incumbent_supersession_contract():
@@ -2762,10 +2565,7 @@ async def test_resource_id_npi_backfill_honors_seen_and_run_scopes(
         "mrf",
         run_id="run-b",
     )
-    assert all(
-        "resource.last_seen_run_id" in call.args[0]
-        for call in status.await_args_list
-    )
+    assert all("resource.last_seen_run_id" in call.args[0] for call in status.await_args_list)
 
 
 async def _assert_dataset_fence_lock_contract(dataset, status):
@@ -2840,9 +2640,7 @@ async def test_dataset_fence_helpers_lock_record_and_aggregate_proof(
         executor,
         dataset.dataset_id,
     )
-    assert executor.scalar.await_args.kwargs["lock_key"].endswith(
-        dataset.dataset_id
-    )
+    assert executor.scalar.await_args.kwargs["lock_key"].endswith(dataset.dataset_id)
 
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
@@ -2851,9 +2649,7 @@ async def test_dataset_fence_helpers_lock_record_and_aggregate_proof(
         importer.PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
         {"complete": True},
     )
-    assert json.loads(status.await_args.kwargs["proof_json"]) == {
-        "complete": True
-    }
+    assert json.loads(status.await_args.kwargs["proof_json"]) == {"complete": True}
     status.reset_mock()
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
@@ -3002,11 +2798,14 @@ async def test_artifact_relation_metadata_and_logged_contract(monkeypatch):
         )
         is None
     )
-    assert await importer._provider_directory_relation_attribute(
-        "mrf",
-        "profile",
-        "relpersistence",
-    ) == "p"
+    assert (
+        await importer._provider_directory_relation_attribute(
+            "mrf",
+            "profile",
+            "relpersistence",
+        )
+        == "p"
+    )
 
     await importer._assert_provider_directory_logged_relation("mrf", "profile")
     with pytest.raises(RuntimeError, match="is not LOGGED"):
@@ -3023,28 +2822,18 @@ def test_artifact_cutover_retryability_follows_postgres_lock_identity():
     )
     pgcode_error = RuntimeError("lock")
     pgcode_error.pgcode = "55P03"
-    assert importer._is_provider_directory_artifact_cutover_retryable(
-        pgcode_error
-    )
+    assert importer._is_provider_directory_artifact_cutover_retryable(pgcode_error)
     wrapped_error = RuntimeError("wrapped")
     wrapped_error.orig = SimpleNamespace(sqlstate="55P03")
-    assert importer._is_provider_directory_artifact_cutover_retryable(
-        wrapped_error
-    )
+    assert importer._is_provider_directory_artifact_cutover_retryable(wrapped_error)
     caused_error = RuntimeError("caused")
     caused_error.__cause__ = RuntimeError("cause")
     caused_error.__cause__.pgcode = "55P03"
-    assert importer._is_provider_directory_artifact_cutover_retryable(
-        caused_error
-    )
-    assert not importer._is_provider_directory_artifact_cutover_retryable(
-        RuntimeError("ordinary")
-    )
+    assert importer._is_provider_directory_artifact_cutover_retryable(caused_error)
+    assert not importer._is_provider_directory_artifact_cutover_retryable(RuntimeError("ordinary"))
     query_canceled = RuntimeError("statement timeout")
     query_canceled.pgcode = "57014"
-    assert not importer._is_provider_directory_artifact_cutover_retryable(
-        query_canceled
-    )
+    assert not importer._is_provider_directory_artifact_cutover_retryable(query_canceled)
 
 
 def test_artifact_transaction_timeout_budget_is_phase_specific():
@@ -3055,28 +2844,24 @@ def test_artifact_transaction_timeout_budget_is_phase_specific():
         should_select_validated_candidates=True,
     )
 
-    ordinary_timeout = (
-        importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
-    )
-    assert importer._provider_directory_artifact_transaction_timeout_seconds(
-        None
-    ) == ordinary_timeout
-    assert importer._provider_directory_artifact_transaction_timeout_seconds(
-        current_fence
-    ) == ordinary_timeout
-    assert importer._provider_directory_artifact_transaction_timeout_seconds(
-        candidate_fence
-    ) == (
+    ordinary_timeout = importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+    assert importer._provider_directory_artifact_transaction_timeout_seconds(None) == ordinary_timeout
+    assert importer._provider_directory_artifact_transaction_timeout_seconds(current_fence) == ordinary_timeout
+    assert importer._provider_directory_artifact_transaction_timeout_seconds(candidate_fence) == (
         importer.PROVIDER_DIRECTORY_ARTIFACT_CANDIDATE_TRANSACTION_TIMEOUT_SECONDS
     )
-    assert importer._provider_directory_artifact_transaction_timeout_seconds(
-        candidate_fence,
-        profile_delta=object(),
-    ) == importer.PROVIDER_DIRECTORY_PROFILE_DELTA_PROMOTION_TIMEOUT_SECONDS
+    assert (
+        importer._provider_directory_artifact_transaction_timeout_seconds(
+            candidate_fence,
+            profile_delta=object(),
+        )
+        == importer.PROVIDER_DIRECTORY_PROFILE_DELTA_PROMOTION_TIMEOUT_SECONDS
+    )
 
 
 def test_artifact_cutover_timeout_tightens_without_extending(monkeypatch):
     """Shorten ordinary walls but retain the candidate publication budget."""
+
     class Timeout:
         def __init__(self, deadline):
             self.deadline = deadline
@@ -3094,15 +2879,11 @@ def test_artifact_cutover_timeout_tightens_without_extending(monkeypatch):
         lambda: SimpleNamespace(time=lambda: 100.0),
     )
     candidate_timeout = Timeout(112.0)
-    importer._tighten_provider_directory_artifact_cutover_timeout(
-        candidate_timeout
-    )
+    importer._tighten_provider_directory_artifact_cutover_timeout(candidate_timeout)
     assert candidate_timeout.rescheduled_to == 102.0
 
     current_timeout = Timeout(101.0)
-    importer._tighten_provider_directory_artifact_cutover_timeout(
-        current_timeout
-    )
+    importer._tighten_provider_directory_artifact_cutover_timeout(current_timeout)
     assert current_timeout.rescheduled_to is None
     candidate_fence = importer.ProviderDirectoryArtifactDatasetFence(
         (),
@@ -3129,9 +2910,7 @@ async def test_artifact_cutover_timeout_reschedule_is_enforced(
     )
     with pytest.raises(TimeoutError):
         async with importer.asyncio.timeout(1.0) as cutover_timeout:
-            importer._tighten_provider_directory_artifact_cutover_timeout(
-                cutover_timeout
-            )
+            importer._tighten_provider_directory_artifact_cutover_timeout(cutover_timeout)
             await importer.asyncio.sleep(0.02)
 
 
@@ -3157,15 +2936,11 @@ async def test_candidate_fence_budget_precedes_cutover(monkeypatch):
         verify,
     )
 
-    await importer._lock_artifact_cutover_fence(
-        candidate_fence
-    )
+    await importer._lock_artifact_cutover_fence(candidate_fence)
     assert events == [
-        "SET LOCAL statement_timeout = "
-        f"'{importer.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}';",
+        f"SET LOCAL statement_timeout = '{importer.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}';",
         "verify-fence",
-        "SET LOCAL statement_timeout = "
-        f"'{importer.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}';",
+        f"SET LOCAL statement_timeout = '{importer.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}';",
     ]
 
     events.clear()
@@ -3201,12 +2976,9 @@ async def test_candidate_fence_failure_skips_reset(monkeypatch):
         fail_verification,
     )
     with pytest.raises(RuntimeError, match="statement timeout"):
-        await importer._lock_artifact_cutover_fence(
-            candidate_fence
-        )
+        await importer._lock_artifact_cutover_fence(candidate_fence)
     assert events == [
-        "SET LOCAL statement_timeout = "
-        f"'{importer.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}';",
+        f"SET LOCAL statement_timeout = '{importer.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}';",
         "verify-fence",
     ]
 
@@ -3258,12 +3030,8 @@ async def test_candidate_bundle_restores_budget_before_table_lock(monkeypatch):
         fence,
     )
 
-    fence_budget = next(
-        index for index, event in enumerate(events) if "8s" in event
-    )
-    retained_budget = max(
-        index for index, event in enumerate(events) if "8s" in event
-    )
+    fence_budget = next(index for index, event in enumerate(events) if "8s" in event)
+    retained_budget = max(index for index, event in enumerate(events) if "8s" in event)
     assert fence_budget < events.index("verify-fence")
     assert events.index("verify-fence") < retained_budget
     assert retained_budget < events.index("lock-tables")
@@ -3318,9 +3086,7 @@ async def test_artifact_lock_prepare_and_build_fence_contract(monkeypatch):
     await importer._assert_provider_directory_artifact_build_fence(fenced_stage)
     relation_oid.return_value = 12
     with pytest.raises(importer.ProviderDirectoryArtifactBuildStale):
-        await importer._assert_provider_directory_artifact_build_fence(
-            fenced_stage
-        )
+        await importer._assert_provider_directory_artifact_build_fence(fenced_stage)
 
 
 @pytest.mark.asyncio
@@ -3357,9 +3123,7 @@ async def test_artifact_stage_install_and_finish_fail_closed(monkeypatch):
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
     with pytest.raises(RuntimeError, match="Unsupported Provider Directory"):
-        await importer._install_provider_directory_prepared_stage(
-            _artifact_stage()
-        )
+        await importer._install_provider_directory_prepared_stage(_artifact_stage())
 
     rename_indexes = AsyncMock()
     assert_logged = AsyncMock()
@@ -3420,9 +3184,7 @@ async def test_artifact_source_alias_cutover_is_exact(monkeypatch):
         serving_endpoint_id="endpoint-new",
     )
     changed = _promotion_dataset(source_id="source-changed")
-    fence = importer.ProviderDirectoryArtifactDatasetFence(
-        (ordinary, unchanged, changed)
-    )
+    fence = importer.ProviderDirectoryArtifactDatasetFence((ordinary, unchanged, changed))
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
     await importer._cutover_provider_directory_artifact_sources(fence)
@@ -3476,16 +3238,11 @@ async def test_artifact_dataset_promotion_parses_compact_metadata_once(
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
 
-    await importer._publish_validated_artifact_dataset(
-        _promotion_dataset()
-    )
+    await importer._publish_validated_artifact_dataset(_promotion_dataset())
 
     publish_sql = status.await_args.args[0]
     assert "artifact_publish_candidate_json AS MATERIALIZED" in publish_sql
-    assert (
-        "artifact_publish_candidate_metadata AS MATERIALIZED"
-        in publish_sql
-    )
+    assert "artifact_publish_candidate_metadata AS MATERIALIZED" in publish_sql
     assert "jsonb_to_record" in publish_sql
     assert "publication_metadata_summary_json" in publish_sql
     assert "content_proof_admission_version" in publish_sql
@@ -3494,20 +3251,11 @@ async def test_artifact_dataset_promotion_parses_compact_metadata_once(
     assert "candidate.eligibility_metadata_jsonb" in publish_sql
     assert "candidate.uhc_publication_present" in publish_sql
     assert "COALESCE(" in publish_sql
-    assert (
-        "__ARTIFACT_PUBLISH_ELIGIBILITY_METADATA_COLUMNS__"
-        not in publish_sql
-    )
+    assert "__ARTIFACT_PUBLISH_ELIGIBILITY_METADATA_COLUMNS__" not in publish_sql
 
-    projected_columns = (
-        importer._artifact_publish_eligibility_metadata_columns()
-    )
-    assert importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY not in (
-        projected_columns
-    )
-    assert importer.UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY not in (
-        projected_columns
-    )
+    projected_columns = importer._artifact_publish_eligibility_metadata_columns()
+    assert importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY not in (projected_columns)
+    assert importer.UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY not in (projected_columns)
 
 
 def test_artifact_bundle_ordering_rejects_schema_and_target_ambiguity():
@@ -3520,13 +3268,9 @@ def test_artifact_bundle_ordering_rejects_schema_and_target_ambiguity():
         stage_table="stage-a",
         target_relation="target-a",
     )
-    assert importer._ordered_provider_directory_artifact_bundle(
-        (stage_b, stage_a)
-    ) == (stage_a, stage_b)
+    assert importer._ordered_provider_directory_artifact_bundle((stage_b, stage_a)) == (stage_a, stage_b)
     with pytest.raises(ValueError, match="schema_mismatch"):
-        importer._ordered_provider_directory_artifact_bundle(
-            (stage_a, importer.replace(stage_b, schema="other"))
-        )
+        importer._ordered_provider_directory_artifact_bundle((stage_a, importer.replace(stage_b, schema="other")))
     with pytest.raises(ValueError, match="target_duplicate"):
         importer._ordered_provider_directory_artifact_bundle(
             (
@@ -3539,6 +3283,7 @@ def test_artifact_bundle_ordering_rejects_schema_and_target_ambiguity():
 @pytest.mark.asyncio
 async def test_artifact_bundle_transaction_runs_all_fenced_steps(monkeypatch):
     """Execute ordered swaps and dataset publication in one transaction."""
+
     @contextlib.asynccontextmanager
     async def transaction():
         yield
@@ -3551,9 +3296,7 @@ async def test_artifact_bundle_transaction_runs_all_fenced_steps(monkeypatch):
         stage_table="stage-a",
         target_relation="target-a",
     )
-    fence = importer.ProviderDirectoryArtifactDatasetFence(
-        (_promotion_dataset(),)
-    )
+    fence = importer.ProviderDirectoryArtifactDatasetFence((_promotion_dataset(),))
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(importer.db, "status", AsyncMock())
     monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=1))
@@ -3571,25 +3314,15 @@ async def test_artifact_bundle_transaction_runs_all_fenced_steps(monkeypatch):
     helpers_by_name = {name: AsyncMock() for name in helper_names}
     for name, helper in helpers_by_name.items():
         monkeypatch.setattr(importer, name, helper)
-    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(
-        fence
-    )
+    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
     try:
-        await importer._promote_provider_directory_artifact_bundle_transaction(
-            (stage_b, stage_a)
-        )
+        await importer._promote_provider_directory_artifact_bundle_transaction((stage_b, stage_a))
     finally:
         importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)
 
-    assert helpers_by_name[
-        "_acquire_provider_directory_artifact_cutover_lock"
-    ].await_count == 2
-    helpers_by_name[
-        "_lock_and_verify_artifact_dataset_fence"
-    ].assert_awaited_once_with(fence)
-    helpers_by_name[
-        "_promote_provider_directory_artifact_datasets"
-    ].assert_awaited_once_with(fence)
+    assert helpers_by_name["_acquire_provider_directory_artifact_cutover_lock"].await_count == 2
+    helpers_by_name["_lock_and_verify_artifact_dataset_fence"].assert_awaited_once_with(fence)
+    helpers_by_name["_promote_provider_directory_artifact_datasets"].assert_awaited_once_with(fence)
     importer.db.status.assert_any_await('LOCK TABLE "mrf"."target-a", "mrf"."target-b" IN ACCESS EXCLUSIVE MODE')
     await importer._promote_provider_directory_artifact_bundle_transaction(())
 
@@ -3669,26 +3402,18 @@ async def test_artifact_bundle_retry_stops_on_cause_or_exhaustion(monkeypatch):
         promote,
     )
     monkeypatch.setattr(importer.asyncio, "sleep", sleep)
-    await importer._retry_provider_directory_artifact_bundle_promotion(
-        (stage,)
-    )
+    await importer._retry_provider_directory_artifact_bundle_promotion((stage,))
     assert promote.await_count == 2
     sleep.assert_awaited_once()
 
     promote.reset_mock(side_effect=True)
     promote.side_effect = RuntimeError("terminal")
     with pytest.raises(RuntimeError, match="terminal"):
-        await importer._retry_provider_directory_artifact_bundle_promotion(
-            (stage,)
-        )
+        await importer._retry_provider_directory_artifact_bundle_promotion((stage,))
     promote.reset_mock(side_effect=True)
-    promote.side_effect = importer.ProviderDirectoryArtifactCutoverConflict(
-        "profile"
-    )
+    promote.side_effect = importer.ProviderDirectoryArtifactCutoverConflict("profile")
     with pytest.raises(importer.ProviderDirectoryArtifactCutoverConflict):
-        await importer._retry_provider_directory_artifact_bundle_promotion(
-            (stage,)
-        )
+        await importer._retry_provider_directory_artifact_bundle_promotion((stage,))
 
 
 @pytest.mark.asyncio
@@ -3697,9 +3422,7 @@ async def test_single_artifact_timeout_recovers_only_verified_commit(
 ):
     """Resolve a one-stage timeout with the same exact-identity contract."""
     stage = _artifact_stage()
-    identities = (
-        importer.ProviderDirectoryArtifactPromotionIdentity(stage, 11),
-    )
+    identities = (importer.ProviderDirectoryArtifactPromotionIdentity(stage, 11),)
     monkeypatch.setattr(
         importer,
         "_capture_provider_directory_artifact_promotion_identities",
@@ -3768,9 +3491,7 @@ def test_credentials_config_ignores_invalid_shapes_and_merges_objects(
 ):
     """Load only JSON objects from the private file and environment overlay."""
     file_path = _write_json(tmp_path / "credentials.json", ["not-an-object"])
-    config_token = importer._PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.set(
-        str(file_path)
-    )
+    config_token = importer._PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.set(str(file_path))
     monkeypatch.setenv(
         importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,
         "[]",
@@ -3793,9 +3514,7 @@ def test_credentials_config_ignores_invalid_shapes_and_merges_objects(
             "sources": {"aetna": {"api_key": "secret"}},
         }
     finally:
-        importer._PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.reset(
-            config_token
-        )
+        importer._PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.reset(config_token)
 
 
 def test_credential_rules_merge_all_scopes_and_allow_relative_urls(
@@ -3805,9 +3524,7 @@ def test_credential_rules_merge_all_scopes_and_allow_relative_urls(
     config_by_name = {
         "defaults": {"headers": {"X-Default": "default"}},
         "hosts": {"example.test": {"query": {"host": "yes"}}},
-        "api_bases": {
-            "https://example.test/fhir": {"headers": {"X-Base": "base"}}
-        },
+        "api_bases": {"https://example.test/fhir": {"headers": {"X-Base": "base"}}},
         "org_names": {"Example Org": {"query_params": {"org": "yes"}}},
         "sources": {"source-a": {"api_key": "source-secret"}},
     }
@@ -3862,12 +3579,7 @@ def test_aetna_credential_base_candidates_keep_exact_partition_rules():
 def test_oauth_credentials_fail_closed_and_cache_valid_token(monkeypatch):
     """Reject incomplete token responses and cache one valid body-auth token."""
     importer._OAUTH_TOKEN_CACHE.clear()
-    assert (
-        importer._fetch_oauth2_client_token_sync(
-            {"token_url": "https://auth.test/token"}
-        )
-        is None
-    )
+    assert importer._fetch_oauth2_client_token_sync({"token_url": "https://auth.test/token"}) is None
     response = MagicMock()
     response.__enter__.return_value = response
     response.read.return_value = b"{}"
@@ -3888,22 +3600,10 @@ def test_oauth_credentials_fail_closed_and_cache_valid_token(monkeypatch):
         "scope": "scope-a",
         "extra_params": {"audience": "aud-a", "empty": ""},
     }
-    assert (
-        importer._fetch_oauth2_client_token_sync(oauth_by_field)
-        is None
-    )
-    assert (
-        importer._fetch_oauth2_client_token_sync(oauth_by_field)
-        is None
-    )
-    assert (
-        importer._fetch_oauth2_client_token_sync(oauth_by_field)
-        == "token-a"
-    )
-    assert (
-        importer._fetch_oauth2_client_token_sync(oauth_by_field)
-        == "token-a"
-    )
+    assert importer._fetch_oauth2_client_token_sync(oauth_by_field) is None
+    assert importer._fetch_oauth2_client_token_sync(oauth_by_field) is None
+    assert importer._fetch_oauth2_client_token_sync(oauth_by_field) == "token-a"
+    assert importer._fetch_oauth2_client_token_sync(oauth_by_field) == "token-a"
     importer._OAUTH_TOKEN_CACHE.clear()
 
 
@@ -3956,17 +3656,18 @@ def test_credential_request_options_resolve_oauth_and_drop_empty_values(
             "query_param_names": [],
         },
     }
-    assert importer._credential_request_options_for_source(
-        source_by_field,
-        "https://api.test/fhir/Practitioner",
-    )["descriptor"] is None
+    assert (
+        importer._credential_request_options_for_source(
+            source_by_field,
+            "https://api.test/fhir/Practitioner",
+        )["descriptor"]
+        is None
+    )
 
 
 def test_profile_identity_helpers_handle_malformed_fhir_values():
     """Extract stable IDs while ignoring malformed or empty FHIR fields."""
-    assert importer._identifier_descriptor(
-        {"type": {"coding": [None, {"code": "NPI"}]}}
-    ).endswith("npi")
+    assert importer._identifier_descriptor({"type": {"coding": [None, {"code": "NPI"}]}}).endswith("npi")
     resource_by_field = {
         "identifier": [
             None,
@@ -3974,11 +3675,14 @@ def test_profile_identity_helpers_handle_malformed_fhir_values():
             {"value": "systemless"},
         ]
     }
-    assert importer._identifier_value(
-        resource_by_field,
-        "missing",
-        allow_systemless=True,
-    ) == "systemless"
+    assert (
+        importer._identifier_value(
+            resource_by_field,
+            "missing",
+            allow_systemless=True,
+        )
+        == "systemless"
+    )
     assert importer._tin({}) is None
     assert importer._string_list("one") == ["one"]
     assert importer._string_list({"one": 1}) == []
@@ -4022,9 +3726,7 @@ async def test_profile_checkpoint_reuse_requires_both_logged_stages(
     """Reject an otherwise exact checkpoint when either stage is unlogged."""
     build = _profile_build()
     checkpoint = _profile_checkpoint_by_name(build)
-    stage_identity = AsyncMock(
-        side_effect=[(11, "r", "p"), (12, "r", "u")]
-    )
+    stage_identity = AsyncMock(side_effect=[(11, "r", "p"), (12, "r", "u")])
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_stage_relation_identity",
@@ -4046,6 +3748,7 @@ async def test_stale_profile_reaper_handles_disappeared_rows_and_lost_delete(
     monkeypatch,
 ):
     """Skip concurrent disappearance and fail if final checkpoint delete loses."""
+
     @contextlib.asynccontextmanager
     async def transaction():
         yield
@@ -4066,10 +3769,13 @@ async def test_stale_profile_reaper_handles_disappeared_rows_and_lost_delete(
     )
     first = AsyncMock(return_value=None)
     monkeypatch.setattr(importer.db, "first", first)
-    assert await importer._reap_stale_provider_directory_profile_builds(
-        "mrf",
-        current_build_id=f"pdpb_{'b' * 32}",
-    ) == 0
+    assert (
+        await importer._reap_stale_provider_directory_profile_builds(
+            "mrf",
+            current_build_id=f"pdpb_{'b' * 32}",
+        )
+        == 0
+    )
 
     first.return_value = checkpoint_by_name
     monkeypatch.setattr(
@@ -4132,9 +3838,7 @@ async def test_profile_unbounded_and_completed_batch_paths(monkeypatch):
 async def test_single_stage_transaction_and_unfenced_bundle_paths(monkeypatch):
     """Exercise active dataset fencing and the ordinary bundle branch."""
     stage = _artifact_stage(target_relation="ordinary_target")
-    fence = importer.ProviderDirectoryArtifactDatasetFence(
-        (_promotion_dataset(),)
-    )
+    fence = importer.ProviderDirectoryArtifactDatasetFence((_promotion_dataset(),))
     monkeypatch.setattr(importer.db, "session_factory", async_sessionmaker())
     monkeypatch.setattr(importer.db, "status", AsyncMock())
     scalar_query = AsyncMock(return_value=False)
@@ -4152,9 +3856,7 @@ async def test_single_stage_transaction_and_unfenced_bundle_paths(monkeypatch):
     helpers_by_name = {name: AsyncMock() for name in helper_names}
     for name, helper in helpers_by_name.items():
         monkeypatch.setattr(importer, name, helper)
-    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(
-        fence
-    )
+    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
     try:
         await importer._promote_provider_directory_artifact_stage_transaction(
             stage.schema,
@@ -4165,19 +3867,17 @@ async def test_single_stage_transaction_and_unfenced_bundle_paths(monkeypatch):
         )
     finally:
         importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)
-    helpers_by_name[
-        "_lock_and_verify_artifact_dataset_fence"
-    ].assert_awaited_once()
-    helpers_by_name[
-        "_promote_provider_directory_artifact_datasets"
-    ].assert_awaited_once()
-    await importer._promote_provider_directory_artifact_bundle_transaction(
-        (stage,)
-    )
+    helpers_by_name["_lock_and_verify_artifact_dataset_fence"].assert_awaited_once()
+    helpers_by_name["_promote_provider_directory_artifact_datasets"].assert_awaited_once()
+    await importer._promote_provider_directory_artifact_bundle_transaction((stage,))
     assert importer.db._transaction_binding() is None
     assert "to_regclass(:table)" in scalar_query.await_args.args[0]
-    importer._provider_directory_relation_attribute.assert_awaited_once_with(stage.schema, stage.target_relation, "relkind")
-    importer.db.status.assert_any_await(f'LOCK TABLE "{stage.schema}"."{stage.target_relation}" IN ACCESS EXCLUSIVE MODE')
+    importer._provider_directory_relation_attribute.assert_awaited_once_with(
+        stage.schema, stage.target_relation, "relkind"
+    )
+    importer.db.status.assert_any_await(
+        f'LOCK TABLE "{stage.schema}"."{stage.target_relation}" IN ACCESS EXCLUSIVE MODE'
+    )
     assert helpers_by_name["_install_provider_directory_prepared_stage"].await_count == 2
     assert helpers_by_name["_finish_provider_directory_prepared_stage"].await_count == 2
     helpers_by_name["_lock_and_verify_artifact_dataset_fence"].assert_awaited_once()
@@ -4197,9 +3897,7 @@ async def test_artifact_cleanup_and_zero_attempt_configuration(monkeypatch):
         "PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS",
         0,
     )
-    await importer._retry_provider_directory_artifact_bundle_promotion(
-        (stage,)
-    )
+    await importer._retry_provider_directory_artifact_bundle_promotion((stage,))
     await importer._retry_provider_directory_artifact_promotion(
         stage.schema,
         stage.stage_table,
@@ -4218,10 +3916,13 @@ async def test_artifact_bundle_and_index_noop_paths(monkeypatch):
     bundle.add(stage)
     assert bundle.stages == [stage]
     target_index = importer.PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_INDEXES[0]
-    assert importer._address_corroboration_index_name(
-        importer.PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
-        target_index,
-    ) == target_index
+    assert (
+        importer._address_corroboration_index_name(
+            importer.PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
+            target_index,
+        )
+        == target_index
+    )
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
     await importer._rename_address_corroboration_stage_indexes(
@@ -4295,6 +3996,7 @@ async def test_artifact_build_guard_connects_and_releases(monkeypatch):
     release.assert_awaited_once_with(
         connection,
         "provider-directory-artifact-build:mrf.profile",
+        maintenance_admission=None,
     )
 
 
@@ -4366,13 +4068,16 @@ async def test_profile_finalization_without_checkpoint_still_cleans_stages(
 
 def test_profile_tin_truncates_matching_identifier():
     """Bound tax identifiers before storing Profile evidence."""
-    assert importer._tin(
-        {
-            "identifier": [
-                {
-                    "system": "https://example.test/tin",
-                    "value": "1" * 80,
-                }
-            ]
-        }
-    ) == "1" * 64
+    assert (
+        importer._tin(
+            {
+                "identifier": [
+                    {
+                        "system": "https://example.test/tin",
+                        "value": "1" * 80,
+                    }
+                ]
+            }
+        )
+        == "1" * 64
+    )

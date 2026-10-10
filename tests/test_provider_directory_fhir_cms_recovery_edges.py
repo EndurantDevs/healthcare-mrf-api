@@ -145,7 +145,7 @@ async def test_bounded_artifact_insert_requires_projection_and_exact_count(
     insert = AsyncMock(return_value=1)
     status = AsyncMock()
     monkeypatch.setattr(fhir, "_profile_capacity_mutation_window", window)
-    monkeypatch.setattr(fhir, "_provider_directory_profile_capacity_transaction", _transaction)
+    monkeypatch.setattr(fhir, "_provider_directory_profile_capacity_transaction", lambda **_kwargs: _transaction())
     monkeypatch.setattr(fhir, "_project_artifact_batch_capacity", project)
     monkeypatch.setattr(fhir, "_reserve_provider_directory_profile_wal_budget", reserve)
     monkeypatch.setattr(fhir, "_insert_artifact_source_batch", insert)
@@ -349,13 +349,71 @@ async def test_target_window_cannot_record_changed_rows(admitted_window, monkeyp
     [
         None,
         {"wal_observed_lsn": "0/2", "cutover_wal_bytes": -1},
-        {"wal_observed_lsn": "0/2", "cutover_wal_bytes": 2001},
     ],
 )
-async def test_target_wal_observation_refuses_missing_negative_or_overrun(admitted_window, monkeypatch, observation):
+async def test_target_wal_observation_refuses_missing_or_negative(admitted_window, monkeypatch, observation):
     monkeypatch.setattr(fhir.db, "first", AsyncMock(return_value=observation))
     forecast = SimpleNamespace(target_projection=SimpleNamespace(wal_bytes=2000))
     with pytest.raises(RuntimeError, match="actual_wal_missing|target_wal_exceeded"):
+        await cutover._observe_cutover_wal(fhir, forecast, "0/1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overrun", [False, True])
+async def test_bounded_target_global_interval_uses_signed_total(admitted_window, monkeypatch, overrun):
+    admission, state = admitted_window
+    tracker = admission.wal_tracker
+    # Cutover follows terminal staging; both target classes retain their full caps.
+    tracker.completed_relation_classes.update(
+        {"artifact_scope", "evidence_stage", "affected_npi_stage", "profile_stage"}
+    )
+    tracker.pending_control_wal_bytes = {"owner": 7}
+    tracker.pending_metadata_wal_bytes = 5
+    tracker.pending_relation_wal_bytes = {"evidence_target": 11}
+    tracker.pending_growth_bytes = {"evidence_target": 2}
+    remaining = (
+        fhir._profile_relation_wal_candidate(admission, {})[2]
+        + capacity.remaining_profile_control_wal_bytes(
+            admission.control_wal_projection, tracker.accounted_control_operation_counts
+        )
+        + admission.geometry.metadata_wal_upper_bound_bytes
+    )
+    maximum = admission.geometry.reservation_bytes_by_storage_class["wal"]
+    pending = sum(tracker.pending_control_wal_bytes.values()) + tracker.pending_metadata_wal_bytes
+    state.wal = maximum - remaining - pending + int(overrun)
+    assert 2001 <= state.wal <= maximum
+    observation_by_field = {"wal_observed_lsn": "0/7D2", "cutover_wal_bytes": 2001}
+    monkeypatch.setattr(fhir.db, "first", AsyncMock(return_value=observation_by_field))
+    forecast = SimpleNamespace(target_projection=SimpleNamespace(wal_bytes=2000))
+    tracker_before_by_field = {
+        name: copy.deepcopy(field_value)
+        for name, field_value in vars(tracker).items()
+        if name not in {"lock", "mutation_lock"}
+    }
+    if overrun:
+        with pytest.raises(RuntimeError, match="total_wal_exceeded"):
+            await cutover._observe_cutover_wal(fhir, forecast, "0/1")
+    else:
+        cutover_receipt = await cutover._observe_cutover_wal(fhir, forecast, "0/1")
+        assert cutover_receipt == (observation_by_field, 2001, admission, True)
+    assert {
+        name: field_value for name, field_value in vars(tracker).items() if name not in {"lock", "mutation_lock"}
+    } == tracker_before_by_field
+
+
+@pytest.mark.asyncio
+async def test_unbounded_target_global_interval_retains_local_forecast_guard(admitted_window, monkeypatch):
+    admission, _ = admitted_window
+    legacy = replace(
+        admission,
+        geometry=replace(admission.geometry, physical_projection_contract_id=capacity.PHYSICAL_PROJECTION_CONTRACT_ID),
+    )
+    monkeypatch.setattr(fhir, "_provider_directory_profile_capacity_admission", lambda: legacy)
+    monkeypatch.setattr(
+        fhir.db, "first", AsyncMock(return_value={"wal_observed_lsn": "0/7D2", "cutover_wal_bytes": 2001})
+    )
+    forecast = SimpleNamespace(target_projection=SimpleNamespace(wal_bytes=2000))
+    with pytest.raises(RuntimeError, match="target_wal_exceeded"):
         await cutover._observe_cutover_wal(fhir, forecast, "0/1")
 
 
@@ -379,6 +437,7 @@ async def test_initial_admission_rechecks_targets_before_consuming_lease(monkeyp
     events = []
 
     monkeypatch.setattr(fhir.db, "transaction", lambda: _recorded_transaction(events))
+    monkeypatch.setattr(fhir.profile_control_custody, "transaction", lambda _fhir, original, **_kwargs: original)
     monkeypatch.setattr(fhir.db, "status", AsyncMock())
     monkeypatch.setattr(fhir, "_provider_directory_profile_selection_catalog", Mock(return_value=object()))
     for name in (

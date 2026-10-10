@@ -68,6 +68,11 @@ async def require_temp_file_limit_capability(database):
         is True
     ):
         return "direct"
+    return await _require_bounded_temp_file_limit_capability(database)
+
+
+async def _require_bounded_temp_file_limit_capability(database):
+    """Verify the exact existing helper after a native privilege probe fails."""
     helper_entries = await database.all(_HELPER_CATALOG_SQL)
     helper_by_field = (
         dict(getattr(helper_entries[0], "_mapping", helper_entries[0])) if len(helper_entries) == 1 else {}

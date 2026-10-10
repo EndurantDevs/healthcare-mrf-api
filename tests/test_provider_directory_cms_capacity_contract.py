@@ -4,6 +4,7 @@
 import datetime
 from copy import deepcopy
 from dataclasses import fields, replace
+from uuid import UUID
 
 import pytest
 
@@ -11,6 +12,9 @@ from process import provider_directory_cms_capacity_contract as contract
 from process import provider_directory_profile_capacity_attestation as attestation
 from process import provider_directory_profile_capacity_preflight_contract as preflight
 from process import provider_directory_profile_selection_contract as selection
+from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_registry_cms_prepared_pair import RegistryCMSRetentionRequest
 from process.provider_directory_cms_preparation import NonprofileAdmissionPlan
 from tests.provider_directory_cms_capacity_test_support import (
     cms_execution,
@@ -28,6 +32,104 @@ from tests.test_provider_directory_profile_capacity_attestation import VALIDATIO
 def configured_node(monkeypatch):
     """Validate every task against the same synthetic runtime identity as the signed pair."""
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
+
+
+def _retention_policy():
+    """Generate the closed request through the production preparation DTO."""
+    request = RegistryCMSRetentionRequest(
+        PinnedFHIRMembershipSource(
+            "fixture",
+            "cms-npd",
+            "cms-endpoint",
+            "cms-dataset",
+            "a" * 64,
+            "release-1",
+            123,
+            "cms-npd",
+            "2026-07-30",
+        ),
+        RegistryNetworkSourceCoordinates("fhir", "cms-npd", "fixture", "cms-dataset", "producer", "edition"),
+        cms_execution().attestation.proof_id,
+        "b" * 64,
+        "c" * 64,
+        4096,
+        8192,
+    )
+    return request.policy(UUID("00000000-0000-0000-0000-000000000001"), "retained_owner", ("reader", "writer"))
+
+
+def test_retention_admission_preserves_real_dto_and_historical_request():
+    raw = cms_request()
+    historical = deepcopy(raw[contract.CMS_ADMISSION_FIELD])
+    assert contract.validated_cms_capacity_admission(historical) == historical
+    policy = _retention_policy()
+    raw[contract.CMS_ADMISSION_FIELD]["registry_source_retention"] = policy
+    parsed = preflight.validated_capacity_preflight_request(raw)
+    assert parsed.request_payload == raw
+    assert parsed.cms_nonprofile_admission["registry_source_retention"] == policy
+    policy["runtime_roles"].append("another_reader")
+    assert parsed.cms_nonprofile_admission["registry_source_retention"]["runtime_roles"] == ["reader", "writer"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "extra",
+        "missing",
+        "null",
+        "version",
+        "capture",
+        "capture-zero",
+        "capture-case",
+        "pin-extra",
+        "source",
+        "scope",
+        "oid",
+        "date",
+        "digest",
+        "raw-family",
+        "address-family",
+        "owner",
+        "role-type",
+        "role-order",
+        "role-overlap",
+        "role-duplicate",
+        "budget-type",
+        "budget-bound",
+    ],
+)
+def test_retention_policy_rejects_malformed_closed_wire(change):
+    policy = _retention_policy()
+    if change == "null":
+        policy = None
+    elif change == "missing":
+        policy.pop("selection_proof_id")
+    else:
+        policy_section, field_name, field_value = {
+            "extra": (policy, "unchecked", 1),
+            "version": (policy, "version", True),
+            "capture": (policy, "capture_id", "invalid"),
+            "capture-zero": (policy, "capture_id", str(UUID(int=0))),
+            "capture-case": (policy, "capture_id", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"),
+            "pin-extra": (policy["source_pin"], "retained_epoch", None),
+            "source": (policy["source_pin"], "source_id", "other-source"),
+            "scope": (policy["binding_coordinates"], "dataset_schema", "another_schema"),
+            "oid": (policy["source_pin"], "resource_table_oid", True),
+            "date": (policy["source_pin"], "as_of", "20260730"),
+            "digest": (policy, "expected_metadata_sha256", "C" * 64),
+            "raw-family": (policy, "raw_tables", policy["raw_tables"][:-1]),
+            "address-family": (policy, "address_tables", list(reversed(policy["address_tables"]))),
+            "owner": (policy, "owner_role", "invalid-role"),
+            "role-type": (policy, "runtime_roles", [True]),
+            "role-order": (policy, "runtime_roles", ["writer", "reader"]),
+            "role-overlap": (policy, "runtime_roles", ["retained_owner"]),
+            "role-duplicate": (policy, "runtime_roles", ["reader", "reader"]),
+            "budget-type": (policy, "extra_data_upper_bound_bytes", True),
+            "budget-bound": (policy, "extra_wal_upper_bound_bytes", 2**63),
+        }[change]
+        policy_section[field_name] = field_value
+    with pytest.raises(preflight.ProviderDirectoryProfileCapacityPreflightError, match="retention_policy_invalid"):
+        contract.validated_registry_source_retention_policy(policy)
 
 
 @pytest.mark.parametrize("projection", [False, True])

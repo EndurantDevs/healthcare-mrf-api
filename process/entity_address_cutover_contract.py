@@ -96,8 +96,15 @@ async def entity_address_tuned_transaction(
     settings,
     quote_literal,
     logger,
+    *,
+    temp_file_limit_bytes: int | None = None,
 ):
     """Apply statement tuning without leaking it into a borrowed transaction."""
+
+    if temp_file_limit_bytes is not None:
+        async with _admitted_temp_transaction(database, settings, quote_literal, logger, temp_file_limit_bytes):
+            yield
+        return
 
     setting_names = [name for name, _value in settings]
     applied_setting_names: set[str] = set()
@@ -115,6 +122,43 @@ async def entity_address_tuned_transaction(
         )
         applied_setting_names.update(applied_settings)
         yield
+
+
+@asynccontextmanager
+async def _admitted_temp_transaction(database, settings, quote_literal, logger, limit_bytes):
+    """Keep an explicit admitted cap on its owner's backend without direct SET rights."""
+    from process.provider_directory_profile_temp_limit import apply_temp_file_limit, require_temp_file_limit_capability
+
+    if (
+        type(limit_bytes) is not int
+        or limit_bytes <= 0
+        or limit_bytes % 1024
+        or [setting_value for name, setting_value in settings if name == "temp_file_limit"]
+        != [f"{limit_bytes // 1024}kB"]
+    ):
+        raise ValueError("entity_address_admitted_temp_limit_invalid")
+    transaction_binding = getattr(database, "_transaction_binding", None)
+    if not callable(transaction_binding):
+        # ConnectionProxy.transaction merely borrows an existing owner. It cannot
+        # establish the transaction-end reset required by this entry point.
+        raise RuntimeError("entity_address_admitted_temp_limit_owner_required")
+    is_borrowed_transaction = transaction_binding() is not None
+    previous = None
+    other_settings = [(name, setting_value) for name, setting_value in settings if name != "temp_file_limit"]
+    async with database.transaction():
+        mode = await require_temp_file_limit_capability(database)
+        if is_borrowed_transaction:
+            previous = await database.scalar("SELECT pg_size_bytes(current_setting('temp_file_limit'))::bigint")
+            if type(previous) is not int or (previous < 0 and mode != "direct"):
+                raise RuntimeError("entity_address_admitted_temp_limit_bounded_owner_required")
+        await apply_temp_file_limit(database, limit_bytes)
+        async with entity_address_tuned_transaction(database, other_settings, quote_literal, logger):
+            yield
+        if is_borrowed_transaction:
+            if previous < 0:
+                await database.status("SET LOCAL temp_file_limit = '-1';")
+            else:
+                await apply_temp_file_limit(database, previous)
 
 
 @asynccontextmanager

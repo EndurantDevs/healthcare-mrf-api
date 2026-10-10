@@ -2,13 +2,28 @@
 """SQL and binary-COPY constants for authenticated packed-finalizer maps."""
 
 _BLOCK_COLUMNS = (
-    "block_hash", "format_version", "object_kind", "block_key", "fragment_no",
-    "entry_count", "codec", "raw_byte_count", "stored_byte_count", "payload",
+    "block_hash",
+    "format_version",
+    "object_kind",
+    "block_key",
+    "fragment_no",
+    "entry_count",
+    "codec",
+    "raw_byte_count",
+    "stored_byte_count",
+    "payload",
 )
 _PACK_COLUMNS = (
-    "object_kind", "pack_no", "first_block_key", "first_fragment_no",
-    "last_block_key", "last_fragment_no", "coordinate_count", "entry_count",
-    "logical_byte_count", "map_block_hash",
+    "object_kind",
+    "pack_no",
+    "first_block_key",
+    "first_fragment_no",
+    "last_block_key",
+    "last_fragment_no",
+    "coordinate_count",
+    "entry_count",
+    "logical_byte_count",
+    "map_block_hash",
 )
 _SENTINEL_PIN_SQL = """
 WITH pinned AS (
@@ -78,7 +93,11 @@ RETURNING snapshot_key
 """
 
 _ROOT_SELECTION_SQL = """
-    SELECT root.snapshot_key IS NOT NULL AS root_present,
+    WITH requested AS (
+        SELECT DISTINCT snapshot_key
+          FROM unnest(CAST(:snapshot_keys AS bigint[])) AS keys(snapshot_key)
+    )
+    SELECT requested.snapshot_key, root.snapshot_key IS NOT NULL AS root_present,
            layout.state AS layout_state, layout.generation AS layout_generation,
            (layout.layout_manifest->'serving_index') ? '{manifest_key}'
                AS manifest_present,
@@ -100,13 +119,14 @@ _ROOT_SELECTION_SQL = """
            EXISTS (
                SELECT 1
                  FROM {schema}.ptg2_v3_snapshot_block AS mapping
-                WHERE mapping.snapshot_key = :snapshot_key
+                WHERE mapping.snapshot_key = requested.snapshot_key
                   AND mapping.object_kind = ANY(CAST(:packed_object_kinds AS text[]))
            ) AS relational_mapping_present
-      FROM {schema}.ptg2_v3_snapshot_layout AS layout
-      FULL JOIN {schema}.{root_table} AS root
-        ON root.snapshot_key = layout.snapshot_key
-     WHERE COALESCE(layout.snapshot_key, root.snapshot_key) = :snapshot_key
+      FROM requested
+      LEFT JOIN {schema}.ptg2_v3_snapshot_layout AS layout
+        ON layout.snapshot_key = requested.snapshot_key
+      LEFT JOIN {schema}.{root_table} AS root
+        ON root.snapshot_key = requested.snapshot_key
 """
 
 _TARGET_ANCHOR_SQL = """

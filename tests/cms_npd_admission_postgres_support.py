@@ -7,7 +7,7 @@ import json
 import os
 import re
 import shutil
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from functools import partial
 from pathlib import Path
 from uuid import uuid4
@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from db.connection import Database
 from process import cms_npd_source as source
+from process import control_lifecycle
 from tests.test_cms_npd_source import _client, _source
 
 fhir = importlib.import_module("process.provider_directory_fhir")
@@ -130,10 +131,13 @@ def _database_url():
     if not raw:
         pytest.skip(f"set {_DSN_ENV} for the PostgreSQL proof")
     url = make_url(raw)
+    allowed_hosts = {"127.0.0.1", "localhost"}
+    if os.getenv("CI") == "true":
+        allowed_hosts.add("postgres")
     if (
         not url.drivername.startswith("postgresql")
         or url.query
-        or url.host not in {"127.0.0.1", "localhost"}
+        or url.host not in allowed_hosts
         or url.port is None
         or not 1 <= url.port <= 65535
         or not re.fullmatch(r"hc_cms_admission_test_[0-9a-f]{32}", url.database or "")
@@ -201,6 +205,10 @@ async def cms_admission_template(request):
                     await connection.exec_driver_sql('CREATE SCHEMA "mrf"')
                 async with engine.connect() as connection:
                     await connection.run_sync(_run_migrations, migration_prefixes)
+                async with engine.connect() as connection:
+                    connection = await connection.execution_options(isolation_level="AUTOCOMMIT")
+                    await connection.exec_driver_sql("ANALYZE")
+                    await connection.exec_driver_sql("VACUUM (FREEZE)")
         finally:
             await engine.dispose()
         assert not await admin.fetchval(
@@ -239,7 +247,10 @@ async def _admission_database_url(
 async def admission_database(monkeypatch, *, migration_prefixes=None):
     """Keep native guards and committed multi-session visibility isolated in each test."""
     migration_prefixes = MIGRATION_PREFIXES if migration_prefixes is None else migration_prefixes
-    async with _admission_database_url(migration_prefixes=migration_prefixes) as (url, is_migrated):
+    async with AsyncExitStack() as cleanup:
+        url, is_migrated = await cleanup.enter_async_context(
+            _admission_database_url(migration_prefixes=migration_prefixes)
+        )
         for name, setting_value in {
             "DRIVER": "asyncpg",
             "HOST": url.host,
@@ -254,6 +265,8 @@ async def admission_database(monkeypatch, *, migration_prefixes=None):
         monkeypatch.setenv("DB_SCHEMA", "mrf")
         database = Database()
         monkeypatch.setattr(fhir, "db", database)
+        control_bindings = cleanup.enter_context(monkeypatch.context())
+        control_bindings.setattr(control_lifecycle, "db", database)
         is_schema_created = False
         try:
             await database.connect()

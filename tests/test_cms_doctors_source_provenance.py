@@ -187,7 +187,7 @@ def _mock_replay_staging(native, monkeypatch):
     monkeypatch.setattr(native.db, "create_table", AsyncMock())
     monkeypatch.setattr(native.db, "status", AsyncMock())
     for module in (native, education, groups):
-        monkeypatch.setattr(module, "push_objects", collect)
+        monkeypatch.setattr(module, "push_objects" if module is native else "_copy_sidecar_rows", collect)
         monkeypatch.setattr(module, "raise_if_cancelled", AsyncMock())
     return staged_by_family
 

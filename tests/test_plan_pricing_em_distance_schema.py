@@ -47,9 +47,36 @@ def test_location_copy_uses_shared_geo_and_taxonomy_contracts():
     assert sql.count("ORDER BY addr.npi, addr.location_key") == 1
 
 
+def _assert_registry_migration_chain():
+    """Load the actual ScriptDirectory and preserve the complete installed head chain."""
+    alembic_config = Config(str(REPOSITORY_ROOT / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(REPOSITORY_ROOT / "alembic"))
+    script = ScriptDirectory.from_config(alembic_config)
+    assert script.get_heads() == ["20261010030000_registry_source_admission_receipt"]
+    assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
+        "20261010000000_custom_import_admission_indexes"
+    )
+    assert script.get_revision("20261010030000_registry_source_admission_receipt").down_revision == (
+        "20261010020000_registry_ptg_office_retention"
+    )
+    assert script.get_revision("20261010020000_registry_ptg_office_retention").down_revision == (
+        "20261010010000_registry_ptg_office_approval"
+    )
+    assert script.get_revision("20261010010000_registry_ptg_office_approval").down_revision == (
+        "20261009040000_registry_ptg_published_plan_scope"
+    )
+    assert script.get_revision("20261009040000_registry_ptg_published_plan_scope").down_revision == (
+        "20261009030000_network_catalog_evidence"
+    )
+    assert script.get_revision("20261006010000_nucc_reference_result_generation").down_revision == (
+        "20261007000000_custom_import_rejection_anti_joins"
+    )
+
+
 def test_em_distance_projection_schema_is_exact_immutable_and_additive(
     monkeypatch,
 ) -> None:
+    """Projection SQL stays immutable and additive across the actual current migration chain."""
     migration = _migration()
     upgrade = _Recorder()
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "em_distance_test")
@@ -61,13 +88,7 @@ def test_em_distance_projection_schema_is_exact_immutable_and_additive(
     sql = " ".join(upgrade.statements)
     assert migration.revision == "20260901103000_plan_pricing_em_distance"
     assert migration.down_revision == ("20260901000000_hospital_price_csv_short_v2")
-    alembic_config = Config(str(REPOSITORY_ROOT / "alembic.ini"))
-    alembic_config.set_main_option("script_location", str(REPOSITORY_ROOT / "alembic"))
-    script = ScriptDirectory.from_config(alembic_config)
-    assert script.get_heads() == ["20261010010000_custom_import_materialization_contract"]
-    assert script.get_revision(script.get_heads()[0]).down_revision == (
-        "20261010000000_custom_import_admission_indexes"
-    )
+    _assert_registry_migration_chain()
     for table_name in (
         "plan_pricing_em_distance_candidate",
         "plan_pricing_em_distance_attachment",

@@ -2,6 +2,7 @@
 """Production routing, snapshot ownership and complete-preparation commit ordering."""
 
 import contextvars
+import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -10,9 +11,18 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from process import provider_directory_cms_address as cms_address
 from process import provider_directory_cms_serving as serving
-from tests.provider_directory_cms_capacity_test_support import cms_execution, cms_guard, cms_plan, sign_guard
-from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME, _trust
+from tests.provider_directory_cms_capacity_test_support import (
+    cms_execution,
+    cms_guard,
+    cms_plan,
+    rehash_guard,
+    sign_guard,
+)
+from tests.test_provider_directory_cms_address import address_build_case as address_build_case
+from tests.test_provider_directory_cms_preflight import _retention_policy
+from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME, _trust, _verify
 
 
 class _Database:
@@ -133,7 +143,8 @@ async def test_fresh_desired_route_preserves_context_and_heartbeat(monkeypatch, 
     events, result = [], {"profile": {"generation_id": "synthetic"}}
     fhir = _fhir(events)
 
-    async def publish(*args):
+    async def publish(*args, registry_source_invocation=None):
+        assert registry_source_invocation is None
         assert fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get() is execution
         assert args[2:4] == ("run_" + "a" * 32,) * 2
         events.append("common-publish")
@@ -201,10 +212,13 @@ async def test_contents_and_revisions_use_one_readonly_snapshot(monkeypatch, exe
         finally:
             events.append("bounded-end")
 
-    verified = object()
+    verified = SimpleNamespace(lease=object())
+    outputs_by_name["capacity_lease"] = verified.lease
     monkeypatch.setattr(serving, "_verified_capture_limits", AsyncMock(return_value=verified))
     monkeypatch.setattr(serving, "remaining_build_seconds", AsyncMock(return_value=60))
     monkeypatch.setattr(serving, "nonprofile_sql_transaction", bounded_sql)
+    apply_limit = AsyncMock(side_effect=lambda *_: events.append("signed-temp-cap"))
+    monkeypatch.setattr(serving, "apply_temp_file_limit", apply_limit)
 
     def reader(name):
         async def observe(*args, **kwargs):
@@ -221,8 +235,10 @@ async def test_contents_and_revisions_use_one_readonly_snapshot(monkeypatch, exe
     monkeypatch.setattr(serving, "_candidate_proof", reader("proof"))
     snapshot = await serving._capture_publish_inputs(fhir, execution, "run_" + "a" * 32, {}, cms_plan()[0])
     assert vars(snapshot) == outputs_by_name
+    apply_limit.assert_awaited_once_with(fhir.db, cms_plan()[0].temp_file_limit_bytes_per_backend)
     assert events == [
         "snapshot-start",
+        "signed-temp-cap",
         "bounded-start",
         "fence",
         "predecessor",
@@ -242,7 +258,14 @@ async def test_preparation_lives_through_common_commit(monkeypatch, execution, c
     events, fhir = [], _fhir([])
     plan = cms_plan()[0]
     snapshot = SimpleNamespace(
-        fence=object(), dependencies=object(), native_fence=object(), proof=object(), predecessor=None
+        fence=object(),
+        dependencies=object(),
+        native_fence=object(),
+        proof=object(),
+        predecessor=None,
+        capacity_lease=_verify(
+            execution.cms_nonprofile_capacity_attestation, expected_capacity_geometry_hash=plan.capacity_geometry_hash
+        ),
     )
     factory = SimpleNamespace(input_hash="00" * 32 if changed else plan.native_address_input_hash)
     admission = object()
@@ -282,6 +305,142 @@ async def test_preparation_lives_through_common_commit(monkeypatch, execution, c
         publication_by_field = await serving._publish_cms(fhir, execution, "run_" + "a" * 32, "run_" + "a" * 32, {})
         assert publication_by_field["cms_serving"]["receipt_id"] == "synthetic"
         assert events == ["prepare", "commit", "cleanup"]
+
+
+def _changed_retention_policy(policy, change):
+    """Change one valid declared coordinate while retaining the previously signed input hash."""
+    changed_policy = deepcopy(policy)
+    mutations_by_name = {
+        "capture": (changed_policy, "capture_id", "00000000-0000-0000-0000-000000000002"),
+        "source-oid": (
+            changed_policy["source_pin"],
+            "resource_table_oid",
+            policy["source_pin"]["resource_table_oid"] + 1,
+        ),
+        "schema": (changed_policy["source_pin"], "schema_name", "other_schema"),
+        "hash": (changed_policy["source_pin"], "dataset_sha256", "f" * 64),
+        "date": (changed_policy["source_pin"], "as_of", "2026-07-31"),
+        "selection": (changed_policy, "selection_proof_id", "f" * 64),
+    }
+    if change in mutations_by_name:
+        policy_section, field_name, field_value = mutations_by_name[change]
+        policy_section[field_name] = field_value
+    if change == "schema":
+        changed_policy["binding_coordinates"]["dataset_schema"] = "other_schema"
+    return changed_policy
+
+
+def _retained_execution(address_build_case, execution, change):
+    """Sign a real closed request with a native input hash from the actual factory."""
+    fhir = _fhir([])
+    fhir._schema = lambda: "fixture"
+    plan, fence, _profile = cms_plan()
+    policy = _retention_policy(execution)
+    bare = cms_address.cms_address_preparation(
+        fhir,
+        execution,
+        fence,
+        address_build_case[3],
+        native_input_fence=address_build_case[4],
+        run_id="run_" + "a" * 32,
+        worker_count=plan.worker_count,
+        temp_file_limit_bytes_per_backend=plan.temp_file_limit_bytes_per_backend,
+    )
+    retained = bare.with_registry_source_retention(policy)
+    plan = replace(plan, native_address_input_hash=retained.input_hash, native_address_targets=retained.native_targets)
+    guard = cms_guard(plan)
+    changed_policy = _changed_retention_policy(policy, change)
+    if change != "missing":
+        for name in ("healthcare_request", "control_plane_request"):
+            guard[name]["cms_nonprofile_admission"]["registry_source_retention"] = deepcopy(changed_policy)
+    rehash_guard(guard)
+    execution = replace(execution, cms_nonprofile_capacity_attestation=sign_guard(guard, cms=True))
+    snapshot = SimpleNamespace(
+        fence=fence,
+        dependencies=address_build_case[3],
+        native_fence=address_build_case[4],
+        proof=object(),
+        predecessor=None,
+    )
+    if change == "fence":
+        next(dataset for dataset in fence.datasets if dataset.source_id == "cms-npd").dataset_hash = "f" * 64
+    return fhir, execution, plan, snapshot, retained, policy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", [None, "missing", "capture", "source-oid", "schema", "hash", "date", "selection", "fence"]
+)
+async def test_signed_retention_policy_is_reconstructed_before_admission_and_scratch(
+    monkeypatch, execution, address_build_case, change
+):
+    fhir, execution, plan, snapshot, retained, policy = _retained_execution(address_build_case, execution, change)
+    monkeypatch.setattr(serving, "_authenticated_source_job", AsyncMock(return_value=None))
+    fhir._profile_capacity_preflight_clock = AsyncMock(return_value=VALIDATION_TIME)
+    monkeypatch.setattr(serving, "configured_capacity_lease_trust", _trust)
+    limits = await serving._verified_capture_limits(fhir, execution, plan)
+    snapshot.capacity_lease = limits.lease
+    capture = AsyncMock(return_value=snapshot)
+    monkeypatch.setattr(serving, "_capture_publish_inputs", capture)
+    monkeypatch.setattr(serving, "configured_storage_continuation", lambda: object())
+    monkeypatch.setattr(serving, "cms_address_preparation", Mock(wraps=cms_address.cms_address_preparation))
+    admission = AsyncMock(return_value=object())
+    monkeypatch.setattr(serving, "produce_nonprofile_admission", admission)
+    events = []
+
+    @asynccontextmanager
+    async def prepare(*args, **kwargs):
+        factory = kwargs["address_preparation"]
+        assert json.loads(factory.input_json)["registry_source_retention"] == policy
+        assert factory.input_hash == retained.input_hash
+        events.append("scratch")
+        yield SimpleNamespace(address=object(), stages=())
+
+    monkeypatch.setattr(serving, "prepare_serving_artifacts", prepare)
+    monkeypatch.setattr(serving, "commit_prepared_serving_generation", AsyncMock(return_value={"published": True}))
+    if change is not None:
+        with pytest.raises((RuntimeError, ValueError), match="admitted_inputs_changed|retention_scope_changed"):
+            await serving._publish_cms(fhir, execution, "run_" + "a" * 32, "run_" + "a" * 32, {})
+        admission.assert_not_awaited()
+        assert events == []
+    else:
+        assert await serving._publish_cms(fhir, execution, "run_" + "a" * 32, "run_" + "a" * 32, {}) == {
+            "published": True
+        }
+        admission.assert_awaited_once()
+        assert events == ["scratch"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["missing", "digest", "request"])
+async def test_publish_requires_exact_verified_snapshot_request_before_factory(monkeypatch, execution, mismatch):
+    plan = cms_plan()[0]
+    lease = _verify(
+        execution.cms_nonprofile_capacity_attestation, expected_capacity_geometry_hash=plan.capacity_geometry_hash
+    )
+    if mismatch == "missing":
+        lease = None
+    elif mismatch == "digest":
+        lease = replace(lease, lease_digest="f" * 64)
+    else:
+        guard = deepcopy(lease.signing_preflight_guard)
+        guard["healthcare_request"]["cms_nonprofile_admission"]["registry_source_retention"] = _retention_policy(
+            execution
+        )
+        lease = replace(lease, signing_preflight_guard=guard)
+    monkeypatch.setattr(
+        serving, "_capture_publish_inputs", AsyncMock(return_value=SimpleNamespace(capacity_lease=lease))
+    )
+    monkeypatch.setattr(serving, "configured_storage_continuation", lambda: object())
+    factory, admission, scratch = Mock(), AsyncMock(), Mock()
+    monkeypatch.setattr(serving, "cms_address_preparation", factory)
+    monkeypatch.setattr(serving, "produce_nonprofile_admission", admission)
+    monkeypatch.setattr(serving, "prepare_serving_artifacts", scratch)
+    with pytest.raises(RuntimeError, match="capture_signed_request_changed"):
+        await serving._publish_cms(_fhir([]), execution, "run_" + "a" * 32, "run_" + "a" * 32, {})
+    factory.assert_not_called()
+    admission.assert_not_awaited()
+    scratch.assert_not_called()
 
 
 @pytest.mark.asyncio

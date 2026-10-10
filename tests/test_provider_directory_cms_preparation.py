@@ -305,6 +305,16 @@ class PreparationFakeFHIR:
             for stage in bundle.stages:
                 await preparation.is_stage_cleanup_handled(self, stage)
 
+    @contextmanager
+    def _provider_directory_artifact_relation_scope(self, overrides):
+        merged_overrides_by_relation = dict(self.scope_relations.get())
+        merged_overrides_by_relation.update(overrides)
+        token = self.scope_relations.set(merged_overrides_by_relation)
+        try:
+            yield
+        finally:
+            self.scope_relations.reset(token)
+
     async def _publish_provider_directory_artifacts(self, request):
         assert request.source_ids == list(self.fence.source_ids)
         assert request.full_address_artifact_rebuild and request.publish_scope_run_id is None
@@ -1126,6 +1136,10 @@ def _manifest_sql_backend(fixture):
     fixture.limits_observed = []
 
     async def scalar(_query, **params):
+        if "has_parameter_privilege" in _query:
+            return True
+        if "pg_size_bytes" in _query and not params:
+            return int(fixture.settings_by_name["temp_file_limit"].removesuffix("kB")) * 1024
         if "setting_name" in params:
             return fixture.settings_by_name[params["setting_name"]]
         fixture.limits_observed.append(dict(params))
@@ -1146,11 +1160,14 @@ def _manifest_sql_backend(fixture):
     @asynccontextmanager
     async def transaction():
         previous = fixture.fhir.db.transaction_active
+        owner_settings_by_name = dict(fixture.settings_by_name)
         fixture.fhir.db.transaction_active = True
         try:
             yield
         finally:
             fixture.fhir.db.transaction_active = previous
+            if not previous:
+                fixture.settings_by_name.update(owner_settings_by_name)
 
     fixture.fhir.db.scalar, fixture.fhir.db.status, fixture.fhir.db.transaction = scalar, status, transaction
 

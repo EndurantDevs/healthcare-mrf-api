@@ -11,7 +11,8 @@ from uuid import UUID
 
 from sqlalchemy import text
 
-from api.custom_import_provider_sql import ProviderImportQuery, merge_native_params
+from api.custom_import_provider_sql import ProviderImportQuery
+from api.provider_list_sql import _provider_list_parameters
 
 _IMPORT_RELATION = "custom_import_provider_relation"
 _PAGE_LIMIT_PARAMETER = "__custom_import_geo_page_limit"
@@ -78,7 +79,7 @@ def build_imported_geo_statements(
             _CURSOR_ADDRESS_KEY_PARAMETER,
             normalized_anchor[1],
         )
-    parameters_by_name = merge_native_params(parameters_by_name, import_context.compiled)
+    parameters_by_name = _provider_list_parameters(parameters_by_name, import_context)
 
     common_ctes = _common_ctes(
         import_context=import_context,
@@ -174,7 +175,9 @@ def _eligible_geo_cte(
 
 
 def _address_row_key_columns(address_table_sql: str) -> tuple[str, ...]:
-    if address_table_sql.endswith(".entity_address_unified"):
+    from api.provider_list_sql import _is_unified_address_table
+
+    if _is_unified_address_table(address_table_sql):
         return ("location_key",)
     return ("checksum", "type")
 
@@ -245,7 +248,9 @@ def _membership_clause(import_context: ProviderImportQuery) -> str:
 def nearby_row_tiebreaker(address_table_sql: str, *, alias: str = "a") -> str:
     """Return the deterministic address-column tie breaker for nearby SQL."""
 
-    column_name = "location_key" if address_table_sql.endswith(".entity_address_unified") else "type"
+    from api.provider_list_sql import _is_unified_address_table
+
+    column_name = "location_key" if _is_unified_address_table(address_table_sql) else "type"
     return f"{alias}.{column_name} ASC"
 
 

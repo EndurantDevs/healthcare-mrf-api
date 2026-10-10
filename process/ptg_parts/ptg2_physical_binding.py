@@ -68,30 +68,7 @@ async def _require_local_preparation_catalog(session, *, lock_tables):
         proof_by_field = (
             (
                 await session.execute(
-                    text(
-                        "SELECT c.relowner::bigint AS owner_oid,c.relkind='r' AND c.relpersistence='p' "
-                        "AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity "
-                        "AND c.relowner=n.nspowner AND NOT owner.rolcanlogin AND NOT owner.rolsuper "
-                        "AND NOT owner.rolcreaterole AND NOT owner.rolcreatedb AND NOT owner.rolreplication "
-                        "AND NOT owner.rolbypassrls AND current_user=session_user "
-                        "AND reader.rolcanlogin AND NOT reader.rolsuper AND NOT reader.rolcreaterole AND NOT reader.rolcreatedb "
-                        "AND NOT reader.rolreplication AND NOT reader.rolbypassrls "
-                        "AND NOT EXISTS(SELECT 1 FROM aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a "
-                        "WHERE a.grantee<>n.nspowner AND a.privilege_type='CREATE') "
-                        "AND NOT EXISTS(SELECT 1 FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) a "
-                        "WHERE a.grantee<>c.relowner AND (a.is_grantable OR NOT (a.privilege_type='SELECT' "
-                        "OR (:child AND a.privilege_type='INSERT')))) "
-                        "AND NOT EXISTS(SELECT 1 FROM pg_attribute col,LATERAL aclexplode(col.attacl) a "
-                        "WHERE col.attrelid=c.oid AND a.grantee<>c.relowner AND (a.is_grantable "
-                        "OR NOT (a.privilege_type='SELECT' OR (a.privilege_type='INSERT' "
-                        "AND (:child OR col.attname=ANY(CAST(:initial_columns AS text[]))))))) "
-                        "AND NOT EXISTS(SELECT 1 FROM pg_rewrite WHERE ev_class=c.oid) "
-                        "AND NOT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) "
-                        "AND NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) AS protected "
-                        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-                        "JOIN pg_roles owner ON owner.oid=c.relowner JOIN pg_roles reader ON reader.rolname=current_user "
-                        "WHERE n.nspname=split_part(:table,'.',1) AND c.relname=split_part(:table,'.',2)"
-                    ),
+                    text(_local_preparation_catalog_sql()),
                     {
                         "table": table,
                         "child": table != _PREPARATION,
@@ -209,9 +186,6 @@ def _qualified_local_read_view_shas(is_prepared):
 
 async def _require_local_physical_view_catalog(session, *, is_prepared, owner_oid):
     """The two fixed role-specific entrypoints share one exact native catalog proof."""
-    import hashlib
-    import json
-
     from sqlalchemy import text
 
     from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
@@ -219,21 +193,7 @@ async def _require_local_physical_view_catalog(session, *, is_prepared, owner_oi
     expected_shas = _qualified_local_read_view_shas(is_prepared)
     view_name = "ptg2_prepared_physical_binding" if is_prepared else "ptg2_installed_physical_binding"
     schema_name = resolve_ptg2_schema()
-    query = text(
-        "SELECT c.oid::bigint AS oid,pg_get_viewdef(c.oid,false) AS definition,"
-        "c.relkind='v' AND c.relpersistence='p' AND c.relowner=:owner_oid "
-        "AND (SELECT array_agg(option ORDER BY option) FROM unnest(c.reloptions) option) "
-        "= ARRAY['security_barrier=true','security_invoker=false']::text[] "
-        "AND has_schema_privilege(current_user,n.oid,'USAGE') AND has_table_privilege(current_user,c.oid,'SELECT') "
-        "AND NOT EXISTS(SELECT 1 FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) a "
-        "WHERE a.grantee<>c.relowner AND (a.grantee=0 OR a.is_grantable OR a.privilege_type<>'SELECT')) "
-        "AND NOT EXISTS(SELECT 1 FROM pg_attribute col,LATERAL aclexplode(col.attacl) a "
-        "WHERE col.attrelid=c.oid AND a.grantee<>c.relowner AND (a.grantee=0 OR a.is_grantable OR a.privilege_type<>'SELECT')) "
-        "AND NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) AS read_only,"
-        "(SELECT jsonb_object_agg(a.attname,pg_catalog.format_type(a.atttypid,a.atttypmod)) "
-        "FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped) AS columns "
-        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=:schema AND c.relname=:view"
-    )
+    query = text(_local_physical_view_catalog_sql())
     parameters_by_name = {"owner_oid": owner_oid, "schema": schema_name, "view": view_name}
     first_identity = None
     for lock_held in (False, True):
@@ -244,14 +204,9 @@ async def _require_local_physical_view_catalog(session, *, is_prepared, owner_oi
                 )
             )
         proof = await _local_read_view_proof(session, query, parameters_by_name)
-        definition_sha = hashlib.sha256(proof["definition"].encode()).hexdigest() if proof else None
-        if proof is None or not proof["read_only"] or definition_sha not in expected_shas:
-            raise PTG2PhysicalBindingError("PTG local read interface catalog differs")
-        columns_by_name = json.loads(proof["columns"]) if isinstance(proof["columns"], str) else proof["columns"]
-        identity = (proof["oid"], definition_sha)
-        if columns_by_name != _local_read_view_columns(is_prepared) or (lock_held and identity != first_identity):
-            raise PTG2PhysicalBindingError("PTG local read interface identity differs")
-        first_identity = identity
+        first_identity = _validate_local_physical_view_catalog(
+            proof, expected_shas, is_prepared=is_prepared, first_identity=first_identity, lock_held=lock_held
+        )
     return owner_oid
 
 
@@ -1436,3 +1391,65 @@ def require_legacy_physical_resolution(declaration):
     """Keep new or unknown physical bindings closed until publisher integration."""
     if declaration is not None:
         raise PTG2PhysicalBindingError("PTG snapshot-local physical binding is not available")
+
+
+def _local_preparation_catalog_sql():
+    """Share the exact existing native catalog predicate across caller types."""
+    return (
+        "SELECT c.relowner::bigint AS owner_oid,c.relkind='r' AND c.relpersistence='p' "
+        "AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity "
+        "AND c.relowner=n.nspowner AND NOT owner.rolcanlogin AND NOT owner.rolsuper "
+        "AND NOT owner.rolcreaterole AND NOT owner.rolcreatedb AND NOT owner.rolreplication "
+        "AND NOT owner.rolbypassrls AND current_user=session_user "
+        "AND reader.rolcanlogin AND NOT reader.rolsuper AND NOT reader.rolcreaterole AND NOT reader.rolcreatedb "
+        "AND NOT reader.rolreplication AND NOT reader.rolbypassrls "
+        "AND NOT EXISTS(SELECT 1 FROM aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a "
+        "WHERE a.grantee<>n.nspowner AND a.privilege_type='CREATE') "
+        "AND NOT EXISTS(SELECT 1 FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) a "
+        "WHERE a.grantee<>c.relowner AND (a.is_grantable OR NOT (a.privilege_type='SELECT' "
+        "OR (:child AND a.privilege_type='INSERT')))) "
+        "AND NOT EXISTS(SELECT 1 FROM pg_attribute col,LATERAL aclexplode(col.attacl) a "
+        "WHERE col.attrelid=c.oid AND a.grantee<>c.relowner AND (a.is_grantable "
+        "OR NOT (a.privilege_type='SELECT' OR (a.privilege_type='INSERT' "
+        "AND (:child OR col.attname=ANY(CAST(:initial_columns AS text[]))))))) "
+        "AND NOT EXISTS(SELECT 1 FROM pg_rewrite WHERE ev_class=c.oid) "
+        "AND NOT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) "
+        "AND NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) AS protected "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "JOIN pg_roles owner ON owner.oid=c.relowner JOIN pg_roles reader ON reader.rolname=current_user "
+        "WHERE n.nspname=split_part(:table,'.',1) AND c.relname=split_part(:table,'.',2)"
+    )
+
+
+def _local_physical_view_catalog_sql():
+    """Share the exact existing native catalog predicate across caller types."""
+    return (
+        "SELECT c.oid::bigint AS oid,pg_get_viewdef(c.oid,false) AS definition,"
+        "c.relkind='v' AND c.relpersistence='p' AND c.relowner=:owner_oid "
+        "AND (SELECT array_agg(option ORDER BY option) FROM unnest(c.reloptions) option) "
+        "= ARRAY['security_barrier=true','security_invoker=false']::text[] "
+        "AND has_schema_privilege(current_user,n.oid,'USAGE') AND has_table_privilege(current_user,c.oid,'SELECT') "
+        "AND NOT EXISTS(SELECT 1 FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) a "
+        "WHERE a.grantee<>c.relowner AND (a.grantee=0 OR a.is_grantable OR a.privilege_type<>'SELECT')) "
+        "AND NOT EXISTS(SELECT 1 FROM pg_attribute col,LATERAL aclexplode(col.attacl) a "
+        "WHERE col.attrelid=c.oid AND a.grantee<>c.relowner AND (a.grantee=0 OR a.is_grantable OR a.privilege_type<>'SELECT')) "
+        "AND NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) AS read_only,"
+        "(SELECT jsonb_object_agg(a.attname,pg_catalog.format_type(a.atttypid,a.atttypmod)) "
+        "FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped) AS columns "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=:schema AND c.relname=:view"
+    )
+
+
+def _validate_local_physical_view_catalog(proof, expected_shas, *, is_prepared, first_identity, lock_held):
+    """Keep one approved native definition and object identity stable across locking."""
+    import hashlib
+    import json
+
+    definition_sha = hashlib.sha256(proof["definition"].encode()).hexdigest() if proof else None
+    if proof is None or not proof["read_only"] or definition_sha not in expected_shas:
+        raise PTG2PhysicalBindingError("PTG local read interface catalog differs")
+    columns_by_name = json.loads(proof["columns"]) if isinstance(proof["columns"], str) else proof["columns"]
+    identity = (proof["oid"], definition_sha)
+    if columns_by_name != _local_read_view_columns(is_prepared) or (lock_held and identity != first_identity):
+        raise PTG2PhysicalBindingError("PTG local read interface identity differs")
+    return identity

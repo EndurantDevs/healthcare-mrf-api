@@ -810,7 +810,7 @@ def test_native_index_keys_require_declared_columns_operator_class_and_expressio
 async def test_native_layout_rejects_catalog_drift_before_returning_fingerprint(failure):
     name = "entity_address_unified_cms" + "a" * 20
     relation = preparation.OwnedRelation("test_schema", name, 41, 10, "u")
-    relation_by_field = {"schema_name": "test_schema", "relation_name": name}
+    relation_by_field = {"relation_oid": 41, "schema_name": "test_schema", "relation_name": name}
     attributes, indexes, constraints, triggers = [], [], [], []
     if failure == "identity":
         relation_by_field["relation_name"] = "replacement"
@@ -1209,7 +1209,8 @@ async def test_bound_validation_uses_one_parent_worker_and_releases_it(monkeypat
     monkeypatch.setattr(native, "db", database)
 
     @asynccontextmanager
-    async def tuned(*args):
+    async def tuned(*args, temp_file_limit_bytes):
+        assert temp_file_limit_bytes == admission.plan.temp_file_limit_bytes_per_backend
         yield
 
     monkeypatch.setattr(native, "entity_address_tuned_transaction", tuned)
@@ -1239,10 +1240,11 @@ async def test_logging_rechecks_stage_oid_after_exclusive_lock(monkeypatch):
     monkeypatch.setattr(native, "db", database)
 
     @asynccontextmanager
-    async def tuned(*args):
+    async def tuned(*args, temp_file_limit_bytes):
+        assert temp_file_limit_bytes == admission.plan.temp_file_limit_bytes_per_backend
         yield
 
-    monkeypatch.setattr(admitted, "native_transaction", tuned)
+    monkeypatch.setattr(admitted, "native_transaction", _transaction)
     monkeypatch.setattr(native, "entity_address_tuned_transaction", tuned)
     token = admitted._ADMISSION.set(scope)
     try:
@@ -1527,8 +1529,12 @@ async def test_missing_creation_oid_is_not_registered_as_an_owned_native_heap(mo
     admission = _admission()
     admission.register_external_relation = AsyncMock()
     scope = admitted._admitted_preparation(admission, admission.plan.native_address_input_hash)
-    database = SimpleNamespace(transaction=_transaction, scalar=AsyncMock(return_value=None))
+    database = SimpleNamespace(
+        transaction=_transaction, scalar=AsyncMock(return_value=None), _transaction_binding=lambda: None
+    )
+    temp_limit = AsyncMock()
     monkeypatch.setattr(native, "db", database)
+    monkeypatch.setattr(admitted, "apply_temp_file_limit", temp_limit)
     monkeypatch.setattr(native, "_apply_entity_address_transaction_settings", AsyncMock())
     create = AsyncMock()
     token = admitted._ADMISSION.set(scope)
@@ -1536,6 +1542,7 @@ async def test_missing_creation_oid_is_not_registered_as_an_owned_native_heap(mo
         with pytest.raises(RuntimeError, match="created stage is missing"):
             await admitted._create_owned_relation("test_schema", "stage_a", create)
         create.assert_awaited_once()
+        temp_limit.assert_awaited_once_with(database, admission.plan.temp_file_limit_bytes_per_backend)
         admission.register_external_relation.assert_not_awaited()
         assert scope.owned_oids == {} and not scope.worker_tasks
         assert scope.workers._value == admission.plan.worker_count
@@ -1672,7 +1679,12 @@ async def test_native_registration_preserves_absent_inputs_and_requires_revision
 async def test_index_free_native_heap_preserves_catalog_fingerprint():
     name = "entity_address_unified_cms" + "a" * 20 + "_raw"
     relation = preparation.OwnedRelation("test_schema", name, 41, 10, "u")
-    relation_by_field = {"schema_name": "test_schema", "relation_name": name, "effective_tablespace_oid": 42}
+    relation_by_field = {
+        "relation_oid": 41,
+        "schema_name": "test_schema",
+        "relation_name": name,
+        "effective_tablespace_oid": 42,
+    }
     fhir = admitted._fhir()
     backend = SimpleNamespace(
         db=SimpleNamespace(all=AsyncMock(), scalar=AsyncMock(return_value=9)),

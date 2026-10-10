@@ -7,6 +7,7 @@ import pytest
 from shapely.geometry import Polygon
 
 from api import init_api
+from api.endpoint.network_catalog import private_catalog_response
 from api.utils import square_poly
 
 EXPECTED_PUBLIC_BLUEPRINT_NAMES = {
@@ -21,6 +22,9 @@ EXPECTED_PUBLIC_BLUEPRINT_NAMES = {
     "formulary_fhir",
     "import",
     "issuer",
+    "network_catalog",
+    "network_providers",
+    "network_serving",
     "npi",
     "nucc",
     "geo",
@@ -28,6 +32,8 @@ EXPECTED_PUBLIC_BLUEPRINT_NAMES = {
     "partd_formulary",
     "pharmacy_license",
     "provider_directory_entities",
+    "registry_management",
+    "registry_publication",
     "reports",
     "site_intelligence",
 }
@@ -45,6 +51,7 @@ def test_init_api_registers_group(monkeypatch):
     class FakeApp:
         def __init__(self):
             self.config = {}
+            self.ctx = types.SimpleNamespace()
             self.registered = None
             self.registered_blueprints = []
             self.registered_middleware = []
@@ -68,7 +75,7 @@ def test_init_api_registers_group(monkeypatch):
         def register_middleware(self, middleware, phase):
             self.registered_middleware.append((middleware, phase))
 
-        def blueprint(self, group):
+        def blueprint(self, group, **_options):
             self.registered = group
             self.registered_blueprints.append(group)
 
@@ -82,6 +89,7 @@ def test_init_api_registers_group(monkeypatch):
         (init_api.__globals__["_capacity_process_request_guard"], "request"),
         (init_api.__globals__["require_internal_plan_release_read"], "request"),
         (init_api.__globals__["add_runtime_identity_headers"], "response"),
+        (private_catalog_response, "response"),
     ]
     assert hasattr(app.registered, "blueprints")
     assert {bp.name for bp in app.registered.blueprints} == (EXPECTED_PUBLIC_BLUEPRINT_NAMES)
