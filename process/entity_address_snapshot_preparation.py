@@ -130,46 +130,48 @@ async def _require_no_untrusted_mutation(session, relation_oids, owner_oid, *, s
 async def _seal_published_relation(session, relation_oid, owner_oid):
     """Preserve read grants while closing effective ordinary DML and ownership bypasses."""
     _require(await _publisher_authority(session) == owner_oid, "publisher owner differs")
-    relation = (
-        (
-            await session.execute(
-                text(
-                    "SELECT quote_ident(n.nspname)||'.'||quote_ident(c.relname) AS name,quote_ident(r.rolname) AS owner,c.relowner "
-                    "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_roles r ON r.oid=:owner WHERE c.oid=:oid"
-                ),
-                {"owner": owner_oid, "oid": relation_oid},
-            )
-        )
-        .mappings()
-        .one()
+    relation_rows = await session.execute(
+        text(
+            "SELECT quote_ident(n.nspname)||'.'||quote_ident(c.relname) AS name,quote_ident(r.rolname) AS owner,c.relowner,"
+            "quote_ident(previous_owner.rolname) AS previous_owner,"
+            "has_table_privilege(c.relowner,c.oid,'SELECT') AND EXISTS(SELECT 1 "
+            "FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) acl "
+            "WHERE acl.grantee=c.relowner AND acl.privilege_type='SELECT') AS previous_owner_can_select,"
+            "ARRAY(SELECT quote_ident(a.attname) FROM pg_attribute a,LATERAL aclexplode(a.attacl) acl "
+            "WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped "
+            "AND acl.grantee=c.relowner AND acl.privilege_type='SELECT' ORDER BY a.attnum) AS previous_owner_read_columns "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_roles r ON r.oid=:owner "
+            "JOIN pg_roles previous_owner ON previous_owner.oid=c.relowner WHERE c.oid=:oid"
+        ),
+        {"owner": owner_oid, "oid": relation_oid},
     )
+    relation = relation_rows.mappings().one()
     if relation["relowner"] == owner_oid:
         await _require_no_untrusted_mutation(session, [relation_oid], owner_oid)
         await _seal_owned_sequences(session, relation_oid, owner_oid, relation["owner"])
         return
     await session.execute(text(f"ALTER TABLE {relation['name']} OWNER TO {relation['owner']}"))
-    principals = (
-        (
-            await session.execute(
-                text("SELECT quote_ident(principal.rolname) FROM pg_roles principal WHERE " + _ORDINARY_PRINCIPAL_SQL),
-                {"owner_oid": owner_oid},
+    if relation["previous_owner_can_select"]:
+        await session.execute(text(f"GRANT SELECT ON {relation['name']} TO {relation['previous_owner']}"))
+    if relation["previous_owner_read_columns"]:
+        await session.execute(
+            text(
+                f"GRANT SELECT ({','.join(relation['previous_owner_read_columns'])}) "
+                f"ON {relation['name']} TO {relation['previous_owner']}"
             )
         )
-        .scalars()
-        .all()
+    principal_rows = await session.execute(
+        text("SELECT quote_ident(principal.rolname) FROM pg_roles principal WHERE " + _ORDINARY_PRINCIPAL_SQL),
+        {"owner_oid": owner_oid},
     )
-    columns = (
-        (
-            await session.execute(
-                text(
-                    "SELECT quote_ident(attname) FROM pg_attribute WHERE attrelid=:oid AND attnum>0 AND NOT attisdropped ORDER BY attnum"
-                ),
-                {"oid": relation_oid},
-            )
-        )
-        .scalars()
-        .all()
+    principals = principal_rows.scalars().all()
+    column_rows = await session.execute(
+        text(
+            "SELECT quote_ident(attname) FROM pg_attribute WHERE attrelid=:oid AND attnum>0 AND NOT attisdropped ORDER BY attnum"
+        ),
+        {"oid": relation_oid},
     )
+    columns = column_rows.scalars().all()
     for principal in ("PUBLIC", *principals):
         await session.execute(
             text(f"REVOKE INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER ON {relation['name']} FROM {principal}")

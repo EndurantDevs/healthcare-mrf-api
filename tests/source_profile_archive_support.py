@@ -3,17 +3,21 @@
 
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import insert, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db import models
 from process import source_profile_result_archive as archive
+
+
+def native_source_copy():
+    """Use the same bounded native model copier for every synthetic source family."""
+    return archive.native.ReferenceFamilySourceCopy(archive.native.native_copy_projection, 16 * 1024 * 1024, 300)
 
 
 def _database_url():
@@ -26,10 +30,15 @@ def _database_url():
     return url.set(drivername="postgresql+asyncpg").render_as_string(hide_password=False)
 
 
-async def _create_family(session, schema):
+async def _create_family(session, schema, *, projection=False):
     spec = archive.native.ReferenceFamilySpec(
         "source-profile-fixture",
-        (*archive.MODELS, models.ProviderProfileSourcePublication, models.ProviderProfileSourcePin),
+        (
+            *archive.MODELS,
+            *((models.ProviderProfileProjection,) if projection else ()),
+            models.ProviderProfileSourcePublication,
+            models.ProviderProfileSourcePin,
+        ),
     )
     await archive.native._create_model_family(session, spec, schema, create_indexes=False)
     await archive.native._create_model_indexes(session, spec, schema, create_constraints=True)
@@ -108,6 +117,9 @@ def _seed_rows(importer):
 
 
 async def _seed(session, schema, importer, *, parent_run_id=None):
+    if importer == archive.PROJECTION_IMPORTER:
+        assert parent_run_id is None
+        return await _seed_florida(session, schema)
     retained_rows = _seed_rows(importer)
     if parent_run_id is not None:
         artifact = (
@@ -164,6 +176,8 @@ async def _drop_family(session, schema):
 
 
 def retained_run(importer_id, run_id=None):
+    if importer_id == archive.PROJECTION_IMPORTER:
+        return florida_run(run_id)
     source_key, version, jurisdiction = archive.SOURCES[importer_id]
     categories = {
         "MA": ["education", "training"],
@@ -215,3 +229,123 @@ def retained_run(importer_id, run_id=None):
         "started_at": datetime(2026, 1, 1),
         "finished_at": datetime(2026, 1, 2),
     }
+
+
+def florida_run(run_id=None):
+    """A complete synthetic ordinary publication, shared by both paired checkouts."""
+    from process.florida_mqa_profile import DEFAULT_SOURCE_KEYS
+
+    source_keys = list(DEFAULT_SOURCE_KEYS)
+    return {
+        "run_id": run_id or uuid4().hex,
+        "source_key": "florida-mqa",
+        "jurisdiction": "FL",
+        "schema_version": "provider-profile/v1",
+        "status": "completed",
+        "started_at": datetime(2026, 1, 1),
+        "finished_at": datetime(2026, 1, 2),
+        "error": None,
+        "source_manifest": {
+            "sources": source_keys,
+            "partial_publish_reasons": [],
+            "allow_volume_drop": False,
+            "publication_guard": {"min_first_publish_providers": 1, "min_publish_ratio": 0.8},
+        },
+        "metrics": {
+            "published_providers": 1,
+            "publication": {"publication": "atomic_table_swap", "published_rows": 1},
+            "selected_sources": source_keys,
+            "source_records": len(source_keys),
+            "source_metrics": {
+                name: {
+                    "schema_complete": True,
+                    "rows": 1,
+                    "matched": 1,
+                    "facts": 1,
+                    "quarantined_rows": 0,
+                    "max_quarantined_rows": 0,
+                    "max_quarantined_ratio": 0,
+                    "header_sha256": "a" * 64,
+                }
+                for name in source_keys
+            },
+        },
+    }
+
+
+async def _seed_florida(session, schema, *, day=0, unrelated=False):
+    """Retain a closed synthetic projection with unrelated CMS evidence optional."""
+    run = florida_run()
+    run["started_at"] += timedelta(days=day)
+    run["finished_at"] += timedelta(days=day)
+    if unrelated:
+        run["source_key"] = "cms-doctors"
+    metadata = archive.native.MetaData()
+
+    async def store(model, values):
+        await session.execute(insert(model.__table__.to_metadata(metadata, schema=schema)), values)
+
+    await store(models.ProviderProfileImportRun, run)
+    for source_key in run["source_manifest"]["sources"]:
+        await _seed_florida_evidence(store, run["run_id"], source_key)
+    if not unrelated:
+        await store(
+            models.ProviderProfileProjection,
+            {
+                "npi": 1234567890,
+                "generation_id": run["run_id"],
+                "schema_version": "provider-profile/v1",
+                "profile_json": {},
+                "source_keys": ["florida-mqa"],
+                "published_at": run["finished_at"],
+            },
+        )
+    return run["run_id"]
+
+
+async def _seed_florida_evidence(store, run_id, source_key):
+    """Retain one artifact, source record and matched fact without reference imports."""
+    artifact_id, record_id = uuid4().hex * 2, uuid4().hex * 2
+    await store(
+        models.ProviderProfileArtifact,
+        {
+            "artifact_id": artifact_id,
+            "run_id": run_id,
+            "source_key": source_key,
+            "file_name": "synthetic.txt",
+            "source_url": "https://example.invalid/source",
+            "category": "profile",
+            "content_sha256": "b" * 64,
+            "content_bytes": 1,
+        },
+    )
+    await store(
+        models.ProviderProfileSourceRecord,
+        {
+            "record_id": record_id,
+            "run_id": run_id,
+            "artifact_id": artifact_id,
+            "source_key": source_key,
+            "source_record_key": "synthetic",
+            "raw_payload": {},
+            "matched_npi": 1234567890,
+            "match_status": "deterministic",
+        },
+    )
+    await store(
+        models.ProviderProfileFact,
+        {
+            "fact_id": uuid4().hex * 2,
+            "run_id": run_id,
+            "source_record_id": record_id,
+            "npi": 1234567890,
+            "logical_fact_key": uuid4().hex * 2,
+            "category": "license",
+            "fact_type": "license",
+            "display": "Synthetic",
+            "value_json": {},
+            "assertion_type": "source",
+            "verification_status": "source",
+            "source_json": {},
+        },
+    )

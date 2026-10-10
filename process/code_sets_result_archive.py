@@ -3,17 +3,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from types import SimpleNamespace
 from uuid import UUID
 
 from sqlalchemy import text
 
 from db.models import CodeCatalog
+from process import reference_family_archive as native
 from process.entity_address_snapshot_receipt import _projected_row_identity
+from process.scoped_catalog_binding import match_catalog_text_columns, model_ordered_columns
 
 TABLE = "code_sets_result_generation"
 CONTRACT = "code-sets-scoped.postgres.v1"
@@ -64,6 +68,7 @@ class CodeSetsActivation:
     predecessor_catalog_oid: int
     predecessor_row_count: int
     predecessor_row_sha256: str
+    retained_family: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -350,24 +355,19 @@ async def _clone_slice(
     *,
     target_table: str = CodeCatalog.__tablename__,
     create_schema: bool = True,
+    source_copy,
 ) -> tuple[int, int]:
-    """Clone physical column/index shape but copy only the fixed source slice."""
-    quoted_source = _schema(source_schema)
+    """Load a model heap with the fixed source slice, then complete its indexes."""
+    _require_copy(source_copy)
+    _schema(source_schema)
     quoted_target = _schema(target_schema)
-    name = CodeCatalog.__tablename__
     if create_schema:
         await session.execute(text(f"CREATE SCHEMA {quoted_target}"))
-    await session.execute(
-        text(f"CREATE TABLE {quoted_target}.{target_table} (LIKE {quoted_source}.{name} INCLUDING ALL)")
-    )
-    columns = ",".join(f'"{column.name}"' for column in CodeCatalog.__table__.columns)
-    await session.execute(
-        text(
-            f"INSERT INTO {quoted_target}.{target_table} ({columns}) SELECT {columns} FROM {quoted_source}.{name} "
-            "WHERE source=ANY(CAST(:sources AS text[]))"
-        ),
-        {"sources": [source_name for source_name, _ in SOURCES]},
-    )
+    spec = _catalog_spec(target_table)
+    await native._create_model_heaps(session, spec, target_schema, create_indexes=False)
+    await match_catalog_text_columns(session, source_schema, target_schema, target_table)
+    await _copy_slice(session, source_schema, target_schema, target_table, source_copy)
+    await native._create_model_indexes(session, spec, target_schema, create_constraints=True)
     schema_oid = await session.scalar(text("SELECT to_regnamespace(:schema)::oid::bigint"), {"schema": target_schema})
     catalog_oid = await session.scalar(
         text("SELECT to_regclass(:relation)::oid::bigint"), {"relation": f"{target_schema}.{target_table}"}
@@ -377,12 +377,51 @@ async def _clone_slice(
     return schema_oid, catalog_oid
 
 
+def _catalog_spec(table_name: str) -> native.ReferenceFamilySpec:
+    _schema(table_name)
+    if table_name == CodeCatalog.__tablename__:
+        model = CodeCatalog
+    else:
+        table = native._clone_model_table(CodeCatalog.__table__, native.MetaData(), schema=None, name=table_name)
+        model = SimpleNamespace(
+            __tablename__=table_name,
+            __table__=table,
+            __my_additional_indexes__=CodeCatalog.__my_additional_indexes__,
+        )
+    return native.ReferenceFamilySpec("code-sets", (model,))
+
+
+def _require_copy(source_copy) -> None:
+    if not isinstance(source_copy, native.ReferenceFamilySourceCopy):
+        raise CodeSetsArchiveError("code-set native COPY capability is required")
+
+
+async def _copy_slice(session, source: str, target: str, target_table: str, source_copy) -> None:
+    _require_copy(source_copy)
+    columns = tuple(column.name for column in CodeCatalog.__table__.columns)
+    sources = ",".join("'" + name + "'" for name, _ in SOURCES)
+    query = (
+        "SELECT "
+        + ",".join(_schema(column) for column in columns)
+        + f" FROM {_schema(source)}.{_schema(CodeCatalog.__tablename__)}"
+        + f" WHERE source=ANY(ARRAY[{sources}]::text[])"
+    )
+    await native._copy_source_projection(
+        session,
+        source_copy,
+        query,
+        target,
+        target_table,
+        columns,
+        source_copy.max_bytes,
+        asyncio.get_running_loop().time() + source_copy.timeout,
+    )
+
+
 async def _verify_clone(
     session, schema: str, schema_oid: int, catalog_oid: int, predecessor_oid: int | None = None
 ) -> None:
     """Reject replacement of the cloned relation or added objects."""
-    from process import reference_family_archive as native
-
     observed_oid = await session.scalar(text("SELECT to_regnamespace(:schema)::oid::bigint"), {"schema": schema})
     observed_table = await session.scalar(
         text("SELECT to_regclass(:relation)::oid::bigint"), {"relation": f"{schema}.{CodeCatalog.__tablename__}"}
@@ -407,30 +446,36 @@ async def _verify_clone(
             raise CodeSetsArchiveError("code-set clone contains an unowned relation")
 
 
-async def prepare_source(session, schema: str, dataset_id: UUID) -> CodeSetsStage:
+async def prepare_source(session, schema: str, dataset_id: UUID, *, source_copy=None) -> CodeSetsStage:
     """Pin one exact published slice and commit a task-owned native clone."""
+    from process.scoped_catalog_binding import pin_catalog_source
+
     _transaction(session)
-    await session.execute(text(f"LOCK TABLE {_schema(schema)}.{CodeCatalog.__tablename__} IN SHARE MODE"))
-    generation = await read_generation(session, schema, lock=True)
+    _require_copy(source_copy)
+    read_only = await pin_catalog_source(session, schema, (CodeCatalog,), TABLE)
+    generation = await read_generation(session, schema, lock=not read_only)
     count, digest, oid = await scope_receipt(session, schema)
     if (generation.code_catalog_oid, generation.row_count, generation.row_sha256) != (oid, count, digest):
         raise CodeSetsArchiveError("code-set source generation drifted")
-    target = stage_schema(dataset_id)
-    schema_oid, catalog_oid = await _clone_slice(session, schema, target)
-    if (await scope_receipt(session, target, stage=True)) != (count, digest, catalog_oid):
+    target_schema = stage_schema(dataset_id)
+    schema_oid, catalog_oid = await _clone_slice(session, schema, target_schema, source_copy=source_copy)
+    if (await scope_receipt(session, target_schema, stage=True)) != (count, digest, catalog_oid):
         raise CodeSetsArchiveError("code-set source clone differs")
-    await _verify_clone(session, target, schema_oid, catalog_oid)
+    await _verify_clone(session, target_schema, schema_oid, catalog_oid)
     if generation.origin_lineage_id is None or generation.origin_generation is None or generation.published_at is None:
         raise CodeSetsArchiveError("code-set source generation is incomplete")
-    source = CodeSetsSourceGeneration(
+    signature = await _column_signature(session, catalog_oid)
+    if signature != await _column_signature(session, oid):
+        raise CodeSetsArchiveError("code-set source table shape differs")
+    source_generation = CodeSetsSourceGeneration(
         generation.origin_lineage_id,
         generation.origin_generation,
         generation.published_at,
         count,
         digest,
-        _schema_digest(await _column_signature(session, catalog_oid)),
+        _schema_digest(signature),
     )
-    return CodeSetsStage(dataset_id, target, schema_oid, catalog_oid, source, count, digest)
+    return CodeSetsStage(dataset_id, target_schema, schema_oid, catalog_oid, source_generation, count, digest)
 
 
 async def precreate_restore(
@@ -439,13 +484,13 @@ async def precreate_restore(
     """Create both registered stage OIDs before data-only restore or freeze."""
     _transaction(session)
     source = validate_manifest(manifest)
+    _schema(destination)
     target = stage_schema(dataset_id)
     name = CodeCatalog.__tablename__
     await session.execute(text(f"CREATE SCHEMA {_schema(target)}"))
     for table_name in (name, PREDECESSOR_TABLE):
-        await session.execute(
-            text(f"CREATE TABLE {_schema(target)}.{table_name} (LIKE {_schema(destination)}.{name} INCLUDING ALL)")
-        )
+        await native._create_model_heaps(session, _catalog_spec(table_name), target, create_indexes=False)
+        await match_catalog_text_columns(session, destination, target, table_name)
     schema_oid = await session.scalar(text("SELECT to_regnamespace(:name)::oid::bigint"), {"name": target})
     catalog_oid = await session.scalar(text("SELECT to_regclass(:name)::oid::bigint"), {"name": f"{target}.{name}"})
     predecessor_oid = await session.scalar(
@@ -454,10 +499,30 @@ async def precreate_restore(
     if not all(type(value) is int and value > 0 for value in (schema_oid, catalog_oid, predecessor_oid)):
         raise CodeSetsArchiveError("code-set restore stage is unavailable")
     await _verify_clone(session, target, schema_oid, catalog_oid, predecessor_oid)
-    if _schema_digest(await _column_signature(session, catalog_oid)) != source.schema_sha256:
+    if _schema_digest(await _column_signature(session, catalog_oid, pending_primary=True)) != source.schema_sha256:
         raise CodeSetsArchiveError("code-set restore schema differs")
     stage = CodeSetsStage(dataset_id, target, schema_oid, catalog_oid, source, source.row_count, source.row_sha256)
     return stage, predecessor_oid
+
+
+async def complete_restore(session, stage: CodeSetsStage, *, predecessor_oid: int) -> None:
+    """Finish a restored candidate's indexes before its registered namespace is frozen."""
+    _transaction(session)
+    if not isinstance(stage, CodeSetsStage) or stage.schema_name != stage_schema(stage.dataset_id):
+        raise CodeSetsArchiveError("code-set stage identity is invalid")
+    await session.execute(
+        text(f"LOCK TABLE {_schema(stage.schema_name)}.{CodeCatalog.__tablename__} IN ACCESS EXCLUSIVE MODE")
+    )
+    await _verify_clone(session, stage.schema_name, stage.schema_oid, stage.catalog_oid, predecessor_oid)
+    if (
+        _schema_digest(await _column_signature(session, stage.catalog_oid, pending_primary=True))
+        != stage.source_generation.schema_sha256
+    ):
+        raise CodeSetsArchiveError("code-set restore schema differs")
+    await native._create_model_indexes(
+        session, _catalog_spec(CodeCatalog.__tablename__), stage.schema_name, create_constraints=True
+    )
+    await verify_stage(session, stage, predecessor_oid=predecessor_oid)
 
 
 async def verify_stage(session, stage: CodeSetsStage, *, predecessor_oid: int | None = None) -> None:
@@ -477,7 +542,7 @@ async def verify_stage(session, stage: CodeSetsStage, *, predecessor_oid: int | 
         raise CodeSetsArchiveError("code-set stage schema changed")
 
 
-async def _column_signature(session, oid: int) -> tuple:
+async def _column_signature(session, oid: int, *, pending_primary: bool = False) -> tuple:
     column_records = (
         await session.execute(
             text(
@@ -489,10 +554,10 @@ async def _column_signature(session, oid: int) -> tuple:
             {"oid": oid},
         )
     ).all()
-    if tuple(column_record[0] for column_record in column_records) != tuple(
-        column.name for column in CodeCatalog.__table__.columns
-    ):
-        raise CodeSetsArchiveError("code-set catalog columns differ")
+    try:
+        column_records = model_ordered_columns(column_records, CodeCatalog)
+    except ValueError as error:
+        raise CodeSetsArchiveError("code-set catalog columns differ") from error
     primary = (
         (
             await session.execute(
@@ -508,7 +573,7 @@ async def _column_signature(session, oid: int) -> tuple:
         .scalars()
         .all()
     )
-    if primary != ["code_system", "code"]:
+    if primary != ([] if pending_primary else ["code_system", "code"]):
         raise CodeSetsArchiveError("code-set catalog key differs")
     return tuple(tuple(column_record) for column_record in column_records)
 
@@ -528,21 +593,44 @@ async def _has_collision(
     )
 
 
-async def _replace_slice(
-    session, destination: str, candidate: str, candidate_table: str = CodeCatalog.__tablename__
-) -> None:
-    name = CodeCatalog.__tablename__
-    await session.execute(
-        text(f"DELETE FROM {_schema(destination)}.{name} WHERE source=ANY(CAST(:sources AS text[]))"),
-        {"sources": [source for source, _ in SOURCES]},
+async def _publish_source_slice(session, destination, candidate, candidate_table, *, origin, expected, source_copy):
+    """Replace an authenticated source contribution through complete-family composition."""
+    from process import scoped_catalog_publication as publication
+
+    incoming = await publication.copy_received_input(
+        session, "code-sets", destination, candidate, (candidate_table,), source_copy
     )
-    columns = ",".join(f'"{column.name}"' for column in CodeCatalog.__table__.columns)
-    await session.execute(
-        text(
-            f"INSERT INTO {_schema(destination)}.{name} ({columns}) "
-            f"SELECT {columns} FROM {_schema(candidate)}.{candidate_table}"
+    composed = await publication.compose_catalog_family(
+        session, destination, "code-sets", incoming, publication.contributions("code-sets"), source_copy
+    )
+    if composed.generations["code-sets"] != expected:
+        raise CodeSetsArchiveError("code-set publication generation changed")
+
+    async def _publish_generation():
+        count, digest, oid = await _slice_identity(session, destination, complete=origin.origin_generation is not None)
+        if origin.origin_generation is None:
+            if count:
+                raise CodeSetsArchiveError("code-set rollback result differs")
+        elif (count, digest) != (origin.row_count, origin.row_sha256):
+            raise CodeSetsArchiveError("code-set activation result differs")
+        adopted = CodeSetsGeneration(
+            expected.local_lineage_id,
+            expected.local_generation + 1,
+            origin.origin_lineage_id,
+            origin.origin_generation,
+            origin.published_at,
+            oid if origin.origin_generation is not None else None,
+            origin.row_count,
+            origin.row_sha256,
         )
-    )
+        current = await _set_generation(session, destination, adopted.local_generation, adopted)
+        if current != adopted:
+            raise CodeSetsArchiveError("code-set activation authority differs")
+        return current
+
+    current, retained = await publication.activate_catalog_family(session, composed, _publish_generation)
+    await native.cleanup_model_family_stage(session, incoming.spec, incoming.ownership)
+    return current, retained
 
 
 async def _set_generation(
@@ -582,9 +670,11 @@ async def prepare_predecessor(
     stage: CodeSetsStage,
     expected: CodeSetsGeneration,
     precreated_predecessor_oid: int | None = None,
+    source_copy=None,
 ) -> CodeSetsPreparedStage:
     """Copy the destination predecessor into the same stage before its ownership freeze."""
     _transaction(session)
+    _require_copy(source_copy)
     await session.execute(
         text(f"LOCK TABLE {_schema(destination)}.{CodeCatalog.__tablename__} IN SHARE ROW EXCLUSIVE MODE")
     )
@@ -602,21 +692,25 @@ async def prepare_predecessor(
         raise CodeSetsArchiveError("code-set destination table shape differs")
     if precreated_predecessor_oid is None:
         predecessor_schema_oid, predecessor_catalog_oid = await _clone_slice(
-            session, destination, stage.schema_name, target_table=PREDECESSOR_TABLE, create_schema=False
+            session,
+            destination,
+            stage.schema_name,
+            target_table=PREDECESSOR_TABLE,
+            create_schema=False,
+            source_copy=source_copy,
         )
     else:
         predecessor_schema_oid, predecessor_catalog_oid = stage.schema_oid, precreated_predecessor_oid
         await _verify_clone(session, stage.schema_name, stage.schema_oid, stage.catalog_oid, predecessor_catalog_oid)
         if await session.scalar(text(f"SELECT EXISTS(SELECT 1 FROM {_schema(stage.schema_name)}.{PREDECESSOR_TABLE})")):
             raise CodeSetsArchiveError("code-set predecessor is not empty")
-        columns = ",".join(f'"{column.name}"' for column in CodeCatalog.__table__.columns)
-        await session.execute(
-            text(
-                f"INSERT INTO {_schema(stage.schema_name)}.{PREDECESSOR_TABLE} ({columns}) "
-                f"SELECT {columns} FROM {_schema(destination)}.{CodeCatalog.__tablename__} "
-                "WHERE source=ANY(CAST(:sources AS text[]))"
-            ),
-            {"sources": [source_name for source_name, _ in SOURCES]},
+        if await _column_signature(session, predecessor_catalog_oid, pending_primary=True) != await _column_signature(
+            session, oid
+        ):
+            raise CodeSetsArchiveError("code-set predecessor table shape differs")
+        await _copy_slice(session, destination, stage.schema_name, PREDECESSOR_TABLE, source_copy)
+        await native._create_model_indexes(
+            session, _catalog_spec(PREDECESSOR_TABLE), stage.schema_name, create_constraints=True
         )
     predecessor_count, predecessor_digest, _ = await _slice_identity(
         session, stage.schema_name, complete=False, table_name=PREDECESSOR_TABLE, strict=True
@@ -651,9 +745,12 @@ async def validate_prepared_stage(
     return CodeSetsPreparedStage(stage, prior, predecessor_oid, count, digest)
 
 
-async def activate_stage(session, *, destination: str, prepared: CodeSetsPreparedStage) -> CodeSetsActivation:
+async def activate_stage(
+    session, *, destination: str, prepared: CodeSetsPreparedStage, source_copy=None
+) -> CodeSetsActivation:
     """CAS just the source rows against a frozen, same-inventory predecessor."""
     _transaction(session)
+    _require_copy(source_copy)
     stage, expected = prepared.stage, prepared.expected
     await session.execute(
         text(f"LOCK TABLE {_schema(destination)}.{CodeCatalog.__tablename__} IN SHARE ROW EXCLUSIVE MODE")
@@ -680,24 +777,15 @@ async def activate_stage(session, *, destination: str, prepared: CodeSetsPrepare
         raise CodeSetsArchiveError("code-set predecessor changed")
     if await _has_collision(session, destination, stage.schema_name):
         raise CodeSetsArchiveError("code-set candidate key belongs to another source")
-    await _replace_slice(session, destination, stage.schema_name)
-    actual_count, actual_digest, actual_oid = await scope_receipt(session, destination)
-    if (actual_count, actual_digest, actual_oid) != (stage.row_count, stage.row_sha256, oid):
-        raise CodeSetsArchiveError("code-set activation result differs")
-    source_generation = stage.source_generation
-    adopted = CodeSetsGeneration(
-        prior.local_lineage_id,
-        prior.local_generation + 1,
-        source_generation.origin_lineage_id,
-        source_generation.origin_generation,
-        source_generation.published_at,
-        oid,
-        actual_count,
-        actual_digest,
+    current, retained = await _publish_source_slice(
+        session,
+        destination,
+        stage.schema_name,
+        CodeCatalog.__tablename__,
+        origin=stage.source_generation,
+        expected=prior,
+        source_copy=source_copy,
     )
-    current = await _set_generation(session, destination, adopted.local_generation, adopted)
-    if current != adopted:
-        raise CodeSetsArchiveError("code-set activation authority differs")
     return CodeSetsActivation(
         stage.dataset_id,
         prior,
@@ -708,12 +796,16 @@ async def activate_stage(session, *, destination: str, prepared: CodeSetsPrepare
         prepared.predecessor_catalog_oid,
         count,
         digest,
+        retained,
     )
 
 
-async def rollback_activation(session, *, destination: str, activation: CodeSetsActivation) -> CodeSetsGeneration:
+async def rollback_activation(
+    session, *, destination: str, activation: CodeSetsActivation, source_copy=None
+) -> CodeSetsGeneration:
     """Restore only the retained predecessor if the candidate is still current."""
     _transaction(session)
+    _require_copy(source_copy)
     if not isinstance(activation, CodeSetsActivation) or activation.predecessor_schema != predecessor_schema(
         activation.dataset_id
     ):
@@ -748,29 +840,19 @@ async def rollback_activation(session, *, destination: str, activation: CodeSets
         activation.predecessor_row_sha256,
     ) or await _has_collision(session, destination, activation.predecessor_schema, PREDECESSOR_TABLE):
         raise CodeSetsArchiveError("code-set rollback predecessor differs")
-    await _replace_slice(session, destination, activation.predecessor_schema, PREDECESSOR_TABLE)
-    restored_count, restored_digest, restored_oid = await _slice_identity(session, destination, complete=False)
-    if (restored_count, restored_digest, restored_oid) != (
-        predecessor_count,
-        predecessor_digest,
-        current.code_catalog_oid,
-    ):
-        raise CodeSetsArchiveError("code-set rollback result differs")
-    previous = activation.previous
-    restored = CodeSetsGeneration(
-        current.local_lineage_id,
-        current.local_generation + 1,
-        previous.origin_lineage_id,
-        previous.origin_generation,
-        previous.published_at,
-        current.code_catalog_oid if previous.origin_generation is not None else None,
-        previous.row_count,
-        previous.row_sha256,
+    restored, retained = await _publish_source_slice(
+        session,
+        destination,
+        activation.predecessor_schema,
+        PREDECESSOR_TABLE,
+        origin=activation.previous,
+        expected=current,
+        source_copy=source_copy,
     )
-    restored_authority = await _set_generation(session, destination, restored.local_generation, restored)
-    if restored_authority != restored:
-        raise CodeSetsArchiveError("code-set rollback authority differs")
-    return restored_authority
+    from process.scoped_catalog_retention import cleanup_retained_catalog
+
+    await cleanup_retained_catalog(session, retained)
+    return restored
 
 
 async def cleanup_stage(session, stage: CodeSetsStage, *, predecessor_oid: int | None = None) -> None:

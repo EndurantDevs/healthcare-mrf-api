@@ -1,17 +1,47 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from click.testing import CliRunner
 from sqlalchemy import Date, DateTime
 
 florida = importlib.import_module("process.florida_mqa_profile")
+
+
+@pytest.mark.asyncio
+async def test_directory_cleanup_drains_actual_thread_before_releasing_cancellation(monkeypatch, tmp_path):
+    started = asyncio.Event()
+    release = Event()
+    loop = asyncio.get_running_loop()
+
+    def remove(root, run_ids):
+        assert root == tmp_path and run_ids == ["a" * 32]
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(5), "test did not release directory cleanup"
+        return {"deleted": [], "missing": run_ids, "errors": {}}
+
+    monkeypatch.setattr(florida, "_remove_artifact_run_directories", remove)
+    cleanup = asyncio.create_task(florida._remove_retained_directories(tmp_path, ["a" * 32]))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        for _ in range(2):
+            cleanup.cancel()
+            await asyncio.sleep(0)
+            assert not cleanup.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(cleanup, 5)
+    finally:
+        release.set()
+        await asyncio.gather(cleanup, return_exceptions=True)
 
 
 def test_copy_serialization_and_dates_preserve_exact_types():
@@ -21,10 +51,13 @@ def test_copy_serialization_and_dates_preserve_exact_types():
     assert florida._copy_value_for_type(DateTime(), aware).tzinfo is None
     plain_date = date(2026, 7, 27)
     assert florida._copy_value_for_type(Date(), plain_date) is plain_date
-    assert florida._copy_value_for_type(
-        DateTime(timezone=True),
-        aware,
-    ).tzinfo is UTC
+    assert (
+        florida._copy_value_for_type(
+            DateTime(timezone=True),
+            aware,
+        ).tzinfo
+        is UTC
+    )
 
 
 def test_identity_matcher_rejects_ambiguous_professions_and_taxonomies():
@@ -67,10 +100,7 @@ def test_row_iterators_skip_fully_empty_physical_rows(tmp_path):
     cannabis = florida.FLORIDA_SOURCES["medical_cannabis_authorization"]
     cannabis_path = tmp_path / "empty-cannabis.txt"
     cannabis_path.write_text(
-        "|".join(cannabis.expected_fields)
-        + "\n"
-        + "|" * (len(cannabis.expected_fields) - 1)
-        + "\n",
+        "|".join(cannabis.expected_fields) + "\n" + "|" * (len(cannabis.expected_fields) - 1) + "\n",
         encoding="latin-1",
     )
     assert list(florida._iter_rows(cannabis_path, cannabis)) == []
@@ -86,12 +116,15 @@ def test_license_status_continuation_rejects_wrong_physical_width():
         (2, ["value"] * 5),
         (3, [""]),
     ]
-    assert florida._license_status_continuation_values(
-        list(florida._LICENSE_STATUS_FIELDS),
-        physical_rows,
-        artifact_member="license_status.txt",
-        parser_metrics={},
-    ) is None
+    assert (
+        florida._license_status_continuation_values(
+            list(florida._LICENSE_STATUS_FIELDS),
+            physical_rows,
+            artifact_member="license_status.txt",
+            parser_metrics={},
+        )
+        is None
+    )
 
 
 def test_license_status_truncated_continuation_is_quarantined(tmp_path):
@@ -141,10 +174,7 @@ async def test_values_upsert_chunks_rows_and_excludes_conflict_key(monkeypatch):
         "insert",
         lambda _table: Statement(),
     )
-    source_rows = [
-        {"artifact_id": str(index), "run_id": "run"}
-        for index in range(1_001)
-    ]
+    source_rows = [{"artifact_id": str(index), "run_id": "run"} for index in range(1_001)]
 
     await florida._upsert_rows_values(
         florida.ProviderProfileArtifact,
@@ -161,9 +191,7 @@ async def test_copy_fallback_switches_remaining_batches_to_values(monkeypatch):
     monkeypatch.setattr(florida, "_is_copy_upsert_enabled", lambda: True)
     monkeypatch.setattr(florida, "_copy_upsert_min_rows", lambda: 1)
     monkeypatch.setattr(florida, "_copy_upsert_batch_rows", lambda: 2)
-    copy = AsyncMock(
-        side_effect=florida._CopyUpsertUnavailable("driver unavailable")
-    )
+    copy = AsyncMock(side_effect=florida._CopyUpsertUnavailable("driver unavailable"))
     values = AsyncMock()
     monkeypatch.setattr(florida, "_copy_upsert_chunk", copy)
     monkeypatch.setattr(florida, "_upsert_rows_values", values)
@@ -184,12 +212,8 @@ async def test_failure_status_helpers_are_bounded_and_best_effort(
 ):
     monkeypatch.setenv("HLTHPRT_FL_MQA_FAILURE_STATUS_TIMEOUT_SECONDS", "bad")
     monkeypatch.setenv("HLTHPRT_FL_MQA_FAILURE_STATUS_WINDOW_SECONDS", "bad")
-    assert florida._failure_status_timeout_seconds() == (
-        florida.DEFAULT_FAILURE_STATUS_TIMEOUT_SECONDS
-    )
-    assert florida._failure_status_window_seconds() == (
-        florida.DEFAULT_FAILURE_STATUS_WINDOW_SECONDS
-    )
+    assert florida._failure_status_timeout_seconds() == (florida.DEFAULT_FAILURE_STATUS_TIMEOUT_SECONDS)
+    assert florida._failure_status_window_seconds() == (florida.DEFAULT_FAILURE_STATUS_WINDOW_SECONDS)
 
     monkeypatch.setattr(florida.db, "engine", object())
     await florida._dispose_failed_database_pool(1)
@@ -252,10 +276,7 @@ def test_source_guard_helpers_report_malformed_metrics_and_header_drift():
         },
     )
     assert "previous_source_header_hash_invalid:invalid" in drift
-    assert any(
-        reason.startswith("source_header_sha256_changed:changed")
-        for reason in drift
-    )
+    assert any(reason.startswith("source_header_sha256_changed:changed") for reason in drift)
 
 
 @pytest.mark.parametrize(
@@ -317,9 +338,7 @@ def test_artifact_cleanup_rechecks_resolved_path_after_symlink_race(
     monkeypatch.setattr(
         Path,
         "is_symlink",
-        lambda path: (
-            False if path == candidate else original_is_symlink(path)
-        ),
+        lambda path: False if path == candidate else original_is_symlink(path),
     )
 
     result = florida._remove_artifact_run_directories(tmp_path, [run_id])
@@ -329,7 +348,7 @@ def test_artifact_cleanup_rechecks_resolved_path_after_symlink_race(
 
 
 @pytest.mark.asyncio
-async def test_post_success_retention_preserves_success_when_metric_write_fails(
+async def test_post_success_retention_reports_without_mutating_published_metrics(
     monkeypatch,
     tmp_path,
 ):
@@ -339,30 +358,21 @@ async def test_post_success_retention_preserves_success_when_metric_write_fails(
         AsyncMock(return_value={"status": "completed"}),
     )
 
-    class Update:
-        def where(self, *_criteria):
-            return self
+    update = Mock(side_effect=AssertionError("published payload must remain immutable"))
+    monkeypatch.setattr(florida.db, "update", update)
 
-        def values(self, **_values):
-            return self
-
-        async def status(self):
-            raise RuntimeError("metrics unavailable")
-
-    monkeypatch.setattr(florida.db, "update", lambda _table: Update())
-
+    published_metrics_by_key = {"published_providers": 10}
     metrics = await florida._apply_post_success_retention(
         run_id="a" * 32,
-        metrics={"published_providers": 10},
+        metrics=published_metrics_by_key,
         artifact_root=tmp_path,
         failed_retention_days=7,
     )
 
     assert metrics["published_providers"] == 10
-    assert metrics["retention"]["metrics_persist_error"] == {
-        "type": "RuntimeError",
-        "message": "metrics unavailable",
-    }
+    assert metrics["retention"] == {"status": "completed"}
+    assert published_metrics_by_key == {"published_providers": 10}
+    update.assert_not_called()
 
 
 def test_projection_deduplicates_assertions_without_merging_unrelated_values():
@@ -406,17 +416,20 @@ def test_projection_deduplicates_assertions_without_merging_unrelated_values():
 
 
 def test_source_ratio_guard_ignores_uncomparable_metrics():
-    assert florida._source_ratio_guard_reasons(
-        {
-            "invalid": "not-a-map",
-            "new": {"rows": 1, "matched": None, "facts": 1},
-        },
-        {
-            "invalid": {"rows": 10},
-            "new": {"rows": 0, "matched": 5, "facts": "unknown"},
-        },
-        min_publish_ratio=0.8,
-    ) == []
+    assert (
+        florida._source_ratio_guard_reasons(
+            {
+                "invalid": "not-a-map",
+                "new": {"rows": 1, "matched": None, "facts": 1},
+            },
+            {
+                "invalid": {"rows": 10},
+                "new": {"rows": 0, "matched": 5, "facts": "unknown"},
+            },
+            min_publish_ratio=0.8,
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio

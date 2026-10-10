@@ -98,10 +98,6 @@ def test_find_latest_manual_toc_url_skips_proposed_links():
 
 @pytest.mark.asyncio
 async def test_catalog_only_import_replaces_only_ms_drg_sources(monkeypatch):
-    class FakeStage:
-        __tablename__ = "stage"
-        __table__ = object()
-
     html_by_url = {
         "https://example.test/toc.html": """
             <a href="appendix-a.html">Appendix A List of MS-DRGs</a>
@@ -116,31 +112,15 @@ async def test_catalog_only_import_replaces_only_ms_drg_sources(monkeypatch):
     async def noop(*_args, **_kwargs):
         return None
 
-    async def push(_stage, rows):
-        return len(rows)
-
-    async def merge_catalog(_stage, _schema, sources):
-        calls.append(("catalog", sources))
-
-    async def merge_synonym(_stage, _schema, sources):
-        calls.append(("synonym", sources))
-
-    async def merge_relationship(_stage, _schema, sources):
-        calls.append(("relationship", sources))
-
-    async def publish_generation(_session, _schema, *, include_relationships):
-        calls.append(("generation", include_relationships))
+    async def prepare(_database, context, **options):
+        calls.append((context, options))
+        return {**options["metrics"], "status": "prepared"}
 
     monkeypatch.setattr(ms_drg, "db", _FakeDb())
     monkeypatch.setattr(ms_drg, "ensure_database", noop)
     monkeypatch.setattr(ms_drg, "_ensure_tables", noop)
     monkeypatch.setattr(ms_drg, "_download_text", lambda url: html_by_url[url])
-    monkeypatch.setattr(ms_drg, "make_class", lambda *_args, **_kwargs: FakeStage)
-    monkeypatch.setattr(ms_drg, "_push", push)
-    monkeypatch.setattr(ms_drg, "_merge_catalog_stage", merge_catalog)
-    monkeypatch.setattr(ms_drg, "_merge_synonym_stage", merge_synonym)
-    monkeypatch.setattr(ms_drg, "_merge_relationship_stage", merge_relationship)
-    monkeypatch.setattr(ms_drg, "publish_local_generation", publish_generation)
+    monkeypatch.setattr(ms_drg, "prepare_catalog_handoff", prepare)
 
     import_summary = await ms_drg.import_ms_drg(
         include_relationships=False,
@@ -149,11 +129,14 @@ async def test_catalog_only_import_replaces_only_ms_drg_sources(monkeypatch):
     )
 
     assert import_summary["relationship_rows"] == 0
-    assert calls == [
-        ("catalog", (ms_drg.SOURCE_MS_DRG,)),
-        ("synonym", (ms_drg.SOURCE_MS_DRG,)),
-        ("generation", False),
-    ]
+    assert import_summary["status"] == "prepared"
+    assert len(calls) == 1 and calls[0][0] is None
+    prepared = calls[0][1]
+    assert prepared["importer"] == "ms-drg"
+    assert prepared["options"] == {"include_relationships": False, "test_mode": False}
+    assert prepared["payloads"]["code_relationship"] == []
+    assert {entry["source"] for entry in prepared["payloads"]["code_catalog"]} == {ms_drg.SOURCE_MS_DRG}
+    assert {entry["source"] for entry in prepared["payloads"]["code_synonym"]} == {ms_drg.SOURCE_MS_DRG}
 
 
 def test_download_text_rejects_file_url(tmp_path, monkeypatch):

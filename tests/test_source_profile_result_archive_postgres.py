@@ -18,7 +18,7 @@ from api import provider_profile_states as serving
 from db import models
 from db.connection import Database
 from process import source_profile_result_archive as archive
-from tests.source_profile_archive_support import _create_family, _database_url, _drop_family, _seed
+from tests.source_profile_archive_support import _create_family, _database_url, _drop_family, _seed, native_source_copy
 
 
 @asynccontextmanager
@@ -47,6 +47,7 @@ async def _prepared_case(importer, *, with_ancestry=False, contract=archive.LEGA
                 run_id=incoming,
                 dataset_id=uuid4(),
                 contract=contract,
+                source_copy=native_source_copy(),
             )
         activation_by_field = dict(
             prepared=prepared,
@@ -69,6 +70,10 @@ async def _prepared_case(importer, *, with_ancestry=False, contract=archive.LEGA
             unrelated=unrelated,
             prepared=prepared,
             activation_by_field=activation_by_field,
+            preparation_by_field={
+                **activation_by_field,
+                "publication_request": {"source_copy": native_source_copy()} if contract == archive.CONTRACT else None,
+            },
         )
     finally:
         await _cleanup_prepared_case(sessions, prepared, source_schema, created_schemas)
@@ -140,7 +145,7 @@ async def _assert_no_canonical_adoption(case, pin_id):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("importer", archive.SOURCES)
+@pytest.mark.parametrize("importer", [name for name in archive.SOURCES if name != archive.PROJECTION_IMPORTER])
 async def test_set_validated_publication_has_no_row_hashes_or_early_adoption(importer, monkeypatch):
     """Require indexed heaps, physical OID publication and late-failure rollback without row validators."""
 
@@ -172,7 +177,7 @@ async def test_set_validated_publication_has_no_row_hashes_or_early_adoption(imp
             set(table) == {"table_name", "row_count", "schema_sha256"} for table in case.prepared.manifest["tables"]
         )
         async with case.sessions() as session, session.begin():
-            validation = await archive.prepare_activation(session, **case.activation_by_field)
+            validation = await archive.prepare_activation(session, **case.preparation_by_field)
             assert validation["publication"]["created_run_ids"] == [case.incoming]
             await _assert_indexed_stage_without_row_guards(session, case.prepared.ownership)
         pin_id = case.activation_by_field["pin_id"]
@@ -314,7 +319,7 @@ async def _prepare_with_incumbent_api_reads(case, monkeypatch):
         patch.setattr(archive.native, "_create_model_indexes", indexed)
         patch.setattr(archive, "_validate_publication_sets", validated)
         async with case.sessions() as session, session.begin():
-            validation = await archive.prepare_activation(session, **case.activation_by_field)
+            validation = await archive.prepare_activation(session, **case.preparation_by_field)
     assert checkpoints == ["loaded", "indexed", "validated"]
     await _assert_api_generation(case, case.incumbent)
     return validation
@@ -406,7 +411,7 @@ async def test_set_validated_source_rejects_equal_count_clone_mutation(monkeypat
 async def test_attached_publication_detaches_only_after_last_reference_and_binds_cleanup_destination():
     async with _prepared_case("massachusetts-borim-profile", contract=archive.CONTRACT) as case:
         async with case.sessions() as session, session.begin():
-            validation = await archive.prepare_activation(session, **case.activation_by_field)
+            validation = await archive.prepare_activation(session, **case.preparation_by_field)
         async with case.sessions() as session, session.begin():
             await archive.activate_validated_result(session, validation=validation, **case.activation_by_field)
             await _seed(session, case.destination_schema, case.importer)
@@ -463,7 +468,7 @@ async def test_attached_publication_detaches_only_after_last_reference_and_binds
 async def test_retained_attachment_rollback_refuses_detached_physical_predecessor():
     async with _prepared_case("massachusetts-borim-profile", contract=archive.CONTRACT) as case:
         async with case.sessions() as session, session.begin():
-            validation = await archive.prepare_activation(session, **case.activation_by_field)
+            validation = await archive.prepare_activation(session, **case.preparation_by_field)
         async with case.sessions() as session, session.begin():
             await archive.activate_validated_result(session, validation=validation, **case.activation_by_field)
             newest = await _seed(session, case.destination_schema, case.importer)
@@ -578,7 +583,7 @@ async def _assert_reference_free_read(case, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("importer", archive.SOURCES)
+@pytest.mark.parametrize("importer", [name for name in archive.SOURCES if name != archive.PROJECTION_IMPORTER])
 @pytest.mark.parametrize("fault", ["run_id", "agency", "jurisdiction", "fact_type"])
 async def test_unservable_fact_semantics_are_rejected(importer, fault):
     async with _prepared_case(importer) as case:
@@ -599,7 +604,7 @@ async def test_unservable_fact_semantics_are_rejected(importer, fault):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("importer", archive.SOURCES)
+@pytest.mark.parametrize("importer", [name for name in archive.SOURCES if name != archive.PROJECTION_IMPORTER])
 async def test_scoped_adoption_and_reference_free_read(importer, monkeypatch):
     async with _prepared_case(importer) as case:
         assert [table["row_count"] for table in case.prepared.manifest["tables"]] == [1, 1, 1, 1]
@@ -610,7 +615,7 @@ async def test_scoped_adoption_and_reference_free_read(importer, monkeypatch):
             unrelated_before = await archive.describe_result(
                 session, importer_id=case.other, schema=case.destination_schema, run_id=case.unrelated
             )
-            validation = await archive.prepare_activation(session, **case.activation_by_field)
+            validation = await archive.prepare_activation(session, **case.preparation_by_field)
             assert (await archive._pointer(session, case.destination_schema, importer))[
                 "current_run_id"
             ] == case.incumbent
@@ -681,7 +686,12 @@ async def test_native_source_retention_excludes_exact_pins_until_release(monkeyp
             incoming = await _seed(session, "mrf", importer)
         async with sessions() as session, session.begin():
             prepared = await archive.prepare_source(
-                session, importer_id=importer, schema="mrf", run_id=incoming, dataset_id=uuid4()
+                session,
+                importer_id=importer,
+                schema="mrf",
+                run_id=incoming,
+                dataset_id=uuid4(),
+                source_copy=native_source_copy(),
             )
         async with sessions() as session, session.begin():
             await _seed(session, "mrf", importer)
@@ -754,13 +764,14 @@ async def _assign_adoption_roles(case, ordinary_role, publisher_role):
         case.activation_by_field["sealed_owner_oid"] = await session.scalar(
             text("SELECT oid FROM pg_roles WHERE rolname=:role"), {"role": publisher_role}
         )
+        case.preparation_by_field["sealed_owner_oid"] = case.activation_by_field["sealed_owner_oid"]
 
 
 async def _exercise_inherited_adoption(case, ordinary_role, publisher_role):
     """Prepare, clean, reactivate and roll back under the role that owns the stage."""
     async with case.sessions() as session, session.begin():
         await session.execute(text(f'SET LOCAL ROLE "{publisher_role}"'))
-        await archive.prepare_activation(session, **case.activation_by_field)
+        await archive.prepare_activation(session, **case.preparation_by_field)
         assert [
             pin["purpose"]
             for pin in await archive._pin_group(session, case.destination_schema, case.activation_by_field["pin_id"])
@@ -790,7 +801,7 @@ async def _exercise_inherited_adoption(case, ordinary_role, publisher_role):
             == "released"
         )
         assert await archive._run(session, case.destination_schema, case.incoming) is None
-        validation = await archive.prepare_activation(session, **case.activation_by_field)
+        validation = await archive.prepare_activation(session, **case.preparation_by_field)
     async with case.sessions() as session, session.begin():
         await session.execute(text(f'SET LOCAL ROLE "{publisher_role}"'))
         await archive.activate_validated_result(session, validation=validation, **case.activation_by_field)
@@ -884,9 +895,9 @@ async def test_unpublished_cleanup_and_active_conflict():
                     ),
                     {"run": case.incumbent},
                 )
-                await archive.prepare_activation(session, **case.activation_by_field)
+                await archive.prepare_activation(session, **case.preparation_by_field)
         async with case.sessions() as session, session.begin():
-            await archive.prepare_activation(session, **case.activation_by_field)
+            await archive.prepare_activation(session, **case.preparation_by_field)
         async with case.sessions() as session, session.begin():
             assert (
                 await archive.cleanup_adoption(

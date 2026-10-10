@@ -34,7 +34,15 @@ class NestedProgressHarness:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("target_module", ["process.places_zcta", "process.entity_address_unified", "process.nucc"])
+@pytest.mark.parametrize(
+    "target_module",
+    [
+        "process.places_zcta",
+        "process.entity_address_unified",
+        "process.nucc",
+        *sorted(control_lifecycle._SOURCE_PROFILE_IMPORTERS_BY_MODULE),
+    ],
+)
 @pytest.mark.parametrize("late_error", [None, ImportCancelledError, RuntimeError])
 async def test_committed_native_handoff_is_not_overwritten_as_terminal(monkeypatch, target_module, late_error):
     committed_by_field = {"native_handoff": "synthetic"}
@@ -59,9 +67,13 @@ async def test_committed_native_handoff_is_not_overwritten_as_terminal(monkeypat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [RuntimeError, ImportCancelledError, asyncio.CancelledError])
-async def test_uncertain_nucc_commit_does_not_overwrite_persisted_custody(monkeypatch, failure):
+@pytest.mark.parametrize(
+    "target_module", ["process.nucc", *sorted(control_lifecycle._SOURCE_PROFILE_IMPORTERS_BY_MODULE)]
+)
+async def test_uncertain_native_commit_does_not_overwrite_persisted_custody(monkeypatch, failure, target_module):
     async def target(ctx, _task):
-        ctx["context"]["nucc_native_commit_unknown"] = True
+        marker = "nucc_native_commit_unknown" if target_module == "process.nucc" else "source_profile_commit_unknown"
+        ctx["context"][marker] = True
         raise failure("synthetic readback lost")
 
     marks = AsyncMock(return_value=True)
@@ -70,7 +82,7 @@ async def test_uncertain_nucc_commit_does_not_overwrite_persisted_custody(monkey
     monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: SimpleNamespace(process_data=target))
     with pytest.raises(failure):
         await control_single_job_start(
-            {}, {"run_id": "synthetic_unknown", "target_module": "process.nucc", "target_function": "process_data"}
+            {}, {"run_id": "synthetic_unknown", "target_module": target_module, "target_function": "process_data"}
         )
     assert [call.kwargs["status"] for call in marks.await_args_list] == ["running"]
 
@@ -81,12 +93,31 @@ def test_nucc_attempt_custody_is_not_copied_from_shared_worker_context():
             "nucc_native_stage": "old",
             "nucc_native_predecessor": "old",
             "nucc_native_commit_unknown": True,
+            "source_profile_commit_unknown": True,
             "start": "original",
         }
     }
     isolated_by_field = control_lifecycle._isolated_control_job_context(context_by_field, "new")
     assert isolated_by_field["context"] == {"start": "original", "control_run_id": "new"}
     assert context_by_field["context"]["nucc_native_stage"] == "old"
+
+
+@pytest.mark.asyncio
+async def test_kwargs_importer_receives_only_the_wrappers_trusted_context():
+    received_contexts = []
+
+    async def target(*, _control_context, source_keys):
+        received_contexts.append((_control_context, source_keys))
+
+    trusted_by_field = {"context": {"control_run_id": "actual"}}
+    await control_lifecycle._invoke_control_target(
+        SimpleNamespace(process_data=target),
+        target_function="process_data",
+        call_style="kwargs",
+        control_context=trusted_by_field,
+        target_task_by_field={"_control_context": {"forged": True}, "source_keys": ["one"]},
+    )
+    assert received_contexts == [(trusted_by_field, ["one"])]
 
 
 @pytest.mark.asyncio

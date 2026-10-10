@@ -6,11 +6,50 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from api import control_workers as workers
+
+
+@pytest.mark.parametrize("role", ["start", "finish"])
+@pytest.mark.parametrize("configured", [False, True])
+def test_source_worker_policy_path_comes_only_from_deployment(monkeypatch, role, configured):
+    setting = "HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE"
+    if configured:
+        monkeypatch.setenv(setting, "/synthetic-readonly/roles.json")
+    else:
+        monkeypatch.delenv(setting, raising=False)
+    request_by_field = {"importer": "massachusetts-borim-profile", "role": role, setting: "/untrusted/roles.json"}
+    spec = workers._resolve_specs(request_by_field)[0]
+    environment, _run_id = workers._worker_job_environment(spec, request_by_field)
+    policy_entries = [entry for entry in environment if entry["name"] == setting]
+    assert policy_entries == ([{"name": setting, "value": "/synthetic-readonly/roles.json"}] if configured else [])
+
+
+def test_process_finish_worker_inherits_independent_policy(monkeypatch, tmp_path):
+    setting = "HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE"
+    monkeypatch.setenv(setting, "/synthetic-readonly/roles.json")
+    monkeypatch.setenv("HLTHPRT_WORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("HLTHPRT_WORKER_LOG_DIR", str(tmp_path / "logs"))
+    started_environments = []
+
+    def start(_command, **options):
+        started_environments.append(options["env"])
+        return SimpleNamespace(pid=42)
+
+    monkeypatch.setattr(workers.subprocess, "Popen", start)
+    request_by_field = {
+        "importer": "massachusetts-borim-profile",
+        "status": "finalizing",
+        "run_id": "synthetic_run",
+        setting: "/untrusted/roles.json",
+    }
+    assert workers._start_process(workers._resolve_specs(request_by_field)[0], request_by_field) == 42
+    assert started_environments[0][setting] == "/synthetic-readonly/roles.json"
+    assert started_environments[0]["HLTHPRT_CONTROL_RUN_ID"] == "synthetic_run"
 
 
 def _scope(monkeypatch, **selector):

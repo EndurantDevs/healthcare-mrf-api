@@ -49,7 +49,7 @@ from db.models import (
     ProviderProfileSourceRecord,
     db,
 )
-from process.florida_profile_retention import protected_projection_run_ids
+from process.florida_profile_retention import _remove_retained_directories, protected_projection_run_ids
 from process.live_progress import enqueue_live_progress
 from process.provider_profile_live_progress import (
     normalization_completed,
@@ -178,9 +178,7 @@ def _profile_source(
     **kwargs: Any,
 ) -> FloridaSource:
     required_fields = tuple(kwargs.pop("required_fields", ("pro_cde", "lic_id")))
-    expected_fields = tuple(
-        kwargs.pop("expected_fields", _PROFILE_EXPECTED_FIELDS.get(key, ()))
-    )
+    expected_fields = tuple(kwargs.pop("expected_fields", _PROFILE_EXPECTED_FIELDS.get(key, ())))
     return FloridaSource(
         key,
         "/ProfileData",
@@ -196,22 +194,70 @@ def _profile_source(
 
 
 _PROFILE_MASTER_REQUIRED_FIELDS = (
-    "pro_cde", "lic_id", "lic_nbr", "l_name", "f_name", "m_name",
-    "name_suffix", "birth_year_range", "ml_addr_line1", "ml_addr_line2",
-    "ml_addr_line3", "ml_addr_city", "ml_addr_state", "ml_addr_zip", "ml_cnty",
-    "addr_line1", "addr_line2", "addr_line3", "addr_city", "addr_state",
-    "addr_zip", "cnty", "pl2_addr_line1", "pl2_addr_line2", "pl2_addr_line3",
-    "pl2_addr_city", "pl2_addr_state", "pl2_addr_zip", "pl2_cnty",
-    "pl3_addr_line1", "pl3_addr_line2", "pl3_addr_line3", "pl3_addr_city",
-    "pl3_addr_state", "pl3_addr_zip", "pl3_cnty", "lic_sta_cde",
-    "lic_actv_sta_cde", "lic_sta_desc", "lic_actv_sta_desc", "rank_cde",
-    "rank_desc", "other_license", "yr_began_practice", "rank_efct_dte",
-    "orig_dte", "expr_dte", "nica_payment",
+    "pro_cde",
+    "lic_id",
+    "lic_nbr",
+    "l_name",
+    "f_name",
+    "m_name",
+    "name_suffix",
+    "birth_year_range",
+    "ml_addr_line1",
+    "ml_addr_line2",
+    "ml_addr_line3",
+    "ml_addr_city",
+    "ml_addr_state",
+    "ml_addr_zip",
+    "ml_cnty",
+    "addr_line1",
+    "addr_line2",
+    "addr_line3",
+    "addr_city",
+    "addr_state",
+    "addr_zip",
+    "cnty",
+    "pl2_addr_line1",
+    "pl2_addr_line2",
+    "pl2_addr_line3",
+    "pl2_addr_city",
+    "pl2_addr_state",
+    "pl2_addr_zip",
+    "pl2_cnty",
+    "pl3_addr_line1",
+    "pl3_addr_line2",
+    "pl3_addr_line3",
+    "pl3_addr_city",
+    "pl3_addr_state",
+    "pl3_addr_zip",
+    "pl3_cnty",
+    "lic_sta_cde",
+    "lic_actv_sta_cde",
+    "lic_sta_desc",
+    "lic_actv_sta_desc",
+    "rank_cde",
+    "rank_desc",
+    "other_license",
+    "yr_began_practice",
+    "rank_efct_dte",
+    "orig_dte",
+    "expr_dte",
+    "nica_payment",
 )
 _CANNABIS_REQUIRED_FIELDS = (
-    "frst_nme", "last_nme", "lic_nbr", "course_type", "dte_compl",
-    "submitted_by", "pl_addr_line1", "pl_addr_line2", "pl_addr_line3",
-    "pl_addr_cty", "pl_st_cde", "pl_zip", "pl_cnty", "phne_nbr",
+    "frst_nme",
+    "last_nme",
+    "lic_nbr",
+    "course_type",
+    "dte_compl",
+    "submitted_by",
+    "pl_addr_line1",
+    "pl_addr_line2",
+    "pl_addr_line3",
+    "pl_addr_cty",
+    "pl_st_cde",
+    "pl_zip",
+    "pl_cnty",
+    "phne_nbr",
     "specialties",
 )
 _LICENSE_STATUS_FIELDS = (
@@ -510,117 +556,240 @@ FLORIDA_SOURCES: dict[str, FloridaSource] = {
     source.key: source
     for source in (
         _profile_source(
-            "profile_master", "licensee_profile.txt", "licenses", "state_license_profile",
-            "Florida practitioner license", "lic_nbr", "lic_sta_desc", "profession_name",
+            "profile_master",
+            "licensee_profile.txt",
+            "licenses",
+            "state_license_profile",
+            "Florida practitioner license",
+            "lic_nbr",
+            "lic_sta_desc",
+            "profession_name",
             required_fields=_PROFILE_MASTER_REQUIRED_FIELDS,
         ),
         _profile_source(
-            "profile_indicators", "tp_lic_indicators.txt", "professional_experience",
-            "profile_indicator", "Profile information coverage",
-            "health_degree", "grad_med_edu", "prof_post_train",
+            "profile_indicators",
+            "tp_lic_indicators.txt",
+            "professional_experience",
+            "profile_indicator",
+            "Profile information coverage",
+            "health_degree",
+            "grad_med_edu",
+            "prof_post_train",
         ),
         _profile_source(
-            "counties", "rbdcty.txt", "professional_experience", "county_reference",
-            "Florida county", "county_desc", "county_name",
+            "counties",
+            "rbdcty.txt",
+            "professional_experience",
+            "county_reference",
+            "Florida county",
+            "county_desc",
+            "county_name",
             required_fields=("cnty", "cnty_desc"),
             expected_fields=("cnty", "cnty_desc"),
         ),
         _profile_source(
-            "staff_privileges", "tp_staff_priv.txt", "privileges", "staff_privilege",
-            "Staff privilege", "hospital_instit", "city", "state",
+            "staff_privileges",
+            "tp_staff_priv.txt",
+            "privileges",
+            "staff_privilege",
+            "Staff privilege",
+            "hospital_instit",
+            "city",
+            "state",
         ),
         _profile_source(
-            "other_licensure", "tp_other_licensure.txt", "licenses", "other_state_license",
-            "Other state license", "other_prof_lic", "other_lic_state",
+            "other_licensure",
+            "tp_other_licensure.txt",
+            "licenses",
+            "other_state_license",
+            "Other state license",
+            "other_prof_lic",
+            "other_lic_state",
         ),
         _profile_source(
-            "education", "rbdled.txt", "education", "education_history",
-            "Education", "inst_nme", "pgm_desc", "educ_mjr", "grad_dte",
+            "education",
+            "rbdled.txt",
+            "education",
+            "education_history",
+            "Education",
+            "inst_nme",
+            "pgm_desc",
+            "educ_mjr",
+            "grad_dte",
             verification_status="verified_at_initial_licensure",
         ),
         _profile_source(
-            "other_degrees", "tp_other_health_dg.txt", "education", "other_health_degree",
-            "Other health-related degree", "school_name", "degree", "degree_title",
+            "other_degrees",
+            "tp_other_health_dg.txt",
+            "education",
+            "other_health_degree",
+            "Other health-related degree",
+            "school_name",
+            "degree",
+            "degree_title",
         ),
         _profile_source(
-            "postgraduate_training", "tp_prof_post_grad.txt", "training",
-            "postgraduate_training", "Professional or postgraduate training",
-            "institute_name", "program_type", "program_spclty_ar",
+            "postgraduate_training",
+            "tp_prof_post_grad.txt",
+            "training",
+            "postgraduate_training",
+            "Professional or postgraduate training",
+            "institute_name",
+            "program_type",
+            "program_spclty_ar",
             "other_spclty_ar",
         ),
         _profile_source(
-            "faculty_appointments", "tp_faculty_appt.txt", "academic_appointments",
-            "faculty_appointment", "Faculty appointment",
-            "fclty_apt_inst", "faculty_title", "city", "state",
+            "faculty_appointments",
+            "tp_faculty_appt.txt",
+            "academic_appointments",
+            "faculty_appointment",
+            "Faculty appointment",
+            "fclty_apt_inst",
+            "faculty_title",
+            "city",
+            "state",
         ),
         _profile_source(
-            "certifications", "tp_certifications.txt", "certifications",
-            "specialty_certification", "Specialty certification",
-            "specialty_brd", "specialty_cert", "specialty_dte",
+            "certifications",
+            "tp_certifications.txt",
+            "certifications",
+            "specialty_certification",
+            "Specialty certification",
+            "specialty_brd",
+            "specialty_cert",
+            "specialty_dte",
         ),
         _profile_source(
-            "financial_responsibility", "tp_financial_resp.txt", "financial_responsibility",
-            "financial_responsibility", "Financial responsibility",
-            "financial_resp", "financial_exempt", "insured", "insured_10_yr",
+            "financial_responsibility",
+            "tp_financial_resp.txt",
+            "financial_responsibility",
+            "financial_responsibility",
+            "Financial responsibility",
+            "financial_resp",
+            "financial_exempt",
+            "insured",
+            "insured_10_yr",
         ),
         _profile_source(
-            "criminal_offenses", "tp_criminal_off.txt", "criminal_disclosures",
-            "criminal_offense", "Reported criminal offense",
-            "offense_desc", "jurisdiction", "offense_date",
-            sensitive=True, public_default=False,
+            "criminal_offenses",
+            "tp_criminal_off.txt",
+            "criminal_disclosures",
+            "criminal_offense",
+            "Reported criminal offense",
+            "offense_desc",
+            "jurisdiction",
+            "offense_date",
+            sensitive=True,
+            public_default=False,
         ),
         _profile_source(
-            "disciplinary_actions", "tp_disciplinary.txt", "regulatory_actions",
-            "disciplinary_action", "Disciplinary action",
-            "disc_body", "disc_action_desc", "disc_date",
-            assertion_type="state_reported", verification_status="government_source",
-            sensitive=True, public_default=False,
+            "disciplinary_actions",
+            "tp_disciplinary.txt",
+            "regulatory_actions",
+            "disciplinary_action",
+            "Disciplinary action",
+            "disc_body",
+            "disc_action_desc",
+            "disc_date",
+            assertion_type="state_reported",
+            verification_status="government_source",
+            sensitive=True,
+            public_default=False,
         ),
         _profile_source(
-            "special_disciplinary_actions", "tp_spec_discipline.txt", "regulatory_actions",
-            "special_disciplinary_action", "Special disciplinary action",
-            "sp_disc_body", "sp_disc_action_desc", "sp_disc_date",
-            assertion_type="state_reported", verification_status="government_source",
-            sensitive=True, public_default=False,
+            "special_disciplinary_actions",
+            "tp_spec_discipline.txt",
+            "regulatory_actions",
+            "special_disciplinary_action",
+            "Special disciplinary action",
+            "sp_disc_body",
+            "sp_disc_action_desc",
+            "sp_disc_date",
+            assertion_type="state_reported",
+            verification_status="government_source",
+            sensitive=True,
+            public_default=False,
         ),
         _profile_source(
-            "final_disciplinary_actions", "tp_ahca_discip.txt", "regulatory_actions",
-            "final_disciplinary_action", "Final disciplinary action",
-            "cse_nbr", "action_desc", "close_date",
-            assertion_type="state_reported", verification_status="government_source",
-            sensitive=True, public_default=False,
+            "final_disciplinary_actions",
+            "tp_ahca_discip.txt",
+            "regulatory_actions",
+            "final_disciplinary_action",
+            "Final disciplinary action",
+            "cse_nbr",
+            "action_desc",
+            "close_date",
+            assertion_type="state_reported",
+            verification_status="government_source",
+            sensitive=True,
+            public_default=False,
         ),
         _profile_source(
-            "closed_liability_claims", "tp_closed_claim.txt", "liability_claims",
-            "closed_liability_claim", "Closed liability claim",
-            "case_number", "incident_date", "settlement_date", "settlement_amt",
-            assertion_type="state_reported", verification_status="government_source",
-            sensitive=True, public_default=False,
+            "closed_liability_claims",
+            "tp_closed_claim.txt",
+            "liability_claims",
+            "closed_liability_claim",
+            "Closed liability claim",
+            "case_number",
+            "incident_date",
+            "settlement_date",
+            "settlement_amt",
+            assertion_type="state_reported",
+            verification_status="government_source",
+            sensitive=True,
+            public_default=False,
         ),
         _profile_source(
-            "memberships", "tp_memberships.txt", "memberships", "committee_or_membership",
-            "Committee or membership", "comm_member",
+            "memberships",
+            "tp_memberships.txt",
+            "memberships",
+            "committee_or_membership",
+            "Committee or membership",
+            "comm_member",
         ),
         _profile_source(
-            "honors", "tp_honors.txt", "honors", "professional_or_community_award",
-            "Professional or community award", "honors_awards", "organization",
+            "honors",
+            "tp_honors.txt",
+            "honors",
+            "professional_or_community_award",
+            "Professional or community award",
+            "honors_awards",
+            "organization",
         ),
         _profile_source(
-            "publications", "tp_publications.txt", "publications", "publication",
-            "Publication", "article_title", "publication", "date_of_pub",
+            "publications",
+            "tp_publications.txt",
+            "publications",
+            "publication",
+            "Publication",
+            "article_title",
+            "publication",
+            "date_of_pub",
         ),
         _profile_source(
-            "languages", "tp_languages.txt", "languages", "spoken_language",
-            "Language", "language_used",
+            "languages",
+            "tp_languages.txt",
+            "languages",
+            "spoken_language",
+            "Language",
+            "language_used",
         ),
         _profile_source(
-            "affiliations", "tp_affiliations.txt", "affiliations",
-            "professional_affiliation", "Professional affiliation",
+            "affiliations",
+            "tp_affiliations.txt",
+            "affiliations",
+            "professional_affiliation",
+            "Professional affiliation",
             "affiliation",
         ),
         FloridaSource(
-            "license_status", "/LicenseStatus?handler=DownloadDataFile", "lic_status.zip",
-            "licenses", "license_status", "Florida license status",
+            "license_status",
+            "/LicenseStatus?handler=DownloadDataFile",
+            "lic_status.zip",
+            "licenses",
+            "license_status",
+            "Florida license status",
             ("profession_name", "license_number", "license_status"),
             assertion_type="state_reported",
             verification_status="government_source",
@@ -629,8 +798,12 @@ FLORIDA_SOURCES: dict[str, FloridaSource] = {
             has_header=False,
         ),
         FloridaSource(
-            "licensure_current", "/LicensureData", "LIC_ALL.zip", "licenses",
-            "state_licensure_record", "Florida current licensure",
+            "licensure_current",
+            "/LicensureData",
+            "LIC_ALL.zip",
+            "licenses",
+            "state_licensure_record",
+            "Florida current licensure",
             ("profession_name", "license_number", "license_status"),
             assertion_type="state_reported",
             verification_status="government_source",
@@ -644,8 +817,12 @@ FLORIDA_SOURCES: dict[str, FloridaSource] = {
             expected_fields=_LICENSURE_FIELDS,
         ),
         FloridaSource(
-            "licensure_all_statuses", "/LicensureData", "PROF_ALL.zip", "licenses",
-            "state_licensure_history", "Florida licensure history",
+            "licensure_all_statuses",
+            "/LicensureData",
+            "PROF_ALL.zip",
+            "licenses",
+            "state_licensure_history",
+            "Florida licensure history",
             ("profession_name", "license_number", "license_status"),
             assertion_type="state_reported",
             verification_status="government_source",
@@ -728,12 +905,8 @@ _PROFILE_MASTER_CATEGORIES = {
     "program_reports",
 }
 
-_INTERNAL_PROFILE_FIELDS = frozenset(
-    {"pro_cde", "lic_id", "rec_id", "rec_key"}
-)
-_PROFILE_RAW_ONLY_FIELDS = frozenset(
-    {*_INTERNAL_PROFILE_FIELDS, "e_mail_addr"}
-)
+_INTERNAL_PROFILE_FIELDS = frozenset({"pro_cde", "lic_id", "rec_id", "rec_key"})
+_PROFILE_RAW_ONLY_FIELDS = frozenset({*_INTERNAL_PROFILE_FIELDS, "e_mail_addr"})
 _PROFILE_VALUE_FIELDS: dict[str, tuple[tuple[str, str], ...]] = {
     "staff_privileges": (
         ("institution", "hospital_instit"),
@@ -839,21 +1012,15 @@ _PROFILE_VALUE_FIELDS: dict[str, tuple[tuple[str, str], ...]] = {
     "affiliations": (("affiliation", "affiliation"),),
 }
 _PROFILE_DATE_VALUE_FIELDS: dict[str, frozenset[str]] = {
-    "education": frozenset(
-        {"graduation_date", "attendance_start", "attendance_end"}
-    ),
+    "education": frozenset({"graduation_date", "attendance_start", "attendance_end"}),
     "other_degrees": frozenset({"attendance_start", "attendance_end"}),
-    "postgraduate_training": frozenset(
-        {"attendance_start", "attendance_end"}
-    ),
+    "postgraduate_training": frozenset({"attendance_start", "attendance_end"}),
     "certifications": frozenset({"certification_date"}),
     "criminal_offenses": frozenset({"offense_date"}),
     "disciplinary_actions": frozenset({"action_date"}),
     "special_disciplinary_actions": frozenset({"action_date"}),
     "final_disciplinary_actions": frozenset({"closed_date"}),
-    "closed_liability_claims": frozenset(
-        {"incident_date", "settlement_date"}
-    ),
+    "closed_liability_claims": frozenset({"incident_date", "settlement_date"}),
     "publications": frozenset({"publication_date"}),
 }
 _PROFILE_DISPLAY_VALUE_FIELDS: dict[str, tuple[str, ...]] = {
@@ -980,11 +1147,7 @@ def _snake(value: Any) -> str:
 
 
 def _clean_row(row: Mapping[str, Any]) -> dict[str, str]:
-    return {
-        _snake(key): str(value or "").strip()
-        for key, value in row.items()
-        if key is not None and _snake(key)
-    }
+    return {_snake(key): str(value or "").strip() for key, value in row.items() if key is not None and _snake(key)}
 
 
 def _first(row: Mapping[str, str], *names: str) -> str:
@@ -1083,12 +1246,8 @@ def _canonical_match_row(
 
 
 def _is_name_compatible(source: Mapping[str, str], candidate: Mapping[str, Any]) -> bool:
-    source_last = _name_token(
-        _first(source, "last_name", "lname", "last_nm", "last_nme", "l_name")
-    )
-    source_first = _name_token(
-        _first(source, "first_name", "fname", "first_nm", "frst_nme", "f_name")
-    )
+    source_last = _name_token(_first(source, "last_name", "lname", "last_nm", "last_nme", "l_name"))
+    source_first = _name_token(_first(source, "first_name", "fname", "first_nm", "frst_nme", "f_name"))
     if source_last and source_last != _name_token(str(candidate.get("last_name") or "")):
         return False
     if source_first:
@@ -1110,20 +1269,13 @@ def _human_display(source: FloridaSource, row: Mapping[str, str]) -> str:
         if value and value not in values:
             values.append(value)
     if not values:
-        values = [
-            value for key, value in row.items()
-            if value and key not in _PROFILE_RAW_ONLY_FIELDS
-        ][:3]
+        values = [value for key, value in row.items() if value and key not in _PROFILE_RAW_ONLY_FIELDS][:3]
     suffix = " — ".join(values)
     return f"{source.title}: {suffix}" if suffix else source.title
 
 
 def _without_empty(value: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        key: item
-        for key, item in value.items()
-        if item not in (None, "", [], {})
-    }
+    return {key: item for key, item in value.items() if item not in (None, "", [], {})}
 
 
 def _normalize_source_date(value: str) -> tuple[str, str]:
@@ -1197,9 +1349,7 @@ def _address_display(value: Mapping[str, Any]) -> str:
     )
     location_types = value.get("location_types") or [value.get("location_type")]
     location_labels = [
-        labels_by_key.get(str(location_type), "Provider location")
-        for location_type in location_types
-        if location_type
+        labels_by_key.get(str(location_type), "Provider location") for location_type in location_types if location_type
     ]
     label = " and ".join(dict.fromkeys(location_labels)) or "Provider location"
     return f"{label}: {address}" if address else label
@@ -1232,13 +1382,9 @@ class FloridaMQAClient:
         parsed = urlparse(final_url)
         policy_base = final_url.split("/oauth2/", 1)[0]
         policy = str(
-            settings.get("policy")
-            or parse_qs(parsed.query).get("p", [""])[0]
-            or policy_base.rsplit("/", 1)[-1]
+            settings.get("policy") or parse_qs(parsed.query).get("p", [""])[0] or policy_base.rsplit("/", 1)[-1]
         )
-        transaction = str(
-            settings.get("transId") or settings.get("transactionId") or ""
-        )
+        transaction = str(settings.get("transId") or settings.get("transactionId") or "")
         csrf = str(settings.get("csrf") or settings.get("csrf_token") or "")
         if not policy or not transaction or not csrf:
             raise RuntimeError("florida_mqa_login_contract_changed")
@@ -1276,15 +1422,11 @@ class FloridaMQAClient:
         body = response.read().decode("utf-8", "replace")
         if "Sign out" in body:
             return
-        final_url, policy_base, policy, transaction, csrf = (
-            self._authentication_contract(response, body)
-        )
+        final_url, policy_base, policy, transaction, csrf = self._authentication_contract(response, body)
         query = urlencode({"tx": transaction, "p": policy})
         login_request = Request(
             f"{policy_base}/SelfAsserted?{query}",
-            data=urlencode(
-                {"request_type": "RESPONSE", "email": self.email, "password": self.password}
-            ).encode(),
+            data=urlencode({"request_type": "RESPONSE", "email": self.email, "password": self.password}).encode(),
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "X-CSRF-TOKEN": csrf,
@@ -1344,9 +1486,7 @@ def _normalized_source_header(
     if not normalized_items:
         raise RuntimeError(f"florida_mqa_header_missing:{artifact_name}")
     if source.expected_fields and tuple(normalized_items) != source.expected_fields:
-        raise RuntimeError(
-            f"florida_mqa_schema_changed:{source.key}:expected_header"
-        )
+        raise RuntimeError(f"florida_mqa_schema_changed:{source.key}:expected_header")
     return normalized_items
 
 
@@ -1358,21 +1498,15 @@ def _artifact_header(path: Path, profile_source: FloridaSource) -> list[str]:
             raise RuntimeError(f"florida_mqa_header_missing:{path.name}")
         if not profile_source.has_header:
             if not profile_source.expected_fields:
-                raise RuntimeError(
-                    f"florida_mqa_headerless_schema_missing:{profile_source.key}"
-                )
+                raise RuntimeError(f"florida_mqa_headerless_schema_missing:{profile_source.key}")
             if len(raw_header) != len(profile_source.expected_fields):
-                raise RuntimeError(
-                    f"florida_mqa_row_changed:{profile_source.key}:1:{len(raw_header)}"
-                )
+                raise RuntimeError(f"florida_mqa_row_changed:{profile_source.key}:1:{len(raw_header)}")
             headers.append(list(profile_source.expected_fields))
             continue
         if profile_source.key == "medical_cannabis_authorization" and len(raw_header) != len(
             profile_source.expected_fields
         ):
-            raise RuntimeError(
-                f"florida_mqa_cannabis_header_changed:{len(raw_header)}"
-            )
+            raise RuntimeError(f"florida_mqa_cannabis_header_changed:{len(raw_header)}")
         normalized = _normalized_source_header(
             profile_source,
             raw_header,
@@ -1423,10 +1557,7 @@ def _is_licensure_email_alignment_plausible(
     )
     if any(field not in header for field in expected_location_fields):
         return False
-    location_values_by_key = {
-        field: field_values[header.index(field)].strip()
-        for field in expected_location_fields
-    }
+    location_values_by_key = {field: field_values[header.index(field)].strip() for field in expected_location_fields}
     suffix_values = field_values[email_index + 2 :]
     if len(suffix_values) != 5:
         return False
@@ -1436,8 +1567,7 @@ def _is_licensure_email_alignment_plausible(
     indicator_values = {"", "Y", "N"}
     return (
         all(
-            not location_values_by_key[field]
-            or bool(re.fullmatch(r"[A-Za-z]{2}", location_values_by_key[field]))
+            not location_values_by_key[field] or bool(re.fullmatch(r"[A-Za-z]{2}", location_values_by_key[field]))
             for field in (
                 "mailing_address_state",
                 "practice_location_address_state",
@@ -1456,8 +1586,7 @@ def _is_licensure_email_alignment_plausible(
                 "practice_location_address_zipcode",
             )
         )
-        and
-        prescribe_items.upper() in indicator_values
+        and prescribe_items.upper() in indicator_values
         and dispensing_items.upper() in indicator_values
         and other_license_items.upper() in indicator_values
         and bool(
@@ -1517,16 +1646,9 @@ def _license_status_continuation_values(
     return field_values, {
         "kind": "wrapped_license_name_recovered",
         "artifact_member": artifact_member,
-        "physical_row_numbers": [
-            row_number for row_number, _ in physical_rows
-        ],
-        "physical_field_counts": [
-            len(row_values) for _, row_values in physical_rows
-        ],
-        "physical_row_sha256": [
-            _physical_row_sha256(row_values)
-            for _, row_values in physical_rows
-        ],
+        "physical_row_numbers": [row_number for row_number, _ in physical_rows],
+        "physical_field_counts": [len(row_values) for _, row_values in physical_rows],
+        "physical_row_sha256": [_physical_row_sha256(row_values) for _, row_values in physical_rows],
         "logical_field_count": len(field_values),
     }
 
@@ -1561,13 +1683,12 @@ def _repair_pipe_value_alignment(
     ):
         email_index = header.index("email")
         email_values = field_values[email_index : email_index + 2]
-        if (
-            all(_is_plausible_email(field_value) for field_value in email_values)
-            and _is_licensure_email_alignment_plausible(
-                header,
-                field_values,
-                email_index,
-            )
+        if all(
+            _is_plausible_email(field_value) for field_value in email_values
+        ) and _is_licensure_email_alignment_plausible(
+            header,
+            field_values,
+            email_index,
         ):
             suffix_values = field_values[email_index + 2 :]
             field_values = [
@@ -1644,9 +1765,7 @@ def _iter_rows(
     for artifact_member, stream in _data_stream(path):
         if profile_source and not profile_source.has_header:
             if not profile_source.expected_fields:
-                raise RuntimeError(
-                    f"florida_mqa_headerless_schema_missing:{profile_source.key}"
-                )
+                raise RuntimeError(f"florida_mqa_headerless_schema_missing:{profile_source.key}")
             header_items = list(profile_source.expected_fields)
             reader = csv.reader(
                 stream,
@@ -1657,11 +1776,7 @@ def _iter_rows(
             numbered_rows = iter(enumerate(reader, start=1))
             while True:
                 try:
-                    row_number, physical_values = (
-                        pending_rows.popleft()
-                        if pending_rows
-                        else next(numbered_rows)
-                    )
+                    row_number, physical_values = pending_rows.popleft() if pending_rows else next(numbered_rows)
                 except StopIteration:
                     break
                 continuation: tuple[list[str], dict[str, Any]] | None = None
@@ -1677,9 +1792,7 @@ def _iter_rows(
                         artifact_member=artifact_member,
                         parser_metrics=parser_metrics,
                     )
-                    pending_rows.extend(
-                        lookahead_items if continuation is None else ()
-                    )
+                    pending_rows.extend(lookahead_items if continuation is None else ())
                 if continuation is not None:
                     field_values, parse_metadata = continuation
                 else:
@@ -1702,16 +1815,10 @@ def _iter_rows(
                     }
                 else:
                     raw_row_by_key = dict(zip(header_items, field_values, strict=True))
-                    raw_row_by_key.update(
-                        {"_source_parse_metadata": parse_metadata}
-                        if parse_metadata
-                        else {}
-                    )
+                    raw_row_by_key.update({"_source_parse_metadata": parse_metadata} if parse_metadata else {})
                     cleaned_by_key = _clean_row(raw_row_by_key)
                     cleaned_by_key.update(
-                        {"_source_parse_repair": str(parse_metadata["kind"])}
-                        if parse_metadata
-                        else {}
+                        {"_source_parse_repair": str(parse_metadata["kind"])} if parse_metadata else {}
                     )
                 if any(cleaned_by_key.values()):
                     yield row_number, raw_row_by_key, cleaned_by_key, header_items
@@ -1724,15 +1831,11 @@ def _iter_rows(
                 artifact_name=path.name,
             )
             if len(raw_header) != len(profile_source.expected_fields):
-                raise RuntimeError(
-                    f"florida_mqa_cannabis_header_changed:{len(raw_header)}"
-                )
+                raise RuntimeError(f"florida_mqa_cannabis_header_changed:{len(raw_header)}")
             for row_number, line in enumerate(stream, start=2):
                 field_values = line.rstrip("\r\n").split("|", 14)
                 if len(field_values) != 15:
-                    raise RuntimeError(
-                        f"florida_mqa_cannabis_row_changed:{row_number}:{len(field_values)}"
-                    )
+                    raise RuntimeError(f"florida_mqa_cannabis_row_changed:{row_number}:{len(field_values)}")
                 raw_row_by_key = dict(zip(raw_header, field_values, strict=True))
                 cleaned_by_key = _clean_row(raw_row_by_key)
                 if any(cleaned_by_key.values()):
@@ -1747,9 +1850,7 @@ def _iter_rows(
         try:
             raw_header = next(reader)
         except StopIteration as exc:
-            raise RuntimeError(
-                f"florida_mqa_header_missing:{path.name}"
-            ) from exc
+            raise RuntimeError(f"florida_mqa_header_missing:{path.name}") from exc
         header_items = (
             _normalized_source_header(
                 profile_source,
@@ -1757,11 +1858,7 @@ def _iter_rows(
                 artifact_name=path.name,
             )
             if profile_source is not None
-            else [
-                _snake(field)
-                for field in raw_header
-                if field and _snake(field)
-            ]
+            else [_snake(field) for field in raw_header if field and _snake(field)]
         )
         if not header_items:
             raise RuntimeError(f"florida_mqa_header_missing:{path.name}")
@@ -1795,19 +1892,13 @@ def _iter_rows(
                     "_physical_field_count": str(len(physical_values)),
                 }
             else:
-                raw_field_names = [
-                    field for field in raw_header if field and _snake(field)
-                ]
-                raw_row_by_key = dict(
-                    zip(raw_field_names, field_values, strict=True)
-                )
+                raw_field_names = [field for field in raw_header if field and _snake(field)]
+                raw_row_by_key = dict(zip(raw_field_names, field_values, strict=True))
                 if parse_metadata:
                     raw_row_by_key["_source_parse_metadata"] = parse_metadata
                 cleaned_by_key = _clean_row(raw_row_by_key)
                 if parse_metadata:
-                    cleaned_by_key["_source_parse_repair"] = str(
-                        parse_metadata["kind"]
-                    )
+                    cleaned_by_key["_source_parse_repair"] = str(parse_metadata["kind"])
             if any(cleaned_by_key.values()):
                 yield row_number, raw_row_by_key, cleaned_by_key, header_items
 
@@ -1822,10 +1913,13 @@ async def _ensure_tables() -> None:
     ):
         table = model.__table__
         relation = f'"{table.schema or "mrf"}"."{table.name}"'
-        if await db.scalar(
-            text("SELECT to_regclass(:relation)"),
-            relation=relation,
-        ) is None:
+        if (
+            await db.scalar(
+                text("SELECT to_regclass(:relation)"),
+                relation=relation,
+            )
+            is None
+        ):
             await db.create_table(table, checkfirst=True)
 
 
@@ -1877,8 +1971,7 @@ def _match_master(
             if _is_taxonomy_compatible(profession_code, candidate["taxonomy"]):
                 candidates_by_npi[candidate["npi"]] = candidate
     compatible_items = [
-        candidate for candidate in candidates_by_npi.values()
-        if _is_name_compatible(source_row, candidate)
+        candidate for candidate in candidates_by_npi.values() if _is_name_compatible(source_row, candidate)
     ]
     evidence_by_key = {
         "method": "exact_state_license_profession_name",
@@ -1909,9 +2002,7 @@ def _record_key(source: FloridaSource, row: Mapping[str, str], row_number: int) 
     ]
     if not parts[-1]:
         source_fields_by_key = {
-            field_name: field_value
-            for field_name, field_value in row.items()
-            if not field_name.startswith("_source_")
+            field_name: field_value for field_name, field_value in row.items() if not field_name.startswith("_source_")
         }
         row_hash = hashlib.sha256(
             json.dumps(
@@ -1926,17 +2017,11 @@ def _record_key(source: FloridaSource, row: Mapping[str, str], row_number: int) 
     return ":".join(parts)
 
 
-def _fact_value(
-    source_row: Mapping[str, str], value_json: Mapping[str, Any] | None
-) -> dict[str, Any]:
+def _fact_value(source_row: Mapping[str, str], value_json: Mapping[str, Any] | None) -> dict[str, Any]:
     if value_json is not None:
         return dict(value_json)
     return _without_empty(
-        {
-            key: field_value
-            for key, field_value in source_row.items()
-            if key not in _PROFILE_RAW_ONLY_FIELDS
-        }
+        {key: field_value for key, field_value in source_row.items() if key not in _PROFILE_RAW_ONLY_FIELDS}
     )
 
 
@@ -1963,9 +2048,7 @@ def _fact_effective_date(
     fields: tuple[str, ...],
     infer_effective_period: bool,
 ) -> str | None:
-    return explicit_date or (
-        _first(source_row, *fields) if infer_effective_period else None
-    ) or None
+    return explicit_date or (_first(source_row, *fields) if infer_effective_period else None) or None
 
 
 def _fact_source(
@@ -2010,9 +2093,7 @@ def _fact_payload(
     resolved_category = category or profile_source.category
     resolved_fact_type = fact_type or profile_source.fact_type
     resolved_value = _fact_value(source_row, value_json)
-    logical_fact_key = _logical_fact_key(
-        resolved_category, resolved_fact_type, fact_key, resolved_value
-    )
+    logical_fact_key = _logical_fact_key(resolved_category, resolved_fact_type, fact_key, resolved_value)
     return {
         "fact_id": hashlib.sha256(f"{run_id}:{record_id}:{logical_fact_key}".encode()).hexdigest(),
         "run_id": run_id,
@@ -2027,12 +2108,14 @@ def _fact_payload(
         "assertion_type": assertion_type or profile_source.assertion_type,
         "verification_status": verification_status or profile_source.verification_status,
         "effective_start": _fact_effective_date(
-            source_row, effective_start,
+            source_row,
+            effective_start,
             ("effective_date", "action_date", "orig_dte", "issue_date"),
             infer_effective_period,
         ),
         "effective_end": _fact_effective_date(
-            source_row, effective_end,
+            source_row,
+            effective_end,
             ("expiration_date", "expr_dte", "end_date"),
             infer_effective_period,
         ),
@@ -2082,9 +2165,7 @@ def _mapped_profile_data_fact(
     """Build one reviewed fact from a mapped practitioner-profile source."""
     field_map = _PROFILE_VALUE_FIELDS.get(profile_source.key)
     if field_map is None:
-        raise RuntimeError(
-            f"provider_profile_source_adapter_missing:{profile_source.key}"
-        )
+        raise RuntimeError(f"provider_profile_source_adapter_missing:{profile_source.key}")
     date_fields = _PROFILE_DATE_VALUE_FIELDS.get(profile_source.key, frozenset())
     field_value_by_key: dict[str, Any] = {}
     for output_field, source_field in field_map:
@@ -2111,18 +2192,8 @@ def _mapped_profile_data_fact(
         artifact=artifact,
         display=_mapped_profile_display(profile_source, field_value_by_key),
         value_json=field_value_by_key,
-        effective_start=(
-            str(field_value_by_key.get(start_field) or "")
-            if start_field
-            else None
-        )
-        or None,
-        effective_end=(
-            str(field_value_by_key.get(end_field) or "")
-            if end_field
-            else None
-        )
-        or None,
+        effective_start=(str(field_value_by_key.get(start_field) or "") if start_field else None) or None,
+        effective_end=(str(field_value_by_key.get(end_field) or "") if end_field else None) or None,
         fact_key=field_value_by_key,
     )
 
@@ -2137,12 +2208,16 @@ _SAFE_PROFILE_INDICATORS = (
 )
 _RESTRICTED_PROFILE_INDICATORS = (
     (
-        "criminal_offense_disclosure", "criminal_offense",
-        "criminal_disclosures", "criminal_offense_disclosure_indicator",
+        "criminal_offense_disclosure",
+        "criminal_offense",
+        "criminal_disclosures",
+        "criminal_offense_disclosure_indicator",
     ),
     (
-        "medicaid_program_disclosure", "medicaid_prgrm",
-        "regulatory_actions", "medicaid_program_disclosure_indicator",
+        "medicaid_program_disclosure",
+        "medicaid_prgrm",
+        "regulatory_actions",
+        "medicaid_program_disclosure_indicator",
     ),
 )
 
@@ -2162,11 +2237,19 @@ def _restricted_indicator_facts(
         indicator = _indicator_value(source_row[source_field])
         restricted_facts.append(
             _fact_payload(
-                profile_source, source_row, run_id=run_id, record_id=record_id,
-                npi=npi, artifact=artifact, category=category, fact_type=fact_type,
+                profile_source,
+                source_row,
+                run_id=run_id,
+                record_id=record_id,
+                npi=npi,
+                artifact=artifact,
+                category=category,
+                fact_type=fact_type,
                 display=f"Restricted {output_field.replace('_', ' ')}",
-                value_json={output_field: indicator}, fact_key={output_field: indicator},
-                sensitive=True, public_default=False,
+                value_json={output_field: indicator},
+                fact_key={output_field: indicator},
+                sensitive=True,
+                public_default=False,
             )
         )
     return restricted_facts
@@ -2195,8 +2278,7 @@ def _profile_indicator_facts(
             if sections_by_key.get(output_field, {}).get("reported") is True
         ]
         display = (
-            "Profile information reported for: "
-            + ", ".join(available_labels)
+            "Profile information reported for: " + ", ".join(available_labels)
             if available_labels
             else "Profile information coverage reported"
         )
@@ -2214,9 +2296,7 @@ def _profile_indicator_facts(
                 fact_key={"sections": sections_by_key},
             )
         )
-    return facts + _restricted_indicator_facts(
-        profile_source, source_row, run_id, record_id, npi, artifact
-    )
+    return facts + _restricted_indicator_facts(profile_source, source_row, run_id, record_id, npi, artifact)
 
 
 def _financial_public_value(source_row: Mapping[str, str]) -> dict[str, Any]:
@@ -2224,18 +2304,13 @@ def _financial_public_value(source_row: Mapping[str, str]) -> dict[str, Any]:
         {
             "financial_responsibility": source_row.get("financial_resp", ""),
             "financial_exemption": (
-                _indicator_value(source_row["financial_exempt"])
-                if source_row.get("financial_exempt") else {}
+                _indicator_value(source_row["financial_exempt"]) if source_row.get("financial_exempt") else {}
             ),
             "insurance": _without_empty(
                 {
-                    "currently_insured": (
-                        _indicator_value(source_row["insured"])
-                        if source_row.get("insured") else {}
-                    ),
+                    "currently_insured": (_indicator_value(source_row["insured"]) if source_row.get("insured") else {}),
                     "insured_for_ten_years": (
-                        _indicator_value(source_row["insured_10_yr"])
-                        if source_row.get("insured_10_yr") else {}
+                        _indicator_value(source_row["insured_10_yr"]) if source_row.get("insured_10_yr") else {}
                     ),
                 }
             ),
@@ -2248,10 +2323,10 @@ def _financial_display_values(source_row: Mapping[str, str]) -> list[str]:
         field_value
         for field_value in (
             source_row.get("financial_resp", ""),
-            "exemption reported" if source_row.get("financial_exempt", "").upper()
-            in {"Y", "YES", "TRUE", "1", "X"} else "",
-            "insurance reported" if source_row.get("insured", "").upper()
-            in {"Y", "YES", "TRUE", "1", "X"} else "",
+            "exemption reported"
+            if source_row.get("financial_exempt", "").upper() in {"Y", "YES", "TRUE", "1", "X"}
+            else "",
+            "insurance reported" if source_row.get("insured", "").upper() in {"Y", "YES", "TRUE", "1", "X"} else "",
         )
         if field_value
     ]
@@ -2268,12 +2343,19 @@ def _liability_fact(
     liability_indicator = _indicator_value(source_row["liability_claim"])
     liability_by_field = {"liability_claim_indicator": liability_indicator}
     return _fact_payload(
-        profile_source, source_row, run_id=run_id, record_id=record_id,
-        npi=npi, artifact=artifact, category="liability_claims",
+        profile_source,
+        source_row,
+        run_id=run_id,
+        record_id=record_id,
+        npi=npi,
+        artifact=artifact,
+        category="liability_claims",
         fact_type="liability_claim_indicator",
         display="Restricted liability claim indicator",
-        value_json=liability_by_field, fact_key=liability_by_field,
-        sensitive=True, public_default=False,
+        value_json=liability_by_field,
+        fact_key=liability_by_field,
+        sensitive=True,
+        public_default=False,
     )
 
 
@@ -2300,18 +2382,14 @@ def _financial_responsibility_facts(
                 npi=npi,
                 artifact=artifact,
                 display=(
-                    f"{profile_source.title}: {' — '.join(display_values)}"
-                    if display_values
-                    else profile_source.title
+                    f"{profile_source.title}: {' — '.join(display_values)}" if display_values else profile_source.title
                 ),
                 value_json=public_value,
                 fact_key=public_value,
             )
         )
     if source_row.get("liability_claim"):
-        facts.append(_liability_fact(
-            profile_source, source_row, run_id, record_id, npi, artifact
-        ))
+        facts.append(_liability_fact(profile_source, source_row, run_id, record_id, npi, artifact))
     return facts
 
 
@@ -2365,15 +2443,12 @@ def _profile_master_identity_demographics_facts(
 ) -> list[dict[str, Any]]:
     """Build identity and demographic facts from one profile master row."""
     facts: list[dict[str, Any]] = []
+    fact_context_by_key = {"run_id": run_id, "record_id": record_id, "npi": npi, "artifact": artifact}
     given_items = [
-        field_value
-        for field_value in (source_row.get("f_name", ""), source_row.get("m_name", ""))
-        if field_value
+        field_value for field_value in (source_row.get("f_name", ""), source_row.get("m_name", "")) if field_value
     ]
     suffix = [source_row["name_suffix"]] if source_row.get("name_suffix") else []
-    display_name = " ".join(
-        [*given_items, source_row.get("l_name", ""), *suffix]
-    ).strip()
+    display_name = " ".join([*given_items, source_row.get("l_name", ""), *suffix]).strip()
     if display_name:
         name = _without_empty(
             {
@@ -2385,9 +2460,13 @@ def _profile_master_identity_demographics_facts(
         )
         facts.append(
             _fact_payload(
-                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
-                artifact=artifact, category="identity", fact_type="name",
-                display=f"Practitioner name: {display_name}", value_json=name,
+                profile_source,
+                source_row,
+                **fact_context_by_key,
+                category="identity",
+                fact_type="name",
+                display=f"Practitioner name: {display_name}",
+                value_json=name,
                 fact_key={"name": name},
                 assertion_type="state_reported",
                 verification_status="government_source",
@@ -2400,8 +2479,10 @@ def _profile_master_identity_demographics_facts(
         range_value_by_key = reported_range["value"]
         facts.append(
             _fact_payload(
-                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
-                artifact=artifact, category="demographics",
+                profile_source,
+                source_row,
+                **fact_context_by_key,
+                category="demographics",
                 fact_type=reported_range["fact_type"],
                 display=reported_range["display"],
                 value_json=range_value_by_key,
@@ -2441,20 +2522,20 @@ def _profile_master_state_license_facts(
             "expiration_date": expiration_date,
         }
     )
-    license_display = " — ".join(
-        field_value
-        for field_value in (
-            source_row.get("lic_nbr", ""),
-            source_row.get("lic_sta_desc", ""),
-            source_row.get("rank_desc", ""),
-        )
-        if field_value
-    )
+    display_fields = ("lic_nbr", "lic_sta_desc", "rank_desc")
+    license_display = " — ".join(source_row[field] for field in display_fields if source_row.get(field))
     return [
         _fact_payload(
-            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
-            artifact=artifact, category="licenses", fact_type="state_license",
-            display=f"Florida license: {license_display}", value_json=license_value,
+            profile_source,
+            source_row,
+            run_id=run_id,
+            record_id=record_id,
+            npi=npi,
+            artifact=artifact,
+            category="licenses",
+            fact_type="state_license",
+            display=f"Florida license: {license_display}",
+            value_json=license_value,
             effective_start=original_issue_date or None,
             effective_end=expiration_date or None,
             fact_key=(
@@ -2489,13 +2570,16 @@ def _profile_master_other_license_facts(
             other_license,
             (None, f"Other state license indicator: {other_license}"),
         )
-        other_license_value = _without_empty(
-            {"reported": reported, "source_code": other_license}
-        )
+        other_license_value = _without_empty({"reported": reported, "source_code": other_license})
         facts.append(
             _fact_payload(
-                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
-                artifact=artifact, category="licenses",
+                profile_source,
+                source_row,
+                run_id=run_id,
+                record_id=record_id,
+                npi=npi,
+                artifact=artifact,
+                category="licenses",
                 fact_type="other_state_license_indicator",
                 display=other_license_display,
                 value_json=other_license_value,
@@ -2526,8 +2610,13 @@ def _profile_master_practice_nica_facts(
         }
         facts.append(
             _fact_payload(
-                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
-                artifact=artifact, category="professional_experience",
+                profile_source,
+                source_row,
+                run_id=run_id,
+                record_id=record_id,
+                npi=npi,
+                artifact=artifact,
+                category="professional_experience",
                 fact_type="practice_start",
                 display=f"Began practicing: {practice_start}",
                 value_json=practice_start_value_by_key,
@@ -2546,9 +2635,15 @@ def _profile_master_practice_nica_facts(
         nica_value_by_key = {"status": nica_status[0], "source_code": nica_code}
         facts.append(
             _fact_payload(
-                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
-                artifact=artifact, category="program_reports",
-                fact_type="nica_assessment_status", display=nica_status[1],
+                profile_source,
+                source_row,
+                run_id=run_id,
+                record_id=record_id,
+                npi=npi,
+                artifact=artifact,
+                category="program_reports",
+                fact_type="nica_assessment_status",
+                display=nica_status[1],
                 value_json=nica_value_by_key,
                 fact_key={"nica_assessment_status": nica_value_by_key},
                 infer_effective_period=False,
@@ -2591,9 +2686,16 @@ def _profile_master_address_facts(
         address["location_types"] = sorted(set(address["location_types"]))
         facts.append(
             _fact_payload(
-                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
-                artifact=artifact, category="locations", fact_type="provider_address",
-                display=_address_display(address), value_json=address,
+                profile_source,
+                source_row,
+                run_id=run_id,
+                record_id=record_id,
+                npi=npi,
+                artifact=artifact,
+                category="locations",
+                fact_type="provider_address",
+                display=_address_display(address),
+                value_json=address,
                 fact_key=hashlib.sha256(address_key.encode()).hexdigest()[:16],
                 infer_effective_period=False,
             )
@@ -2612,30 +2714,50 @@ def _profile_master_facts(
 ) -> list[dict[str, Any]]:
     """Build reviewed identity and biography facts from a profile master row."""
     facts = _profile_master_identity_demographics_facts(
-        profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
+        profile_source,
+        source_row,
+        run_id=run_id,
+        record_id=record_id,
+        npi=npi,
         artifact=artifact,
     )
     facts.extend(
         _profile_master_state_license_facts(
-            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
+            profile_source,
+            source_row,
+            run_id=run_id,
+            record_id=record_id,
+            npi=npi,
             artifact=artifact,
         )
     )
     facts.extend(
         _profile_master_other_license_facts(
-            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
+            profile_source,
+            source_row,
+            run_id=run_id,
+            record_id=record_id,
+            npi=npi,
             artifact=artifact,
         )
     )
     facts.extend(
         _profile_master_practice_nica_facts(
-            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
+            profile_source,
+            source_row,
+            run_id=run_id,
+            record_id=record_id,
+            npi=npi,
             artifact=artifact,
         )
     )
     facts.extend(
         _profile_master_address_facts(
-            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
+            profile_source,
+            source_row,
+            run_id=run_id,
+            record_id=record_id,
+            npi=npi,
             artifact=artifact,
         )
     )
@@ -2645,15 +2767,9 @@ def _profile_master_facts(
 def _state_license_fields_by_name(source_row: Mapping[str, str]) -> dict[str, Any]:
     """Shape the reviewed source fields for one Florida license fact."""
 
-    original_date, _ = _normalize_source_date(
-        _first(source_row, "orig_dte", "original_date")
-    )
-    expiration_date, _ = _normalize_source_date(
-        _first(source_row, "expr_dte", "expire_date")
-    )
-    status_effective_date, _ = _normalize_source_date(
-        source_row.get("status_effective_date", "")
-    )
+    original_date, _ = _normalize_source_date(_first(source_row, "orig_dte", "original_date"))
+    expiration_date, _ = _normalize_source_date(_first(source_row, "expr_dte", "expire_date"))
+    status_effective_date, _ = _normalize_source_date(source_row.get("status_effective_date", ""))
     profession_code = _first(source_row, "pro_cde", "profession_code")
     rank_code = _first(source_row, "rank_cde", "rank_code")
     license_number = _first(source_row, "lic_nbr", "license_number")
@@ -2855,11 +2971,7 @@ def _administrative_complaint_fact(
         record_id=record_id,
         npi=npi,
         artifact=artifact,
-        display=(
-            f"Administrative complaint (allegation): {details}"
-            if details
-            else profile_source.title
-        ),
+        display=(f"Administrative complaint (allegation): {details}" if details else profile_source.title),
         value_json=field_value,
         effective_start=activity_date or None,
         fact_key={
@@ -2916,9 +3028,7 @@ def _pain_management_fact(
     artifact: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build one reviewed pain-management report fact."""
-    report_period = _without_empty(
-        {"year": source_row.get("year", ""), "quarter": source_row.get("qtr", "")}
-    )
+    report_period = _without_empty({"year": source_row.get("year", ""), "quarter": source_row.get("qtr", "")})
     field_value = _pain_management_value(source_row, report_period)
     period_display = " ".join(
         profile_item
@@ -2929,9 +3039,7 @@ def _pain_management_fact(
         if profile_item
     )
     details = " — ".join(
-        profile_item
-        for profile_item in (source_row.get("clinic_name", ""), period_display)
-        if profile_item
+        profile_item for profile_item in (source_row.get("clinic_name", ""), period_display) if profile_item
     )
     return _fact_payload(
         profile_source,
@@ -3022,9 +3130,7 @@ def _pharmacy_relationship_fact(
     """Build one reviewed pharmacy relationship fact."""
     original_date, _ = _normalize_source_date(source_row.get("pharm_orig_dte", ""))
     expiration_date, _ = _normalize_source_date(source_row.get("pharm_expr_dte", ""))
-    status_effective_date, _ = _normalize_source_date(
-        source_row.get("pharm_stat_efctv_dte", "")
-    )
+    status_effective_date, _ = _normalize_source_date(source_row.get("pharm_stat_efctv_dte", ""))
     field_value = _pharmacy_relationship_value(
         source_row,
         original_date=original_date,
@@ -3076,6 +3182,21 @@ def _medical_cannabis_authorization(course: str) -> tuple[str, str, str]:
     )
 
 
+def _medical_cannabis_practice_location(source_row):
+    """Keep the source's reported address fields without adding inferred geography."""
+    return _without_empty(
+        {
+            "address_line_1": source_row.get("pl_addr_line1", ""),
+            "address_line_2": source_row.get("pl_addr_line2", ""),
+            "address_line_3": source_row.get("pl_addr_line3", ""),
+            "city": source_row.get("pl_addr_cty", ""),
+            "state": source_row.get("pl_st_cde", ""),
+            "postal_code": source_row.get("pl_zip", ""),
+            "county": source_row.get("pl_cnty", ""),
+        }
+    )
+
+
 def _medical_cannabis_fact(
     profile_source: FloridaSource,
     source_row: Mapping[str, str],
@@ -3088,20 +3209,7 @@ def _medical_cannabis_fact(
     """Build one reviewed medical-cannabis authorization fact."""
     course = source_row.get("course_type", "")
     course_token = course.strip().upper()
-    authorization_type, semantic_fact_type, display = (
-        _medical_cannabis_authorization(course)
-    )
-    practice_location = _without_empty(
-        {
-            "address_line_1": source_row.get("pl_addr_line1", ""),
-            "address_line_2": source_row.get("pl_addr_line2", ""),
-            "address_line_3": source_row.get("pl_addr_line3", ""),
-            "city": source_row.get("pl_addr_cty", ""),
-            "state": source_row.get("pl_st_cde", ""),
-            "postal_code": source_row.get("pl_zip", ""),
-            "county": source_row.get("pl_cnty", ""),
-        }
-    )
+    authorization_type, semantic_fact_type, display = _medical_cannabis_authorization(course)
     completion_date_source = source_row.get("dte_compl", "")
     completion_date, completion_precision = _normalize_source_date(completion_date_source)
     field_value = _without_empty(
@@ -3114,7 +3222,7 @@ def _medical_cannabis_fact(
             "course_completed_precision": completion_precision if completion_date else "",
             "submitted_by_code": source_row.get("submitted_by", ""),
             "license_number": source_row.get("lic_nbr", ""),
-            "practice_location": practice_location,
+            "practice_location": _medical_cannabis_practice_location(source_row),
             "practice_phone": source_row.get("phne_nbr", ""),
             "specialties": [
                 field_value.strip()
@@ -3128,9 +3236,15 @@ def _medical_cannabis_fact(
     if completion_date:
         display = f"{display} — course completed {completion_date}"
     return _fact_payload(
-        profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
-        artifact=artifact, category="prescribing_authorizations",
-        fact_type=semantic_fact_type, display=display,
+        profile_source,
+        source_row,
+        run_id=run_id,
+        record_id=record_id,
+        npi=npi,
+        artifact=artifact,
+        category="prescribing_authorizations",
+        fact_type=semantic_fact_type,
+        display=display,
         value_json=field_value,
     )
 
@@ -3176,26 +3290,19 @@ def _facts_for_row(
     """Map one normalized source row into reviewed provider-profile facts."""
     if profile_source.key == "counties":
         return []
+    fact_builder = None
     if profile_source.key == "profile_master":
-        return _profile_master_facts(
-            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
-            artifact=artifact,
-        )
-    if profile_source.key in {
+        fact_builder = _profile_master_facts
+    elif profile_source.key in {
         "license_status",
         "licensure_current",
         "licensure_all_statuses",
     }:
-        return _state_license_facts(
-            profile_source,
-            source_row,
-            run_id=run_id,
-            record_id=record_id,
-            npi=npi,
-            artifact=artifact,
-        )
-    if profile_source.path == "/ProfileData":
-        return _profile_data_facts(
+        fact_builder = _state_license_facts
+    elif profile_source.path == "/ProfileData":
+        fact_builder = _profile_data_facts
+    if fact_builder is not None:
+        return fact_builder(
             profile_source,
             source_row,
             run_id=run_id,
@@ -3215,7 +3322,11 @@ def _facts_for_row(
         return [specialized_fact]
     return [
         _fact_payload(
-            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
+            profile_source,
+            source_row,
+            run_id=run_id,
+            record_id=record_id,
+            npi=npi,
             artifact=artifact,
         )
     ]
@@ -3304,7 +3415,7 @@ def _retained_source_record(
 def _env_positive_int(name: str, default: int) -> int:
     try:
         return max(int(os.getenv(name, str(default))), 1)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
@@ -3333,10 +3444,7 @@ def _copy_upsert_batch_rows() -> int:
 
 def _validated_identifier(identifier: Any) -> str:
     value = str(identifier or "")
-    if (
-        not _POSTGRES_IDENTIFIER.fullmatch(value)
-        or len(value.encode("utf-8")) > _POSTGRES_IDENTIFIER_MAX_BYTES
-    ):
+    if not _POSTGRES_IDENTIFIER.fullmatch(value) or len(value.encode("utf-8")) > _POSTGRES_IDENTIFIER_MAX_BYTES:
         raise ValueError(f"unsafe PostgreSQL identifier: {value!r}")
     return value
 
@@ -3358,10 +3466,7 @@ def _strip_postgres_nuls(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_strip_postgres_nuls(item) for item in value)
     if isinstance(value, dict):
-        return {
-            _strip_postgres_nuls(key): _strip_postgres_nuls(item)
-            for key, item in value.items()
-        }
+        return {_strip_postgres_nuls(key): _strip_postgres_nuls(item) for key, item in value.items()}
     return value
 
 
@@ -3390,10 +3495,7 @@ def _copy_value_for_type(column_type: Any, field_value: Any) -> Any:
                 raise ValueError("COPY array value must be a JSON array or sequence") from exc
         if not isinstance(field_value, (list, tuple)):
             raise ValueError("COPY array value must be a sequence")
-        return [
-            _copy_value_for_type(column_type.item_type, profile_item)
-            for profile_item in field_value
-        ]
+        return [_copy_value_for_type(column_type.item_type, profile_item) for profile_item in field_value]
     if isinstance(column_type, DateTime):
         if isinstance(field_value, str):
             field_value = datetime.fromisoformat(field_value.strip().replace("Z", "+00:00"))
@@ -3420,13 +3522,7 @@ def _copy_records(
     column_names = [_validated_identifier(column.name) for column in columns]
     return (
         column_names,
-        [
-            tuple(
-                _copy_value_for_type(column.type, row.get(column.name))
-                for column in columns
-            )
-            for row in rows
-        ],
+        [tuple(_copy_value_for_type(column.type, row.get(column.name)) for column in columns) for row in rows],
     )
 
 
@@ -3440,20 +3536,13 @@ def _copy_upsert_statement_parts(
 
     stage_table = _copy_stage_table_name(table_name)
     quoted_stage = _quoted_identifier(stage_table)
-    target_ref = (
-        f"{_quoted_identifier(schema_name)}.{_quoted_identifier(table_name)}"
-    )
-    quoted_columns = ", ".join(
-        _quoted_identifier(column_name) for column_name in column_names
-    )
-    update_columns = [
-        column_name for column_name in column_names if column_name != key
-    ]
+    target_ref = f"{_quoted_identifier(schema_name)}.{_quoted_identifier(table_name)}"
+    quoted_columns = ", ".join(_quoted_identifier(column_name) for column_name in column_names)
+    update_columns = [column_name for column_name in column_names if column_name != key]
     conflict_action = (
         "DO UPDATE SET "
         + ", ".join(
-            f"{_quoted_identifier(column_name)} = "
-            f"EXCLUDED.{_quoted_identifier(column_name)}"
+            f"{_quoted_identifier(column_name)} = EXCLUDED.{_quoted_identifier(column_name)}"
             for column_name in update_columns
         )
         if update_columns
@@ -3477,9 +3566,7 @@ def _copy_records_to_table_driver(connection: Any) -> Any:
         None,
     )
     if copy_records_to_table is None:
-        raise _CopyUpsertUnavailable(
-            "active database driver lacks copy_records_to_table"
-        )
+        raise _CopyUpsertUnavailable("active database driver lacks copy_records_to_table")
     return copy_records_to_table
 
 
@@ -3587,11 +3674,7 @@ async def _upsert_rows(model: Any, rows: list[dict[str, Any]], key: str) -> None
         return
     rows = _coalesced_upsert_rows(rows, key)
     table_name = _validated_identifier(model.__table__.name)
-    if (
-        table_name not in _COPY_UPSERT_TABLES
-        or not _is_copy_upsert_enabled()
-        or len(rows) < _copy_upsert_min_rows()
-    ):
+    if table_name not in _COPY_UPSERT_TABLES or not _is_copy_upsert_enabled() or len(rows) < _copy_upsert_min_rows():
         await _upsert_rows_values(model, rows, key)
         return
 
@@ -3613,9 +3696,7 @@ async def _retained_import_counts(run_id: str) -> dict[str, int]:
     retained_counts = await db.first(
         select(
             func.count().label("source_records"),
-            func.count()
-            .filter(ProviderProfileSourceRecord.match_status == "deterministic")
-            .label("matched_records"),
+            func.count().filter(ProviderProfileSourceRecord.match_status == "deterministic").label("matched_records"),
             func.count()
             .filter(
                 ProviderProfileSourceRecord.match_status == "deterministic",
@@ -3637,9 +3718,7 @@ async def _retained_import_counts(run_id: str) -> dict[str, int]:
     return {
         "retained_source_records": retained_source_records,
         "retained_facts": int(retained_counts_by_key["facts"] or 0),
-        "retained_matched_records": int(
-            retained_counts_by_key["matched_records"] or 0
-        ),
+        "retained_matched_records": int(retained_counts_by_key["matched_records"] or 0),
         "retained_non_projectable_records": retained_source_records
         - int(retained_counts_by_key["projectable_records"] or 0),
     }
@@ -3660,18 +3739,11 @@ async def _claim_import_run(run_row: Mapping[str, Any]) -> None:
     if claimed_run_id == run_id:
         return
     existing_status = await db.scalar(
-        select(ProviderProfileImportRun.status).where(
-            ProviderProfileImportRun.run_id == run_id
-        )
+        select(ProviderProfileImportRun.status).where(ProviderProfileImportRun.run_id == run_id)
     )
     if existing_status == "completed":
-        raise RuntimeError(
-            f"provider_profile_run_already_completed:{run_id}"
-        )
-    raise RuntimeError(
-        "provider_profile_run_scope_exists:"
-        f"{run_id}:{existing_status or 'unknown'}"
-    )
+        raise RuntimeError(f"provider_profile_run_already_completed:{run_id}")
+    raise RuntimeError(f"provider_profile_run_scope_exists:{run_id}:{existing_status or 'unknown'}")
 
 
 def _failure_status_attempts() -> int:
@@ -3692,7 +3764,7 @@ def _failure_status_timeout_seconds() -> float:
             ),
             0.1,
         )
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return DEFAULT_FAILURE_STATUS_TIMEOUT_SECONDS
 
 
@@ -3707,7 +3779,7 @@ def _failure_status_window_seconds() -> float:
             ),
             0.1,
         )
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return DEFAULT_FAILURE_STATUS_WINDOW_SECONDS
 
 
@@ -3717,17 +3789,12 @@ def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
     while current is not None and id(current) not in seen_items:
         seen_items.add(id(current))
         yield current
-        current = (
-            getattr(current, "orig", None)
-            or current.__cause__
-            or current.__context__
-        )
+        current = getattr(current, "orig", None) or current.__cause__ or current.__context__
 
 
 def _is_transient_database_error(exc: BaseException) -> bool:
     return any(
-        isinstance(item, (ConnectionError, TimeoutError))
-        or type(item).__name__ in _TRANSIENT_DATABASE_ERROR_NAMES
+        isinstance(item, (ConnectionError, TimeoutError)) or type(item).__name__ in _TRANSIENT_DATABASE_ERROR_NAMES
         for item in _exception_chain(exc)
     )
 
@@ -3810,10 +3877,7 @@ async def _mark_failed_run_status(
             return None
         except Exception as exc:
             last_error = exc
-            if (
-                attempt + 1 >= attempts
-                or not _is_transient_database_error(exc)
-            ):
+            if attempt + 1 >= attempts or not _is_transient_database_error(exc):
                 break
             remaining_seconds = deadline - loop.time()
             if remaining_seconds <= 0:
@@ -3849,7 +3913,8 @@ async def _projection_row_batches(
                 ProviderProfileFact.npi.is_not(None),
                 ProviderProfileFact.npi > last_npi,
             )
-            .distinct().order_by(ProviderProfileFact.npi)
+            .distinct()
+            .order_by(ProviderProfileFact.npi)
             .limit(npi_batch_size)
         )
         npis = [int(source_row._mapping["npi"]) for source_row in npi_rows]
@@ -3871,27 +3936,27 @@ async def _projection_row_batches(
         for fact_row in fact_rows:
             fact_by_key = dict(fact_row._mapping)
             facts_by_npi[int(fact_by_key["npi"])].append(fact_by_key)
-        projection_rows: list[dict[str, Any]] = []
-        for npi in npis:
-            profile, evidence = _projection(
-                npi,
-                run_id,
-                facts_by_npi.get(npi, []),
-                loaded_categories,
-            )
-            projection_rows.append(
-                {
-                    "npi": npi,
-                    "generation_id": run_id,
-                    "schema_version": PROFILE_SCHEMA_VERSION,
-                    "profile_json": profile,
-                    "evidence_json": evidence,
-                    "source_keys": [FL_MQA_SOURCE_KEY],
-                    "published_at": published_at,
-                }
-            )
-        yield projection_rows
+        yield _projection_rows_for_npis(npis, facts_by_npi, run_id, loaded_categories, published_at)
         last_npi = npis[-1]
+
+
+def _projection_rows_for_npis(npis, facts_by_npi, run_id, loaded_categories, published_at):
+    """Project one already bounded provider batch without changing its source order."""
+    projection_rows = []
+    for npi in npis:
+        profile, evidence = _projection(npi, run_id, facts_by_npi.get(npi, []), loaded_categories)
+        projection_rows.append(
+            {
+                "npi": npi,
+                "generation_id": run_id,
+                "schema_version": PROFILE_SCHEMA_VERSION,
+                "profile_json": profile,
+                "evidence_json": evidence,
+                "source_keys": [FL_MQA_SOURCE_KEY],
+                "published_at": published_at,
+            }
+        )
+    return projection_rows
 
 
 async def _publish_projection_swap(
@@ -3903,8 +3968,15 @@ async def _publish_projection_swap(
     allow_volume_drop: bool,
     min_first_publish_providers: int,
     min_publish_ratio: float,
+    control_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build and validate a complete generation, then atomically rotate it live."""
+    from types import SimpleNamespace
+
+    from process import florida_projection_archive as projection_archive
+    from process import reference_family_archive as native
+    from process import source_profile_result_archive as source_archive
+
     schema = ProviderProfileProjection.__table__.schema or "mrf"
     live_name = ProviderProfileProjection.__tablename__
     stage_name = f"{live_name}_{run_id[:16]}"
@@ -3912,11 +3984,15 @@ async def _publish_projection_swap(
     if not re.fullmatch(r"[a-z0-9_]+", stage_name):
         raise RuntimeError("provider_profile_stage_name_invalid")
 
-    await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_name};")
-    await db.status(
-        f"CREATE TABLE {schema}.{stage_name} "
-        f"(LIKE {schema}.{live_name} INCLUDING ALL EXCLUDING DEFAULTS);"
-    )
+    async with db.transaction() as session:
+        requires_handoff = await source_archive.is_native_handoff_required(session, schema)
+        if requires_handoff and control_context is None:
+            raise RuntimeError("provider_profile_managed_publication_required")
+        await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_name};")
+        await db.status(
+            f"CREATE TABLE {schema}.{stage_name} (LIKE {schema}.{live_name} INCLUDING CONSTRAINTS EXCLUDING DEFAULTS);"
+        )
+        stage_seal = await projection_archive.isolate_ordinary_projection(session, schema, stage_name)
     stage_table = ProviderProfileProjection.__table__.to_metadata(
         MetaData(),
         schema=schema,
@@ -3926,27 +4002,56 @@ async def _publish_projection_swap(
     async for row_batch in row_batches:
         if not row_batch:
             continue
-        await db.insert(stage_table).values(row_batch).status()
-        inserted_count += len(row_batch)
-        projection_batches(inserted_count, report=enqueue_live_progress)
+        for offset in range(0, len(row_batch), 5_000):
+            columns, copy_records = _copy_records(stage_table, row_batch[offset : offset + 5_000])
+            async with db.transaction() as session:
+                await session.execute(text("SELECT pg_current_xact_id()"))
+                await native.native_copy_record_batch(
+                    session,
+                    ProviderProfileProjection,
+                    schema_name=schema,
+                    table_name=stage_name,
+                    columns=columns,
+                    records=copy_records,
+                )
+            inserted_count += len(copy_records)
+            projection_batches(inserted_count, report=enqueue_live_progress)
     if inserted_count == 0:
         raise RuntimeError("provider_profile_stage_empty")
 
-    stage_count = int(
-        await db.scalar(text(f"SELECT count(*) FROM {schema}.{stage_name}")) or 0
-    )
-    distinct_npi_count = int(
-        await db.scalar(
-            text(f"SELECT count(DISTINCT npi) FROM {schema}.{stage_name}")
+    async with db.transaction() as session:
+        await native._create_model_indexes(
+            session,
+            native.ReferenceFamilySpec(
+                "florida-mqa-profile", (SimpleNamespace(__tablename__=stage_name, __table__=stage_table),)
+            ),
+            schema,
+            create_constraints=True,
         )
-        or 0
-    )
+
+    stage_count = int(await db.scalar(text(f"SELECT count(*) FROM {schema}.{stage_name}")) or 0)
+    distinct_npi_count = int(await db.scalar(text(f"SELECT count(DISTINCT npi) FROM {schema}.{stage_name}")) or 0)
     if stage_count != inserted_count or distinct_npi_count != stage_count:
         raise RuntimeError(
             "provider_profile_stage_validation_failed:"
             f"expected={inserted_count}:rows={stage_count}:"
             f"distinct_npis={distinct_npi_count}"
         )
+    if requires_handoff:
+        from process.control_lifecycle import suppress_control_run_heartbeat_persistence
+
+        control_run_id = control_context["context"]["control_run_id"]
+        async with suppress_control_run_heartbeat_persistence(control_run_id):
+            result_by_field = await source_archive.handoff_native_publication(
+                db,
+                control_context,
+                importer_id="florida-mqa-profile",
+                schema=schema,
+                source_run_id=run_id,
+                metrics=dict(completion_metrics),
+                projection={**stage_seal, "row_count": stage_count},
+            )
+        return {"publication": "awaiting_protected_publisher", "published_rows": 0}, result_by_field
     publication_by_key = {
         "stage_table": f"{schema}.{stage_name}",
         "published_table": f"{schema}.{live_name}",
@@ -3956,7 +4061,7 @@ async def _publish_projection_swap(
     }
     final_metrics_by_key: dict[str, Any] = {}
 
-    async with db.transaction():
+    async with db.transaction() as session:
         await db.scalar(
             text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"),
             lock_name=f"{schema}.{live_name}.publication",
@@ -3977,32 +4082,18 @@ async def _publish_projection_swap(
         previous_source_record_count: int | None = None
         previous_metrics: Mapping[str, Any] | None = None
         if current_generations:
-            current_generation_id = str(
-                current_generations[0]._mapping["generation_id"] or ""
-            )
-            current_provider_count = int(
-                current_generations[0]._mapping["provider_count"] or 0
-            )
+            current_generation_id = str(current_generations[0]._mapping["generation_id"] or "")
+            current_provider_count = int(current_generations[0]._mapping["provider_count"] or 0)
             current_run = await db.first(
                 select(
                     ProviderProfileImportRun.started_at,
                     ProviderProfileImportRun.metrics,
                 ).where(ProviderProfileImportRun.run_id == current_generation_id)
             )
-            current_started_at = (
-                current_run._mapping["started_at"]
-                if current_run is not None
-                else None
-            )
-            previous_metrics = (
-                current_run._mapping["metrics"]
-                if current_run is not None
-                else None
-            )
+            current_started_at = current_run._mapping["started_at"] if current_run is not None else None
+            previous_metrics = current_run._mapping["metrics"] if current_run is not None else None
             if isinstance(previous_metrics, Mapping):
-                previous_source_records = previous_metrics.get(
-                    "physical_source_records"
-                )
+                previous_source_records = previous_metrics.get("physical_source_records")
                 if not isinstance(previous_source_records, int):
                     previous_source_records = previous_metrics.get("source_records")
                 if isinstance(previous_source_records, int):
@@ -4013,9 +4104,7 @@ async def _publish_projection_swap(
                 started_at,
                 run_id,
             ):
-                raise RuntimeError(
-                    "provider_profile_newer_generation_already_published"
-                )
+                raise RuntimeError("provider_profile_newer_generation_already_published")
         candidate_source_metrics_by_key = completion_metrics.get("source_metrics")
         if not isinstance(candidate_source_metrics_by_key, Mapping):
             candidate_source_metrics_by_key = {}
@@ -4050,19 +4139,12 @@ async def _publish_projection_swap(
         if source_validation_reasons or source_header_reasons:
             raise RuntimeError(
                 "provider_profile_source_validation_guard:"
-                + ",".join(
-                    [*source_validation_reasons, *source_header_reasons]
-                )
+                + ",".join([*source_validation_reasons, *source_header_reasons])
             )
         if source_ratio_reasons and not allow_volume_drop:
-            raise RuntimeError(
-                "provider_profile_source_volume_guard:"
-                + ",".join(source_ratio_reasons)
-            )
+            raise RuntimeError("provider_profile_source_volume_guard:" + ",".join(source_ratio_reasons))
         candidate_physical_source_records = int(
-            completion_metrics.get("physical_source_records")
-            or completion_metrics.get("source_records")
-            or 0
+            completion_metrics.get("physical_source_records") or completion_metrics.get("source_records") or 0
         )
         guard_reasons = _publication_guard_reasons(
             candidate_provider_count=stage_count,
@@ -4084,15 +4166,13 @@ async def _publish_projection_swap(
             "reasons": guard_reasons,
         }
         if guard_reasons and not allow_volume_drop:
-            raise RuntimeError(
-                "provider_profile_publication_volume_guard:"
-                + ",".join(guard_reasons)
-            )
+            raise RuntimeError("provider_profile_publication_volume_guard:" + ",".join(guard_reasons))
         final_metrics_by_key = {
             **completion_metrics,
             "published_providers": stage_count,
             "publication": publication_by_key,
         }
+        await projection_archive.preserve_ordinary_projection_access(session, schema, stage_seal)
         projection_tables = await db.all(
             text(
                 """
@@ -4111,9 +4191,7 @@ async def _publish_projection_swap(
             old_name=old_name,
             stage_pattern=f"{live_name}_%",
         )
-        allowed_name = re.compile(
-            rf"{re.escape(live_name)}(?:_old|_[a-f0-9]{{16}})?"
-        )
+        allowed_name = re.compile(rf"{re.escape(live_name)}(?:_old|_[a-f0-9]{{16}})?")
         for projection_table in projection_tables:
             table_name = str(projection_table._mapping["tablename"])
             if not allowed_name.fullmatch(table_name):
@@ -4121,17 +4199,10 @@ async def _publish_projection_swap(
             # Older local/prototype tables used BIGSERIAL for the externally
             # supplied NPI key. A copied sequence default makes DROP old fail
             # after a LIKE-based swap, so remove it from every generation.
-            await db.status(
-                f"ALTER TABLE {schema}.{table_name} "
-                "ALTER COLUMN npi DROP DEFAULT;"
-            )
+            await db.status(f"ALTER TABLE {schema}.{table_name} ALTER COLUMN npi DROP DEFAULT;")
         await db.status(f"DROP TABLE IF EXISTS {schema}.{old_name};")
-        await db.status(
-            f"ALTER TABLE IF EXISTS {schema}.{live_name} RENAME TO {old_name};"
-        )
-        await db.status(
-            f"ALTER TABLE {schema}.{stage_name} RENAME TO {live_name};"
-        )
+        await db.status(f"ALTER TABLE IF EXISTS {schema}.{live_name} RENAME TO {old_name};")
+        await db.status(f"ALTER TABLE {schema}.{stage_name} RENAME TO {live_name};")
         await (
             db.update(ProviderProfileImportRun.__table__)
             .where(ProviderProfileImportRun.run_id == run_id)
@@ -4168,24 +4239,16 @@ def _source_quarantine_guard_reasons(
     if not isinstance(max_quarantined_rows, int) or max_quarantined_rows < 0:
         reasons.append(f"source_quarantine_count_limit_invalid:{source_key}")
     elif quarantined_rows > max_quarantined_rows:
-        reasons.append(
-            f"source_quarantine_count_exceeded:{source_key}:"
-            f"{quarantined_rows}>{max_quarantined_rows}"
-        )
+        reasons.append(f"source_quarantine_count_exceeded:{source_key}:{quarantined_rows}>{max_quarantined_rows}")
     if (
         not isinstance(max_quarantined_ratio, (int, float))
         or isinstance(max_quarantined_ratio, bool)
         or not 0 <= max_quarantined_ratio <= 1
     ):
         reasons.append(f"source_quarantine_ratio_limit_invalid:{source_key}")
-    elif (
-        isinstance(source_rows, int)
-        and source_rows > 0
-        and quarantined_rows / source_rows > max_quarantined_ratio
-    ):
+    elif isinstance(source_rows, int) and source_rows > 0 and quarantined_rows / source_rows > max_quarantined_ratio:
         reasons.append(
-            f"source_quarantine_ratio_exceeded:{source_key}:"
-            f"{quarantined_rows}/{source_rows}>{max_quarantined_ratio:g}"
+            f"source_quarantine_ratio_exceeded:{source_key}:{quarantined_rows}/{source_rows}>{max_quarantined_ratio:g}"
         )
     return reasons
 
@@ -4276,10 +4339,7 @@ def _source_ratio_guard_reasons(
                 and previous_count > 0
                 and candidate_count < previous_count * min_publish_ratio
             ):
-                reasons.append(
-                    f"source_{metric_name}_ratio:{source_key}:"
-                    f"{candidate_count}/{previous_count}"
-                )
+                reasons.append(f"source_{metric_name}_ratio:{source_key}:{candidate_count}/{previous_count}")
     return reasons
 
 
@@ -4305,10 +4365,7 @@ def _source_header_drift_guard_reasons(
             reasons.append(f"previous_source_header_hash_invalid:{source_key}")
             continue
         if candidate_hash != previous_hash:
-            reasons.append(
-                f"source_header_sha256_changed:{source_key}:"
-                f"{previous_hash}->{candidate_hash}"
-            )
+            reasons.append(f"source_header_sha256_changed:{source_key}:{previous_hash}->{candidate_hash}")
     return reasons
 
 
@@ -4325,25 +4382,15 @@ def _publication_guard_reasons(
     reasons: list[str] = []
     if current_provider_count <= 0:
         if candidate_provider_count < min_first_publish_providers:
-            reasons.append(
-                "first_publish_provider_count:"
-                f"{candidate_provider_count}<{min_first_publish_providers}"
-            )
+            reasons.append(f"first_publish_provider_count:{candidate_provider_count}<{min_first_publish_providers}")
         return reasons
     if candidate_provider_count < current_provider_count * min_publish_ratio:
-        reasons.append(
-            "provider_count_ratio:"
-            f"{candidate_provider_count}/{current_provider_count}"
-        )
+        reasons.append(f"provider_count_ratio:{candidate_provider_count}/{current_provider_count}")
     if (
         previous_source_record_count
-        and candidate_source_record_count
-        < previous_source_record_count * min_publish_ratio
+        and candidate_source_record_count < previous_source_record_count * min_publish_ratio
     ):
-        reasons.append(
-            "source_record_count_ratio:"
-            f"{candidate_source_record_count}/{previous_source_record_count}"
-        )
+        reasons.append(f"source_record_count_ratio:{candidate_source_record_count}/{previous_source_record_count}")
     return reasons
 
 
@@ -4353,11 +4400,7 @@ def _validated_loaded_categories(
     """Only declare categories covered when their source passed validation."""
     categories: set[str] = set()
     for source_key, metric in source_metrics.items():
-        if (
-            source_key not in FLORIDA_SOURCES
-            or not isinstance(metric, Mapping)
-            or metric.get("validated") is not True
-        ):
+        if source_key not in FLORIDA_SOURCES or not isinstance(metric, Mapping) or metric.get("validated") is not True:
             continue
         categories.add(FLORIDA_SOURCES[source_key].category)
         if source_key == "profile_master":
@@ -4384,11 +4427,7 @@ def _retention_eligible_run_ids(
             eligible_items.append(run_id)
             continue
         finished_at = row.get("finished_at")
-        if (
-            status == "failed"
-            and isinstance(finished_at, datetime)
-            and finished_at <= failed_cutoff
-        ):
+        if status == "failed" and isinstance(finished_at, datetime) and finished_at <= failed_cutoff:
             eligible_items.append(run_id)
     return sorted(set(eligible_items))
 
@@ -4443,15 +4482,15 @@ async def _delete_retained_payload_rows(
     ):
         predicate = model.run_id.in_(run_ids)
         deleted_rows_by_key[metric_name] = int(
-            await db.scalar(
-                select(func.count())
-                .select_from(model.__table__)
-                .where(predicate)
-            )
-            or 0
+            await db.scalar(select(func.count()).select_from(model.__table__).where(predicate)) or 0
         )
         await db.delete(model.__table__).where(predicate).status()
     return deleted_rows_by_key
+
+
+def _artifact_root():
+    """Use the same worker-local root for acquisition and deferred maintenance."""
+    return Path(os.getenv("HLTHPRT_FL_MQA_ARTIFACT_ROOT", "/data/healthporta/florida-mqa"))
 
 
 async def _post_success_retention(
@@ -4495,17 +4534,9 @@ async def _post_success_retention(
                 eligible_run_ids,
             )
 
-    directory_result = await asyncio.to_thread(
-        _remove_artifact_run_directories,
-        artifact_root,
-        eligible_run_ids,
-    )
+        directory_result = await _remove_retained_directories(artifact_root, eligible_run_ids)
     return {
-        "status": (
-            "completed_with_directory_errors"
-            if directory_result["errors"]
-            else "completed"
-        ),
+        "status": ("completed_with_directory_errors" if directory_result["errors"] else "completed"),
         "failed_retention_days": failed_retention_days,
         "protected_audit_run_ids": sorted(protected_run_ids),
         "deleted_run_ids": eligible_run_ids,
@@ -4545,7 +4576,7 @@ async def _apply_post_success_retention(
     artifact_root: Path,
     failed_retention_days: int,
 ) -> dict[str, Any]:
-    """Keep a published run successful even if best-effort retention needs retry."""
+    """Report maintenance in the attempt result without rewriting published payload."""
     try:
         retention_by_key = await _post_success_retention(
             run_id=run_id,
@@ -4561,20 +4592,7 @@ async def _apply_post_success_retention(
                 "message": str(exc),
             },
         }
-    final_metrics_by_key = {**metrics, "retention": retention_by_key}
-    try:
-        await (
-            db.update(ProviderProfileImportRun.__table__)
-            .where(ProviderProfileImportRun.run_id == run_id)
-            .values(metrics=final_metrics_by_key)
-            .status()
-        )
-    except Exception as exc:
-        retention_by_key["metrics_persist_error"] = {
-            "type": type(exc).__name__,
-            "message": str(exc),
-        }
-    return final_metrics_by_key
+    return {**metrics, "retention": retention_by_key}
 
 
 def _ordered_source_keys(source_keys: Iterable[str]) -> tuple[str, ...]:
@@ -4591,13 +4609,9 @@ def _partial_publish_reasons(
     max_providers: int | None,
 ) -> list[str]:
     reasons: list[str] = []
-    missing_default_sources = sorted(
-        set(DEFAULT_SOURCE_KEYS) - set(selected_keys)
-    )
+    missing_default_sources = sorted(set(DEFAULT_SOURCE_KEYS) - set(selected_keys))
     if missing_default_sources:
-        reasons.append(
-            f"missing_default_sources:{','.join(missing_default_sources)}"
-        )
+        reasons.append(f"missing_default_sources:{','.join(missing_default_sources)}")
     if max_providers is not None:
         reasons.append(f"max_providers:{max_providers}")
     return reasons
@@ -4705,11 +4719,7 @@ def _profile_categories(
         items = list(grouped.get(category, {}).values())
         categories_by_key[category] = {
             "availability": (
-                "available"
-                if items
-                else "not_reported"
-                if category in loaded_categories
-                else "unavailable"
+                "available" if items else "not_reported" if category in loaded_categories else "unavailable"
             ),
             "items": items,
         }
@@ -4744,19 +4754,13 @@ def _projection(
         ],
     }
     serialized_evidence = sorted(
-        {
-            json.dumps(evidence_by_field, sort_keys=True)
-            for evidence_by_field in evidence_items
-        }
+        {json.dumps(evidence_by_field, sort_keys=True) for evidence_by_field in evidence_items}
     )
     evidence_json_by_key = {
         "schema_version": PROFILE_SCHEMA_VERSION,
         "npi": npi,
         "generation_id": generation_id,
-        "records": [
-            json.loads(serialized_evidence_by_field)
-            for serialized_evidence_by_field in serialized_evidence
-        ],
+        "records": [json.loads(serialized_evidence_by_field) for serialized_evidence_by_field in serialized_evidence],
     }
     return profile_by_key, evidence_json_by_key
 
@@ -4770,20 +4774,18 @@ async def import_florida_mqa_profile(
     allow_volume_drop: bool = False,
     artifact_root: Path | None = None,
     control_run_id: str | None = None,
-    manage_db: bool = True,
+    **execution_options,
 ) -> dict[str, Any]:
     """Import, validate, and atomically publish one Florida provider-profile generation."""
+    if set(execution_options) - {"manage_db", "control_context"}:
+        raise TypeError("unsupported Florida execution option")
+    manage_db = execution_options.get("manage_db", True)
+    control_context = execution_options.get("control_context")
     load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-    email = (
-        os.getenv("HLTHPRT_FL_MQA_USERNAME")
-        or os.getenv("HLTHPRT_FL_MQA_EMAIL")
-        or ""
-    ).strip()
+    email = (os.getenv("HLTHPRT_FL_MQA_USERNAME") or os.getenv("HLTHPRT_FL_MQA_EMAIL") or "").strip()
     password = os.getenv("HLTHPRT_FL_MQA_PASSWORD", "")
     if not email or not password:
-        raise RuntimeError(
-            "HLTHPRT_FL_MQA_USERNAME and HLTHPRT_FL_MQA_PASSWORD are required"
-        )
+        raise RuntimeError("HLTHPRT_FL_MQA_USERNAME and HLTHPRT_FL_MQA_PASSWORD are required")
     selected_keys = _ordered_source_keys(source_keys)
     unknown = sorted(set(selected_keys) - FLORIDA_SOURCES.keys())
     if unknown:
@@ -4824,39 +4826,23 @@ async def import_florida_mqa_profile(
         )
     )
     if min_first_publish_providers < 1:
-        raise ValueError(
-            "HLTHPRT_FL_MQA_MIN_FIRST_PUBLISH_PROVIDERS must be at least 1"
-        )
+        raise ValueError("HLTHPRT_FL_MQA_MIN_FIRST_PUBLISH_PROVIDERS must be at least 1")
     if not 0 < min_publish_ratio <= 1:
         raise ValueError("HLTHPRT_FL_MQA_MIN_PUBLISH_RATIO must be in (0, 1]")
     if failed_retention_days < 0:
-        raise ValueError(
-            "HLTHPRT_FL_MQA_FAILED_RUN_RETENTION_DAYS must be non-negative"
-        )
+        raise ValueError("HLTHPRT_FL_MQA_FAILED_RUN_RETENTION_DAYS must be non-negative")
     if max_quarantined_rows < 0:
-        raise ValueError(
-            "HLTHPRT_FL_MQA_MAX_QUARANTINED_ROWS_PER_SOURCE "
-            "must be non-negative"
-        )
+        raise ValueError("HLTHPRT_FL_MQA_MAX_QUARANTINED_ROWS_PER_SOURCE must be non-negative")
     if not 0 <= max_quarantined_ratio <= 1:
-        raise ValueError(
-            "HLTHPRT_FL_MQA_MAX_QUARANTINED_ROW_RATIO must be in [0, 1]"
-        )
+        raise ValueError("HLTHPRT_FL_MQA_MAX_QUARANTINED_ROW_RATIO must be in [0, 1]")
 
     run_id = (
-        hashlib.sha256(
-            f"florida-mqa-control:{control_run_id}".encode()
-        ).hexdigest()
+        hashlib.sha256(f"florida-mqa-control:{control_run_id}".encode()).hexdigest()
         if control_run_id
         else uuid.uuid4().hex
     )
     started_at = _utcnow()
-    root = artifact_root or Path(
-        os.getenv(
-            "HLTHPRT_FL_MQA_ARTIFACT_ROOT",
-            "/data/healthporta/florida-mqa",
-        )
-    )
+    root = artifact_root or _artifact_root()
     run_root = root / run_id
     if manage_db:
         await db.connect()
@@ -5014,9 +5000,7 @@ async def import_florida_mqa_profile(
                     [run_row_by_key],
                     "run_id",
                 )
-                raise RuntimeError(
-                    f"florida_mqa_schema_changed:{profile_source.key}:{','.join(missing)}"
-                )
+                raise RuntimeError(f"florida_mqa_schema_changed:{profile_source.key}:{','.join(missing)}")
             async for row_number, raw_row, source_row, header in normalization_rows(
                 _iter_rows(path, profile_source, parser_metrics=source_metric_by_key),
                 title=profile_source.title,
@@ -5028,9 +5012,7 @@ async def import_florida_mqa_profile(
                 source_metric_by_key["rows"] += 1
                 if header != header_seen:
                     source_metric_by_key["schema_complete"] = False
-                    source_metric_by_key["missing_required_fields"] = [
-                        "inconsistent_header"
-                    ]
+                    source_metric_by_key["missing_required_fields"] = ["inconsistent_header"]
                     run_row_by_key["metrics"] = {
                         "artifacts": len(artifacts_by_key),
                         "counter_semantics": "physical_input",
@@ -5054,18 +5036,14 @@ async def import_florida_mqa_profile(
                         [run_row_by_key],
                         "run_id",
                     )
-                    raise RuntimeError(
-                        f"florida_mqa_schema_changed:{profile_source.key}:inconsistent_header"
-                    )
+                    raise RuntimeError(f"florida_mqa_schema_changed:{profile_source.key}:inconsistent_header")
                 if source_row.get("_source_parse_quarantine"):
                     source_record_key = _record_key(
                         profile_source,
                         source_row,
                         row_number,
                     )
-                    record_id = hashlib.sha256(
-                        f"{run_id}:{source_record_key}".encode()
-                    ).hexdigest()
+                    record_id = hashlib.sha256(f"{run_id}:{source_record_key}".encode()).hexdigest()
                     source_records.append(
                         _retained_source_record(
                             record_id=record_id,
@@ -5108,9 +5086,7 @@ async def import_florida_mqa_profile(
                         _first(source_row, "rank_cde", "rank_code"),
                     )
                     if profession_name and all(profession_detail):
-                        discovered_profession_details[
-                            _name_token(profession_name)
-                        ].add(profession_detail)
+                        discovered_profession_details[_name_token(profession_name)].add(profession_detail)
                 match_row = _canonical_match_row(
                     profile_source,
                     source_row,
@@ -5216,13 +5192,12 @@ async def import_florida_mqa_profile(
                     await _upsert_rows(ProviderProfileFact, facts, "fact_id")
                     facts.clear()
             source_metric_by_key["quarantine_ratio"] = (
-                source_metric_by_key["quarantined_rows"]
-                / source_metric_by_key["rows"]
+                source_metric_by_key["quarantined_rows"] / source_metric_by_key["rows"]
                 if source_metric_by_key["rows"]
                 else 0.0
             )
-            source_metric_by_key["quarantine_within_threshold"] = (
-                _is_source_quarantine_within_threshold(source_metric_by_key)
+            source_metric_by_key["quarantine_within_threshold"] = _is_source_quarantine_within_threshold(
+                source_metric_by_key
             )
             source_metric_by_key["validated"] = bool(
                 source_metric_by_key["schema_complete"]
@@ -5248,8 +5223,11 @@ async def import_florida_mqa_profile(
                 "run_id",
             )
             normalization_completed(
-                profile_source, source_index, len(selected_keys),
-                run_row_by_key["metrics"], enqueue_live_progress,
+                profile_source,
+                source_index,
+                len(selected_keys),
+                run_row_by_key["metrics"],
+                enqueue_live_progress,
             )
 
         await _upsert_rows(ProviderProfileSourceRecord, source_records, "record_id")
@@ -5320,10 +5298,7 @@ async def import_florida_mqa_profile(
                 expected_source_keys=selected_keys,
             )
             if source_validation_reasons:
-                raise RuntimeError(
-                    "provider_profile_source_validation_guard:"
-                    + ",".join(source_validation_reasons)
-                )
+                raise RuntimeError("provider_profile_source_validation_guard:" + ",".join(source_validation_reasons))
             enqueue_live_progress(
                 phase="publishing",
                 pct=94,
@@ -5341,7 +5316,10 @@ async def import_florida_mqa_profile(
                 allow_volume_drop=allow_volume_drop,
                 min_first_publish_providers=min_first_publish_providers,
                 min_publish_ratio=min_publish_ratio,
+                control_context=control_context,
             )
+            if (control_context or {}).get("context", {}).get("control_run_handoff_committed") is True:
+                return {"run_id": run_id, "control_run_id": control_run_id, **metrics_by_key}
         else:
             publication_by_key = {
                 "publication": "skipped_partial",
@@ -5393,16 +5371,17 @@ async def import_florida_mqa_profile(
             **metrics_by_key,
         }
     except BaseException as exc:
+        publication_context = (control_context or {}).get("context") or {}
+        if publication_context.get("control_run_handoff_committed") or publication_context.get(
+            "source_profile_commit_unknown"
+        ):
+            raise
         cleanup_error: str | None = None
         projection_schema = ProviderProfileProjection.__table__.schema or "mrf"
-        projection_stage = (
-            f"{ProviderProfileProjection.__tablename__}_{run_id[:16]}"
-        )
+        projection_stage = f"{ProviderProfileProjection.__tablename__}_{run_id[:16]}"
         if re.fullmatch(r"[a-z0-9_]+", projection_stage):
             try:
-                await db.status(
-                    f"DROP TABLE IF EXISTS {projection_schema}.{projection_stage};"
-                )
+                await db.status(f"DROP TABLE IF EXISTS {projection_schema}.{projection_stage};")
             except Exception as cleanup_exc:
                 cleanup_error = f"{type(cleanup_exc).__name__}: {cleanup_exc}"
         failure_status_error = await _mark_failed_run_status(
@@ -5433,6 +5412,17 @@ async def import_florida_mqa_profile(
             await db.disconnect()
 
 
+def _requested_source_keys(sources):
+    """Normalize the existing worker selector without widening supported source names."""
+    return (
+        list(DEFAULT_SOURCE_KEYS)
+        if sources is None
+        else [source_key.strip() for source_key in sources.split(",") if source_key.strip()]
+        if isinstance(sources, str)
+        else [str(source_key).strip() for source_key in sources if str(source_key).strip()]
+    )
+
+
 async def process_data(
     *,
     sources: str | Iterable[str] | None = None,
@@ -5441,25 +5431,21 @@ async def process_data(
     publish_partial: bool = False,
     allow_volume_drop: bool = False,
     run_id: str | None = None,
+    _control_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Worker entry point using the shared database connection."""
-    source_keys = (
-        list(DEFAULT_SOURCE_KEYS)
-        if sources is None
-        else
-        [value.strip() for value in sources.split(",") if value.strip()]
-        if isinstance(sources, str)
-        else [str(value).strip() for value in sources if str(value).strip()]
-    )
-    return await import_florida_mqa_profile(
-        source_keys=source_keys,
-        max_providers=max_providers,
-        only_matched=only_matched,
-        publish_partial=publish_partial,
-        allow_volume_drop=allow_volume_drop,
-        control_run_id=run_id,
-        manage_db=False,
-    )
+    options_by_field = {
+        "source_keys": _requested_source_keys(sources),
+        "max_providers": max_providers,
+        "only_matched": only_matched,
+        "publish_partial": publish_partial,
+        "allow_volume_drop": allow_volume_drop,
+        "control_run_id": run_id,
+        "manage_db": False,
+    }
+    if _control_context is not None:
+        options_by_field["control_context"] = _control_context
+    return await import_florida_mqa_profile(**options_by_field)
 
 
 @click.command(help="Import Florida MQA practitioner profile facts.")

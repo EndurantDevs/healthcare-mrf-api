@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import importlib
-from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, call
 
 import pytest
@@ -28,18 +27,12 @@ RC_HTML = """
 
 
 def _pos_html_for_codes(codes: list[str]) -> str:
-    body = "".join(
-        f"<tr><td>{code}</td><td>POS {code}</td><td>Description {code}</td></tr>"
-        for code in codes
-    )
+    body = "".join(f"<tr><td>{code}</td><td>POS {code}</td><td>Description {code}</td></tr>" for code in codes)
     return f"<table>{body}</table>"
 
 
 def _revenue_html_for_codes(codes: list[str]) -> str:
-    body = "".join(
-        f"<tr><td>{code}</td><td>Revenue {code}</td></tr>"
-        for code in codes
-    )
+    body = "".join(f"<tr><td>{code}</td><td>Revenue {code}</td></tr>" for code in codes)
     return f"<table>{body}</table>"
 
 
@@ -51,7 +44,7 @@ def _stub_import_dependencies(
 ) -> tuple[AsyncMock, AsyncMock, AsyncMock]:
     ensure_database = AsyncMock()
     ensure_catalog = AsyncMock()
-    upsert_rows = AsyncMock(side_effect=lambda _schema, code_rows: len(code_rows))
+    prepare = AsyncMock(side_effect=lambda _db, _ctx, **options: {**options["metrics"], "status": "prepared"})
     source_html_by_url = {
         code_sets.DEFAULT_POS_URL: pos_html,
         code_sets.DEFAULT_RC_URL: rc_html,
@@ -59,21 +52,15 @@ def _stub_import_dependencies(
 
     monkeypatch.setattr(code_sets, "ensure_database", ensure_database)
     monkeypatch.setattr(code_sets, "_ensure_code_catalog", ensure_catalog)
-    monkeypatch.setattr(code_sets, "_upsert_code_rows", upsert_rows)
-    monkeypatch.setattr(code_sets, "publish_local_generation", AsyncMock())
+    monkeypatch.setattr(code_sets, "prepare_catalog_handoff", prepare)
     monkeypatch.setattr(code_sets.db, "status", AsyncMock())
 
-    @asynccontextmanager
-    async def transaction():
-        yield object()
-
-    monkeypatch.setattr(code_sets.db, "transaction", transaction)
     monkeypatch.setattr(
         code_sets,
         "_download_text",
         lambda url: source_html_by_url[url],
     )
-    return ensure_database, ensure_catalog, upsert_rows
+    return ensure_database, ensure_catalog, prepare
 
 
 def test_parse_pos_rows_expand_ranges_and_normalize_html_text():
@@ -243,7 +230,7 @@ def test_download_text_honors_response_charset_with_utf8_fallback(
 
 
 @pytest.mark.asyncio
-async def test_ensure_code_catalog_creates_and_normalizes_catalog(monkeypatch):
+async def test_ensure_code_catalog_does_not_alter_live_shape(monkeypatch):
     create_table = AsyncMock()
     execute_status = AsyncMock()
     monkeypatch.setattr(code_sets.db, "create_table", create_table)
@@ -255,59 +242,36 @@ async def test_ensure_code_catalog_creates_and_normalizes_catalog(monkeypatch):
         code_sets.CodeCatalog.__table__,
         checkfirst=True,
     )
-    sql = execute_status.await_args.args[0]
-    assert "ALTER TABLE catalog_schema.code_catalog" in sql
-    assert "ALTER COLUMN code TYPE VARCHAR(128)" in sql
-
-
-@pytest.mark.asyncio
-async def test_upsert_code_rows_preserves_first_duplicate_per_system_and_code(
-    monkeypatch,
-):
-    execute_status = AsyncMock(return_value=1)
-    monkeypatch.setattr(code_sets.db, "status", execute_status)
-    code_rows = [
-        code_sets.CodeSetRow("RC", "0450", "First display", source="first"),
-        code_sets.CodeSetRow("RC", "0450", "Later display", source="later"),
-        code_sets.CodeSetRow("POS", "0450", "Different system", source="pos"),
-    ]
-
-    inserted_count = await code_sets._upsert_code_rows("mrf", code_rows)
-
-    assert inserted_count == 2
-    assert execute_status.await_count == 2
-    first_params = execute_status.await_args_list[0].kwargs
-    second_params = execute_status.await_args_list[1].kwargs
-    assert first_params["display_name"] == "First display"
-    assert first_params["source"] == "first"
-    assert second_params["code_system"] == "POS"
-    assert "ON CONFLICT (code_system, code) DO UPDATE" in (
-        execute_status.await_args_list[0].args[0]
-    )
-    assert "WHERE code_catalog.source = excluded.source" in execute_status.await_args_list[0].args[0]
-
-
-@pytest.mark.asyncio
-async def test_upsert_code_rows_does_not_write_an_empty_collection(monkeypatch):
-    execute_status = AsyncMock()
-    monkeypatch.setattr(code_sets.db, "status", execute_status)
-
-    assert await code_sets._upsert_code_rows("mrf", []) == 0
     execute_status.assert_not_awaited()
 
 
+def test_code_payloads_preserve_first_duplicate_per_system_and_code():
+    code_rows = [
+        code_sets.CodeSetRow("RC", "0450", "First display", source=code_sets.SOURCE_RC),
+        code_sets.CodeSetRow("RC", "0450", "Later display", source=code_sets.SOURCE_RC),
+        code_sets.CodeSetRow("POS", "0450", "Different system", source=code_sets.SOURCE_POS),
+    ]
+    payloads = code_sets._code_payloads(code_rows)
+    assert len(payloads) == 2
+    first_params, second_params = payloads
+    assert first_params["display_name"] == "First display"
+    assert first_params["source"] == code_sets.SOURCE_RC
+    assert second_params["code_system"] == "POS"
+    assert first_params["updated_at"] == second_params["updated_at"]
+    assert first_params["is_active"] is True
+
+
+def test_code_payloads_accept_an_empty_collection():
+    assert code_sets._code_payloads([]) == []
+
+
+def test_code_payloads_reject_foreign_source():
+    with pytest.raises(RuntimeError, match="source system differs"):
+        code_sets._code_payloads([code_sets.CodeSetRow("POS", "23", "Candidate", source="unrelated")])
+
+
 @pytest.mark.asyncio
-async def test_upsert_code_rows_rejects_foreign_source(monkeypatch):
-    monkeypatch.setattr(code_sets.db, "status", AsyncMock(return_value=0))
-
-    with pytest.raises(RuntimeError, match="owned by another source"):
-        await code_sets._upsert_code_rows(
-            "mrf", [code_sets.CodeSetRow("POS", "23", "Candidate", source=code_sets.SOURCE_POS)]
-        )
-
-
-@pytest.mark.asyncio
-async def test_import_code_sets_writes_all_sources_and_reports_counts(
+async def test_import_code_sets_prepares_all_sources_and_reports_counts(
     monkeypatch,
     capsys,
 ):
@@ -322,17 +286,17 @@ async def test_import_code_sets_writes_all_sources_and_reports_counts(
 
     ensure_database.assert_awaited_once_with(False)
     ensure_catalog.assert_awaited_once_with("mrf")
-    assert [entry.args[0] for entry in upsert_rows.await_args_list] == [
-        "mrf",
-        "mrf",
-        "mrf",
-    ]
+    upsert_rows.assert_awaited_once()
+    prepared = upsert_rows.await_args.kwargs
+    assert prepared["schema"] == "mrf" and prepared["importer"] == "code-sets"
+    assert len(prepared["payloads"]["code_catalog"]) == 14
     assert import_report == {
         "pos_rows": 4,
         "rc_rows": 2,
         "modifier_rows": 8,
         "pos_url": code_sets.DEFAULT_POS_URL,
         "rc_url": code_sets.DEFAULT_RC_URL,
+        "status": "prepared",
     }
     assert "POS=4 RC=2 MODIFIER=8" in capsys.readouterr().out
 
@@ -351,10 +315,9 @@ async def test_import_code_sets_test_mode_prefers_representative_codes(
     await code_sets.import_code_sets(test_mode=True)
 
     ensure_catalog.assert_awaited_once_with("code_schema")
-    pos_rows = upsert_rows.await_args_list[0].args[1]
-    rc_rows = upsert_rows.await_args_list[1].args[1]
-    assert [code_row.code for code_row in pos_rows] == ["21", "22", "23"]
-    assert [code_row.code for code_row in rc_rows] == ["0450", "0981"]
+    payloads = upsert_rows.await_args.kwargs["payloads"]["code_catalog"]
+    assert [entry["code"] for entry in payloads if entry["code_system"] == "POS"] == ["21", "22", "23"]
+    assert [entry["code"] for entry in payloads if entry["code_system"] == "RC"] == ["0450", "0981"]
 
 
 @pytest.mark.asyncio
@@ -364,19 +327,16 @@ async def test_import_code_sets_test_mode_falls_back_to_first_ten_rows(
     _, _, upsert_rows = _stub_import_dependencies(
         monkeypatch,
         pos_html=_pos_html_for_codes([f"{number:02}" for number in range(1, 13)]),
-        rc_html=_revenue_html_for_codes(
-            [f"{number:04}" for number in range(1, 13)]
-        ),
+        rc_html=_revenue_html_for_codes([f"{number:04}" for number in range(1, 13)]),
     )
 
     await code_sets.import_code_sets(test_mode=True)
 
-    pos_rows = upsert_rows.await_args_list[0].args[1]
-    rc_rows = upsert_rows.await_args_list[1].args[1]
-    assert [code_row.code for code_row in pos_rows] == [
+    payloads = upsert_rows.await_args.kwargs["payloads"]["code_catalog"]
+    assert [entry["code"] for entry in payloads if entry["code_system"] == "POS"] == [
         f"{number:02}" for number in range(1, 11)
     ]
-    assert [code_row.code for code_row in rc_rows] == [
+    assert [entry["code"] for entry in payloads if entry["code_system"] == "RC"] == [
         f"{number:04}" for number in range(1, 11)
     ]
 
@@ -420,7 +380,7 @@ async def test_main_returns_import_report_and_disconnects(monkeypatch):
 
     assert await code_sets.main(test_mode=True) is import_report_map
     initialize_database.assert_awaited_once_with(code_sets.db)
-    import_all_code_sets.assert_awaited_once_with(test_mode=True)
+    import_all_code_sets.assert_awaited_once_with(test_mode=True, _control_context=None)
     disconnect_database.assert_awaited_once_with()
 
 

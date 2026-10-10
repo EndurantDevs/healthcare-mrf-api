@@ -30,7 +30,9 @@ def _quoted(value: str) -> str:
     return f'"{value}"'
 
 
-async def _table_shape(session, oid: int, model) -> str:
+async def _table_shape(session, oid: int, model, *, pending_primary: bool = False) -> str:
+    from process.scoped_catalog_binding import model_ordered_columns
+
     columns = (
         await session.execute(
             text(
@@ -42,8 +44,10 @@ async def _table_shape(session, oid: int, model) -> str:
             {"oid": oid},
         )
     ).all()
-    if tuple(column_shape[0] for column_shape in columns) != tuple(column.name for column in model.__table__.columns):
-        raise RuntimeError("MS-DRG result columns differ")
+    try:
+        columns = model_ordered_columns(columns, model)
+    except ValueError as error:
+        raise RuntimeError("MS-DRG result columns differ") from error
     primary = (
         (
             await session.execute(
@@ -59,10 +63,11 @@ async def _table_shape(session, oid: int, model) -> str:
         .scalars()
         .all()
     )
-    if primary != [column.name for column in model.__table__.primary_key.columns]:
+    declared_primary_columns = [column.name for column in model.__table__.primary_key.columns]
+    if primary != ([] if pending_primary else declared_primary_columns):
         raise RuntimeError("MS-DRG result key differs")
     return hashlib.sha256(
-        json.dumps([list(map(list, columns)), primary], default=str, separators=(",", ":")).encode()
+        json.dumps([list(map(list, columns)), declared_primary_columns], default=str, separators=(",", ":")).encode()
     ).hexdigest()
 
 
@@ -151,10 +156,10 @@ async def publish_local_generation(session, schema: str, *, include_relationship
 
 async def read_current_generation(session, schema: str) -> dict:
     """Reject drift between the publication receipt and serving rows/OIDs."""
+    from process.scoped_catalog_binding import pin_catalog_source
+
     qualified = _quoted(schema)
-    await session.execute(
-        text("LOCK TABLE " + ", ".join(f"{qualified}.{_quoted(name)}" for name, _ in _SCOPES) + " IN SHARE MODE")
-    )
+    await pin_catalog_source(session, schema, _MODELS, TABLE)
     row = (
         (
             await session.execute(

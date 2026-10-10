@@ -1,8 +1,8 @@
-from datetime import UTC, datetime, timedelta
 import importlib
 import json
-from unittest.mock import AsyncMock
 import zipfile
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -13,19 +13,19 @@ from api.provider_profile import (
 )
 from db.models.provider_profile import ProviderProfileProjection
 from process.florida_mqa_profile import (
+    _PROFILE_MASTER_CATEGORIES,
     DEFAULT_SOURCE_KEYS,
     FLORIDA_SOURCES,
     PROFILE_SCHEMA_VERSION,
     STANDARD_CATEGORIES,
-    _PROFILE_MASTER_CATEGORIES,
     _artifact_header,
     _canonical_match_row,
     _clean_row,
     _delete_retained_payload_rows,
     _facts_for_row,
-    _is_generation_newer,
     _header_sha256,
     _human_display,
+    _is_generation_newer,
     _iter_rows,
     _match_master,
     _ordered_source_keys,
@@ -35,31 +35,23 @@ from process.florida_mqa_profile import (
     _record_key,
     _remove_artifact_run_directories,
     _retention_eligible_run_ids,
-    _source_ratio_guard_reasons,
     _source_header_drift_guard_reasons,
+    _source_ratio_guard_reasons,
     _source_validation_guard_reasons,
     _validated_loaded_categories,
 )
 
-florida_mqa_profile_module = importlib.import_module(
-    "process.florida_mqa_profile"
-)
+florida_mqa_profile_module = importlib.import_module("process.florida_mqa_profile")
 
 
 def test_manifest_covers_profile_and_state_report_sources():
     assert len(FLORIDA_SOURCES) == 28
-    assert FLORIDA_SOURCES["profile_master"].url.endswith(
-        "fileName=licensee_profile.txt&handler=DownloadDataFile"
-    )
-    assert FLORIDA_SOURCES["license_status"].url == (
-        "/LicenseStatus?handler=DownloadDataFile"
-    )
+    assert FLORIDA_SOURCES["profile_master"].url.endswith("fileName=licensee_profile.txt&handler=DownloadDataFile")
+    assert FLORIDA_SOURCES["license_status"].url == ("/LicenseStatus?handler=DownloadDataFile")
     assert FLORIDA_SOURCES["administrative_complaints"].assertion_type == "allegation"
     assert FLORIDA_SOURCES["administrative_complaints"].public_default is False
     cannabis = FLORIDA_SOURCES["medical_cannabis_authorization"]
-    assert cannabis.url == (
-        "/AuthtoOrderMedicalandLowTHCCannabis?handler=DownloadDataFile"
-    )
+    assert cannabis.url == ("/AuthtoOrderMedicalandLowTHCCannabis?handler=DownloadDataFile")
     assert cannabis.category == "prescribing_authorizations"
     assert cannabis.required_fields == (
         "frst_nme",
@@ -79,9 +71,7 @@ def test_manifest_covers_profile_and_state_report_sources():
         "specialties",
     )
     assert all(
-        not profile_source.public_default
-        for profile_source in FLORIDA_SOURCES.values()
-        if profile_source.sensitive
+        not profile_source.public_default for profile_source in FLORIDA_SOURCES.values() if profile_source.sensitive
     )
 
 
@@ -155,13 +145,15 @@ async def test_schema_bootstrap_and_license_index_use_the_profile_schema(monkeyp
                 type(
                     "Row",
                     (),
-                    {"_mapping": {
-                        "npi": 1000000004,
-                        "provider_license_number": "ME-12345",
-                        "healthcare_provider_taxonomy_code": "207Q00000X",
-                        "provider_first_name": "Alex",
-                        "provider_last_name": "Example",
-                    }},
+                    {
+                        "_mapping": {
+                            "npi": 1000000004,
+                            "provider_license_number": "ME-12345",
+                            "healthcare_provider_taxonomy_code": "207Q00000X",
+                            "provider_first_name": "Alex",
+                            "provider_last_name": "Example",
+                        }
+                    },
                 )()
             ]
 
@@ -280,9 +272,7 @@ def test_profile_master_expands_biography_into_distinct_categories():
         "locations",
     }
     locations = [fact for fact in facts if fact["category"] == "locations"]
-    assert {
-        tuple(fact["value_json"]["location_types"]) for fact in locations
-    } == {("mailing",), ("practice_primary",)}
+    assert {tuple(fact["value_json"]["location_types"]) for fact in locations} == {("mailing",), ("practice_primary",)}
     assert all(fact["value_json"] != source_row_by_key for fact in facts)
 
 
@@ -323,9 +313,7 @@ def test_profile_master_age_band_does_not_inherit_license_period():
     facts = _age_band_profile_master_facts()
     facts_by_type = {fact["fact_type"]: fact for fact in facts}
 
-    assert facts_by_type["age_range"]["display"] == (
-        "Reported age range: 80–90 years"
-    )
+    assert facts_by_type["age_range"]["display"] == ("Reported age range: 80–90 years")
     assert facts_by_type["age_range"]["value_json"] == {
         "minimum_years": 80,
         "maximum_years": 90,
@@ -344,8 +332,7 @@ def test_profile_master_age_band_does_not_inherit_license_period():
         "provider_address",
     }
     assert all(
-        facts_by_type[fact_type]["effective_start"] is None
-        and facts_by_type[fact_type]["effective_end"] is None
+        facts_by_type[fact_type]["effective_start"] is None and facts_by_type[fact_type]["effective_end"] is None
         for fact_type in non_license_types
     )
 
@@ -439,12 +426,8 @@ def test_cannabis_course_semantics_distinguish_ordering_from_director_eligibilit
     assert physician["value_json"]["authorization_type"] == "medical_cannabis_ordering"
     assert physician["fact_type"] == "medical_cannabis_ordering_authorization"
     assert "Authorized to order" in physician["display"]
-    assert director["value_json"]["authorization_type"] == (
-        "dispensing_organization_medical_director_eligibility"
-    )
-    assert director["fact_type"] == (
-        "dispensing_organization_medical_director_eligibility"
-    )
+    assert director["value_json"]["authorization_type"] == ("dispensing_organization_medical_director_eligibility")
+    assert director["fact_type"] == ("dispensing_organization_medical_director_eligibility")
     assert "Eligible to serve" in director["display"]
 
 
@@ -557,14 +540,8 @@ def test_licensure_history_uses_same_reviewed_contract_as_current():
 def test_headerless_license_status_keeps_first_record_and_validates_width(tmp_path):
     source = FLORIDA_SOURCES["license_status"]
     path = tmp_path / source.filename
-    first = (
-        "1501|ME|12345|Active|Clear|05/16/1979|02/28/2027|01/30/2025|"
-        "ALEX||EXAMPLE|N|N|N|N"
-    )
-    second = (
-        "1901|OS|54321|Active|Clear|05/16/1980|03/31/2028|01/31/2026|"
-        "JAMIE||SAMPLE|N|N|N|N"
-    )
+    first = "1501|ME|12345|Active|Clear|05/16/1979|02/28/2027|01/30/2025|ALEX||EXAMPLE|N|N|N|N"
+    second = "1901|OS|54321|Active|Clear|05/16/1980|03/31/2028|01/31/2026|JAMIE||SAMPLE|N|N|N|N"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("lic_status.dat", f"{first}\n{second}\n")
 
@@ -831,15 +808,11 @@ def test_complaint_and_pain_report_facts_use_reviewed_human_categories():
 
     complaint_json = json.dumps(complaint["value_json"], sort_keys=True)
     assert complaint["category"] == "complaints"
-    assert "Administrative complaint (allegation): CASE-1 — AC Filed — 2026-07-10" == (
-        complaint["display"]
-    )
+    assert "Administrative complaint (allegation): CASE-1 — AC Filed — 2026-07-10" == (complaint["display"])
     assert "9 Private Mailing Lane" not in complaint_json
     assert "EXAMPLE, ALEX" not in complaint_json
     assert pain_report["category"] == "program_reports"
-    assert pain_report["display"] == (
-        "Pain management clinic report: Synthetic Clinic — 2026 Q2"
-    )
+    assert pain_report["display"] == ("Pain management clinic report: Synthetic Clinic — 2026 Q2")
     assert pain_report["value_json"]["reporting_provider"] == {
         "profession": "Medical Doctor",
         "license_number": "83615",
@@ -945,14 +918,17 @@ def test_publication_volume_guard_rejects_small_first_load_and_large_drops():
         min_first_publish_providers=100,
         min_publish_ratio=0.8,
     ) == ["first_publish_provider_count:99<100"]
-    assert _publication_guard_reasons(
-        candidate_provider_count=800,
-        candidate_source_record_count=800,
-        current_provider_count=1_000,
-        previous_source_record_count=1_000,
-        min_first_publish_providers=100,
-        min_publish_ratio=0.8,
-    ) == []
+    assert (
+        _publication_guard_reasons(
+            candidate_provider_count=800,
+            candidate_source_record_count=800,
+            current_provider_count=1_000,
+            previous_source_record_count=1_000,
+            min_first_publish_providers=100,
+            min_publish_ratio=0.8,
+        )
+        == []
+    )
     assert _publication_guard_reasons(
         candidate_provider_count=799,
         candidate_source_record_count=799,
@@ -1024,14 +1000,14 @@ def test_source_header_drift_fails_closed_with_hashes_only():
     assert _source_header_drift_guard_reasons(
         {"education": {"header_sha256": candidate_hash}},
         {"education": {"header_sha256": previous_hash}},
-    ) == [
-        "source_header_sha256_changed:education:"
-        f"{previous_hash}->{candidate_hash}"
-    ]
-    assert _source_header_drift_guard_reasons(
-        {"education": {"header_sha256": candidate_hash}},
-        {},
-    ) == []
+    ) == [f"source_header_sha256_changed:education:{previous_hash}->{candidate_hash}"]
+    assert (
+        _source_header_drift_guard_reasons(
+            {"education": {"header_sha256": candidate_hash}},
+            {},
+        )
+        == []
+    )
 
 
 def test_loaded_categories_are_derived_only_from_validated_sources():
@@ -1155,46 +1131,26 @@ async def test_retention_failure_does_not_reclassify_published_run(
     monkeypatch,
     tmp_path,
 ):
-    class UpdateStatement:
-        def __init__(self):
-            self.persisted_values = None
-
-        def where(self, _predicate):
-            return self
-
-        def values(self, **values):
-            self.persisted_values = values
-            return self
-
-        async def status(self):
-            return 1
-
-    class FakeDb:
-        def __init__(self):
-            self.statement = UpdateStatement()
-
-        def update(self, _table):
-            return self.statement
-
-    fake_db = FakeDb()
-    monkeypatch.setattr(florida_mqa_profile_module, "db", fake_db)
+    update = Mock(side_effect=AssertionError("published payload must remain immutable"))
+    monkeypatch.setattr(florida_mqa_profile_module.db, "update", update)
     monkeypatch.setattr(
         florida_mqa_profile_module,
         "_post_success_retention",
         AsyncMock(side_effect=RuntimeError("synthetic cleanup failure")),
     )
 
+    published_metrics_by_key = {"published_providers": 12}
     metrics = await florida_mqa_profile_module._apply_post_success_retention(
         run_id="b" * 32,
-        metrics={"published_providers": 12},
+        metrics=published_metrics_by_key,
         artifact_root=tmp_path,
         failed_retention_days=7,
     )
 
     assert metrics["published_providers"] == 12
     assert metrics["retention"]["status"] == "failed"
-    assert fake_db.statement.persisted_values == {"metrics": metrics}
-    assert "status" not in fake_db.statement.persisted_values
+    assert published_metrics_by_key == {"published_providers": 12}
+    update.assert_not_called()
 
 
 def test_generation_freshness_uses_started_at_then_generation_id():
@@ -1275,10 +1231,7 @@ def _profile_master_artifact(source):
         }
     )
     return (
-        "|".join(source.expected_fields)
-        + "\n"
-        + "|".join(row_by_key[field] for field in source.expected_fields)
-        + "\n"
+        "|".join(source.expected_fields) + "\n" + "|".join(row_by_key[field] for field in source.expected_fields) + "\n"
     )
 
 
@@ -1365,9 +1318,7 @@ async def test_partial_import_deduplicates_evidence_but_cannot_publish(
     tmp_path,
 ):
     """Keep physical counters while duplicate evidence retains one identity."""
-    upserts, progress_events, connect, disconnect = (
-        _configure_duplicate_import_runtime(monkeypatch)
-    )
+    upserts, progress_events, connect, disconnect = _configure_duplicate_import_runtime(monkeypatch)
 
     operation_result = await florida_mqa_profile_module.import_florida_mqa_profile(
         source_keys=["profile_master"],
@@ -1377,24 +1328,16 @@ async def test_partial_import_deduplicates_evidence_but_cannot_publish(
 
     assert operation_result["publication"] == {
         "publication": "skipped_partial",
-        "reasons": [
-            "missing_default_sources:"
-            + ",".join(sorted(set(DEFAULT_SOURCE_KEYS) - {"profile_master"}))
-        ],
+        "reasons": ["missing_default_sources:" + ",".join(sorted(set(DEFAULT_SOURCE_KEYS) - {"profile_master"}))],
         "published_rows": 0,
     }
     assert operation_result["source_records"] == 2
     assert operation_result["retained_source_records"] == 1
     assert operation_result["physical_source_records"] == 2
     assert operation_result["counter_semantics"]["source_records"] == "physical_input"
-    assert operation_result["counter_semantics"]["retained_prefix"] == (
-        "retained_unique"
-    )
+    assert operation_result["counter_semantics"]["retained_prefix"] == ("retained_unique")
     assert operation_result["source_metrics"]["profile_master"]["rows"] == 2
-    assert (
-        operation_result["source_metrics"]["profile_master"]["counter_semantics"]
-        == "physical_input"
-    )
+    assert operation_result["source_metrics"]["profile_master"]["counter_semantics"] == "physical_input"
     assert operation_result["published_providers"] == 0
     physical_source_rows = [
         source_row
@@ -1405,8 +1348,7 @@ async def test_partial_import_deduplicates_evidence_but_cannot_publish(
     assert len(physical_source_rows) == 2
     assert len({source_row["record_id"] for source_row in physical_source_rows}) == 1
     counters_by_phase = {
-        progress_event["phase"]: progress_event.get("counters", {})
-        for progress_event in progress_events
+        progress_event["phase"]: progress_event.get("counters", {}) for progress_event in progress_events
     }
     for phase in ("validating", "completed"):
         assert counters_by_phase[phase]["source_records"] == 2
@@ -1582,9 +1524,7 @@ async def test_complete_catalog_import_requires_every_validated_source_before_pu
     published.assert_awaited_once()
     completion_metrics = published.await_args.kwargs["completion_metrics"]
     assert completion_metrics["source_records"] == len(DEFAULT_SOURCE_KEYS)
-    assert completion_metrics["physical_source_records"] == len(
-        DEFAULT_SOURCE_KEYS
-    )
+    assert completion_metrics["physical_source_records"] == len(DEFAULT_SOURCE_KEYS)
     assert completion_metrics["selected_sources"] == list(DEFAULT_SOURCE_KEYS)
 
 
@@ -1623,9 +1563,7 @@ async def test_import_failure_preserves_original_error_when_stage_cleanup_fails(
             manage_db=False,
         )
 
-    assert mark_failed.await_args.kwargs["cleanup_error"] == (
-        "RuntimeError: cleanup unavailable"
-    )
+    assert mark_failed.await_args.kwargs["cleanup_error"] == ("RuntimeError: cleanup unavailable")
 
 
 class _WorkflowStatement:
@@ -1644,6 +1582,17 @@ class _WorkflowStatement:
 
 
 class _WorkflowTransaction:
+    def in_transaction(self):
+        return True
+
+    async def scalar(self, statement, parameters):
+        assert "n.nspname='hp_snapshot_retention'" in str(statement)
+        assert parameters["relation"].endswith('."provider_profile_source_pin"')
+        return None
+
+    async def execute(self, statement):
+        assert str(statement) == "SELECT pg_current_xact_id()"
+
     async def __aenter__(self):
         return self
 
@@ -1678,8 +1627,23 @@ class _ProjectionPublicationDb:
         return _WorkflowStatement(self.write_calls)
 
 
+def _mock_projection_publication_storage(monkeypatch):
+    from process import florida_projection_archive as archive
+    from process import reference_family_archive as native
+
+    copier, indexes = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(native, "native_copy_record_batch", copier)
+    monkeypatch.setattr(native, "_create_model_indexes", indexes)
+    isolate, access = AsyncMock(return_value={"relation_oid": 10}), AsyncMock()
+    monkeypatch.setattr(archive, "isolate_ordinary_projection", isolate)
+    monkeypatch.setattr(archive, "preserve_ordinary_projection_access", access)
+    return copier, indexes, isolate, access
+
+
 @pytest.mark.asyncio
 async def test_projection_publication_builds_validated_stage_before_atomic_swap(monkeypatch):
+    """COPY, indexes and captured access precede the unchanged atomic publication."""
+    copier, indexes, isolate, access = _mock_projection_publication_storage(monkeypatch)
     workflow_db = _ProjectionPublicationDb()
     monkeypatch.setattr(florida_mqa_profile_module, "db", workflow_db)
 
@@ -1724,6 +1688,9 @@ async def test_projection_publication_builds_validated_stage_before_atomic_swap(
 
     assert publication["publication"] == "atomic_table_swap"
     assert metrics["published_providers"] == 1
+    assert copier.await_count == indexes.await_count == 1
+    isolate.assert_awaited_once()
+    assert access.await_args.args[1:] == ("mrf", isolate.return_value)
     assert any("CREATE TABLE mrf.provider_profile_projection_" in call for call in workflow_db.status_calls)
     assert any("RENAME TO provider_profile_projection_old" in call for call in workflow_db.status_calls)
     assert any("RENAME TO provider_profile_projection;" in call for call in workflow_db.status_calls)
@@ -1787,10 +1754,7 @@ def test_composer_merges_fhir_and_state_facts_into_standard_categories():
     state_profile_by_key = {
         "schema_version": PROFILE_SCHEMA_VERSION,
         "npi": 1000000004,
-        "categories": {
-            category: {"availability": "unavailable", "items": []}
-            for category in STANDARD_CATEGORIES
-        },
+        "categories": {category: {"availability": "unavailable", "items": []} for category in STANDARD_CATEGORIES},
         "sources": [
             {
                 "source_key": "synthetic-state",
@@ -1934,8 +1898,7 @@ def test_item_id_survives_state_source_join_and_departure():
         requested_categories=["identity"],
     )
     state_categories_by_key = {
-        category: {"availability": "unavailable", "items": []}
-        for category in STANDARD_CATEGORIES
+        category: {"availability": "unavailable", "items": []} for category in STANDARD_CATEGORIES
     }
     state_categories_by_key["identity"] = {
         "availability": "available",
@@ -2004,10 +1967,7 @@ def _cross_source_state_profile_fixture(name_value_by_key):
     profile_by_key = {
         "schema_version": PROFILE_SCHEMA_VERSION,
         "npi": 1000000004,
-        "categories": {
-            category: {"availability": "unavailable", "items": []}
-            for category in STANDARD_CATEGORIES
-        },
+        "categories": {category: {"availability": "unavailable", "items": []} for category in STANDARD_CATEGORIES},
         "sources": [],
     }
     profile_by_key["categories"]["identity"] = {
@@ -2119,19 +2079,14 @@ def test_composer_deduplicates_equal_cross_source_fact_and_keeps_both_evidence_p
 
     evidence = _cross_source_profile_evidence(name_value_by_key, profile)
     assert len(evidence["sources"]["state_regulator"]["records"]) == 1
-    assert len(
-        evidence["sources"]["provider_directory_fhir"]["facts"]["name"]["items"]
-    ) == 1
+    assert len(evidence["sources"]["provider_directory_fhir"]["facts"]["name"]["items"]) == 1
 
 
 def test_composer_marks_filtered_sensitive_items_restricted():
     state_profile_by_key = {
         "schema_version": PROFILE_SCHEMA_VERSION,
         "npi": 1000000004,
-        "categories": {
-            category: {"availability": "unavailable", "items": []}
-            for category in STANDARD_CATEGORIES
-        },
+        "categories": {category: {"availability": "unavailable", "items": []} for category in STANDARD_CATEGORIES},
         "sources": [],
     }
     state_profile_by_key["categories"]["complaints"] = {
@@ -2172,10 +2127,7 @@ def test_single_category_mode_is_stably_sorted_and_paginated():
         "schema_version": PROFILE_SCHEMA_VERSION,
         "npi": 1000000004,
         "generation_id": "generation-one",
-        "categories": {
-            category: {"availability": "unavailable", "items": []}
-            for category in STANDARD_CATEGORIES
-        },
+        "categories": {category: {"availability": "unavailable", "items": []} for category in STANDARD_CATEGORIES},
         "sources": [],
     }
     state_profile_by_key["categories"]["education"] = {
@@ -2205,10 +2157,7 @@ def test_single_category_mode_is_stably_sorted_and_paginated():
         "Middle College",
         "Zulu College",
     ]
-    assert all(
-        len(profile_item["item_id"]) == 64
-        for profile_item in page["categories"]["education"]["items"]
-    )
+    assert all(len(profile_item["item_id"]) == 64 for profile_item in page["categories"]["education"]["items"])
     assert page["category_pagination"] == {
         "category": "education",
         "total": 3,
@@ -2292,11 +2241,12 @@ async def test_normalization_announces_source_before_completing_it(monkeypatch, 
     """Long source work must not retain the preceding matching-stage label."""
     _, progress_events, _, _ = _configure_duplicate_import_runtime(monkeypatch)
     await florida_mqa_profile_module.import_florida_mqa_profile(
-        source_keys=["profile_master"], artifact_root=tmp_path, control_run_id="progress-run",
+        source_keys=["profile_master"],
+        artifact_root=tmp_path,
+        control_run_id="progress-run",
     )
     normalization_start = next(
-        event for event in progress_events
-        if event.get("message") == "Normalizing Florida practitioner license"
+        event for event in progress_events if event.get("message") == "Normalizing Florida practitioner license"
     )
     assert normalization_start["phase"] == "normalizing"
     assert normalization_start["file_index"] == 1

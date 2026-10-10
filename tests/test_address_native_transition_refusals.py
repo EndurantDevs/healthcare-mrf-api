@@ -523,7 +523,10 @@ async def test_native_cleanup_rechecks_catalog_and_reference_guards_before_drop(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("already_owned", [False, True])
 @pytest.mark.parametrize("unsafe", [False, True])
-async def test_native_sealing_closes_table_columns_and_sequence_mutation_without_losing_reads(already_owned, unsafe):
+@pytest.mark.parametrize("previous_select", [False, True])
+@pytest.mark.parametrize("previous_read_columns", [[], ['"evidence_id"']])
+async def test_native_sealing_read_authority(already_owned, unsafe, previous_select, previous_read_columns):
+    """Preserve only existing reads while refusing every ordinary mutation path."""
     queries = []
 
     async def execute(statement, *_args):
@@ -532,22 +535,25 @@ async def test_native_sealing_closes_table_columns_and_sequence_mutation_without
         if query.startswith("SELECT owner.oid AS owner_oid"):
             return _result([{"owner_oid": 52, "owner_safe": True, "caller_safe": True}])
         if query.startswith("SELECT quote_ident(n.nspname)"):
-            return _result(
-                [
-                    {
-                        "name": '"candidate"."entity_address_evidence"',
-                        "owner": '"synthetic_owner"',
-                        "relowner": 52 if already_owned else 54,
-                    }
-                ]
-            )
+            assert "has_table_privilege(c.relowner,c.oid,'SELECT') AND EXISTS(SELECT 1" in query
+            assert "acl.grantee=c.relowner AND acl.privilege_type='SELECT') AS previous_owner_can_select" in query
+            assert "AND acl.grantee=c.relowner AND acl.privilege_type='SELECT' ORDER BY a.attnum)" in query
+            catalog_by_field = {
+                "name": '"candidate"."entity_address_evidence"',
+                "owner": '"synthetic_owner"',
+                "relowner": 52 if already_owned else 54,
+                "previous_owner": '"prior_reader"',
+                "previous_owner_can_select": previous_select,
+                "previous_owner_read_columns": previous_read_columns,
+            }
+            return _result([catalog_by_field])
         if query.startswith("SELECT quote_ident(principal.rolname)"):
             return _result(['"synthetic_reader"'])
         if query.startswith("SELECT quote_ident(attname)"):
             return _result(['"evidence_id"', '"payload"'])
         if query.startswith("SELECT s.oid"):
             return _result([{"oid": 201, "name": '"candidate"."entity_address_evidence_evidence_id_seq"'}])
-        assert query.startswith(("ALTER TABLE", "ALTER SEQUENCE", "REVOKE")), query
+        assert query.startswith(("ALTER TABLE", "ALTER SEQUENCE", "REVOKE", "GRANT SELECT")), query
         return _result()
 
     session = SimpleNamespace(
@@ -558,7 +564,17 @@ async def test_native_sealing_closes_table_columns_and_sequence_mutation_without
             await preparation._seal_published_relation(session, 100, 52)
     else:
         await preparation._seal_published_relation(session, 100, 52)
-    assert not any("SELECT ON" in query or "REVOKE ALL" in query for query in queries)
+    assert not any(
+        "REVOKE SELECT" in query or "REVOKE ALL" in query or "WITH GRANT OPTION" in query for query in queries
+    )
+    expected_grants = []
+    if not already_owned and previous_select:
+        expected_grants.append('GRANT SELECT ON "candidate"."entity_address_evidence" TO "prior_reader"')
+    if not already_owned and previous_read_columns:
+        expected_grants.append(
+            'GRANT SELECT ("evidence_id") ON "candidate"."entity_address_evidence" TO "prior_reader"'
+        )
+    assert [query for query in queries if query.startswith("GRANT SELECT")] == expected_grants
     if already_owned:
         assert not any(query.startswith("ALTER TABLE") for query in queries)
     else:

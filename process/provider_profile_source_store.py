@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -24,7 +23,7 @@ from db.models import (
 from process.florida_mqa_profile import (
     _claim_import_run,
     _delete_retained_payload_rows,
-    _remove_artifact_run_directories,
+    _remove_retained_directories,
 )
 
 RUN_ID_PATTERN = re.compile(r"(?:[a-f0-9]{32}|[a-f0-9]{64})")
@@ -97,8 +96,8 @@ class SourceProfileStore:
 
     policy: ProfileSourcePolicy
 
-    def _table(self, model):
-        schema = model.__table__.schema or "mrf"
+    def _table(self, model, *, schema=None):
+        schema = schema or model.__table__.schema or "mrf"
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
             raise ValueError(f"{self.policy.error_prefix}_schema_invalid")
         return f'"{schema}"."{model.__table__.name}"'
@@ -256,18 +255,32 @@ class SourceProfileStore:
         """Count stored source records and public NPIs, including integrity failures."""
         return (await self._retained_counts_by_run([run_id]))[run_id]
 
-    async def _retained_counts_by_run(self, run_ids):
+    async def _retained_counts_by_run(self, run_ids, *, schema=None, session=None):
         """Count retained rows and integrity failures for each validated run."""
 
         run_ids = sorted({self._run_id(run_id) for run_id in run_ids})
         if not run_ids:
             return {}
-        source_records = self._table(ProviderProfileSourceRecord)
-        facts = self._table(ProviderProfileFact)
-        artifacts = self._table(ProviderProfileArtifact)
-        runs = self._table(ProviderProfileImportRun)
-        count_rows = await db.all(
-            text(f"""
+        statement = self._retained_counts_statement(schema)
+        parameters_by_field = {
+            "run_ids": run_ids,
+            "source_key": self.policy.source_key,
+            "schema_version": self.policy.schema_version,
+        }
+        count_rows = (
+            (await session.execute(statement, parameters_by_field)).all()
+            if session is not None
+            else await db.all(statement, **parameters_by_field)
+        )
+        return _counts_by_run(count_rows)
+
+    def _retained_counts_statement(self, schema):
+        """Use the same scoped aggregate SQL for ordinary and caller-owned transactions."""
+        source_records = self._table(ProviderProfileSourceRecord, schema=schema)
+        facts = self._table(ProviderProfileFact, schema=schema)
+        artifacts = self._table(ProviderProfileArtifact, schema=schema)
+        runs = self._table(ProviderProfileImportRun, schema=schema)
+        return text(f"""
             WITH source_counts AS (
                 SELECT run_id, count(*) AS retained_source_records,
                    count(*) FILTER (WHERE {self.policy.received_profile_sql}) AS received_profiles,
@@ -309,12 +322,7 @@ class SourceProfileStore:
               FROM unnest(CAST(:run_ids AS text[])) AS requested(run_id)
               LEFT JOIN source_counts USING (run_id) LEFT JOIN fact_counts USING (run_id)
               LEFT JOIN artifact_counts USING (run_id)
-        """),
-            run_ids=run_ids,
-            source_key=self.policy.source_key,
-            schema_version=self.policy.schema_version,
-        )
-        return _counts_by_run(count_rows)
+        """)
 
     def _completion_metrics(self, run_by_field, metrics, counts_by_field):
         manifest = self._manifest(run_by_field)
@@ -360,12 +368,17 @@ class SourceProfileStore:
 
     async def publish_run(self, run_id, *, expected_current_run_id, metrics):
         """Atomically complete a validated full run and advance its source pointer."""
-        async with db.transaction():
+        from process.source_profile_result_archive import require_ordinary_publication_authority
+
+        async with db.transaction() as session:
+            await require_ordinary_publication_authority(session, ProviderProfileImportRun.__table__.schema or "mrf")
             await self._lock_source()
             candidate_run = await self._read_run(run_id)
             if candidate_run["status"] not in ACTIVE_STATUSES:
                 raise RuntimeError(f"{self.policy.error_prefix}_run_not_active")
             manifest = self._manifest(candidate_run)
+            if manifest.get("bundle_contract") is not None:
+                raise RuntimeError(f"{self.policy.error_prefix}_native_publication_required")
             if manifest["max_providers"] is not None:
                 raise RuntimeError(f"{self.policy.error_prefix}_bounded_publication_forbidden")
             if manifest["expected_current_run_id"] != expected_current_run_id:
@@ -406,8 +419,11 @@ class SourceProfileStore:
             await self._complete_run(run_id, {**final_metrics, "published": False})
         return {**final_metrics, "published": False, "run_id": run_id}
 
-    async def mark_run_failed(self, run_id, error):
+    async def mark_run_failed(self, run_id, error, *, ctx=None):
         """Record failure without downgrading a completed publication or test run."""
+        context = (ctx or {}).get("context") or {}
+        if context.get("control_run_handoff_committed") or context.get("source_profile_commit_unknown"):
+            return
         async with db.transaction():
             await self._lock_source()
             run_by_field = await self._read_run(run_id)
@@ -502,9 +518,7 @@ class SourceProfileStore:
             await self._assert_source_ownership(eligible_run_ids)
             deleted_by_kind = await _delete_retained_payload_rows(eligible_run_ids) if eligible_run_ids else {}
             # Keep the same source lock through exact directory deletion so a resume cannot race cleanup.
-            directory_receipt = await asyncio.to_thread(
-                _remove_artifact_run_directories, Path(artifact_root), eligible_run_ids
-            )
+            directory_receipt = await _remove_retained_directories(Path(artifact_root), eligible_run_ids)
         return {
             "status": "completed_with_directory_errors" if directory_receipt["errors"] else "completed",
             "source_key": self.policy.source_key,

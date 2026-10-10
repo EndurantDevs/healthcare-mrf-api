@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -392,6 +393,468 @@ async def current_identity(session, schema):
     return {"run_id": run_id, "relation_oid": oid}
 
 
+async def publication_pointer(session, schema):
+    """Use exact live/rollback relations as the shared lifecycle's local CAS token."""
+    if await native._relation_oid(session, schema, "provider_profile_source_publication") is not None:
+        managed = (
+            (
+                await session.execute(
+                    text(
+                        f"SELECT current_run_id,previous_run_id FROM {_table(schema, 'provider_profile_source_publication')} "
+                        "WHERE source_key=:source"
+                    ),
+                    {"source": FL_MQA_SOURCE_KEY},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if managed is not None:
+            current_oid = await _retained_run_projection_oid(session, schema, managed["current_run_id"], serving=True)
+            previous = managed["previous_run_id"]
+            previous_oid = await _retained_run_projection_oid(session, schema, previous) if previous else None
+            return {
+                "current_run_id": managed["current_run_id"],
+                "current_relation_oid": current_oid,
+                "previous_run_id": previous,
+                "previous_relation_oid": previous_oid,
+            }
+    pointer_by_field = {}
+    for name, prefix in ((PROJECTION, "current"), (PROJECTION + "_old", "previous")):
+        oid = await native._relation_oid(session, schema, name)
+        require(oid is not None or prefix == "previous", "Florida projection is unavailable")
+        generations = (
+            []
+            if oid is None
+            else (await session.execute(text(f"SELECT DISTINCT generation_id FROM {_table(schema, name)} LIMIT 2")))
+            .scalars()
+            .all()
+        )
+        require(len(generations) <= 1, "Florida live generation is mixed")
+        run_id = generations[0] if generations else None
+        if run_id is not None:
+            _validate_run(await _run(session, schema, run_id))
+        pointer_by_field[prefix + "_run_id"] = run_id
+        pointer_by_field[prefix + "_relation_oid"] = oid
+    return pointer_by_field
+
+
+def retained_projection_name(relation_oid):
+    """An alias retains the original heap; reconstructing an equal heap is not rollback."""
+    require(type(relation_oid) is int and 0 < relation_oid < 2**32, "Florida retained OID differs")
+    return f"{PROJECTION}_retained_{relation_oid}"
+
+
+async def _retained_run_projection_oid(session, schema, run_id, *, serving=False):
+    proofs = (
+        (
+            await session.execute(
+                text(
+                    f"SELECT authority_json FROM {_table(schema, pins.TABLE)} WHERE source_key=:source AND run_id=:run "
+                    "AND purpose='adoption' AND authority_json->>'root_run_id'=:run LIMIT 65"
+                ),
+                {"source": FL_MQA_SOURCE_KEY, "run": run_id},
+            )
+        )
+        .scalars()
+        .all()
+    )
+    require(0 < len(proofs) <= 64, "Florida retained serving authority is unavailable")
+    oids = set()
+    for proof in proofs:
+        validation = proof.get("validation") or {}
+        if validation.get("contract") == profiles.NATIVE_PUBLICATION_CONTRACT:
+            oids.add(validation["handoff"]["projection"]["relation_oid"])
+        elif validation.get("contract") == profiles.NATIVE_CAPTURE_CONTRACT:
+            oids.add(validation["serving"]["relation_oid"])
+        elif validation.get("contract") == profiles.VALIDATION_CONTRACT:
+            oids.add(validation["projection"]["cutover"]["relation_oid"])
+    require(len(oids) == 1, "Florida retained serving authority differs")
+    oid = oids.pop()
+    name = PROJECTION if serving else retained_projection_name(oid)
+    require(await native._relation_oid(session, schema, name) == oid, "Florida retained serving heap changed")
+    return oid
+
+
+async def publish_retained_projection(session, schema, seal, expected, run_id, owner_oid):
+    """Move only authenticated serving heaps; old pinned aliases are never rotated away."""
+    from process.entity_address_snapshot_preparation import _seal_published_relation
+
+    require(await native.protected_publisher_owner(session) == owner_oid, "Florida retained publisher differs")
+    await _publication_lock(session, schema)
+    require(await publication_pointer(session, schema) == expected, "Florida retained predecessor changed")
+    await native._lock_family(session, schema, (PROJECTION, seal["table_name"]), "ACCESS EXCLUSIVE", nowait=True)
+    require(
+        await native._relation_oid(session, schema, seal["table_name"]) == seal["relation_oid"],
+        "Florida retained candidate changed",
+    )
+    require(
+        await session.scalar(text("SELECT relowner FROM pg_class WHERE oid=:oid"), {"oid": seal["relation_oid"]})
+        == owner_oid,
+        "Florida retained owner changed",
+    )
+    require(
+        not await session.scalar(
+            text(
+                "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE contype='f' AND confrelid=:oid "
+                "UNION ALL SELECT 1 FROM pg_depend d JOIN pg_rewrite r ON r.oid=d.objid "
+                "WHERE d.classid='pg_rewrite'::regclass AND d.refobjid=:oid AND r.ev_class<>:oid)"
+            ),
+            {"oid": expected["current_relation_oid"]},
+        ),
+        "Florida live projection has external dependents",
+    )
+    retained_name = retained_projection_name(expected["current_relation_oid"])
+    require(await native._relation_oid(session, schema, retained_name) is None, "Florida retained alias exists")
+    await _preserve_retained_read_access(
+        session, schema, seal["table_name"], expected["current_relation_oid"], owner_oid
+    )
+    if expected["current_run_id"] is None:
+        require(
+            not await session.scalar(text(f"SELECT EXISTS(SELECT 1 FROM {_table(schema, PROJECTION)})")),
+            "Florida bootstrap predecessor is not empty",
+        )
+        await session.execute(text(f"DROP TABLE {_table(schema, PROJECTION)} RESTRICT"))
+    else:
+        await session.execute(
+            text(f"ALTER TABLE {_table(schema, PROJECTION)} RENAME TO {native._quoted(retained_name)}")
+        )
+    await session.execute(
+        text(f"ALTER TABLE {_table(schema, seal['table_name'])} RENAME TO {native._quoted(PROJECTION)}")
+    )
+    pointer_oid = await native._relation_oid(session, schema, "provider_profile_source_publication")
+    await _seal_published_relation(session, pointer_oid, owner_oid)
+    await session.execute(
+        text(
+            f"INSERT INTO {_table(schema, 'provider_profile_source_publication')} "
+            "(source_key,current_run_id,previous_run_id,published_at) VALUES(:source,:run,:previous,clock_timestamp()) "
+            "ON CONFLICT(source_key) DO UPDATE SET current_run_id=EXCLUDED.current_run_id,"
+            "previous_run_id=EXCLUDED.previous_run_id,published_at=EXCLUDED.published_at"
+        ),
+        {"source": FL_MQA_SOURCE_KEY, "run": run_id, "previous": expected["current_run_id"]},
+    )
+    return {"run_id": run_id, "relation_oid": seal["relation_oid"]}
+
+
+async def _preserve_retained_read_access(session, schema, name, live_oid, owner_oid):
+    """Preserve effective reads, not the ordinary writer's old DDL/DML authority."""
+    security = await _live_projection_security(session, live_oid)
+    grants = await _retained_read_grants(session, live_oid)
+    await _apply_retained_read_grants(session, schema, name, grants, security["relowner"], owner_oid)
+
+
+async def _retained_read_grants(session, live_oid):
+    grants = (
+        (
+            await session.execute(
+                text(
+                    "SELECT a.grantee,a.is_grantable,r.rolname FROM pg_class c "
+                    "CROSS JOIN LATERAL aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) a "
+                    "LEFT JOIN pg_roles r ON r.oid=a.grantee WHERE c.oid=:oid AND a.privilege_type='SELECT'"
+                ),
+                {"oid": live_oid},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    require(len(grants) <= 128, "Florida read ACL exceeds its bound")
+    return grants
+
+
+async def _apply_retained_read_grants(session, schema, name, grants, previous_owner_oid, owner_oid):
+    await _clear_stage_grants(session, schema, name, owner_oid)
+    for grant in grants:
+        if grant["grantee"] == owner_oid:
+            continue
+        require(grant["grantee"] == 0 or isinstance(grant["rolname"], str), "Florida read role changed")
+        grantee = "PUBLIC" if grant["grantee"] == 0 else _role_ident(grant["rolname"])
+        grant_option = grant["is_grantable"] and grant["grantee"] != previous_owner_oid
+        await session.execute(
+            text(
+                f"GRANT SELECT ON TABLE {_table(schema, name)} TO {grantee}"
+                + (" WITH GRANT OPTION" if grant_option else "")
+            )
+        )
+
+
+async def seal_retained_projection(session, schema, serving, owner_oid):
+    """Transfer the same first-use heap while retaining every incumbent effective read."""
+    from process.entity_address_snapshot_preparation import _seal_published_relation
+
+    await native._lock_family(session, schema, (serving["table_name"],), "ACCESS EXCLUSIVE", nowait=True)
+    require(
+        await native._relation_oid(session, schema, serving["table_name"]) == serving["relation_oid"],
+        "Florida capture serving heap changed",
+    )
+    security = await _live_projection_security(session, serving["relation_oid"])
+    grants = await _retained_read_grants(session, serving["relation_oid"])
+    await _seal_published_relation(session, serving["relation_oid"], owner_oid)
+    await _apply_retained_read_grants(session, schema, serving["table_name"], grants, security["relowner"], owner_oid)
+
+
+def validate_native_run(run):
+    """Carry only a complete ordinary publication and its existing source policy."""
+    florida = importlib.import_module("process.florida_mqa_profile")
+
+    _validate_run(run)
+    manifest, metrics = run["source_manifest"], run["metrics"]
+    source_keys = manifest["sources"]
+    require(
+        manifest.get("partial_publish_reasons") == []
+        and not florida._partial_publish_reasons(source_keys, None)
+        and len(source_keys) == len(set(source_keys))
+        and set(source_keys) <= set(florida.FLORIDA_SOURCES)
+        and metrics.get("selected_sources") == source_keys
+        and isinstance(metrics.get("source_metrics"), Mapping)
+        and set(metrics["source_metrics"]) == set(source_keys),
+        "Florida source completeness differs",
+    )
+    require(
+        not florida._source_validation_guard_reasons(metrics["source_metrics"], expected_source_keys=source_keys),
+        "Florida source validation differs",
+    )
+    guard = manifest.get("publication_guard")
+    require(
+        isinstance(guard, Mapping)
+        and type(guard.get("min_first_publish_providers")) is int
+        and guard["min_first_publish_providers"] > 0
+        and type(guard.get("min_publish_ratio")) in (int, float)
+        and 0 < guard["min_publish_ratio"] <= 1
+        and type(manifest.get("allow_volume_drop")) is bool
+        and run["started_at"] <= run["finished_at"],
+        "Florida publication policy differs",
+    )
+
+
+async def validate_native_result(session, schema, run_id):
+    """Check the closed typed evidence/projection set without rematching or row hashes."""
+    run = await _run(session, schema, run_id)
+    validate_native_run(run)
+    generation_id, count = await _projection_identity(session, schema)
+    require(
+        generation_id == run_id and count == run["metrics"]["published_providers"],
+        "Florida projection receipt differs",
+    )
+    await _verify_evidence_lineage(session, schema, run_id)
+    artifact_table = _table(schema, TABLES[1])
+    source_records_table = _table(schema, TABLES[2])
+    facts = _table(schema, TABLES[3])
+    projection = _table(schema, PROJECTION)
+    require(
+        await session.scalar(
+            text(
+                f"SELECT NOT EXISTS(SELECT 1 FROM {artifact_table} WHERE run_id=:run AND "
+                "(NOT(source_key=ANY(CAST(:sources AS text[]))) OR content_bytes<=0 OR content_sha256 !~ '^[0-9a-f]{64}$')) "
+                f"AND (SELECT count(DISTINCT source_key) FROM {artifact_table} WHERE run_id=:run)=:source_count "
+                f"AND EXISTS(SELECT 1 FROM {source_records_table} WHERE run_id=:run) "
+                f"AND EXISTS(SELECT 1 FROM {facts} WHERE run_id=:run) "
+                f"AND NOT EXISTS(SELECT 1 FROM {facts} f JOIN {source_records_table} r ON r.record_id=f.source_record_id "
+                "WHERE f.run_id=:run AND f.npi IS DISTINCT FROM r.matched_npi) "
+                f"AND NOT EXISTS(SELECT 1 FROM {projection} p WHERE p.generation_id<>:run "
+                "OR p.schema_version<>:version OR p.source_keys::jsonb<>CAST(:keys AS jsonb) "
+                f"OR NOT EXISTS(SELECT 1 FROM {facts} f WHERE f.run_id=:run AND f.npi=p.npi)) "
+                f"AND NOT EXISTS(SELECT 1 FROM {facts} f WHERE f.run_id=:run AND f.npi IS NOT NULL "
+                f"AND NOT EXISTS(SELECT 1 FROM {projection} p WHERE p.npi=f.npi))"
+            ),
+            {
+                "run": run_id,
+                "sources": run["source_manifest"]["sources"],
+                "source_count": len(run["source_manifest"]["sources"]),
+                "version": PROFILE_SCHEMA_VERSION,
+                "keys": '["florida-mqa"]',
+            },
+        )
+        is True,
+        "Florida native evidence closure differs",
+    )
+
+
+def validate_native_cutover(value, expected_run_id, cutover_id):
+    """Bind the projection candidate and both predecessor OIDs to the adoption seal."""
+    require(isinstance(value, Mapping) and set(value) == {"expected", "cutover"}, "Florida native cutover differs")
+    expected, cutover = value["expected"], value["cutover"]
+    require(
+        isinstance(expected, Mapping)
+        and set(expected) == {"current_run_id", "previous_run_id", "current_relation_oid", "previous_relation_oid"}
+        and expected["current_run_id"] == expected_run_id
+        and type(expected["current_relation_oid"]) is int
+        and expected["current_relation_oid"] > 0
+        and (
+            expected["previous_relation_oid"] is None
+            or type(expected["previous_relation_oid"]) is int
+            and expected["previous_relation_oid"] > 0
+        )
+        and all(
+            value is None or isinstance(value, str) and _RUN.fullmatch(value)
+            for value in (expected["current_run_id"], expected["previous_run_id"])
+        )
+        and isinstance(cutover, Mapping)
+        and set(cutover) == {"relation_oid", "owner_oid", "table_name"}
+        and cutover["table_name"] == _cutover_name(cutover_id)
+        and all(type(cutover[key]) is int and cutover[key] > 0 for key in ("relation_oid", "owner_oid")),
+        "Florida native cutover identity differs",
+    )
+    return {"expected": dict(expected), "cutover": dict(cutover)}
+
+
+async def require_native_publication_order(session, prepared, schema, expected):
+    """Apply ordinary source/header/volume/newer fences to the received completed run."""
+    candidate = await _run(session, prepared.ownership.schema_name, prepared.manifest["run_id"])
+    current = await _run(session, schema, expected["current_run_id"]) if expected["current_run_id"] else None
+    return native_publication_policy(candidate, current)
+
+
+def native_publication_policy(candidate, current):
+    """Keep ordinary guard decisions and their audit values identical at native publication."""
+    florida = importlib.import_module("process.florida_mqa_profile")
+
+    validate_native_run(candidate)
+    metrics, manifest = candidate["metrics"], candidate["source_manifest"]
+    previous = current["metrics"] if current else {}
+    require(
+        current is None
+        or not florida._is_generation_newer(
+            current["started_at"], current["run_id"], candidate["started_at"], candidate["run_id"]
+        ),
+        "Florida newer generation is already published",
+    )
+    source_metrics, previous_sources = metrics["source_metrics"], previous.get("source_metrics", {})
+    require(
+        not florida._source_header_drift_guard_reasons(source_metrics, previous_sources),
+        "Florida source header changed",
+    )
+    policy = manifest["publication_guard"]
+    ratios = florida._source_ratio_guard_reasons(
+        source_metrics, previous_sources, min_publish_ratio=policy["min_publish_ratio"]
+    )
+    volume = florida._publication_guard_reasons(
+        candidate_provider_count=metrics["published_providers"],
+        candidate_source_record_count=metrics.get("physical_source_records") or metrics.get("source_records") or 0,
+        current_provider_count=previous.get("published_providers", 0),
+        previous_source_record_count=previous.get("physical_source_records", previous.get("source_records")),
+        min_first_publish_providers=policy["min_first_publish_providers"],
+        min_publish_ratio=policy["min_publish_ratio"],
+    )
+    require(manifest["allow_volume_drop"] or not (ratios or volume), "Florida publication volume changed")
+    return {
+        "source_guard": {
+            "allow_volume_drop": manifest["allow_volume_drop"],
+            "min_publish_ratio": policy["min_publish_ratio"],
+            "validation_reasons": [],
+            "header_reasons": [],
+            "ratio_reasons": ratios,
+        },
+        "volume_guard": {
+            "allow_volume_drop": manifest["allow_volume_drop"],
+            "candidate_providers": metrics["published_providers"],
+            "current_providers": previous.get("published_providers", 0),
+            "source_record_counter_semantics": "physical_input",
+            "candidate_source_records": metrics.get("physical_source_records") or metrics.get("source_records") or 0,
+            "previous_source_records": previous.get("physical_source_records", previous.get("source_records")),
+            "min_first_publish_providers": policy["min_first_publish_providers"],
+            "min_publish_ratio": policy["min_publish_ratio"],
+            "reasons": volume,
+        },
+    }
+
+
+async def prepare_native_cutover(session, *, prepared, schema, expected, owner_oid, cutover_id, source_copy, deadline):
+    """Reuse the fixed model copier and index/set checks for one sealed projection heap."""
+    require(isinstance(source_copy, native.ReferenceFamilySourceCopy), "Florida native COPY capability is required")
+    await require_native_publication_order(session, prepared, schema, expected)
+    name = _cutover_name(cutover_id)
+    require(await native._relation_oid(session, schema, name) is None, "Florida cutover candidate exists")
+    await session.execute(
+        text(
+            f"CREATE TABLE {_table(schema, name)} (LIKE {_table(prepared.ownership.schema_name, PROJECTION)} INCLUDING CONSTRAINTS EXCLUDING DEFAULTS)"
+        )
+    )
+    await native._copy_model_run_scope(
+        session,
+        native.ReferenceFamilySpec(IMPORTER_ID, (models.ProviderProfileProjection,)),
+        source_schema=prepared.ownership.schema_name,
+        target_schema=schema,
+        target_names=(name,),
+        run_scope=(("generation_id",), (prepared.manifest["run_id"],)),
+        source_copy=source_copy,
+        deadline=deadline,
+    )
+    from types import SimpleNamespace
+
+    table = models.ProviderProfileProjection.__table__.to_metadata(native.MetaData(), name=name)
+    await native._create_model_indexes(
+        session,
+        native.ReferenceFamilySpec(IMPORTER_ID, (SimpleNamespace(__tablename__=name, __table__=table),)),
+        schema,
+        create_constraints=True,
+    )
+    require(
+        await native._is_model_table_equal(
+            session,
+            models.ProviderProfileProjection,
+            left_schema=prepared.ownership.schema_name,
+            left_name=PROJECTION,
+            right_schema=schema,
+            right_name=name,
+        ),
+        "Florida native projection content differs",
+    )
+    owner = await session.scalar(text("SELECT rolname FROM pg_roles WHERE oid=:oid"), {"oid": owner_oid})
+    require(isinstance(owner, str), "Florida cutover owner differs")
+    await session.execute(text(f"ALTER TABLE {_table(schema, name)} OWNER TO {_role_ident(owner)}"))
+    await _clear_stage_grants(session, schema, name, owner_oid)
+    return validate_native_cutover(
+        {"expected": dict(expected), "cutover": await _candidate_seal(session, schema, cutover_id, owner_oid)},
+        expected["current_run_id"],
+        cutover_id,
+    )
+
+
+async def rollback_native_projection(session, prepared, schema, expected, projection):
+    """Restore the recorded old heap, preserving installation OIDs and pinned readers."""
+    old_name = PROJECTION + "_old"
+    await native._lock_family(session, schema, (old_name,), "ACCESS EXCLUSIVE", nowait=True)
+    require(
+        await publication_pointer(session, schema) == expected
+        and expected["previous_run_id"] == prepared.manifest["run_id"]
+        and expected["previous_relation_oid"] == projection["cutover"]["relation_oid"],
+        "Florida rollback predecessor identity differs",
+    )
+    require(
+        await native._is_model_table_equal(
+            session,
+            models.ProviderProfileProjection,
+            left_schema=prepared.ownership.schema_name,
+            left_name=PROJECTION,
+            right_schema=schema,
+            right_name=old_name,
+        ),
+        "Florida rollback predecessor content differs",
+    )
+    await native._lock_family(session, schema, (PROJECTION,), "ACCESS EXCLUSIVE", nowait=True)
+    # Both exact tables stay locked through the three transactional renames.
+    temporary_name = _cutover_name(prepared.ownership.dataset_id)
+    require(await native._relation_oid(session, schema, temporary_name) is None, "Florida rollback temporary exists")
+    await _live_projection_security(session, expected["current_relation_oid"])
+    await _live_projection_security(session, expected["previous_relation_oid"])
+    require(
+        not await session.scalar(
+            text(
+                "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE contype='f' AND confrelid=ANY(CAST(:oids AS oid[])) "
+                "UNION ALL SELECT 1 FROM pg_depend d JOIN pg_rewrite r ON r.oid=d.objid "
+                "WHERE d.classid='pg_rewrite'::regclass AND d.refobjid=ANY(CAST(:oids AS oid[])) AND r.ev_class<>d.refobjid)"
+            ),
+            {"oids": [expected["current_relation_oid"], expected["previous_relation_oid"]]},
+        ),
+        "Florida rollback projection has external dependents",
+    )
+    for source_name, target_name in ((PROJECTION, temporary_name), (old_name, PROJECTION), (temporary_name, old_name)):
+        await session.execute(
+            text(f"ALTER TABLE {_table(schema, source_name)} RENAME TO {native._quoted(target_name)}")
+        )
+
+
 def _identity(value):
     require(
         isinstance(value, Mapping)
@@ -436,7 +899,10 @@ def _cutover_name(cutover_id):
 
 
 async def _candidate_seal(session, schema, cutover_id, owner_oid):
-    name = _cutover_name(cutover_id)
+    return await _projection_candidate_seal(session, schema, _cutover_name(cutover_id), owner_oid)
+
+
+async def _projection_candidate_seal(session, schema, name, owner_oid):
     relation_oid = await native._relation_oid(session, schema, name)
     require(type(relation_oid) is int and relation_oid > 0, "Florida cutover candidate is missing")
     candidate = (
@@ -465,6 +931,28 @@ async def _candidate_seal(session, schema, cutover_id, owner_oid):
         "Florida cutover candidate has external grants",
     )
     return {"relation_oid": relation_oid, "owner_oid": owner_oid, "table_name": name}
+
+
+async def isolate_ordinary_projection(session, schema, name):
+    """Close default grants in the same transaction that creates an ordinary candidate."""
+    owner_oid = await session.scalar(
+        text("SELECT relowner FROM pg_class WHERE oid=to_regclass(:table)"), {"table": _table(schema, name)}
+    )
+    require(type(owner_oid) is int and owner_oid > 0, "Florida ordinary candidate owner differs")
+    await _clear_stage_grants(session, schema, name, owner_oid)
+    return await _projection_candidate_seal(session, schema, name, owner_oid)
+
+
+async def preserve_ordinary_projection_access(session, schema, seal):
+    """Keep the verified candidate private until the locked incumbent's access is replayed."""
+    await native._lock_family(session, schema, (seal["table_name"],), "SHARE", nowait=True)
+    require(
+        await _projection_candidate_seal(session, schema, seal["table_name"], seal["owner_oid"]) == seal,
+        "Florida ordinary candidate changed",
+    )
+    await native._lock_family(session, schema, (PROJECTION,), "ACCESS EXCLUSIVE")
+    live_oid = await native._relation_oid(session, schema, PROJECTION)
+    await _restore_projection_access(session, schema, seal["table_name"], live_oid)
 
 
 async def _build_projection_candidate(session, schema, source_schema, manifest, owner_oid, cutover_id):
@@ -580,11 +1068,17 @@ async def _copy_projection_access(session, schema, temporary_name, live_oid):
     """Replace inherited stage ACLs with the incumbent's exact table grants."""
     live = _table(schema, PROJECTION)
     temporary = _table(schema, temporary_name)
+    require(await native._relation_oid(session, schema, temporary_name) is None, "Florida cutover stage exists")
+    await session.execute(text(f"CREATE TABLE {temporary} (LIKE {live} INCLUDING ALL EXCLUDING DEFAULTS)"))
+    await _restore_projection_access(session, schema, temporary_name, live_oid)
+
+
+async def _restore_projection_access(session, schema, temporary_name, live_oid):
+    """Preserve the incumbent owner and supported explicit ACLs across every projection writer."""
+    temporary = _table(schema, temporary_name)
     security = await _live_projection_security(session, live_oid)
     owner = await session.scalar(text("SELECT rolname FROM pg_roles WHERE oid=:oid"), {"oid": security["relowner"]})
     require(isinstance(owner, str), "Florida live projection owner changed")
-    require(await native._relation_oid(session, schema, temporary_name) is None, "Florida cutover stage exists")
-    await session.execute(text(f"CREATE TABLE {temporary} (LIKE {live} INCLUDING ALL EXCLUDING DEFAULTS)"))
     await session.execute(text(f"ALTER TABLE {temporary} OWNER TO {_role_ident(owner)}"))
     await _clear_stage_grants(session, schema, temporary_name, security["relowner"])
     await _replay_live_grants(session, temporary, live_oid, security["relowner"])
@@ -740,12 +1234,7 @@ async def _cutover_prepared_projection(session, schema, run_id, cutover_id, seal
         {"oid": live_oid},
     )
     require(not dependents, "Florida live projection has external dependents")
-    security = await _live_projection_security(session, live_oid)
-    owner = await session.scalar(text("SELECT rolname FROM pg_roles WHERE oid=:oid"), {"oid": security["relowner"]})
-    require(isinstance(owner, str), "Florida live projection owner changed")
-    await session.execute(text(f"ALTER TABLE {temporary} OWNER TO {_role_ident(owner)}"))
-    await _clear_stage_grants(session, schema, seal["table_name"], security["relowner"])
-    await _replay_live_grants(session, temporary, live_oid, security["relowner"])
+    await _restore_projection_access(session, schema, seal["table_name"], live_oid)
     await session.execute(text(f"DROP TABLE IF EXISTS {old} RESTRICT"))
     await session.execute(text(f"ALTER TABLE {live} RENAME TO {native._quoted(PROJECTION + '_old')}"))
     await session.execute(text(f"ALTER TABLE {temporary} RENAME TO {native._quoted(PROJECTION)}"))
@@ -854,7 +1343,14 @@ async def cleanup_cutover_candidate(session, *, schema, cutover_id, seal):
     name = _cutover_name(cutover_id)
     relation_oid = await native._relation_oid(session, schema, name)
     if relation_oid is None:
+        require(
+            not await session.scalar(
+                text("SELECT EXISTS(SELECT 1 FROM pg_class WHERE oid=:oid)"), {"oid": seal["relation_oid"]}
+            ),
+            "Florida cutover candidate moved",
+        )
         return
+    await native._lock_family(session, schema, (name,), "ACCESS EXCLUSIVE", nowait=True)
     require(
         await _candidate_seal(session, schema, cutover_id, seal["owner_oid"]) == seal,
         "Florida cutover candidate changed",
