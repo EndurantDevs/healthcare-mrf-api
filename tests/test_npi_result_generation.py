@@ -80,6 +80,7 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261006010000_nucc_reference_result_generation",
     "20261009000000_custom_import_child_presence_decode",
     "20261010000000_custom_import_admission_indexes",
+    "20261010010000_custom_import_materialization_contract",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -90,9 +91,9 @@ _SERVICE_NETWORK_UPGRADE_REVISIONS = (
 
 def _assert_current_head(script: ScriptDirectory) -> None:
     """Require the sole current head and its exact immediate predecessor."""
-    assert script.get_heads() == ["20261010000000_custom_import_admission_indexes"]
+    assert script.get_heads() == ["20261010010000_custom_import_materialization_contract"]
     assert script.get_revision(script.get_heads()[0]).down_revision == (
-        "20261009000000_custom_import_child_presence_decode"
+        "20261010000000_custom_import_admission_indexes"
     )
 
 
@@ -187,6 +188,7 @@ def test_profile_migrations_follow_custom_import_processing_policy() -> None:
         "20261006010000_nucc_reference_result_generation",
         "20261009000000_custom_import_child_presence_decode",
         "20261010000000_custom_import_admission_indexes",
+        "20261010010000_custom_import_materialization_contract",
     )
 
 

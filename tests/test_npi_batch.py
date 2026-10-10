@@ -21,6 +21,32 @@ class _ResultRows:
         return self._rows
 
 
+@pytest.mark.parametrize(
+    "columns",
+    [set(), {"lat", "long"}, {"premise_key"}, {"lat", "long", "premise_key", "formatted_address"}],
+)
+def test_overlay_query_scopes_rows_before_current_resource_visibility(columns):
+    """Filter the complete requested overlay set before its visibility join."""
+    sql = npi_module._provider_directory_overlay_query_sql(columns)
+    selected, visible = sql.split("matched_overlays AS MATERIALIZED (", 1)[1].split(
+        "), visible_overlay AS MATERIALIZED (", 1
+    )
+    assert "WHERE overlay.npi = ANY(:npis)" in selected
+    assert "CAST(:address_key AS uuid) IS NULL" in selected
+    assert "overlay.address_key = CAST(:address_key AS uuid)" in selected
+    assert "CAST(:address_site_key AS uuid) IS NULL" in selected
+    assert ("overlay.premise_key = CAST(:address_site_key AS uuid)" in selected) == ("premise_key" in columns)
+    assert "JOIN current_resources" not in selected
+    assert "FROM matched_overlays AS overlay" in visible
+    assert "current_resource.source_id = overlay.source_id" in visible
+    assert "current_resource.resource_type = overlay.resource_type" in visible
+    assert "current_resource.resource_id = overlay.resource_id" in visible
+    assert "overlay.last_seen_run_id = current_resource.run_id" in visible
+    assert "COUNT(DISTINCT overlay.source_id)" in visible
+    assert "AS location_status" in visible
+    assert "ORDER BY first_line NULLS LAST, city_name NULLS LAST, address_key" in visible
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("native_query", [{}, {"limit": "1"}, {"offset": "2"}, {"order_by": "npi", "limit": "1"}])
 async def test_extended_batch_pages_successes_without_reclassifying_excluded_rows(monkeypatch, native_query):

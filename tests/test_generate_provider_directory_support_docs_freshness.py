@@ -11,8 +11,10 @@ import pytest
 from scripts import generate_provider_directory_support_docs as generator
 from scripts.research import provider_directory_endpoint_acquisition_harness as harness
 from tests.provider_directory_endpoint_acquisition_test_support import (
-    synthetic_support_manifest, synthetic_verification_snapshot,
+    synthetic_support_manifest,
+    synthetic_verification_snapshot,
 )
+
 
 def test_validate_manifest_rejects_unusable_catalog_confirmation():
     manifest = synthetic_support_manifest()
@@ -24,9 +26,7 @@ def test_validate_manifest_rejects_unusable_catalog_confirmation():
 
 def test_freshness_validation_rejects_expired_catalog_source_and_proof():
     manifest = synthetic_support_manifest()
-    blockers = generator.validate_blocker_registry(
-        generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY)
-    )
+    blockers = generator.validate_blocker_registry(generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY))
     snapshot = synthetic_verification_snapshot(manifest)
 
     with pytest.raises(generator.SupportDocumentationError, match="catalog confirmation expired") as error:
@@ -42,9 +42,7 @@ def test_freshness_validation_rejects_expired_catalog_source_and_proof():
 
 def test_freshness_validation_accepts_current_reviews():
     manifest = synthetic_support_manifest()
-    blockers = generator.validate_blocker_registry(
-        generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY)
-    )
+    blockers = generator.validate_blocker_registry(generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY))
     snapshot = synthetic_verification_snapshot(manifest)
 
     generator.validate_support_freshness(
@@ -57,13 +55,13 @@ def test_freshness_validation_accepts_current_reviews():
 
 def test_freshness_validation_rejects_stale_active_observation():
     manifest = synthetic_support_manifest()
-    blockers = generator.validate_blocker_registry(
-        generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY)
-    )
+    blockers = generator.validate_blocker_registry(generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY))
     snapshot = synthetic_verification_snapshot(manifest)
     snapshot["entries"]["aetna-commercial-medicare"]["current_observation"] = {
-        "run_id": "run_" + "2" * 32, "state_status": "observed",
-        "run_status": "running", "observed_at": "2026-07-12T00:00:00Z",
+        "run_id": "run_" + "2" * 32,
+        "state_status": "observed",
+        "run_status": "running",
+        "observed_at": "2026-07-12T00:00:00Z",
     }
 
     with pytest.raises(generator.SupportDocumentationError, match="active observation expired"):
@@ -78,6 +76,9 @@ def test_freshness_validation_rejects_stale_active_observation():
 @pytest.mark.parametrize(
     "entry_id, expected_detail",
     [
+        ("san-bernardino-county-dbh", "_offset page index by one after each full page"),
+        ("san-mateo-county-bhrs", "_offset page index by one after each full page"),
+        ("devoted-health", "PractitionerRole uses adaptive _lastUpdated partitions"),
         ("idaho", "official public cursor continuations with checkpoints"),
         ("molina", "fails closed with pagination_resume_required"),
         ("michigan", "Synthetic _getpagesoffset continuation is not equivalent"),
@@ -91,14 +92,14 @@ def test_freshness_validation_rejects_stale_active_observation():
         ("wyoming", "PractitionerRole pagination requires complete traversal proof"),
         ("amerihealth-caritas-carrier", "clears plan_name"),
         ("texas-tmhp", "stable _id sorting and offset pagination"),
-        ("nebraska", "Endpoint returns HTTP 404 and remains excluded"),
+        ("nebraska", "Historical probes returned HTTP 404 for Endpoint, which remains excluded"),
         ("uhc", "ignored :missing modifier"),
-        ("maine", "Five collections are anonymously readable with ct cursor pagination"),
+        ("maine", "Five collections are configured with ct cursor pagination"),
         ("horizon-nj", "approved Provider Directory API-product subscription"),
         ("missouri", "Practitioner response exceeds the 20 MiB cap"),
         ("scan", "1,000-result search ceiling"),
         ("centene", "Location requires at least one resource search parameter"),
-        ("contra-costa", "Seven public collections follow opaque next-link pagination"),
+        ("contra-costa", "Seven public collections are configured with opaque next-link pagination"),
         ("alohr", "A fresh four-resource GraphQL acquisition"),
     ],
 )
@@ -111,19 +112,11 @@ def test_support_metadata_retains_audited_source_details(entry_id, expected_deta
 
 def test_reviewed_manual_subset_support_never_claims_exhaustive():
     manifest = synthetic_support_manifest()
-    manual_entries = [
-        entry
-        for entry in manifest["entries"]
-        if entry["classification"] == "manual_acquisition"
-    ]
+    manual_entries = [entry for entry in manifest["entries"] if entry["classification"] == "manual_acquisition"]
     assert len(manual_entries) == 1
     entry_id = manual_entries[0]["entry_id"]
-    limitation = manifest["support_documentation"]["entry_support"][
-        entry_id
-    ]["limitation"]
-    current_audit = generator.load_current_dataset_audit(
-        generator.DEFAULT_CURRENT_DATASET_AUDIT
-    )
+    limitation = manifest["support_documentation"]["entry_support"][entry_id]["limitation"]
+    current_audit = generator.load_current_dataset_audit(generator.DEFAULT_CURRENT_DATASET_AUDIT)
     assert current_audit == {"schema_version": 1, "as_of": None, "records": []}
     generated_support = generator.DEFAULT_OUTPUT.read_text(encoding="utf-8")
 
@@ -149,9 +142,7 @@ def test_amerihealth_uses_one_carrier_acquisition_and_five_probe_aliases():
     manifest = synthetic_support_manifest()
     support_by_entry = manifest["support_documentation"]["entry_support"]
     entries_by_id = {
-        entry["entry_id"]: entry
-        for entry in manifest["entries"]
-        if entry["entry_id"].startswith("amerihealth-")
+        entry["entry_id"]: entry for entry in manifest["entries"] if entry["entry_id"].startswith("amerihealth-")
     }
     carrier = entries_by_id.pop("amerihealth-caritas-carrier")
 
@@ -160,8 +151,11 @@ def test_amerihealth_uses_one_carrier_acquisition_and_five_probe_aliases():
     assert carrier["canonical_base"].endswith("/0900/provider-api")
     assert carrier["source_ids"] == ["pdfhir_3e8f8d73e9f63b41f4f3fca5"]
     assert set(entries_by_id) == {
-        "amerihealth-de", "amerihealth-la", "amerihealth-nc",
-        "amerihealth-dc", "amerihealth-pa",
+        "amerihealth-de",
+        "amerihealth-la",
+        "amerihealth-nc",
+        "amerihealth-dc",
+        "amerihealth-pa",
     }
     assert all(entry["classification"] == "probe_only" for entry in entries_by_id.values())
     assert all(entry["resources"] == [] for entry in entries_by_id.values())
@@ -176,15 +170,13 @@ def test_amerihealth_uses_one_carrier_acquisition_and_five_probe_aliases():
 def test_documentation_metadata_does_not_change_entry_execution_fingerprints():
     manifest = synthetic_support_manifest()
     fingerprints_by_entry = {
-        entry["entry_id"]: harness._entry_fingerprint(manifest, entry)
-        for entry in manifest["entries"]
+        entry["entry_id"]: harness._entry_fingerprint(manifest, entry) for entry in manifest["entries"]
     }
     changed = copy.deepcopy(manifest)
     changed["support_documentation"]["entry_support"]["idaho"]["limitation"] = "Documentation-only wording."
 
     assert {
-        entry["entry_id"]: harness._entry_fingerprint(changed, entry)
-        for entry in changed["entries"]
+        entry["entry_id"]: harness._entry_fingerprint(changed, entry) for entry in changed["entries"]
     } == fingerprints_by_entry
 
 
@@ -194,18 +186,36 @@ def test_check_reports_generated_documentation_drift(tmp_path):
     manifest_path.write_text(json.dumps(generator.load_manifest(generator.DEFAULT_MANIFEST)), encoding="utf-8")
 
     assert generator.main(["--manifest", str(manifest_path), "--output", str(output_path)]) == 0
-    assert generator.main([
-        "--manifest", str(manifest_path),
-        "--output", str(output_path),
-        "--check", "--as-of", "2026-07-11",
-    ]) == 0
+    assert (
+        generator.main(
+            [
+                "--manifest",
+                str(manifest_path),
+                "--output",
+                str(output_path),
+                "--check",
+                "--as-of",
+                "2026-07-11",
+            ]
+        )
+        == 0
+    )
     output_path.write_text("stale\n", encoding="utf-8")
 
-    assert generator.main([
-        "--manifest", str(manifest_path),
-        "--output", str(output_path),
-        "--check", "--as-of", "2026-07-11",
-    ]) == 1
+    assert (
+        generator.main(
+            [
+                "--manifest",
+                str(manifest_path),
+                "--output",
+                str(output_path),
+                "--check",
+                "--as-of",
+                "2026-07-11",
+            ]
+        )
+        == 1
+    )
 
 
 def test_provider_directory_guide_local_links_resolve():
@@ -273,9 +283,7 @@ def test_verification_snapshot_rejects_terminal_record_without_timestamp():
 def test_verification_snapshot_rejects_current_proof_for_changed_entry():
     manifest = synthetic_support_manifest()
     snapshot = synthetic_verification_snapshot(manifest)
-    idaho_entry = next(
-        entry for entry in manifest["entries"] if entry["entry_id"] == "idaho"
-    )
+    idaho_entry = next(entry for entry in manifest["entries"] if entry["entry_id"] == "idaho")
     idaho_entry["canonical_base"] = "https://changed.example.test/fhir"
 
     with pytest.raises(generator.SupportDocumentationError, match="current manifest entry"):

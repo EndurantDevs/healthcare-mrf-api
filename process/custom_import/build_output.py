@@ -92,6 +92,7 @@ from process.custom_import.build_source import (
 )
 from process.custom_import.build_source import _call as _typed_call
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
+from process.custom_import.compact_materialization import frozen_materialization as _frozen_materialization
 from process.custom_import.execution import lease_token_sha256
 from process.custom_import.runner_codec import (
     digest_text,
@@ -922,7 +923,7 @@ def _child_material(session, request, build_id, generation, digests):
     return child_count
 
 
-def _projection_query(models, generation, *, child):
+def _projection_query(models, generation, *, child, revision_ids=None):
     """Keep every selected revision visible, even when all its scalars are missing."""
 
     record = models[CustomImportRootRecord]
@@ -940,6 +941,10 @@ def _projection_query(models, generation, *, child):
     statement = statement.outerjoin(scalar, scalar_id == revision_id).with_only_columns(
         scalar, revision, record.logical_key_sha256, maintain_column_froms=True
     )
+    if revision_ids is not None:
+        statement = statement.where(
+            revision_id == any_(bindparam("sample_revision_ids", revision_ids, type_=ARRAY(BigInteger)))
+        )
     keys = (record.logical_key_sha256,)
     if child:
         keys += (models[CustomImportFamilyChild].collection_slot, revision.child_key_sha256)
@@ -987,7 +992,9 @@ def _expected_projections(request, registry, revision, *, child):
     return sorted(projections, key=lambda projection: projection.field_slot)
 
 
-def _verified_projection_rows(session, request, registry, build_id, generation, *, child, bounds=_ReadPage()):
+def _verified_projection_rows(
+    session, request, registry, build_id, generation, *, child, bounds=_ReadPage(), revision_ids=None
+):
     """Compare the bounded scalar stream without retaining payloads across pages."""
 
     model = CustomImportChildScalar if child else CustomImportRootScalar
@@ -998,7 +1005,7 @@ def _verified_projection_rows(session, request, registry, build_id, generation, 
     def query(models):
         """Drop prepared values before reading each physical metadata/payload page."""
         projections.clear()
-        return _projection_query(models, generation, child=child)
+        return _projection_query(models, generation, child=child, revision_ids=revision_ids)
 
     try:
         with closing(_output_rows(session, request, build_id, query, bounds=bounds)) as projection_records:
@@ -1220,7 +1227,7 @@ def _attempt_query(models, request, model):
     )
 
 
-def _frozen_materialization(session, request, registry, build_id, generation, proof):
+def _exhaustive_materialization(session, request, registry, build_id, generation, proof):
     with _read_transaction(session, request, build_id) as (build, _deadline):
         _proof_matches(build, generation, proof)
     source_digest = _source_digest(session, request, build_id, generation.capture_bundle_id)
@@ -1271,6 +1278,8 @@ async def _unchanged_base(session, request, build, materialization):
     )
     await _prepare_statement(session)
     base_seal = await publication._validated_generation_seal(session, base)
+    if publication._materialization_contract(base_seal) != publication._materialization_contract(materialization):
+        return None
     if not hmac.compare_digest(bytes(base_seal.effective_output_sha256), materialization.effective_output_sha256):
         return None
     await _prepare_statement(session)

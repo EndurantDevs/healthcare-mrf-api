@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 from dataclasses import replace
 
 import pytest
-from sqlalchemy import func, select, tuple_, update
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy import func, select, text, tuple_, update
 from sqlalchemy.exc import DBAPIError
 
 from db.models.custom_import import (
@@ -18,6 +21,7 @@ from db.models.custom_import import (
     CustomImportBuildFamily,
     CustomImportBuildOccurrence,
     CustomImportBuildVerification,
+    CustomImportChildScalar,
     CustomImportCurrentGeneration,
     CustomImportExecution,
     CustomImportFamilyChild,
@@ -26,21 +30,27 @@ from db.models.custom_import import (
     CustomImportGenerationSeal,
     CustomImportLease,
     CustomImportPack,
+    CustomImportRootScalar,
 )
 from process.custom_import import build_graph as graph
 from process.custom_import import build_graph_prepare_page as graph_prepare
 from process.custom_import import build_graph_sets as graph_sets
 from process.custom_import import build_output as output
+from process.custom_import import compact_materialization as compact
 from process.custom_import import execution as lifecycle
-from process.custom_import import publication
+from process.custom_import import publication, read_core, runner
 from process.custom_import.build_source import SourceBuildRequest, stage_segmented_source
 from process.custom_import.capture_pending import seal_pending_parquet_bundle
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.definition_store import register_definition
 from process.custom_import.runner_types import CancellationRequested, CandidateRunnerError, LeaseAuthorityLost
+from tests import test_custom_import_runner_postgres as legacy_runner
+from tests.custom_import_postgres_support import install_materialization_contract_migration
 from tests.test_custom_import_build_source_postgres import _candidate_models, _sealed_parts, _source_case
 from tests.test_custom_import_capture_pending_postgres import _receipt, _retain, _start_attempt
+from tests.test_custom_import_compact_contract import _migration as _contract_migration
 from tests.test_custom_import_definition import _raw_definition
+from tests.test_custom_import_read_core_postgres import _service
 from tests.test_custom_import_snowflake_shared_capture import _shared_definition
 
 
@@ -138,24 +148,31 @@ async def _activate(case, request, generation_id, *, base=None, version=0):
         )
 
 
-async def _assert_legacy_parity(case, request, sealed):
+async def _assert_sealed_materialization(case, request, sealed):
     async with case.sessions() as session, session.begin():
         generation = await session.get(CustomImportGeneration, sealed.generation_id)
         legacy = await publication._materialization(session, generation)
-        assert legacy.materialization_sha256.hex() == sealed.seal.materialization_sha256
-        assert legacy.effective_output_sha256.hex() == sealed.seal.effective_output_sha256
+        persisted = await session.get(CustomImportGenerationSeal, sealed.generation_id)
+        publication._validate_generation_seal_identity(persisted, generation)
+        assert persisted.materialization_contract == "custom-import/materialization/v2"
+        assert persisted.verification_evidence["contract"] == "custom-import/verification-sample/v1"
+        assert persisted.materialization_sha256.hex() == sealed.seal.materialization_sha256
+        assert persisted.effective_output_sha256.hex() == sealed.seal.effective_output_sha256
+        assert legacy.materialization_sha256 != persisted.materialization_sha256
+        assert legacy.effective_output_sha256 != persisted.effective_output_sha256
         assert all(getattr(legacy, name) == getattr(sealed.seal, name) for name in output._COUNT_NAMES)
         assert (await session.get(CustomImportExecution, request.execution_id)).state in {"completed", "no_change"}
+        return legacy
 
 
-async def test_bounded_output_matches_legacy_digest_and_replays():
+async def test_bounded_output_seals_versioned_digest_and_replays():
     async with _source_case() as case:
         request = await _request_for(case, _records(10, 25, last_empty=True))
         build_id, sealed = await _complete(case, request)
         assert sealed.no_change is None
         assert sealed.seal.family_count == 10 and sealed.seal.family_child_count == 33
         assert sealed.seal.winner_count == 25
-        await _assert_legacy_parity(case, request, sealed)
+        await _assert_sealed_materialization(case, request, sealed)
         replay = await output.build_output(case.sessions, request, build_id)
         assert replay.seal.replayed
         async with case.sessions() as session:
@@ -176,7 +193,7 @@ async def test_retained_copy_pages_record_no_change_with_exact_pointer():
         )
         build_id, sealed = await _complete(case, request)
         assert sealed.no_change is not None and sealed.no_change.event_kind == "no_change"
-        await _assert_legacy_parity(case, request, sealed)
+        await _assert_sealed_materialization(case, request, sealed)
         assert sealed.seal.effective_output_sha256 == first.seal.effective_output_sha256
         replay = await output.build_output(case.sessions, request, build_id)
         assert replay.no_change.replayed
@@ -191,6 +208,64 @@ async def test_retained_copy_pages_record_no_change_with_exact_pointer():
             assert all(copy.source_ordinal is None for copy in copies)
             packs = (await session.scalars(select(pack).where(pack.execution_id == request.execution_id))).all()
             assert len(packs) == 27 and all(pack.record_count == 1 for pack in packs)
+
+
+async def _retained_revisions(case, request, build_id):
+    """Resolve expected retained revisions from exact frozen family ownership."""
+    async with case.sessions() as session:
+        models = await session.run_sync(_candidate_models, request)
+        plan, family = models[CustomImportBuildFamily], models[CustomImportFamilyRevision]
+        edge = models[CustomImportFamilyChild]
+        selected = (
+            select(family.root_revision_id)
+            .select_from(plan)
+            .join(
+                family,
+                (family.family_revision_id == plan.family_revision_id) & (family.root_record_id == plan.root_record_id),
+            )
+            .where(plan.build_id == build_id, plan.selection_kind == "retained")
+        )
+        roots = set(await session.scalars(selected))
+        child_ids = set(
+            await session.scalars(
+                selected.join(edge, edge.family_revision_id == family.family_revision_id).with_only_columns(
+                    edge.child_revision_id, maintain_column_froms=True
+                )
+            )
+        )
+        return {False: roots, True: child_ids}
+
+
+async def test_final_presence_reads_only_retained_ids_in_a_mixed_origin_build(monkeypatch):
+    original = compact._present_scalars_query
+    audited_ids_by_kind = {False: [], True: []}
+
+    def observed(models, generation, *, child, revision_ids):
+        audited_ids_by_kind[child].extend(revision_ids)
+        return original(models, generation, child=child, revision_ids=revision_ids)
+
+    monkeypatch.setattr(compact, "_present_scalars_query", observed)
+    async with _source_case() as case:
+        initial = await _request_for(case, _records(2, 1), page_rows=16)
+        _, first = await _complete(case, initial)
+        assert not any(audited_ids_by_kind.values())
+        await _activate(case, initial, first.generation_id)
+        request = await _request_for(
+            case, _records(1, 1, amount="11"), seed=initial, base=first.generation_id, version=1, page_rows=16
+        )
+        build_id, generation_id = await _build(case, request)
+        expected_ids = await _retained_revisions(case, request, build_id)
+        assert len(expected_ids[False]) == len(expected_ids[True]) == 1
+        sealed = await output.build_output(case.sessions, request, build_id)
+        assert sealed.generation_id == generation_id and sealed.no_change is None
+        assert {child: set(identifiers) for child, identifiers in audited_ids_by_kind.items()} == expected_ids
+        assert all(len(identifiers) == len(expected_ids[child]) for child, identifiers in audited_ids_by_kind.items())
+        assert sealed.seal.family_count == sealed.seal.family_child_count == 2
+        await _assert_sealed_materialization(case, request, sealed)
+        replayed = await output.build_output(case.sessions, request, build_id)
+        assert replayed.seal.replayed
+        assert replayed.seal.materialization_sha256 == sealed.seal.materialization_sha256
+        assert all(len(identifiers) == len(expected_ids[child]) for child, identifiers in audited_ids_by_kind.items())
 
 
 @pytest.mark.parametrize("collection_names", [("details", "other"), ("a2", "a_1")])
@@ -216,7 +291,7 @@ async def test_name_ordered_source_and_membership_ordered_copy_have_legacy_parit
         first_request = await _request_for(case, records_by_stream, definition=definition)
         _, first = await _complete(case, first_request)
         assert first.seal.family_child_count == 26
-        await _assert_legacy_parity(case, first_request, first)
+        await _assert_sealed_materialization(case, first_request, first)
         await _activate(case, first_request, first.generation_id)
         request = await _request_for(
             case,
@@ -229,7 +304,7 @@ async def test_name_ordered_source_and_membership_ordered_copy_have_legacy_parit
         _, copied = await _complete(case, request)
         assert copied.no_change is not None
         assert copied.seal.effective_output_sha256 == first.seal.effective_output_sha256
-        await _assert_legacy_parity(case, request, copied)
+        await _assert_sealed_materialization(case, request, copied)
 
 
 async def test_pointer_drift_allows_seal_but_not_no_change_or_old_cas():
@@ -380,7 +455,7 @@ async def test_child_batches_resume_from_the_committed_cursor(monkeypatch, commi
         await graph.build_graph(case.sessions, request, staged.build_id)
         sealed = await output.build_output(case.sessions, request, staged.build_id)
         assert sealed.seal.family_child_count == 13
-        await _assert_legacy_parity(case, request, sealed)
+        await _assert_sealed_materialization(case, request, sealed)
 
 
 async def test_child_batches_shrink_after_exact_sql_byte_rejection(monkeypatch):
@@ -419,7 +494,7 @@ async def test_child_batches_shrink_after_exact_sql_byte_rejection(monkeypatch):
         _, sealed = await _complete(case, request)
         assert rejected_sizes and min(rejected_sizes) > 1
         assert sealed.seal.family_child_count == 13
-        await _assert_legacy_parity(case, request, sealed)
+        await _assert_sealed_materialization(case, request, sealed)
 
 
 @pytest.mark.parametrize("canceled", [False, True])
@@ -492,4 +567,202 @@ async def test_child_batches_preserve_duplicate_and_membership_admission(monkeyp
         assert max(batch_sizes) > 1
         assert sealed.seal.family_count == 1
         assert sealed.seal.family_child_count == (14 if membership else 13)
-        await _assert_legacy_parity(case, request, sealed)
+        await _assert_sealed_materialization(case, request, sealed)
+
+
+async def test_compact_finalizer_matches_exhaustive_on_the_same_frozen_snapshot(monkeypatch):
+    original = output._frozen_materialization
+    exhaustive_materializations = []
+
+    def compare(*arguments):
+        sampled = original(*arguments)
+        exhaustive = output._exhaustive_materialization(*arguments)
+        assert sampled.materialization_contract == "custom-import/materialization/v2"
+        assert exhaustive.materialization_contract == "custom-import/materialization/v1"
+        assert sampled.source_bundle_sha256 == exhaustive.source_bundle_sha256
+        assert all(getattr(sampled, name) == getattr(exhaustive, name) for name in output._COUNT_NAMES)
+        exhaustive_materializations.append(exhaustive)
+        return sampled
+
+    monkeypatch.setattr(output, "_frozen_materialization", compare)
+    async with _source_case() as case:
+        request = await _request_for(case, _records(4, 25, last_empty=True), page_rows=64)
+        _, sealed = await _complete(case, request)
+        readback = await _assert_sealed_materialization(case, request, sealed)
+        assert len(exhaustive_materializations) == 1
+        assert exhaustive_materializations[0].materialization_sha256 == readback.materialization_sha256
+        assert exhaustive_materializations[0].effective_output_sha256 == readback.effective_output_sha256
+        assert sealed.seal.family_count == 4 and sealed.seal.family_child_count == 27
+
+
+async def test_compact_checkpoint_cancellation_resumes_the_same_build_and_sample(monkeypatch):
+    original = compact._complete_coverage
+    seeds = []
+    task = None
+    loop = asyncio.get_running_loop()
+
+    def checkpoint(session, request, build_id, generation, proof, winner_populations):
+        result = original(session, request, build_id, generation, proof, winner_populations)
+        if not seeds:
+            seeds.append(compact._seed(generation, proof).hex())
+            loop.call_soon(task.cancel)
+        return result
+
+    async with _source_case() as case:
+        request = await _request_for(case, _records(1, 36), page_rows=128)
+        build_id, generation_id = await _build(case, request)
+        monkeypatch.setattr(compact, "_complete_coverage", checkpoint)
+        task = asyncio.create_task(output.build_output(case.sessions, request, build_id))
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(seeds) == 1
+        async with case.sessions() as session:
+            assert await session.get(CustomImportGenerationSeal, generation_id) is None
+            assert (await session.get(CustomImportBuildAttempt, build_id)).phase == "verified"
+            assert (await session.get(CustomImportExecution, request.execution_id)).state == "running"
+        monkeypatch.setattr(compact, "_complete_coverage", original)
+        sealed = await output.build_output(case.sessions, request, build_id)
+        assert sealed.generation_id == generation_id
+        await _assert_sealed_materialization(case, request, sealed)
+        async with case.sessions() as session:
+            persisted = await session.get(CustomImportGenerationSeal, generation_id)
+            assert persisted.verification_evidence["seed_sha256"] == seeds[0]
+        replay = await output.build_output(case.sessions, request, build_id)
+        assert replay.seal.replayed and replay.generation_id == generation_id
+
+
+def _null_and_missing_records():
+    document = json.loads(_definition().canonical)
+    document["schema"]["root"]["fields"].append(
+        {"id": "optional_note", "slot": 7, "type": "string", "nullable": True, "projection_slot": 5}
+    )
+    document["query"]["root_fields"].append("optional_note")
+    roots = [
+        {"npi": "1234567893", "display_name": "Null", "optional_note": None},
+        {"npi": "1234567893", "display_name": "Missing"},
+    ]
+    child_records = [
+        {"rate_npi": "1234567893", "rate_name": "Null", "service_code": "N", "amount": None},
+        {"rate_npi": "1234567893", "rate_name": "Missing", "service_code": "M"},
+    ]
+    return CustomImportDefinition.from_mapping(document), roots, child_records
+
+
+async def test_compact_fresh_null_and_retained_missing_survive_publication_and_reads():
+    definition, roots, children = _null_and_missing_records()
+    async with _source_case() as case:
+        seed = await legacy_runner._seed_case(case, "compact_states", definition)
+        execution_id, token = await legacy_runner._new_execution(case, seed, "compact_states")
+        initial = await runner.run_candidate(
+            case.sessions, legacy_runner._request(seed, execution_id, token, roots, children)
+        )
+        assert initial.status == "activated"
+        async with case.sessions() as session, session.begin():
+            previous = await publication._materialization(
+                session, await session.get(CustomImportGeneration, initial.generation_id)
+            )
+        # Fixed-schema Parquet represents absent cells as null; retained canonical rows preserve missing.
+        request = await _request_for(
+            case,
+            {"providers": [[roots[0]]], "rates": [[children[0]]]},
+            seed=seed,
+            base=initial.generation_id,
+            version=1,
+            definition=definition,
+            page_rows=16,
+        )
+        _, sealed = await _complete(case, request)
+        assert sealed.no_change is None
+        current = await _assert_sealed_materialization(case, request, sealed)
+        assert current.effective_output_sha256 == previous.effective_output_sha256
+        assert sealed.seal.root_scalar_count == 5 and sealed.seal.child_scalar_count == 3
+        async with case.sessions() as session:
+            models = await legacy_runner._generation_models(session, sealed.generation_id)
+            for scalar, slot in ((models[CustomImportRootScalar], 7), (models[CustomImportChildScalar], 5)):
+                states = (await session.scalars(select(scalar.value_state).where(scalar.field_slot == slot))).all()
+                assert states == ["null"]
+        await _activate(case, request, sealed.generation_id, base=initial.generation_id, version=1)
+        read_target = read_core.PinnedReadTarget(
+            request.dataset_id,
+            sealed.generation_id,
+            request.definition_revision_id,
+            request.schema_revision_id,
+            "default",
+        )
+        async with case.sessions() as session:
+            page = await _service().search(
+                session,
+                authorization=read_core.ExtensionReadAuthorization("synthetic-compact-states"),
+                request=read_core.SearchRequest(target=read_target, page_size=10),
+            )
+        assert page.total == len(page.items) == 2
+        for fields, name in (("context_fields", "amount"), ("root_fields", "optional_note")):
+            states = {
+                next(field.state for field in getattr(entry, fields) if field.field_id == name) for entry in page.items
+            }
+            assert states == {"null", "missing"}
+
+
+def _downgrade_temporary_materialization_metadata(connection):
+    migration = _contract_migration()
+    migration._schema = lambda: "pg_temp"
+    migration.op = Operations(MigrationContext.configure(connection))
+    migration.downgrade()
+
+
+async def _reject_incompatible_materialization_metadata(connection):
+    for contract, evidence in (
+        ("custom-import/materialization/v1", "{}"),
+        ("custom-import/materialization/v1", "null"),
+        ("custom-import/materialization/v2", None),
+        ("custom-import/materialization/v2", "[]"),
+        ("custom-import/materialization/v2", "null"),
+        ("unknown", None),
+    ):
+        with pytest.raises(DBAPIError) as failed:
+            async with connection.begin_nested():
+                await connection.execute(
+                    text(
+                        "INSERT INTO pg_temp.custom_import_generation_seal "
+                        "VALUES (2, :contract, CAST(:evidence AS jsonb))"
+                    ),
+                    {"contract": contract, "evidence": evidence},
+                )
+        assert failed.value.orig.sqlstate == "23514"
+
+
+async def test_compact_metadata_upgrade_enforces_checks_and_refuses_lossy_downgrade():
+    async with _source_case() as case, case.engine.connect() as connection:
+        async with connection.begin():
+            await connection.execute(
+                text("CREATE TEMP TABLE custom_import_generation_seal (id integer PRIMARY KEY) ON COMMIT DROP")
+            )
+            await connection.execute(text("INSERT INTO pg_temp.custom_import_generation_seal VALUES (1)"))
+            await connection.run_sync(install_materialization_contract_migration, "pg_temp")
+            legacy_metadata = (
+                await connection.execute(
+                    text(
+                        "SELECT materialization_contract, verification_evidence FROM pg_temp.custom_import_generation_seal"
+                    )
+                )
+            ).one()
+            assert tuple(legacy_metadata) == ("custom-import/materialization/v1", None)
+            await _reject_incompatible_materialization_metadata(connection)
+            await connection.execute(
+                text(
+                    "INSERT INTO pg_temp.custom_import_generation_seal VALUES (3, 'custom-import/materialization/v2', '{}'::jsonb)"
+                )
+            )
+            with pytest.raises(RuntimeError, match="compact_materialization_downgrade_blocked"):
+                async with connection.begin_nested():
+                    await connection.run_sync(_downgrade_temporary_materialization_metadata)
+            retained_contracts = (
+                await connection.execute(
+                    text("SELECT id, materialization_contract FROM pg_temp.custom_import_generation_seal ORDER BY id")
+                )
+            ).all()
+            assert retained_contracts == [
+                (1, "custom-import/materialization/v1"),
+                (3, "custom-import/materialization/v2"),
+            ]
+        assert await connection.scalar(text("SELECT to_regclass('pg_temp.custom_import_generation_seal')")) is None

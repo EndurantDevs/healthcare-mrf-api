@@ -67,6 +67,9 @@ from process.custom_import.storage_layout import snapshot_models
 
 PublicationKind = Literal["activated", "rolled_back", "no_change"]
 _GENERATION_SEAL_CONTRACT = "custom-import-generation-seal/v1"
+_MATERIALIZATION_CONTRACT = "custom-import/materialization/v1"
+_COMPACT_MATERIALIZATION_CONTRACT = "custom-import/materialization/v2"
+_VERIFICATION_SAMPLE_CONTRACT = "custom-import/verification-sample/v1"
 _NO_CHANGE_SEAL_CONTRACT = "custom-import-no-change-seal/v1"
 FINALITY_EVENT_CONTRACT = "custom-import-finality/v1"
 _MATERIALIZATION_DOMAIN = "generation-materialization/v1"
@@ -184,6 +187,85 @@ class _Materialization:
     profile_count: int
     root_scalar_count: int
     child_scalar_count: int
+    materialization_contract: str = _MATERIALIZATION_CONTRACT
+    verification_evidence: dict[str, Any] | None = None
+
+
+def _materialization_contract(value: Any) -> str:
+    """Default historical in-memory receipts only; persisted seals are NOT NULL."""
+    contract = getattr(value, "materialization_contract", None)
+    if contract is None:
+        contract = _MATERIALIZATION_CONTRACT
+    if type(contract) is not str or contract not in {_MATERIALIZATION_CONTRACT, _COMPACT_MATERIALIZATION_CONTRACT}:
+        raise PublicationConflict("unknown materialization contract")
+    return contract
+
+
+def _validate_sample_coverage(coverage: Any) -> None:
+    """Reject impossible, duplicate or unbounded sampled verification accounting."""
+    if type(coverage) is not list or not 0 < len(coverage) <= 256:
+        raise PublicationConflict("invalid verification coverage")
+    seen_scopes = set()
+    for item in coverage:
+        if type(item) is not dict or set(item) != {"kind", "slot", "population", "sampled", "capped"}:
+            raise PublicationConflict("invalid verification coverage")
+        kind, slot = item["kind"], item["slot"]
+        population, sampled = item["population"], item["sampled"]
+        if (
+            type(kind) is not str
+            or kind not in {"root", "child", "winner"}
+            or type(slot) is not int
+            or not 0 <= slot <= 32_767
+            or (kind == "root") != (slot == 0)
+            or type(population) is not int
+            or not 0 <= population <= MAX_BIGINT
+            or type(sampled) is not int
+            or not 0 <= sampled <= population
+            or type(item["capped"]) is not bool
+            or item["capped"] != (sampled < population)
+            or (kind, slot) in seen_scopes
+        ):
+            raise PublicationConflict("invalid verification coverage")
+        seen_scopes.add((kind, slot))
+    if ("root", 0) not in seen_scopes:
+        raise PublicationConflict("verification coverage omits roots")
+
+
+def _validate_verification_counts(evidence: dict[str, Any], counts: tuple[int, int, int, int]) -> None:
+    """Bind reported sample populations to the exact frozen seal accounting."""
+    if any(type(value) is not int or not 0 <= value <= MAX_BIGINT for value in counts):
+        raise PublicationConflict("invalid verification population counts")
+    coverage = evidence["coverage"]
+    roots = [entry["population"] for entry in coverage if entry["kind"] == "root"]
+    child_populations = [entry["population"] for entry in coverage if entry["kind"] == "child"]
+    winners = [entry["population"] for entry in coverage if entry["kind"] == "winner"]
+    if (roots[0], sum(child_populations), sum(winners), len(winners)) != counts:
+        raise PublicationConflict("verification populations differ from frozen counts")
+
+
+def _validate_verification_evidence(
+    contract: str, evidence: Any, *, counts: tuple[int, int, int, int] | None = None
+) -> None:
+    """Keep legacy proofs unchanged and bind only bounded, explicit sample evidence."""
+    if contract == _MATERIALIZATION_CONTRACT:
+        if evidence is not None:
+            raise PublicationConflict("legacy materialization cannot contain sampled evidence")
+        return
+    if contract != _COMPACT_MATERIALIZATION_CONTRACT:
+        raise PublicationConflict("unknown materialization contract")
+    if type(evidence) is not dict or set(evidence) != {"contract", "seed_sha256", "selection_sha256", "coverage"}:
+        raise PublicationConflict("invalid verification evidence")
+    if evidence["contract"] != _VERIFICATION_SAMPLE_CONTRACT:
+        raise PublicationConflict("unknown verification sample contract")
+    for field in ("seed_sha256", "selection_sha256"):
+        value = evidence[field]
+        if type(value) is not str or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise PublicationConflict("invalid verification evidence digest")
+    _validate_sample_coverage(evidence["coverage"])
+    if len(canonical_json(evidence).encode("utf-8")) > 65536:
+        raise PublicationConflict("verification evidence exceeds its bound")
+    if counts is not None:
+        _validate_verification_counts(evidence, counts)
 
 
 def _positive_integer(value: object, label: str) -> int:
@@ -2110,6 +2192,12 @@ def _validate_generation_seal_identity(
 ) -> None:
     """Validate immutable seal ownership without rescanning its frozen graph."""
 
+    contract = _materialization_contract(seal)
+    _validate_verification_evidence(
+        contract,
+        getattr(seal, "verification_evidence", None),
+        counts=(seal.root_count, seal.family_child_count, seal.winner_count, seal.profile_count),
+    )
     sealed_identity_fields = (
         (seal.dataset_id, generation.dataset_id),
         (seal.definition_revision_id, generation.definition_revision_id),
@@ -2145,6 +2233,22 @@ def _validate_generation_seal(
     materialization: _Materialization,
 ) -> None:
     _validate_generation_seal_identity(seal, generation)
+    contract = _materialization_contract(materialization)
+    _validate_verification_evidence(
+        contract,
+        materialization.verification_evidence,
+        counts=(
+            materialization.root_count,
+            materialization.family_child_count,
+            materialization.winner_count,
+            materialization.profile_count,
+        ),
+    )
+    if (
+        _materialization_contract(seal) != contract
+        or getattr(seal, "verification_evidence", None) != materialization.verification_evidence
+    ):
+        raise PublicationConflict("generation seal verification contract differs")
     sealed_materialization_fields = (
         (seal.root_count, materialization.root_count),
         (seal.family_count, materialization.family_count),
@@ -2289,6 +2393,17 @@ def _new_generation_seal(
 ) -> CustomImportGenerationSeal:
     """Build the immutable finality receipt from one verified materialization."""
 
+    contract = _materialization_contract(materialization)
+    _validate_verification_evidence(
+        contract,
+        materialization.verification_evidence,
+        counts=(
+            materialization.root_count,
+            materialization.family_child_count,
+            materialization.winner_count,
+            materialization.profile_count,
+        ),
+    )
     return CustomImportGenerationSeal(
         generation_id=generation.generation_id,
         dataset_id=generation.dataset_id,
@@ -2297,6 +2412,8 @@ def _new_generation_seal(
         execution_id=generation.execution_id,
         capture_bundle_id=generation.capture_bundle_id,
         seal_contract=_GENERATION_SEAL_CONTRACT,
+        materialization_contract=contract,
+        verification_evidence=materialization.verification_evidence,
         sealing_fence=request.lease_fence,
         sealing_token_sha256=request.token_sha256,
         root_count=materialization.root_count,
@@ -2691,6 +2808,14 @@ def _no_change_request(
     )
 
 
+def _matching_materialization_contract(base_seal: Any, candidate_seal: Any) -> str:
+    """Never compare output hashes produced by different algorithms."""
+    contract = _materialization_contract(base_seal)
+    if contract != _materialization_contract(candidate_seal):
+        raise PublicationConflict("no-change materialization contracts differ")
+    return contract
+
+
 def _no_change_receipt_document(
     request: _NoChangeRequest,
     execution: CustomImportExecution,
@@ -2700,6 +2825,7 @@ def _no_change_receipt_document(
     base_seal: CustomImportGenerationSeal,
     candidate_seal: CustomImportGenerationSeal,
 ) -> tuple[str, bytes]:
+    contract = _matching_materialization_contract(base_seal, candidate_seal)
     receipt_fields_by_name = {
         "base_generation_id": base_generation.generation_id,
         "base_effective_output_sha256": bytes(base_seal.effective_output_sha256).hex(),
@@ -2717,6 +2843,8 @@ def _no_change_receipt_document(
         "sealing_fence": request.lease_fence,
         "sealing_token_sha256": request.token_sha256.hex(),
     }
+    if contract != _MATERIALIZATION_CONTRACT:
+        receipt_fields_by_name["materialization_contract"] = contract
     canonical = json.dumps(
         receipt_fields_by_name,
         allow_nan=False,
@@ -2738,6 +2866,7 @@ def _validate_no_change_seal(
     base_seal: CustomImportGenerationSeal,
     candidate_seal: CustomImportGenerationSeal,
 ) -> None:
+    _matching_materialization_contract(base_seal, candidate_seal)
     if (
         seal.seal_contract != _NO_CHANGE_SEAL_CONTRACT
         or seal.dataset_id != request.dataset_id
@@ -3060,6 +3189,7 @@ async def _record_new_no_change(
     async with _finality_scan_window(session, now=renewed_at, expires_at=lease.expires_at):
         candidate_seal = await _seal_no_change_candidate(session, request, execution, lease, candidate_generation)
         _require_materialization_budget(session)
+    _matching_materialization_contract(base_seal, candidate_seal)
     if not hmac.compare_digest(
         bytes(base_seal.effective_output_sha256),
         bytes(candidate_seal.effective_output_sha256),

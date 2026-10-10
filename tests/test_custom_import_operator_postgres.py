@@ -24,6 +24,7 @@ from process.custom_import.publication import activate_generation, record_no_cha
 from tests import test_custom_import_snowflake_operator_cli as registration_cli_tests
 from tests.custom_import_postgres_support import (
     digest,
+    install_materialization_contract_migration,
     install_segmented_capture_migration,
     isolated_publication_case,
     lease_digest,
@@ -252,6 +253,7 @@ async def _seed_legacy_current_generation(case):
         )
         await connection.run_sync(_upgrade_finality_schema, case.schema_name)
         await connection.run_sync(install_segmented_capture_migration, case.schema_name)
+        await connection.run_sync(install_materialization_contract_migration, case.schema_name)
     return identity[0], generation_id
 
 

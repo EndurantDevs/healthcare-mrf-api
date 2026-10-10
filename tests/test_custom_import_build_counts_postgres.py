@@ -245,7 +245,7 @@ async def test_candidate_admitted_before_upgrade_can_complete_after_upgrade():
         async with case.engine.begin() as connection:
             await connection.run_sync(_install_admission_indexes, case.schema_name)
         _, completed = await output_fixture._complete(case, request)
-        await output_fixture._assert_legacy_parity(case, request, completed)
+        await output_fixture._assert_sealed_materialization(case, request, completed)
 
 
 @pytest.mark.parametrize("reverse", (False, True))
@@ -279,4 +279,4 @@ async def test_configured_membership_uses_early_slot_index_and_candidate_statist
             ).one()
             assert statistics.indisvalid and statistics.reltuples == staged.source_occurrence_count
         _, completed = await output_fixture._complete(case, request)
-        await output_fixture._assert_legacy_parity(case, request, completed)
+        await output_fixture._assert_sealed_materialization(case, request, completed)

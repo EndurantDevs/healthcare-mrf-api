@@ -83,9 +83,12 @@ def test_rendered_support_matrix_preserves_inventory_access_and_live_metadata():
     )
     assert "| Registration | Reviewed at | Review valid through |" in rendered_document
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`)" in rendered_document
-    assert "Required | 2026-08-26 | 2026-10-10 | OAuth2 client credentials and Bulk" in rendered_document
+    assert "Required | 2026-10-11 | 2026-11-25 | OAuth2 client credentials and Bulk" in rendered_document
     assert "Cigna (`cigna`)" in rendered_document
-    assert "Not required | 2026-08-26 | 2026-10-10 | Sequential REST pagination" in rendered_document
+    assert "Not required | 2026-10-11 | 2026-11-25 | Sequential REST pagination" in rendered_document
+    assert (
+        "Historical source and probe notes retained in limitations are not new live verification" in rendered_document
+    )
     assert "## Observed Live Verification" in rendered_document
     assert (
         "| Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at |"
