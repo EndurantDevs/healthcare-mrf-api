@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Native row-scoped code-set activation and rollback, without shared-table swaps."""
+"""Scoped code-set activation through complete native family swaps and exact rollback."""
 
 from __future__ import annotations
 
@@ -12,12 +12,18 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.schema import MetaData
 
 from db.models import CodeCatalog
 from process import code_sets_result_archive as archive
+from process import reference_family_archive as native
+from process.scoped_catalog_retention import cleanup_retained_catalog
+from tests.scoped_catalog_native_fixture import catalog_actors, seal_catalog
+
+
+def _copy():
+    return native.ReferenceFamilySourceCopy(native.native_copy_projection, 1024**2, 30)
 
 
 def test_manifest_rejects_non_string_identity_and_timestamp():
@@ -72,12 +78,16 @@ def _dsn():
     return url.set(drivername="postgresql+asyncpg").render_as_string(hide_password=False)
 
 
-async def _setup(engine, schema):
+async def _setup(engine, schema, *, appended_attribution=False):
     metadata = MetaData(schema=schema)
-    CodeCatalog.__table__.to_metadata(metadata, schema=schema)
+    table = CodeCatalog.__table__.to_metadata(metadata, schema=schema)
+    if appended_attribution:
+        table._columns.remove(table.c.source_attribution)
     async with engine.begin() as connection:
         await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
         await connection.run_sync(metadata.create_all)
+        if appended_attribution:
+            await connection.execute(text(f'ALTER TABLE "{schema}".code_catalog ADD COLUMN source_attribution TEXT'))
         await connection.execute(
             text(
                 f'CREATE TABLE "{schema}".code_sets_result_generation ('
@@ -131,21 +141,25 @@ async def _seed_merge_catalogs(sessions, source, destination):
         )
 
 
-async def _assert_conflict_rejection(sessions, source, destination, dataset_id):
-    async with sessions.begin() as session:
-        stage = await archive.prepare_source(session, source, dataset_id)
+async def _assert_conflict_rejection(sessions, source, destination, dataset_id, source_sessions):
+    async with source_sessions.begin() as session:
+        stage = await archive.prepare_source(session, source, dataset_id, source_copy=_copy())
     async with sessions.begin() as session:
         expected = await archive.read_generation(session, destination)
         with pytest.raises(archive.CodeSetsArchiveError, match="untracked"):
-            await archive.prepare_predecessor(session, destination=destination, stage=stage, expected=expected)
+            await archive.prepare_predecessor(
+                session, destination=destination, stage=stage, expected=expected, source_copy=_copy()
+            )
     async with sessions.begin() as session:
         await session.execute(
             text(f'DELETE FROM "{destination}".code_catalog WHERE source=:pos'), {"pos": archive.SOURCES[0][0]}
         )
         expected = await archive.read_generation(session, destination)
-        prepared = await archive.prepare_predecessor(session, destination=destination, stage=stage, expected=expected)
+        prepared = await archive.prepare_predecessor(
+            session, destination=destination, stage=stage, expected=expected, source_copy=_copy()
+        )
         with pytest.raises(archive.CodeSetsArchiveError, match="another source"):
-            await archive.activate_stage(session, destination=destination, prepared=prepared)
+            await archive.activate_stage(session, destination=destination, prepared=prepared, source_copy=_copy())
         assert await _catalog_entries(session, destination) == [
             ("OTHER", "2", "destination-unrelated"),
             ("RC", "0450", "foreign-writer"),
@@ -170,19 +184,28 @@ async def _assert_insert_failure_rolls_back(sessions, destination, expected, pre
                 f'FOR EACH ROW EXECUTE FUNCTION "{destination}".reject_candidate()'
             )
         )
-    with pytest.raises(DBAPIError, match="synthetic insert failure"):
+    with pytest.raises(RuntimeError, match="trigger|catalog|custody"):
         async with sessions.begin() as session:
-            await archive.activate_stage(session, destination=destination, prepared=prepared)
+            await archive.activate_stage(session, destination=destination, prepared=prepared, source_copy=_copy())
     async with sessions.begin() as session:
         assert await _catalog_entries(session, destination) == [("OTHER", "2", "destination-unrelated")]
         assert (await archive.read_generation(session, destination)) == expected
         await session.execute(text(f'DROP TRIGGER reject_candidate ON "{destination}".code_catalog'))
         await session.execute(text(f'DROP FUNCTION "{destination}".reject_candidate()'))
+    with pytest.raises(RuntimeError, match="synthetic late failure"):
+        async with sessions.begin() as session:
+            await archive.activate_stage(session, destination=destination, prepared=prepared, source_copy=_copy())
+            raise RuntimeError("synthetic late failure")
+    async with sessions.begin() as session:
+        assert await archive.read_generation(session, destination) == expected
+        assert await _catalog_entries(session, destination) == [("OTHER", "2", "destination-unrelated")]
 
 
 async def _assert_activation_and_rollback(sessions, destination, prepared):
     async with sessions.begin() as session:
-        activation = await archive.activate_stage(session, destination=destination, prepared=prepared)
+        activation = await archive.activate_stage(
+            session, destination=destination, prepared=prepared, source_copy=_copy()
+        )
         assert await _catalog_entries(session, destination) == [
             ("MODIFIER", "26", archive.SOURCES[2][0]),
             ("OTHER", "2", "destination-unrelated"),
@@ -196,15 +219,20 @@ async def _assert_activation_and_rollback(sessions, destination, prepared):
                 "VALUES ('OTHER','3','later-unrelated')"
             )
         )
-        restored = await archive.rollback_activation(session, destination=destination, activation=activation)
+        restored = await archive.rollback_activation(
+            session, destination=destination, activation=activation, source_copy=_copy()
+        )
         assert restored.local_generation == 2 and restored.origin_generation is None
         assert await _catalog_entries(session, destination) == [
             ("OTHER", "2", "destination-unrelated"),
             ("OTHER", "3", "later-unrelated"),
         ]
+        await cleanup_retained_catalog(session, activation.retained_family)
     async with sessions.begin() as session:
         with pytest.raises(archive.CodeSetsArchiveError, match="generation changed"):
-            await archive.rollback_activation(session, destination=destination, activation=activation)
+            await archive.rollback_activation(
+                session, destination=destination, activation=activation, source_copy=_copy()
+            )
 
 
 @pytest.mark.asyncio
@@ -217,44 +245,52 @@ async def test_scoped_archive_merge_rollback_and_foreign_conflict():
     dataset_id = uuid4()
     owned_schemas = [source, destination, archive.stage_schema(dataset_id)]
     try:
-        await _setup(engine, source)
-        await _setup(engine, destination)
-        await _seed_merge_catalogs(sessions, source, destination)
-        expected, prepared = await _assert_conflict_rejection(sessions, source, destination, dataset_id)
-        await _assert_insert_failure_rolls_back(sessions, destination, expected, prepared)
-        await _assert_activation_and_rollback(sessions, destination, prepared)
+        async with catalog_actors(engine, owned_schemas) as actors:
+            await _setup(engine, source)
+            await _setup(engine, destination)
+            await _seed_merge_catalogs(sessions, source, destination)
+            for schema in (source, destination):
+                await seal_catalog(actors, schema, (CodeCatalog,), archive.TABLE)
+            expected, prepared = await _assert_conflict_rejection(
+                actors.publisher, source, destination, dataset_id, actors.builder
+            )
+            await _assert_insert_failure_rolls_back(actors.publisher, destination, expected, prepared)
+            await _assert_activation_and_rollback(actors.publisher, destination, prepared)
     finally:
-        async with engine.begin() as connection:
-            for name in reversed(owned_schemas):
-                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{name}" CASCADE'))
         await engine.dispose()
 
 
 async def _seed_tracked_catalogs(sessions, source, destination):
     for schema, pos_code in ((source, "23"), (destination, "99")):
-        async with sessions.begin() as session:
-            await session.execute(
-                text(
-                    f'INSERT INTO "{schema}".code_catalog (code_system,code,source) VALUES '
-                    "(:system,:pos,:pos_source),('RC','0450',:rc),('MODIFIER','26',:modifier)"
-                ),
-                {
-                    "system": "POS",
-                    "pos": pos_code,
-                    "pos_source": archive.SOURCES[0][0],
-                    "rc": archive.SOURCES[1][0],
-                    "modifier": archive.SOURCES[2][0],
-                },
-            )
-            await archive.publish_local_generation(session, schema)
+        await _seed_code_generation(sessions, schema, pos_code)
+
+
+async def _seed_code_generation(sessions, schema, pos_code):
+    async with sessions.begin() as session:
+        await session.execute(
+            text(
+                f'INSERT INTO "{schema}".code_catalog (code_system,code,source) VALUES '
+                "(:system,:pos,:pos_source),('RC','0450',:rc),('MODIFIER','26',:modifier)"
+            ),
+            {
+                "system": "POS",
+                "pos": pos_code,
+                "pos_source": archive.SOURCES[0][0],
+                "rc": archive.SOURCES[1][0],
+                "modifier": archive.SOURCES[2][0],
+            },
+        )
+        await archive.publish_local_generation(session, schema)
 
 
 async def _prepare_tracked_predecessor(sessions, source, destination, dataset_id):
     async with sessions.begin() as session:
-        stage = await archive.prepare_source(session, source, dataset_id)
+        stage = await archive.prepare_source(session, source, dataset_id, source_copy=_copy())
     async with sessions.begin() as session:
         expected = await archive.read_generation(session, destination)
-        prepared = await archive.prepare_predecessor(session, destination=destination, stage=stage, expected=expected)
+        prepared = await archive.prepare_predecessor(
+            session, destination=destination, stage=stage, expected=expected, source_copy=_copy()
+        )
     return stage, expected, prepared
 
 
@@ -267,7 +303,7 @@ async def _assert_foreign_predecessors_rejected(sessions, destination, stage, pr
             )
         )
         with pytest.raises(archive.CodeSetsArchiveError, match="contains foreign rows"):
-            await archive.activate_stage(session, destination=destination, prepared=prepared)
+            await archive.activate_stage(session, destination=destination, prepared=prepared, source_copy=_copy())
         await session.execute(
             text(f"DELETE FROM \"{stage.schema_name}\".code_catalog_predecessor WHERE code_system='OTHER'")
         )
@@ -278,7 +314,7 @@ async def _assert_foreign_predecessors_rejected(sessions, destination, stage, pr
             )
         )
         with pytest.raises(archive.CodeSetsArchiveError, match="contains foreign rows"):
-            await archive.activate_stage(session, destination=destination, prepared=prepared)
+            await archive.activate_stage(session, destination=destination, prepared=prepared, source_copy=_copy())
         await session.execute(
             text(f"DELETE FROM \"{stage.schema_name}\".code_catalog_predecessor WHERE code='null-source'")
         )
@@ -290,10 +326,12 @@ async def _assert_drift_rejected_and_restored(sessions, destination, stage, expe
             text(f"UPDATE \"{destination}\".code_catalog SET display_name='untracked edit' WHERE code='99'")
         )
         with pytest.raises(archive.CodeSetsArchiveError, match="source rows changed"):
-            await archive.activate_stage(session, destination=destination, prepared=prepared)
+            await archive.activate_stage(session, destination=destination, prepared=prepared, source_copy=_copy())
     async with sessions.begin() as session:
         await session.execute(text(f"UPDATE \"{destination}\".code_catalog SET display_name=NULL WHERE code='99'"))
-        activation = await archive.activate_stage(session, destination=destination, prepared=prepared)
+        activation = await archive.activate_stage(
+            session, destination=destination, prepared=prepared, source_copy=_copy()
+        )
         assert (
             await archive.read_generation(session, destination)
         ).origin_lineage_id == stage.source_generation.origin_lineage_id
@@ -302,10 +340,14 @@ async def _assert_drift_rejected_and_restored(sessions, destination, stage, expe
             text(f"UPDATE \"{destination}\".code_catalog SET display_name='untracked edit' WHERE code='23'")
         )
         with pytest.raises(archive.CodeSetsArchiveError, match="source rows changed"):
-            await archive.rollback_activation(session, destination=destination, activation=activation)
+            await archive.rollback_activation(
+                session, destination=destination, activation=activation, source_copy=_copy()
+            )
     async with sessions.begin() as session:
         await session.execute(text(f"UPDATE \"{destination}\".code_catalog SET display_name=NULL WHERE code='23'"))
-        restored = await archive.rollback_activation(session, destination=destination, activation=activation)
+        restored = await archive.rollback_activation(
+            session, destination=destination, activation=activation, source_copy=_copy()
+        )
         assert restored.origin_lineage_id == expected.origin_lineage_id
         assert restored.origin_generation == expected.origin_generation
         assert await _catalog_entries(session, destination) == [
@@ -313,6 +355,7 @@ async def _assert_drift_rejected_and_restored(sessions, destination, stage, expe
             ("POS", "99", archive.SOURCES[0][0]),
             ("RC", "0450", archive.SOURCES[1][0]),
         ]
+        await cleanup_retained_catalog(session, activation.retained_family)
 
 
 @pytest.mark.asyncio
@@ -325,21 +368,55 @@ async def test_tracked_predecessor_and_drifted_source_fail_closed():
     dataset_id = uuid4()
     owned_schemas = [source, destination, archive.stage_schema(dataset_id)]
     try:
-        await _setup(engine, source)
-        await _setup(engine, destination)
-        await _seed_tracked_catalogs(sessions, source, destination)
-        stage, expected, prepared = await _prepare_tracked_predecessor(sessions, source, destination, dataset_id)
-        await _assert_foreign_predecessors_rejected(sessions, destination, stage, prepared)
-        await _assert_drift_rejected_and_restored(sessions, destination, stage, expected, prepared)
+        async with catalog_actors(engine, owned_schemas) as actors:
+            await _setup(engine, source)
+            await _setup(engine, destination)
+            await _seed_tracked_catalogs(sessions, source, destination)
+            for schema in (source, destination):
+                await seal_catalog(actors, schema, (CodeCatalog,), archive.TABLE)
+            stage, expected, prepared = await _prepare_tracked_predecessor(
+                actors.publisher, source, destination, dataset_id
+            )
+            await _assert_foreign_predecessors_rejected(actors.publisher, destination, stage, prepared)
+            await _assert_drift_rejected_and_restored(actors.publisher, destination, stage, expected, prepared)
     finally:
-        async with engine.begin() as connection:
-            for name in reversed(owned_schemas):
-                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{name}" CASCADE'))
         await engine.dispose()
+
+
+async def _restored_preparation(sessions, destination, original, receive_id):
+    manifest = original.source_generation.as_dict()
+    assert archive.validate_manifest(manifest) == original.source_generation
+    async with sessions.begin() as session:
+        received, predecessor_oid = await archive.precreate_restore(
+            session, destination=destination, dataset_id=receive_id, manifest=manifest
+        )
+        await session.execute(
+            text(
+                f'INSERT INTO "{received.schema_name}".code_catalog SELECT * FROM "{original.schema_name}".code_catalog'
+            )
+        )
+    async with sessions.begin() as session:
+        await archive.complete_restore(session, received, predecessor_oid=predecessor_oid)
+        expected = await archive.read_generation(session, destination)
+        await archive.prepare_predecessor(
+            session,
+            destination=destination,
+            stage=received,
+            expected=expected,
+            precreated_predecessor_oid=predecessor_oid,
+            source_copy=_copy(),
+        )
+    async with sessions.begin() as session:
+        prepared = await archive.validate_prepared_stage(
+            session, destination=destination, stage=received, predecessor_oid=predecessor_oid
+        )
+        assert prepared.expected == expected
+    return prepared
 
 
 @pytest.mark.asyncio
 async def test_precreated_two_relation_stage_validates_after_restore():
+    """Authenticate the registered frozen restore before a genuine publisher swaps it."""
     engine = create_async_engine(_dsn())
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     token = uuid4().hex[:12]
@@ -347,54 +424,25 @@ async def test_precreated_two_relation_stage_validates_after_restore():
     source_id, receive_id = uuid4(), uuid4()
     owned_schemas = [source_schema, destination, archive.stage_schema(source_id), archive.stage_schema(receive_id)]
     try:
-        await _setup(engine, source_schema)
-        await _setup(engine, destination)
-        async with sessions.begin() as session:
-            await session.execute(
-                text(
-                    f'INSERT INTO "{source_schema}".code_catalog (code_system,code,source) VALUES '
-                    "('POS','23',:pos),('RC','0450',:rc),('MODIFIER','26',:modifier)"
-                ),
-                {"pos": archive.SOURCES[0][0], "rc": archive.SOURCES[1][0], "modifier": archive.SOURCES[2][0]},
-            )
-            await archive.publish_local_generation(session, source_schema)
-        async with sessions.begin() as session:
-            original = await archive.prepare_source(session, source_schema, source_id)
-            manifest = original.source_generation.as_dict()
-            assert archive.validate_manifest(manifest) == original.source_generation
-        async with sessions.begin() as session:
-            received, predecessor_oid = await archive.precreate_restore(
-                session, destination=destination, dataset_id=receive_id, manifest=manifest
-            )
-            await session.execute(
-                text(
-                    f'INSERT INTO "{received.schema_name}".code_catalog '
-                    f'SELECT * FROM "{original.schema_name}".code_catalog'
+        async with catalog_actors(engine, owned_schemas) as actors:
+            await _setup(engine, source_schema)
+            await _setup(engine, destination)
+            await _seed_code_generation(sessions, source_schema, "23")
+            for schema in (source_schema, destination):
+                await seal_catalog(actors, schema, (CodeCatalog,), archive.TABLE)
+            async with actors.builder.begin() as session:
+                original = await archive.prepare_source(session, source_schema, source_id, source_copy=_copy())
+            prepared = await _restored_preparation(actors.publisher, destination, original, receive_id)
+            async with actors.publisher.begin() as session:
+                activation = await archive.activate_stage(
+                    session, destination=destination, prepared=prepared, source_copy=_copy()
                 )
-            )
-        async with sessions.begin() as session:
-            expected = await archive.read_generation(session, destination)
-            await archive.prepare_predecessor(
-                session,
-                destination=destination,
-                stage=received,
-                expected=expected,
-                precreated_predecessor_oid=predecessor_oid,
-            )
-        async with sessions.begin() as session:
-            prepared = await archive.validate_prepared_stage(
-                session, destination=destination, stage=received, predecessor_oid=predecessor_oid
-            )
-            assert prepared.expected == expected
-            activation = await archive.activate_stage(session, destination=destination, prepared=prepared)
-            assert activation.predecessor_catalog_oid == predecessor_oid
-            assert await _catalog_entries(session, destination) == [
-                ("MODIFIER", "26", archive.SOURCES[2][0]),
-                ("POS", "23", archive.SOURCES[0][0]),
-                ("RC", "0450", archive.SOURCES[1][0]),
-            ]
+                assert activation.predecessor_catalog_oid == prepared.predecessor_catalog_oid
+                assert await _catalog_entries(session, destination) == [
+                    ("MODIFIER", "26", archive.SOURCES[2][0]),
+                    ("POS", "23", archive.SOURCES[0][0]),
+                    ("RC", "0450", archive.SOURCES[1][0]),
+                ]
+                await cleanup_retained_catalog(session, activation.retained_family)
     finally:
-        async with engine.begin() as connection:
-            for name in reversed(owned_schemas):
-                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{name}" CASCADE'))
         await engine.dispose()

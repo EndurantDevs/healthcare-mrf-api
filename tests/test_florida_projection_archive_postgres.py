@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Native Florida projection archive on an isolated PostgreSQL database."""
 
+import importlib
 import os
 from datetime import datetime
 from uuid import uuid4
@@ -12,6 +13,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from db import models
 from process import florida_projection_archive as archive
 from process.source_profile_result_pins import statement_pin_guard_statements
+from tests.source_profile_archive_support import _create_family
+from tests.source_profile_archive_support import _seed_florida as _native_seed
 
 
 async def _seed_published_run(session, run_id, when):
@@ -156,7 +159,27 @@ async def _assert_rollback_candidate_retry(session, prepared):
                 {"tampered": '{"tampered":true}'},
             )
             await archive.prepare_rollback_cutover(session, **retry_parameters_by_name)
+    renamed_name = rollback_candidate["table_name"] + "_moved"
+    async with session.begin_nested() as renamed_candidate:
+        await session.execute(
+            text(
+                f"ALTER TABLE {archive._table('mrf', rollback_candidate['table_name'])} "
+                f"RENAME TO {archive.native._quoted(renamed_name)}"
+            )
+        )
+        with pytest.raises(archive.FloridaProjectionArchiveError, match="candidate moved"):
+            await archive.cleanup_cutover_candidate(session, schema="mrf", cutover_id=retry_id, seal=rollback_candidate)
+        assert await archive.native._relation_oid(session, "mrf", rollback_candidate["table_name"]) is None
+        assert await archive.native._relation_oid(session, "mrf", renamed_name) == rollback_candidate["relation_oid"]
+        await renamed_candidate.rollback()
+    assert (
+        await archive.native._relation_oid(session, "mrf", rollback_candidate["table_name"])
+        == rollback_candidate["relation_oid"]
+    )
     await archive.cleanup_cutover_candidate(session, schema="mrf", cutover_id=retry_id, seal=rollback_candidate)
+    assert not await session.scalar(
+        text("SELECT EXISTS(SELECT 1 FROM pg_class WHERE oid=:oid)"), {"oid": rollback_candidate["relation_oid"]}
+    )
 
 
 async def _assert_source_cutover(session, run_id, dataset_id):
@@ -270,3 +293,176 @@ async def test_published_projection_stage_and_atomic_swap():
             await _drop_test_schemas(engine, schema_names)
         finally:
             await engine.dispose()
+
+
+async def _native_family(session, schema):
+    await _create_family(session, schema, projection=True)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_florida_publication_uses_bounded_native_copy_and_model_indexes(monkeypatch):
+    """Exercise actual lazy SQLAlchemy transactions and JSON binary COPY on the ordinary writer."""
+    from db.connection import Database
+
+    url = os.getenv("FLORIDA_SNAPSHOT_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("isolated PostgreSQL URL not configured")
+    florida = importlib.import_module("process.florida_mqa_profile")
+    engine = create_async_engine(url)
+    sessions = async_sessionmaker(engine)
+    is_created = False
+    try:
+        async with sessions.begin() as session:
+            await _native_family(session, "mrf")
+            run_id = await _native_seed(session, "mrf")
+        is_created = True
+        async with sessions.begin() as session:
+            run = await archive._run(session, "mrf", run_id)
+            projection_rows = [
+                dict(projection_row)
+                for projection_row in (
+                    await session.execute(text("SELECT * FROM mrf.provider_profile_projection"))
+                ).mappings()
+            ]
+            old_oid = await archive.native._relation_oid(session, "mrf", archive.PROJECTION)
+
+        async def batches():
+            yield projection_rows
+
+        monkeypatch.setattr(florida, "db", Database(engine=engine, session_factory=sessions))
+        publication, _ = await florida._publish_projection_swap(
+            run_id,
+            batches(),
+            started_at=run["started_at"],
+            completion_metrics=run["metrics"],
+            allow_volume_drop=False,
+            min_first_publish_providers=1,
+            min_publish_ratio=0.8,
+        )
+        assert publication["published_rows"] == 1
+        async with sessions.begin() as session:
+            await archive.validate_native_result(session, "mrf", run_id)
+            assert await archive.native._relation_oid(session, "mrf", archive.PROJECTION + "_old") == old_oid
+            assert (
+                await session.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_index WHERE indrelid='mrf.provider_profile_projection'::regclass AND indisprimary AND indisvalid"
+                    )
+                )
+                == 1
+            )
+    finally:
+        try:
+            if is_created:
+                await _drop_test_schemas(engine, ("mrf",))
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_native_florida_copy_publish_rollback_and_mixed_evidence():
+    """One rollback-owned transaction closes all five models without external references."""
+    url = os.getenv("FLORIDA_SNAPSHOT_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("isolated PostgreSQL URL not configured")
+    engine = create_async_engine(url)
+    sessions = async_sessionmaker(engine)
+    schemas = ["fl_native_" + uuid4().hex for _ in range(3)]
+    try:
+        async with sessions() as session:
+            await session.begin()
+            try:
+                for schema in schemas:
+                    await _native_family(session, schema)
+                destination = schemas[-1]
+                unrelated = await _native_seed(session, destination, unrelated=True)
+                installations = [
+                    await _native_projection_installation(session, source_schema, destination, day=index * 3)
+                    for index, source_schema in enumerate(schemas[:2])
+                ]
+                assert await archive.profiles._run(session, destination, unrelated) is not None
+                await _assert_native_projection_rollback(session, destination, installations)
+            finally:
+                await session.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def _native_projection_installation(session, source_schema, destination, *, day):
+    """Prepare invisible COPY/indexed heaps before publishing their exact sealed identities."""
+    profiles = archive.profiles
+    copier = archive.native.ReferenceFamilySourceCopy(archive.native.native_copy_projection, 1024 * 1024, 300)
+    run_id = await _native_seed(session, source_schema, day=day)
+    candidate = await profiles.prepare_source(
+        session,
+        importer_id=archive.IMPORTER_ID,
+        schema=source_schema,
+        run_id=run_id,
+        dataset_id=uuid4(),
+        contract=profiles.CONTRACT,
+        source_copy=copier,
+    )
+    assert len(candidate.manifest["tables"]) == 5
+    assert len(candidate.ownership.relation_oids) == 9
+    owner = await session.scalar(
+        text("SELECT relowner FROM pg_class WHERE oid=:oid"), {"oid": candidate.ownership.relation_oids[0][1]}
+    )
+    expected = await profiles._pointer(session, destination, archive.IMPORTER_ID)
+    pin_id = uuid4()
+    activation_by_field = dict(
+        prepared=candidate,
+        destination_schema=destination,
+        expected_current_run_id=expected["current_run_id"],
+        package_id="f" * 64,
+        sealed_owner_oid=owner,
+        pin_id=pin_id,
+    )
+    validation = await profiles.prepare_activation(
+        session,
+        **activation_by_field,
+        publication_request={"expected": expected, "source_copy": copier},
+    )
+    assert await profiles._run(session, destination, run_id) is None
+    activation = await profiles.activate_validated_result(session, **activation_by_field, validation=validation)
+    assert activation["current_run_id"] == run_id
+    return candidate, activation, pin_id
+
+
+async def _assert_native_projection_rollback(session, destination, installations):
+    """Reject changed OIDs and preserve the original installation plus both live/old pins."""
+    profiles = archive.profiles
+    first, activation, first_pin = installations[0]
+    second, _, second_pin = installations[1]
+    expected = await profiles._pointer(session, destination, archive.IMPORTER_ID)
+    with pytest.raises(profiles.SourceProfileArchiveError, match="projection predecessor"):
+        async with session.begin_nested():
+            await profiles._admission(
+                session,
+                first.manifest,
+                destination,
+                second.manifest["run_id"],
+                projection={"expected": {**expected, "previous_relation_oid": 1}},
+            )
+    await profiles.rollback_validated_result(
+        session,
+        schema=destination,
+        importer_id=archive.IMPORTER_ID,
+        expected_current_run_id=second.manifest["run_id"],
+        expected_previous_run_id=first.manifest["run_id"],
+        pin_id=first_pin,
+        manifest=first.manifest,
+        package_id="f" * 64,
+    )
+    restored = await profiles._pointer(session, destination, archive.IMPORTER_ID)
+    assert restored["current_relation_oid"] == activation["projection"]["cutover"]["relation_oid"]
+    assert restored["current_run_id"] == first.manifest["run_id"]
+    assert (
+        await profiles.cleanup_adoption(
+            session,
+            schema=destination,
+            importer_id=archive.IMPORTER_ID,
+            run_id=second.manifest["run_id"],
+            pin_id=second_pin,
+        )
+        == "retained"
+    )

@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 import pytest
 
 import process.ms_drg_publication as publication
+import process.scoped_catalog_publication as native_publication
 from db.models import CodeCatalog, CodeRelationship, CodeSynonym
 
 ms_drg = importlib.import_module("process.ms_drg")
@@ -43,27 +44,18 @@ FULL_TOC_URL = "https://example.test/manual/P0001.html"
 FULL_DIAGNOSIS_LANDING = "https://example.test/manual/diagnosis.html"
 FULL_PROCEDURE_LANDING = "https://example.test/manual/procedure.html"
 FULL_HTML_BY_URL = {
-    FULL_CMS_URL: (
-        '<h2>Final Rule</h2><a href="/manual/P0001.html">'
-        "Definitions Manual Table of Contents</a>"
-    ),
+    FULL_CMS_URL: ('<h2>Final Rule</h2><a href="/manual/P0001.html">Definitions Manual Table of Contents</a>'),
     FULL_TOC_URL: (
         "Version 44.2 "
         '<a href="appendix.html">Appendix A List of MS-DRGs</a>'
         '<a href="diagnosis.html">Diagnosis Code/MDC/MS-DRG Index</a>'
         '<a href="procedure.html">Procedure Code/MS-DRG Index</a>'
     ),
-    "https://example.test/manual/appendix.html": (
-        '<a href="list.html">List of MS-DRGs</a>'
-    ),
+    "https://example.test/manual/appendix.html": ('<a href="list.html">List of MS-DRGs</a>'),
     "https://example.test/manual/list.html": MS_DRG_LIST_HTML,
-    FULL_DIAGNOSIS_LANDING: (
-        '<a href="diagnosis/P0100.html">Diagnosis Code/MDC/MS-DRG Index</a>'
-    ),
+    FULL_DIAGNOSIS_LANDING: ('<a href="diagnosis/P0100.html">Diagnosis Code/MDC/MS-DRG Index</a>'),
     "https://example.test/manual/diagnosis/P0100.html": DIAGNOSIS_HTML,
-    FULL_PROCEDURE_LANDING: (
-        '<a href="procedure/P0200.html">Procedure Code/MS-DRG Index</a>'
-    ),
+    FULL_PROCEDURE_LANDING: ('<a href="procedure/P0200.html">Procedure Code/MS-DRG Index</a>'),
     "https://example.test/manual/procedure/P0200.html": PROCEDURE_HTML,
 }
 SECOND_PAGE_BY_URL = {
@@ -71,15 +63,9 @@ SECOND_PAGE_BY_URL = {
         "<table><tr><td>A999</td><td>01</td><td>999</td></tr></table>"
     ),
     "https://example.test/manual/procedure/P0201.html": (
-        "<table><tr><td>0ZZZZZZ</td><td>01</td><td>999</td>"
-        "<td>Filtered procedure</td></tr></table>"
+        "<table><tr><td>0ZZZZZZ</td><td>01</td><td>999</td><td>Filtered procedure</td></tr></table>"
     ),
 }
-
-
-class _FakeStage:
-    __tablename__ = "stage"
-    __table__ = object()
 
 
 class _RecordingDb:
@@ -166,17 +152,9 @@ async def test_manual_source_discovery_and_validation(monkeypatch):
     cms_url = "https://example.test/cms"
     toc_url = "https://example.test/manual/P0001.html"
     html_by_url = {
-        cms_url: (
-            '<h2>Final Rule</h2><a href="/manual/P0001.html">'
-            "Definitions Manual Table of Contents</a>"
-        ),
-        toc_url: (
-            "Version 44.2 "
-            '<a href="appendix.html">Appendix A List of MS-DRGs</a>'
-        ),
-        "https://example.test/manual/appendix.html": (
-            '<a href="list.html">List of MS-DRGs</a>'
-        ),
+        cms_url: ('<h2>Final Rule</h2><a href="/manual/P0001.html">Definitions Manual Table of Contents</a>'),
+        toc_url: ('Version 44.2 <a href="appendix.html">Appendix A List of MS-DRGs</a>'),
+        "https://example.test/manual/appendix.html": ('<a href="list.html">List of MS-DRGs</a>'),
         "https://example.test/manual/list.html": MS_DRG_LIST_HTML,
     }
     monkeypatch.setattr(ms_drg, "_download_text", html_by_url.__getitem__)
@@ -204,12 +182,8 @@ async def test_manual_source_discovery_and_validation(monkeypatch):
 async def test_manual_source_rejects_empty_catalog(monkeypatch):
     """A located list that parses to zero rows fails with the list URL for context."""
     html_by_url = {
-        "https://example.test/toc.html": (
-            '<a href="appendix.html">Appendix A List of MS-DRGs</a>'
-        ),
-        "https://example.test/appendix.html": (
-            '<a href="list.html">List of MS-DRGs</a>'
-        ),
+        "https://example.test/toc.html": ('<a href="appendix.html">Appendix A List of MS-DRGs</a>'),
+        "https://example.test/appendix.html": ('<a href="list.html">List of MS-DRGs</a>'),
         "https://example.test/list.html": "<table></table>",
     }
     monkeypatch.setattr(ms_drg, "_download_text", html_by_url.__getitem__)
@@ -225,13 +199,9 @@ def test_relationship_link_errors_name_every_missing_index():
     assert "diagnosis" in str(both_missing.value)
     assert "procedure" in str(both_missing.value)
 
-    diagnosis_only_html = (
-        '<a href="diagnosis.html">Diagnosis Code/MDC/MS-DRG Index</a>'
-    )
+    diagnosis_only_html = '<a href="diagnosis.html">Diagnosis Code/MDC/MS-DRG Index</a>'
     with pytest.raises(RuntimeError) as procedure_missing:
-        ms_drg._relationship_landing_urls(
-            _manual_source(toc_html=diagnosis_only_html)
-        )
+        ms_drg._relationship_landing_urls(_manual_source(toc_html=diagnosis_only_html))
     assert "procedure" in str(procedure_missing.value)
 
 
@@ -245,34 +215,22 @@ def _install_full_import_stubs(monkeypatch):
     async def download_many(page_urls, _concurrency):
         return [(page_url, SECOND_PAGE_BY_URL[page_url]) for page_url in page_urls]
 
-    async def push_rows(_stage, row_maps):
-        return len(row_maps)
-
-    async def merge_catalog(_stage, _schema, source_names):
-        merge_calls.append(("catalog", source_names))
-
-    async def merge_synonyms(_stage, _schema, source_names):
-        merge_calls.append(("synonym", source_names))
-
-    async def merge_relationships(_stage, _schema, source_names):
-        merge_calls.append(("relationship", source_names))
+    async def prepare(_database, _context, **options):
+        merge_calls.append(options)
+        return {**options["metrics"], "status": "prepared"}
 
     monkeypatch.setattr(ms_drg, "db", recording_db)
     monkeypatch.setattr(ms_drg, "ensure_database", no_operation)
     monkeypatch.setattr(ms_drg, "_ensure_tables", no_operation)
     monkeypatch.setattr(ms_drg, "_download_text", FULL_HTML_BY_URL.__getitem__)
     monkeypatch.setattr(ms_drg, "_download_many", download_many)
-    monkeypatch.setattr(ms_drg, "make_class", lambda *_args: _FakeStage)
-    monkeypatch.setattr(ms_drg, "_push", push_rows)
-    monkeypatch.setattr(ms_drg, "_merge_catalog_stage", merge_catalog)
-    monkeypatch.setattr(ms_drg, "_merge_synonym_stage", merge_synonyms)
-    monkeypatch.setattr(ms_drg, "_merge_relationship_stage", merge_relationships)
+    monkeypatch.setattr(ms_drg, "prepare_catalog_handoff", prepare)
     return merge_calls
 
 
 @pytest.mark.asyncio
-async def test_full_import_publishes_filtered_relationships(monkeypatch):
-    """A synthetic full flow downloads both indexes and publishes only smoke DRGs."""
+async def test_full_import_prepares_filtered_relationships(monkeypatch):
+    """A synthetic full flow downloads both indexes and prepares only smoke DRGs."""
     merge_calls = _install_full_import_stubs(monkeypatch)
 
     summary_map = await ms_drg.import_ms_drg(
@@ -287,14 +245,15 @@ async def test_full_import_publishes_filtered_relationships(monkeypatch):
     assert summary_map["icd10pcs_rows"] == 1
     assert summary_map["diagnosis_index_pages"] == 2
     assert summary_map["procedure_index_pages"] == 2
-    assert merge_calls == [
-        ("catalog", ms_drg.SOURCES),
-        ("synonym", (ms_drg.SOURCE_MS_DRG,)),
-        (
-            "relationship",
-            (ms_drg.SOURCE_ICD10CM_INDEX, ms_drg.SOURCE_ICD10PCS_INDEX),
-        ),
-    ]
+    assert summary_map["status"] == "prepared"
+    assert len(merge_calls) == 1
+    prepared = merge_calls[0]
+    assert prepared["options"] == {"include_relationships": True, "test_mode": True}
+    assert len(prepared["payloads"]["code_relationship"]) == 4
+    assert {entry["source"] for entry in prepared["payloads"]["code_relationship"]} == {
+        ms_drg.SOURCE_ICD10CM_INDEX,
+        ms_drg.SOURCE_ICD10PCS_INDEX,
+    }
 
 
 @pytest.mark.asyncio
@@ -339,59 +298,30 @@ def test_payload_builder_assigns_relationship_sources():
 
     assert len(import_payloads.catalog_payloads) == 2
     assert len(import_payloads.synonym_payloads) == 3
-    assert {
-        relationship_map["source"]
-        for relationship_map in import_payloads.relationship_payloads
-    } == {
+    assert {relationship_map["source"] for relationship_map in import_payloads.relationship_payloads} == {
         ms_drg.SOURCE_ICD10CM_INDEX,
         ms_drg.SOURCE_ICD10PCS_INDEX,
     }
 
 
 @pytest.mark.asyncio
-async def test_publication_helpers_batch_and_merge_owned_rows(monkeypatch):
-    """Publication helpers create tables, batch rows, and scope every source replacement."""
+async def test_publication_preserves_live_shape_and_fixed_source_rules(monkeypatch):
+    """Table initialization cannot mutate serving indexes or perform a slice replacement."""
     recording_db = _RecordingDb()
-    pushed_chunks = []
-
-    async def push_objects(row_chunk, stage_class):
-        pushed_chunks.append((stage_class.__tablename__, list(row_chunk)))
-
     monkeypatch.setattr(publication, "db", recording_db)
-    monkeypatch.setattr(publication, "push_objects", push_objects)
-    monkeypatch.setattr(publication, "BATCH_SIZE", 1)
-
     await publication._ensure_tables("unit")
-    pushed_count = await publication._push(
-        _FakeStage,
-        [{"code": "1"}, {"code": "2"}],
-    )
-    await publication._merge_catalog_stage(
-        _FakeStage,
-        "unit",
-        (publication.SOURCE_MS_DRG,),
-    )
-    await publication._merge_synonym_stage(
-        _FakeStage,
-        "unit",
-        (publication.SOURCE_MS_DRG,),
-    )
-    await publication._merge_relationship_stage(
-        _FakeStage,
-        "unit",
-        (
-            publication.SOURCE_ICD10CM_INDEX,
-            publication.SOURCE_ICD10PCS_INDEX,
-        ),
-    )
-
-    assert pushed_count == 2
-    assert [len(row_chunk) for _stage, row_chunk in pushed_chunks] == [1, 1]
     assert len(recording_db.created_tables) == 3
-    sql_text = "\n".join(recording_db.queries)
-    assert "DELETE FROM unit.code_catalog" in sql_text
-    assert "DELETE FROM unit.code_synonym" in sql_text
-    assert "DELETE FROM unit.code_relationship" in sql_text
+    assert recording_db.queries == []
+    rules = native_publication.contributions("ms-drg")
+    assert tuple(rule.model_type for rule in rules) == (CodeCatalog, CodeSynonym, CodeRelationship)
+    assert tuple(rule.source_values for rule in rules) == (
+        publication.SOURCES,
+        (publication.SOURCE_MS_DRG,),
+        (publication.SOURCE_ICD10CM_INDEX, publication.SOURCE_ICD10PCS_INDEX),
+    )
+    partial = native_publication.contributions("ms-drg", include_relationships=False)
+    assert tuple(rule.model_type for rule in partial) == (CodeCatalog, CodeSynonym)
+    assert all(rule.source_values == (publication.SOURCE_MS_DRG,) for rule in partial)
 
 
 def test_catalog_rows_cover_designation_and_description_contracts():
@@ -436,3 +366,26 @@ async def test_entrypoint_disconnects_after_import_failure(monkeypatch):
     with pytest.raises(RuntimeError, match="synthetic import failure"):
         await ms_drg.main()
     assert lifecycle_events == ["init", "disconnect"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_managed_entrypoint_preserves_real_attempt_and_disconnects(monkeypatch, fails):
+    """Only the managed wrapper receives the caller's attempt; standalone stays compatible."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    context_by_field = {"context": {"control_run_id": "synthetic-run"}}
+    database = SimpleNamespace(disconnect=AsyncMock())
+    monkeypatch.setattr(ms_drg, "db", database)
+    monkeypatch.setattr(ms_drg, "init_db", AsyncMock())
+    importer = AsyncMock(return_value={"status": "finalizing"}, side_effect=RuntimeError("failure") if fails else None)
+    monkeypatch.setattr(ms_drg, "_import_request", importer)
+    if fails:
+        with pytest.raises(RuntimeError, match="failure"):
+            await ms_drg.managed_main(context_by_field, {"include_relationships": False})
+    else:
+        assert await ms_drg.managed_main(context_by_field, {"include_relationships": False}) == {"status": "finalizing"}
+    request, supplied_context = importer.await_args.args
+    assert request.include_relationships is False and supplied_context is context_by_field
+    database.disconnect.assert_awaited_once()

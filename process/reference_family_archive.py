@@ -24,7 +24,6 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import (
     ARRAY,
-    JSON,
     Column,
     DefaultClause,
     ForeignKeyConstraint,
@@ -36,6 +35,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import AddConstraint, CreateIndex, CreateSequence, CreateTable, MetaData
+from sqlalchemy.sql.elements import TextClause
 
 from db import models
 from db.tiger_models import Zip_zcta5, ZipState
@@ -59,6 +59,15 @@ from process.mrf_address_publication import (
 )
 from process.mrf_publication_receipt import require_completed_publication
 from process.provider_quality_parts.table_helpers import _index_name_for_table
+from process.reference_family_composition import (
+    ReferenceModelContribution as ReferenceModelContribution,
+)
+from process.reference_family_composition import (
+    _is_model_projection_equal,
+)
+from process.reference_family_composition import (
+    compose_model_family_stage as compose_model_family_stage,
+)
 from process.reference_family_dictionary import (
     _CLAIMS_SCOPED_MODELS as _CLAIMS_SCOPED_MODELS,
 )
@@ -1614,9 +1623,15 @@ async def _copy_source_projection(session, source_copy, query, schema_name, tabl
     timeout = deadline - asyncio.get_running_loop().time()
     if timeout <= 0:
         raise TimeoutError("reference family source COPY deadline expired")
+    query_args = ()
+    if isinstance(query, TextClause):
+        compiled = query.compile(dialect=postgresql.asyncpg.dialect())
+        query_args = tuple(compiled.params[name] for name in compiled.positiontup)
+        query = str(compiled)
     copied = await source_copy.copy_rows(
         session,
         query,
+        *query_args,
         schema_name=schema_name,
         table_name=table_name,
         columns=columns,
@@ -1628,37 +1643,33 @@ async def _copy_source_projection(session, source_copy, query, schema_name, tabl
     return remaining - copied
 
 
-async def native_copy_projection(session, query, *, schema_name, table_name, columns, max_bytes, timeout):
-    """Reuse sequential native binary COPY on one owning transaction and bounded spool.
-
-    COPY OUT completes before COPY IN begins. This preserves the caller's own
-    uncommitted staged rows without a second snapshot or concurrent driver use.
+async def native_copy_projection(session, query, *args, schema_name, table_name, columns, max_bytes, timeout):
+    """Copy OUT/IN sequentially on the owning transaction, preserving its uncommitted
+    rows without a second snapshot or concurrent driver use, within one bounded spool.
     """
-    _require_transaction(session)
     if (
-        type(max_bytes) is not int
-        or not 0 <= max_bytes < 2**63
-        or type(timeout) not in (int, float)
-        or not math.isfinite(timeout)
-        or not 0 < timeout <= 300
-        or not isinstance(query, str)
-        or not query.startswith("SELECT ")
-        or not isinstance(columns, (list, tuple))
-        or not columns
+        (type(max_bytes) is not int or not 0 <= max_bytes < 2**63)
+        or (type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 86400)
+        or (not isinstance(query, str) or not query.startswith("SELECT "))
+        or (not isinstance(columns, (list, tuple)) or not 1 <= len(columns) <= 1600)
         or any(
             not isinstance(name, str) or not _IDENTIFIER.fullmatch(name) for name in (schema_name, table_name, *columns)
         )
+        or len(set(columns)) != len(columns)
     ):
         raise ReferenceFamilyArchiveError("native model projection COPY bounds differ")
     driver = await _native_model_copy_driver(session, ("copy_from_query", "copy_to_table"))
-    return await _copy_native_projection(driver, query, schema_name, table_name, columns, max_bytes, timeout)
+    return await _copy_native_projection(driver, query, schema_name, table_name, columns, max_bytes, timeout, *args)
 
 
 async def _native_model_copy_driver(session, methods):
     """Require the caller's actual driver transaction before any native protocol command."""
-    _require_transaction(session)
-    connection = await session.connection()
-    driver = (await connection.get_raw_connection()).driver_connection
+    if callable(getattr(session, "is_in_transaction", None)):
+        driver = session
+    else:
+        _require_transaction(session)
+        connection = await session.connection()
+        driver = (await connection.get_raw_connection()).driver_connection
     if (
         not callable(getattr(driver, "is_in_transaction", None))
         or not driver.is_in_transaction()
@@ -1668,35 +1679,41 @@ async def _native_model_copy_driver(session, methods):
     return driver
 
 
-async def _capture_native_projection(driver, query, spool, max_bytes, deadline, *, copy_format="binary"):
+async def _capture_native_projection(driver, query, spool, max_bytes, deadline, *query_args, copy_format="binary"):
     """Drain native COPY OUT with a fixed spool cap before restoring any payload."""
     if copy_format not in {"binary", "text"}:
         raise ReferenceFamilyArchiveError("native model projection COPY format differs")
-    accounting_by_field = {"copied_bytes": 0, "has_overflow": False}
+    accounting_by_field = {"copied_bytes": 0, "error": None}
 
     async def consume(chunk):
         """Bound native wire bytes, without interpreting or validating records."""
-        if accounting_by_field["has_overflow"] or accounting_by_field["copied_bytes"] + len(chunk) > max_bytes:
-            accounting_by_field["has_overflow"] = True
+        if accounting_by_field["error"] is not None:
             return
-        spool.write(chunk)
+        if accounting_by_field["copied_bytes"] + len(chunk) > max_bytes:
+            accounting_by_field["error"] = ReferenceFamilyArchiveError("native model projection COPY byte cap exceeded")
+            return
+        try:
+            spool.write(chunk)
+        except Exception as error:
+            accounting_by_field["error"] = error
+            return
         accounting_by_field["copied_bytes"] += len(chunk)
 
     status = await driver.copy_from_query(
-        query, output=consume, format=copy_format, timeout=deadline - asyncio.get_running_loop().time()
+        query, *query_args, output=consume, format=copy_format, timeout=deadline - asyncio.get_running_loop().time()
     )
-    if accounting_by_field["has_overflow"]:
-        raise ReferenceFamilyArchiveError("native model projection COPY byte cap exceeded")
+    if accounting_by_field["error"] is not None:
+        raise accounting_by_field["error"]
     return status, accounting_by_field["copied_bytes"]
 
 
-async def _copy_native_projection(driver, query, schema_name, table_name, columns, max_bytes, timeout):
+async def _copy_native_projection(driver, query, schema_name, table_name, columns, max_bytes, timeout, *query_args):
     """Keep sequential COPY OUT/IN inside one native deadline and caller-owned transaction."""
-    try:
-        async with asyncio.timeout(timeout) as deadline:
-            with TemporaryFile(mode="w+b") as spool:
+    with TemporaryFile(mode="w+b") as spool:
+        try:
+            async with asyncio.timeout(timeout) as deadline:
                 captured, copied_bytes = await _capture_native_projection(
-                    driver, query, spool, max_bytes, deadline.when()
+                    driver, query, spool, max_bytes, deadline.when(), *query_args
                 )
                 spool.seek(0)
                 restored = await driver.copy_to_table(
@@ -1709,9 +1726,9 @@ async def _copy_native_projection(driver, query, schema_name, table_name, column
                 )
                 if not isinstance(captured, str) or not re.fullmatch(r"COPY [0-9]+", captured) or captured != restored:
                     raise ReferenceFamilyArchiveError("native model projection COPY count differs")
-    except asyncio.CancelledError, TimeoutError:
-        driver.terminate()
-        raise
+        except asyncio.CancelledError, TimeoutError:
+            driver.terminate()
+            raise
     return copied_bytes
 
 
@@ -4055,22 +4072,6 @@ async def _is_model_table_equal(
 ) -> bool:
     """Compare indexed, isolated model tables exactly without row serialization or hashes."""
     _require_transaction(session)
-    table = model_type.__table__
-    keys = tuple(table.primary_key.columns)
-    if not keys:
-        raise ReferenceFamilyArchiveError("set comparison requires a model primary key")
-    join = " AND ".join(f"l.{_quoted(column.name)}=r.{_quoted(column.name)}" for column in keys)
-    fields = []
-    for column in table.columns:
-        name = _quoted(column.name)
-        cast = "::jsonb" if isinstance(column.type, JSON) else ""
-        if isinstance(column.type, ARRAY) and isinstance(column.type.item_type, JSON):
-            cast = "::jsonb[]"
-        if str(column.type).lower().startswith(("geometry", "geography")):
-            cast = "::text"
-        fields.append(f"{name}{cast}")
-    left_row = "ROW(" + ", ".join(f"l.{field}" for field in fields) + ")"
-    right_row = "ROW(" + ", ".join(f"r.{field}" for field in fields) + ")"
     parameters_by_field = {}
     left = f"{_quoted(left_schema)}.{_quoted(left_name)}"
     right = f"{_quoted(right_schema)}.{_quoted(right_name)}"
@@ -4078,24 +4079,13 @@ async def _is_model_table_equal(
         left = f"(SELECT canonical.* FROM {left} canonical {left_predicate})"
     if scope is not None:
         scope_column, scope_values = scope
-        if scope_column not in table.c or not isinstance(scope_values, tuple):
+        if scope_column not in model_type.__table__.c or not isinstance(scope_values, tuple):
             raise ReferenceFamilyArchiveError("set comparison scope differs from the installed model")
         parameters_by_field["scope_values"] = list(scope_values)
         predicate = f"{_quoted(scope_column)}=ANY(CAST(:scope_values AS text[]))"
         left = f"(SELECT * FROM {left} WHERE {predicate})"
         right = f"(SELECT * FROM {right} WHERE {predicate})"
-    equal = await session.scalar(
-        text(
-            # A scalar PK probe keeps wide payloads out of hash/sort join storage.
-            # The reverse anti-join checks only keys, so extra right rows still refuse.
-            f"SELECT NOT EXISTS(SELECT 1 FROM {left} l WHERE {left_row} "
-            f"IS DISTINCT FROM (SELECT {right_row} FROM {right} r WHERE {join})) "
-            f"AND NOT EXISTS(SELECT 1 FROM {right} r "
-            f"WHERE NOT EXISTS(SELECT 1 FROM {left} l WHERE {join}))"
-        ),
-        parameters_by_field,
-    )
-    return equal is True
+    return await _is_model_projection_equal(session, model_type, left, right, parameters_by_field)
 
 
 async def _create_model_family(

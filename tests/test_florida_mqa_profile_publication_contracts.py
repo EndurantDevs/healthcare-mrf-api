@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -10,26 +11,41 @@ from db.models import ProviderProfileProjection
 florida = importlib.import_module("process.florida_mqa_profile")
 
 
+@pytest.fixture(autouse=True)
+def native_projection_copy(monkeypatch):
+    from process import florida_projection_archive as archive
+    from process import reference_family_archive as native
+
+    copier, indexes = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(native, "native_copy_record_batch", copier)
+    monkeypatch.setattr(native, "_create_model_indexes", indexes)
+    monkeypatch.setattr(archive, "isolate_ordinary_projection", AsyncMock(return_value={"relation_oid": 10}))
+    monkeypatch.setattr(archive, "preserve_ordinary_projection_access", AsyncMock())
+    return copier, indexes
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("write_fails", [False, True])
-async def test_publication_progress_counts_only_successful_staging(monkeypatch, write_fails):
+async def test_publication_progress_counts_only_successful_staging(monkeypatch, write_fails, native_projection_copy):
     """Staging progress cannot claim failed writes or a completed publication."""
     events = []
     database = _PublicationDb(scalar_results=[0, 0], all_results=[])
     monkeypatch.setattr(florida, "db", database)
     monkeypatch.setattr(florida, "enqueue_live_progress", lambda **event: events.append(event))
     if write_fails:
-        async def failed_write(self):
-            raise RuntimeError("staging write failed")
-        monkeypatch.setattr(_Statement, "status", failed_write)
+        native_projection_copy[0].side_effect = RuntimeError("staging write failed")
     with pytest.raises(RuntimeError, match="staging write failed|stage_validation_failed"):
         await florida._publish_projection_swap(
-            "a" * 32, _one_projection_row("a" * 32),
+            "a" * 32,
+            _one_projection_row("a" * 32),
             started_at=datetime(2026, 7, 27, tzinfo=UTC),
-            completion_metrics=_completion_metrics(1), allow_volume_drop=False,
-            min_first_publish_providers=1, min_publish_ratio=0.8,
+            completion_metrics=_completion_metrics(1),
+            allow_volume_drop=False,
+            min_first_publish_providers=1,
+            min_publish_ratio=0.8,
         )
     assert len(events) == (0 if write_fails else 1)
+    assert native_projection_copy[1].await_count == (0 if write_fails else 1)
     if events:
         assert events[0]["counters"] == {"staged_providers": 1}
         assert events[0]["phase"] == "publishing"
@@ -42,6 +58,17 @@ class _Row:
 
 
 class _Transaction:
+    def in_transaction(self):
+        return True
+
+    async def scalar(self, statement, parameters):
+        assert "n.nspname='hp_snapshot_retention'" in str(statement)
+        assert parameters["relation"].endswith('."provider_profile_source_pin"')
+        return None
+
+    async def execute(self, statement):
+        assert str(statement) == "SELECT pg_current_xact_id()"
+
     async def __aenter__(self):
         return self
 
@@ -260,9 +287,7 @@ async def test_publication_volume_override_is_auditable_and_rotates_tables(
     assert publication["volume_guard"]["allow_volume_drop"] is True
     assert metrics["published_providers"] == 1
     dropped_defaults = [
-        statement
-        for statement in database.status_calls
-        if "ALTER COLUMN npi DROP DEFAULT" in statement
+        statement for statement in database.status_calls if "ALTER COLUMN npi DROP DEFAULT" in statement
     ]
     assert len(dropped_defaults) == 3
     assert all("unrelated_projection_table" not in profile_item for profile_item in dropped_defaults)

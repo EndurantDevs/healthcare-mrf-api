@@ -1,7 +1,29 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Audit generations excluded from ordinary Florida payload retention."""
 
+import asyncio
+
 from sqlalchemy import text
+
+
+async def _remove_retained_directories(artifact_root, run_ids):
+    """Drain actual filesystem work before cancellation can release the source lock."""
+    from process.florida_mqa_profile import _remove_artifact_run_directories
+
+    deletion = asyncio.create_task(asyncio.to_thread(_remove_artifact_run_directories, artifact_root, run_ids))
+    try:
+        return await asyncio.shield(deletion)
+    except asyncio.CancelledError:
+        while not deletion.done():
+            try:
+                await asyncio.shield(deletion)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not deletion.cancelled():
+            deletion.exception()
+        raise
 
 
 async def protected_projection_run_ids(database, schema: str, live_name: str, old_name: str) -> set[str]:

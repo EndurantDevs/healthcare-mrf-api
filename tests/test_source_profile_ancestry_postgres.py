@@ -14,7 +14,7 @@ from db.connection import Database
 from process import massachusetts_profile_store
 from process import provider_profile_source_store as shared
 from process import source_profile_result_archive as archive
-from tests.source_profile_archive_support import _seed
+from tests.source_profile_archive_support import _seed, native_source_copy
 from tests.test_source_profile_result_archive_postgres import (
     _assert_reference_free_read,
     _drop_prepared_stage,
@@ -36,7 +36,7 @@ async def _retain(case, schema, monkeypatch, tmp_path):
 
 async def _assert_root_only_activation(case, monkeypatch, tmp_path):
     async with case.sessions() as session, session.begin():
-        validation = await archive.prepare_activation(session, **case.activation_by_field)
+        validation = await archive.prepare_activation(session, **case.preparation_by_field)
         assert (await archive._pointer(session, case.destination_schema, IMPORTER))["current_run_id"] == case.incumbent
     async with case.sessions() as session, session.begin():
         await archive.activate_validated_result(session, validation=validation, **case.activation_by_field)
@@ -116,7 +116,9 @@ async def _exercise_set_validated_descendant(case):
             "pin_id": uuid4(),
         }
         async with case.sessions() as session, session.begin():
-            validation = await archive.prepare_activation(session, **activation_by_field)
+            validation = await archive.prepare_activation(
+                session, **activation_by_field, publication_request={"source_copy": native_source_copy()}
+            )
             assert await archive._run(session, case.destination_schema, descendant) is None
             assert await archive._pin_group(session, case.destination_schema, activation_by_field["pin_id"]) == []
         with pytest.raises(archive.SourceProfileArchiveError, match="content differs"):
@@ -169,6 +171,7 @@ async def _prepare_descendant(case):
             run_id=descendant,
             dataset_id=uuid4(),
             contract=case.prepared.manifest["contract"],
+            source_copy=native_source_copy(),
         )
 
 

@@ -15,15 +15,22 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.schema import MetaData
 
 from db.models import CodeCatalog, CodeRelationship, CodeSynonym
 from process import ms_drg_result_archive as archive
 from process import ms_drg_result_generation as authority
+from process import reference_family_archive as native
 from process.ms_drg_publication import SOURCE_ICD10PCS_INDEX, SOURCE_MS_DRG
+from process.scoped_catalog_retention import cleanup_retained_catalog
+from tests.scoped_catalog_native_fixture import catalog_actors, seal_catalog
 
 _MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260923021000_ms_drg_result_generation.py"
+
+
+def _copy():
+    return native.ReferenceFamilySourceCopy(native.native_copy_projection, 1024**2, 30)
 
 
 async def _upgrade_generation(connection) -> None:
@@ -84,17 +91,21 @@ async def _source_variants(sessions, schema):
         assert first["local_generation"] == 1
         assert first["receipt"]["tables"][2]["row_count"] == 0
     async with sessions.begin() as session:
-        catalog_stage, catalog_manifest = await archive.prepare_source(session, schema, uuid4())
+        catalog_stage, catalog_manifest = await archive.prepare_source(session, schema, uuid4(), source_copy=_copy())
         assert catalog_manifest["include_relationships"] is False
         assert catalog_manifest["tables"][2]["row_count"] == 0
         await archive.cleanup_stage(session, catalog_stage, receiving=False)
 
     async with sessions.begin() as session:
         await session.execute(
+            text(f"INSERT INTO \"{schema}\".code_catalog (code_system,code,source) VALUES ('ICD10PCS','a',:source)"),
+            {"source": SOURCE_ICD10PCS_INDEX},
+        )
+        await session.execute(
             text(
                 f'INSERT INTO "{schema}".code_relationship '
                 "(from_system,from_code,relationship,to_system,to_code,source) "
-                "VALUES ('ICD10PCS','a','belongs_to','MS_DRG','001',:source)"
+                "VALUES ('ICD10PCS','a','groups_to_ms_drg','MS_DRG','001',:source)"
             ),
             {"source": SOURCE_ICD10PCS_INDEX},
         )
@@ -121,7 +132,7 @@ async def _source_variants(sessions, schema):
 async def _source_stage_validation(sessions, schema):
     dataset_id = uuid4()
     async with sessions.begin() as session:
-        stage, manifest = await archive.prepare_source(session, schema, dataset_id)
+        stage, manifest = await archive.prepare_source(session, schema, dataset_id, source_copy=_copy())
     async with sessions.begin() as session:
         await archive.verify_stage(session, stage, manifest, receiving=False)
         await session.execute(
@@ -136,8 +147,7 @@ async def _source_stage_validation(sessions, schema):
         await archive.cleanup_stage(session, stage, receiving=False)
 
 
-async def _create_destination(engine):
-    destination = "ms_drg_dest_" + uuid4().hex[:12]
+async def _create_destination(engine, destination):
     destination_tables = MetaData(schema=destination)
     for model in (CodeCatalog, CodeSynonym, CodeRelationship):
         model.__table__.to_metadata(destination_tables, schema=destination)
@@ -170,7 +180,7 @@ async def _create_destination(engine):
 
 async def _activation_roundtrip(engine, sessions, schema, destination):
     async with sessions.begin() as session:
-        source_stage, manifest = await archive.prepare_source(session, schema, uuid4())
+        source_stage, manifest = await archive.prepare_source(session, schema, uuid4(), source_copy=_copy())
         receiving = await archive.precreate_restore(session, destination, uuid4(), manifest)
         for name in archive.TABLES:
             await session.execute(
@@ -179,26 +189,28 @@ async def _activation_roundtrip(engine, sessions, schema, destination):
                     f'SELECT * FROM "{source_stage["schema_name"]}"."{name}"'
                 )
             )
-        await archive.verify_stage(session, receiving, manifest, receiving=True)
-        prepared = await archive.prepare_predecessor(session, destination, receiving, manifest)
+        await archive.complete_restore(session, receiving, manifest)
+        prepared = await archive.prepare_predecessor(session, destination, receiving, manifest, source_copy=_copy())
     with pytest.raises(archive.MsDrgArchiveError, match="key belongs to another source"):
         async with sessions.begin() as session:
-            await archive.activate_stage(session, destination, receiving, manifest, prepared)
+            await archive.activate_stage(session, destination, receiving, manifest, prepared, source_copy=_copy())
     async with sessions.begin() as session:
         await session.execute(text(f"DELETE FROM \"{destination}\".code_catalog WHERE code='001'"))
     with pytest.raises(RuntimeError, match="synthetic activation failure"):
         async with sessions.begin() as session:
-            await archive.activate_stage(session, destination, receiving, manifest, prepared)
+            await archive.activate_stage(session, destination, receiving, manifest, prepared, source_copy=_copy())
             raise RuntimeError("synthetic activation failure")
     async with sessions.begin() as session:
         assert await session.scalar(text(f'SELECT local_generation FROM "{destination}".ms_drg_result_generation')) == 0
         assert await session.scalar(text(f'SELECT count(*) FROM "{destination}".code_relationship')) == 0
     async with sessions.begin() as session:
-        activation = await archive.activate_stage(session, destination, receiving, manifest, prepared)
+        activation = await archive.activate_stage(
+            session, destination, receiving, manifest, prepared, source_copy=_copy()
+        )
         assert activation["current"]["local_generation"] == 1
         assert activation["current"]["include_relationships"] is True
     async with sessions.begin() as session:
-        restored = await archive.rollback_activation(session, destination, activation)
+        restored = await archive.rollback_activation(session, destination, activation, source_copy=_copy())
         assert restored["local_generation"] == 2
         assert restored["origin_generation"] is None
         assert (
@@ -207,6 +219,7 @@ async def _activation_roundtrip(engine, sessions, schema, destination):
         )
         await archive.cleanup_stage(session, receiving, receiving=True)
         await archive.cleanup_stage(session, source_stage, receiving=False)
+        await cleanup_retained_catalog(session, activation["retained_family"])
     async with engine.begin() as connection:
         await connection.execute(text(f'DROP SCHEMA "{destination}" CASCADE'))
 
@@ -242,7 +255,7 @@ async def _retained_and_drift(sessions, schema):
     async with sessions.begin() as session:
         retained = await authority.publish_local_generation(session, schema, include_relationships=False)
         assert retained["receipt"]["tables"][2]["row_count"] == 1
-        retained_stage, retained_manifest = await archive.prepare_source(session, schema, uuid4())
+        retained_stage, retained_manifest = await archive.prepare_source(session, schema, uuid4(), source_copy=_copy())
         assert retained_manifest["include_relationships"] is False
         assert retained_manifest["tables"][2]["row_count"] == 1
         await archive.cleanup_stage(session, retained_stage, receiving=False)
@@ -250,7 +263,7 @@ async def _retained_and_drift(sessions, schema):
     # A failed pre-publication DDL change must invalidate the old source receipt.
     async with sessions.begin() as session:
         await session.execute(text(f'ALTER TABLE "{schema}".code_catalog ALTER COLUMN source TYPE varchar(130)'))
-    with pytest.raises(RuntimeError, match="MS-DRG serving result changed"):
+    with pytest.raises(RuntimeError, match="MS-DRG serving result changed|model columns differ"):
         async with sessions.begin() as session:
             await authority.read_current_generation(session, schema)
 
@@ -259,19 +272,20 @@ async def _retained_and_drift(sessions, schema):
 async def test_ms_drg_generation_variants_rollback_and_concurrent_publish(monkeypatch):
     """Exercise native publication, archive rollback, concurrency, and drift checks."""
     engine = create_async_engine(_dsn())
-    sessions = async_sessionmaker(engine, expire_on_commit=False)
     schema = "ms_drg_test_" + uuid4().hex[:12]
+    destination = "ms_drg_dest_" + uuid4().hex[:12]
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     monkeypatch.delenv("DB_SCHEMA", raising=False)
     try:
-        await _create_source(engine, schema)
-        await _source_variants(sessions, schema)
-        await _source_stage_validation(sessions, schema)
-        destination = await _create_destination(engine)
-        await _activation_roundtrip(engine, sessions, schema, destination)
-        await _concurrent_publication(sessions, schema)
-        await _retained_and_drift(sessions, schema)
+        async with catalog_actors(engine, [schema, destination]) as actors:
+            await _create_source(engine, schema)
+            await _create_destination(engine, destination)
+            for name in (schema, destination):
+                await seal_catalog(actors, name, (CodeCatalog, CodeSynonym, CodeRelationship), authority.TABLE)
+            await _source_variants(actors.publisher, schema)
+            await _source_stage_validation(actors.builder, schema)
+            await _activation_roundtrip(engine, actors.publisher, schema, destination)
+            await _concurrent_publication(actors.publisher, schema)
+            await _retained_and_drift(actors.publisher, schema)
     finally:
-        async with engine.begin() as connection:
-            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         await engine.dispose()

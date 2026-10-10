@@ -77,6 +77,8 @@ async def _load_target_snapshot(
     session: Any,
     schema: str,
     snapshot_id: str,
+    *,
+    is_readonly: bool = False,
 ) -> dict[str, Any]:
     return await _one(
         session,
@@ -93,7 +95,7 @@ async def _load_target_snapshot(
           JOIN {schema}.ptg2_v3_snapshot_layout AS layout
             ON layout.snapshot_key = binding.snapshot_key
          WHERE snapshot.snapshot_id = :snapshot_id
-         FOR SHARE OF snapshot, binding, layout
+         {"" if is_readonly else "FOR SHARE OF snapshot, binding, layout"}
         """,
         {"snapshot_id": snapshot_id},
     )
@@ -123,6 +125,7 @@ async def _load_rollback_pin(
     owner_type: str,
     owner_id: str,
     snapshot_id: str,
+    is_readonly: bool = False,
 ) -> dict[str, Any]:
     return await _one(
         session,
@@ -132,7 +135,7 @@ async def _load_rollback_pin(
          WHERE owner_type = :owner_type
            AND owner_id = :owner_id
            AND snapshot_id = :snapshot_id
-         FOR SHARE
+         {"" if is_readonly else "FOR SHARE"}
         """,
         {
             "owner_type": owner_type,
@@ -146,6 +149,8 @@ async def _load_target_plan_scopes(
     session: Any,
     schema: str,
     snapshot_id: str,
+    *,
+    is_readonly: bool = False,
 ) -> tuple[Mapping[str, Any], ...]:
     return await _all(
         session,
@@ -154,7 +159,7 @@ async def _load_target_plan_scopes(
           FROM {schema}.ptg2_v3_snapshot_plan_scope
          WHERE snapshot_id = :snapshot_id
          ORDER BY plan_id, plan_market_type
-         FOR SHARE
+         {"" if is_readonly else "FOR SHARE"}
         """,
         {"snapshot_id": snapshot_id},
     )
@@ -217,15 +222,9 @@ async def load_rollback_context(
 
     schema = _quote_ident(schema_name)
     return RollbackContext(
-        source_pointer_by_field=await _load_source_pointer(
-            session, schema, source_key
-        ),
-        target_snapshot_by_field=await _load_target_snapshot(
-            session, schema, snapshot_id
-        ),
-        expected_snapshot_by_field=await _load_expected_snapshot(
-            session, schema, expected_current_snapshot_id
-        ),
+        source_pointer_by_field=await _load_source_pointer(session, schema, source_key),
+        target_snapshot_by_field=await _load_target_snapshot(session, schema, snapshot_id),
+        expected_snapshot_by_field=await _load_expected_snapshot(session, schema, expected_current_snapshot_id),
         rollback_pin_by_field=await _load_rollback_pin(
             session,
             schema,
@@ -233,22 +232,12 @@ async def load_rollback_context(
             owner_id=rollback_owner_id,
             snapshot_id=snapshot_id,
         ),
-        target_snapshot_scope_by_field=await load_target_snapshot_scope(
-            session, schema, snapshot_id
-        ),
-        target_attestation_by_field=await load_target_attestation(
-            session, schema, snapshot_id
-        ),
-        target_plan_scope_records=await _load_target_plan_scopes(
-            session, schema, snapshot_id
-        ),
-        source_plan_pointer_records=await _load_source_plan_pointers(
-            session, schema, source_key
-        ),
+        target_snapshot_scope_by_field=await load_target_snapshot_scope(session, schema, snapshot_id),
+        target_attestation_by_field=await load_target_attestation(session, schema, snapshot_id),
+        target_plan_scope_records=await _load_target_plan_scopes(session, schema, snapshot_id),
+        source_plan_pointer_records=await _load_source_plan_pointers(session, schema, source_key),
         global_pointer_by_field={},
-        allowed_pointer_by_field=await _load_allowed_pointer(
-            session, schema, source_key
-        ),
+        allowed_pointer_by_field=await _load_allowed_pointer(session, schema, source_key),
     )
 
 
@@ -298,10 +287,7 @@ async def _replace_plan_pointers(
     pointer_entries: list[dict[str, Any]],
 ) -> None:
     await session.execute(
-        db.text(
-            f"DELETE FROM {schema}.ptg2_current_plan_source "
-            "WHERE source_key = :source_key"
-        ),
+        db.text(f"DELETE FROM {schema}.ptg2_current_plan_source WHERE source_key = :source_key"),
         {"source_key": source_key},
     )
     await session.execute(
@@ -430,8 +416,7 @@ async def apply_rollback(
     }
     await _reverse_source_pointer(session, schema, pointer_params_by_name)
     pointer_entries = [
-        {**dict(entry_by_field), "updated_at": updated_at}
-        for entry_by_field in decision.plan_pointer_entries
+        {**dict(entry_by_field), "updated_at": updated_at} for entry_by_field in decision.plan_pointer_entries
     ]
     await _replace_plan_pointers(
         session,

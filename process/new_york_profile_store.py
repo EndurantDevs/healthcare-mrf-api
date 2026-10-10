@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import re
 from contextlib import aclosing
+from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import JSON, Boolean, Integer, MetaData, String, select, text
+from sqlalchemy.schema import CreateTable
 
 from process import new_york_nysed_profile as nysed
 from process import new_york_nysed_profile_retries as nysed_retries
@@ -27,6 +30,7 @@ IMPORTER = "new-york-nypp-profile"
 SOURCE_URL = "https://www.nydoctorprofile.com/"
 CATEGORIES = ("education", "training", "certifications")
 COVERAGE_SCOPE = "supported_nppes_derived_ny_physician_license_roots"
+WITNESS_CONTRACT = "ny-profile-model-witness.v1"
 CAPTURE_FIELDS = ("capture_manifest", "file_sha256", "manifest_sha256", "acquisition_sha256")
 NYSED_IDENTITY_FIELDS = (
     "source_record_id",
@@ -39,6 +43,8 @@ NYSED_IDENTITY_FIELDS = (
     "license_number",
     "legal_name",
 )
+_LEGACY_TRANSFER_ROWS = 256
+_LEGACY_TRANSFER_BYTES = 8 * 1024 * 1024
 
 
 def _require(condition, reason):
@@ -56,6 +62,39 @@ def _hash(content):
 
 def _fact_hash(fact):
     return _hash({key: content for key, content in fact.items() if key != "published_at"})
+
+
+def witnessed_profile(descriptor, record, facts):
+    """Keep the already-remapped model values under their original canonical digests."""
+    return {
+        **descriptor,
+        "record_values": record,
+        "fact_values": [{key: value for key, value in fact.items() if key != "published_at"} for fact in facts],
+    }
+
+
+def bundle_reference(artifact):
+    """Bind the complete producer envelope without passing a worker filesystem path."""
+    return {
+        "contract": WITNESS_CONTRACT,
+        **{key: artifact[key] for key in ("artifact_id", "run_id", "content_sha256", "content_bytes")},
+    }
+
+
+def validate_bundle_reference(value, run_id):
+    """Require one bounded reference to this run's existing canonical artifact identity."""
+    _require(
+        isinstance(value, dict)
+        and set(value) == {"contract", "artifact_id", "run_id", "content_sha256", "content_bytes"}
+        and value["contract"] == WITNESS_CONTRACT
+        and value["run_id"] == run_id
+        and value["artifact_id"] == _hash([run_id, SOURCE_KEY])
+        and _sha(value["content_sha256"])
+        and type(value["content_bytes"]) is int
+        and 0 < value["content_bytes"] < 2**63,
+        "bundle_reference_invalid",
+    )
+    return value
 
 
 def _capture_descriptor(run_id, license_number, capture_manifest, file_sha256, *, is_held):
@@ -210,7 +249,7 @@ def _cohort_roots(cohort, manifest):
     return by_license
 
 
-def _validate_descriptor(descriptor_by_field, run_id, license_number):
+def _validate_descriptor(descriptor_by_field, run_id, license_number, *, witnessed=False):
     _require(
         isinstance(descriptor_by_field, dict)
         and set(descriptor_by_field)
@@ -227,10 +266,13 @@ def _validate_descriptor(descriptor_by_field, run_id, license_number):
             "record_id",
             "record_sha256",
             "facts",
-        },
+        }
+        | ({"record_values", "fact_values"} if witnessed else set()),
         "attempt_descriptor_invalid",
     )
     is_held = descriptor_by_field["acquisition_outcome"] == "held"
+    if witnessed:
+        _require_witness_values(descriptor_by_field, is_held)
     capture = _capture_descriptor(
         run_id,
         license_number,
@@ -267,25 +309,15 @@ def _validate_descriptor(descriptor_by_field, run_id, license_number):
         )
 
 
-def _has_matching_record_lineage(record, descriptor_by_field, manifest):
-    capture_by_field = {key: descriptor_by_field[key] for key in CAPTURE_FIELDS}
-    if not isinstance(record.get("match_evidence"), dict) or not isinstance(record.get("normalized_payload"), dict):
-        return False
-    binding = record["match_evidence"].get("registry_binding", {})
-    if not isinstance(binding, dict):
-        return False
-    return (
-        record.get("normalized_payload", {}).get("profile_capture")
-        == {**capture_by_field, "artifact_id": descriptor_by_field["capture_artifact_id"]}
-        and record.get("artifact_id") == _hash([record["run_id"], SOURCE_KEY])
-        and record.get("license_number") == descriptor_by_field["capture_manifest"]["license_number"]
-        and binding.get("snapshot_sha256") == manifest["snapshot_sha256"]
-        and binding.get("manifest_sha256") == descriptor_by_field["manifest_sha256"]
-        and binding.get("acquisition_sha256") == descriptor_by_field["acquisition_sha256"]
-        and binding.get("status") == record.get("match_status")
-        and binding.get("npi") == record.get("matched_npi")
-        and binding.get("reason") == descriptor_by_field["reason"]
-        and descriptor_by_field["binding_outcome"] == ("accepted" if record.get("matched_npi") is not None else "held")
+def _require_witness_values(descriptor, is_held):
+    _require(
+        isinstance(descriptor["fact_values"], list)
+        and (
+            descriptor["record_values"] is None and not descriptor["fact_values"]
+            if is_held
+            else isinstance(descriptor["record_values"], dict)
+        ),
+        "witness_shape_invalid",
     )
 
 
@@ -425,27 +457,529 @@ def _validate_nysed_inventory(acquisition, profiles, run_id):
         _validate_nysed_capture(support, run_id, license_number)
 
 
-def _has_matching_nysed_support(record, support):
-    if not isinstance(record.get("match_evidence"), dict):
-        return False
-    binding = record["match_evidence"].get("registry_binding")
-    if not isinstance(binding, dict):
-        return False
-    corroboration = binding.get("nysed_corroboration")
-    if support["receipt"]["outcome"] in {"held", "invalid"}:
-        return binding.get("method") == "exact_ny_license_name_components" and corroboration is None
-    return (
-        binding.get("method") == CORROBORATED_METHOD
-        and isinstance(corroboration, dict)
-        and corroboration.get("receipt_sha256") == support["receipt_sha256"]
-        and all(corroboration.get(field) == support["source_identity"][field] for field in NYSED_IDENTITY_FIELDS)
-        and all(type(corroboration.get(field)) is bool for field in ("license_matches", "header_legal_name_matches"))
-        and (
-            record.get("matched_npi") is None
-            or corroboration["license_matches"]
-            and corroboration["header_legal_name_matches"]
-        )
+def _witness_rows(schema, run_id, kind):
+    """Expand canonical producer values without re-encoding retained database rows."""
+    from process.source_profile_result_archive import _table
+
+    run_id = store._run_id(run_id)
+    artifact = _table(schema, shared.ProviderProfileArtifact.__tablename__)
+    profiles = (
+        f"SELECT a.metadata_json AS bundle,p.key AS license,p.value AS descriptor FROM {artifact} a "
+        "CROSS JOIN LATERAL json_each(a.metadata_json->'profiles') p "
+        f"WHERE a.run_id='{run_id}' AND p.value->>'acquisition_outcome'='acquired'"
     )
+    if kind == "records":
+        values = (
+            "SELECT descriptor->>'record_id' AS identity,descriptor->>'record_sha256' AS digest,"
+            "descriptor->'record_values' AS value,bundle,descriptor,license FROM profiles"
+        )
+    else:
+        _require(kind == "facts", "witness_kind_invalid")
+        values = (
+            "SELECT f.value->>'fact_id' AS identity,descriptor->'facts'->>(f.value->>'fact_id') AS digest,"
+            "f.value,bundle,descriptor,license FROM profiles "
+            "CROSS JOIN LATERAL json_array_elements(descriptor->'fact_values') f"
+        )
+    return f"WITH profiles AS MATERIALIZED ({profiles}),witness AS MATERIALIZED ({values}) "
+
+
+def witness_projection(schema, run_id, model, target_schema):
+    """Use the installed model composite type for the shared binary COPY projection."""
+    from process.source_profile_result_archive import _table
+
+    kind = "records" if model is shared.ProviderProfileSourceRecord else "facts"
+    _require(model in (shared.ProviderProfileSourceRecord, shared.ProviderProfileFact), "witness_model_invalid")
+    composite = _table(target_schema, model.__tablename__)
+    query = _witness_rows(schema, run_id, kind)
+    return (
+        f"SELECT model_row.* FROM ({query}SELECT value FROM witness) w "
+        f"CROSS JOIN LATERAL json_populate_record(NULL::{composite},w.value) model_row"
+    )
+
+
+def _model_witness_shape(model, value, *, fact=False):
+    """Reject JSON coercion and undeclared fields before comparing native model values."""
+    columns = [column for column in model.__table__.columns if not (fact and column.name == "published_at")]
+    names = ",".join("'" + column.name + "'" for column in columns)
+    clauses = [
+        f"json_typeof({value})='object'",
+        f"(SELECT count(*)={len(columns)} AND count(DISTINCT key)={len(columns)} "
+        f"AND bool_and(key=ANY(ARRAY[{names}])) FROM json_object_keys({value}) key)",
+    ]
+    for column in columns:
+        field = f"{value}->'{column.name}'"
+        if isinstance(column.type, JSON):
+            continue
+        if isinstance(column.type, Boolean):
+            condition = f"json_typeof({field})='boolean'"
+        elif isinstance(column.type, Integer):
+            condition = f"json_typeof({field})='number' AND ({field})::text ~ '^-?(0|[1-9][0-9]*)$'"
+        else:
+            _require(isinstance(column.type, String), "witness_column_type_invalid")
+            condition = f"json_typeof({field})='string'"
+        if column.nullable:
+            condition = f"json_typeof({field})='null' OR ({condition})"
+        clauses.append(f"({condition})")
+    return " AND ".join(clauses)
+
+
+def _model_witness_row(model, alias, *, fact=False):
+    from process.reference_family_archive import _quoted
+
+    fields = [
+        f"{alias}.{_quoted(column.name)}" + ("::text" if isinstance(column.type, JSON) else "")
+        for column in model.__table__.columns
+        if not (fact and column.name == "published_at")
+    ]
+    return "ROW(" + ",".join(fields) + ")"
+
+
+async def is_canonical_model_equal(session, model, *, left, right, run_ids):
+    """Keep canonical JSON text significant when comparing indexed NY model snapshots."""
+    from process.source_profile_result_archive import _table, native
+
+    native._require_transaction(session)
+    left_table, right_table = _table(*left), _table(*right)
+    keys = tuple(model.__table__.primary_key.columns)
+    _require(bool(keys), "witness_primary_key_required")
+    join = " AND ".join(f'l."{column.name}"=r."{column.name}"' for column in keys)
+    left_rows = f"(SELECT * FROM {left_table} WHERE run_id=ANY(CAST(:runs AS text[])))"
+    right_rows = f"(SELECT * FROM {right_table} WHERE run_id=ANY(CAST(:runs AS text[])))"
+    return (
+        await session.scalar(
+            text(
+                f"SELECT NOT EXISTS(SELECT 1 FROM {left_rows} l WHERE {_model_witness_row(model, 'l')} "
+                f"IS DISTINCT FROM (SELECT {_model_witness_row(model, 'r')} FROM {right_rows} r WHERE {join})) "
+                f"AND NOT EXISTS(SELECT 1 FROM {right_rows} r WHERE NOT EXISTS(SELECT 1 FROM {left_rows} l WHERE {join}))"
+            ),
+            {"runs": list(run_ids)},
+        )
+        is True
+    )
+
+
+async def witness_inventory_counts(session, schema, run):
+    """Return only aggregates; payload comparison stays in indexed native set queries."""
+    from process.source_profile_result_archive import _table
+
+    counts_by_field = {}
+    for model, key, kind in (
+        (shared.ProviderProfileSourceRecord, "record_id", "records"),
+        (shared.ProviderProfileFact, "fact_id", "facts"),
+    ):
+        table = _table(schema, model.__tablename__)
+        witness = _witness_rows(schema, run["run_id"], kind)
+        is_fact = kind == "facts"
+        shape = _model_witness_shape(model, "w.value", fact=is_fact)
+        invalid = await session.scalar(
+            text(
+                witness + f"SELECT count(*) FROM witness w WHERE ({shape}) IS DISTINCT FROM TRUE "
+                "OR encode(sha256(convert_to(w.value::text,'UTF8')),'hex') IS DISTINCT FROM w.digest"
+            )
+        )
+        _require(invalid == 0, "witness_canonical_values_invalid")
+        equal = _model_witness_row(model, "r", fact=is_fact) + " IS NOT DISTINCT FROM "
+        equal += _model_witness_row(model, "expected", fact=is_fact)
+        invalid = await session.scalar(
+            text(
+                witness + f"SELECT (SELECT count(*) FROM witness w CROSS JOIN LATERAL "
+                f"json_populate_record(NULL::{table},w.value) expected LEFT JOIN {table} r ON r.{key}=w.identity "
+                f"AND r.run_id=:run WHERE r.{key} IS NULL OR NOT ({equal})) + "
+                f"(SELECT count(*) FROM {table} r WHERE r.run_id=:run AND NOT EXISTS "
+                f"(SELECT 1 FROM witness w WHERE w.identity=r.{key}))"
+            ),
+            {"run": run["run_id"]},
+        )
+        counts_by_field["invalid_bundle_" + kind] = invalid
+    if run["status"] in shared.ACTIVE_STATUSES:
+        counts_by_field["invalid_bundle_facts"] += await session.scalar(
+            text(
+                f"SELECT count(*) FROM {_table(schema, shared.ProviderProfileFact.__tablename__)} "
+                "WHERE run_id=:run AND published_at IS NOT NULL"
+            ),
+            {"run": run["run_id"]},
+        )
+    counts_by_field["invalid_bundle_records"] += await _witness_lineage_errors(session, schema, run)
+    return counts_by_field
+
+
+async def _witness_lineage_errors(session, schema, run):
+    """Keep independent capture/support evidence authoritative even after a row is rehashed."""
+    from process.source_profile_result_archive import _table
+
+    table = _table(schema, shared.ProviderProfileSourceRecord.__tablename__)
+    binding = "r.match_evidence->'registry_binding'"
+    capture = "r.normalized_payload->'profile_capture'"
+    support = "w.bundle->'acquisition'->'nysed_support'->w.license"
+    corroboration = f"{binding}->'nysed_corroboration'"
+    checks = [
+        "r.artifact_id=:artifact",
+        "r.license_number=w.license",
+        f"({binding}->'snapshot_sha256')::text=(w.bundle->'source_manifest'->'snapshot_sha256')::text",
+        f"({binding}->>'npi')::bigint IS NOT DISTINCT FROM r.matched_npi",
+        f"json_typeof({binding}->'npi')=CASE WHEN r.matched_npi IS NULL THEN 'null' ELSE 'number' END",
+        f"{binding}->>'status'=r.match_status",
+        f"json_typeof({binding}->'status')='string'",
+        f"({binding}->'reason')::text=(w.descriptor->'reason')::text",
+        "(w.descriptor->>'binding_outcome'='accepted')=(r.matched_npi IS NOT NULL)",
+        f"{capture}->>'artifact_id'=w.descriptor->>'capture_artifact_id'",
+        f"json_typeof({capture}->'artifact_id')='string'",
+        f"(SELECT count(*)=5 FROM json_object_keys({capture}))",
+    ]
+    checks.extend(f"({capture}->'{field}')::text=(w.descriptor->'{field}')::text" for field in CAPTURE_FIELDS)
+    checks.extend(
+        f"({binding}->'{field}')::text=(w.descriptor->'{field}')::text"
+        for field in ("manifest_sha256", "acquisition_sha256")
+    )
+    support_checks = [f"({corroboration}->'receipt_sha256')::text=({support}->'receipt_sha256')::text"]
+    support_checks.extend(
+        f"({corroboration}->'{field}')::text=({support}->'source_identity'->'{field}')::text"
+        for field in NYSED_IDENTITY_FIELDS
+    )
+    support_checks.extend(
+        f"json_typeof({corroboration}->'{field}')='boolean'"
+        for field in ("license_matches", "header_legal_name_matches")
+    )
+    support_checks.append(
+        f"(r.matched_npi IS NULL OR ({corroboration}->>'license_matches'='true' "
+        f"AND {corroboration}->>'header_legal_name_matches'='true'))"
+    )
+    checks.append(
+        f"CASE WHEN {support}->'receipt'->>'outcome'='acquired' THEN "
+        f"{binding}->>'method'=:method AND ({' AND '.join(support_checks)}) ELSE "
+        f"{binding}->>'method'='exact_ny_license_name_components' AND "
+        f"COALESCE(json_typeof({corroboration}),'null')='null' END"
+    )
+    return await session.scalar(
+        text(
+            _witness_rows(schema, run["run_id"], "records") + f"SELECT count(*) FROM witness w "
+            f"JOIN {table} r ON r.record_id=w.identity WHERE ({' AND '.join(checks)}) IS DISTINCT FROM TRUE"
+        ),
+        {"artifact": _hash([run["run_id"], SOURCE_KEY]), "method": CORROBORATED_METHOD},
+    )
+
+
+async def read_witness_bundle(session, schema, run, reference=None):
+    """Authenticate the actual JSON bytes and the producer's closed retained inventory."""
+    from process.source_profile_result_archive import _table
+
+    _require(run["source_manifest"].get("bundle_contract") == WITNESS_CONTRACT, "witness_contract_required")
+    artifact_rows = (
+        (
+            await session.execute(
+                text(
+                    f"SELECT a.*,encode(sha256(convert_to(metadata_json::text,'UTF8')),'hex') AS stored_sha256,"
+                    f"octet_length(convert_to(metadata_json::text,'UTF8')) AS stored_bytes FROM "
+                    f"{_table(schema, shared.ProviderProfileArtifact.__tablename__)} a WHERE run_id=:run"
+                ),
+                {"run": run["run_id"]},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    _require(len(artifact_rows) == 1, "bundle_artifact_count_invalid")
+    artifact_by_field = dict(artifact_rows[0])
+    _require(
+        artifact_by_field.pop("stored_sha256") == artifact_by_field["content_sha256"]
+        and artifact_by_field.pop("stored_bytes") == artifact_by_field["content_bytes"],
+        "bundle_canonical_bytes_changed",
+    )
+    observed = bundle_reference(artifact_by_field)
+    if reference is not None:
+        _require(validate_bundle_reference(reference, run["run_id"]) == observed, "bundle_reference_changed")
+    return artifact_by_field, store._bundle(run, [artifact_by_field])
+
+
+async def native_witness_counts(session, schema, run, bundle):
+    """Scope the existing producer counts to one isolated or already sealed model family."""
+    counts = (await store._retained_counts_by_run([run["run_id"]], schema=schema, session=session))[run["run_id"]]
+    return {
+        **counts,
+        **await witness_inventory_counts(session, schema, run),
+        **_bundle_counts(bundle),
+    }
+
+
+def _bundle_counts(bundle):
+    return {
+        "bundle_metrics": bundle["acquisition"],
+        "acquired_profiles": sum(
+            profile["acquisition_outcome"] == "acquired" for profile in bundle["profiles"].values()
+        ),
+        "held_attempts": sum(profile["acquisition_outcome"] == "held" for profile in bundle["profiles"].values()),
+        "bundle_fact_count": sum(len(profile["facts"]) for profile in bundle["profiles"].values()),
+    }
+
+
+def _legacy_witness_fragments(run_id, kind, ordinal, content):
+    """Carry canonical bytes in a disposable Artifact TEXT field, never as source authority."""
+    columns = tuple(column.name for column in shared.ProviderProfileArtifact.__table__.columns)
+    offset, part = 0, 0
+    while offset < len(content):
+        end = min(offset + _LEGACY_TRANSFER_BYTES - 512, len(content))
+        while end < len(content) and content[end] & 0xC0 == 0x80:
+            end -= 1
+        identity = f"{kind}:{ordinal}:{part}"
+        values_by_field = {
+            "artifact_id": identity,
+            "run_id": run_id,
+            "source_key": identity,
+            "file_name": str(ordinal),
+            "source_url": content[offset:end].decode("utf-8"),
+            "category": kind,
+            "content_sha256": "",
+            "content_bytes": end - offset,
+            "header": str(part),
+            "downloaded_at": None,
+            "metadata_json": None,
+        }
+        values = tuple(values_by_field[column] for column in columns)
+        size = sum(len(value.encode("utf-8")) if isinstance(value, str) else 8 for value in values)
+        yield values, size
+        offset, part = end, part + 1
+
+
+def _legacy_metadata_values(content):
+    """Injectively escape string data for JSON extraction, without changing digest preimages."""
+    if isinstance(content, str):
+        return content.replace("\\", "\\\\").replace("\u0000", "\\u0000")
+    if isinstance(content, dict):
+        return {_legacy_metadata_values(key): _legacy_metadata_values(value) for key, value in content.items()}
+    if isinstance(content, list):
+        return [_legacy_metadata_values(value) for value in content]
+    return content
+
+
+async def _legacy_witness_values(session, schema, run_id, bundle):
+    """Only encode actual decoded model values; SQL makes every payload validation decision."""
+    yield "bundle", 0, encoded_json(_legacy_metadata_values(bundle))
+    for model, kind in ((shared.ProviderProfileSourceRecord, "records"), (shared.ProviderProfileFact, "facts")):
+        table = model.__table__.to_metadata(MetaData(), schema=schema)
+        statement = select(table).where(table.c.run_id == run_id).execution_options(yield_per=32)
+        rows = await session.stream(statement)
+        try:
+            ordinal = 0
+            async for stored in rows:
+                values_by_field = {
+                    key: value for key, value in stored._mapping.items() if kind != "facts" or key != "published_at"
+                }
+                yield kind, ordinal, encoded_json(values_by_field)
+                # Opaque JSON remains digest-bound without JSON extraction rejecting a legal escaped NUL.
+                opaque_fields = ("value_json", "source_json") if kind == "facts" else ("raw_payload",)
+                typed_values_by_field = {
+                    key: None if key in opaque_fields else value for key, value in values_by_field.items()
+                }
+                yield kind + "_fields", ordinal, encoded_json(_legacy_metadata_values(typed_values_by_field))
+                ordinal += 1
+        finally:
+            await rows.close()
+
+
+async def _copy_legacy_witness(session, source_schema, scratch_table, run_id, bundle):
+    from process import reference_family_archive as native
+
+    model = shared.ProviderProfileArtifact
+    options_by_field = {
+        "schema_name": "pg_temp",
+        "table_name": scratch_table,
+        "columns": tuple(column.name for column in model.__table__.columns),
+    }
+    batch, batch_bytes = [], 0
+    async with aclosing(_legacy_witness_values(session, source_schema, run_id, bundle)) as rows:
+        async for kind, ordinal, content in rows:
+            for fragment, size in _legacy_witness_fragments(run_id, kind, ordinal, content):
+                if batch and (len(batch) == _LEGACY_TRANSFER_ROWS or batch_bytes + size > _LEGACY_TRANSFER_BYTES):
+                    await native.native_copy_record_batch(session, model, **options_by_field, records=batch)
+                    batch, batch_bytes = [], 0
+                batch.append(fragment)
+                batch_bytes += size
+        if batch:
+            await native.native_copy_record_batch(session, model, **options_by_field, records=batch)
+
+
+def _legacy_witness_rows(scratch_table, kind):
+    from process.source_profile_result_archive import _table
+
+    artifact = _table("pg_temp", scratch_table)
+    expected = (
+        "SELECT descriptor->>'record_id' AS identity,descriptor->>'record_sha256' AS digest,"
+        "descriptor,snapshot,support,license FROM profiles WHERE descriptor->>'record_id' IS NOT NULL"
+        if kind == "records"
+        else "SELECT f.key AS identity,f.value AS digest FROM profiles "
+        "CROSS JOIN LATERAL json_each_text(descriptor->'facts') f"
+    )
+    key = "record_id" if kind == "records" else "fact_id"
+    return (
+        f"WITH transferred AS MATERIALIZED (SELECT category,file_name,"
+        f"string_agg(source_url,'' ORDER BY header::text::bigint) AS canonical FROM {artifact} "
+        f"WHERE category IN ('bundle','{kind}','{kind}_fields') GROUP BY category,file_name),"
+        "profiles AS MATERIALIZED (SELECT a.canonical::json->'source_manifest'->'snapshot_sha256' AS snapshot,"
+        "a.canonical::json->'acquisition'->'nysed_support'->p.key AS support,"
+        "p.key AS license,p.value AS descriptor FROM transferred a "
+        "CROSS JOIN LATERAL json_each(CASE WHEN a.category='bundle' THEN a.canonical::json->'profiles' END) p),"
+        f"expected AS MATERIALIZED ({expected}),witness AS MATERIALIZED (SELECT fields.canonical::json AS value,"
+        f"fields.canonical::json->>'{key}' AS identity,actual.canonical FROM transferred actual "
+        f"JOIN transferred fields USING(file_name) WHERE actual.category='{kind}' AND fields.category='{kind}_fields') "
+    )
+
+
+def _legacy_npi_equality(binding, record):
+    """Preserve Python's decoded int/float/bool equality without rounding a large integer."""
+    expected, observed = f"{record}->'matched_npi'", f"{binding}->'npi'"
+    number = f"({observed})::text"
+    floating = f"({number})::double precision"
+    return (
+        f"CASE WHEN ({expected})::text='null' THEN COALESCE(json_typeof({observed}),'null')='null' "
+        f"WHEN json_typeof({observed})='boolean' THEN ({expected})::text="
+        f"CASE WHEN ({observed})::text='true' THEN '1' ELSE '0' END "
+        f"WHEN json_typeof({observed})='number' THEN CASE WHEN {number} ~ '^-?[0-9]+$' "
+        f"THEN ({number})::numeric=(({expected})::text)::numeric "
+        f"WHEN {floating}>=(-9223372036854775808)::double precision "
+        f"AND {floating}<9223372036854775808::double precision THEN "
+        f"{floating}=(({expected})::text)::double precision AND "
+        f"({floating})::bigint=(({expected})::text)::bigint ELSE FALSE END ELSE FALSE END"
+    )
+
+
+def _legacy_lineage_checks():
+    """Both operands are Python-encoded transfer values, not arbitrary stored JSON text."""
+    record, descriptor = "w.value", "e.descriptor"
+    binding = f"{record}->'match_evidence'->'registry_binding'"
+    capture = f"{record}->'normalized_payload'->'profile_capture'"
+    checks = [
+        f"json_typeof({record}->'match_evidence')='object'",
+        f"json_typeof({binding})='object'",
+        f"json_typeof({record}->'normalized_payload')='object'",
+        f"json_typeof({capture})='object'",
+        f"(SELECT count(*)=5 FROM json_object_keys(CASE WHEN json_typeof({capture})='object' "
+        f"THEN {capture} ELSE '{{}}'::json END))",
+        f"({capture}->'artifact_id')::text=({descriptor}->'capture_artifact_id')::text",
+        f"{record}->>'artifact_id'=:artifact",
+        f"({record}->'license_number')::text=({descriptor}->'capture_manifest'->'license_number')::text",
+        f"({binding}->'snapshot_sha256')::text=e.snapshot::text",
+        f"({binding}->'status')::text=({record}->'match_status')::text",
+        f"({binding}->'reason')::text=({descriptor}->'reason')::text",
+        f"({descriptor}->>'binding_outcome'='accepted')=(({record}->'matched_npi')::text<>'null')",
+        _legacy_npi_equality(binding, record),
+    ]
+    checks.extend(f"({capture}->'{field}')::text=({descriptor}->'{field}')::text" for field in CAPTURE_FIELDS)
+    checks.extend(
+        f"({binding}->'{field}')::text=({descriptor}->'{field}')::text"
+        for field in ("manifest_sha256", "acquisition_sha256")
+    )
+    return " AND ".join(f"({check})" for check in checks)
+
+
+def _legacy_support_checks():
+    binding = "w.value->'match_evidence'->'registry_binding'"
+    corroboration = f"{binding}->'nysed_corroboration'"
+    support = "e.support"
+    checks = [
+        f"json_typeof({corroboration})='object'",
+        f"({corroboration}->'receipt_sha256')::text=({support}->'receipt_sha256')::text",
+    ]
+    checks.extend(
+        f"({corroboration}->'{field}')::text=({support}->'source_identity'->'{field}')::text"
+        for field in NYSED_IDENTITY_FIELDS
+    )
+    checks.extend(
+        f"json_typeof({corroboration}->'{field}')='boolean'"
+        for field in ("license_matches", "header_legal_name_matches")
+    )
+    checks.append(
+        f"((w.value->'matched_npi')::text='null' OR ({corroboration}->>'license_matches'='true' "
+        f"AND {corroboration}->>'header_legal_name_matches'='true'))"
+    )
+    return (
+        f"CASE WHEN {support}->'receipt'->>'outcome'='acquired' THEN {binding}->>'method'=:method "
+        f"AND ({' AND '.join(checks)}) ELSE {binding}->>'method'='exact_ny_license_name_components' "
+        f"AND COALESCE(json_typeof({corroboration}),'null')='null' END"
+    )
+
+
+async def _legacy_witness_counts(session, schema, source_schema, run):
+    from process.source_profile_result_archive import _table
+
+    counts_by_field = {}
+    parameters_by_field = {
+        "run": run["run_id"],
+        "artifact": _hash([run["run_id"], SOURCE_KEY]),
+        "method": CORROBORATED_METHOD,
+    }
+    for model, kind in ((shared.ProviderProfileSourceRecord, "records"), (shared.ProviderProfileFact, "facts")):
+        prefix = _legacy_witness_rows(schema, kind)
+        shape = _model_witness_shape(model, "w.value", fact=kind == "facts")
+        invalid = f"CASE WHEN ({shape}) IS DISTINCT FROM TRUE OR w.value->>'run_id' IS DISTINCT FROM :run "
+        invalid += "OR encode(sha256(convert_to(w.canonical,'UTF8')),'hex') IS DISTINCT FROM e.digest THEN 1 ELSE 0 END"
+        if kind == "records":
+            for predicate in (_legacy_lineage_checks(), _legacy_support_checks()):
+                invalid += (
+                    f" + CASE WHEN e.identity IS NOT NULL AND ({predicate}) IS DISTINCT FROM TRUE THEN 1 ELSE 0 END"
+                )
+        duplicates, errors = (
+            await session.execute(
+                text(
+                    prefix + "SELECT (SELECT count(*)-count(DISTINCT identity) FROM expected),"
+                    f"COALESCE((SELECT sum({invalid}) FROM witness w LEFT JOIN expected e USING(identity)),0) + "
+                    "(SELECT count(*)-count(DISTINCT identity) FROM witness) + "
+                    "(SELECT count(*) FROM expected e WHERE NOT EXISTS(SELECT 1 FROM witness w WHERE w.identity=e.identity))"
+                ),
+                parameters_by_field,
+            )
+        ).one()
+        _require(duplicates == 0, "duplicate_fact_identity" if kind == "facts" else "duplicate_record_identity")
+        counts_by_field["invalid_bundle_" + kind] = errors
+    if run["status"] in shared.ACTIVE_STATUSES:
+        counts_by_field["invalid_bundle_facts"] += await session.scalar(
+            text(
+                f"SELECT count(*) FROM {_table(source_schema, shared.ProviderProfileFact.__tablename__)} "
+                "WHERE run_id=:run AND published_at IS NOT NULL"
+            ),
+            {"run": run["run_id"]},
+        )
+    return counts_by_field
+
+
+def _legacy_witness_table(name):
+    from process import reference_family_archive as native
+
+    table = native._clone_model_table(shared.ProviderProfileArtifact.__table__, MetaData(), schema="pg_temp", name=name)
+    table._prefixes.append("TEMPORARY")
+    table.dialect_options["postgresql"]["on_commit"] = "DROP"
+    for index, constraint in enumerate(sorted(table.constraints, key=lambda item: type(item).__name__)):
+        constraint.name = f"{name}_key_{index}"
+    return table
+
+
+async def legacy_inventory_counts(session, schema, run, bundle):
+    """Validate caller-fenced legacy rows in sets; connection-private scratch requires TEMP."""
+    from process import reference_family_archive as native
+
+    _require(bundle.get("bundle_contract") is None, "witness_requires_native_validation")
+    native._require_transaction(session)
+    scratch_name = "ny_legacy_witness_" + uuid4().hex
+    table = _legacy_witness_table(scratch_name)
+    native._defer_table_constraints(table)
+    connection = await session.connection()
+    driver = (await connection.get_raw_connection()).driver_connection
+    async with session.begin_nested() as scratch:
+        try:
+            await session.execute(CreateTable(table))
+            await _copy_legacy_witness(session, schema, scratch_name, run["run_id"], bundle)
+            for backing_indexes in (True, False):
+                await native._create_table_constraints(
+                    session, _legacy_witness_table(scratch_name), backing_indexes=backing_indexes
+                )
+            # shortcut: native SHA256 needs a PostgreSQL-sized preimage; larger historical rows need a separate verifier.
+            counts = await _legacy_witness_counts(session, scratch_name, schema, run)
+            await scratch.rollback()
+        except asyncio.CancelledError, TimeoutError:
+            if not connection.invalidated and driver.is_closed():
+                # COPY already terminated this connection; prevent savepoint cleanup from masking its interruption.
+                await connection.invalidate()
+            raise
+    return counts
 
 
 class NewYorkProfileStore(SourceProfileStore):
@@ -454,7 +988,7 @@ class NewYorkProfileStore(SourceProfileStore):
     def _manifest(self, run):
         manifest = super()._manifest(run)
         _require(
-            set(manifest)
+            set(manifest) - {"bundle_contract"}
             == {
                 "control_run_id",
                 "expected_current_run_id",
@@ -469,6 +1003,10 @@ class NewYorkProfileStore(SourceProfileStore):
                 "source",
             },
             "manifest_invalid",
+        )
+        _require(
+            "bundle_contract" not in manifest or manifest["bundle_contract"] == WITNESS_CONTRACT,
+            "bundle_contract_invalid",
         )
         _require(manifest["max_providers"] is None and manifest["resume_from"] is None, "complete_cohort_required")
         _require(
@@ -508,7 +1046,9 @@ class NewYorkProfileStore(SourceProfileStore):
             and artifact.get("file_name") == "manifest.json"
             and artifact.get("source_url") == SOURCE_URL
             and isinstance(bundle, dict)
-            and set(bundle) == {"schema_version", "run_id", "source_manifest", "cohort", "profiles", "acquisition"}
+            and set(bundle) - {"bundle_contract"}
+            == {"schema_version", "run_id", "source_manifest", "cohort", "profiles", "acquisition"}
+            and bundle.get("bundle_contract") == manifest.get("bundle_contract")
             and bundle["schema_version"] == SCHEMA_VERSION
             and bundle["run_id"] == run["run_id"]
             and bundle["source_manifest"] == manifest
@@ -520,79 +1060,73 @@ class NewYorkProfileStore(SourceProfileStore):
         profiles = bundle["profiles"]
         _require(isinstance(profiles, dict) and set(profiles) == set(roots), "attempt_inventory_incomplete")
         for license_number, descriptor_by_field in profiles.items():
-            _validate_descriptor(descriptor_by_field, run["run_id"], license_number)
+            _validate_descriptor(
+                descriptor_by_field,
+                run["run_id"],
+                license_number,
+                witnessed=bundle.get("bundle_contract") == WITNESS_CONTRACT,
+            )
         _validate_nysed_inventory(bundle["acquisition"], profiles, run["run_id"])
         return bundle
 
-    async def _inventory_counts(self, run, bundle):
-        records_by_id = {
-            descriptor_by_field["record_id"]: descriptor_by_field
-            for descriptor_by_field in bundle["profiles"].values()
-            if descriptor_by_field["record_id"] is not None
-        }
-        facts_by_id = {
-            fact_id: digest
-            for descriptor_by_field in records_by_id.values()
-            for fact_id, digest in descriptor_by_field["facts"].items()
-        }
-        _require(
-            len(facts_by_id)
-            == sum(len(descriptor_by_field["facts"]) for descriptor_by_field in records_by_id.values()),
-            "duplicate_fact_identity",
-        )
-        counts_by_field = {}
-        for model, expected, identifier, hash_row, label in (
-            (
-                shared.ProviderProfileSourceRecord,
-                {key: descriptor_by_field["record_sha256"] for key, descriptor_by_field in records_by_id.items()},
-                "record_id",
-                _hash,
-                "records",
-            ),
-            (shared.ProviderProfileFact, facts_by_id, "fact_id", _fact_hash, "facts"),
-        ):
-            table = model.__table__
-            seen, invalid = set(), 0
-            async with aclosing(shared.db.select(table).where(table.c.run_id == run["run_id"]).iterate()) as retained:
-                async for stored_row in retained:
-                    stored_by_field = dict(stored_row._mapping)
-                    key = stored_by_field[identifier]
-                    invalid += key in seen or expected.get(key) != hash_row(stored_by_field)
-                    if label == "records" and key in records_by_id:
-                        invalid += not _has_matching_record_lineage(
-                            stored_by_field, records_by_id[key], run["source_manifest"]
-                        )
-                        license_number = records_by_id[key]["capture_manifest"]["license_number"]
-                        invalid += not _has_matching_nysed_support(
-                            stored_by_field, bundle["acquisition"]["nysed_support"][license_number]
-                        )
-                    if (
-                        label == "facts"
-                        and run["status"] in shared.ACTIVE_STATUSES
-                        and stored_by_field["published_at"] is not None
-                    ):
-                        invalid += 1
-                    seen.add(key)
-            counts_by_field["invalid_bundle_" + label] = invalid + len(expected.keys() - seen)
-        return counts_by_field
+    async def _inventory_counts(self, run, bundle, *, session=None, schema=None):
+        _require(bundle.get("bundle_contract") is None, "witness_requires_native_validation")
+        return await legacy_inventory_counts(session, schema, run, bundle)
+
+    async def _legacy_retained_counts(self, run_id):
+        from process import reference_family_archive as native
+
+        schema = shared.ProviderProfileArtifact.__table__.schema or "mrf"
+        async with shared.db.transaction() as session:
+            await self._lock_source()
+            await native._lock_family(
+                session,
+                schema,
+                tuple(
+                    model.__tablename__
+                    for model in (
+                        shared.ProviderProfileImportRun,
+                        shared.ProviderProfileArtifact,
+                        shared.ProviderProfileSourceRecord,
+                        shared.ProviderProfileFact,
+                    )
+                ),
+                "SHARE",
+            )
+            run = await self._read_run(run_id)
+            counts = (await self._retained_counts_by_run([run_id], schema=schema, session=session))[run_id]
+            table = shared.ProviderProfileArtifact.__table__
+            artifacts = await shared.db.all(select(table).where(table.c.run_id == run_id))
+            bundle = self._bundle(run, [dict(artifact._mapping) for artifact in artifacts])
+            return {
+                **counts,
+                **await self._inventory_counts(run, bundle, session=session, schema=schema),
+                **_bundle_counts(bundle),
+            }
 
     async def retained_counts(self, run_id):
-        """Reconcile the bundle against complete streamed SQL records and facts."""
-        counts = await super().retained_counts(run_id)
+        """Reconcile complete retained models under the bundle's original validation contract."""
         run = await self._read_run(run_id)
-        table = shared.ProviderProfileArtifact.__table__
-        artifacts = await shared.db.all(select(table).where(table.c.run_id == run_id))
-        bundle = self._bundle(run, [dict(artifact._mapping) for artifact in artifacts])
-        return {
-            **counts,
-            **await self._inventory_counts(run, bundle),
-            "bundle_metrics": bundle["acquisition"],
-            "acquired_profiles": sum(
-                profile["acquisition_outcome"] == "acquired" for profile in bundle["profiles"].values()
-            ),
-            "held_attempts": sum(profile["acquisition_outcome"] == "held" for profile in bundle["profiles"].values()),
-            "bundle_fact_count": sum(len(profile["facts"]) for profile in bundle["profiles"].values()),
-        }
+        if run["source_manifest"].get("bundle_contract") == WITNESS_CONTRACT:
+            async with shared.db.transaction() as session:
+                schema = shared.ProviderProfileArtifact.__table__.schema or "mrf"
+                artifact, bundle = await read_witness_bundle(session, schema, run)
+                return {
+                    **await native_witness_counts(session, schema, run, bundle),
+                    "bundle_reference": bundle_reference(artifact),
+                }
+        return await self._legacy_retained_counts(run_id)
+
+    def _acquisition_metrics(self, run, metrics, counts):
+        """A witnessed completion carries the artifact reference, never its per-license support inventory."""
+        if run["source_manifest"].get("bundle_contract") == WITNESS_CONTRACT:
+            reference = validate_bundle_reference(metrics.get("bundle"), run["run_id"])
+            _require(reference == counts.get("bundle_reference"), "bundle_reference_changed")
+            return {
+                **{key: metric for key, metric in counts["bundle_metrics"].items() if key != "nysed_support"},
+                "bundle": reference,
+            }
+        return counts["bundle_metrics"]
 
     def _completion_metrics(self, run, metrics, counts):
         manifest = self._manifest(run)
@@ -601,7 +1135,7 @@ class NewYorkProfileStore(SourceProfileStore):
         if type(metrics.get("transport_failures")) is not int or metrics["transport_failures"] != 0:
             raise RuntimeError("new_york_profile_transport_failures")
         if (
-            _hash(metrics) != _hash(counts["bundle_metrics"])
+            _hash(metrics) != _hash(self._acquisition_metrics(run, metrics, counts))
             or type(metrics.get("responses")) is not int
             or metrics["responses"] != manifest["requested_licenses"]
             or counts["acquired_profiles"] + counts["held_attempts"] != metrics["responses"]
@@ -638,7 +1172,7 @@ class NewYorkProfileStore(SourceProfileStore):
             raise RuntimeError("new_york_profile_retained_integrity_invalid")
         return {
             **{key: metric for key, metric in metrics.items() if key != "nysed_support"},
-            **{key: count for key, count in counts.items() if key != "bundle_metrics"},
+            **{key: count for key, count in counts.items() if key not in {"bundle_metrics", "bundle_reference"}},
             "requested_licenses": manifest["requested_licenses"],
             "full_cohort_licenses": manifest["full_cohort_licenses"],
             "coverage_scope": COVERAGE_SCOPE,

@@ -17,15 +17,15 @@ from functools import partial
 from pathlib import Path
 
 import click
+from sqlalchemy import JSON, literal
 
-from db.models import ProviderProfileArtifact, ProviderProfileFact, ProviderProfileSourceRecord, db
+from db.models import ProviderProfileArtifact, db
 from process import new_york_nysed_profile as nysed
 from process import new_york_nysed_profile_acquisition as nysed_acquisition
 from process import new_york_nysed_profile_retries as nysed_retries
 from process import new_york_profile_acquisition as acquisition
 from process import new_york_profile_registry as registry
 from process.control_cancel import raise_if_cancelled
-from process.florida_mqa_profile import _upsert_rows
 from process.kentucky_profile_acquisition import _read_artifact, _reject_symlinks
 from process.live_progress import enqueue_live_progress
 from process.massachusetts_profile_acquisition import encoded_json
@@ -38,11 +38,15 @@ from process.new_york_profile_store import (
     SCHEMA_VERSION,
     SOURCE_KEY,
     SOURCE_URL,
+    WITNESS_CONTRACT,
+    bundle_reference,
     completion,
     prepare_profile,
     store,
+    witnessed_profile,
 )
 from process.provider_profile_source_store import _now, ensure_tables
+from process.source_profile_result_pins import load_role_policy
 
 logger = logging.getLogger(__name__)
 NYSED_FILES = {
@@ -52,7 +56,6 @@ NYSED_FILES = {
     "result.json": nysed.MAX_METADATA_BYTES,
 }
 DISK_RESERVE_BYTES = 64 * 1024 * 1024
-BATCH_SIZE = 250
 
 
 def _require(condition, reason):
@@ -62,6 +65,15 @@ def _require(condition, reason):
 
 def _hash(content):
     return hashlib.sha256(encoded_json(content)).hexdigest()
+
+
+def _artifact_root():
+    """Maintenance needs the existing local root, not acquisition credentials."""
+    configured = os.getenv("HLTHPRT_NYPP_ARTIFACT_ROOT", "/work/new-york-nypp")
+    _require(bool(configured.strip()), "artifact_root_invalid")
+    root = Path(configured).absolute()
+    _reject_symlinks(root)
+    return root
 
 
 def _parameters(task):
@@ -77,8 +89,7 @@ def _parameters(task):
     _require(api_key not in task["run_id"], "public_header_overlaps_identity")
     configured = os.getenv("HLTHPRT_NYPP_ARTIFACT_ROOT", "/work/new-york-nypp")
     _require(configured.strip() and api_key not in configured, "artifact_root_invalid")
-    root = Path(configured).absolute()
-    _reject_symlinks(root)
+    root = _artifact_root()
     limits_by_field = {}
     for field, environment in (
         ("max_bytes", "HLTHPRT_NYPP_MAX_RETAINED_BYTES"),
@@ -217,6 +228,7 @@ async def _capture_inputs(ctx, task, directory, budget):
 
 def _run_row(task, snapshot_pin, row_count, cohort, previous):
     manifest_by_field = {
+        "bundle_contract": WITNESS_CONTRACT,
         "control_run_id": task["run_id"],
         "expected_current_run_id": previous,
         "max_providers": None,
@@ -345,20 +357,9 @@ async def _acquire_profile(ctx, task, root, directory, run_id, loaded, api_key, 
     return prepared, support
 
 
-async def _persist_batch(ctx, task, source_records, facts, budget):
-    await _checkpoint(ctx, task, budget)
-    async with db.transaction():
-        for model, rows, identifier in (
-            (ProviderProfileSourceRecord, source_records, "record_id"),
-            (ProviderProfileFact, facts, "fact_id"),
-        ):
-            for offset in range(0, len(rows), BATCH_SIZE):
-                await _checkpoint(ctx, task, budget)
-                await _upsert_rows(model, rows[offset : offset + BATCH_SIZE], identifier)
-
-
 def _artifact(run, cohort, profiles, metrics_by_field, directory, budget):
     bundle_by_field = {
+        "bundle_contract": WITNESS_CONTRACT,
         "schema_version": SCHEMA_VERSION,
         "run_id": run["run_id"],
         "source_manifest": run["source_manifest"],
@@ -414,7 +415,7 @@ async def _run_claimed(ctx, task, run, cohort, directory, api_key, budget):
     (directory / "profiles").mkdir(mode=0o700)
     (directory / "nysed").mkdir(mode=0o700)
     loaded = RegistrySnapshot(directory / "snapshot.json", snapshot_sha256=run["source_manifest"]["snapshot_sha256"])
-    profiles, source_records, facts = {}, [], []
+    profiles_by_license = {}
     metrics_by_field = {
         "acquisition_complete": False,
         "transport_failures": 0,
@@ -428,11 +429,12 @@ async def _run_claimed(ctx, task, run, cohort, directory, api_key, budget):
     }
     budget["bundle_bytes"] = _json_size(
         {
+            "bundle_contract": WITNESS_CONTRACT,
             "schema_version": SCHEMA_VERSION,
             "run_id": run["run_id"],
             "source_manifest": run["source_manifest"],
             "cohort": cohort,
-            "profiles": profiles,
+            "profiles": profiles_by_license,
             "acquisition": metrics_by_field,
         },
         budget["max_bundle_bytes"],
@@ -441,28 +443,38 @@ async def _run_claimed(ctx, task, run, cohort, directory, api_key, budget):
         (descriptor, source_record, captured_facts), support = await _acquire_profile(
             ctx, task, root, directory, run["run_id"], loaded, api_key, budget
         )
-        _append_profile(profiles, metrics_by_field, root["license_number"], descriptor, support, budget)
-        if source_record is not None:
-            source_records.append(source_record)
-            facts.extend(captured_facts)
-        if len(source_records) >= BATCH_SIZE or len(facts) >= BATCH_SIZE or index == len(cohort["roots"]):
-            await _persist_batch(ctx, task, source_records, facts, budget)
-            source_records, facts = [], []
+        _append_profile(
+            profiles_by_license,
+            metrics_by_field,
+            root["license_number"],
+            witnessed_profile(descriptor, source_record, captured_facts),
+            support,
+            budget,
+        )
         _progress(task, "retaining", index, len(cohort["roots"]))
     del loaded
     metrics_by_field["acquisition_complete"] = True
     budget["bundle_bytes"] -= 1  # Canonical JSON changes false to true.
-    artifact = _artifact(run, cohort, profiles, metrics_by_field, directory, budget)
+    artifact = _artifact(run, cohort, profiles_by_license, metrics_by_field, directory, budget)
     await _checkpoint(ctx, task, budget)
-    await _upsert_rows(ProviderProfileArtifact, [artifact], "artifact_id")
+    await (
+        db.insert(ProviderProfileArtifact.__table__)
+        .values(
+            **{**artifact, "metadata_json": literal(encoded_json(artifact["metadata_json"]).decode("utf-8")).cast(JSON)}
+        )
+        .status()
+    )
     await store.update_run(run["run_id"], {"status": "validating", "metrics": _aggregate_metrics(metrics_by_field)})
     await _checkpoint(ctx, task, budget)
-    return await completion.complete_run(ctx, task, run, metrics_by_field)
+    return await completion.complete_run(
+        ctx, task, run, {**_aggregate_metrics(metrics_by_field), "bundle": bundle_reference(artifact)}
+    )
 
 
 async def import_profiles(ctx, task):
     """Claim before HTTP and publish only after the complete supported cohort is retained."""
     artifact_root, api_key, budget = _parameters(task)
+    load_role_policy()
     await raise_if_cancelled(ctx, task)
     artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     directory = artifact_root / _hash([SOURCE_KEY, task["run_id"]])
@@ -485,10 +497,12 @@ async def import_profiles(ctx, task):
             completed = await _run_claimed(ctx, task, run, cohort, directory, api_key, budget)
     except BaseException as error:
         if is_claimed:
-            await store.mark_run_failed(run["run_id"], error)
+            await store.mark_run_failed(run["run_id"], error, ctx=ctx)
         elif is_created:
             shutil.rmtree(directory)
         raise
+    if (ctx.get("context") or {}).get("control_run_handoff_committed") is True:
+        return completed
     try:
         await store.retain_source_history(artifact_root)
     except Exception:
