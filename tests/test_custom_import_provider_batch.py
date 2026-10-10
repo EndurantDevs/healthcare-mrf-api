@@ -17,10 +17,12 @@ from api import custom_import_read_http as transport
 from api import provider_batch, provider_list_sql
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
 from api.endpoint import extension_reads
+from api.endpoint import npi as npi_module
 from process.custom_import.read_contracts import CustomImportReadRequestError, CustomImportReadUnavailableError
 from process.custom_import.read_core import PreparedNpiEntityRelation, ReadFieldValue, ReadOrderTerm
 from tests import test_custom_import_read_http as fixtures
 from tests.test_custom_import_provider_http import _Session
+from tests.test_npi_batch import _ranked_batch_addresses
 
 
 def _body(**changes):
@@ -189,11 +191,84 @@ def test_signed_batch_retains_original_native_bounds():
     native_batch = json.loads(_body())["native_batch"]
     for field, value in (
         ("npis", [str(9000000000 + index) for index in range(101)]),
-        ("address_limit", 21),
+        ("address_limit", 1001),
         ("address_offset", -1),
     ):
         with pytest.raises(InvalidUsage):
             batch._parse_batch_request(_body(native_batch={**native_batch, field: value}))
+
+
+@pytest.mark.parametrize("address_limit", [0, 21, 1000])
+def test_signed_batch_accepts_canonical_expanded_address_limits(address_limit):
+    native_batch = json.loads(_body())["native_batch"]
+    parsed = batch._parse_batch_request(_body(native_batch={**native_batch, "address_limit": address_limit}))
+    assert parsed.native_batch["address_limit"] == address_limit
+
+
+@pytest.mark.parametrize("address_limit", ["all", "0", True, None, -1, 1000.5])
+def test_signed_batch_retains_integer_only_address_limit_shape(address_limit):
+    native_batch = json.loads(_body())["native_batch"]
+    with pytest.raises((CustomImportReadRequestError, InvalidUsage, transport.CustomImportReadTransportError)):
+        batch._parse_batch_request(_body(native_batch={**native_batch, "address_limit": address_limit}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_filter", [False, True])
+@pytest.mark.parametrize("address_limit,address_offset", [(0, 0), (1000, 0), (21, 2)])
+async def test_signed_batch_serializes_complete_flat_address_pages(
+    monkeypatch, include_filter, address_limit, address_offset
+):
+    session = _Session()
+    native_reader = provider_batch.read_native_batch
+    _, chunks = _install(monkeypatch, session)
+    monkeypatch.setattr(provider_batch, "read_native_batch", native_reader)
+    identities = [9000000000, 9000000001]
+    addresses_by_npi = {
+        identity: [
+            {
+                **_ranked_batch_addresses(identity)[0],
+                "first_line": f"{index} Example Avenue",
+                "_base_row_identities": [f"location:{identity}-{index}"],
+            }
+            for index in range(35 if identity == identities[0] else 2)
+        ]
+        for identity in identities
+    }
+    state = provider_batch._NativeBatchState({identity: {"npi": identity} for identity in identities}, addresses_by_npi)
+    prepare = AsyncMock(return_value=state)
+    monkeypatch.setattr(provider_batch, "_prepare_native_batch", prepare)
+    monkeypatch.setattr(provider_batch, "_batch_eligible_npis", AsyncMock(return_value=identities))
+    hydration = AsyncMock(return_value=addresses_by_npi)
+    monkeypatch.setattr(npi_module, "_fetch_npi_address_rows_map", hydration)
+    monkeypatch.setattr(npi_module, "_fetch_other_names_map", AsyncMock(return_value={}))
+    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", AsyncMock(return_value={}))
+    native_batch = json.loads(_body())["native_batch"]
+    native_batch.update(address_limit=address_limit, address_offset=address_offset)
+    reply = await batch.serve_custom_import_provider_batch(
+        _request(_body(native_batch=native_batch, include_filter=include_filter)), session
+    )
+    assert reply.status == 200
+    response_by_field = json.loads(reply.body)
+    assert (response_by_field["requested"], response_by_field["found"], response_by_field["not_found"]) == (2, 2, 0)
+    for provider_item in response_by_field["items"]:
+        ranked = addresses_by_npi[provider_item["npi"]]
+        selected = ranked[address_offset : address_offset + address_limit] if address_limit else ranked
+        provider = provider_item["provider"]
+        assert [address["first_line"] for address in provider["address_list"]] == [
+            address["first_line"] for address in selected
+        ]
+        assert provider["address_pagination"] == {
+            "limit": address_limit or None,
+            "offset": address_offset if address_limit else 0,
+            "returned": len(selected),
+            "total": len(ranked),
+            "has_more": bool(address_limit and address_offset + len(selected) < len(ranked)),
+        }
+        assert ("custom_import" in provider) is include_filter
+    assert chunks == ([tuple(str(identity) for identity in identities)] if include_filter else [])
+    assert hydration.await_count == 1 and session.events == ["begin", "snapshot", "end"]
+    assert prepare.await_args.args[2] is session
+    assert prepare.await_args.kwargs["import_context"].native_npis == tuple(identities)
 
 
 @pytest.mark.parametrize("require_match", (False, True))

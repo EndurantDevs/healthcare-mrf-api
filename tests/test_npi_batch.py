@@ -180,6 +180,57 @@ async def test_batch_extra_info_preserves_nonstreet_addresses_before_ranking(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("extra_info", [False, True])
+@pytest.mark.parametrize("imported", [False, True])
+async def test_batch_status_lookup_uses_the_pinned_import_session(monkeypatch, extra_info, imported):
+    identity = 9000000000
+    session = object()
+    role_id = "provider_directory_fhir:practitioner_role:synthetic:role"
+    address_by_field = {**_ranked_batch_addresses(identity)[0], "source_record_ids": [role_id]}
+    monkeypatch.setattr(
+        npi_module, "_build_npi_identity_details_map", AsyncMock(return_value={identity: {"npi": identity}})
+    )
+    monkeypatch.setattr(
+        npi_module, "_fetch_npi_location_candidates_map", AsyncMock(return_value={identity: [address_by_field]})
+    )
+    monkeypatch.setattr(npi_module, "_fetch_provider_directory_address_overlay_map", AsyncMock(return_value={}))
+    statuses = AsyncMock(return_value={role_id: "active"})
+    monkeypatch.setattr(npi_module, "_fetch_location_status_by_record_id", statuses)
+    args = provider_batch.parse_native_batch_query({"extra_info": str(extra_info).lower()})
+
+    state = await provider_batch._prepare_native_batch(
+        [identity], args, session, import_context=object() if imported else None
+    )
+
+    statuses.assert_awaited_once_with([role_id], session=session, use_request_session=imported, fail_closed=imported)
+    assert state.addresses[identity][0]["location_status"] == "active"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_info", [False, True])
+async def test_import_batch_status_failure_propagates_before_provider_selection(monkeypatch, extra_info):
+    identity = 9000000000
+    address_by_field = {
+        **_ranked_batch_addresses(identity)[0],
+        "source_record_ids": ["provider_directory_fhir:practitioner_role:synthetic:role"],
+    }
+    monkeypatch.setattr(npi_module, "_build_npi_identity_details_map", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        npi_module, "_fetch_npi_location_candidates_map", AsyncMock(return_value={identity: [address_by_field]})
+    )
+    monkeypatch.setattr(npi_module, "_fetch_provider_directory_address_overlay_map", AsyncMock(return_value={}))
+    statuses = AsyncMock(side_effect=RuntimeError("status unavailable"))
+    monkeypatch.setattr(npi_module, "_fetch_location_status_by_record_id", statuses)
+    args = provider_batch.parse_native_batch_query({"extra_info": str(extra_info).lower()})
+    session = object()
+
+    with pytest.raises(RuntimeError, match="status unavailable"):
+        await provider_batch._prepare_native_batch([identity], args, session, import_context=object())
+
+    assert statuses.await_args.kwargs == {"session": session, "use_request_session": True, "fail_closed": True}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("view", ["full", "card"])
 async def test_batch_shaping_reuses_selected_addresses_and_card_projection(monkeypatch, view):
     identity = 9000000000
@@ -316,6 +367,10 @@ def test_openapi_documents_npi_batch_contract():
     npi_schema = request_schema["properties"]["npis"]
     assert npi_schema["uniqueItems"] is True
     assert "normalization" in npi_schema["description"]
+    assert request_schema["properties"]["address_limit"]["oneOf"] == [
+        {"type": "integer", "minimum": 0, "maximum": 1000},
+        {"type": "string", "enum": ["all"]},
+    ]
     response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
     meta_schema = response_schema["properties"]["meta"]
     assert set(meta_schema["required"]) == {"elapsed_ms", "max_batch_size", "view"}
@@ -628,7 +683,7 @@ def test_batch_source_controls_must_agree_before_reading(field, batch_value):
     assert provider_batch._batch_shape_params(params, agreeing)[field] is batch_value
 
 
-@pytest.mark.parametrize("address_limit", [6, 20])
+@pytest.mark.parametrize("address_limit", [0, "all", 6, 20, 1000])
 def test_batch_premise_limit_cannot_exceed_existing_group_bound(address_limit):
     params = npi_module._normalize_npi_batch_request({"npis": [9000000000], "address_limit": address_limit})
     args = provider_batch.parse_native_batch_query({"address_grouping": "premise"})
@@ -741,3 +796,73 @@ def test_batch_premise_accepts_both_existing_group_limit_boundaries(address_limi
     params = npi_module._normalize_npi_batch_request({"npis": [9000000000], "address_limit": address_limit})
     args = provider_batch.parse_native_batch_query({"address_grouping": "premise"})
     assert provider_batch._batch_shape_params(params, args)["address_limit"] == address_limit
+
+
+@pytest.mark.parametrize("raw_limit,expected", [(0, 0), ("all", 0), (" ALL ", 0), (21, 21), (1000, 1000)])
+def test_batch_address_limit_accepts_normal_public_exact_provider_values(raw_limit, expected):
+    params = npi_module._normalize_npi_batch_request({"npis": [9000000000], "address_limit": raw_limit})
+    assert params["address_limit"] == expected
+
+
+@pytest.mark.parametrize("raw_limit", [-1, 1001, True, None, 1.5, "0", "1000", "invalid"])
+def test_batch_address_limit_preserves_public_and_json_type_bounds(raw_limit):
+    with pytest.raises(InvalidUsage, match="address_limit"):
+        npi_module._normalize_npi_batch_request({"npis": [9000000000], "address_limit": raw_limit})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("composed", [False, True])
+@pytest.mark.parametrize("address_limit", [0, 1000])
+async def test_batch_large_address_pages_hydrate_every_selected_provider_address(monkeypatch, composed, address_limit):
+    identities = [9000000000, 9000000001]
+    addresses_by_npi = {
+        identity: [
+            {
+                **_ranked_batch_addresses(identity)[0],
+                "first_line": f"{index} Example Avenue",
+                "_base_row_identities": [f"location:{identity}-{index}"],
+            }
+            for index in range(1100 if identity == identities[0] else 3)
+        ]
+        for identity in identities
+    }
+    details_by_npi = {identity: {"npi": identity} for identity in identities}
+    monkeypatch.setattr(npi_module, "_build_npi_identity_details_map", AsyncMock(return_value=details_by_npi))
+    monkeypatch.setattr(npi_module, "_rank_npi_batch_addresses", AsyncMock(return_value=addresses_by_npi))
+    hydration = AsyncMock(return_value=addresses_by_npi)
+    monkeypatch.setattr(npi_module, "_fetch_npi_address_rows_map", hydration)
+    monkeypatch.setattr(npi_module, "_fetch_other_names_map", AsyncMock(return_value={}))
+    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", AsyncMock(return_value={}))
+    batch_params_by_field = {
+        "npis": identities,
+        "address_limit": address_limit,
+        "address_offset": 0,
+        "include_sources": False,
+        "include_evidence": False,
+    }
+    if composed:
+        state = provider_batch._NativeBatchState(details_by_npi, addresses_by_npi)
+        provider_items = await provider_batch._hydrate_native_batch(
+            identities, state, batch_params_by_field, provider_batch.parse_native_batch_query({}), object()
+        )
+    else:
+        provider_items = (await provider_batch.build_native_batch_payload(batch_params_by_field, session=object()))[
+            "items"
+        ]
+    expected_counts = [1100 if address_limit == 0 else 1000, 3]
+    assert [len(provider_item["provider"]["address_list"]) for provider_item in provider_items] == expected_counts
+    assert hydration.await_count == 1
+    assert len(hydration.await_args.kwargs["address_row_identities"]) == sum(expected_counts)
+    for provider_item, count in zip(provider_items, expected_counts, strict=True):
+        identity = provider_item["npi"]
+        provider = provider_item["provider"]
+        assert [address["first_line"] for address in provider["address_list"]] == [
+            address["first_line"] for address in addresses_by_npi[identity][:count]
+        ]
+        assert provider["address_pagination"] == {
+            "limit": address_limit or None,
+            "offset": 0,
+            "returned": count,
+            "total": len(addresses_by_npi[identity]),
+            "has_more": count < len(addresses_by_npi[identity]),
+        }
