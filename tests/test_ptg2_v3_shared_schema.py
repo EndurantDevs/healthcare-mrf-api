@@ -152,10 +152,8 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261010000000_custom_import_admission_indexes"]
-    assert (
-        script.get_revision(script.get_heads()[0]).down_revision == "20261009000000_custom_import_child_presence_decode"
-    )
+    assert script.get_heads() == ["20261010010000_custom_import_materialization_contract"]
+    assert script.get_revision(script.get_heads()[0]).down_revision == "20261010000000_custom_import_admission_indexes"
 
 
 def test_candidate_audit_hold_migration_matches_runtime_digest():

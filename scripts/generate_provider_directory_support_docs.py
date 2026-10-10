@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Generate the maintained Provider Directory endpoint support matrix."""
+
 from __future__ import annotations
+
 import argparse
 import datetime as dt
 import json
@@ -11,32 +13,39 @@ from typing import Any
 try:
     from scripts.provider_directory_catalog_confirmation import (
         catalog_confirmation_fields as _catalog_confirmation_fields,
+    )
+    from scripts.provider_directory_catalog_confirmation import (
         render_catalog_inventory_snapshot as _catalog_inventory_snapshot,
+    )
+    from scripts.provider_directory_readiness_display import (
+        display_verification as _display_verification,
+    )
+    from scripts.provider_directory_readiness_display import (
+        observation_display as _observation_display,
+    )
+    from scripts.provider_directory_readiness_display import (
+        publication_readiness_display,
     )
     from scripts.provider_directory_support_contract import (
         ACCESS_REQUIREMENTS,
         RESOURCE_TYPES,
         SUPPORT_LEVELS,
         SupportDocumentationError,
-        validate_access_review_metadata,
-        validate_blocker_registry,
         parse_review_date,
         parse_timestamp_date,
         review_valid_through,
+        validate_access_review_metadata,
+        validate_blocker_registry,
         validate_configured_endpoint,
         validate_freshness_policy,
         validate_support_freshness,
     )
     from scripts.provider_directory_support_inventory import (
-        load_current_dataset_audit, render_blocked_support_section,
+        load_current_dataset_audit,
+        render_blocked_support_section,
         render_current_dataset_audit_section,
         render_inventory_summary,
         resource_completion_display,
-    )
-    from scripts.provider_directory_readiness_display import (
-        display_verification as _display_verification,
-        observation_display as _observation_display,
-        publication_readiness_display,
     )
     from scripts.provider_directory_verification_contract import (
         VERIFICATION_STATUSES,
@@ -47,32 +56,39 @@ try:
 except ModuleNotFoundError:
     from provider_directory_catalog_confirmation import (
         catalog_confirmation_fields as _catalog_confirmation_fields,
+    )
+    from provider_directory_catalog_confirmation import (
         render_catalog_inventory_snapshot as _catalog_inventory_snapshot,
+    )
+    from provider_directory_readiness_display import (
+        display_verification as _display_verification,
+    )
+    from provider_directory_readiness_display import (
+        observation_display as _observation_display,
+    )
+    from provider_directory_readiness_display import (
+        publication_readiness_display,
     )
     from provider_directory_support_contract import (
         ACCESS_REQUIREMENTS,
         RESOURCE_TYPES,
         SUPPORT_LEVELS,
         SupportDocumentationError,
-        validate_access_review_metadata,
-        validate_blocker_registry,
         parse_review_date,
         parse_timestamp_date,
         review_valid_through,
+        validate_access_review_metadata,
+        validate_blocker_registry,
         validate_configured_endpoint,
         validate_freshness_policy,
         validate_support_freshness,
     )
     from provider_directory_support_inventory import (
-        load_current_dataset_audit, render_blocked_support_section,
+        load_current_dataset_audit,
+        render_blocked_support_section,
         render_current_dataset_audit_section,
         render_inventory_summary,
         resource_completion_display,
-    )
-    from provider_directory_readiness_display import (
-        display_verification as _display_verification,
-        observation_display as _observation_display,
-        publication_readiness_display,
     )
     from provider_directory_verification_contract import (
         VERIFICATION_STATUSES,
@@ -110,28 +126,40 @@ DISPLAY_VALUES = {
 }
 NOT_RECORDED = "not recorded"
 NOT_RECORDED_DISPLAY = "Not recorded"
+
+
 def load_manifest(manifest_path: Path) -> dict[str, Any]:
     """Load the endpoint manifest as a JSON object."""
     decoded = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(decoded, dict):
         raise SupportDocumentationError(f"{manifest_path} must contain a JSON object")
     return decoded
+
+
 def load_blocker_registry(registry_path: Path) -> dict[str, Any]:
     """Load the maintained non-importable source registry."""
     decoded = json.loads(registry_path.read_text(encoding="utf-8"))
     if not isinstance(decoded, dict):
         raise SupportDocumentationError(f"{registry_path} must contain a JSON object")
     return decoded
+
+
 def load_verification_snapshot(snapshot_path: Path) -> dict[str, Any]:
     """Load the tracked terminal live-verification snapshot."""
     decoded = json.loads(snapshot_path.read_text(encoding="utf-8"))
     if not isinstance(decoded, dict):
         raise SupportDocumentationError(f"{snapshot_path} must contain a JSON object")
     return decoded
+
+
 def _display(value: str) -> str:
     return DISPLAY_VALUES[value]
+
+
 def _markdown_cell(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", "<br>")
+
+
 def _entry_ids(entries: Any) -> list[str]:
     if not isinstance(entries, list) or not entries:
         raise SupportDocumentationError("entries must be a non-empty list")
@@ -140,12 +168,26 @@ def _entry_ids(entries: Any) -> list[str]:
         raise SupportDocumentationError("entries must have unique non-empty entry_id values")
     return entry_ids
 
+
 def _validate_entry_support(entry: dict[str, Any], support: Any) -> None:
     entry_id = str(entry["entry_id"])
-    required_fields = {"support_level", "access_requirement", "requires_registration", "reviewed_at", "method", "limitation"}
+    required_fields = {
+        "support_level",
+        "access_requirement",
+        "requires_registration",
+        "reviewed_at",
+        "method",
+        "limitation",
+    }
     optional_fields = {"documented_resources"}
-    if not isinstance(support, dict) or not required_fields.issubset(support) or not set(support).issubset(required_fields | optional_fields):
-        raise SupportDocumentationError(f"{entry_id}: support metadata must contain {sorted(required_fields)} and optional documented_resources only")
+    if (
+        not isinstance(support, dict)
+        or not required_fields.issubset(support)
+        or not set(support).issubset(required_fields | optional_fields)
+    ):
+        raise SupportDocumentationError(
+            f"{entry_id}: support metadata must contain {sorted(required_fields)} and optional documented_resources only"
+        )
     support_level = support["support_level"]
     access_requirement = support["access_requirement"]
     method = support["method"]
@@ -167,6 +209,8 @@ def _validate_entry_support(entry: dict[str, Any], support: Any) -> None:
     ):
         raise SupportDocumentationError(f"{entry_id}: documented_resources must contain known resource types")
     validate_configured_endpoint(entry, support)
+
+
 def validate_manifest(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Validate complete top-level support metadata without altering run entries."""
     entries = manifest.get("entries")
@@ -181,11 +225,7 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     if not isinstance(report_path, str) or not report_path.startswith("reports/"):
         raise SupportDocumentationError("runtime_status_report must be a reports/ path")
     blocker_path = documentation.get("blocker_registry")
-    if (
-        not isinstance(blocker_path, str)
-        or not blocker_path.startswith("specs/")
-        or ".." in Path(blocker_path).parts
-    ):
+    if not isinstance(blocker_path, str) or not blocker_path.startswith("specs/") or ".." in Path(blocker_path).parts:
         raise SupportDocumentationError("blocker_registry must be a safe specs/ path")
     verification_path = documentation.get("verification_snapshot")
     if (
@@ -246,17 +286,23 @@ def validate_verification_snapshot(
             allow_current_spec_mismatch=allow_current_spec_mismatch,
         )
     return entries
+
+
 def _support_document_header(manifest: dict[str, Any]) -> list[str]:
     report_path = manifest["support_documentation"]["runtime_status_report"]
     policy = validate_freshness_policy(manifest)
     return [
         "# Provider Directory Endpoint Support",
         "",
-        "This matrix describes maintained implementation and campaign configuration. It does not claim that a live probe succeeded, that an import ran, or that a dataset is current. Credential-safe operator results are written locally or on dev to `" + report_path + "`, or to a selected `--output` path with `--verification-report`; the report is not tracked.",
+        "This matrix describes maintained implementation and campaign configuration. It does not claim that a live probe succeeded, that an import ran, or that a dataset is current. Credential-safe operator results are written locally or on dev to `"
+        + report_path
+        + "`, or to a selected `--output` path with `--verification-report`; the report is not tracked.",
         "",
         "The live catalog and curated support matrix are distinct: a recorded catalog inventory covers observed sources, while this maintained matrix tracks sources with curated support records. Missing operational evidence is displayed as not recorded and establishes no live status.",
         "",
         "`None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.",
+        "",
+        "Source review dates record checks of the maintained implementation and configuration. Historical source and probe notes retained in limitations are not new live verification.",
         "",
         "A canonical base identifies the maintained source endpoint; its source IDs retain product or plan provenance. Endpoint identity describes the complete acquisition contract, including connector-specific transport fields when acquisition does not use that canonical base. Shared endpoint aliases must not be collapsed into one published product result merely because they share a transport base. Access configuration, current published dataset state, terminal acquisition proof, derived artifact state, and unified/API readiness are separate claims.",
         "",
@@ -275,9 +321,7 @@ def _configured_support_rows(
     support_by_entry: dict[str, dict[str, Any]],
 ) -> list[str]:
     markdown_rows = []
-    maximum_age_days = validate_freshness_policy(manifest)[
-        "source_review_max_age_days"
-    ]
+    maximum_age_days = validate_freshness_policy(manifest)["source_review_max_age_days"]
     for entry in manifest["entries"]:
         support_record = support_by_entry[entry["entry_id"]]
         documented_resources = support_record.get("documented_resources")
@@ -305,26 +349,20 @@ def _configured_support_rows(
         ]
         markdown_rows.append("| " + " | ".join(_markdown_cell(cell) for cell in cells) + " |")
     return markdown_rows
+
+
 def _terminal_resource_rows_display(
     entry: dict[str, Any],
     verification_record: dict[str, Any],
 ) -> str:
     terminal_evidence = verification_record.get("terminal_evidence")
-    resource_outcomes = (
-        terminal_evidence.get("resource_outcomes")
-        if isinstance(terminal_evidence, dict)
-        else None
-    )
+    resource_outcomes = terminal_evidence.get("resource_outcomes") if isinstance(terminal_evidence, dict) else None
     if not isinstance(resource_outcomes, dict):
         return NOT_RECORDED_DISPLAY
     row_count_labels = []
     for resource_name in entry["resources"]:
         resource_outcome = resource_outcomes.get(resource_name)
-        rows_fetched = (
-            resource_outcome.get("rows_fetched")
-            if isinstance(resource_outcome, dict)
-            else None
-        )
+        rows_fetched = resource_outcome.get("rows_fetched") if isinstance(resource_outcome, dict) else None
         if not isinstance(rows_fetched, int) or rows_fetched < 0:
             continue
         row_count_labels.append(f"{resource_name}: {rows_fetched:,}")
@@ -338,9 +376,7 @@ def _observed_verification_section(
     verification_records = validate_verification_snapshot(snapshot, manifest)
     checked_at = snapshot["checked_at"] or NOT_RECORDED
     support_by_entry = manifest["support_documentation"]["entry_support"]
-    verification_age = validate_freshness_policy(manifest)[
-        "terminal_verification_max_age_days"
-    ]
+    verification_age = validate_freshness_policy(manifest)["terminal_verification_max_age_days"]
     return_lines = [
         "",
         "## Observed Live Verification",
@@ -361,11 +397,13 @@ def _observed_verification_section(
         )
         cells = [
             f"{entry['display_name']} (`{entry['entry_id']}`)",
-            _display_verification(verification_record.get("proof_state", "current" if verification_record["terminal_status"] else "not_recorded")),
-            _display_verification(verification_record["terminal_status"]),
-            resource_completion_display(
-                entry, support_by_entry[entry["entry_id"]], verification_record
+            _display_verification(
+                verification_record.get(
+                    "proof_state", "current" if verification_record["terminal_status"] else "not_recorded"
+                )
             ),
+            _display_verification(verification_record["terminal_status"]),
+            resource_completion_display(entry, support_by_entry[entry["entry_id"]], verification_record),
             artifact_state,
             api_state,
             readiness_observed_at,
@@ -389,6 +427,8 @@ def _observed_verification_section(
         ]
         return_lines.append("| " + " | ".join(_markdown_cell(str(cell)) for cell in cells) + " |")
     return return_lines
+
+
 def render_markdown(
     manifest: dict[str, Any],
     blocker_registry: dict[str, Any] | None = None,
@@ -401,20 +441,22 @@ def render_markdown(
         snapshot_path = ROOT / manifest["support_documentation"]["verification_snapshot"]
         snapshot = load_verification_snapshot(snapshot_path)
     support_by_entry = validate_manifest(manifest)
-    blockers = validate_blocker_registry(blocker_registry if blocker_registry is not None else load_blocker_registry(DEFAULT_BLOCKER_REGISTRY))
-    overlapping_ids = sorted({entry["entry_id"] for entry in manifest["entries"]} & {blocker["id"] for blocker in blockers})
+    blockers = validate_blocker_registry(
+        blocker_registry if blocker_registry is not None else load_blocker_registry(DEFAULT_BLOCKER_REGISTRY)
+    )
+    overlapping_ids = sorted(
+        {entry["entry_id"] for entry in manifest["entries"]} & {blocker["id"] for blocker in blockers}
+    )
     if overlapping_ids:
-        raise SupportDocumentationError("blocker registry IDs overlap runnable manifest entries: " + ", ".join(overlapping_ids))
+        raise SupportDocumentationError(
+            "blocker registry IDs overlap runnable manifest entries: " + ", ".join(overlapping_ids)
+        )
     markdown_lines = _support_document_header(manifest)
     markdown_lines.extend(_catalog_inventory_snapshot(manifest, blockers))
     markdown_lines.extend(render_inventory_summary(manifest, support_by_entry, blockers, _display))
     markdown_lines.extend(_configured_support_rows(manifest, support_by_entry))
     if current_dataset_audit is not None:
-        markdown_lines.extend(
-            render_current_dataset_audit_section(
-                current_dataset_audit, manifest, snapshot
-            )
-        )
+        markdown_lines.extend(render_current_dataset_audit_section(current_dataset_audit, manifest, snapshot))
     markdown_lines.extend(
         render_blocked_support_section(
             blockers,
@@ -424,8 +466,12 @@ def render_markdown(
         )
     )
     markdown_lines.extend(_observed_verification_section(manifest, snapshot))
-    markdown_lines.extend(["", "Generated by `scripts/generate_provider_directory_support_docs.py`; do not edit this file directly.", ""])
+    markdown_lines.extend(
+        ["", "Generated by `scripts/generate_provider_directory_support_docs.py`; do not edit this file directly.", ""]
+    )
     return "\n".join(markdown_lines)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse deterministic generation arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -446,6 +492,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Freshness date for --check (defaults to current UTC date).",
     )
     return parser.parse_args(argv)
+
+
 def _render_requested_document(
     args: argparse.Namespace,
     manifest: dict[str, Any],
@@ -459,15 +507,15 @@ def _render_requested_document(
         load_verification_snapshot(verification_path),
         load_current_dataset_audit(args.current_dataset_audit),
     )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Write the support matrix or check it for drift."""
     args = parse_args(argv)
     manifest = load_manifest(args.manifest)
     blocker_path = args.blocker_registry or ROOT / manifest["support_documentation"]["blocker_registry"]
     verification_path = args.verification_snapshot or ROOT / manifest["support_documentation"]["verification_snapshot"]
-    rendered = _render_requested_document(
-        args, manifest, blocker_path, verification_path
-    )
+    rendered = _render_requested_document(args, manifest, blocker_path, verification_path)
     blockers = validate_blocker_registry(load_blocker_registry(blocker_path))
     current = args.output.read_text(encoding="utf-8") if args.output.exists() else None
     if args.check:
@@ -486,5 +534,7 @@ def main(argv: list[str] | None = None) -> int:
     args.output.write_text(rendered, encoding="utf-8")
     print(f"Wrote Provider Directory support documentation: {args.output}")
     return 0
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

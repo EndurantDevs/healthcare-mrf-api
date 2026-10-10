@@ -73,6 +73,9 @@ _EXECUTION_REQUEST_IDENTITY_MIGRATION_PATH = (
     _ROOT / "alembic" / "versions" / "20260922010000_custom_import_execution_request_identity.py"
 )
 _SOURCE_BINDING_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20260923030000_custom_import_source_binding.py"
+_MATERIALIZATION_CONTRACT_MIGRATION_PATH = (
+    _ROOT / "alembic" / "versions" / "20261010010000_custom_import_materialization_contract.py"
+)
 _SEGMENTED_CAPTURE_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20261002000000_custom_import_segmented_capture.py"
 _SNAPSHOT_MIGRATION_NAMES = (
     "20261002010000_custom_import_bounded_build",
@@ -166,6 +169,16 @@ def _install_custom_import_migrations(
             migration._schema = lambda: schema_name
             migration.op = Operations(MigrationContext.configure(sync_connection))
             migration.upgrade()
+
+    install_materialization_contract_migration(sync_connection, schema_name)
+
+
+def install_materialization_contract_migration(sync_connection, schema_name: str) -> None:
+    """Keep current model metadata when a fixture selects historical writer DDL."""
+    migration = _migration(_MATERIALIZATION_CONTRACT_MIGRATION_PATH, "custom_import_materialization_contract_test")
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(sync_connection))
+    migration.upgrade()
 
 
 def install_segmented_capture_migration(sync_connection, schema_name: str) -> None:
@@ -1261,6 +1274,7 @@ __all__ = (
     "attach_generation_family",
     "digest",
     "execution_state",
+    "install_materialization_contract_migration",
     "install_segmented_capture_migration",
     "isolated_publication_case",
     "lease_digest",

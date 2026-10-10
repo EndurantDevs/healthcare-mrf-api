@@ -94,46 +94,51 @@ def _prepare_read(session, request, deadline):
     )
 
 
+def _read_authority(session, request, build_id):
+    """Refresh read authority inside the caller's READ COMMITTED transaction."""
+    session.execute(select(func.set_config("statement_timeout", str(request.statement_timeout_ms), True)))
+    started = time.monotonic()
+    build, execution, lease, now, isolation = session.execute(
+        select(
+            CustomImportBuildAttempt,
+            CustomImportExecution,
+            CustomImportLease,
+            func.clock_timestamp(),
+            func.current_setting("transaction_isolation"),
+        )
+        .join(CustomImportExecution, CustomImportExecution.execution_id == CustomImportBuildAttempt.execution_id)
+        .join(CustomImportLease, CustomImportLease.execution_id == CustomImportExecution.execution_id)
+        .where(CustomImportBuildAttempt.build_id == build_id)
+        .execution_options(populate_existing=True)
+    ).one()
+    _verify_request(build, request, execution)
+    if isolation != "read committed":
+        raise CandidateRunnerError("build reads require READ COMMITTED")
+    if execution.state == "canceling":
+        raise CancellationRequested("candidate execution is canceling")
+    if (
+        execution.state != "running"
+        or execution.capture_bundle_id != build.capture_bundle_id
+        or lease.fence != request.fence
+        or lease.token_sha256 is None
+        or not hmac.compare_digest(bytes(lease.token_sha256), bytes(build.producing_token_sha256))
+        or lease.expires_at is None
+    ):
+        raise LeaseAuthorityLost("build read requires the current running attempt")
+    remaining = (min(lease.expires_at, build.build_deadline_at) - now).total_seconds() - 0.001
+    if remaining <= 0:
+        raise LeaseAuthorityLost("build read deadline elapsed")
+    deadline = started + remaining
+    session.info["custom_import_build_read_deadline"] = deadline
+    _prepare_read(session, request, deadline)
+    return build, deadline
+
+
 @contextmanager
 def _read_transaction(session, request, build_id):
     """Read one frozen page without acquiring the dataset write lock."""
-
     with session.begin():
-        session.execute(select(func.set_config("statement_timeout", str(request.statement_timeout_ms), True)))
-        started = time.monotonic()
-        build, execution, lease, now, isolation = session.execute(
-            select(
-                CustomImportBuildAttempt,
-                CustomImportExecution,
-                CustomImportLease,
-                func.clock_timestamp(),
-                func.current_setting("transaction_isolation"),
-            )
-            .join(CustomImportExecution, CustomImportExecution.execution_id == CustomImportBuildAttempt.execution_id)
-            .join(CustomImportLease, CustomImportLease.execution_id == CustomImportExecution.execution_id)
-            .where(CustomImportBuildAttempt.build_id == build_id)
-            .execution_options(populate_existing=True)
-        ).one()
-        _verify_request(build, request, execution)
-        if isolation != "read committed":
-            raise CandidateRunnerError("build reads require READ COMMITTED")
-        if execution.state == "canceling":
-            raise CancellationRequested("candidate execution is canceling")
-        if (
-            execution.state != "running"
-            or execution.capture_bundle_id != build.capture_bundle_id
-            or lease.fence != request.fence
-            or lease.token_sha256 is None
-            or not hmac.compare_digest(bytes(lease.token_sha256), bytes(build.producing_token_sha256))
-            or lease.expires_at is None
-        ):
-            raise LeaseAuthorityLost("build read requires the current running attempt")
-        remaining = (min(lease.expires_at, build.build_deadline_at) - now).total_seconds() - 0.001
-        if remaining <= 0:
-            raise LeaseAuthorityLost("build read deadline elapsed")
-        deadline = started + remaining
-        session.info["custom_import_build_read_deadline"] = deadline
-        _prepare_read(session, request, deadline)
+        build, deadline = _read_authority(session, request, build_id)
         yield build, deadline
         _require_budget(deadline)
         session.expunge_all()
@@ -292,6 +297,8 @@ def _physical_keys(metadata, request, available_bytes, fixed_bytes):
 def _read_physical_payload(session, request, deadline, page, keys, admitted):
     """Check the complete prefix count without fetching an unbudgeted extra payload."""
     prefix = page.where(tuple_(*keys) <= admitted[-1])
+    if len(keys) > 1:
+        prefix = prefix.where(keys[0] <= admitted[-1][0])
     prefix_count = (
         prefix.with_only_columns(func.count(), maintain_column_froms=True)
         .order_by(None)
@@ -336,6 +343,9 @@ def _read_physical_pages(session, request, build_id, query_factory, *, after, bo
             page = statement.order_by(None)
             if after is not None:
                 page = page.where(tuple_(*keys) > tuple(after))
+                if len(keys) > 1:
+                    # Expose the leading relation's range before ordering its joined suffix.
+                    page = page.where(keys[0] >= after[0])
             _prepare_read(session, request, deadline)
             metadata = session.execute(
                 page.with_only_columns(*keys, variable_bytes, maintain_column_froms=True).order_by(*keys).limit(limit)
