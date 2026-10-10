@@ -309,10 +309,8 @@ async def apply_prepared_cms_doctors_generation(prepared):
     if prepared.committed:
         raise RuntimeError("cms_doctors_preparation_already_committed")
     session = binding.session
-    stages = tuple(stage for _, stage, _ in prepared.stage_oids)
-    live_names = tuple(name for name, oid in prepared.incumbent.relation_oids if oid is not None)
-    await archive._lock_family(session, prepared.schema, stages, "ACCESS EXCLUSIVE", nowait=True)
-    await native.lock_live_serving_relations(native.db.status, prepared.schema, live_names)
+    stage_cls = native.make_class(native.DoctorClinicianAddress, prepared.import_date)
+    await native._lock_cms_doctors_publication(session, stage_cls, prepared.schema, prepared.import_date)
     await archive._verify_incumbent(session, prepared.incumbent)
     authority = await generation.read_reference_family_result_generation_authority(
         session,
@@ -326,8 +324,8 @@ async def apply_prepared_cms_doctors_generation(prepared):
         await _assert_stage(session, prepared.schema, stage, oid, logged=True)
         await _assert_stage_indexes(session, prepared.schema, native.make_class(model, prepared.import_date))
     await assert_prepared_cms_doctors_seal(session, prepared)
-    prepared.native_receipt = await native._apply_cms_doctors_stage(
-        native.make_class(native.DoctorClinicianAddress, prepared.import_date),
+    prepared.native_receipt = await native._apply_locked_cms_doctors_stage(
+        stage_cls,
         prepared.schema,
         prepared.import_date,
     )

@@ -759,15 +759,17 @@ async def test_doctors_apply_refuses_stale_authority_or_already_consumed_prepara
         committed=committed,
     )
     session = object()
+    stage_cls = object()
+    lock = AsyncMock()
     apply = AsyncMock()
     native = SimpleNamespace(
         db=SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session), status=object()),
-        lock_live_serving_relations=AsyncMock(),
-        _apply_cms_doctors_stage=apply,
+        make_class=Mock(return_value=stage_cls),
+        DoctorClinicianAddress=object(),
+        _lock_cms_doctors_publication=lock,
+        _apply_locked_cms_doctors_stage=apply,
     )
     monkeypatch.setattr(preparation, "_native", lambda: native)
-    lock = AsyncMock()
-    monkeypatch.setattr(archive, "_lock_family", lock)
     monkeypatch.setattr(archive, "_verify_incumbent", AsyncMock())
     read = AsyncMock(return_value=replace(authority, local_generation=2))
     monkeypatch.setattr(generation, "read_reference_family_result_generation_authority", read)
@@ -780,6 +782,7 @@ async def test_doctors_apply_refuses_stale_authority_or_already_consumed_prepara
         lock.assert_not_awaited()
         read.assert_not_awaited()
     else:
+        lock.assert_awaited_once_with(session, stage_cls, "mrf", "20260730")
         read.assert_awaited_once_with(session, importer_id="cms-doctors", schema_name="mrf", lock=True)
 
 
@@ -1251,11 +1254,10 @@ async def test_doctors_apply_rejects_catalog_or_result_drift_without_consuming_p
         make_class=original_native.make_class,
         _stage_index_name=original_native._stage_index_name,
         DoctorClinicianAddress=original_native.DoctorClinicianAddress,
-        lock_live_serving_relations=AsyncMock(),
-        _apply_cms_doctors_stage=apply,
+        _lock_cms_doctors_publication=AsyncMock(),
+        _apply_locked_cms_doctors_stage=apply,
     )
     monkeypatch.setattr(preparation, "_native", lambda: native)
-    monkeypatch.setattr(archive, "_lock_family", AsyncMock())
     monkeypatch.setattr(archive, "_verify_incumbent", AsyncMock())
     monkeypatch.setattr(
         generation,

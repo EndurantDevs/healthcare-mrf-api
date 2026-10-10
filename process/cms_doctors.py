@@ -33,16 +33,16 @@ from process.cms_doctors_groups import (
     validate_group_site_stage,
 )
 from process.cms_doctors_organizations import bind_group_site_organizations
-from process.cms_doctors_sites import bind_cms_doctors_sites
 from process.cms_doctors_rows import doctor_address_row
+from process.cms_doctors_sites import bind_cms_doctors_sites
 from process.cms_doctors_source_provenance import read_doctors_source_provenance
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import mark_control_run
 from process.entity_address_cutover_contract import lock_live_serving_relations, wait_for_publication_lock
-from process.reference_family_archive import _lock_family
 from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info, push_objects
 from process.redis_config import build_redis_settings
+from process.reference_family_archive import _lock_family
 from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.serialization import deserialize_job, serialize_job
 
@@ -125,9 +125,7 @@ async def _ensure_schema_exists(db_schema: str) -> None:
     try:
         await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
     except Exception as exc:
-        exists = bool(
-            await db.scalar(f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;")
-        )
+        exists = bool(await db.scalar(f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;"))
         if exists:
             logger.warning(
                 "Schema %s already exists but CREATE SCHEMA failed (%s); continuing",
@@ -284,21 +282,27 @@ async def _stage_doctors_sidecars(source_path, url, ctx, task, test_mode, *, sou
         ctx["context"]["artifact"] = retain_doctors_artifact(source_path, url)
     manifest_kwargs = {"source_manifest": source_manifest} if source_manifest is not None else {}
     ctx["context"]["education"] = await import_doctor_education(
-        source_path, url, ctx, task,
+        source_path,
+        url,
+        ctx,
+        task,
         source_manifest["dataset_id"] if source_manifest is not None else DEFAULT_DOCTORS_DATASET_ID,
         **manifest_kwargs,
     )
     if not test_mode and (
-        ctx["context"]["artifact"]["content_sha256"]
-        != ctx["context"]["education"]["content_sha256"]
+        ctx["context"]["artifact"]["content_sha256"] != ctx["context"]["education"]["content_sha256"]
     ):
         raise RuntimeError("cms_doctors_artifact_digest_mismatch")
     ctx["context"]["group_site"] = await import_group_site_rows(
-        source_path, ctx, task, ctx["context"]["education"],
+        source_path,
+        ctx,
+        task,
+        ctx["context"]["education"],
     )
     group_stage = make_class(CMSDoctorGroupSite, ctx["import_date"])
     await _create_stage_indexes(
-        group_stage, _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"),
+        group_stage,
+        _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"),
     )
 
 
@@ -308,16 +312,26 @@ async def _replay_doctors_source(ctx, task, stage_cls, batch_size, test_mode, te
     source_path = verify_doctors_artifact(original["artifact"])
     ctx["context"]["artifact"] = dict(original["artifact"])
     source_manifest_by_field = {
-        key: value for key, value in original["education"].items()
+        key: field_value
+        for key, field_value in original["education"].items()
         if key not in {"source_rows", "education_rows"}
     }
     await _stage_doctors_sidecars(
-        source_path, original["artifact"]["source_url"], ctx, task, test_mode,
+        source_path,
+        original["artifact"]["source_url"],
+        ctx,
+        task,
+        test_mode,
         source_manifest=source_manifest_by_field,
     )
     accepted_rows = await _import_doctors_source(
-        source_path, ctx=ctx, task=task, stage_cls=stage_cls, batch_size=batch_size,
-        test_mode=test_mode, test_row_limit=test_row_limit,
+        source_path,
+        ctx=ctx,
+        task=task,
+        stage_cls=stage_cls,
+        batch_size=batch_size,
+        test_mode=test_mode,
+        test_row_limit=test_row_limit,
     )
     verify_doctors_artifact(original["artifact"])
     if not test_mode and (
@@ -355,11 +369,10 @@ async def import_cms_doctors_data(ctx, task=None):
 
     try:
         if "cms_doctors_retained_source_provenance" in task:
-            accepted_rows = await _replay_doctors_source(
-                ctx, task, stage_cls, batch_size, test_mode, test_row_limit,
-            )
+            accepted_rows = await _replay_doctors_source(ctx, task, stage_cls, batch_size, test_mode, test_row_limit)
         else:
             import aiohttp
+
             client = aiohttp.ClientSession()
             url = await _fetch_doctors_download_url(client)
             logger.info("Found CMS Doctors source: %s", url)
@@ -483,10 +496,17 @@ async def _lock_cms_doctors_publication(session, stage_cls, db_schema, import_da
 
 
 async def _apply_cms_doctors_stage(stage_cls, db_schema: str, import_date: str):
-    """Swap every Doctors relation and advance authority without committing the owner."""
+    """Lock and swap every Doctors relation without committing the owner."""
     if db._transaction_binding() is None:
         raise RuntimeError("cms_doctors_publication_requires_transaction")
     await _lock_cms_doctors_publication(db._transaction_binding().session, stage_cls, db_schema, import_date)
+    return await _apply_locked_cms_doctors_stage(stage_cls, db_schema, import_date)
+
+
+async def _apply_locked_cms_doctors_stage(stage_cls, db_schema: str, import_date: str):
+    """Swap the already-locked family and advance authority in the owner's transaction."""
+    if db._transaction_binding() is None:
+        raise RuntimeError("cms_doctors_publication_requires_transaction")
     table = DoctorClinicianAddress.__main_table__
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
     await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
@@ -503,9 +523,7 @@ async def _apply_cms_doctors_stage(stage_cls, db_schema: str, import_date: str):
         old_live_name = f"{table}_idx_{index_name}"
         archived_live_name = _archived_identifier(old_live_name)
         await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} RENAME TO {archived_live_name};"
-        )
+        await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} RENAME TO {archived_live_name};")
         await db.status(
             f"ALTER INDEX IF EXISTS {db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
             f"RENAME TO {old_live_name};"
@@ -559,11 +577,11 @@ async def _prepare_cms_doctors_sources(ctx, stage_cls, db_schema, stage_rows):
     context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
     if stage_rows < DEFAULT_MIN_ROWS:
-        raise RuntimeError(
-            f"CMS Doctors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting."
-        )
+        raise RuntimeError(f"CMS Doctors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting.")
     education_manifest, group_receipt = await _validate_cms_doctors_publication_sources(
-        ctx["import_date"], db_schema, context,
+        ctx["import_date"],
+        db_schema,
+        context,
     )
     organization_groups = await bind_group_site_organizations(ctx, ctx["import_date"], db_schema, group_receipt)
     sites = await bind_cms_doctors_sites(ctx, ctx["import_date"], db_schema, group_receipt)
@@ -609,10 +627,7 @@ async def _publish_cms_doctors_generation(ctx):
     await ensure_database(bool(context.get("test_mode")))
     db_schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     stage_cls = make_class(DoctorClinicianAddress, import_date)
-    stage_rows = int(
-        await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};")
-        or 0
-    )
+    stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
     if context.get("test_mode"):
         logger.info("CMS Doctors test mode: staged rows=%d", stage_rows)
         return await _finish_cms_doctors_test_run(ctx, db_schema, stage_rows)
