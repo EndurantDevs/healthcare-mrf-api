@@ -34,11 +34,17 @@ def test_fixed_index_definitions_match_the_model_and_are_candidate_only():
     migration = _migration()
     specifications = json.loads(migration._INDEX_SPECIFICATIONS)
     for phase in ("admission", "graph", "output", "serving"):
+        phase_specifications = list(specifications)
+        if phase == "admission":
+            child_index = next(item for item in specifications if item["name"] == "custom_import_build_graph_child_idx")
+            phase_specifications.append({**child_index, "phase": "admission"})
         expected_statements = (
             snapshot_serving_index_statements(1) if phase == "serving" else snapshot_phase_index_statements(1, phase)
         )
         actual_statements = tuple(
-            item["ddl"].replace("__CANDIDATE__", "ci_snapshot_1") for item in specifications if item["phase"] == phase
+            item["ddl"].replace("__CANDIDATE__", "ci_snapshot_1")
+            for item in sorted(phase_specifications, key=lambda item: item["name"] if phase != "serving" else "")
+            if item["phase"] == phase
         )
         assert actual_statements == expected_statements
     assert len(specifications) == 20
