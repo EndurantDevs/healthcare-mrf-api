@@ -1065,16 +1065,13 @@ PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL = """
 """
 
 
-# A handful of reference labs / large health systems carry 1k+ service locations.
-# Returning every address inline produces multi-MB responses and 90ms+ build times
-# (one geocode-enrichment task per address). Page the address_list by default so the
-# common provider (a few addresses) is unchanged while the outliers stay bounded;
-# callers walk every address via address_offset, or opt out with address_limit=all.
+# Provider address lists are paged by default; all or 0 returns the full ranked list.
+# Positive batch address limits share the exact-provider ceiling.
 NPI_DETAIL_ADDRESS_DEFAULT_LIMIT = 200
 NPI_DETAIL_ADDRESS_MAX_LIMIT = 1000
 NPI_BATCH_MAX_SIZE = 100
 NPI_BATCH_ADDRESS_DEFAULT_LIMIT = 5
-NPI_BATCH_ADDRESS_MAX_LIMIT = 20
+NPI_BATCH_ADDRESS_MAX_LIMIT = NPI_DETAIL_ADDRESS_MAX_LIMIT
 NPI_DETAIL_ADDRESS_GROUP_DEFAULT_LIMIT = 5
 NPI_DETAIL_ADDRESS_GROUP_MAX_LIMIT = 5
 NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT = 5
@@ -11457,19 +11454,17 @@ async def _rank_npi_batch_addresses(
     npis: Sequence[int],
     *,
     session: Any,
+    use_request_session: bool = False,
+    fail_closed: bool = False,
 ) -> dict[int, list[dict[str, Any]]]:
     """Fetch and rank summary address candidates with fixed-count reads."""
-    base_addresses_by_npi = await _fetch_npi_location_candidates_map(
-        npis,
-        session=session,
-    )
-    overlay_addresses_by_npi = await _fetch_provider_directory_address_overlay_map(
-        npis,
-        session=session,
-    )
+    base_addresses_by_npi = await _fetch_npi_location_candidates_map(npis, session=session)
+    overlay_addresses_by_npi = await _fetch_provider_directory_address_overlay_map(npis, session=session)
     await _apply_location_statuses(
         [address for npi in npis for address in base_addresses_by_npi.get(npi, [])],
         session=session,
+        use_request_session=use_request_session,
+        fail_closed=fail_closed,
     )
     ranked_addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
     for npi in npis:
@@ -11494,9 +11489,9 @@ async def _hydrate_npi_batch_addresses(
     session: Any,
 ) -> dict[int, list[dict[str, Any]]]:
     """Hydrate only each provider's selected address page."""
-    selected_addresses_by_npi = {
-        npi: list(ranked_addresses_by_npi[npi])[address_offset : address_offset + address_limit] for npi in npis
-    }
+    selected_offset = address_offset if address_limit else 0
+    selected_end = address_offset + address_limit if address_limit else None
+    selected_addresses_by_npi = {npi: list(ranked_addresses_by_npi[npi])[selected_offset:selected_end] for npi in npis}
 
     selected_identity_list = sorted(
         {identity for npi in npis for identity in _selected_base_identity_list(selected_addresses_by_npi[npi])}
@@ -11574,14 +11569,15 @@ def _npi_batch_provider_result(
         )
         for address in selected_addresses
     ]
-    address_offset = int(batch_params["address_offset"])
+    address_limit = int(batch_params["address_limit"]) or None
+    address_offset = int(batch_params["address_offset"]) if address_limit is not None else 0
     public_provider_map["address_list"] = finalized_addresses
     public_provider_map["address_pagination"] = {
-        "limit": int(batch_params["address_limit"]),
+        "limit": address_limit,
         "offset": address_offset,
         "returned": len(finalized_addresses),
         "total": address_total,
-        "has_more": address_offset + len(finalized_addresses) < address_total,
+        "has_more": address_limit is not None and address_offset + len(finalized_addresses) < address_total,
     }
     public_provider_map["other_name_list"] = list(other_names)
     public_provider_map["do_business_as"] = _npi_batch_dba_names(

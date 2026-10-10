@@ -67,7 +67,7 @@ def _batch_shape_params(batch_params, native_args):
     if npi._is_truthy_arg(native_args.get("debug"), default=False):
         options_by_field.update(include_sources=True, include_evidence=True)
     if native_args.get("address_grouping", "flat").strip().lower() == npi.ADDRESS_GROUPING_PREMISE:
-        if options_by_field["address_limit"] > npi.NPI_DETAIL_ADDRESS_GROUP_MAX_LIMIT:
+        if not 1 <= options_by_field["address_limit"] <= npi.NPI_DETAIL_ADDRESS_GROUP_MAX_LIMIT:
             raise InvalidUsage("premise address_limit must be between 1 and 5")
     for name in ("include_sources", "include_evidence"):
         if name in native_args and npi._is_truthy_arg(native_args.get(name), default=False) != batch_params[name]:
@@ -79,7 +79,7 @@ async def read_native_batch(request, batch_params, *, native_args, session, impo
     """Match every requested identity before paging successful native providers."""
 
     params = _batch_shape_params(batch_params, native_args)
-    state = await _prepare_native_batch(params["npis"], native_args, session)
+    state = await _prepare_native_batch(params["npis"], native_args, session, import_context=import_context)
     state = _filter_batch_address_state(state, native_args)
     found_npis = [
         identity for identity in params["npis"] if state.details.get(identity) is not None or state.addresses[identity]
@@ -120,14 +120,23 @@ async def read_native_batch(request, batch_params, *, native_args, session, impo
     }
 
 
-async def _prepare_native_batch(npis, native_args, session):
+async def _prepare_native_batch(npis, native_args, session, *, import_context=None):
     details = await npi._build_npi_identity_details_map(npis, session=session)
+    has_import_context = import_context is not None
     if not npi._is_truthy_arg(native_args.get("extra_info"), default=False):
-        return _NativeBatchState(details, await npi._rank_npi_batch_addresses(npis, session=session))
+        return _NativeBatchState(
+            details,
+            await npi._rank_npi_batch_addresses(
+                npis, session=session, use_request_session=has_import_context, fail_closed=has_import_context
+            ),
+        )
     base = await npi._fetch_npi_location_candidates_map(npis, session=session)
     overlays = await npi._fetch_provider_directory_address_overlay_map(npis, session=session)
     await npi._apply_location_statuses(
-        [address for identity in npis for address in base.get(identity, ())], session=session
+        [address for identity in npis for address in base.get(identity, ())],
+        session=session,
+        use_request_session=has_import_context,
+        fail_closed=has_import_context,
     )
     addresses_by_npi = {
         identity: npi._rank_provider_locations(
@@ -231,9 +240,11 @@ def _batch_address_selection(npis, state, params, native_args):
                 member for group in selected for member in group["members"][: npi.NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT]
             ]
         else:
-            addresses_by_npi[identity] = ranked[
-                params["address_offset"] : params["address_offset"] + params["address_limit"]
-            ]
+            addresses_by_npi[identity] = (
+                ranked[params["address_offset"] : params["address_offset"] + params["address_limit"]]
+                if params["address_limit"]
+                else ranked
+            )
     return addresses_by_npi, groups_by_npi
 
 
@@ -244,7 +255,7 @@ async def _hydrate_native_batch(npis, state, params, native_args, session, *, wi
     hydrated = await npi._hydrate_npi_batch_addresses(
         npis,
         selected,
-        address_limit=npi.NPI_DETAIL_ADDRESS_GROUP_MAX_LIMIT * npi.NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT,
+        address_limit=0,
         address_offset=0,
         include_sources=params["include_sources"],
         include_evidence=params["include_evidence"],
@@ -334,13 +345,16 @@ def normalize_native_batch_request(raw_body: Any) -> dict[str, Any]:
     unknown_fields = sorted(set(raw_body) - allowed_fields)
     if unknown_fields:
         raise InvalidUsage(f"unsupported batch field: {unknown_fields[0]}")
+    address_limit = raw_body.get("address_limit", npi.NPI_BATCH_ADDRESS_DEFAULT_LIMIT)
+    if isinstance(address_limit, str) and address_limit.strip().lower() == "all":
+        address_limit = 0
     return {
         "npis": npi._normalize_npi_batch_npis(raw_body.get("npis")),
         "address_limit": npi._bounded_npi_batch_integer(
-            raw_body,
+            {"address_limit": address_limit},
             "address_limit",
             default=npi.NPI_BATCH_ADDRESS_DEFAULT_LIMIT,
-            minimum=1,
+            minimum=0,
             maximum=npi.NPI_BATCH_ADDRESS_MAX_LIMIT,
         ),
         "address_offset": npi._bounded_npi_batch_integer(

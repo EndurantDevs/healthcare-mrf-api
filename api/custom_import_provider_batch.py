@@ -46,7 +46,11 @@ def _parse_batch_request(body):
     if type(document) is not dict or transport._canonical_json_bytes(document) != body:
         raise transport._fail()
     native_batch = document.get("native_batch")
-    if type(native_batch) is not dict or set(native_batch) != _BATCH_KEYS:
+    if (
+        type(native_batch) is not dict
+        or set(native_batch) != _BATCH_KEYS
+        or type(native_batch.get("address_limit")) is not int
+    ):
         raise CustomImportReadRequestError("native batch is invalid")
     canonical_npis = native_batch.get("npis")
     if type(canonical_npis) is not list or any(type(identity) is not str for identity in canonical_npis):
