@@ -130,7 +130,7 @@ def _native_row(context, fields, layout, values_by_field):
     if not _has_native_scalar_values(values_by_field):
         return None
     normalized_by_field = staging._normalized_integer_replay_values(dict(values_by_field), fields)
-    _fields, root_key, code = staging._source_row_shape(context.request.definition, context.stream, normalized_by_field)
+    fields, root_key, code = staging._source_row_shape(context.request.definition, context.stream, normalized_by_field)
     if code is not None:
         return None
     raw_key = raw_family_key_evidence(root_key, maximum_canonical_bytes=context.request.page_byte_limit)
