@@ -14,6 +14,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Any, AsyncIterator
 
+from process.provider_directory_cms_native_layout import RetainedNativeSourceLayout
 from process.provider_directory_profile_capacity_attestation import (
     VerifiedDatabaseCapacityLease,
     assert_database_capacity_lease_reservation,
@@ -106,6 +107,43 @@ class OwnedRelation:
 
 
 @dataclass(frozen=True)
+class RetainedRawRelation:
+    """Bind an original raw heap to its signed policy and exact index phase."""
+
+    schema: str
+    relation: str
+    oid: int
+    policy_json: str
+    index_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RetainedNativeRelation:
+    """Bind an original retained clone to signed custody and immutable native source evidence."""
+
+    schema: str
+    relation: str
+    oid: int
+    policy_json: str
+    source_layout: RetainedNativeSourceLayout
+
+
+def retained_raw_policy(lease: VerifiedDatabaseCapacityLease) -> dict[str, Any]:
+    """Require the exact retention policy inside the verified native lease."""
+    from process.provider_directory_cms_capacity_contract import validated_registry_source_retention_policy
+
+    try:
+        if not isinstance(lease, VerifiedDatabaseCapacityLease):
+            raise ValueError
+        policy = lease.signing_preflight_guard["healthcare_request"]["cms_nonprofile_admission"][
+            "registry_source_retention"
+        ]
+        return validated_registry_source_retention_policy(policy)
+    except KeyError, TypeError, ValueError:
+        raise RuntimeError("provider_directory_nonprofile_raw_policy_required") from None
+
+
+@dataclass(frozen=True)
 class NonprofileAdmissionCheck:
     """Input to the authoritative aggregate reservation and runtime recheck."""
 
@@ -114,6 +152,8 @@ class NonprofileAdmissionCheck:
     plan: NonprofileAdmissionPlan
     relations: tuple[OwnedRelation, ...]
     logging_relations: tuple[tuple[str, str], ...] = ()
+    raw_relations: tuple[RetainedRawRelation, ...] = ()
+    native_relations: tuple[RetainedNativeRelation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -138,6 +178,8 @@ class NonprofileAdmission:
     _relations: dict[tuple[str, str], int] = field(default_factory=dict, init=False)
     _logged_relations: set[tuple[str, str]] = field(default_factory=set, init=False)
     _external_relations: set[tuple[str, str]] = field(default_factory=set, init=False)
+    _raw_relations: dict[tuple[str, str], RetainedRawRelation] = field(default_factory=dict, init=False)
+    _native_relations: dict[tuple[str, str], RetainedNativeRelation] = field(default_factory=dict, init=False)
     _started: bool = field(default=False, init=False)
     profile_admission: Any = field(default=None, init=False)
     pause_profile: Callable[..., Awaitable[Any]] | None = field(default=None, repr=False)
@@ -149,6 +191,7 @@ class NonprofileAdmission:
     )
     _cutover_active: bool = field(default=False, init=False)
     cleanup_preserved: list[tuple[str, str]] = field(default_factory=list, init=False)
+    registry_source_job: Any = field(default=None, init=False, repr=False, compare=False)
 
     def _assert_lease(self) -> None:
         """Require signature-bound geometry and existing storage reservation checks."""
@@ -186,7 +229,15 @@ class NonprofileAdmission:
             logging_relations,
         )
         receipt = await self.check_phase(
-            NonprofileAdmissionCheck(phase, self.lease, self.plan, relations, logging_relations)
+            NonprofileAdmissionCheck(
+                phase,
+                self.lease,
+                self.plan,
+                relations,
+                logging_relations,
+                tuple(self._raw_relations.values()),
+                tuple(self._native_relations.values()),
+            )
         )
         if not isinstance(receipt, NonprofileAdmissionReceipt) or receipt != expected:
             raise RuntimeError("provider_directory_nonprofile_phase_receipt_changed")
@@ -280,18 +331,112 @@ class NonprofileAdmission:
             "pre_logging" if logging_relations else "readiness", relations, logging_relations=logging_relations
         )
 
-    async def register_external_relation(self, fhir: Any, schema: str, name: str, oid: int) -> None:
+    def _record_raw_relation(self, schema: str, name: str, oid: int, raw_relation: RetainedRawRelation | None) -> None:
+        """Keep signed raw annotations separate from ordinary native ownership records."""
+        if raw_relation is None:
+            if (schema, name) in self._raw_relations:
+                raise RuntimeError("provider_directory_nonprofile_raw_identity_invalid")
+            return
+        if type(raw_relation) is not RetainedRawRelation or (
+            raw_relation.schema,
+            raw_relation.relation,
+            raw_relation.oid,
+        ) != (schema, name, oid):
+            raise RuntimeError("provider_directory_nonprofile_raw_identity_invalid")
+        previous = self._raw_relations.get((schema, name))
+        if previous is not None and (previous.oid != oid or previous.policy_json != raw_relation.policy_json):
+            raise RuntimeError("provider_directory_nonprofile_raw_identity_invalid")
+        self._raw_relations[(schema, name)] = raw_relation
+
+    async def register_external_relation(
+        self,
+        fhir: Any,
+        schema: str,
+        name: str,
+        oid: int,
+        *,
+        raw_relation: RetainedRawRelation | None = None,
+        native_relation: RetainedNativeRelation | None = None,
+    ) -> None:
         """Capture a native CREATE's original OID while native cleanup retains ownership."""
         if type(oid) is not int or oid <= 0 or self._relations.get((schema, name), oid) != oid:
             raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
+        await self._record_native_relation(fhir, schema, name, oid, native_relation, raw_relation)
         self._relations[(schema, name)] = oid
         self._external_relations.add((schema, name))
+        self._record_raw_relation(schema, name, oid, raw_relation)
         await self._check("readiness", await self.measure(fhir, schema))
 
-    async def assert_external_relation(self, fhir: Any, schema: str, name: str, oid: int) -> None:
+    async def _record_native_relation(self, fhir, schema, name, oid, native_relation, raw_relation):
+        """Enroll strict source evidence once; later checks never consult a renamed source heap."""
+        from process.provider_directory_cms_native_layout import _retained_source_model, capture_retained_native_source
+
+        coordinate = (schema, name)
+        previous = self._native_relations.get(coordinate)
+        if native_relation is None:
+            if previous is not None:
+                raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
+            return
+        self._assert_lease()
+        policy = retained_raw_policy(self.lease)
+        if (
+            type(native_relation) is not RetainedNativeRelation
+            or (native_relation.schema, native_relation.relation, native_relation.oid) != (schema, name, oid)
+            or raw_relation is not None
+            or coordinate in self._raw_relations
+            or native_relation.policy_json != json.dumps(policy, sort_keys=True, separators=(",", ":"))
+            or policy["selection_proof_id"] != self.plan.selection_proof_id
+            or schema != "entity_address_archive_" + uuid.UUID(policy["capture_id"]).hex
+            or name not in policy["address_tables"]
+            or type(native_relation.source_layout) is not RetainedNativeSourceLayout
+        ):
+            raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
+        source_layout = native_relation.source_layout
+        model = _retained_source_model(source_layout, self.plan.native_address_targets)
+        if (
+            model.__tablename__ != name
+            or source_layout.database_oid != self.lease.database_oid
+            or source_layout.oid == oid
+        ):
+            raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
+        if previous is not None:
+            if previous != native_relation:
+                raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
+            return
+        source_coordinate = (source_layout.schema, source_layout.relation)
+        if (
+            source_coordinate not in self._external_relations
+            or self._relations.get(source_coordinate) != source_layout.oid
+            or any(entry.source_layout.oid == source_layout.oid for entry in self._native_relations.values())
+        ):
+            raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
+        source_relations = await self.measure(fhir, source_layout.schema)
+        source_relation = next(
+            (entry for entry in source_relations if (entry.schema, entry.relation) == source_coordinate), None
+        )
+        if (
+            source_relation is None
+            or await capture_retained_native_source(fhir, source_relation, self.plan.native_address_targets)
+            != source_layout
+        ):
+            raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
+        self._native_relations[coordinate] = native_relation
+
+    async def assert_external_relation(
+        self,
+        fhir: Any,
+        schema: str,
+        name: str,
+        oid: int,
+        *,
+        raw_relation: RetainedRawRelation | None = None,
+        native_relation: RetainedNativeRelation | None = None,
+    ) -> None:
         """Recheck fresh aggregate availability before growth, without inventing its bound."""
         if (schema, name) not in self._external_relations or self._relations.get((schema, name)) != oid:
             raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
+        await self._record_native_relation(fhir, schema, name, oid, native_relation, raw_relation)
+        self._record_raw_relation(schema, name, oid, raw_relation)
         await self._check("readiness", await self.measure(fhir, schema))
 
     async def retire_external_relation(self, fhir: Any, schema: str, name: str, oid: int) -> None:
@@ -305,10 +450,14 @@ class NonprofileAdmission:
             raise RuntimeError("provider_directory_nonprofile_relation_changed")
         del self._relations[(schema, name)]
         self._external_relations.remove((schema, name))
+        self._raw_relations.pop((schema, name), None)
+        self._native_relations.pop((schema, name), None)
         self._logged_relations.discard((schema, name))
 
     async def rename_external_relation(self, fhir: Any, schema: str, old_name: str, new_name: str, oid: int) -> None:
         """Follow a verified rename of the original OID, never a replacement identity."""
+        if (schema, old_name) in self._raw_relations or (schema, old_name) in self._native_relations:
+            raise RuntimeError("provider_directory_nonprofile_raw_identity_invalid")
         if (schema, new_name) in self._relations:
             raise RuntimeError("provider_directory_nonprofile_external_name_conflict")
         actual_oid = await fhir.db.scalar(
@@ -394,7 +543,9 @@ async def nonprofile_sql_transaction(fhir: Any, admission: NonprofileAdmission):
         ("statement_timeout", f"{timeout_ms}ms"),
         ("lock_timeout", f"{timeout_ms}ms"),
     )
-    async with native.entity_address_tuned_transaction(fhir.db, settings, native._sql_literal, native.logger):
+    async with native.entity_address_tuned_transaction(
+        fhir.db, settings, native._sql_literal, native.logger, temp_file_limit_bytes=limit
+    ):
         valid = await fhir.db.scalar(
             "SELECT current_setting('temp_file_limit') <> '-1' "
             "AND pg_size_bytes(current_setting('temp_file_limit'))=:limit "
@@ -617,6 +768,8 @@ class PreparedServingArtifacts:
     relation_overrides: dict[str, str]
     overlay_identity: OwnedRelation | None
     address: Any = None
+    source_session_factory: Callable[[], Any] | None = field(default=None, repr=False, compare=False)
+    registry_source_pair: Any = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def stages(self) -> tuple[Any, ...]:
@@ -634,13 +787,18 @@ class PreparedServingArtifacts:
         """Carry the exact sealed archive prepared by the full bundle owner."""
         return getattr(self.nonprofile_bundle, "archive_delta", None)
 
-    async def assert_ready(self, *, cutover: bool = False) -> None:
+    async def assert_ready(self, *, cutover: bool = False, archive_applied: bool = False) -> None:
         """Require the separate nonprofile reservation at final publication."""
         if self.nonprofile_admission is not None:
             await self.nonprofile_admission.assert_ready(self.fhir, self.fhir._schema(), cutover=cutover)
         if self.archive_delta is not None:
             async with nonprofile_sql_transaction(self.fhir, self.nonprofile_admission):
-                await self.archive_delta.assert_read_identity(self.fhir, self.fhir.db._transaction_binding().session)
+                if archive_applied:
+                    await self.archive_delta.assert_applied_backend(self.fhir.db)
+                else:
+                    await self.archive_delta.assert_read_identity(
+                        self.fhir, self.fhir.db._transaction_binding().session
+                    )
 
     async def mark_committed(self, *, profile_result: Mapping[str, Any]) -> None:
         """Consume stages using the owner's verified immutable historical result."""
@@ -796,6 +954,7 @@ async def _prepare_address_and_profile(
         if address is None:
             raise RuntimeError("provider_directory_nonprofile_address_preparation_incomplete")
         prepared.address = address
+        await _prepare_registry_source_pair(prepared, address_preparation)
         async with _profile_scope(
             prepared.fhir, prepared.execution, prepared.fence, run_id, control_run_id, metrics, admission
         ) as pair:
@@ -805,6 +964,29 @@ async def _prepare_address_and_profile(
             metrics.update(prepared.metrics)
             await _emit_prepared_manifest(prepared, run_id, control_run_id)
             yield
+
+
+async def _prepare_registry_source_pair(prepared, address_preparation):
+    """Retain the complete address and raw source before Profile WAL resumes."""
+    from process.network_registry_cms_prepared_pair import prepare_registry_cms_source_pair
+    from process.provider_directory_cms_source_runtime import BoundCMSRegistrySourceJob
+
+    job = getattr(prepared.nonprofile_admission, "registry_source_job", None)
+    if job is None:
+        return
+    if type(job) is not BoundCMSRegistrySourceJob:
+        raise RuntimeError("cms_registry_source_runtime_invalid")
+    prepared.source_session_factory = job.source_session_factory
+    prepared.registry_source_pair = await prepare_registry_cms_source_pair(
+        prepared,
+        address_preparation,
+        job.retention_request,
+        capture_id=job.capture_id,
+        owner_role=job.owner_role,
+        runtime_roles=job.runtime_roles,
+        source_session_factory=job.source_session_factory,
+        source_attempt=job.source_attempt,
+    )
 
 
 def _manifest_required_indexes(fhir, target, name):
@@ -1130,13 +1312,16 @@ async def _profile_scope(
             publish_corroboration=False,
             publish_artifacts_targets=profile_targets,
         )
-        async with fhir._prepare_artifact_bundle_from_fence(
-            fence,
-            request,
-            artifact_resource_types=types,
-            resource_fence=resource_fence,
-        ) as prepared:
-            yield prepared
+        from process.provider_directory_cms_nonprofile_capacity import original_profile_input_scope
+
+        with original_profile_input_scope(fhir):
+            async with fhir._prepare_artifact_bundle_from_fence(
+                fence,
+                request,
+                artifact_resource_types=types,
+                resource_fence=resource_fence,
+            ) as prepared:
+                yield prepared
     finally:
         _ACTIVE.reset(admission_token)
         fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(capacity_token)

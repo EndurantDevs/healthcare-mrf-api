@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from process import provider_directory_cms_capacity_contract as capacity_contract
 from process import provider_directory_cms_nonprofile_capacity as capacity
@@ -533,21 +534,20 @@ async def test_valid_source_batch_binds_exact_raw_and_normalized_witness(npd_cas
     path.write_bytes(zstd.compress(json.dumps(resource_dict, ensure_ascii=False).encode() + b"\n"))
     witnessed_resources = []
 
-    async def persist(_model, rows, dataset_id, **options):
-        assert case.fhir.db.binding is not None
-        assert dataset_id == case.candidate.dataset_id
-        assert options == {
-            "resource_hash_contract": case.candidate.resource_hash_contract,
-            "semantic_projection_as_of": case.candidate.semantic_projection_as_of,
-        }
+    async def persist(importer, session, _model, rows, candidate):
+        assert importer is case.fhir and session is case.fhir.db.session
+        assert case.fhir.db.binding is not None and candidate is case.candidate
+        assert candidate.resource_hash_contract == fhir.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        assert candidate.semantic_projection_as_of == case.identity["generated_at"]
         assert rows[0]["resource_id"] == resource_dict["id"] and rows[0]["name"] == resource_dict["name"]
-        return [{**rows[0], "dataset_id": dataset_id, "resource_type": "Location", "payload_hash": "a" * 64}]
+        return [{**rows[0], "dataset_id": candidate.dataset_id, "resource_type": "Location", "payload_hash": "a" * 64}]
 
     async def witness(session, by_id):
         assert session is case.fhir.db.session and case.fhir.db.binding is not None
         witnessed_resources.append(deepcopy(by_id))
 
-    case.fhir._persist_endpoint_dataset_rows.side_effect = persist
+    batch_writer = AsyncMock(side_effect=persist)
+    monkeypatch.setattr(cms, "persist_cms_dataset_rows", batch_writer)
     insert = AsyncMock(side_effect=witness)
     monkeypatch.setattr(cms, "_insert_verified_witnesses", insert)
     assert await cms._stream_file(case.fhir, path, case.candidate, "Location", {}, {}) == 1
@@ -559,7 +559,8 @@ async def test_valid_source_batch_binds_exact_raw_and_normalized_witness(npd_cas
         case.identity["vector_sha256"],
         "Location",
     )
-    case.fhir._persist_endpoint_dataset_rows.assert_awaited_once()
+    batch_writer.assert_awaited_once()
+    case.fhir._persist_endpoint_dataset_rows.assert_not_awaited()
     insert.assert_awaited_once()
     assert case.fhir.db.binding is None
 
@@ -597,7 +598,8 @@ async def test_source_witnesses_cannot_commit_another_projection(npd_case, monke
         normalized_resources[0]["dataset_id"] = "other-dataset"
     else:
         normalized_resources[0]["resource_type"] = "Organization"
-    case.fhir._persist_endpoint_dataset_rows.return_value = normalized_resources
+    batch_writer = AsyncMock(return_value=normalized_resources)
+    monkeypatch.setattr(cms, "persist_cms_dataset_rows", batch_writer)
     witnesses = AsyncMock()
     monkeypatch.setattr(cms, "_insert_verified_witnesses", witnesses)
     with pytest.raises(RuntimeError, match=reason):
@@ -605,6 +607,11 @@ async def test_source_witnesses_cannot_commit_another_projection(npd_case, monke
             case.fhir, object, submitted_resources, raw_resources, case.candidate, "Location"
         )
     witnesses.assert_not_awaited()
+    if fault in {"length", "duplicate"}:
+        batch_writer.assert_not_awaited()
+    else:
+        batch_writer.assert_awaited_once()
+    case.fhir._persist_endpoint_dataset_rows.assert_not_awaited()
     case.fhir._finalize_endpoint_dataset_candidate.assert_not_awaited()
     assert case.fhir.db.binding is None
 
@@ -799,7 +806,8 @@ async def test_admission_reads_effective_bounded_backend_before_signatures(capac
     native = importlib.import_module("process.entity_address_unified")
 
     @asynccontextmanager
-    async def bounded_backend(database, settings, _quote, _logger):
+    async def bounded_backend(database, settings, _quote, _logger, *, temp_file_limit_bytes):
+        assert temp_file_limit_bytes == case.producer.plan.temp_file_limit_bytes_per_backend
         assert dict(settings) == {
             "temp_file_limit": "1kB",
             "max_parallel_workers_per_gather": "0",
@@ -1212,15 +1220,21 @@ async def test_new_staging_row_count_change_stops_before_vector_validation(stage
         ["Organization/unresolved"],
     ],
 )
-async def test_plan_identity_does_not_invent_unproved_network_binding(npd_case, references):
+async def test_plan_identity_sends_unresolved_references_unchanged_to_bulk_validation(npd_case, references):
     case = npd_case
 
     @asynccontextmanager
     async def session():
-        yield object()
+        async with AsyncSession() as current:
+            yield current
+
+    transaction_states = []
+
+    async def record_network_batch(writer_session, **_fields):
+        transaction_states.append(writer_session.in_transaction())
 
     case.fhir.db.session = session
-    network = SimpleNamespace(record_insurance_network_plan=AsyncMock())
+    network = SimpleNamespace(record_insurance_network_batch=AsyncMock(side_effect=record_network_batch))
     resource = SimpleNamespace(bind_resource_identity_batch=AsyncMock())
     plan_dict = {
         "resourceType": "InsurancePlan",
@@ -1229,12 +1243,15 @@ async def test_plan_identity_does_not_invent_unproved_network_binding(npd_case, 
     }
     await cms._write_identity_batch(case.fhir, None, network, resource, "InsurancePlan", [plan_dict], case.identity)
     resource.bind_resource_identity_batch.assert_awaited_once()
-    network.record_insurance_network_plan.assert_not_awaited()
-    if references[0].startswith("Organization/"):
-        assert case.fhir.db.all.call_args.kwargs["resource_ids"] == ["unresolved"]
-        assert case.fhir.db.all.call_args.kwargs["release_id"] == case.identity["vector_sha256"]
-    else:
-        case.fhir.db.all.assert_not_awaited()
+    network.record_insurance_network_batch.assert_awaited_once()
+    assert transaction_states == [True]
+    assert network.record_insurance_network_batch.await_args.kwargs == {
+        "source_id": cms.SOURCE_ID,
+        "release_id": case.identity["vector_sha256"],
+        "resource_type": "InsurancePlan",
+        "resources": [plan_dict],
+    }
+    case.fhir.db.all.assert_not_awaited()
 
 
 async def test_failed_finalization_cannot_produce_serving_candidate(stage_case, monkeypatch, tmp_path):
@@ -1417,6 +1434,8 @@ async def test_published_replay_keeps_serving_result_when_optional_tax_retry_fai
     monkeypatch.setattr(coverage, "prepare_cms_candidate_coverage", AsyncMock(return_value=proof_dict))
     tax = importlib.import_module("process.cms_npd_tax_candidate_followup")
     monkeypatch.setattr(tax, "cms_npd_tax_candidate_followup", AsyncMock(side_effect=RuntimeError("synthetic_retry")))
+    replayed_admission = AsyncMock(return_value={"dataset_hash": case.state["dataset_hash"]})
+    monkeypatch.setattr(cms, "_replayed_registry_admission", replayed_admission)
     before = deepcopy(case.state)
     replay_result = await cms._stage_acquired(
         {}, {}, "run-synthetic", tmp_path, _receipt(), None, candidate.endpoint_id
@@ -1424,6 +1443,7 @@ async def test_published_replay_keeps_serving_result_when_optional_tax_retry_fai
     assert replay_result["status"] == "published" and replay_result["replayed"] is True
     assert replay_result["cms_serving_candidate"]["status"] == "ready"
     assert replay_result["tax_candidates"] == {"status": "failed", "retryable": True, "retry_via": "same_byte_import"}
+    replayed_admission.assert_awaited_once_with(fhir, candidate)
     assert case.state == before
     case.fhir._persist_endpoint_dataset_rows.assert_not_awaited()
     case.fhir._finalize_endpoint_dataset_candidate.assert_not_awaited()

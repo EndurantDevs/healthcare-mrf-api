@@ -20,7 +20,7 @@ from process import provider_directory_profile_initial_contract as contract
 from process import provider_directory_profile_initial_guards as guards
 from process import provider_directory_profile_selection as selection
 from tests.provider_directory_profile_capacity_signing_guard_test_support import synthetic_profile_execution
-from tests.test_provider_directory_profile_bounded_capacity import admitted_window
+from tests.test_provider_directory_profile_bounded_capacity import admitted_window as admitted_window
 from tests.test_provider_directory_profile_capacity import _geometry_payload
 from tests.test_provider_directory_profile_capacity_runtime import _geometry_inputs
 from tests.test_provider_directory_profile_control_capacity import _control_wal_plan_input
@@ -427,6 +427,8 @@ async def test_initial_live_guards_refuse_drift_without_repeating_census(initial
 async def test_initial_composite_preparation_uses_earlier_paired_deadline(initial_case, monkeypatch):
     case = initial_case
     events = []
+    session = object()
+    binding = SimpleNamespace(session=session)
 
     @asynccontextmanager
     async def authorized(*args):
@@ -436,7 +438,7 @@ async def test_initial_composite_preparation_uses_earlier_paired_deadline(initia
     @asynccontextmanager
     async def transaction():
         events.append("transaction")
-        yield object()
+        yield session
 
     admission = SimpleNamespace(publication=authorized)
     prepared = SimpleNamespace(
@@ -448,6 +450,7 @@ async def test_initial_composite_preparation_uses_earlier_paired_deadline(initia
         assert_ready=AsyncMock(),
     )
     monkeypatch.setattr(case.db, "transaction", transaction, raising=False)
+    monkeypatch.setattr(case.db, "_transaction_binding", lambda: binding, raising=False)
     monkeypatch.setattr(fhir, "_profile_capacity_remaining_ms", AsyncMock(return_value=15000))
     monkeypatch.setattr(fhir, "_configure_provider_directory_artifact_promotion", AsyncMock())
     monkeypatch.setattr(initial, "lock_metadata", AsyncMock())
@@ -459,8 +462,12 @@ async def test_initial_composite_preparation_uses_earlier_paired_deadline(initia
     async with publication._publication_transaction(fhir, execution, prepared, {}, None, None) as (_session, timeout):
         assert 0 < timeout.when() - asyncio.get_running_loop().time() <= 0.25
         assert events == ["authorized", "transaction"]
+        assert _session is session
         prepared.assert_ready.assert_awaited_once_with(cutover=True)
     publication.remaining_build_seconds.assert_awaited_once_with(fhir, admission)
+    group = case.admission.wal_tracker.owned_control_transaction_groups[-1]
+    assert group["body_complete"] and group["original_outcome"] is None
+    assert not group["consumed"] and not group["accounting_authority"]
 
 
 async def test_initial_composite_refuses_expired_witness_before_live_locks(initial_case, monkeypatch):
@@ -482,7 +489,7 @@ async def test_initial_composite_refuses_expired_witness_before_live_locks(initi
     monkeypatch.setattr(publication, "apply_prepared_artifact_bundle", prepared_bundle)
     with pytest.raises(RuntimeError, match="synthetic_witness_expired"):
         await publication._apply_prepared_results(fhir, None, prepared, None, {}, None, None)
-    prepared.assert_ready.assert_awaited_once_with(cutover=True)
+    prepared.assert_ready.assert_awaited_once_with(cutover=True, archive_applied=False)
     lock_live.assert_not_awaited()
 
 

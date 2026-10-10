@@ -451,13 +451,18 @@ def _composite_session(snapshot):
 
 def _composite_initial_stages():
     build = SimpleNamespace(
-        schema="synthetic", evidence_stage="initial_evidence_stage", profile_stage="initial_profile_stage",
+        schema="synthetic",
+        evidence_stage="initial_evidence_stage",
+        profile_stage="initial_profile_stage",
         materialization_mode="full_swap",
     )
     return tuple(
         _preflight_fhir.ProviderDirectoryPreparedArtifactStage(
-            schema=build.schema, stage_table=stage_table, target_relation=target,
-            rename_stage_indexes=AsyncMock(), profile_initial_build=build,
+            schema=build.schema,
+            stage_table=stage_table,
+            target_relation=target,
+            rename_stage_indexes=AsyncMock(),
+            profile_initial_build=build,
         )
         for target, stage_table in (
             (_preflight_fhir.profile_artifact.PROFILE_EVIDENCE_TABLE, build.evidence_stage),
@@ -481,10 +486,16 @@ def _composite_prepared(fhir, with_forecast):
     fhir._validate_profile_delta_total_wal = AsyncMock()
     prepared = _prepared(fhir)
     prepared.stages = () if with_forecast else _composite_initial_stages()
-    prepared.profile_delta = SimpleNamespace(
-        schema="synthetic", evidence_stage="delta_evidence_stage", profile_stage="delta_profile_stage",
-        affected_npi_stage="delta_affected_stage",
-    ) if with_forecast else None
+    prepared.profile_delta = (
+        SimpleNamespace(
+            schema="synthetic",
+            evidence_stage="delta_evidence_stage",
+            profile_stage="delta_profile_stage",
+            affected_npi_stage="delta_affected_stage",
+        )
+        if with_forecast
+        else None
+    )
     prepared.archive_delta = SimpleNamespace(apply=AsyncMock(return_value=_archive_result()))
     prepared.nonprofile_admission = SimpleNamespace(assert_cutover_complete=AsyncMock())
     return prepared
@@ -521,7 +532,7 @@ def _assert_composite_completion(fhir, session, prepared, has_doctors, forecast)
         )
     else:
         assert '"provider_directory_profile"' in locks[0]
-        prepared.assert_ready.assert_awaited_once_with(cutover=True)
+        prepared.assert_ready.assert_awaited_once_with(cutover=True, archive_applied=True)
         fhir._validate_profile_delta_total_wal.assert_not_awaited()
 
 

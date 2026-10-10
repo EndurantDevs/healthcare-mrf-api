@@ -6,11 +6,20 @@
       "display_name": "Chorus Community Health Plans (fka Children's Community Health Plan)",
       "plan_name": "Medicaid MCO",
       "acquisition_method": "not-importable",
-      "documented_resources": [],
+      "documented_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ],
       "canonical_base": null,
       "access_requirement": "none",
       "requires_registration": false,
-      "operational_status": "unreachable",
+      "operational_status": "reachable-unverified",
       "live_verification": {
         "status": "not_recorded",
         "checked_at": null
@@ -18,8 +27,8 @@
       "reviewed_at": "2026-10-10",
       "source_detail": "blocked Provider Directory endpoint discovery",
       "source_url": "https://appconnect.chorushealthplans.org/developers/providerapi",
-      "reason": "No importable FHIR base or CapabilityStatement was confirmed from the reviewed portal and metadata request.",
-      "note": "The official portal returned HTTP 200 as a JavaScript shell. A request to the previously recorded metadata URL timed out from this client. The linked script did not reaffirm the historical base attribution. The unreachable classification reflects that limited observation; it does not establish a general outage or a current canonical base. Portal access does not establish anonymous FHIR access."
+      "reason": "The public API is reachable, but a supported acquisition recipe and complete traversal have not been verified.",
+      "note": "Official public configuration now advertises a different R4 endpoint. Anonymous metadata and eight directory-family count checks succeed; four return nonzero totals. A supported acquisition recipe, complete traversal, and publication remain unverified."
     },
     {
       "id": "provider-directory-blocked-first-medical-pr",
@@ -42,8 +51,8 @@
       "reviewed_at": "2026-10-10",
       "source_detail": "blocked Provider Directory endpoint discovery",
       "source_url": "https://devportal.firstmedicalpr.com/ApiLibrary",
-      "reason": "Indexed official documentation describes registered-developer, user-token APIs, but no open, importable Provider Directory base is confirmed.",
-      "note": "The API library and portal returned HTTP 403 to unauthenticated requests. Indexed official documentation lists Practitioner, PractitionerRole and Location with user-token security and developer registration for member/US Core APIs. These documentary requirements do not establish a Provider Directory access contract; no open production base or CapabilityStatement was confirmed."
+      "reason": "Official portal requires a user token and no open public FHIR base is confirmed.",
+      "note": "Indexed official API Library documentation lists Practitioner, PractitionerRole, and Location under user-token access. Indexed Getting Started documentation requires developer registration and production approval. Direct portal requests return HTTP 403; no open public Provider Directory base or complete traversal has been verified."
     },
     {
       "id": "provider-directory-blocked-territory-of-puerto-rico",
@@ -63,7 +72,7 @@
       "source_detail": "CMS SMA Endpoint Directory Provider Directory implementation date TBD",
       "source_url": "https://raw.githubusercontent.com/CMSgov/SMA-Endpoint-Directory/main/SMAEndpointDirectory.csv",
       "reason": "CMS SMA Endpoint Directory provides no Puerto Rico Provider Directory production base and lists implementation date as TBD.",
-      "note": "The cited CMS directory's Puerto Rico row leaves Provider Directory production base, status, capability link and FHIR version blank and lists implementation date TBD. This is a statement about the directory listing, not a current statewide service census. No separate resource-list field was identified."
+      "note": "The current CMS SMA Endpoint Directory row retains a survey date of 2024-10-21. Its Provider Directory base, status, capability link, FHIR version, and implementation-guide fields remain blank; the implementation date remains TBD."
     }
   ]
 }

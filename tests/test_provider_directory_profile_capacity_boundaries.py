@@ -15,11 +15,6 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from .test_provider_directory_profile_selection_attestation import _execution
-from .test_provider_directory_profile_capacity import _geometry_payload
-from .test_provider_directory_profile_control_capacity import (
-    _bound_control_wal_projection,
-)
 from .provider_directory_profile_execution_test_support import (
     _capacity_consumption_row,
     _capacity_geometry_identity,
@@ -27,6 +22,11 @@ from .provider_directory_profile_execution_test_support import (
     _published_dataset_state,
     _wal_tracker_admission,
 )
+from .test_provider_directory_profile_capacity import _geometry_payload
+from .test_provider_directory_profile_control_capacity import (
+    _bound_control_wal_projection,
+)
+from .test_provider_directory_profile_selection_attestation import _execution
 
 importer = importlib.import_module("process.provider_directory_fhir")
 capacity = importlib.import_module("process.provider_directory_profile_capacity")
@@ -39,7 +39,7 @@ capacity = importlib.import_module("process.provider_directory_profile_capacity"
         importer._profile_cutover_observation,
         importer._profile_delta_target_wal_start_lsn,
         importer.profile_capacity_cutover._observe_cutover_wal,
-        importer._validate_profile_delta_final_wal,
+        importer._profile_delta_cutover_wal_bytes,
         importer._PROFILE_CAPACITY_DATABASE_IDENTITY_SQL,
     ),
 )
@@ -65,24 +65,39 @@ async def test_cutover_actual_samples_one_insert_location(monkeypatch, is_bounde
     monkeypatch.setattr(importer, "_provider_directory_profile_capacity_admission", lambda: admission)
     forecast = SimpleNamespace(
         forecast_hash="a" * 64,
-        forecast_json=importer.json.dumps({
-            "contract_id": (capacity.BOUNDED_CUTOVER_FORECAST_CONTRACT_ID if is_bounded
-                            else capacity.CUTOVER_FORECAST_CONTRACT_ID),
-        }),
+        forecast_json=importer.json.dumps(
+            {
+                "contract_id": (
+                    capacity.BOUNDED_CUTOVER_FORECAST_CONTRACT_ID
+                    if is_bounded
+                    else capacity.CUTOVER_FORECAST_CONTRACT_ID
+                ),
+            }
+        ),
         wal_start_lsn="0/1",
         evidence_target_bytes_before=10,
         profile_target_bytes_before=20,
         target_projection=SimpleNamespace(wal_bytes=100),
         metadata_projection=SimpleNamespace(wal_bytes=5, commit_envelope_bytes=3),
     )
-    database = SimpleNamespace(first=AsyncMock(return_value={
-        "wal_observed_lsn": "0/20", "cutover_wal_bytes": 17,
-    }))
+    database = SimpleNamespace(
+        first=AsyncMock(
+            return_value={
+                "wal_observed_lsn": "0/20",
+                "cutover_wal_bytes": 17,
+            }
+        )
+    )
     monkeypatch.setattr(importer, "db", database)
+    total_guard = AsyncMock()
+    monkeypatch.setattr(importer, "_assert_provider_directory_profile_wal_budget", total_guard)
 
     actual_by_field = await importer._profile_delta_cutover_actual(
-        forecast, "0/F", importer._ProfileDeltaTargetBytes(evidence_after=30, profile_after=40),
+        forecast,
+        "0/F",
+        importer._ProfileDeltaTargetBytes(evidence_after=30, profile_after=40),
     )
+    assert total_guard.await_count == int(is_bounded)
 
     database.first.assert_awaited_once()
     query = database.first.await_args.args[0]
@@ -120,9 +135,7 @@ async def test_capacity_admitted_progress_failure_is_fail_closed(
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_relation_storage_fingerprint",
-        AsyncMock(
-            return_value=SimpleNamespace(exact_fingerprint="f" * 64)
-        ),
+        AsyncMock(return_value=SimpleNamespace(exact_fingerprint="f" * 64)),
     )
     monkeypatch.setattr(
         importer,
@@ -154,10 +167,7 @@ def _wal_tracker_admission():
         geometry=geometry,
         control_wal_projection=control_projection,
         lease=SimpleNamespace(
-            max_build_deadline=(
-                datetime.datetime.now(datetime.UTC)
-                + datetime.timedelta(minutes=10)
-            )
+            max_build_deadline=(datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=10))
         ),
         database_identity=SimpleNamespace(),
         build_id="pdpb_" + "a" * 32,
@@ -176,17 +186,11 @@ def _capacity_consumption_row(admission):
     return {
         "attestation_id": admission.lease.attestation_id,
         "lease_digest": admission.lease.lease_digest,
-        "capacity_geometry_hash": capacity.capacity_geometry_hash(
-            admission.geometry
-        ),
+        "capacity_geometry_hash": capacity.capacity_geometry_hash(admission.geometry),
         "executable_plan_hash": admission.geometry.executable_plan_hash,
         "selection_proof_id": admission.geometry.selection_proof_id,
-        "source_vector_hash": (
-            admission.geometry.desired_source_vector_hash
-        ),
-        "source_context_vector_hash": (
-            admission.geometry.desired_context_vector_hash
-        ),
+        "source_vector_hash": (admission.geometry.desired_source_vector_hash),
+        "source_context_vector_hash": (admission.geometry.desired_context_vector_hash),
         "run_id": admission.run_id,
         "build_id": admission.build_id,
         "profile_as_of": admission.geometry.profile_as_of,
@@ -198,9 +202,7 @@ async def test_capacity_wal_observation_uses_insert_location(monkeypatch):
     scalar = AsyncMock(return_value=17)
     monkeypatch.setattr(importer.db, "scalar", scalar)
 
-    observed = await importer._provider_directory_profile_current_wal_bytes(
-        SimpleNamespace(initial_wal_lsn="0/1")
-    )
+    observed = await importer._provider_directory_profile_current_wal_bytes(SimpleNamespace(initial_wal_lsn="0/1"))
 
     query = scalar.await_args.args[0]
     assert observed == 17
@@ -236,10 +238,7 @@ async def test_capacity_consumption_allows_terminal_prior_same_build(
         lease=SimpleNamespace(
             attestation_id="c" * 64,
             lease_digest="d" * 64,
-            max_build_deadline=(
-                datetime.datetime.now(datetime.UTC)
-                + datetime.timedelta(minutes=10)
-            ),
+            max_build_deadline=(datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=10)),
         ),
     )
     monkeypatch.setattr(
@@ -268,10 +267,7 @@ async def test_capacity_consumption_rejects_nonterminal_prior_same_build(
         lease=SimpleNamespace(
             attestation_id="c" * 64,
             lease_digest="d" * 64,
-            max_build_deadline=(
-                datetime.datetime.now(datetime.UTC)
-                + datetime.timedelta(minutes=10)
-            ),
+            max_build_deadline=(datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=10)),
         ),
     )
     monkeypatch.setattr(
@@ -289,12 +285,9 @@ async def test_capacity_consumption_rejects_nonterminal_prior_same_build(
         importer.ProviderDirectoryArtifactBuildStale,
         match="capacity_competing_owner",
     ):
-        await (
-            importer
-            ._assert_provider_directory_profile_capacity_consumption(
-                admission,
-                SimpleNamespace(schema="mrf"),
-            )
+        await importer._assert_provider_directory_profile_capacity_consumption(
+            admission,
+            SimpleNamespace(schema="mrf"),
         )
 
 
@@ -321,12 +314,7 @@ async def test_capacity_wal_tracker_reserves_two_worker_wave_atomically(
         ]
     )
 
-    assert (
-        admission.wal_tracker.accounted_control_operation_counts[
-            "evidence_payload"
-        ]
-        == 2
-    )
+    assert admission.wal_tracker.accounted_control_operation_counts["evidence_payload"] == 2
 
 
 @pytest.mark.asyncio
@@ -347,17 +335,11 @@ async def test_capacity_wal_tracker_refuses_unforecast_external_wal(
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_current_wal_bytes",
-        AsyncMock(
-            return_value=(
-                capacity_operation.wal_bytes + admission_lock_operation.wal_bytes + 1
-            )
-        ),
+        AsyncMock(return_value=(capacity_operation.wal_bytes + admission_lock_operation.wal_bytes + 1)),
     )
 
     with pytest.raises(
         RuntimeError,
         match="capacity_total_wal_exceeded",
     ):
-        await importer._assert_provider_directory_profile_wal_budget(
-            admission
-        )
+        await importer._assert_provider_directory_profile_wal_budget(admission)

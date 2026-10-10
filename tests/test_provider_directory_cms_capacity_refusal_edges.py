@@ -142,7 +142,7 @@ def test_pending_control_wal_cannot_exceed_the_signed_relation_window():
 
 @pytest.mark.parametrize("growth", [True, -1, 1.5, "1"])
 async def test_growth_reservation_rejects_invalid_counts_before_observation(growth):
-    tracker = SimpleNamespace()
+    tracker = SimpleNamespace(completed_relation_classes=set())
     fhir = SimpleNamespace(_provider_directory_profile_capacity_relation_bytes=AsyncMock())
     with pytest.raises(RuntimeError, match="growth_reservation_invalid"):
         await projection.reserve_growth(fhir, SimpleNamespace(wal_tracker=tracker), "profile", growth)
@@ -153,7 +153,7 @@ async def test_growth_reservation_rejects_invalid_counts_before_observation(grow
     "window,unresolved", [(None, False), ((object(), "other"), False), ((object(), "profile"), True)]
 )
 async def test_growth_reservation_requires_the_matching_resolved_window(window, unresolved):
-    tracker = SimpleNamespace(unresolved_window=unresolved)
+    tracker = SimpleNamespace(unresolved_window=unresolved, completed_relation_classes=set())
     fhir = SimpleNamespace(
         _PROFILE_CAPACITY_MUTATION_WINDOW=contextvars.ContextVar("test_window", default=window),
         _provider_directory_profile_capacity_relation_bytes=AsyncMock(),

@@ -49,6 +49,7 @@ class _AdmittedWorkerRequest(dict[str, Any]):
     """Carry an observed queue identity outside the serialized launch request."""
 
     admitted_job: tuple[str, str, str, str, str] | None = None
+    cms_registry_launch: object | None = None
 
 
 _PROVIDER_DIRECTORY_WORKER_CLASS = "process.ProviderDirectoryFHIR"
@@ -275,6 +276,13 @@ async def _admit_worker_ensure(
             "source-attempt identity requires a PTG import",
         )
     _bind_admitted_job(worker_payload, admitted_run)
+    if isinstance(worker_payload, _AdmittedWorkerRequest):
+        from api.provider_directory_cms_registry_worker import admit_cms_registry_worker_launch
+
+        try:
+            worker_payload.cms_registry_launch = await admit_cms_registry_worker_launch(admitted_run)
+        except ValueError, RuntimeError:
+            return _failed_worker_admission(worker_payload, "CMS registry worker admission is unavailable")
     return None
 
 
@@ -298,6 +306,7 @@ async def guarded_ensure_worker(
 ) -> dict[str, Any]:
     """Persist run/selector admission before any worker launch."""
 
+    worker_payload = _AdmittedWorkerRequest(worker_payload)
     importer = str(worker_payload.get("importer") or "").strip()
     run_id = str(worker_payload.get("run_id") or "").strip()
     selected_specs = _resolve_specs(worker_payload)
@@ -538,7 +547,13 @@ def _finish_spec_after_completed_start(importer: str, payload: dict[str, Any]) -
 
 
 def _ensure_spec(spec: WorkerSpec, payload: dict[str, Any]) -> dict[str, Any]:
+    from api.provider_directory_cms_registry_worker import authorized_cms_registry_worker_launch
+
+    if authorized_cms_registry_worker_launch(spec, payload) is not None and _launcher_mode() != "kubernetes":
+        return {"status": "failed", "message": "CMS registry worker requires the configured isolated launcher"}
     state = _worker_state(spec, payload)
+    if state.get("job_status") == "purpose_mismatch":
+        return {**state, "status": "failed", "message": "Existing worker purpose does not match admission"}
     if state["running"]:
         return {**state, "status": "already_running"}
     if _launcher_mode() == "kubernetes":
@@ -630,18 +645,21 @@ def _launcher_mode() -> str:
 
 def _ensure_kubernetes_job(
     spec: WorkerSpec,
-    payload: dict[str, Any],
+    launch_request: dict[str, Any],
     state: dict[str, Any],
 ) -> dict[str, Any]:
-    image = os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip()
+    from api.provider_directory_cms_registry_worker import authorized_cms_registry_worker_launch
+
+    launch = authorized_cms_registry_worker_launch(spec, launch_request)
+    image = launch.image if launch is not None else os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip()
     if not image:
         return {**state, "status": "failed", "message": "HLTHPRT_WORKER_JOB_IMAGE is not configured"}
 
-    job = _worker_job_manifest(spec, payload, image)
+    job = _worker_job_manifest(spec, launch_request, image)
     namespace = _kubernetes_namespace()
     if state.get("job_status") in {"succeeded", "failed"}:
         try:
-            _delete_terminal_kubernetes_worker_jobs(namespace, spec, payload)
+            _delete_terminal_kubernetes_worker_jobs(namespace, spec, launch_request)
         except _KubernetesApiError as exc:
             if exc.status != 404:
                 return {**state, "status": "failed", "message": str(exc)}
@@ -650,10 +668,12 @@ def _ensure_kubernetes_job(
         _kubernetes_request("POST", f"/apis/batch/v1/namespaces/{namespace}/jobs", job)
     except _KubernetesApiError as exc:
         if exc.status == 409:
-            refreshed = _worker_state(spec, payload)
+            refreshed = _worker_state(spec, launch_request)
+            if refreshed.get("job_status") == "purpose_mismatch":
+                return {**refreshed, "status": "failed", "message": "Existing worker purpose does not match admission"}
             return {**refreshed, "status": "already_running" if refreshed.get("running") else "exists"}
         return {**state, "status": "failed", "message": str(exc)}
-    return {**_worker_state(spec, payload), "status": "started"}
+    return {**_worker_state(spec, launch_request), "status": "started"}
 
 
 def _delete_terminal_kubernetes_worker_jobs(namespace: str, spec: WorkerSpec, payload: dict[str, Any]) -> None:
@@ -845,6 +865,29 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
 
     raw_job_records = body.get("items") if isinstance(body, dict) else []
     jobs = [job_record for job_record in raw_job_records if isinstance(job_record, dict)]
+    from api.provider_directory_cms_registry_worker import (
+        authorized_cms_registry_worker_launch,
+        is_cms_registry_job_matching,
+    )
+
+    launch = authorized_cms_registry_worker_launch(spec, launch_request)
+    if launch is not None and any(not is_cms_registry_job_matching(job, launch) for job in jobs):
+        return {**state_base_dict, "job_status": "purpose_mismatch"}
+    state_map = _kubernetes_job_state(state_base_dict, jobs, spec, launch_request or {})
+    if state_map["job_status"] == "failed":
+        failure = _kubernetes_worker_failure(namespace, selector)
+        if failure:
+            state_map["failure"] = failure
+    return state_map
+
+
+def _kubernetes_job_state(
+    state_base_dict: dict[str, Any],
+    jobs: list[dict[str, Any]],
+    spec: WorkerSpec,
+    launch_request: dict[str, Any],
+) -> dict[str, Any]:
+    """Summarize counts and the latest matching Kubernetes job."""
     active = sum(int((job.get("status") or {}).get("active") or 0) for job in jobs)
     succeeded = sum(int((job.get("status") or {}).get("succeeded") or 0) for job in jobs)
     failed = sum(int((job.get("status") or {}).get("failed") or 0) for job in jobs)
@@ -860,7 +903,7 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
         job_status = "succeeded"
     else:
         job_status = "missing"
-    state_map = {
+    return {
         **state_base_dict,
         "running": active > 0,
         "job_name": latest_name,
@@ -869,11 +912,6 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
         "succeeded_jobs": succeeded,
         "failed_jobs": failed,
     }
-    if job_status == "failed":
-        failure = _kubernetes_worker_failure(namespace, selector)
-        if failure:
-            state_map["failure"] = failure
-    return state_map
 
 
 def _kubernetes_worker_failure(namespace: str, selector: str) -> dict[str, Any] | None:
@@ -1024,6 +1062,11 @@ def _worker_job_container(
         "env": env_list,
         "securityContext": _worker_job_container_security_context(),
     }
+    from api.provider_directory_cms_registry_worker import COMMAND, authorized_cms_registry_worker_launch
+
+    launch = authorized_cms_registry_worker_launch(spec, launch_request)
+    if launch is not None:
+        container_dict.update(image=launch.image, command=list(COMMAND), workingDir="/app")
     env_from_list = _worker_job_env_from()
     if env_from_list:
         container_dict["envFrom"] = env_from_list
@@ -1122,6 +1165,9 @@ def _worker_job_manifest(
         volumes,
         run_id,
     )
+    from api.provider_directory_cms_registry_worker import apply_cms_registry_worker_spec
+
+    apply_cms_registry_worker_spec(spec, launch_request, labels_by_key, job_spec_dict["template"]["spec"])
 
     return {
         "apiVersion": "batch/v1",
@@ -1194,6 +1240,11 @@ def _worker_job_secret_env(
 
 def _is_admitted_importer_selected(selection_spec, worker_class, launch_request) -> bool:
     """Require exact single-job admission before selecting importer-scoped secrets."""
+
+    from api.provider_directory_cms_registry_worker import is_cms_registry_secret_selected
+
+    if not is_cms_registry_secret_selected(selection_spec, worker_class, launch_request):
+        return False
 
     if "importers" not in selection_spec:
         return True

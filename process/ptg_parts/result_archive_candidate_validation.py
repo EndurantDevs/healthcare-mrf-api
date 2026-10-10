@@ -1239,33 +1239,7 @@ async def local_data_serving_row(session, snapshot_id, row_by_field, *, is_prepa
     _authority, _evidence, physical_binding, candidate = await local_data_physical_read_state(
         session, snapshot_id, is_prepared=is_prepared
     )
-    serving_index = candidate["manifest"]["serving_index"]
-    layout_serving_index = candidate["layout_manifest"]["serving_index"]
-    resolved_row_by_field = {
-        **row_by_field,
-        **{
-            key: candidate[key]
-            for key in (
-                "attested_source_key",
-                "attested_coverage_scope_id",
-                "attested_source_set_digest",
-                "attested_audit_sample_digest",
-            )
-        },
-    }
-    resolved_row_by_field.update(
-        candidate_serving_index=serving_index,
-        layout_serving_index=layout_serving_index,
-        snapshot_source_set=serving_index.get("source_set"),
-        bound_snapshot_key=physical_binding.destination_layout_key,
-        layout_audit_sample=layout_serving_index.get("audit_sample"),
-        layout_source_witness=layout_serving_index.get("source_witness"),
-        layout_coverage_scope_id=layout_serving_index.get("coverage_scope_id"),
-        layout_code_count=layout_serving_index.get("code_count"),
-        snapshot_plan_id=candidate["plan_id"],
-        snapshot_plan_market_type=candidate["plan_market_type"],
-        snapshot_coverage_scope_id=bytes(candidate["coverage_scope_id"]).hex(),
-    )
+    resolved_row_by_field = _local_serving_row_fields(row_by_field, candidate, physical_binding)
     if is_prepared:
         witness_result = await session.execute(
             text(
@@ -1462,3 +1436,35 @@ __all__ = [
     "validate_result_archive_candidate_for_audit",
     "stage_local_data_candidate_for_audit",
 ]
+
+
+def _local_serving_row_fields(row_by_field, candidate, physical_binding):
+    """Rewrite only from already authenticated native payload and destination controls."""
+    serving_index = candidate["manifest"]["serving_index"]
+    layout_serving_index = candidate["layout_manifest"]["serving_index"]
+    resolved_row_by_field = {
+        **row_by_field,
+        **{
+            key: candidate[key]
+            for key in (
+                "attested_source_key",
+                "attested_coverage_scope_id",
+                "attested_source_set_digest",
+                "attested_audit_sample_digest",
+            )
+        },
+    }
+    resolved_row_by_field.update(
+        candidate_serving_index=serving_index,
+        layout_serving_index=layout_serving_index,
+        snapshot_source_set=serving_index.get("source_set"),
+        bound_snapshot_key=physical_binding.destination_layout_key,
+        layout_audit_sample=layout_serving_index.get("audit_sample"),
+        layout_source_witness=layout_serving_index.get("source_witness"),
+        layout_coverage_scope_id=layout_serving_index.get("coverage_scope_id"),
+        layout_code_count=layout_serving_index.get("code_count"),
+        snapshot_plan_id=candidate["plan_id"],
+        snapshot_plan_market_type=candidate["plan_market_type"],
+        snapshot_coverage_scope_id=bytes(candidate["coverage_scope_id"]).hex(),
+    )
+    return resolved_row_by_field

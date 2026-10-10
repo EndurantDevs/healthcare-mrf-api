@@ -11,7 +11,6 @@ import importlib
 import importlib.util
 import json
 import os
-import re
 import tempfile
 from compression import zstd
 from contextlib import asynccontextmanager
@@ -21,13 +20,16 @@ from typing import Any
 
 import httpx
 from sqlalchemy import select, text
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from db.models import ProviderDirectoryCMSNPDResourceWitness
 from process import cms_npd_source as source
 from process import provider_directory_cms_npd_recovery as recovery
 from process import provider_directory_cms_npd_relationship as relationships
 from process.provider_directory_cms_observation import observe_intake as _observe_intake
+from process.provider_directory_cms_resource_batch import persist_cms_dataset_rows
 from process.provider_directory_profile_selection_dataset import _cms_dataset_pair
+from process.provider_directory_registry_network_metadata import fhir_network_binding_metadata
 
 SOURCE_ID = source.SOURCE_ID
 RESOURCE_TYPES = tuple(resource_type for _, resource_type in source.RESOURCE_FILES)
@@ -36,7 +38,6 @@ ADAPTER_CONTRACT = "cms-npd-bulk-fhir-v1"
 BATCH_SIZE = 1_000
 BATCH_MAX_DECODED_BYTES = 8 * 1024 * 1024
 IDENTITY_BATCH_SIZE = 1_000
-_LOCAL_ORGANIZATION_REF = re.compile(r"Organization/([A-Za-z0-9.-]{1,64})\Z")
 _NETWORK_ROLE_SQL = (
     'organization.payload_json::jsonb @> \'{"type":[{"text":"ntwk"}]}\'::jsonb '
     'OR organization.payload_json::jsonb @> \'{"type":[{"coding":[{"code":"ntwk"}]}]}\'::jsonb'
@@ -246,6 +247,7 @@ def _source_row(fhir: Any, endpoint_id: str, now: Any) -> dict[str, Any]:
             "provider_directory_supported_resources": sorted(RESOURCE_SET),
             "provider_directory_acquisition_enabled": True,
             "provider_directory_fhir_endpoint": False,
+            "registry_network_source": {"producer_id": ADAPTER_CONTRACT, "alias_scope": SOURCE_ID},
         },
         "created_at": now,
         "updated_at": now,
@@ -256,6 +258,36 @@ def _assert_candidate_release(state: dict[str, Any], identity: dict[str, Any]) -
     metadata = state.get("publication_metadata_json")
     if not isinstance(metadata, dict) or metadata.get("source_release") != identity:
         raise RuntimeError("cms_npd_candidate_release_changed")
+
+
+def _existing_candidate_root(fhir, state, endpoint_id, identity):
+    """Retain the original acquisition authority and exact release on replay."""
+    _assert_candidate_release(state, identity)
+    if (
+        state.get("endpoint_id") != endpoint_id
+        or fhir._dataset_resource_hash_contract(state) != fhir.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        or fhir._dataset_semantic_projection_as_of(state, fhir.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT)
+        != identity["generated_at"]
+        or (state.get("status") == fhir.ENDPOINT_DATASET_PUBLISHED and state.get("is_current") is not True)
+    ):
+        raise RuntimeError("cms_npd_candidate_identity_changed")
+    root_run_id = state.get("acquisition_root_run_id")
+    if not isinstance(root_run_id, str) or not root_run_id:
+        raise RuntimeError("cms_npd_candidate_root_invalid")
+    return root_run_id
+
+
+def _candidate_network_metadata(fhir, state, dataset_id):
+    """Declare new editions without adding authority to retained sealed metadata."""
+    if state:
+        return state["publication_metadata_json"].get("network_bindings")
+    return fhir_network_binding_metadata(
+        source_id=SOURCE_ID,
+        dataset_schema=fhir._schema(),
+        dataset_id=dataset_id,
+        producer_id=ADAPTER_CONTRACT,
+        alias_scope=SOURCE_ID,
+    )
 
 
 async def _candidate(
@@ -274,20 +306,10 @@ async def _candidate(
     if state:
         if await recovery.is_disposed(fhir, dataset_id):
             raise RuntimeError("cms_npd_candidate_disposed")
-        _assert_candidate_release(state, identity)
-        if (
-            state.get("endpoint_id") != endpoint_id
-            or fhir._dataset_resource_hash_contract(state) != fhir.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            or fhir._dataset_semantic_projection_as_of(state, fhir.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT)
-            != identity["generated_at"]
-            or (state.get("status") == fhir.ENDPOINT_DATASET_PUBLISHED and state.get("is_current") is not True)
-        ):
-            raise RuntimeError("cms_npd_candidate_identity_changed")
-        root_run_id = state.get("acquisition_root_run_id")
-        if not isinstance(root_run_id, str) or not root_run_id:
-            raise RuntimeError("cms_npd_candidate_root_invalid")
+        root_run_id = _existing_candidate_root(fhir, state, endpoint_id, identity)
     else:
         root_run_id = run_id
+    registry_metadata = _candidate_network_metadata(fhir, state, dataset_id)
     candidate = fhir.EndpointDatasetCandidate(
         endpoint_id=endpoint_id,
         dataset_id=dataset_id,
@@ -307,6 +329,7 @@ async def _candidate(
         resource_hash_contract=fhir.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
         semantic_projection_as_of=identity["generated_at"],
         source_release=identity,
+        registry_network_binding_metadata=registry_metadata,
     )
     if state and state.get("status") not in (
         fhir.ENDPOINT_DATASET_ACQUIRING,
@@ -649,13 +672,7 @@ async def _persist_source_batch(
         raise RuntimeError("cms_npd_witness_batch_invalid")
     witness_by_id = _source_witnesses_by_id(raw_resources, candidate, resource_type)
     async with fhir.db.transaction() as session:
-        normalized_rows = await fhir._persist_endpoint_dataset_rows(
-            model,
-            resource_rows,
-            candidate.dataset_id,
-            resource_hash_contract=candidate.resource_hash_contract,
-            semantic_projection_as_of=candidate.semantic_projection_as_of,
-        )
+        normalized_rows = await persist_cms_dataset_rows(fhir, session, model, resource_rows, candidate)
         normalized_by_id = {normalized_row["resource_id"]: normalized_row for normalized_row in normalized_rows}
         if set(normalized_by_id) != set(witness_by_id) or any(
             normalized_row["resource_type"] != resource_type or normalized_row["dataset_id"] != candidate.dataset_id
@@ -667,6 +684,19 @@ async def _persist_source_batch(
         await _insert_verified_witnesses(session, witness_by_id)
 
 
+def _resource_from_line(line: bytes, resource_type: str) -> dict[str, Any]:
+    """Decode one bounded source record with the shared staging/identity contract."""
+    if len(line) > source.MAX_RESOURCE_LINE_BYTES:
+        raise source.CmsNpdSourceError("cms_npd_decoded_size_invalid")
+    try:
+        resource = json.loads(line)
+    except (UnicodeError, ValueError) as error:
+        raise source.CmsNpdSourceError("cms_npd_ndjson_invalid") from error
+    if not isinstance(resource, dict) or resource.get("resourceType") != resource_type:
+        raise source.CmsNpdSourceError("cms_npd_resource_invalid")
+    return resource
+
+
 async def _stream_file(fhir: Any, path: Path, candidate: Any, resource_type: str, ctx: dict, task: dict) -> int:
     model = fhir.RESOURCE_MODELS_BY_TYPE[resource_type]
     resource_rows: list[dict[str, Any]] = []
@@ -675,14 +705,14 @@ async def _stream_file(fhir: Any, path: Path, candidate: Any, resource_type: str
     batch_bytes = 0
     with zstd.open(path, "rb") as decoded:
         while line := decoded.readline(source.MAX_RESOURCE_LINE_BYTES + 1):
-            if len(line) > source.MAX_RESOURCE_LINE_BYTES:
-                raise source.CmsNpdSourceError("cms_npd_decoded_size_invalid")
-            try:
-                resource = json.loads(line)
-            except (UnicodeError, ValueError) as error:
-                raise source.CmsNpdSourceError("cms_npd_ndjson_invalid") from error
-            if not isinstance(resource, dict) or resource.get("resourceType") != resource_type:
-                raise source.CmsNpdSourceError("cms_npd_resource_invalid")
+            resource = _resource_from_line(line, resource_type)
+            if resource_rows and batch_bytes + len(line) > BATCH_MAX_DECODED_BYTES:
+                await _persist_source_batch(fhir, model, resource_rows, raw_resources, candidate, resource_type)
+                _observe_intake(ctx, phase="staging", family=resource_type, completed_rows=row_count)
+                resource_rows.clear()
+                raw_resources.clear()
+                batch_bytes = 0
+                await fhir._raise_if_resource_import_cancelled(ctx, task)
             parsed_model, resource_row_by_field = _parse_batch_row(fhir, resource, candidate)
             if parsed_model is not model:
                 raise source.CmsNpdSourceError("cms_npd_resource_invalid")
@@ -720,7 +750,7 @@ async def _materialize_identity_evidence(
         return
 
     entity_writer = importlib.import_module("process.provider_directory_entity_identity")
-    network_writer = importlib.import_module("process.provider_directory_insurance_network_identity")
+    network_writer = importlib.import_module("process.provider_directory_insurance_network_batch")
     resource_writer = importlib.import_module("process.provider_directory_resource_identity")
     selected_resource_types = {"Organization", "Location", "InsurancePlan", "PractitionerRole"}
     for name, resource_type in source.RESOURCE_FILES:
@@ -732,14 +762,15 @@ async def _materialize_identity_evidence(
         row_count = 0
         with zstd.open(directory / f"{name}.zst", "rb") as decoded:
             while line := decoded.readline(source.MAX_RESOURCE_LINE_BYTES + 1):
-                if len(line) > source.MAX_RESOURCE_LINE_BYTES:
-                    raise source.CmsNpdSourceError("cms_npd_decoded_size_invalid")
-                try:
-                    resource = json.loads(line)
-                except (UnicodeError, ValueError) as error:
-                    raise source.CmsNpdSourceError("cms_npd_ndjson_invalid") from error
-                if not isinstance(resource, dict) or resource.get("resourceType") != resource_type:
-                    raise source.CmsNpdSourceError("cms_npd_resource_invalid")
+                resource = _resource_from_line(line, resource_type)
+                if resources and batch_bytes + len(line) > BATCH_MAX_DECODED_BYTES:
+                    await _write_identity_batch(
+                        fhir, entity_writer, network_writer, resource_writer, resource_type, resources, identity
+                    )
+                    _observe_intake(ctx, phase="identity", family=resource_type, completed_rows=row_count)
+                    resources.clear()
+                    batch_bytes = 0
+                    await fhir._raise_if_resource_import_cancelled(ctx, task)
                 resources.append(resource)
                 row_count += 1
                 batch_bytes += len(line)
@@ -784,10 +815,11 @@ async def _backfill_network_roles(fhir: Any, identity: dict[str, Any], ctx: dict
     schema = fhir._schema()
     evidence_table = fhir._qt(schema, "provider_directory_entity_release_evidence")
     binding_table = fhir._qt(schema, "provider_directory_insurance_network_source_binding")
-    network_writer = importlib.import_module("process.provider_directory_insurance_network_identity")
+    network_writer = importlib.import_module("process.provider_directory_insurance_network_batch")
     after_id = ""
     while True:
         missing = await fhir.db.all(
+            "WITH missing AS MATERIALIZED ("
             f"SELECT organization.resource_id, organization.payload_json FROM {evidence_table} AS organization "
             "WHERE organization.source_id=:source_id AND organization.release_id=:release_id "
             "AND organization.resource_type='Organization' AND organization.resource_id>:after_id "
@@ -795,20 +827,28 @@ async def _backfill_network_roles(fhir: Any, identity: dict[str, Any], ctx: dict
             f"AND NOT EXISTS (SELECT 1 FROM {binding_table} AS network "
             "WHERE network.source_id=organization.source_id AND network.resource_type='Organization' "
             "AND network.resource_id=organization.resource_id) "
-            "ORDER BY organization.resource_id LIMIT :batch_size",
+            "ORDER BY organization.resource_id LIMIT :batch_size), bounded AS ("
+            "SELECT resource_id,payload_json,row_number() OVER (ORDER BY resource_id) AS ordinal,"
+            "sum(octet_length(payload_json::text)) OVER (ORDER BY resource_id) AS decoded_bytes FROM missing) "
+            "SELECT resource_id,payload_json FROM bounded WHERE ordinal=1 OR decoded_bytes<=:batch_bytes "
+            "ORDER BY resource_id",
             source_id=SOURCE_ID,
             release_id=identity["vector_sha256"],
             after_id=after_id,
             batch_size=IDENTITY_BATCH_SIZE,
+            batch_bytes=BATCH_MAX_DECODED_BYTES,
         )
         if not missing:
             return
-        async with fhir.db.session() as session:
-            for resource_id, organization in missing:
-                await network_writer.record_insurance_network_organization(
-                    session, source_id=SOURCE_ID, release_id=identity["vector_sha256"], organization=organization
-                )
-                after_id = resource_id
+        async with fhir.db.session() as session, session.begin():
+            await network_writer.record_insurance_network_batch(
+                session,
+                source_id=SOURCE_ID,
+                release_id=identity["vector_sha256"],
+                resource_type="Organization",
+                resources=[organization for _, organization in missing],
+            )
+        after_id = missing[-1][0]
         await fhir._raise_if_resource_import_cancelled(ctx, task)
 
 
@@ -831,10 +871,13 @@ async def _write_identity_batch(
                 resources=resources,
             )
             if resource_type == "Organization":
-                for resource in filter(network_writer.has_source_declared_network_role, resources):
-                    await network_writer.record_insurance_network_organization(
-                        session, source_id=SOURCE_ID, release_id=identity["vector_sha256"], organization=resource
-                    )
+                await network_writer.record_insurance_network_batch(
+                    session,
+                    source_id=SOURCE_ID,
+                    release_id=identity["vector_sha256"],
+                    resource_type=resource_type,
+                    resources=resources,
+                )
         return
 
     async with fhir.db.session() as session:
@@ -847,54 +890,14 @@ async def _write_identity_batch(
     if resource_type == "PractitionerRole":
         return
 
-    await _write_plan_network_batch(fhir, network_writer, resources, identity)
-
-
-async def _write_plan_network_batch(
-    fhir: Any,
-    network_writer: Any,
-    resources: list[dict[str, Any]],
-    identity: dict[str, Any],
-) -> None:
-    """Record only plan links to Organization IDs seen in this release."""
-
-    plan_network_targets: list[tuple[dict[str, Any], list[str]]] = []
-    all_network_resource_ids: set[str] = set()
-    for resource in resources:
-        network_resource_ids = [
-            match.group(1)
-            for reference in fhir._insurance_plan_network_references(resource)
-            if (match := _LOCAL_ORGANIZATION_REF.fullmatch(reference))
-        ]
-        plan_network_targets.append((resource, network_resource_ids))
-        all_network_resource_ids.update(network_resource_ids)
-    if not all_network_resource_ids:
-        return
-    entity_table = fhir._qt(fhir._schema(), "provider_directory_entity_release_evidence")
-    bound_org_rows = await fhir.db.all(
-        f"SELECT resource_id FROM {entity_table} "
-        "WHERE source_id=:source_id AND release_id=:release_id "
-        "AND resource_type='Organization' "
-        "AND resource_id = ANY(CAST(:resource_ids AS varchar[]))",
-        source_id=SOURCE_ID,
-        release_id=identity["vector_sha256"],
-        resource_ids=list(all_network_resource_ids),
-    )
-    bound_network_resource_ids = {str(bound_org_row[0]) for bound_org_row in bound_org_rows}
-    if not bound_network_resource_ids:
-        return
-    async with fhir.db.session() as session:
-        for resource, network_resource_ids in plan_network_targets:
-            for network_resource_id in network_resource_ids:
-                if network_resource_id not in bound_network_resource_ids:
-                    continue
-                await network_writer.record_insurance_network_plan(
-                    session,
-                    source_id=SOURCE_ID,
-                    release_id=identity["vector_sha256"],
-                    network_resource_id=network_resource_id,
-                    plan=resource,
-                )
+    async with fhir.db.session() as session, session.begin():
+        await network_writer.record_insurance_network_batch(
+            session,
+            source_id=SOURCE_ID,
+            release_id=identity["vector_sha256"],
+            resource_type=resource_type,
+            resources=resources,
+        )
 
 
 async def _assert_identity_evidence(fhir: Any, candidate: Any, identity: dict[str, Any]) -> None:
@@ -1031,7 +1034,52 @@ async def _assert_witness_counts(fhir: Any, candidate: Any, identity: dict[str, 
         raise RuntimeError("cms_npd_witness_counts_incomplete")
 
 
-async def _validate_candidate(fhir: Any, candidate: Any, identity: dict, counts_by_type: dict) -> None:
+async def _replayed_registry_admission(fhir, candidate):
+    """Reconstruct completed metadata and verify actual payloads before a replay handoff."""
+    from process.provider_directory_admission_backfill import _locked_dataset_row, _validated_row_seal
+    from process.provider_directory_admission_seal import ADMISSION_GENERIC_PROOF_SUMMARY_KEY
+
+    async with fhir.db.acquire() as connection:
+        await connection.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+        driver = connection.raw_connection.driver_connection
+        dataset_row = await _locked_dataset_row(
+            driver, fhir._qt(fhir._schema(), "provider_directory_endpoint_dataset"), candidate.dataset_id
+        )
+        if (
+            dataset_row is None
+            or dataset_row["endpoint_id"] != candidate.endpoint_id
+            or dataset_row["evidence_run_id"] != candidate.acquisition_root_run_id
+            or dataset_row["status"]
+            not in {fhir.ENDPOINT_DATASET_VALIDATED, fhir.ENDPOINT_DATASET_PUBLISHED, fhir.ENDPOINT_DATASET_SUPERSEDED}
+        ):
+            raise RuntimeError("provider_directory_admission_replay_changed")
+        seal = await _validated_row_seal(
+            driver, fhir._qt(fhir._schema(), "provider_directory_endpoint_dataset"), dataset_row
+        )
+        proof = await fhir._endpoint_dataset_content_proof(
+            connection,
+            candidate.dataset_id,
+            candidate.selected_resources,
+            verify_payload_hashes=True,
+            resource_hash_contract=candidate.resource_hash_contract,
+        )
+        expected_proof_by_field = seal.metadata_summary[ADMISSION_GENERIC_PROOF_SUMMARY_KEY]
+        if (
+            seal.proof_sha256 != dataset_row["content_proof_admission_sha256"]
+            or seal.metadata_sha256 != dataset_row["publication_metadata_sha256"]
+            or {
+                "dataset_hash": proof.dataset_hash,
+                "resource_count": proof.resource_count,
+                "resource_hashes": proof.resource_hashes,
+                "resource_counts": proof.resource_counts,
+            }
+            != expected_proof_by_field
+        ):
+            raise RuntimeError("provider_directory_admission_replay_changed")
+        return {"dataset_hash": proof.dataset_hash, **fhir._endpoint_dataset_admission_handoff(seal)}
+
+
+async def _validate_candidate(fhir: Any, candidate: Any, identity: dict, counts_by_type: dict) -> dict:
     """Validate the complete resource vector without moving the serving pointer."""
 
     if not candidate.already_validated and not candidate.already_published:
@@ -1050,6 +1098,45 @@ async def _validate_candidate(fhir: Any, candidate: Any, identity: dict, counts_
         finalization = await fhir._finalize_endpoint_dataset_candidate(candidate, diagnostics_by_resource)
         if not finalization or finalization.get("validated") is not True:
             raise RuntimeError("cms_npd_candidate_validation_failed")
+        return finalization
+    return await _replayed_registry_admission(fhir, candidate)
+
+
+async def _registry_source_admission(fhir, candidate, finalization):
+    """Hand off computed admission hashes without asserting office or serving authority."""
+    if not finalization or "admission_receipt" not in finalization:
+        return None
+    receipt = finalization["admission_receipt"]
+    declaration = receipt["network_bindings"]
+    expected = fhir_network_binding_metadata(
+        source_id=SOURCE_ID,
+        dataset_schema=fhir._schema(),
+        dataset_id=candidate.dataset_id,
+        producer_id=ADAPTER_CONTRACT,
+        alias_scope=SOURCE_ID,
+    )
+    if declaration != expected or receipt["semantic_projection_as_of"] != candidate.semantic_projection_as_of:
+        raise RuntimeError("cms_npd_registry_admission_changed")
+    oid = await fhir.db.scalar(
+        "SELECT to_regclass(:resource_table)::oid::bigint",
+        resource_table=fhir._qt(fhir._schema(), "provider_directory_dataset_resource"),
+    )
+    if type(oid) is not int or not 0 < oid <= 4294967295:
+        raise RuntimeError("cms_npd_registry_admission_changed")
+    descriptor_by_field = {
+        "version": 1,
+        "network_bindings": declaration,
+        "endpoint_id": candidate.endpoint_id,
+        "dataset_sha256": finalization["dataset_hash"],
+        "release_id": candidate.source_release["vector_sha256"],
+        "resource_table_oid": oid,
+        "semantic_projection_as_of": receipt["semantic_projection_as_of"],
+        "expected_admission_sha256": receipt["expected_admission_sha256"],
+        "expected_metadata_sha256": receipt["expected_metadata_sha256"],
+    }
+    if len(json.dumps(descriptor_by_field, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()) > 4096:
+        raise RuntimeError("cms_npd_registry_admission_changed")
+    return descriptor_by_field
 
 
 async def _serving_candidate_descriptor(fhir, state, proof_by_field):
@@ -1175,14 +1262,37 @@ async def _tax_candidate_followup_status(fhir: Any, directory: Path, candidate: 
         return {"status": "failed", "retryable": True, "retry_via": "same_byte_import"}
 
 
+def _source_stage_workers(fhir):
+    """Bound file writers by connected capacity after reserving the intake guard."""
+    pool = getattr(getattr(getattr(fhir, "db", None), "engine", None), "pool", None)
+    if not isinstance(pool, AsyncAdaptedQueuePool) or pool._max_overflow < 0:
+        return 1
+    capacity = min(fhir._provider_directory_database_pool_capacity(), pool.size() + pool._max_overflow)
+    if capacity < 2:
+        raise RuntimeError("cms_npd_intake_pool_capacity_exceeded")
+    return min(2, capacity - 1)
+
+
 async def _stage_and_validate_candidate(fhir, directory, candidate, identity, receipt_by_field, ctx, task):
     """Retain bounded resources and verify their counts, witnesses, and resolved evidence."""
     if not candidate.already_validated and not candidate.already_published:
-        for name, resource_type in source.RESOURCE_FILES:
-            _observe_intake(ctx, phase="staging", family=resource_type)
-            count = await _stream_file(fhir, directory / f"{name}.zst", candidate, resource_type, ctx, task)
-            if count != identity["files"][name]["row_count"]:
-                raise RuntimeError("cms_npd_file_row_count_changed")
+        files = iter(source.RESOURCE_FILES)
+
+        async def stage_files():
+            """Stage each claimed retained file and require its exact admitted row count."""
+            for name, resource_type in files:
+                _observe_intake(ctx, phase="staging", family=resource_type)
+                count = await _stream_file(fhir, directory / f"{name}.zst", candidate, resource_type, ctx, task)
+                if count != identity["files"][name]["row_count"]:
+                    raise RuntimeError("cms_npd_file_row_count_changed")
+
+        workers = _source_stage_workers(fhir)
+        if workers == 1:
+            await stage_files()
+        else:
+            await fhir._gather_provider_directory_profile_tasks(
+                [asyncio.create_task(stage_files()) for _ in range(workers)]
+            )
     _observe_intake(ctx, phase="count_validation")
     counts_by_type = await _assert_counts(fhir, candidate, identity)
     _observe_intake(ctx, phase="release_validation")
@@ -1196,7 +1306,7 @@ async def _stage_and_validate_candidate(fhir, directory, candidate, identity, re
     _observe_intake(ctx, phase="release_validation")
     await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None, task)
     _observe_intake(ctx, phase="candidate_validation")
-    await _validate_candidate(fhir, candidate, identity, counts_by_type)
+    return await _validate_candidate(fhir, candidate, identity, counts_by_type)
 
 
 async def _stage_acquired(
@@ -1222,7 +1332,10 @@ async def _stage_acquired(
     await recovery.resume_pending_cleanup(fhir, endpoint_id)
     await recovery.dispose_prior_vectors(fhir, endpoint_id, identity["vector_sha256"])
     candidate = await _admission_candidate(fhir, endpoint_id, run_id, identity, task, repair_selection)
-    await _stage_and_validate_candidate(fhir, directory, candidate, identity, receipt_by_field, ctx, task)
+    finalization = await _stage_and_validate_candidate(
+        fhir, directory, candidate, identity, receipt_by_field, ctx, task
+    )
+    registry_admission = await _registry_source_admission(fhir, candidate, finalization)
     _observe_intake(ctx, phase="coverage")
     state, serving_candidate = await _prepare_serving_candidate(
         fhir, candidate, identity, directory, receipt_by_field, client, ctx, task
@@ -1242,6 +1355,7 @@ async def _stage_acquired(
         "status": state["status"],
         "replayed": candidate.already_published,
         "cms_serving_candidate": serving_candidate,
+        **({"registry_source_admission": registry_admission} if registry_admission is not None else {}),
         "tax_candidates": tax_candidate_status_by_field,
     }
 
@@ -1323,6 +1437,25 @@ async def _prepare_current_serving_candidate(fhir, state, release_id):
     return await _serving_candidate_descriptor(fhir, state, proof_by_field)
 
 
+async def _current_registry_source_admission(fhir, state):
+    """Verify a declared completed source without adding authority to legacy metadata."""
+    metadata = state.get("publication_metadata_json")
+    if not isinstance(metadata, dict) or "network_bindings" not in metadata:
+        return None
+    contract = fhir._dataset_resource_hash_contract(state)
+    candidate = SimpleNamespace(
+        dataset_id=state["dataset_id"],
+        endpoint_id=state["endpoint_id"],
+        acquisition_root_run_id=state["acquisition_root_run_id"],
+        selected_resources=tuple(sorted(RESOURCE_SET)),
+        resource_hash_contract=contract,
+        source_release=metadata["source_release"],
+        semantic_projection_as_of=fhir._dataset_semantic_projection_as_of(state, contract),
+    )
+    finalization = await _replayed_registry_admission(fhir, candidate)
+    return await _registry_source_admission(fhir, candidate, finalization)
+
+
 async def _unchanged_publication_result(
     observed: source.ObservedRelease,
     state: dict[str, Any],
@@ -1339,6 +1472,7 @@ async def _unchanged_publication_result(
     async with _intake_guard(fhir, state["endpoint_id"]):
         _observe_intake(ctx, phase="coverage")
         serving_candidate = await _prepare_current_serving_candidate(fhir, state, observed.vector_sha256)
+        registry_admission = await _current_registry_source_admission(fhir, state)
     return {
         "source_id": SOURCE_ID,
         "dataset_id": state["dataset_id"],
@@ -1347,6 +1481,7 @@ async def _unchanged_publication_result(
         "status": "published",
         "replayed": True,
         "cms_serving_candidate": serving_candidate,
+        **({"registry_source_admission": registry_admission} if registry_admission is not None else {}),
     }
 
 

@@ -48,11 +48,38 @@ HIDDEN_RUNTIME_ALIASES = {
     ("get", "/pricing/physicians/{npi}/prescriptions/{rx_code_system}/{rx_code}"),
 }
 ROUTE_QUERY_PARAM_ADDITIONS = {
+    # Registry parsers reject unknown/duplicate fields before reading a snapshot.
+    ("get", "/registry/manage/{kind}"): {"limit", "offset", "record_ids"},
+    ("get", "/registry/manage/{kind}/{record_id}/history"): {"limit", "offset"},
+    ("get", "/registry/publication/approved-companies"): {"limit", "offset", "approved_revision"},
+    ("get", "/registry/serving/manifest"): {"network_generation"},
+    ("get", "/registry/serving/providers"): {
+        "network_ids",
+        "network_generation",
+        "limit",
+        "offset",
+        "location_id",
+        "lat",
+        "long",
+        "radius_miles",
+    },
+    ("get", "/registry/serving/providers/{provider_system}/{provider_id}"): {
+        "network_ids",
+        "network_generation",
+        "location_id",
+        "lat",
+        "long",
+        "radius_miles",
+    },
+    ("get", "/issuer/registry"): {"issuer_ids", "reporting_year"},
     # The shared directory request parser validates these outside the route AST.
     ("get", "/provider-directory/entities/{kind}"): {"source_id", "generation_id", "limit", "cursor"},
     ("get", "/provider-directory/entities/{kind}/{entity_id}"): {"source_id", "generation_id"},
     ("get", "/provider-directory/entities/{kind}/{entity_id}/relationships"): {
-        "source_id", "generation_id", "limit", "cursor",
+        "source_id",
+        "generation_id",
+        "limit",
+        "cursor",
     },
     ("get", "/hospital-prices/facilities"): {
         "cursor",
@@ -62,7 +89,9 @@ ROUTE_QUERY_PARAM_ADDITIONS = {
         "q",
     },
     ("get", "/hospital-prices/facilities/{hospital_id}/payer-plans"): {
-        "version_id", "cursor", "limit",
+        "version_id",
+        "cursor",
+        "limit",
     },
     # The taxonomy filter helper parses these outside the decorated route's AST.
     ("get", "/nucc/all"): {"code", "q"},

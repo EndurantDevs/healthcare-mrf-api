@@ -54,6 +54,7 @@ from api.custom_import_provider_service_sql import (
     provider_service_zip_filter,
 )
 from api.endpoint.pagination import PaginationParams, parse_pagination
+from api.network_address_scope import canonical_network_read
 from api.plan_pricing_em_distance import (
     _request_code_index as _em_distance_request_code_index,
 )
@@ -89,6 +90,14 @@ from api.provider_demographic_filters import (
     provider_sex_exists_sql,
 )
 from api.provider_service_code_coverage import add_provider_service_summary
+from api.provider_service_scope import (
+    _canonical_network_procedure_clause,
+    _canonical_procedure_location_filter,
+    _canonical_procedure_locations,
+    _canonical_procedure_zip_anchor,
+    _provider_service_evidence,
+    _reject_resolver_only_procedure_search_params,
+)
 from api.provider_specialty_filters import (
     ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
     PRIMARY_CARE_TAXONOMY_CODES,
@@ -11636,24 +11645,6 @@ async def audit_ptg2_source_witness_batch(request):
 # After the route was renamed to /by-procedure, that path fell through to
 # /providers/<npi> -> "Parameter 'npi' must be an integer", 500-ing every
 # plan-scoped pricing search. Keep the old path pointed at this handler.
-def _reject_resolver_only_procedure_search_params(args) -> None:
-    """Direct callers must resolve clinical intent before pricing search."""
-
-    resolver_only_param = next(
-        (param_name for param_name in ("clinical_intent", "intent") if args.get(param_name) is not None),
-        None,
-    )
-    if resolver_only_param is None:
-        return
-    raise InvalidUsage(
-        f"Parameter '{resolver_only_param}' is resolver-only. Call "
-        "/pricing/procedure-taxonomy/resolve first. When "
-        "recommended_mode=hard_filter, copy provider_filter.taxonomy_codes, "
-        "provider_filter.primary_only, and "
-        "provider_filter.include_subspecialties into the pricing search."
-    )
-
-
 @blueprint.get("/providers/search-by-procedure", name="pricing.providers.search_by_procedure")
 @blueprint.get(
     "/providers/audit-search-by-procedure",
@@ -11662,10 +11653,14 @@ def _reject_resolver_only_procedure_search_params(args) -> None:
 @blueprint.get("/providers/by-procedure", name="pricing.providers.by_procedure")
 @blueprint.get("/providers/by-service", name="pricing.providers.by_service")
 @blueprint.get("/physicians/by-service", name="pricing.physicians.by_service")
+@canonical_network_read
 async def list_providers_by_procedure(request, *, native_args=None, import_context=None):
     """List providers with pricing records matching a procedure or service code."""
     args = request.args
     args = provider_service_native_args(args, native_args, import_context)
+    canonical_network_clause = _canonical_network_procedure_clause(
+        args, import_context, provider_procedure_table.c.npi, query_string=getattr(request, "query_string", None)
+    )
     if "billing_entity_ref" in args:
         if import_context is not None:
             raise InvalidUsage("custom-import provider-service queries cannot use billing search")
@@ -12202,12 +12197,25 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
             raise InvalidUsage("Parameter 'order_by=cost_index' requires 'code'")
         if not (zip5 or (state and city)):
             raise InvalidUsage("Parameter 'order_by=cost_index' requires either 'zip5' or both 'state' and 'city'")
-
     year, year_source = await _resolve_year(session, provider_procedure_table, year)
     code_context = None
     zip_distance_map: dict[str, dict[str, Any]] = {}
     zip_filter_values: list[str] = []
-    if zip5 and zip_radius_miles > 0:
+    canonical_location_filter = None
+    if canonical_network_clause is not None:
+        anchor = await _canonical_procedure_zip_anchor(session, zip5) if zip5 and zip_radius_miles > 0 else None
+        canonical_location_filter = _canonical_procedure_location_filter(
+            state=state,
+            city=city,
+            zip5=zip5,
+            zip_radius=zip_radius_miles,
+            coordinates=(latitude, longitude, coordinate_radius_miles),
+            zip_anchor=anchor,
+        )
+        canonical_network_clause = _canonical_network_procedure_clause(
+            args, import_context, provider_procedure_table.c.npi, location_filter=canonical_location_filter
+        )
+    if canonical_network_clause is None and zip5 and zip_radius_miles > 0:
         zip_rows = await _zip_radius_rows(
             session,
             zip5=zip5,
@@ -12241,11 +12249,13 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
         provider_table.c.year == year,
         provider_table.c.npi == provider_procedure_table.c.npi,
     ]
+    if canonical_network_clause is not None:
+        filters.append(canonical_network_clause)
     if npi is not None:
         filters.append(provider_procedure_table.c.npi == npi)
-    if state:
+    if canonical_network_clause is None and state:
         filters.append(func.upper(provider_table.c.state) == state)
-    if city and not (zip5 and zip_radius_miles > 0):
+    if canonical_network_clause is None and city and not (zip5 and zip_radius_miles > 0):
         filters.append(func.lower(provider_table.c.city).like(f"%{city}%"))
     zip_filter = provider_service_zip_filter(
         provider_table.c.zip5,
@@ -12255,7 +12265,7 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
         (latitude, longitude, coordinate_radius_miles),
         _distance_miles_expression,
     )
-    if zip_filter is not None:
+    if canonical_network_clause is None and zip_filter is not None:
         filters.append(zip_filter)
     provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
         session,
@@ -12321,6 +12331,7 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
     total = None
     if (
         import_context is None
+        and canonical_network_clause is None
         and len(internal_codes) == 1
         and not query_text
         and not state
@@ -12384,7 +12395,7 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
         _normalize_provider_service_aggregate(_row_to_dict(provider_record), include_legacy=include_legacy_fields)
         for provider_record in query_result
     ]
-    if zip5 and provider_items:
+    if canonical_network_clause is None and zip5 and provider_items:
         for provider_item_by_field in provider_items:
             item_zip = _normalize_zip5(provider_item_by_field.get("zip5"))
             if item_zip is None:
@@ -12403,10 +12414,13 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
             provider_items,
             year=year,
             internal_codes=internal_codes,
-            fallback_state=state or None,
-            fallback_city=city or None,
-            fallback_zip5=zip5 or None,
+            fallback_state=(state or None) if canonical_network_clause is None else None,
+            fallback_city=(city or None) if canonical_network_clause is None else None,
+            fallback_zip5=(zip5 or None) if canonical_network_clause is None else None,
         )
+
+    if canonical_network_clause is not None:
+        await _canonical_procedure_locations(session, provider_items, canonical_location_filter)
 
     query_by_field: dict[str, Any] = {
         "q": query_text or None,
@@ -12451,44 +12465,14 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
         },
         "query": query_by_field,
     }
-    if include_sources:
-        response_by_field["sources"] = [
-            {
-                "source_key": "cms_medicare_provider_services_claims",
-                "source_importer": "claims-pricing",
-                "source_system": "cms_medicare_part_b",
-                "dataset": "Medicare Physician & Other Practitioners by Provider and Service",
-                "serving_tables": ["pricing_provider", "pricing_provider_procedure"],
-                "grain": "provider_npi/year/procedure aggregate",
-                "derived": True,
-            }
-        ]
-    if include_evidence or include_debug:
-        response_by_field["evidence"] = {
-            "matched_provider_location_count": total,
-            "filters": {
-                "year": year,
-                "year_source": year_source,
-                "code": code or None,
-                "state": state or None,
-                "city": city or None,
-                "zip5": zip5 or None,
-                "specialty": specialty or None,
-                "provider_sex_code": provider_sex_code,
-                "q": query_text or None,
-                "min_claims": min_claims,
-                "min_total_cost": min_total_cost,
-                "provider_type_resolution": provider_type_resolution,
-                "procedure_term_resolution": procedure_resolution_by_field,
-            },
-            "zip_scope": {
-                "anchor_zip5": zip5,
-                "zip_radius_miles": zip_radius_miles if zip5 else None,
-                "candidate_count": len(zip_filter_values) if zip_filter_values else (1 if zip5 else None),
-            },
-            "code_resolution": code_context,
-        }
-    return response.json(response_by_field)
+    _provider_service_evidence(response_by_field, code_context, canonical=canonical_network_clause is not None)
+    reply = response.json(response_by_field)
+    if canonical_network_clause is not None:
+        from api.network_provider_read import MAX_RESPONSE_BYTES
+
+        if len(reply.body) > MAX_RESPONSE_BYTES:
+            raise sanic.exceptions.ServiceUnavailable("Complete selected-office evidence is unavailable.")
+    return reply
 
 
 @blueprint.get("/providers/by-prescription", name="pricing.providers.by_prescription")

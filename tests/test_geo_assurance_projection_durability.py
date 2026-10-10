@@ -30,56 +30,8 @@ from tests.test_geo_assurance_projection import (
 )
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("current_projection_available", "expected_force"),
-    ((True, False), (False, True)),
-)
-async def test_projection_receipt_locks_sources_and_forces_stale_reimports(
-    monkeypatch,
-    current_projection_available,
-    expected_force,
-):
-    """Require locking before projection and full work for stale imports."""
-    events: list[str] = []
-
-    class FakeDB:
-        @asynccontextmanager
-        async def transaction(self):
-            yield
-
-        async def status(self, statement):
-            events.append(str(statement))
-            return 7 if "UPDATE fixture.stage AS target" in str(statement) else 0
-
-        async def scalar(self, statement):
-            statement = str(statement)
-            events.append(statement)
-            if statement.lstrip().startswith("SELECT EXISTS"):
-                return current_projection_available
-            if "SELECT COUNT(*)" in statement:
-                return 0
-            if "INSERT INTO fixture.entity_address_geo_assurance_state" in statement:
-                return 42
-            raise AssertionError(f"unexpected scalar SQL: {statement}")
-
-    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
-    monkeypatch.setattr(
-        entity_address_unified,
-        "_entity_address_sql_settings",
-        lambda: [("lock_timeout", "1s")],
-    )
-    progress = Mock()
-    monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", progress)
-    projection_context_by_field: dict = {}
-    assert await entity_address_unified._materialize_geo_assurance(
-        "fixture",
-        "stage",
-        force=False,
-        context=projection_context_by_field,
-        run_id="run-1",
-        stage_rows=7,
-    ) == 7
+def _assert_projection_receipt_order(events, projection_context_by_field, expected_force, progress):
+    """Keep lock ordering, complete work and row accounting assertions together."""
     settings_at = next(i for i, sql in enumerate(events) if "SET LOCAL lock_timeout" in sql)
     lock_at = next(i for i, sql in enumerate(events) if sql.startswith("LOCK TABLE"))
     update_sql = next(sql for sql in events if "UPDATE fixture.stage AS target" in sql)
@@ -93,6 +45,81 @@ async def test_projection_receipt_locks_sources_and_forces_stale_reimports(
     assert [call.kwargs["done"] for call in progress.call_args_list] == [0, 7]
     assert "row(s)" not in progress.call_args_list[0].kwargs["message"]
     assert "7 row(s)" in progress.call_args_list[1].kwargs["message"]
+
+
+def _receipt_database(current_projection_available, events):
+    """Keep transaction custody observable in the provider projection fixture."""
+
+    class FakeDB:
+        transaction_depth = 0
+
+        def _transaction_binding(self):
+            return self if self.transaction_depth else None
+
+        @asynccontextmanager
+        async def transaction(self):
+            self.transaction_depth += 1
+            try:
+                yield
+            finally:
+                self.transaction_depth -= 1
+
+        async def status(self, statement):
+            assert self._transaction_binding() is not None
+            events.append(str(statement))
+            return 7 if "UPDATE fixture.stage AS target" in str(statement) else 0
+
+        async def scalar(self, statement):
+            assert self._transaction_binding() is not None
+            statement = str(statement)
+            events.append(statement)
+            if statement.lstrip().startswith("SELECT EXISTS"):
+                return current_projection_available
+            if "SELECT COUNT(*)" in statement:
+                return 0
+            if "INSERT INTO fixture.entity_address_geo_assurance_state" in statement:
+                return 42
+            raise AssertionError(f"unexpected scalar SQL: {statement}")
+
+    return FakeDB()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("current_projection_available", "expected_force"),
+    ((True, False), (False, True)),
+)
+async def test_projection_receipt_locks_sources_and_forces_stale_reimports(
+    monkeypatch,
+    current_projection_available,
+    expected_force,
+):
+    """Require locking before projection and full work for stale imports."""
+    events: list[str] = []
+
+    database = _receipt_database(current_projection_available, events)
+    monkeypatch.setattr(entity_address_unified, "db", database)
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_entity_address_sql_settings",
+        lambda: [("lock_timeout", "1s")],
+    )
+    progress = Mock()
+    monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", progress)
+    projection_context_by_field: dict = {}
+    assert (
+        await entity_address_unified._materialize_geo_assurance(
+            "fixture",
+            "stage",
+            force=False,
+            context=projection_context_by_field,
+            run_id="run-1",
+            stage_rows=7,
+        )
+        == 7
+    )
+    assert database._transaction_binding() is None
+    _assert_projection_receipt_order(events, projection_context_by_field, expected_force, progress)
 
 
 @pytest.mark.asyncio
@@ -137,10 +164,13 @@ async def test_projection_stage_housekeeping_is_fail_closed(monkeypatch):
         "db",
         SimpleNamespace(status=status, execute_ddl=execute_ddl),
     )
-    assert await entity_address_unified._drop_stage_secondary_indexes(
-        FakeStage,
-        "fixture",
-    ) == 1
+    assert (
+        await entity_address_unified._drop_stage_secondary_indexes(
+            FakeStage,
+            "fixture",
+        )
+        == 1
+    )
     assert "DROP INDEX IF EXISTS fixture." in status.await_args.args[0]
 
     persistence = AsyncMock(side_effect=(None, "u", "p"))
@@ -175,9 +205,7 @@ async def test_projection_stage_housekeeping_is_fail_closed(monkeypatch):
         == "vacuum_full"
     )
     promote.assert_awaited_once_with("fixture", "entity_address_unified_stage")
-    execute_ddl.assert_awaited_once_with(
-        "VACUUM (FULL, ANALYZE) fixture.entity_address_unified_stage;"
-    )
+    execute_ddl.assert_awaited_once_with("VACUUM (FULL, ANALYZE) fixture.entity_address_unified_stage;")
 
 
 async def _activate_projection_state(database, schema: str, projected_rows: int) -> None:
@@ -201,10 +229,10 @@ async def _activate_projection_state(database, schema: str, projected_rows: int)
         )
     )
     assert active_oid == candidate_oid
-    assert await database.scalar(
-        f"SELECT candidate_table_oid IS NULL "
-        f"FROM {schema}.entity_address_geo_assurance_state"
-    ) is True
+    assert (
+        await database.scalar(f"SELECT candidate_table_oid IS NULL FROM {schema}.entity_address_geo_assurance_state")
+        is True
+    )
 
 
 def _runtime_assurance_sql(schema: str) -> tuple[str, str, str]:
@@ -233,8 +261,7 @@ async def _runtime_assurance(database, schema: str, sql: tuple[str, str, str]):
 
 async def _materialize_active_projection(database, schema: str) -> None:
     await database.status(
-        f"UPDATE {schema}.entity_address_unified "
-        "SET lat = 42.0, long = -83.0 WHERE location_key = 'nppes'"
+        f"UPDATE {schema}.entity_address_unified SET lat = 42.0, long = -83.0 WHERE location_key = 'nppes'"
     )
     materialize_sql = _schema_sql(
         entity_address_unified._materialize_geo_assurance_sql(
@@ -250,13 +277,8 @@ async def _materialize_active_projection(database, schema: str) -> None:
 
 async def _replace_npi_source_table(database, schema: str) -> None:
     await database.status(f"ALTER TABLE {schema}.npi_address RENAME TO npi_address_old")
-    await database.status(
-        f"CREATE TABLE {schema}.npi_address "
-        f"(LIKE {schema}.npi_address_old INCLUDING ALL)"
-    )
-    await database.status(
-        f"INSERT INTO {schema}.npi_address SELECT * FROM {schema}.npi_address_old"
-    )
+    await database.status(f"CREATE TABLE {schema}.npi_address (LIKE {schema}.npi_address_old INCLUDING ALL)")
+    await database.status(f"INSERT INTO {schema}.npi_address SELECT * FROM {schema}.npi_address_old")
 
 
 @pytest.mark.asyncio
@@ -279,16 +301,19 @@ async def test_reimport_invalidates_and_recovers_projection():
             False,
             False,
         )
-        assert await database.scalar(
-            _schema_sql(
-                entity_address_unified._record_geo_assurance_candidate_sql(
+        assert (
+            await database.scalar(
+                _schema_sql(
+                    entity_address_unified._record_geo_assurance_candidate_sql(
+                        schema,
+                        "entity_address_unified",
+                        5,
+                    ),
                     schema,
-                    "entity_address_unified",
-                    5,
-                ),
-                schema,
+                )
             )
-        ) is not None
+            is not None
+        )
 
         await _replace_npi_source_table(database, schema)
         assert await _runtime_assurance(database, schema, runtime_sql) == (
@@ -296,9 +321,7 @@ async def test_reimport_invalidates_and_recovers_projection():
             True,
             True,
         )
-        activation_sql = entity_address_unified._activate_geo_assurance_candidate_sql(
-            schema
-        )
+        activation_sql = entity_address_unified._activate_geo_assurance_candidate_sql(schema)
         assert await database.scalar(_schema_sql(activation_sql, schema)) is None
         await _materialize_active_projection(database, schema)
         assert await _runtime_assurance(database, schema, runtime_sql) == (
@@ -309,10 +332,7 @@ async def test_reimport_invalidates_and_recovers_projection():
 
 
 async def _fail_projection_validation(database, schema, _requested_schema, _table):
-    await database.status(
-        f"UPDATE {schema}.entity_address_geo_assurance_state "
-        "SET candidate_projected_rows = 777"
-    )
+    await database.status(f"UPDATE {schema}.entity_address_geo_assurance_state SET candidate_projected_rows = 777")
     raise RuntimeError("induced validation failure")
 
 
@@ -356,10 +376,7 @@ async def test_projection_validation_failure_rolls_back_cells_and_state(monkeypa
             f"INSERT INTO {schema}.entity_address_unified "
             "(location_key, type, checksum) VALUES ('rollback', 'practice', 1)"
         )
-        await database.status(
-            f"UPDATE {schema}.entity_address_geo_assurance_state "
-            "SET candidate_projected_rows = 99"
-        )
+        await database.status(f"UPDATE {schema}.entity_address_geo_assurance_state SET candidate_projected_rows = 99")
         _patch_failed_projection(monkeypatch, database, schema)
         with pytest.raises(RuntimeError, match="induced validation failure"):
             await entity_address_unified._materialize_geo_assurance(
@@ -371,14 +388,17 @@ async def test_projection_validation_failure_rolls_back_cells_and_state(monkeypa
                 stage_rows=1,
             )
 
-        assert await database.scalar(
-            f"SELECT geo_assurance_version IS NULL "
-            f"FROM {schema}.entity_address_unified WHERE location_key = 'rollback'"
-        ) is True
-        assert await database.scalar(
-            f"SELECT candidate_projected_rows "
-            f"FROM {schema}.entity_address_geo_assurance_state"
-        ) == 99
+        assert (
+            await database.scalar(
+                f"SELECT geo_assurance_version IS NULL "
+                f"FROM {schema}.entity_address_unified WHERE location_key = 'rollback'"
+            )
+            is True
+        )
+        assert (
+            await database.scalar(f"SELECT candidate_projected_rows FROM {schema}.entity_address_geo_assurance_state")
+            == 99
+        )
 
 
 async def _hold_projection_receipt_lock(
@@ -389,9 +409,7 @@ async def _hold_projection_receipt_lock(
     release_lock: asyncio.Event,
 ) -> None:
     async with database.transaction():
-        await database.status(
-            _schema_sql(projection.projection_dependency_lock_sql(schema), schema)
-        )
+        await database.status(_schema_sql(projection.projection_dependency_lock_sql(schema), schema))
         assert await database.scalar(candidate_sql) is not None
         lock_acquired.set()
         await release_lock.wait()
@@ -425,9 +443,7 @@ async def test_projection_receipt_lock_blocks_source_swap_and_stale_activation()
         publisher = Database()
         await publisher.connect()
         swap_task = asyncio.create_task(
-            publisher.status(
-                f"ALTER TABLE {schema}.npi_address RENAME TO npi_address_reimported"
-            )
+            publisher.status(f"ALTER TABLE {schema}.npi_address RENAME TO npi_address_reimported")
         )
         try:
             with pytest.raises(asyncio.TimeoutError):
@@ -435,9 +451,7 @@ async def test_projection_receipt_lock_blocks_source_swap_and_stale_activation()
             release_lock.set()
             await asyncio.wait_for(lock_task, timeout=2)
             await asyncio.wait_for(swap_task, timeout=2)
-            activation_sql = (
-                entity_address_unified._activate_geo_assurance_candidate_sql(schema)
-            )
+            activation_sql = entity_address_unified._activate_geo_assurance_candidate_sql(schema)
             assert await database.scalar(_schema_sql(activation_sql, schema)) is None
         finally:
             release_lock.set()

@@ -20,6 +20,7 @@ from api.ptg2_candidate_audit import PTG2_CANDIDATE_AUDIT_ACCESS_ARG, PTG2Candid
 from api.ptg2_v4_graph import V4GraphRoot
 from tests import ptg2_v3_audit_occurrences_support as audit_fixture
 from tests.ptg2_candidate_audit_batch_postgres_fixture import SOURCE_DIGEST, source_witness
+from tests.ptg2_manifest_tables_support import FakeSession, strict_serving_index, strict_snapshot_row
 from tests.test_ptg2_candidate_audit_batch_integrity import _persisted_audit_rows, _sample_serving_tables
 from tests.test_ptg2_physical_binding import _binding
 from tests.test_ptg2_v4_serving_exact_paths import _tables
@@ -419,3 +420,31 @@ async def test_optional_failures_preserve_outer_family_read_fence(query):
     assert events == ["family-read-locks", "savepoint", "savepoint-rollback"]
     session.rollback.assert_not_awaited()
     session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_published_loader_renders_each_selected_schema_after_import(monkeypatch):
+    """Schema selection stays fresh while the real strict loader verifies each row."""
+
+    class DatabaseSession(FakeSession):
+        sync_session = object()
+
+    session = DatabaseSession(
+        [None, strict_snapshot_row(strict_serving_index(41)), strict_snapshot_row(strict_serving_index(42))]
+    )
+    schemas = ("synthetic_initial", "synthetic_serving_a", "synthetic_serving_b")
+    monkeypatch.setattr(tables_module, "PTG2_SCHEMA", schemas[0])
+    with pytest.raises(tables_module.PTG2ManifestArtifactError, match="published.*sealed"):
+        await tables_module.snapshot_serving_tables(session, "strict-schema-runtime")
+    monkeypatch.setattr(tables_module, "PTG2_SCHEMA", schemas[1])
+    first = await tables_module.snapshot_serving_tables(session, "strict-schema-runtime")
+    monkeypatch.setattr(tables_module, "PTG2_SCHEMA", schemas[2])
+    second = await tables_module.snapshot_serving_tables(session, "strict-schema-runtime")
+    assert (first.shared_snapshot_key, second.shared_snapshot_key) == (41, 42)
+    assert len(session.calls) == 3
+    for invocation, schema in zip(session.calls, schemas):
+        statement = str(invocation[0][0])
+        assert f"FROM {schema}.ptg2_snapshot snapshot" in statement
+        assert f"JOIN {schema}.ptg2_v3_snapshot_layout layout" in statement
+        assert "snapshot.status = 'published'" in statement
+        assert "attestation.activated_at IS NOT NULL" in statement

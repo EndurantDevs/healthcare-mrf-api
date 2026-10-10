@@ -154,6 +154,14 @@ async def _availability(session, schema, expected, address):
             )
         )
     available_by_name.update({name: True for name in _native().PROVIDER_DIRECTORY_DATASET_FENCE_TABLES})
+    from process.provider_directory_cms_typed_offices import CMS_OFFICE_READ_TABLES
+
+    available_by_name.update(
+        {
+            name: expected["native_input_fence"]["cms_office_read_relations"][name]["relation_oid"] is not None
+            for name in CMS_OFFICE_READ_TABLES
+        }
+    )
     return available_by_name
 
 

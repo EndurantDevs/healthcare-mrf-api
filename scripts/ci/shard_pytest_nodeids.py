@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-
 TEST_PROCESS_TIMEOUT_SECONDS = "295s"
 
 
@@ -38,17 +37,13 @@ def pytest_collection_modifyitems(config, items) -> None:
     if not selected_ids:
         raise pytest.UsageError("selected shard has no node IDs")
     config.hook.pytest_deselected(items=[item for item in items if item.nodeid not in selected_ids])
-    items[:] = sorted(
-        (item for item in items if item.nodeid in selected_ids), key=lambda item: item.nodeid
-    )
+    items[:] = sorted((item for item in items if item.nodeid in selected_ids), key=lambda item: item.nodeid)
 
 
 def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse and validate one deterministic shard request."""
 
-    parser = argparse.ArgumentParser(
-        description="Collect pytest node IDs and write one deterministic shard."
-    )
+    parser = argparse.ArgumentParser(description="Collect pytest node IDs and write one deterministic shard.")
     parser.add_argument("--shard-count", type=int, required=True)
     parser.add_argument("--shard-index", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -88,11 +83,7 @@ def collect_nodeids(pytest_arguments: Sequence[str]) -> list[str]:
         capture_output=True,
         text=True,
     )
-    nodeids = sorted(
-        line
-        for line in completed.stdout.splitlines()
-        if line.startswith("tests/") and "::" in line
-    )
+    nodeids = sorted(line for line in completed.stdout.splitlines() if line.startswith("tests/") and "::" in line)
     if not nodeids:
         raise ValueError("pytest collection returned no node IDs")
     if len(nodeids) != len(set(nodeids)):
@@ -104,7 +95,32 @@ def shard_index_for_nodeid(nodeid: str, shard_count: int) -> int:
     """Map one node ID to a stable shard index."""
 
     digest = hashlib.sha256(nodeid.encode("utf-8")).digest()
-    return int.from_bytes(digest, byteorder="big") % shard_count
+    shard_index = int.from_bytes(digest, byteorder="big") % shard_count
+    if shard_count == 8:
+        # Balance expensive proofs without changing the remaining hash assignment.
+        if nodeid == (
+            "tests/test_network_cms_registry_complete_publication_postgres.py"
+            "::test_complete_publication_and_retained_pair"
+        ):
+            return 2
+        if nodeid == (
+            "tests/test_registry_approval_preview_postgres.py"
+            "::test_complete_imported_counts_above_copy_page[rebind-1-10000-0]"
+        ):
+            return 6
+        if shard_index == 2 and nodeid.split("::", 1)[0] in (
+            "tests/test_registry_publication_execution_postgres.py",
+            "tests/test_provider_directory_cms_resource_batch_postgres.py",
+            "tests/test_network_registry_cms_prepared_cleanup_postgres.py",
+            "tests/test_registry_source_recipe_composition_postgres.py",
+        ):
+            return 7
+        if shard_index == 6 and nodeid.split("::", 1)[0] in (
+            "tests/test_network_registry_cms_prepared_pair_postgres.py",
+            "tests/test_cms_publication_source_session_postgres.py",
+        ):
+            return 5
+    return shard_index
 
 
 def select_nodeids(
@@ -115,11 +131,7 @@ def select_nodeids(
 ) -> list[str]:
     """Return the sorted node IDs assigned to one shard."""
 
-    return [
-        nodeid
-        for nodeid in sorted(nodeids)
-        if shard_index_for_nodeid(nodeid, shard_count) == shard_index
-    ]
+    return [nodeid for nodeid in sorted(nodeids) if shard_index_for_nodeid(nodeid, shard_count) == shard_index]
 
 
 def write_nodeids(output: Path, nodeids: Sequence[str]) -> None:

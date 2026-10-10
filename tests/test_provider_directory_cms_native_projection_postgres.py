@@ -45,9 +45,9 @@ async def _seed_sources(database, schema):
     await database.status(f"""INSERT INTO {schema}.desired_overlay
         (source_id,last_seen_run_id,resource_type,resource_id,npi,first_line,city_name,state_name,
          postal_code,country_code,telephone_number,source_record_id)
-        VALUES ('cms-npd','desired-root','Organization','desired',1000000004,'  20 Second Road  ',
+        VALUES ('synthetic-source','desired-root','Organization','desired',1000000004,'  20 Second Road  ',
                 'Example','CA','90001','US','202-555-0101','cms:desired'),
-               ('cms-npd','old-root','Organization','old',1000000004,'Excluded',
+               ('synthetic-source','old-root','Organization','old',1000000004,'Excluded',
                 'Example','CA','90001','US',NULL,'cms:old')""")
     await database.status(f"""CREATE TABLE {schema}.provider_directory_endpoint_dataset (
         endpoint_id text,dataset_id text,dataset_hash text,acquisition_root_run_id text,
@@ -56,7 +56,7 @@ async def _seed_sources(database, schema):
     await database.status(
         f"""INSERT INTO {schema}.provider_directory_endpoint_dataset VALUES
         ('cms-endpoint','desired-dataset',:hash,'desired-root',now(),NULL,NULL,'validated',false,
-         '{{"source_ids":["cms-npd"]}}')""",
+         '{{"source_ids":["synthetic-source"]}}')""",
         hash="a" * 64,
     )
     await database.status(
@@ -72,7 +72,11 @@ async def _inputs(database, schema):
     """Use a real physical overlay only to compare virtual and ordinary builder SQL."""
     oid = await database.scalar("SELECT to_regclass(:name)::oid::bigint", name=f"{schema}.desired_overlay")
     return ProviderDirectoryAddressPreparationInput(
-        (ProviderDirectoryAddressDatasetPin("cms-npd", "cms-endpoint", "desired-dataset", "a" * 64, "desired-root"),),
+        (
+            ProviderDirectoryAddressDatasetPin(
+                "synthetic-source", "cms-endpoint", "desired-dataset", "a" * 64, "desired-root"
+            ),
+        ),
         "desired_overlay",
         oid,
         1,

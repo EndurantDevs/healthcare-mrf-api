@@ -190,6 +190,9 @@ def _resume_backend(admission, identity):
 
     return SimpleNamespace(
         db=SimpleNamespace(transaction=transaction),
+        ProviderDirectorySource=fhir.ProviderDirectorySource,
+        RESOURCE_MODELS=fhir.RESOURCE_MODELS,
+        _provider_directory_artifact_relation_scope=fhir._provider_directory_artifact_relation_scope,
         _profile_admission_identity=AsyncMock(return_value=identity),
         _profile_admission_workload=AsyncMock(return_value="workload"),
         _profile_admission_inputs=lambda *args: "inputs",

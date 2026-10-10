@@ -82,7 +82,10 @@ async def read_native_batch(request, batch_params, *, native_args, session, impo
     state = await _prepare_native_batch(params["npis"], native_args, session, import_context=import_context)
     state = _filter_batch_address_state(state, native_args)
     found_npis = [
-        identity for identity in params["npis"] if state.details.get(identity) is not None or state.addresses[identity]
+        identity
+        for identity in params["npis"]
+        if state.addresses[identity]
+        or (npi.current_network_address_scope() is None and state.details.get(identity) is not None)
     ]
     witness_by_npi = {}
     eligible_npis = await _batch_eligible_npis(
@@ -131,7 +134,11 @@ async def _prepare_native_batch(npis, native_args, session, *, import_context=No
             ),
         )
     base = await npi._fetch_npi_location_candidates_map(npis, session=session)
-    overlays = await npi._fetch_provider_directory_address_overlay_map(npis, session=session)
+    overlays = (
+        {}
+        if npi.current_network_address_scope() is not None
+        else await npi._fetch_provider_directory_address_overlay_map(npis, session=session)
+    )
     await npi._apply_location_statuses(
         [address for identity in npis for address in base.get(identity, ())],
         session=session,

@@ -190,7 +190,7 @@ async def test_denied_actual_backend_limit_stops_heavy_work(monkeypatch, worker)
         ctx, inputs, admission, _states = await _admitted_fixture(database, schema, monkeypatch)
         _deny_temp_setting(monkeypatch, database)
         if worker == "logging":
-            with pytest.raises(RuntimeError, match="executing-session settings changed"):
+            with pytest.raises(RuntimeError, match="permission denied to set parameter"):
                 await _prepare(ctx, inputs, admission)
         else:
             await _assert_denied_worker(database, schema, admission, worker)
@@ -202,7 +202,8 @@ async def _assert_denied_worker(database, schema, admission, worker):
     """Reject a skipped signed bound before the pooled, borrowed, or projection SQL executes."""
     token = admitted._ADMISSION.set(admitted._admitted_preparation(admission, _INPUT_HASH))
     try:
-        with pytest.raises(RuntimeError, match="executing-session settings changed"):
+        expected = "permission denied to set parameter" if worker == "bound" else "executing-session settings changed"
+        with pytest.raises(RuntimeError, match=expected):
             await _run_worker(database, schema, worker)
     finally:
         admitted._ADMISSION.reset(token)

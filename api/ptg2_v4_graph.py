@@ -228,6 +228,7 @@ class _CachedPhysicalBlock:
 
 @dataclass
 class _V4GraphRequestIO:
+    read_budget: Any = None
     database_bytes: int = 0
     database_blocks: int = 0
     cache_hit_bytes: int = 0
@@ -533,14 +534,16 @@ _ACTIVE_V4_TAXONOMY_WORK: ContextVar[_V4TaxonomyProjectionWork | None] = Context
 
 
 @contextmanager
-def v4_graph_request_scope() -> Iterator[_V4GraphRequestIO]:
+def v4_graph_request_scope(*, read_budget=None) -> Iterator[_V4GraphRequestIO]:
     """Aggregate all V4 graph reads into one API-request metric observation."""
 
     active = _ACTIVE_V4_GRAPH_REQUEST_IO.get()
     if active is not None:
+        if read_budget is not None and active.read_budget is not read_budget:
+            raise PTG2SharedBlockError("PTG V4 graph read budget changed")
         yield active
         return
-    request_io = _V4GraphRequestIO()
+    request_io = _V4GraphRequestIO(read_budget=read_budget)
     token = _ACTIVE_V4_GRAPH_REQUEST_IO.set(request_io)
     try:
         yield request_io
@@ -1323,6 +1326,9 @@ async def _load_map_coordinate_pairs(
 
     cache_scope = _graph_cache_scope(session, schema_name)
     requested_pairs = _normalized_map_coordinate_pairs(coordinate_pairs)
+    budget = getattr(_ACTIVE_V4_GRAPH_REQUEST_IO.get(), "read_budget", None)
+    if budget is not None:
+        budget.reserve([], len(requested_pairs))
     coordinates_by_pair, missing_pairs = _cached_map_coordinate_pairs(
         schema_name=cache_scope,
         snapshot_key=int(snapshot_key),
@@ -1393,52 +1399,16 @@ def _cached_map_coordinate_pairs(
     return coordinates_by_pair, missing_pairs
 
 
-async def _query_v4_map_packs(
-    session: Any,
-    *,
-    schema_name: str,
-    snapshot_key: int,
-    object_kind: str,
-    missing_pairs: list[tuple[int, int]],
-) -> Any:
-    return await session.execute(
-        text(
-            f"""
-            SELECT pack.pack_no, pack.first_block_key, pack.first_fragment_no,
-                   pack.last_block_key, pack.last_fragment_no,
-                   pack.coordinate_count, pack.map_block_hash AS block_hash,
-                   block.format_version, block.object_kind, block.codec,
-                   block.entry_count AS block_entry_count,
-                   block.raw_byte_count, block.stored_byte_count, block.payload
-              FROM {snapshot_candidate_relation(session, _quote_ident(schema_name), "ptg2_v4_snapshot_map_pack")} AS pack
-              JOIN {_quote_ident(schema_name)}.ptg2_v3_block AS block
-                ON block.block_hash = pack.map_block_hash
-             WHERE pack.snapshot_key = :snapshot_key
-               AND pack.object_kind = :object_kind
-               AND EXISTS (
-                   SELECT 1
-                     FROM unnest(
-                              CAST(:block_keys AS bigint[]),
-                              CAST(:fragment_nos AS integer[])
-                          ) AS wanted(block_key, fragment_no)
-                    WHERE ROW(wanted.block_key, wanted.fragment_no)
-                          BETWEEN ROW(
-                              pack.first_block_key,
-                              pack.first_fragment_no
-                          ) AND ROW(
-                              pack.last_block_key,
-                              pack.last_fragment_no
-                          )
-               )
-             ORDER BY pack.pack_no
-            """
-        ),
-        {
-            "snapshot_key": snapshot_key,
-            "object_kind": object_kind,
-            "block_keys": [pair[0] for pair in missing_pairs],
-            "fragment_nos": [pair[1] for pair in missing_pairs],
-        },
+async def _query_v4_map_packs(session, *, schema_name, snapshot_key, object_kind, missing_pairs):
+    from process.registry_ptg_graph_payload_read import query_v4_map_packs
+
+    return await query_v4_map_packs(
+        session,
+        schema_name=schema_name,
+        snapshot_key=snapshot_key,
+        object_kind=object_kind,
+        missing_pairs=missing_pairs,
+        budget=getattr(_ACTIVE_V4_GRAPH_REQUEST_IO.get(), "read_budget", None),
     )
 
 
@@ -1550,6 +1520,8 @@ def _cached_physical_blocks(
             continue
         if cached.object_kind != object_kind or cached.entry_count != int(coordinate.entry_count):
             raise PTG2SharedBlockError("PTG V4 cached block identity is inconsistent")
+        if _request_io().read_budget is not None:
+            _request_io().read_budget.reserve([{"raw_byte_count": len(cached.payload)}])
         blocks_by_hash[block_hash] = cached
         _request_io().cache_hit_bytes += len(cached.payload)
     return blocks_by_hash, missing_hashes
@@ -1565,18 +1537,26 @@ async def _fetch_missing_physical_blocks(
     missing_hashes: list[bytes],
 ) -> None:
     schema = _quote_ident(schema_name)
+    budget = _request_io().read_budget
+    payload_expression = "payload" if budget is None else "octet_length(payload) AS payload_byte_count"
     query_result = await session.execute(
         text(
             f"""
             SELECT block_hash, format_version, object_kind, codec,
                    entry_count AS block_entry_count,
-                   raw_byte_count, stored_byte_count, payload
+                   raw_byte_count, stored_byte_count, {payload_expression}
               FROM {schema}.ptg2_v3_block
              WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))
             """
         ),
         {"block_hashes": missing_hashes},
     )
+    if budget is not None:
+        from process.registry_ptg_graph_payload_read import budgeted_graph_payloads
+
+        query_result = await budgeted_graph_payloads(
+            session, query_result, schema_name, budget, object_kind, maximum_raw_bytes
+        )
     for raw_row in query_result:
         block_row = _row_mapping(raw_row)
         physical = _validated_physical_block(
@@ -1774,6 +1754,11 @@ async def _load_v4_heavy_bitmap_payloads(
 
     if not heavy_owners:
         return {}
+    budget = getattr(_ACTIVE_V4_GRAPH_REQUEST_IO.get(), "read_budget", None)
+    if budget is not None and sum(owner.fragment_count for owner in heavy_owners.values()) > min(
+        budget.maximum_pages - budget.read_pages, budget.maximum_coordinates - budget.coordinates
+    ):
+        raise PTG2SharedBlockError("PTG V4 graph selection exceeds the read budget")
     coordinate_pairs = [
         (owner.owner_key, fragment_no) for owner in heavy_owners.values() for fragment_no in range(owner.fragment_count)
     ]

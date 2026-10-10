@@ -12,6 +12,7 @@ from typing import Any
 from sqlalchemy import text
 
 from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
+from api.ptg2_descriptor import _serving_tables_descriptor
 from api.ptg2_serving_utils import ein_plan_id_variants
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
@@ -74,6 +75,88 @@ def local_physical_binding_declared_sql(snapshot_alias: str, layout_alias: str) 
         OR {snapshot_alias}.manifest::jsonb ? 'local_data_preparation'
     )"""
 
+
+_PUBLISHED_SNAPSHOT_SQL = f"""
+            SELECT layout.layout_manifest->'serving_index'
+                       AS layout_serving_index,
+                   {local_physical_binding_declared_sql("snapshot", "layout")}
+                       AS has_local_physical_binding,
+                   snapshot.manifest->'serving_index'->'source_set'
+                       AS snapshot_source_set,
+                   binding.snapshot_key AS bound_snapshot_key,
+                   snapshot_scope.plan_id AS snapshot_plan_id,
+                   snapshot_scope.plan_market_type AS snapshot_plan_market_type,
+                   encode(snapshot_scope.coverage_scope_id, 'hex')
+                       AS snapshot_coverage_scope_id,
+                   attestation.source_key AS attested_source_key,
+                   encode(attestation.coverage_scope_id, 'hex')
+                       AS attested_coverage_scope_id,
+                   encode(attestation.source_set_digest, 'hex')
+                       AS attested_source_set_digest,
+                   encode(attestation.audit_sample_digest, 'hex')
+                       AS attested_audit_sample_digest,
+                   source_summary.source_row_count,
+                   source_summary.distinct_source_key_count,
+                   source_summary.minimum_source_key,
+                   source_summary.maximum_source_key,
+                   source_summary.source_identity_rows,
+                   current_setting('server_version_num')::integer
+                       AS postgres_server_version_num,
+                   current_database() IS NOT NULL AS database_selected,
+                   pg_backend_pid() > 0 AS backend_session_active,
+                   txid_current_snapshot() IS NOT NULL
+                       AS transaction_snapshot_observed
+              FROM __PTG2_SCHEMA__.ptg2_snapshot snapshot
+              JOIN __PTG2_SCHEMA__.ptg2_v3_snapshot_binding binding
+                ON binding.snapshot_id = snapshot.snapshot_id
+              JOIN __PTG2_SCHEMA__.ptg2_v3_snapshot_layout layout
+                ON layout.snapshot_key = binding.snapshot_key
+              JOIN __PTG2_SCHEMA__.ptg2_v3_snapshot_scope snapshot_scope
+                ON snapshot_scope.snapshot_id = snapshot.snapshot_id
+              JOIN __PTG2_SCHEMA__.ptg2_v3_candidate_audit_attestation attestation
+                ON attestation.snapshot_id = snapshot.snapshot_id
+               AND attestation.snapshot_key = binding.snapshot_key
+               AND attestation.coverage_scope_id
+                   = snapshot_scope.coverage_scope_id
+              CROSS JOIN LATERAL (
+                  SELECT COUNT(*)::bigint AS source_row_count,
+                         COUNT(DISTINCT source.source_key)::bigint
+                             AS distinct_source_key_count,
+                         MIN(source.source_key) AS minimum_source_key,
+                         MAX(source.source_key) AS maximum_source_key,
+                         JSON_AGG(
+                             JSON_BUILD_OBJECT(
+                                 'source_key', source.source_key,
+                                 'source_type', source.source_type,
+                                 'identity_kind', source.identity_kind,
+                                 'identity_sha256', source.identity_sha256,
+                                 'raw_container_sha256',
+                                     source.raw_container_sha256,
+                                 'logical_json_sha256',
+                                     source.logical_json_sha256,
+                                 'logical_hash_deferred',
+                                     source.logical_hash_deferred,
+                                 'source_trace_set_hash',
+                                     source.source_trace_set_hash
+                             )
+                             ORDER BY source.source_key
+                         ) AS source_identity_rows
+                    FROM __PTG2_SCHEMA__.ptg2_v3_snapshot_source source
+                   WHERE source.snapshot_id = snapshot.snapshot_id
+              ) source_summary
+             WHERE snapshot.snapshot_id = :snapshot_id
+               AND snapshot.status = 'published'
+               AND layout.state = 'sealed'
+               AND layout.generation = ANY(CAST(:storage_generations AS text[]))
+               AND attestation.contract = ANY(
+                   CAST(:attestation_contracts AS text[])
+               )
+               AND attestation.activated_at IS NOT NULL
+               AND attestation.plan_id = snapshot_scope.plan_id
+               AND attestation.plan_market_type
+                   = snapshot_scope.plan_market_type
+             LIMIT 1
+        """
 
 PTG2_V3_ARCH_VERSION = "postgres_binary_v3"
 PTG2_V3_STORAGE_TYPE = "ptg2_shared_blocks_v3"
@@ -856,23 +939,17 @@ def _strict_v3_manifest_fields(
     )
 
 
-async def _load_v4_provider_graph_root(
-    session: Any,
-    *,
-    snapshot_key: int,
-    physical_binding=None,
-) -> dict[str, Any]:
-    schema_name = PTG2_SCHEMA if physical_binding is None else physical_binding.schema_name
+def _v4_provider_graph_root_sql(schema_name):
     persisted_columns = ", ".join(
-        f"diagnostic.{field_name}"
-        for field_name in (
-            *PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
-            *PTG2_V4_GRAPH_RESOURCE_FIELDS,
+        (
+            f"diagnostic.{field_name}"
+            for field_name in (
+                *PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
+                *PTG2_V4_GRAPH_RESOURCE_FIELDS,
+            )
         )
     )
-    root_query_result = await session.execute(
-        text(
-            f"""
+    return f"""
             SELECT root.representation, root.map_format,
                    root.projection_id_scope,
                    encode(root.map_digest, 'hex') AS map_digest,
@@ -888,7 +965,17 @@ async def _load_v4_provider_graph_root(
                AND layout.state = 'sealed'
                AND layout.generation = :storage_generation
             """
-        ),
+
+
+async def _load_v4_provider_graph_root(
+    session: Any,
+    *,
+    snapshot_key: int,
+    physical_binding=None,
+) -> dict[str, Any]:
+    schema_name = PTG2_SCHEMA if physical_binding is None else physical_binding.schema_name
+    root_query_result = await session.execute(
+        text(_v4_provider_graph_root_sql(schema_name)),
         {
             "snapshot_key": int(snapshot_key),
             "storage_generation": PTG2_V4_SHARED_GENERATION,
@@ -991,6 +1078,78 @@ async def read_serving_tables(
     ):
         raise PTG2ManifestArtifactError("PTG snapshot-local physical read changed")
     return resolved
+
+
+def _validated_published_source_fields(row_fields, source_count):
+    """Validate the complete dense source dictionary and original attestation."""
+    source_row_count = _optional_integer(row_fields.get("source_row_count"))
+    distinct_source_key_count = _optional_integer(row_fields.get("distinct_source_key_count"))
+    minimum_source_key = _optional_integer(row_fields.get("minimum_source_key"))
+    maximum_source_key = _optional_integer(row_fields.get("maximum_source_key"))
+    if (
+        source_count is None
+        or source_count <= 0
+        or source_row_count != source_count
+        or distinct_source_key_count != source_count
+        or minimum_source_key != 0
+        or maximum_source_key != source_count - 1
+    ):
+        raise PTG2ManifestArtifactError("PTG2 published source dictionary is not complete and dense")
+    snapshot_source_set = row_fields.get("snapshot_source_set")
+    if isinstance(snapshot_source_set, str):
+        try:
+            snapshot_source_set = json.loads(snapshot_source_set)
+        except json.JSONDecodeError as exc:
+            raise PTG2ManifestArtifactError("PTG2 published snapshot source set is malformed") from exc
+    manifest_source_set = _strict_v3_source_set(
+        {"source_set": snapshot_source_set},
+        source_count=source_count,
+    )
+    if manifest_source_set is None:
+        raise PTG2ManifestArtifactError("PTG2 published source set is missing from its snapshot manifest")
+    source_set_by_field = _validated_published_source_set(
+        row_fields.get("source_identity_rows"),
+        expected_source_count=source_count,
+    )
+    attested_source_set_digest = str(row_fields.get("attested_source_set_digest") or "")
+    if (
+        manifest_source_set != source_set_by_field
+        or attested_source_set_digest != source_set_by_field["raw_container_sha256_digest"]
+    ):
+        raise PTG2ManifestArtifactError("PTG2 published source set does not match its manifest and attestation")
+    source_key = str(row_fields.get("attested_source_key") or "").strip() or None
+    if source_key is None:
+        raise PTG2ManifestArtifactError("PTG2 published source key is missing from its attestation")
+    return source_set_by_field, source_key
+
+
+def _validated_published_snapshot_fields(
+    row_fields,
+    *,
+    shared_snapshot_key,
+    physical_binding,
+    coverage_scope_id,
+    audit_sample,
+    source_count,
+    code_count,
+):
+    """Reuse the exact published layout, scope, audit and source row checks."""
+    bound_snapshot_key = _optional_integer(row_fields.get("bound_snapshot_key"))
+    if bound_snapshot_key != (
+        shared_snapshot_key if physical_binding is None else physical_binding.destination_layout_key
+    ):
+        raise PTG2ManifestArtifactError("PTG2 sealed layout binding does not match its metadata")
+    if (
+        str(row_fields.get("snapshot_coverage_scope_id") or "") != coverage_scope_id
+        or str(row_fields.get("attested_coverage_scope_id") or "") != coverage_scope_id
+    ):
+        raise PTG2ManifestArtifactError("PTG2 published scope does not match its sealed layout")
+    if str(row_fields.get("attested_audit_sample_digest") or "") != str(audit_sample.get("sample_digest") or ""):
+        raise PTG2ManifestArtifactError("PTG2 published audit attestation does not match its sealed sample")
+    source_set_by_field, source_key = _validated_published_source_fields(row_fields, source_count)
+    if code_count is None or code_count < 0:
+        raise PTG2ManifestArtifactError("PTG2 sealed layout code count is invalid")
+    return source_set_by_field, source_key
 
 
 async def snapshot_serving_tables(
@@ -1102,87 +1261,7 @@ async def snapshot_serving_tables(
         """
     else:
         query_params_by_name["attestation_contracts"] = list(PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS)
-        query_sql = f"""
-            SELECT layout.layout_manifest->'serving_index'
-                       AS layout_serving_index,
-                   {local_physical_binding_declared_sql("snapshot", "layout")}
-                       AS has_local_physical_binding,
-                   snapshot.manifest->'serving_index'->'source_set'
-                       AS snapshot_source_set,
-                   binding.snapshot_key AS bound_snapshot_key,
-                   snapshot_scope.plan_id AS snapshot_plan_id,
-                   snapshot_scope.plan_market_type AS snapshot_plan_market_type,
-                   encode(snapshot_scope.coverage_scope_id, 'hex')
-                       AS snapshot_coverage_scope_id,
-                   attestation.source_key AS attested_source_key,
-                   encode(attestation.coverage_scope_id, 'hex')
-                       AS attested_coverage_scope_id,
-                   encode(attestation.source_set_digest, 'hex')
-                       AS attested_source_set_digest,
-                   encode(attestation.audit_sample_digest, 'hex')
-                       AS attested_audit_sample_digest,
-                   source_summary.source_row_count,
-                   source_summary.distinct_source_key_count,
-                   source_summary.minimum_source_key,
-                   source_summary.maximum_source_key,
-                   source_summary.source_identity_rows,
-                   current_setting('server_version_num')::integer
-                       AS postgres_server_version_num,
-                   current_database() IS NOT NULL AS database_selected,
-                   pg_backend_pid() > 0 AS backend_session_active,
-                   txid_current_snapshot() IS NOT NULL
-                       AS transaction_snapshot_observed
-              FROM {PTG2_SCHEMA}.ptg2_snapshot snapshot
-              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_binding binding
-                ON binding.snapshot_id = snapshot.snapshot_id
-              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_layout layout
-                ON layout.snapshot_key = binding.snapshot_key
-              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_scope snapshot_scope
-                ON snapshot_scope.snapshot_id = snapshot.snapshot_id
-              JOIN {PTG2_SCHEMA}.ptg2_v3_candidate_audit_attestation attestation
-                ON attestation.snapshot_id = snapshot.snapshot_id
-               AND attestation.snapshot_key = binding.snapshot_key
-               AND attestation.coverage_scope_id
-                   = snapshot_scope.coverage_scope_id
-              CROSS JOIN LATERAL (
-                  SELECT COUNT(*)::bigint AS source_row_count,
-                         COUNT(DISTINCT source.source_key)::bigint
-                             AS distinct_source_key_count,
-                         MIN(source.source_key) AS minimum_source_key,
-                         MAX(source.source_key) AS maximum_source_key,
-                         JSON_AGG(
-                             JSON_BUILD_OBJECT(
-                                 'source_key', source.source_key,
-                                 'source_type', source.source_type,
-                                 'identity_kind', source.identity_kind,
-                                 'identity_sha256', source.identity_sha256,
-                                 'raw_container_sha256',
-                                     source.raw_container_sha256,
-                                 'logical_json_sha256',
-                                     source.logical_json_sha256,
-                                 'logical_hash_deferred',
-                                     source.logical_hash_deferred,
-                                 'source_trace_set_hash',
-                                     source.source_trace_set_hash
-                             )
-                             ORDER BY source.source_key
-                         ) AS source_identity_rows
-                    FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_source source
-                   WHERE source.snapshot_id = snapshot.snapshot_id
-              ) source_summary
-             WHERE snapshot.snapshot_id = :snapshot_id
-               AND snapshot.status = 'published'
-               AND layout.state = 'sealed'
-               AND layout.generation = ANY(CAST(:storage_generations AS text[]))
-               AND attestation.contract = ANY(
-                   CAST(:attestation_contracts AS text[])
-               )
-               AND attestation.activated_at IS NOT NULL
-               AND attestation.plan_id = snapshot_scope.plan_id
-               AND attestation.plan_market_type
-                   = snapshot_scope.plan_market_type
-             LIMIT 1
-        """
+        query_sql = _PUBLISHED_SNAPSHOT_SQL.replace("__PTG2_SCHEMA__", PTG2_SCHEMA)
     snapshot_query = await session.execute(
         text(query_sql),
         query_params_by_name,
@@ -1194,11 +1273,16 @@ async def snapshot_serving_tables(
     physical_binding = None
     if row_fields.get("has_local_physical_binding"):
         from process.ptg_parts.ptg2_physical_binding import PTG2PhysicalBindingError
-        from process.ptg_parts.result_archive_candidate_validation import local_data_serving_row
+        from process.ptg_parts.result_archive_candidate_validation import (
+            local_data_serving_row,
+        )
 
         try:
             row_fields, physical_binding = await local_data_serving_row(
-                session, str(snapshot_id), dict(row_fields), is_prepared=candidate_audit_access is not None
+                session,
+                str(snapshot_id),
+                dict(row_fields),
+                is_prepared=candidate_audit_access is not None,
             )
         except PTG2PhysicalBindingError as error:
             raise PTG2ManifestArtifactError("PTG snapshot-local physical binding is not available") from error
@@ -1289,149 +1373,36 @@ async def snapshot_serving_tables(
         if source_key != candidate_audit_access.source_key:
             raise PTG2ManifestArtifactError("PTG2 candidate source does not match its snapshot manifest")
     else:
-        bound_snapshot_key = _optional_integer(row_fields.get("bound_snapshot_key"))
-        if bound_snapshot_key != (
-            shared_snapshot_key if physical_binding is None else physical_binding.destination_layout_key
-        ):
-            raise PTG2ManifestArtifactError("PTG2 sealed layout binding does not match its metadata")
-        if (
-            str(row_fields.get("snapshot_coverage_scope_id") or "") != coverage_scope_id
-            or str(row_fields.get("attested_coverage_scope_id") or "") != coverage_scope_id
-        ):
-            raise PTG2ManifestArtifactError("PTG2 published scope does not match its sealed layout")
-        if str(row_fields.get("attested_audit_sample_digest") or "") != str(audit_sample.get("sample_digest") or ""):
-            raise PTG2ManifestArtifactError("PTG2 published audit attestation does not match its sealed sample")
-        source_row_count = _optional_integer(row_fields.get("source_row_count"))
-        distinct_source_key_count = _optional_integer(row_fields.get("distinct_source_key_count"))
-        minimum_source_key = _optional_integer(row_fields.get("minimum_source_key"))
-        maximum_source_key = _optional_integer(row_fields.get("maximum_source_key"))
-        if (
-            source_count is None
-            or source_count <= 0
-            or source_row_count != source_count
-            or distinct_source_key_count != source_count
-            or minimum_source_key != 0
-            or maximum_source_key != source_count - 1
-        ):
-            raise PTG2ManifestArtifactError("PTG2 published source dictionary is not complete and dense")
-        snapshot_source_set = row_fields.get("snapshot_source_set")
-        if isinstance(snapshot_source_set, str):
-            try:
-                snapshot_source_set = json.loads(snapshot_source_set)
-            except json.JSONDecodeError as exc:
-                raise PTG2ManifestArtifactError("PTG2 published snapshot source set is malformed") from exc
-        manifest_source_set = _strict_v3_source_set(
-            {"source_set": snapshot_source_set},
+        source_set_by_field, source_key = _validated_published_snapshot_fields(
+            row_fields,
+            shared_snapshot_key=shared_snapshot_key,
+            physical_binding=physical_binding,
+            coverage_scope_id=coverage_scope_id,
+            audit_sample=audit_sample,
             source_count=source_count,
+            code_count=code_count,
         )
-        if manifest_source_set is None:
-            raise PTG2ManifestArtifactError("PTG2 published source set is missing from its snapshot manifest")
-        source_set_by_field = _validated_published_source_set(
-            row_fields.get("source_identity_rows"),
-            expected_source_count=source_count,
-        )
-        attested_source_set_digest = str(row_fields.get("attested_source_set_digest") or "")
-        if (
-            manifest_source_set != source_set_by_field
-            or attested_source_set_digest != source_set_by_field["raw_container_sha256_digest"]
-        ):
-            raise PTG2ManifestArtifactError("PTG2 published source set does not match its manifest and attestation")
-        source_key = str(row_fields.get("attested_source_key") or "").strip() or None
-        if source_key is None:
-            raise PTG2ManifestArtifactError("PTG2 published source key is missing from its attestation")
-        if code_count is None or code_count < 0:
-            raise PTG2ManifestArtifactError("PTG2 sealed layout code count is invalid")
     serving_rate_count = _optional_integer(serving_index.get("serving_rates"))
     if code_count == 0 and serving_rate_count is not None and serving_rate_count > 0:
         raise PTG2ManifestArtifactError("PTG2 shared layout is missing code metadata for a non-empty snapshot")
-    network_names = serving_index.get("network_names")
-    provider_graph_v4_hot_prefix_by_field: dict[str, Any] | None = None
-    provider_graph_v4_inferred_taxonomy_candidates: dict[str, Any] | None = None
-    provider_tax_identity_source_publication = None
-    if storage_generation == PTG2_V4_SHARED_GENERATION:
-        serving_binary = serving_index.get("serving_binary")
-        provider_graph = serving_binary.get("provider_graph_v4") if isinstance(serving_binary, dict) else None
-        raw_hot_prefix = provider_graph.get("hot_prefix") if isinstance(provider_graph, dict) else None
-        if not _has_valid_v4_manifest(
-            raw_hot_prefix,
-            representation=str(provider_graph.get("representation") or "").strip().lower(),
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 V4 snapshot is missing sealed hot-prefix limits; reimport the snapshot"
-            )
-        provider_graph_v4_hot_prefix_by_field = dict(raw_hot_prefix)
-        raw_inferred_taxonomy_candidates = (
-            provider_graph.get("inferred_taxonomy_candidates") if isinstance(provider_graph, dict) else None
-        )
-        if raw_inferred_taxonomy_candidates is not None:
-            provider_graph_v4_inferred_taxonomy_candidates = validate_v4_inferred_taxonomy_projection_manifest(
-                raw_inferred_taxonomy_candidates
-            )
-        if candidate_audit_access is None and include_billing_tax_identity_source is True:
-            provider_tax_identity_source_publication = _v4_tax_identity_source_publication(
-                serving_index,
-                source_count=int(source_count or 0),
-            )
-    return PTG2ServingTables(
+    return _serving_tables_descriptor(
+        snapshot_id,
+        row_fields,
+        serving_index,
+        layout_by_field={
+            "cold_lookup_contract": cold_lookup_contract,
+            "shared_snapshot_key": shared_snapshot_key,
+            "storage_generation": storage_generation,
+        },
+        source_by_field={
+            "audit_sample": audit_sample,
+            "code_count": code_count,
+            "coverage_scope_id": coverage_scope_id,
+            "source_count": source_count,
+            "source_key": source_key,
+            "source_set_by_field": source_set_by_field,
+            "source_witness_by_field": source_witness_by_field,
+        },
         physical_binding=physical_binding,
-        snapshot_id=str(snapshot_id),
-        arch_version=PTG2_V3_ARCH_VERSION,
-        storage="manifest_snapshot",
-        shared_snapshot_key=shared_snapshot_key,
-        storage_generation=storage_generation,
-        cold_lookup_contract=cold_lookup_contract,
-        serving_table_layout=PTG2_V3_SERVING_LAYOUT,
-        shared_block_layout=(
-            PTG2_V4_SHARED_BLOCK_LAYOUT
-            if storage_generation == PTG2_V4_SHARED_GENERATION
-            else PTG2_V3_SHARED_BLOCK_LAYOUT
-        ),
-        source_count=source_count,
-        code_count=code_count,
-        coverage_scope_id=coverage_scope_id,
-        plan_id=str(row_fields.get("snapshot_plan_id") or "").strip() or None,
-        plan_market_type=(str(row_fields.get("snapshot_plan_market_type") or "").strip() or None),
-        source_key=source_key,
-        audit_sample=audit_sample,
-        source_witness=source_witness_by_field,
-        source_set=source_set_by_field,
-        database_evidence=_database_execution_evidence(row_fields),
-        provider_graph_v4_hot_prefix=provider_graph_v4_hot_prefix_by_field,
-        provider_graph_v4_inferred_taxonomy_candidates=(provider_graph_v4_inferred_taxonomy_candidates),
-        provider_tax_identity_source_publication=(provider_tax_identity_source_publication),
-        source_trace_set_hash=str(serving_index.get("source_trace_set_hash") or "").strip() or None,
-        network_names=(
-            [str(network_name) for network_name in network_names] if isinstance(network_names, list) else None
-        ),
-        price_atom_constant_values=(
-            dict(serving_index.get("price_atom_constant_values") or {})
-            if isinstance(serving_index.get("price_atom_constant_values"), dict)
-            else None
-        ),
-        price_dictionary_item_count=_serving_binary_section_integer(
-            serving_index,
-            "price_dictionary",
-            "price_set_count",
-        ),
-        price_dictionary_block_bytes=_serving_binary_section_integer(
-            serving_index,
-            "price_dictionary",
-            "block_bytes",
-        ),
-        provider_shard_span=_serving_binary_section_integer(
-            serving_index,
-            "assigned_encoder",
-            "provider_shard_span",
-        ),
-        atom_key_bits=_serving_index_atom_key_bits(serving_index),
-        price_key_block_span=_serving_binary_section_integer(
-            serving_index,
-            "price_set_atom_memberships_v3",
-            "block_span",
-        ),
-        atom_key_block_span=_serving_binary_section_integer(
-            serving_index,
-            "price_atoms_v3",
-            "block_span",
-        ),
+        include_tax_identity=candidate_audit_access is None and include_billing_tax_identity_source is True,
     )

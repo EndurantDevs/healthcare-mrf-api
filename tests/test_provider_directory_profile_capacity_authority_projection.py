@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import importlib
 import json
-from pathlib import Path
 import types
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -30,12 +30,8 @@ from tests.test_provider_directory_profile_capacity_preflight import (
 )
 from tests.test_provider_directory_profile_capacity_runtime import _limits_payload
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
-GOLDEN_PATH = (
-    Path(__file__).parent
-    / "fixtures/provider_directory_profile_capacity_authority_projection_v1.json"
-)
+GOLDEN_PATH = Path(__file__).parent / "fixtures/provider_directory_profile_capacity_authority_projection_v1.json"
 
 
 def _conn_info(peername: tuple) -> ConnInfo:
@@ -56,9 +52,7 @@ def _projection_payload() -> dict[str, object]:
 
 
 def _projection_request():
-    return contract.validated_capacity_authority_projection_request(
-        _projection_payload()
-    )
+    return contract.validated_capacity_authority_projection_request(_projection_payload())
 
 
 def _projection_geometry(request):
@@ -139,9 +133,7 @@ def test_socket_loopback_accepts_real_conn_info_peername(peername):
     assert isinstance(conn_info.client, str)
     assert conn_info.peername == peername
 
-    preflight_api._require_socket_loopback(
-        types.SimpleNamespace(conn_info=conn_info)
-    )
+    preflight_api._require_socket_loopback(types.SimpleNamespace(conn_info=conn_info))
 
 
 @pytest.mark.asyncio
@@ -173,9 +165,7 @@ async def test_authority_projection_rejects_forwarded_loopback_for_remote_peer(
         conn_info=_conn_info(peername),
     )
     with pytest.raises(Forbidden, match="loopback"):
-        await preflight_api.control_profile_capacity_authority_projection(
-            remote_request
-        )
+        await preflight_api.control_profile_capacity_authority_projection(remote_request)
     runner.assert_not_awaited()
 
 
@@ -189,18 +179,14 @@ async def test_authority_projection_maps_invalid_request_to_bad_request(monkeypa
     )
 
     with pytest.raises(BadRequest, match="authority_projection_request_fields_invalid"):
-        await preflight_api.control_profile_capacity_authority_projection(
-            invalid_request
-        )
+        await preflight_api.control_profile_capacity_authority_projection(invalid_request)
 
 
 @pytest.mark.asyncio
 async def test_authority_projection_maps_stale_state_to_conflict(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
-    runner = AsyncMock(
-        side_effect=preflight_api.ProviderDirectoryArtifactBuildStale("stale")
-    )
+    runner = AsyncMock(side_effect=preflight_api.ProviderDirectoryArtifactBuildStale("stale"))
     monkeypatch.setattr(
         preflight_api,
         "provider_directory_profile_capacity_authority_projection",
@@ -213,9 +199,7 @@ async def test_authority_projection_maps_stale_state_to_conflict(monkeypatch):
     )
 
     with pytest.raises(SanicException) as raised:
-        await preflight_api.control_profile_capacity_authority_projection(
-            stale_request
-        )
+        await preflight_api.control_profile_capacity_authority_projection(stale_request)
     assert raised.value.status_code == 409
     runner.assert_awaited_once()
 
@@ -235,14 +219,8 @@ async def test_authority_projection_accepts_ipv6_loopback_peer(monkeypatch):
         json=_projection_payload(),
         conn_info=_conn_info(("::1", 41234, 0, 0)),
     )
-    projection_response = (
-        await preflight_api.control_profile_capacity_authority_projection(
-            loopback_request
-        )
-    )
-    assert json.loads(projection_response.body) == {
-        "authority_projection_sha256": "f" * 64
-    }
+    projection_response = await preflight_api.control_profile_capacity_authority_projection(loopback_request)
+    assert json.loads(projection_response.body) == {"authority_projection_sha256": "f" * 64}
     runner.assert_awaited_once()
 
 
@@ -319,11 +297,7 @@ async def _project_with_stubs(monkeypatch):
         "_consume_profile_capacity_preflight_receipt",
         observed.consume,
     )
-    observed.projection = (
-        await importer.provider_directory_profile_capacity_authority_projection(
-            observed.request
-        )
-    )
+    observed.projection = await importer.provider_directory_profile_capacity_authority_projection(observed.request)
     return observed
 
 
@@ -331,16 +305,14 @@ async def _project_with_stubs(monkeypatch):
 async def test_projection_transaction_is_read_only_and_receipt_free(monkeypatch):
     observed = await _project_with_stubs(monkeypatch)
 
-    observed.status.assert_awaited_once_with(
-        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY;"
-    )
+    observed.status.assert_awaited_once_with("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY;")
     observed.current.assert_awaited_once()
     observed.geometry_loader.assert_awaited_once_with(
         observed.request,
         [SYNTHETIC_PROFILE_SOURCE_ID],
         observed.serving,
     )
-    observed.runtime_loader.assert_awaited_once_with()
+    observed.runtime_loader.assert_awaited_once_with(importer.db)
     observed.runtime_match.assert_called_once_with(
         observed.runtime_observation,
         observed.geometry,
@@ -376,9 +348,7 @@ async def test_projection_response_is_closed_and_self_hashed(monkeypatch):
         contract.CAPACITY_AUTHORITY_PROJECTION_CONTRACT_ID,
         projection,
     )
-    assert projection["capacity_geometry_hash"] == capacity.capacity_geometry_hash(
-        observed.geometry
-    )
+    assert projection["capacity_geometry_hash"] == capacity.capacity_geometry_hash(observed.geometry)
 
 
 @pytest.mark.asyncio

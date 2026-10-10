@@ -35,7 +35,7 @@ RESOURCE_TYPES = {
     "Endpoint",
 }
 ACTIVE_RUN_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
-BLOCKER_OPERATIONAL_STATUSES = {"unreachable", "auth-gated", "not-published"}
+BLOCKER_OPERATIONAL_STATUSES = {"unreachable", "auth-gated", "not-published", "reachable-unverified"}
 BLOCKER_ACQUISITION_METHODS = {"not-importable"}
 SOURCE_ID_PATTERN = re.compile(r"pdfhir_[0-9a-f]{24}")
 FRESHNESS_POLICY_FIELDS = {
@@ -71,13 +71,9 @@ def validate_access_review_metadata(entry_id: str, support: dict[str, Any]) -> N
     requires_registration = support["requires_registration"]
     access_requirement = support["access_requirement"]
     if not isinstance(requires_registration, bool):
-        raise SupportDocumentationError(
-            f"{entry_id}: requires_registration must be boolean"
-        )
+        raise SupportDocumentationError(f"{entry_id}: requires_registration must be boolean")
     if access_requirement == "none" and requires_registration:
-        raise SupportDocumentationError(
-            f"{entry_id}: public access cannot require registration"
-        )
+        raise SupportDocumentationError(f"{entry_id}: public access cannot require registration")
     gated_access_requirements = {
         "oauth2-client-credentials",
         "private-connector",
@@ -85,15 +81,11 @@ def validate_access_review_metadata(entry_id: str, support: dict[str, Any]) -> N
         "user-token",
     }
     if access_requirement in gated_access_requirements and not requires_registration:
-        raise SupportDocumentationError(
-            f"{entry_id}: configured access requires registration or a private arrangement"
-        )
+        raise SupportDocumentationError(f"{entry_id}: configured access requires registration or a private arrangement")
     try:
         dt.date.fromisoformat(str(support["reviewed_at"] or ""))
     except ValueError as exc:
-        raise SupportDocumentationError(
-            f"{entry_id}: reviewed_at must be an ISO date"
-        ) from exc
+        raise SupportDocumentationError(f"{entry_id}: reviewed_at must be an ISO date") from exc
 
 
 def _validate_endpoint_identity(entry_id: str, entry: dict[str, Any]) -> None:
@@ -113,13 +105,9 @@ def _validate_endpoint_identity(entry_id: str, entry: dict[str, Any]) -> None:
             for source_id in source_ids
         )
     ):
-        raise SupportDocumentationError(
-            f"{entry_id}: source_ids must contain unique full pdfhir IDs"
-        )
+        raise SupportDocumentationError(f"{entry_id}: source_ids must contain unique full pdfhir IDs")
     if not isinstance(canonical_base, str):
-        raise SupportDocumentationError(
-            f"{entry_id}: canonical_base must be a credential-free HTTPS URL"
-        )
+        raise SupportDocumentationError(f"{entry_id}: canonical_base must be a credential-free HTTPS URL")
     parsed_base = urllib.parse.urlsplit(canonical_base)
     if (
         parsed_base.scheme != "https"
@@ -128,9 +116,7 @@ def _validate_endpoint_identity(entry_id: str, entry: dict[str, Any]) -> None:
         or parsed_base.password
         or parsed_base.fragment
     ):
-        raise SupportDocumentationError(
-            f"{entry_id}: canonical_base must be a credential-free HTTPS URL"
-        )
+        raise SupportDocumentationError(f"{entry_id}: canonical_base must be a credential-free HTTPS URL")
 
 
 def _validate_endpoint_resources(entry_id: str, entry: dict[str, Any]) -> None:
@@ -141,9 +127,7 @@ def _validate_endpoint_resources(entry_id: str, entry: dict[str, Any]) -> None:
         or len(resources) != len(set(resources))
         or not all(isinstance(resource, str) and resource in RESOURCE_TYPES for resource in resources)
     ):
-        raise SupportDocumentationError(
-            f"{entry_id}: resources must contain unique known resource types"
-        )
+        raise SupportDocumentationError(f"{entry_id}: resources must contain unique known resource types")
 
 
 def _validate_endpoint_classification(
@@ -168,25 +152,17 @@ def _validate_endpoint_classification(
     if expected_support is None:
         raise SupportDocumentationError(f"{entry_id}: invalid classification")
     support_level, methods, expects_resources = expected_support
-    if (
-        support.get("support_level") != support_level
-        or support.get("method") not in methods
-    ):
+    if support.get("support_level") != support_level or support.get("method") not in methods:
         method_list = " or ".join(sorted(methods))
         raise SupportDocumentationError(
-            f"{entry_id}: {classification} classification requires "
-            f"{support_level} support and {method_list} method"
+            f"{entry_id}: {classification} classification requires {support_level} support and {method_list} method"
         )
     if bool(resources) != expects_resources:
         requirement = "non-empty" if expects_resources else "empty"
-        raise SupportDocumentationError(
-            f"{entry_id}: {classification} resources must be {requirement}"
-        )
+        raise SupportDocumentationError(f"{entry_id}: {classification} resources must be {requirement}")
     documented_resources = support.get("documented_resources")
     if classification == "external" and not documented_resources:
-        raise SupportDocumentationError(
-            f"{entry_id}: external support requires documented_resources"
-        )
+        raise SupportDocumentationError(f"{entry_id}: external support requires documented_resources")
     if classification not in {"external", "probe_only"} and documented_resources is not None:
         raise SupportDocumentationError(
             f"{entry_id}: documented_resources is reserved for external or probe-only support"
@@ -203,16 +179,10 @@ def validate_configured_endpoint(entry: dict[str, Any], support: dict[str, Any])
 
 def validate_freshness_policy(manifest: dict[str, Any]) -> dict[str, int]:
     """Return the controlled positive-age documentation policy."""
-    freshness_policy = manifest.get("support_documentation", {}).get(
-        "freshness_policy"
-    )
-    if (
-        not isinstance(freshness_policy, dict)
-        or set(freshness_policy) != FRESHNESS_POLICY_FIELDS
-    ):
+    freshness_policy = manifest.get("support_documentation", {}).get("freshness_policy")
+    if not isinstance(freshness_policy, dict) or set(freshness_policy) != FRESHNESS_POLICY_FIELDS:
         raise SupportDocumentationError(
-            "support_documentation.freshness_policy must contain "
-            f"{sorted(FRESHNESS_POLICY_FIELDS)}"
+            f"support_documentation.freshness_policy must contain {sorted(FRESHNESS_POLICY_FIELDS)}"
         )
     if not all(
         isinstance(age_days, int) and not isinstance(age_days, bool) and age_days > 0
@@ -235,9 +205,7 @@ def parse_timestamp_date(timestamp_value: Any, label: str) -> dt.date:
     if not isinstance(timestamp_value, str) or not timestamp_value.strip():
         raise SupportDocumentationError(f"{label} must be ISO-8601")
     try:
-        parsed_timestamp = dt.datetime.fromisoformat(
-            timestamp_value.replace("Z", "+00:00")
-        )
+        parsed_timestamp = dt.datetime.fromisoformat(timestamp_value.replace("Z", "+00:00"))
     except ValueError as exc:
         raise SupportDocumentationError(f"{label} must be ISO-8601") from exc
     if parsed_timestamp.tzinfo is None:
@@ -260,33 +228,19 @@ def _review_expiration_messages(
     catalog_confirmation = manifest["catalog_confirmation"]
     expiration_messages = []
     if catalog_confirmation is not None:
-        catalog_date = parse_timestamp_date(
-            catalog_confirmation["checked_at"], "catalog_confirmation.checked_at"
-        )
-        catalog_due = catalog_date + dt.timedelta(
-            days=freshness_policy["catalog_confirmation_max_age_days"]
-        )
+        catalog_date = parse_timestamp_date(catalog_confirmation["checked_at"], "catalog_confirmation.checked_at")
+        catalog_due = catalog_date + dt.timedelta(days=freshness_policy["catalog_confirmation_max_age_days"])
         if evaluation_date > catalog_due:
-            expiration_messages.append(
-                f"catalog confirmation expired {catalog_due.isoformat()}"
-            )
+            expiration_messages.append(f"catalog confirmation expired {catalog_due.isoformat()}")
     support_records_by_entry = manifest["support_documentation"]["entry_support"]
     source_reviews = [
-        (entry["entry_id"], support_records_by_entry[entry["entry_id"]]["reviewed_at"])
-        for entry in manifest["entries"]
-    ] + [
-        (blocker_entry["id"], blocker_entry["reviewed_at"])
-        for blocker_entry in blocker_entries
-    ]
+        (entry["entry_id"], support_records_by_entry[entry["entry_id"]]["reviewed_at"]) for entry in manifest["entries"]
+    ] + [(blocker_entry["id"], blocker_entry["reviewed_at"]) for blocker_entry in blocker_entries]
     for entry_id, reviewed_at in source_reviews:
         reviewed_on = parse_review_date(reviewed_at, f"{entry_id}: reviewed_at")
-        review_due = reviewed_on + dt.timedelta(
-            days=freshness_policy["source_review_max_age_days"]
-        )
+        review_due = reviewed_on + dt.timedelta(days=freshness_policy["source_review_max_age_days"])
         if evaluation_date > review_due:
-            expiration_messages.append(
-                f"{entry_id} review expired {review_due.isoformat()}"
-            )
+            expiration_messages.append(f"{entry_id} review expired {review_due.isoformat()}")
     return expiration_messages
 
 
@@ -296,31 +250,19 @@ def _verification_expiration_messages(
     evaluation_date: dt.date,
 ) -> list[str]:
     """Return expiration messages for current terminal proof."""
-    maximum_age_days = validate_freshness_policy(manifest)[
-        "terminal_verification_max_age_days"
-    ]
+    maximum_age_days = validate_freshness_policy(manifest)["terminal_verification_max_age_days"]
     expiration_messages = []
     verification_records_by_entry = verification_snapshot.get("entries", {})
     for entry_id, verification_record in verification_records_by_entry.items():
-        observation = (
-            verification_record.get("current_observation")
-            if isinstance(verification_record, dict)
-            else None
-        )
+        observation = verification_record.get("current_observation") if isinstance(verification_record, dict) else None
         observed_status = (
-            observation.get("run_status") or observation.get("state_status")
-            if isinstance(observation, dict)
-            else None
+            observation.get("run_status") or observation.get("state_status") if isinstance(observation, dict) else None
         )
         if observed_status in ACTIVE_RUN_STATUSES:
-            observed_on = parse_timestamp_date(
-                observation.get("observed_at"), f"{entry_id}: observed_at"
-            )
+            observed_on = parse_timestamp_date(observation.get("observed_at"), f"{entry_id}: observed_at")
             observation_due = observed_on + dt.timedelta(days=maximum_age_days)
             if evaluation_date > observation_due:
-                expiration_messages.append(
-                    f"{entry_id} active observation expired {observation_due.isoformat()}"
-                )
+                expiration_messages.append(f"{entry_id} active observation expired {observation_due.isoformat()}")
         if (
             not isinstance(verification_record, dict)
             or verification_record.get("proof_state") == "superseded"
@@ -328,14 +270,10 @@ def _verification_expiration_messages(
             or verification_record.get("checked_at") is None
         ):
             continue
-        checked_on = parse_timestamp_date(
-            verification_record["checked_at"], f"{entry_id}: checked_at"
-        )
+        checked_on = parse_timestamp_date(verification_record["checked_at"], f"{entry_id}: checked_at")
         proof_due = checked_on + dt.timedelta(days=maximum_age_days)
         if evaluation_date > proof_due:
-            expiration_messages.append(
-                f"{entry_id} terminal proof expired {proof_due.isoformat()}"
-            )
+            expiration_messages.append(f"{entry_id} terminal proof expired {proof_due.isoformat()}")
     return expiration_messages
 
 
@@ -346,27 +284,15 @@ def validate_support_freshness(
     evaluation_date: dt.date,
 ) -> None:
     """Fail when maintained catalog, source, or current proof review has expired."""
-    expiration_messages = _review_expiration_messages(
-        manifest, blocker_entries, evaluation_date
-    )
-    expiration_messages.extend(
-        _verification_expiration_messages(
-            manifest, verification_snapshot, evaluation_date
-        )
-    )
+    expiration_messages = _review_expiration_messages(manifest, blocker_entries, evaluation_date)
+    expiration_messages.extend(_verification_expiration_messages(manifest, verification_snapshot, evaluation_date))
     if expiration_messages:
-        raise SupportDocumentationError(
-            "stale Provider Directory support evidence: "
-            + "; ".join(expiration_messages)
-        )
+        raise SupportDocumentationError("stale Provider Directory support evidence: " + "; ".join(expiration_messages))
 
 
 def _validate_blocker_acquisition(entry_id: str, entry: dict[str, Any]) -> None:
     acquisition_method = entry.get("acquisition_method")
-    if (
-        not isinstance(acquisition_method, str)
-        or acquisition_method not in BLOCKER_ACQUISITION_METHODS
-    ):
+    if not isinstance(acquisition_method, str) or acquisition_method not in BLOCKER_ACQUISITION_METHODS:
         raise SupportDocumentationError(f"{entry_id}: invalid acquisition method")
     documented_resources = entry.get("documented_resources")
     if (
@@ -375,20 +301,14 @@ def _validate_blocker_acquisition(entry_id: str, entry: dict[str, Any]) -> None:
         or len(documented_resources) != len(set(documented_resources))
         or not all(resource in RESOURCE_TYPES for resource in documented_resources)
     ):
-        raise SupportDocumentationError(
-            f"{entry_id}: documented_resources must contain unique known resource types"
-        )
+        raise SupportDocumentationError(f"{entry_id}: documented_resources must contain unique known resource types")
     if entry.get("canonical_base") is not None:
-        raise SupportDocumentationError(
-            f"{entry_id}: blocked canonical_base must be null until confirmed"
-        )
+        raise SupportDocumentationError(f"{entry_id}: blocked canonical_base must be null until confirmed")
     if entry.get("live_verification") != {
         "status": "not_recorded",
         "checked_at": None,
     }:
-        raise SupportDocumentationError(
-            f"{entry_id}: blocked live_verification must remain not recorded"
-        )
+        raise SupportDocumentationError(f"{entry_id}: blocked live_verification must remain not recorded")
 
 
 def _validate_blocker_evidence(entry_id: str, entry: dict[str, Any]) -> None:
@@ -400,35 +320,23 @@ def _validate_blocker_evidence(entry_id: str, entry: dict[str, Any]) -> None:
     }
     for field_name in text_fields:
         if not isinstance(entry.get(field_name), str) or not entry[field_name].strip():
-            raise SupportDocumentationError(
-                f"{entry_id}: {field_name} must be non-empty text"
-            )
+            raise SupportDocumentationError(f"{entry_id}: {field_name} must be non-empty text")
     if not str(entry["source_url"]).startswith("https://"):
         raise SupportDocumentationError(f"{entry_id}: source_url must use HTTPS")
 
 
 def _validate_blocker_entry(entry: Any, seen_ids: set[str]) -> dict[str, Any]:
     if not isinstance(entry, dict) or set(entry) != BLOCKER_REQUIRED_FIELDS:
-        raise SupportDocumentationError(
-            f"blocker entries must contain {sorted(BLOCKER_REQUIRED_FIELDS)}"
-        )
+        raise SupportDocumentationError(f"blocker entries must contain {sorted(BLOCKER_REQUIRED_FIELDS)}")
     entry_id = str(entry.get("id") or "")
     if not entry_id or entry_id in seen_ids:
-        raise SupportDocumentationError(
-            "blocker entries must have unique non-empty ids"
-        )
+        raise SupportDocumentationError("blocker entries must have unique non-empty ids")
     seen_ids.add(entry_id)
     access_requirement = entry.get("access_requirement")
-    if (
-        not isinstance(access_requirement, str)
-        or access_requirement not in ACCESS_REQUIREMENTS
-    ):
+    if not isinstance(access_requirement, str) or access_requirement not in ACCESS_REQUIREMENTS:
         raise SupportDocumentationError(f"{entry_id}: invalid access requirement")
     operational_status = entry.get("operational_status")
-    if (
-        not isinstance(operational_status, str)
-        or operational_status not in BLOCKER_OPERATIONAL_STATUSES
-    ):
+    if not isinstance(operational_status, str) or operational_status not in BLOCKER_OPERATIONAL_STATUSES:
         raise SupportDocumentationError(f"{entry_id}: invalid operational status")
     validate_access_review_metadata(entry_id, entry)
     _validate_blocker_acquisition(entry_id, entry)
@@ -442,8 +350,6 @@ def validate_blocker_registry(registry: dict[str, Any]) -> list[dict[str, Any]]:
         raise SupportDocumentationError("blocker registry schema_version must be 2")
     entries = registry.get("entries")
     if not isinstance(entries, list) or not entries:
-        raise SupportDocumentationError(
-            "blocker registry entries must be a non-empty list"
-        )
+        raise SupportDocumentationError("blocker registry entries must be a non-empty list")
     seen_ids: set[str] = set()
     return [_validate_blocker_entry(entry, seen_ids) for entry in entries]

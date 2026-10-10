@@ -80,7 +80,7 @@ async def test_group_site_stages_every_physical_row_before_address_dedup(tmp_pat
         staged_rows.extend(dict(row) for row in batch)
 
     monkeypatch.setattr(groups.db, "create_table", AsyncMock())
-    monkeypatch.setattr(groups, "push_objects", push)
+    monkeypatch.setattr(groups, "_copy_sidecar_rows", push)
     monkeypatch.setattr(groups, "raise_if_cancelled", AsyncMock())
     worker_context_by_key = {"import_date": "synthetic", "context": {}}
     receipt = await groups.import_group_site_rows(source, worker_context_by_key, {}, MANIFEST)
@@ -141,3 +141,197 @@ def test_artifact_uses_existing_directory_root_when_dedicated_root_is_unset(monk
     monkeypatch.delenv("HLTHPRT_CMS_DOCTORS_ARTIFACT_ROOT", raising=False)
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", "/srv/example-evidence")
     assert str(artifact._artifact_root()) == "/srv/example-evidence/cms-doctors"
+
+
+class _SidecarCopyDriver:
+    def __init__(self, state):
+        self.state = state
+
+    async def set_type_codec(self, _name, **options):
+        self.encoder = options["encoder"]
+
+    def is_in_transaction(self):
+        return self.state.driver_started
+
+    def terminate(self):
+        self.state.terminated = True
+
+    async def copy_records_to_table(self, table_name, *, schema_name, columns, records, timeout=None):
+        if hasattr(records, "__aiter__"):
+            rows = [tuple(row) async for row in records]
+        else:
+            rows = list(records)
+        position = tuple(columns).index("source_json")
+        for row in rows:
+            self.encoder(row[position])
+        self.state.batches.append((table_name, schema_name, tuple(columns), rows))
+        if self.state.failure is not None and len(self.state.batches) == 2:
+            raise self.state.failure
+        return f"COPY {len(rows)}"
+
+
+@pytest.fixture
+async def native_sidecar_copy(monkeypatch):
+    """Exercise the actual bounded COPY helper and installed JSON codec without sockets."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
+
+    from process import cms_doctors_education as education
+
+    state = SimpleNamespace(batches=[], transactions=[], failure=None)
+    state.active = state.driver_started = state.terminated = False
+    state.acquires = state.begins = 0
+
+    driver = _SidecarCopyDriver(state)
+    await PGDialect_asyncpg().setup_asyncpg_json_codec(SimpleNamespace(_connection=driver))
+
+    async def connection():
+        async def raw():
+            return SimpleNamespace(driver_connection=driver)
+
+        return SimpleNamespace(get_raw_connection=raw)
+
+    async def execute(statement):
+        assert str(statement) == "SELECT pg_current_xact_id()"
+        state.driver_started = True
+        state.begins += 1
+
+    session = SimpleNamespace(in_transaction=lambda: state.active, connection=connection, execute=execute)
+
+    @asynccontextmanager
+    async def transaction():
+        state.active = True
+        try:
+            yield session
+        except BaseException:
+            state.transactions.append("rollback")
+            raise
+        else:
+            state.transactions.append("commit")
+        finally:
+            state.active = False
+            state.driver_started = False
+
+    @asynccontextmanager
+    async def legacy_acquire():
+        state.acquires += 1
+        yield SimpleNamespace(raw_connection=SimpleNamespace(driver_connection=driver))
+
+    def no_insert(*_args, **_kwargs):
+        raise AssertionError("sidecar INSERT fallback is forbidden")
+
+    monkeypatch.setattr(education.db, "transaction", transaction)
+    monkeypatch.setattr(education.db, "acquire", legacy_acquire)
+    monkeypatch.setattr(education.db, "insert", no_insert)
+    monkeypatch.setattr(education.db, "create_table", AsyncMock())
+    monkeypatch.setattr(education.db, "status", AsyncMock())
+    monkeypatch.setattr(education, "raise_if_cancelled", AsyncMock())
+    monkeypatch.setattr(groups, "raise_if_cancelled", AsyncMock())
+    return state
+
+
+def _sidecar_source(tmp_path, family, rows):
+    """Write distinct synthetic observations at the production source-row grain."""
+    import csv
+
+    source = tmp_path / "sidecars.csv"
+    with source.open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        if family == "education":
+            writer.writerow(("NPI", "Med_sch", "Grd_yr"))
+            writer.writerows((NPI, f"Example School {index}", "2001") for index in range(rows))
+        else:
+            writer.writerow(("NPI", "Ind_enrl_ID", "Org_PAC_ID", "adrs_id", "Facility Name", "num_org_mem"))
+            writer.writerows(
+                (NPI, "E-1", "0012345678", f"site-{index}", "Example Group", "12") for index in range(rows)
+            )
+    return source
+
+
+async def _import_sidecar(source, family, ctx):
+    from process import cms_doctors_education as education
+
+    if family == "education":
+        return await education.import_doctor_education(source, "https://example.test/sidecars.csv", ctx, {})
+    return await groups.import_group_site_rows(source, ctx, {}, MANIFEST)
+
+
+@pytest.mark.parametrize("family", ["education", "group_site"])
+async def test_sidecars_use_codec_compatible_copy_only_in_fixed_batches(
+    tmp_path,
+    native_sidecar_copy,
+    family,
+    capsys,
+):
+    """Real readers reach the actual native helper without INSERT or copied_record fallback."""
+    import json
+    from uuid import uuid4
+
+    source_path = _sidecar_source(tmp_path, family, 10_001)
+    worker_context_by_key = {"import_date": uuid4().hex, "context": {}}
+    receipt = await _import_sidecar(source_path, family, worker_context_by_key)
+    batches = native_sidecar_copy.batches
+    assert [len(batch[3]) for batch in batches] == [5000, 5000, 1]
+    assert native_sidecar_copy.transactions == ["commit"] * 3
+    assert native_sidecar_copy.begins == 3
+    assert native_sidecar_copy.acquires == 0
+    assert receipt["source_rows"] == 10_001
+    copied_rows = [
+        dict(zip(columns, copied_record, strict=True))
+        for _, _, columns, batch_records in batches
+        for copied_record in batch_records
+    ]
+    source_observations = [json.loads(copied_record["source_json"]) for copied_record in copied_rows]
+    assert [copied_record["row_number"] for copied_record in source_observations] == list(range(1, 10_002))
+    assert all(
+        copied_record["source_json"]
+        == json.dumps(
+            json.loads(copied_record["source_json"]),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        for copied_record in copied_rows
+    )
+    if family == "education":
+        assert receipt["education_rows"] == 10_001
+        assert len({copied_record["education_key"] for copied_record in copied_rows}) == 10_001
+    else:
+        assert [copied_record["row_number"] for copied_record in copied_rows] == list(range(1, 10_002))
+        assert all(
+            copied_record["membership_start_at"] is copied_record["membership_end_at"] is None
+            for copied_record in copied_rows
+        )
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("family", ["education", "group_site"])
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_sidecar_copy_failure_rolls_back_batch_and_discards_owned_stage(
+    tmp_path,
+    native_sidecar_copy,
+    family,
+    cancelled,
+    capsys,
+):
+    """A failed or cancelled native batch keeps prior semantics and never falls back."""
+    import asyncio
+    from uuid import uuid4
+
+    source_path = _sidecar_source(tmp_path, family, 5001)
+    worker_context_by_key = {"import_date": uuid4().hex, "context": {}}
+    error = asyncio.CancelledError() if cancelled else RuntimeError("synthetic native COPY refusal")
+    native_sidecar_copy.failure = error
+    with pytest.raises(type(error)):
+        await _import_sidecar(source_path, family, worker_context_by_key)
+    assert native_sidecar_copy.transactions == ["commit", "rollback"]
+    assert native_sidecar_copy.acquires == 0
+    assert native_sidecar_copy.terminated is cancelled
+    ownership = "education_stage_owned" if family == "education" else "group_site_stage_owned"
+    assert ownership not in worker_context_by_key["context"]
+    groups.db.status.assert_awaited_once()
+    assert groups.db.status.await_args.args[0].endswith(worker_context_by_key["import_date"])
+    assert capsys.readouterr() == ("", "")

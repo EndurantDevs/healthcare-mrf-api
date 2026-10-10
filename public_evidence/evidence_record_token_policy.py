@@ -109,6 +109,8 @@ def build_opaque_tax_identity(
     )
     identity_fields = _exact_dict(raw, fields)
     contract_id = identity_fields["token_policy_contract_id"]
+    if type(contract_id) is not str:
+        raise _fail()
     profile = _profile(contract_id)
     policy_id = _policy_id(profile, identity_fields["token_policy_id"])
     tin_type = identity_fields["tin_type"]
@@ -126,7 +128,7 @@ def build_opaque_tax_identity(
         raise _fail()
     identity_payload_by_field = {
         "tin_type": tin_type,
-        "token_policy_contract_id": cast(str, contract_id),
+        "token_policy_contract_id": contract_id,
         "token_policy_id": policy_id,
         "token_policy_descriptor_sha256": supplied_descriptor,
         "locator_128": locator,
@@ -134,7 +136,13 @@ def build_opaque_tax_identity(
         "normalization_contract_id": profile.normalization_by_type[tin_type],
     }
     return OpaqueTaxIdentityReference(
-        **identity_payload_by_field,
+        tin_type=tin_type,
+        token_policy_contract_id=contract_id,
+        token_policy_id=policy_id,
+        token_policy_descriptor_sha256=supplied_descriptor,
+        locator_128=locator,
+        full_hmac_sha256=full_hmac,
+        normalization_contract_id=profile.normalization_by_type[tin_type],
         tax_identity_ref=_derived_ref(
             PUBLIC_EVIDENCE_TAX_IDENTITY_REF_PREFIX,
             "tax_identity",

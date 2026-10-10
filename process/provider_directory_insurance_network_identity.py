@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import (
     ProviderDirectoryEntityReleaseEvidence,
+    ProviderDirectoryEntitySourceBinding,
     ProviderDirectoryInsuranceNetworkIdentity,
     ProviderDirectoryInsuranceNetworkPlanEvidence,
     ProviderDirectoryInsuranceNetworkSourceBinding,
@@ -63,14 +64,18 @@ def has_source_declared_network_role(organization: Mapping[str, Any]) -> bool:
     )
 
 
-async def _bind_network(session: AsyncSession, source_id: str, network_resource_id: str, observed_at: datetime) -> UUID:
-    """Create one ID under the exact source/resource transaction lock."""
-    binding = ProviderDirectoryInsuranceNetworkSourceBinding.__table__
-    identity = ProviderDirectoryInsuranceNetworkIdentity.__table__
+async def _lock_source(session: AsyncSession, source_id: str) -> None:
+    """Coordinate compatibility writes with the bounded source-wide batch writer."""
     await session.execute(
         text("SELECT pg_catalog.pg_advisory_xact_lock(hashtextextended(:identity_key, 0))"),
-        {"identity_key": f"provider-directory-insurance-network:{source_id}:{network_resource_id}"},
+        {"identity_key": f"provider-directory-insurance-network-batch:{source_id}"},
     )
+
+
+async def _bind_network(session: AsyncSession, source_id: str, network_resource_id: str, observed_at: datetime) -> UUID:
+    """Create one identity while the caller holds the source-wide control lock."""
+    binding = ProviderDirectoryInsuranceNetworkSourceBinding.__table__
+    identity = ProviderDirectoryInsuranceNetworkIdentity.__table__
     network_id = (
         await session.execute(
             select(binding.c.network_id).where(
@@ -81,15 +86,16 @@ async def _bind_network(session: AsyncSession, source_id: str, network_resource_
     ).scalar_one_or_none()
     if network_id is None:
         # The foreign key is the final guard; this check fails before making an ID.
-        schema = binding.schema.replace('"', '""')
+        entity_binding = ProviderDirectoryEntitySourceBinding.__table__
         organization_exists = (
             await session.execute(
-                text(
-                    f'SELECT 1 FROM "{schema}".provider_directory_entity_source_binding '
-                    "WHERE source_id = :source_id AND resource_type = 'Organization' "
-                    "AND resource_id = :resource_id FOR KEY SHARE"
-                ),
-                {"source_id": source_id, "resource_id": network_resource_id},
+                select(entity_binding.c.organization_id)
+                .where(
+                    entity_binding.c.source_id == source_id,
+                    entity_binding.c.resource_type == "Organization",
+                    entity_binding.c.resource_id == network_resource_id,
+                )
+                .with_for_update(read=True, key_share=True),
             )
         ).scalar_one_or_none()
         if organization_exists is None:
@@ -155,6 +161,7 @@ async def record_insurance_network_organization(
     if not _FHIR_ID.fullmatch(network_resource_id) or not has_source_declared_network_role(organization):
         raise ValueError("provider_directory_insurance_network_role_missing")
     payload_text = json.dumps(organization, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    await _lock_source(session, source_id)
     await _require_release_evidence(
         session, source_id, network_resource_id, release_id, hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
     )
@@ -187,10 +194,7 @@ async def record_insurance_network_plan(
         raise ValueError("provider_directory_insurance_network_ref_missing")
     plan_payload_text = json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     observed_at = datetime.now(timezone.utc)
-    await session.execute(
-        text("SELECT pg_catalog.pg_advisory_xact_lock(hashtextextended(:identity_key, 0))"),
-        {"identity_key": f"provider-directory-insurance-plan:{source_id}:{release_id}:{plan_id}"},
-    )
+    await _lock_source(session, source_id)
     evidence_dict = {
         "source_id": source_id,
         "release_id": release_id,
