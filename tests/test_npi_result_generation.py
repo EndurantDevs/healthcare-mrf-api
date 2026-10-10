@@ -79,6 +79,27 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261007000000_custom_import_rejection_anti_joins",
     "20261006010000_nucc_reference_result_generation",
     "20261009000000_custom_import_child_presence_decode",
+    "20261007010000_managed_network_registry",
+    "20261007020000_registry_revision_history",
+    "20261007030000_network_serving_control",
+    "20261007040000_registry_source_evidence",
+    "20261007050000_canonical_address_network_ids",
+    "20261007060000_registry_approved_selection",
+    "20261007070000_registry_company_links",
+    "20261007080000_manual_directory_registry",
+    "20261007090000_network_membership_drafts",
+    "20261007100000_registry_publication_requests",
+    "20261007110000_registry_site_bindings",
+    "20261007120000_company_network_assertions",
+    "20261007130000_registry_network_bindings",
+    "20261007140000_registry_source_recipes",
+    "20261007150000_provider_directory_content_cursor_index",
+    "20261009010000_registry_ptg_producer_scope",
+    "20261009020000_company_registry_assertions",
+    "20261009030000_network_catalog_evidence",
+    "20261009040000_registry_ptg_published_plan_scope",
+    "20261010010000_registry_ptg_office_approval",
+    "20261010020000_registry_ptg_office_retention",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -87,11 +108,26 @@ _SERVICE_NETWORK_UPGRADE_REVISIONS = (
 )
 
 
-def _assert_current_head(script: ScriptDirectory) -> None:
-    """Require the sole current head and its exact immediate predecessor."""
-    assert script.get_heads() == ["20261009000000_custom_import_child_presence_decode"]
-    assert script.get_revision(script.get_heads()[0]).down_revision == (
+def _assert_current_registry_head(script: ScriptDirectory) -> None:
+    """Require one registry head after the unchanged published custom-import chain."""
+    assert script.get_heads() == ["20261010020000_registry_ptg_office_retention"]
+    assert script.get_revision("20261010020000_registry_ptg_office_retention").down_revision == (
+        "20261010010000_registry_ptg_office_approval"
+    )
+    assert script.get_revision("20261010010000_registry_ptg_office_approval").down_revision == (
+        "20261009040000_registry_ptg_published_plan_scope"
+    )
+    assert script.get_revision("20261009040000_registry_ptg_published_plan_scope").down_revision == (
+        "20261009030000_network_catalog_evidence"
+    )
+    assert script.get_revision("20261006010000_nucc_reference_result_generation").down_revision == (
+        "20261007000000_custom_import_rejection_anti_joins"
+    )
+    assert script.get_revision("20261009000000_custom_import_child_presence_decode").down_revision == (
         "20261006010000_nucc_reference_result_generation"
+    )
+    assert script.get_revision("20261007010000_managed_network_registry").down_revision == (
+        "20261009000000_custom_import_child_presence_decode"
     )
 
 
@@ -120,7 +156,7 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     request_identity_revision = "20260922010000_custom_import_execution_request_identity"
     source_binding_revision = "20260923030000_custom_import_source_binding"
     doctors_revision = "20260929000000_cms_doctor_group_site"
-    _assert_current_head(script)
+    _assert_current_registry_head(script)
     assert script.get_revision("20260930080000_cms_npd_coverage_version").down_revision == (
         "20260930070000_provider_directory_entity_redirect"
     )
@@ -185,6 +221,27 @@ def test_profile_migrations_follow_custom_import_processing_policy() -> None:
         "20261007000000_custom_import_rejection_anti_joins",
         "20261006010000_nucc_reference_result_generation",
         "20261009000000_custom_import_child_presence_decode",
+        "20261007010000_managed_network_registry",
+        "20261007020000_registry_revision_history",
+        "20261007030000_network_serving_control",
+        "20261007040000_registry_source_evidence",
+        "20261007050000_canonical_address_network_ids",
+        "20261007060000_registry_approved_selection",
+        "20261007070000_registry_company_links",
+        "20261007080000_manual_directory_registry",
+        "20261007090000_network_membership_drafts",
+        "20261007100000_registry_publication_requests",
+        "20261007110000_registry_site_bindings",
+        "20261007120000_company_network_assertions",
+        "20261007130000_registry_network_bindings",
+        "20261007140000_registry_source_recipes",
+        "20261007150000_provider_directory_content_cursor_index",
+        "20261009010000_registry_ptg_producer_scope",
+        "20261009020000_company_registry_assertions",
+        "20261009030000_network_catalog_evidence",
+        "20261009040000_registry_ptg_published_plan_scope",
+        "20261010010000_registry_ptg_office_approval",
+        "20261010020000_registry_ptg_office_retention",
     )
 
 

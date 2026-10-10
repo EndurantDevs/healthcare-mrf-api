@@ -226,7 +226,8 @@ async def test_actual_archive_readiness_and_common_publication(monkeypatch, outc
         prepared, address = await _prepared_serving(monkeypatch, database, schema, outcome, phase_checks)
         delta = prepared.archive_delta
         cms_token = preparation._ACTIVE.set(None)
-        profile_token = fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(object())
+        profile_token = fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(None)
+        assert fhir._provider_directory_profile_capacity_admission() is None
         try:
 
             async def no_rescan(*_args):
@@ -242,6 +243,7 @@ async def test_actual_archive_readiness_and_common_publication(monkeypatch, outc
         finally:
             fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(profile_token)
             preparation._ACTIVE.reset(cms_token)
+            database.acknowledgement_failure = None
             await delta.cleanup(fhir)
         assert not prepared.nonprofile_admission._relations
         assert await archive._oid(database, schema, delta.delta_table) is None

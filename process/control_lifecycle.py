@@ -17,6 +17,8 @@ from inspect import signature
 from typing import Any, AsyncIterator
 
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 from sqlalchemy import and_, func, or_, text, update
 
 from db.models import ImportRun, db
@@ -1131,6 +1133,12 @@ async def _should_update_control_run_db(
     error: dict[str, Any] | None,
     snapshot_id: str | None,
 ) -> bool:
+    if db._reader_binding() is not None:
+        raise RuntimeError("control_run_bound_transaction_invalid")
+    binding = db._transaction_binding()
+    if binding is not None:
+        _require_control_run_bound_transaction(binding, os.getenv("HLTHPRT_DB_DATABASE", "postgres"))
+        return True
     status_key = str(status or "").strip().lower()
     if status_key != "running" or status_key in _TERMINAL_STATUSES or error or snapshot_id:
         return True
@@ -1174,8 +1182,9 @@ def _control_run_db_throttle_client() -> redis.Redis:
         port=settings.port,
         db=settings.database,
         password=settings.password,
-        socket_connect_timeout=settings.conn_timeout,
-        socket_timeout=settings.conn_timeout,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+        retry=Retry(NoBackoff(), 0),
     )
 
 
@@ -1231,17 +1240,47 @@ def _is_progress_from_attempt(
     )
 
 
+def _require_control_run_bound_transaction(binding: Any, base_database: str) -> None:
+    """Keep a progress update inside its caller's verified control transaction."""
+
+    if db._reader_binding() is not None or db._transaction_binding() is not binding:
+        raise RuntimeError("control_run_bound_transaction_invalid")
+    session = binding.session
+    if (
+        session.in_transaction() is not True
+        or session.in_nested_transaction() is not False
+        or not base_database
+        or db._session_database_name(session) != base_database
+    ):
+        raise RuntimeError("control_run_bound_transaction_invalid")
+
+
 async def _execute_control_run_update(stmt: Any) -> int:
+    if db._reader_binding() is not None:
+        raise RuntimeError("control_run_bound_transaction_invalid")
+    binding = db._transaction_binding()
+    if binding is not None:
+        base_database = os.getenv("HLTHPRT_DB_DATABASE", "postgres")
+        _require_control_run_bound_transaction(binding, base_database)
+        update_result = await db.execute(stmt)
+        _require_control_run_bound_transaction(binding, base_database)
+        if update_result is None:
+            return 0
+        try:
+            returned_rows = update_result.all()
+        except Exception:
+            return 0
+        return len(returned_rows)
     previous_override = getattr(db, "_database_override", None)
     base_database = os.getenv("HLTHPRT_DB_DATABASE", "postgres")
     db._database_override = base_database
     try:
         await db.connect()
-        result = await db.execute(stmt)
-        if result is None:
+        update_result = await db.execute(stmt)
+        if update_result is None:
             return 0
         try:
-            returned_rows = result.all()
+            returned_rows = update_result.all()
         except Exception:
             return 0
         return len(returned_rows)

@@ -1,6 +1,10 @@
 import datetime as dt
+from unittest.mock import Mock
 
-from process import live_progress
+import pytest
+from redis.exceptions import AuthenticationError, ConnectionError, TimeoutError
+
+from process import control_lifecycle, live_progress
 
 
 def test_terminal_status_event_preserves_database_heartbeat():
@@ -171,9 +175,7 @@ def test_nested_profile_progress_replaces_outer_publish_snapshot():
     assert incoming_by_field["done"] == 1
     assert incoming_by_field["total"] == 2_185
     assert incoming_by_field["pct"] == 57.15
-    assert incoming_by_field["phase"] == (
-        "provider-directory profile evidence batches"
-    )
+    assert incoming_by_field["phase"] == ("provider-directory profile evidence batches")
 
 
 def _nested_profile_snapshots():
@@ -250,9 +252,7 @@ def test_nested_profile_progress_advances_through_live_candidate_merge():
     snapshots = _nested_profile_snapshots()
     merged_snapshots = _merge_nested_profile_snapshots(run_id, snapshots)
 
-    assert [snapshot["phase"] for snapshot in merged_snapshots] == [
-        snapshot["phase"] for snapshot in snapshots
-    ]
+    assert [snapshot["phase"] for snapshot in merged_snapshots] == [snapshot["phase"] for snapshot in snapshots]
     assert [snapshot["done"] for snapshot in merged_snapshots] == [
         4,
         0,
@@ -261,8 +261,50 @@ def test_nested_profile_progress_advances_through_live_candidate_merge():
         400,
         5,
     ]
-    progress_sequences = [
-        int(snapshot["progress_seq"])
-        for snapshot in merged_snapshots
-    ]
+    progress_sequences = [int(snapshot["progress_seq"]) for snapshot in merged_snapshots]
     assert progress_sequences == sorted(set(progress_sequences))
+
+
+@pytest.mark.parametrize("client_factory", [live_progress._redis, control_lifecycle._control_run_db_throttle_client])
+@pytest.mark.parametrize("failure", [AuthenticationError, ConnectionError, TimeoutError])
+def test_optional_progress_redis_uses_one_transport_attempt_without_backoff(monkeypatch, client_factory, failure):
+    """Optional progress never inherits the installed client's retry/backoff default."""
+    client_factory.cache_clear()
+    monkeypatch.setenv("HLTHPRT_REDIS_ADDRESS", "redis://127.0.0.1:1/0")
+    monkeypatch.setenv("HLTHPRT_REDIS_CONN_TIMEOUT_SECONDS", "10")
+    try:
+        client = client_factory()
+        settings = client.connection_pool.connection_kwargs
+        assert settings["socket_connect_timeout"] == 1.0
+        assert settings["socket_timeout"] == 1.0
+        connection = client.connection_pool.make_connection()
+        connect = Mock(side_effect=failure("synthetic optional progress failure"))
+        monkeypatch.setattr(connection, "_connect", connect)
+        sleep = Mock(side_effect=AssertionError("optional progress must not back off"))
+        monkeypatch.setattr("redis.retry.sleep", sleep)
+        with pytest.raises(failure):
+            connection.connect()
+        connect.assert_called_once_with()
+        sleep.assert_not_called()
+    finally:
+        client_factory.cache_clear()
+
+
+def test_optional_throttle_failure_still_permits_database_progress(monkeypatch):
+    """A transport failure preserves the existing fail-open DB-update decision."""
+    client = Mock()
+    client.set.side_effect = AuthenticationError("synthetic optional authentication failure")
+    monkeypatch.setattr(control_lifecycle, "_control_run_db_throttle_client", lambda: client)
+    assert control_lifecycle._is_db_update_slot_claimed("synthetic_slot", 30.0) is True
+    client.set.assert_called_once_with("synthetic_slot", "1", nx=True, px=30_000)
+
+
+def test_optional_live_progress_authentication_failure_is_not_reported_as_written(monkeypatch):
+    """Unavailable Redis produces no accepted live event or attempt sequence."""
+    client = Mock()
+    client.set.side_effect = AuthenticationError("synthetic optional authentication failure")
+    monkeypatch.setattr(live_progress, "_redis", lambda: client)
+    assert live_progress.write_live_progress(run_id="synthetic_optional_run", status="running") is False
+    client.set.assert_called_once()
+    client.get.assert_not_called()
+    client.eval.assert_not_called()

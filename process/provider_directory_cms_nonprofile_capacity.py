@@ -13,7 +13,7 @@ import importlib
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -25,7 +25,10 @@ from process.provider_directory_cms_preparation import (
     NonprofileAdmissionPlan,
     NonprofileAdmissionReceipt,
     OwnedRelation,
+    RetainedNativeRelation,
+    RetainedRawRelation,
     desired_fence_hash,
+    retained_raw_policy,
 )
 from process.provider_directory_cms_storage_continuation import (
     StorageContinuationRequest,
@@ -78,7 +81,8 @@ async def resume_profile_capacity(
     )
     if identity != admission.admitted_identity:
         raise _error("profile_build_identity_changed")
-    workload = await fhir._profile_admission_workload(identity, fence, resource_fence, types)
+    with original_profile_input_scope(fhir):
+        workload = await fhir._profile_admission_workload(identity, fence, resource_fence, types)
     geometry = fhir._profile_admission_geometry(workload, fhir._profile_admission_inputs(execution, identity, workload))
     if geometry.geometry != admission.geometry or geometry.control_wal_projection != admission.control_wal_projection:
         raise _error("profile_geometry_changed")
@@ -103,6 +107,16 @@ async def resume_profile_capacity(
             )
     await fhir._assert_provider_directory_profile_wal_budget(resumed)
     return resumed
+
+
+@contextmanager
+def original_profile_input_scope(fhir: Any):
+    """Read the admitted inputs while retaining other prepared artifact overrides."""
+    original_relation_by_name = {
+        model.__tablename__: model.__tablename__ for model in (fhir.ProviderDirectorySource, *fhir.RESOURCE_MODELS)
+    }
+    with fhir._provider_directory_artifact_relation_scope(original_relation_by_name):
+        yield
 
 
 async def _assert_resumed_profile_state(fhir: Any, identity: Any, geometry: Any) -> None:
@@ -184,7 +198,13 @@ async def _database_observation(fhir: Any, plan: NonprofileAdmissionPlan) -> dic
         ("max_parallel_workers_per_gather", "0"),
         ("max_parallel_maintenance_workers", "0"),
     )
-    async with native.entity_address_tuned_transaction(fhir.db, settings, native._sql_literal, native.logger):
+    async with native.entity_address_tuned_transaction(
+        fhir.db,
+        settings,
+        native._sql_literal,
+        native.logger,
+        temp_file_limit_bytes=plan.temp_file_limit_bytes_per_backend,
+    ):
         observation = await _read_database_observation(fhir)
         if (
             observation["query_parallel_workers"]
@@ -588,30 +608,134 @@ class _CapacityProducer:
         ]:
             raise _error("consumption_changed")
 
+    def _raw_relation_policies(self, request: NonprofileAdmissionCheck) -> dict:
+        """Reject annotations outside this verified policy and measured original OIDs."""
+        if not request.raw_relations:
+            return {}
+        policy = retained_raw_policy(self.lease)
+        if (
+            request.lease != self.lease
+            or request.plan != self.plan
+            or self.lease.capacity_geometry_hash != self.plan.capacity_geometry_hash
+            or policy["selection_proof_id"] != self.plan.selection_proof_id
+        ):
+            raise _error("raw_identity_changed")
+        policy_json = json.dumps(policy, sort_keys=True, separators=(",", ":"))
+        measured_oid_by_coordinate = {
+            (relation.schema, relation.relation): relation.oid for relation in request.relations
+        }
+        raw_by_coordinate = {}
+        for raw_relation in request.raw_relations:
+            if type(raw_relation) is not RetainedRawRelation:
+                raise _error("raw_identity_changed")
+            coordinate = (raw_relation.schema, raw_relation.relation)
+            if (
+                coordinate in raw_by_coordinate
+                or type(raw_relation.oid) is not int
+                or not 0 < raw_relation.oid < 2**32
+                or measured_oid_by_coordinate.get(coordinate) != raw_relation.oid
+                or raw_relation.policy_json != policy_json
+                or type(raw_relation.index_names) is not tuple
+                or any(type(name) is not str for name in raw_relation.index_names)
+            ):
+                raise _error("raw_identity_changed")
+            raw_by_coordinate[coordinate] = (raw_relation, policy)
+        return raw_by_coordinate
+
+    def _native_relation_policies(self, request: NonprofileAdmissionCheck) -> dict:
+        """Authorize only signed seven-family clones with immutable original native evidence."""
+        from uuid import UUID
+
+        from process.provider_directory_cms_native_layout import _retained_source_model
+
+        if not request.native_relations:
+            return {}
+        policy = retained_raw_policy(self.lease)
+        if (
+            request.lease != self.lease
+            or request.plan != self.plan
+            or self.lease.capacity_geometry_hash != self.plan.capacity_geometry_hash
+            or policy["selection_proof_id"] != self.plan.selection_proof_id
+        ):
+            raise _error("native_identity_changed")
+        policy_json = json.dumps(policy, sort_keys=True, separators=(",", ":"))
+        schema = "entity_address_archive_" + UUID(policy["capture_id"]).hex
+        measured_oid_by_coordinate = {
+            (relation.schema, relation.relation): relation.oid for relation in request.relations
+        }
+        if len(measured_oid_by_coordinate) != len(request.relations):
+            raise _error("native_identity_changed")
+        raw_coordinates = {(relation.schema, relation.relation) for relation in request.raw_relations}
+        native_by_coordinate, source_oids, clone_oids = {}, set(), set()
+        for annotation in request.native_relations:
+            if type(annotation) is not RetainedNativeRelation or (
+                type(annotation.schema) is not str or type(annotation.relation) is not str
+            ):
+                raise _error("native_identity_changed")
+            source_layout = annotation.source_layout
+            model = _retained_source_model(source_layout, self.plan.native_address_targets)
+            coordinate = (annotation.schema, annotation.relation)
+            if (
+                coordinate in native_by_coordinate
+                or coordinate in raw_coordinates
+                or annotation.schema != schema
+                or annotation.relation != model.__tablename__
+                or annotation.relation not in policy["address_tables"]
+                or type(annotation.oid) is not int
+                or not 0 < annotation.oid < 2**32
+                or measured_oid_by_coordinate.get(coordinate) != annotation.oid
+                or annotation.policy_json != policy_json
+                or source_layout.database_oid != self.lease.database_oid
+                or source_layout.oid in source_oids
+                or annotation.oid in clone_oids
+                or annotation.oid == source_layout.oid
+            ):
+                raise _error("native_identity_changed")
+            source_oids.add(source_layout.oid)
+            clone_oids.add(annotation.oid)
+            native_by_coordinate[coordinate] = source_layout
+        return native_by_coordinate
+
     async def _assert_physical(self, request: NonprofileAdmissionCheck, observation: Mapping[str, Any]) -> None:
         """Measure aggregate native relations and conservative cluster-wide emitted WAL."""
         data_bytes = sum(relation.total_bytes for relation in request.relations)
         if data_bytes > dict(self.plan.reservation_bytes)["data"]:
             raise _error("data_budget_exceeded")
         await self._assert_wal_budget(request)
-        from process import provider_directory_cms_archive as archive
-        from process import provider_directory_cms_native_layout as native_layout
-
+        raw_by_coordinate = self._raw_relation_policies(request)
+        native_by_coordinate = self._native_relation_policies(request)
         for relation in request.relations:
-            if archive.is_archive_relation(relation.relation):
-                layout = await archive.capture_archive_layout(self.fhir, relation)
-            elif native_layout.is_native_relation(relation.relation, self.plan.native_address_targets):
-                layout = await native_layout.capture_native_layout(
-                    self.fhir, relation, self.plan.native_address_targets
-                )
-            else:
-                layout = await self.fhir._provider_directory_profile_relation_storage_fingerprint(
-                    relation.oid, expected_persistence=relation.persistence
-                )
+            raw_state = raw_by_coordinate.get((relation.schema, relation.relation))
+            native_source = native_by_coordinate.get((relation.schema, relation.relation))
+            layout = await self._capture_relation_layout(relation, raw_state, native_source)
             if layout.relation_oid != relation.oid or layout.effective_tablespace_oids != (
                 observation["data_tablespace_oid"],
             ):
                 raise _error("physical_tablespace_changed")
+
+    async def _capture_relation_layout(self, relation: OwnedRelation, raw_state: tuple | None, native_source=None):
+        """Select a verified raw layout or retain the existing native/Profile checks."""
+        from process import provider_directory_cms_archive as archive
+        from process import provider_directory_cms_native_layout as native_layout
+
+        if native_source is not None:
+            return await native_layout.capture_retained_native_layout(
+                self.fhir, relation, native_source, self.plan.native_address_targets
+            )
+        if raw_state is not None:
+            from process.provider_directory_cms_raw_layout import capture_retained_raw_layout
+
+            raw_relation, policy = raw_state
+            return await capture_retained_raw_layout(self.fhir, relation, policy, raw_relation.index_names)
+        if archive.is_archive_relation(relation.relation):
+            return await archive.capture_archive_layout(self.fhir, relation)
+        if native_layout.is_native_relation(relation.relation, self.plan.native_address_targets):
+            return await native_layout.capture_native_layout(self.fhir, relation, self.plan.native_address_targets)
+        if native_layout.is_scope_relation(self.fhir, relation.relation):
+            return await native_layout.capture_scope_layout(self.fhir, relation)
+        return await self.fhir._provider_directory_profile_relation_storage_fingerprint(
+            relation.oid, expected_persistence=relation.persistence
+        )
 
     async def _assert_wal_budget(self, request: NonprofileAdmissionCheck) -> None:
         """Spend each CMS phase once, excluding only the separately admitted Profile window."""

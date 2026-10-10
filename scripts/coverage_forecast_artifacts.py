@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 import re
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from coverage import __version__ as coverage_package_version
-
 from coverage_reports import CoverageRatchetError
-
 
 BASELINE_NAME = "test-coverage-baseline.json"
 PROVENANCE_SCHEMA_VERSION = 1
@@ -51,6 +49,14 @@ SHARD_SPEC_BY_KIND = {
             "core-services",
             "core-imports",
             "core-ptg",
+            "registry-0",
+            "registry-1",
+            "registry-2",
+            "registry-3",
+            "registry-4",
+            "registry-5",
+            "registry-6",
+            "registry-7",
             "directory-source",
             "directory-storage",
             "directory-address",
@@ -77,10 +83,7 @@ def _git_output(root: Path, *arguments: str) -> str:
             text=True,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise CoverageForecastError(
-            "could not resolve coverage forecast Git identity: "
-            + " ".join(arguments)
-        ) from exc
+        raise CoverageForecastError("could not resolve coverage forecast Git identity: " + " ".join(arguments)) from exc
     return completed.stdout.strip()
 
 
@@ -107,9 +110,7 @@ def resolve_forecast_base(root: Path, base_revision: str) -> tuple[str, str]:
         "merge base SHA",
     )
     if merge_base != base_sha:
-        raise CoverageForecastError(
-            "coverage forecast head does not contain the exact target base"
-        )
+        raise CoverageForecastError("coverage forecast head does not contain the exact target base")
     return base_sha, head_sha
 
 
@@ -161,9 +162,7 @@ def base_baseline(root: Path, base_sha: str) -> dict[str, Any]:
             capture_output=True,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise CoverageForecastError(
-            "target base has no readable coverage baseline"
-        ) from exc
+        raise CoverageForecastError("target base has no readable coverage baseline") from exc
     return load_baseline_bytes(completed.stdout, f"{base_sha}:{BASELINE_NAME}")
 
 
@@ -178,14 +177,10 @@ def reference_baseline(
     if tracked.get("machine_artifact_required") is not True:
         return tracked
     if artifact_path is None:
-        raise CoverageForecastError(
-            f"base {base_sha} requires its 90-day coverage baseline artifact"
-        )
+        raise CoverageForecastError(f"base {base_sha} requires its 90-day coverage baseline artifact")
     artifact = load_baseline(artifact_path)
     if artifact.get("source_sha") != base_sha:
-        raise CoverageForecastError(
-            f"coverage baseline artifact source_sha must equal base {base_sha}"
-        )
+        raise CoverageForecastError(f"coverage baseline artifact source_sha must equal base {base_sha}")
     return artifact
 
 
@@ -210,9 +205,7 @@ def _baseline(root: Path) -> dict[str, Any]:
     if not isinstance(reports, dict):
         raise CoverageForecastError("coverage baseline reports are malformed")
     if set(reports) != set(REPORT_SPEC_BY_NAME):
-        raise CoverageForecastError(
-            "coverage baseline reports differ from the forecast artifact contract"
-        )
+        raise CoverageForecastError("coverage baseline reports differ from the forecast artifact contract")
     for report_name, expected in REPORT_SPEC_BY_NAME.items():
         report = reports.get(report_name)
         if not isinstance(report, dict):
@@ -220,8 +213,7 @@ def _baseline(root: Path) -> dict[str, Any]:
         for field_name, expected_value in expected.items():
             if report.get(field_name) != expected_value:
                 raise CoverageForecastError(
-                    f"{report_name}: baseline {field_name} differs from "
-                    "the forecast artifact contract"
+                    f"{report_name}: baseline {field_name} differs from the forecast artifact contract"
                 )
     return baseline
 
@@ -265,30 +257,21 @@ def _coverage_version() -> str:
     return coverage_package_version
 
 
-def _rust_tool_versions(
-    baseline: dict[str, Any], supplied_versions: dict[str, str] | None = None
-) -> dict[str, str]:
+def _rust_tool_versions(baseline: dict[str, Any], supplied_versions: dict[str, str] | None = None) -> dict[str, str]:
     """Bind Rust reports to the versions frozen by the Rust baseline policy."""
 
     try:
         policy = baseline["reports"]["rust"]["scope"]["policy"]
     except (KeyError, TypeError) as exc:
         raise CoverageForecastError("rust: baseline measurement policy is malformed") from exc
-    expected_versions_by_name = {
-        field: policy.get(field) for field in RUST_TOOL_VERSION_FIELDS
-    }
-    if not all(
-        isinstance(value, str) and value
-        for value in expected_versions_by_name.values()
-    ):
+    expected_versions_by_name = {field: policy.get(field) for field in RUST_TOOL_VERSION_FIELDS}
+    if not all(isinstance(value, str) and value for value in expected_versions_by_name.values()):
         raise CoverageForecastError("rust: baseline tool versions are malformed")
     if supplied_versions is None:
         return expected_versions_by_name
     if set(supplied_versions) != set(RUST_TOOL_VERSION_FIELDS):
         raise CoverageForecastError("rust: producer tool versions are incomplete")
-    normalized_versions_by_name = {
-        field: supplied_versions[field].strip() for field in expected_versions_by_name
-    }
+    normalized_versions_by_name = {field: supplied_versions[field].strip() for field in expected_versions_by_name}
     if normalized_versions_by_name != expected_versions_by_name:
         raise CoverageForecastError("rust: producer tool versions differ from the baseline")
     return normalized_versions_by_name
@@ -307,9 +290,7 @@ def _shard_provenance(
     specification = _validate_shard(kind, shard)
     expected_coverage, _ = shard_file_names(kind, shard)
     if coverage_path.name != expected_coverage:
-        raise CoverageForecastError(
-            f"{kind}/{shard}: coverage file must be named {expected_coverage}"
-        )
+        raise CoverageForecastError(f"{kind}/{shard}: coverage file must be named {expected_coverage}")
     _baseline(root)
     return {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
@@ -345,9 +326,7 @@ def write_shard_provenance(
     _validate_shard(kind, shard)
     _, expected_output = shard_file_names(kind, shard)
     if output_path.name != expected_output:
-        raise CoverageForecastError(
-            f"{kind}/{shard}: provenance file must be named {expected_output}"
-        )
+        raise CoverageForecastError(f"{kind}/{shard}: provenance file must be named {expected_output}")
     base_sha, head_sha = resolve_forecast_base(root, base_revision)
     _write_json(
         output_path,
@@ -378,11 +357,7 @@ def verify_shard_artifacts(
     """Reject missing, stale, renamed, or mixed Python coverage producers."""
 
     specification = _shard_spec(kind)
-    expected_names = {
-        file_name
-        for shard in specification["shards"]
-        for file_name in shard_file_names(kind, shard)
-    }
+    expected_names = {file_name for shard in specification["shards"] for file_name in shard_file_names(kind, shard)}
     try:
         actual_names = {path.name for path in artifact_directory.iterdir() if path.is_file()}
     except OSError as exc:
@@ -390,9 +365,7 @@ def verify_shard_artifacts(
             f"{kind}: coverage artifact directory is unavailable: {artifact_directory}"
         ) from exc
     if actual_names != expected_names:
-        raise CoverageForecastError(
-            f"{kind}: coverage artifact files differ from the exact producer set"
-        )
+        raise CoverageForecastError(f"{kind}: coverage artifact files differ from the exact producer set")
     coverage_paths: list[Path] = []
     for shard in specification["shards"]:
         coverage_name, provenance_name = shard_file_names(kind, shard)
@@ -407,9 +380,7 @@ def verify_shard_artifacts(
             head_sha,
         )
         if provenance != expected:
-            raise CoverageForecastError(
-                f"{kind}/{shard}: coverage provenance differs from the exact CI input"
-            )
+            raise CoverageForecastError(f"{kind}/{shard}: coverage provenance differs from the exact CI input")
         coverage_paths.append(coverage_path)
     return coverage_paths
 
@@ -437,9 +408,7 @@ def _report_provenance(
     except KeyError as exc:
         raise CoverageForecastError(f"unsupported coverage report {report_name!r}") from exc
     if report_path.name != specification["path"]:
-        raise CoverageForecastError(
-            f"{report_name}: report must be named {specification['path']}"
-        )
+        raise CoverageForecastError(f"{report_name}: report must be named {specification['path']}")
     baseline = _baseline(root)
     provenance_by_field: dict[str, Any] = {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
@@ -452,9 +421,7 @@ def _report_provenance(
         "report_sha256": _sha256_file(report_path),
     }
     if report_name == "rust":
-        provenance_by_field["producer_tool_versions"] = _rust_tool_versions(
-            baseline, supplied_rust_tool_versions
-        )
+        provenance_by_field["producer_tool_versions"] = _rust_tool_versions(baseline, supplied_rust_tool_versions)
     else:
         provenance_by_field["coverage_version"] = _coverage_version()
     return provenance_by_field
@@ -472,9 +439,7 @@ def write_report_provenance(
     """Write provenance for a complete direct report such as Rust coverage."""
 
     if output_path.name != report_provenance_name(report_name):
-        raise CoverageForecastError(
-            f"{report_name}: provenance file has an unexpected name"
-        )
+        raise CoverageForecastError(f"{report_name}: provenance file has an unexpected name")
     base_sha, head_sha = resolve_forecast_base(root, base_revision)
     supplied_rust_tool_versions_by_name = None
     if report_name == "rust":
@@ -518,14 +483,10 @@ def verify_report_artifact(
         ) from exc
     provenance_path = artifact_directory / report_provenance_name(report_name)
     if actual_names != {specification["path"], provenance_path.name}:
-        raise CoverageForecastError(
-            f"{report_name}: coverage artifact files differ from the exact report set"
-        )
+        raise CoverageForecastError(f"{report_name}: coverage artifact files differ from the exact report set")
     report_path = artifact_directory / specification["path"]
     expected = _report_provenance(root, report_name, report_path, base_sha, head_sha)
     provenance = _read_json(provenance_path, "coverage provenance")
     if provenance != expected:
-        raise CoverageForecastError(
-            f"{report_name}: coverage provenance differs from the exact CI input"
-        )
+        raise CoverageForecastError(f"{report_name}: coverage provenance differs from the exact CI input")
     return report_path

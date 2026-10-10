@@ -7,14 +7,20 @@ from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from uuid import UUID
 
 import pytest
 
+from process import provider_directory_cms_address as cms_address
 from process import provider_directory_cms_capacity_contract as contract
 from process import provider_directory_cms_preflight as producer
 from process import provider_directory_profile_capacity_preflight_contract as preflight
 from process import provider_directory_profile_runtime_observation as runtime
+from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_registry_cms_prepared_pair import RegistryCMSRetentionRequest
 from tests.provider_directory_cms_capacity_test_support import cms_guard, cms_plan, rehash_guard, sign_guard
+from tests.test_provider_directory_cms_address import address_build_case as address_build_case
 from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME, _trust, _verify
 
 fhir = importlib.import_module("process.provider_directory_fhir")
@@ -37,18 +43,45 @@ def _fresh_guard(plan=None):
     return guard
 
 
-def _request(*, projection=False, limits=None):
+def _request(*, projection=False, limits=None, retention_policy=None):
     raw = _fresh_guard()["healthcare_request"]
     if projection:
         raw["contract_id"] = contract.CMS_PROJECTION_REQUEST_CONTRACT
         raw.pop("signing_guard")
     raw[contract.CMS_ADMISSION_FIELD]["limits"].update(limits or {})
+    if retention_policy is not None:
+        raw[contract.CMS_ADMISSION_FIELD]["registry_source_retention"] = retention_policy
     validate = (
         preflight.validated_capacity_authority_projection_request
         if projection
         else preflight.validated_capacity_preflight_request
     )
     return validate(raw)
+
+
+def _retention_policy(execution):
+    """Use the real request DTO for the exact selected synthetic CMS dataset."""
+    cms = execution.attestation.desired_cms_dataset
+    request = RegistryCMSRetentionRequest(
+        PinnedFHIRMembershipSource(
+            "fixture",
+            cms["source_id"],
+            cms["endpoint_id"],
+            cms["dataset_id"],
+            cms["dataset_hash"],
+            "release-1",
+            123,
+            "cms-npd",
+            execution.attestation.desired_profile_as_of,
+        ),
+        RegistryNetworkSourceCoordinates("fhir", cms["source_id"], "fixture", cms["dataset_id"], "producer", "edition"),
+        execution.attestation.proof_id,
+        "b" * 64,
+        "c" * 64,
+        4096,
+        8192,
+    )
+    return request.policy(UUID("00000000-0000-0000-0000-000000000001"), "retained_owner", ("reader", "writer"))
 
 
 def _inputs(request):
@@ -124,6 +157,7 @@ def _database(monkeypatch):
         status=AsyncMock(return_value=1),
     )
     monkeypatch.setattr(fhir, "db", database)
+    monkeypatch.setattr(producer, "apply_temp_file_limit", AsyncMock())
     return database, session, events
 
 
@@ -189,11 +223,34 @@ async def test_registration_commits_before_read_snapshot_and_restores_context(mo
     assert fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get() is prior
 
 
-@pytest.mark.asyncio
-async def test_full_proof_projection_and_revisions_share_one_read_snapshot(monkeypatch):
-    request = _request()
-    inputs, profile_lease = _inputs(request)
-    _database_value, session, events = _database(monkeypatch)
+def _retention_preflight_inputs(monkeypatch, request, inputs, address_build_case, policy):
+    """Bind the actual address factory before computing its expected signed geometry."""
+    monkeypatch.setattr(fhir, "_schema", lambda: "fixture")
+    inputs = replace(inputs, native_dependencies=address_build_case[3], native_input_fence=address_build_case[4])
+    bare_factory = cms_address.cms_address_preparation(
+        fhir,
+        request.execution,
+        inputs.fence,
+        inputs.native_dependencies,
+        native_input_fence=inputs.native_input_fence,
+        run_id="run_" + "2" * 32,
+        worker_count=inputs.plan.worker_count,
+        temp_file_limit_bytes_per_backend=inputs.plan.temp_file_limit_bytes_per_backend,
+    )
+    retained_factory = bare_factory.with_registry_source_retention(policy)
+    inputs = replace(
+        inputs,
+        plan=replace(
+            inputs.plan,
+            native_address_targets=retained_factory.native_targets,
+            native_address_input_hash=retained_factory.input_hash,
+        ),
+    )
+    return inputs, bare_factory, retained_factory
+
+
+def _read_inputs_observations(monkeypatch, inputs, session, events):
+    """Retain all source/projection observations in the same synthetic read snapshot."""
     monkeypatch.setattr(fhir, "_provider_directory_profile_selection_catalog", lambda: {})
     monkeypatch.setattr(fhir, "assert_profile_selection_current_in_transaction", AsyncMock())
     monkeypatch.setattr(
@@ -228,11 +285,28 @@ async def test_full_proof_projection_and_revisions_share_one_read_snapshot(monke
     monkeypatch.setattr(
         producer, "capture_native_address_input_fence", in_snapshot("revisions", inputs.native_input_fence)
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retention", [False, True])
+async def test_full_proof_projection_and_revisions_share_one_read_snapshot(monkeypatch, address_build_case, retention):
+    request = _request()
+    policy = _retention_policy(request.execution) if retention else None
+    request = _request(retention_policy=policy)
+    inputs, profile_lease = _inputs(request)
+    _database_value, session, events = _database(monkeypatch)
+    if retention:
+        inputs, bare_factory, retained_factory = _retention_preflight_inputs(
+            monkeypatch, request, inputs, address_build_case, policy
+        )
+    _read_inputs_observations(monkeypatch, inputs, session, events)
     factory = Mock(
         return_value=SimpleNamespace(
             native_targets=inputs.plan.native_address_targets, input_hash=inputs.plan.native_address_input_hash
         )
     )
+    if retention:
+        factory = Mock(wraps=cms_address.cms_address_preparation)
     monkeypatch.setattr(producer, "cms_address_preparation", factory)
     monkeypatch.setattr(
         producer, "_database_observation", AsyncMock(return_value=_database_observation(inputs, profile_lease))
@@ -242,10 +316,13 @@ async def test_full_proof_projection_and_revisions_share_one_read_snapshot(monke
     actual = await producer._read_inputs(fhir, request, profile_lease)
     assert actual == inputs
     assert events.index("full-proof") < events.index("revisions") < events.index("end")
-    assert "SET LOCAL temp_file_limit='1kB'" in events
+    producer.apply_temp_file_limit.assert_awaited_once_with(fhir.db, 1024)
     assert "SET LOCAL max_parallel_workers_per_gather=0" in events
     assert "SET LOCAL max_parallel_maintenance_workers=0" in events
     assert factory.call_args.kwargs["native_input_fence"] is inputs.native_input_fence
+    if retention:
+        assert actual.plan.native_address_input_hash == retained_factory.input_hash
+        assert actual.plan.native_address_input_hash != bare_factory.input_hash
 
 
 def _issue_stubs(monkeypatch, request, inputs, profile_lease):

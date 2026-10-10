@@ -15,6 +15,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     LargeBinary,
     PrimaryKeyConstraint,
@@ -23,7 +24,8 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -131,26 +133,26 @@ class EntityAddressResultGeneration(Base, JSONOutputMixin):
 
 
 class ImportHistory(Base, JSONOutputMixin):
-    __tablename__ = 'history'
+    __tablename__ = "history"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('import_id'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("import_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['import_id']
+    __my_index_elements__ = ["import_id"]
     import_id = Column(String)
     json_status = Column(JSON)
     when = Column(DateTime)
 
 
 class ImportLog(Base, JSONOutputMixin):
-    __tablename__ = 'log'
+    __tablename__ = "log"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('issuer_id', 'checksum'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("issuer_id", "checksum"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['issuer_id', 'checksum']
+    __my_index_elements__ = ["issuer_id", "checksum"]
     issuer_id = Column(Integer)
     checksum = Column(Integer)
     type = Column(String(4))
@@ -335,25 +337,25 @@ class PTGImportWave(Base, JSONOutputMixin):
         CheckConstraint(
             "((cohort_attestation ->> 'schema_version' = "
             "'healthporta.ptg-import-wave-attestation.v6' "
-                "AND receipt_key_id IS NOT NULL "
-                "AND receipt_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
-                "AND cohort_attestation ->> 'receipt_key_id' = receipt_key_id "
-                "AND receipt_public_modulus_hex IS NOT NULL "
-                "AND length(receipt_public_modulus_hex) = 512 "
-                "AND receipt_public_modulus_hex ~ '^[0-9a-f]+$' "
-                "AND left(receipt_public_modulus_hex, 1) ~ '^[89a-f]$' "
-                "AND right(receipt_public_modulus_hex, 1) ~ '^[13579bdf]$' "
-                "AND receipt_public_exponent IS NOT NULL "
-                "AND receipt_public_exponent = 65537 "
-                "AND cohort_attestation ->> 'receipt_public_modulus_hex' "
-                "= receipt_public_modulus_hex "
-                "AND (cohort_attestation ->> 'receipt_public_exponent')::integer "
-                "= receipt_public_exponent) "
-                "OR (cohort_attestation ->> 'schema_version' <> "
-                "'healthporta.ptg-import-wave-attestation.v6' "
-                "AND receipt_key_id IS NULL "
-                "AND receipt_public_modulus_hex IS NULL "
-                "AND receipt_public_exponent IS NULL))",
+            "AND receipt_key_id IS NOT NULL "
+            "AND receipt_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
+            "AND cohort_attestation ->> 'receipt_key_id' = receipt_key_id "
+            "AND receipt_public_modulus_hex IS NOT NULL "
+            "AND length(receipt_public_modulus_hex) = 512 "
+            "AND receipt_public_modulus_hex ~ '^[0-9a-f]+$' "
+            "AND left(receipt_public_modulus_hex, 1) ~ '^[89a-f]$' "
+            "AND right(receipt_public_modulus_hex, 1) ~ '^[13579bdf]$' "
+            "AND receipt_public_exponent IS NOT NULL "
+            "AND receipt_public_exponent = 65537 "
+            "AND cohort_attestation ->> 'receipt_public_modulus_hex' "
+            "= receipt_public_modulus_hex "
+            "AND (cohort_attestation ->> 'receipt_public_exponent')::integer "
+            "= receipt_public_exponent) "
+            "OR (cohort_attestation ->> 'schema_version' <> "
+            "'healthporta.ptg-import-wave-attestation.v6' "
+            "AND receipt_key_id IS NULL "
+            "AND receipt_public_modulus_hex IS NULL "
+            "AND receipt_public_exponent IS NULL))",
             name="ptg_import_wave_receipt_key_epoch_check",
         ),
         CheckConstraint(
@@ -470,7 +472,8 @@ class PTGImportWaveQuarantine(Base, JSONOutputMixin):
     __table_args__ = (
         PrimaryKeyConstraint("predecessor_wave_id"),
         ForeignKeyConstraint(
-            ("predecessor_wave_id",), (PTGImportWave.wave_id,),
+            ("predecessor_wave_id",),
+            (PTGImportWave.wave_id,),
             name="ptg_import_wave_quarantine_predecessor_wave_fkey",
             ondelete="RESTRICT",
         ),
@@ -613,12 +616,14 @@ class PTGImportWaveSupersession(Base, JSONOutputMixin):
     __table_args__ = (
         PrimaryKeyConstraint("predecessor_wave_id"),
         ForeignKeyConstraint(
-            ("predecessor_wave_id",), (PTGImportWave.wave_id,),
+            ("predecessor_wave_id",),
+            (PTGImportWave.wave_id,),
             name="ptg_import_wave_supersession_predecessor_wave_fkey",
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ("successor_wave_id",), (PTGImportWave.wave_id,),
+            ("successor_wave_id",),
+            (PTGImportWave.wave_id,),
             name="ptg_import_wave_supersession_successor_wave_fkey",
             ondelete="RESTRICT",
             deferrable=True,
@@ -633,8 +638,7 @@ class PTGImportWaveSupersession(Base, JSONOutputMixin):
             name="ptg_import_wave_supersession_distinct_check",
         ),
         CheckConstraint(
-            "recovery_basis IN ('logical_preclaim_failure', "
-            "'materialized_preclaim_failure')",
+            "recovery_basis IN ('logical_preclaim_failure', 'materialized_preclaim_failure')",
             name="ptg_import_wave_supersession_basis_check",
         ),
         CheckConstraint(
@@ -742,17 +746,23 @@ class PTGImportWaveIntent(Base, JSONOutputMixin):
     __table_args__ = (
         PrimaryKeyConstraint("wave_id", "ordinal"),
         ForeignKeyConstraint(
-            ("wave_id",), (PTGImportWave.wave_id,),
-            name="ptg_import_wave_intent_wave_fkey", ondelete="CASCADE",
+            ("wave_id",),
+            (PTGImportWave.wave_id,),
+            name="ptg_import_wave_intent_wave_fkey",
+            ondelete="CASCADE",
         ),
         UniqueConstraint("run_id", name="ptg_import_wave_intent_run_id_key"),
         UniqueConstraint("job_id", name="ptg_import_wave_intent_job_id_key"),
         UniqueConstraint(
-            "wave_id", "ordinal", "run_id", "job_id",
+            "wave_id",
+            "ordinal",
+            "run_id",
+            "job_id",
             name="ptg_import_wave_intent_claim_identity_key",
         ),
         UniqueConstraint(
-            "wave_id", "source_file_import_id",
+            "wave_id",
+            "source_file_import_id",
             name="ptg_import_wave_intent_source_per_wave_key",
         ),
         CheckConstraint(
@@ -854,10 +864,13 @@ class PTGImportWaveClaim(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ("wave_id", "ordinal", "run_id", "job_id"),
             (
-                PTGImportWaveIntent.wave_id, PTGImportWaveIntent.ordinal,
-                PTGImportWaveIntent.run_id, PTGImportWaveIntent.job_id,
+                PTGImportWaveIntent.wave_id,
+                PTGImportWaveIntent.ordinal,
+                PTGImportWaveIntent.run_id,
+                PTGImportWaveIntent.job_id,
             ),
-            name="ptg_import_wave_claim_intent_fkey", ondelete="CASCADE",
+            name="ptg_import_wave_claim_intent_fkey",
+            ondelete="CASCADE",
         ),
         UniqueConstraint("run_id", name="ptg_import_wave_claim_run_id_key"),
         UniqueConstraint("job_id", name="ptg_import_wave_claim_job_id_key"),
@@ -907,10 +920,13 @@ class PTGImportWaveOutcome(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ("wave_id", "ordinal", "run_id", "job_id"),
             (
-                PTGImportWaveIntent.wave_id, PTGImportWaveIntent.ordinal,
-                PTGImportWaveIntent.run_id, PTGImportWaveIntent.job_id,
+                PTGImportWaveIntent.wave_id,
+                PTGImportWaveIntent.ordinal,
+                PTGImportWaveIntent.run_id,
+                PTGImportWaveIntent.job_id,
             ),
-            name="ptg_import_wave_outcome_intent_fkey", ondelete="CASCADE",
+            name="ptg_import_wave_outcome_intent_fkey",
+            ondelete="CASCADE",
         ),
         UniqueConstraint("run_id", name="ptg_import_wave_outcome_run_id_key"),
         CheckConstraint(
@@ -1343,6 +1359,12 @@ class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("dataset_id", "resource_type", "resource_id"),
+        Index(
+            "provider_directory_dataset_resource_content_cursor_c_idx",
+            "dataset_id",
+            text('resource_type COLLATE "C"'),
+            text('resource_id COLLATE "C"'),
+        ),
         {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
     __my_index_elements__ = ["dataset_id", "resource_type", "resource_id"]
@@ -1409,8 +1431,7 @@ class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):
     plan_active = Column(
         Boolean,
         Computed(
-            "COALESCE(NULLIF(lower(btrim(payload_json ->> 'status')), ''), "
-            "'active') = 'active'",
+            "COALESCE(NULLIF(lower(btrim(payload_json ->> 'status')), ''), 'active') = 'active'",
             persisted=True,
         ),
     )
@@ -1805,12 +1826,22 @@ class ProviderDirectoryPractitionerRole(Base, JSONOutputMixin):
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
         {"index_elements": ("practitioner_ref",), "name": "provider_directory_role_practitioner_idx"},
-        {"index_elements": ("source_id", "practitioner_ref"), "name": "provider_directory_role_source_practitioner_idx"},
+        {
+            "index_elements": ("source_id", "practitioner_ref"),
+            "name": "provider_directory_role_source_practitioner_idx",
+        },
         {"index_elements": ("organization_ref",), "name": "provider_directory_role_organization_idx"},
-        {"index_elements": ("source_id", "organization_ref"), "name": "provider_directory_role_source_organization_idx"},
+        {
+            "index_elements": ("source_id", "organization_ref"),
+            "name": "provider_directory_role_source_organization_idx",
+        },
         {"index_elements": ("last_seen_run_id", "source_id"), "name": "provider_directory_role_run_source_idx"},
         {"index_elements": ("location_refs",), "using": "gin", "name": "provider_directory_role_location_refs_gin_idx"},
-        {"index_elements": ("specialty_codes",), "using": "gin", "name": "provider_directory_role_specialty_codes_gin_idx"},
+        {
+            "index_elements": ("specialty_codes",),
+            "using": "gin",
+            "name": "provider_directory_role_specialty_codes_gin_idx",
+        },
         {"index_elements": ("code_codes",), "using": "gin", "name": "provider_directory_role_code_codes_gin_idx"},
         {"index_elements": ("network_refs",), "using": "gin", "name": "provider_directory_role_network_refs_gin_idx"},
     ]
@@ -2063,14 +2094,10 @@ class ProviderDirectoryDatasetRehydrationCheckpoint(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_dataset_rehydration_checkpoint"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint(
-            "source_id", "dataset_id", "acquisition_root_run_id", "resource_type"
-        ),
+        PrimaryKeyConstraint("source_id", "dataset_id", "acquisition_root_run_id", "resource_type"),
         {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = [
-        "source_id", "dataset_id", "acquisition_root_run_id", "resource_type"
-    ]
+    __my_index_elements__ = ["source_id", "dataset_id", "acquisition_root_run_id", "resource_type"]
     __my_additional_indexes__ = [
         {"index_elements": ("owner_run_id",), "name": "pd_dataset_rehydrate_checkpoint_owner_idx"},
         {"index_elements": ("state", "updated_at"), "name": "pd_dataset_rehydrate_checkpoint_state_idx"},
@@ -2337,8 +2364,7 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
             name="pd_profile_build_checkpoint_stage_storage_check",
         ),
         CheckConstraint(
-            "state IN ('building_evidence', 'evidence_complete', "
-            "'building_profile', 'ready', 'failed')",
+            "state IN ('building_evidence', 'evidence_complete', 'building_profile', 'ready', 'failed')",
             name="pd_profile_build_checkpoint_state_check",
         ),
         CheckConstraint(
@@ -2349,13 +2375,11 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
             name="pd_profile_build_checkpoint_batch_bounds_check",
         ),
         CheckConstraint(
-            "profile_next_batch = 0 "
-            "OR evidence_next_batch = evidence_total_batches",
+            "profile_next_batch = 0 OR evidence_next_batch = evidence_total_batches",
             name="pd_profile_build_checkpoint_phase_order_check",
         ),
         CheckConstraint(
-            "executable_plan_hash IS NULL "
-            "OR executable_plan_hash ~ '^[0-9a-f]{64}$'",
+            "executable_plan_hash IS NULL OR executable_plan_hash ~ '^[0-9a-f]{64}$'",
             name="pd_profile_build_checkpoint_plan_hash_check",
         ),
         CheckConstraint(
@@ -2700,7 +2724,8 @@ class ProviderDirectoryProfileCapacityLeaseConsumption(
             name="pd_profile_capacity_consumption_reservation_key",
         ),
         UniqueConstraint(
-            "run_id", "admission_purpose",
+            "run_id",
+            "admission_purpose",
             name="pd_profile_capacity_consumption_run_purpose_key",
         ),
         CheckConstraint(
@@ -2802,9 +2827,7 @@ class ProviderDirectoryProfileCapacityLeaseConsumption(
     )
 
 
-_PROFILE_CAPACITY_CONTROL_PLANE_RECEIPT_COLUMN = (
-    "control_plane_receipt_sha256"
-)
+_PROFILE_CAPACITY_CONTROL_PLANE_RECEIPT_COLUMN = "control_plane_receipt_sha256"
 
 
 class ProviderDirectoryProfileCapacityPreflightReceipt(
@@ -2942,8 +2965,7 @@ class ProviderDirectoryProfileSelectionProof(Base, JSONOutputMixin):
             name="provider_directory_profile_selection_proof_id_key",
         ),
         CheckConstraint(
-            "input_identity_digest ~ '^[0-9a-f]{64}$' "
-            "AND proof_id ~ '^[0-9a-f]{64}$'",
+            "input_identity_digest ~ '^[0-9a-f]{64}$' AND proof_id ~ '^[0-9a-f]{64}$'",
             name="pd_profile_selection_proof_identity_check",
         ),
         {

@@ -401,13 +401,59 @@ async def capture_native_address_input_fence(session, schema: str, *, cutover=Fa
         "reference_authorities": await _reference_authorities(session, schema),
         "geo_bindings": _geo_bindings(schema, before),
         "revisions": await _revision_guards(session, schema, before),
+        "cms_office_read_relations": await _cms_office_read_relations(session, schema, cutover=cutover),
     }
     require_supported_native_address_inputs(fence_by_field)
     return fence_by_field
 
 
+async def _cms_office_read_relations(session, schema, *, cutover=False):
+    """Pin existing sealed CMS read catalogs; never install mutation hooks."""
+    from process.provider_directory_cms_typed_offices import CMS_OFFICE_READ_TABLES
+
+    statement = text("""SELECT requested.name,relation.oid::bigint AS relation_oid,
+      namespace.oid::bigint AS schema_oid,namespace.nspowner::bigint AS schema_owner_oid,
+      relation.relowner::bigint AS owner_oid,relation.relkind::text AS relkind,
+      relation.relpersistence::text AS relpersistence,relation.relacl::text AS raw_acl,
+      namespace.nspacl::text AS raw_schema_acl,relation.relrowsecurity,relation.relforcerowsecurity,
+      relation.relispartition OR EXISTS(SELECT 1 FROM pg_inherits
+        WHERE inhrelid=relation.oid OR inhparent=relation.oid) AS inherited
+      FROM unnest(CAST(:names AS text[])) requested(name)
+      LEFT JOIN pg_class relation ON relation.oid=to_regclass(:schema||'.'||requested.name)
+      LEFT JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace ORDER BY requested.name""")
+    parameters_by_name = {"names": list(CMS_OFFICE_READ_TABLES), "schema": '"' + schema + '"'}
+    before_catalog_by_name = {
+        catalog_row["name"]: dict(catalog_row)
+        for catalog_row in (await session.execute(statement, parameters_by_name)).mappings()
+    }
+    for name, catalog_row in before_catalog_by_name.items():
+        if catalog_row["relation_oid"] is not None:
+            if (
+                catalog_row["relkind"] != "r"
+                or catalog_row["relpersistence"] != "p"
+                or catalog_row["inherited"]
+                or catalog_row["relrowsecurity"]
+                or catalog_row["relforcerowsecurity"]
+            ):
+                raise RuntimeError("cms_typed_office_read_heap_unavailable")
+            await session.execute(
+                text(f'LOCK TABLE "{schema}"."{name}" IN ' + ("SHARE" if cutover else "ACCESS SHARE") + " MODE NOWAIT")
+            )
+    after_catalog_by_name = {
+        catalog_row["name"]: dict(catalog_row)
+        for catalog_row in (await session.execute(statement, parameters_by_name)).mappings()
+    }
+    if before_catalog_by_name != after_catalog_by_name:
+        raise RuntimeError("cms_typed_office_read_catalog_changed")
+    return before_catalog_by_name
+
+
 def require_supported_native_address_inputs(fence: dict) -> None:
     """Require complete physical pins plus accepted native publication families."""
+    from process.provider_directory_cms_typed_offices import CMS_OFFICE_READ_TABLES
+
+    if set(fence.get("cms_office_read_relations", {})) != set(CMS_OFFICE_READ_TABLES):
+        raise RuntimeError("cms_address_native_office_read_fence_invalid")
     schema = npi._schema_name(fence["schema"])
     expected_names = {f'"{namespace}"."{name}"' for namespace, name in _relations(schema)}
     if fence.get("version") != 1 or set(fence["relations"]) != expected_names:

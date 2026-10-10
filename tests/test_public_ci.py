@@ -48,6 +48,7 @@ MATRIX_ROWS_BY_JOB = {
             ("core-services", "services"),
             ("core-imports", "imports"),
             ("core-ptg", "PTG"),
+            *((f"registry-{index}", f"registry {index + 1}") for index in range(8)),
             ("directory-source", "directory source"),
             ("directory-storage", "directory storage"),
             ("directory-address", "directory address"),
@@ -127,6 +128,12 @@ def _assert_smoke_job(workflow, workflow_text) -> None:
     assert "uv-x86_64-unknown-linux-gnu/uv uv-x86_64-unknown-linux-gnu/uvx" in bootstrap["run"]
     assert '"$GITHUB_PATH"' in bootstrap["run"]
 
+    setup = next(step for step in job["steps"] if step.get("name") == "Install uv-managed Python")
+    assert "uv --no-config venv" in setup["run"]
+    assert "--managed-python --python 3.14.7" in setup["run"]
+    assert "UV_PYTHON_PREFERENCE=only-managed" in setup["run"]
+    assert job["steps"].index(bootstrap) < job["steps"].index(setup)
+    assert not any(step.get("uses", "").startswith("actions/setup-python@") for step in job["steps"])
     commands = "\n".join(step.get("run", "") for step in job["steps"])
     assert "scripts/ci/public_hygiene.py" in commands
     assert "uv venv --python 3.14.7 --no-python-downloads .venv" in commands
@@ -342,13 +349,13 @@ def _assert_matrix_artifact_identity(job_id, job) -> None:
     }
 
 
-def test_public_test_matrices_fail_fast_and_preserve_all_shards():
+def test_public_test_matrices_preserve_independent_database_shards():
     workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
     jobs = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))["jobs"]
     assert {job_id for job_id, job in jobs.items() if "strategy" in job} == set(MATRIX_ROWS_BY_JOB)
     for job_id, rows in MATRIX_ROWS_BY_JOB.items():
         job = jobs[job_id]
-        assert job["strategy"] == {"fail-fast": True, "matrix": {"include": rows}}
+        assert job["strategy"] == {"fail-fast": job_id == "python-tests", "matrix": {"include": rows}}
         assert job["env"]["CI_SHARD"] == "${{ matrix.shard }}"
         stage = next(step for step in job["steps"] if step.get("name") == "Run complete validation stage")
         mode = "python-main" if job_id == "python-tests" else "postgres"
@@ -356,7 +363,7 @@ def test_public_test_matrices_fail_fast_and_preserve_all_shards():
         _assert_matrix_artifact_identity(job_id, job)
 
 
-def test_publisher_requires_every_matrix_result_and_fourteen_immutable_artifacts():
+def test_publisher_requires_every_matrix_result_and_twenty_two_immutable_artifacts():
     workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
     workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
     jobs = workflow["jobs"]
@@ -384,7 +391,7 @@ def test_publisher_requires_every_matrix_result_and_fourteen_immutable_artifacts
         for matrix_row in MATRIX_ROWS_BY_JOB["address-canonical-db-tests"]
     )
     assert identities == expected_ids
-    assert len(set(identities)) == 14
+    assert len(set(identities)) == 22
     assert download["with"]["digest-mismatch"] == "error"
     assert download["with"]["merge-multiple"] is False
     assert jobs["source-validation"]["needs"] == ["measurement"]

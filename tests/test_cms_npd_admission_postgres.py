@@ -521,7 +521,7 @@ async def test_published_plan_only_release_replay_backfills_network_role(monkeyp
     """A v1 receipt cannot serve until exact new network roles are bound and rechecked."""
     directory, receipt = retained_release(cms_artifact_root, include_unplanned_network_role=True)
     async with admission_database(monkeypatch) as database:
-        from process import provider_directory_insurance_network_identity as network_writer
+        from process import provider_directory_insurance_network_batch as network_writer
 
         current_require = coverage.require_cms_bindings
 
@@ -530,7 +530,11 @@ async def test_published_plan_only_release_replay_backfills_network_role(monkeyp
                 await current_require(session, schema, generation, kind)
 
         with monkeypatch.context() as legacy:
-            legacy.setattr(network_writer, "has_source_declared_network_role", lambda _organization: False)
+            legacy.setattr(
+                network_writer,
+                "_TARGETS_SQL",
+                network_writer._TARGETS_SQL.replace("AND (observation_json->>'network_role')::boolean", "AND FALSE"),
+            )
             legacy.setattr(cms, "_NETWORK_ROLE_SQL", "FALSE")
             legacy.setattr(coverage, "require_cms_bindings", plan_only_require)
             published = await _admit_legacy_source(directory, receipt, "cms-network-role-first")
@@ -1153,17 +1157,27 @@ async def test_committed_batch_cancellation_keeps_incumbent_and_replays_safely(m
     async with admission_database(monkeypatch) as database:
         incumbent = await _admit_legacy_source(directory, receipt, "cms-test-incumbent")
         next_directory, next_receipt = retained_release(cms_artifact_root, revision="cancelled")
-        original_probe = fhir._raise_if_resource_import_cancelled
-        probe_numbers = count(1)
+        original_persist = cms._persist_source_batch
+        batch_gate = asyncio.Lock()
+        committed_batch_numbers = []
+        cancellation = asyncio.CancelledError()
 
-        async def cancel_after_three_commits(*_args):
-            if next(probe_numbers) == 3:
-                raise asyncio.CancelledError
+        async def cancel_after_three_commits(*args, **kwargs):
+            async with batch_gate:
+                if len(committed_batch_numbers) == 3:
+                    raise cancellation
+                await original_persist(*args, **kwargs)
+                committed_batch_numbers.append(len(committed_batch_numbers) + 1)
+                if len(committed_batch_numbers) == 3:
+                    raise cancellation
 
         monkeypatch.setattr(cms, "BATCH_SIZE", 1)
-        monkeypatch.setattr(fhir, "_raise_if_resource_import_cancelled", cancel_after_three_commits)
-        with pytest.raises(asyncio.CancelledError):
-            await _admit_legacy_source(next_directory, next_receipt, "cms-test-cancelled")
+        with monkeypatch.context() as cancelled:
+            cancelled.setattr(cms, "_persist_source_batch", cancel_after_three_commits)
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await _admit_legacy_source(next_directory, next_receipt, "cms-test-cancelled")
+        assert caught.value is cancellation
+        assert committed_batch_numbers == [1, 2, 3]
         await _assert_current(database, incumbent["dataset_id"])
         candidate = await database.first(
             "SELECT dataset_id FROM mrf.provider_directory_endpoint_dataset WHERE status='acquiring'"
@@ -1176,7 +1190,6 @@ async def test_committed_batch_cancellation_keeps_incumbent_and_replays_safely(m
             )
             == 3
         )
-        monkeypatch.setattr(fhir, "_raise_if_resource_import_cancelled", original_probe)
         resumed = await _admit_legacy_source(next_directory, next_receipt, "cms-test-resumed")
         assert resumed["dataset_id"] == candidate[0]
         await _assert_current(database, resumed["dataset_id"])

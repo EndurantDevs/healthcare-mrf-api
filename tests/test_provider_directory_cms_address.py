@@ -6,6 +6,7 @@ import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 
@@ -13,6 +14,10 @@ from process import cms_doctors_preparation as doctors_preparation
 from process import provider_directory_cms_address as address
 from process import provider_directory_cms_native_inputs as native_inputs
 from process.cms_doctors_source_provenance import mint_doctors_source_provenance
+from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_registry_cms_prepared_pair import RegistryCMSRetentionRequest
+from process.provider_directory_cms_typed_offices import CMS_OFFICE_READ_TABLES
 from tests.test_cms_doctors_source_provenance import source_metrics
 
 
@@ -29,8 +34,14 @@ def _incumbent_geo_bindings():
     }
 
 
+@asynccontextmanager
+async def _address_mock_session():
+    yield SimpleNamespace(execute=AsyncMock())
+
+
 @pytest.fixture
 def address_build_case(monkeypatch):
+    """Bind complete synthetic native inputs to the actual address preparation factory."""
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_STAGE", "true")
     for name in (
         "LIMIT_PER_SOURCE",
@@ -40,7 +51,7 @@ def address_build_case(monkeypatch):
         "COMPACT_SOURCE_RECORD_IDS_BY_REWRITE",
     ):
         monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_" + name, raising=False)
-    monkeypatch.setattr(address, "_mapping_digest", lambda: "d" * 64)
+    monkeypatch.setattr(address, "_mapping_digest", lambda **_options: "d" * 64)
     datasets = tuple(
         SimpleNamespace(
             source_id=source_id,
@@ -60,12 +71,8 @@ def address_build_case(monkeypatch):
         )
     )
 
-    @asynccontextmanager
-    async def session():
-        yield SimpleNamespace(execute=AsyncMock())
-
     fhir = SimpleNamespace(
-        db=SimpleNamespace(session=session, _transaction_binding=lambda: None), _schema=lambda: "fixture"
+        db=SimpleNamespace(session=_address_mock_session, _transaction_binding=lambda: None), _schema=lambda: "fixture"
     )
     monkeypatch.setattr(address._native(), "db", fhir.db)
     native_input_fence_by_field = {
@@ -77,6 +84,7 @@ def address_build_case(monkeypatch):
         "geo_bindings": _incumbent_geo_bindings(),
         "reference_authorities": {name: {} for name in ("cms-doctors", "geo", "tiger", "mrf")},
         "npi": {"input_revision": 1},
+        "cms_office_read_relations": {name: {"relation_oid": None} for name in CMS_OFFICE_READ_TABLES},
     }
     monkeypatch.setattr(
         address, "capture_native_address_input_fence", AsyncMock(return_value=native_input_fence_by_field)
@@ -111,6 +119,113 @@ def _admission(factory):
             temp_file_limit_bytes_per_backend=1024,
         )
     )
+
+
+def _retention_policy(address_build_case):
+    """Construct the real policy against the factory's actual synthetic CMS fence."""
+    _fhir, execution, fence = address_build_case[:3]
+    execution.attestation.proof_id = "e" * 64
+    cms = fence.datasets[0]
+    request = RegistryCMSRetentionRequest(
+        PinnedFHIRMembershipSource(
+            "fixture",
+            cms.source_id,
+            cms.endpoint_id,
+            cms.dataset_id,
+            cms.dataset_hash,
+            "release-1",
+            123,
+            "cms-npd",
+            execution.attestation.desired_profile_as_of,
+        ),
+        RegistryNetworkSourceCoordinates("fhir", cms.source_id, "fixture", cms.dataset_id, "producer", "edition"),
+        execution.attestation.proof_id,
+        "b" * 64,
+        "c" * 64,
+        4096,
+        8192,
+    )
+    return request.policy(UUID("00000000-0000-0000-0000-000000000001"), "retained_owner", ("reader", "writer"))
+
+
+def test_retention_policy_survives_current_input_recheck_and_binds_hash(address_build_case):
+    policy = _retention_policy(address_build_case)
+    original = _factory(address_build_case)
+    factory = original.with_registry_source_retention(policy)
+    expected = json.loads(factory.input_json)
+    assert factory.input_hash != original.input_hash
+    assert factory._current_input(address_build_case[2], expected) == factory.input_json
+    assert factory._assert_inputs(address_build_case[2], _admission(factory)) == expected
+    policy["runtime_roles"].append("z_reader")
+    assert json.loads(factory.input_json)["registry_source_retention"]["runtime_roles"] == ["reader", "writer"]
+    assert original.with_registry_source_retention(policy).input_hash != factory.input_hash
+    with pytest.raises(RuntimeError, match="admitted_inputs_changed"):
+        factory._assert_inputs(address_build_case[2], _admission(original))
+
+
+@pytest.mark.parametrize("change", ["schema", "source", "endpoint", "dataset", "hash", "date", "selection"])
+def test_retention_policy_requires_exact_fence_and_selection(address_build_case, change):
+    policy = _retention_policy(address_build_case)
+    mutations_by_name = {
+        "schema": (policy["source_pin"], "schema_name", "different"),
+        "source": (policy["source_pin"], "source_id", "other"),
+        "endpoint": (policy["source_pin"], "endpoint_id", "other"),
+        "dataset": (policy["source_pin"], "dataset_id", "other"),
+        "hash": (policy["source_pin"], "dataset_sha256", "f" * 64),
+        "date": (policy["source_pin"], "as_of", "2026-01-03"),
+        "selection": (policy, "selection_proof_id", "f" * 64),
+    }
+    target, key, value = mutations_by_name[change]
+    target[key] = value
+    if change == "schema":
+        policy["binding_coordinates"]["dataset_schema"] = "different"
+    elif change in {"source", "dataset"}:
+        policy["binding_coordinates"][key + "_id"] = "other"
+    with pytest.raises(ValueError, match="retention_(scope_changed|policy_invalid)"):
+        _factory(address_build_case).with_registry_source_retention(policy)
+
+
+@pytest.mark.parametrize("change", ["date", "hash", "selection"])
+def test_retention_current_input_refuses_successor_scope(address_build_case, change):
+    policy = _retention_policy(address_build_case)
+    factory = _factory(address_build_case).with_registry_source_retention(policy)
+    execution, fence = address_build_case[1:3]
+    if change == "date":
+        execution.attestation.desired_profile_as_of = "2026-01-03"
+    elif change == "hash":
+        fence.datasets[0].dataset_hash = "f" * 64
+    else:
+        execution.attestation.proof_id = "f" * 64
+    with pytest.raises(RuntimeError, match="admitted_inputs_changed"):
+        factory._assert_inputs(fence, _admission(factory))
+
+
+@pytest.mark.parametrize("changed_field", ["capture_id", "owner_role", "runtime_roles"])
+def test_retention_custody_identity_changes_capacity_input_hash(address_build_case, changed_field):
+    policy = _retention_policy(address_build_case)
+    factory = _factory(address_build_case).with_registry_source_retention(policy)
+    policy[changed_field] = {
+        "capture_id": "00000000-0000-0000-0000-000000000002",
+        "owner_role": "successor_owner",
+        "runtime_roles": ["reader", "writer", "z_reader"],
+    }[changed_field]
+    changed_factory = _factory(address_build_case).with_registry_source_retention(policy)
+    assert changed_factory.input_hash != factory.input_hash
+    with pytest.raises(RuntimeError, match="admitted_inputs_changed"):
+        changed_factory._assert_inputs(address_build_case[2], _admission(factory))
+
+
+def test_retention_policy_survives_both_prepared_doctors_extension_orders(address_build_case, prepared_doctors_case):
+    policy = _retention_policy(address_build_case)
+    doctors, bindings = prepared_doctors_case
+    before = (
+        _factory(address_build_case).with_registry_source_retention(policy).with_prepared_doctors(doctors, bindings)
+    )
+    after = _factory(address_build_case, doctors=doctors, dependency_bindings=bindings).with_registry_source_retention(
+        policy
+    )
+    assert before.input_json == after.input_json
+    assert before._assert_inputs(address_build_case[2], _admission(before))["registry_source_retention"] == policy
 
 
 @pytest.mark.parametrize(
@@ -157,7 +272,7 @@ def test_changed_semantic_inputs_cannot_use_original_address_reservation(address
         "date": lambda: setattr(execution.attestation, "desired_profile_as_of", "2026-01-03"),
         "context": lambda: setattr(execution.attestation, "source_context_digest", "c" * 64),
         "data": lambda: setattr(fence.datasets[0], "dataset_hash", "c" * 64),
-        "mapper": lambda: monkeypatch.setattr(address, "_mapping_digest", lambda: "e" * 64),
+        "mapper": lambda: monkeypatch.setattr(address, "_mapping_digest", lambda **_options: "e" * 64),
         "option": lambda: monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SOURCE_CONCURRENCY", "2"),
         "facility-option": lambda: monkeypatch.setenv("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES", "true"),
         "alias": lambda: dependencies.__setitem__("alias_generation", 3),

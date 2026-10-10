@@ -349,7 +349,10 @@ class Database:
             get_bind = getattr(session, "get_bind", None)
             if callable(get_bind):
                 bind = get_bind()
-        database_name = getattr(getattr(bind, "url", None), "database", None)
+        bind_url = getattr(bind, "url", None)
+        if bind_url is None:
+            bind_url = getattr(getattr(bind, "engine", None), "url", None)
+        database_name = getattr(bind_url, "database", None)
         return None if database_name is None else str(database_name)
 
     @staticmethod
@@ -470,9 +473,14 @@ class Database:
         assert self.engine is not None
         async with self.engine.begin() as connection:
             if table.schema:
-                preparer = connection.dialect.identifier_preparer
-                schema_name = preparer.quote_schema(table.schema)
-                await connection.exec_driver_sql(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
+                schema_exists = await connection.scalar(
+                    sa_text("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = :schema)"),
+                    {"schema": table.schema},
+                )
+                if not schema_exists:
+                    preparer = connection.dialect.identifier_preparer
+                    schema_name = preparer.quote_schema(table.schema)
+                    await connection.exec_driver_sql(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
             await connection.run_sync(table.create, **kwargs)
 
     async def disconnect(self) -> None:

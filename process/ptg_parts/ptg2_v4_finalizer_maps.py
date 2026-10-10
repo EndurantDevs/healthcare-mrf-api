@@ -24,7 +24,6 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     _decode_persisted_map_payload,
 )
 
-
 PTG2_V4_FINALIZER_MAP_CONTRACT = "packed_finalizer_map_v2"
 PTG2_V4_FINALIZER_MAP_ROOT_TABLE = "ptg2_v4_finalizer_map_root"
 PTG2_V4_FINALIZER_MAP_PACK_TABLE = "ptg2_v4_finalizer_map_pack"
@@ -38,9 +37,7 @@ PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS = (
     "provider_set_count_dictionary",
     "provider_set_page_v3_s2",
 )
-PTG2_V4_FINALIZER_PACKED_OBJECT_KIND_SET = frozenset(
-    PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS
-)
+PTG2_V4_FINALIZER_PACKED_OBJECT_KIND_SET = frozenset(PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS)
 _MAP_PACK_PAGE_ROWS = 128
 
 _SUMMARY_COUNT_FIELDS = (
@@ -64,12 +61,15 @@ _MANIFEST_FIELDS = frozenset(
         "target_identity_digest",
     )
 )
+
+
 class FinalizerMapError(RuntimeError):
     """Raised when an explicit packed-finalizer contract cannot be proven."""
 
 
 class FinalizerMapReadLimitError(FinalizerMapError):
     """Raised before packed mapping metadata exceeds its bounded read limit."""
+
 
 def _first_row(query_result: Any) -> dict[str, Any]:
     first = getattr(query_result, "first", None)
@@ -109,19 +109,13 @@ def _validate_root_manifest_identity(
         finalizer_manifest.get("contract") != PTG2_V4_FINALIZER_MAP_CONTRACT
         or finalizer_manifest.get("map_format") != PTG2_V4_MAP_FORMAT
         or not isinstance(manifest_object_kinds, (list, tuple))
-        or tuple(manifest_object_kinds)
-        != PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS
+        or tuple(manifest_object_kinds) != PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS
     ):
         raise FinalizerMapError("packed finalizer map manifest contract is incompatible")
     map_digest = bytes(root_fields.get("root_map_digest") or b"")
-    if (
-        len(map_digest) != 32
-        or finalizer_manifest.get("map_digest") != map_digest.hex()
-    ):
+    if len(map_digest) != 32 or finalizer_manifest.get("map_digest") != map_digest.hex():
         raise FinalizerMapError("packed finalizer map digest does not match its manifest")
-    canonical_digest = bytes(
-        root_fields.get("root_canonical_mapping_digest") or b""
-    )
+    canonical_digest = bytes(root_fields.get("root_canonical_mapping_digest") or b"")
     target_digest = bytes(root_fields.get("root_target_identity_digest") or b"")
     canonical_bytes = _strict_count(
         root_fields.get("root_canonical_byte_count"),
@@ -131,14 +125,11 @@ def _validate_root_manifest_identity(
         len(canonical_digest) != 32
         or len(target_digest) != 32
         or canonical_bytes <= 0
-        or finalizer_manifest.get("canonical_mapping_digest")
-        != canonical_digest.hex()
+        or finalizer_manifest.get("canonical_mapping_digest") != canonical_digest.hex()
         or finalizer_manifest.get("canonical_byte_count") != canonical_bytes
         or finalizer_manifest.get("target_identity_digest") != target_digest.hex()
     ):
-        raise FinalizerMapError(
-            "packed finalizer native receipt does not match its manifest"
-        )
+        raise FinalizerMapError("packed finalizer native receipt does not match its manifest")
 
 
 def _validated_root(
@@ -153,52 +144,19 @@ def _validated_root(
         root_value = _strict_count(root_fields.get(f"root_{field_name}"), field_name)
         manifest_value = _strict_count(finalizer_manifest.get(field_name), field_name)
         if root_value != manifest_value:
-            raise FinalizerMapError(
-                f"packed finalizer map {field_name} does not match its manifest"
-            )
+            raise FinalizerMapError(f"packed finalizer map {field_name} does not match its manifest")
         count_by_field[field_name] = root_value
     if (
-        count_by_field["object_kind_count"]
-        != len(PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS)
+        count_by_field["object_kind_count"] != len(PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS)
         or count_by_field["map_pack_count"] < count_by_field["object_kind_count"]
         or count_by_field["coordinate_count"] < count_by_field["map_pack_count"]
-        or not 0
-        < count_by_field["target_block_count"]
-        <= count_by_field["coordinate_count"]
+        or not 0 < count_by_field["target_block_count"] <= count_by_field["coordinate_count"]
         or count_by_field["stored_map_byte_count"] <= 0
     ):
         raise FinalizerMapError("packed finalizer map root geometry is invalid")
 
 
-async def has_complete_v4_finalizer_map(
-    session: Any,
-    *,
-    schema_name: str,
-    snapshot_key: int,
-) -> bool:
-    """Select legacy absence or authenticate one explicit complete packed root."""
-
-    normalized_snapshot_key = int(snapshot_key)
-    schema = _quote_ident(schema_name)
-    if not await _has_finalizer_map_tables(
-        session,
-        schema_name=schema_name,
-    ):
-        return False
-    root_query = await session.execute(
-        text(
-            _ROOT_SELECTION_SQL.format(
-                schema=schema,
-                root_table=_quote_ident(PTG2_V4_FINALIZER_MAP_ROOT_TABLE),
-                manifest_key=PTG2_V4_FINALIZER_MAP_MANIFEST_KEY,
-            )
-        ),
-        {
-            "snapshot_key": normalized_snapshot_key,
-            "packed_object_kinds": PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
-        },
-    )
-    root_fields = _first_row(root_query)
+def _is_complete_finalizer_root(root_fields: Mapping[str, Any]) -> bool:
     manifest_present = bool(root_fields.get("manifest_present"))
     root_present = bool(root_fields.get("root_present"))
     if not manifest_present and not root_present:
@@ -210,6 +168,74 @@ async def has_complete_v4_finalizer_map(
     if bool(root_fields.get("relational_mapping_present")):
         raise FinalizerMapError("packed finalizer map snapshot also contains relational mappings")
     return True
+
+
+def _finalizer_readiness_by_snapshot(root_query, normalized_snapshot_keys):
+    root_fields_by_snapshot: dict[int, dict[str, Any]] = {}
+    requested_snapshot_keys = set(normalized_snapshot_keys)
+    for root_row in root_query:
+        root_fields = _row_mapping(root_row)
+        snapshot_key = root_fields.get("snapshot_key")
+        if (
+            type(snapshot_key) is not int
+            or snapshot_key not in requested_snapshot_keys
+            or snapshot_key in root_fields_by_snapshot
+        ):
+            raise FinalizerMapError("packed finalizer map snapshot selection is inconsistent")
+        root_fields_by_snapshot[snapshot_key] = root_fields
+    return {key: _is_complete_finalizer_root(root_fields_by_snapshot.get(key, {})) for key in normalized_snapshot_keys}
+
+
+async def read_v4_finalizer_map_set(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_keys: Iterable[int],
+) -> dict[int, bool]:
+    """Authenticate requested packed roots in one query, accepting legacy absence.
+
+    Uses only the caller's session. A malformed explicit root raises the same
+    error as singleton selection; this does not establish snapshot readiness.
+    Duplicate keys are checked once, in their first input order.
+    """
+
+    normalized_snapshot_keys = tuple(dict.fromkeys(int(key) for key in snapshot_keys))
+    schema = _quote_ident(schema_name)
+    if not normalized_snapshot_keys:
+        return {}
+    if not await _has_finalizer_map_tables(session, schema_name=schema_name):
+        return dict.fromkeys(normalized_snapshot_keys, False)
+    root_query = await session.execute(
+        text(
+            _ROOT_SELECTION_SQL.format(
+                schema=schema,
+                root_table=_quote_ident(PTG2_V4_FINALIZER_MAP_ROOT_TABLE),
+                manifest_key=PTG2_V4_FINALIZER_MAP_MANIFEST_KEY,
+            )
+        ),
+        {
+            "snapshot_keys": list(normalized_snapshot_keys),
+            "packed_object_kinds": PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
+        },
+    )
+    return _finalizer_readiness_by_snapshot(root_query, normalized_snapshot_keys)
+
+
+async def has_complete_v4_finalizer_map(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+) -> bool:
+    """Select legacy absence or authenticate one explicit complete packed root."""
+
+    normalized_snapshot_key = int(snapshot_key)
+    readiness_by_snapshot = await read_v4_finalizer_map_set(
+        session,
+        schema_name=schema_name,
+        snapshot_keys=(normalized_snapshot_key,),
+    )
+    return readiness_by_snapshot[normalized_snapshot_key]
 
 
 async def _has_finalizer_map_tables(
@@ -231,16 +257,13 @@ async def _has_finalizer_map_tables(
         text(
             "SELECT "
             + ", ".join(
-                f"to_regclass(:{table_name}) IS NOT NULL AS {table_name}"
-                for table_name in relation_name_by_table
+                f"to_regclass(:{table_name}) IS NOT NULL AS {table_name}" for table_name in relation_name_by_table
             )
         ),
         relation_name_by_table,
     )
     fields_by_name = _first_row(availability)
-    present_count = sum(
-        bool(fields_by_name.get(name)) for name in relation_name_by_table
-    )
+    present_count = sum(bool(fields_by_name.get(name)) for name in relation_name_by_table)
     if present_count not in (0, len(relation_name_by_table)):
         raise FinalizerMapError("packed finalizer map storage extension is partial")
     return present_count == len(relation_name_by_table)
@@ -256,17 +279,13 @@ async def has_valid_finalizer_map(
     """Validate a sealed packed pair while permitting pre-table legacy absence."""
 
     serving_index = layout_manifest.get("serving_index")
-    manifest_present = isinstance(serving_index, Mapping) and (
-        PTG2_V4_FINALIZER_MAP_MANIFEST_KEY in serving_index
-    )
+    manifest_present = isinstance(serving_index, Mapping) and (PTG2_V4_FINALIZER_MAP_MANIFEST_KEY in serving_index)
     if not await _has_finalizer_map_tables(
         session,
         schema_name=schema_name,
     ):
         if manifest_present:
-            raise FinalizerMapError(
-                "packed finalizer map manifest has no storage contract"
-            )
+            raise FinalizerMapError("packed finalizer map manifest has no storage contract")
         return False
     return await has_complete_v4_finalizer_map(
         session,
@@ -293,8 +312,7 @@ def _validate_pack_geometry(
         first != stored_first
         or last != stored_last
         or int(pack_row.get("coordinate_count") or 0) != len(coordinates)
-        or int(pack_row.get("entry_count") or 0)
-        != sum(coordinate.entry_count for coordinate in coordinates)
+        or int(pack_row.get("entry_count") or 0) != sum(coordinate.entry_count for coordinate in coordinates)
     ):
         raise FinalizerMapError("packed finalizer map pack geometry is inconsistent")
 
@@ -331,16 +349,13 @@ async def _load_target_metadata(
         if (
             block_hash not in target_hashes
             or block_hash in metadata_by_hash
-            or int(anchor_fields.get("format_version") or 0)
-            != PTG2_V3_SHARED_FORMAT_VERSION
+            or int(anchor_fields.get("format_version") or 0) != PTG2_V3_SHARED_FORMAT_VERSION
             or object_kind not in PTG2_V4_FINALIZER_PACKED_OBJECT_KIND_SET
             or codec not in {"none", "zlib"}
             or min(entry_count, raw_byte_count, stored_byte_count) < 0
             or (codec == "none" and raw_byte_count != stored_byte_count)
         ):
-            raise FinalizerMapError(
-                "packed finalizer map target CAS metadata is invalid"
-            )
+            raise FinalizerMapError("packed finalizer map target CAS metadata is invalid")
         metadata_by_hash[block_hash] = (object_kind, entry_count, raw_byte_count)
     if set(metadata_by_hash) != target_hashes:
         raise FinalizerMapError("packed finalizer map is missing a durable target anchor")
@@ -383,21 +398,14 @@ def _decode_map_packs(
     *,
     object_kind: str,
 ) -> list[tuple[dict[str, Any], tuple[V4SnapshotMapCoordinate, ...]]]:
-    decoded_packs: list[
-        tuple[dict[str, Any], tuple[V4SnapshotMapCoordinate, ...]]
-    ] = []
+    decoded_packs: list[tuple[dict[str, Any], tuple[V4SnapshotMapCoordinate, ...]]] = []
     previous_pack_no = -1
     previous_last: tuple[int, int] | None = None
     for raw_pack in pack_query:
         pack_fields = _row_mapping(raw_pack)
         pack_no = int(pack_fields.get("pack_no") or 0)
-        if (
-            pack_fields.get("object_kind") != object_kind
-            or pack_no <= previous_pack_no
-        ):
-            raise FinalizerMapError(
-                "packed finalizer map query returned an unexpected pack"
-            )
+        if pack_fields.get("object_kind") != object_kind or pack_no <= previous_pack_no:
+            raise FinalizerMapError("packed finalizer map query returned an unexpected pack")
         try:
             coordinates = _decode_persisted_map_payload(
                 pack_fields,
@@ -409,9 +417,7 @@ def _decode_map_packs(
         first = (coordinates[0].block_key, coordinates[0].fragment_no)
         last = (coordinates[-1].block_key, coordinates[-1].fragment_no)
         if previous_last is not None and first <= previous_last:
-            raise FinalizerMapError(
-                "packed finalizer map pack ranges overlap"
-            )
+            raise FinalizerMapError("packed finalizer map pack ranges overlap")
         previous_pack_no = pack_no
         previous_last = last
         decoded_packs.append((pack_fields, coordinates))
@@ -433,9 +439,7 @@ async def load_v4_finalizer_mapping_records(
     normalized_kind = str(object_kind)
     if normalized_kind not in PTG2_V4_FINALIZER_PACKED_OBJECT_KIND_SET:
         return None
-    is_packed = await has_complete_v4_finalizer_map(
-        session, schema_name=schema_name, snapshot_key=int(snapshot_key)
-    )
+    is_packed = await has_complete_v4_finalizer_map(session, schema_name=schema_name, snapshot_key=int(snapshot_key))
     if not is_packed:
         return None
     normalized_row_limit = int(row_limit)
@@ -444,9 +448,7 @@ async def load_v4_finalizer_mapping_records(
     normalized_block_keys = tuple(sorted({int(block_key) for block_key in block_keys}))
     has_fragment_filter = fragment_nos is not None
     normalized_fragment_nos = (
-        tuple(sorted({int(fragment_no) for fragment_no in fragment_nos}))
-        if fragment_nos is not None
-        else ()
+        tuple(sorted({int(fragment_no) for fragment_no in fragment_nos})) if fragment_nos is not None else ()
     )
     if not normalized_block_keys or (has_fragment_filter and not normalized_fragment_nos):
         return ()

@@ -24,9 +24,14 @@ from process.provider_directory_cms_preparation import (
 )
 from process.provider_directory_cms_publication import commit_prepared_serving_generation
 from process.provider_directory_cms_storage_continuation import configured_storage_continuation
-from process.provider_directory_profile_capacity_attestation import verify_database_capacity_lease
+from process.provider_directory_profile_capacity_attestation import (
+    CAPACITY_LEASE_DIGEST_DOMAIN,
+    _domain_hash,
+    verify_database_capacity_lease,
+)
 from process.provider_directory_profile_capacity_preflight_contract import validated_capacity_preflight_request
 from process.provider_directory_profile_capacity_runtime import configured_capacity_lease_trust
+from process.provider_directory_profile_temp_limit import apply_temp_file_limit
 
 
 async def _current_predecessor(fhir, session):
@@ -106,6 +111,7 @@ async def _capture_publish_inputs(fhir, execution, run_id, metrics, plan):
     async with asyncio.timeout(await remaining_build_seconds(fhir, limits)):
         async with fhir.db.transaction() as session:
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            await apply_temp_file_limit(fhir.db, plan.temp_file_limit_bytes_per_backend)
             async with nonprofile_sql_transaction(fhir, limits):
                 fence = await prepare_desired_fence(
                     fhir, execution, run_id=run_id, metrics=metrics, publish_targets=targets
@@ -115,15 +121,47 @@ async def _capture_publish_inputs(fhir, execution, run_id, metrics, plan):
                 native_fence = await capture_native_address_input_fence(session, fhir._schema())
                 proof = await _candidate_proof(fhir, session, execution)
     return SimpleNamespace(
-        fence=fence, predecessor=predecessor, dependencies=dependencies, native_fence=native_fence, proof=proof
+        fence=fence,
+        predecessor=predecessor,
+        dependencies=dependencies,
+        native_fence=native_fence,
+        proof=proof,
+        capacity_lease=limits.lease,
     )
 
 
-async def _publish_cms(fhir, execution, run_id, control_run_id, metrics):
+def _captured_capacity_request(snapshot, envelope):
+    """Use only the exact envelope already verified before native input capture."""
+    lease = getattr(snapshot, "capacity_lease", None)
+    if (
+        lease is None
+        or lease.lease_digest != _domain_hash(CAPACITY_LEASE_DIGEST_DOMAIN, envelope)
+        or lease.signing_preflight_guard != envelope["lease"]["signing_preflight_guard"]
+    ):
+        raise RuntimeError("cms_serving_capture_signed_request_changed")
+    return validated_capacity_preflight_request(lease.signing_preflight_guard["healthcare_request"])
+
+
+async def _authenticated_source_job(invocation, execution, request, snapshot):
+    """Require the owner capability before any signed retention workload grows."""
+    from process.provider_directory_cms_source_runtime import CMSRegistrySourceInvocation
+
+    if invocation is None:
+        if "registry_source_retention" in request.cms_nonprofile_admission:
+            raise RuntimeError("cms_registry_source_runtime_required")
+        return None
+    if type(invocation) is not CMSRegistrySourceInvocation:
+        raise RuntimeError("cms_registry_source_runtime_invalid")
+    return await invocation.bind_verified_job(execution, request, snapshot.capacity_lease)
+
+
+async def _publish_cms(fhir, execution, run_id, control_run_id, metrics, *, registry_source_invocation=None):
     """Build all desired serving families before their single bounded publication."""
     envelope, plan = _signed_plan(execution)
     authority = configured_storage_continuation()
     snapshot = await _capture_publish_inputs(fhir, execution, run_id, metrics, plan)
+    request = _captured_capacity_request(snapshot, envelope)
+    source_job = await _authenticated_source_job(registry_source_invocation, execution, request, snapshot)
     factory = cms_address_preparation(
         fhir,
         execution,
@@ -134,6 +172,8 @@ async def _publish_cms(fhir, execution, run_id, control_run_id, metrics):
         worker_count=plan.worker_count,
         temp_file_limit_bytes_per_backend=plan.temp_file_limit_bytes_per_backend,
     )
+    if "registry_source_retention" in request.cms_nonprofile_admission:
+        factory = factory.with_registry_source_retention(request.cms_nonprofile_admission["registry_source_retention"])
     if factory.input_hash != plan.native_address_input_hash:
         raise RuntimeError("cms_address_admitted_inputs_changed")
     admission = await produce_nonprofile_admission(
@@ -146,6 +186,8 @@ async def _publish_cms(fhir, execution, run_id, control_run_id, metrics):
         signed_plan=plan,
         fresh_storage_envelope=authority,
     )
+    if source_job is not None:
+        admission.registry_source_job = source_job
     async with prepare_serving_artifacts(
         fhir,
         execution,
@@ -231,7 +273,9 @@ async def _assert_retained_legacy_cms(fhir, execution):
         raise RuntimeError("cms_serving_desired_selection_required")
 
 
-async def publish_current_attested_profile(fhir, *, run_id, control_run_id, metrics, execution):
+async def publish_current_attested_profile(
+    fhir, *, run_id, control_run_id, metrics, execution, registry_source_invocation=None
+):
     """Route only current selections; historical replay remains in the outer owner."""
     await fhir.assert_registered_profile_selection_current(
         execution.attestation, fhir._provider_directory_profile_selection_catalog()
@@ -243,15 +287,25 @@ async def publish_current_attested_profile(fhir, *, run_id, control_run_id, metr
                 raise RuntimeError("cms_serving_preparation_requires_own_transaction")
             validated_run = fhir._validated_admission_run_id(run_id, control_run_id, execution)
             async with fhir.suppress_control_run_heartbeat_persistence(validated_run):
-                result = await (
-                    _publish_cms if execution.attestation.operation == "publish" else _purge_common_profile
-                )(fhir, execution, validated_run, control_run_id, metrics)
+                if execution.attestation.operation == "publish":
+                    publication_metrics = await _publish_cms(
+                        fhir,
+                        execution,
+                        validated_run,
+                        control_run_id,
+                        metrics,
+                        registry_source_invocation=registry_source_invocation,
+                    )
+                else:
+                    publication_metrics = await _purge_common_profile(
+                        fhir, execution, validated_run, control_run_id, metrics
+                    )
         else:
-            result = None
+            publication_metrics = None
             await _assert_retained_legacy_cms(fhir, execution)
-        if result is None:
-            result = await _ordinary_profile(fhir, execution, run_id, control_run_id, metrics)
+        if publication_metrics is None:
+            publication_metrics = await _ordinary_profile(fhir, execution, run_id, control_run_id, metrics)
     finally:
         fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(token)
-    fhir._attach_profile_selection_result(execution, result)
-    return result
+    fhir._attach_profile_selection_result(execution, publication_metrics)
+    return publication_metrics

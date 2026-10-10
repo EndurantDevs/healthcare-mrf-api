@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import Column, Integer, MetaData, Table, event, select, text
+from sqlalchemy.dialects.postgresql import dialect
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -201,6 +202,27 @@ async def test_session_and_native_acquire_reuse_bound_session_without_ending_it(
                     assert session.in_nested_transaction()
                 assert session.in_transaction() and not session.in_nested_transaction()
             assert session.in_transaction()
+    finally:
+        await engine.dispose()
+    assert db.engine is None and db.session_factory is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connection_bound", [False, True])
+@pytest.mark.parametrize("database_matches", [False, True])
+async def test_session_metadata_checks_engine_and_connection_database_identity(connection_bound, database_matches):
+    engine = create_async_engine("postgresql+asyncpg://tester@localhost/synthetic")
+    session = SimpleNamespace(bind=engine.connect() if connection_bound else engine)
+    db = Database()
+    db._database_override = "synthetic" if database_matches else "other"
+    try:
+        assert db._session_database_name(session) == "synthetic"
+        if database_matches:
+            db._validate_existing_session_database(session)
+        else:
+            with pytest.raises(RuntimeError, match="database identity does not match"):
+                db._validate_existing_session_database(session)
+        assert engine.pool.checkedout() == 0
     finally:
         await engine.dispose()
     assert db.engine is None and db.session_factory is None
@@ -801,6 +823,81 @@ async def test_create_table_and_execute_ddl(monkeypatch):
 
     await db.execute_ddl("VACUUM")
     assert run_calls_by_name["ddl"] == "VACUUM"
+
+
+@pytest.fixture
+def table_creation_database():
+    connection = SimpleNamespace(
+        dialect=dialect(),
+        scalar=AsyncMock(return_value=True),
+        exec_driver_sql=AsyncMock(),
+        run_sync=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def begin():
+        yield connection
+
+    return Database(engine=SimpleNamespace(begin=begin)), connection
+
+
+@pytest.mark.asyncio
+async def test_create_table_skips_existing_schema_ddl(table_creation_database):
+    database, connection = table_creation_database
+    table = Table("things", MetaData(), Column("id", Integer), schema="tenant")
+    connection.exec_driver_sql.side_effect = PermissionError("schema creation denied")
+
+    await database.create_table(table, checkfirst=True)
+
+    statement, parameters = connection.scalar.await_args.args
+    assert str(statement) == "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = :schema)"
+    assert parameters == {"schema": "tenant"}
+    connection.exec_driver_sql.assert_not_awaited()
+    connection.run_sync.assert_awaited_once_with(table.create, checkfirst=True)
+
+
+@pytest.mark.asyncio
+async def test_create_table_creates_quoted_missing_schema(table_creation_database):
+    database, connection = table_creation_database
+    table = Table("things", MetaData(), Column("id", Integer), schema='tenant"area')
+    connection.scalar.return_value = False
+
+    await database.create_table(table, checkfirst=False)
+
+    assert connection.scalar.await_args.args[1] == {"schema": 'tenant"area'}
+    connection.exec_driver_sql.assert_awaited_once_with('CREATE SCHEMA IF NOT EXISTS "tenant""area"')
+    connection.run_sync.assert_awaited_once_with(table.create, checkfirst=False)
+
+
+@pytest.mark.asyncio
+async def test_create_table_without_schema_skips_namespace_check(table_creation_database):
+    database, connection = table_creation_database
+    table = Table("things", MetaData(), Column("id", Integer))
+
+    await database.create_table(table, checkfirst=True)
+
+    connection.scalar.assert_not_awaited()
+    connection.exec_driver_sql.assert_not_awaited()
+    connection.run_sync.assert_awaited_once_with(table.create, checkfirst=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_operation", ["scalar", "exec_driver_sql", "run_sync"])
+async def test_create_table_propagates_errors(table_creation_database, failed_operation):
+    database, connection = table_creation_database
+    table = Table("things", MetaData(), Column("id", Integer), schema="tenant")
+    connection.scalar.return_value = False
+    error = PermissionError("creation denied")
+    getattr(connection, failed_operation).side_effect = error
+
+    with pytest.raises(PermissionError) as raised:
+        await database.create_table(table, checkfirst=True)
+
+    assert raised.value is error
+    if failed_operation == "scalar":
+        connection.exec_driver_sql.assert_not_awaited()
+    if failed_operation != "run_sync":
+        connection.run_sync.assert_not_awaited()
 
 
 @pytest.mark.asyncio

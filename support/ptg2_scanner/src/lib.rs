@@ -2,12 +2,17 @@
 
 pub mod address_canon;
 pub mod address_evidence_alias;
+pub mod canonical_network_values;
+pub mod cms_mlr_registry;
+pub mod cms_planfinder_registry;
+pub mod company_network_assertions;
 pub mod config;
 pub mod contact_canon;
 pub mod copy_format;
 pub mod custom_import_scalar;
 pub mod custom_import_source;
 pub mod dedupe;
+pub mod fhir_network_identity;
 pub mod hashing;
 pub mod hospital_mrf;
 pub mod hospital_price_block;
@@ -15,6 +20,8 @@ pub mod hospital_price_selector_block;
 pub mod hospital_price_service_block;
 pub mod input;
 pub mod manifest;
+pub mod network_membership_codec;
+pub mod network_source_binding_values;
 pub mod normalize;
 mod npi_identifier;
 pub mod output;
@@ -22,6 +29,13 @@ pub mod progress;
 pub mod provider_directory_projection;
 pub mod provider_graph_v4;
 pub mod rate_schedule_observe;
+pub mod registry_network_coverage;
+pub mod registry_network_evidence_values;
+pub mod registry_ptg_capture_input;
+pub mod registry_ptg_graph_python;
+pub mod registry_ptg_graph_witness;
+pub mod registry_required_target_review;
+pub mod registry_target_ledger;
 pub mod shared_graph;
 pub mod tax_identity;
 pub mod tax_identity_sidecar_bundle;
@@ -95,6 +109,83 @@ mod python_api {
 
     include!("python_hospital_price.rs");
     include!("python_custom_import.rs");
+
+    #[pyfunction]
+    fn encode_network_membership_batch(
+        py: Python<'_>,
+        input: &[u8],
+    ) -> PyResult<(Py<PyBytes>, usize)> {
+        let batch = py
+            .detach(|| crate::network_membership_codec::encode_network_membership_batch(input))
+            .map_err(|error| {
+                PyValueError::new_err(
+                    serde_json::to_string(&error).unwrap_or_else(|_| error.code.to_string()),
+                )
+            })?;
+        Ok((
+            PyBytes::new(py, &batch.copy_bytes).unbind(),
+            batch.row_count,
+        ))
+    }
+
+    #[pyfunction]
+    fn encode_cms_mlr_observations(
+        py: Python<'_>,
+        input: &[u8],
+        edition_json: &[u8],
+    ) -> PyResult<(Py<PyBytes>, usize, Py<PyBytes>)> {
+        if edition_json.len() > 65_536 {
+            return Err(PyValueError::new_err(
+                "MLR edition metadata exceeds byte limit",
+            ));
+        }
+        let (encoded, metadata) = py.detach(|| {
+            let edition: crate::cms_mlr_registry::MlrEdition = serde_json::from_slice(edition_json)
+                .map_err(|_| PyValueError::new_err("MLR edition metadata is invalid"))?;
+            let encoded = crate::cms_mlr_registry::encode_cms_mlr_observations(input, &edition)
+                .map_err(|error| {
+                    PyValueError::new_err(
+                        serde_json::to_string(&error).unwrap_or_else(|_| error.code.to_string()),
+                    )
+                })?;
+            let metadata = serde_json::to_vec(&serde_json::json!({
+                "edition": &encoded.batch.edition,
+                "counts": &encoded.batch.counts,
+                "conflicts": &encoded.batch.conflicts,
+            }))
+            .map_err(|_| PyValueError::new_err("MLR metadata encoding failed"))?;
+            if metadata.len() > 16 * 1024 * 1024 {
+                return Err(PyValueError::new_err("MLR metadata exceeds byte limit"));
+            }
+            Ok::<_, PyErr>((encoded, metadata))
+        })?;
+        Ok((
+            PyBytes::new(py, &encoded.copy_bytes).unbind(),
+            encoded.row_count,
+            PyBytes::new(py, &metadata).unbind(),
+        ))
+    }
+
+    #[pyfunction]
+    fn validate_network_catalog_batch(py: Python<'_>, input: &[u8]) -> PyResult<Py<PyBytes>> {
+        let encoded = py.detach(|| {
+            let batch = crate::canonical_network_values::validate_network_catalog_batch(input)
+                .map_err(|error| {
+                    PyValueError::new_err(
+                        serde_json::to_string(&error).unwrap_or_else(|_| error.code.to_string()),
+                    )
+                })?;
+            let encoded = serde_json::to_vec(&batch)
+                .map_err(|_| PyValueError::new_err("Network catalog encoding failed"))?;
+            if encoded.len() > 16 * 1024 * 1024 {
+                return Err(PyValueError::new_err(
+                    "Network catalog output exceeds byte limit",
+                ));
+            }
+            Ok::<_, PyErr>(encoded)
+        })?;
+        Ok(PyBytes::new(py, &encoded).unbind())
+    }
 
     fn location_canon_pool() -> PyResult<&'static ThreadPool> {
         if let Some(pool) = LOCATION_CANON_POOL.get() {
@@ -221,6 +312,229 @@ mod python_api {
         super::decode_u32_le(payload.as_bytes()).map_err(PyValueError::new_err)
     }
 
+    #[pyfunction]
+    fn encode_cms_planfinder_observations(
+        py: Python<'_>,
+        input: &[u8],
+        edition_json: &[u8],
+    ) -> PyResult<(Py<PyBytes>, usize, Py<PyBytes>)> {
+        if edition_json.len() > 65_536 {
+            return Err(PyValueError::new_err(
+                "Plan Finder edition metadata exceeds byte limit",
+            ));
+        }
+        let (encoded, metadata) = py.detach(|| {
+            let edition: crate::cms_planfinder_registry::PlanFinderEdition =
+                serde_json::from_slice(edition_json).map_err(|_| {
+                    PyValueError::new_err("Plan Finder edition metadata is invalid")
+                })?;
+            let encoded =
+                crate::cms_planfinder_registry::encode_cms_planfinder_observations(input, &edition)
+                    .map_err(|error| {
+                        PyValueError::new_err(
+                            serde_json::to_string(&error)
+                                .unwrap_or_else(|_| error.code.to_string()),
+                        )
+                    })?;
+            let metadata = serde_json::to_vec(&serde_json::json!({
+                "edition": &encoded.batch.edition,
+                "counts": &encoded.batch.counts,
+                "conflicts": &encoded.batch.conflicts,
+            }))
+            .map_err(|_| PyValueError::new_err("Plan Finder metadata encoding failed"))?;
+            Ok::<_, PyErr>((encoded, metadata))
+        })?;
+        Ok((
+            PyBytes::new(py, &encoded.copy_bytes).unbind(),
+            encoded.row_count,
+            PyBytes::new(py, &metadata).unbind(),
+        ))
+    }
+
+    #[pyfunction]
+    fn validate_company_network_assertions(py: Python<'_>, input: &[u8]) -> PyResult<Py<PyBytes>> {
+        let encoded = py.detach(|| {
+            let validated =
+                crate::company_network_assertions::validate_company_network_assertions(input)
+                    .map_err(|error| {
+                        PyValueError::new_err(
+                            serde_json::to_string(&error)
+                                .unwrap_or_else(|_| error.code.to_string()),
+                        )
+                    })?;
+            let encoded = serde_json::to_vec(&validated)
+                .map_err(|_| PyValueError::new_err("Company network assertion encoding failed"))?;
+            if encoded.len() > 16 * 1024 * 1024 {
+                return Err(PyValueError::new_err(
+                    "Company network assertion output exceeds byte limit",
+                ));
+            }
+            Ok::<_, PyErr>(encoded)
+        })?;
+        Ok(PyBytes::new(py, &encoded).unbind())
+    }
+
+    #[pyfunction]
+    fn encode_network_source_binding_batch(
+        py: Python<'_>,
+        input: &[u8],
+    ) -> PyResult<(Py<PyBytes>, usize)> {
+        let encoded = py.detach(|| {
+            crate::network_source_binding_values::encode_network_source_binding_batch(input)
+                .map_err(|error| {
+                    PyValueError::new_err(
+                        serde_json::to_string(&error).unwrap_or_else(|_| error.code.to_string()),
+                    )
+                })
+        })?;
+        Ok((
+            PyBytes::new(py, &encoded.copy_bytes).unbind(),
+            encoded.row_count,
+        ))
+    }
+
+    #[pyfunction]
+    fn parse_registry_target_ledger(py: Python<'_>, input: &[u8]) -> PyResult<Py<PyBytes>> {
+        let encoded = py.detach(|| {
+            let ledger = crate::registry_target_ledger::parse_registry_target_ledger(input)
+                .map_err(|error| PyValueError::new_err(error.code))?;
+            serde_json::to_vec(&ledger)
+                .map_err(|_| PyValueError::new_err("Registry target ledger encoding failed"))
+        })?;
+        Ok(PyBytes::new(py, &encoded).unbind())
+    }
+
+    #[pyfunction]
+    fn parse_registry_network_evidence(py: Python<'_>, input: &[u8]) -> PyResult<Py<PyBytes>> {
+        let encoded = py.detach(|| {
+            let evidence =
+                crate::registry_network_evidence_values::parse_registry_network_evidence(input)
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            serde_json::to_value(&evidence)
+                .and_then(|document| serde_json::to_vec(&document))
+                .map_err(|_| PyValueError::new_err("registry_network_evidence_invalid"))
+        })?;
+        Ok(PyBytes::new(py, &encoded).unbind())
+    }
+
+    #[pyfunction]
+    fn encode_registry_target_ledger_artifact(
+        py: Python<'_>,
+        input: &[u8],
+        snapshot_id: &str,
+    ) -> PyResult<(Py<PyBytes>, Py<PyBytes>)> {
+        let (copy_bytes, descriptor_bytes) = py.detach(|| {
+            crate::registry_target_ledger::encode_registry_target_ledger_artifact(
+                input,
+                snapshot_id,
+            )
+            .map_err(|error| PyValueError::new_err(error.code))
+        })?;
+        Ok((
+            PyBytes::new(py, &copy_bytes).unbind(),
+            PyBytes::new(py, &descriptor_bytes).unbind(),
+        ))
+    }
+
+    #[pyfunction]
+    fn encode_registry_required_target_review_artifact(
+        py: Python<'_>,
+        input: &[u8],
+        ledger_document: &[u8],
+        snapshot_id: &str,
+    ) -> PyResult<(Py<PyBytes>, Py<PyBytes>)> {
+        let (copy, descriptor) = py.detach(|| {
+            crate::registry_required_target_review::encode_registry_required_target_review_artifact(
+                input,
+                ledger_document,
+                snapshot_id,
+            )
+            .map_err(|error| PyValueError::new_err(error.code))
+        })?;
+        Ok((
+            PyBytes::new(py, &copy).unbind(),
+            PyBytes::new(py, &descriptor).unbind(),
+        ))
+    }
+
+    #[pyfunction]
+    fn validate_registry_required_target_ledger_artifact(
+        py: Python<'_>,
+        input: &[u8],
+    ) -> PyResult<Py<PyBytes>> {
+        let descriptor = py.detach(|| {
+            crate::registry_required_target_review::validate_registry_required_target_ledger_artifact(input)
+                .map_err(|error| PyValueError::new_err(error.code))
+        })?;
+        Ok(PyBytes::new(py, &descriptor).unbind())
+    }
+
+    #[pyfunction]
+    fn validate_registry_required_target_review_artifacts(
+        py: Python<'_>,
+        input: &[u8],
+    ) -> PyResult<Py<PyBytes>> {
+        let descriptor = py.detach(|| {
+            crate::registry_required_target_review::validate_registry_required_target_review_artifacts(input)
+                .map_err(|error| PyValueError::new_err(error.code))
+        })?;
+        Ok(PyBytes::new(py, &descriptor).unbind())
+    }
+
+    #[pyfunction]
+    fn extract_fhir_network_identity_batch(py: Python<'_>, input: &[u8]) -> PyResult<Py<PyBytes>> {
+        let encoded = py.detach(|| {
+            let batch = crate::fhir_network_identity::extract_fhir_network_identity_batch(input)
+                .map_err(|error| {
+                    PyValueError::new_err(
+                        serde_json::to_string(&error).unwrap_or_else(|_| error.code.to_string()),
+                    )
+                })?;
+            serde_json::to_vec(&batch)
+                .map_err(|_| PyValueError::new_err("FHIR network batch encoding failed"))
+        })?;
+        Ok(PyBytes::new(py, &encoded).unbind())
+    }
+
+    #[pyfunction]
+    fn encode_fhir_network_identity_batch(
+        py: Python<'_>,
+        input: &[u8],
+    ) -> PyResult<(Py<PyBytes>, usize, usize, usize)> {
+        let encoded = py.detach(|| {
+            crate::fhir_network_identity::encode_fhir_network_identity_batch(input).map_err(
+                |error| {
+                    PyValueError::new_err(
+                        serde_json::to_string(&error).unwrap_or_else(|_| error.code.to_string()),
+                    )
+                },
+            )
+        })?;
+        Ok((
+            PyBytes::new(py, &encoded.copy_bytes).unbind(),
+            encoded.row_count,
+            encoded.input_count,
+            encoded.duplicate_count,
+        ))
+    }
+
+    #[pyfunction]
+    fn build_registry_network_coverage(py: Python<'_>, input: &[u8]) -> PyResult<Py<PyBytes>> {
+        let encoded = py.detach(|| {
+            let coverage = crate::registry_network_coverage::build_registry_network_coverage(input)
+                .map_err(|error| PyValueError::new_err(error.code))?;
+            let encoded = serde_json::to_vec(&coverage)
+                .map_err(|_| PyValueError::new_err("Registry coverage encoding failed"))?;
+            if encoded.len() > 16 * 1024 * 1024 {
+                return Err(PyValueError::new_err(
+                    "Registry coverage output exceeds byte limit",
+                ));
+            }
+            Ok::<_, PyErr>(encoded)
+        })?;
+        Ok(PyBytes::new(py, &encoded).unbind())
+    }
+
     fn canonical_to_dict<'py>(
         py: Python<'py>,
         item: &CanonicalAddress,
@@ -242,6 +556,46 @@ mod python_api {
 
     #[pymodule]
     fn ptg2_address_canon(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add_function(wrap_pyfunction!(
+            crate::registry_ptg_graph_python::locator,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            crate::registry_ptg_graph_python::members,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            crate::registry_ptg_graph_python::verification,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            crate::registry_ptg_capture_input::encode_registry_ptg_capture_batch_py,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(encode_network_membership_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(encode_cms_mlr_observations, m)?)?;
+        m.add_function(wrap_pyfunction!(encode_cms_planfinder_observations, m)?)?;
+        m.add_function(wrap_pyfunction!(validate_company_network_assertions, m)?)?;
+        m.add_function(wrap_pyfunction!(encode_network_source_binding_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(build_registry_network_coverage, m)?)?;
+        m.add_function(wrap_pyfunction!(parse_registry_target_ledger, m)?)?;
+        m.add_function(wrap_pyfunction!(parse_registry_network_evidence, m)?)?;
+        m.add_function(wrap_pyfunction!(encode_registry_target_ledger_artifact, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            validate_registry_required_target_ledger_artifact,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            encode_registry_required_target_review_artifact,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            validate_registry_required_target_review_artifacts,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(extract_fhir_network_identity_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(encode_fhir_network_identity_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(validate_network_catalog_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canonicalize_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canonicalize_location_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canonicalize_contact_batch, m)?)?;

@@ -162,7 +162,44 @@ async def _cutover_authorization(prepared):
 
 
 @asynccontextmanager
-async def _publication_transaction(fhir, execution, prepared, native_dependencies, predecessor, native_input_fence):
+async def _publication_session(fhir, source_session_factory, *, capture_id=None):
+    """Choose the source pool before opening the final owner's transaction."""
+    from process import provider_directory_cms_publication_custody as wal_custody
+
+    if source_session_factory is None:
+        async with wal_custody.database_session(fhir) as session:
+            yield session
+        return
+    if not callable(source_session_factory) or fhir.db._transaction_binding() is not None:
+        raise RuntimeError("cms_serving_publication_requires_own_transaction")
+    if capture_id is not None:
+        from process.network_registry_cms_capture_lock import registry_cms_capture_transaction
+
+        options = {"fhir": fhir} if wal_custody.is_bounded(fhir) else {}
+        async with registry_cms_capture_transaction(
+            source_session_factory, capture_id=capture_id, **options
+        ) as session:
+            async with fhir.db.bind_existing_session(session):
+                async with wal_custody.source_body(fhir, source_session_factory, capture_id, session):
+                    yield session
+        return
+    group = None
+    try:
+        async with source_session_factory() as session, session.begin():
+            async with fhir.db.bind_existing_session(session):
+                async with wal_custody.source_body(fhir, source_session_factory, capture_id, session) as group:
+                    await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+                    yield session
+    except BaseException as failure:
+        if group is not None and group["failure"] is None:
+            group["failure"] = failure
+        raise
+
+
+@asynccontextmanager
+async def _publication_transaction(
+    fhir, execution, prepared, native_dependencies, predecessor, native_input_fence, *, source_session_factory=None
+):
     """Apply the native publication wall and lock order before any serving writes."""
     timeout_seconds = fhir._provider_directory_artifact_transaction_timeout_seconds(
         prepared.fence, profile_delta=prepared.profile_delta
@@ -177,7 +214,10 @@ async def _publication_transaction(fhir, execution, prepared, native_dependencie
                 timeout_seconds = min(
                     timeout_seconds, await remaining_build_seconds(fhir, prepared.nonprofile_admission)
                 )
-        async with asyncio.timeout(timeout_seconds) as cutover_timeout, fhir.db.transaction() as session:
+        async with (
+            asyncio.timeout(timeout_seconds) as cutover_timeout,
+            _publication_session(fhir, source_session_factory, capture_id=_source_capture_id(prepared)) as session,
+        ):
             _schema, _relations, lock_timeout, statement_timeout = fhir._provider_directory_artifact_bundle_context(
                 fhir._ordered_provider_directory_artifact_bundle(prepared.stages), prepared.profile_delta
             )
@@ -198,6 +238,17 @@ async def _publication_transaction(fhir, execution, prepared, native_dependencie
             _assert_expected_incumbent(execution, predecessor)
             await prepared.assert_ready(cutover=True)
             yield session, cutover_timeout
+
+
+def _source_capture_id(prepared):
+    from process.network_registry_cms_prepared_pair import PreparedRegistryCMSSourcePair
+
+    pair = getattr(prepared, "registry_source_pair", None)
+    if pair is None:
+        return None
+    if type(pair) is not PreparedRegistryCMSSourcePair:
+        raise RuntimeError("cms_registry_source_preparation_required")
+    return pair.address_ownership.dataset_id
 
 
 async def _lock_retained_relations(fhir, session, fence):
@@ -240,7 +291,7 @@ async def _apply_prepared_results(
     async def before_swaps():
         """Keep every prepared swap behind the complete live lock phase."""
         if fhir.profile_initial.build_from_stages(fhir, prepared.stages, prepared.profile_delta) is not None:
-            await prepared.assert_ready(cutover=True)
+            await prepared.assert_ready(cutover=True, archive_applied=archive_result is not None)
         await _lock_live_swap_relations(fhir, session, prepared, address, doctors)
         if doctors is not None:
             await apply_prepared_cms_doctors_generation(doctors)
@@ -259,6 +310,7 @@ async def _apply_prepared_results(
     snapshot = await receipts.capture_native_dependencies(session, fhir._schema())
     receipt_payload = _receipt_payload(execution, proof, predecessor, snapshot, archive_result)
     receipt_id = await receipts.append_serving_receipt(session, fhir._schema(), receipt_payload)
+    await _bind_registry_source_receipt(session, prepared, receipt_id, receipt_payload)
     await session.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
     if capacity_forecast is not None:
         await fhir._validate_profile_delta_total_wal(
@@ -267,6 +319,22 @@ async def _apply_prepared_results(
     if prepared.nonprofile_admission is not None:
         await prepared.nonprofile_admission.assert_cutover_complete()
     return receipt_id, receipt_payload
+
+
+async def _bind_registry_source_receipt(session, prepared, receipt_id, receipt_payload):
+    """Bind retention and enqueue its notification in the source publication TX."""
+    from process.network_registry_cms_prepared_pair import bind_prepared_registry_cms_source_pair
+    from process.provider_directory_cms_source_runtime import BoundCMSRegistrySourceJob
+
+    job = getattr(prepared.nonprofile_admission, "registry_source_job", None)
+    if job is None:
+        return
+    if type(job) is not BoundCMSRegistrySourceJob or prepared.registry_source_pair is None:
+        raise RuntimeError("cms_registry_source_runtime_invalid")
+    pair = await bind_prepared_registry_cms_source_pair(
+        session, prepared.registry_source_pair, receipt_id=receipt_id, receipt_payload=receipt_payload
+    )
+    await job.notify_receipt(session, receipt_id=receipt_id, pair=pair)
 
 
 async def commit_prepared_serving_generation(
@@ -292,7 +360,13 @@ async def commit_prepared_serving_generation(
     receipt_id, receipt_payload, publication_error, cancellation = None, None, None, None
     try:
         async with _publication_transaction(
-            fhir, execution, prepared, native_dependencies, predecessor, native_input_fence
+            fhir,
+            execution,
+            prepared,
+            native_dependencies,
+            predecessor,
+            native_input_fence,
+            source_session_factory=getattr(prepared, "source_session_factory", None),
         ) as (
             session,
             cutover_timeout,

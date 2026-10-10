@@ -13,6 +13,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from process.provider_directory_profile_temp_limit import apply_temp_file_limit
+
 if TYPE_CHECKING:
     from process.provider_directory_cms_preparation import NonprofileAdmission
 
@@ -190,7 +192,9 @@ async def _create_owned_relation(db_schema, name, create):
     scope.db_schema = db_schema
     async with _worker_slot():
         await check_owned_storage()
+        is_transaction_owner = native.db._transaction_binding() is None
         async with native.db.transaction() as session:
+            await _apply_owned_temp_entry(native.db, is_transaction_owner)
             await native._apply_entity_address_transaction_settings()
             await create(session)
             oid = await native.db.scalar("SELECT to_regclass(:relation)::oid::bigint", relation=f"{db_schema}.{name}")
@@ -312,9 +316,24 @@ async def native_transaction():
     """Count the direct geo projection backend without reacquiring its slot in tuning."""
     async with _worker_slot():
         await check_owned_storage()
-        async with _native().db.transaction() as session:
+        database = _native().db
+        is_transaction_owner = database._transaction_binding() is None
+        async with database.transaction() as session:
+            await _apply_owned_temp_entry(database, is_transaction_owner)
             await lock_owned_relations(_native().db)
             yield session
+
+
+async def _apply_owned_temp_entry(database, is_transaction_owner):
+    """Retain a signed cap only on an owned transaction; require it on borrowed entries."""
+    scope = _ADMISSION.get()
+    if scope is None:
+        return
+    limit = scope.admission.plan.temp_file_limit_bytes_per_backend
+    if is_transaction_owner:
+        await apply_temp_file_limit(database, limit)
+    elif await database.scalar("SELECT pg_size_bytes(current_setting('temp_file_limit'))::bigint") != limit:
+        raise RuntimeError("entity_address_admitted_temp_limit_bounded_owner_required")
 
 
 def sql_settings(settings: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -329,6 +348,12 @@ def sql_settings(settings: list[tuple[str, str]]) -> list[tuple[str, str]]:
         max_parallel_maintenance_workers="0",
     )
     return list(settings_by_name.items())
+
+
+def _admitted_temp_options() -> dict[str, int]:
+    """Keep the historical tuning path unchanged outside signed admission."""
+    scope = _ADMISSION.get()
+    return {} if scope is None else {"temp_file_limit_bytes": scope.admission.plan.temp_file_limit_bytes_per_backend}
 
 
 def native_sql_settings() -> list[tuple[str, str]]:
@@ -389,7 +414,9 @@ async def _execute_tuned_status(statement, **params):
     settings = native._entity_address_sql_settings()
     transaction_binding = getattr(database, "_transaction_binding", None)
     if callable(transaction_binding) and transaction_binding() is not None:
-        async with native.entity_address_tuned_transaction(database, settings, native._sql_literal, native.logger):
+        async with native.entity_address_tuned_transaction(
+            database, settings, native._sql_literal, native.logger, **_admitted_temp_options()
+        ):
             await verify_sql_settings(database)
             await lock_owned_relations(database)
             return native._coerce_rowcount(await database.status(statement, **params))
@@ -405,7 +432,7 @@ async def _execute_tuned_status(statement, **params):
             savepoint = f"entity_address_sql_setting_{index}"
             await connection.status(f"SAVEPOINT {savepoint};")
             try:
-                await connection.status(f"SET LOCAL {name} = {native._sql_literal(setting_value)};")
+                await _apply_status_setting(connection, native, name, setting_value)
                 await connection.status(f"RELEASE SAVEPOINT {savepoint};")
             except Exception as exc:
                 await connection.status(f"ROLLBACK TO SAVEPOINT {savepoint};")
@@ -420,13 +447,29 @@ async def _execute_tuned_status(statement, **params):
         return native._coerce_rowcount(await connection.status(statement, **params))
 
 
+async def _apply_status_setting(connection, native, name, setting_value):
+    """Use the verified cap helper for admitted temp settings on the owned backend."""
+    scope = _ADMISSION.get()
+    if name == "temp_file_limit" and scope is not None:
+        limit = scope.admission.plan.temp_file_limit_bytes_per_backend
+        if setting_value != f"{limit // 1024}kB":
+            raise ValueError("entity_address_admitted_temp_limit_invalid")
+        await apply_temp_file_limit(connection, limit)
+    else:
+        await connection.status(f"SET LOCAL {name} = {native._sql_literal(setting_value)};")
+
+
 async def _bounded_read(database, operation):
     """Keep direct validation reads within the same worker and spill limits as build SQL."""
     native = _native()
     async with _worker_slot():
+        is_transaction_owner = database._transaction_binding() is None
         async with database.transaction():
+            scope = _ADMISSION.get()
+            if scope is not None and is_transaction_owner:
+                await apply_temp_file_limit(database, scope.admission.plan.temp_file_limit_bytes_per_backend)
             async with native.entity_address_tuned_transaction(
-                database, native_sql_settings(), native._sql_literal, native.logger
+                database, native_sql_settings(), native._sql_literal, native.logger, **_admitted_temp_options()
             ):
                 await verify_sql_settings(database)
                 await lock_owned_relations(database)
@@ -492,7 +535,7 @@ async def stage_logging_scope(db_schema: str, stage: str):
     relation = f"{_identifier(db_schema)}.{_identifier(stage)}"
     async with native_transaction():
         async with native.entity_address_tuned_transaction(
-            native.db, native_sql_settings(), native._sql_literal, native.logger
+            native.db, native_sql_settings(), native._sql_literal, native.logger, **_admitted_temp_options()
         ):
             await verify_sql_settings(native.db)
             await native.db.status(f"LOCK TABLE {relation} IN ACCESS EXCLUSIVE MODE NOWAIT")

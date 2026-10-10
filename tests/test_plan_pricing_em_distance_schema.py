@@ -64,9 +64,18 @@ def test_em_distance_projection_schema_is_exact_immutable_and_additive(
     alembic_config = Config(str(REPOSITORY_ROOT / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(REPOSITORY_ROOT / "alembic"))
     script = ScriptDirectory.from_config(alembic_config)
-    assert script.get_heads() == ["20261009000000_custom_import_child_presence_decode"]
-    assert script.get_revision(script.get_heads()[0]).down_revision == (
-        "20261006010000_nucc_reference_result_generation"
+    assert script.get_heads() == ["20261010020000_registry_ptg_office_retention"]
+    assert script.get_revision("20261010020000_registry_ptg_office_retention").down_revision == (
+        "20261010010000_registry_ptg_office_approval"
+    )
+    assert script.get_revision("20261010010000_registry_ptg_office_approval").down_revision == (
+        "20261009040000_registry_ptg_published_plan_scope"
+    )
+    assert script.get_revision("20261009040000_registry_ptg_published_plan_scope").down_revision == (
+        "20261009030000_network_catalog_evidence"
+    )
+    assert script.get_revision("20261006010000_nucc_reference_result_generation").down_revision == (
+        "20261007000000_custom_import_rejection_anti_joins"
     )
     for table_name in (
         "plan_pricing_em_distance_candidate",

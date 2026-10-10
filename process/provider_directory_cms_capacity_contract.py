@@ -44,9 +44,107 @@ CMS_LIMIT_FIELDS = frozenset(
 )
 
 
+_RETENTION_POLICY_FIELDS = frozenset(
+    {
+        "version",
+        "capture_id",
+        "source_pin",
+        "binding_coordinates",
+        "selection_proof_id",
+        "expected_admission_sha256",
+        "expected_metadata_sha256",
+        "raw_tables",
+        "address_tables",
+        "owner_role",
+        "runtime_roles",
+        "extra_data_upper_bound_bytes",
+        "extra_wal_upper_bound_bytes",
+    }
+)
+_RETENTION_SOURCE_PIN_FIELDS = frozenset(
+    {
+        "schema_name",
+        "source_id",
+        "endpoint_id",
+        "dataset_id",
+        "dataset_sha256",
+        "release_id",
+        "resource_table_oid",
+        "alias_scope",
+        "as_of",
+    }
+)
+_RETENTION_BINDING_FIELDS = frozenset(
+    {
+        "source_system",
+        "source_id",
+        "dataset_schema",
+        "dataset_id",
+        "producer_id",
+        "edition_id",
+    }
+)
+
+
 def _invalid(reason: str) -> None:
     """Reject unsafe additional requests without disclosing their contents."""
     raise ProviderDirectoryProfileCapacityPreflightError("provider_directory_cms_capacity_" + reason)
+
+
+def validated_registry_source_retention_policy(raw: Any) -> dict[str, Any]:
+    """Decode the original source policy through its native preparation DTO."""
+    from uuid import UUID
+
+    from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+    from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+    from process.network_registry_cms_prepared_pair import (
+        RegistryCMSRetentionRequest,
+        _validate_preparation_request,
+    )
+
+    try:
+        policy_by_field = dict(_exact_mapping(raw, _RETENTION_POLICY_FIELDS, reason="retention_policy_invalid"))
+        pin_by_field = dict(
+            _exact_mapping(
+                policy_by_field["source_pin"], _RETENTION_SOURCE_PIN_FIELDS, reason="retention_policy_invalid"
+            )
+        )
+        coordinates_by_field = dict(
+            _exact_mapping(
+                policy_by_field["binding_coordinates"], _RETENTION_BINDING_FIELDS, reason="retention_policy_invalid"
+            )
+        )
+        if (
+            type(policy_by_field["version"]) is not int
+            or policy_by_field["version"] != 1
+            or type(policy_by_field["capture_id"]) is not str
+            or type(policy_by_field["runtime_roles"]) is not list
+            or not 1 <= len(policy_by_field["runtime_roles"]) <= 64
+            or any(type(role) is not str for role in policy_by_field["runtime_roles"])
+            or type(policy_by_field["owner_role"]) is not str
+            or type(pin_by_field["schema_name"]) is not str
+            or type(policy_by_field["raw_tables"]) is not list
+            or type(policy_by_field["address_tables"]) is not list
+        ):
+            _invalid("retention_policy_invalid")
+        capture_id = UUID(policy_by_field["capture_id"])
+        request = RegistryCMSRetentionRequest(
+            PinnedFHIRMembershipSource(**pin_by_field),
+            RegistryNetworkSourceCoordinates(**coordinates_by_field),
+            policy_by_field["selection_proof_id"],
+            policy_by_field["expected_admission_sha256"],
+            policy_by_field["expected_metadata_sha256"],
+            policy_by_field["extra_data_upper_bound_bytes"],
+            policy_by_field["extra_wal_upper_bound_bytes"],
+        )
+        roles = tuple(policy_by_field["runtime_roles"])
+        _validate_preparation_request(request, capture_id, policy_by_field["owner_role"], roles)
+        normalized = request.policy(capture_id, policy_by_field["owner_role"], roles)
+        if policy_by_field != normalized:
+            _invalid("retention_policy_invalid")
+        return json.loads(canonical_preflight_json(normalized))
+    except ValueError, TypeError, KeyError, AttributeError:
+        _invalid("retention_policy_invalid")
 
 
 def require_profile_capacity_request(request: Any) -> None:
@@ -110,8 +208,16 @@ def capacity_preflight_receipt_row_values(
 
     is_cms = request.cms_nonprofile_admission is not None
     is_initial = initial.is_initial_request(request)
-    receipt_contract = CMS_PREFLIGHT_CONTRACT if is_cms else (initial.RECEIPT_CONTRACT if is_initial else CAPACITY_PREFLIGHT_CONTRACT_ID)
-    request_contract = CMS_PREFLIGHT_REQUEST_CONTRACT if is_cms else (initial.REQUEST_CONTRACT if is_initial else CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID)
+    receipt_contract = (
+        CMS_PREFLIGHT_CONTRACT
+        if is_cms
+        else (initial.RECEIPT_CONTRACT if is_initial else CAPACITY_PREFLIGHT_CONTRACT_ID)
+    )
+    request_contract = (
+        CMS_PREFLIGHT_REQUEST_CONTRACT
+        if is_cms
+        else (initial.REQUEST_CONTRACT if is_initial else CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID)
+    )
     if (
         receipt["contract_id"] != receipt_contract
         or receipt["request_contract_id"] != request_contract
@@ -150,9 +256,8 @@ def capacity_preflight_receipt_row_values(
 def read_capacity_preflight_receipt(receipt_row: Mapping[str, Any], lease: Any) -> dict[str, Any]:
     """Check stored bytes and CMS metadata against the already verified signed guard."""
     from process import provider_directory_profile_capacity_preflight_contract as base
-    from process.provider_directory_profile_capacity_signing_guard_contract import _HEALTHCARE_RECEIPT_FIELDS
-
     from process import provider_directory_profile_initial_contract as initial
+    from process.provider_directory_profile_capacity_signing_guard_contract import _HEALTHCARE_RECEIPT_FIELDS
 
     signed_receipt = lease.signing_preflight_guard["healthcare_receipt"]
     is_cms = signed_receipt["contract_id"] == CMS_PREFLIGHT_CONTRACT
@@ -164,7 +269,11 @@ def read_capacity_preflight_receipt(receipt_row: Mapping[str, Any], lease: Any) 
     if isinstance(raw_receipt, str):
         raw_receipt = json.loads(raw_receipt)
     receipt_by_field = dict(_exact_mapping(raw_receipt, fields, reason="stored_receipt_fields_invalid"))
-    contract = CMS_PREFLIGHT_CONTRACT if is_cms else (initial.RECEIPT_CONTRACT if is_initial else CAPACITY_PREFLIGHT_CONTRACT_ID)
+    contract = (
+        CMS_PREFLIGHT_CONTRACT
+        if is_cms
+        else (initial.RECEIPT_CONTRACT if is_initial else CAPACITY_PREFLIGHT_CONTRACT_ID)
+    )
     digest = preflight_domain_sha256(
         contract, {name: field_value for name, field_value in receipt_by_field.items() if name != "receipt_sha256"}
     )
@@ -209,8 +318,8 @@ def validated_cms_capacity_limits(raw: Any) -> dict[str, Any]:
 def _paired_profile_envelope(raw: Any) -> dict[str, Any]:
     """Parse a current Profile pair without admitting a recursive CMS envelope."""
     from process import provider_directory_profile_capacity_attestation as lease
-    from process.provider_directory_profile_capacity_attestation_contract import _SIGNED_BODY_FIELDS
     from process import provider_directory_profile_initial_contract as initial
+    from process.provider_directory_profile_capacity_attestation_contract import _SIGNED_BODY_FIELDS
 
     envelope_by_field = dict(_exact_mapping(raw, frozenset({"lease", "signature"}), reason="cms_pair_fields_invalid"))
     body_by_field = dict(
@@ -224,8 +333,12 @@ def _paired_profile_envelope(raw: Any) -> dict[str, Any]:
         or receipt.get("contract_id") not in {CAPACITY_PREFLIGHT_CONTRACT_ID, initial.RECEIPT_CONTRACT}
         or (
             not isinstance(request, Mapping)
-            or request.get("contract_id") != (initial.REQUEST_CONTRACT if receipt.get("contract_id") == initial.RECEIPT_CONTRACT
-                                              else CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID)
+            or request.get("contract_id")
+            != (
+                initial.REQUEST_CONTRACT
+                if receipt.get("contract_id") == initial.RECEIPT_CONTRACT
+                else CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID
+            )
             or CMS_ADMISSION_FIELD in request
         )
     ):
@@ -250,6 +363,8 @@ def _paired_profile_envelope(raw: Any) -> dict[str, Any]:
 def validated_cms_capacity_admission(raw: Any) -> dict[str, Any]:
     """Bind one exact Profile envelope and closed reviewed execution ceilings."""
     fields = frozenset({"contract_id", "admission_purpose", "paired_profile_lease", "limits"})
+    if isinstance(raw, Mapping) and "registry_source_retention" in raw:
+        fields |= {"registry_source_retention"}
     admission_by_field = dict(_exact_mapping(raw, fields, reason="cms_admission_fields_invalid"))
     if (
         admission_by_field["contract_id"] != CMS_ADMISSION_REQUEST_CONTRACT
@@ -258,6 +373,10 @@ def validated_cms_capacity_admission(raw: Any) -> dict[str, Any]:
         _invalid("admission_contract_invalid")
     admission_by_field["limits"] = validated_cms_capacity_limits(admission_by_field["limits"])
     admission_by_field["paired_profile_lease"] = _paired_profile_envelope(admission_by_field["paired_profile_lease"])
+    if "registry_source_retention" in admission_by_field:
+        admission_by_field["registry_source_retention"] = validated_registry_source_retention_policy(
+            admission_by_field["registry_source_retention"]
+        )
     return admission_by_field
 
 

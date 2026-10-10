@@ -1,40 +1,16 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import importlib.util
 import os
-import re
 import subprocess
 import sys
 import uuid
 from pathlib import Path
 
 import pytest
-import sqlalchemy as sa
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import Database
-from db.models import (
-    PTG2V3AuditOccurrence,
-    PTG2V3Block,
-    PTG2V3CandidateAuditAttestation,
-    PTG2V3Code,
-    PTG2V3GCCandidate,
-    PTG2V3GraphOwner,
-    PTG2V3LayoutFingerprint,
-    PTG2V3NPIScope,
-    PTG2V3PriceAttr,
-    PTG2V3ProviderGroup,
-    PTG2V3ProviderSet,
-    PTG2V3SnapshotBinding,
-    PTG2V3SnapshotBlock,
-    PTG2V3SnapshotLayout,
-    PTG2V3SnapshotScope,
-    PTG2V3SnapshotSource,
-    PTG2V3SourceAuditWitness,
-    PTG2WitnessPart,
-)
 from db.models._legacy import (
     _move_address_key_column_to_end,
     _resolve_ptg2_database_schema,
@@ -65,14 +41,9 @@ from tests.ptg2_v3_shared_schema_assertions import (
     _assert_v3_sealed_mapping_index,
     _assert_v3_timezone_column_types,
     _assert_v3_unique_constraints,
-    _constraints,
-    _expected_v3_foreign_key_shapes,
-    _foreign_key_shapes,
-    _index_shapes,
     _load_migration,
     _normalized,
     _OpRecorder,
-    _primary_key,
     _record_upgrade,
 )
 from tests.ptg2_v3_shared_schema_migrations import (
@@ -152,8 +123,20 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261009000000_custom_import_child_presence_decode"]
-    assert script.get_revision(script.get_heads()[0]).down_revision == "20261006010000_nucc_reference_result_generation"
+    assert script.get_heads() == ["20261010020000_registry_ptg_office_retention"]
+    assert script.get_revision("20261010020000_registry_ptg_office_retention").down_revision == (
+        "20261010010000_registry_ptg_office_approval"
+    )
+    assert script.get_revision("20261010010000_registry_ptg_office_approval").down_revision == (
+        "20261009040000_registry_ptg_published_plan_scope"
+    )
+    assert script.get_revision("20261009040000_registry_ptg_published_plan_scope").down_revision == (
+        "20261009030000_network_catalog_evidence"
+    )
+    assert (
+        script.get_revision("20261006010000_nucc_reference_result_generation").down_revision
+        == "20261007000000_custom_import_rejection_anti_joins"
+    )
 
 
 def test_candidate_audit_hold_migration_matches_runtime_digest():

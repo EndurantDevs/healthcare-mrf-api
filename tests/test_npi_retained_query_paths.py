@@ -6,12 +6,16 @@ from collections import OrderedDict
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
 
 import pytest
 from sanic.exceptions import InvalidUsage
 from sqlalchemy import column, select, table
 
+from api import provider_list_sql
 from api.endpoint import npi as npi_module
+from api.network_address_scope import network_address_read_scope
+from process.network_serving_read import PinnedNetworkServingManifest
 from tests.npi_location_hydration_support import unified_location_mapping
 from tests.test_custom_import_provider_geo_sql import _context as imported_geo_context
 from tests.test_npi_api_extended import FakeAcquire
@@ -858,6 +862,66 @@ def _install_query_connection(monkeypatch, query_rows=()):
     )
     monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=lambda: FakeAcquire(connection)))
     return connection
+
+
+@pytest.mark.parametrize("count_only", (True, False))
+async def test_canonical_all_binds_count_and_late_hydration_on_pinned_session(monkeypatch, count_only):
+    """Raw list branches keep the selector, office contacts and pinned transaction."""
+    candidate_id = uuid4()
+    manifest = PinnedNetworkServingManifest(
+        1, str(candidate_id), "network_candidate_" + candidate_id.hex, 1, {}, 0, "c" * 64, 1
+    )
+    session = object()
+    location_by_field = {**unified_location_mapping(), "npi": 1234567890, "inferred_npi": None}
+    location_by_field["location_key"] = "a" * 64
+    hydrated_by_field = {
+        **location_by_field,
+        "fax_number": "2025550199",
+        "phone_extension": "44",
+        "aca_plan_array": ["synthetic-plan"],
+    }
+    statements = []
+
+    async def query(statement, **parameters):
+        sql = str(statement)
+        statements.append((sql, parameters))
+        if "canonical_network_ids" in sql:
+            assert parameters["_canonical_network_ids"] == [42]
+            assert "provider_directory_address_overlay" not in sql
+        if "COUNT(DISTINCT ft.npi)" in sql:
+            return [("Pharmacy", 1)]
+        if "COUNT(DISTINCT" in sql:
+            return [(1,)]
+        if "c.location_key = ANY" in sql:
+            return [SimpleNamespace(_mapping=hydrated_by_field)]
+        if "FROM mrf.npi_taxonomy AS taxonomy" in sql:
+            return []
+        return [SimpleNamespace(_mapping=location_by_field)]
+
+    connection = SimpleNamespace(all=query)
+    proxy = Mock(return_value=connection)
+    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", proxy)
+    monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=Mock(side_effect=AssertionError("unpinned query"))))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
+    monkeypatch.setattr(npi_module, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
+    monkeypatch.setattr(npi_module, "_apply_location_statuses", AsyncMock())
+    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", AsyncMock(return_value={}))
+    request = SimpleNamespace(
+        args={"count_only": "1" if count_only else "0", "format": "all", "limit": "1", "phone": "2025550101"},
+        app=SimpleNamespace(),
+        ctx=SimpleNamespace(sa_session=session),
+    )
+    with network_address_read_scope(manifest, (42,)):
+        response_by_field = json.loads((await npi_module.get_all(request)).body)
+    assert proxy.called and all(call.args[1] is session for call in proxy.call_args_list)
+    if count_only:
+        assert response_by_field == {"rows": {"Pharmacy": 1}}
+    else:
+        assert any("c.location_key = ANY" in sql for sql, _ in statements)
+        address = response_by_field["rows"][0]["address_list"][0]
+        assert address["fax_number_digits"] == "2025550199"
+        assert address["phone_extension"] == "44"
+        assert address["aca_plan_array"] == ["synthetic-plan"]
 
 
 @pytest.mark.asyncio
