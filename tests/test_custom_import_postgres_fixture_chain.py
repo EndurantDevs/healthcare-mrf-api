@@ -72,8 +72,8 @@ def test_fixture_loads_the_actual_snapshot_read_and_write_functions():
     assert "FOR UPDATE" in module._WRITE_BINDING_BODY
 
 
-def test_fixture_current_chain_ends_at_child_presence_decode():
-    assert support._SNAPSHOT_MIGRATION_NAMES[-8:] == (
+def test_fixture_current_chain_ends_at_admission_indexes():
+    assert support._SNAPSHOT_MIGRATION_NAMES[-9:] == (
         "20261005030000_custom_import_snapshot_storage",
         "20261005040000_custom_import_bulk_snapshot_writers",
         "20261005050000_custom_import_legacy_snapshot_writers",
@@ -82,6 +82,7 @@ def test_fixture_current_chain_ends_at_child_presence_decode():
         "20261005080000_custom_import_writer_cutover",
         "20261007000000_custom_import_rejection_anti_joins",
         "20261009000000_custom_import_child_presence_decode",
+        "20261010000000_custom_import_admission_indexes",
     )
 
 

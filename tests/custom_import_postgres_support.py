@@ -88,6 +88,7 @@ _SNAPSHOT_MIGRATION_NAMES = (
     "20261005080000_custom_import_writer_cutover",
     "20261007000000_custom_import_rejection_anti_joins",
     "20261009000000_custom_import_child_presence_decode",
+    "20261010000000_custom_import_admission_indexes",
 )
 
 

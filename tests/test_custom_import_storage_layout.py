@@ -87,7 +87,7 @@ def test_phase_and_serving_indexes_never_target_canonical_or_another_snapshot():
         for statement in storage.snapshot_phase_index_statements(17, phase)
     )
     serving_statements = storage.snapshot_serving_index_statements(17)
-    assert len(phase_statements) == 10
+    assert len(phase_statements) == 11
     assert len(serving_statements) == 10
     assert all(
         "ON ci_snapshot_17.custom_import_" in statement for statement in (*phase_statements, *serving_statements)

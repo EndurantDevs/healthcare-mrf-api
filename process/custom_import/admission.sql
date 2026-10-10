@@ -271,19 +271,6 @@ membership_keys AS MATERIALIZED (
     SELECT m.*,sha256(decode('637573746f6d2d696d706f72742f76310063616e6469646174652d72756e6e65722f31006368696c642d6b657900','hex')
         ||convert_to(m.expected_key,'UTF8')) expected_hash FROM mapped_memberships m
 ),
-requested_memberships AS MATERIALIZED (
-    SELECT DISTINCT m.root_record_id,m.outer_slot,m.expected_hash FROM membership_keys m WHERE NOT m.malformed_key
-),
-membership_peers AS MATERIALIZED (
-    SELECT DISTINCT ON (x.root_record_id,x.collection_slot,x.child_key_sha256)
-        x.root_record_id,x.collection_slot,x.child_key_sha256,c.canonical_child_key
-    FROM requested_memberships m
-    JOIN __CANDIDATE__.custom_import_build_occurrence x ON x.build_id=:build_id AND x.origin='source'
-      AND x.root_record_id=m.root_record_id AND x.collection_slot=m.outer_slot
-      AND x.child_key_sha256=m.expected_hash AND x.child_revision_id IS NOT NULL
-    JOIN __CANDIDATE__.custom_import_child_revision c ON c.child_revision_id=x.child_revision_id
-    ORDER BY x.root_record_id,x.collection_slot,x.child_key_sha256,x.child_revision_id
-),
 membership_checks AS MATERIALIZED (
     SELECT m.occurrence_id,m.relation_order,
         CASE WHEN m.malformed_key THEN 'custom_import_build_structure_mismatch: membership key differs'
@@ -291,8 +278,15 @@ membership_checks AS MATERIALIZED (
           WHEN peer.canonical_child_key COLLATE "C" IS DISTINCT FROM m.expected_key COLLATE "C"
             THEN 'custom_import_build_structure_mismatch: membership key digest collision' END problem
     FROM membership_keys m
-    LEFT JOIN membership_peers peer ON peer.root_record_id=m.root_record_id AND peer.collection_slot=m.outer_slot
-      AND peer.child_key_sha256=m.expected_hash
+    LEFT JOIN LATERAL (
+        SELECT c.canonical_child_key
+        FROM __CANDIDATE__.custom_import_build_occurrence x
+        JOIN __CANDIDATE__.custom_import_child_revision c ON c.child_revision_id=x.child_revision_id
+        WHERE x.build_id=:build_id AND x.origin='source' AND x.root_record_id=m.root_record_id
+          AND x.collection_slot=m.outer_slot AND x.child_key_sha256=m.expected_hash
+          AND x.child_revision_id IS NOT NULL
+        ORDER BY x.child_revision_id LIMIT 1
+    ) peer ON NOT m.malformed_key
 ),
 first_membership_problem AS MATERIALIZED (
     SELECT DISTINCT ON (m.occurrence_id) m.occurrence_id,m.problem

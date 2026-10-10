@@ -82,14 +82,21 @@ def test_registered_namespace_uses_installer_body_spelling_and_quoted_header():
 
 
 @pytest.mark.parametrize("already_updated", (False, True))
-def test_refresh_preserves_all_nonbody_metadata(monkeypatch, already_updated):
+@pytest.mark.parametrize("preserve_execute_grants", (False, True))
+def test_refresh_preserves_all_nonbody_metadata(monkeypatch, already_updated, preserve_execute_grants):
     migration = _migration()
     metadata = dict(oid=101, proowner=10, proacl=["owner=X/owner"], proconfig=["search_path=pg_catalog"])
     before = SimpleNamespace(prosrc="new" if already_updated else "old", metadata=metadata)
     after = SimpleNamespace(prosrc="new", metadata=dict(metadata))
     states = iter((before, after))
     statements = []
-    monkeypatch.setattr(migration, "_installed", lambda *_args, **_kwargs: next(states))
+    installed_options = []
+
+    def installed(*_args, **kwargs):
+        installed_options.append(kwargs)
+        return next(states)
+
+    monkeypatch.setattr(migration, "_installed", installed)
     monkeypatch.setattr(migration.op, "execute", statements.append)
     migration._refresh(
         object(),
@@ -99,8 +106,10 @@ def test_refresh_preserves_all_nonbody_metadata(monkeypatch, already_updated):
         "CREATE FUNCTION $fn$old$fn$",
         "CREATE FUNCTION $fn$new$fn$",
         "$fn$",
+        preserve_execute_grants=preserve_execute_grants,
     )
     assert statements == ["CREATE OR REPLACE FUNCTION $fn$new$fn$"]
+    assert installed_options == [dict(returns_set=False, preserve_execute_grants=preserve_execute_grants)] * 2
 
 
 @pytest.mark.parametrize("before", (None, SimpleNamespace(prosrc="unknown", metadata={})))
@@ -120,6 +129,7 @@ def test_missing_or_unknown_body_is_never_recreated(monkeypatch, before):
         None,
         SimpleNamespace(prosrc="new", metadata={"oid": 102}),
         SimpleNamespace(prosrc="wrong", metadata={"oid": 101}),
+        SimpleNamespace(prosrc="new", metadata={"oid": 101, "proacl": ["other=X/owner"]}),
     ),
 )
 def test_post_refresh_catalog_or_body_drift_fails(monkeypatch, after):
@@ -131,15 +141,32 @@ def test_post_refresh_catalog_or_body_drift_fails(monkeypatch, after):
         migration._refresh(object(), "identity", "owner_table", "bigint", "$fn$old$fn$", "$fn$new$fn$", "$fn$")
 
 
-def test_catalog_query_pins_result_security_cost_and_owner_only_acl():
+@pytest.mark.parametrize("preserve_execute_grants", (False, True))
+def test_catalog_query_pins_result_security_cost_and_owner_only_acl(preserve_execute_grants):
     migration = _migration()
     calls = []
     bind = SimpleNamespace(
         execute=lambda sql, parameters: calls.append((str(sql), parameters)) or SimpleNamespace(first=lambda: None)
     )
-    assert migration._installed(bind, "identity", "owner_table", "bigint", returns_set=False) is None
+    assert (
+        migration._installed(
+            bind,
+            "identity",
+            "owner_table",
+            "bigint",
+            returns_set=False,
+            preserve_execute_grants=preserve_execute_grants,
+        )
+        is None
+    )
     sql, parameters = calls[0]
-    assert parameters == dict(identity="identity", owner_table="owner_table", result="bigint", returns_set=False)
+    assert parameters == dict(
+        identity="identity",
+        owner_table="owner_table",
+        result="bigint",
+        returns_set=False,
+        preserve_execute_grants=preserve_execute_grants,
+    )
     for term in (
         "to_jsonb(p)-'prosrc'",
         "p.prokind='f' AND p.prosecdef",
@@ -152,6 +179,8 @@ def test_catalog_query_pins_result_security_cost_and_owner_only_acl():
         "p.proconfig=ARRAY['search_path=pg_catalog']",
         "p.proowner=owner_table.relowner",
         "privilege.grantee<>p.proowner",
+        "NOT :preserve_execute_grants",
+        "privilege.grantee=0 OR privilege.privilege_type<>'EXECUTE'",
     ):
         assert term in sql
 
