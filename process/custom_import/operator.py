@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from sqlalchemy import and_, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +24,11 @@ from db.models.custom_import import (
     CustomImportSchemaRevision,
     CustomImportSourceBindingRevision,
 )
+from process.custom_import.publication import (
+    _MATERIALIZATION_CONTRACT,
+    PublicationConflict,
+    _validate_verification_evidence,
+)
 
 MAX_BIGINT = 9_223_372_036_854_775_807
 _EXECUTION_STATES = frozenset({"queued", "running", "canceling", "canceled", "failed", "completed", "no_change"})
@@ -36,6 +41,8 @@ PublicationState = Literal["unsealed", "sealed_unpublished", "current", "superse
 
 _SEAL_STATUS_COLUMNS = (
     CustomImportGenerationSeal.seal_contract,
+    CustomImportGenerationSeal.materialization_contract,
+    CustomImportGenerationSeal.verification_evidence,
     CustomImportGenerationSeal.sealing_fence,
     CustomImportGenerationSeal.root_count.label("sealed_root_count"),
     CustomImportGenerationSeal.family_count.label("sealed_family_count"),
@@ -162,6 +169,8 @@ _SEAL_EVIDENCE_FIELDS = (
     "seal_capture_bundle_id",
     "seal_token_sha256",
     "seal_contract",
+    "materialization_contract",
+    "verification_evidence",
     "sealing_fence",
     "sealed_root_count",
     "sealed_family_count",
@@ -268,6 +277,8 @@ class GenerationSealStatus:
     materialization_sha256: str
     effective_output_sha256: str
     sealed_at: dt.datetime
+    materialization_contract: str = _MATERIALIZATION_CONTRACT
+    verification_evidence: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -479,25 +490,44 @@ async def inspect_execution(
     )
 
 
-def _seal_status(row) -> GenerationSealStatus | None:
-    contract = row["seal_contract"]
+def _seal_status(seal_snapshot) -> GenerationSealStatus | None:
+    contract = seal_snapshot["seal_contract"]
     if contract is None:
         return None
     if contract != _GENERATION_SEAL_CONTRACT:
         raise OperatorInvariantError("custom import operator evidence is invalid")
+    materialization_contract = seal_snapshot.get("materialization_contract")
+    if materialization_contract is None:
+        materialization_contract = _MATERIALIZATION_CONTRACT
+    evidence = seal_snapshot.get("verification_evidence")
+    try:
+        _validate_verification_evidence(
+            materialization_contract,
+            evidence,
+            counts=(
+                seal_snapshot["sealed_root_count"],
+                seal_snapshot["family_child_count"],
+                seal_snapshot["winner_count"],
+                seal_snapshot["profile_count"],
+            ),
+        )
+    except PublicationConflict:
+        raise OperatorInvariantError("custom import operator evidence is invalid") from None
     return GenerationSealStatus(
-        sealing_fence=row["sealing_fence"],
-        root_count=row["sealed_root_count"],
-        family_count=row["sealed_family_count"],
-        generation_family_count=row["generation_family_count"],
-        family_child_count=row["family_child_count"],
-        winner_count=row["winner_count"],
-        profile_count=row["profile_count"],
-        root_scalar_count=row["root_scalar_count"],
-        child_scalar_count=row["child_scalar_count"],
-        materialization_sha256=_digest(row["materialization_sha256"]),
-        effective_output_sha256=_digest(row["sealed_effective_output_sha256"]),
-        sealed_at=row["sealed_at"],
+        sealing_fence=seal_snapshot["sealing_fence"],
+        root_count=seal_snapshot["sealed_root_count"],
+        family_count=seal_snapshot["sealed_family_count"],
+        generation_family_count=seal_snapshot["generation_family_count"],
+        family_child_count=seal_snapshot["family_child_count"],
+        winner_count=seal_snapshot["winner_count"],
+        profile_count=seal_snapshot["profile_count"],
+        root_scalar_count=seal_snapshot["root_scalar_count"],
+        child_scalar_count=seal_snapshot["child_scalar_count"],
+        materialization_sha256=_digest(seal_snapshot["materialization_sha256"]),
+        effective_output_sha256=_digest(seal_snapshot["sealed_effective_output_sha256"]),
+        sealed_at=seal_snapshot["sealed_at"],
+        materialization_contract=materialization_contract,
+        verification_evidence=evidence,
     )
 
 
@@ -859,7 +889,7 @@ def _evidence_generation_seal(
 ) -> GenerationSealStatus | None:
     seal_generation_id = evidence_snapshot["seal_generation_id"]
     if seal_generation_id is None:
-        if any(evidence_snapshot[field] is not None for field in _SEAL_EVIDENCE_FIELDS):
+        if any(evidence_snapshot.get(field) is not None for field in _SEAL_EVIDENCE_FIELDS):
             raise OperatorInvariantError("custom import operator evidence is invalid")
         return None
     if (
@@ -937,7 +967,7 @@ def _evidence_generation(
     generation_id = evidence_snapshot["evidence_generation_id"]
     if generation_id is None:
         if any(
-            evidence_snapshot[field] is not None
+            evidence_snapshot.get(field) is not None
             for field in _GENERATION_EVIDENCE_FIELDS + _SEAL_EVIDENCE_FIELDS + _NO_CHANGE_EVIDENCE_FIELDS
         ):
             raise OperatorInvariantError("custom import operator evidence is invalid")
