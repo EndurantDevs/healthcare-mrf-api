@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sanic.exceptions import ServiceUnavailable
+from sqlalchemy import text
 
 from api import provider_profile as profile
 from api import provider_profile_cms as cms
@@ -101,16 +102,30 @@ def runtime(monkeypatch):
 
 
 async def republish(runtime, monkeypatch, mode):
-    """Run each publication entry point through the actual shared authority update."""
-    monkeypatch.setattr(native, "_lock_cms_doctors_publication", AsyncMock())
+    """Run each publication entry point with one complete prelock and shared authority update."""
+    prelock = AsyncMock(wraps=native._lock_cms_doctors_publication)
+    monkeypatch.setattr(native, "_lock_cms_doctors_publication", prelock)
+    runtime.database.text = text
+    runtime.session.execute.return_value = SimpleNamespace(
+        scalars=lambda: SimpleNamespace(all=lambda: [*RELATIONS, *(name + "_old" for name in RELATIONS)])
+    )
+    live_lock_statements = []
+
+    async def status(statement):
+        if statement.startswith("LOCK TABLE "):
+            live_lock_statements.append(statement)
+            assert len(live_lock_statements) == 1
+
+    runtime.database.status.side_effect = status
     monkeypatch.setattr(native, "swap_education_stage", AsyncMock())
     monkeypatch.setattr(native, "swap_group_site_stage", AsyncMock())
     stage = native.make_class(native.DoctorClinicianAddress, "synthetic")
     if mode == "ordinary":
-        return await native._publish_cms_doctors_stage(stage, "mrf", "synthetic")
-    monkeypatch.setattr(preparation.archive, "_lock_family", AsyncMock())
+        receipt = await native._publish_cms_doctors_stage(stage, "mrf", "synthetic")
+        prelock.assert_awaited_once_with(runtime.session, stage, "mrf", "synthetic")
+        assert len(live_lock_statements) == 1
+        return receipt
     monkeypatch.setattr(preparation.archive, "_verify_incumbent", AsyncMock())
-    monkeypatch.setattr(native, "lock_live_serving_relations", AsyncMock())
     for name in ("_assert_stage", "_assert_stage_indexes", "assert_prepared_cms_doctors_seal"):
         monkeypatch.setattr(preparation, name, AsyncMock())
     prepared = preparation.PreparedCMSDoctorsGeneration(
@@ -123,7 +138,10 @@ async def republish(runtime, monkeypatch, mode):
         {},
     )
     async with runtime.database.transaction():
-        return await preparation.apply_prepared_cms_doctors_generation(prepared)
+        receipt = await preparation.apply_prepared_cms_doctors_generation(prepared)
+    prelock.assert_awaited_once_with(runtime.session, stage, "mrf", "synthetic")
+    assert len(live_lock_statements) == 1
+    return receipt
 
 
 @pytest.mark.asyncio
