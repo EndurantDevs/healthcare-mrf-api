@@ -13,6 +13,7 @@ from decimal import Decimal
 from io import BytesIO
 from threading import current_thread
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -891,6 +892,44 @@ def test_bundle_replay_rejects_corrupt_in_memory_evidence():
     ):
         with pytest.raises(SnowflakeBundleError, match=message):
             callback()
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    (
+        ("manifest", None, "manifest is invalid"),
+        ("source_snapshot_token", "different-snapshot", "token does not match"),
+        ("compressed_bytes", 0, "partition exceeds the byte limit"),
+        ("decoded_bytes", 0, "partition exceeds the byte limit"),
+    ),
+)
+def test_acquisition_rechecks_nested_capture_evidence(field, value, message):
+    connector = _connector(_Adapter(lambda: _result(query_id="synthetic-capture-evidence")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    acquisition = connector.acquire(request)
+    root, detail = acquisition.stream_captures
+    original = root.captures[0]
+    manifest = value if field == "manifest" else replace(original.manifest, **{field: value})
+    corrupted = replace(root, captures=(replace(original, manifest=manifest),))
+
+    with pytest.raises(SnowflakeBundleError, match=message):
+        replace(acquisition, stream_captures=(corrupted, detail))
+
+
+@pytest.mark.parametrize("scope", ("stream", "bundle"))
+def test_acquisition_rechecks_partition_count_limits(monkeypatch, scope):
+    connector = _connector(_Adapter(lambda: _result(query_id="synthetic-partition-count")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    acquisition = connector.acquire(request)
+    root, detail = acquisition.stream_captures
+    if scope == "stream":
+        monkeypatch.setattr(snowflake_bundle, "MAX_RESULT_PARTITIONS", 1)
+        root = replace(root, captures=root.captures * 2)
+    else:
+        monkeypatch.setattr(snowflake_bundle, "MAX_BUNDLE_PARTITIONS", 1)
+
+    with pytest.raises(SnowflakeBundleError, match="partitions exceed"):
+        replace(acquisition, stream_captures=(root, detail))
 
 
 def test_bundle_replay_rejects_invalid_field_types_and_partition_schema():
@@ -2190,7 +2229,8 @@ async def test_bundle_candidate_seals_prepared_captures_in_worker(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_bundle_candidate_replays_durable_captures_in_worker(monkeypatch):
+@pytest.mark.parametrize("invalid_replay", (False, True))
+async def test_bundle_candidate_replays_durable_captures_in_worker(monkeypatch, invalid_replay):
     event_loop_thread = current_thread()
     prepared_statement = object()
     durable_captures = object()
@@ -2206,20 +2246,104 @@ async def test_bundle_candidate_replays_durable_captures_in_worker(monkeypatch):
     def replay_captures(statement, captures):
         assert current_thread() is not event_loop_thread
         assert statement is prepared_statement and captures is durable_captures
+        if invalid_replay:
+            raise SnowflakeBundleError("synthetic replay failure")
         return replay
 
     monkeypatch.setattr(snowflake_candidate, "load_replayable_parquet_bundle", load_captures)
     monkeypatch.setattr(snowflake_candidate, "reconstruct_replayable_parquet_bundle", replay_captures)
 
-    assert (
-        await snowflake_candidate._load_bundle_replay(
-            session_factory,
-            SimpleNamespace(dataset_id=1, definition_revision_id=1, schema_revision_id=1),
-            prepared_statement,
-            1,
-        )
-        is replay
+    pending = snowflake_candidate._load_bundle_replay(
+        session_factory,
+        SimpleNamespace(dataset_id=1, definition_revision_id=1, schema_revision_id=1),
+        prepared_statement,
+        1,
     )
+    if invalid_replay:
+        with pytest.raises(SnowflakeCandidateError, match="durable bundle cannot be replayed") as caught:
+            await pending
+        assert isinstance(caught.value.__cause__, SnowflakeBundleError)
+    else:
+        assert await pending is replay
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lost_at", ("reservation", "before_open", "after_open", "before_bind"))
+async def test_bundle_candidate_stops_after_lost_lease(monkeypatch, lost_at):
+    adapter = _Adapter(lambda: _result(query_id="synthetic-lease-loss")[0])
+    connector = _connector(adapter)
+    bundle = connector.prepare_request(_definition(), bindings=_bindings())
+    request = SnowflakeBundleCandidateRequest(1, 1, 1, _definition(), bundle, "synthetic-lease-loss", b"owner")
+    sessions, transitions = _fenced_failure_dependencies(monkeypatch, transition_state="canceled")
+    grant = SimpleNamespace(execution_id=1, fence=1, state="running")
+    step = ("reservation", "before_open", "after_open", "before_bind").index(lost_at)
+    renewed = AsyncMock(side_effect=[grant] * max(0, step - 1) + [None])
+    monkeypatch.setattr(snowflake_candidate, "_renew_bundle_lease", renewed)
+    if step == 0:
+        stopped = SimpleNamespace(execution_id=1, fence=1, state="canceling")
+        monkeypatch.setattr(snowflake_candidate, "_reserve_bundle_execution", AsyncMock(return_value=(None, stopped)))
+    register, replay, run = AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(snowflake_candidate, "_register_bundle_captures", register)
+    monkeypatch.setattr(snowflake_candidate, "_load_bundle_replay", replay)
+    monkeypatch.setattr(snowflake_candidate, "_run_claimed_bundle_candidate", run)
+
+    result = await run_snowflake_bundle_candidate(sessions, connector, request)
+
+    assert result.status == "canceled" and result.execution_id == 1
+    assert renewed.await_count == step and len(adapter.statements) == (step >= 2)
+    register.assert_not_awaited()
+    replay.assert_not_awaited()
+    run.assert_not_awaited()
+    assert transitions == [{"execution_id": 1, "fence": 1, "token": b"owner", "terminal_state": "canceled"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_state", ("canceled", "running"))
+async def test_unbound_retry_preserves_cancellation_or_new_owner(monkeypatch, terminal_state):
+    adapter = _Adapter(lambda: pytest.fail("unbound retry must not reopen the source"))
+    connector = _connector(adapter)
+    bundle = connector.prepare_request(_definition(), bindings=_bindings())
+    request = SnowflakeBundleCandidateRequest(1, 1, 1, _definition(), bundle, "synthetic-unbound-retry", b"owner")
+    sessions, transitions = _fenced_failure_dependencies(monkeypatch, transition_state=terminal_state)
+    submission = SimpleNamespace(execution_id=1, state="running", capture_bundle_id=None)
+    grant = SimpleNamespace(execution_id=1, fence=2, state="running")
+    monkeypatch.setattr(snowflake_candidate, "_reserve_bundle_execution", AsyncMock(return_value=(submission, grant)))
+
+    result = await run_snowflake_bundle_candidate(sessions, connector, request)
+
+    assert result.status == ("canceled" if terminal_state == "canceled" else "lease_lost")
+    assert adapter.statements == []
+    assert transitions == [
+        {
+            "execution_id": 1,
+            "fence": 2,
+            "token": b"owner",
+            "terminal_state": "failed",
+            "terminal_reason": "unbound_source_capture",
+        },
+        {"execution_id": 1, "fence": 2, "token": b"owner", "terminal_state": "canceled"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_preparation_failure_fences_without_retaining_or_replaying(monkeypatch):
+    connector = _connector(_Adapter(lambda: _result(query_id="synthetic-preparation-failure")[0]))
+    bundle = connector.prepare_request(_definition(), bindings=_bindings())
+    request = SnowflakeBundleCandidateRequest(1, 1, 1, _definition(), bundle, "synthetic-prepare", b"owner")
+    sessions, transitions = _fenced_failure_dependencies(monkeypatch, transition_state="failed")
+    failure = RuntimeError("synthetic preparation failure")
+    register, replay = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(snowflake_candidate, "_prepared_bundle_captures", Mock(side_effect=failure))
+    monkeypatch.setattr(snowflake_candidate, "_register_bundle_captures", register)
+    monkeypatch.setattr(snowflake_candidate, "_load_bundle_replay", replay)
+
+    with pytest.raises(RuntimeError) as caught:
+        await run_snowflake_bundle_candidate(sessions, connector, request)
+
+    assert caught.value is failure
+    register.assert_not_awaited()
+    replay.assert_not_awaited()
+    _assert_fenced_failure(transitions, b"owner")
 
 
 @pytest.mark.asyncio

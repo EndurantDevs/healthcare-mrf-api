@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import DateTime, Numeric, String, literal, select, text, union_all
@@ -16,6 +17,7 @@ from sqlalchemy.sql.elements import BindParameter
 from api import billing_search_pagination as pagination
 from api import custom_import_billing_query as composition
 from api.billing_search_cursor import BillingSearchCursorError
+from api.billing_search_import_contract import validate_billing_search_composed_order
 from api.ptg2_billing_search_contract import BillingSearchServingUnavailableError
 from process.custom_import.read_contracts import PinnedReadTarget
 from process.custom_import.read_core import PreparedNpiEntityRelation, ReadOrderTerm
@@ -62,14 +64,16 @@ def _context(*, require_match=True, direction="desc", nulls="last"):
     )
 
 
-def test_statement_is_unpaged_and_uses_exact_typed_native_scope():
-    context = _context()
+@pytest.mark.parametrize("direction", (None, "desc"))
+def test_statement_is_unpaged_and_uses_exact_typed_native_scope(direction):
+    context = _context(direction=direction)
     candidates = tuple(candidate(npi=npi) for npi in NPI_VALUES)
     statement = composition._candidate_statement(candidates, context)
     sql = str(statement)
     assert "unnest" in sql and "WITH ORDINALITY" in sql and "LIMIT" not in sql
     assert "CAST(billing_candidates.npi AS VARCHAR)" in sql
-    assert "DESC NULLS LAST" in sql
+    assert ("DESC NULLS LAST" in sql) is (direction is not None)
+    assert sql.endswith("billing_candidates.ordinal ASC")
     assert "billing_candidate_entities" in statement.compile().params
 
 
@@ -186,6 +190,117 @@ def test_mutated_datetime_bind_changes_driver_cast_but_cannot_reuse_seal():
     assert "TIMESTAMP WITHOUT TIME ZONE" in mutated_sql
     with pytest.raises(BillingSearchServingUnavailableError):
         composition.validate_billing_import_query(context, endpoint_access_state_sha256=_ACCESS_STATE)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("compiled", None),
+        ("import_scope", None),
+        ("endpoint_access_state_sha256", None),
+        ("endpoint_access_state_sha256", "d" * 63),
+        ("endpoint_access_state_sha256", "D" * 64),
+    ),
+)
+async def test_substituted_query_state_fails_before_sql(field, value):
+    context = replace(_context(), **{field: value})
+    session = Mock(execute=AsyncMock())
+
+    with pytest.raises(BillingSearchServingUnavailableError, match="^billing_search_serving_generation_unavailable$"):
+        await composition.compose_billing_candidates(
+            session, (candidate(),), context, endpoint_access_state_sha256=_ACCESS_STATE
+        )
+
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("effective_require_match", False),
+        ("query_fingerprint", "c" * 64),
+        ("authorization_scope_sha256", "c" * 64),
+    ),
+)
+def test_changed_prepared_authority_cannot_reuse_query_seal(field, value):
+    context = _context()
+    context = replace(context, prepared=replace(context.prepared, **{field: value}))
+
+    with pytest.raises(BillingSearchServingUnavailableError, match="^billing_search_serving_generation_unavailable$"):
+        composition.validate_billing_import_query(context, endpoint_access_state_sha256=_ACCESS_STATE)
+
+
+def test_untyped_query_and_pin_cannot_enter_billing_composition():
+    with pytest.raises(BillingSearchServingUnavailableError):
+        composition.validate_billing_import_query(None, endpoint_access_state_sha256=_ACCESS_STATE)
+    with pytest.raises(BillingSearchServingUnavailableError):
+        composition._new_billing_import_query(_prepared(), True, None, _ACCESS_STATE)
+
+
+@pytest.mark.parametrize(
+    "candidates",
+    (
+        [candidate()],
+        (None,),
+        (candidate(), candidate()),
+        (candidate(binding_ordinal=1), candidate()),
+    ),
+    ids=("mutable-container", "untyped-candidate", "duplicate-identity", "unordered-identities"),
+)
+async def test_invalid_native_candidate_scope_fails_before_sql(candidates):
+    session = Mock(execute=AsyncMock())
+
+    with pytest.raises(BillingSearchServingUnavailableError):
+        await composition.compose_billing_candidates(
+            session, candidates, _context(), endpoint_access_state_sha256=_ACCESS_STATE
+        )
+
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "require_match,ordinals",
+    (
+        (True, (True,)),
+        (True, (1.0,)),
+        (True, ("1",)),
+        (True, (None,)),
+        (True, (0,)),
+        (True, (-1,)),
+        (True, (3,)),
+        (True, (1, 1)),
+        (False, (1,)),
+        (False, ()),
+    ),
+)
+async def test_invalid_composed_ordinals_cannot_produce_an_order_proof(require_match, ordinals):
+    candidates = (candidate(), candidate(binding_ordinal=1))
+    session = Mock(execute=AsyncMock(return_value=Mock()))
+    session.execute.return_value.scalars.return_value.all.return_value = ordinals
+
+    with pytest.raises(BillingSearchServingUnavailableError):
+        await composition.compose_billing_candidates(
+            session, candidates, _context(require_match=require_match), endpoint_access_state_sha256=_ACCESS_STATE
+        )
+
+    session.execute.assert_awaited_once()
+
+
+@pytest.mark.parametrize("require_match,ordinals", ((True, (2,)), (True, ()), (False, (2, 1))))
+async def test_composed_order_proof_retains_complete_native_identities(require_match, ordinals):
+    candidates = (candidate(), candidate(binding_ordinal=1))
+    context = _context(require_match=require_match)
+    session = Mock(execute=AsyncMock(return_value=Mock()))
+    session.execute.return_value.scalars.return_value.all.return_value = ordinals
+
+    ordered, proof = await composition.compose_billing_candidates(
+        session, candidates, context, endpoint_access_state_sha256=_ACCESS_STATE
+    )
+
+    assert ordered == tuple(candidates[ordinal - 1] for ordinal in ordinals)
+    assert proof.import_scope == context.import_scope
+    validate_billing_search_composed_order(tuple(item.sort_key for item in ordered), proof, complete=True)
+    session.execute.assert_awaited_once()
 
 
 @asynccontextmanager

@@ -438,6 +438,8 @@ mod tests {
         let combined_provider = Mutex::new(vec![0u64]);
         let combined_price = Mutex::new(vec![0u64]);
         let ranges = [(0, 1)];
+        let missing_identity = DenseIdentityMap::with_capacity(0).unwrap();
+        let wrong_range = [(1, 1)];
         for owned in [false, true] {
             let work = temporary.path().join(format!("failed-{owned}"));
             let mut context = V3AssignmentContext {
@@ -455,6 +457,65 @@ mod tests {
                 consume_serving_inputs: owned,
                 scratch_durability: ScratchDurability::Ephemeral,
             };
+            for (case, expected) in [
+                ("partition", "missing code partition"),
+                ("code", "assigned code identity is absent"),
+                ("provider", "assigned provider identity is absent"),
+                ("price", "assigned price identity is absent"),
+                (
+                    "range",
+                    "code identity is outside its leading-bit partition range",
+                ),
+            ] {
+                let rejected_work = temporary.path().join(format!("{case}-{owned}"));
+                let mut rejected_context = V3AssignmentContext {
+                    work_root: &rejected_work,
+                    ..context
+                };
+                match case {
+                    "partition" => rejected_context.code_partition_ranges = &[],
+                    "code" => rejected_context.code_map = &missing_identity,
+                    "provider" => rejected_context.provider_map = &missing_identity,
+                    "price" => rejected_context.price_map = &missing_identity,
+                    _ => rejected_context.code_partition_ranges = &wrong_range,
+                }
+                let error = assign_v3_partition(0, &inputs, &rejected_context).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(error.to_string(), expected);
+                for input in &inputs {
+                    assert_eq!(std::fs::read(&input.path).unwrap(), record.encode());
+                }
+            }
+            for role in ["provider", "price"] {
+                let rejected_work = temporary.path().join(format!("poisoned-{role}-{owned}"));
+                let provider_seen = Mutex::new(vec![0u64]);
+                let price_seen = Mutex::new(vec![0u64]);
+                let poisoned = if role == "provider" {
+                    &provider_seen
+                } else {
+                    &price_seen
+                };
+                assert!(std::panic::catch_unwind(|| {
+                    let _guard = poisoned.lock().unwrap();
+                    panic!("worker failed while updating coverage");
+                })
+                .is_err());
+                let rejected_context = V3AssignmentContext {
+                    work_root: &rejected_work,
+                    combined_provider_seen_words: &provider_seen,
+                    combined_price_seen_words: &price_seen,
+                    ..context
+                };
+                let error = assign_v3_partition(0, &inputs, &rejected_context).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Other);
+                assert_eq!(
+                    error.to_string(),
+                    format!("combined {role} coverage bitmap is poisoned")
+                );
+                for input in &inputs {
+                    assert_eq!(std::fs::read(&input.path).unwrap(), record.encode());
+                }
+            }
             let mut bad_inputs = inputs.clone();
             bad_inputs[1].sha256 = [0; 32];
             let error = assign_v3_partition(0, &bad_inputs, &context).unwrap_err();

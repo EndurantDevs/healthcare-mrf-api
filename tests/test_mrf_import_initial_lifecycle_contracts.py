@@ -1,7 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import csv
 import datetime
+import io
 import json
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
@@ -9,6 +12,68 @@ from unittest.mock import ANY, AsyncMock, Mock
 import pytest
 
 from process import initial
+
+
+def _catalog_csv(rows):
+    stream = io.StringIO()
+    writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+    writer.writeheader()
+    writer.writerows(rows)
+    return "\ufeff" + stream.getvalue()
+
+
+def _catalog_zip(members):
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+    return stream.getvalue()
+
+
+@pytest.fixture
+def catalog_archives(monkeypatch):
+    archive_by_url = {}
+    downloads = []
+
+    async def download(source_url, destination):
+        destination = Path(destination)
+        downloads.append((source_url, destination.parent))
+        destination.write_bytes(archive_by_url[source_url])
+
+    monkeypatch.setattr(initial, "download_it_and_save", download)
+    return archive_by_url, downloads
+
+
+def _federal_attribute_row(**overrides):
+    return {
+        "StandardComponentId": "12345AA0000001",
+        "PlanId": "12345AA0000001-00",
+        "BusinessYear": "2026",
+        "IssuerId": "12345",
+        "StateCode": "aa",
+        "PlanMarketingName": "Synthetic Plan, Silver",
+        "URLForSummaryofBenefitsCoverage": "https://data.example.invalid/summary",
+        "PlanBrochure": "https://data.example.invalid/brochure",
+        "FormularyURL": "https://data.example.invalid/formulary",
+        "NetworkId": "network-a",
+        "ImportDate": "2026-01-02",
+        "IssuerMarketPlaceMarketingName": "  Synthetic Issuer  ",
+        **overrides,
+    }
+
+
+def _state_attribute_row(**overrides):
+    return {
+        "StandardComponentId": "23456BB0000001",
+        "PlanId": "",
+        "BusinessYear": "2026",
+        "IssuerId": "23456",
+        "StateCode": "bb",
+        "ImportDate": "2026-02-03",
+        "IssuerName": "  State Issuer  ",
+        **overrides,
+    }
+
 
 @pytest.mark.parametrize(
     ("value", "expected"),
@@ -187,10 +252,7 @@ def _assert_initial_import_catalog_result(context_by_field, pushed_batches):
         "mrf_file_chunking": "providers,formularies",
     }
     transparency_rows = [
-        pushed_row
-        for label, row_dicts in pushed_batches
-        for pushed_row in row_dicts
-        if label == "PlanTransparency"
+        pushed_row for label, row_dicts in pushed_batches for pushed_row in row_dicts if label == "PlanTransparency"
     ]
     assert transparency_rows == [
         {
@@ -207,20 +269,13 @@ def _assert_initial_import_catalog_result(context_by_field, pushed_batches):
             "claims_payment_policies_url": "https://data.example.invalid/policies",
         }
     ]
-    issuer_rows = [
-        pushed_row
-        for label, row_dicts in pushed_batches
-        for pushed_row in row_dicts
-        if label == "Issuer"
-    ]
+    issuer_rows = [pushed_row for label, row_dicts in pushed_batches for pushed_row in row_dicts if label == "Issuer"]
     assert {issuer_row["issuer_id"] for issuer_row in issuer_rows} == {
         12345,
         23456,
         99999,
     }
-    assert next(
-        issuer_row for issuer_row in issuer_rows if issuer_row["issuer_id"] == 12345
-    ) == {
+    assert next(issuer_row for issuer_row in issuer_rows if issuer_row["issuer_id"] == 12345) == {
         "issuer_id": 12345,
         "issuer_name": "Synthetic Issuer",
         "issuer_marketing_name": "",
@@ -231,19 +286,12 @@ def _assert_initial_import_catalog_result(context_by_field, pushed_batches):
 
 
 def _assert_initial_import_queue_result(progress_events, redis):
-    index_calls = [
-        call
-        for call in redis.enqueue_job.await_args_list
-        if call.args[0] == "process_json_index"
-    ]
+    index_calls = [call for call in redis.enqueue_job.await_args_list if call.args[0] == "process_json_index"]
     assert [call.args[1]["url"] for call in index_calls] == [
         "https://data.example.invalid/index-a.json",
         "https://data.example.invalid/index-b.json",
     ]
-    assert all(
-        call.kwargs["_queue_name"] == initial.MRF_QUEUE_NAME
-        for call in index_calls
-    )
+    assert all(call.kwargs["_queue_name"] == initial.MRF_QUEUE_NAME for call in index_calls)
     shutdown_call = redis.enqueue_job.await_args_list[-1]
     assert shutdown_call.args[0] == "shutdown"
     assert shutdown_call.kwargs == {
@@ -265,9 +313,7 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
     workbook_by_path = _initial_import_workbooks()
     pushed_batches = []
     progress_events = []
-    _install_initial_import_mocks(
-        monkeypatch, workbook_by_path, pushed_batches, progress_events
-    )
+    _install_initial_import_mocks(monkeypatch, workbook_by_path, pushed_batches, progress_events)
     _install_initial_import_catalog_mocks(monkeypatch, progress_events)
     redis = SimpleNamespace(enqueue_job=AsyncMock(return_value=SimpleNamespace()))
     context_by_field = {
@@ -442,7 +488,7 @@ async def test_chunk_handoff_skips_ineligible_or_unsplittable_files(
 ):
     source_file = tmp_path / "plans.json"
     source_file.write_bytes(b"x" * file_size)
-    split = Mock(return_value=[{"path": str(tmp_path / "chunk.json")} ] if has_chunks else [])
+    split = Mock(return_value=[{"path": str(tmp_path / "chunk.json")}] if has_chunks else [])
     monkeypatch.setattr(initial, "_is_mrf_file_chunking_enabled", lambda *_args, **_kwargs: chunking_enabled)
     monkeypatch.setattr(initial, "_mrf_size_bytes", lambda name, _default: 50 if name.endswith("MIN_BYTES") else 10)
     monkeypatch.setattr(initial, "_mrf_chunk_dir", lambda *_args, **_kwargs: tmp_path)
@@ -460,3 +506,219 @@ async def test_chunk_handoff_skips_ineligible_or_unsplittable_files(
     )
 
     assert handed_off is False
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.asyncio
+async def test_federal_attribute_archive_merges_identities_without_overwriting_duplicates(
+    monkeypatch, catalog_archives, fallback
+):
+    archive_by_url, downloads = catalog_archives
+    url = "https://data.example.invalid/federal.zip"
+    attribute_rows = [
+        _federal_attribute_row(StandardComponentId=""),
+        _federal_attribute_row(PlanId=""),
+        _federal_attribute_row(),
+        _federal_attribute_row(PlanMarketingName="Duplicate", IssuerMarketPlaceMarketingName="Duplicate"),
+        _federal_attribute_row(
+            StandardComponentId="34567CC0000001", IssuerId="34567", IssuerMarketPlaceMarketingName=" "
+        ),
+    ]
+    archive_by_url[url] = _catalog_zip({"attributes.csv": _catalog_csv(attribute_rows)})
+    if fallback:
+        monkeypatch.setattr(initial, "unzip", AsyncMock(side_effect=OSError("synthetic extraction failure")))
+    plans, issuers = {}, {}
+
+    await initial._read_unknown_federal_attribute_file(url, plans, issuers)
+
+    assert set(plans) == {"12345AA0000001_2026", "34567CC0000001_2026"}
+    plan = plans["12345AA0000001_2026"]
+    assert plan == {
+        "plan_id": "12345AA0000001",
+        "plan_id_type": "CMS-HIOS-PLAN-ID",
+        "year": 2026,
+        "issuer_id": 12345,
+        "state": "AA",
+        "marketing_name": "Synthetic Plan, Silver",
+        "summary_url": "https://data.example.invalid/summary",
+        "marketing_url": "https://data.example.invalid/brochure",
+        "formulary_url": "https://data.example.invalid/formulary",
+        "plan_contact": "",
+        "network": ["network-a"],
+        "benefits": [],
+        "last_updated_on": datetime.datetime(2026, 1, 2),
+        "checksum": initial.return_checksum(["12345aa0000001", 2026], crc=32),
+    }
+    assert issuers[12345]["issuer_name"] == "Synthetic Issuer"
+    assert issuers[34567]["issuer_name"] == "34567"
+    assert issuers[12345]["state"] == "AA"
+    assert all(not directory.exists() for _, directory in downloads)
+
+
+@pytest.mark.parametrize(("preferred_name", "row_limit"), [(True, None), (False, 2)])
+@pytest.mark.asyncio
+async def test_state_attribute_archive_selects_csv_and_counts_only_new_identities(
+    monkeypatch, catalog_archives, preferred_name, row_limit
+):
+    archive_by_url, downloads = catalog_archives
+    url = "https://data.example.invalid/state.zip"
+    attribute_rows = [
+        _state_attribute_row(StandardComponentId=""),
+        _state_attribute_row(),
+        _state_attribute_row(StandardComponentId="23456bb0000001", IssuerName="Duplicate"),
+        _state_attribute_row(StandardComponentId="34567CC0000001", IssuerId="34567", IssuerName=" "),
+    ]
+    content_by_name = {"StatePlans.csv" if preferred_name else "attributes.csv": _catalog_csv(attribute_rows)}
+    if preferred_name:
+        content_by_name["ignored.csv"] = "not,a,plan\n"
+    else:
+        monkeypatch.setattr(initial, "unzip", AsyncMock(side_effect=OSError("synthetic extraction failure")))
+    archive_by_url[url] = _catalog_zip(content_by_name)
+    plans, issuers = {}, {}
+
+    count = await initial._read_unknown_state_attribute_file(url, plans, issuers, 1, row_limit)
+
+    assert count == (3 if row_limit is None else 2)
+    assert set(plans) == (
+        {"23456BB0000001_2026", "34567CC0000001_2026"} if row_limit is None else {"23456BB0000001_2026"}
+    )
+    plan = plans["23456BB0000001_2026"]
+    assert (plan["plan_id_type"], plan["year"], plan["issuer_id"], plan["state"]) == (
+        "STATE-HIOS-PLAN-ID",
+        2026,
+        23456,
+        "BB",
+    )
+    assert plan["last_updated_on"] == datetime.datetime(2026, 2, 3)
+    assert plan["marketing_name"] is None
+    assert plan["summary_url"] is None
+    assert plan["marketing_url"] is None
+    assert plan["formulary_url"] is None
+    assert plan["network"] == [None]
+    assert issuers[23456]["issuer_name"] == "State Issuer"
+    if row_limit is None:
+        assert issuers[34567]["issuer_name"] == "34567"
+    assert all(not directory.exists() for _, directory in downloads)
+
+
+@pytest.mark.parametrize("test_mode", [False, True])
+@pytest.mark.asyncio
+async def test_identity_import_uses_real_archives_and_global_state_limit(monkeypatch, catalog_archives, test_mode):
+    archive_by_url, downloads = catalog_archives
+    urls = [f"https://data.example.invalid/{name}.zip" for name in ("federal", "state-a", "state-b")]
+    archive_by_url[urls[0]] = _catalog_zip({"attributes.csv": _catalog_csv([_federal_attribute_row()])})
+    archive_by_url[urls[1]] = _catalog_zip(
+        {
+            "Plans.csv": _catalog_csv(
+                [
+                    _state_attribute_row(
+                        StandardComponentId="12345AA0000001", IssuerId="12345", IssuerName="Duplicate"
+                    ),
+                    _state_attribute_row(),
+                ]
+            )
+        }
+    )
+    archive_by_url[urls[2]] = _catalog_zip(
+        {
+            "Plans.csv": _catalog_csv(
+                [
+                    _state_attribute_row(StandardComponentId="34567CC0000001", IssuerId="34567"),
+                ]
+            )
+        }
+    )
+    monkeypatch.setenv("HLTHPRT_CMSGOV_PLAN_ATTRIBUTES_URL_PUF", json.dumps([{"url": urls[0]}]))
+    monkeypatch.setenv("HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF", json.dumps([{"url": url} for url in urls[1:]]))
+    monkeypatch.setattr(initial, "TEST_UNKNOWN_STATE_ROWS", 1)
+
+    issuers, plans = await initial.import_unknown_state_issuers_data(test_mode=test_mode)
+
+    assert issuers[12345]["issuer_name"] == "Synthetic Issuer"
+    assert plans["12345AA0000001_2026"]["plan_id_type"] == "CMS-HIOS-PLAN-ID"
+    assert (34567 in issuers) is (not test_mode)
+    assert len(plans) == (2 if test_mode else 3)
+    assert [url for url, _ in downloads] == (urls[:2] if test_mode else urls)
+    assert all(not directory.exists() for _, directory in downloads)
+
+
+@pytest.mark.parametrize("test_mode", [False, True])
+@pytest.mark.asyncio
+async def test_rate_review_archives_refresh_names_with_remaining_global_budget(
+    monkeypatch, catalog_archives, test_mode
+):
+    archive_by_url, downloads = catalog_archives
+    urls = [f"https://data.example.invalid/review-{index}.zip" for index in range(3)]
+    for url, review_rows in zip(
+        urls,
+        [
+            [{"ISSUER_ID": "12345", "STATE": "aa", "COMPANY": " Original, Issuer "}],
+            [
+                {"ISSUER_ID": "12345", "STATE": "bb", "COMPANY": " Renamed Issuer "},
+                {"ISSUER_ID": "23456", "STATE": "bb", "COMPANY": " "},
+            ],
+            [{"ISSUER_ID": "34567", "STATE": "cc", "COMPANY": "Third Issuer"}],
+        ],
+        strict=True,
+    ):
+        archive_by_url[url] = _catalog_zip({"RatePUF.csv": _catalog_csv(review_rows), "ignored.csv": "invalid\n"})
+    monkeypatch.setenv("HLTHPRT_CMSGOV_RATE_REVIEW_URL_PUF", json.dumps([{"url": url} for url in urls]))
+    monkeypatch.setattr(initial, "TEST_UNKNOWN_STATE_ROWS", 2)
+
+    issuers = await initial.update_issuer_names_data(test_mode=test_mode)
+
+    assert issuers[12345]["issuer_name"] == "Renamed Issuer"
+    assert issuers[12345]["state"] == "BB"
+    assert set(issuers) == ({12345} if test_mode else {12345, 23456, 34567})
+    if not test_mode:
+        assert issuers[23456]["issuer_name"] == "23456"
+    assert [url for url, _ in downloads] == (urls[:2] if test_mode else urls)
+    assert all(not directory.exists() for _, directory in downloads)
+
+
+@pytest.mark.parametrize("reader", ["federal", "state", "rate_review"])
+@pytest.mark.parametrize(
+    ("malformation", "error"),
+    [
+        ("bad_zip", zipfile.BadZipFile),
+        ("invalid_id", ValueError),
+        ("missing_columns", KeyError),
+    ],
+)
+@pytest.mark.asyncio
+async def test_catalog_failures_propagate_and_remove_extracted_files(
+    monkeypatch, catalog_archives, reader, malformation, error
+):
+    archive_by_url, downloads = catalog_archives
+    url = "https://data.example.invalid/malformed.zip"
+    failure_rows = {
+        "federal": [_federal_attribute_row(BusinessYear="invalid")],
+        "state": [_state_attribute_row(IssuerId="invalid")],
+        "rate_review": [{"ISSUER_ID": "invalid", "STATE": "aa", "COMPANY": "Issuer"}],
+    }[reader]
+    if malformation == "missing_columns":
+        failure_rows = {
+            "federal": [{"StandardComponentId": "12345AA0000001"}],
+            "state": [_state_attribute_row(IssuerId=None)],
+            "rate_review": [{"STATE": "aa", "COMPANY": "Issuer"}],
+        }[reader]
+        if reader == "state":
+            del failure_rows[0]["IssuerId"]
+            error = TypeError
+    archive_by_url[url] = (
+        b"not a ZIP archive"
+        if malformation == "bad_zip"
+        else _catalog_zip({"PlansPUF.csv": _catalog_csv(failure_rows)})
+    )
+
+    with pytest.raises(error):
+        if reader == "federal":
+            await initial._read_unknown_federal_attribute_file(url, {}, {})
+        elif reader == "state":
+            await initial._read_unknown_state_attribute_file(url, {}, {}, 0, None)
+        else:
+            monkeypatch.setenv("HLTHPRT_CMSGOV_RATE_REVIEW_URL_PUF", json.dumps([{"url": url}]))
+            await initial.update_issuer_names_data()
+
+    assert len(downloads) == 1
+    assert not downloads[0][1].exists()

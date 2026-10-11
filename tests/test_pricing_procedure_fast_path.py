@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import json
+from collections import OrderedDict
 
 import pytest
 
@@ -224,3 +225,55 @@ async def test_native_claims_thresholds_filter_rows_before_count_and_page(monkey
         "npi ASC",
     )
     assert "LIMIT 2 OFFSET 4" in statements[1]
+
+
+@pytest.mark.asyncio
+async def test_coordinate_search_preserves_zip_distances(monkeypatch):
+    monkeypatch.setattr(pricing_module, "_ZIP_RADIUS_ROWS_CACHE", OrderedDict())
+    request = make_request(
+        [
+            FakeResult(rows=[{"zip5": "10001", "state": "NY", "latitude": 40.75, "longitude": -73.99}]),
+            FakeResult(
+                rows=[
+                    {"zip5": "10002", "state": "NY", "distance_miles": 7.0},
+                ]
+            ),
+            FakeResult(scalar=None),
+            FakeResult(scalar=3),
+            FakeResult(
+                rows=[
+                    {"npi": 1000000001, "zip5": "10001"},
+                    {"npi": 1000000002, "zip5": "10002"},
+                    {"npi": 1000000003, "zip5": "10003"},
+                ]
+            ),
+        ],
+        args={
+            "q": "synthetic",
+            "year": "2025",
+            "zip5": "10001",
+            "zip_radius_miles": "30",
+            "lat": "40.75",
+            "long": "-73.99",
+            "radius": "50",
+        },
+    )
+
+    reply = await list_providers_by_procedure(request)
+
+    response_by_field = json.loads(reply.body)
+    assert response_by_field["query"]["zip_candidate_count"] == 2
+    assert response_by_field["pagination"]["total"] == 3
+    provider_items = response_by_field["items"]
+    assert [provider_item["npi"] for provider_item in provider_items] == [1000000001, 1000000002, 1000000003]
+    assert provider_items[0]["distance_miles"] == 0.0
+    assert provider_items[0]["anchor_zip5"] == "10001"
+    assert provider_items[1]["distance_miles"] == 7.0
+    assert provider_items[1]["distance_bucket"] == "within_10mi"
+    assert "distance_miles" not in provider_items[2]
+    assert "anchor_zip5" not in provider_items[2]
+    for execution_args, _execution_kwargs in request.ctx.sa_session.executions[-2:]:
+        statement = str(execution_args[0].compile(compile_kwargs={"literal_binds": True}))
+        assert "mrf.pricing_provider.zip5 IN (SELECT mrf.geo_zip_lookup.zip_code" in statement
+        assert "mrf.geo_zip_lookup.zip_code = '10001' OR" in statement
+        assert "<= 50.0" in statement

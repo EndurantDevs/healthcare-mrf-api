@@ -13,12 +13,14 @@ import threading
 import weakref
 from dataclasses import asdict, replace
 from decimal import Decimal
+from io import BytesIO
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from process.custom_import import snowflake_capture as capture
-from process.custom_import.capture import CaptureError
+from process.custom_import.capture import CaptureError, capture_stream
 from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.execution import ExecutionSubmission, LeaseGrant
@@ -331,6 +333,108 @@ def test_segmented_request_identity_pins_policy_and_does_not_change_v1(monkeypat
     changed = replace(harness.policy, acquisition_deadline_seconds=61)
     assert capture.segmented_bundle_request_identity_sha256(statement.request, statement, changed) != new
     assert capture.bundle_request_identity_sha256(statement.request, statement) == old
+    configured = harness.builder.build_statement(harness.request.bundle_request)
+    with pytest.raises(capture.SnowflakeCaptureError, match="policy differs"):
+        capture.segmented_bundle_request_identity_sha256(configured.request, configured, changed)
+
+
+@pytest.mark.asyncio
+async def test_missing_capture_authority_never_opens_source(monkeypatch):
+    harness = _Harness(monkeypatch)
+    monkeypatch.setattr(capture.lifecycle, "_lock_current_capture_binding", AsyncMock(return_value=None))
+
+    with pytest.raises(capture.SnowflakeCaptureError, match="authority was lost before source opening"):
+        await harness.run()
+
+    assert "credentials" not in harness.timeline and harness.cursor.executed == []
+    assert harness.pending is None and harness.parts == [] and harness.receipts == ()
+    assert harness.finishes[0]["terminal_state"] == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ("not_claimed", "canceling", "unbound"))
+async def test_unavailable_capture_reservation_never_opens_source(monkeypatch, state):
+    harness = _Harness(monkeypatch)
+    unavailable = AsyncMock(return_value=SimpleNamespace(status="canceled", execution_id=9))
+    unbound = AsyncMock(return_value=SimpleNamespace(status="lease_lost", execution_id=9))
+    monkeypatch.setattr(capture, "_reservation_unavailable_result", unavailable)
+    monkeypatch.setattr(capture, "_unbound_capture_result", unbound)
+    if state == "not_claimed":
+        harness.grant = None
+    elif state == "canceling":
+        harness.grant = replace(harness.grant, state="canceling")
+    else:
+        harness.grant = replace(harness.grant, fence=2)
+        harness.submission = replace(harness.submission, state="running", created=False)
+
+    result = await harness.run()
+
+    assert result.status == {"not_claimed": "not_claimed", "canceling": "canceled", "unbound": "lease_lost"}[state]
+    assert unavailable.await_count == (state == "canceling")
+    assert unbound.await_count == (state == "unbound")
+    assert harness.timeline == ["reserve"] and harness.cursor.executed == []
+    assert harness.parts == [] and harness.receipts == () and harness.finishes == []
+
+
+@pytest.mark.parametrize("defect", ("statement", "credential_type", "remaining_time"))
+def test_affinity_open_rechecks_immutable_inputs_before_source(monkeypatch, defect):
+    harness = _Harness(monkeypatch)
+    statement = harness.builder.build_statement(harness.request.bundle_request)
+    attempt = capture._Attempt(capture.time.monotonic() + 60)
+    owner = capture._AffinityLanding(
+        harness.builder, harness.adapter, harness.credentials, statement, harness.policy, 17, attempt
+    )
+    if defect == "statement":
+        columns = statement.selected_columns_by_stream
+        changed = replace(columns[0][0], column_identifier="other_npi")
+        drift = replace(statement, selected_columns_by_stream=((changed, *columns[0][1:]), *columns[1:]))
+        monkeypatch.setattr(harness.builder, "build_statement", lambda _request: drift)
+    elif defect == "credential_type":
+        monkeypatch.setattr(harness.credentials, "load_key_pair", lambda: None)
+    else:
+        attempt.deadline = capture.time.monotonic() + 0.5
+
+    with pytest.raises(capture.SnowflakeCaptureError, match="drifted|invalid type|insufficient source-opening time"):
+        owner.open()
+
+    assert owner.result is None and harness.cursor.executed == []
+    assert harness.pending is None and harness.parts == []
+
+
+@pytest.mark.asyncio
+async def test_canceled_owned_future_is_not_retried():
+    attempt = capture._Attempt(capture.time.monotonic() + 60)
+    future = asyncio.get_running_loop().create_future()
+    future.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await capture._await_owned(future, attempt)
+
+    assert attempt.stopped.is_set() and attempt.reason == "capture caller canceled"
+
+
+def test_affinity_cleanup_failure_cannot_be_hidden_by_retry(monkeypatch):
+    harness = _Harness(monkeypatch)
+    statement = harness.builder.build_statement(harness.request.bundle_request)
+    owner = capture._AffinityLanding(
+        harness.builder,
+        harness.adapter,
+        harness.credentials,
+        statement,
+        harness.policy,
+        17,
+        capture._Attempt(capture.time.monotonic() + 60),
+    )
+    failure = RuntimeError("synthetic cleanup failure")
+    close = Mock(side_effect=failure)
+    owner.result = SimpleNamespace(close=close)
+
+    for _retry in range(2):
+        with pytest.raises(RuntimeError) as caught:
+            owner.close()
+        assert caught.value is failure
+
+    close.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -475,7 +579,8 @@ async def test_bound_capture_returns_without_source_or_credentials(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_loss_during_blocking_open_discards_late_result(monkeypatch):
+@pytest.mark.parametrize("renewal_raises", (False, True))
+async def test_heartbeat_loss_during_blocking_open_discards_late_result(monkeypatch, renewal_raises):
     harness = _Harness(monkeypatch, (_shared_row(),))
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -489,6 +594,8 @@ async def test_heartbeat_loss_during_blocking_open_discards_late_result(monkeypa
 
     async def lost(*arguments):
         await entered.wait()
+        if renewal_raises:
+            raise RuntimeError("synthetic heartbeat failure")
         return None
 
     monkeypatch.setattr(harness.adapter, "open_bundle_landing", blocking_open)
@@ -500,7 +607,9 @@ async def test_heartbeat_loss_during_blocking_open_discards_late_result(monkeypa
         assert not task.done() and harness.pending is None
     finally:
         release.set()
-    with pytest.raises(capture.SnowflakeCaptureError, match="authority was lost"):
+    with pytest.raises(
+        capture.SnowflakeCaptureError, match="heartbeat failed" if renewal_raises else "authority was lost"
+    ):
         await task
     assert harness.cursor.closed and harness.connection.closed
     assert harness.parts == [] and "seal" not in harness.timeline
@@ -767,7 +876,9 @@ async def test_coordinator_retains_no_previous_part_events(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["stream_order", "metadata_key", "schema", "schema_type", "token", "query"])
+@pytest.mark.parametrize(
+    "drift", ["stream_order", "metadata_key", "schema", "schema_type", "schema_container", "token", "query"]
+)
 async def test_landing_metadata_drift_closes_before_pending_begin(monkeypatch, drift):
     harness = _Harness(monkeypatch)
     opener = harness.adapter.open_bundle_landing
@@ -797,6 +908,9 @@ def _drift_landing_metadata(result, drift):
             (replace(result.schemas[0][0], source_type="BOOLEAN"), *result.schemas[0][1:]),
             result.schemas[1],
         )
+        return result
+    if drift == "schema_container":
+        result.schemas = (list(result.schemas[0]), result.schemas[1])
         return result
     if drift == "token":
         result.source_snapshot_token = "synthetic-other-snapshot"
@@ -834,6 +948,57 @@ async def test_malformed_event_stops_before_append_or_eof(monkeypatch, drift):
     monkeypatch.setattr(capture._AffinityLanding, "next_event", invalid)
     with pytest.raises(ValueError):
         await harness.run()
+    assert harness.cursor.closed and harness.connection.closed
+    assert harness.parts == [] and "eof" not in harness.timeline and "seal" not in harness.timeline
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", ("stream", "snapshot", "missing_eof", "part_after_eof"))
+async def test_invalid_landing_sequence_never_seals(monkeypatch, defect):
+    harness = _Harness(monkeypatch, (_shared_row(),))
+    consume = capture.SnowflakeBundleLandingResult.consume_events
+
+    def events(result):
+        for event in consume(result):
+            if isinstance(event, SnowflakeLandingEOF):
+                if defect != "missing_eof":
+                    yield event
+                continue
+            if defect == "stream":
+                event = replace(event, stream_id="unknown_source")
+            elif defect == "snapshot":
+                stream = next(
+                    item for item in harness.request.definition.source_streams if item.stream_id == event.stream_id
+                )
+                sealed = capture_stream(
+                    BytesIO(event.capture.payload),
+                    stream,
+                    source_snapshot_token="different-snapshot",
+                    limits=harness.policy.part_limits,
+                )
+                event = replace(event, capture=sealed)
+            yield event
+            if defect == "part_after_eof":
+                yield SnowflakeLandingEOF(event.stream_id, event.ordinal, event.record_count)
+
+    monkeypatch.setattr(capture.SnowflakeBundleLandingResult, "consume_events", events)
+    with pytest.raises(
+        capture.SnowflakeCaptureError, match="stream coverage|snapshot identity|exhaust every|followed source EOF"
+    ):
+        await harness.run()
+
+    assert harness.cursor.closed and harness.connection.closed
+    assert len(harness.parts) == {"missing_eof": 2, "part_after_eof": 1}.get(defect, 0)
+    assert "eof" not in harness.timeline and "seal" not in harness.timeline and harness.receipts == ()
+
+
+@pytest.mark.asyncio
+async def test_part_manifest_limit_rejects_before_append(monkeypatch):
+    harness = _Harness(monkeypatch, (_shared_row(),), capture_policy=_policy(maximum_part_manifest_bytes=1))
+
+    with pytest.raises(capture.SnowflakeCaptureError, match="manifest exceeds policy"):
+        await harness.run()
+
     assert harness.cursor.closed and harness.connection.closed
     assert harness.parts == [] and "eof" not in harness.timeline and "seal" not in harness.timeline
 
