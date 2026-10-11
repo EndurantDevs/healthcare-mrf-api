@@ -1154,7 +1154,7 @@ async def local_data_physical_read_state(session, snapshot_id, *, is_prepared):
     """Resolve one qualified read view and keep exact payload locks in this reader transaction."""
     from process.ptg_parts import ptg2_physical_binding as native
 
-    native._qualified_local_read_view_sha(is_prepared)
+    native._qualified_local_read_view_shas(is_prepared)
     if not callable(getattr(session, "in_transaction", None)) or not session.in_transaction():
         raise native.PTG2PhysicalBindingError("PTG local read requires a caller transaction")
     is_publisher, owner_oid, authority_by_field = await _local_read_authority(
