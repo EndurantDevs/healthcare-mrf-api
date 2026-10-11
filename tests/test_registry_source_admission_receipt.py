@@ -138,6 +138,87 @@ def _path_connection(original_search_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["type", "transaction", "incomplete", "year"])
+async def test_edition_identity_requires_complete_validated_dto_and_transaction(invalid):
+    connection = _connection()
+    edition = _edition()
+    if invalid == "type":
+        edition = asdict(edition)
+    elif invalid == "transaction":
+        connection.is_in_transaction = lambda: False
+    elif invalid == "incomplete":
+        edition = object.__new__(admission.RegistrySourceEdition)
+    else:
+        object.__setattr__(edition, "reporting_year", True)
+    with pytest.raises(admission.RegistrySourceAdmissionError):
+        await admission.read_registry_source_edition_identity(connection, edition)
+    connection.fetchval.assert_not_awaited()
+    connection.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("different_uuid", [False, True])
+async def test_edition_identity_reads_one_exact_key_and_returns_original_context(present, different_uuid):
+    from asyncpg.pgproto.pgproto import UUID as DriverUUID
+
+    connection, state, events = _path_connection("public, pg_temp, pg_catalog")
+    original = _edition()
+    provisional = replace(original, snapshot_id=UUID(int=2)) if different_uuid else original
+
+    async def fetchrow(sql, *args):
+        assert state["search_path"] == "pg_catalog,pg_temp"
+        assert args == ("cms", "commercial-mlr", "2024", original.input_sha256, "cms-v1")
+        assert sql.split(" WHERE ")[1] == (
+            "source_system=$1 AND source_id=$2 AND edition_id=$3 AND input_sha256=$4 AND parser_version=$5"
+        )
+        assert 'FROM "synthetic".registry_source_snapshot' in sql
+        assert "admission_receipt" not in sql and "FOR UPDATE" not in sql
+        events.append("read")
+        return {**asdict(original), "snapshot_id": DriverUUID(str(original.snapshot_id))} if present else None
+
+    connection.fetchrow = AsyncMock(side_effect=fetchrow)
+    result = await admission.read_registry_source_edition_identity(connection, provisional, control_schema="synthetic")
+    assert result == (original if present else None)
+    assert result is None or type(result.snapshot_id) is UUID
+    connection.fetchrow.assert_awaited_once()
+    assert events == ["begin", "pin", "read", "restore", "release"]
+    assert state["search_path"] == "public, pg_temp, pg_catalog"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("source_url", "https://example.test/other.zip"),
+        ("artifact_sha256", "f" * 64),
+        ("reporting_year", 2025),
+        ("published_at", None),
+    ],
+)
+async def test_edition_identity_refuses_other_immutable_metadata(field, value):
+    connection, state, events = _path_connection("public")
+    connection.fetchrow = AsyncMock(return_value=asdict(_edition()))
+    provisional = replace(_edition(), snapshot_id=UUID(int=2), **{field: value})
+    with pytest.raises(admission.RegistrySourceAdmissionError, match="immutable"):
+        await admission.read_registry_source_edition_identity(connection, provisional, control_schema="synthetic")
+    connection.fetchrow.assert_awaited_once()
+    assert events == ["begin", "pin", "rollback"] and state["search_path"] == "public"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_edition_identity_failure_restores_caller_transaction(cancel):
+    connection, state, events = _path_connection("public")
+    failure = asyncio.CancelledError() if cancel else RuntimeError("identity_lookup_failed")
+    connection.fetchrow = AsyncMock(side_effect=failure)
+    with pytest.raises(type(failure)) as caught:
+        await admission.read_registry_source_edition_identity(connection, _edition(), control_schema="synthetic")
+    assert caught.value is failure
+    assert events == ["begin", "pin", "rollback"] and state["search_path"] == "public"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("original_search_path", ['"$user", public', "pg_temp, public, pg_catalog"])
 @pytest.mark.parametrize("outcome", ["receipt", "absent", "error", "cancel"])
 async def test_public_lookup_pins_search_path_and_preserves_caller_transaction(

@@ -9,7 +9,7 @@ import io
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -329,6 +329,44 @@ async def admit_cms_planfinder_edition(connection, workbook_path, edition, *, co
 
 def _source_header_sha256(headers):
     return hashlib.sha256(json.dumps(headers, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+async def read_registry_source_edition_identity(
+    connection, edition, *, control_schema=None
+) -> RegistrySourceEdition | None:
+    """Read an exact edition's original identity, without asserting completion.
+
+    The provisional snapshot UUID may differ; all other immutable metadata must
+    match. Missing identities remain absent and are never registered here.
+    """
+    if type(edition) is not RegistrySourceEdition or not connection.is_in_transaction():
+        raise RegistrySourceAdmissionError("Source identity lookup requires a complete edition and caller transaction")
+    try:
+        edition_by_field = asdict(replace(edition))
+    except AttributeError, TypeError:
+        raise RegistrySourceAdmissionError("Source identity lookup requires a complete edition") from None
+    namespace = _identifier(control_schema or registry_schema())
+    identity_fields = ("source_system", "source_id", "edition_id", "input_sha256", "parser_version")
+    columns = ",".join(edition_by_field)
+    identity_predicate = " AND ".join(f"{field}=${index}" for index, field in enumerate(identity_fields, 1))
+    async with connection.transaction():
+        original_search_path = await connection.fetchval("SELECT pg_catalog.current_setting('search_path')")
+        await connection.execute("SELECT pg_catalog.set_config('search_path','pg_catalog,pg_temp',true)")
+        snapshot = await connection.fetchrow(
+            f"SELECT {columns} FROM {namespace}.registry_source_snapshot WHERE {identity_predicate}",
+            *(edition_by_field[field] for field in identity_fields),
+        )
+        original_edition = (
+            RegistrySourceEdition(**{**dict(snapshot), "snapshot_id": UUID(str(snapshot["snapshot_id"]))})
+            if snapshot is not None
+            else None
+        )
+        if original_edition is not None and original_edition != replace(
+            edition, snapshot_id=original_edition.snapshot_id
+        ):
+            raise RegistrySourceAdmissionError("Source edition metadata is immutable")
+        await connection.execute("SELECT pg_catalog.set_config('search_path',$1,true)", original_search_path)
+    return original_edition
 
 
 async def read_registry_source_admission_receipt(connection, edition, *, header_sha256, control_schema=None):
