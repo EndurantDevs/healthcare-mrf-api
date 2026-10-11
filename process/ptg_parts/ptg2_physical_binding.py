@@ -11,6 +11,8 @@ PHYSICAL_BINDING_CONTRACT = "ptg.snapshot-local-physical-binding.v1"
 SERVING_SCOPE_CONTRACT = "ptg.snapshot-local-serving-scope.v1"
 PREPARED_LOCAL_READ_VIEW_SHA256 = "b5c5a00338fcb6ddcd09dbe1ef24b73a43d759c9f61ab3ca34bd42c93ea0cb26"
 INSTALLED_LOCAL_READ_VIEW_SHA256 = "0525c69ffa3b9815a9e278fe76fab967013fcb0f200c450167ac92e611a76cb3"
+PREPARED_OPERATION_OWNED_READ_VIEW_SHA256 = "dfe5f17dd57fa6670f1ebc3b71b0f98df7a96bcaccdfd81a498958f61fb0f23a"
+INSTALLED_OPERATION_OWNED_READ_VIEW_SHA256 = "33e987d6c5239909fb26b7e3596e331bcab99cc3969fe7fac7e0bbfc05826fe4"
 _SOURCE_FIELDS = (
     "source_key",
     "source_type",
@@ -152,7 +154,7 @@ async def require_local_physical_read_view(session, *, is_prepared):
 
     from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 
-    _qualified_local_read_view_sha(is_prepared)
+    _qualified_local_read_view_shas(is_prepared)
     owner_oid = await local_preparation_catalog_owner(session)
     ordinary_reader = await session.scalar(
         text(
@@ -170,7 +172,7 @@ async def require_local_physical_publisher_view(session, *, is_prepared):
     """Authenticate actual publisher inheritance separately, never by a reader privilege flag."""
     from sqlalchemy import text
 
-    _qualified_local_read_view_sha(is_prepared)
+    _qualified_local_read_view_shas(is_prepared)
     owner_oid = await _local_preparation_owner(session)
     if (
         await session.scalar(
@@ -191,14 +193,18 @@ async def require_local_binding_publisher(session):
     await require_local_publication_controls(session)
 
 
-def _qualified_local_read_view_sha(is_prepared):
+def _qualified_local_read_view_shas(is_prepared):
     """Native qualification is source-bound, never a caller-supplied digest."""
     import re
 
-    expected_sha = PREPARED_LOCAL_READ_VIEW_SHA256 if is_prepared else INSTALLED_LOCAL_READ_VIEW_SHA256
-    if not isinstance(expected_sha, str) or re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None:
+    expected_shas = (
+        (PREPARED_LOCAL_READ_VIEW_SHA256, PREPARED_OPERATION_OWNED_READ_VIEW_SHA256)
+        if is_prepared
+        else (INSTALLED_LOCAL_READ_VIEW_SHA256, INSTALLED_OPERATION_OWNED_READ_VIEW_SHA256)
+    )
+    if any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in expected_shas):
         raise PTG2PhysicalBindingError("PTG local read interface is not qualified")
-    return expected_sha
+    return expected_shas
 
 
 async def _require_local_physical_view_catalog(session, *, is_prepared, owner_oid):
@@ -210,7 +216,7 @@ async def _require_local_physical_view_catalog(session, *, is_prepared, owner_oi
 
     from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 
-    expected_sha = _qualified_local_read_view_sha(is_prepared)
+    expected_shas = _qualified_local_read_view_shas(is_prepared)
     view_name = "ptg2_prepared_physical_binding" if is_prepared else "ptg2_installed_physical_binding"
     schema_name = resolve_ptg2_schema()
     query = text(
@@ -229,7 +235,7 @@ async def _require_local_physical_view_catalog(session, *, is_prepared, owner_oi
         "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=:schema AND c.relname=:view"
     )
     parameters_by_name = {"owner_oid": owner_oid, "schema": schema_name, "view": view_name}
-    first_oid = None
+    first_identity = None
     for lock_held in (False, True):
         if lock_held:
             await session.execute(
@@ -238,16 +244,14 @@ async def _require_local_physical_view_catalog(session, *, is_prepared, owner_oi
                 )
             )
         proof = await _local_read_view_proof(session, query, parameters_by_name)
-        if (
-            proof is None
-            or not proof["read_only"]
-            or hashlib.sha256(proof["definition"].encode()).hexdigest() != expected_sha
-        ):
+        definition_sha = hashlib.sha256(proof["definition"].encode()).hexdigest() if proof else None
+        if proof is None or not proof["read_only"] or definition_sha not in expected_shas:
             raise PTG2PhysicalBindingError("PTG local read interface catalog differs")
         columns_by_name = json.loads(proof["columns"]) if isinstance(proof["columns"], str) else proof["columns"]
-        if columns_by_name != _local_read_view_columns(is_prepared) or (lock_held and proof["oid"] != first_oid):
+        identity = (proof["oid"], definition_sha)
+        if columns_by_name != _local_read_view_columns(is_prepared) or (lock_held and identity != first_identity):
             raise PTG2PhysicalBindingError("PTG local read interface identity differs")
-        first_oid = proof["oid"]
+        first_identity = identity
     return owner_oid
 
 
