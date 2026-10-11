@@ -98,6 +98,7 @@ def test_freshness_validation_rejects_stale_active_observation():
         ("horizon-nj", "approved Provider Directory API-product subscription"),
         ("missouri", "Practitioner response exceeds the 20 MiB cap"),
         ("scan", "1,000-result search ceiling"),
+        ("scan", "executable partitioned candidate path is separate"),
         ("centene", "Location requires at least one resource search parameter"),
         ("contra-costa", "Seven public collections are configured with opaque next-link pagination"),
         ("alohr", "A fresh four-resource GraphQL acquisition"),
