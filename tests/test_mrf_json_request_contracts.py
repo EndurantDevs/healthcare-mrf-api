@@ -130,6 +130,7 @@ def _json_contract_archive(member_by_name):
             "zip member index.json exceeds 256 byte",
         ),
     ],
+    ids=["invalid-zip", "no-json-members", "oversized-json-member"],
 )
 def test_zip_json_inventory__rejects_invalid_empty_or_oversized_members(archive_bytes, max_bytes, message):
     assert len(archive_bytes) <= max_bytes
