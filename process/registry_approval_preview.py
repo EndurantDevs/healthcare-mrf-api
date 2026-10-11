@@ -13,6 +13,7 @@ from process.registry_approval_store import (
     _validate_selected_history,
     _validated_command,
 )
+from process.registry_approved_company_groups import approved_company_group_diagnostics
 from process.registry_approved_membership import approved_membership_diagnostics
 from process.registry_imported_selection_preview import MAX_PREVIEW_COUNT, preview_imported_registry_selection
 from process.registry_record_store import RegistryActor, _validated_actor
@@ -95,11 +96,15 @@ async def preview_registry_approval(
         source_selection = await preview_imported_registry_selection(
             connection, command, staging, control["serving_generation"], control_schema=control_schema
         )
+        company_groups = await approved_company_group_diagnostics(
+            connection, namespace, staging, command.expected_approved_revision
+        )
         await connection.execute(f"DROP TABLE {staging}")
         if preview_json is None:
             raise ValueError("registry_approval_preview_too_large")
         preview = json.loads(preview_json)
         _merge_preview_diagnostics(preview, diagnostics, source_selection)
+        _merge_company_group_diagnostics(preview, company_groups)
         if len(json.dumps(preview, sort_keys=True).encode()) > 1048576:
             raise ValueError("registry_approval_preview_too_large")
         return preview
@@ -123,3 +128,48 @@ def _merge_preview_diagnostics(preview, diagnostics, source_selection):
             if not 0 <= unresolved <= MAX_PREVIEW_COUNT:
                 raise ValueError("registry_approval_preview_too_large")
             preview["unresolved_count"] = unresolved
+
+
+_GROUP_REVIEW_CODES = {
+    "missing_group",
+    "missing_effective_start",
+    "missing_group_and_effective_start",
+    "contradictory_overlapping_groups",
+}
+_GROUP_COUNT_FIELDS = {
+    "group_family_invalid_count",
+    "group_target_conflict_count",
+    "group_source_conflict_count",
+    "group_assertion_rows",
+    "group_review_count",
+    "group_review_rows",
+    "group_unresolved_count",
+}
+
+
+def _merge_company_group_diagnostics(preview, diagnostics):
+    """Retain closed bounded diagnostics without double-counting overlapping reasons."""
+    if type(diagnostics) is not dict or set(diagnostics) != _GROUP_COUNT_FIELDS | {"group_reviews_by_code"}:
+        raise ValueError("registry_approval_preview_company_groups_invalid")
+    if any(
+        type(diagnostics[key]) is not int or not 0 <= diagnostics[key] <= MAX_PREVIEW_COUNT
+        for key in _GROUP_COUNT_FIELDS
+    ):
+        raise ValueError("registry_approval_preview_too_large")
+    reviews_by_code = diagnostics["group_reviews_by_code"]
+    if (
+        type(reviews_by_code) is not dict
+        or set(reviews_by_code) - _GROUP_REVIEW_CODES
+        or any(type(count) is not int or not 1 <= count <= MAX_PREVIEW_COUNT for count in reviews_by_code.values())
+        or sum(reviews_by_code.values()) != diagnostics["group_review_count"]
+        or not diagnostics["group_review_count"]
+        <= diagnostics["group_review_rows"]
+        <= diagnostics["group_assertion_rows"]
+    ):
+        raise ValueError("registry_approval_preview_company_groups_invalid")
+    unresolved = preview["unresolved_count"] + diagnostics["group_unresolved_count"]
+    if not 0 <= unresolved <= MAX_PREVIEW_COUNT:
+        raise ValueError("registry_approval_preview_too_large")
+    preview["unresolved_count"] = unresolved
+    if any(diagnostics[key] for key in _GROUP_COUNT_FIELDS):
+        preview["company_group_diagnostics"] = diagnostics

@@ -38,6 +38,7 @@ async def record_db():
         for filename in [
             "20261007010000_managed_network_registry.py",
             "20261007020000_registry_revision_history.py",
+            "20261007040000_registry_source_evidence.py",
             "20261007060000_registry_approved_selection.py",
             "20261007070000_registry_company_links.py",
             "20261007080000_manual_directory_registry.py",
@@ -47,6 +48,7 @@ async def record_db():
             "20261007130000_registry_network_bindings.py",
             "20261009020000_company_registry_assertions.py",
             "20261009030000_network_catalog_evidence.py",
+            "20261011010000_company_registry_group_assertions.py",
         ]:
             path = Path(__file__).parents[1] / "alembic/versions" / filename
             spec = importlib.util.spec_from_file_location(filename.removesuffix(".py"), path)

@@ -220,6 +220,7 @@ async def _create_control_store(connection, control, roles, document):
         "20261009010000_registry_ptg_producer_scope.py",
         "20261009020000_company_registry_assertions.py",
         "20261009030000_network_catalog_evidence.py",
+        "20261011010000_company_registry_group_assertions.py",
     ):
         for statement in _migration(filename)._ddl(control):
             await connection.exec_driver_sql(statement)

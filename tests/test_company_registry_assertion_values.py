@@ -3,7 +3,7 @@
 
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 import pytest
@@ -320,3 +320,195 @@ def test_empty_assertion_replacement_requires_existing_revision_and_no_identifie
     ):
         with pytest.raises(values.CompanyRegistryAssertionValueError):
             _parse(document)
+
+
+def _group(ordinal=40, **changes):
+    """A declared group reference supplies no approval or source custody."""
+    assertion_by_field = {
+        "assertion_id": str(UUID(int=ordinal)),
+        "company_id": str(COMPANY),
+        "group_id": "33333333-3333-4333-8333-333333333333",
+        "group_kind": "corporate_parent",
+        "relationship_kind": "reported_affiliation",
+        "valid_from": "2025-01-01",
+        "valid_to": None,
+        "provenance": _provenance(),
+    }
+    return assertion_by_field | changes
+
+
+def test_group_omission_preserves_legacy_bytes_and_explicit_empty_is_distinct():
+    import json
+
+    document = _command()
+    expected = json.dumps(document | {"identifier_assertions": []}, sort_keys=True, separators=(",", ":")).encode()
+    omitted = _parse(document)
+    cleared = _parse(_command(group_assertions=[]))
+    assert omitted.group_assertions is None
+    assert omitted.canonical_json() == expected
+    assert "group_assertions" not in omitted.as_dict()
+    assert cleared.group_assertions == () and cleared.as_dict()["group_assertions"] == []
+    assert cleared.canonical_json() != omitted.canonical_json()
+    assert _parse(cleared.as_dict()) == cleared
+    assert _parse(omitted.as_dict()) == omitted
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        _parse(_command(group_assertions=None))
+
+
+def test_group_batch_validates_once_and_keeps_canonical_rows(monkeypatch):
+    import json
+
+    import ptg2_address_canon
+
+    genuine = ptg2_address_canon.validate_company_group_assertions
+    batches = []
+
+    def observed(payload):
+        batches.append(json.loads(payload))
+        return genuine(payload)
+
+    monkeypatch.setattr(ptg2_address_canon, "validate_company_group_assertions", observed)
+    _parse(_command())
+    assert batches == []
+    rows = [_group(ordinal=40 + index) for index in range(128)]
+    command = _parse(_command(group_assertions=rows[::-1]))
+    assert len(batches) == 1 and len(batches[0]) == 128
+    assert command.as_dict()["group_assertions"] == rows
+    assert all(set(row) == set(_group()) for row in batches[0])
+    assert command.group_assertions[0].company_id == UUID(COMPANY)
+    assert command.group_assertions[0].valid_from == date(2025, 1, 1)
+    assert _parse(command.as_dict()) == command and len(batches) == 2
+    command.canonical_json()
+    command.as_dict()
+    assert len(batches) == 2
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        _parse(_command(group_assertions=[*rows, _group(200)]))
+    assert len(batches) == 2
+
+
+def test_reviewable_group_rows_remain_retained_without_becoming_effective_claims():
+    rows = [
+        _group(valid_from=None, valid_to="2025-12-31"),
+        _group(41, group_id=None, valid_from=None, provenance=_provenance("source_reference")),
+        _group(42, valid_to="2025-01-01"),
+        _group(43, group_id="44444444-4444-4444-8444-444444444444", valid_to="2025-01-01"),
+        _group(44, group_kind="naic_group", relationship_kind="verified_ownership"),
+    ]
+    command = _parse(_command(group_assertions=rows))
+    assert command.as_dict()["group_assertions"] == rows
+    assert set(command.as_dict()) == set(_command()) | {"identifier_assertions", "group_assertions"}
+    assert _parse(command.as_dict()) == command
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        _parse(_command(role_assertions=[_role(valid_from=None)], group_assertions=rows))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("company_id", str(UUID(int=99))),
+        ("company_id", str(UUID(int=0))),
+        ("assertion_id", str(UUID(int=0))),
+        ("group_id", str(UUID(int=0))),
+        ("group_id", "33333333-3333-4333-8333-33333333333A"),
+        ("group_id", None),
+        ("group_kind", "brand"),
+        ("relationship_kind", "presumed_ownership"),
+        ("valid_from", "2025-02-29"),
+        ("valid_from", "2025-1-01"),
+        ("valid_to", "2024-12-31"),
+        ("unexpected", True),
+    ],
+)
+def test_group_malformed_later_row_refuses_whole_command(field, value):
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        _parse(_command(group_assertions=[_group(), _group(41, **{field: value})]))
+
+
+@pytest.mark.parametrize("field", tuple(_group()))
+def test_group_wire_requires_exact_eight_fields(field):
+    row = _group()
+    del row[field]
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        _parse(_command(group_assertions=[row]))
+
+
+@pytest.mark.parametrize("family", ["role", "identifier", "group"])
+def test_group_assertion_ids_are_unique_across_every_family(family):
+    command = _command(group_assertions=[_group(1 if family == "role" else 20)])
+    if family == "identifier":
+        command["identifier_assertions"] = [_identifier()]
+    if family == "group":
+        command["group_assertions"].append(_group(20, group_kind="naic_group"))
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        _parse(command)
+
+
+def test_group_values_are_deeply_immutable_and_direct_replacement_revalidates():
+    document = _command(group_assertions=[_group()])
+    command = _parse(document)
+    document["group_assertions"][0]["provenance"]["evidence_ref"] = "changed-reference"
+    assert command.group_assertions[0].provenance.evidence_ref == "reviewed-reference-a"
+    with pytest.raises(FrozenInstanceError):
+        command.group_assertions[0].group_id = UUID(int=99)
+    fresh = command.as_dict()
+    fresh["group_assertions"].clear()
+    assert len(command.group_assertions) == 1
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        replace(command, group_assertions=list(command.group_assertions))
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        replace(command, group_assertions=(replace(command.group_assertions[0], company_id=UUID(int=99)),))
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        replace(command.group_assertions[0], valid_from=datetime(2025, 1, 1))
+
+
+@pytest.mark.parametrize("value", ["before\u200dafter", "before\u00a0after", "é" * 65])
+def test_group_provenance_keeps_printable_utf8_limits_even_for_review_rows(value):
+    provenance = _provenance("source_reference") | {"evidence_ref": value}
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        _parse(_command(group_assertions=[_group(group_id=None, valid_from=None, provenance=provenance)]))
+
+
+def test_group_native_refusal_is_sanitized_and_never_falls_back(monkeypatch):
+    import ptg2_address_canon
+
+    def rejected(payload):
+        raise ValueError("synthetic-invalid-reference")
+
+    monkeypatch.setattr(ptg2_address_canon, "validate_company_group_assertions", rejected)
+    with pytest.raises(values.CompanyRegistryAssertionValueError, match="^company_registry_assertion_values_invalid$"):
+        _parse(_command(group_assertions=[_group()]))
+    assert _parse(_command()).group_assertions is None
+    monkeypatch.delattr(ptg2_address_canon, "validate_company_group_assertions")
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        _parse(_command(group_assertions=[]))
+
+
+def test_groups_share_the_unchanged_whole_command_byte_limit(monkeypatch):
+    import json
+
+    import ptg2_address_canon
+
+    provenance = _provenance("source_reference") | {"evidence_ref": '"' * 128, "source_record_key": '"' * 128}
+    identifiers = [
+        _identifier(
+            ordinal + 20,
+            identifier_system="external_reference",
+            identifier_scope='"' * 128,
+            identifier_value=f"{ordinal:03d}" + '"' * 61,
+            provenance=provenance,
+        )
+        for ordinal in range(64)
+    ]
+    rows = [_group(ordinal + 1000, provenance=provenance) for ordinal in range(128)]
+    document = _command(identifier_assertions=identifiers, group_assertions=rows)
+    assert len(_parse(_command(identifier_assertions=identifiers)).canonical_json()) < values.MAX_DOCUMENT_BYTES
+    assert len(_parse(_command(group_assertions=rows)).canonical_json()) < values.MAX_DOCUMENT_BYTES
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    assert values.MAX_DOCUMENT_BYTES == 131072 and len(encoded) > values.MAX_DOCUMENT_BYTES
+
+    def unexpected(payload):
+        pytest.fail("whole-command bound must refuse before native work")
+
+    monkeypatch.setattr(ptg2_address_canon, "validate_company_group_assertions", unexpected)
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        _parse(document)

@@ -3,7 +3,11 @@
 
 from db.models.company_group_registry import CompanyGroupRegistry
 from db.models.company_registry import CompanyRegistry, HIOSIssuerRegistry
-from db.models.company_registry_assertions import CompanyRegistryIdentifierAssertion, CompanyRegistryRoleAssertion
+from db.models.company_registry_assertions import (
+    CompanyRegistryGroupAssertion,
+    CompanyRegistryIdentifierAssertion,
+    CompanyRegistryRoleAssertion,
+)
 from db.models.company_registry_links import CompanyRegistryLinks, RegistryCompanyLinkBatch
 from db.models.manual_directory_registry import (
     ManualLocationRegistry,
@@ -50,6 +54,7 @@ _HEAD_MODELS = (
 _MODELS = _HEAD_MODELS + (
     CompanyRegistryRoleAssertion,
     CompanyRegistryIdentifierAssertion,
+    CompanyRegistryGroupAssertion,
     HIOSIssuerRegistry,
     NetworkRegistryIdentity,
     NetworkRegistryAlias,
@@ -102,7 +107,7 @@ _INSERT_COLUMNS.update(
 _INSERT_COLUMNS.update(
     {
         model.__tablename__: tuple(column for column in model.__table__.columns.keys() if column != "created_at")
-        for model in (CompanyRegistryRoleAssertion, CompanyRegistryIdentifierAssertion)
+        for model in (CompanyRegistryRoleAssertion, CompanyRegistryIdentifierAssertion, CompanyRegistryGroupAssertion)
     }
 )
 _UPDATE_COLUMNS = {

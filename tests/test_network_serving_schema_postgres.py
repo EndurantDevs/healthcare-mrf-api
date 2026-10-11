@@ -44,6 +44,7 @@ async def serving_schema():
             "20261009030000_network_catalog_evidence.py",
             "20261007140000_registry_source_recipes.py",
             "20261010030000_registry_source_admission_receipt.py",
+            "20261011010000_company_registry_group_assertions.py",
         )
         async with engine.begin() as sqlalchemy_connection:
             for filename in filenames:
