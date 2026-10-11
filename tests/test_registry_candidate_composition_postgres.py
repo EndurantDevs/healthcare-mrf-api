@@ -977,7 +977,7 @@ async def test_source_rollback_rechecks_publication_head_and_latest_approval(rol
     history.copy_targets.append(copy_target)
     if drift == "approval":
         draft = await _draft(fixture, _create(), history.seed.actor)
-        await _approve(
+        approval = await _approve(
             fixture.connection,
             fixture.control_schema,
             await _command(fixture.connection, fixture.control_schema, draft),
@@ -996,3 +996,29 @@ async def test_source_rollback_rechecks_publication_head_and_latest_approval(rol
         f'SELECT EXISTS(SELECT 1 FROM "{fixture.control_schema}".network_serving_manifest WHERE candidate_id=$1)',
         UUID(copy_target.candidate_id),
     )
+    if drift == "approval":
+        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+            approved = await pin_approved_membership_source(
+                fixture.connection,
+                approved_revision=approval["approved_revision"],
+                control_schema=fixture.control_schema,
+            )
+        fixture.composition_ids.append(uuid5(arguments_by_name["request_id"], "address:" + approved.generation_id))
+        retry_arguments_by_name = {
+            **arguments_by_name,
+            "approved_revision": approved.approved_revision,
+        }
+        retry_target, retry_addresses = await compose_registry_membership_candidate(
+            fixture.connection, **retry_arguments_by_name
+        )
+        history.copy_targets.append(retry_target)
+        assert retry_target != copy_target
+        assert (await _initial_candidate(fixture, retry_target))["source_recipes_json"] == (
+            await _initial_candidate(fixture, history.copy_targets[0])
+        )["source_recipes_json"]
+        await _publish_composition_target(fixture, retry_target, retry_addresses)
+        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+            current = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
+            assert current.approved_custom_revision == approved.approved_revision > history.revision
+            latest_history = SimpleNamespace(**{**vars(history), "revision": approved.approved_revision})
+            await _assert_rollback_source_and_manual(latest_history, current)
