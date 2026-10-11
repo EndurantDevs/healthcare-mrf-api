@@ -149,7 +149,7 @@ def _assert_source_validation_job(workflow) -> None:
     job = workflow["jobs"]["source-validation"]
     assert job["name"] == "Validation complete"
     assert job["timeout-minutes"] == 45
-    assert job["if"] == "${{ always() }}"
+    assert job["if"] == "${{ !cancelled() }}"
     assert job["permissions"] == {"actions": "read"}
     step = job["steps"]
     assert step == [
@@ -218,11 +218,11 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     }
     for job_id, job in workflow["jobs"].items():
         _assert_job_label(job_id, job)
-        condition = "always()" if job_id in {"measurement", "source-validation"} else "success()"
+        condition = "!cancelled()" if job_id in {"measurement", "source-validation"} else "success()"
         if job_id == "smoke":
             assert job["if"] == "${{ success() }}"
         elif job_id == "source-validation":
-            assert job["if"] == "${{ always() }}"
+            assert job["if"] == "${{ !cancelled() }}"
         else:
             assert job["if"] == "${{ !(" + METADATA_ONLY + ") && (" + condition + ") }}"
         assert "uses" not in job
