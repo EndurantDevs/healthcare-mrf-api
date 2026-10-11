@@ -60,21 +60,27 @@ async def test_unqualified_view_refuses_before_catalog_or_lock(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", [None, "body", "acl", "oid", "columns"])
-async def test_fixed_read_interface_rechecks_catalog_after_access_share(monkeypatch, drift):
+@pytest.mark.parametrize("is_prepared", [True, False])
+@pytest.mark.parametrize("definition", ["SELECT 1;", "SELECT 2;"])
+@pytest.mark.parametrize("drift", [None, "body", "qualified-body", "acl", "oid", "columns"])
+async def test_fixed_read_interface_rechecks_catalog_after_access_share(monkeypatch, is_prepared, definition, drift):
     """A valid first observation never admits a swapped view or changed privileges."""
-    definition = "SELECT 1;"
-    monkeypatch.setattr(native, "PREPARED_LOCAL_READ_VIEW_SHA256", hashlib.sha256(definition.encode()).hexdigest())
+    prefix = "PREPARED" if is_prepared else "INSTALLED"
+    monkeypatch.setattr(native, prefix + "_LOCAL_READ_VIEW_SHA256", hashlib.sha256(b"SELECT 1;").hexdigest())
+    monkeypatch.setattr(
+        native, prefix + "_OPERATION_OWNED_READ_VIEW_SHA256", hashlib.sha256(b"SELECT 2;").hexdigest(), raising=False
+    )
     monkeypatch.setattr(native, "local_preparation_catalog_owner", AsyncMock(return_value=73))
     first_by_field = {
         "oid": 88,
         "definition": definition,
         "read_only": True,
-        "columns": native._local_read_view_columns(True),
+        "columns": native._local_read_view_columns(is_prepared),
     }
     second_by_field = deepcopy(first_by_field)
     mutations_by_name = {
-        "body": ("definition", "SELECT 2;"),
+        "body": ("definition", "SELECT 3;"),
+        "qualified-body": ("definition", "SELECT 2;" if definition == "SELECT 1;" else "SELECT 1;"),
         "acl": ("read_only", False),
         "oid": ("oid", 89),
         "columns": ("columns", {}),
@@ -87,13 +93,24 @@ async def test_fixed_read_interface_rechecks_catalog_after_access_share(monkeypa
     session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=True))
     if drift:
         with pytest.raises(native.PTG2PhysicalBindingError):
-            await native.require_local_physical_read_view(session, is_prepared=True)
+            await native.require_local_physical_read_view(session, is_prepared=is_prepared)
     else:
-        assert await native.require_local_physical_read_view(session, is_prepared=True) == 73
+        assert await native.require_local_physical_read_view(session, is_prepared=is_prepared) == 73
     assert "ACCESS SHARE MODE NOWAIT" in str(session.execute.await_args.args[0])
     catalog_sql = str(proof.await_args.args[1])
     assert "security_invoker=false" in catalog_sql and "a.privilege_type<>'SELECT'" in catalog_sql
     assert "NOT pg_has_role(current_user,CAST(:owner_oid AS oid),'MEMBER')" in str(session.scalar.await_args.args[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_prepared", [True, False])
+async def test_unqualified_successor_refuses_before_catalog_or_lock(monkeypatch, is_prepared):
+    prefix = "PREPARED" if is_prepared else "INSTALLED"
+    monkeypatch.setattr(native, prefix + "_OPERATION_OWNED_READ_VIEW_SHA256", None, raising=False)
+    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=True))
+    with pytest.raises(native.PTG2PhysicalBindingError, match="not qualified"):
+        await native.require_local_physical_read_view(session, is_prepared=is_prepared)
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
