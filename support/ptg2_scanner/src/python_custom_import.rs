@@ -8,6 +8,7 @@ use crate::custom_import_source::{
     MAX_SOURCE_FIELDS, MAX_SOURCE_INPUT_BYTES, MAX_SOURCE_OUTPUT_BYTES, MAX_SOURCE_ROWS,
     MAX_SOURCE_TEXT_BYTES,
 };
+use crate::custom_import_source_payload::{validate_payload, PayloadField};
 use pyo3::types::{PyBool, PyInt, PyString, PyTuple};
 
 type ScalarDigestBinding = (i16, i16, i16, Option<i16>, String, String);
@@ -665,6 +666,73 @@ fn custom_import_source_documents_v1<'py>(
         ))?;
     }
     Ok(result)
+}
+
+#[pyfunction]
+fn custom_import_validate_source_payloads_v1(
+    py: Python<'_>,
+    layout: &Bound<'_, PyTuple>,
+    payloads: &Bound<'_, PyList>,
+) -> PyResult<Option<(usize, String)>> {
+    // Python callbacks must finish before owning the non-reentrant SOURCE slot.
+    let integer_digits: usize = py
+        .import("sys")?
+        .call_method0("get_int_max_str_digits")?
+        .extract()?;
+    let _slot = py
+        .detach(source_encoding_slot)
+        .map_err(PyValueError::new_err)?;
+    if layout.is_empty()
+        || layout.len() > MAX_SOURCE_FIELDS
+        || payloads.is_empty()
+        || payloads.len() > MAX_SOURCE_ROWS
+    {
+        return Err(PyValueError::new_err(
+            "source payload validation row or field bound exceeded",
+        ));
+    }
+    let mut fields: Vec<PayloadField> = Vec::with_capacity(layout.len());
+    let mut input_bytes = 0usize;
+    for field in layout.iter() {
+        let field = verification_tuple(&field, 3)?;
+        let name = source_identifier(&field.get_item(0)?)?;
+        bounded_scalar_text(&field.get_item(1)?, 16)?;
+        let kind: String = field.get_item(1)?.extract()?;
+        if !["string", "integer", "decimal", "boolean"].contains(&kind.as_str())
+            || fields.iter().any(|(prior, _, _)| prior == &name)
+            || !field.get_item(2)?.is_exact_instance_of::<PyBool>()
+        {
+            return Err(PyValueError::new_err(
+                "source payload validation field differs",
+            ));
+        }
+        input_bytes += 128 + name.len() + kind.len();
+        fields.push((name, kind, field.get_item(2)?.extract()?));
+    }
+    let mut owned = Vec::with_capacity(payloads.len());
+    for payload in payloads.iter() {
+        if payload.is_none() {
+            return Err(PyValueError::new_err(
+                "source payload validation requires text",
+            ));
+        }
+        bounded_scalar_text(&payload, MAX_SOURCE_INPUT_BYTES)?;
+        let text = payload.cast::<PyString>()?.to_str()?;
+        input_bytes += 64 + text.len();
+        if input_bytes > MAX_SOURCE_INPUT_BYTES {
+            return Err(PyValueError::new_err(
+                "source payload validation input byte bound exceeded",
+            ));
+        }
+        owned.push(text.to_owned());
+    }
+    Ok(py.detach(move || {
+        owned.iter().enumerate().find_map(|(index, payload)| {
+            validate_payload(&fields, payload, integer_digits)
+                .err()
+                .map(|message| (index, message.to_owned()))
+        })
+    }))
 }
 
 #[cfg(test)]

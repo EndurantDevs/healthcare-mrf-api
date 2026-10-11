@@ -455,7 +455,7 @@ def _model_bytes(models):
     )
 
 
-def _page_cost(request, models, *, reserved_rows=0, projection_values=()):
+def _page_cost(request, models, *, reserved_rows=0, reserved_bytes=0, projection_values=()):
     if len(models) + len(projection_values) + reserved_rows > request.page_row_limit:
         raise CandidateRunnerError("record projection fanout exceeds the admitted row page")
     projection_bytes = sum(
@@ -464,7 +464,7 @@ def _page_cost(request, models, *, reserved_rows=0, projection_values=()):
         for value in row.values()
         if isinstance(value, (str, bytes, bytearray, memoryview))
     )
-    if _model_bytes(models) + projection_bytes > request.page_byte_limit:
+    if _model_bytes(models) + projection_bytes + reserved_bytes > request.page_byte_limit:
         raise CandidateRunnerError("record projection fanout exceeds the admitted byte page")
 
 
