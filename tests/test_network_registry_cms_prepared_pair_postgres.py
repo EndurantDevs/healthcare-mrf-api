@@ -41,6 +41,7 @@ from process.provider_directory_cms_preparation import (
 from tests import cms_npd_admission_postgres_support as support
 from tests import test_provider_directory_cms_serving_receipt_postgres as native
 from tests.provider_directory_cms_capacity_test_support import cms_execution, paired_profile_envelope, signed_cms_plan
+from tests.retained_wal_diagnostics import RetainedWalDiagnostic, retained_bound_operands
 from tests.test_network_cms_registry_source_pair_postgres import _publish_pair
 from tests.test_network_custom_address_source_postgres import BootstrapCopyConnection
 from tests.test_provider_directory_cms_preparation import VALIDATION_TIME
@@ -254,13 +255,14 @@ async def _native_admission(fhir, plan, policy, execution):
                     fhir, relation, annotation.source_layout, check.plan.native_address_targets
                 )
                 assert captured.relation_oid == relation.oid
-        assert (
-            await fhir.db.scalar(
-                "SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(),CAST(CAST(:start AS text) AS pg_lsn))::bigint",
-                start=start,
-            )
-            < 128 * 1024**2
+        wal_bytes = await fhir.db.scalar(
+            "SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(),CAST(CAST(:start AS text) AS pg_lsn))::bigint",
+            start=start,
         )
+        diagnostic = getattr(admission, "_retained_wal_diagnostic", None)
+        if diagnostic is not None:
+            diagnostic.record(start, wal_bytes)
+        assert wal_bytes < 128 * 1024**2
         return NonprofileAdmissionReceipt(
             check.phase,
             check.lease.lease_digest,
@@ -523,37 +525,84 @@ def _retained_creation_observer(prepared, capture_id, created_relations):
     return observe_creation
 
 
-def _retained_bounds_note(error):
-    """Report only the original failed native operands, without another database read."""
-    pending_errors = [error]
-    seen_error_ids = set()
-    while pending_errors:
-        current = pending_errors.pop()
-        if id(current) in seen_error_ids:
-            continue
-        seen_error_ids.add(id(current))
-        pending_errors.extend(link for link in (current.__context__, current.__cause__) if link is not None)
-        traceback = current.__traceback__
-        while traceback is not None:
-            frame = traceback.tb_frame
-            if frame.f_code is retention._assert_retained_bounds.__code__:
-                observed_by_name = frame.f_locals
-                required_names = {"relations", "request", "before_bytes", "wal_bytes"}
-                if not required_names.issubset(observed_by_name):
-                    return None
-                request = observed_by_name["request"]
-                operand_by_name = {
-                    "data_delta_bytes": sum(relation.total_bytes for relation in observed_by_name["relations"])
-                    - observed_by_name["before_bytes"],
-                    "data_limit_bytes": request.extra_data_upper_bound_bytes,
-                    "wal_bytes": observed_by_name["wal_bytes"],
-                    "wal_limit_bytes": request.extra_wal_upper_bound_bytes,
-                }
-                if any(type(operand) is not int for operand in operand_by_name.values()):
-                    return None
-                return "retention_native_bounds " + json.dumps(operand_by_name, sort_keys=True)
-            traceback = traceback.tb_next
-    return None
+def _retained_bounds_note(error, bounds_check=None):
+    """Preserve the original four-operand note without any additional database read."""
+    operands = retained_bound_operands(
+        error,
+        bounds_check or retention._assert_retained_bounds,
+        relation_limit=len(epoch_capture._TABLES) + 2 * len(RELATION_NAMES),
+    )
+    return "retention_native_bounds " + json.dumps(operands, sort_keys=True) if operands is not None else None
+
+
+def _retained_diagnostic_observers():
+    """Wrap only existing test boundaries and carry closed notes across the FHIR wrapper."""
+    diagnostic, failure_notes = RetainedWalDiagnostic(), []
+    original_admission = retention._raw_copy_admission
+    original_bounds = retention._assert_retained_bounds
+    original_address = retention.prepare_retained_registry_address
+    original_stamp = retention._stamp_prepared
+
+    async def observe_admission(*args, **kwargs):
+        adapter = await original_admission(*args, **kwargs)
+        diagnostic.begin(adapter.wal_start)
+        return adapter
+
+    async def observe_bounds(*args, **kwargs):
+        if diagnostic.phase == "readiness":
+            diagnostic.enter("final_bounds")
+        try:
+            return await original_bounds(*args, **kwargs)
+        except ValueError as error:
+            note = _retained_bounds_note(error, original_bounds)
+            if note is not None:
+                operands = json.loads(note.split(" ", 1)[1])
+                diagnostic.record(diagnostic.start_lsn, operands["wal_bytes"])
+                failure_notes.extend(value for value in (note, diagnostic.note(operands)) if value is not None)
+                for value in failure_notes:
+                    error.add_note(value)
+            raise
+
+    async def observe_address(*args, **kwargs):
+        diagnostic.enter("address_prepare")
+        return await original_address(*args, **kwargs)
+
+    async def observe_stamp(*args, **kwargs):
+        diagnostic.enter("stamp")
+        result = await original_stamp(*args, **kwargs)
+        diagnostic.enter("readiness")
+        return result
+
+    return SimpleNamespace(
+        diagnostic=diagnostic,
+        failure_notes=failure_notes,
+        observers={
+            "_raw_copy_admission": observe_admission,
+            "_assert_retained_bounds": observe_bounds,
+            "prepare_retained_registry_address": observe_address,
+            "_stamp_prepared": observe_stamp,
+        },
+    )
+
+
+def _install_retained_diagnostic_observers(patch, admission, diagnostic_state):
+    """Install only the four existing test-boundary observers in this scoped patch."""
+    patch.setattr(admission, "_retained_wal_diagnostic", diagnostic_state.diagnostic, raising=False)
+    for name, observer in diagnostic_state.observers.items():
+        patch.setattr(retention, name, observer)
+
+
+async def _prepare_with_retained_notes(prepared, factory, request, capture_id, roles, failure_notes):
+    """Keep closed original-bound notes when admission hides its exception context."""
+    try:
+        return await retention.prepare_registry_cms_source_pair(
+            prepared, factory, request, capture_id=capture_id, owner_role=roles[0], runtime_roles=(roles[1],)
+        )
+    except (ValueError, epoch_capture.FHIRSourceEpochError) as error:
+        for note in failure_notes:
+            if note not in getattr(error, "__notes__", ()):
+                error.add_note(note)
+        raise
 
 
 async def _prepare_observed(prepared, factory, request, roles, capture_id, monkeypatch):
@@ -565,6 +614,7 @@ async def _prepare_observed(prepared, factory, request, roles, capture_id, monke
     await _reject_address_copy_interruptions(prepared, factory, request, roles, capture_id, monkeypatch)
     original_growth = retention.RegistryCMSRawEpochAdmission.__call__
     original_copy = epoch_capture._copy_native_batch
+    diagnostic_state = _retained_diagnostic_observers()
 
     async def observe_binary_copy(connection, query, arguments, schema, table, expected_count, **options):
         """Observe real COPY input sizes without replacing either driver operation."""
@@ -576,12 +626,16 @@ async def _prepare_observed(prepared, factory, request, roles, capture_id, monke
         binary_inputs.extend(proxy.import_bytes)
 
     async def observe_growth(adapter, phase, schema, logical, oid):
+        diagnostic_state.diagnostic.enter(
+            "raw_create" if phase == "created" else "raw_index" if "index" in phase else "raw_copy"
+        )
         row_count = await adapter.connection.fetchval(f'SELECT count(*) FROM "{schema}"."{logical}"')
         indexes = await adapter.connection.fetchval("SELECT count(*) FROM pg_index WHERE indrelid=$1", oid)
         growth_events.append((phase, logical, oid, row_count, indexes))
         await original_growth(adapter, phase, schema, logical, oid)
 
     with monkeypatch.context() as patch:
+        _install_retained_diagnostic_observers(patch, prepared.nonprofile_admission, diagnostic_state)
         patch.setattr(retention.RegistryCMSRawEpochAdmission, "__call__", observe_growth)
         patch.setattr(
             NonprofileAdmission,
@@ -594,15 +648,9 @@ async def _prepare_observed(prepared, factory, request, roles, capture_id, monke
             "_copy_native_batch",
             _address_copy_observer(prepared, created_relations, address_inputs, address_phases),
         )
-        try:
-            retained = await retention.prepare_registry_cms_source_pair(
-                prepared, factory, request, capture_id=capture_id, owner_role=roles[0], runtime_roles=(roles[1],)
-            )
-        except ValueError as error:
-            note = _retained_bounds_note(error)
-            if note is not None:
-                error.add_note(note)
-            raise
+        retained = await _prepare_with_retained_notes(
+            prepared, factory, request, capture_id, roles, diagnostic_state.failure_notes
+        )
     _assert_original_heap_growth(growth_events, created_relations, retained, prepared)
     assert binary_inputs
     assert {table for table, _count, _bytes in address_inputs} == set(prepared_address._COPY_KEYS)
