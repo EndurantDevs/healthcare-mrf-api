@@ -158,7 +158,7 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
     revision = _plans_migration().revision
-    assert script.get_heads() == ["20261010000000_custom_import_admission_indexes"]
+    assert script.get_heads() == ["20261010010000_custom_import_materialization_contract"]
     assert tuple(
         step.revision.revision for step in script._upgrade_revs("head", "20261001110000_profile_initial_publication")
     ) == (
@@ -178,6 +178,7 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
         "20261006010000_nucc_reference_result_generation",
         "20261009000000_custom_import_child_presence_decode",
         "20261010000000_custom_import_admission_indexes",
+        "20261010010000_custom_import_materialization_contract",
     )
 
 

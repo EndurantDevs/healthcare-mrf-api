@@ -167,6 +167,37 @@ original current-pointer compare-and-swap; a conflict retains a sealed but
 unpublished candidate. Identical effective output records `no_change` only while
 the original base and pointer version remain current.
 
+### Frozen materialization verification
+
+Bounded builds use `custom-import/materialization/v2` inside the existing
+`custom-import-generation-seal/v1` envelope. They commit every selected canonical
+family and winner identity, verify complete projection presence/null states and
+relationships set-wise, and audit derived scalar values and complete winner
+rankings on a bounded reproducible sample. They do not reread every scalar value
+or rehash every large family after the protected snapshot freezes.
+Protected SOURCE page writes close exact projection presence/null-state coverage;
+finalization checks retained copies against canonical payloads in bounded batches,
+including unexpected scalar rows. Complete selected-revision accounting and
+relationship checks still cover both origins.
+
+Operator status includes `materialization_contract` and `verification_evidence`.
+The evidence records the seed, selected-key digest and actual root, child and
+winner-group coverage. Child key probes are not a uniform row sample. Every
+sampled revision receives a complete typed-value comparison. Whole-family
+rehashing is limited to one sampled family with at most 128 children per selection
+origin (source or retained), at most two families total. Oversized families receive
+bounded revision checks rather than whole-family rehashing; oversized winner
+groups may have zero independently recomputed rankings. Reported sample coverage
+is not exhaustive proof. Isolated incorrect derived values or rankings outside
+the sample can escape this redundant audit.
+Authorization, candidate freeze, exact completeness and atomic publication are
+not sampled.
+
+Retained exhaustive `custom-import/materialization/v1` seals remain readable and
+rollback-safe. Hashes from different materialization contracts are never used as
+equivalent no-change evidence; the first compact rebuild of a legacy generation
+may therefore produce a new generation even when its served content is unchanged.
+
 The build deadline is the capture's database `sealed_at` plus the retained build
 duration. Resume uses the same capture and deadline, without accessing source
 credentials or fetching source rows. An expired deadline cannot be extended by

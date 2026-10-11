@@ -17,6 +17,7 @@ from tests import custom_import_postgres_support as support
         (True, True, None, support._SNAPSHOT_MIGRATION_NAMES),
         (True, False, None, ()),
         (False, True, None, ()),
+        (False, False, None, ()),
         (True, True, "20261002010000", support._SNAPSHOT_MIGRATION_NAMES[:1]),
         (True, True, "20261002030000", support._SNAPSHOT_MIGRATION_NAMES[:3]),
         (True, True, "20261002040000", support._SNAPSHOT_MIGRATION_NAMES[:4]),
@@ -24,6 +25,8 @@ from tests import custom_import_postgres_support as support
         (True, True, "20261005030000", support._SNAPSHOT_MIGRATION_NAMES[:6]),
         (True, True, "20261005040000", support._SNAPSHOT_MIGRATION_NAMES[:7]),
         (True, True, "20261005060000", support._SNAPSHOT_MIGRATION_NAMES[:9]),
+        (True, True, "20261009000000", support._SNAPSHOT_MIGRATION_NAMES[:-1]),
+        (True, True, "20261010000000", support._SNAPSHOT_MIGRATION_NAMES),
     ],
 )
 def test_fixture_installs_snapshot_prerequisites_exactly_once(
@@ -58,7 +61,9 @@ def test_fixture_installs_snapshot_prerequisites_exactly_once(
     ]
     if segmented:
         expected_migrations.append("20261002000000_custom_import_segmented_capture")
-    assert installed_migrations == expected_migrations + list(expected_tail)
+    expected_migrations.extend(expected_tail)
+    expected_migrations.append("20261010010000_custom_import_materialization_contract")
+    assert installed_migrations == expected_migrations
     assert len(installed_migrations) == len(set(installed_migrations))
 
 
@@ -72,7 +77,7 @@ def test_fixture_loads_the_actual_snapshot_read_and_write_functions():
     assert "FOR UPDATE" in module._WRITE_BINDING_BODY
 
 
-def test_fixture_current_chain_ends_at_admission_indexes():
+def test_fixture_snapshot_chain_and_additive_metadata_head_stay_separate():
     assert support._SNAPSHOT_MIGRATION_NAMES[-9:] == (
         "20261005030000_custom_import_snapshot_storage",
         "20261005040000_custom_import_bulk_snapshot_writers",
@@ -83,6 +88,9 @@ def test_fixture_current_chain_ends_at_admission_indexes():
         "20261007000000_custom_import_rejection_anti_joins",
         "20261009000000_custom_import_child_presence_decode",
         "20261010000000_custom_import_admission_indexes",
+    )
+    assert support._MATERIALIZATION_CONTRACT_MIGRATION_PATH.stem == (
+        "20261010010000_custom_import_materialization_contract"
     )
 
 

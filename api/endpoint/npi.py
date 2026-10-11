@@ -13494,21 +13494,20 @@ def _overlay_location_status_sql() -> str:
 
 
 _PROVIDER_DIRECTORY_OVERLAY_QUERY_TEMPLATE = """
-        WITH {current_resource_ctes_sql}, visible_overlay AS MATERIALIZED (
-            SELECT overlay.*, current_resource.canonical_api_base,
-                   current_resource.payload_json
-              FROM {overlay_table_sql} AS overlay
+        WITH {current_resource_ctes_sql}, matched_overlays AS MATERIALIZED (
+            SELECT overlay.* FROM {overlay_table_sql} AS overlay
+             WHERE overlay.npi = ANY(:npis)
+               AND (CAST(:address_key AS uuid) IS NULL
+                   OR overlay.address_key = CAST(:address_key AS uuid))
+               {premise_filter}
+        ), visible_overlay AS MATERIALIZED (
+            SELECT overlay.*, current_resource.canonical_api_base, current_resource.payload_json
+              FROM matched_overlays AS overlay
               JOIN current_resources AS current_resource
                 ON current_resource.source_id = overlay.source_id
                AND current_resource.resource_type = overlay.resource_type
                AND current_resource.resource_id = overlay.resource_id
                AND overlay.last_seen_run_id = current_resource.run_id
-             WHERE overlay.npi = ANY(:npis)
-               AND (
-                   CAST(:address_key AS uuid) IS NULL
-                   OR overlay.address_key = CAST(:address_key AS uuid)
-               )
-               {premise_filter}
         )
         SELECT
             npi,

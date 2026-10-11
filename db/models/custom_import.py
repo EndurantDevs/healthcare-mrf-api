@@ -32,6 +32,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -1700,6 +1701,12 @@ class CustomImportGenerationSeal(_CustomImportModel):
             + _sha256_check("effective_output_sha256"),
             name="custom_import_generation_seal_shape_check",
         ),
+        CheckConstraint(
+            "(materialization_contract = 'custom-import/materialization/v1' AND verification_evidence IS NULL) OR "
+            "(materialization_contract = 'custom-import/materialization/v2' AND verification_evidence IS NOT NULL "
+            "AND jsonb_typeof(verification_evidence) = 'object')",
+            name="custom_import_generation_seal_materialization_check",
+        ),
     )
 
     generation_id = Column(BigInteger, primary_key=True)
@@ -1709,6 +1716,10 @@ class CustomImportGenerationSeal(_CustomImportModel):
     execution_id = Column(BigInteger, nullable=False)
     capture_bundle_id = Column(BigInteger, nullable=False)
     seal_contract = Column(String(63), nullable=False)
+    materialization_contract = Column(
+        String(63), nullable=False, server_default=text("'custom-import/materialization/v1'")
+    )
+    verification_evidence = Column(JSONB(none_as_null=True))
     sealing_fence = Column(BigInteger, nullable=False)
     sealing_token_sha256 = Column(LargeBinary(32), nullable=False)
     root_count = Column(BigInteger, nullable=False)
