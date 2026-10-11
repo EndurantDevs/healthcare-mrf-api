@@ -1,11 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Native pages hydrate only the exact query's bounded selected winners."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -17,6 +18,7 @@ from process.custom_import.read_contracts import (
     CustomImportReadUnavailableError,
     ExtensionReadAuthorization,
 )
+from tests import custom_import_grouped_support as grouped_fixture
 from tests import test_custom_import_provider_query as query_fixture
 
 
@@ -52,12 +54,251 @@ def _install_context(monkeypatch):
 
     @asynccontextmanager
     async def bounded(session, *, timeout_ms):
-        yield
+        yield True
 
     monkeypatch.setattr(read_core, "_bounded_read_window", bounded)
     monkeypatch.setattr(read_core, "_load_read_context", AsyncMock(return_value=context))
     monkeypatch.setattr(read_core, "verify_published_generation", AsyncMock())
     return context
+
+
+def _transaction_session():
+    session = SimpleNamespace(
+        transaction=SimpleNamespace(is_active=True),
+        nested_transaction=None,
+        root_transaction=SimpleNamespace(is_active=True),
+        connection_nested_transaction=None,
+        execute=AsyncMock(
+            return_value=SimpleNamespace(all=lambda: [], scalars=lambda: SimpleNamespace(all=lambda: []))
+        ),
+    )
+    session.get_transaction = lambda: session.transaction
+    session.get_nested_transaction = lambda: session.nested_transaction
+    session.connection = AsyncMock(
+        return_value=SimpleNamespace(
+            get_transaction=lambda: session.root_transaction,
+            get_nested_transaction=lambda: session.connection_nested_transaction,
+        )
+    )
+    return session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("isolation", "read_only", "expected"),
+    [
+        ("repeatable read", "on", True),
+        ("serializable", "on", True),
+        ("read committed", "on", False),
+        ("repeatable read", "off", False),
+        (None, None, False),
+    ],
+)
+async def test_read_window_proves_snapshot_without_extra_timeout_queries(isolation, read_only, expected):
+    row = SimpleNamespace(
+        timeout_text="45s",
+        timeout_milliseconds="45000",
+        transaction_isolation=isolation,
+        transaction_read_only=read_only,
+    )
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: row)))
+    async with read_core._bounded_read_window(session, timeout_ms=5_000) as repeatable_read_only:
+        assert repeatable_read_only is expected
+    assert session.execute.await_count == 3
+    settings = session.execute.await_args_list[0].args[0]
+    narrowed = session.execute.await_args_list[1].args[0]
+    restored = session.execute.await_args_list[2].args[0]
+    assert settings is read_core._READ_TIMEOUT_SETTINGS
+    assert "5000" in narrowed.compile().params.values()
+    assert "45s" in restored.compile().params.values()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grouped", [False, True])
+async def test_provider_hydration_reuses_verified_metadata_for_chunks_and_empty_page(monkeypatch, grouped):
+    context = _install_context(monkeypatch)
+    query = read_core.NpiEntityRelationQuery()
+    if grouped:
+        context, query = grouped_fixture.context(), grouped_fixture.query(family_entitlement="full_family")
+        read_core._load_read_context.return_value = context
+    authorizer = Mock(wraps=query_fixture._Allow())
+    service = read_core.CustomImportReadService(authorizer=authorizer)
+    session = _transaction_session()
+    authorization = ExtensionReadAuthorization("synthetic")
+    prepared = await service.prepare_npi_entity_relation(
+        session, authorization=authorization, target=context.target, query=query
+    )
+    for start in (0, 50, 100, None):
+        entities = () if start is None else tuple(str(1000000000 + index) for index in range(start, start + 50))
+        assert (
+            await service.hydrate_npi_page(
+                session,
+                authorization=authorization,
+                pinned_target=context.target,
+                prepared=prepared,
+                entity_values=entities,
+                query=query,
+            )
+            == {}
+        )
+    read_core._load_read_context.assert_awaited_once_with(session, context.target)
+    assert authorizer.authorize.call_count == 5
+    assert read_core.verify_published_generation.await_count == 4
+    assert service._prepared_read_context.context is context
+    assert "definition" not in repr(service._prepared_read_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "session",
+        "transaction",
+        "root_transaction",
+        "nested_transaction",
+        "connection_nested_transaction",
+        "inactive_transaction",
+        "inactive_root",
+        "copied_prepared",
+        "other_service",
+    ],
+)
+async def test_provider_hydration_context_reuse_requires_exact_owner_and_active_transaction(monkeypatch, changed):
+    context = _install_context(monkeypatch)
+    service = read_core.CustomImportReadService(authorizer=query_fixture._Allow())
+    session = _transaction_session()
+    authorization = ExtensionReadAuthorization("synthetic")
+    prepared = await service.prepare_npi_entity_relation(session, authorization=authorization, target=context.target)
+    if changed == "session":
+        session = _transaction_session()
+    elif changed in {"transaction", "root_transaction", "nested_transaction", "connection_nested_transaction"}:
+        setattr(session, changed, SimpleNamespace(is_active=True))
+    elif changed == "inactive_transaction":
+        session.transaction.is_active = False
+    elif changed == "inactive_root":
+        session.root_transaction.is_active = False
+    if changed == "copied_prepared":
+        prepared = replace(prepared)
+    if changed == "other_service":
+        service = read_core.CustomImportReadService(authorizer=query_fixture._Allow())
+    assert (
+        await service.hydrate_npi_page(
+            session, authorization=authorization, pinned_target=context.target, prepared=prepared, entity_values=()
+        )
+        == {}
+    )
+    assert read_core._load_read_context.await_count == 2
+    read_core.verify_published_generation.assert_awaited_once_with(session, context.target)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["query", "scope", "target", "null_prepared"])
+async def test_provider_hydration_reuse_preserves_query_scope_and_target_errors(monkeypatch, changed):
+    context = _install_context(monkeypatch)
+    authorizer = Mock(wraps=query_fixture._Allow())
+    service = read_core.CustomImportReadService(authorizer=authorizer)
+    session = _transaction_session()
+    authorization = ExtensionReadAuthorization("synthetic")
+    prepared = await service.prepare_npi_entity_relation(session, authorization=authorization, target=context.target)
+    query, target = read_core.NpiEntityRelationQuery(), context.target
+    if changed == "query":
+        query = replace(query, filters=(read_core.ReadFilter("display_name", "eq", "Changed"),))
+    elif changed == "scope":
+        authorizer.authorize.return_value = read_core.ExtensionReadScope("synthetic:other-scope")
+    elif changed == "target":
+        target = replace(target, generation_id=target.generation_id + 1)
+        read_core._load_read_context.return_value = replace(context, target=target)
+    else:
+        prepared = None
+    with pytest.raises(CustomImportReadUnavailableError, match="provider page query identity is unavailable"):
+        await service.hydrate_npi_page(
+            session, authorization=authorization, pinned_target=target, prepared=prepared, entity_values=(), query=query
+        )
+    assert read_core._load_read_context.await_count == (2 if changed in {"target", "null_prepared"} else 1)
+    assert authorizer.authorize.call_count == 2
+    read_core.verify_published_generation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_hydration_reused_context_never_bypasses_fresh_authorization(monkeypatch):
+    context = _install_context(monkeypatch)
+    authorizer = Mock(wraps=query_fixture._Allow())
+    service = read_core.CustomImportReadService(authorizer=authorizer)
+    session = _transaction_session()
+    authorization = ExtensionReadAuthorization("synthetic")
+    prepared = await service.prepare_npi_entity_relation(session, authorization=authorization, target=context.target)
+    authorizer.authorize.side_effect = ValueError("revoked")
+    with pytest.raises(CustomImportReadAuthorizationError):
+        await service.hydrate_npi_page(
+            session, authorization=authorization, pinned_target=context.target, prepared=prepared, entity_values=()
+        )
+    assert authorizer.authorize.call_count == 2
+    read_core._load_read_context.assert_awaited_once()
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_hydration_reuse_preserves_final_publication_failure(monkeypatch):
+    context = _install_context(monkeypatch)
+    service = read_core.CustomImportReadService(authorizer=query_fixture._Allow())
+    session = _transaction_session()
+    authorization = ExtensionReadAuthorization("synthetic")
+    prepared = await service.prepare_npi_entity_relation(session, authorization=authorization, target=context.target)
+    read_core.verify_published_generation.side_effect = CustomImportReadUnavailableError("finality unavailable")
+    with pytest.raises(CustomImportReadUnavailableError, match="finality unavailable"):
+        await service.hydrate_npi_page(
+            session, authorization=authorization, pinned_target=context.target, prepared=prepared, entity_values=()
+        )
+    read_core._load_read_context.assert_awaited_once()
+    read_core.verify_published_generation.assert_awaited_once_with(session, context.target)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["authorization", "shape", "normalization", "context", "cancelled", "restoration"])
+async def test_failed_provider_preparation_discards_previous_verified_context(monkeypatch, failure):
+    context = _install_context(monkeypatch)
+    window = read_core._bounded_read_window
+    authorizer = Mock(wraps=query_fixture._Allow())
+    service = read_core.CustomImportReadService(authorizer=authorizer)
+    session = _transaction_session()
+    authorization = ExtensionReadAuthorization("synthetic")
+    prepared = await service.prepare_npi_entity_relation(session, authorization=authorization, target=context.target)
+    query = read_core.NpiEntityRelationQuery()
+    error = CustomImportReadRequestError
+    if failure == "authorization":
+        authorizer.authorize.side_effect = ValueError("revoked")
+        error = CustomImportReadAuthorizationError
+    elif failure == "shape":
+        query = None
+    elif failure == "normalization":
+        query = replace(query, filters=(read_core.ReadFilter("undeclared", "eq", "value"),))
+    elif failure in {"context", "cancelled"}:
+        error = asyncio.CancelledError if failure == "cancelled" else CustomImportReadUnavailableError
+        read_core._load_read_context.side_effect = [error(), context]
+    else:
+        error = CustomImportReadUnavailableError
+
+        @asynccontextmanager
+        async def failed_restore(_session, *, timeout_ms):
+            yield
+            raise error("restore failed")
+
+        monkeypatch.setattr(read_core, "_bounded_read_window", failed_restore)
+    with pytest.raises(error):
+        await service.prepare_npi_entity_relation(
+            session, authorization=authorization, target=context.target, query=query
+        )
+    assert service._prepared_read_context is None
+    authorizer.authorize.side_effect = None
+    monkeypatch.setattr(read_core, "_bounded_read_window", window)
+    before = read_core._load_read_context.await_count
+    assert (
+        await service.hydrate_npi_page(
+            session, authorization=authorization, pinned_target=context.target, prepared=prepared, entity_values=()
+        )
+        == {}
+    )
+    assert read_core._load_read_context.await_count == before + 1
 
 
 @pytest.mark.asyncio

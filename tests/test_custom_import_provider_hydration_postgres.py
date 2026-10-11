@@ -40,6 +40,7 @@ from process.custom_import.read_core import (
     RootDetailRequest,
 )
 from process.custom_import.runner import run_candidate
+from process.custom_import.storage_layout import snapshot_schema
 from tests import custom_import_grouped_support as fixture
 from tests import test_custom_import_provider_query_postgres as npi_fixture
 from tests import test_custom_import_read_core_postgres as read_fixture
@@ -183,6 +184,114 @@ async def _case(*, children=None):
             "families_by_period",
         )
         yield case, target
+
+
+async def _hydrate_context_page(service, session, pinned_target, prepared, query, entities):
+    return await service.hydrate_npi_page(
+        session,
+        authorization=_AUTHORIZATION,
+        pinned_target=pinned_target,
+        prepared=prepared,
+        entity_values=entities,
+        query=query,
+    )
+
+
+async def _read_context_mode(case, pinned_target, query, load_context, mode):
+    isolation, read_only, expected_loads = mode
+    load_context.reset_mock()
+    async with case.sessions() as session, session.begin():
+        await session.execute(text(f"SET TRANSACTION ISOLATION LEVEL {isolation} {read_only}"))
+        timeout_before = await session.scalar(text("SHOW statement_timeout"))
+        identity = await read_core._read_transaction_identity(session)
+        service = _service(pinned_target)
+        prepared = await service.prepare_npi_entity_relation(
+            session, authorization=_AUTHORIZATION, target=pinned_target, query=query
+        )
+        outputs = []
+        for entities in ((_A,), (_B,), (), (_C,)):
+            outputs.append(await _hydrate_context_page(service, session, pinned_target, prepared, query, entities))
+            assert read_core._is_same_read_transaction(identity, await read_core._read_transaction_identity(session))
+        assert load_context.await_count == expected_loads
+        assert await session.scalar(text("SHOW statement_timeout")) == timeout_before
+        assert (service._prepared_read_context is not None) is (expected_loads == 1)
+        assert set(outputs[0]) == {_A} and set(outputs[1]) == {_B} and outputs[2:] == [{}, {}]
+        return outputs
+
+
+async def _assert_context_savepoint(case, pinned_target, query, load_context, expected):
+    load_context.reset_mock()
+    async with case.sessions() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        service = _service(pinned_target)
+        async with session.begin_nested():
+            identity = await read_core._read_transaction_identity(session)
+            prepared = await service.prepare_npi_entity_relation(
+                session, authorization=_AUTHORIZATION, target=pinned_target, query=query
+            )
+            for _ in range(2):
+                assert await _hydrate_context_page(service, session, pinned_target, prepared, query, (_A,)) == expected
+                assert read_core._is_same_read_transaction(
+                    identity, await read_core._read_transaction_identity(session)
+                )
+            assert load_context.await_count == 1
+        assert not read_core._is_same_read_transaction(identity, await read_core._read_transaction_identity(session))
+        assert await _hydrate_context_page(service, session, pinned_target, prepared, query, (_A,)) == expected
+        assert load_context.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_context_reuse_requires_repeatable_read_only_native_transaction(monkeypatch, request):
+    """Actual snapshot and savepoint boundaries govern metadata reuse, preserving output."""
+
+    load_context = AsyncMock(wraps=read_core._load_read_context)
+    monkeypatch.setattr(read_core, "_load_read_context", load_context)
+    query = fixture.query(family_entitlement="full_family")
+    baseline_pages, loads_by_mode = None, {}
+    async with _case() as (case, pinned_target):
+        control_schema = case.schema_name
+        async with case.engine.connect() as connection:
+            families = (
+                (
+                    await connection.execute(
+                        text(f'SELECT family_id FROM "{control_schema}".custom_import_snapshot_family')
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        snapshot_schemas = [snapshot_schema(family_id) for family_id in families]
+        modes = (
+            ("REPEATABLE READ", "READ ONLY", 1),
+            ("SERIALIZABLE", "READ ONLY", 1),
+            ("READ COMMITTED", "READ ONLY", 5),
+            ("REPEATABLE READ", "READ WRITE", 5),
+        )
+        for mode in modes:
+            outputs = await _read_context_mode(case, pinned_target, query, load_context, mode)
+            if baseline_pages is None:
+                baseline_pages = outputs
+            else:
+                assert outputs == baseline_pages
+            loads_by_mode[" ".join(mode[:2])] = load_context.await_count
+        await _assert_context_savepoint(case, pinned_target, query, load_context, baseline_pages[0])
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.connect() as connection:
+            for namespace in (control_schema, *snapshot_schemas):
+                assert (
+                    await connection.scalar(text("SELECT to_regnamespace(:namespace)"), {"namespace": namespace})
+                    is None
+                )
+    finally:
+        await engine.dispose()
+    request.node.user_properties.extend(
+        [
+            ("context_load_counts", json.dumps(loads_by_mode, sort_keys=True)),
+            ("control_schema_removed", control_schema),
+            ("snapshot_schemas_removed", json.dumps(snapshot_schemas)),
+        ]
+    )
 
 
 def _service(target):
