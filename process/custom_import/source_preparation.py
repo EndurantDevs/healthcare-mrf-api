@@ -199,16 +199,38 @@ async def _finish_native_batch(encoder, layout, context, prepared_rows):
         )
 
 
+def _has_allocation_failure(error):
+    """Cleanup can hide a fatal allocation error behind an ordinary failure."""
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        if isinstance(current, MemoryError):
+            return True
+        seen.add(id(current))
+        pending.extend((current.__cause__, current.__context__))
+    return False
+
+
 def _next_preparation(context, fields, layout, decoded):
     try:
         decoded_row = next(decoded)
     except StopIteration:
         return None, None, None
+    except MemoryError:
+        raise
     except Exception as error:
+        if _has_allocation_failure(error):
+            raise
         return None, None, error
     try:
         return decoded_row, _native_row(context, fields, layout, decoded_row.values), None
+    except MemoryError:
+        raise
     except Exception as error:
+        if _has_allocation_failure(error):
+            raise
         return None, None, error
 
 

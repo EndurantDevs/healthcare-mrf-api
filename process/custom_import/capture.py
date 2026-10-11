@@ -819,6 +819,8 @@ def _open_parquet_reader(
         yield parquet_reader
     except CaptureError:
         raise
+    except MemoryError:
+        raise
     except (pa.ArrowException, EOFError, OSError, OverflowError, ValueError) as exc:
         raise CaptureError("Parquet source payload is invalid") from exc
     finally:

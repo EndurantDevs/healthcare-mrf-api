@@ -338,6 +338,8 @@ def _aggregate_parquet_arrow_bytes(
                 if decoded_bytes > limits.maximum_decoded_bytes:
                     has_exceeded_limit = True
                     break
+    except MemoryError:
+        raise
     except (pa.ArrowException, EOFError, OSError, OverflowError, ValueError) as exc:
         raise CaptureError("Parquet source payload is invalid") from exc
     if has_exceeded_limit:
