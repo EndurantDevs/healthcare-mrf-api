@@ -22,6 +22,7 @@ from process.registry_record_store import (
     apply_registry_record_command,
     get_registry_record,
     list_registry_records,
+    search_registry_companies,
 )
 
 
@@ -265,6 +266,67 @@ async def test_distinct_group_kinds_and_company_roles_are_not_name_identity(reco
     assert first["record"]["display_name"] == second["record"]["display_name"]
     company = await _apply(sessions, schema, _create("company"), actor)
     assert company["record"]["roles"] == ["employer", "network_operator"]
+
+
+@pytest.mark.asyncio
+async def test_company_search_filters_complete_scope_before_paging(record_db):
+    _, schema, sessions = record_db
+    company_rows = [
+        {
+            "company_id": UUID(int=index),
+            "display_name": "Other Company",
+            "roles": ["employer"],
+            "aliases": ["Shared Needle"] if index >= 101 else [],
+            "revision": 1,
+        }
+        for index in range(1, 104)
+    ]
+    async with sessions() as session, session.begin():
+        from sqlalchemy import insert
+
+        from process.registry_record_store import CompanyRegistry, _table
+
+        await session.execute(insert(_table(CompanyRegistry, schema)), company_rows)
+    selectors = [str(UUID(int=index)) for index in range(1, 103)]
+    async with sessions() as session:
+        selected = await search_registry_companies(
+            session, "needle", limit=1, offset=1, record_ids=selectors, schema=schema
+        )
+        assert [company_record["company_id"] for company_record in selected] == [str(UUID(int=102))]
+        admin = await search_registry_companies(session, "NEEDLE", record_ids=None, schema=schema)
+        assert [company_record["company_id"] for company_record in admin] == [
+            str(UUID(int=index)) for index in range(101, 104)
+        ]
+        assert await search_registry_companies(session, "Needle", record_ids=[], schema=schema) == []
+        with pytest.raises(ValueError, match="selector_invalid"):
+            await list_registry_records(
+                session, "company", record_ids=[UUID(selector) for selector in selectors], schema=schema
+            )
+
+
+@pytest.mark.asyncio
+async def test_company_search_literal_uuid_and_assertions(record_db):
+    from tests.test_company_registry_assertions_postgres import _create as asserted_company
+    from tests.test_company_registry_assertions_postgres import _identifier
+
+    _, schema, sessions = record_db
+    command = replace(
+        asserted_company(identifiers=[_identifier()]), record_id=UUID("abcdefab-cdef-4abc-8def-abcdefabcdef")
+    )
+    command.fields["assertions"]["company_id"] = str(command.record_id)
+    command.fields.update(display_name="Literal %_\\ Company", aliases=["Mixed Réseau Alias"])
+    created = await _apply(sessions, schema, command, _actor())
+    other = await _apply(sessions, schema, _create("company"), _actor())
+    async with sessions() as session:
+        for query in ("%_\\", "réseau alias", str(command.record_id)):
+            found = await search_registry_companies(session, query, record_ids=None, schema=schema)
+            assert found == [created["record"]]
+        assert (
+            await search_registry_companies(session, str(command.record_id).upper(), record_ids=None, schema=schema)
+            == []
+        )
+        assert await search_registry_companies(session, "12345", record_ids=None, schema=schema) == []
+        assert await search_registry_companies(session, "%_\\", record_ids=[other["record_id"]], schema=schema) == []
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,7 @@ async def registry_app(record_db, monkeypatch):
         "apply_registry_record_command",
         "get_registry_record",
         "list_registry_records",
+        "search_registry_companies",
         "verify_registry_targets",
         "prepare_registry_manual_undo",
         "read_registry_manual_history",
@@ -381,6 +382,7 @@ async def company_registry_app(assertion_db, monkeypatch):
         "apply_registry_record_command",
         "get_registry_record",
         "list_registry_records",
+        "search_registry_companies",
         "read_registry_manual_history",
     ):
         original = getattr(management, name)
@@ -416,6 +418,51 @@ def _company_http_command(group_id):
     del document_by_field["allocation_key"]
     document_by_field["actor"] = _network_create()["actor"]
     return document_by_field
+
+
+@pytest.mark.asyncio
+async def test_company_search_http_preserves_assertion_record(company_registry_app):
+    app, fixture = company_registry_app
+    command = _company_http_command(await _http_group_target(app))
+    command["fields"]["aliases"] = ["RéSeau %_\\ Alias"]
+    endpoint = "/api/v1/registry/manage/company"
+    _, created = await app.asgi_client.post(endpoint, headers=_AUTH, json=command)
+    assert created.status == 200
+    body_by_field = {"q": "%_\\", "limit": 1, "offset": 0, "record_ids": [command["record_id"]]}
+    _, found = await app.asgi_client.post(endpoint + "/search", headers=_AUTH, json=body_by_field)
+    assert found.status == 200 and found.json == {"records": [created.json["record"]]}
+    assert found.headers["Cache-Control"] == "private, no-store"
+    assert found.json["records"][0]["group_assertions"]
+    _, empty = await app.asgi_client.post(endpoint + "/search", headers=_AUTH, json=body_by_field | {"record_ids": []})
+    assert empty.status == 200 and empty.json == {"records": []}
+    _, admin = await app.asgi_client.post(
+        endpoint + "/search", headers=_AUTH, json=body_by_field | {"record_ids": None}
+    )
+    assert admin.json == found.json
+    assert (await assertion_accounting(fixture))["history"] == 2
+
+
+@pytest.mark.asyncio
+async def test_company_search_http_auth_and_closed_validation(registry_app):
+    app, (connection, schema, _) = registry_app
+    endpoint = "/api/v1/registry/manage/company/search"
+    body_by_field = {"q": "Example", "limit": 50, "offset": 0, "record_ids": None}
+    _, denied = await app.asgi_client.post(endpoint, json=body_by_field)
+    assert denied.status == 403
+    for altered in (
+        body_by_field | {"q": "é" * 65},
+        body_by_field | {"limit": True},
+        body_by_field | {"record_ids": [str(uuid4())] * 2},
+        body_by_field | {"extra": True},
+    ):
+        _, invalid = await app.asgi_client.post(endpoint, headers=_AUTH, json=altered)
+        assert invalid.status == 400 and invalid.json == {"error": {"code": "registry_request_invalid"}}
+        assert invalid.headers["Cache-Control"] == "private, no-store"
+    _, duplicate = await app.asgi_client.post(
+        endpoint, headers=_AUTH, content=b'{"q":"x","q":"y","limit":1,"offset":0,"record_ids":null}'
+    )
+    assert duplicate.status == 400
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".company_registry') == 0
 
 
 def _company_http_correction(command, revision):

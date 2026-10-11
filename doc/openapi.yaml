@@ -7633,6 +7633,45 @@ paths:
           $ref: '#/components/responses/RegistryConflict'
         '503':
           $ref: '#/components/responses/RegistryUnavailable'
+  /registry/manage/company/search:
+    post:
+      operationId: searchRegistryCompanies
+      summary: Search bounded authorized company draft heads
+      description: Control-authenticated read only, with no query-string parameters.
+        The complete closed JSON body is at most 262144 UTF-8 bytes. The trusted
+        authorization layer supplies the complete company selection; null is reserved
+        for an authenticated platform administrator, while an empty array selects no
+        companies. Scope is applied before matching, durable company-ID ordering and
+        pagination. Matches literal case-insensitive display-name or alias substrings,
+        or an exact canonical nonzero company UUID. Percent, underscore and backslash
+        are literal; optional identifiers do not define a search grammar. Returns
+        existing company draft records and retained assertions without granting write
+        authority or publishing them. Existing list and write contracts are unchanged.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistryCompanySearchRequest'
+      responses:
+        '200':
+          description: Complete bounded company page, no partial or fallback result.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/DirectoryCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryCompanySearchPage'
+        '400':
+          $ref: '#/components/responses/RegistryInvalidRequest'
+        '403':
+          $ref: '#/components/responses/RegistryControlDenied'
+        '503':
+          $ref: '#/components/responses/RegistryUnavailable'
   /registry/manage/{kind}:
     get:
       operationId: listRegistryDraftRecords
@@ -16644,6 +16683,55 @@ components:
         document_sha256:
           type: string
           pattern: '^[0-9a-f]{64}$'
+    RegistryCompanySearchRequest:
+      type: object
+      additionalProperties: false
+      required: [q, limit, offset, record_ids]
+      properties:
+        q:
+          type: string
+          minLength: 1
+          description: Unicode control characters (category Cc) and invalid UTF-8 are
+            rejected before trimming. Trimmed text must be nonempty and at most
+            128 UTF-8 bytes. Whitespace before and after trimming remains subject
+            to the whole-body byte maximum.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        offset:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+        record_ids:
+          type: array
+          nullable: true
+          maxItems: 5000
+          uniqueItems: true
+          description: The trusted authorization layer's complete distinct company
+            grant selection, supplied before paging. Null is reserved for an actual
+            platform administrator; [] remains empty and never means unscoped.
+            Oversized selections are refused rather than truncated. Browser callers
+            cannot supply this field.
+          items:
+            type: string
+            format: uuid
+            minLength: 36
+            maxLength: 36
+            pattern: '^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    RegistryCompanySearchPage:
+      type: object
+      additionalProperties: false
+      required: [records]
+      properties:
+        records:
+          type: array
+          maxItems: 100
+          description: Existing company management records with retained assertions,
+            unique company IDs, at most the requested limit and within record_ids
+            when scoped. An empty result still requires live actor authorization.
+          items:
+            type: object
     RegistryRecordCommand:
       type: object
       additionalProperties: false
