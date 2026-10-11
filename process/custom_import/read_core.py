@@ -127,7 +127,9 @@ _SCALAR_COLUMNS = {
 _READ_TIMEOUT_SETTINGS = text(
     """
     SELECT current_setting('statement_timeout') AS timeout_text,
-           setting AS timeout_milliseconds
+           setting AS timeout_milliseconds,
+           current_setting('transaction_isolation') AS transaction_isolation,
+           current_setting('transaction_read_only') AS transaction_read_only
     FROM pg_catalog.pg_settings
     WHERE name = 'statement_timeout'
     """
@@ -428,6 +430,16 @@ class _ReadContext:
         return canonical_model if self.storage_models is None else self.storage_models[canonical_model]
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _PreparedReadContext:
+    """Service-owned metadata retained only for one exact prepared transaction."""
+
+    prepared: PreparedNpiEntityRelation
+    session: AsyncSession
+    transactions: tuple[object | None, ...]
+    context: _ReadContext
+
+
 class CustomImportReadService:
     """Read exact winner materialization results after a host policy decision."""
 
@@ -451,6 +463,7 @@ class CustomImportReadService:
         self._cursor_ttl_seconds = cursor_ttl_seconds
         self._statement_timeout_ms = statement_timeout_ms
         self._now = time.time if now is None else now
+        self._prepared_read_context: _PreparedReadContext | None = None
 
     async def search(
         self,
@@ -515,6 +528,7 @@ class CustomImportReadService:
     ) -> PreparedNpiEntityRelation:
         """Prepare one unpaged NPI relation; ``None`` order is filter-only."""
 
+        self._prepared_read_context = None
         authorization_scope = self._authorize(authorization, target)
         if type(query) is not NpiEntityRelationQuery:
             raise CustomImportReadRequestError("imported membership mode is invalid")
@@ -545,43 +559,26 @@ class CustomImportReadService:
             raise CustomImportReadRequestError("imported membership mode is invalid")
         if query.entity_values is not None:
             _validate_npi_page(query.entity_values)
-        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
+        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms) as is_repeatable_read_only:
+            transactions = await _read_transaction_identity(session) if is_repeatable_read_only else None
             context = await _load_read_context(session, pinned_target)
             if context.definition.query.entity_selection is not None or query.grouped_entity_selection is not None:
                 from process.custom_import.grouped_read import prepare_relation
 
-                return prepare_relation(context, query, authorization_scope)
-            normalized_context_filters, normalized_filters, normalized_order_terms = _normalized_npi_query(
-                context,
-                query.context_filters,
-                query.filters,
-                query.order_terms,
-                query.require_exact_context,
+                prepared = prepare_relation(context, query, authorization_scope)
+            else:
+                prepared = _prepare_single_family_relation(context, query, authorization_scope)
+            current_transactions = await _read_transaction_identity(session) if transactions is not None else None
+            retained = (
+                _PreparedReadContext(prepared, session, transactions, context)
+                if context.target == pinned_target and _is_same_read_transaction(transactions, current_transactions)
+                else None
             )
-            if not query.require_match:
-                if query.context_filters is None:
-                    _require_context_only_filters(normalized_filters, context)
-                elif normalized_filters:
-                    raise CustomImportReadRequestError("metric predicates require imported membership")
-            query_sha256 = _npi_entity_relation_fingerprint(
-                context.target,
-                normalized_filters,
-                normalized_order_terms,
-                context_filters=normalized_context_filters,
-                entity_values=query.entity_values,
-            )
-            return PreparedNpiEntityRelation(
-                statement=_npi_entity_relation_statement(
-                    context,
-                    normalized_filters,
-                    normalized_order_terms,
-                    context_filters=normalized_context_filters,
-                    entity_values=query.entity_values,
-                ),
-                normalized_order_terms=normalized_order_terms,
-                query_fingerprint=query_sha256,
-                authorization_scope_sha256=_scope_digest(authorization_scope),
-            )
+        if retained is not None and all(
+            transaction is None or transaction.is_active for transaction in retained.transactions
+        ):
+            self._prepared_read_context = retained
+        return prepared
 
     async def hydrate_npi_page(
         self,
@@ -616,8 +613,19 @@ class CustomImportReadService:
                 raise CustomImportReadUnavailableError("provider page identities exceed the native query scope")
         if full_family and len(entity_values) > MAX_FULL_FAMILY_PAGE_SIZE:
             raise CustomImportReadRequestError("full-family provider page exceeds its bound")
-        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
-            context = await _load_read_context(session, pinned_target)
+        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms) as is_repeatable_read_only:
+            retained = self._prepared_read_context
+            if (
+                is_repeatable_read_only
+                and retained is not None
+                and retained.prepared is prepared
+                and retained.session is session
+                and retained.context.target == pinned_target
+                and _is_same_read_transaction(retained.transactions, await _read_transaction_identity(session))
+            ):
+                context = retained.context
+            else:
+                context = await _load_read_context(session, pinned_target)
             if context.definition.query.entity_selection is not None or query.grouped_entity_selection is not None:
                 from process.custom_import.grouped_read import hydrate_page
 
@@ -943,14 +951,14 @@ async def _cache_result(cache: CustomImportReadCache | None, cache_key: str, val
 
 
 @asynccontextmanager
-async def _bounded_read_window(session: AsyncSession, *, timeout_ms: int) -> AsyncIterator[None]:
+async def _bounded_read_window(session: AsyncSession, *, timeout_ms: int) -> AsyncIterator[bool]:
     """Apply one cumulative, caller-transaction-local database read budget."""
 
     monotonic_deadline = time.monotonic() + timeout_ms / 1_000
     try:
         async with asyncio.timeout(timeout_ms / 1_000):
-            async with _local_statement_timeout(session, timeout_ms=timeout_ms):
-                yield
+            async with _local_statement_timeout(session, timeout_ms=timeout_ms) as is_repeatable_read_only:
+                yield is_repeatable_read_only
                 if time.monotonic() >= monotonic_deadline:
                     raise TimeoutError
     except TimeoutError:
@@ -962,15 +970,15 @@ async def _bounded_read_window(session: AsyncSession, *, timeout_ms: int) -> Asy
 
 
 @asynccontextmanager
-async def _local_statement_timeout(session: AsyncSession, *, timeout_ms: int) -> AsyncIterator[None]:
+async def _local_statement_timeout(session: AsyncSession, *, timeout_ms: int) -> AsyncIterator[bool]:
     """Temporarily narrow the caller's transaction-local statement timeout."""
 
-    previous_timeout_text, previous_timeout_ms = await _current_statement_timeout(session)
+    previous_timeout_text, previous_timeout_ms, is_repeatable_read_only = await _current_statement_timeout(session)
     effective_timeout_ms = timeout_ms if previous_timeout_ms == 0 else min(timeout_ms, previous_timeout_ms)
     await session.execute(select(func.set_config("statement_timeout", str(effective_timeout_ms), True)))
     has_read_failed = False
     try:
-        yield
+        yield is_repeatable_read_only
     except BaseException:
         has_read_failed = True
         raise
@@ -978,7 +986,7 @@ async def _local_statement_timeout(session: AsyncSession, *, timeout_ms: int) ->
         await _restore_statement_timeout(session, previous_timeout_text, has_read_failed=has_read_failed)
 
 
-async def _current_statement_timeout(session: AsyncSession) -> tuple[str, int]:
+async def _current_statement_timeout(session: AsyncSession) -> tuple[str, int, bool]:
     timeout_row = (await session.execute(_READ_TIMEOUT_SETTINGS)).one_or_none()
     if timeout_row is None or not isinstance(timeout_row.timeout_text, str):
         raise CustomImportReadUnavailableError("bounded read is unavailable")
@@ -988,7 +996,11 @@ async def _current_statement_timeout(session: AsyncSession) -> tuple[str, int]:
         raise CustomImportReadUnavailableError("bounded read is unavailable") from None
     if previous_timeout_ms < 0:
         raise CustomImportReadUnavailableError("bounded read is unavailable")
-    return timeout_row.timeout_text, previous_timeout_ms
+    is_repeatable_read_only = (
+        getattr(timeout_row, "transaction_isolation", None) in {"repeatable read", "serializable"}
+        and getattr(timeout_row, "transaction_read_only", None) == "on"
+    )
+    return timeout_row.timeout_text, previous_timeout_ms, is_repeatable_read_only
 
 
 async def _restore_statement_timeout(
@@ -1009,6 +1021,70 @@ def _is_statement_timeout(error: DBAPIError) -> bool:
 
     driver_error = error.orig
     return any(getattr(driver_error, attribute, None) == "57014" for attribute in ("sqlstate", "pgcode"))
+
+
+def _prepare_single_family_relation(context, query, authorization_scope):
+    """Keep ordinary query normalization and identity independent of context reuse."""
+
+    normalized_context_filters, normalized_filters, normalized_order_terms = _normalized_npi_query(
+        context, query.context_filters, query.filters, query.order_terms, query.require_exact_context
+    )
+    if not query.require_match:
+        if query.context_filters is None:
+            _require_context_only_filters(normalized_filters, context)
+        elif normalized_filters:
+            raise CustomImportReadRequestError("metric predicates require imported membership")
+    query_sha256 = _npi_entity_relation_fingerprint(
+        context.target,
+        normalized_filters,
+        normalized_order_terms,
+        context_filters=normalized_context_filters,
+        entity_values=query.entity_values,
+    )
+    return PreparedNpiEntityRelation(
+        statement=_npi_entity_relation_statement(
+            context,
+            normalized_filters,
+            normalized_order_terms,
+            context_filters=normalized_context_filters,
+            entity_values=query.entity_values,
+        ),
+        normalized_order_terms=normalized_order_terms,
+        query_fingerprint=query_sha256,
+        authorization_scope_sha256=_scope_digest(authorization_scope),
+    )
+
+
+async def _read_transaction_identity(session) -> tuple[object | None, ...] | None:
+    """Include the connection root so externally ended transactions cannot reuse metadata."""
+
+    if not all(
+        callable(getattr(session, name, None)) for name in ("get_transaction", "get_nested_transaction", "connection")
+    ):
+        return None
+    transaction = session.get_transaction()
+    if transaction is None or not transaction.is_active:
+        return None
+    connection = await session.connection()
+    if not all(callable(getattr(connection, name, None)) for name in ("get_transaction", "get_nested_transaction")):
+        return None
+    transactions = (
+        transaction,
+        session.get_nested_transaction(),
+        connection.get_transaction(),
+        connection.get_nested_transaction(),
+    )
+    if transactions[2] is None or any(value is not None and not value.is_active for value in transactions):
+        return None
+    return transactions
+
+
+def _is_same_read_transaction(first, second) -> bool:
+    return (
+        first is not None
+        and second is not None
+        and all(left is right for left, right in zip(first, second, strict=True))
+    )
 
 
 async def _load_read_context(session: AsyncSession, target: PinnedReadTarget) -> _ReadContext:
