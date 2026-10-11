@@ -187,17 +187,7 @@ async def test_accepted_native_rows_do_not_run_serial_document_serializers(monke
         monkeypatch.setattr(staging, name, forbidden)
     actual = await _pages(context, _part(4))
     assert len(calls) == 1 and len(actual[0].records) == 4
-    # The unchanged landing validator still parses every generated payload.
-    decoded_calls = []
-    original = runner_codec.payload_values
-
-    def checked(*args, **kwargs):
-        decoded_calls.append(args)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(runner_codec, "payload_values", checked)
     _landing(context, actual)
-    assert len(decoded_calls) == 4
 
 
 @pytest.mark.parametrize("value", ["\ud800", "Ω" * 4097, 2**100, Decimal("1e1000"), Decimal("NaN")])
@@ -363,6 +353,103 @@ async def test_native_failure_precedes_later_python_failure_without_serial_retry
     with pytest.raises(ValueError) as caught:
         await _pages(context, _part(2))
     assert caught.value is failure and len(calls) == 1 and serial.call_count == 0
+
+
+@pytest.mark.parametrize("error_type", [MemoryError, capture.pa.ArrowMemoryError])
+@pytest.mark.parametrize("boundary", ["decoder", "native_row"])
+async def test_fatal_preparation_failure_does_not_flush_pending_rows(monkeypatch, error_type, boundary):
+    failure = error_type("synthetic allocation failure")
+    events = _decoded(
+        monkeypatch,
+        [_root()] if boundary == "decoder" else [_root(), _root()],
+        read_failure=failure if boundary == "decoder" else None,
+    )
+    if boundary == "native_row":
+        original = preparation._native_row
+        preparation_calls = []
+
+        def checked(*args):
+            preparation_calls.append(args)
+            if len(preparation_calls) == 2:
+                raise failure
+            return original(*args)
+
+        monkeypatch.setattr(preparation, "_native_row", checked)
+
+    def forbidden(*_args):
+        raise AssertionError("fatal preparation must not start another native call")
+
+    calls = _native_double(monkeypatch, forbidden)
+    serial = AsyncMock(side_effect=AssertionError("fatal preparation must not retry serially"))
+    monkeypatch.setattr(staging, "_prepare_decoded_row", serial)
+    with pytest.raises(error_type) as caught:
+        await _pages(_bulk_context(), _part(2))
+    assert caught.value is failure and calls == [] and serial.call_count == 0
+    assert events == ["closed"]
+
+
+@pytest.mark.parametrize("error_type", [MemoryError, capture.pa.ArrowMemoryError])
+@pytest.mark.parametrize("failed_close", ["reader", "buffer"])
+async def test_parquet_fatal_body_and_close_failure_do_not_flush_pending_rows(monkeypatch, error_type, failed_close):
+    body, cleanup = error_type("synthetic allocation failure"), OSError("synthetic close")
+    events = []
+
+    def close(name):
+        events.append(name)
+        if name == failed_close:
+            raise cleanup
+
+    monkeypatch.setattr(capture.pa, "BufferReader", lambda *_: SimpleNamespace(close=lambda: close("buffer")))
+    monkeypatch.setattr(
+        capture.pq, "ParquetFile", lambda *_args, **_kwargs: SimpleNamespace(close=lambda: close("reader"))
+    )
+
+    def records(*_args, _cleanup_failures=None, **_kwargs):
+        with capture._open_parquet_reader(b"synthetic", _policy().part_limits, _cleanup_failures=_cleanup_failures):
+            yield SimpleNamespace(values=_root())
+            raise body
+
+    monkeypatch.setattr(staging, "iter_records", records)
+    calls = _native_double(monkeypatch)
+    with pytest.raises(OSError) as caught:
+        await _pages(_bulk_context(), _part(2))
+    assert caught.value is cleanup and cleanup.__context__ is body and cleanup.__cause__ is None
+    assert calls == []
+    assert events == (["reader"] if failed_close == "reader" else ["reader", "buffer"])
+
+
+@pytest.mark.parametrize("boundary", ["decoder", "native_row"])
+@pytest.mark.parametrize("error_type", [MemoryError, RuntimeError])
+async def test_chained_preparation_failure_preserves_fatality_and_ordinary_order(monkeypatch, boundary, error_type):
+    failure, bridge, nested = (
+        OSError("synthetic outer failure"),
+        ValueError("synthetic context"),
+        error_type("synthetic body"),
+    )
+    failure.__context__, bridge.__context__, bridge.__cause__ = bridge, failure, nested
+    events = _decoded(
+        monkeypatch,
+        [_root()] if boundary == "decoder" else [_root(), _root()],
+        read_failure=failure if boundary == "decoder" else None,
+    )
+    if boundary == "native_row":
+        original = preparation._native_row
+        preparation_calls = []
+
+        def checked(*args):
+            preparation_calls.append(args)
+            if len(preparation_calls) == 2:
+                raise failure
+            return original(*args)
+
+        monkeypatch.setattr(preparation, "_native_row", checked)
+    calls = _native_double(monkeypatch)
+    with pytest.raises(OSError) as caught:
+        await _pages(_bulk_context(), _part(2))
+    assert caught.value is failure and failure.__context__ is bridge
+    assert bridge.__context__ is failure and bridge.__cause__ is nested
+    assert len(calls) == (0 if error_type is MemoryError else 1)
+    assert events == ["closed"]
 
 
 @pytest.mark.parametrize("serial", [False, True])
@@ -535,6 +622,38 @@ async def test_hosted_soft_stop_cleanup_failure_prevents_commit(monkeypatch, nat
     commit.assert_not_awaited()
 
 
+@pytest.mark.parametrize("error_type", [MemoryError, capture.pa.ArrowMemoryError])
+async def test_hosted_soft_stop_cannot_discard_observed_fatal_lookahead(monkeypatch, error_type):
+    context = replace(_bulk_context(), request=replace(_bulk_context().request, page_row_limit=2))
+    failure = error_type("synthetic allocation failure")
+    events = _decoded(monkeypatch, [_root()] * 3, read_failure=failure)
+    calls = _native_double(monkeypatch)
+    monkeypatch.setattr(service, "_verify_part", lambda *_args: None)
+    monkeypatch.setattr(service, "_load_context", AsyncMock(return_value=(context, _policy(), 9, float("inf"), False)))
+
+    async def read_parts(_factory, loaded, policy, _bundle, cursor, permit, deadline):
+        return await service._prepare_part(
+            None, loaded, _part(3), policy, cursor, permit, deadline, (2, service.MAX_BATCH_BYTES, deadline)
+        )
+
+    monkeypatch.setattr(service, "_read_parts", read_parts)
+    commit = AsyncMock()
+    monkeypatch.setattr(service, "_commit", commit)
+    with pytest.raises(error_type) as caught:
+        await service.serve_source_batch(
+            None,
+            execution_id=4,
+            build_id=11,
+            fence=1,
+            stream_slot=1,
+            expected_cursor=_CURSOR,
+            lease_token=context.request.lease_token,
+            source_permit=_PERMIT,
+        )
+    assert caught.value is failure and calls == [] and events == ["closed"]
+    commit.assert_not_awaited()
+
+
 @pytest.mark.parametrize("cursor", [(1, 1, 0), (2, 0, 0)])
 def test_replayed_prefix_is_serial_before_capability_selection(monkeypatch, cursor):
     context = _bulk_context()
@@ -601,11 +720,34 @@ async def test_soft_stop_discards_read_fault_but_keeps_cleanup_error(monkeypatch
     assert caught.value is cleanup and cleanup.__cause__ is None
 
 
+@pytest.mark.parametrize("error_type", [MemoryError, capture.pa.ArrowMemoryError])
+@pytest.mark.parametrize("boundary", ["open", "body"])
+def test_parquet_reader_preserves_fatal_allocation_errors(monkeypatch, error_type, boundary):
+    failure = error_type("synthetic allocation failure")
+    events = []
+    monkeypatch.setattr(capture.pa, "BufferReader", lambda *_: SimpleNamespace(close=lambda: events.append("buffer")))
+
+    def reader(*_args, **_kwargs):
+        if boundary == "open":
+            raise failure
+        return SimpleNamespace(close=lambda: events.append("reader"))
+
+    monkeypatch.setattr(capture.pq, "ParquetFile", reader)
+    with pytest.raises(error_type) as caught:
+        with capture._open_parquet_reader(b"synthetic", _policy().part_limits):
+            raise failure
+    assert caught.value is failure
+    assert events == (["buffer"] if boundary == "open" else ["reader", "buffer"])
+
+
 @pytest.mark.parametrize("observed", [False, True])
 @pytest.mark.parametrize("failed_close", ["reader", "buffer"])
-def test_parquet_finally_marker_preserves_type_context_and_close_order(monkeypatch, observed, failed_close):
+@pytest.mark.parametrize("body_error_type", [RuntimeError, MemoryError, capture.pa.ArrowMemoryError])
+def test_parquet_finally_marker_preserves_type_context_and_close_order(
+    monkeypatch, observed, failed_close, body_error_type
+):
     events, failures = [], []
-    cleanup, body = OSError("synthetic close"), RuntimeError("synthetic body")
+    cleanup, body = OSError("synthetic close"), body_error_type("synthetic body")
 
     def close(name):
         events.append(name)

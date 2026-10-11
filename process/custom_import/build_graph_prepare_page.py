@@ -59,11 +59,11 @@ from db.models.custom_import import (
     CustomImportSourceStream as Stream,
 )
 from process.custom_import import build_graph as graph
+from process.custom_import import graph_payloads, runner_codec
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
 from process.custom_import.execution import lease_token_sha256
 from process.custom_import.runner_codec import (
     digest_text,
-    new_family_hash_ordered,
     payload_values,
     record_payload,
     root_key_contract_hash,
@@ -515,10 +515,15 @@ def _source_input_with_digest(request, registry, family_input, child_groups, pen
             family_input, registry, collection, child_rows, child_counter, request=request if physical else None
         )
 
-    digest = new_family_hash_ordered(
+    digest = runner_codec._family_hash_from_documents(
         request.definition,
         family_input.values,
-        {collection.name: documents(collection.name) for collection in request.definition.child_collections},
+        {
+            collection.name: graph_payloads.validated_documents(
+                request.definition, collection.name, documents(collection.name)
+            )
+            for collection in request.definition.child_collections
+        },
     )
     return replace(family_input, family_sha256=digest, child_count=next(child_counter))
 

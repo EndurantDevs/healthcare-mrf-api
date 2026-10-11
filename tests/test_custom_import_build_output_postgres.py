@@ -331,7 +331,7 @@ async def test_pointer_drift_allows_seal_but_not_no_change_or_old_cas():
 
 
 async def test_python_verification_rejects_structurally_valid_wrong_family_hash(monkeypatch):
-    original = graph_prepare.new_family_hash_ordered
+    original = graph_prepare.runner_codec._family_hash_from_documents
 
     def _wrong_digest(*args, **kwargs):
         original(*args, **kwargs)
@@ -339,9 +339,9 @@ async def test_python_verification_rejects_structurally_valid_wrong_family_hash(
 
     async with _source_case() as case:
         request = await _request_for(case, _records(1))
-        monkeypatch.setattr(graph_prepare, "new_family_hash_ordered", _wrong_digest)
+        monkeypatch.setattr(graph_prepare.runner_codec, "_family_hash_from_documents", _wrong_digest)
         build_id, generation_id = await _build(case, request)
-        monkeypatch.setattr(graph_prepare, "new_family_hash_ordered", original)
+        monkeypatch.setattr(graph_prepare.runner_codec, "_family_hash_from_documents", original)
         with pytest.raises(CandidateRunnerError, match="family digest"):
             await output.build_output(case.sessions, request, build_id)
         async with case.sessions() as session:

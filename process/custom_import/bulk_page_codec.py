@@ -123,10 +123,8 @@ def _rejection_values(rejection, context, typed_key):
     return code, rejection_text, rejection_hash, evidence
 
 
-def _row_values(prepared: _PreparedRow, context: _StreamContext, fields):
+def _row_fields(prepared: _PreparedRow, context: _StreamContext):
     """Preserve native accepted/rejected COPY shape and canonical byte accounting."""
-    from process.custom_import.runner_codec import payload_values
-
     raw_text, raw_hash = _key_pair(prepared.raw_key, "raw key")
     typed_text, typed_hash = _key_pair(prepared.typed_key, "typed key")
     _pair(prepared.payload, prepared.payload_hash, "payload")
@@ -153,9 +151,7 @@ def _row_values(prepared: _PreparedRow, context: _StreamContext, fields):
     if byte_count > context.request.page_byte_limit:
         raise ValueError("one source occurrence exceeds its admitted page byte limit")
     rejection_values = (None, None, None, None)
-    if rejection is None:
-        payload_values(fields, prepared.payload, label="landing source payload")
-    else:
+    if rejection is not None:
         rejection_values = _rejection_values(rejection, context, (typed_text, typed_hash))
     landing_values = (
         raw_text,
@@ -169,6 +165,36 @@ def _row_values(prepared: _PreparedRow, context: _StreamContext, fields):
         *rejection_values,
     )
     return landing_values, byte_count
+
+
+def _row_values(prepared: _PreparedRow, context: _StreamContext, fields):
+    """Keep the individual-row entry point on the complete serial validator."""
+    from process.custom_import.runner_codec import payload_values
+
+    values = _row_fields(prepared, context)
+    if prepared.rejection is None:
+        payload_values(fields, prepared.payload, label="landing source payload")
+    return values
+
+
+def _page_values(records, context, fields):
+    """Earlier payload errors precede later envelope or rejection failures."""
+    from process.custom_import.source_payload_validation import validate_landing_payloads
+
+    values, payloads = [], []
+    try:
+        for prepared in records:
+            row_values, byte_count = _row_fields(prepared, context)
+            values.append((row_values, byte_count))
+            if prepared.rejection is None:
+                payloads.append((prepared.payload, byte_count))
+    except MemoryError:
+        raise
+    except Exception:
+        validate_landing_payloads(fields, payloads)
+        raise
+    validate_landing_payloads(fields, payloads)
+    return values
 
 
 def _landing_fields(context, batch_id, first_pack_ordinal, row_limit, byte_limit):
@@ -216,7 +242,7 @@ def _page_landing_rows(context, page, fields, batch_id, pack_ordinal, remaining_
         raise ValueError("source page exceeds its admitted byte limit")
     if page_bytes > remaining_bytes:
         raise ValueError("landing batch exceeds its admitted byte limit")
-    page_values = [_row_values(prepared, context, fields) for prepared in page.records]
+    page_values = _page_values(page.records, context, fields)
     pack_digest = pack_hash(
         context.stream.child_collection or "root",
         [prepared.payload_hash for prepared in page.records if prepared.payload_hash is not None],

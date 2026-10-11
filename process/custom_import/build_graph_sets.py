@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from itertools import groupby
 
 from sqlalchemy import BigInteger, LargeBinary, SmallInteger, and_, any_, bindparam, case, func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import ARRAY
@@ -45,6 +46,7 @@ from db.models.custom_import import (
     CustomImportSourceStream as Stream,
 )
 from process.custom_import import build_graph as graph
+from process.custom_import import graph_payloads
 from process.custom_import.build_graph_source_page import _SCALAR_COLUMNS
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
 from process.custom_import.execution import lease_token_sha256
@@ -501,30 +503,84 @@ def _logical_child_groups(rows, states):
     )
 
 
+def _serial_child_projection(request, registry, group, collection, child, fields):
+    values = payload_values(fields, child.canonical_payload, label="build child payload")
+    verify_stored_child(request, group.state.source.record, StoredCandidateChild(collection, child, values))
+    if digest_text("child-payload", child.canonical_payload) != bytes(child.payload_sha256):
+        raise CandidateRunnerError("build child payload digest differs")
+    _edge, scalars, contexts = graph._child_projection_values(
+        request,
+        registry,
+        group.state.current.build_id,
+        group.state.family,
+        group.state.source.values,
+        child,
+        values,
+        collection,
+    )
+    scalar_bytes = sum(
+        len(value.encode("utf-8")) for row in scalars for value in row.values() if isinstance(value, str)
+    )
+    return [tuple(row[field] for _kind, field in _SCALAR_COLUMNS) for row in scalars], contexts, scalar_bytes
+
+
 def _source_projections(request, registry, group):
     collection_names_by_slot = {slot: name for name, slot in registry.child_collection_slots.items()}
     fields = fields_by_collection(request.definition)
-    edges, scalars, contexts = [], [], []
-    for child in group.children:
-        collection = collection_names_by_slot[child.collection_slot]
-        values = payload_values(fields[collection], child.canonical_payload, label="build child payload")
-        verify_stored_child(request, group.state.source.record, StoredCandidateChild(collection, child, values))
-        if digest_text("child-payload", child.canonical_payload) != bytes(child.payload_sha256):
-            raise CandidateRunnerError("build child payload digest differs")
-        edge, child_scalars, child_contexts = graph._child_projection_values(
-            request,
-            registry,
-            group.state.current.build_id,
-            group.state.family,
-            group.state.source.values,
-            child,
-            values,
-            collection,
-        )
-        edges.append(edge)
-        scalars.extend(child_scalars)
-        contexts.extend(child_contexts)
-    return edges, scalars, contexts
+    scalars, contexts, scalar_bytes = [], [], 0
+    for slot, children in groupby(group.children, key=lambda child: child.collection_slot):
+        collection = collection_names_by_slot[slot]
+        child_inputs = ((child, child.canonical_payload) for child in children)
+        for child, proof in graph_payloads.decode_records(request.definition, collection, child_inputs):
+            if proof is None:
+                child_scalars, child_contexts, child_bytes = _serial_child_projection(
+                    request, registry, group, collection, child, fields[collection]
+                )
+            else:
+                values_by_field, child_scalars, child_bytes = graph_payloads.projection_values(
+                    fields[collection], proof, child.child_revision_id
+                )
+                root_record = group.state.source.record
+                if (
+                    child.canonical_parent_key != root_record.canonical_logical_key
+                    or bytes(child.parent_key_sha256) != bytes(root_record.logical_key_sha256)
+                    or child.canonical_child_key != proof[2]
+                    or bytes(child.child_key_sha256) != proof[3]
+                ):
+                    raise CandidateRunnerError("current generation child identity does not match its payload")
+                if bytes(child.payload_sha256) != proof[4]:
+                    raise CandidateRunnerError("build child payload digest differs")
+                child_contexts = ()
+                if collection == request.definition.query.child_collection:
+                    child_contexts = graph._context_values(
+                        request,
+                        registry,
+                        group.state.current.build_id,
+                        graph._candidate(
+                            request.definition, group.state.family, group.state.source.values, child, values_by_field
+                        ),
+                    )
+            scalars.extend(child_scalars)
+            scalar_bytes += child_bytes
+            contexts.extend(child_contexts)
+    return scalars, contexts, scalar_bytes
+
+
+def _source_page_projections(request, registry, groups):
+    scalars, contexts, scalar_bytes = [], [], 0
+    for group in groups:
+        group_scalars, group_contexts, group_bytes = _source_projections(request, registry, group)
+        scalars.extend(group_scalars)
+        contexts.extend(group_contexts)
+        scalar_bytes += group_bytes
+    graph._page_cost(
+        request,
+        (),
+        reserved_rows=3 * sum(len(group.children) for group in groups) + len(scalars),
+        reserved_bytes=scalar_bytes,
+        projection_values=contexts,
+    )
+    return scalars, contexts
 
 
 def _child_arguments(request, registry, groups):
@@ -549,13 +605,7 @@ def _child_arguments(request, registry, groups):
             *_transpose(encoded_rows, 9, 13, arrays=True),
             ("integer[]", (len(child_roots),)),
         )
-    edges, scalars, contexts = [], [], []
-    for group in groups:
-        group_edges, group_scalars, group_contexts = _source_projections(request, registry, group)
-        edges.extend(group_edges)
-        scalars.extend(group_scalars)
-        contexts.extend(group_contexts)
-    graph._page_cost(request, (), reserved_rows=2 * len(child_roots), projection_values=(*edges, *scalars, *contexts))
+    scalars, contexts = _source_page_projections(request, registry, groups)
     return "append_custom_import_build_source_families_page", (
         ("bigint", current.build_id),
         ("bigint", request.execution_id),
@@ -574,7 +624,10 @@ def _child_arguments(request, registry, groups):
         ),
         ("bigint[]", child_roots),
         ("bigint[]", tuple(child.child_revision_id for group in groups for child in group.children)),
-        *((kind, tuple(projection[field] for projection in scalars)) for kind, field in _SCALAR_COLUMNS),
+        *(
+            (kind, tuple(scalar_row[index] for scalar_row in scalars))
+            for index, (kind, _field) in enumerate(_SCALAR_COLUMNS)
+        ),
         ("bigint[]", tuple(context["context_child_revision_id"] for context in contexts)),
         ("smallint[]", tuple(context["profile_slot"] for context in contexts)),
         ("text[]", tuple(context["canonical_context_key"] for context in contexts)),

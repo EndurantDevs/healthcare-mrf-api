@@ -1123,6 +1123,31 @@ def test_durable_replay_rechecks_arrow_accounting(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("error_type", [MemoryError, pa.ArrowMemoryError])
+def test_aggregate_arrow_accounting_preserves_fatal_allocation_errors(monkeypatch, error_type):
+    failure = error_type("synthetic allocation failure")
+    events = []
+
+    class FailedBatchReader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            events.append("closed")
+
+        def iter_batches(self, **_kwargs):
+            events.append("decode")
+            raise failure
+
+    monkeypatch.setattr(snowflake_bundle_replay, "_validate_parquet_envelope", lambda _payload: None)
+    monkeypatch.setattr(snowflake_bundle_replay, "_open_parquet_reader", lambda *_args: FailedBatchReader())
+    with pytest.raises(error_type) as caught:
+        snowflake_bundle_replay._aggregate_parquet_arrow_bytes(
+            SimpleNamespace(payload=object()), limits=snowflake_bundle.DEFAULT_CAPTURE_LIMITS, decoded_bytes=0
+        )
+    assert caught.value is failure and events == ["decode", "closed"]
+
+
 def test_bundle_generates_one_safe_statement_with_fixed_order_and_encoding_inputs():
     adapter = _Adapter(lambda: _result(query_id="query-a")[0])
     connector = _connector(adapter)
