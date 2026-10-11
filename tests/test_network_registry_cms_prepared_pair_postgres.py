@@ -525,26 +525,34 @@ def _retained_creation_observer(prepared, capture_id, created_relations):
 
 def _retained_bounds_note(error):
     """Report only the original failed native operands, without another database read."""
-    traceback = error.__traceback__
-    while traceback is not None:
-        frame = traceback.tb_frame
-        if frame.f_code is retention._assert_retained_bounds.__code__:
-            observed_by_name = frame.f_locals
-            required_names = {"relations", "request", "before_bytes", "wal_bytes"}
-            if not required_names.issubset(observed_by_name):
-                return None
-            request = observed_by_name["request"]
-            operand_by_name = {
-                "data_delta_bytes": sum(relation.total_bytes for relation in observed_by_name["relations"])
-                - observed_by_name["before_bytes"],
-                "data_limit_bytes": request.extra_data_upper_bound_bytes,
-                "wal_bytes": observed_by_name["wal_bytes"],
-                "wal_limit_bytes": request.extra_wal_upper_bound_bytes,
-            }
-            if any(type(operand) is not int for operand in operand_by_name.values()):
-                return None
-            return "retention_native_bounds " + json.dumps(operand_by_name, sort_keys=True)
-        traceback = traceback.tb_next
+    pending_errors = [error]
+    seen_error_ids = set()
+    while pending_errors:
+        current = pending_errors.pop()
+        if id(current) in seen_error_ids:
+            continue
+        seen_error_ids.add(id(current))
+        pending_errors.extend(link for link in (current.__context__, current.__cause__) if link is not None)
+        traceback = current.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if frame.f_code is retention._assert_retained_bounds.__code__:
+                observed_by_name = frame.f_locals
+                required_names = {"relations", "request", "before_bytes", "wal_bytes"}
+                if not required_names.issubset(observed_by_name):
+                    return None
+                request = observed_by_name["request"]
+                operand_by_name = {
+                    "data_delta_bytes": sum(relation.total_bytes for relation in observed_by_name["relations"])
+                    - observed_by_name["before_bytes"],
+                    "data_limit_bytes": request.extra_data_upper_bound_bytes,
+                    "wal_bytes": observed_by_name["wal_bytes"],
+                    "wal_limit_bytes": request.extra_wal_upper_bound_bytes,
+                }
+                if any(type(operand) is not int for operand in operand_by_name.values()):
+                    return None
+                return "retention_native_bounds " + json.dumps(operand_by_name, sort_keys=True)
+            traceback = traceback.tb_next
     return None
 
 

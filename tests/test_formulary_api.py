@@ -1,11 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import datetime
 import json
 import types
 
 import pytest
 from sanic.exceptions import InvalidUsage, NotFound
 from sqlalchemy import create_engine, select
+from sqlalchemy.dialects import postgresql
 
 from api.endpoint import formulary
 
@@ -28,8 +30,10 @@ class FakeResult:
 class FakeSession:
     def __init__(self, results):
         self._results = list(results)
+        self.statements = []
 
-    async def execute(self, *_args, **_kwargs):
+    async def execute(self, statement, *_args, **_kwargs):
+        self.statements.append(statement)
         if self._results:
             return self._results.pop(0)
         return FakeResult()
@@ -116,10 +120,9 @@ def test_sort_and_order_normalization_cover_valid_and_invalid_values():
         formulary._normalise_order("sideways")
 
 
-def test_pharmacy_filter_returns_only_tiers_available_at_that_pharmacy():
-    engine = create_engine(
-        "sqlite://", execution_options={"schema_translate_map": {"mrf": None}}
-    )
+def test_pharmacy_filter_returns_only_tiers_available_at_that_pharmacy(request):
+    engine = create_engine("sqlite://", execution_options={"schema_translate_map": {"mrf": None}})
+    request.addfinalizer(engine.dispose)
     drug_table = formulary.PlanDrugRaw.__table__
     pharmacy_table = formulary.PlanFormulary.__table__
     with engine.begin() as connection:
@@ -149,9 +152,7 @@ def test_pharmacy_filter_returns_only_tiers_available_at_that_pharmacy():
                 },
             ],
         )
-        filters = formulary._formulary_drug_filters(
-            "PLAN123", 2025, {"pharmacy_type": "RETAIL"}
-        )
+        filters = formulary._formulary_drug_filters("PLAN123", 2025, {"pharmacy_type": "RETAIL"})
         statement = select(drug_table.c.drug_tier).where(*filters)
 
         assert connection.execute(statement).scalars().all() == ["Tier 1"]
@@ -171,9 +172,7 @@ def test_get_session_and_tier_options_cover_failure_and_duplicate_paths():
 
 @pytest.mark.asyncio
 async def test_collect_distinct_strings_ignores_nulls_and_deduplicates():
-    session = FakeSession(
-        [FakeResult(rows=[("Retail",), (None,), ("Mail",), ("Retail",)])]
-    )
+    session = FakeSession([FakeResult(rows=[("Retail",), (None,), ("Mail",), ("Retail",)])])
 
     assert await formulary._collect_distinct_strings(session, object()) == [
         "Mail",
@@ -182,7 +181,8 @@ async def test_collect_distinct_strings_ignores_nulls_and_deduplicates():
 
 
 @pytest.mark.asyncio
-async def test_list_formularies_returns_rows():
+@pytest.mark.parametrize("updated", [None, datetime.datetime(2025, 5, 1, 12, 30)])
+async def test_list_formularies_returns_rows(updated):
     request = make_request(
         [
             FakeResult(scalar=2),
@@ -197,7 +197,7 @@ async def test_list_formularies_returns_rows():
                         issuer_name="Issuer One",
                         issuer_marketing_name="Issuer Marketing",
                         drug_count=12,
-                        last_updated=None,
+                        last_updated=updated,
                     )
                 ]
             ),
@@ -214,10 +214,18 @@ async def test_list_formularies_returns_rows():
     assert response_payload["items"][0]["formulary_id"] == "PLAN123:2025"
     assert response_payload["items"][0]["formulary_uri"] == "PLAN123/2025"
     assert response_payload["items"][0]["issuer"]["issuer_name"] == "Issuer One"
+    assert response_payload["items"][0]["last_updated"] == (updated.isoformat() if updated else None)
 
 
 @pytest.mark.asyncio
-async def test_get_formulary_returns_detail():
+@pytest.mark.parametrize(
+    ("stats_rows", "expected_count", "expected_updated"),
+    [
+        ([{"drug_count": 42, "last_updated": datetime.datetime(2025, 5, 1, 12, 30)}], 42, "2025-05-01T12:30:00"),
+        ([], 0, None),
+    ],
+)
+async def test_get_formulary_returns_detail(stats_rows, expected_count, expected_updated):
     request = make_request(
         [
             FakeResult(
@@ -235,7 +243,7 @@ async def test_get_formulary_returns_detail():
                     )
                 ]
             ),
-            FakeResult(rows=[{"drug_count": 42, "last_updated": None}]),
+            FakeResult(rows=stats_rows),
             FakeResult(rows=[("Tier 1",), ("Specialty",)]),
             FakeResult(rows=[("MAIL_ORDER",), ("RETAIL",)]),
         ]
@@ -246,7 +254,8 @@ async def test_get_formulary_returns_detail():
 
     assert response_payload["plan"]["plan_id"] == "PLAN123"
     assert response_payload["formulary_uri"] == "PLAN123/2025"
-    assert response_payload["drug_count"] == 42
+    assert response_payload["drug_count"] == expected_count
+    assert response_payload["last_updated"] == expected_updated
     assert response_payload["available_tiers"][0]["tier_slug"] == "tier_1"
     assert response_payload["available_pharmacy_types"] == ["MAIL_ORDER", "RETAIL"]
 
@@ -284,7 +293,11 @@ async def test_get_formulary_handles_index_only_stats_row():
 
 
 @pytest.mark.asyncio
-async def test_list_formulary_drugs_respects_filters():
+@pytest.mark.parametrize(
+    ("sort_args", "updated"),
+    [({}, None), ({"sort": "tier", "order": "desc"}, datetime.datetime(2025, 5, 1, 12, 30))],
+)
+async def test_list_formulary_drugs_respects_filters(sort_args, updated):
     request = make_request(
         [
             FakeResult(scalar=1),  # exists check
@@ -295,16 +308,24 @@ async def test_list_formulary_drugs_respects_filters():
                         rxnorm_id="12345",
                         drug_name="Example Drug",
                         drug_tier="Tier 1",
-                        prior_authorization=True,
-                        step_therapy=False,
-                        quantity_limit=True,
-                        last_updated_on=None,
+                        prior_authorization=False,
+                        step_therapy=True,
+                        quantity_limit=False,
+                        last_updated_on=updated,
                     )
                 ]
             ),
             FakeResult(rows=[("MAIL_ORDER",), ("RETAIL",)]),
         ],
-        args={"tier": "PREFERRED", "page": "1", "page_size": "5"},
+        args={
+            "tier": "Tier 1",
+            "page": "1",
+            "page_size": "5",
+            "authorization_required": "false",
+            "step_therapy": "true",
+            "quantity_limit": "false",
+            **sort_args,
+        },
     )
 
     response = await formulary.list_formulary_drugs(request, "PLAN123:2025")
@@ -315,8 +336,16 @@ async def test_list_formulary_drugs_respects_filters():
     assert response_payload["offset"] == 0
     assert response_payload["items"][0]["rxnorm_id"] == "12345"
     assert response_payload["items"][0]["drug_tier_slug"] == "tier_1"
+    assert response_payload["items"][0]["last_updated"] == (updated.isoformat() if updated else None)
     assert response_payload["available_pharmacy_types"] == ["MAIL_ORDER", "RETAIL"]
     assert response_payload["formulary_uri"] == "PLAN123/2025"
+    for statement in request.ctx.sa_session.statements[1:3]:
+        sql = str(statement.compile(dialect=postgresql.dialect()))
+        assert "prior_authorization = false" in sql
+        assert "step_therapy = true" in sql
+        assert "quantity_limit = false" in sql
+    sort_sql = "mrf.plan_drug_raw.drug_tier DESC" if sort_args else "mrf.plan_drug_raw.drug_name"
+    assert f"ORDER BY {sort_sql}, mrf.plan_drug_raw.rxnorm_id ASC" in str(request.ctx.sa_session.statements[2])
 
 
 @pytest.mark.asyncio
@@ -417,7 +446,8 @@ async def test_formulary_statistics_returns_summary():
 
 
 @pytest.mark.asyncio
-async def test_check_plan_drug_without_year_uses_latest():
+@pytest.mark.parametrize("updated", [None, datetime.datetime(2025, 5, 1, 12, 30)])
+async def test_check_plan_drug_without_year_uses_latest(updated):
     request = make_request(
         [
             FakeResult(scalar=2026),  # latest year
@@ -432,7 +462,7 @@ async def test_check_plan_drug_without_year_uses_latest():
                         prior_authorization=True,
                         step_therapy=False,
                         quantity_limit=True,
-                        last_updated_on=None,
+                        last_updated_on=updated,
                     )
                 ]
             ),
@@ -446,6 +476,7 @@ async def test_check_plan_drug_without_year_uses_latest():
     assert response_payload["year"] == 2026
     assert response_payload["details"]["drug_tier"] == "Tier 1"
     assert response_payload["details"]["drug_tier_slug"] == "tier_1"
+    assert response_payload["details"]["last_updated"] == (updated.isoformat() if updated else None)
     assert response_payload["formulary_uri"] == "PLAN123/2026"
 
 
@@ -477,3 +508,194 @@ async def test_list_formularies_supports_offset_limit_window():
     assert data["page_size"] == 20
     assert data["limit"] == 20
     assert data["offset"] == 40
+
+
+@pytest.mark.asyncio
+async def test_list_formularies_applies_filters_to_count_and_page():
+    request = make_request(
+        [FakeResult(scalar=0), FakeResult()],
+        args={
+            "issuer_id": "7",
+            "plan_id": "sample",
+            "state": "ca",
+            "year": "2025",
+            "drug": " Example ",
+            "limit": "5",
+            "offset": "10",
+        },
+    )
+
+    payload = json.loads((await formulary.list_formularies(request)).body)
+
+    assert payload == {"items": [], "page": 3, "page_size": 5, "limit": 5, "offset": 10, "total": 0}
+    for statement in request.ctx.sa_session.statements:
+        compiled = statement.compile(dialect=postgresql.dialect())
+        assert {
+            "issuer_id_1": 7,
+            "plan_id_1": "%sample%",
+            "state_1": "CA",
+            "year_1": 2025,
+            "drug_name_1": "%Example%",
+            "rxnorm_id_1": "Example",
+        }.items() <= compiled.params.items()
+        assert "drug_name ILIKE" in str(compiled)
+        assert " OR " in str(compiled)
+
+
+@pytest.mark.asyncio
+async def test_list_formularies_ignores_null_numbers_and_whitespace_drug():
+    request = make_request(
+        [FakeResult(scalar=0), FakeResult()],
+        args={"issuer_id": "null", "year": "null", "drug": "   "},
+    )
+
+    payload = json.loads((await formulary.list_formularies(request)).body)
+
+    assert payload["items"] == []
+    assert payload["total"] == 0
+    assert all("WHERE" not in str(statement) for statement in request.ctx.sa_session.statements)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("numeric", ["null", "7"])
+async def test_cross_formulary_drug_filters_and_missing_drug(numeric):
+    request = make_request([FakeResult()], args={"year": numeric, "issuer_id": numeric, "state": "ca"})
+
+    with pytest.raises(NotFound, match="Drug not present"):
+        await formulary.cross_formulary_drug(request, "12345")
+
+    compiled = request.ctx.sa_session.statements[0].compile(dialect=postgresql.dialect())
+    assert compiled.params["rxnorm_id_1"] == "12345"
+    assert compiled.params["state_1"] == "CA"
+    assert ("year_1" in compiled.params) is (numeric != "null")
+    assert ("issuer_id_1" in compiled.params) is (numeric != "null")
+    if numeric != "null":
+        assert compiled.params["year_1"] == compiled.params["issuer_id_1"] == 7
+    assert "ORDER BY mrf.plan.plan_id ASC, mrf.plan.year ASC" in str(compiled)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("numeric", ["null", "2025"])
+async def test_formulary_statistics_filters_every_aggregate_and_handles_empty_rows(numeric):
+    request = make_request(
+        [
+            FakeResult(),
+            FakeResult(),
+            FakeResult(rows=[MappingRow(total_drugs=0, auth_required=0, auth_not_required=0)]),
+            FakeResult(scalar=0),
+        ],
+        args={"year": numeric, "issuer_id": numeric, "state": "tx"},
+    )
+
+    payload = json.loads((await formulary.formulary_statistics(request)).body)
+
+    assert payload == {
+        "total_formularies": 0,
+        "total_drugs": 0,
+        "top_issuers": [],
+        "tier_distribution": [],
+        "authorization_distribution": {"required": 0, "not_required": 0},
+    }
+    for statement in request.ctx.sa_session.statements:
+        compiled = statement.compile(dialect=postgresql.dialect())
+        assert compiled.params["state_1"] == "TX"
+        assert ("year_1" in compiled.params) is (numeric != "null")
+        assert ("issuer_id_1" in compiled.params) is (numeric != "null")
+        if numeric != "null":
+            assert compiled.params["year_1"] == compiled.params["issuer_id_1"] == 2025
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("updated", [None, datetime.datetime(2025, 5, 1, 12, 30)])
+async def test_get_formulary_drug_serializes_coverage_and_timestamp(updated):
+    request = make_request(
+        [
+            FakeResult(scalar=1),
+            FakeResult(
+                rows=[
+                    MappingRow(
+                        rxnorm_id="12345",
+                        drug_name="Example Drug",
+                        drug_tier="Tier 2",
+                        prior_authorization=False,
+                        step_therapy=True,
+                        quantity_limit=False,
+                        last_updated_on=updated,
+                    )
+                ]
+            ),
+            FakeResult(rows=[("MAIL_ORDER",), ("RETAIL",)]),
+        ]
+    )
+
+    drug_payload = json.loads((await formulary.get_formulary_drug(request, "PLAN123:2025", "12345")).body)
+
+    assert drug_payload == {
+        "formulary_id": "PLAN123:2025",
+        "formulary_uri": "PLAN123/2025",
+        "rxnorm_id": "12345",
+        "drug_name": "Example Drug",
+        "drug_tier": "Tier 2",
+        "drug_tier_slug": "tier_2",
+        "prior_authorization": False,
+        "step_therapy": True,
+        "quantity_limit": False,
+        "available_pharmacy_types": ["MAIL_ORDER", "RETAIL"],
+        "last_updated": updated.isoformat() if updated else None,
+        "linked_plans": [{"plan_id": "PLAN123", "year": 2025}],
+    }
+    compiled = request.ctx.sa_session.statements[1].compile(dialect=postgresql.dialect())
+    assert compiled.params == {"plan_id_1": "PLAN123", "rxnorm_id_1": "12345"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler", "extra_args"),
+    [
+        (formulary.list_formulary_drugs, ()),
+        (formulary.get_formulary_drug, ("12345",)),
+        (formulary.get_formulary_summary, ()),
+    ],
+)
+async def test_formulary_children_reject_unknown_plan_before_reading_drugs(handler, extra_args):
+    request = make_request([FakeResult(scalar=0)])
+
+    with pytest.raises(NotFound, match="Unknown formulary"):
+        await handler(request, "PLAN123:2025", *extra_args)
+
+    assert len(request.ctx.sa_session.statements) == 1
+
+
+@pytest.mark.asyncio
+async def test_check_plan_drug_explicit_year_returns_uncovered_without_latest_year_query():
+    request = make_request([FakeResult(scalar=1), FakeResult()], args={"year": "2025"})
+
+    payload = json.loads((await formulary.check_plan_drug(request, "PLAN123", "12345")).body)
+
+    assert payload["year"] == 2025
+    assert payload["covered"] is False
+    assert payload["details"] is None
+    assert len(request.ctx.sa_session.statements) == 2
+    assert "max(" not in str(request.ctx.sa_session.statements[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("args", [{}, {"year": "null"}])
+async def test_check_plan_drug_rejects_missing_latest_year_and_explicit_null(args):
+    request = make_request([FakeResult(scalar=None)], args=args)
+    error, message = (InvalidUsage, "must be provided") if args else (NotFound, "Plan not found")
+
+    with pytest.raises(error, match=message):
+        await formulary.check_plan_drug(request, "PLAN123", "12345")
+
+    assert len(request.ctx.sa_session.statements) == (0 if args else 1)
+
+
+@pytest.mark.asyncio
+async def test_get_formulary_rejects_unknown_plan_before_loading_stats():
+    request = make_request([FakeResult()])
+
+    with pytest.raises(NotFound, match="Unknown formulary"):
+        await formulary.get_formulary(request, "PLAN123:2025")
+
+    assert len(request.ctx.sa_session.statements) == 1

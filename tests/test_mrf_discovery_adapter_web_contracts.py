@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-from unittest.mock import AsyncMock
+import json
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -163,9 +164,7 @@ async def test_web_api_resolver_stops_at_configured_target_limit(monkeypatch):
         object(),
     )
 
-    assert [crawl_target.url for crawl_target in crawl_targets] == [
-        "https://files.example.invalid/first.json"
-    ]
+    assert [crawl_target.url for crawl_target in crawl_targets] == ["https://files.example.invalid/first.json"]
 
 
 @pytest.mark.parametrize(
@@ -298,9 +297,7 @@ async def test_directory_resolver_combines_direct_nested_and_landing_targets(
         "https://files.example.invalid/current.json.gz",
         "https://files.example.invalid/nested.json",
     ]
-    assert crawl_targets[0].metadata["auxiant_network_name"] == (
-        "Historical Out of Network Allowed Amounts"
-    )
+    assert crawl_targets[0].metadata["auxiant_network_name"] == ("Historical Out of Network Allowed Amounts")
     assert crawl_targets[2].metadata["nested_resolver"] == "nested-adapter"
     assert crawl_targets[2].metadata["external_hosting_platform"] == "nested-platform"
 
@@ -374,9 +371,7 @@ async def test_directory_resolver_rejects_directory_without_networks_or_files(
 async def test_directory_resolver_ignores_unused_page_limit(monkeypatch):
     directory_url = "https://directory.example.invalid/networks"
     monkeypatch.setattr(discovery, "_fetch_text", AsyncMock(return_value="directory"))
-    monkeypatch.setattr(
-        discovery, "_parse_auxiant_directory_networks", lambda *_args, **_kwargs: []
-    )
+    monkeypatch.setattr(discovery, "_parse_auxiant_directory_networks", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         discovery,
         "_parse_auxiant_page_links",
@@ -397,3 +392,311 @@ async def test_directory_resolver_ignores_unused_page_limit(monkeypatch):
     )
 
     assert target.url == "https://files.example.invalid/historical.json"
+
+
+@pytest.mark.parametrize("known_file", [True, False])
+@pytest.mark.asyncio
+async def test_viva_direct_file_selection_does_not_fetch_employer_pages(monkeypatch, known_file):
+    fetch_text = AsyncMock(side_effect=AssertionError("unexpected page request"))
+    monkeypatch.setattr(discovery, "_fetch_text", fetch_text)
+    file_info = discovery._VIVA_HEALTH_COMMERCIAL_MRF_FILES[0]
+    url = file_info["url"] if known_file else "https://adapter.example.invalid/files/mrf/unknown"
+
+    if known_file:
+        [target] = await discovery._resolve_viva_health_mrf({}, url, {}, object())
+        assert target.url == file_info["url"]
+        assert target.resolved_from_url == url
+        assert target.metadata["target_file_type"] == "in-network"
+        assert target.metadata["content_disposition_filename"] == (file_info["content_disposition_filename"])
+    else:
+        with pytest.raises(ValueError, match="no VIVA Health commercial MRF target"):
+            await discovery._resolve_viva_health_mrf({}, url, {}, object())
+    fetch_text.assert_not_awaited()
+
+
+@pytest.mark.parametrize("include_commercial", [True, False])
+@pytest.mark.asyncio
+async def test_viva_employer_fetch_failure_preserves_only_available_static_files(monkeypatch, include_commercial):
+    fetch_text = AsyncMock(side_effect=OSError("synthetic employer page failure"))
+    monkeypatch.setattr(discovery, "_fetch_text", fetch_text)
+    session = object()
+    resolver_by_field = {"include_commercial_static": include_commercial, "max_bytes": 4096}
+    url = "https://adapter.example.invalid/mrf/"
+
+    if include_commercial:
+        targets = await discovery._resolve_viva_health_mrf({}, url, resolver_by_field, session)
+        assert [target.url for target in targets] == [
+            file_info["url"] for file_info in discovery._VIVA_HEALTH_COMMERCIAL_MRF_FILES
+        ]
+    else:
+        with pytest.raises(ValueError, match="no VIVA Health MRF targets"):
+            await discovery._resolve_viva_health_mrf({}, url, resolver_by_field, session)
+    fetch_text.assert_awaited_once_with(
+        "https://adapter.example.invalid/mrf/employers/", max_bytes=4096, session=session
+    )
+
+
+@pytest.mark.parametrize(("max_links", "max_targets", "expected_count"), [(1, 3, 1), (3, 1, 1), (3, 3, 2)])
+@pytest.mark.asyncio
+async def test_viva_employer_html_filters_duplicates_and_respects_both_limits(
+    monkeypatch, max_links, max_targets, expected_count
+):
+    employer_urls = [
+        "https://www.mymedicalshopper.com/mrf/synthetic-first-viva-health-x00001",
+        "https://www.mymedicalshopper.com/mrf/synthetic-second-viva-health-x00002",
+    ]
+    page_html = (
+        f'<a href="{employer_urls[0]}">First</a>'
+        f'<a href="{employer_urls[0]}">Duplicate</a>'
+        '<a href="https://unrecognized.example.invalid/mrf/">Unsupported</a>'
+        '<a href="https://transparency.auxiant.com/directory-of-data-sources/">Other adapter</a>'
+        f'<a href="{employer_urls[1]}">Second</a>'
+    )
+    fetch_text = AsyncMock(return_value=page_html)
+    monkeypatch.setattr(discovery, "_fetch_text", fetch_text)
+
+    employer_targets = await discovery._resolve_viva_health_mrf(
+        {"source_id": "mrfsource_synthetic"},
+        "https://adapter.example.invalid/mrf/",
+        {
+            "include_commercial_static": False,
+            "max_employer_links": max_links,
+            "max_targets": max_targets,
+        },
+        object(),
+    )
+
+    assert [employer_target.url for employer_target in employer_targets] == employer_urls[:expected_count]
+    assert employer_targets[0].metadata["group_number"] == "x00001"
+    assert employer_targets[0].metadata["plan_info"][0]["plan_id"] == "x00001"
+    assert all(employer_target.metadata["target_kind"] == "source_landing_page" for employer_target in employer_targets)
+    fetch_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_viva_disabled_sources_fail_without_network_requests(monkeypatch):
+    fetch_text = AsyncMock(side_effect=AssertionError("unexpected page request"))
+    monkeypatch.setattr(discovery, "_fetch_text", fetch_text)
+
+    with pytest.raises(ValueError, match="no VIVA Health MRF targets"):
+        await discovery._resolve_viva_health_mrf(
+            {},
+            "https://adapter.example.invalid/mrf/",
+            {"include_commercial_static": False, "include_employer_mrf_links": False},
+            object(),
+        )
+    fetch_text.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("url", "group_numbers"),
+    [
+        ("https://adapter.example.invalid/MRF?groupNumber=12", []),
+        ("https://adapter.example.invalid/MRF", ["1234", "12x4"]),
+        ("https://adapter.example.invalid/MRF?g=1234", [" 1234 ", "12345"]),
+    ],
+)
+def test_asr_group_resolver_rejects_invalid_identifiers_before_producing_targets(url, group_numbers):
+    with pytest.raises(ValueError, match="4 digits"):
+        discovery._resolve_asr_health_benefits_mrf({}, url, {"group_numbers": group_numbers})
+
+
+def test_asr_group_resolver_requires_at_least_one_group():
+    with pytest.raises(ValueError, match="no ASR Health Benefits group numbers configured"):
+        discovery._resolve_asr_health_benefits_mrf(
+            {}, "https://adapter.example.invalid/MRF", {"group_numbers": [None, ""]}
+        )
+
+
+def test_asr_duplicate_seed_context_merges_nonempty_fields_without_losing_order(tmp_path, monkeypatch):
+    seed_path = tmp_path / "groups.csv"
+    seed_path.write_text(
+        "group_number,status,company_name,employer_name,client_name,plan_name\n"
+        "1234,active,Synthetic Company,First Employer,,Initial Plan\n"
+        "1234,active,,Updated Employer,,Updated Plan\n"
+        "2345,active,,,Synthetic Client,Client Plan\n"
+        "3456,retired,Retired Company,,,\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "sources.json"
+    config_path.write_text(
+        json.dumps({"seed_lists": {"synthetic": {"schema": "group_number_seed_v1", "path": str(seed_path)}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(discovery.SOURCE_CONFIG_ENV, str(config_path))
+    monkeypatch.delenv(discovery.PRIVATE_SEED_CONTEXT_PATHS_ENV, raising=False)
+
+    group_targets = discovery._resolve_asr_health_benefits_mrf(
+        {},
+        "https://adapter.example.invalid/MRF?g=1234",
+        {"seed_list": "synthetic", "group_numbers": ["2345", "", None, "4567"], "toc_path": "/download"},
+    )
+
+    assert [group_target.metadata["group_number"] for group_target in group_targets] == ["1234", "2345", "4567"]
+    assert group_targets[0].metadata["company_name"] == "Synthetic Company"
+    assert group_targets[0].metadata["employer_name"] == "Updated Employer"
+    assert group_targets[0].metadata["plan_name"] == "Updated Plan"
+    assert group_targets[0].label == "ASR Health Benefits group 1234 - Synthetic Company"
+    assert group_targets[1].label == "ASR Health Benefits group 2345 - Synthetic Client"
+    assert group_targets[2].label == "ASR Health Benefits group 4567"
+    assert group_targets[0].url == (
+        "https://adapter.example.invalid/download?fileType=TableOfContents&groupNumber=1234"
+    )
+
+
+def test_auxiant_directory_html_rejects_navigation_and_keeps_available_duplicate():
+    page_html = """
+        <a href="/outside/">*Outside content</a>
+        <div class="wide entry-content">
+          <a>No href</a><a href="">Empty href</a><a href="#top">*Top</a>
+          <a href="mailto:synthetic@example.invalid">*Email</a>
+          <a href="tel:000">*Phone</a><a href="javascript:void(0)">*Script</a>
+          <a href="/blank/"> </a><a href="/stars/">***</a>
+          <a href="https://external.example.invalid/network/">*External</a>
+          <a href="/">*Home</a><a href="/directory-of-data-sources/">*Directory</a>
+          <a href="/implementation-in-process/">*Pending</a>
+          <a href="/wp-admin/">*Admin</a><a href="/index/example/">*Index</a>
+          <a href="/network-a/">Earlier name</a>
+          <a href="/network-a/">*Synthetic &amp; Network</a>
+          <a href="/network-a/">Later name</a>
+          <a href="/network-b/">Synthetic Unavailable</a>
+        </div><!-- .entry-content -->
+    """
+    base_url = "https://directory.example.invalid/directory-of-data-sources/"
+
+    all_networks = discovery._parse_auxiant_directory_networks(page_html, base_url=base_url, data_available_only=False)
+    available_networks = discovery._parse_auxiant_directory_networks(page_html, base_url=base_url)
+
+    assert all_networks == [
+        {"url": "https://directory.example.invalid/network-a/", "label": "Synthetic & Network", "data_available": True},
+        {
+            "url": "https://directory.example.invalid/network-b/",
+            "label": "Synthetic Unavailable",
+            "data_available": False,
+        },
+    ]
+    assert available_networks == all_networks[:1]
+
+
+def test_auxiant_page_html_filters_assets_and_retains_labelled_downloads():
+    base_url = "https://directory.example.invalid/network/"
+    links = discovery._parse_auxiant_page_links(
+        """
+        <img src="/image.json"><a href="/wp-content/asset.zip">Asset</a>
+        <a href="/wp-includes/asset.json">Asset</a>
+        <a href="/wp-admin/admin-ajax.php?cmd=other">Ignored archive.zip</a>
+        <a href="/local/">Local navigation</a>
+        <a href="/directory/">Return to list of networks</a>
+        <a href="ftp://external.example.invalid/landing">Unsupported</a>
+        <a href="/download?id=1">Synthetic out of network.json.zip</a>
+        <a href="/download?id=2">Synthetic pharmacy.json</a>
+        <a href="/in-network.json"></a>
+        <a href="https://external.example.invalid/landing">Synthetic external</a>
+        """,
+        base_url=base_url,
+    )
+
+    assert [link["url"] for link in links] == [
+        "https://directory.example.invalid/download?id=1",
+        "https://directory.example.invalid/download?id=2",
+        "https://directory.example.invalid/in-network.json",
+        "https://external.example.invalid/landing",
+    ]
+    assert [link.get("target_file_type") for link in links] == ["allowed-amounts", "payer-drug", "in-network", None]
+    assert [link.get("container_format") for link in links] == ["zip", None, None, None]
+    assert links[2]["label"] == "in-network.json"
+    assert links[3]["target_kind"] == "external_landing"
+
+
+def _auxiant_contract_pages(fixture):
+    return {
+        fixture["directory_url"]: (
+            f'<a href="{fixture["page_url"]}">*Synthetic Network</a>'
+            '<a href="/ignored/">*Ignored Network</a>'
+            f'<a href="{fixture["directory_link"]["url"]}">Historical out of network.json</a>'
+        ),
+        fixture["page_url"]: (
+            f'<a href="{fixture["page_link"]["url"]}">Current in-network</a>'
+            f'<a href="{fixture["external_url"]}">Synthetic external</a>'
+        ),
+    }
+
+
+@pytest.mark.parametrize("nested_result", ["empty", "failure", "file"])
+@pytest.mark.asyncio
+async def test_auxiant_html_resolution_keeps_nested_provenance_and_bounded_page_requests(monkeypatch, nested_result):
+    """Preserve nested provenance and enforce page request limits for each outcome."""
+    fixture = _auxiant_contract_fixture()
+    session = object()
+    page_html_by_url = _auxiant_contract_pages(fixture)
+    fetch_text = AsyncMock(side_effect=lambda url, **_kwargs: page_html_by_url[url])
+    monkeypatch.setattr(discovery, "_fetch_text", fetch_text)
+    original_nested = discovery.CrawlTarget(
+        source={"source_id": "nested"},
+        url="https://files.example.invalid/nested.json",
+        label="Nested label",
+        resolved_from_url=None,
+        metadata={},
+    )
+    nested = AsyncMock(return_value=[original_nested] if nested_result == "file" else [])
+    if nested_result == "failure":
+        nested.side_effect = ValueError("x" * 600)
+    monkeypatch.setattr(discovery, "_crawl_targets_for_source", nested)
+
+    directory_targets = await discovery._resolve_auxiant_wordpress_directory(
+        fixture["source"],
+        fixture["directory_url"],
+        {"directory_path": "/networks", "max_networks": 1, "max_bytes": 2048, "page_max_bytes": 4096},
+        session,
+    )
+
+    assert [directory_target.url for directory_target in directory_targets[:2]] == [
+        fixture["directory_link"]["url"],
+        fixture["page_link"]["url"],
+    ]
+    fetch_text.assert_has_awaits(
+        [
+            call(fixture["directory_url"], max_bytes=2048, session=session),
+            call(fixture["page_url"], max_bytes=4096, session=session),
+        ]
+    )
+    assert fetch_text.await_count == 2
+    nested.assert_awaited_once_with(
+        {**fixture["source"], "hosting_platform": "custom"}, fixture["external_url"], session
+    )
+    assert directory_targets[2].source == fixture["source"]
+    assert directory_targets[2].metadata["auxiant_network_name"] == "Synthetic Network"
+    assert directory_targets[2].metadata["external_source_url"] == fixture["external_url"]
+    if nested_result == "file":
+        assert directory_targets[2].url == original_nested.url
+        assert directory_targets[2].resolved_from_url == fixture["external_url"]
+        assert directory_targets[2].metadata["nested_target_label"] == "Nested label"
+        assert original_nested.metadata == {}
+    else:
+        assert directory_targets[2].url == fixture["external_url"]
+        assert directory_targets[2].metadata["landing_reason"] == "external_landing_no_concrete_targets"
+        error = directory_targets[2].metadata["nested_error"]
+        if nested_result == "failure":
+            assert error.startswith("ValueError: ")
+            assert len(error) == 500
+        else:
+            assert error is None
+
+
+@pytest.mark.asyncio
+async def test_auxiant_network_fetch_failure_does_not_return_partial_directory_results(monkeypatch):
+    fixture = _auxiant_contract_fixture()
+    failure = OSError("synthetic network page failure")
+    directory_html = (
+        f'<a href="{fixture["directory_link"]["url"]}">Historical.json</a>'
+        f'<a href="{fixture["page_url"]}">*Synthetic Network</a>'
+    )
+    fetch_text = AsyncMock(side_effect=[directory_html, failure])
+    monkeypatch.setattr(discovery, "_fetch_text", fetch_text)
+
+    with pytest.raises(OSError, match="synthetic network page failure") as error:
+        await discovery._resolve_auxiant_wordpress_directory(
+            fixture["source"], fixture["directory_url"], {"directory_path": "/networks"}, object()
+        )
+    assert error.value is failure
+    assert fetch_text.await_count == 2

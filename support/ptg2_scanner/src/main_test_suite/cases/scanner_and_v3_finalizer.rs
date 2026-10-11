@@ -4444,6 +4444,63 @@ fn v3_finalizer_requires_one_existing_price_key_map_input() {
         .to_string()
         .contains("requires --price-key-map-row-count"));
 
+    for option in [
+        "--workers",
+        "--total-sort-memory-bytes",
+        "--identity-map-max-bytes",
+        "--price-key-map-input",
+        "--price-key-map-row-count",
+        "--price-membership-input",
+        "--price-atom-input",
+    ] {
+        let error = parse_v3_finalizer_options(&[output.clone(), option.to_owned()]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), v3_finalizer_usage(), "{option}");
+    }
+
+    for option in [
+        "--workers",
+        "--total-sort-memory-bytes",
+        "--identity-map-max-bytes",
+        "--price-key-map-row-count",
+    ] {
+        let error = parse_v3_finalizer_options(&[
+            output.clone(),
+            option.to_owned(),
+            "not-a-number".to_owned(),
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("invalid {option} value:")),
+            "{option}: {error}",
+        );
+    }
+
+    for (required_arguments, expected) in [
+        (vec![], "requires --workers"),
+        (vec!["--workers", "2"], "requires --identity-map-max-bytes"),
+        (
+            vec!["--workers", "2", "--identity-map-max-bytes", "1"],
+            "requires --total-sort-memory-bytes",
+        ),
+    ] {
+        let mut arguments = vec![
+            output.clone(),
+            "--price-key-map-input".to_owned(),
+            map_path.display().to_string(),
+            "--price-key-map-row-count".to_owned(),
+            "1".to_owned(),
+        ];
+        arguments.extend(required_arguments.into_iter().map(str::to_owned));
+        arguments.push(manifest.clone());
+        let error = parse_v3_finalizer_options(&arguments).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
     for invalid_count in ["0", "4294967297"] {
         let invalid = parse_v3_finalizer_options(&[
             output.clone(),
