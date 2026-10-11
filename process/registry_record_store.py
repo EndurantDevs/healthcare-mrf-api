@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from uuid import UUID
@@ -792,6 +793,70 @@ async def list_registry_records(session, record_kind, *, limit=50, offset=0, rec
     records = [_snapshot(row) for row in rows]
     if record_kind == "company":
         await _attach_company_assertions(session, records, schema)
+    return records
+
+
+def _company_search_ids(record_ids):
+    if record_ids is None:
+        return None
+    if type(record_ids) is not list or len(record_ids) > 5000:
+        raise ValueError("registry_selector_invalid")
+    identities = []
+    for value in record_ids:
+        if type(value) is not str:
+            raise ValueError("registry_selector_invalid")
+        identity = UUID(value)
+        if not identity.int or str(identity) != value:
+            raise ValueError("registry_selector_invalid")
+        identities.append(identity)
+    if len(set(identities)) != len(identities):
+        raise ValueError("registry_selector_duplicate")
+    return identities
+
+
+def _company_search_statement(query, limit, offset, record_ids, schema):
+    """Scope literal name/alias matches before durable ordering and pagination."""
+    if type(query) is not str or any(unicodedata.category(character) == "Cc" for character in query):
+        raise ValueError("registry_company_search_invalid")
+    query = query.strip()
+    if not query or len(query.encode("utf-8")) > 128:
+        raise ValueError("registry_company_search_invalid")
+    if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or not 0 <= offset <= 1000000:
+        raise ValueError("registry_page_invalid")
+    identities = _company_search_ids(record_ids)
+    table = _table(CompanyRegistry, schema)
+    pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    aliases = (
+        func.jsonb_array_elements_text(table.c.aliases)
+        .table_valued(column("alias", String))
+        .render_derived(name="company_aliases")
+    )
+    alias_match = (
+        select(literal(1))
+        .select_from(aliases)
+        .where(aliases.c.alias.ilike(pattern, escape="\\"))
+        .correlate(table)
+        .exists()
+    )
+    predicate = or_(table.c.display_name.ilike(pattern, escape="\\"), alias_match)
+    try:
+        exact_id = UUID(query)
+    except ValueError:
+        exact_id = None
+    if exact_id is not None and exact_id.int and str(exact_id) == query:
+        predicate = or_(predicate, table.c.company_id == exact_id)
+    statement = select(table).where(predicate)
+    if identities is not None:
+        statement = statement.where(table.c.company_id.in_(identities))
+    return statement.order_by(table.c.company_id).limit(limit).offset(offset)
+
+
+async def search_registry_companies(session, q, *, limit=50, offset=0, record_ids, schema=None):
+    """Read companies for an explicit trusted admin or complete authorized selector."""
+    statement = _company_search_statement(q, limit, offset, record_ids, schema)
+    rows = (await session.execute(statement)).mappings()
+    records = [_snapshot(row) for row in rows]
+    await _attach_company_assertions(session, records, schema)
     return records
 
 

@@ -36,6 +36,7 @@ from process.registry_record_store import (
     apply_registry_record_command,
     get_registry_record,
     list_registry_records,
+    search_registry_companies,
 )
 from process.registry_source_site_catalog import (
     RegistrySourceSiteCatalogUnavailable,
@@ -245,6 +246,29 @@ async def read_source_sites(request):
     except ValueError, TypeError:
         return _error(400)
     except SQLAlchemyError, asyncpg.PostgresError, RegistrySourceSiteCatalogUnavailable:
+        return _error(503)
+
+
+@blueprint.post("/company/search")
+async def search_companies(request):
+    """Search within the trusted app's complete company authorization selector."""
+    require_control_auth(request)
+    try:
+        document = _body(request, maximum=262144)
+        if set(document) != {"q", "limit", "offset", "record_ids"}:
+            raise ValueError("registry_company_search_invalid")
+        async with request.ctx.sa_session.begin():
+            records = await search_registry_companies(
+                request.ctx.sa_session,
+                document["q"],
+                limit=document["limit"],
+                offset=document["offset"],
+                record_ids=document["record_ids"],
+            )
+        return response.json({"records": records}, headers=_HEADERS)
+    except ValueError, TypeError:
+        return _error(400)
+    except SQLAlchemyError, RegistryAddressUnavailable:
         return _error(503)
 
 
