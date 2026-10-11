@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import hashlib
 import importlib
 import importlib.util
 import inspect
@@ -23,6 +24,36 @@ if importlib.util.find_spec("ptg2_address_canon") is None:
 ptg2_address_canon = importlib.import_module("ptg2_address_canon")
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
+
+
+def _compiled_export(name):
+    export = getattr(ptg2_address_canon, name)
+    assert inspect.isbuiltin(export), f"installed {name} must be compiled"
+    return export
+
+
+def _copy_fields(wire, width):
+    """Independently decode complete COPY framing at the Python extension boundary."""
+    assert type(wire) is bytes
+    assert wire[:19] == b"PGCOPY\n\xff\r\n\0" + bytes(8)
+    offset, rows = 19, []
+    while True:
+        count = struct.unpack_from(">h", wire, offset)[0]
+        offset += 2
+        if count == -1:
+            break
+        assert count == width
+        fields = []
+        for _ in range(count):
+            length = struct.unpack_from(">i", wire, offset)[0]
+            offset += 4
+            assert length >= -1
+            fields.append(None if length == -1 else wire[offset : offset + length])
+            if length >= 0:
+                offset += length
+        rows.append(fields)
+    assert offset == len(wire)
+    return rows
 
 
 def _golden_cases():
@@ -560,3 +591,282 @@ def test_installed_batch_limits_accept_exact_boundary_and_refuse_excess(native_v
         "reviews": [],
         "counts": {"input_rows": 0, "effective_rows": 0, "review_rows": 0},
     }
+
+
+@pytest.mark.parametrize(
+    "name,arguments,code",
+    [
+        ("encode_network_membership_batch", (b"\xff",), "invalid_json"),
+        ("validate_network_catalog_batch", (b"\xff",), "invalid_json"),
+        ("validate_company_network_assertions", (b"\xff",), "invalid_json"),
+        ("encode_network_source_binding_batch", (b"\xff",), "invalid_json"),
+        ("parse_registry_target_ledger", (b"\xff",), "invalid_utf8"),
+        ("parse_registry_network_evidence", (b"\xff",), "registry_network_evidence_invalid"),
+        ("extract_fhir_network_identity_batch", (b"\xff",), "invalid_batch"),
+        ("encode_fhir_network_identity_batch", (b"\xff",), "invalid_batch"),
+        ("build_registry_network_coverage", (b"\xff",), "registry_coverage_invalid"),
+        ("validate_registry_required_target_ledger_artifact", (b"\xff",), "registry_target_review_ledger_invalid"),
+        ("validate_registry_required_target_review_artifacts", (b"\xff",), "registry_target_review_invalid"),
+        ("encode_registry_target_ledger_artifact", (b"\xff", _identity(1)), "invalid_utf8"),
+        (
+            "encode_registry_required_target_review_artifact",
+            (b"\xff", b"{}", _identity(1)),
+            "registry_target_review_invalid",
+        ),
+    ],
+)
+def test_compiled_registry_interfaces_preserve_validation_failures(name, arguments, code):
+    with pytest.raises(ValueError, match=code):
+        _compiled_export(name)(*arguments)
+
+
+def test_compiled_membership_copy_preserves_namespace_and_rejects_id_coercion():
+    encode = _compiled_export("encode_network_membership_batch")
+    membership_by_field = {
+        "network_id": 42,
+        "provider_system": "manual",
+        "provider_id": "000123",
+        "location_id": _identity(1),
+        "evidence_id": "review-1",
+    }
+    wire, count = encode(_wire([membership_by_field]))
+    assert count == 1
+    assert _copy_fields(wire, 5) == [
+        [struct.pack(">i", 42), b"manual", b"000123", UUID(_identity(1)).bytes, b"review-1"]
+    ]
+    with pytest.raises(ValueError, match="invalid_row"):
+        encode(_wire([{**membership_by_field, "network_id": "42"}]))
+
+
+def test_compiled_catalog_and_company_links_keep_typed_identity():
+    catalog = _compiled_export("validate_network_catalog_batch")
+    catalog_by_field = {
+        "network_id": 42,
+        "display_name": " Example Réseau ",
+        "aliases": [],
+        "source_aliases": [],
+        "directory_available": True,
+        "priceable": False,
+    }
+    validated_by_field = json.loads(catalog(_wire([catalog_by_field])))[0]
+    assert (
+        validated_by_field["network_id"],
+        validated_by_field["display_name"],
+        validated_by_field["raw_display_name"],
+    ) == (
+        42,
+        "Example Réseau",
+        catalog_by_field["display_name"],
+    )
+    assert validated_by_field["directory_available"] is True and validated_by_field["priceable"] is False
+    with pytest.raises(ValueError, match="invalid_network_id"):
+        catalog(_wire([{**catalog_by_field, "network_id": True}]))
+    validate = _compiled_export("validate_company_network_assertions")
+    assertion_by_field = {
+        "company_id": _identity(2),
+        "network_id": 42,
+        "relationship_role": "uses",
+        "benefit_domain": None,
+        "applicability": "national",
+        "states": [],
+        "valid_from": None,
+        "valid_to": None,
+        "evidence_text": "Reviewed relationship",
+    }
+    validated_by_field = json.loads(validate(_wire([assertion_by_field])))
+    assert validated_by_field["assertions"] == [assertion_by_field] and validated_by_field["conflicts"] == []
+    with pytest.raises(ValueError, match="invalid_row"):
+        validate(_wire([{**assertion_by_field, "network_id": "42"}]))
+
+
+def test_compiled_source_binding_copy_keeps_exact_scope_and_revision():
+    encode = _compiled_export("encode_network_source_binding_batch")
+    binding_by_field = {
+        "binding_id": _identity(3),
+        "source_system": "ptg",
+        "source_id": "source-one",
+        "dataset_schema": "source_snapshot",
+        "dataset_id": "dataset-one",
+        "producer_id": "producer-one",
+        "edition_id": "edition-one",
+        "source_key": "opaque-key",
+        "source_scope_json": {"cohort_id": "cohort-one", "snapshot_id": "snapshot-one", "company_key": "company-one"},
+        "network_id": 42,
+        "evidence_id": "review-one",
+        "evidence_sha256": "a" * 64,
+        "operation": "bind",
+        "expected_revision": 0,
+        "expected_network_id": None,
+    }
+    wire, count = encode(_wire([binding_by_field]))
+    fields = _copy_fields(wire, 16)[0]
+    assert count == 1 and fields[0] == UUID(binding_by_field["binding_id"]).bytes
+    assert fields[7] == b"opaque-key" and json.loads(fields[8][1:]) == binding_by_field["source_scope_json"]
+    assert fields[10] == struct.pack(">i", 42) and fields[-1] is None
+    with pytest.raises(ValueError, match="invalid_row"):
+        encode(_wire([{**binding_by_field, "expected_revision": True}]))
+
+
+def test_compiled_network_evidence_and_coverage_preserve_unknown_pricing():
+    parse = _compiled_export("parse_registry_network_evidence")
+    evidence_by_field = {"network_id": 42, "expected_record_revision": 1, "pricing_refs": None, "benefit_refs": []}
+    assert json.loads(parse(_wire(evidence_by_field))) == evidence_by_field
+    with pytest.raises(ValueError, match="registry_network_evidence_invalid"):
+        parse(_wire({**evidence_by_field, "expected_record_revision": 0}))
+    coverage = _compiled_export("build_registry_network_coverage")
+    request_by_field = {
+        "targets": [{"target_key": "required:one"}],
+        "bindings": [{"target_key": "required:one", "network_id": 42, "resolution_status": "resolved"}],
+        "evidence": [
+            {
+                "network_id": 42,
+                "company_link_verified": True,
+                "exact_membership_count": 3,
+                "pricing_evidence_count": None,
+                "source_status": "current",
+                "unresolved_location_count": 0,
+            }
+        ],
+    }
+    coverage_by_field = json.loads(coverage(_wire(request_by_field)))
+    assert coverage_by_field["targets"][0]["directory_available"] is True
+    assert coverage_by_field["targets"][0]["priceable"] is None
+    assert coverage_by_field["totals"]["exact_membership_count"] == 3
+    with pytest.raises(ValueError, match="registry_coverage_invalid"):
+        coverage(_wire({**request_by_field, "targets": [{"target_key": "required:one"}] * 2}))
+
+
+def test_compiled_fhir_network_projection_preserves_reference_order_and_copy():
+    extract = _compiled_export("extract_fhir_network_identity_batch")
+    encode = _compiled_export("encode_fhir_network_identity_batch")
+    resource_by_field = {
+        "resourceType": "InsurancePlan",
+        "id": "plan-one",
+        "network": [{"reference": "Organization/network-two"}, {"reference": "Organization/network-one"}],
+    }
+    request_by_field = {
+        "source_id": "source-one",
+        "release_id": "release-one",
+        "resource_type": "InsurancePlan",
+        "resources": [resource_by_field],
+    }
+    decoded_by_field = json.loads(extract(_wire(request_by_field)))
+    assert decoded_by_field["plans"][0]["network_refs"] == ["Organization/network-two", "Organization/network-one"]
+    wire, rows, inputs, duplicates = encode(_wire(request_by_field))
+    assert (rows, inputs, duplicates) == (1, 1, 0)
+    assert len(_copy_fields(wire, 5)) == 1
+    for export in (extract, encode):
+        with pytest.raises(ValueError, match="resource_type_mismatch"):
+            export(_wire({**request_by_field, "resources": [{**resource_by_field, "resourceType": "Organization"}]}))
+
+
+@pytest.fixture
+def native_ledger_artifact():
+    source = (
+        b"COMPANY_ALIAS,COMPANY_NAME,PLAN_NAME,PLAN_TYPE,PLAN_CARRIER,FIND_CARE_NETWORK_NAME,NETWORK_FC_ID,RIBBON_IDS\r\n"
+        b"Example,Company,Plan,PPO,Carrier,Network,123,[]\r\n"
+    )
+    ledger = json.loads(_compiled_export("parse_registry_target_ledger")(source))
+    wire, descriptor_bytes = _compiled_export("encode_registry_target_ledger_artifact")(source, _identity(4))
+    descriptor = json.loads(descriptor_bytes)
+    fields = _copy_fields(wire, 6)[0]
+    assert fields[:4] == [UUID(_identity(4)).bytes, b"ledger:v1", struct.pack(">i", 1), b"accepted"]
+    assert fields[4][0] == 1 and fields[5] == b"\x01[]"
+    document = json.loads(fields[4][1:])
+    assert document["ledger"] == ledger
+    assert descriptor["source_sha256"] == hashlib.sha256(source).hexdigest()
+    assert descriptor["artifact_sha256"] == hashlib.sha256(fields[4][1:]).hexdigest()
+    return {"snapshot_id": _identity(4), "artifact_sha256": descriptor["artifact_sha256"], "document": document}
+
+
+def test_compiled_ledger_validation_rejects_body_substitution(native_ledger_artifact):
+    validate = _compiled_export("validate_registry_required_target_ledger_artifact")
+    result = json.loads(validate(_wire(native_ledger_artifact)))
+    assert (result["source_rows"], result["target_count"], result["snapshot_id"]) == (1, 1, _identity(4))
+    with pytest.raises(ValueError, match="registry_target_review_ledger_mismatch"):
+        validate(_wire({**native_ledger_artifact, "artifact_sha256": "0" * 64}))
+
+
+def test_compiled_review_artifact_roundtrip_binds_exact_retained_ledger(native_ledger_artifact):
+    ledger = native_ledger_artifact
+    request_by_field = {
+        "ledger_snapshot_id": ledger["snapshot_id"],
+        "ledger_artifact_sha256": ledger["artifact_sha256"],
+        "decisions": [
+            {
+                "target_key": "fc:123:ribbon:missing",
+                "resolution_status": "unresolved",
+                "network_id": None,
+                "source_binding": None,
+                "evidence_reference": "Reviewed pending identity",
+                "evidence_sha256": "a" * 64,
+                "reason": "Awaiting evidence",
+            }
+        ],
+    }
+    encode = _compiled_export("encode_registry_required_target_review_artifact")
+    wire, descriptor_bytes = encode(_wire(request_by_field), _wire(ledger["document"]), _identity(5))
+    fields = _copy_fields(wire, 6)[0]
+    assert fields[:4] == [UUID(_identity(5)).bytes, b"review:v1", struct.pack(">i", 1), b"accepted"]
+    descriptor = json.loads(descriptor_bytes)
+    assert descriptor["resolved_count"] == 0
+    assert descriptor["artifact_sha256"] == hashlib.sha256(fields[4][1:]).hexdigest()
+    retained_by_field = {
+        "snapshot_id": _identity(5),
+        "artifact_sha256": descriptor["artifact_sha256"],
+        "document": json.loads(fields[4][1:]),
+    }
+    bundle_by_role = {"ledgers": [ledger], "reviews": [retained_by_field]}
+    validate = _compiled_export("validate_registry_required_target_review_artifacts")
+    validated_by_field = json.loads(validate(_wire(bundle_by_role)))
+    assert (validated_by_field["ledger_count"], validated_by_field["review_count"]) == (1, 1)
+    with pytest.raises(ValueError, match="registry_target_review_ledger_mismatch"):
+        validate(_wire({**bundle_by_role, "ledgers": []}))
+    with pytest.raises(ValueError, match="registry_target_review_ledger_mismatch"):
+        encode(_wire({**request_by_field, "ledger_artifact_sha256": "0" * 64}), _wire(ledger["document"]), _identity(5))
+
+
+def test_compiled_source_editions_preserve_copy_metadata_and_reject_digest_changes(tmp_path):
+    from tests.test_cms_planfinder_workbook_input import _batches, _workbook
+    from tests.test_registry_source_admission_postgres import _input
+
+    mlr = _input()
+    path, workbook_digest = _workbook(tmp_path, count=1)
+    for name, source, digest, count in (
+        ("encode_cms_mlr_observations", mlr, hashlib.sha256(mlr).hexdigest(), 2),
+        ("encode_cms_planfinder_observations", _batches(path, workbook_digest)[0], workbook_digest, 1),
+    ):
+        encode = _compiled_export(name)
+        edition_by_field = {"snapshot_id": _identity(6), "reporting_year": 2024, "input_sha256": digest}
+        wire, rows, metadata_bytes = encode(source, _wire(edition_by_field))
+        fields = _copy_fields(wire, 6)
+        metadata = json.loads(metadata_bytes)
+        assert rows == len(fields) == metadata["counts"]["input_rows"] == count
+        assert metadata["edition"] == edition_by_field
+        assert all(row[0] == UUID(_identity(6)).bytes and row[4][0] == 1 for row in fields)
+        with pytest.raises(ValueError, match="digest_mismatch"):
+            encode(source, _wire({**edition_by_field, "input_sha256": "0" * 64}))
+        with pytest.raises(ValueError, match="edition metadata is invalid"):
+            encode(source, b"{}")
+        with pytest.raises(ValueError, match="edition metadata exceeds byte limit"):
+            encode(source, b" " * 65_537)
+
+
+def test_compiled_source_payload_failure_keeps_original_row_ordinal():
+    validate = _compiled_export("custom_import_validate_source_payloads_v1")
+    layout = (("key", "string", False),)
+    good = '{"contract":"custom-import-record/v1","fields":[{"field":"key","value":{"state":"value","type":"string","value":"a"}}]}'
+    assert validate(layout, [good]) is None
+    rejected = validate(layout, [good, "{}"])
+    assert rejected[0] == 1 and isinstance(rejected[1], str) and rejected[1]
+
+
+@pytest.mark.parametrize(
+    "binding,message",
+    [((False, 32768, 1), "graph field slot differs"), ((False, 1, 32768), "graph projection slot differs")],
+)
+def test_compiled_graph_binding_slots_reject_integer_narrowing(binding, message):
+    decode = _compiled_export("custom_import_graph_children_v1")
+    source = (True, (("key", "string"),), (("parent", 0),), (0,))
+    with pytest.raises(ValueError, match=message):
+        decode((source, (binding,)), ["{}"])

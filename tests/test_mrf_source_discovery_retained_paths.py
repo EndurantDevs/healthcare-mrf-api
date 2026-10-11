@@ -538,3 +538,236 @@ async def test_filelist_rejects_empty_inventory(monkeypatch):
     )
     with pytest.raises(ValueError, match="no BCBS ASO index URLs"):
         await discovery._resolve_bcbs_asomrf_filelist(SOURCE, URL, {}, None)
+
+
+_SOCRATA_DATASET = {
+    "title": "In Network Rates - Example Plan - January 2026",
+    "description": "Published negotiated rates",
+    "accessLevel": "public",
+    "contactPoint": {"fn": "Example Catalog"},
+    "keyword": ["price transparency"],
+    "distribution": [
+        {"downloadURL": "https://files.example.invalid/download/abcd-1234/rates.json", "mediaType": "application/json"}
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    "changes,resolver",
+    [
+        ({"title": " "}, {}),
+        ({"accessLevel": "private"}, {}),
+        ({"title": "County budget", "description": "Annual expenditure"}, {}),
+        ({}, {"title_regex": "Dental"}),
+        ({}, {"title_regex": "["}),
+        ({"contactPoint": None, "publisher": []}, {"contact_regex": "Example"}),
+        ({}, {"contact_regex": "["}),
+        ({}, {"keyword_any": ["dental"]}),
+        ({"distribution": {"downloadURL": "https://files.example.invalid/rates.json"}}, {}),
+        ({"distribution": [None, {}, {"downloadURL": " "}]}, {}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_socrata_catalog_rejects_unusable_datasets(monkeypatch, changes, resolver):
+    """Private, unrelated, and malformed catalog entries cannot become MRF targets."""
+    response = _TrackedResponse(json.dumps({"dataset": [None, {**_SOCRATA_DATASET, **changes}]}).encode())
+    session = _Session(response)
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", AsyncMock())
+    with pytest.raises(ValueError, match="no Socrata MRF catalog files"):
+        await discovery._resolve_socrata_data_json_mrf_catalog(SOURCE, URL, resolver, session)
+    assert response.released
+    assert len(session.get_calls) == 1
+
+
+@pytest.mark.parametrize("latest_only,limit,expected_count", [(True, None, 2), (True, 1, 1), (False, None, 3)])
+@pytest.mark.asyncio
+async def test_socrata_catalog_filters_month_before_limiting(monkeypatch, latest_only, limit, expected_count):
+    """Pick the latest publication before capping the sorted, typed inventory."""
+    datasets = [
+        {**_SOCRATA_DATASET, "title": "In Network Rates - Commercial - December 2025"},
+        {
+            **_SOCRATA_DATASET,
+            "title": "In Network Rates - Individual and Family - January 2026",
+            "identifier": "https://catalog.example.invalid/d/efgh-5678",
+            "distribution": [
+                None,
+                {},
+                {"downloadURL": "https://files.example.invalid/rates.csv", "mediaType": "text/csv"},
+                {"downloadURL": "https://files.example.invalid/rates.json", "mediaType": "application/json"},
+            ],
+        },
+        {
+            **_SOCRATA_DATASET,
+            "title": "Allowed Amounts - Employer Group - January 2026",
+            "distribution": [{"downloadURL": "https://files.example.invalid/allowed.csv"}],
+        },
+    ]
+    response = _TrackedResponse(json.dumps({"dataset": datasets}).encode())
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", AsyncMock())
+    crawl_targets = await discovery._resolve_socrata_data_json_mrf_catalog(
+        SOURCE,
+        URL,
+        {"latest_coverage_month_only": latest_only, "max_targets": limit, "keyword_any": [" ", "TRANSPARENCY"]},
+        _Session(response),
+    )
+    assert len(crawl_targets) == expected_count
+    assert [crawl_target.label for crawl_target in crawl_targets] == sorted(
+        crawl_target.label for crawl_target in crawl_targets
+    )
+    assert crawl_targets[0].metadata["target_file_type"] == "allowed-amounts"
+    assert crawl_targets[0].metadata["plan_info"][0]["plan_market_type"] == "group"
+    assert "socrata_media_type" not in crawl_targets[0].metadata
+    if limit is None:
+        individual = next(crawl_target for crawl_target in crawl_targets if "Individual" in crawl_target.label)
+        assert individual.url == "https://files.example.invalid/rates.json"
+        assert individual.metadata["socrata_dataset_id"] == "efgh-5678"
+        assert individual.metadata["plan_info"][0]["plan_market_type"] == "individual"
+    if latest_only:
+        assert {crawl_target.metadata["socrata_coverage_month"] for crawl_target in crawl_targets} == {"2026-01"}
+    assert all(
+        crawl_target.source == SOURCE and crawl_target.resolved_from_url == URL for crawl_target in crawl_targets
+    )
+    assert response.released
+
+
+@pytest.mark.asyncio
+async def test_socrata_catalog_keeps_undated_rates_and_contact_fallback(monkeypatch):
+    """A valid undated catalog uses publisher attribution without inventing an ID or month."""
+    dataset_by_field = {
+        **_SOCRATA_DATASET,
+        "title": "In Network Rates - Dental and Vision",
+        "contactPoint": [],
+        "publisher": {"name": "Example Publisher"},
+        "distribution": [{"downloadURL": "https://files.example.invalid/rates.json"}],
+    }
+    response = _TrackedResponse(json.dumps({"dataset": [dataset_by_field]}).encode())
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", AsyncMock())
+    [target] = await discovery._resolve_socrata_data_json_mrf_catalog(
+        SOURCE, URL, {"latest_coverage_month_only": True, "contact_regex": "Publisher"}, _Session(response)
+    )
+    assert target.metadata["benefit_lines"] == ["dental", "vision"]
+    assert "benefit_line" not in target.metadata
+    assert "socrata_coverage_month" not in target.metadata
+    assert "socrata_dataset_id" not in target.metadata
+    assert target.metadata["plan_info"][0]["plan_id"] is None
+    assert target.metadata["plan_info"][0]["plan_market_type"] is None
+    assert response.released
+
+
+@pytest.mark.parametrize("payload", [{}, {"dataset": []}])
+@pytest.mark.asyncio
+async def test_socrata_catalog_requires_an_inventory(monkeypatch, payload):
+    """Missing and empty dataset collections fail after releasing the response."""
+    response = _TrackedResponse(json.dumps(payload).encode())
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", AsyncMock())
+    with pytest.raises(ValueError, match="no Socrata MRF catalog files"):
+        await discovery._resolve_socrata_data_json_mrf_catalog(SOURCE, URL, {}, _Session(response))
+    assert response.released
+
+
+@pytest.mark.parametrize("limit", [None, 1])
+@pytest.mark.asyncio
+async def test_meritain_search_validates_links_and_bounds_groups(monkeypatch, limit):
+    """Malformed and foreign links cannot displace valid group and unscoped references."""
+    grouped_url = "https://health1.meritain.com/?insurerCode=MERITAIN_I&brandCode=EXAMPLE&reportingEntityType=TPA_10001"
+    unscoped_url = "https://health1.aetna.com/?insurerCode=MERITAIN_I&brandCode=EXAMPLE"
+    html = "".join(
+        f'<a href="{link}">{label}</a>'
+        for link, label in [
+            ("https://foreign.example.invalid/?insurerCode=MERITAIN_I&brandCode=EXAMPLE", "Foreign"),
+            ("https://health1.meritain.com/?insurerCode=MERITAIN_I", "Missing brand"),
+            ("https://health1.meritain.com/?insurerCode=OTHER&brandCode=EXAMPLE", "Other insurer"),
+            (grouped_url, ""),
+            (grouped_url, "Duplicate"),
+            (unscoped_url, ""),
+        ]
+    )
+    response = _TrackedResponse(html.encode(), content_type="text/html")
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", AsyncMock())
+    crawl_targets = await discovery._resolve_meritain_mrf_search(
+        SOURCE, URL, {"max_targets": limit, "max_bytes": len(html.encode())}, _Session(response)
+    )
+    assert [crawl_target.url for crawl_target in crawl_targets] == [grouped_url, unscoped_url][:limit]
+    assert crawl_targets[0].label == "Meritain group 10001"
+    assert crawl_targets[0].metadata["group_id"] == "10001"
+    assert crawl_targets[0].metadata["plan_info"][0]["plan_id_type"] == "group_id"
+    if limit is None:
+        assert crawl_targets[1].label == "Meritain Health"
+        assert crawl_targets[1].metadata["group_id"] is None
+        assert crawl_targets[1].metadata["plan_info"][0]["plan_id_type"] is None
+    assert all(crawl_target.resolved_from_url == URL for crawl_target in crawl_targets)
+    assert response.released
+
+
+@pytest.mark.parametrize("max_bytes,error", [(1024, "no Meritain Health group MRF links"), (1, "exceeds 1 byte")])
+@pytest.mark.asyncio
+async def test_meritain_search_releases_rejected_responses(monkeypatch, max_bytes, error):
+    """An empty listing or oversized response fails without retaining its HTTP body."""
+    response = _TrackedResponse(b"<html>No current files</html>", content_type="text/html")
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", AsyncMock())
+    with pytest.raises(ValueError, match=error):
+        await discovery._resolve_meritain_mrf_search(SOURCE, URL, {"max_bytes": max_bytes}, _Session(response))
+    assert response.released
+
+
+@pytest.mark.parametrize(
+    "builder,config_key,error_prefix",
+    [
+        (discovery._monthly_toc_targets, "file_templates", "monthly TOC"),
+        (discovery._bcbsma_monthly_toc_targets, "toc_suffixes", "BCBSMA"),
+    ],
+)
+def test_monthly_toc_configuration_requires_location_and_files(builder, config_key, error_prefix):
+    """Incomplete configuration fails instead of yielding unusable publication URLs."""
+    with pytest.raises(ValueError, match=f"{error_prefix} resolver requires base_url or source URL"):
+        builder(SOURCE, " ", {})
+    with pytest.raises(ValueError, match=f"{error_prefix} resolver requires {config_key}"):
+        builder(SOURCE, URL, {config_key: [" "]})
+
+
+@pytest.mark.parametrize("offsets", [None, [], "invalid"])
+def test_monthly_toc_defaults_to_current_month(monkeypatch, offsets):
+    """Absent or malformed offset lists still produce the configured current publication."""
+    monkeypatch.setattr(discovery, "_utc_now", lambda: dt.datetime(2026, 1, 31, tzinfo=dt.timezone.utc))
+    [target] = discovery._monthly_toc_targets(
+        SOURCE, URL, {"file_templates": [" ", "{month_start_compact}_index.json"], "month_offsets": offsets}
+    )
+    assert target.url == "https://adapter.example.invalid/landing/20260101_index.json"
+    assert target.metadata["month_start"] == "2026-01-01"
+    assert target.metadata["resolver"] == "monthly_toc"
+    assert target.metadata["target_max_bytes"] is None
+
+
+def test_monthly_toc_deduplicates_offsets_and_absolute_templates():
+    """Repeated configuration yields one target per publication across a year boundary."""
+    targets = discovery._monthly_toc_targets(
+        SOURCE,
+        URL,
+        {
+            "base_url": "https://files.example.invalid/",
+            "file_templates": ["{month_prefix}_index.json", "https://files.example.invalid/{month_prefix}_index.json"],
+            "month_offsets": ["invalid", 0, -1, -1],
+            "toc_max_bytes": "2 MB",
+        },
+        now=dt.datetime(2026, 1, 31),
+    )
+    assert [target.url for target in targets] == [
+        "https://files.example.invalid/2026-01_index.json",
+        "https://files.example.invalid/2025-12_index.json",
+    ]
+    assert [target.metadata["month_start"] for target in targets] == ["2026-01-01", "2025-12-01"]
+    assert all(target.metadata["target_max_bytes"] == 2_000_000 for target in targets)
+
+
+@pytest.mark.parametrize("offsets", [None, [], "invalid", ["invalid", 0, 0]])
+def test_issuer_monthly_toc_defaults_and_deduplicates(monkeypatch, offsets):
+    """Issuer TOCs tolerate invalid offsets and avoid duplicate suffix publications."""
+    monkeypatch.setattr(discovery, "_utc_now", lambda: dt.datetime(2026, 1, 31))
+    [target] = discovery._bcbsma_monthly_toc_targets(
+        SOURCE,
+        URL,
+        {"toc_suffixes": [" ", "-01_Example_index.json", "-01_Example_index.json"], "month_offsets": offsets},
+    )
+    assert target.url == "https://adapter.example.invalid/landing/2026-01-01_Example_index.json"
+    assert target.metadata["issuer_slug"] == "Example"
+    assert target.metadata["month_start"] == "2026-01-01"

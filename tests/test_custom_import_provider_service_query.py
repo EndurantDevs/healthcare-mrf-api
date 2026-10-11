@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -145,7 +146,8 @@ async def test_by_service_import_order_groups_then_joins_counts_and_pages(monkey
     _assert_imported_claims_sql(session.statements, direction)
 
 
-def test_membership_only_relation_uses_exists_without_duplicate_native_rows():
+@pytest.mark.parametrize("require_match", (False, True))
+def test_membership_only_relation_uses_exists_without_duplicate_native_rows(require_match):
     duplicate_npis = (
         select(literal("1000000001").label("entity_value"))
         .union_all(select(literal("1000000001").label("entity_value")))
@@ -159,13 +161,55 @@ def test_membership_only_relation_uses_exists_without_duplicate_native_rows():
     )
     relation = service_sql.compose_provider_service_claims_relation(
         select(literal(1000000001).label("npi")),
-        service_sql.ProviderServiceImportQuery(prepared, require_match=True),
+        service_sql.ProviderServiceImportQuery(prepared, require_match=require_match),
     )
 
     compiled = _compiled(relation.statement)
 
-    assert "EXISTS" in compiled
+    assert ("EXISTS" in compiled) is require_match
     assert "JOIN" not in compiled
+    assert ("custom_import_provider_service" in compiled) is require_match
+    assert relation.import_order_terms == ()
+
+
+@pytest.mark.parametrize("require_match", (False, True))
+def test_prepared_membership_overrides_caller_before_ordered_composition(require_match):
+    prepared = replace(_prepared(), effective_require_match=require_match)
+    context = service_sql.ProviderServiceImportQuery(prepared, require_match=not require_match)
+    relation = service_sql.compose_provider_service_claims_relation(select(literal(1000000001).label("npi")), context)
+
+    compiled = _compiled(relation.statement.order_by(*relation.import_order_terms))
+
+    assert context.require_match is require_match
+    assert "LEFT OUTER JOIN" in compiled
+    assert ("WHERE custom_import_provider_service.entity_value IS NOT NULL" in compiled) is require_match
+    assert "custom_import_provider_service.sort_0 DESC NULLS LAST" in compiled
+    assert compiled.endswith("native_provider_service.npi ASC")
+    assert "LIMIT" not in compiled and "OFFSET" not in compiled
+
+
+@pytest.mark.parametrize("prepared,require_match", ((None, True), (_prepared(), 1)))
+def test_import_context_rejects_untyped_query_inputs(prepared, require_match):
+    with pytest.raises(CustomImportReadUnavailableError, match="^provider-service import query is invalid$"):
+        service_sql.ProviderServiceImportQuery(prepared, require_match=require_match)
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    (
+        ("statement", None, "relation"),
+        ("query_fingerprint", "a" * 63, "query"),
+        ("authorization_scope_sha256", "B" * 64, "query"),
+        ("authorization_scope_sha256", None, "query"),
+        ("normalized_order_terms", [ReadOrderTerm("metric", "desc", "last")], "order"),
+        ("normalized_order_terms", (None,), "order"),
+    ),
+)
+def test_import_context_rejects_malformed_prepared_authority(field, value, message):
+    prepared = replace(_prepared(), **{field: value})
+
+    with pytest.raises(CustomImportReadUnavailableError, match=f"^provider-service import {message} is invalid$"):
+        service_sql.ProviderServiceImportQuery(prepared, require_match=True)
 
 
 def test_import_context_rejects_malformed_prepared_relation():
@@ -184,6 +228,7 @@ def test_import_context_rejects_malformed_prepared_relation():
     "statement",
     (
         select(literal("1000000001").label("entity_value")).limit(1),
+        select(literal("1000000001").label("entity_value")).offset(1),
         select(literal("1000000001").label("entity_value")).order_by(literal(1)),
     ),
 )
@@ -194,12 +239,33 @@ def test_import_context_rejects_paged_or_ordered_prepared_relation(statement):
         service_sql.ProviderServiceImportQuery(prepared, require_match=True)
 
 
-def test_claims_composition_rejects_paged_native_relation():
+@pytest.mark.parametrize(
+    "statement",
+    (
+        select(literal(1000000001).label("npi")).limit(1),
+        select(literal(1000000001).label("npi")).offset(1),
+        select(literal(1000000001).label("npi")).order_by(literal(1)),
+    ),
+)
+def test_claims_composition_rejects_paged_or_ordered_native_relation(statement):
     with pytest.raises(CustomImportReadUnavailableError, match="claims relation is not unpaged"):
         service_sql.compose_provider_service_claims_relation(
-            select(literal(1000000001).label("npi")).limit(1),
+            statement,
             service_sql.ProviderServiceImportQuery(_prepared(), require_match=True),
         )
+
+
+@pytest.mark.parametrize("statement", (None, select(literal(1000000001).label("not_an_npi"))))
+def test_claims_composition_rejects_malformed_native_relation(statement):
+    with pytest.raises(CustomImportReadUnavailableError, match="^provider-service claims relation is invalid$"):
+        service_sql.compose_provider_service_claims_relation(
+            statement, service_sql.ProviderServiceImportQuery(_prepared(), require_match=True)
+        )
+
+
+def test_claims_composition_rejects_substituted_import_context():
+    with pytest.raises(CustomImportReadUnavailableError, match="^provider-service import query is invalid$"):
+        service_sql.compose_provider_service_claims_relation(select(literal(1000000001).label("npi")), None)
 
 
 def test_claims_coordinate_eligibility_is_unpaged_and_preserves_exact_zip_union():

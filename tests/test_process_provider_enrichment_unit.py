@@ -406,3 +406,238 @@ async def test_run_nppes_gap_check_detects_medical_school(monkeypatch, tmp_path)
     assert report["checked"] is True
     assert "Provider Medical School Name" in report["medical_school_headers"]
     assert report["unmapped_field_count"] >= 1
+
+
+def _complete_source_catalogs():
+    catalog_map, resource_map = _latest_ffs_resource_catalogs()
+    for spec_key, title in (
+        ("hospital", "Hospital Enrollments"),
+        ("hha", "Home Health Agency Enrollments"),
+        ("hospice", "Hospice Enrollments"),
+        ("fqhc", "Federally Qualified Health Center Enrollments"),
+        ("rhc", "Rural Health Clinic Enrollments"),
+        ("snf", "Skilled Nursing Facility Enrollments"),
+    ):
+        catalog_map["dataset"].append(
+            {
+                "title": title,
+                "distribution": [
+                    {
+                        "title": f"{title} 2026",
+                        "downloadURL": f"https://example.com/{spec_key}.csv",
+                        "mediaType": "text/csv",
+                        "modified": "2026-02-01",
+                    }
+                ],
+            }
+        )
+    return catalog_map, resource_map
+
+
+@pytest.mark.asyncio
+async def test_strict_discovery_ignores_noise_and_duplicate_sources(monkeypatch):
+    catalog_map, resource_map = _complete_source_catalogs()
+    latest_distributions = catalog_map["dataset"][0]["distribution"]
+    latest_distributions[:0] = [None, {"description": "historical"}, {"description": "latest"}]
+    hospital_distributions = catalog_map["dataset"][1]["distribution"]
+    hospital_distributions.extend(
+        [
+            None,
+            {"mediaType": "text/csv"},
+            {"downloadURL": "https://example.com/hospital.pdf", "mediaType": "application/pdf"},
+            dict(hospital_distributions[0]),
+        ]
+    )
+    catalog_map["dataset"].extend([None, {}, {"title": "Monthly Enrollment"}])
+    resource_map["data"].extend(
+        [
+            None,
+            {"name": "Missing download"},
+            {"name": "Unregistered resource", "downloadURL": "https://example.com/unregistered.csv"},
+            dict(resource_map["data"][0]),
+        ]
+    )
+    download = AsyncMock(side_effect=[json.dumps(catalog_map), json.dumps(resource_map)])
+    monkeypatch.setattr(provider_enrichment, "download_it", download)
+    monkeypatch.setattr(provider_enrichment, "STRICT_SOURCE_PRESENCE", True)
+    monkeypatch.setattr(provider_enrichment, "INCLUDE_PROVIDER_ENRICHMENT_HISTORY", True)
+
+    discovered_sources, unmapped = await provider_enrichment._discover_sources(test_mode=False)
+
+    assert unmapped == []
+    assert len(discovered_sources) == 11
+    assert {source_map["spec_key"] for source_map in discovered_sources} == {
+        "ffs_public",
+        "ffs_additional_npi",
+        "ffs_reassignment",
+        "ffs_address",
+        "ffs_secondary_specialty",
+        "hospital",
+        "hha",
+        "hospice",
+        "fqhc",
+        "rhc",
+        "snf",
+    }
+    assert len({source_map["download_url"] for source_map in discovered_sources}) == 11
+    assert [call.args[0] for call in download.await_args_list] == [
+        provider_enrichment.CATALOG_URL,
+        "https://example.com/ffs-resources",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("datasets", "message"),
+    [
+        ([], "No FFS provider-enrollment dataset"),
+        ([{"title": "Medicare Fee-For-Service Public Provider Enrollment"}], "missing a latest resources API"),
+        (
+            [
+                {
+                    "title": "Medicare Fee-For-Service Public Provider Enrollment",
+                    "distribution": [None, {"description": "historical"}, {"description": "latest"}],
+                }
+            ],
+            "missing a latest resources API",
+        ),
+    ],
+)
+async def test_strict_discovery_requires_a_latest_resource_api(monkeypatch, datasets, message):
+    download = AsyncMock(return_value=json.dumps({"dataset": datasets}))
+    monkeypatch.setattr(provider_enrichment, "download_it", download)
+    monkeypatch.setattr(provider_enrichment, "STRICT_SOURCE_PRESENCE", True)
+
+    with pytest.raises(RuntimeError, match=message):
+        await provider_enrichment._discover_sources(test_mode=False)
+
+    download.assert_awaited_once_with(provider_enrichment.CATALOG_URL)
+
+
+@pytest.mark.asyncio
+async def test_optional_discovery_skips_bundle_without_resource_api(monkeypatch):
+    catalog_map, _ = _latest_ffs_resource_catalogs()
+    catalog_map["dataset"][0]["distribution"][0].pop("resourcesAPI")
+    download = AsyncMock(return_value=json.dumps(catalog_map))
+    monkeypatch.setattr(provider_enrichment, "download_it", download)
+    monkeypatch.setattr(provider_enrichment, "STRICT_SOURCE_PRESENCE", False)
+
+    assert await provider_enrichment._discover_sources(test_mode=False) == ([], [])
+
+    download.assert_awaited_once_with(provider_enrichment.CATALOG_URL)
+
+
+@pytest.mark.asyncio
+async def test_strict_discovery_rejects_incomplete_subfile_bundle(monkeypatch):
+    catalog_map, resource_map = _complete_source_catalogs()
+    resource_map["data"].pop(3)
+    download = AsyncMock(side_effect=[json.dumps(catalog_map), json.dumps(resource_map)])
+    monkeypatch.setattr(provider_enrichment, "download_it", download)
+    monkeypatch.setattr(provider_enrichment, "STRICT_SOURCE_PRESENCE", True)
+
+    with pytest.raises(RuntimeError, match="missing required CSV files: ffs_address"):
+        await provider_enrichment._discover_sources(test_mode=False)
+
+    assert download.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remove_dataset", "message"),
+    [
+        (True, "No sources discovered for registered dataset 'Hospital Enrollments'"),
+        (False, "Registered provider-enrichment dataset has no CSV distributions: Hospital Enrollments"),
+    ],
+)
+async def test_strict_discovery_requires_each_registered_catalog(monkeypatch, remove_dataset, message):
+    catalog_map, resource_map = _complete_source_catalogs()
+    if remove_dataset:
+        catalog_map["dataset"].pop(1)
+    else:
+        catalog_map["dataset"][1]["distribution"] = []
+    download = AsyncMock(side_effect=[json.dumps(catalog_map), json.dumps(resource_map)])
+    monkeypatch.setattr(provider_enrichment, "download_it", download)
+    monkeypatch.setattr(provider_enrichment, "STRICT_SOURCE_PRESENCE", True)
+
+    with pytest.raises(RuntimeError, match=message):
+        await provider_enrichment._discover_sources(test_mode=False)
+
+    assert download.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("archive_members", "expected_error"),
+    [
+        ({"readme.txt": "No provider rows"}, "npidata_pfile*.csv was not found"),
+        ({"npidata_pfile_sample.csv": ""}, None),
+        (None, "File is not a zip file"),
+    ],
+)
+async def test_nppes_archive_boundaries_remove_downloaded_files(monkeypatch, tmp_path, archive_members, expected_error):
+    zip_name = "NPPES_Data_Dissemination_20260101_V2.zip"
+    archive_path = tmp_path / zip_name
+    if archive_members is None:
+        archive_path.write_bytes(b"not a ZIP archive")
+    else:
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            for member_name, content in archive_members.items():
+                archive.writestr(member_name, content)
+    downloaded_paths = []
+
+    async def copy_archive(url, target_path):
+        assert url == f"https://example.com/{zip_name}"
+        downloaded_paths.append(Path(target_path))
+        shutil.copyfile(archive_path, target_path)
+
+    monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_DIR", "https://example.com/")
+    monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_FILE", "index.html")
+    monkeypatch.setattr(provider_enrichment, "download_it", AsyncMock(return_value=f'<a href="{zip_name}">ZIP</a>'))
+    monkeypatch.setattr(provider_enrichment, "_download_source", copy_archive)
+    context_map = {"context": {}}
+
+    report = await provider_enrichment._run_nppes_gap_check(context_map)
+
+    assert report["source_zip"] == zip_name
+    assert report["checked"] is (expected_error is None)
+    assert len(downloaded_paths) == 1
+    assert not downloaded_paths[0].exists()
+    assert not downloaded_paths[0].parent.exists()
+    if expected_error is None:
+        assert report["error"] is None
+        assert report["unmapped_fields"] == []
+        assert report["medical_school_headers"] == []
+        assert context_map["context"]["audit"]["nppes_gap_report"] is report
+    else:
+        assert expected_error in report["error"]
+
+
+@pytest.mark.asyncio
+async def test_nppes_listing_without_archives_does_not_download(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_DIR", "https://example.com/")
+    monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_FILE", "index.html")
+    listing_download = AsyncMock(return_value="<html>No archives available</html>")
+    archive_download = AsyncMock()
+    monkeypatch.setattr(provider_enrichment, "download_it", listing_download)
+    monkeypatch.setattr(provider_enrichment, "_download_source", archive_download)
+
+    report = await provider_enrichment._run_nppes_gap_check({"context": {}})
+
+    assert report["checked"] is False
+    assert report["error"] == "no NPPES dissemination zip links found"
+    listing_download.assert_awaited_once_with("https://example.com/index.html")
+    archive_download.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nppes_audit_without_configuration_does_not_fetch(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_NPPES_DOWNLOAD_URL_DIR", raising=False)
+    monkeypatch.delenv("HLTHPRT_NPPES_DOWNLOAD_URL_FILE", raising=False)
+    download = AsyncMock()
+    monkeypatch.setattr(provider_enrichment, "download_it", download)
+
+    report = await provider_enrichment._run_nppes_gap_check({"context": {}})
+
+    assert report["checked"] is False
+    assert "are not configured" in report["error"]
+    download.assert_not_awaited()

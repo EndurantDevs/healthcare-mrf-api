@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from io import BytesIO
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import jwt
 import pyarrow as pa
@@ -787,6 +788,114 @@ def test_adapter_fetches_legacy_single_stream_reads(monkeypatch, credentials):
     result.close()
     assert cursor.executed == ["USE SECONDARY ROLES NONE", _legacy_statement().sql]
     assert cursor.closed and connection.closed
+
+
+@pytest.mark.parametrize("method", ("fetch_parquet", "open_bundle_landing"))
+@pytest.mark.parametrize("error_type", (RuntimeError, CancelledError))
+def test_open_failure_preserves_error_and_closes_owned_resources(monkeypatch, credentials, method, error_type):
+    cursor = _Cursor(())
+    connection, _arguments = _connect(monkeypatch, cursor)
+    failure = error_type("synthetic source-open failure")
+    execute = cursor.execute
+
+    def fail_select(sql):
+        if sql.startswith("USE "):
+            return execute(sql)
+        raise failure
+
+    monkeypatch.setattr(cursor, "execute", fail_select)
+    adapter = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh")
+    statement = _legacy_statement() if method == "fetch_parquet" else _bundle_statement()
+    options = (
+        {}
+        if method == "fetch_parquet"
+        else {
+            "part_limits": CaptureLimits(),
+            "maximum_part_arrow_bytes": 1024 * 1024,
+            "timeout_seconds": 17,
+        }
+    )
+    expected = CancelledError if error_type is CancelledError else SnowflakeConnectorError
+
+    with pytest.raises(expected) as caught:
+        getattr(adapter, method)(statement, credentials, **options)
+
+    if error_type is CancelledError:
+        assert caught.value is failure
+    else:
+        assert caught.value.__cause__ is failure
+        assert str(caught.value) == (
+            "Snowflake read failed" if method == "fetch_parquet" else "Snowflake bundle landing read failed"
+        )
+    assert cursor.closed and connection.closed
+
+
+@pytest.mark.parametrize("invalid_field", ("statement", "credentials"))
+def test_landing_contract_rejection_precedes_connection(monkeypatch, credentials, invalid_field):
+    adapter = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh")
+    connect = Mock(side_effect=AssertionError("invalid landing must not open a connection"))
+    monkeypatch.setattr(adapter, "_connect", connect)
+
+    with pytest.raises((SnowflakeConnectorError, SnowflakeCredentialError)):
+        adapter.open_bundle_landing(
+            None if invalid_field == "statement" else _bundle_statement(),
+            None if invalid_field == "credentials" else credentials,
+            part_limits=CaptureLimits(),
+            maximum_part_arrow_bytes=1024 * 1024,
+            timeout_seconds=17,
+        )
+
+    connect.assert_not_called()
+
+
+@pytest.mark.parametrize("error_type", (SnowflakeConnectorError, RuntimeError))
+def test_legacy_fetch_failure_closes_without_replacing_primary(monkeypatch, credentials, error_type):
+    cursor = _Cursor((), description=(_Metadata("npi", "TEXT", False),))
+    connection, _arguments = _connect(monkeypatch, cursor)
+    result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_parquet(
+        _legacy_statement(), credentials
+    )
+    failure = error_type("synthetic fetch failure")
+    monkeypatch.setattr(cursor, "fetchone", Mock(side_effect=failure))
+    with pytest.raises(SnowflakeConnectorError) as caught:
+        next(result.consume_partition_sources())
+
+    assert (caught.value if error_type is SnowflakeConnectorError else caught.value.__cause__) is failure
+    assert cursor.closed and connection.closed
+    result.close()
+
+
+def test_legacy_byte_boundary_carries_one_unread_row_without_loss(monkeypatch):
+    schema = (SnowflakeResultColumn(field_id="npi", source_type="TEXT", nullable=False),)
+    cursor = _Cursor((("first",), ("second",)))
+    connection = _Connection(cursor)
+    sources = snowflake_python._SnowflakeParquetPartitionSources(
+        connection=connection, cursor=cursor, result_schema=schema
+    )
+    bound = snowflake_python._fixed_batch_bytes(schema, 1) + len("second")
+    monkeypatch.setattr(snowflake_python, "MAX_RESULT_PARTITION_BYTES", bound)
+    try:
+        first, pending, exhausted = sources._next_partition_rows(None)
+        assert first == [("first",)] and pending == ("second",) and not exhausted
+        assert cursor.fetch_count == 2
+        second, pending, exhausted = sources._next_partition_rows(pending)
+        assert second == [("second",)] and pending is None and exhausted
+    finally:
+        sources.close()
+
+    assert cursor.fetch_count == 3 and cursor.closed and connection.closed
+
+
+@pytest.mark.parametrize("value", (Decimal("NaN"), Decimal("1e30"), True))
+def test_invalid_converted_real_is_rejected_before_arrow_allocation(monkeypatch, value):
+    column = SnowflakeResultColumn(field_id="amount", source_type="REAL", nullable=False)
+    allocate = Mock(side_effect=AssertionError("invalid converted decimal must not allocate Arrow buffers"))
+    monkeypatch.setattr(snowflake_python.pa, "array", allocate)
+
+    with pytest.raises(SnowflakeConnectorError, match="converted REAL result is invalid"):
+        snowflake_python._parquet_reader(((value,),), (column,))
+
+    allocate.assert_not_called()
 
 
 def test_adapter_wraps_invalid_private_key_material(monkeypatch):

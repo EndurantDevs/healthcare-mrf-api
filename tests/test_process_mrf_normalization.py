@@ -1,17 +1,17 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import csv
 import datetime
+import importlib
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import importlib
-import os
-
-from asyncpg.exceptions import DeadlockDetectedError
 import pytest
+from asyncpg.exceptions import DeadlockDetectedError
 from sqlalchemy import BigInteger
 
 os.environ.setdefault("HLTHPRT_REDIS_ADDRESS", "redis://localhost")
@@ -20,6 +20,7 @@ process_pkg = importlib.import_module("process")
 process_initial = importlib.import_module("process.initial")
 process_npi = importlib.import_module("process.npi")
 utils_module = importlib.import_module("process.ext.utils")
+
 
 def test_parallel_download_disabled_host_matching(monkeypatch):
     monkeypatch.setenv(
@@ -30,12 +31,8 @@ def test_parallel_download_disabled_host_matching(monkeypatch):
     assert utils_module._parallel_download_disabled_for_url(
         "https://www22.elevancehealth.com/cms/PROVIDERS_TX_2_OF_2.json"
     )
-    assert utils_module._parallel_download_disabled_for_url(
-        "https://files.blocked.example/provider.json"
-    )
-    assert not utils_module._parallel_download_disabled_for_url(
-        "https://www.example.com/provider.json"
-    )
+    assert utils_module._parallel_download_disabled_for_url("https://files.blocked.example/provider.json")
+    assert not utils_module._parallel_download_disabled_for_url("https://www.example.com/provider.json")
 
 
 def test_extract_plan_years_from_years_array():
@@ -394,3 +391,103 @@ async def test_save_mrf_data_skips_mrf_address_aggregate_ingest(monkeypatch):
     )
 
     assert calls == [("mrf_address_evidence_20260612", [{"evidence_checksum": 2}], {})]
+
+
+def _write_identity_csv(path, fields, rows):
+    with path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    ("fields", "rows", "issuer_field", "summary_field"),
+    [
+        (
+            ["STANDARD COMPONENT ID", "PLAN ID"],
+            [{"STANDARD COMPONENT ID": "12345AA0000001", "PLAN ID": "12345AA0000001-00"}],
+            "ISSUER ID",
+            "URL FOR SUMMARY OF BENEFITS COVERAGE",
+        ),
+        (
+            ["StandardComponentId", "PlanId"],
+            [{"StandardComponentId": "12345AA0000001", "PlanId": ""}],
+            "IssuerId",
+            "UrlForSummaryOfBenefitsCoverage",
+        ),
+        (["STANDARD COMPONENT ID", "PLAN ID"], [], "ISSUER ID", "URL FOR SUMMARY OF BENEFITS COVERAGE"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_state_attribute_headers_are_resolved_from_actual_csv(
+    tmp_path, fields, rows, issuer_field, summary_field
+):
+    path = _write_identity_csv(tmp_path / "attributes.csv", fields, rows)
+
+    field_map = await process_initial._state_attribute_field_name_map(path)
+
+    assert len(field_map) == 12
+    assert field_map["ISSUER ID"] == issuer_field
+    assert field_map["URL FOR SUMMARY OF BENEFITS COVERAGE"] == summary_field
+
+
+@pytest.mark.parametrize("row_limit", [None, 1, 3])
+@pytest.mark.asyncio
+async def test_rate_review_csv_names_are_normalized_and_limits_count_rows(tmp_path, row_limit):
+    fields = ["ISSUER_ID", "STATE", "COMPANY", "IGNORED"]
+    first = _write_identity_csv(
+        tmp_path / "first.csv",
+        fields,
+        [
+            {"ISSUER_ID": "12345", "STATE": "aa", "COMPANY": " Original, Issuer ", "IGNORED": "extra"},
+            {"ISSUER_ID": "23456", "STATE": "bb", "COMPANY": " ", "IGNORED": ""},
+        ],
+    )
+    second = _write_identity_csv(
+        tmp_path / "second.csv",
+        fields,
+        [
+            {"ISSUER_ID": "12345", "STATE": "cc", "COMPANY": " Updated Issuer ", "IGNORED": ""},
+            {"ISSUER_ID": "34567", "STATE": "dd", "COMPANY": "Third Issuer", "IGNORED": ""},
+        ],
+    )
+
+    issuers, count = await process_initial._read_rate_review_issuer_names([first, second], row_limit)
+
+    assert count == (4 if row_limit is None else row_limit)
+    assert issuers[12345] == {
+        "state": "AA" if row_limit == 1 else "CC",
+        "issuer_id": 12345,
+        "mrf_url": "",
+        "data_contact_email": "",
+        "issuer_marketing_name": "",
+        "issuer_name": "Original, Issuer" if row_limit == 1 else "Updated Issuer",
+    }
+    assert set(issuers) == ({12345} if row_limit == 1 else {12345, 23456} if row_limit == 3 else {12345, 23456, 34567})
+    if row_limit != 1:
+        assert issuers[23456]["issuer_name"] == "23456"
+
+
+@pytest.mark.parametrize(
+    ("content", "error"),
+    [
+        ("STATE,COMPANY\naa,Issuer\n", KeyError),
+        ("ISSUER_ID,STATE,COMPANY\ninvalid,aa,Issuer\n", ValueError),
+        ("ISSUER_ID,STATE,COMPANY\n12345,aa\n", AttributeError),
+    ],
+)
+@pytest.mark.asyncio
+async def test_rate_review_csv_rejects_malformed_required_fields(tmp_path, content, error):
+    path = tmp_path / "malformed.csv"
+    path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(error):
+        await process_initial._read_rate_review_issuer_names([str(path)], None)
+
+
+@pytest.mark.asyncio
+async def test_rate_review_csv_empty_sources_have_no_identity_rows(tmp_path):
+    path = _write_identity_csv(tmp_path / "empty.csv", ["ISSUER_ID", "STATE", "COMPANY"], [])
+    assert await process_initial._read_rate_review_issuer_names([], None) == ({}, 0)
+    assert await process_initial._read_rate_review_issuer_names([path], None) == ({}, 0)

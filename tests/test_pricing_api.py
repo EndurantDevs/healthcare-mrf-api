@@ -16,8 +16,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sanic import Sanic
 from sanic.request import RequestParameters
 
-from api import ptg2_capacity_evidence as capacity_evidence
 from api import plan_release_serving
+from api import ptg2_capacity_evidence as capacity_evidence
+from api.provider_service_code_coverage import provider_service_code_coverage
 from api.ptg2_address_policy import postal_box_address_sql
 from api.ptg2_candidate_audit import (
     PTG2_CANDIDATE_AUDIT_ACCESS_ARG,
@@ -25,7 +26,6 @@ from api.ptg2_candidate_audit import (
 )
 from api.ptg2_rate_option_refs import encode_rate_option_ref
 from api.ptg2_serving import PTG2LocationScopeError
-from api.provider_service_code_coverage import provider_service_code_coverage
 from process.terminology_synonyms import _procedure_rows
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "api" / "endpoint" / "pricing.py"
@@ -36,9 +36,7 @@ MODULE_SPEC.loader.exec_module(pricing_module)
 
 get_provider_procedure = pricing_module.get_provider_procedure
 get_pricing_provider = pricing_module.get_pricing_provider
-get_provider_procedure_estimated_cost_level_internal = (
-    pricing_module.get_provider_procedure_cost_level
-)
+get_provider_procedure_estimated_cost_level_internal = pricing_module.get_provider_procedure_cost_level
 get_procedure_benchmarks = pricing_module.get_procedure_benchmarks
 get_procedure_geo_benchmarks = pricing_module.get_procedure_geo_benchmarks
 get_provider_prescription = pricing_module.get_provider_prescription
@@ -113,14 +111,9 @@ def test_provider_type_autocomplete_items_deduplicate_and_rank():
         },
     ]
 
-    provider_type_items = pricing_module._provider_type_autocomplete_items(
-        provider_type_rows
-    )
+    provider_type_items = pricing_module._provider_type_autocomplete_items(provider_type_rows)
 
-    assert [
-        provider_type_item["target_code"]
-        for provider_type_item in provider_type_items
-    ] == [
+    assert [provider_type_item["target_code"] for provider_type_item in provider_type_items] == [
         "family",
         "neutral-code",
     ]
@@ -131,9 +124,7 @@ def test_provider_type_autocomplete_items_deduplicate_and_rank():
 
 
 def test_allowed_amount_response_filters_preserve_numeric_zero():
-    filters_by_name = pricing_module._allowed_amount_response_filters(
-        {"lat": 0.0, "long": 0.0, "radius_miles": 0.0}
-    )
+    filters_by_name = pricing_module._allowed_amount_response_filters({"lat": 0.0, "long": 0.0, "radius_miles": 0.0})
 
     assert filters_by_name["lat"] == 0.0
     assert filters_by_name["long"] == 0.0
@@ -292,9 +283,7 @@ def _autocomplete_prescription_row(total=1):
     }
 
 
-async def _synthetic_em_scope_search(
-    _session, args_by_name, _pagination, **_kwargs
-):
+async def _synthetic_em_scope_search(_session, args_by_name, _pagination, **_kwargs):
     if (
         not pricing_module._parse_bool(
             args_by_name.get("include_providers"),
@@ -316,9 +305,7 @@ async def _synthetic_em_scope_search(
     }
 
 
-async def _synthetic_legacy_distance_scope_search(
-    _session, args_by_name, _pagination, **_kwargs
-):
+async def _synthetic_legacy_distance_scope_search(_session, args_by_name, _pagination, **_kwargs):
     """Accept only the complete legacy ascending-distance retry."""
 
     if (
@@ -693,11 +680,15 @@ async def test_plan_scoped_search_resolves_dynamic_specialty_without_legacy_cach
     monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
     request = make_request(
         [
-            FakeResult(rows=[{
-                "target_system": "NUCC",
-                "target_code": "2085R0202X",
-                "metadata_json": None,
-            }]),
+            FakeResult(
+                rows=[
+                    {
+                        "target_system": "NUCC",
+                        "target_code": "2085R0202X",
+                        "metadata_json": None,
+                    }
+                ]
+            ),
         ],
         args={
             "plan_id": "TESTPLAN001",
@@ -1025,15 +1016,10 @@ async def fake_adversarial_serving_tables(_session, snapshot_id):
 
 def adversarial_provider_pages(cursor, limit):
     eligible_streams = [
-        [npi for npi in provider_stream if npi > cursor]
-        for provider_stream in ADVERSARIAL_PROVIDER_STREAMS
+        [npi for npi in provider_stream if npi > cursor] for provider_stream in ADVERSARIAL_PROVIDER_STREAMS
     ]
     unbounded_page = sorted(set().union(*map(set, eligible_streams)))[:limit]
-    bounded_page = sorted(
-        set().union(
-            *(set(eligible_stream[:limit]) for eligible_stream in eligible_streams)
-        )
-    )[:limit]
+    bounded_page = sorted(set().union(*(set(eligible_stream[:limit]) for eligible_stream in eligible_streams)))[:limit]
     return bounded_page, unbounded_page
 
 
@@ -1045,11 +1031,15 @@ async def test_group_plan_provider_stream_limits_preserve_distinct_page_and_tota
     cursor = 1000000001
     limit = 3
     bounded_page, unbounded_page = adversarial_provider_pages(cursor, limit)
-    assert bounded_page == unbounded_page == [
-        1000000002,
-        1000000003,
-        1000000004,
-    ]
+    assert (
+        bounded_page
+        == unbounded_page
+        == [
+            1000000002,
+            1000000003,
+            1000000004,
+        ]
+    )
 
     monkeypatch.setattr(
         pricing_module,
@@ -1063,12 +1053,8 @@ async def test_group_plan_provider_stream_limits_preserve_distinct_page_and_tota
     )
     request = make_request(
         [
-            FakeResult(
-                rows=[types.SimpleNamespace(npi=npi) for npi in bounded_page]
-            ),
-            FakeResult(
-                scalar=len(set().union(*map(set, ADVERSARIAL_PROVIDER_STREAMS)))
-            ),
+            FakeResult(rows=[types.SimpleNamespace(npi=npi) for npi in bounded_page]),
+            FakeResult(scalar=len(set().union(*map(set, ADVERSARIAL_PROVIDER_STREAMS)))),
         ],
         args={
             "plan_id": "TESTPLAN001",
@@ -1082,9 +1068,7 @@ async def test_group_plan_provider_stream_limits_preserve_distinct_page_and_tota
 
     response_payload = json.loads((await group_plan_providers(request)).body)
 
-    assert [
-        provider["npi"] for provider in response_payload["providers"]["items"]
-    ] == bounded_page
+    assert [provider["npi"] for provider in response_payload["providers"]["items"]] == bounded_page
     assert response_payload["providers"]["total_distinct"] == 9
     page_sql = str(request.ctx.sa_session.executions[0][0][0])
     count_sql = str(request.ctx.sa_session.executions[1][0][0])
@@ -1184,18 +1168,12 @@ def _configure_canonical_directory(monkeypatch, selection, tables_by_snapshot_id
     monkeypatch.setattr(
         pricing_module,
         "snapshot_serving_tables",
-        AsyncMock(
-            side_effect=lambda _session, snapshot_id: (
-                tables_by_snapshot_id[snapshot_id]
-            )
-        ),
+        AsyncMock(side_effect=lambda _session, snapshot_id: tables_by_snapshot_id[snapshot_id]),
     )
     monkeypatch.setattr(
         pricing_module,
         "_group_plan_provider_address_source",
-        AsyncMock(
-            return_value=("mrf.entity_address_unified", True, True, True)
-        ),
+        AsyncMock(return_value=("mrf.entity_address_unified", True, True, True)),
     )
 
 
@@ -1312,13 +1290,15 @@ async def test_canonical_group_directory_fails_closed_on_scope_mismatch(
     monkeypatch.setattr(
         pricing_module,
         "snapshot_serving_tables",
-        AsyncMock(return_value=types.SimpleNamespace(
-            uses_shared_blocks=True,
-            shared_snapshot_key=71,
-            plan_id="ANOTHER-PLAN",
-            plan_market_type="group",
-            source_key="aetna-a",
-        )),
+        AsyncMock(
+            return_value=types.SimpleNamespace(
+                uses_shared_blocks=True,
+                shared_snapshot_key=71,
+                plan_id="ANOTHER-PLAN",
+                plan_market_type="group",
+                source_key="aetna-a",
+            )
+        ),
     )
     request = make_request(
         [],
@@ -1340,18 +1320,14 @@ async def test_unknown_canonical_group_release_stays_unresolved(monkeypatch):
         AsyncMock(return_value=None),
     )
     release_id = "hprelease_" + "0" * 26
-    response = await group_plan_providers(
-        make_request([], args={"plan_release_id": release_id})
-    )
+    response = await group_plan_providers(make_request([], args={"plan_release_id": release_id}))
     response_by_field = json.loads(response.body)
 
     assert response_by_field["resolved"] is False
     assert response_by_field["plan_release_id"] == release_id
     assert "healthporta_plan_id" not in response_by_field
     assert response_by_field["providers"]["items"] == []
-    assert response_by_field["reason"] == (
-        "no complete published serving revision for this plan_release_id"
-    )
+    assert response_by_field["reason"] == ("no complete published serving revision for this plan_release_id")
 
 
 @pytest.mark.asyncio
@@ -1372,11 +1348,13 @@ async def test_group_plan_providers_splits_multi_network_postal_scans(monkeypatc
     monkeypatch.setattr(pricing_module, "_zip_radius_rows", fake_postal_radius_rows)
     request = make_request(
         [
-            FakeResult(rows=[
-                types.SimpleNamespace(npi=1003000126),
-                types.SimpleNamespace(npi=1073913877),
-                types.SimpleNamespace(npi=1234567890),
-            ]),
+            FakeResult(
+                rows=[
+                    types.SimpleNamespace(npi=1003000126),
+                    types.SimpleNamespace(npi=1073913877),
+                    types.SimpleNamespace(npi=1234567890),
+                ]
+            ),
             FakeResult(rows=[]),
         ],
         args={
@@ -1412,6 +1390,7 @@ async def test_group_plan_providers_splits_multi_network_postal_scans(monkeypatc
 @pytest.mark.asyncio
 async def test_group_plan_providers_uses_unified_service_locations_when_configured(monkeypatch):
     """Unified address serving should use service-location rows for group-plan filters."""
+
     async def fake_group_plan_provider_address_source(_session):
         return "mrf.entity_address_unified", True, True, True
 
@@ -1453,10 +1432,8 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
             "limit": "10",
         },
     )
-
     response = await group_plan_providers(request)
     pricing_response = json.loads(response.body)
-
     assert pricing_response["providers"]["items"][0]["address"] == {
         "type": "practice",
         "first_line": "2335 S MICHIGAN AVE",
@@ -1811,9 +1788,7 @@ async def test_get_pricing_provider_score_success():
         [
             FakeResult(scalar="mrf.pricing_provider_quality_score"),
             FakeResult(scalar="mrf.pricing_provider_quality_domain"),
-            FakeResult(
-                rows=[_pricing_score_primary_row(), *_pricing_score_alternate_rows()]
-            ),
+            FakeResult(rows=[_pricing_score_primary_row(), *_pricing_score_alternate_rows()]),
             FakeResult(rows=_pricing_score_domain_rows()),
         ],
         args={"year": "2023", "benchmark_mode": "national"},
@@ -1847,9 +1822,7 @@ async def test_quality_peer_targets_preserve_scoped_and_unscoped_fallbacks():
     )
 
     assert peer_targets == [peer_target_by_field]
-    executed_sql_statements = [
-        str(args[0]) for args, _kwargs in session.executions
-    ]
+    executed_sql_statements = [str(args[0]) for args, _kwargs in session.executions]
     assert len(executed_sql_statements) == 3
     assert "UNION ALL" in executed_sql_statements[0]
     assert "geography_scope IS NULL" in executed_sql_statements[1]
@@ -1969,9 +1942,7 @@ def _live_override_request(*, cohort_rows=None, benchmark_mode="zip"):
     if benchmark_mode is not None:
         request_args_map["benchmark_mode"] = benchmark_mode
     return make_request(
-        _live_override_results(
-            cohort_rows=cohort_rows or [_live_override_cohort_row()]
-        ),
+        _live_override_results(cohort_rows=cohort_rows or [_live_override_cohort_row()]),
         args=request_args_map,
     )
 
@@ -2249,45 +2220,45 @@ async def test_get_pricing_provider_score_unavailable_when_profile_is_insufficie
 
 def _provider_score_variant_cohort_rows():
     return [
-                _live_override_cohort_row(
-                    target_appropriateness=2.0,
-                    target_cost=24500.0,
-                ),
-                _live_override_cohort_row(
-                    geography_scope="state",
-                    geography_value="MD",
-                    cohort_level="L1",
-                    peer_count=90,
-                    target_appropriateness=2.1,
-                    target_rx_appropriateness=2.1,
-                    target_effectiveness=81.0,
-                    target_qpp_cost=71.0,
-                    target_cost=25000.0,
-                ),
-                _live_override_cohort_row(
-                    benchmark_mode="state",
-                    geography_scope="state",
-                    geography_value="MD",
-                    cohort_level="L1",
-                    peer_count=130,
-                    target_appropriateness=2.1,
-                    target_rx_appropriateness=2.2,
-                    target_effectiveness=81.0,
-                    target_qpp_cost=72.0,
-                    target_cost=25000.0,
-                ),
-                _live_override_cohort_row(
-                    benchmark_mode="national",
-                    geography_scope="national",
-                    geography_value="US",
-                    cohort_level="L2",
-                    peer_count=500,
-                    target_appropriateness=2.2,
-                    target_rx_appropriateness=2.1,
-                    target_effectiveness=82.0,
-                    target_qpp_cost=71.0,
-                    target_cost=25500.0,
-                ),
+        _live_override_cohort_row(
+            target_appropriateness=2.0,
+            target_cost=24500.0,
+        ),
+        _live_override_cohort_row(
+            geography_scope="state",
+            geography_value="MD",
+            cohort_level="L1",
+            peer_count=90,
+            target_appropriateness=2.1,
+            target_rx_appropriateness=2.1,
+            target_effectiveness=81.0,
+            target_qpp_cost=71.0,
+            target_cost=25000.0,
+        ),
+        _live_override_cohort_row(
+            benchmark_mode="state",
+            geography_scope="state",
+            geography_value="MD",
+            cohort_level="L1",
+            peer_count=130,
+            target_appropriateness=2.1,
+            target_rx_appropriateness=2.2,
+            target_effectiveness=81.0,
+            target_qpp_cost=72.0,
+            target_cost=25000.0,
+        ),
+        _live_override_cohort_row(
+            benchmark_mode="national",
+            geography_scope="national",
+            geography_value="US",
+            cohort_level="L2",
+            peer_count=500,
+            target_appropriateness=2.2,
+            target_rx_appropriateness=2.1,
+            target_effectiveness=82.0,
+            target_qpp_cost=71.0,
+            target_cost=25500.0,
+        ),
     ]
 
 
@@ -2455,7 +2426,7 @@ async def test_get_provider_prescription_success():
                         "total_drug_cost": 600.0,
                     }
                 ]
-            )
+            ),
         ],
         args={"year": "2023"},
     )
@@ -2722,9 +2693,7 @@ async def test_autocomplete_procedures_falls_back_to_token_terminology(
         if terminology_row["term_key"] == "knee surgery"
         and terminology_row["target_code"] in {"27445", "27446", "27447"}
     ]
-    terminology_query = AsyncMock(
-        return_value=terminology_rows
-    )
+    terminology_query = AsyncMock(return_value=terminology_rows)
     monkeypatch.setattr(
         pricing_module,
         "_query_procedure_autocomplete_terminology",
@@ -2736,19 +2705,13 @@ async def test_autocomplete_procedures_falls_back_to_token_terminology(
     )
 
     pricing_response = json.loads((await autocomplete_procedures(request)).body)
-    returned_codes = [
-        code["code"]
-        for procedure_item in pricing_response["items"]
-        for code in procedure_item["codes"]
-    ]
+    returned_codes = [code["code"] for procedure_item in pricing_response["items"] for code in procedure_item["codes"]]
 
     assert expected_codes <= set(returned_codes)
     assert set(returned_codes[:3]) == {"27445", "27446", "27447"}
     terminology_query.assert_awaited_once()
     assert len(request.ctx.sa_session.executions) == 1
-    assert "matched_source AS MATERIALIZED" in str(
-        request.ctx.sa_session.executions[0][0][0]
-    )
+    assert "matched_source AS MATERIALIZED" in str(request.ctx.sa_session.executions[0][0][0])
 
 
 @pytest.mark.asyncio
@@ -2871,28 +2834,37 @@ async def test_procedure_autocomplete_terminology_edge_paths(monkeypatch):
     query_terminology = AsyncMock(return_value=terminology_rows)
     monkeypatch.setattr(pricing_module, "_query_terminology", query_terminology)
 
-    assert await pricing_module._query_procedure_autocomplete_terminology(
-        FakeSession(),
-        search_query="knee replacement",
-        target_systems=None,
-        full_phrase_only=True,
-        limit=50,
-    ) == terminology_rows
-    assert await pricing_module._query_procedure_autocomplete_terminology(
-        FakeSession(), search_query="of the", target_systems=None, limit=50
-    ) == []
+    assert (
+        await pricing_module._query_procedure_autocomplete_terminology(
+            FakeSession(),
+            search_query="knee replacement",
+            target_systems=None,
+            full_phrase_only=True,
+            limit=50,
+        )
+        == terminology_rows
+    )
+    assert (
+        await pricing_module._query_procedure_autocomplete_terminology(
+            FakeSession(), search_query="of the", target_systems=None, limit=50
+        )
+        == []
+    )
 
     monkeypatch.setattr(
         pricing_module,
         "_is_terminology_available",
         AsyncMock(return_value=False),
     )
-    assert await pricing_module._query_procedure_autocomplete_terminology(
-        FakeSession(),
-        search_query="knee arthroplasty",
-        target_systems=None,
-        limit=50,
-    ) is None
+    assert (
+        await pricing_module._query_procedure_autocomplete_terminology(
+            FakeSession(),
+            search_query="knee arthroplasty",
+            target_systems=None,
+            limit=50,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -2970,11 +2942,7 @@ async def test_autocomplete_procedures_returns_complete_curated_knee_aliases(
         "29888": "Repair of anterior cruciate ligament of knee using an endoscope",
         "29889": "Repair of posterior cruciate ligament of knee using an endoscope",
     }
-    alias_rows = [
-        procedure_row
-        for procedure_row in _procedure_rows()
-        if procedure_row["term_key"] == query
-    ]
+    alias_rows = [procedure_row for procedure_row in _procedure_rows() if procedure_row["term_key"] == query]
     terminology_query = AsyncMock(return_value=alias_rows)
     monkeypatch.setattr(
         pricing_module,
@@ -2988,11 +2956,7 @@ async def test_autocomplete_procedures_returns_complete_curated_knee_aliases(
 
     response = await autocomplete_procedures(request)
     pricing_response = json.loads(response.body)
-    returned_codes = {
-        code["code"]
-        for procedure_item in pricing_response["items"]
-        for code in procedure_item["codes"]
-    }
+    returned_codes = {code["code"] for procedure_item in pricing_response["items"] for code in procedure_item["codes"]}
     returned_terms_by_code = {
         code["code"]: procedure_item["term"]
         for procedure_item in pricing_response["items"]
@@ -3000,9 +2964,7 @@ async def test_autocomplete_procedures_returns_complete_curated_knee_aliases(
     }
 
     assert returned_codes == expected_codes
-    assert returned_terms_by_code == {
-        code: expected_terms_by_code[code] for code in expected_codes
-    }
+    assert returned_terms_by_code == {code: expected_terms_by_code[code] for code in expected_codes}
     assert pricing_response["pagination"]["total"] == len(expected_codes)
     terminology_query.assert_awaited_once()
 
@@ -3083,10 +3045,7 @@ async def test_autocomplete_procedures_deduped_edge_rows(monkeypatch):
     response = await autocomplete_procedures(request)
     pricing_response = json.loads(response.body)
 
-    assert [
-        pricing_item_by_field["term"]
-        for pricing_item_by_field in pricing_response["items"]
-    ] == [
+    assert [pricing_item_by_field["term"] for pricing_item_by_field in pricing_response["items"]] == [
         "Synthetic term",
         "Other term",
         "Other code term",
@@ -3094,9 +3053,7 @@ async def test_autocomplete_procedures_deduped_edge_rows(monkeypatch):
     ]
     synthetic_item_by_field = pricing_response["items"][0]
     assert synthetic_item_by_field["internal_codes"] == ["123"]
-    assert synthetic_item_by_field["codes"] == [
-        {"code_system": "HP_PROCEDURE_CODE", "code": "123"}
-    ]
+    assert synthetic_item_by_field["codes"] == [{"code_system": "HP_PROCEDURE_CODE", "code": "123"}]
     assert len(synthetic_item_by_field["matches"]) == 5
 
 
@@ -3472,9 +3429,7 @@ async def test_list_providers_by_procedure_with_q():
     assert pricing_response["evidence"]["matched_provider_location_count"] == 1
     assert pricing_response["evidence"]["filters"]["state"] == "MD"
     assert "mrf.npi" in str(request.ctx.sa_session.executions[1][0][0])
-    assert "provider_sex_code" in str(
-        request.ctx.sa_session.executions[1][0][0]
-    )
+    assert "provider_sex_code" in str(request.ctx.sa_session.executions[1][0][0])
 
 
 @pytest.mark.asyncio
@@ -3534,9 +3489,9 @@ async def test_list_provider_specialties_filters_by_procedure_and_geo():
     assert pricing_response["query"]["code"] == "99214"
     assert pricing_response["query"]["zip5"] == "10001"
     assert pricing_response["query"]["q"] == "medicine"
-    assert {"code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM, "code": "1607056713"} in pricing_response["query"][
-        "resolved_codes"
-    ]
+    assert {"code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM, "code": "1607056713"} in pricing_response[
+        "query"
+    ]["resolved_codes"]
 
 
 @pytest.mark.asyncio
@@ -3846,18 +3801,15 @@ async def test_load_procedure_taxonomy_evidence_uses_cache(monkeypatch):
 async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatch):
     """Pass plan filters through the PTG provider search path."""
     seen_argument_map = {}
+
     async def fake_search(_session, args, pagination):
         seen_argument_map.update(args)
         return {
             "items": [{"npi": 1234567890, "tic_prices": [{"negotiated_rate": "450.00"}]}],
-            "pagination": {
-                "total": 1,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
+            "pagination": dict(total=1, limit=pagination.limit, offset=pagination.offset, page=pagination.page),
             "query": {"source": "ptg2", "plan_id": args["plan_id"]},
         }
+
     monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
     request = make_request(
         [FakeResult(scalar=1)],
@@ -3883,7 +3835,6 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     )
     response = await list_providers_by_procedure(request)
     pricing_response = json.loads(response.body)
-
     assert pricing_response["items"][0]["tic_prices"][0]["negotiated_rate"] == "450.00"
     assert pricing_response["query"]["source"] == "ptg2"
     assert seen_argument_map["plan_market_type"] == "group"
@@ -4026,9 +3977,7 @@ async def test_non_plan_hcpcs_geo_keeps_legacy_cost_order(monkeypatch):
 
     response = await list_providers_by_procedure(request)
 
-    assert json.loads(response.body)["query"]["order_by"] == (
-        "total_allowed_amount"
-    )
+    assert json.loads(response.body)["query"]["order_by"] == ("total_allowed_amount")
 
 
 def _public_billing_option_by_field():
@@ -4155,10 +4104,7 @@ async def test_plan_pricing_translates_only_online_work_budget_to_503(
     assert json.loads(endpoint_response.body) == {
         "error": {
             "code": "ptg2_online_work_budget_exceeded",
-            "message": (
-                "The exact query exceeds this snapshot's sealed online work "
-                "budget."
-            ),
+            "message": ("The exact query exceeds this snapshot's sealed online work budget."),
             "dimension": budget_dimension,
         }
     }
@@ -4223,9 +4169,7 @@ async def test_plan_pricing_translates_unsupported_provider_filter_to_400(
             [],
         ),
         (
-            pricing_module.PTG2ProviderFilterScopeError(
-                "Internal detail must not escape."
-            ),
+            pricing_module.PTG2ProviderFilterScopeError("Internal detail must not escape."),
             "ptg2_provider_filter_scope_required",
             [],
         ),
@@ -4284,9 +4228,7 @@ async def test_plan_pricing_translates_scope_refusal_to_structured_422(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "code", ("99203", "99204", "99205", "99213", "99214", "99215")
-)
+@pytest.mark.parametrize("code", ("99203", "99204", "99205", "99213", "99214", "99215"))
 @pytest.mark.parametrize("raw_order", (None, "null", "desc"))
 @pytest.mark.parametrize("raw_include_providers", (None, "false"))
 async def test_office_visit_scope_refusal_retry_options_are_servable(
@@ -4294,10 +4236,7 @@ async def test_office_visit_scope_refusal_retry_options_are_servable(
 ):
     """Every advertised E&M retry must override the refused request into a 200."""
     selection = _mixed_canonical_release_selection()
-
-    monkeypatch.setattr(
-        pricing_module, "search_current_ptg2_index", _synthetic_em_scope_search
-    )
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", _synthetic_em_scope_search)
     monkeypatch.setattr(
         pricing_module,
         "resolve_plan_release_guard_selection",
@@ -4319,7 +4258,11 @@ async def test_office_visit_scope_refusal_retry_options_are_servable(
         "code_system": "CPT",
         "zip5": "60611",
         "zip_radius_miles": "25",
-        "view": "full", "limit": "25", "page": "2", "offset": "25", "start": "25",
+        "view": "full",
+        "limit": "25",
+        "page": "2",
+        "offset": "25",
+        "start": "25",
     }
     if raw_order is not None:
         base_args_by_name["order"] = raw_order
@@ -4332,7 +4275,6 @@ async def test_office_visit_scope_refusal_retry_options_are_servable(
         "latitude": 41.895,
         "longitude": -87.621,
     }
-
     refused_response = await list_providers_by_procedure(
         make_request([FakeResult(rows=[zip_row_by_name])], args=base_args_by_name)
     )
@@ -4503,9 +4445,7 @@ async def test_g0289_geo_candidate_budget_returns_structured_503(monkeypatch):
     assert endpoint_response.status == 503
     assert json.loads(endpoint_response.body)["error"] == {
         "code": "ptg2_online_work_budget_exceeded",
-        "message": (
-            "The exact query exceeds this snapshot's sealed online work budget."
-        ),
+        "message": ("The exact query exceeds this snapshot's sealed online work budget."),
         "dimension": "candidate_members",
     }
 
@@ -4560,9 +4500,7 @@ def _configure_pricing_capacity_evidence(monkeypatch):
     key_id = "capacity-api-test-key"
     run_nonce = "a1" * 32
     contention_run_id = "b1" * 32
-    process_started_at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(
-        seconds=1
-    )
+    process_started_at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=1)
 
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "operator-secret")
     monkeypatch.setenv(capacity_evidence.CAPACITY_ISOLATED_PROCESS_ENV, "1")
@@ -4571,21 +4509,11 @@ def _configure_pricing_capacity_evidence(monkeypatch):
         private_key.private_bytes_raw().hex(),
     )
     monkeypatch.setenv(capacity_evidence.CAPACITY_KEY_ID_ENV, key_id)
-    monkeypatch.setenv(
-        capacity_evidence.CAPACITY_RELEASE_DIGEST_ENV, release_digest
-    )
-    monkeypatch.setenv(
-        capacity_evidence.CAPACITY_ENVIRONMENT_ID_ENV, environment_id
-    )
-    monkeypatch.setattr(
-        capacity_evidence._PROCESS_IDENTITY, "process_id", os.getpid()
-    )
-    monkeypatch.setattr(
-        capacity_evidence._PROCESS_IDENTITY, "instance", "ab" * 32
-    )
-    monkeypatch.setattr(
-        capacity_evidence._PROCESS_IDENTITY, "started_at", process_started_at
-    )
+    monkeypatch.setenv(capacity_evidence.CAPACITY_RELEASE_DIGEST_ENV, release_digest)
+    monkeypatch.setenv(capacity_evidence.CAPACITY_ENVIRONMENT_ID_ENV, environment_id)
+    monkeypatch.setattr(capacity_evidence._PROCESS_IDENTITY, "process_id", os.getpid())
+    monkeypatch.setattr(capacity_evidence._PROCESS_IDENTITY, "instance", "ab" * 32)
+    monkeypatch.setattr(capacity_evidence._PROCESS_IDENTITY, "started_at", process_started_at)
     monkeypatch.setattr(
         capacity_evidence._PROCESS_IDENTITY,
         "challenge_state",
@@ -4640,9 +4568,7 @@ def _capacity_evidence_pricing_request(run_nonce, contention_run_id):
     }
     request.method = "GET"
     request.path = capacity_evidence.CAPACITY_QUERY_PATH
-    request.route = types.SimpleNamespace(
-        name="pricing.providers.search_by_procedure"
-    )
+    request.route = types.SimpleNamespace(name="pricing.providers.search_by_procedure")
     return request, challenge
 
 
@@ -4693,9 +4619,7 @@ async def test_standard_ptg_route_attaches_authenticated_capacity_evidence(
         contention_run_id,
     ) = _configure_pricing_capacity_evidence(monkeypatch)
     monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
-    request, challenge = _capacity_evidence_pricing_request(
-        run_nonce, contention_run_id
-    )
+    request, challenge = _capacity_evidence_pricing_request(run_nonce, contention_run_id)
 
     capacity_response = await list_providers_by_procedure(request)
 
@@ -4750,9 +4674,7 @@ async def test_public_procedure_route_cannot_escalate_to_candidate(monkeypatch):
             "code": "70551",
         },
     )
-    request.route = types.SimpleNamespace(
-        name="pricing.providers.search_by_procedure"
-    )
+    request.route = types.SimpleNamespace(name="pricing.providers.search_by_procedure")
     request.headers = {
         PTG2_CANDIDATE_AUDIT_HEADER: "candidate-snapshot",
         "Authorization": "Bearer operator-secret",
@@ -4792,9 +4714,7 @@ async def test_audit_procedure_route_attaches_exact_candidate_capability(monkeyp
             "code": "70551",
         },
     )
-    request.route = types.SimpleNamespace(
-        name="pricing.providers.audit_search_by_procedure"
-    )
+    request.route = types.SimpleNamespace(name="pricing.providers.audit_search_by_procedure")
     request.headers = {
         PTG2_CANDIDATE_AUDIT_HEADER: "candidate-snapshot",
         "Authorization": "Bearer operator-secret",
@@ -4847,9 +4767,7 @@ def _build_allowed_amount_fallback_response() -> dict:
         "items": [
             {
                 "npi": 1427166008,
-                "network_status": (
-                    "out_of_network_or_not_confirmed_in_network"
-                ),
+                "network_status": ("out_of_network_or_not_confirmed_in_network"),
                 "prices": [
                     {
                         "source": "allowed_amounts",
@@ -5008,10 +4926,11 @@ async def test_release_state_scan_routes_before_legacy_ptg_expansion(monkeypatch
     assert json.loads(response.body)["pagination"]["scanned_npi_count"] == 1
     state_scan.assert_awaited_once()
     state_scan_args = state_scan.await_args.args[2]
-    assert {
-        field_name: state_scan_args[field_name]
-        for field_name in ("mode", "code_system", "code")
-    } == {"mode": "product_search", "code_system": "CPT", "code": "27447"}
+    assert {field_name: state_scan_args[field_name] for field_name in ("mode", "code_system", "code")} == {
+        "mode": "product_search",
+        "code_system": "CPT",
+        "code": "27447",
+    }
     legacy_search.assert_not_awaited()
 
 
@@ -5068,9 +4987,7 @@ async def test_release_state_scan_rejects_invalid_mode_before_hydration(
     "legacy_args_by_name",
     ({}, {"specialty": "cardiology", "include_allowed_amounts": "false"}),
 )
-async def test_release_npi_legacy_shapes_bypass_state_scan(
-    monkeypatch, legacy_args_by_name
-):
+async def test_release_npi_legacy_shapes_bypass_state_scan(monkeypatch, legacy_args_by_name):
     """Keep pre-existing NPI ordering shapes on the legacy PTG lane."""
 
     selection = _mixed_canonical_release_selection()
@@ -5168,9 +5085,7 @@ async def test_release_state_scan_budget_refusal_is_deterministic_422(monkeypatc
         "_resolve_ptg_specialty_or_raise",
         AsyncMock(return_value=types.SimpleNamespace(unresolved_specialty=None, taxonomy_codes=())),
     )
-    monkeypatch.setattr(
-        pricing_module, "resolve_plan_release_serving", AsyncMock(return_value=selection)
-    )
+    monkeypatch.setattr(pricing_module, "resolve_plan_release_serving", AsyncMock(return_value=selection))
     monkeypatch.setattr(
         pricing_module,
         "search_plan_pricing_state_scan",
@@ -5216,9 +5131,7 @@ async def test_release_state_scan_maps_stale_cursor_generation_to_409(monkeypatc
         "_resolve_ptg_specialty_or_raise",
         AsyncMock(return_value=types.SimpleNamespace(unresolved_specialty=None, taxonomy_codes=())),
     )
-    monkeypatch.setattr(
-        pricing_module, "resolve_plan_release_serving", AsyncMock(return_value=selection)
-    )
+    monkeypatch.setattr(pricing_module, "resolve_plan_release_serving", AsyncMock(return_value=selection))
     monkeypatch.setattr(
         pricing_module,
         "search_plan_pricing_state_scan",
@@ -5256,9 +5169,7 @@ async def test_release_state_scan_maps_stale_cursor_generation_to_409(monkeypatc
         pricing_module.PTG2ManifestArtifactError,
     ),
 )
-async def test_release_state_scan_hides_internal_serving_errors(
-    monkeypatch, caplog, error_type
-):
+async def test_release_state_scan_hides_internal_serving_errors(monkeypatch, caplog, error_type):
     selection = replace(
         _mixed_canonical_release_selection(),
         pricing_projection_id="f" * 64,
@@ -5306,9 +5217,7 @@ async def test_release_state_scan_hides_internal_serving_errors(
     )
     assert "private serving detail" not in response.body.decode()
     assert "private serving detail" not in caplog.text
-    assert caplog.records[-1].plan_pricing_state_scan_failure_class == (
-        error_type.__name__
-    )
+    assert caplog.records[-1].plan_pricing_state_scan_failure_class == (error_type.__name__)
 
 
 @pytest.mark.asyncio
@@ -5349,9 +5258,7 @@ async def test_release_state_scan_unavailable_projection_is_cursor_aware(
     monkeypatch.setattr(
         pricing_module,
         "search_plan_pricing_state_scan",
-        AsyncMock(
-            side_effect=pricing_module.PlanPricingProjectionUnavailable("not ready")
-        ),
+        AsyncMock(side_effect=pricing_module.PlanPricingProjectionUnavailable("not ready")),
     )
     state_scan_args_by_name = {
         "plan_release_id": "hprelease_01J00000000000000000000000",
@@ -5365,9 +5272,7 @@ async def test_release_state_scan_unavailable_projection_is_cursor_aware(
     if cursor is not None:
         state_scan_args_by_name["cursor"] = cursor
 
-    response = await list_providers_by_procedure(
-        make_request([], args=state_scan_args_by_name)
-    )
+    response = await list_providers_by_procedure(make_request([], args=state_scan_args_by_name))
 
     assert response.status == expected_status
     assert json.loads(response.body)["error"]["code"] == expected_code
@@ -5389,9 +5294,7 @@ async def test_card_requires_plan_release_id():
 
 
 @pytest.mark.asyncio
-async def test_group_plan_99213_card_and_full_share_ready_refusal(
-    monkeypatch,
-):
+async def test_group_plan_99213_card_and_full_share_ready_refusal(monkeypatch):
     selection = replace(
         _mixed_canonical_release_selection(),
         pricing_projection_id="f" * 64,
@@ -5442,7 +5345,9 @@ async def test_group_plan_99213_card_and_full_share_ready_refusal(
             "order": "asc",
             "include_providers": True,
             "view": "card",
-            "offset": 0, "start": 0, "page": 1,
+            "offset": 0,
+            "start": 0,
+            "page": 1,
         }
     ]
     assert guard_resolver.await_count == 2
@@ -5710,9 +5615,7 @@ async def test_card_missing_projection_returns_503(monkeypatch):
     selection = _mixed_canonical_release_selection()
     release_resolver = AsyncMock(return_value=selection)
     strict_search = AsyncMock(
-        side_effect=pricing_module.PlanPricingProjectionUnavailable(
-            "the selected release has no ready card projection"
-        )
+        side_effect=pricing_module.PlanPricingProjectionUnavailable("the selected release has no ready card projection")
     )
     monkeypatch.setattr(
         pricing_module,
@@ -5738,9 +5641,7 @@ async def test_card_missing_projection_returns_503(monkeypatch):
     response = await list_providers_by_procedure(request)
 
     assert response.status == 503
-    assert json.loads(response.body)["error"]["code"] == (
-        "pricing_projection_unavailable"
-    )
+    assert json.loads(response.body)["error"]["code"] == ("pricing_projection_unavailable")
     release_resolver.assert_awaited_once_with(
         request.ctx.sa_session,
         selection.plan_release_id,
@@ -5798,9 +5699,7 @@ def _build_allowed_amount_page_row(*, total: int = 12501) -> dict:
     return {
         "total": total,
         "result_network_statuses": ["in_network"],
-        "result_network_semantics_values": [
-            "in_network_historical_allowed_amounts"
-        ],
+        "result_network_semantics_values": ["in_network_historical_allowed_amounts"],
         "source_rows_json": json.dumps(
             [
                 {
@@ -5835,9 +5734,7 @@ def _build_allowed_amount_page_row(*, total: int = 12501) -> dict:
         "billed_charge_max": 210.0,
         "evidence_count": 15000,
         "network_statuses": ["in_network"],
-        "network_semantics_values": [
-            "in_network_historical_allowed_amounts"
-        ],
+        "network_semantics_values": ["in_network_historical_allowed_amounts"],
         "source_keys": ["allowed_source_a", "allowed_source_b"],
         "snapshot_ids": [
             "ptg2:202607:allowed-a",
@@ -5876,9 +5773,7 @@ async def test_list_providers_by_procedure_falls_back_to_allowed_amounts(
     monkeypatch,
 ):
     strict_search = AsyncMock(return_value=None)
-    allowed_search = AsyncMock(
-        return_value=_build_allowed_amount_fallback_response()
-    )
+    allowed_search = AsyncMock(return_value=_build_allowed_amount_fallback_response())
     monkeypatch.setattr(pricing_module, "search_current_ptg2_index", strict_search)
     monkeypatch.setattr(
         pricing_module,
@@ -5904,9 +5799,7 @@ async def test_list_providers_by_procedure_falls_back_to_allowed_amounts(
     assert response_by_field["result_state"] == "allowed_amounts_found"
     assert response_by_field["pricing_scope"] == "plan_scoped_allowed_amounts"
     assert response_by_field["items"][0]["prices"][0]["allowed_amount"] == 133.0
-    assert response_by_field["query"]["year_semantics"] == (
-        "ignored_for_plan_scoped_ptg_rates"
-    )
+    assert response_by_field["query"]["year_semantics"] == ("ignored_for_plan_scoped_ptg_rates")
     strict_search.assert_awaited_once()
     allowed_search.assert_awaited_once()
     assert strict_search.await_args.args[1]["provider_sex_code"] == "U"
@@ -5929,9 +5822,7 @@ async def test_canonical_empty_negotiated_result_reuses_release_for_allowed_fall
             "query": {"source": "ptg2", "status": "no_match"},
         }
     )
-    allowed_search = AsyncMock(
-        return_value=_build_allowed_amount_fallback_response()
-    )
+    allowed_search = AsyncMock(return_value=_build_allowed_amount_fallback_response())
     monkeypatch.setattr(
         pricing_module,
         "resolve_plan_release_serving",
@@ -5978,10 +5869,7 @@ def test_allowed_amount_provider_predicate_preserves_provider_sex():
         query_parameter_map,
     )
 
-    assert (
-        "npi_data.provider_sex_code = :allowed_provider_sex_code"
-        in provider_predicate_sql
-    )
+    assert "npi_data.provider_sex_code = :allowed_provider_sex_code" in provider_predicate_sql
     assert query_parameter_map["allowed_provider_sex_code"] == "X"
 
 
@@ -6017,9 +5905,7 @@ async def test_missing_plan_snapshots_return_empty_200_after_default_allowed_fal
     assert response_by_field["result_state"] == "no_snapshot_for_plan"
     assert response_by_field["pricing_scope"] == "plan_scoped_ptg"
     assert response_by_field["resolved"] is False
-    assert response_by_field["reason"] == (
-        "no published serving snapshot for this plan_id + market_type"
-    )
+    assert response_by_field["reason"] == ("no published serving snapshot for this plan_id + market_type")
     assert response_by_field["items"] == []
     strict_search.assert_awaited_once()
     allowed_search.assert_awaited_once()
@@ -6085,8 +5971,7 @@ async def test_negotiated_ptg_result_does_not_query_allowed_amounts(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_allowed_amount_snapshot_lookup_uses_allowed_only_current_pointers(
-):
+async def test_allowed_amount_snapshot_lookup_uses_allowed_only_current_pointers():
     session = FakeSession(
         [
             FakeResult(
@@ -6104,12 +5989,10 @@ async def test_allowed_amount_snapshot_lookup_uses_allowed_only_current_pointers
         ]
     )
 
-    current_snapshots = (
-        await pricing_module._current_allowed_amount_snapshots_for_plan(
-            session,
-            {"market_type": "group"},
-            plan_id="TESTPLAN001",
-        )
+    current_snapshots = await pricing_module._current_allowed_amount_snapshots_for_plan(
+        session,
+        {"market_type": "group"},
+        plan_id="TESTPLAN001",
     )
 
     assert current_snapshots == _build_current_allowed_snapshots()
@@ -6125,16 +6008,13 @@ async def test_allowed_amount_snapshot_lookup_uses_allowed_only_current_pointers
     assert "allowed_index->>'arch_version' = 'postgres_binary_v3'" in lookup_sql
     assert "allowed_index->>'storage' = 'postgresql'" in lookup_sql
     assert "allowed_index->>'snapshot_scoped' = 'true'" in lookup_sql
-    assert lookup_parameters["allowed_contract"] == (
-        pricing_module.PTG2_ALLOWED_AMOUNT_CONTRACT
-    )
+    assert lookup_parameters["allowed_contract"] == (pricing_module.PTG2_ALLOWED_AMOUNT_CONTRACT)
     assert lookup_parameters["market_type"] == "group"
     assert lookup_parameters["plan_ids"] == ["TESTPLAN001"]
 
 
 @pytest.mark.asyncio
-async def test_allowed_amount_snapshot_lookup_uses_isolated_divergent_pointer(
-):
+async def test_allowed_amount_snapshot_lookup_uses_isolated_divergent_pointer():
     session = FakeSession(
         [
             FakeResult(
@@ -6148,15 +6028,13 @@ async def test_allowed_amount_snapshot_lookup_uses_isolated_divergent_pointer(
         ]
     )
 
-    current_snapshots = (
-        await pricing_module._current_allowed_amount_snapshots_for_plan(
-            session,
-            {
-                "market_type": "group",
-                "snapshot_id": "ptg2:202607:negotiated-current",
-            },
-            plan_id="TESTPLAN001",
-        )
+    current_snapshots = await pricing_module._current_allowed_amount_snapshots_for_plan(
+        session,
+        {
+            "market_type": "group",
+            "snapshot_id": "ptg2:202607:negotiated-current",
+        },
+        plan_id="TESTPLAN001",
     )
 
     assert current_snapshots == [
@@ -6212,18 +6090,9 @@ def test_allowed_amount_sql_filters_before_exact_count_and_pagination():
 
     assert "ptg2_current_plan_source" not in sql_text
     assert "mrf.ptg2_current_source_snapshot allowed_pointer" in sql_text
-    assert (
-        "allowed_pointer.snapshot_id = snapshot.snapshot_id"
-        in sql_text
-    )
-    assert (
-        "allowed_pointer.source_key"
-        in sql_text
-    )
-    assert (
-        "->'allowed_amount_index'->>'current_source_key'"
-        in sql_text
-    )
+    assert "allowed_pointer.snapshot_id = snapshot.snapshot_id" in sql_text
+    assert "allowed_pointer.source_key" in sql_text
+    assert "->'allowed_amount_index'->>'current_source_key'" in sql_text
     assert "unnest(" in sql_text
     assert "mrf.ptg2_allowed_amount_plan" in sql_text
     assert "mrf.ptg2_allowed_amount_item" in sql_text
@@ -6252,12 +6121,10 @@ def test_allowed_amount_sql_filters_before_exact_count_and_pagination():
 
 def test_allowed_amount_state_city_filter_excludes_postal_boxes_once():
     parameter_map = {}
-    location_join_sql, _select_sql, required_sql = (
-        pricing_module._allowed_amount_location_sql(
-            {"state": "MI", "city": "Detroit"},
-            address_table="mrf.entity_address_unified",
-            parameter_map=parameter_map,
-        )
+    location_join_sql, _select_sql, required_sql = pricing_module._allowed_amount_location_sql(
+        {"state": "MI", "city": "Detroit"},
+        address_table="mrf.entity_address_unified",
+        parameter_map=parameter_map,
     )
 
     assert location_join_sql.count(postal_box_address_sql("addr")) == 1
@@ -6271,9 +6138,7 @@ def test_allowed_amount_state_city_filter_excludes_postal_boxes_once():
 async def test_allowed_amount_spatial_lookup_fails_without_geo_capability(
     monkeypatch,
 ):
-    address_table_lookup = AsyncMock(
-        return_value="mrf.entity_address_unified"
-    )
+    address_table_lookup = AsyncMock(return_value="mrf.entity_address_unified")
     capability_check = AsyncMock(return_value=False)
     monkeypatch.setattr(
         pricing_module,
@@ -6295,9 +6160,7 @@ async def test_allowed_amount_spatial_lookup_fails_without_geo_capability(
             {"zip5": "00000"},
         )
 
-    assert address_table_lookup.await_args.args[1] == (
-        pricing_module.PTG2_UNIFIED_ADDRESS_COLUMNS
-    )
+    assert address_table_lookup.await_args.args[1] == (pricing_module.PTG2_UNIFIED_ADDRESS_COLUMNS)
 
 
 @pytest.mark.asyncio
@@ -6319,10 +6182,13 @@ async def test_allowed_amount_spatial_lookup_returns_unified_table_when_geo_capa
         capability_check,
     )
 
-    assert await pricing_module._allowed_amount_address_table(
-        session,
-        {"lat": 0.0, "long": 0.0},
-    ) == address_table
+    assert (
+        await pricing_module._allowed_amount_address_table(
+            session,
+            {"lat": 0.0, "long": 0.0},
+        )
+        == address_table
+    )
     address_table_lookup.assert_awaited_once_with(
         session,
         pricing_module.PTG2_UNIFIED_ADDRESS_COLUMNS,
@@ -6373,26 +6239,22 @@ async def test_allowed_amount_text_filter_requires_complete_unified_schema(
             {"state": "TS"},
         )
 
-    assert address_table_lookup.await_args.args[1] == (
-        pricing_module.PTG2_UNIFIED_ADDRESS_COLUMNS
-    )
+    assert address_table_lookup.await_args.args[1] == (pricing_module.PTG2_UNIFIED_ADDRESS_COLUMNS)
     capability_check.assert_not_awaited()
 
 
 def test_allowed_amount_legacy_spatial_filter_combines_zip_and_geo():
     parameter_map = {}
 
-    _distance_sql, spatial_predicates = (
-        pricing_module._allowed_amount_spatial_filter_sql(
-            {
-                "zip5": "00000",
-                "lat": 0.0,
-                "long": 0.0,
-                "radius_miles": 0.0,
-            },
-            uses_unified_addresses=False,
-            parameter_map=parameter_map,
-        )
+    _distance_sql, spatial_predicates = pricing_module._allowed_amount_spatial_filter_sql(
+        {
+            "zip5": "00000",
+            "lat": 0.0,
+            "long": 0.0,
+            "radius_miles": 0.0,
+        },
+        uses_unified_addresses=False,
+        parameter_map=parameter_map,
     )
 
     assert len(spatial_predicates) == 1
@@ -6426,22 +6288,10 @@ def test_allowed_amount_data_queries_rebind_snapshots_to_live_pointer():
 
     for query_sql in (page_sql, detail_sql):
         assert "ptg2_current_source_snapshot allowed_pointer" in query_sql
-        assert (
-            "allowed_pointer.snapshot_id = snapshot.snapshot_id"
-            in query_sql
-        )
-        assert (
-            "snapshot.manifest"
-            in query_sql
-        )
-        assert (
-            "->'allowed_amount_index'->>'current_source_key'"
-            in query_sql
-        )
-        assert (
-            "= LOWER(current_snapshot.source_key)"
-            in query_sql
-        )
+        assert "allowed_pointer.snapshot_id = snapshot.snapshot_id" in query_sql
+        assert "snapshot.manifest" in query_sql
+        assert "->'allowed_amount_index'->>'current_source_key'" in query_sql
+        assert "= LOWER(current_snapshot.source_key)" in query_sql
 
 
 def test_allowed_amount_sql_uses_shared_file_plan_coverage_for_each_plan():
@@ -6555,10 +6405,7 @@ def test_canonical_allowed_amount_parameters_preserve_binding_local_tuples():
         )
     )
     assert "plan_coverage.plan_id = current_snapshot.plan_id" in query_sql
-    assert (
-        "plan_coverage.plan_market_type, '') "
-        "= current_snapshot.plan_market_type"
-    ) in " ".join(query_sql.split())
+    assert ("plan_coverage.plan_market_type, '') = current_snapshot.plan_market_type") in " ".join(query_sql.split())
 
 
 def _assert_allowed_amount_multi_source_response(response_by_field):
@@ -6579,17 +6426,12 @@ def _assert_allowed_amount_multi_source_response(response_by_field):
         "has_more": True,
         "total_is_exact": True,
     }
-    assert {
-        source_by_field["source_key"]
-        for source_by_field in response_by_field["sources"]
-    } == {"allowed_source_a", "allowed_source_b"}
-    assert all(
-        source_by_field["network_status"] == "in_network"
-        for source_by_field in response_by_field["sources"]
-    )
-    assert response_by_field["warnings"][0]["code"] == (
-        "allowed_amounts_not_negotiated_rates"
-    )
+    assert {source_by_field["source_key"] for source_by_field in response_by_field["sources"]} == {
+        "allowed_source_a",
+        "allowed_source_b",
+    }
+    assert all(source_by_field["network_status"] == "in_network" for source_by_field in response_by_field["sources"])
+    assert response_by_field["warnings"][0]["code"] == ("allowed_amounts_not_negotiated_rates")
     provider_by_field = response_by_field["items"][0]
     assert provider_by_field["network_status"] == "in_network"
     assert provider_by_field["prices"][0]["allowed_amount"] == 133.0
@@ -6634,14 +6476,10 @@ def _assert_allowed_amount_location_payload_suppressed(provider_by_field):
             pending_payloads.extend(nested_payload.values())
         elif isinstance(nested_payload, list):
             pending_payloads.extend(nested_payload)
-    assert provider_by_field["confidence"] == {
-        "network": "allowed_amounts_in_network"
-    }
+    assert provider_by_field["confidence"] == {"network": "allowed_amounts_in_network"}
     assert provider_by_field["network_bound_address"] is False
     assert provider_by_field["requires_location_confirmation"] is True
-    assert provider_by_field["address_network_binding"] == (
-        "not_applicable_allowed_amounts"
-    )
+    assert provider_by_field["address_network_binding"] == ("not_applicable_allowed_amounts")
 
 
 @pytest.mark.asyncio
@@ -6663,12 +6501,8 @@ async def test_allowed_amount_search_combines_sources_and_keeps_exact_large_tota
             FakeResult([_build_allowed_amount_page_row()]),
             FakeResult(
                 [
-                    _build_in_network_allowed_evidence(
-                        source_key="allowed_source_a"
-                    ),
-                    _build_in_network_allowed_evidence(
-                        source_key="allowed_source_b"
-                    ),
+                    _build_in_network_allowed_evidence(source_key="allowed_source_a"),
+                    _build_in_network_allowed_evidence(source_key="allowed_source_b"),
                 ]
             ),
         ]
@@ -6729,9 +6563,7 @@ async def test_allowed_amount_search_filters_with_location_but_omits_unverified_
         "state": "IL",
     }
     if include_unverified_addresses is not None:
-        request_args_by_name["include_unverified_addresses"] = (
-            include_unverified_addresses
-        )
+        request_args_by_name["include_unverified_addresses"] = include_unverified_addresses
     response_by_field = await pricing_module._search_ptg_allowed_amount_evidence(
         session,
         request_args_by_name,
@@ -6762,21 +6594,17 @@ async def test_canonical_allowed_amount_zero_rows_is_resolved_no_match(
         "_allowed_amount_address_table",
         AsyncMock(return_value="mrf.npi_address"),
     )
-    session = FakeSession(
-        [FakeResult(rows=[_build_allowed_amount_page_row(total=0)])]
-    )
+    session = FakeSession([FakeResult(rows=[_build_allowed_amount_page_row(total=0)])])
 
-    response_by_field = (
-        await pricing_module._search_ptg_allowed_amount_evidence(
-            session,
-            {
-                "plan_release_id": selection.plan_release_id,
-                "code": "99214",
-                "code_system": "CPT",
-            },
-            types.SimpleNamespace(limit=25, offset=0, page=1),
-            release_selection=selection,
-        )
+    response_by_field = await pricing_module._search_ptg_allowed_amount_evidence(
+        session,
+        {
+            "plan_release_id": selection.plan_release_id,
+            "code": "99214",
+            "code_system": "CPT",
+        },
+        types.SimpleNamespace(limit=25, offset=0, page=1),
+        release_selection=selection,
     )
 
     _assert_allowed_release_no_match(response_by_field, selection, session)
@@ -6798,9 +6626,7 @@ async def test_allowed_amount_route_rejects_invalid_supplied_release(
     supplied_selection,
 ):
     selection = _allowed_only_release_selection()
-    resolver = AsyncMock(
-        side_effect=AssertionError("mismatched selection must fail closed")
-    )
+    resolver = AsyncMock(side_effect=AssertionError("mismatched selection must fail closed"))
     monkeypatch.setattr(
         pricing_module,
         "resolve_plan_release_serving",
@@ -7005,8 +6831,7 @@ async def test_list_providers_by_procedure_rejects_statewide_taxonomy_office_vis
     assert raised.value.context == {
         "fix_it": {
             "reason": (
-                "A statewide taxonomy search expands too many provider-rate "
-                "candidates for an interactive request."
+                "A statewide taxonomy search expands too many provider-rate candidates for an interactive request."
             ),
             "retry_options": [
                 {
@@ -7752,9 +7577,7 @@ def _zip_ring_procedure_cost_request():
                     {"zip5": "20816", "state": "MD", "city_lower": "bethesda", "distance_miles": 6.5},
                 ]
             ),
-            FakeResult(
-                rows=[_procedure_peer_stats_row(geography_value="20816")]
-            ),
+            FakeResult(rows=[_procedure_peer_stats_row(geography_value="20816")]),
             FakeResult(
                 rows=[
                     {
@@ -7982,9 +7805,7 @@ async def test_get_procedure_benchmarks_success():
                     }
                 ]
             ),
-            FakeResult(
-                rows=[{"p20": 200.0, "p40": 400.0, "p60": 600.0, "p80": 800.0}]
-            ),
+            FakeResult(rows=[{"p20": 200.0, "p40": 400.0, "p60": 600.0, "p80": 800.0}]),
         ],
         args={"year": "2023", "state": "MD", "include_legacy_fields": "true"},
     )
@@ -8054,12 +7875,14 @@ async def test_get_procedure_geo_benchmarks_success():
 
 @pytest.mark.asyncio
 async def test_pricing_statistics_success():
-    request = make_request([
-        FakeResult(scalar=321000),
-        FakeResult(scalar=845000),
-        FakeResult(scalar=6123),
-        FakeResult(scalar=27890),
-    ])
+    request = make_request(
+        [
+            FakeResult(scalar=321000),
+            FakeResult(scalar=845000),
+            FakeResult(scalar=6123),
+            FakeResult(scalar=27890),
+        ]
+    )
 
     response = await pricing_statistics(request)
     pricing_response = json.loads(response.body)
@@ -8070,3 +7893,217 @@ async def test_pricing_statistics_success():
         "procedure_codes_tracked": 6123,
         "procedure_zip_codes": 27890,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_name", "query_args", "message"),
+    (
+        ("list_providers_by_procedure", {}, "Provide at least one"),
+        ("list_providers_by_prescription", {}, "Provide at least one"),
+        ("list_providers_by_procedure", {"q": "synthetic", "lat": "0"}, "provided together"),
+        ("list_providers_by_procedure", {"q": "synthetic", "long": "0"}, "provided together"),
+        ("list_providers_by_procedure", {"q": "synthetic", "lat": "91", "long": "0"}, "'lat' must"),
+        ("list_providers_by_procedure", {"q": "synthetic", "lat": "0", "long": "181"}, "'long' must"),
+        ("list_providers_by_procedure", {"q": "synthetic", "radius_miles": "5"}, "requires 'lat'"),
+        ("list_providers_by_procedure", {"q": "synthetic", "radius": "5"}, "requires 'lat'"),
+        ("list_providers_by_procedure", {"q": "synthetic", "view": "wide"}, "'view' must"),
+        ("list_providers_by_procedure", {"q": "synthetic", "plan_id_type": "other"}, "'plan_id_type' must"),
+    ),
+)
+async def test_claims_search_rejects_invalid_arguments(handler_name, query_args, message):
+    request = make_request([], args=query_args)
+
+    with pytest.raises(pricing_module.InvalidUsage, match=message):
+        await getattr(pricing_module, handler_name)(request)
+
+    assert request.ctx.sa_session.executions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("year", (None, "2025"))
+async def test_prescription_search_unavailable_contract(year):
+    request_args_by_name = {"q": "Synthetic medication", "limit": "2", "offset": "2"}
+    if year is not None:
+        request_args_by_name["year"] = year
+    request = make_request([FakeResult(scalar=None)], args=request_args_by_name)
+
+    response = await list_providers_by_prescription(request)
+
+    response_by_field = json.loads(response.body)
+    assert response_by_field == {
+        "items": [],
+        "pagination": {"total": 0, "limit": 2, "offset": 2, "page": 2},
+        "query": {
+            "q": "synthetic medication",
+            "code": None,
+            "year": int(year) if year else None,
+            "year_used": int(year) if year else None,
+            "year_source": "request" if year else "env",
+            "data_status": "unavailable",
+        },
+    }
+    assert len(request.ctx.sa_session.executions) == 1
+    assert "to_regclass" in str(request.ctx.sa_session.executions[0][0][0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("minimum", ("0", "5"))
+async def test_prescription_search_filters_before_pagination(minimum):
+    request = make_request(
+        [
+            FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
+            FakeResult(scalar=7),
+            FakeResult(rows=[{"npi": 1000000001, "total_claims": 12, "total_drug_cost": 120, "total_benes": 9}]),
+        ],
+        args={
+            "year": "2025",
+            "state": " ny ",
+            "city": "Example City",
+            "zip5": "10001",
+            "specialty": "Cardiology",
+            "code": " rx-demo ",
+            "rx_code_system": pricing_module.INTERNAL_RX_CODE_SYSTEM,
+            "min_claims": minimum,
+            "min_total_cost": minimum,
+            "order_by": "npi",
+            "order": "asc",
+            "limit": "2",
+            "offset": "6",
+        },
+    )
+
+    response = await list_providers_by_prescription(request)
+
+    response_by_field = json.loads(response.body)
+    assert response_by_field["pagination"] == {"total": 7, "limit": 2, "offset": 6, "page": 4}
+    assert response_by_field["items"][0]["total_prescriptions"] == 12
+    assert response_by_field["items"][0]["total_beneficiaries"] == 9
+    assert response_by_field["items"][0]["total_allowed_amount"] == 120
+    assert response_by_field["query"]["input_code"] == {
+        "code_system": pricing_module.INTERNAL_RX_CODE_SYSTEM,
+        "code": "RX-DEMO",
+    }
+    assert response_by_field["query"]["min_claims"] == float(minimum)
+    assert response_by_field["query"]["min_total_cost"] == float(minimum)
+    statements = [
+        str(execution_args[0].compile(compile_kwargs={"literal_binds": True}))
+        for execution_args, _execution_kwargs in request.ctx.sa_session.executions[-2:]
+    ]
+    for statement in statements:
+        for predicate in (
+            "upper(mrf.pricing_provider_prescription.state) = 'NY'",
+            "lower(mrf.pricing_provider_prescription.city) LIKE '%example city%'",
+            "mrf.pricing_provider_prescription.zip5 = '10001'",
+            "lower(mrf.pricing_provider_prescription.provider_type) LIKE '%cardiology%'",
+            "mrf.pricing_provider_prescription.rx_code IN ('RX-DEMO')",
+            f"mrf.pricing_provider_prescription.total_claims >= {float(minimum)}",
+            f"mrf.pricing_provider_prescription.total_drug_cost >= {float(minimum)}",
+        ):
+            assert statement.index(predicate) < statement.index("GROUP BY"), statement
+    assert "LIMIT" not in statements[0] and "OFFSET" not in statements[0]
+    assert "ORDER BY anon_1.npi ASC" in statements[1]
+    assert "LIMIT 2 OFFSET 6" in statements[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_name", "domain", "code_system", "code", "column", "resolution_key"),
+    (
+        (
+            "list_providers_by_procedure",
+            "procedure",
+            pricing_module.INTERNAL_CODE_SYSTEM,
+            "100",
+            "procedure_code",
+            "procedure_term_resolution",
+        ),
+        (
+            "list_providers_by_prescription",
+            "medication",
+            pricing_module.INTERNAL_RX_CODE_SYSTEM,
+            "RX-DEMO",
+            "rx_code",
+            "medication_term_resolution",
+        ),
+    ),
+)
+async def test_claims_search_resolves_terminology_codes(
+    handler_name, domain, code_system, code, column, resolution_key
+):
+    terminology_records = [
+        {"domain": domain, "synonym": "Synthetic match", "target_system": "", "target_code": ""},
+        {
+            "domain": domain,
+            "synonym": "Synthetic match",
+            "target_system": code_system,
+            "target_code": code,
+            "metadata_json": "invalid-json",
+        },
+    ]
+    query_results = [FakeResult(scalar="mrf.terminology_synonym"), FakeResult(rows=terminology_records)]
+    if domain == "medication":
+        query_results.insert(0, FakeResult(scalar="mrf.pricing_provider_prescription"))
+    query_results.extend([FakeResult(scalar=1), FakeResult(rows=[{"npi": 1000000001}])])
+    request = make_request(query_results, args={"q": "Synthetic match", "year": "2025"})
+
+    response = await getattr(pricing_module, handler_name)(request)
+
+    response_by_field = json.loads(response.body)
+    resolution_by_field = response_by_field["query"][resolution_key]
+    assert resolution_by_field["input"] == "synthetic match"
+    assert resolution_by_field["internal_codes"] == [code]
+    assert len(resolution_by_field["matches"]) == 2
+    assert resolution_by_field["matches"][1]["metadata"] == {"raw": "invalid-json"}
+    assert response_by_field["pagination"]["total"] == 1
+    assert response_by_field["items"][0]["npi"] == 1000000001
+    for execution_args, _execution_kwargs in request.ctx.sa_session.executions[-2:]:
+        statement = str(execution_args[0].compile(compile_kwargs={"literal_binds": True}))
+        expected_code = code if domain == "procedure" else f"'{code}'"
+        assert f".{column} IN ({expected_code})" in statement
+        assert "LIKE '%synthetic match%'" in statement
+
+
+@pytest.mark.asyncio
+async def test_procedure_search_filters_native_demographics():
+    request = make_request(
+        [FakeResult(scalar=None), FakeResult(scalar=None), FakeResult(scalar=3), FakeResult(rows=[])],
+        args={
+            "q": "Synthetic procedure",
+            "year": "2025",
+            "npi": "1000000001",
+            "state": " ny ",
+            "city": "Example City",
+            "specialty": "Cardiology",
+            "provider_sex_code": "F",
+            "limit": "2",
+            "offset": "4",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+
+    response_by_field = json.loads(response.body)
+    assert response_by_field["pagination"] == {"total": 3, "limit": 2, "offset": 4, "page": 3}
+    assert response_by_field["query"]["state"] == "NY"
+    assert response_by_field["query"]["city"] == "example city"
+    assert response_by_field["query"]["specialty"] == "cardiology"
+    assert response_by_field["query"]["provider_sex_code"] == "F"
+    statements = [
+        str(execution_args[0].compile(compile_kwargs={"literal_binds": True}))
+        for execution_args, _execution_kwargs in request.ctx.sa_session.executions[-2:]
+    ]
+    for statement in statements:
+        for predicate in (
+            "mrf.pricing_provider_procedure.npi = 1000000001",
+            "upper(mrf.pricing_provider.state) = 'NY'",
+            "lower(mrf.pricing_provider.city) LIKE '%example city%'",
+            "lower(mrf.pricing_provider.provider_type) LIKE '%cardiology%'",
+            "mrf.npi.provider_sex_code = 'F'",
+        ):
+            assert predicate in statement, (predicate, statement)
+            assert statement.index(predicate) < statement.index("GROUP BY")
+        assert "JOIN mrf.npi" in statement
+    assert "LIMIT" not in statements[0] and "OFFSET" not in statements[0]
+    assert "LIMIT 2 OFFSET 4" in statements[1]
