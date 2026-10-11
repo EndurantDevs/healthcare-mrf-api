@@ -159,6 +159,8 @@ async def test_provider_hydration_reuses_verified_metadata_for_chunks_and_empty_
         "connection_nested_transaction",
         "inactive_transaction",
         "inactive_root",
+        "missing_connection_transaction",
+        "missing_connection_nested_transaction",
         "copied_prepared",
         "other_service",
     ],
@@ -177,6 +179,10 @@ async def test_provider_hydration_context_reuse_requires_exact_owner_and_active_
         session.transaction.is_active = False
     elif changed == "inactive_root":
         session.root_transaction.is_active = False
+    if changed == "missing_connection_transaction":
+        del session.connection.return_value.get_transaction
+    elif changed == "missing_connection_nested_transaction":
+        del session.connection.return_value.get_nested_transaction
     if changed == "copied_prepared":
         prepared = replace(prepared)
     if changed == "other_service":
