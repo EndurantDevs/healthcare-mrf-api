@@ -398,6 +398,8 @@ paths:
         imported data access. Imported selection and filtering precede native
         pagination and exact totals; order-only reads retain absent imports last.
         The canonical signed body contains all native and imported selectors.
+        An optional trusted network_binding pins canonical location membership
+        before imported eligibility; the response identifies its exact generation.
       parameters:
         - $ref: '#/components/parameters/CustomImportProviderReadContext'
         - $ref: '#/components/parameters/CustomImportProviderReadKeyId'
@@ -412,6 +414,8 @@ paths:
         '200':
           description: Native provider page with one nullable imported projection per row.
           headers:
+            X-Network-Generation:
+              $ref: '#/components/headers/RegistryNetworkGeneration'
             Cache-Control:
               $ref: '#/components/headers/CustomImportReadCacheControl'
           content:
@@ -433,6 +437,8 @@ paths:
         Eligibility and ordering cover every requested NPI before successful
         matches are paginated. Excluded page matches are omitted, not reported
         as missing. Imported payloads are returned only when include_filter is true.
+        An optional trusted network_binding applies canonical location membership
+        to the complete batch before imported filtering, totals, ordering and paging.
       parameters:
         - $ref: '#/components/parameters/CustomImportProviderReadContext'
         - $ref: '#/components/parameters/CustomImportProviderReadKeyId'
@@ -447,6 +453,8 @@ paths:
         '200':
           description: Native batch envelope with exact pre-page counts and optional imported payloads.
           headers:
+            X-Network-Generation:
+              $ref: '#/components/headers/RegistryNetworkGeneration'
             Cache-Control:
               $ref: '#/components/headers/CustomImportReadCacheControl'
           content:
@@ -9305,6 +9313,8 @@ components:
       additionalProperties: false
       required: [target, native_query, context, filters, order, require_match]
       properties:
+        network_binding:
+          $ref: '#/components/schemas/CustomImportProviderNetworkBinding'
         target:
           $ref: '#/components/schemas/CustomImportReadTarget'
         native_query:
@@ -9388,6 +9398,8 @@ components:
       additionalProperties: false
       required: [target, native_query, native_batch, context, filters, order, require_match]
       properties:
+        network_binding:
+          $ref: '#/components/schemas/CustomImportProviderNetworkBinding'
         target:
           $ref: '#/components/schemas/CustomImportProviderRequest/properties/target'
         native_query:
@@ -9428,6 +9440,36 @@ components:
             address_offset: {type: integer, minimum: 0, maximum: 1000000}
             include_sources: {type: boolean}
             include_evidence: {type: boolean}
+    CustomImportProviderNetworkBinding:
+      type: object
+      additionalProperties: false
+      description: Optional trusted canonical membership scope for signed provider list and batch reads only. The existing transport permit authenticates the complete body; the Reader pins and verifies this exact eligible manifest in its read transaction before native membership, imported eligibility, totals and paging.
+      required: [version, client_id, policy_revision, generation_id, manifest_sha256, selector, network_ids, query_sha256]
+      properties:
+        version: {type: integer, enum: [2]}
+        client_id: {type: string, minLength: 1, maxLength: 64}
+        policy_revision: {type: integer, minimum: 0, maximum: 9223372036854775807}
+        generation_id: {type: integer, minimum: 1, maximum: 9223372036854775807}
+        manifest_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        selector:
+          type: object
+          additionalProperties: false
+          required: [namespace, values]
+          properties:
+            namespace: {type: string, enum: [canonical]}
+            values:
+              $ref: '#/components/schemas/CustomImportProviderNetworkBinding/properties/network_ids'
+        network_ids:
+          type: array
+          minItems: 1
+          maxItems: 50
+          uniqueItems: true
+          description: Sorted positive canonical IDs, exactly equal to selector.values.
+          items: {type: integer, minimum: 1, maximum: 2147483647}
+        query_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Plain SHA256 of canonical ASCII JSON of the complete body with network_binding omitted, including native_batch for batch requests.
     CustomImportProviderBatchResponse:
       type: object
       additionalProperties: false

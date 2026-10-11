@@ -13,6 +13,12 @@ from sanic.request.parameters import RequestParameters
 from sqlalchemy import text
 
 from api import custom_import_read_http as transport
+from api.custom_import_provider_network import (
+    ProviderNetworkBinding,
+    parse_provider_network_binding,
+    provider_network_read_scope,
+    provider_network_response,
+)
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
 from api.endpoint.pagination import _parse_non_negative_int
 from process.custom_import.read_contracts import (
@@ -63,6 +69,7 @@ class _ParsedProviderRequest:
     # Missing preserves enrichment for deployed signed-v2 callers.
     include_filter: bool = True
     maximum_family_rows: int = MAX_FULL_FAMILY_PAGE_SIZE
+    network_binding: ProviderNetworkBinding | None = None
 
 
 def _provider_relation_query(
@@ -106,12 +113,12 @@ def _parse_native_query(document: object) -> RequestParameters:
     return args
 
 
-def _provider_document(body):
+def _provider_document(body, *, allow_network_binding=False):
     document = transport._strict_json(body)
     base_keys = {"target", "native_query", "context", "filters", "order", "require_match"}
     if (
         type(document) is not dict
-        or (set(document) - {"include_filter"})
+        or (set(document) - ({"include_filter", "network_binding"} if allow_network_binding else {"include_filter"}))
         not in (
             base_keys,
             base_keys | {"grouped_entity_selection"},
@@ -126,11 +133,17 @@ def _provider_document(body):
 
 
 def _parse_provider_request(
-    body: bytes, *, native_query_parser=_parse_native_query, maximum_family_rows=MAX_FULL_FAMILY_PAGE_SIZE
+    body: bytes,
+    *,
+    native_query_parser=_parse_native_query,
+    maximum_family_rows=MAX_FULL_FAMILY_PAGE_SIZE,
+    allow_network_binding=False,
+    network_document=None,
 ) -> _ParsedProviderRequest:
     """Separate context selectors from whether imported membership is required."""
 
-    document = _provider_document(body)
+    document = _provider_document(body, allow_network_binding=allow_network_binding)
+    network_binding = parse_provider_network_binding(document if network_document is None else network_document)
     if type(document["require_match"]) is not bool:
         raise CustomImportReadRequestError("imported membership mode is invalid")
     include_filter = document.get("include_filter", True)
@@ -156,17 +169,7 @@ def _parse_provider_request(
     entitlement = document.get("family_entitlement")
     if "family_entitlement" in document and entitlement != "full_family":
         raise transport._fail()
-    maximum_terms = MAX_GROUPED_PREDICATE_TERMS if grouped is not None else MAX_FILTER_TERMS
-    if child is not None:
-        maximum_terms = MAX_GROUPED_CHILD_PREDICATE_TERMS
-    if len(context) + len(filters) > maximum_terms or (grouped is not None and child is None and len(context) > 2):
-        raise CustomImportReadRequestError("filter count exceeds the read-core limit")
-    if any(predicate.operator != "eq" or predicate.value is None for predicate in context):
-        raise CustomImportReadRequestError("context selectors are invalid")
-    if any(
-        predicate.operator not in {"eq", "gt", "gte", "lt", "lte"} or predicate.value is None for predicate in filters
-    ):
-        raise CustomImportReadRequestError("metric filters are invalid")
+    _validate_provider_predicates(context, filters, grouped, child)
     return _ParsedProviderRequest(
         target=transport._parse_target(document["target"]),
         native_args=_bounded_native_args(
@@ -184,7 +187,24 @@ def _parse_provider_request(
         grouped_child_query=child,
         include_filter=include_filter,
         maximum_family_rows=maximum_family_rows,
+        network_binding=network_binding,
     )
+
+
+def _validate_provider_predicates(context, filters, grouped, child):
+    """Preserve context, metric and grouped-child predicate bounds for every caller."""
+
+    maximum_terms = MAX_GROUPED_PREDICATE_TERMS if grouped is not None else MAX_FILTER_TERMS
+    if child is not None:
+        maximum_terms = MAX_GROUPED_CHILD_PREDICATE_TERMS
+    if len(context) + len(filters) > maximum_terms or (grouped is not None and child is None and len(context) > 2):
+        raise CustomImportReadRequestError("filter count exceeds the read-core limit")
+    if any(predicate.operator != "eq" or predicate.value is None for predicate in context):
+        raise CustomImportReadRequestError("context selectors are invalid")
+    if any(
+        predicate.operator not in {"eq", "gt", "gte", "lt", "lte"} or predicate.value is None for predicate in filters
+    ):
+        raise CustomImportReadRequestError("metric filters are invalid")
 
 
 def _bounded_native_args(document, parser, *, complete_family, maximum_rows=MAX_FULL_FAMILY_PAGE_SIZE):
@@ -212,7 +232,7 @@ async def serve_custom_import_providers(request: Any, session: Any):
         body = getattr(request, "body", None)
         if type(body) is not bytes or not 1 <= len(body) <= transport._MAX_BODY_BYTES:
             raise transport._fail()
-        parsed = _parse_provider_request(body)
+        parsed = _parse_provider_request(body, allow_network_binding=True)
         verified = transport._verify_provider_transport(
             headers=request.headers,
             body=body,
@@ -225,12 +245,15 @@ async def serve_custom_import_providers(request: Any, session: Any):
             raise CustomImportReadUnavailableError("fresh provider read session is required")
         async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-            async with _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS):
+            async with (
+                _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS),
+                provider_network_read_scope(session, parsed.network_binding) as manifest,
+            ):
                 provider_payload = await _read_provider_payload(request, session, parsed, verified)
                 encoded = transport._canonical_json_bytes(provider_payload)
                 if len(encoded) > _provider_response_limit(parsed, len(provider_payload["rows"])):
                     raise CustomImportReadUnavailableError("provider response is unavailable")
-                return transport._response(encoded, 200)
+                return provider_network_response(encoded, manifest)
     except Exception as failure:
         transport._log_failure(failure)
         status = 400 if isinstance(failure, InvalidUsage) else transport._failure_status(failure)
