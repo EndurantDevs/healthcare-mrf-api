@@ -12,6 +12,7 @@ from uuid import uuid4
 import pytest
 from asyncpg import CheckViolationError
 
+from process import registry_source_admission as admission
 from process.registry_source_admission import RegistrySourceAdmissionError, RegistrySourceEdition, admit_cms_mlr_edition
 from tests.test_network_serving_schema_postgres import serving_schema
 
@@ -70,6 +71,95 @@ def _edition(input_bytes):
         2024,
         datetime(2025, 9, 12, tzinfo=timezone.utc),
     )
+
+
+@pytest.mark.asyncio
+async def test_native_edition_identity_absent_does_not_register(serving_schema):
+    connection, schema, _ = serving_schema
+    async with connection.transaction():
+        assert (
+            await admission.read_registry_source_edition_identity(connection, _edition(_input()), control_schema=schema)
+            is None
+        )
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_source_snapshot') == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("different_uuid", [False, True])
+async def test_native_edition_identity_restores_original_context_without_completion(serving_schema, different_uuid):
+    connection, schema, _ = serving_schema
+    original = _edition(_input())
+    provisional = replace(original, snapshot_id=uuid4()) if different_uuid else original
+    async with connection.transaction():
+        await admission._register_edition(connection, f'"{schema}"', original)
+        await connection.execute("SELECT pg_catalog.set_config('search_path','public,pg_temp,pg_catalog',true)")
+        assert (
+            await admission.read_registry_source_edition_identity(connection, provisional, control_schema=schema)
+            == original
+        )
+        assert (
+            await connection.fetchval("SELECT pg_catalog.current_setting('search_path')") == "public,pg_temp,pg_catalog"
+        )
+        assert connection.is_in_transaction()
+        assert (
+            await admission.read_registry_source_admission_receipt(
+                connection, original, header_sha256=admission._source_header_sha256(_HEADERS), control_schema=schema
+            )
+            is None
+        )
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_source_snapshot') == 1
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_source_observation') == 0
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_source_admission_receipt') == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("source_url", "https://example.test/other.zip"),
+        ("artifact_sha256", "f" * 64),
+        ("reporting_year", 2025),
+        ("published_at", None),
+    ],
+)
+async def test_native_edition_identity_refuses_immutable_drift(serving_schema, field, value):
+    connection, schema, _ = serving_schema
+    original = _edition(_input())
+    async with connection.transaction():
+        await admission._register_edition(connection, f'"{schema}"', original)
+        with pytest.raises(RegistrySourceAdmissionError, match="immutable"):
+            await admission.read_registry_source_edition_identity(
+                connection, replace(original, snapshot_id=uuid4(), **{field: value}), control_schema=schema
+            )
+        assert connection.is_in_transaction() and await connection.fetchval("SELECT 1") == 1
+        assert (
+            await admission.read_registry_source_edition_identity(connection, original, control_schema=schema)
+            == original
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("source_id", "plan-finder"),
+        ("edition_id", "2024-as-of-2025-09-12"),
+        ("input_sha256", "f" * 64),
+        ("parser_version", "cms-header-v2"),
+    ],
+)
+async def test_native_edition_identity_does_not_alias_distinct_keys(serving_schema, field, value):
+    connection, schema, _ = serving_schema
+    original = _edition(_input())
+    async with connection.transaction():
+        await admission._register_edition(connection, f'"{schema}"', original)
+        assert (
+            await admission.read_registry_source_edition_identity(
+                connection, replace(original, snapshot_id=uuid4(), **{field: value}), control_schema=schema
+            )
+            is None
+        )
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_source_snapshot') == 1
 
 
 @pytest.mark.asyncio
