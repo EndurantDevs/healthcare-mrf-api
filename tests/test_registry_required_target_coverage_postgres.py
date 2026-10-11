@@ -4,30 +4,40 @@
 import csv
 import io
 import json
+from contextlib import AsyncExitStack, aclosing
 from dataclasses import replace
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import uuid4, uuid5
 
 import pytest
 
 from process import network_approved_catalog_evidence as catalog_evidence
 from process import network_approved_membership_source as membership_source
+from process.network_address_projection import PinnedAddressSource
+from process.network_approved_membership_source import pin_approved_membership_source
+from process.network_membership_pipeline import prepare_and_publish_network_candidate
+from process.registry_candidate_composition import (
+    RegistryCompositionAddressSources,
+    compose_registry_membership_candidate,
+)
 from process.registry_required_target_coverage import (
     RegistryRequiredTargetCoverageError,
     RegistryRequiredTargetCoverageUnavailable,
     read_registry_required_target_coverage,
 )
 from process.registry_required_target_store import admit_registry_required_targets
+from tests import cms_registry_recipe_postgres_support as cms_recipe_support
 from tests.test_network_custom_address_source_postgres import _draft, _seed
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_provider_routes_postgres import _composed_candidate, _durable_state
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_approval_store_postgres import _approve, _command, _create
-from tests.test_registry_candidate_composition_postgres import _imported_candidate, _remove_candidates
+from tests.test_registry_candidate_composition_postgres import _imported_candidate, _remove_candidates, _roles
 from tests.test_registry_company_links_postgres import _assertion, _links
 from tests.test_registry_network_binding_approval_postgres import _bind, _binding
 from tests.test_registry_required_target_review_store_postgres import _SOURCE_FIELDS, _review
 from tests.test_registry_required_target_store_postgres import _HEADERS, _edition
+from tests.test_registry_source_recipe_composition_postgres import _publish_raw_recipe
 
 pytestmark = pytest.mark.asyncio
 
@@ -227,18 +237,33 @@ async def test_all_targets_exact_office_shared_network_and_unknown_pricing(cover
     context = coverage_db
     report = await _read(context)
     assert len(report["targets"]) == report["totals"]["ledger_targets"] == 3
-    mapped_targets = [target for target in report["targets"] if target["mapping_status"] == "resolved"]
+    mapped_targets = [
+        coverage_target for coverage_target in report["targets"] if coverage_target["mapping_status"] == "resolved"
+    ]
     assert len(mapped_targets) == report["totals"]["mapped_targets"] == report["totals"]["directory_available"] == 2
     assert report["totals"]["exact_membership_count"] == 1
     assert report["totals"]["pricing_evidence_count"] is None
     assert report["totals"]["priceable"] == 0
-    assert all(target["priceable"] is None and "pricing_not_assessed" in target["gaps"] for target in mapped_targets)
+    assert all(
+        coverage_target["priceable"] is None and "pricing_not_assessed" in coverage_target["gaps"]
+        for coverage_target in mapped_targets
+    )
     assert report["totals"]["unresolved_location_count"] == 0
     assert report["provenance"]["approved_map_pin"] == "manifest"
     assert report["provenance"]["reviews"] == [
         {"snapshot_id": str(context.review_edition.snapshot_id), "artifact_sha256": context.review["artifact_sha256"]}
     ]
     assert report["assessment"]["source_status"] == "selected_serving_generation_lineage"
+    source_selection = report["provenance"]["reviewed_source_selection"]
+    assert source_selection["totals"] == {"ledger_targets": 3, "selected": 0, "not_selected": 0, "not_assessed": 3}
+    assert [diagnostic_entry["target_key"] for diagnostic_entry in source_selection["targets"]] == [
+        diagnostic_entry["target_key"] for diagnostic_entry in report["targets"]
+    ]
+    assert report["provenance"]["source_selection"] is None
+    assert all(
+        diagnostic_entry["selected_source_count"] is None and not diagnostic_entry["missing_sources"]
+        for diagnostic_entry in source_selection["targets"]
+    )
     assert context.seed.second["record_id"] not in json.dumps(report["provenance"]["target_evidence"])
     assert (
         await context.fixture.connection.fetchval(
@@ -387,6 +412,11 @@ async def test_unreviewed_ledger_is_native_verified_and_keeps_every_target(cover
     assert all(target["mapping_status"] == "missing" and target["priceable"] is None for target in report["targets"])
     assert report["provenance"]["ledger"]["artifact_sha256"] == receipt["artifact_sha256"]
     assert report["provenance"]["ledger"]["source_rows"] == 4
+    selection = report["provenance"]["reviewed_source_selection"]
+    assert selection["totals"] == {"ledger_targets": 4, "selected": 0, "not_selected": 0, "not_assessed": 4}
+    assert all(
+        target["reviewed_source_count"] == 0 and target["status"] == "not_assessed" for target in selection["targets"]
+    )
 
 
 async def test_new_unapproved_review_and_draft_do_not_change_pinned_report(coverage_db):
@@ -495,3 +525,115 @@ async def test_read_only_repeatable_transaction_and_selectors_are_required(cover
                 await read_registry_required_target_coverage(
                     fixture.connection, selector, control_schema=fixture.control_schema
                 )
+
+
+@pytest.fixture
+async def staged_target_source(monkeypatch, tmp_path):
+    """Use original CMS contexts only for this case, sharing one registry connection."""
+    async with AsyncExitStack() as cleanup:
+        template = await cleanup.enter_async_context(aclosing(cms_recipe_support.cms_recipe_template.__wrapped__()))
+        await anext(template)
+        database_fixture = await cleanup.enter_async_context(
+            aclosing(cms_recipe_support.cms_recipe_database.__wrapped__(monkeypatch))
+        )
+        database = await anext(database_fixture)
+        schema_fixture = await cleanup.enter_async_context(
+            aclosing(cms_recipe_support.serving_schema.__wrapped__(database, monkeypatch))
+        )
+        serving = await anext(schema_fixture)
+        custom_fixture = await cleanup.enter_async_context(aclosing(custom_db.__wrapped__(serving)))
+        fixture = await anext(custom_fixture)
+        source_fixture = await cleanup.enter_async_context(
+            aclosing(cms_recipe_support.reviewed_cms_source.__wrapped__(database, serving, monkeypatch, tmp_path))
+        )
+        source = await anext(source_fixture)
+        assert fixture.connection is serving[0] is source[0][0]
+        assert fixture.control_schema == serving[1] == source[0][1]
+        assert fixture.engine is serving[2]
+        yield fixture, source
+
+
+async def _approve_staged_target_review(fixture, reviewed_source):
+    """Attach genuine retained target review evidence through the existing binding CAS."""
+    _, actor, _, binding, _, _ = reviewed_source
+    edition, ledger, required_targets = await _ledger(fixture)
+    review_document_dict = {
+        "ledger_snapshot_id": str(edition.snapshot_id),
+        "ledger_artifact_sha256": ledger["artifact_sha256"],
+        "decisions": [_decision(required_target["target_key"], binding) for required_target in required_targets[:2]],
+    }
+    _, review = await _review(
+        (fixture.connection, fixture.control_schema, fixture.engine), edition, review_document_dict
+    )
+    reviewed_binding_dict = {
+        **binding,
+        "operation": "rebind",
+        "expected_revision": 1,
+        "expected_network_id": binding["network_id"],
+        "evidence_id": review["evidence_id"],
+        "evidence_sha256": review["artifact_sha256"],
+    }
+    changed = (await _bind(fixture.connection, fixture.control_schema, reviewed_binding_dict, actor))["records"][0]
+    approval = await _approve(
+        fixture.connection,
+        fixture.control_schema,
+        await _command(fixture.connection, fixture.control_schema, changed),
+        actor,
+    )
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        approved = await pin_approved_membership_source(
+            fixture.connection, approved_revision=approval["approved_revision"], control_schema=fixture.control_schema
+        )
+    return edition, required_targets, approved
+
+
+async def test_staged_recipe_preserves_exact_office(staged_target_source):
+    """Real source admission and staged composition prove inclusion without a pricing claim."""
+    fixture, reviewed_source = staged_target_source
+    copy_targets = []
+    request_id = uuid4()
+    try:
+        original = await _publish_raw_recipe(fixture, reviewed_source, copy_targets)
+        edition, required_targets, approved = await _approve_staged_target_review(fixture, reviewed_source)
+        fixture.composition_ids.append(uuid5(request_id, "address:" + approved.generation_id))
+        copy_target, addresses = await compose_registry_membership_candidate(
+            fixture.connection,
+            request_id=request_id,
+            approved_revision=approved.approved_revision,
+            expected_head=original.generation_id,
+            address_sources=RegistryCompositionAddressSources(
+                PinnedAddressSource(original.schema_name, "entity_address_unified", original.manifest_sha256)
+            ),
+            writer_roles=_roles(fixture),
+            source_manifest=original,
+            control_schema=fixture.control_schema,
+        )
+        copy_targets.append(copy_target)
+        manifest = await prepare_and_publish_network_candidate(
+            fixture.connection, copy_target, addresses, **_roles(fixture), control_schema=fixture.control_schema
+        )
+        report = await _read(SimpleNamespace(fixture=fixture, edition=edition), generation_id=manifest["generation_id"])
+        selection = report["provenance"]["reviewed_source_selection"]
+        assert selection["totals"] == {"ledger_targets": 3, "selected": 2, "not_selected": 0, "not_assessed": 1}
+        assert {
+            selection_target["target_key"]
+            for selection_target in selection["targets"]
+            if selection_target["status"] == "selected"
+        } == {required_target["target_key"] for required_target in required_targets[:2]}
+        assert all(not selection_target["missing_sources"] for selection_target in selection["targets"])
+        receipt = report["provenance"]["source_selection"]
+        assert (receipt["recipe_count"], receipt["mapped_rows"], receipt["omitted_rows"]) == (1, 1, 0)
+        members = await fixture.connection.fetch(
+            f'SELECT network_id,provider_system,provider_id,location_id FROM "{copy_target.schema_name}".network_membership'
+        )
+        assert [tuple(member) for member in members] == [
+            (reviewed_source[2][0]["record_id"], "npi", "1000000491", reviewed_source[0][3][0])
+        ]
+        assert reviewed_source[0][3][1] not in {member["location_id"] for member in members}
+        assert report["totals"]["exact_membership_count"] == 1
+        assert report["totals"]["directory_available"] == 2
+        assert report["provenance"]["serving"]["generation_id"] == manifest["generation_id"]
+        assert report["totals"]["pricing_evidence_count"] is None
+        assert all(required_target["priceable"] is None for required_target in report["targets"])
+    finally:
+        await _remove_candidates(fixture, copy_targets, request_id)

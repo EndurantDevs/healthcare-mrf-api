@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from process import registry_record_store as record_store
 from process.company_registry_assertion_values import CONTRACT
 from process.registry_approval_store import RegistryApprovalConflict, approve_registry_records
+from process.registry_issuer_resolution import read_registry_issuer_resolutions
 from process.registry_management_permissions import (
     install_registry_management_permissions,
     verify_registry_management_permissions,
@@ -1130,3 +1131,98 @@ async def test_company_group_store_joint_rollback_and_insert_failure(assertion_d
     assert (await _draft(fixture, command))["record"]["group_assertions"] == command.fields["assertions"][
         "group_assertions"
     ]
+
+
+async def _durable_manual_state(fixture, group_id, company_id, approved_revision):
+    async with fixture.sessions() as session:
+        heads = (
+            await get_registry_record(session, "group", group_id, schema=fixture.schema),
+            await get_registry_record(session, "company", company_id, schema=fixture.schema),
+        )
+    keys = [str(group_id), str(company_id)]
+    history = await fixture.connection.fetch(
+        f"SELECT to_jsonb(history) AS document FROM {fixture.namespace}.registry_record_history history "
+        "WHERE record_key=ANY($1::text[]) ORDER BY record_kind,revision",
+        keys,
+    )
+    approved = await fixture.connection.fetch(
+        f"SELECT to_jsonb(record) AS document FROM {fixture.namespace}.registry_approved_record record "
+        "WHERE approved_revision=$1 AND record_key=ANY($2::text[]) ORDER BY record_kind",
+        approved_revision,
+        keys,
+    )
+    control = await fixture.connection.fetchrow(
+        f"SELECT draft_revision,approved_revision FROM {fixture.namespace}.registry_revision_control WHERE id=1"
+    )
+    return heads, history, approved, control
+
+
+def _manual_durability_edition_input(company_name, year):
+    input_bytes = cms_input(company_name=company_name)
+    if year == 2025:
+        rows = list(csv.DictReader(io.StringIO(input_bytes.decode(), newline="")))
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(output, fieldnames=list(rows[0]), lineterminator="\r\n")
+        writer.writeheader()
+        writer.writerows(row | {"naic_group_code": ""} for row in rows)
+        input_bytes = output.getvalue().encode()
+    return input_bytes
+
+
+async def test_manual_company_group_history_survives_two_source_editions(assertion_db):
+    fixture = assertion_db
+    group_creation = group_command()
+    group_creation.fields.update(aliases=["Manual parent alias"])
+    group = await _draft(fixture, group_creation)
+    creation = _create()
+    creation.fields.update(roles=["employer", "network_operator"], aliases=["Original company alias"])
+    creation.fields["assertions"]["role_assertions"].append(_role() | {"role": "network_operator"})
+    creation = _with_groups(creation, [_declared_group(creation.record_id, group_creation.record_id)])
+    created = await _draft(fixture, creation)
+    correction = replace(
+        creation,
+        operation="correct",
+        expected_revision=1,
+        fields=creation.fields
+        | {
+            "aliases": ["Corrected company alias"],
+            "assertions": creation.fields["assertions"] | {"expected_revision": 1},
+        },
+        idempotency_key=uuid4().hex,
+    )
+    corrected = await _draft(fixture, correction)
+    assert created["record"]["identifier_assertions"] == corrected["record"]["identifier_assertions"] == []
+    approved = await _approve(fixture, group, corrected)
+    before = await _durable_manual_state(
+        fixture, group_creation.record_id, creation.record_id, approved["approved_revision"]
+    )
+    assert len(before[1]) == 3 and len(before[2]) == 2
+    for year in (2024, 2025):
+        input_bytes = _manual_durability_edition_input(corrected["record"]["display_name"], year)
+        edition = replace(cms_edition(input_bytes), edition_id=str(year), reporting_year=year)
+        async with fixture.connection.transaction():
+            receipt = await admit_cms_mlr_edition(
+                fixture.connection, input_bytes, edition, control_schema=fixture.schema
+            )
+        assert receipt["replayed"] is False and receipt["resolved_issuers"] == 2
+        assert (
+            await _durable_manual_state(
+                fixture, group_creation.record_id, creation.record_id, approved["approved_revision"]
+            )
+            == before
+        )
+        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+            issuers = await read_registry_issuer_resolutions(
+                fixture.connection, ("00123", "00124"), control_schema=fixture.schema
+            )
+        assert tuple(issuer["hios_issuer_id"] for issuer in issuers) == ("00123", "00124")
+        assert all(
+            issuer["reporting_year"] == year and issuer["company_resolution_status"] == "resolved" for issuer in issuers
+        )
+        assert all(issuer["legal_company"]["company_id"] != str(creation.record_id) for issuer in issuers)
+        assert all(issuer["resolution_status"] == ("resolved" if year == 2024 else "unresolved") for issuer in issuers)
+        if year == 2025:
+            assert all(
+                issuer["reported_group"] is None and issuer["group_resolution_status"] == "unresolved"
+                for issuer in issuers
+            )

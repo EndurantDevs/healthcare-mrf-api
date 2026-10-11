@@ -5,12 +5,13 @@ import json
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import urlencode
 from uuid import uuid4
 
 import pytest
 from sanic import Sanic, response
 from sanic.exceptions import InvalidUsage, NotFound
-from sqlalchemy import MetaData, func, select, text
+from sqlalchemy import MetaData, event, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api.endpoint import npi
@@ -26,12 +27,13 @@ from api.network_address_scope import (
 )
 from api.provider_geo_sql import nearby_row_tiebreaker
 from api.provider_list_sql import _is_unified_address_table, _provider_list_connection, _provider_list_parameters
-from db.models import EntityAddressUnified, NPIData, NPIDataTaxonomy, NPIDataTaxonomyGroup
+from db.models import EntityAddressUnified, NPIData, NPIDataTaxonomy, NPIDataTaxonomyGroup, NUCCTaxonomy
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.test_network_address_projection_postgres import projection_db
 from tests.test_network_membership_publication_postgres import _candidate_writer_roles, _publish
 from tests.test_network_membership_serving_indexes_postgres import _prepare, serving_indexes_db
 from tests.test_network_membership_validation_postgres import validation_db
+from tests.test_network_serving_routes_postgres import _next_full_candidate, _reader_engine
 from tests.test_network_serving_schema_postgres import serving_schema
 
 
@@ -399,3 +401,171 @@ async def test_nearby_continuation_binds_actual_manifest_and_current_access(serv
             with pytest.raises(InvalidUsage, match="cursor is invalid"):
                 npi._decode_nearby_cursor(cursor, npi._nearby_cursor_scope(query_by_name))
     assert npi._nearby_cursor_scope(query_by_name) == legacy_scope
+
+
+_NEARBY_IDENTITY_OBJECTS_SQL = """SELECT object.oid,object.relowner,object.relname,object.relkind
+FROM pg_class object WHERE object.relnamespace=to_regnamespace('mrf') ORDER BY object.oid"""
+
+
+async def _remove_nearby_identity_schema(connection, schema_identity_parts, identity_objects):
+    """Remove only the exact fixture-owned identity schema after its readers close."""
+    current_identity = await connection.fetchrow("SELECT oid,nspowner FROM pg_namespace WHERE nspname='mrf'")
+    if current_identity is None:
+        return
+    assert schema_identity_parts is not None and tuple(current_identity) == schema_identity_parts
+    current_objects = await connection.fetch(_NEARBY_IDENTITY_OBJECTS_SQL)
+    assert tuple(tuple(identity_object) for identity_object in current_objects) == identity_objects
+    assert not await connection.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE pronamespace=to_regnamespace('mrf'))"
+    )
+    await connection.execute('DROP SCHEMA "mrf" CASCADE')
+    assert await connection.fetchval("SELECT to_regnamespace('mrf')") is None
+
+
+@pytest.fixture
+async def nearby_identity_db(serving_indexes_db, serving_schema):
+    """Supply literal nearby identity joins without ambient tables or SQL rewriting."""
+    fixture = serving_indexes_db
+    _, _, engine = serving_schema
+    assert await fixture.connection.fetchval("SELECT to_regnamespace('mrf')") is None
+    identity_metadata = MetaData()
+    for model in (NPIData, NPIDataTaxonomy, NUCCTaxonomy):
+        model.__table__.to_metadata(identity_metadata, schema="mrf")
+    schema_identity_parts = None
+    identity_objects = ()
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text('CREATE SCHEMA "mrf"'))
+            await connection.run_sync(identity_metadata.create_all)
+            await connection.execute(text('INSERT INTO "mrf".npi(npi) VALUES(1111111111),(2222222222)'))
+            schema_identity_parts = tuple(
+                (await connection.execute(text("SELECT oid,nspowner FROM pg_namespace WHERE nspname='mrf'"))).one()
+            )
+            identity_objects = tuple(
+                tuple(identity_object)
+                for identity_object in (await connection.execute(text(_NEARBY_IDENTITY_OBJECTS_SQL))).all()
+            )
+        async with fixture.connection.transaction():
+            await _prepare(fixture)
+        async with _candidate_writer_roles(fixture):
+            reader_role = fixture.writer_roles["reader"]
+            await fixture.connection.execute(f'GRANT USAGE ON SCHEMA "mrf" TO "{reader_role}"')
+            for table_name in ("npi", "npi_taxonomy", "nucc_taxonomy"):
+                await fixture.connection.execute(f'GRANT SELECT ON TABLE "mrf"."{table_name}" TO "{reader_role}"')
+            yield fixture
+    finally:
+        try:
+            for schema_name in getattr(fixture, "additional_schemas", ()):
+                await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
+                assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", schema_name) is None
+        finally:
+            await _remove_nearby_identity_schema(fixture.connection, schema_identity_parts, identity_objects)
+
+
+@pytest.fixture
+async def nearby_http_app(nearby_identity_db, serving_schema, monkeypatch):
+    """Use the public nearby handler and actual SELECT-only native HTTP connection."""
+    fixture = nearby_identity_db
+    _, _, source_engine = serving_schema
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-nearby-token")
+    async with fixture.connection.transaction():
+        fixture.published_manifest = await _publish(fixture)
+    engine = _reader_engine(source_engine, fixture.writer_roles["reader"])
+    statements = []
+    observed_locations = []
+    genuine_mapping = npi._populate_near_provider_mapping
+
+    def observe_mapping(*arguments):
+        """Observe original native office identity and delegate all response assembly."""
+        observed_locations.append(arguments[1]["location_key"])
+        return genuine_mapping(*arguments)
+
+    monkeypatch.setattr(npi, "_populate_near_provider_mapping", observe_mapping)
+    event.listen(engine.sync_engine, "before_cursor_execute", lambda *arguments: statements.append(arguments[2]))
+    app = _canonical_read_app(engine, [])
+    app.add_route(npi.get_near_npi, "/api/v1/npi/near/", methods=["GET"])
+    try:
+        yield SimpleNamespace(app=app, fixture=fixture, statements=statements, observed_locations=observed_locations)
+    finally:
+        await engine.dispose()
+
+
+async def _nearby_http_reply(context, query_by_name, headers_by_name):
+    _, reply = await context.app.asgi_client.get(
+        "/api/v1/npi/near/?" + urlencode(query_by_name), headers=headers_by_name
+    )
+    return reply
+
+
+def _assert_nearby_page(reply, *, generation, provider_npi, total_count):
+    assert reply.status == 200 and reply.json["total_count"] == total_count
+    assert [provider["npi"] for provider in reply.json["items"]] == [provider_npi]
+    assert reply.headers["X-Network-Generation"] == str(generation)
+    assert reply.headers["Cache-Control"] == "private, no-store"
+    assert all("canonical_network_ids" not in provider for provider in reply.json["items"])
+
+
+async def _assert_nearby_cursor_refusals(context, query_by_name, headers_by_name, cursor):
+    for query_change, header_change in (
+        ({"network_ids": "42"}, {}),
+        ({}, {"X-Network-Access-Scope": "b" * 64}),
+        ({"lat": "40.76"}, {}),
+        ({"network_generation": str(context.fixture.published_manifest["generation_id"])}, {}),
+    ):
+        statement_count = len(context.statements)
+        refused = await _nearby_http_reply(
+            context, query_by_name | query_change | {"cursor": cursor}, headers_by_name | header_change
+        )
+        assert refused.status == 400 and refused.headers["Cache-Control"] == "private, no-store"
+        assert not any(
+            "WITH sub_s AS" in statement or "COUNT(DISTINCT (a.npi, a.address_key))" in statement
+            for statement in context.statements[statement_count:]
+        )
+
+
+@pytest.mark.asyncio
+async def test_public_nearby_http_keeps_exact_offices_and_continuation_scope(nearby_http_app):
+    context = nearby_http_app
+    headers_by_name = {"Authorization": "Bearer synthetic-network-nearby-token", "X-Network-Access-Scope": "a" * 64}
+    query_by_name = {"network_ids": "42,88", "lat": "40.75", "long": "-73.98", "include_total": "1", "limit": "1"}
+    original_generation = context.fixture.published_manifest["generation_id"]
+    selected = await _nearby_http_reply(context, query_by_name | {"network_ids": "42"}, headers_by_name)
+    _assert_nearby_page(selected, generation=original_generation, provider_npi=1111111111, total_count=1)
+    assert selected.json["has_more"] is False and selected.json["next_cursor"] is None
+    assert set(context.observed_locations) == {"a" * 64}
+    first = await _nearby_http_reply(context, query_by_name, headers_by_name)
+    _assert_nearby_page(first, generation=original_generation, provider_npi=1111111111, total_count=2)
+    cursor = first.json["next_cursor"]
+    assert first.json["has_more"] is True and isinstance(cursor, str) and cursor
+    second = await _nearby_http_reply(context, query_by_name | {"cursor": cursor}, headers_by_name)
+    _assert_nearby_page(second, generation=original_generation, provider_npi=2222222222, total_count=2)
+    assert second.json["has_more"] is False and second.json["next_cursor"] is None
+    assert set(context.observed_locations) == {"a" * 64, "c" * 64} and "b" * 64 not in context.observed_locations
+    nearby_statements = [
+        statement for statement in context.statements if "FROM mrf.npi" in statement or "JOIN mrf.npi" in statement
+    ]
+    assert nearby_statements and all(
+        "WHERE canonical_network_ids && CAST" in statement for statement in nearby_statements
+    )
+    assert all(
+        statement.index("WHERE canonical_network_ids") < statement.index("LIMIT")
+        for statement in nearby_statements
+        if "LIMIT" in statement
+    )
+    await _assert_nearby_cursor_refusals(context, query_by_name, headers_by_name, cursor)
+    retained_query = query_by_name | {"network_generation": str(original_generation)}
+    retained_first = await _nearby_http_reply(context, retained_query, headers_by_name)
+    retained_cursor = retained_first.json["next_cursor"]
+    assert retained_first.status == 200 and retained_cursor
+    next_fixture = await _next_full_candidate(context.fixture)
+    async with context.fixture.connection.transaction():
+        next_manifest = await _publish(next_fixture)
+    changed = await _nearby_http_reply(context, query_by_name | {"cursor": cursor}, headers_by_name)
+    assert changed.status == 400 and changed.headers["X-Network-Generation"] == str(next_manifest["generation_id"])
+    retained = await _nearby_http_reply(context, retained_query | {"cursor": retained_cursor}, headers_by_name)
+    _assert_nearby_page(retained, generation=original_generation, provider_npi=2222222222, total_count=2)
+    unavailable = await _nearby_http_reply(
+        context, query_by_name | {"network_generation": "9223372036854775807"}, headers_by_name
+    )
+    assert unavailable.status == 503 and unavailable.headers["Cache-Control"] == "private, no-store"
+    assert set(context.observed_locations) == {"a" * 64, "c" * 64}
