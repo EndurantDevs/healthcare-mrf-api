@@ -5,13 +5,13 @@ Registration, migration, protected persistence and approval are caller-owned.
 Rows reuse CompanyRegistry.company_id and do not independently establish approval.
 """
 
-from sqlalchemy import TIMESTAMP, BigInteger, CheckConstraint, Column, Date, String, UniqueConstraint, func
+from sqlalchemy import TIMESTAMP, BigInteger, CheckConstraint, Column, Date, Index, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 
 from db.connection import Base
 from db.registry_schema import registry_schema
 
-__all__ = ("CompanyRegistryRoleAssertion", "CompanyRegistryIdentifierAssertion")
+__all__ = ("CompanyRegistryRoleAssertion", "CompanyRegistryIdentifierAssertion", "CompanyRegistryGroupAssertion")
 _SCHEMA = registry_schema()
 _ZERO_UUID = "'00000000-0000-0000-0000-000000000000'::uuid"
 
@@ -108,6 +108,42 @@ class CompanyRegistryIdentifierAssertion(Base):
     identifier_scope = Column(String(128), nullable=False)
     identifier_value = Column(String(64), nullable=False)
     valid_from = Column(Date, nullable=False)
+    valid_to = Column(Date)
+    provenance_kind = Column(String(32), nullable=False)
+    evidence_ref = Column(String(128), nullable=False)
+    source_snapshot_id = Column(UUID(as_uuid=True))
+    source_record_key = Column(String(128))
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+
+
+class CompanyRegistryGroupAssertion(Base):
+    """Retain dated group evidence within one immutable company draft revision."""
+
+    __tablename__ = "company_registry_group_assertion"
+    __runtime_schema_sync__ = False
+    __table_args__ = (
+        *_common_checks("company_group_assertion"),
+        CheckConstraint(f"group_id IS NULL OR group_id<>{_ZERO_UUID}", name="company_group_assertion_group_identity"),
+        CheckConstraint("group_kind IN ('corporate_parent','naic_group')", name="company_group_assertion_group_kind"),
+        CheckConstraint(
+            "relationship_kind IN ('reported_affiliation','verified_ownership')",
+            name="company_group_assertion_relationship",
+        ),
+        CheckConstraint(
+            "provenance_kind<>'manual_reference' OR group_id IS NOT NULL",
+            name="company_group_assertion_manual_group",
+        ),
+        Index("company_group_assertion_revision_idx", "company_id", "company_revision"),
+        {"schema": _SCHEMA},
+    )
+
+    assertion_id = Column(UUID(as_uuid=True), primary_key=True)
+    company_id = Column(UUID(as_uuid=True), primary_key=True)
+    company_revision = Column(BigInteger, primary_key=True)
+    group_id = Column(UUID(as_uuid=True))
+    group_kind = Column(String(32), nullable=False)
+    relationship_kind = Column(String(32), nullable=False)
+    valid_from = Column(Date)
     valid_to = Column(Date)
     provenance_kind = Column(String(32), nullable=False)
     evidence_ref = Column(String(128), nullable=False)

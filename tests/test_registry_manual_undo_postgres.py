@@ -2,6 +2,7 @@
 """Historical undo preparation and actual draft correction on isolated native SQL."""
 
 import json
+from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 from uuid import UUID, uuid4
 
@@ -16,10 +17,16 @@ from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_manual_undo import (
     MAX_UNDO_SNAPSHOT_BYTES,
     RegistryManualUndoCommand,
+    _prepare_correction,
     prepare_registry_manual_undo,
 )
 from process.registry_record_store import RegistryRecordConflict, apply_registry_record_command
 from process.registry_retained_site_adoption import RetainedSiteAdoptionError
+from tests.test_company_registry_assertions_postgres import _ACTOR as _assertion_actor
+from tests.test_company_registry_assertions_postgres import _create as _assertion_company
+from tests.test_company_registry_assertions_postgres import _draft as _assertion_draft
+from tests.test_company_registry_assertions_postgres import _identifier as _assertion_identifier
+from tests.test_company_registry_assertions_postgres import assertion_db
 from tests.test_manual_location_identity_store_postgres import _create as _location
 from tests.test_manual_provider_identity_store_postgres import _create as _provider
 from tests.test_network_custom_address_source_postgres import custom_db
@@ -454,3 +461,139 @@ async def test_retained_site_revalidation_and_replay(retained_db):
         )
         == 3
     )
+
+
+def _undo_group_assertion(company_id, **changes):
+    return {
+        "assertion_id": str(uuid4()),
+        "company_id": str(company_id),
+        "group_id": str(uuid4()),
+        "group_kind": "corporate_parent",
+        "relationship_kind": "reported_affiliation",
+        "valid_from": "2025-06-30",
+        "valid_to": "2025-06-30",
+        "provenance": {
+            "kind": "manual_reference",
+            "evidence_ref": "Reviewed group reference",
+            "snapshot_id": None,
+            "source_record_key": None,
+        },
+    } | changes
+
+
+def _company_undo_target():
+    original = _assertion_company(identifiers=[_assertion_identifier()])
+    snapshot_by_field = {
+        "company_id": str(original.record_id),
+        "revision": 1,
+        "archived": False,
+        **{key: original.fields[key] for key in ("display_name", "roles", "aliases")},
+        **{key: original.fields["assertions"][key] for key in ("role_assertions", "identifier_assertions")},
+    }
+    history_by_field = {
+        "record_json": snapshot_by_field,
+        "request_sha256": "a" * 64,
+        "custom_revision": 7,
+        "current_revision": 2,
+    }
+    undo = RegistryManualUndoCommand("company", original.record_id, 2, 1, "Reviewed target", uuid4().hex)
+    return undo, history_by_field
+
+
+@pytest.mark.parametrize("groups", ["legacy", "empty", "manual_nullable", "source_nullable"])
+async def test_company_undo_preparation_restores_exact_target_group_family(groups):
+    undo, history_by_field = _company_undo_target()
+    snapshot = history_by_field["record_json"]
+    if groups != "legacy":
+        snapshot["group_assertions"] = []
+    if groups == "manual_nullable":
+        snapshot["group_assertions"] = [_undo_group_assertion(undo.record_id, valid_from=None)]
+    if groups == "source_nullable":
+        snapshot["group_assertions"] = [
+            _undo_group_assertion(
+                undo.record_id,
+                group_id=None,
+                valid_from=None,
+                valid_to=None,
+                provenance={
+                    "kind": "source_reference",
+                    "evidence_ref": "Retained group observation",
+                    "snapshot_id": str(uuid4()),
+                    "source_record_key": "company-observation-17",
+                },
+            )
+        ]
+    before = deepcopy(history_by_field)
+    prepared = _prepare_correction(undo, history_by_field, "company_id")
+    assertions = prepared.command.fields["assertions"]
+    assert "group_assertions" in assertions
+    assert assertions["group_assertions"] == snapshot.get("group_assertions", [])
+    for family in ("role_assertions", "identifier_assertions"):
+        assert assertions[family] == snapshot[family]
+    assert assertions["expected_revision"] == prepared.command.expected_revision == 2
+    assert assertions["company_id"] == str(undo.record_id)
+    assert prepared.command.idempotency_key == undo.idempotency_key
+    assert prepared.provenance.target_custom_revision == 7
+    assert prepared.provenance.target_request_sha256 == "a" * 64
+    assert prepared.provenance.target_archived is False
+    assert history_by_field == before
+
+
+@pytest.mark.parametrize("malformation", ["null", "relationship", "company", "extra_key", "period"])
+async def test_company_undo_preparation_rejects_explicit_malformed_group_history(malformation):
+    undo, history_by_field = _company_undo_target()
+    assertion = _undo_group_assertion(undo.record_id)
+    changes_by_case = {
+        "relationship": {"relationship_kind": "unsupported_relationship"},
+        "company": {"company_id": str(uuid4())},
+        "extra_key": {"unreviewed": True},
+        "period": {"valid_to": "2025-06-29"},
+    }
+    history_by_field["record_json"]["group_assertions"] = (
+        None if malformation == "null" else [assertion | changes_by_case[malformation]]
+    )
+    before = deepcopy(history_by_field)
+    with pytest.raises(ValueError, match="company_registry_assertion_values_invalid"):
+        _prepare_correction(undo, history_by_field, "company_id")
+    assert history_by_field == before
+
+
+@pytest.mark.parametrize("target_groups", ["legacy", "empty", "populated"])
+async def test_company_group_undo_round_trip_preserves_history_and_replay(assertion_db, target_groups):
+    fixture = assertion_db
+    group = _create(
+        "group", fields={"display_name": "Reviewed parent", "group_kind": "corporate_parent", "aliases": []}
+    )
+    await _assertion_draft(fixture, group)
+    original = _assertion_company(identifiers=[_assertion_identifier()])
+    assertion = _undo_group_assertion(original.record_id, group_id=str(group.record_id))
+    if target_groups != "legacy":
+        original.fields["assertions"]["group_assertions"] = [assertion] if target_groups == "populated" else []
+    first = await _assertion_draft(fixture, original)
+    later_fields = deepcopy(original.fields)
+    later_fields["display_name"] = "Later company"
+    later_fields["assertions"].update(
+        expected_revision=1, group_assertions=[] if target_groups == "populated" else [assertion]
+    )
+    later = replace(
+        original, operation="correct", expected_revision=1, fields=later_fields, idempotency_key=uuid4().hex
+    )
+    await _assertion_draft(fixture, later)
+    undo = RegistryManualUndoCommand("company", original.record_id, 2, 1, "Reviewed historical groups", uuid4().hex)
+    preparation = await _prepare(fixture.sessions, fixture.schema, undo, _assertion_actor)
+    assert preparation.command.fields["assertions"]["group_assertions"] == first["record"]["group_assertions"]
+    restored = await _assertion_draft(fixture, preparation.command)
+    assert restored["revision"] == 3
+    for family in ("roles", "role_assertions", "identifier_assertions", "group_assertions"):
+        assert restored["record"][family] == first["record"][family]
+    assert await _assertion_draft(fixture, preparation.command) == restored
+    historical_record_by_field = json.loads(
+        await fixture.connection.fetchval(
+            f"SELECT record_json::text FROM {fixture.namespace}.registry_record_history "
+            "WHERE record_kind='company' AND record_key=$1 AND revision=1",
+            str(original.record_id),
+        )
+    )
+    assert historical_record_by_field == first["record"]
+    with pytest.raises(RegistryRecordConflict, match="revision_conflict"):
+        await _assertion_draft(fixture, replace(preparation.command, idempotency_key=uuid4().hex))

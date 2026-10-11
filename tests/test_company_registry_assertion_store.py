@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Protected draft flow with fake SQL results; native transaction proof is separate."""
 
+import asyncio
 import copy
 import importlib.util
 from contextlib import asynccontextmanager
@@ -19,7 +20,7 @@ from process import registry_approval_store as approval
 from process import registry_management_permissions as permissions
 from process import registry_record_store as store
 from process.registry_manual_undo import RegistryManualUndoCommand, _prepare_correction
-from tests.test_company_registry_assertion_values import COMPANY, _command, _identifier, _role
+from tests.test_company_registry_assertion_values import COMPANY, _command, _group, _identifier, _role
 
 ACTOR = store.RegistryActor("platform_admin", UUID(int=100), "example-client")
 
@@ -216,7 +217,7 @@ async def test_invalid_actor_and_missing_caller_transaction_never_query():
 
 
 @pytest.mark.asyncio
-async def test_company_read_batches_two_families_for_multiple_revisions():
+async def test_company_read_batches_three_families_for_multiple_revisions():
     records = [{"company_id": COMPANY, "revision": 2}, {"company_id": str(UUID(int=5)), "revision": 3}]
     row = store._company_assertion_row(_identifier(), COMPANY, 2)
     queries = []
@@ -229,7 +230,7 @@ async def test_company_read_batches_two_families_for_multiple_revisions():
             return Result([row] if "company_registry_identifier_assertion" in sql else [])
 
     await store._attach_company_assertions(Reader(), records, "example_registry")
-    assert len(queries) == 2
+    assert len(queries) == 3
     assert records[0]["identifier_assertions"] == [_identifier()]
     assert records[1]["identifier_assertions"] == []
 
@@ -255,8 +256,8 @@ async def test_approval_compares_exact_assertion_revision_without_legacy_bypass(
             assert "assertion.company_revision=head.revision" in sql
             assert "ORDER BY assertion.assertion_id" in sql
             assert (
-                "jsonb_build_object('role_assertions','[]'::jsonb,'identifier_assertions','[]'::jsonb)||history.record_json"
-                in sql
+                "jsonb_build_object('role_assertions','[]'::jsonb,'identifier_assertions','[]'::jsonb,"
+                "'group_assertions','[]'::jsonb)||history.record_json" in "".join(sql.split())
             )
             assert "heads.record_json-'created_at'" in sql
             return valid
@@ -358,3 +359,168 @@ async def test_manual_undo_restores_target_assertion_families_and_evidence(legac
     for key in ("display_name", "roles", "aliases", "role_assertions", "identifier_assertions"):
         assert restored["record"][key] == first["record"][key]
     assert session.history[0]["record_json"] == first["record"]
+
+
+def _group_edit(**changes):
+    command = _edit(**changes)
+    command.fields["assertions"]["group_assertions"] = [_group()]
+    return command
+
+
+@pytest.mark.asyncio
+async def test_groups_use_one_batch_and_preserve_exact_replay(monkeypatch):
+    import ptg2_address_canon
+
+    genuine = ptg2_address_canon.validate_company_group_assertions
+    calls = []
+
+    def observed(encoded):
+        calls.append(encoded)
+        return genuine(encoded)
+
+    monkeypatch.setattr(ptg2_address_canon, "validate_company_group_assertions", observed)
+    session = Session()
+    command = _group_edit()
+    created = await _apply(session, command)
+    assert created["record"]["group_assertions"] == [_group()]
+    assert len(calls) == 1
+    assert session.events.count("validate-set") == 1 and session.events.count("insert-set") == 3
+    stored = session.assertions["company_registry_group_assertion"][0]
+    assert stored["company_id"] == UUID(COMPANY) and stored["group_id"] == UUID(_group()["group_id"])
+    assert store._company_assertion_document(stored) == _group()
+    correction = _edit(operation="correct", expected_revision=1, idempotency_key="omitted-group")
+    correction.fields["assertions"]["expected_revision"] = 1
+    later = await _apply(session, correction)
+    assert later["record"]["group_assertions"] == created["record"]["group_assertions"]
+    assert len(calls) == 2
+    session.valid = False
+    assert await _apply(session, command) == created
+    assert len(calls) == 3  # Submitted DTO validation remains before exact replay.
+    assert session.events[-2:] == ["control-lock", "replay"]
+
+
+@pytest.mark.asyncio
+async def test_group_omission_clear_archive_and_restore_preserve_history():
+    session = Session()
+    command = _group_edit()
+    created = await _apply(session, command)
+    for revision, operation in enumerate(("correct", "archive", "restore"), 1):
+        fields = _edit(assertions=False).fields if operation == "correct" else {}
+        result = await _apply(
+            session, _edit(operation=operation, expected_revision=revision, fields=fields, idempotency_key=operation)
+        )
+        assert result["record"]["group_assertions"] == created["record"]["group_assertions"]
+    clear = _group_edit(operation="correct", expected_revision=4, idempotency_key="clear-groups")
+    clear.fields["assertions"].update(expected_revision=4, group_assertions=[])
+    assert (await _apply(session, clear))["record"]["group_assertions"] == []
+    assert session.history[0]["record_json"]["group_assertions"] == [_group()]
+    omitted = copy.deepcopy(clear)
+    del omitted.fields["assertions"]["group_assertions"]
+    with pytest.raises(store.RegistryRecordConflict, match="idempotency_conflict"):
+        await _apply(session, omitted)
+    with pytest.raises(store.RegistryRecordConflict, match="revision_conflict"):
+        await _apply(session, replace(clear, idempotency_key="stale-clear"))
+    assert len(session.history) == 5
+    assert (await _apply(Session(), _edit(assertions=False)))["record"]["group_assertions"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", ["role_assertions", "identifier_assertions"])
+async def test_preserved_groups_recheck_cross_family_ids(family):
+    session = Session()
+    await _apply(session, _group_edit())
+    before = copy.deepcopy((session.head, session.history, session.assertions, session.draft))
+    correction = _edit(operation="correct", expected_revision=1, idempotency_key="collision")
+    correction.fields["assertions"]["expected_revision"] = 1
+    correction.fields["assertions"][family][0]["assertion_id"] = _group()["assertion_id"]
+    with pytest.raises(ValueError):
+        await _apply(session, correction)
+    assert (session.head, session.history, session.assertions, session.draft) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["validation", "history", "group_insert", "cancel_group_insert"])
+async def test_group_failures_roll_back_every_family(failure):
+    class FailingSession(Session):
+        async def execute(self, statement, rows=None):
+            table = getattr(statement, "table", None)
+            if table is not None and table.name == "company_registry_group_assertion":
+                if failure == "group_insert":
+                    raise RuntimeError("synthetic-group-insert-failure")
+                if failure == "cancel_group_insert":
+                    raise asyncio.CancelledError
+            return await super().execute(statement, rows)
+
+    session = FailingSession()
+    session.valid = failure != "validation"
+    session.fail_history = failure == "history"
+    with pytest.raises((store.RegistryRecordConflict, RuntimeError, asyncio.CancelledError)):
+        await _apply(session, _group_edit())
+    assert session.head is None and session.history == [] and session.assertions == {} and session.draft == 0
+
+
+@pytest.mark.asyncio
+async def test_group_reads_are_bounded_and_keep_nullable_identity():
+    document = _group(
+        group_id=None,
+        valid_from=None,
+        provenance={
+            "kind": "source_reference",
+            "evidence_ref": "source-reference",
+            "snapshot_id": str(UUID(int=99)),
+            "source_record_key": "record-99",
+        },
+    )
+    group_row = store._company_assertion_row(document, COMPANY, 2)
+    assert group_row["group_id"] is group_row["valid_from"] is group_row["valid_to"] is None
+    queries = []
+
+    class Reader:
+        async def execute(self, statement):
+            queries.append(str(statement.compile(dialect=postgresql.dialect())))
+            return Result([group_row] if "company_registry_group_assertion" in queries[-1] else [])
+
+    company_records = [{"company_id": COMPANY, "revision": 2}]
+    await store._attach_company_assertions(Reader(), company_records, "example_registry")
+    assert len(queries) == 3 and " LIMIT " in queries[-1]
+    assert company_records[0]["group_assertions"] == [document]
+
+    class OversizedReader(Reader):
+        async def execute(self, statement):
+            result = await super().execute(statement)
+            return Result([group_row] * 129) if result.rows else result
+
+    with pytest.raises(store.RegistryAddressUnavailable):
+        await store._attach_company_assertions(OversizedReader(), company_records, "example_registry")
+
+
+def test_group_targets_use_exact_source_edge_and_actual_kind():
+    sql = store._COMPANY_ASSERTION_TARGETS_SQL
+    for predicate in (
+        "edge.company_id=CAST(:company_id AS uuid)",
+        "edge.group_id IS NOT DISTINCT FROM",
+        "edge.valid_from IS NOT DISTINCT FROM",
+        "edge.valid_to IS NOT DISTINCT FROM",
+        "edge.relationship_kind=",
+        "edge.resolution_status IN ('resolved','unresolved')",
+        "target.group_kind=",
+        "NOT target.archived",
+        "observation.status IN ('accepted','unresolved')",
+    ):
+        assert predicate in sql
+    current = store._company_record_json_sql('"example_registry"')
+    assert "company_registry_group_assertion" in current and "LIMIT 129" in current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [None, {}, [_group()] * 129])
+async def test_malformed_retained_groups_refuse_before_any_write(invalid):
+    session = Session()
+    await _apply(session, _group_edit())
+    session.history[0]["record_json"]["group_assertions"] = invalid
+    before = copy.deepcopy((session.head, session.history, session.assertions, session.draft))
+    correction = _edit(operation="correct", expected_revision=1, idempotency_key="malformed-history")
+    correction.fields["assertions"]["expected_revision"] = 1
+    with pytest.raises(store.RegistryRecordConflict, match="group_assertions_invalid"):
+        await _apply(session, correction)
+    assert (session.head, session.history, session.assertions, session.draft) == before

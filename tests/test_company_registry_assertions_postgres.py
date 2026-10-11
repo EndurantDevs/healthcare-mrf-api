@@ -2,11 +2,14 @@
 """Opt-in native company assertion lifecycle and precise protected draft ACLs."""
 
 import asyncio
+import csv
 import importlib.util
+import io
 import json
 import os
 import secrets
 from dataclasses import dataclass, replace
+from datetime import date, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -16,8 +19,10 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from process import registry_record_store as record_store
 from process.company_registry_assertion_values import CONTRACT
 from process.registry_approval_store import RegistryApprovalConflict, approve_registry_records
 from process.registry_management_permissions import (
@@ -33,7 +38,11 @@ from process.registry_record_store import (
     get_registry_record,
     list_registry_records,
 )
+from process.registry_source_admission import admit_cms_mlr_edition
 from tests.test_registry_approval_store_postgres import _command as approval_command
+from tests.test_registry_approval_store_postgres import _create as group_command
+from tests.test_registry_source_admission_postgres import _edition as cms_edition
+from tests.test_registry_source_admission_postgres import _input as cms_input
 from tests.test_result_archive_published_authority_postgres import _is_guarded_test_service
 
 pytestmark = pytest.mark.asyncio
@@ -56,6 +65,7 @@ _MIGRATIONS = (
     "20261009020000_company_registry_assertions.py",
     "20261009030000_network_catalog_evidence.py",
     "20261010030000_registry_source_admission_receipt.py",
+    "20261011010000_company_registry_group_assertions.py",
 )
 
 
@@ -328,6 +338,7 @@ async def _accounting(fixture):
         f"SELECT (SELECT count(*) FROM {fixture.namespace}.company_registry) AS heads,"
         f"(SELECT count(*) FROM {fixture.namespace}.company_registry_role_assertion) AS roles,"
         f"(SELECT count(*) FROM {fixture.namespace}.company_registry_identifier_assertion) AS identifiers,"
+        f"(SELECT count(*) FROM {fixture.namespace}.company_registry_group_assertion) AS groups,"
         f"(SELECT count(*) FROM {fixture.namespace}.registry_record_history) AS history,"
         f"(SELECT draft_revision FROM {fixture.namespace}.registry_revision_control WHERE id=1) AS draft"
     )
@@ -589,7 +600,11 @@ async def test_assertion_draft_role_has_insert_only_effective_privileges(asserti
             )
             is False
         )
-        for table in ("company_registry_role_assertion", "company_registry_identifier_assertion"):
+        for table in (
+            "company_registry_role_assertion",
+            "company_registry_identifier_assertion",
+            "company_registry_group_assertion",
+        ):
             for statement in (
                 f"UPDATE {fixture.namespace}.{table} SET evidence_ref=evidence_ref",
                 f"DELETE FROM {fixture.namespace}.{table}",
@@ -676,3 +691,442 @@ async def test_manual_undo_restores_historical_assertions_under_current_checks(a
     assert target_record == first["record"]
     with pytest.raises(RegistryRecordConflict, match="revision_conflict"):
         await _draft(fixture, replace(preparation.command, idempotency_key=uuid4().hex))
+
+
+def _group_assertion_rows():
+    source_by_field = {
+        "assertion_id": uuid4(),
+        "company_id": uuid4(),
+        "company_revision": 1,
+        "group_id": None,
+        "group_kind": "corporate_parent",
+        "relationship_kind": "reported_affiliation",
+        "valid_from": None,
+        "valid_to": None,
+        "provenance_kind": "source_reference",
+        "evidence_ref": "Retained source reference",
+        "source_snapshot_id": uuid4(),
+        "source_record_key": "record-17",
+    }
+    manual_by_field = {
+        **source_by_field,
+        "assertion_id": uuid4(),
+        "group_id": uuid4(),
+        "group_kind": "naic_group",
+        "relationship_kind": "verified_ownership",
+        "valid_from": date(2024, 2, 29),
+        "valid_to": date(2024, 2, 29),
+        "provenance_kind": "manual_reference",
+        "source_snapshot_id": None,
+        "source_record_key": None,
+    }
+    return source_by_field, manual_by_field
+
+
+async def test_migrated_group_assertions_retain_unknown_periods_and_enforce_native_constraints(assertion_db):
+    fixture = assertion_db
+    statement = text(
+        f"INSERT INTO {fixture.namespace}.company_registry_group_assertion "
+        "(assertion_id,company_id,company_revision,group_id,group_kind,relationship_kind,valid_from,valid_to,"
+        "provenance_kind,evidence_ref,source_snapshot_id,source_record_key) "
+        "VALUES(:assertion_id,:company_id,:company_revision,:group_id,:group_kind,:relationship_kind,"
+        ":valid_from,:valid_to,:provenance_kind,:evidence_ref,:source_snapshot_id,:source_record_key) "
+        "RETURNING assertion_id,group_id,valid_from,valid_to,created_at"
+    )
+    source_by_field, manual_by_field = _group_assertion_rows()
+    async with fixture.sessions() as session, session.begin():
+        assert await session.scalar(text("SELECT current_user")) == fixture.roles_by_kind["draft"]
+        retained_source = (await session.execute(statement, source_by_field)).mappings().one()
+        assert retained_source["group_id"] is retained_source["valid_from"] is retained_source["valid_to"] is None
+        assert retained_source["created_at"] is not None
+        retained_manual = (await session.execute(statement, manual_by_field)).mappings().one()
+        assert retained_manual["group_id"] == manual_by_field["group_id"]
+        assert retained_manual["valid_from"] == retained_manual["valid_to"] == date(2024, 2, 29)
+        for changes in (
+            {"assertion_id": UUID(int=0)},
+            {"company_id": UUID(int=0)},
+            {"company_revision": 0},
+            {"group_id": UUID(int=0)},
+            {"group_kind": "inferred_parent"},
+            {"relationship_kind": "automatic_ownership"},
+            {"valid_to": date(2024, 2, 28)},
+            {"evidence_ref": " leading"},
+            {"group_id": None},
+            {"source_record_key": "unexpected-manual-source"},
+        ):
+            with pytest.raises(IntegrityError):
+                async with session.begin_nested():
+                    await session.execute(statement, {**manual_by_field, "assertion_id": uuid4(), **changes})
+        with pytest.raises(IntegrityError):
+            async with session.begin_nested():
+                await session.execute(statement, source_by_field)
+        assert (
+            await session.scalar(text(f"SELECT count(*) FROM {fixture.namespace}.company_registry_group_assertion"))
+            == 2
+        )
+
+
+async def _draft_group_target(fixture, *, kind="corporate_parent", archived=False):
+    identity = uuid4()
+    command = RegistryRecordCommand(
+        "group",
+        identity,
+        "create",
+        0,
+        {"group_kind": kind, "display_name": "Example Group", "aliases": []},
+        "Reviewed group target",
+        uuid4().hex,
+    )
+    await _draft(fixture, command)
+    if archived:
+        await _draft(
+            fixture, replace(command, operation="archive", expected_revision=1, fields={}, idempotency_key=uuid4().hex)
+        )
+    return identity
+
+
+def _declared_group(company, group, **changes):
+    return {
+        "assertion_id": str(uuid4()),
+        "company_id": str(company),
+        "group_id": None if group is None else str(group),
+        "group_kind": "corporate_parent",
+        "relationship_kind": "reported_affiliation",
+        "valid_from": "2025-01-01",
+        "valid_to": None,
+        "provenance": {
+            "kind": "manual_reference",
+            "evidence_ref": "Reviewed group reference",
+            "snapshot_id": None,
+            "source_record_key": None,
+        },
+    } | changes
+
+
+def _with_groups(command, rows):
+    return replace(
+        command, fields=command.fields | {"assertions": command.fields["assertions"] | {"group_assertions": rows}}
+    )
+
+
+async def _admitted_group_edge(fixture, *, unknown=False):
+    input_bytes = cms_input()
+    if unknown:
+        decoded_rows = list(csv.DictReader(io.StringIO(input_bytes.decode(), newline="")))
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(output, fieldnames=list(decoded_rows[0]), lineterminator="\r\n")
+        writer.writeheader()
+        writer.writerows([group_assertion | {"naic_group_code": ""} for group_assertion in decoded_rows])
+        input_bytes = output.getvalue().encode()
+    edition = cms_edition(input_bytes)
+    async with fixture.connection.transaction():
+        receipt = await admit_cms_mlr_edition(fixture.connection, input_bytes, edition, control_schema=fixture.schema)
+    assert receipt["group_assertions"] == 2 and receipt["replayed"] is False
+    edge = await fixture.connection.fetchrow(
+        f"SELECT * FROM {fixture.namespace}.registry_company_group_assertion WHERE snapshot_id=$1 ORDER BY source_record_key LIMIT 1",
+        edition.snapshot_id,
+    )
+    assert edge["valid_from"] is edge["valid_to"] is None
+    command = _create()
+    command = replace(command, record_id=edge["company_id"], operation="correct", expected_revision=1)
+    command.fields["assertions"].update(company_id=str(edge["company_id"]), expected_revision=1)
+    provenance_by_field = {
+        "kind": "source_reference",
+        "evidence_ref": "Retained group occurrence",
+        "snapshot_id": str(edition.snapshot_id),
+        "source_record_key": edge["source_record_key"],
+    }
+    group_assertion = _declared_group(
+        edge["company_id"],
+        edge["group_id"],
+        group_kind="naic_group",
+        valid_from=None,
+        provenance=provenance_by_field,
+    )
+    return _with_groups(command, [group_assertion])
+
+
+async def _current_company_json(fixture, company_id):
+    async with fixture.connection.transaction():
+        await fixture.connection.execute("SET LOCAL TIME ZONE 'Etc/GMT-2'")
+        return json.loads(
+            await fixture.connection.fetchval(
+                f"SELECT ({record_store._company_record_json_sql(fixture.namespace)})::text FROM {fixture.namespace}.company_registry head WHERE company_id=$1",
+                company_id,
+            )
+        )
+
+
+async def test_group_target_requires_prospective_approval(assertion_db):
+    fixture = assertion_db
+    group_creation = group_command()
+    group = await _draft(fixture, group_creation)
+    creation = _create()
+    company = await _draft(
+        fixture, _with_groups(creation, [_declared_group(creation.record_id, group_creation.record_id)])
+    )
+    before = await _accounting(fixture)
+    with pytest.raises(RegistryApprovalConflict, match="assertion_target_conflict"):
+        await _approve(fixture, company)
+    assert await _accounting(fixture) == before
+    assert await fixture.connection.fetchval(f"SELECT count(*) FROM {fixture.namespace}.registry_approval_history") == 0
+    approved = await _approve(fixture, group, company)
+    assert approved["selected_count"] == 2
+    retained = await fixture.connection.fetch(
+        f"SELECT record_kind,record_json::text FROM {fixture.namespace}.registry_approved_record "
+        "WHERE approved_revision=$1 ORDER BY record_kind",
+        approved["approved_revision"],
+    )
+    assert [row["record_kind"] for row in retained] == ["company", "group"]
+    assert json.loads(retained[0]["record_json"])["group_assertions"] == company["record"]["group_assertions"]
+    assert json.loads(retained[1]["record_json"]) == group["record"]
+
+
+@pytest.mark.parametrize("change", ["archive", "kind"])
+async def test_group_drafts_preserve_approved_targets(assertion_db, change):
+    fixture = assertion_db
+    group_creation = group_command()
+    group = await _draft(fixture, group_creation)
+    creation = _create()
+    company = await _draft(
+        fixture, _with_groups(creation, [_declared_group(creation.record_id, group_creation.record_id)])
+    )
+    await _approve(fixture, group, company)
+    changed = await _draft(
+        fixture,
+        replace(
+            group_creation,
+            operation="archive" if change == "archive" else "correct",
+            expected_revision=1,
+            fields={} if change == "archive" else group_creation.fields | {"group_kind": "naic_group"},
+            idempotency_key=uuid4().hex,
+        ),
+    )
+    unrelated = await _draft(fixture, _create())
+    approved = await _approve(fixture, unrelated)
+    retained = await fixture.connection.fetchval(
+        f"SELECT record_json::text FROM {fixture.namespace}.registry_approved_record "
+        "WHERE approved_revision=$1 AND record_kind='group' AND record_key=$2",
+        approved["approved_revision"],
+        str(group_creation.record_id),
+    )
+    assert json.loads(retained) == group["record"]
+    assert changed["record"]["archived"] == (change == "archive")
+    assert changed["record"]["group_kind"] == ("corporate_parent" if change == "archive" else "naic_group")
+    with pytest.raises(RegistryApprovalConflict, match="assertion_target_conflict"):
+        await _approve(fixture, changed)
+    assert (
+        await fixture.connection.fetchval(
+            f"SELECT approved_revision FROM {fixture.namespace}.registry_revision_control WHERE id=1"
+        )
+        == approved["approved_revision"]
+    )
+
+
+async def test_company_group_store_roundtrip_omission_clear_and_replay(assertion_db):
+    fixture = assertion_db
+    group_id = await _draft_group_target(fixture)
+    original = _create()
+    group_assertion = _declared_group(original.record_id, group_id)
+    command = _with_groups(original, [group_assertion])
+    created = await _draft(fixture, command)
+    assert created["record"]["group_assertions"] == [group_assertion]
+    correction = replace(command, operation="correct", expected_revision=1, idempotency_key=uuid4().hex)
+    correction = replace(
+        correction,
+        fields=correction.fields | {"assertions": correction.fields["assertions"] | {"expected_revision": 1}},
+    )
+    del correction.fields["assertions"]["group_assertions"]
+    preserved = await _draft(fixture, correction)
+    assert preserved["record"]["group_assertions"] == [group_assertion]
+    legacy = replace(
+        correction,
+        expected_revision=2,
+        fields={key: field_value for key, field_value in correction.fields.items() if key != "assertions"},
+        idempotency_key=uuid4().hex,
+    )
+    retained = await _draft(fixture, legacy)
+    assert retained["record"]["group_assertions"] == [group_assertion]
+    async with fixture.sessions() as session:
+        assert (await get_registry_record(session, "company", command.record_id, schema=fixture.schema)) == retained[
+            "record"
+        ]
+        assert (await list_registry_records(session, "company", schema=fixture.schema))[0] == retained["record"]
+    actual = await _current_company_json(fixture, command.record_id)
+    actual_created = datetime.fromisoformat(actual["created_at"])
+    retained_created = datetime.fromisoformat(retained["record"]["created_at"])
+    assert actual_created.utcoffset() is not None and retained_created.utcoffset() is not None
+    assert actual_created == retained_created and actual["created_at"] != retained["record"]["created_at"]
+    assert {key: field_value for key, field_value in actual.items() if key != "created_at"} == {
+        key: field_value for key, field_value in retained["record"].items() if key != "created_at"
+    }
+    assert set(actual["group_assertions"][0]) == set(group_assertion)
+    clear = _with_groups(replace(correction, expected_revision=3, idempotency_key=uuid4().hex), [])
+    clear.fields["assertions"]["expected_revision"] = 3
+    assert (await _draft(fixture, clear))["record"]["group_assertions"] == []
+    assert await _draft(fixture, command) == created
+    omitted = replace(
+        clear,
+        fields=clear.fields
+        | {
+            "assertions": {
+                key: field_value for key, field_value in clear.fields["assertions"].items() if key != "group_assertions"
+            }
+        },
+    )
+    with pytest.raises(RegistryRecordConflict, match="idempotency_conflict"):
+        await _draft(fixture, omitted)
+    before = await _accounting(fixture)
+    with pytest.raises(RegistryRecordConflict, match="revision_conflict"):
+        await _draft(fixture, replace(correction, idempotency_key=uuid4().hex))
+    assert await _accounting(fixture) == before and before["groups"] == 3
+
+
+@pytest.mark.parametrize("retained_group", [False, True], ids=["no-typed-group", "retained-typed-group"])
+async def test_materialized_company_correction_preserves_omitted_groups(assertion_db, retained_group):
+    fixture = assertion_db
+    command = await _admitted_group_edge(fixture)
+    expected_groups = command.fields["assertions"]["group_assertions"] if retained_group else []
+    async with fixture.sessions() as session, session.begin():
+        initial = await get_registry_record(session, "company", command.record_id, schema=fixture.schema)
+        assert initial["revision"] == 1 and initial["group_assertions"] == []
+        if retained_group:
+            # Retain a typed child through the restricted draft writer; its source edge is genuinely admitted.
+            await record_store._retain_company_assertions(
+                session,
+                initial,
+                {"role_assertions": [], "identifier_assertions": [], "group_assertions": expected_groups},
+                fixture.schema,
+            )
+    assert await fixture.connection.fetchval(f"SELECT count(*) FROM {fixture.namespace}.registry_record_history") == 0
+    omitted = replace(
+        command,
+        fields=command.fields
+        | {
+            "assertions": {
+                key: field_value
+                for key, field_value in command.fields["assertions"].items()
+                if key != "group_assertions"
+            }
+        },
+        idempotency_key=uuid4().hex,
+    )
+    preserved = await _draft(fixture, omitted)
+    assert preserved["record"]["revision"] == 2
+    assert preserved["record"]["group_assertions"] == expected_groups
+    assert preserved["record"]["role_assertions"] == omitted.fields["assertions"]["role_assertions"]
+    assert preserved["record"]["identifier_assertions"] == omitted.fields["assertions"]["identifier_assertions"]
+    before = await _accounting(fixture)
+    with pytest.raises(RegistryRecordConflict, match="revision_conflict"):
+        await _draft(fixture, replace(omitted, idempotency_key=uuid4().hex))
+    assert await _accounting(fixture) == before
+    clear = _with_groups(
+        replace(
+            omitted,
+            expected_revision=2,
+            fields=omitted.fields | {"assertions": omitted.fields["assertions"] | {"expected_revision": 2}},
+            idempotency_key=uuid4().hex,
+        ),
+        [],
+    )
+    assert (await _draft(fixture, clear))["record"]["group_assertions"] == []
+    assert await _draft(fixture, omitted) == preserved
+
+
+@pytest.mark.parametrize("case", ["missing", "archived", "kind"])
+async def test_company_group_store_rejects_incompatible_targets(assertion_db, case):
+    fixture = assertion_db
+    target = uuid4() if case == "missing" else await _draft_group_target(fixture, archived=case == "archived")
+    command = _create()
+    row = _declared_group(command.record_id, target, group_kind="naic_group" if case == "kind" else "corporate_parent")
+    before = await _accounting(fixture)
+    with pytest.raises(RegistryRecordConflict, match="assertion_target_conflict"):
+        await _draft(fixture, _with_groups(command, [row]))
+    assert await _accounting(fixture) == before
+
+
+@pytest.mark.parametrize("unknown", [False, True], ids=["known-group", "unknown-group"])
+async def test_company_group_store_retains_genuine_source_unknown_periods(assertion_db, unknown):
+    command = await _admitted_group_edge(assertion_db, unknown=unknown)
+    created = await _draft(assertion_db, command)
+    row = command.fields["assertions"]["group_assertions"][0]
+    assert created["record"]["group_assertions"] == [row]
+    assert (row["group_id"] is None) is unknown and row["valid_from"] is row["valid_to"] is None
+    async with assertion_db.sessions() as session:
+        read = await get_registry_record(session, "company", command.record_id, schema=assertion_db.schema)
+    assert read == created["record"]
+
+
+@pytest.mark.parametrize(
+    "case", ["other_company", "group", "relationship", "start", "end", "occurrence", "snapshot", "null_group_claim"]
+)
+async def test_company_group_store_requires_exact_native_source_edge(assertion_db, case):
+    fixture = assertion_db
+    command = await _admitted_group_edge(fixture, unknown=case == "null_group_claim")
+    row = command.fields["assertions"]["group_assertions"][0]
+    match case:
+        case "other_company":
+            other = _create()
+            row["company_id"] = str(other.record_id)
+            command = _with_groups(other, [row])
+        case "group":
+            row["group_id"] = None
+        case "null_group_claim":
+            row["group_id"] = str(await _draft_group_target(fixture, kind="naic_group"))
+        case "relationship":
+            row["relationship_kind"] = "verified_ownership"
+        case "start" | "end":
+            row["valid_from" if case == "start" else "valid_to"] = "2024-01-01"
+        case "occurrence":
+            row["provenance"]["source_record_key"] = "missing-occurrence"
+        case _:
+            row["provenance"]["snapshot_id"] = str(uuid4())
+    before = await _accounting(fixture)
+    with pytest.raises(RegistryRecordConflict, match="assertion_target_conflict"):
+        await _draft(fixture, command)
+    assert await _accounting(fixture) == before
+
+
+async def test_company_group_store_joint_rollback_and_insert_failure(assertion_db):
+    fixture = assertion_db
+    group_id = await _draft_group_target(fixture)
+    command = _create(identifiers=[_identifier()])
+    command = _with_groups(command, [_declared_group(command.record_id, group_id)])
+    before = await _accounting(fixture)
+    async with fixture.sessions() as session:
+        await session.begin()
+        try:
+            await apply_registry_record_command(session, command, _ACTOR, schema=fixture.schema)
+        finally:
+            await session.rollback()
+    assert await _accounting(fixture) == before
+    columns = ",".join(
+        '"' + name + '"'
+        for name in (
+            "assertion_id",
+            "company_id",
+            "company_revision",
+            "group_id",
+            "group_kind",
+            "relationship_kind",
+            "valid_from",
+            "valid_to",
+            "provenance_kind",
+            "evidence_ref",
+            "source_snapshot_id",
+            "source_record_key",
+        )
+    )
+    await fixture.connection.execute(
+        f'REVOKE INSERT({columns}) ON {fixture.namespace}.company_registry_group_assertion FROM "{fixture.roles_by_kind["draft"]}"'
+    )
+    try:
+        with pytest.raises(Exception) as failure:
+            await _draft(fixture, command)
+        assert "permission denied" in str(failure.value).lower()
+        assert await _accounting(fixture) == before
+    finally:
+        await _install(fixture)
+    assert (await _draft(fixture, command))["record"]["group_assertions"] == command.fields["assertions"][
+        "group_assertions"
+    ]

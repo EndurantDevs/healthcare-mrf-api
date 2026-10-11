@@ -15,6 +15,7 @@ IDENTIFIER_SYSTEMS = ("ein", "naic_company", "external_reference")
 PROVENANCE_KINDS = ("manual_reference", "source_reference")
 MAX_ROLE_ASSERTIONS = 32
 MAX_IDENTIFIER_ASSERTIONS = 128
+MAX_GROUP_ASSERTIONS = 128
 MAX_DOCUMENT_BYTES = 131072
 MAX_EXPECTED_REVISION = 9223372036854775806
 
@@ -126,6 +127,53 @@ class CompanyIdentifierAssertion:
             _fail()
 
 
+@dataclass(frozen=True, slots=True)
+class CompanyGroupAssertion:
+    """Retained dated affiliation; incomplete evidence remains reviewable."""
+
+    assertion_id: UUID
+    company_id: UUID
+    group_id: UUID | None
+    group_kind: str
+    relationship_kind: str
+    valid_from: date | None
+    valid_to: date | None
+    provenance: CompanyAssertionProvenance
+
+    def __post_init__(self):
+        _uuid(self.assertion_id)
+        _uuid(self.company_id)
+        _text(self.group_kind, 32)
+        _text(self.relationship_kind, 32)
+        if self.group_id is not None:
+            _uuid(self.group_id)
+        if self.valid_from is None:
+            if self.valid_to is not None and type(self.valid_to) is not date:
+                _fail()
+        else:
+            _period(self.valid_from, self.valid_to)
+        if type(self.provenance) is not CompanyAssertionProvenance:
+            _fail()
+        replace(self.provenance)
+
+
+def _validate_group_batch(groups):
+    """Use the genuine whole-family reducer, including its Python printable gate."""
+    encoded = json.dumps(
+        [asdict(group) for group in groups],
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+        default=_wire_scalar,
+    ).encode("utf-8")
+    try:
+        from ptg2_address_canon import validate_company_group_assertions
+
+        validate_company_group_assertions(encoded)
+    except ImportError, ValueError, TypeError:
+        _fail()
+
+
 def _entries(entries, kind, minimum, maximum):
     if type(entries) is not tuple or not minimum <= len(entries) <= maximum:
         _fail()
@@ -134,8 +182,8 @@ def _entries(entries, kind, minimum, maximum):
     return tuple(replace(entry, provenance=replace(entry.provenance)) for entry in entries)
 
 
-def _unique_entries(roles, identifiers):
-    assertion_ids = [entry.assertion_id for entry in (*roles, *identifiers)]
+def _unique_entries(roles, identifiers, groups):
+    assertion_ids = [entry.assertion_id for entry in (*roles, *identifiers, *groups)]
     role_keys = [(entry.role, entry.valid_from) for entry in roles]
     identifier_keys = [
         (entry.identifier_system, entry.identifier_scope, entry.identifier_value) for entry in identifiers
@@ -160,6 +208,7 @@ class CompanyRegistryAssertionValues:
     expected_revision: int
     role_assertions: tuple[CompanyRoleAssertion, ...]
     identifier_assertions: tuple[CompanyIdentifierAssertion, ...] = ()
+    group_assertions: tuple[CompanyGroupAssertion, ...] | None = None
 
     def __post_init__(self):
         _uuid(self.company_id)
@@ -168,12 +217,21 @@ class CompanyRegistryAssertionValues:
         minimum_roles = 0 if self.expected_revision > 0 and not self.identifier_assertions else 1
         roles = _entries(self.role_assertions, CompanyRoleAssertion, minimum_roles, MAX_ROLE_ASSERTIONS)
         identifiers = _entries(self.identifier_assertions, CompanyIdentifierAssertion, 0, MAX_IDENTIFIER_ASSERTIONS)
-        _unique_entries(roles, identifiers)
+        groups = None
+        if self.group_assertions is not None:
+            groups = _entries(self.group_assertions, CompanyGroupAssertion, 0, MAX_GROUP_ASSERTIONS)
+            if any(group.company_id != self.company_id for group in groups):
+                _fail()
+            groups = tuple(sorted(groups, key=lambda entry: str(entry.assertion_id)))
+        _unique_entries(roles, identifiers, groups or ())
+        object.__setattr__(self, "group_assertions", groups)
         object.__setattr__(self, "role_assertions", tuple(sorted(roles, key=lambda entry: str(entry.assertion_id))))
         object.__setattr__(
             self, "identifier_assertions", tuple(sorted(identifiers, key=lambda entry: str(entry.assertion_id)))
         )
         self.canonical_json()
+        if groups is not None:
+            _validate_group_batch(groups)
 
     def as_dict(self):
         """Return a fresh canonical wire document containing proposed values only."""
@@ -182,6 +240,8 @@ class CompanyRegistryAssertionValues:
     def canonical_json(self):
         """Encode bounded complete values; these bytes are not authentication."""
         document = asdict(self)
+        if self.group_assertions is None:
+            del document["group_assertions"]
         document["contract"] = CONTRACT
         encoded = json.dumps(
             document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False, default=_wire_scalar
@@ -241,17 +301,25 @@ def _parse_provenance(document):
 def _parse_assertions(documents, kind, maximum):
     if type(documents) is not list or len(documents) > maximum:
         _fail()
-    fields = {"role"} if kind is CompanyRoleAssertion else {"identifier_system", "identifier_scope", "identifier_value"}
+    fields = {
+        CompanyRoleAssertion: {"role"},
+        CompanyIdentifierAssertion: {"identifier_system", "identifier_scope", "identifier_value"},
+        CompanyGroupAssertion: {"company_id", "group_id", "group_kind", "relationship_kind"},
+    }[kind]
     assertions = []
     for document in documents:
         _closed(document, fields | {"assertion_id", "valid_from", "valid_to", "provenance"})
+        values_by_field = {name: document[name] for name in fields}
+        if kind is CompanyGroupAssertion:
+            values_by_field["company_id"] = _parse_uuid(document["company_id"])
+            values_by_field["group_id"] = None if document["group_id"] is None else _parse_uuid(document["group_id"])
         assertions.append(
             kind(
                 assertion_id=_parse_uuid(document["assertion_id"]),
-                valid_from=_parse_date(document["valid_from"]),
+                valid_from=_parse_date(document["valid_from"], optional=kind is CompanyGroupAssertion),
                 valid_to=_parse_date(document["valid_to"], optional=True),
                 provenance=_parse_provenance(document["provenance"]),
-                **{name: document[name] for name in fields},
+                **values_by_field,
             )
         )
     return tuple(assertions)
@@ -259,7 +327,11 @@ def _parse_assertions(documents, kind, maximum):
 
 def validated_company_registry_assertions(document):
     """Parse closed proposals; existing record commands do not accept these fields."""
-    _closed(document, {"contract", "company_id", "expected_revision", "role_assertions"}, {"identifier_assertions"})
+    _closed(
+        document,
+        {"contract", "company_id", "expected_revision", "role_assertions"},
+        {"identifier_assertions", "group_assertions"},
+    )
     if document["contract"] != CONTRACT:
         _fail()
     return CompanyRegistryAssertionValues(
@@ -269,4 +341,7 @@ def validated_company_registry_assertions(document):
         _parse_assertions(
             document.get("identifier_assertions", []), CompanyIdentifierAssertion, MAX_IDENTIFIER_ASSERTIONS
         ),
+        _parse_assertions(document["group_assertions"], CompanyGroupAssertion, MAX_GROUP_ASSERTIONS)
+        if "group_assertions" in document
+        else None,
     )

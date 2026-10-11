@@ -161,6 +161,7 @@ def _prepare_correction(command, history_by_field, identity_column):
             "expected_revision": command.expected_revision,
             "role_assertions": snapshot.get("role_assertions", []),
             "identifier_assertions": snapshot.get("identifier_assertions", []),
+            "group_assertions": snapshot.get("group_assertions", []),
         }
     if command.record_kind == "company_links":
         fields_by_name["network_assertions"] = snapshot.get("network_assertions", [])

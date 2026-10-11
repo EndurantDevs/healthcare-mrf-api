@@ -1,13 +1,33 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Assemble the management blueprint with native persistence and real HTTP."""
 
+import copy
+import json
+from dataclasses import asdict
 from uuid import uuid4
 
 import pytest
 from sanic import Blueprint, Sanic
+from sqlalchemy import text
 
 from api.endpoint import registry_management as management
 from process import registry_record_store
+from process.registry_management_permissions import _INSERT_COLUMNS
+from tests.test_company_registry_assertions_postgres import (
+    _accounting as assertion_accounting,
+)
+from tests.test_company_registry_assertions_postgres import (
+    _create as create_company,
+)
+from tests.test_company_registry_assertions_postgres import (
+    _declared_group as declared_group,
+)
+from tests.test_company_registry_assertions_postgres import (
+    _install as install_assertion_permissions,
+)
+from tests.test_company_registry_assertions_postgres import (
+    assertion_db,
+)
 from tests.test_registry_record_store_postgres import record_db
 
 _AUTH = {"Authorization": "Bearer synthetic-registry-service-token"}
@@ -351,3 +371,179 @@ async def test_location_native_dependency_failure_is_sanitized_and_atomic(regist
     assert failed.headers["Cache-Control"] == "private, no-store"
     assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".manual_location_registry') == 0
     assert await connection.fetchval(f'SELECT draft_revision FROM "{schema}".registry_revision_control') == 0
+
+
+@pytest.fixture
+async def company_registry_app(assertion_db, monkeypatch):
+    fixture = assertion_db
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-registry-service-token")
+    for name in (
+        "apply_registry_record_command",
+        "get_registry_record",
+        "list_registry_records",
+        "read_registry_manual_history",
+    ):
+        original = getattr(management, name)
+
+        def mapped_company_call(original):
+            async def invoke(*args, **kwargs):
+                return await original(*args, **kwargs, schema=fixture.schema)
+
+            return invoke
+
+        monkeypatch.setattr(management, name, mapped_company_call(original))
+    async with fixture.sessions() as session:
+        assert await session.scalar(text("SELECT current_user")) == fixture.roles_by_kind["draft"]
+    app = Sanic("registry_company_http_test_" + uuid4().hex)
+    app.blueprint(Blueprint.group([management.blueprint], version_prefix="/api/v"))
+
+    @app.middleware("request")
+    async def open_company_session(request):
+        request.ctx.sa_session = fixture.sessions()
+
+    @app.middleware("response")
+    async def close_company_session(request, response):
+        await request.ctx.sa_session.close()
+
+    yield app, fixture
+
+
+def _company_http_command(group_id):
+    command = create_company()
+    command.fields["assertions"]["group_assertions"] = [declared_group(command.record_id, group_id)]
+    document_by_field = json.loads(json.dumps(asdict(command), default=str))
+    del document_by_field["record_kind"]
+    del document_by_field["allocation_key"]
+    document_by_field["actor"] = _network_create()["actor"]
+    return document_by_field
+
+
+def _company_http_correction(command, revision):
+    corrected_by_field = copy.deepcopy(command)
+    corrected_by_field.update(operation="correct", expected_revision=revision, idempotency_key=uuid4().hex)
+    corrected_by_field["fields"]["assertions"]["expected_revision"] = revision
+    return corrected_by_field
+
+
+async def _http_group_target(app):
+    command_by_field = _network_create()
+    del command_by_field["allocation_key"]
+    command_by_field.update(
+        record_id=str(uuid4()),
+        fields={"group_kind": "corporate_parent", "display_name": "Example Group", "aliases": []},
+    )
+    _, created = await app.asgi_client.post("/api/v1/registry/manage/group", headers=_AUTH, json=command_by_field)
+    assert created.status == 200
+    return command_by_field["record_id"]
+
+
+async def _http_company_read(app, command):
+    path = "/api/v1/registry/manage/company/" + command["record_id"]
+    _, readback = await app.asgi_client.get(path, headers=_AUTH)
+    assert readback.status == 200 and readback.headers["Cache-Control"] == "private, no-store"
+    return readback.json["record"]
+
+
+@pytest.mark.asyncio
+async def test_company_group_http_roundtrip_history_and_omitted_preservation(company_registry_app):
+    app, fixture = company_registry_app
+    command = _company_http_command(await _http_group_target(app))
+    endpoint = "/api/v1/registry/manage/company"
+    before = await assertion_accounting(fixture)
+    _, denied = await app.asgi_client.post(endpoint, json=command)
+    assert denied.status == 403 and await assertion_accounting(fixture) == before
+    _, created = await app.asgi_client.post(endpoint, headers=_AUTH, json=command)
+    assert created.status == 200 and created.headers["Cache-Control"] == "private, no-store"
+    group_assertions = command["fields"]["assertions"]["group_assertions"]
+    assert created.json["record"]["group_assertions"] == group_assertions
+    assert await _http_company_read(app, command) == created.json["record"]
+    for revision, omission in ((1, "group_assertions"), (2, "assertions")):
+        correction = _company_http_correction(command, revision)
+        del correction["fields"]["assertions"]["group_assertions"]
+        if omission == "assertions":
+            del correction["fields"]["assertions"]
+        _, preserved = await app.asgi_client.post(endpoint, headers=_AUTH, json=correction)
+        assert preserved.status == 200 and preserved.json["record"]["group_assertions"] == group_assertions
+    clear = _company_http_correction(command, 3)
+    clear["fields"]["assertions"]["group_assertions"] = []
+    _, cleared = await app.asgi_client.post(endpoint, headers=_AUTH, json=clear)
+    assert cleared.status == 200 and cleared.json["record"]["group_assertions"] == []
+    assert await _http_company_read(app, command) == cleared.json["record"]
+    _, history = await app.asgi_client.get(endpoint + "/" + command["record_id"] + "/history", headers=_AUTH)
+    assert history.status == 200 and history.headers["Cache-Control"] == "private, no-store"
+    assert [entry["revision"] for entry in history.json["records"]] == [4, 3, 2, 1]
+    assert [entry["record"]["group_assertions"] for entry in history.json["records"]] == [
+        [],
+        group_assertions,
+        group_assertions,
+        group_assertions,
+    ]
+    _, replay = await app.asgi_client.post(endpoint, headers=_AUTH, json=command)
+    assert replay.status == 200 and replay.json == created.json
+    actor = json.loads(
+        await fixture.connection.fetchval(
+            f"SELECT actor_json::text FROM {fixture.namespace}.registry_record_history WHERE record_kind='company' AND revision=1"
+        )
+    )
+    assert actor == command["actor"] | {"impersonator_id": None}
+    assert (
+        await fixture.connection.fetchval(
+            f"SELECT approved_revision FROM {fixture.namespace}.registry_revision_control"
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case,status", [("company", 400), ("source", 409), ("target", 409)])
+async def test_company_group_http_refusal_rolls_back_every_family(company_registry_app, case, status):
+    app, fixture = company_registry_app
+    command = _company_http_command(await _http_group_target(app))
+    endpoint = "/api/v1/registry/manage/company"
+    _, created = await app.asgi_client.post(endpoint, headers=_AUTH, json=command)
+    assert created.status == 200
+    correction = _company_http_correction(command, 1)
+    group_assertion = correction["fields"]["assertions"]["group_assertions"][0]
+    match case:
+        case "company":
+            group_assertion["company_id"] = str(uuid4())
+        case "source":
+            group_assertion["provenance"] = {
+                "kind": "source_reference",
+                "evidence_ref": "Unretained occurrence",
+                "snapshot_id": str(uuid4()),
+                "source_record_key": "missing-occurrence",
+            }
+        case "target":
+            group_assertion["group_id"] = str(uuid4())
+    before = await assertion_accounting(fixture)
+    _, refused = await app.asgi_client.post(endpoint, headers=_AUTH, json=correction)
+    assert refused.status == status and refused.headers["Cache-Control"] == "private, no-store"
+    assert await assertion_accounting(fixture) == before
+    assert await _http_company_read(app, command) == created.json["record"]
+
+
+@pytest.mark.asyncio
+async def test_company_group_http_live_insert_revocation_rolls_back(company_registry_app):
+    app, fixture = company_registry_app
+    command = _company_http_command(await _http_group_target(app))
+    endpoint = "/api/v1/registry/manage/company"
+    _, created = await app.asgi_client.post(endpoint, headers=_AUTH, json=command)
+    assert created.status == 200
+    correction = _company_http_correction(command, 1)
+    correction["fields"]["display_name"] = "Changed company"
+    before = await assertion_accounting(fixture)
+    columns = ",".join('"' + name + '"' for name in _INSERT_COLUMNS["company_registry_group_assertion"])
+    try:
+        await fixture.connection.execute(
+            f'REVOKE INSERT({columns}) ON {fixture.namespace}.company_registry_group_assertion FROM "{fixture.roles_by_kind["draft"]}"'
+        )
+        _, refused = await app.asgi_client.post(endpoint, headers=_AUTH, json=correction)
+        assert refused.status == 503 and refused.json == {"error": {"code": "registry_unavailable"}}
+        assert refused.headers["Cache-Control"] == "private, no-store"
+        assert await assertion_accounting(fixture) == before
+        assert await _http_company_read(app, command) == created.json["record"]
+    finally:
+        await install_assertion_permissions(fixture)
+    _, restored = await app.asgi_client.post(endpoint, headers=_AUTH, json=correction)
+    assert restored.status == 200 and restored.json["record"]["display_name"] == "Changed company"
