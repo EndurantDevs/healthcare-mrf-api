@@ -36,7 +36,11 @@ from sqlalchemy.exc import IntegrityError
 from db.models import NPIData
 from db.models.company_group_registry import CompanyGroupRegistry
 from db.models.company_registry import CompanyRegistry
-from db.models.company_registry_assertions import CompanyRegistryIdentifierAssertion, CompanyRegistryRoleAssertion
+from db.models.company_registry_assertions import (
+    CompanyRegistryGroupAssertion,
+    CompanyRegistryIdentifierAssertion,
+    CompanyRegistryRoleAssertion,
+)
 from db.models.company_registry_links import CompanyRegistryLinks
 from db.models.manual_directory_registry import (
     ManualLocationRegistry,
@@ -48,7 +52,11 @@ from db.models.network_registry import NetworkRegistryIdentity, NetworkRegistryR
 from db.models.registry_network_binding import RegistryNetworkBinding
 from db.models.registry_revision import RegistryRecordHistory, RegistryRevisionControl
 from db.models.registry_site_binding import RegistrySiteBinding
-from process.company_registry_assertion_values import validated_company_registry_assertions
+from process.company_registry_assertion_values import (
+    CONTRACT,
+    MAX_GROUP_ASSERTIONS,
+    validated_company_registry_assertions,
+)
 from process.ext.address_fast import _fast_module
 from process.network_membership_copy import MAX_INPUT_BYTES, MembershipCopyError, _encode
 from process.network_registry_identity import allocate_network_ids
@@ -606,7 +614,7 @@ async def apply_registry_record_command(session, command, actor, *, schema=None,
             fields = await _resolve_site_binding(session, command, fields, schema)
         assertions = None
         if command.record_kind == "company":
-            assertions = await _company_revision_assertions(session, command, fields, history_table)
+            assertions = await _company_revision_assertions(session, command, fields, history_table, schema)
             if command.operation != "archive":
                 await _validate_company_assertions(session, command, assertions, schema)
         record_snapshot = await _write_record_head(session, command, table, identity_column, record_id, fields)
@@ -787,27 +795,55 @@ async def list_registry_records(session, record_kind, *, limit=50, offset=0, rec
     return records
 
 
-async def _company_revision_assertions(session, command, fields, history):
+async def _company_revision_assertions(session, command, fields, history, schema):
     document = fields.pop("assertions", None)
-    if document is not None:
-        return {key: document[key] for key in ("role_assertions", "identifier_assertions")}
-    if command.operation == "create":
-        return {"role_assertions": [], "identifier_assertions": []}
-    retained = await session.scalar(
-        select(history.c.record_json).where(
-            history.c.record_kind == "company",
-            history.c.record_key == str(command.record_id),
-            history.c.revision == command.expected_revision,
+    retained_by_field = {}
+    if command.operation != "create" and (document is None or "group_assertions" not in document):
+        retained_by_field = await session.scalar(
+            select(history.c.record_json).where(
+                history.c.record_kind == "company",
+                history.c.record_key == str(command.record_id),
+                history.c.revision == command.expected_revision,
+            )
         )
+        if retained_by_field is None and command.expected_revision == 1:
+            retained_by_field = await get_registry_record(session, "company", command.record_id, schema=schema)
+            if retained_by_field is not None and retained_by_field["revision"] != command.expected_revision:
+                retained_by_field = None
+        if retained_by_field is None:
+            raise RegistryRecordConflict("registry_record_revision_conflict")
+    assertions_by_family = {
+        key: (document if document is not None else retained_by_field).get(key, [])
+        for key in ("role_assertions", "identifier_assertions")
+    }
+    assertions_by_family["group_assertions"] = (document or {}).get(
+        "group_assertions", retained_by_field.get("group_assertions", [])
     )
-    if retained is None:
-        raise RegistryRecordConflict("registry_record_revision_conflict")
-    return {key: retained.get(key, []) for key in ("role_assertions", "identifier_assertions")}
+    if (
+        type(assertions_by_family["group_assertions"]) is not list
+        or len(assertions_by_family["group_assertions"]) > MAX_GROUP_ASSERTIONS
+    ):
+        raise RegistryRecordConflict("registry_company_group_assertions_invalid")
+    if assertions_by_family["group_assertions"] and (document is None or "group_assertions" not in document):
+        assertions_by_family = validated_company_registry_assertions(
+            {"contract": CONTRACT, "company_id": str(command.record_id), "expected_revision": command.expected_revision}
+            | assertions_by_family
+        ).as_dict()
+        assertions_by_family = {
+            key: assertions_by_family[key] for key in ("role_assertions", "identifier_assertions", "group_assertions")
+        }
+    assertion_ids = [entry["assertion_id"] for family in assertions_by_family.values() for entry in family]
+    if len(assertion_ids) != len(set(assertion_ids)):
+        raise RegistryRecordConflict("registry_company_assertion_id_conflict")
+    return assertions_by_family
 
 
 _COMPANY_ASSERTION_TARGETS_SQL = """WITH proposed AS MATERIALIZED (
   SELECT value AS assertion FROM jsonb_array_elements(CAST(:roles AS jsonb))
   UNION ALL SELECT value FROM jsonb_array_elements(CAST(:identifiers AS jsonb))
+  UNION ALL SELECT value FROM jsonb_array_elements(CAST(:groups AS jsonb))
+), proposed_groups AS MATERIALIZED (
+  SELECT value AS assertion FROM jsonb_array_elements(CAST(:groups AS jsonb))
 ), identifiers AS MATERIALIZED (
   SELECT value AS assertion FROM jsonb_array_elements(CAST(:identifiers AS jsonb))
 ), current_claims AS MATERIALIZED (
@@ -854,6 +890,29 @@ SELECT NOT EXISTS (
             (p.assertion->>'identifier_system',p.assertion->>'identifier_value')
           AND observation.resolution_status<>'conflicting'
           AND (observation.entity_id IS NULL OR observation.entity_id=CAST(:company_id AS uuid))))
+) AND NOT EXISTS (
+  SELECT 1 FROM proposed_groups p WHERE
+    (p.assertion->>'company_id')::uuid<>CAST(:company_id AS uuid)
+    OR (p.assertion->>'group_id' IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM {namespace}.company_group_registry target
+      WHERE target.group_id=(p.assertion->>'group_id')::uuid
+        AND NOT target.archived AND target.group_kind=p.assertion->>'group_kind'))
+    OR (p.assertion->'provenance'->>'kind'='source_reference' AND NOT EXISTS (
+      SELECT 1 FROM {namespace}.registry_source_snapshot snapshot
+      JOIN {namespace}.registry_source_observation observation USING(snapshot_id)
+      JOIN {namespace}.registry_company_group_assertion edge
+        ON (edge.snapshot_id,edge.source_record_key)=(observation.snapshot_id,observation.source_record_key)
+      WHERE snapshot.snapshot_id=(p.assertion->'provenance'->>'snapshot_id')::uuid
+        AND observation.source_record_key=p.assertion->'provenance'->>'source_record_key'
+        AND observation.status IN ('accepted','unresolved')
+        AND edge.resolution_status IN ('resolved','unresolved')
+        AND edge.company_id=CAST(:company_id AS uuid)
+        AND edge.group_id IS NOT DISTINCT FROM (p.assertion->>'group_id')::uuid
+        AND edge.relationship_kind=p.assertion->>'relationship_kind'
+        AND edge.valid_from IS NOT DISTINCT FROM (p.assertion->>'valid_from')::date
+        AND edge.valid_to IS NOT DISTINCT FROM (p.assertion->>'valid_to')::date
+        AND (observation.observation_json->>'group_kind' IS NULL
+          OR observation.observation_json->>'group_kind'=p.assertion->>'group_kind')))
 )"""
 
 
@@ -868,6 +927,7 @@ async def _validate_company_assertions(session, command, assertions, schema):
             "company_id": command.record_id,
             "roles": json.dumps(assertions["role_assertions"]),
             "identifiers": json.dumps(assertions["identifier_assertions"]),
+            "groups": json.dumps(assertions["group_assertions"]),
         },
     )
     if valid is not True:
@@ -876,23 +936,29 @@ async def _validate_company_assertions(session, command, assertions, schema):
 
 def _company_assertion_row(assertion, company_id, revision):
     provenance = assertion["provenance"]
-    return {key: value for key, value in assertion.items() if key not in {"provenance", "valid_from", "valid_to"}} | {
+    row = {key: value for key, value in assertion.items() if key not in {"provenance", "valid_from", "valid_to"}} | {
         "assertion_id": UUID(assertion["assertion_id"]),
         "company_id": UUID(company_id),
         "company_revision": revision,
-        "valid_from": date.fromisoformat(assertion["valid_from"]),
+        "valid_from": None
+        if "group_kind" in assertion and assertion["valid_from"] is None
+        else date.fromisoformat(assertion["valid_from"]),
         "valid_to": None if assertion["valid_to"] is None else date.fromisoformat(assertion["valid_to"]),
         "provenance_kind": provenance["kind"],
         "evidence_ref": provenance["evidence_ref"],
         "source_snapshot_id": None if provenance["snapshot_id"] is None else UUID(provenance["snapshot_id"]),
         "source_record_key": provenance["source_record_key"],
     }
+    if "group_id" in assertion:
+        row["group_id"] = None if assertion["group_id"] is None else UUID(assertion["group_id"])
+    return row
 
 
 async def _retain_company_assertions(session, record, assertions, schema):
     for model, key in (
         (CompanyRegistryRoleAssertion, "role_assertions"),
         (CompanyRegistryIdentifierAssertion, "identifier_assertions"),
+        (CompanyRegistryGroupAssertion, "group_assertions"),
     ):
         rows = [_company_assertion_row(item, record["company_id"], record["revision"]) for item in assertions[key]]
         if rows:
@@ -909,6 +975,8 @@ def _company_assertion_document(row):
         "source_snapshot_id",
         "source_record_key",
     }
+    if "group_kind" in row:
+        excluded_columns.remove("company_id")
     return {
         key: value.isoformat() if isinstance(value, date) else str(value) if isinstance(value, UUID) else value
         for key, value in row.items()
@@ -930,19 +998,24 @@ async def _attach_company_assertions(session, records, schema):
     for model, key in (
         (CompanyRegistryRoleAssertion, "role_assertions"),
         (CompanyRegistryIdentifierAssertion, "identifier_assertions"),
+        (CompanyRegistryGroupAssertion, "group_assertions"),
     ):
         for record in records:
             record[key] = []
         table = _table(model, schema)
-        rows = (
-            await session.execute(
-                select(table)
-                .where(tuple_(table.c.company_id, table.c.company_revision).in_(tuple(by_identity)))
-                .order_by(table.c.assertion_id)
-            )
-        ).mappings()
+        statement = (
+            select(table)
+            .where(tuple_(table.c.company_id, table.c.company_revision).in_(tuple(by_identity)))
+            .order_by(table.c.assertion_id)
+        )
+        if key == "group_assertions":
+            statement = statement.limit(len(by_identity) * MAX_GROUP_ASSERTIONS + 1)
+        rows = (await session.execute(statement)).mappings()
         for row in rows:
-            by_identity[(row["company_id"], row["company_revision"])][key].append(_company_assertion_document(row))
+            family = by_identity[(row["company_id"], row["company_revision"])][key]
+            if key == "group_assertions" and len(family) >= MAX_GROUP_ASSERTIONS:
+                raise RegistryAddressUnavailable("registry_company_assertions_unavailable")
+            family.append(_company_assertion_document(row))
 
 
 def _company_record_json_sql(namespace):
@@ -951,14 +1024,19 @@ def _company_record_json_sql(namespace):
     for table, key in (
         ("company_registry_role_assertion", "role_assertions"),
         ("company_registry_identifier_assertion", "identifier_assertions"),
+        ("company_registry_group_assertion", "group_assertions"),
     ):
-        document = """to_jsonb(assertion)-ARRAY['company_id','company_revision','created_at','provenance_kind',
+        company_column = "" if key == "group_assertions" else "'company_id',"
+        document = f"""to_jsonb(assertion)-ARRAY[{company_column}'company_revision','created_at','provenance_kind',
           'evidence_ref','source_snapshot_id','source_record_key']||jsonb_build_object('provenance',jsonb_build_object(
           'kind',assertion.provenance_kind,'evidence_ref',assertion.evidence_ref,
           'snapshot_id',assertion.source_snapshot_id,'source_record_key',assertion.source_record_key))"""
-        parts.append(
-            f"'{key}',COALESCE((SELECT jsonb_agg({document} ORDER BY assertion.assertion_id) "
-            f"FROM {namespace}.{table} assertion WHERE assertion.company_id=head.company_id "
-            "AND assertion.company_revision=head.revision),'[]'::jsonb)"
-        )
+        relation = f"{namespace}.{table} assertion"
+        predicate = "WHERE assertion.company_id=head.company_id AND assertion.company_revision=head.revision"
+        aggregate = f"COALESCE(jsonb_agg({document} ORDER BY assertion.assertion_id),'[]'::jsonb)"
+        if key == "group_assertions":
+            relation = f"(SELECT * FROM {relation} {predicate} LIMIT {MAX_GROUP_ASSERTIONS + 1}) assertion"
+            predicate = ""
+            aggregate = f"CASE WHEN count(*)<={MAX_GROUP_ASSERTIONS} THEN {aggregate} ELSE NULL END"
+        parts.append(f"'{key}',(SELECT {aggregate} FROM {relation} {predicate})")
     return "to_jsonb(head)||jsonb_build_object(" + ",".join(parts) + ")"

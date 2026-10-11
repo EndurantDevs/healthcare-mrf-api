@@ -30,12 +30,13 @@ async def _migrated_tables(resources, monkeypatch):
     database = Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
     try:
         script = ScriptDirectory.from_config(Config("alembic.ini"))
-        assert script.get_heads() == ["20261010030000_registry_source_admission_receipt"]
+        assert script.get_heads() == ["20261011010000_company_registry_group_assertions"]
         assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
             "20261010000000_custom_import_admission_indexes"
         )
         assert (
-            script.get_revision(script.get_heads()[0]).down_revision == "20261010020000_registry_ptg_office_retention"
+            script.get_revision("20261010030000_registry_source_admission_receipt").down_revision
+            == "20261010020000_registry_ptg_office_retention"
         )
         assert script.get_revision("20261010020000_registry_ptg_office_retention").down_revision == (
             "20261010010000_registry_ptg_office_approval"
@@ -64,7 +65,7 @@ async def _migrated_tables(resources, monkeypatch):
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", _SCHEMA)
         await _upgrade_disposable_schema_to_head(url.render_as_string(hide_password=False), _SCHEMA)
         assert await database.scalar(f'SELECT version_num FROM "{_SCHEMA}".alembic_version') == (
-            "20261010030000_registry_source_admission_receipt"
+            "20261011010000_company_registry_group_assertions"
         )
         metadata = MetaData(schema=_SCHEMA)
         for model in preparation.destination.restore._models():

@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import asyncpg
 
+from process.registry_approved_company_groups import approved_company_group_diagnostics
 from process.registry_approved_membership import approved_membership_diagnostics
 from process.registry_company_approval_fence import lock_registry_company_approval_writer
 from process.registry_record_store import (
@@ -104,7 +105,8 @@ async def _stage_selection(connection, selection_json):
 def _selected_history_json_sql():
     """Normalize only absent legacy fields when comparing immutable snapshots."""
     return """CASE WHEN selected.record_kind='company' THEN
-            jsonb_build_object('role_assertions','[]'::jsonb,'identifier_assertions','[]'::jsonb)||history.record_json
+            jsonb_build_object('role_assertions','[]'::jsonb,'identifier_assertions','[]'::jsonb,
+              'group_assertions','[]'::jsonb)||history.record_json
             WHEN selected.record_kind='company_links' AND NOT history.record_json ? 'network_assertions'
             THEN history.record_json||jsonb_build_object('network_assertions','[]'::jsonb)
             WHEN selected.record_kind='network' AND NOT history.record_json ? 'catalog_evidence_json'
@@ -237,6 +239,17 @@ async def _write_approval(connection, namespace, staging, command, approval_meta
     }
 
 
+async def _validate_company_groups(connection, namespace, staging, previous_revision):
+    diagnostics = await approved_company_group_diagnostics(connection, namespace, staging, previous_revision)
+    if any(
+        diagnostics[key]
+        for key in ("group_family_invalid_count", "group_target_conflict_count", "group_source_conflict_count")
+    ):
+        raise RegistryApprovalConflict("registry_company_assertion_target_conflict")
+    if diagnostics["group_review_count"]:
+        raise RegistryApprovalConflict("registry_approval_company_group_unresolved")
+
+
 async def approve_registry_records(connection, command, actor: RegistryActor, *, control_schema=None):
     """Retain an explicit approved map; the caller authenticates live grants first.
 
@@ -285,6 +298,7 @@ async def approve_registry_records(connection, command, actor: RegistryActor, *,
             raise RegistryApprovalConflict("registry_approval_source_binding_unresolved")
         if diagnostics["unresolved_count"]:
             raise RegistryApprovalConflict("registry_approval_membership_unresolved")
+        await _validate_company_groups(connection, namespace, staging, command.expected_approved_revision)
         receipt = await _write_approval(connection, namespace, staging, command, approval_metadata)
         await connection.execute(f"DROP TABLE {staging}")
         return receipt

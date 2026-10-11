@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from dataclasses import replace
+from datetime import date
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -413,6 +414,10 @@ class _CountedConnection:
         self.statements += 1
         return await self.connection.fetchval(*arguments)
 
+    def cursor(self, *arguments, **keywords):
+        self.statements += 1
+        return self.connection.cursor(*arguments, **keywords)
+
 
 async def _bulk_manual_versions(connection, schema, seed):
     await connection.execute(
@@ -454,7 +459,349 @@ async def test_statement_count_is_constant_for_one_and_five_thousand(serving_sch
     command = await _command(connection, schema, selection=selected_versions)
     bulk = await _approve(counted, schema, command, actor)
     # One company writer fence and one prospective membership anti-join per batch.
-    assert counted.statements == one_count == 11
+    assert counted.statements == one_count == 12
     assert bulk["selected_count"] == 5000
     assert len(await _approved(connection, schema, bulk["approved_revision"])) == 5000
     assert len(await _approved(connection, schema, first["approved_revision"])) == 1
+
+
+def _company_groups(command, group_assertions):
+    from process.company_registry_assertion_values import CONTRACT
+
+    return replace(
+        command,
+        fields=command.fields
+        | {
+            "assertions": {
+                "contract": CONTRACT,
+                "company_id": str(command.record_id),
+                "expected_revision": command.expected_revision,
+                "role_assertions": [
+                    {
+                        "assertion_id": str(uuid4()),
+                        "role": "employer",
+                        "valid_from": "2024-01-01",
+                        "valid_to": None,
+                        "provenance": {
+                            "kind": "manual_reference",
+                            "evidence_ref": "Reviewed company role",
+                            "snapshot_id": None,
+                            "source_record_key": None,
+                        },
+                    }
+                ],
+                "identifier_assertions": [],
+                "group_assertions": group_assertions,
+            }
+        },
+    )
+
+
+def _group_row(company, group, **changes):
+    return {
+        "assertion_id": str(uuid4()),
+        "company_id": str(company),
+        "group_id": str(group),
+        "group_kind": "corporate_parent",
+        "relationship_kind": "reported_affiliation",
+        "valid_from": "2024-01-01",
+        "valid_to": None,
+        "provenance": {
+            "kind": "manual_reference",
+            "evidence_ref": "Reviewed association",
+            "snapshot_id": None,
+            "source_record_key": None,
+        },
+    } | changes
+
+
+async def test_company_group_approval_replay_and_carried_reference_archive(serving_schema):
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    target_command, company = _create(), _create("company")
+    group = await _draft(engine, schema, target_command, actor)
+    original = _company_groups(company, [_group_row(company.record_id, target_command.record_id)])
+    company_record = await _draft(engine, schema, original, actor)
+    command = await _command(connection, schema, group, company_record)
+    receipt = await _approve(connection, schema, command, actor)
+    assert [
+        approved_record["record_kind"]
+        for approved_record in await _approved(connection, schema, receipt["approved_revision"])
+    ] == ["company", "group"]
+    archived_group = await _draft(
+        engine,
+        schema,
+        replace(target_command, operation="archive", expected_revision=1, fields={}, idempotency_key=uuid4().hex),
+        actor,
+    )
+    before = await _approved(connection, schema, receipt["approved_revision"])
+    with pytest.raises(RegistryApprovalConflict, match="assertion_target_conflict"):
+        await _approve(connection, schema, await _command(connection, schema, archived_group), actor)
+    assert await _approved(connection, schema, receipt["approved_revision"]) == before
+    assert await _approve(connection, schema, command, actor) == receipt | {"replayed": True}
+    archived_company = await _draft(
+        engine,
+        schema,
+        replace(original, operation="archive", expected_revision=1, fields={}, idempotency_key=uuid4().hex),
+        actor,
+    )
+    final = await _approve(
+        connection, schema, await _command(connection, schema, archived_group, archived_company), actor
+    )
+    assert all(
+        approved_record["record_json"]
+        for approved_record in await _approved(connection, schema, final["approved_revision"])
+    )
+    assert group["revision"] == 1
+
+
+async def test_company_group_approval_refuses_native_reviews_but_allows_archive(serving_schema):
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    target, company = _create(), _create("company")
+    target_record = await _draft(engine, schema, target, actor)
+    original = _company_groups(company, [_group_row(company.record_id, target.record_id, valid_from=None)])
+    record = await _draft(engine, schema, original, actor)
+    with pytest.raises(RegistryApprovalConflict, match="company_group_unresolved"):
+        await _approve(connection, schema, await _command(connection, schema, target_record, record), actor)
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_approval_history') == 0
+    archived = await _draft(
+        engine,
+        schema,
+        replace(original, operation="archive", expected_revision=1, fields={}, idempotency_key=uuid4().hex),
+        actor,
+    )
+    assert (await _approve(connection, schema, await _command(connection, schema, archived), actor))[
+        "selected_count"
+    ] == 1
+
+
+async def _alter_admitted_group_edge(connection, schema, edition, edge, change):
+    # Corrupt only genuinely admitted evidence to prove approval rechecks it.
+    if change in {"company", "group", "relationship", "start", "end", "edge"}:
+        column, changed_value = {
+            "company": ("company_id", uuid4()),
+            "group": ("group_id", uuid4()),
+            "relationship": ("relationship_kind", "verified_ownership"),
+            "start": ("valid_from", date(2024, 1, 1)),
+            "end": ("valid_to", date(2024, 12, 31)),
+            "edge": ("resolution_status", "conflicting"),
+        }[change]
+        assignment = f"{column}=$3" + (",group_id=NULL" if change == "edge" else "")
+        await connection.execute(
+            f'UPDATE "{schema}".registry_company_group_assertion SET {assignment} '
+            "WHERE snapshot_id=$1 AND source_record_key=$2",
+            edition.snapshot_id,
+            edge["source_record_key"],
+            changed_value,
+        )
+    elif change == "observation":
+        await connection.execute(
+            f'UPDATE "{schema}".registry_source_observation SET status=$3 '
+            "WHERE snapshot_id=$1 AND source_record_key=$2",
+            edition.snapshot_id,
+            edge["source_record_key"],
+            "rejected",
+        )
+    elif change == "kind":
+        await connection.execute(
+            f'UPDATE "{schema}".registry_source_observation '
+            "SET observation_json=jsonb_set(observation_json,'{group_kind}','\"corporate_parent\"'::jsonb) "
+            "WHERE snapshot_id=$1 AND source_record_key=$2",
+            edition.snapshot_id,
+            edge["source_record_key"],
+        )
+    elif change == "missing":
+        await connection.execute(
+            f'DELETE FROM "{schema}".registry_company_group_assertion WHERE snapshot_id=$1 AND source_record_key=$2',
+            edition.snapshot_id,
+            edge["source_record_key"],
+        )
+
+
+@pytest.mark.parametrize(
+    "change", ["none", "company", "group", "relationship", "start", "end", "observation", "edge", "kind", "missing"]
+)
+async def test_company_group_approval_genuine_admission_retains_unknown_start(serving_schema, change):
+    from process.registry_source_admission import admit_cms_mlr_edition
+    from tests.test_registry_source_admission_postgres import _edition, _input
+
+    connection, schema, engine = serving_schema
+    input_bytes = _input()
+    edition = _edition(input_bytes)
+    async with connection.transaction():
+        admitted = await admit_cms_mlr_edition(connection, input_bytes, edition, control_schema=schema)
+    assert admitted["group_assertions"] == 2
+    edge = await connection.fetchrow(
+        f'SELECT * FROM "{schema}".registry_company_group_assertion WHERE snapshot_id=$1 ORDER BY source_record_key LIMIT 1',
+        edition.snapshot_id,
+    )
+    assert edge["valid_from"] is edge["valid_to"] is None
+    company = replace(_create("company"), record_id=edge["company_id"], operation="correct", expected_revision=1)
+    group_assertion = _group_row(
+        edge["company_id"],
+        edge["group_id"],
+        group_kind="naic_group",
+        valid_from=None,
+        provenance={
+            "kind": "source_reference",
+            "evidence_ref": "Retained occurrence",
+            "snapshot_id": str(edition.snapshot_id),
+            "source_record_key": edge["source_record_key"],
+        },
+    )
+    company_record = await _draft(engine, schema, _company_groups(company, [group_assertion]), _actor())
+    group_record = await _draft(
+        engine,
+        schema,
+        replace(
+            _create(),
+            record_id=edge["group_id"],
+            operation="correct",
+            expected_revision=1,
+            fields={"display_name": "Reviewed source group", "aliases": [], "group_kind": "naic_group"},
+        ),
+        _actor(),
+    )
+    await _alter_admitted_group_edge(connection, schema, edition, edge, change)
+    refusal = "company_group_unresolved" if change == "none" else "assertion_target_conflict"
+    with pytest.raises(RegistryApprovalConflict, match=refusal):
+        await _approve(connection, schema, await _command(connection, schema, group_record, company_record), _actor())
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_approval_history') == 0
+
+
+@pytest.mark.parametrize("legacy", [True, False], ids=["absent-legacy", "malformed-present"])
+async def test_company_group_history_normalizes_absence_without_hiding_null(serving_schema, legacy):
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    record = await _draft(engine, schema, _create("company"), actor)
+    expression = "record_json-'group_assertions'" if legacy else "record_json||'{\"group_assertions\":null}'::jsonb"
+    await connection.execute(
+        f'UPDATE "{schema}".registry_record_history SET record_json={expression} '
+        "WHERE record_kind='company' AND record_key=$1",
+        record["record_id"],
+    )
+    command = await _command(connection, schema, record)
+    if legacy:
+        assert (await _approve(connection, schema, command, actor))["selected_count"] == 1
+        retained = await _approved(connection, schema, command.expected_draft_revision + 1)
+        assert "group_assertions" not in json.loads(retained[0]["record_json"])
+    else:
+        with pytest.raises(RegistryApprovalConflict, match="selection_conflict"):
+            await _approve(connection, schema, command, actor)
+        assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_approval_history') == 0
+
+
+async def test_company_group_approval_preserves_company_scoped_assertion_ids(serving_schema):
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    target = _create()
+    target_record = await _draft(engine, schema, target, actor)
+    companies = [_create("company"), _create("company")]
+    shared_id = str(uuid4())
+    records = [
+        await _draft(
+            engine,
+            schema,
+            _company_groups(command, [_group_row(command.record_id, target.record_id, assertion_id=shared_id)]),
+            actor,
+        )
+        for command in companies
+    ]
+    receipt = await _approve(connection, schema, await _command(connection, schema, target_record, *records), actor)
+    assert receipt["selected_count"] == 3
+    assert (
+        await connection.fetchval(
+            f'SELECT count(*) FROM "{schema}".company_registry_group_assertion WHERE assertion_id=$1', UUID(shared_id)
+        )
+        == 2
+    )
+
+
+async def test_company_group_conflict_diagnostics_exhaust_cursor_before_staging_drop(serving_schema):
+    from process.registry_approval_store import _stage_selection
+    from process.registry_approved_company_groups import approved_company_group_diagnostics
+    from process.registry_company_approval_fence import lock_registry_company_approval_writer
+
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    target, company = _create(), _create("company")
+    await _draft(engine, schema, target, actor)
+    original = _company_groups(company, [_group_row(company.record_id, target.record_id)])
+    company_record = await _draft(engine, schema, original, actor)
+    await _draft(
+        engine,
+        schema,
+        replace(target, operation="archive", expected_revision=1, fields={}, idempotency_key=uuid4().hex),
+        actor,
+    )
+    async with connection.transaction():
+        await lock_registry_company_approval_writer(connection, schema)
+        await connection.fetchrow(f'SELECT * FROM "{schema}".registry_revision_control WHERE id=1 FOR UPDATE')
+        staging = await _stage_selection(connection, json.dumps(_selection(company_record)))
+        diagnostics = await approved_company_group_diagnostics(connection, f'"{schema}"', staging, 0)
+        assert diagnostics["group_target_conflict_count"] == diagnostics["group_unresolved_count"] == 1
+        assert diagnostics["group_review_count"] == 0
+        # PostgreSQL refuses this DROP while a suspended portal still uses the table.
+        await connection.execute(f"DROP TABLE {staging}")
+        assert await connection.fetchval("SELECT to_regclass($1)", staging) is None
+
+
+async def test_malformed_group_evidence_remains_reviewable(serving_schema):
+    from process.registry_approval_preview import preview_registry_approval
+
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    group_command, company = _create(), _create("company")
+    group_record = await _draft(engine, schema, group_command, actor)
+    company_record = await _draft(
+        engine, schema, _company_groups(company, [_group_row(company.record_id, group_command.record_id)]), actor
+    )
+    approved = await _approve(
+        connection, schema, await _command(connection, schema, group_record, company_record), actor
+    )
+    pending = await _draft(engine, schema, _create(), actor)
+    command = await _command(connection, schema, pending)
+    previous = await _approved(connection, schema, approved["approved_revision"])
+    original = json.loads(previous[0]["record_json"])
+    assertion = _group_row(
+        company.record_id,
+        group_command.record_id,
+        valid_to="2024-12-31",
+        provenance={
+            "kind": "source_reference",
+            "evidence_ref": "Retained occurrence",
+            "snapshot_id": str(uuid4()),
+            "source_record_key": "retained-row",
+        },
+    )
+    for field, malformed in (
+        ("snapshot_id", "invalid-uuid"),
+        ("group_id", "invalid-uuid"),
+        ("valid_from", "invalid-date"),
+        ("valid_to", "invalid-date"),
+        ("valid_from", "2024-02-30"),
+        ("valid_to", "2024-13-01"),
+    ):
+        changed = json.loads(json.dumps(assertion))
+        fields = changed["provenance"] if field == "snapshot_id" else changed
+        fields[field] = malformed
+        await connection.execute(
+            f'UPDATE "{schema}".registry_approved_record SET record_json=$1::jsonb '
+            "WHERE approved_revision=$2 AND record_kind='company' AND record_key=$3",
+            json.dumps(original | {"group_assertions": [changed]}),
+            approved["approved_revision"],
+            company_record["record_id"],
+        )
+        async with connection.transaction():
+            preview = await preview_registry_approval(connection, command, actor, control_schema=schema)
+        assert preview["company_group_diagnostics"]["group_family_invalid_count"] == 1
+        assert preview["company_group_diagnostics"]["group_review_count"] == 0
+        with pytest.raises(RegistryApprovalConflict, match="assertion_target_conflict"):
+            await _approve(connection, schema, command, actor)
+        assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_approval_history') == 1
+        assert tuple(
+            await connection.fetchrow(
+                f'SELECT draft_revision,approved_revision FROM "{schema}".registry_revision_control'
+            )
+        ) == (command.expected_draft_revision, command.expected_approved_revision)

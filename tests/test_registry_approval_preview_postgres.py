@@ -352,7 +352,7 @@ async def test_full_response_size_and_sql_count_are_bounded_at_five_thousand(ser
     command = await _command(connection, schema, selection=selected_versions)
     with pytest.raises(ValueError, match="preview_too_large"):
         await _preview(counted, schema, command, actor)
-    assert counted.statements == one_count == 7  # Includes one prospective membership anti-join.
+    assert counted.statements == one_count == 8  # Includes one set-based company-group diagnostics cursor.
     assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_approval_history') == 0
     assert tuple(
         await connection.fetchrow(f'SELECT draft_revision,approved_revision FROM "{schema}".registry_revision_control')
@@ -565,7 +565,7 @@ async def test_complete_imported_counts_above_copy_page(expanded_aca_preview, op
         "omitted_rows": omitted,
         "unresolved_rows": 0,
     }
-    assert counted.statements == 16
+    assert counted.statements == 17
     assert preview["unresolved_count"] == 0
     assert await _durable_state(fixture.connection, fixture.control_schema) == initial_state
     await _assert_staging_removed(fixture.connection)
@@ -585,7 +585,7 @@ async def test_imported_preview_query_count_is_fixed_per_recipe(retained_aca_pre
         "omitted_rows": 0,
         "unresolved_rows": 0,
     }
-    assert counted.statements == 16
+    assert counted.statements == 17
 
 
 async def test_bootstrap_binding_preview_has_no_invented_source_count(office_db):
@@ -793,7 +793,7 @@ async def test_cms_preview_counts_all_source_rows_above_both_native_page_limits(
         "omitted_rows": count if operation == "close" else 0,
         "unresolved_rows": 0,
     }
-    assert counted.statements == 26
+    assert counted.statements == 27
 
 
 @pytest.mark.parametrize("retained_cms_preview", [{"mixed": True}], indirect=True)
@@ -853,3 +853,186 @@ async def test_cms_preview_cancel_preserves_caller_work_and_durable_state(retain
         await task
     assert await _durable_state(fixture.connection, fixture.control_schema) == initial_state
     await _assert_staging_removed(fixture.connection)
+
+
+def _group_diagnostics(**changes):
+    return (
+        dict(
+            group_family_invalid_count=0,
+            group_target_conflict_count=0,
+            group_source_conflict_count=0,
+            group_assertion_rows=0,
+            group_review_count=0,
+            group_review_rows=0,
+            group_reviews_by_code={},
+            group_unresolved_count=0,
+        )
+        | changes
+    )
+
+
+async def test_company_group_preview_merge_preserves_exact_legacy_output():
+    from process.registry_approval_preview import _merge_company_group_diagnostics
+
+    preview_by_field = {"unresolved_count": 7, "records": []}
+    original = copy.deepcopy(preview_by_field)
+    _merge_company_group_diagnostics(preview_by_field, _group_diagnostics())
+    assert preview_by_field == original
+
+
+async def test_company_group_preview_merge_counts_distinct_findings_once():
+    from process.registry_approval_preview import _merge_company_group_diagnostics, _merge_preview_diagnostics
+
+    preview_by_field = {"unresolved_count": 0}
+    membership_by_field = dict(
+        membership_rows=1, source_binding_rows=1, source_binding_unresolved_count=2, unresolved_count=3
+    )
+    source_by_field = {"status": "available", "unresolved_rows": 4}
+    _merge_preview_diagnostics(preview_by_field, membership_by_field, source_by_field)
+    diagnostics = _group_diagnostics(
+        group_assertion_rows=1, group_target_conflict_count=1, group_source_conflict_count=1, group_unresolved_count=1
+    )
+    _merge_company_group_diagnostics(preview_by_field, diagnostics)
+    assert preview_by_field["unresolved_count"] == 10
+    assert preview_by_field["company_group_diagnostics"] == diagnostics
+
+
+async def test_company_group_preview_merge_preserves_ready_and_reviewed_families():
+    from process.registry_approval_preview import _merge_company_group_diagnostics
+
+    for diagnostics in [
+        _group_diagnostics(group_assertion_rows=2),
+        _group_diagnostics(
+            group_assertion_rows=2,
+            group_review_rows=2,
+            group_review_count=1,
+            group_unresolved_count=2,
+            group_reviews_by_code={"contradictory_overlapping_groups": 1},
+        ),
+    ]:
+        preview_by_field = {"unresolved_count": 0}
+        _merge_company_group_diagnostics(preview_by_field, diagnostics)
+        assert preview_by_field == {
+            "unresolved_count": diagnostics["group_unresolved_count"],
+            "company_group_diagnostics": diagnostics,
+        }
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"extra": 1},
+        {"group_unresolved_count": True},
+        {"group_assertion_rows": -1},
+        {"group_assertion_rows": 9007199254740992},
+        {"group_reviews_by_code": {"guessed_parent": 1}},
+        {"group_reviews_by_code": {"missing_group": True}},
+        {"group_reviews_by_code": {"missing_group": 0}},
+        {"group_review_count": 1},
+        {"group_review_rows": 1},
+    ],
+)
+async def test_company_group_preview_merge_refuses_unbounded_or_nonclosed_diagnostics(change):
+    from process.registry_approval_preview import _merge_company_group_diagnostics
+
+    with pytest.raises(ValueError):
+        _merge_company_group_diagnostics({"unresolved_count": 0}, _group_diagnostics(**change))
+
+
+async def test_company_group_preview_merge_limits_aggregate_without_capping_carried_map():
+    from process.registry_approval_preview import MAX_PREVIEW_COUNT, _merge_company_group_diagnostics
+
+    diagnostics = _group_diagnostics(
+        group_assertion_rows=MAX_PREVIEW_COUNT, group_target_conflict_count=1, group_unresolved_count=1
+    )
+    preview_by_field = {"unresolved_count": MAX_PREVIEW_COUNT - 1}
+    _merge_company_group_diagnostics(preview_by_field, diagnostics)
+    assert preview_by_field["unresolved_count"] == MAX_PREVIEW_COUNT
+    with pytest.raises(ValueError, match="preview_too_large"):
+        _merge_company_group_diagnostics(preview_by_field, diagnostics)
+
+
+@pytest.mark.parametrize("state", ["ready", "review", "target_conflict"])
+async def test_company_group_preview_native_diagnostics_are_readonly_and_drop_staging(serving_schema, state):
+    from tests.test_registry_approval_store_postgres import _company_groups, _group_row
+
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    target, company = _create(), _create("company")
+    target_record = await _draft(engine, schema, target, actor)
+    assertion = _group_row(company.record_id, target.record_id)
+    if state == "review":
+        assertion["valid_from"] = None
+    company_record = await _draft(engine, schema, _company_groups(company, [assertion]), actor)
+    if state == "target_conflict":
+        target_record = await _draft(
+            engine,
+            schema,
+            replace(target, operation="archive", expected_revision=1, fields={}, idempotency_key=uuid4().hex),
+            actor,
+        )
+    before = await _durable_state(connection, schema)
+    preview = await _preview(
+        connection, schema, await _command(connection, schema, target_record, company_record), actor
+    )
+    diagnostics = preview["company_group_diagnostics"]
+    assert diagnostics["group_assertion_rows"] == 1
+    assert preview["unresolved_count"] == diagnostics["group_unresolved_count"] == (state != "ready")
+    assert diagnostics["group_target_conflict_count"] == (state == "target_conflict")
+    assert diagnostics["group_review_rows"] == (state == "review")
+    assert await _durable_state(connection, schema) == before
+    await _assert_staging_removed(connection)
+
+
+async def test_company_group_preview_genuine_source_conflict_is_counted_once(serving_schema):
+    from process.registry_source_admission import admit_cms_mlr_edition
+    from tests.test_registry_approval_store_postgres import _company_groups, _group_row
+    from tests.test_registry_source_admission_postgres import _edition, _input
+
+    connection, schema, engine = serving_schema
+    input_bytes = _input()
+    edition = _edition(input_bytes)
+    async with connection.transaction():
+        receipt = await admit_cms_mlr_edition(connection, input_bytes, edition, control_schema=schema)
+    assert receipt["group_assertions"] == 2
+    edge = await connection.fetchrow(
+        f'SELECT * FROM "{schema}".registry_company_group_assertion '
+        "WHERE snapshot_id=$1 ORDER BY source_record_key LIMIT 1",
+        edition.snapshot_id,
+    )
+    company = replace(_create("company"), record_id=edge["company_id"], operation="correct", expected_revision=1)
+    assertion = _group_row(
+        edge["company_id"],
+        edge["group_id"],
+        group_kind="naic_group",
+        valid_from=None,
+        provenance={
+            "kind": "source_reference",
+            "evidence_ref": "Retained source occurrence",
+            "snapshot_id": str(edition.snapshot_id),
+            "source_record_key": edge["source_record_key"],
+        },
+    )
+    company_record = await _draft(engine, schema, _company_groups(company, [assertion]), _actor())
+    archived_group = await _draft(
+        engine,
+        schema,
+        replace(_create(), record_id=edge["group_id"], operation="archive", expected_revision=1, fields={}),
+        _actor(),
+    )
+    # This negative mutation removes genuine admitted evidence.
+    await connection.execute(
+        f'DELETE FROM "{schema}".registry_company_group_assertion WHERE snapshot_id=$1 AND source_record_key=$2',
+        edition.snapshot_id,
+        edge["source_record_key"],
+    )
+    before = await _durable_state(connection, schema)
+    preview = await _preview(
+        connection, schema, await _command(connection, schema, archived_group, company_record), _actor()
+    )
+    diagnostics = preview["company_group_diagnostics"]
+    assert diagnostics["group_target_conflict_count"] == diagnostics["group_source_conflict_count"] == 1
+    assert diagnostics["group_unresolved_count"] == preview["unresolved_count"] == 1
+    assert diagnostics["group_review_rows"] == 0
+    assert await _durable_state(connection, schema) == before
+    await _assert_staging_removed(connection)

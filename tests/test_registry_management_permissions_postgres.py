@@ -102,7 +102,7 @@ async def _draft(fixture, command, actor):
 async def test_full_draft_services_and_protected_publisher_approval(permissions_db):
     fixture, actor = permissions_db, _actor()
     receipt = await _install(fixture)
-    assert len(receipt["table_oids"]) == 33 and len(receipt["sequence_oids"]) == 2
+    assert len(receipt["table_oids"]) == 34 and len(receipt["sequence_oids"]) == 2
     assert set(receipt["table_oids"]) == set(_TABLES)
     commands = [create_record(kind) for kind in ("group", "company", "network")]
     created_records = [await _draft(fixture, command, actor) for command in commands]

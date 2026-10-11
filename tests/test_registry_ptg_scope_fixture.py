@@ -50,6 +50,11 @@ async def test_fixture_loads_company_assertions():
     first_assertion = statements.index(assertion_ddl[0])
     assert statements[first_assertion : first_assertion + len(assertion_ddl)] == assertion_ddl
     assert statements.index(fixture._migration()._ddl(schema)[0]) < first_assertion
+    group_ddl = fixture._migration("20261011010000_company_registry_group_assertions.py")._ddl(schema)
+    first_group = statements.index(group_ddl[0])
+    assert statements[first_group : first_group + len(group_ddl)] == group_ddl
+    assert first_group > first_assertion
+    assert not any("GRANT" in statement and "company_registry_group_assertion" in statement for statement in statements)
     assert all("CREATE FUNCTION" not in statement and "CREATE TRIGGER" not in statement for statement in statements)
     assert (
         'GRANT SELECT ON "scope_native_offline"."registry_ptg_producer_scope" TO "scope_offline_reader"' in statements
