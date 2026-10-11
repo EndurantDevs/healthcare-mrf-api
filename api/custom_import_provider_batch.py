@@ -63,6 +63,8 @@ def _parse_batch_request(body):
         transport._canonical_json_bytes(provider_by_field),
         native_query_parser=provider_batch.parse_native_batch_query,
         maximum_family_rows=npi.NPI_BATCH_MAX_SIZE,
+        allow_network_binding=True,
+        network_document=document,
     )
     provider_batch._batch_shape_params(normalized, parsed.native_args)
     return _ParsedBatchRequest(parsed, normalized)
@@ -94,13 +96,16 @@ async def serve_custom_import_provider_batch(request, session):
             raise CustomImportReadUnavailableError("fresh provider read session is required")
         async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-            async with _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS):
+            async with (
+                _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS),
+                provider_http.provider_network_read_scope(session, parsed.provider.network_binding) as manifest,
+            ):
                 batch_payload = await _read_batch_payload(request, session, parsed, verified)
                 encoded = transport._canonical_json_bytes(json.loads(response.json(batch_payload, default=str).body))
                 bound = (len(parsed.native_batch["npis"]) + 1) * transport._MAX_RESPONSE_BYTES
                 if len(encoded) > bound:
                     raise CustomImportReadUnavailableError("provider response is unavailable")
-                return transport._response(encoded, 200)
+                return provider_http.provider_network_response(encoded, manifest)
     except Exception as failure:
         transport._log_failure(failure)
         return transport._error(400 if isinstance(failure, InvalidUsage) else transport._failure_status(failure))
