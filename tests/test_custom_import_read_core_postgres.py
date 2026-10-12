@@ -967,6 +967,8 @@ async def test_read_core_enforces_one_cumulative_operation_deadline(monkeypatch)
 
             assert cache.set_calls == 0
             assert cache.values == {}
+            # The deadline may cancel database I/O, so the caller must roll back before reuse.
+            await session.rollback()
             assert await _statement_timeout_ms(session) == 0
             assert await session.scalar(text("SELECT 1")) == 1
 

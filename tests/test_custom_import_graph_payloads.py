@@ -260,7 +260,20 @@ def test_decimal_resource_failure_propagates_without_serial_retry(monkeypatch, a
     decoder.assert_called_once()
 
 
-@pytest.mark.parametrize("corruption", ["type", "length", "invalid", "nonfinite", "projection"])
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "type",
+        "length",
+        "invalid",
+        "nonfinite",
+        "projection",
+        "cell_shape",
+        "cell_missing",
+        "scalar_shape",
+        "scalar_type",
+    ],
+)
 def test_native_decimal_text_and_projection_must_agree(monkeypatch, corruption):
     request = _request(page_row_limit=256)
     group = _group(request, [_rate("0000000001")])
@@ -268,19 +281,32 @@ def test_native_decimal_text_and_projection_must_agree(monkeypatch, corruption):
     proof_parts = list(_native_proof(request, _proof(request, _registry(request.definition), group, child)))
     fields = runner_codec.fields_by_collection(request.definition)["rates"]
     index = next(index for index, field in enumerate(fields) if field.value_type == "decimal")
-    if corruption == "projection":
+    if corruption in {"projection", "scalar_shape", "scalar_type"}:
         scalars = list(proof_parts[6])
         projected = next(index for index, scalar in enumerate(scalars) if scalar[2] == "decimal")
         scalar = scalars[projected]
-        scalars[projected] = (*scalar[:6], "0.5", *scalar[7:])
+        scalars[projected] = (
+            (*scalar[:6], "0.5", *scalar[7:])
+            if corruption == "projection"
+            else (scalar[0],)
+            if corruption == "scalar_shape"
+            else (True, *scalar[1:])
+        )
         proof_parts[6] = tuple(scalars)
     else:
         cells = list(proof_parts[5])
-        cells[index] = ("value", {"type": 1, "length": "1" * 65, "invalid": "bad", "nonfinite": "NaN"}[corruption])
+        cells[index] = (
+            ("value",)
+            if corruption == "cell_shape"
+            else ("missing", None)
+            if corruption == "cell_missing"
+            else ("value", {"type": 1, "length": "1" * 65, "invalid": "bad", "nonfinite": "NaN"}[corruption])
+        )
         proof_parts[5] = tuple(cells)
     decoder = Mock(return_value=[tuple(proof_parts)])
     monkeypatch.setattr(graph_payloads, "native_decoder", lambda: decoder)
-    with pytest.raises(CandidateRunnerError, match="native graph.*decimal"):
+    message = "native graph.*malformed scalar" if corruption == "scalar_shape" else "native graph.*decimal"
+    with pytest.raises(CandidateRunnerError, match=message):
         list(graph_payloads.decode_records(request.definition, "rates", [(child, child.canonical_payload)]))
     decoder.assert_called_once()
 
@@ -313,7 +339,7 @@ def test_family_prepass_keeps_earlier_validation_error_before_later_read_error(o
         list(graph_payloads.validated_documents(request.definition, "rates", documents()))
 
 
-@pytest.mark.parametrize("corruption", ["prefix", "row", "binding", "lane", "accounting"])
+@pytest.mark.parametrize("corruption", ["prefix", "row", "binding", "lane", "accounting", "cell_shape", "cell_type"])
 def test_malformed_native_output_fails_closed(monkeypatch, oracle_decoder, corruption):
     request = _request(page_row_limit=256)
     group = _group(request, [_rate("0000000001")])
@@ -324,7 +350,11 @@ def test_malformed_native_output_fails_closed(monkeypatch, oracle_decoder, corru
     elif corruption == "row":
         decoder.side_effect = lambda *_: [("malformed",)]
     else:
-        if corruption == "accounting":
+        if corruption in {"cell_shape", "cell_type"}:
+            cells = list(proof_parts[5])
+            cells[0] = ("value",) if corruption == "cell_shape" else ("value", 1)
+            proof_parts[5] = tuple(cells)
+        elif corruption == "accounting":
             proof_parts[7] += 1
         else:
             scalars = [list(scalar) for scalar in proof_parts[6]]
@@ -333,6 +363,18 @@ def test_malformed_native_output_fails_closed(monkeypatch, oracle_decoder, corru
         decoder.side_effect = lambda *_: [tuple(proof_parts)]
     with pytest.raises(CandidateRunnerError, match="native graph"):
         sets._child_arguments(request, _registry(request.definition), (group,))
+
+
+@pytest.mark.parametrize("failure", [ValueError("bounded input"), TypeError("bounded input")])
+def test_decoder_input_rejection_preserves_cause_without_serial_retry(monkeypatch, failure):
+    request = _request()
+    group = _group(request, [_rate("0000000001")])
+    decoder = Mock(side_effect=failure)
+    monkeypatch.setattr(graph_payloads, "native_decoder", lambda: decoder)
+    with pytest.raises(CandidateRunnerError, match="rejected its bounded input") as caught:
+        list(graph_payloads.decode_records(request.definition, "rates", [(group.children[0], "{}")]))
+    assert caught.value.__cause__ is failure
+    decoder.assert_called_once()
 
 
 def test_compiled_decoder_matches_full_codec_projection_and_family_hash(monkeypatch):
