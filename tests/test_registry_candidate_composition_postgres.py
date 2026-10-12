@@ -4,6 +4,7 @@
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4, uuid5
 
@@ -23,6 +24,7 @@ from process.network_membership_candidate_lifecycle import (
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
+from process.registry_approved_company_read import read_registry_approved_companies
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
@@ -33,6 +35,7 @@ from process.registry_initial_source_composition import (
     validate_initial_source_office_receipt,
     verify_initial_source_office_receipt,
 )
+from process.registry_record_store import _history_result
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests.test_network_custom_address_source_postgres import _draft, _seed, custom_db
 from tests.test_network_initial_source_office_bindings_postgres import (
@@ -1022,3 +1025,142 @@ async def test_source_rollback_rechecks_publication_head_and_latest_approval(rol
             assert current.approved_custom_revision == approved.approved_revision > history.revision
             latest_history = SimpleNamespace(**{**vars(history), "revision": approved.approved_revision})
             await _assert_rollback_source_and_manual(latest_history, current)
+
+
+async def _approved_roundtrip_organization(fixture):
+    actor, command = _actor(), _create("company")
+    organization = await _draft(fixture, command, actor)
+    await _approve(
+        fixture.connection,
+        fixture.control_schema,
+        await _command(fixture.connection, fixture.control_schema, organization),
+        actor,
+    )
+    correction = replace(
+        command,
+        operation="correct",
+        expected_revision=1,
+        fields={**command.fields, "display_name": "Approved organization override"},
+        idempotency_key=uuid4().hex,
+    )
+    override = await _draft(fixture, correction, actor)
+    await _approve(
+        fixture.connection,
+        fixture.control_schema,
+        await _command(fixture.connection, fixture.control_schema, override),
+        actor,
+    )
+    pending = await _draft(
+        fixture,
+        replace(
+            correction,
+            expected_revision=2,
+            fields={**correction.fields, "display_name": "Pending organization correction"},
+            idempotency_key=uuid4().hex,
+        ),
+        actor,
+    )
+    return SimpleNamespace(approved=override, pending=pending)
+
+
+async def _roundtrip_organization_history(fixture, organization):
+    return await fixture.connection.fetch(
+        f'SELECT * FROM "{fixture.control_schema}".registry_record_history '
+        "WHERE record_kind='company' AND record_key=$1 ORDER BY revision",
+        organization.approved["record_id"],
+    )
+
+
+async def _assert_roundtrip_custom_records(history, organization, current, original_history):
+    fixture = history.fixture
+    retained_override_by_field = dict(
+        next(historical_record for historical_record in original_history if historical_record["revision"] == 2)
+    )
+    retained_override_by_field["record_json"] = json.loads(retained_override_by_field["record_json"])
+    assert _history_result(retained_override_by_field) == organization.approved
+    for manifest, location in (
+        (history.first, history.seed.first),
+        (history.second, history.seed.first),
+        (current, history.seed.second),
+    ):
+        approved = await fixture.connection.fetchrow(
+            f'SELECT record_revision,record_json FROM "{fixture.control_schema}".registry_approved_record '
+            "WHERE approved_revision=$1 AND record_kind='company' AND record_key=$2",
+            manifest.approved_custom_revision,
+            organization.approved["record_id"],
+        )
+        assert approved["record_revision"] == 2
+        assert json.loads(approved["record_json"]) == retained_override_by_field["record_json"]
+        manual_members = [
+            member for member in await _rollback_members(fixture.connection, manifest) if member[0] == "manual"
+        ]
+        assert len(manual_members) == 1 and manual_members[0][4] == history.seed.network["record_id"]
+        assert str(manual_members[0][2]) == location["record_id"]
+    assert await _roundtrip_organization_history(fixture, organization) == original_history
+    assert [historical_record["revision"] for historical_record in original_history] == [1, 2, 3]
+    assert (
+        await fixture.connection.fetchval(
+            f'SELECT revision FROM "{fixture.control_schema}".company_registry WHERE company_id=$1',
+            UUID(organization.pending["record_id"]),
+        )
+        == 3
+    )
+    assert (
+        await fixture.connection.fetchval(
+            f'SELECT revision FROM "{fixture.control_schema}".network_membership_draft WHERE network_id=$1',
+            history.seed.network["record_id"],
+        )
+        == 3
+    )
+    choices = await read_registry_approved_companies(
+        fixture.connection, approved_revision=current.approved_custom_revision, schema=fixture.control_schema
+    )
+    assert (
+        next(choice for choice in choices["items"] if choice["company_id"] == organization.approved["record_id"])[
+            "display_name"
+        ]
+        == "Approved organization override"
+    )
+
+
+async def test_source_roundtrip_keeps_approved_organization_override_exact_membership_and_drafts(
+    initial_composition, replacement_aca_source
+):
+    fixture = initial_composition
+    organization = await _approved_roundtrip_organization(fixture)
+    original_history = await _roundtrip_organization_history(fixture, organization)
+    copy_targets, requests = [], []
+    try:
+        seed, first, second = await _rollback_source_versions(fixture, replacement_aca_source, copy_targets, requests)
+        revision = await _approve_rollback_manual_office(fixture, seed)
+        request_id = uuid4()
+        requests.append(request_id)
+        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+            approved = await pin_approved_membership_source(
+                fixture.connection, approved_revision=revision, control_schema=fixture.control_schema
+            )
+        fixture.composition_ids.append(uuid5(request_id, "address:" + approved.generation_id))
+        copy_target, addresses = await compose_registry_membership_candidate(
+            fixture.connection,
+            request_id=request_id,
+            approved_revision=revision,
+            expected_head=second.generation_id,
+            source_manifest=first,
+            address_sources=RegistryCompositionAddressSources(
+                PinnedAddressSource(first.schema_name, "entity_address_unified", first.manifest_sha256)
+            ),
+            writer_roles=_roles(fixture),
+            control_schema=fixture.control_schema,
+        )
+        copy_targets.append(copy_target)
+        await _publish_composition_target(fixture, copy_target, addresses)
+        history = SimpleNamespace(fixture=fixture, seed=seed, first=first, second=second, revision=revision)
+        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+            current = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
+            assert current.generation_id > second.generation_id > first.generation_id
+            assert current.approved_custom_revision == revision
+            await _assert_rollback_source_and_manual(history, current)
+            await _assert_roundtrip_custom_records(history, organization, current, original_history)
+    finally:
+        for request_id in requests:
+            await _remove_candidates(fixture, copy_targets, request_id)

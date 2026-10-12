@@ -123,7 +123,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261012010000_company_registry_name_origin"]
+    assert script.get_heads() == ["20261013010000_registry_custom_history_events"]
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )

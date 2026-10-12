@@ -76,6 +76,7 @@ _MIGRATIONS = (
     "20261010030000_registry_source_admission_receipt.py",
     "20261011010000_company_registry_group_assertions.py",
     "20261012010000_company_registry_name_origin.py",
+    "20261013010000_registry_custom_history_events.py",
 )
 
 
@@ -329,10 +330,12 @@ def _create(*, identifiers=(), assertions=True):
     )
 
 
-async def _draft(fixture, command):
+async def _draft(fixture, command, *, undo_provenance=None):
     async with fixture.sessions() as session, session.begin():
         assert await session.scalar(text("SELECT current_user")) == fixture.roles_by_kind["draft"]
-        return await apply_registry_record_command(session, command, _ACTOR, schema=fixture.schema)
+        return await apply_registry_record_command(
+            session, command, _ACTOR, schema=fixture.schema, undo_provenance=undo_provenance
+        )
 
 
 async def _approve(fixture, *records):
@@ -732,10 +735,10 @@ async def test_manual_undo_restores_historical_assertions_under_current_checks(a
     before = await _accounting(fixture)
     if collision:
         with pytest.raises(RegistryRecordConflict, match="assertion_target_conflict"):
-            await _draft(fixture, preparation.command)
+            await _draft(fixture, preparation.command, undo_provenance=preparation.provenance)
         assert await _accounting(fixture) == before
         return
-    restored = await _draft(fixture, preparation.command)
+    restored = await _draft(fixture, preparation.command, undo_provenance=preparation.provenance)
     for key in ("roles", "role_assertions", "identifier_assertions"):
         assert restored["record"][key] == first["record"][key]
     assert restored["revision"] == 3
@@ -757,7 +760,9 @@ async def test_manual_undo_restores_historical_assertions_under_current_checks(a
     )
     assert target_record == first["record"]
     with pytest.raises(RegistryRecordConflict, match="revision_conflict"):
-        await _draft(fixture, replace(preparation.command, idempotency_key=uuid4().hex))
+        await _draft(
+            fixture, replace(preparation.command, idempotency_key=uuid4().hex), undo_provenance=preparation.provenance
+        )
 
 
 def _group_assertion_rows():
@@ -1131,7 +1136,7 @@ async def _verify_materialized_undo(fixture, materialized, company_id):
         )
     async with fixture.sessions() as session, session.begin():
         preparation = await prepare_registry_manual_undo(session, command, _ACTOR, schema=fixture.schema)
-    restored = await _draft(fixture, preparation.command)
+    restored = await _draft(fixture, preparation.command, undo_provenance=preparation.provenance)
     assert restored["revision"] == 3
     for field in ("display_name", "roles", "aliases", "role_assertions", "identifier_assertions", "group_assertions"):
         assert restored["record"][field] == materialized[field]
@@ -1142,7 +1147,7 @@ async def _verify_materialized_undo(fixture, materialized, company_id):
     async with fixture.sessions() as session, session.begin():
         replay = await prepare_registry_manual_undo(session, command, _ACTOR, schema=fixture.schema)
     assert replay.command == preparation.command
-    assert await _draft(fixture, replay.command) == restored
+    assert await _draft(fixture, replay.command, undo_provenance=replay.provenance) == restored
     assert await fixture.connection.fetch(history_query, str(company_id)) == history
 
 
@@ -1277,3 +1282,82 @@ async def test_company_group_store_joint_rollback_and_insert_failure(assertion_d
     assert (await _draft(fixture, command))["record"]["group_assertions"] == command.fields["assertions"][
         "group_assertions"
     ]
+
+
+async def test_materialized_group_first_correction_preserves_baseline_and_undo(assertion_db):
+    fixture = assertion_db
+    company_command = await _admitted_group_edge(fixture)
+    group_id = UUID(company_command.fields["assertions"]["group_assertions"][0]["group_id"])
+    async with fixture.sessions() as session, session.begin():
+        materialized = await get_registry_record(session, "group", group_id, schema=fixture.schema)
+    assert materialized["revision"] == 1 and materialized["group_kind"] == "naic_group"
+    correction = RegistryRecordCommand(
+        "group",
+        group_id,
+        "correct",
+        1,
+        {"group_kind": "naic_group", "display_name": "Corrected source group", "aliases": ["Corrected"]},
+        "Reviewed materialized group correction",
+        uuid4().hex,
+    )
+    await _verify_materialized_rollback(fixture, correction)
+    async with fixture.sessions() as session, session.begin():
+        assert await get_registry_record(session, "group", group_id, schema=fixture.schema) == materialized
+    corrected = await _draft(fixture, correction)
+    retained = await fixture.connection.fetch(
+        f"SELECT revision,custom_revision,record_json::text,actor_json::text,reason,idempotency_key,request_sha256 "
+        f"FROM {fixture.namespace}.registry_record_history WHERE record_kind='group' AND record_key=$1 ORDER BY revision",
+        str(group_id),
+    )
+    assert [history_entry["revision"] for history_entry in retained] == [1, 2]
+    assert json.loads(retained[0]["record_json"]) == materialized
+    assert retained[0]["reason"] == "Preserved materialized group before manual correction"
+    assert retained[0]["actor_json"] == retained[1]["actor_json"]
+    assert retained[0]["custom_revision"] == retained[1]["custom_revision"] == corrected["custom_revision"]
+    assert "correction_predecessors" not in json.loads(retained[1]["record_json"])
+    before = await _accounting(fixture)
+    with pytest.raises(RegistryRecordConflict, match="revision_conflict"):
+        await _draft(fixture, replace(correction, idempotency_key=uuid4().hex))
+    assert await _accounting(fixture) == before
+    await _verify_materialized_group_undo(fixture, materialized, group_id)
+    assert await _draft(fixture, correction) == corrected
+
+
+async def _verify_materialized_group_undo(fixture, materialized, group_id):
+    query = (
+        f"SELECT revision,custom_revision,record_json::text,actor_json::text,reason,idempotency_key,request_sha256 "
+        f"FROM {fixture.namespace}.registry_record_history WHERE record_kind='group' AND record_key=$1 ORDER BY revision"
+    )
+    retained = await fixture.connection.fetch(query, str(group_id))
+    command = RegistryManualUndoCommand("group", group_id, 2, 1, "Restore materialized group", uuid4().hex)
+    await fixture.connection.execute(
+        f"UPDATE {fixture.namespace}.registry_record_history SET reason='Unrelated history' "
+        "WHERE record_kind='group' AND record_key=$1 AND revision=1",
+        str(group_id),
+    )
+    try:
+        async with fixture.sessions() as session, session.begin():
+            with pytest.raises(RegistryRecordConflict, match="undo_history_conflict"):
+                await prepare_registry_manual_undo(session, command, _ACTOR, schema=fixture.schema)
+    finally:
+        await fixture.connection.execute(
+            f"UPDATE {fixture.namespace}.registry_record_history SET reason=$1 "
+            "WHERE record_kind='group' AND record_key=$2 AND revision=1",
+            retained[0]["reason"],
+            str(group_id),
+        )
+    async with fixture.sessions() as session, session.begin():
+        preparation = await prepare_registry_manual_undo(session, command, _ACTOR, schema=fixture.schema)
+    restored = await _draft(fixture, preparation.command, undo_provenance=preparation.provenance)
+    assert restored["revision"] == 3
+    for field in ("group_kind", "display_name", "aliases", "created_at", "archived"):
+        assert restored["record"][field] == materialized[field]
+    history = await fixture.connection.fetch(query, str(group_id))
+    assert history[:2] == retained
+    assert history[2]["actor_json"] == retained[0]["actor_json"]
+    assert history[2]["reason"] == preparation.command.reason
+    async with fixture.sessions() as session, session.begin():
+        replay = await prepare_registry_manual_undo(session, command, _ACTOR, schema=fixture.schema)
+    assert replay.command == preparation.command
+    assert await _draft(fixture, replay.command, undo_provenance=replay.provenance) == restored
+    assert await fixture.connection.fetch(query, str(group_id)) == history

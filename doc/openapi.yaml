@@ -7441,7 +7441,14 @@ paths:
       summary: Read one bounded group-company draft snapshot
       description: A single statement reads the group, company heads and companion
         links. An explicit company allowlist only narrows the group page; an empty
-        list returns no companies. This read does not assign links or publish.
+        list returns no companies. Without effective_on, this returns management history,
+        including expired and future assertions and unqualified network_ids. With effective_on,
+        only explicit assertions satisfying valid_from <= effective_on < valid_to are returned;
+        null period bounds are open. The returned network_ids are derived from those assertions;
+        unqualified network_ids do not establish effective coverage. Provenance and applicability
+        are retained. Archived companies and networks do not contribute effective links.
+        Companies without effective links remain on the authorized company page
+        with empty relationship arrays. This read does not assign links, inherit group coverage or publish.
       security:
       - RegistryControlBearer: []
       - RegistryControlHeader: []
@@ -7475,6 +7482,11 @@ paths:
                   type: integer
                   minimum: 0
                   maximum: 1000000
+                effective_on:
+                  type: string
+                  format: date
+                  pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                  description: Optional canonical ISO calendar date; omission retains management history.
       responses:
         '200':
           description: Complete page within an 8 MiB response bound.
@@ -7503,6 +7515,10 @@ paths:
                     type: integer
                     minimum: 0
                     maximum: 1000000
+                  effective_on:
+                    type: string
+                    format: date
+                    description: Echoed only for a date-qualified read.
                   records:
                     type: array
                     maxItems: 100
@@ -7672,6 +7688,45 @@ paths:
           $ref: '#/components/responses/RegistryControlDenied'
         '503':
           $ref: '#/components/responses/RegistryUnavailable'
+  /registry/manage/group/search:
+    post:
+      operationId: searchRegistryGroups
+      summary: Search bounded authorized group draft heads
+      description: Control-authenticated read only, with no query-string parameters.
+        The complete closed JSON body is at most 262144 UTF-8 bytes. The trusted
+        authorization layer supplies the complete group selection; null is reserved
+        for an authenticated platform administrator, while an empty array selects no
+        groups. Scope is applied before matching, durable group-ID ordering and
+        pagination. Matches literal case-insensitive display-name or alias substrings,
+        or an exact canonical nonzero group UUID. Percent, underscore and backslash
+        are literal; optional identifiers do not define a search grammar. Returns
+        existing group draft records without granting write
+        authority or publishing them. Existing list and write contracts are unchanged.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistryGroupSearchRequest'
+      responses:
+        '200':
+          description: Complete bounded group page, no partial or fallback result.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/DirectoryCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryGroupSearchPage'
+        '400':
+          $ref: '#/components/responses/RegistryInvalidRequest'
+        '403':
+          $ref: '#/components/responses/RegistryControlDenied'
+        '503':
+          $ref: '#/components/responses/RegistryUnavailable'
   /registry/manage/{kind}:
     get:
       operationId: listRegistryDraftRecords
@@ -7742,6 +7797,17 @@ paths:
         schema:
           type: string
           description: Optional comma-separated exact identities, at most 100.
+      - name: custom_revision
+        in: query
+        required: false
+        description: Membership reads only. Select an exact global custom revision
+          using canonical nonnegative decimal text; other kinds reject this parameter.
+          Omission reads current draft heads. This does not approve or publish drafts.
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9223372036854775807
     post:
       operationId: writeRegistryDraftRecord
       summary: Save an evidenced durable draft revision
@@ -7845,6 +7911,17 @@ paths:
           type: string
           description: Positive canonical int32 for network/membership; canonical UUID
             for other record kinds.
+      - name: custom_revision
+        in: query
+        required: false
+        description: Membership reads only. Select an exact global custom revision
+          using canonical nonnegative decimal text; other kinds reject this parameter.
+          Omission reads the current draft head. This does not approve or publish drafts.
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9223372036854775807
   /registry/publication/approved-companies:
     get:
       operationId: listRegistryApprovedCompanies
@@ -16729,6 +16806,55 @@ components:
           maxItems: 100
           description: Existing company management records with retained assertions,
             unique company IDs, at most the requested limit and within record_ids
+            when scoped. An empty result still requires live actor authorization.
+          items:
+            type: object
+    RegistryGroupSearchRequest:
+      type: object
+      additionalProperties: false
+      required: [q, limit, offset, record_ids]
+      properties:
+        q:
+          type: string
+          minLength: 1
+          description: Unicode control characters (category Cc) and invalid UTF-8 are
+            rejected before trimming. Trimmed text must be nonempty and at most
+            128 UTF-8 bytes. Whitespace before and after trimming remains subject
+            to the whole-body byte maximum.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        offset:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+        record_ids:
+          type: array
+          nullable: true
+          maxItems: 5000
+          uniqueItems: true
+          description: The trusted authorization layer's complete distinct group
+            grant selection, supplied before paging. Null is reserved for an actual
+            platform administrator; [] remains empty and never means unscoped.
+            Oversized selections are refused rather than truncated. Browser callers
+            cannot supply this field.
+          items:
+            type: string
+            format: uuid
+            minLength: 36
+            maxLength: 36
+            pattern: '^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    RegistryGroupSearchPage:
+      type: object
+      additionalProperties: false
+      required: [records]
+      properties:
+        records:
+          type: array
+          maxItems: 100
+          description: Existing group management records,
+            unique group IDs, at most the requested limit and within record_ids
             when scoped. An empty result still requires live actor authorization.
           items:
             type: object

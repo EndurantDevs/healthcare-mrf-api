@@ -103,11 +103,11 @@ async def test_consumed_stager_selects_ptg_and_preserves_cancel(monkeypatch):
 
     reader = AsyncMock(side_effect=cancel)
     monkeypatch.setattr(composition, "read_ptg_office_membership_batch", reader)
-    monkeypatch.setattr(composition, "read_aca_membership_batch", AsyncMock())
+    monkeypatch.setattr(composition, "read_aca_raw_fact_batch", AsyncMock())
     with pytest.raises(BaseException, match="synthetic interruption"):
         await composition._read_recipe_page(driver, _recipe(), approved, None, "control_fixture", 10, verified)
     reader.assert_awaited_once()
-    composition.read_aca_membership_batch.assert_not_awaited()
+    composition.read_aca_raw_fact_batch.assert_not_awaited()
 
 
 @pytest.mark.asyncio

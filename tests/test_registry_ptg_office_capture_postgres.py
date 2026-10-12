@@ -22,6 +22,7 @@ import asyncpg
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from process import registry_ptg_office_capture as capture
 from process import registry_ptg_scope_engine as scope_engine
@@ -122,6 +123,26 @@ async def _seed_retained_membership(fixture, copy_target, source_table, provider
         await seal_network_candidate(connection, copy_target, control_schema=fixture.control_schema)
 
 
+async def _stamp_address_witness(connection, source_table):
+    """Give retained fixture rows genuine canonical keys without changing site UUIDs."""
+    import ptg2_address_canon
+
+    addresses = await connection.fetch(
+        f"SELECT location_key,first_line,second_line,city_name,state_name,postal_code,country_code FROM {source_table} ORDER BY location_key"
+    )
+    canonical = ptg2_address_canon.canonicalize_batch([tuple(address_row.values())[1:] for address_row in addresses])
+    await connection.execute(
+        f"UPDATE {source_table} address SET address_key=item.address_key FROM jsonb_to_recordset($1::jsonb) "
+        "AS item(location_key text,address_key uuid) WHERE address.location_key=item.location_key",
+        json.dumps(
+            [
+                {"location_key": address_row["location_key"], "address_key": canonical_address["address_key"]}
+                for address_row, canonical_address in zip(addresses, canonical, strict=True)
+            ]
+        ),
+    )
+
+
 async def _publish_sites(fixture, copy_targets, journal, roles):
     """Use the existing full address models and genuine publication pipeline."""
     connection = fixture.connection
@@ -129,6 +150,7 @@ async def _publish_sites(fixture, copy_targets, journal, roles):
     provider_id = "1999999901"
     await connection.execute(f"UPDATE {source_table} SET entity_id=$1,npi=$2", provider_id, int(provider_id))
     await connection.execute(f'UPDATE "{fixture.source_schema}".npi SET npi=$1', int(provider_id))
+    await _stamp_address_witness(connection, source_table)
     network = await _draft(fixture, _create("network"), _actor())
     identity = uuid4()
     copy_target = MembershipCopyTarget(
@@ -396,6 +418,8 @@ async def office_db(custom_db, tmp_path, monkeypatch, *, complete_graph=False):
                 targets=copy_targets,
                 journal=journal,
                 sessions=scope_fixture.reader,
+                native_sessions=async_sessionmaker(custom_db.engine),
+                retained_reader=custom_db.roles["reader"],
             )
         finally:
             await _cleanup_office_resources(
@@ -495,6 +519,201 @@ async def test_native_candidate_copy_adopts_exact_sites_and_select_only_consumer
         assert not await consumer.fetchval("SELECT pg_has_role(current_user,$1,'SET')", fixture.roles[0])
     finally:
         await consumer.close()
+
+
+async def _binding_batch(fixture, session, descriptor, request, *, limit=1):
+    """Use real page/adoption SQL after the existing native capture preparation."""
+    from process.network_approved_membership_source import pin_approved_membership_source
+    from process.registry_ptg_office_membership import _VerifiedOfficeSource, read_ptg_office_membership_batch
+    from process.registry_ptg_office_membership_contract import PinnedPTGOfficeMembershipSource
+
+    driver = (await (await session.connection()).get_raw_connection()).driver_connection
+    control = fixture.context.control_schema
+    revision = await driver.fetchval(f'SELECT approved_revision FROM "{control}".registry_revision_control')
+    approved = await pin_approved_membership_source(driver, approved_revision=revision, control_schema=control)
+    network = await driver.fetchval(f'SELECT min(network_id) FROM "{fixture.serving.schema_name}".network_membership')
+    pin = PinnedPTGOfficeMembershipSource(
+        str(request.capture_id),
+        fixture.context.client_id,
+        "a" * 64,
+        "b" * 64,
+        descriptor.manifest_sha256,
+        fixture.context.coordinates,
+        network,
+        fixture.serving.generation_id,
+    )
+    verified = _VerifiedOfficeSource(
+        session, driver, session.get_transaction(), pin, fixture.context, request, descriptor, fixture.serving
+    )
+    batch = await read_ptg_office_membership_batch(driver, verified, approved, None, limit, control)
+    return driver, batch
+
+
+async def _office_candidate(fixture, driver, batch, address_source):
+    """Register the exact candidate before creating it under the replay snapshot."""
+    identity = uuid4()
+    copy_target = MembershipCopyTarget(
+        *(str(uuid4()) for _ in range(3)), str(identity), "network_candidate_" + identity.hex
+    )
+    fixture.targets.append(copy_target)
+    await create_network_candidate(
+        driver,
+        copy_target,
+        source_generations={
+            "unified_address": address_source.generation_id,
+            "ptg": batch.generation_id,
+            "custom_membership": batch.approved_source.generation_id,
+        },
+        approved_custom_revision=batch.approved_source.approved_revision,
+        expected_head=fixture.serving.generation_id,
+        expected_rows=batch.membership_rows,
+        control_schema=fixture.context.control_schema,
+    )
+    return copy_target
+
+
+async def _copy_selected_offices(fixture, driver, batch, address, pin, copy_target, conflict):
+    """Preserve explicit UUIDs and refuse a conflicting tuple atomically."""
+    from process.network_initial_source_office_bindings import _copy_bindings
+    from process.registry_ptg_office_bindings import copy_ptg_office_bindings
+
+    office = batch.office_records[0]
+    if conflict:
+        wrong_key = next(
+            office_row["location_key"]
+            for office_row in fixture.rows
+            if office_row["location_key"] != office.location_key
+        )
+        await _copy_bindings(
+            driver,
+            copy_target,
+            [
+                (
+                    office.provider_system,
+                    office.provider_id,
+                    UUID(office.location_id),
+                    wrong_key,
+                    office.entity_type,
+                    office.entity_id,
+                )
+            ],
+        )
+        with pytest.raises(ValueError, match="initial_aca_office_binding_conflict"):
+            await copy_ptg_office_bindings(
+                driver,
+                batch,
+                copy_target,
+                pin,
+                runtime_roles=(fixture.retained_reader,),
+                control_schema=fixture.context.control_schema,
+            )
+    else:
+        receipt = await copy_ptg_office_bindings(
+            driver,
+            batch,
+            copy_target,
+            pin,
+            runtime_roles=(fixture.retained_reader,),
+            control_schema=fixture.context.control_schema,
+        )
+        assert receipt == {"office_count": 1}
+    copied = await driver.fetch(
+        f'SELECT location_id::text,location_key FROM "{copy_target.schema_name}".provider_location_binding'
+    )
+    assert [dict(office_row) for office_row in copied] == [
+        {"location_id": office.location_id, "location_key": wrong_key if conflict else office.location_key}
+    ]
+    other_ids = {
+        office_row["location_id"] for office_row in fixture.rows if office_row["location_id"] != office.location_id
+    }
+    assert other_ids.isdisjoint(office_row["location_id"] for office_row in copied)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", [False, True])
+async def test_explicit_site_uuid_keeps_canonical_address_witness_and_other_office(office_db, conflict):
+    from process.network_address_projection import PinnedAddressSource
+    from process.registry_ptg_office_bindings import pin_ptg_office_address_source
+
+    fixture = office_db
+    request = await _registered_request(fixture, fixture.rows)
+    descriptor = await _prepare(fixture, request, _stream(fixture.rows))
+    retained = f'"{fixture.serving.schema_name}"'
+    before = await fixture.connection.fetchval(
+        f"SELECT jsonb_agg(to_jsonb(address) ORDER BY location_key)::text FROM {retained}.entity_address_unified address"
+    )
+    async with fixture.native_sessions() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        driver, batch = await _binding_batch(fixture, session, descriptor, request, limit=2 if conflict else 1)
+        office = batch.office_records[0]
+        key = await driver.fetchval(
+            f"SELECT address_key FROM {retained}.entity_address_unified WHERE location_key=$1", office.location_key
+        )
+        assert key is not None and str(key) != office.location_id
+        address = PinnedAddressSource(
+            fixture.serving.schema_name, "entity_address_unified", "retained-office-addresses"
+        )
+        copy_target = await _office_candidate(fixture, driver, batch, address)
+        pin = await pin_ptg_office_address_source(
+            driver,
+            batch,
+            address,
+            runtime_roles=(fixture.retained_reader,),
+            control_schema=fixture.context.control_schema,
+        )
+        await _copy_selected_offices(fixture, driver, batch, address, pin, copy_target, conflict)
+
+    assert (
+        await fixture.connection.fetchval(
+            f"SELECT jsonb_agg(to_jsonb(address) ORDER BY location_key)::text FROM {retained}.entity_address_unified address"
+        )
+        == before
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["missing", "address_key", "source_collision", "provider", "hash"])
+async def test_explicit_site_copy_refuses_changed_or_unmatched_exact_witness(office_db, damage):
+    from process.network_address_projection import PinnedAddressSource
+    from process.registry_ptg_office_bindings import pin_ptg_office_address_source
+
+    fixture = office_db
+    request = await _registered_request(fixture, fixture.rows)
+    descriptor = await _prepare(fixture, request, _stream(fixture.rows))
+    async with fixture.native_sessions() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        driver, batch = await _binding_batch(fixture, session, descriptor, request)
+        office = batch.office_records[0]
+        address = PinnedAddressSource(
+            fixture.serving.schema_name, "entity_address_unified", "retained-office-addresses"
+        )
+        retained = f'"{fixture.serving.schema_name}".entity_address_unified'
+        assertions = f'"{descriptor.schema_name}".office_assertion'
+        statement_by_damage = {
+            "missing": (f"DELETE FROM {retained} WHERE location_key=$1", office.location_key),
+            "address_key": (
+                f"UPDATE {retained} SET address_key=$1 WHERE location_key='{office.location_key}'",
+                uuid4(),
+            ),
+            "source_collision": (
+                f"UPDATE {assertions} SET location_key=$1 WHERE ordinal=1",
+                fixture.rows[1]["location_key"],
+            ),
+            "provider": (f"UPDATE {assertions} SET provider_id=$1 WHERE ordinal=1", "1000000004"),
+            "hash": (f"UPDATE {assertions} SET address_row_sha256=$1 WHERE ordinal=1", "0" * 64),
+        }
+        await driver.execute(*statement_by_damage[damage])
+        with pytest.raises(RetainedSiteAdoptionError):
+            await pin_ptg_office_address_source(
+                driver,
+                batch,
+                address,
+                runtime_roles=(fixture.retained_reader,),
+                control_schema=fixture.context.control_schema,
+            )
+        assert not await driver.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() AND relname LIKE 'initial_aca_offices_%')"
+        )
 
 
 @pytest.mark.asyncio

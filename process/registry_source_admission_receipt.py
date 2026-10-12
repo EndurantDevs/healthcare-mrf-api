@@ -22,6 +22,9 @@ _MAX_DOCUMENT_BYTES = 16384
 
 def _edition_document(edition):
     document = asdict(edition)
+    # Fetch time is first-snapshot provenance, not stable edition identity.
+    # Keep existing sealed documents valid after a later conditional fetch.
+    document.pop("retrieved_at")
     document["snapshot_id"] = str(edition.snapshot_id)
     if edition.published_at is not None:
         document["published_at"] = edition.published_at.astimezone(timezone.utc).isoformat()
@@ -39,10 +42,18 @@ def _admission_receipt(receipt, edition):
     from process.registry_source_import import _COUNTERS, _IDENTITY_COUNTERS, _NATIVE_COUNTERS, _receipt_json
 
     fields = {*_COUNTERS, "identity_materialization", "native_counts", "copy_sha256", "copy_bytes", "replayed"}
-    if edition.source_id == "plan-finder":
+    if edition.source_id in {"plan-finder", "company-listings"}:
         fields.add("copy_batches")
+    if edition.source_system == "naic":
+        fields.add("source_members")
     if type(receipt) is not dict or set(receipt) != fields:
         raise RegistrySourceAdmissionError("Source admission receipt shape is invalid")
+    if edition.source_system == "naic":
+        from process.registry_naic_observations import validate_naic_manifest
+
+        validate_naic_manifest(_canonical(receipt["source_members"]).decode(), edition.input_sha256)
+        if receipt["copy_batches"] != 3:
+            raise RegistrySourceAdmissionError("Company listing receipt members are incomplete")
     for name, allowed in (("identity_materialization", _IDENTITY_COUNTERS), ("native_counts", _NATIVE_COUNTERS)):
         counters_by_field = receipt[name]
         allowed = {*allowed, "replayed"} if name == "identity_materialization" else set(allowed)
@@ -190,7 +201,7 @@ async def seal_registry_source_admission(connection, namespace, schema, edition,
 
 
 def _valid_retained_scope(document, edition):
-    from process.registry_source_observation_store import MAX_PLANFINDER_ROWS, MAX_ROWS
+    from process.registry_source_observation_store import source_row_limit
 
     custody, content = document["custody"], document["content"]
     if (
@@ -229,7 +240,7 @@ def _valid_retained_scope(document, edition):
         or len(content) != 4
     ):
         return False
-    maximum = MAX_PLANFINDER_ROWS if edition.source_id == "plan-finder" else MAX_ROWS
+    maximum = source_row_limit(edition)
     for content_entry, table, factor in zip(content, _TABLES[2:], (1, 3, 1, 1)):
         if (
             type(content_entry) is not dict
@@ -284,7 +295,9 @@ async def read_completed_registry_source_admission(connection, namespace, schema
     snapshot = await connection.fetchrow(
         f"SELECT * FROM {namespace}.registry_source_snapshot WHERE snapshot_id=$1 FOR SHARE", edition.snapshot_id
     )
-    if snapshot is None or any(snapshot[name] != expected_value for name, expected_value in asdict(edition).items()):
+    if snapshot is None or any(
+        snapshot[name] != expected_value for name, expected_value in asdict(edition).items() if name != "retrieved_at"
+    ):
         return None
     receipt_row = await connection.fetchrow(
         f"SELECT manifest_json,manifest_sha256 FROM {namespace}.registry_source_admission_receipt WHERE snapshot_id=$1 FOR SHARE",

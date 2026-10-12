@@ -14,8 +14,10 @@ from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_custom_address_source import _require_transaction, _source_identity
 from process.network_legacy_membership_source import (
     ACAMembershipBatch,
+    ACARawFactPosition,
     PinnedACAMembershipSource,
     read_aca_membership_batch,
+    read_aca_raw_fact_batch,
 )
 from process.network_membership_candidate_lifecycle import _control_namespace, _locked_candidate, _require_open
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, MembershipCopyTarget, _encode
@@ -37,6 +39,7 @@ class PinnedACAOfficeAddressSource:
     selected_offices_sha256: str
     after_evidence_checksum: int | None
     office_count: int
+    after_source_position: ACARawFactPosition | None = None
 
 
 async def pin_aca_office_address_source(
@@ -46,6 +49,7 @@ async def pin_aca_office_address_source(
     *,
     runtime_roles,
     after_evidence_checksum=None,
+    after_source_position=None,
     control_schema=None,
 ):
     """Pin closed native identities and actual selected office hashes before COPY."""
@@ -56,9 +60,11 @@ async def pin_aca_office_address_source(
         raise InitialACAOfficeBindingError("initial_aca_office_source_pin_invalid")
     _validate_roles(runtime_roles)
     await _require_transaction(connection)
-    await _verify_batch(connection, batch, _control_namespace(control_schema)[1:-1], after_evidence_checksum)
+    await _verify_batch(
+        connection, batch, _control_namespace(control_schema)[1:-1], after_evidence_checksum, after_source_position
+    )
     identity = await _source_identity(connection, address_source, runtime_roles, address=True)
-    office_records = await _office_records(connection, batch, address_source, after_evidence_checksum)
+    office_records = await _office_records(connection, batch, address_source)
     bindings = await _canonical_bindings(connection, office_records)
     return PinnedACAOfficeAddressSource(
         address_source,
@@ -69,6 +75,7 @@ async def pin_aca_office_address_source(
         _digest(office_records),
         after_evidence_checksum,
         len(bindings),
+        after_source_position,
     )
 
 
@@ -81,7 +88,7 @@ _OFFICES_SQL = """WITH pairs AS MATERIALIZED (
  JOIN pairs p ON p.provider_id=e.npi::text AND p.location_id=e.address_key
  LEFT JOIN {source}.mrf_canonical_address c ON c.address_key=e.address_key
  WHERE e.import_id=$2 AND e.issuer_id=$3 AND e.year=$4 AND e.source_url=$5
-   AND ($6::bigint IS NULL OR e.evidence_checksum>$6) AND e.evidence_checksum<=$7
+   AND e.evidence_checksum=ANY($6::bigint[])
 ), matched AS MATERIALIZED (
  SELECT e.*,a.location_key,a.entity_type,a.entity_id,a.address_precision,a.row_origin,
    a.type AS address_type,a.inferred_npi,to_jsonb(a) AS address,to_jsonb(e) AS evidence_json,
@@ -165,12 +172,20 @@ def _validate_input(batch, target, address_pin, runtime_roles):
         raise InitialACAOfficeBindingError("initial_aca_office_source_not_external")
 
 
-async def _verify_batch(connection, batch, control_schema, after):
-    replay = await read_aca_membership_batch(
+async def _verify_batch(connection, batch, control_schema, after, after_source_position=None):
+    reader = read_aca_raw_fact_batch if batch.complete_raw_facts else read_aca_membership_batch
+    cursor_options = (
+        {"after_source_position": after_source_position}
+        if batch.complete_raw_facts
+        else {"after_evidence_checksum": after}
+    )
+    if batch.complete_raw_facts and after is not None:
+        raise InitialACAOfficeBindingError("initial_aca_office_cursor_differs")
+    replay = await reader(
         connection,
         batch.source,
         registry_schema=control_schema,
-        after_evidence_checksum=after,
+        **cursor_options,
         limit=max(1, batch.source_rows),
         approved_source=batch.approved_source,
         binding_coordinates=batch.binding_coordinates,
@@ -203,7 +218,7 @@ async def _candidate(connection, target, batch, address_source, control):
         raise InitialACAOfficeBindingError("initial_aca_office_candidate_pin_differs")
 
 
-async def _office_records(connection, batch, address_source, after):
+async def _office_records(connection, batch, address_source):
     source_pin = batch.source
     result = await connection.fetchrow(
         _OFFICES_SQL.format(
@@ -215,8 +230,7 @@ async def _office_records(connection, batch, address_source, after):
         source_pin.issuer_id,
         source_pin.year,
         source_pin.source_url,
-        after,
-        batch.next_evidence_checksum,
+        list(batch.accepted_evidence_checksums),
     )
     if result["invalid"] or result["pairs"] != result["covered_pairs"] or result["records_json"] is None:
         raise InitialACAOfficeBindingError("initial_aca_office_unresolved")
@@ -312,6 +326,7 @@ async def copy_initial_aca_office_bindings(
     *,
     runtime_roles,
     after_evidence_checksum=None,
+    after_source_position=None,
     control_schema=None,
 ):
     """COPY bounded exact offices under a caller RR transaction and local savepoint.
@@ -323,18 +338,21 @@ async def copy_initial_aca_office_bindings(
     the receipt and closes all candidate writers before validation/publication.
     """
     _validate_input(batch, copy_target, address_pin, runtime_roles)
-    if after_evidence_checksum != address_pin.after_evidence_checksum:
+    if (
+        after_evidence_checksum != address_pin.after_evidence_checksum
+        or after_source_position != address_pin.after_source_position
+    ):
         raise InitialACAOfficeBindingError("initial_aca_office_cursor_differs")
     address_source = address_pin.address_source
     await _require_transaction(connection)
     control = _control_namespace(control_schema)
     async with connection.transaction():
         await _candidate(connection, copy_target, batch, address_source, control)
-        await _verify_batch(connection, batch, control[1:-1], after_evidence_checksum)
+        await _verify_batch(connection, batch, control[1:-1], after_evidence_checksum, after_source_position)
         address_identity = await _source_identity(connection, address_source, runtime_roles, address=True)
         if address_identity != address_pin.address_identity:
             raise InitialACAOfficeBindingError("initial_aca_office_native_identity_differs")
-        office_records = await _office_records(connection, batch, address_source, after_evidence_checksum)
+        office_records = await _office_records(connection, batch, address_source)
         if _digest(office_records) != address_pin.selected_offices_sha256:
             raise InitialACAOfficeBindingError("initial_aca_office_rows_differ")
         bindings = await _canonical_bindings(connection, office_records)

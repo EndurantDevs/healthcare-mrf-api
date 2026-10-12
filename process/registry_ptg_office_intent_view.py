@@ -163,14 +163,13 @@ def _prepared_source(prepared, source_command, selector):
     source = prepared["command"]["source"]
     scope = source["source_scope"]
     expected_source_by_field = {
-        **{
-            name: source_command[name]
-            for name in ("coordinates", "legal_company_id", "approved_revision", "file_versions", "network_id")
-        },
+        **{name: source_command[name] for name in ("coordinates", "legal_company_id", "file_versions", "network_id")},
         **{name: source_command["source"][name] for name in ("binding_source_key", "snapshot_id")},
     }
+    # The source review stays immutable; genuine preparation verifies the current approved map.
     if (
-        prepared["command"]["input_row_count"] != len(selector["selections"])
+        source["approved_revision"] < source_command["approved_revision"]
+        or prepared["command"]["input_row_count"] != len(selector["selections"])
         or prepared["command"]["office_evidence_kind"] != "reviewed_exact_office"
         or source["evidence"]["graph_identity"] != _graph_identity(source_command["published_identity"])
         or any(source[name] != value for name, value in expected_source_by_field.items())

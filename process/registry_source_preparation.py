@@ -312,3 +312,10 @@ def prepare_registry_source_input(candidate, fetched, input_dir):
         if type(exc) is RegistrySourcePreparationError:
             raise
         raise RegistrySourcePreparationError() from None
+
+
+def prepare_naic_registry_source_input(fetched, input_dir, layout_paths, *, snapshot_id):
+    """Retain three exact listing members and caller-supplied layout provenance."""
+    from process.registry_naic_source import prepare_naic_source_input
+
+    return prepare_naic_source_input(fetched, input_dir, layout_paths, snapshot_id=snapshot_id)

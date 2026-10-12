@@ -6,6 +6,7 @@ import json
 import re
 import sys
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -125,6 +126,27 @@ async def test_cli_native_admission_replay_and_explicit_later_edition(serving_sc
         "identity_materialization",
         "native_counts",
     }
+
+
+@pytest.mark.asyncio
+async def test_cli_retains_first_fetch_time_on_later_and_unknown_refetch(serving_schema, monkeypatch, tmp_path, capsys):
+    connection, schema, engine = serving_schema
+    _configured_pool(monkeypatch, engine, schema)
+    input_bytes = _input()
+    input_file = tmp_path / "source.csv"
+    input_file.write_bytes(input_bytes)
+    retrieved_at = datetime(2024, 9, 12, 8, 30, 45, 123456, timezone(timedelta(hours=2)))
+    edition = _edition(input_bytes)
+    timestamp_sql = f'SELECT retrieved_at FROM "{schema}".registry_source_snapshot WHERE snapshot_id=$1'
+    original_totals = None
+    for attempt, fetch_time in enumerate((retrieved_at, retrieved_at + timedelta(days=1), None)):
+        status, receipt = await _invoke(_arguments(input_file, replace(edition, retrieved_at=fetch_time)), capsys)
+        assert status == 0 and receipt["replayed"] is bool(attempt)
+        assert await connection.fetchval(timestamp_sql, edition.snapshot_id) == retrieved_at
+        totals = await _source_totals(connection, schema)
+        if original_totals is None:
+            original_totals = totals
+        assert totals == original_totals
 
 
 @pytest.mark.asyncio

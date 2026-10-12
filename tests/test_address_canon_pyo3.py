@@ -870,3 +870,230 @@ def test_compiled_graph_binding_slots_reject_integer_narrowing(binding, message)
     source = (True, (("key", "string"),), (("parent", 0),), (0,))
     with pytest.raises(ValueError, match=message):
         decode((source, (binding,)), ["{}"])
+
+
+def _naic_member_fixture(member="HLTH.csv"):
+    headers_by_member = {
+        "HLTH.csv": [
+            "COMPANY NAME",
+            "STATE OF DOMICILE",
+            "GROUP CODE",
+            "COMPANY CODE",
+            "FEIN NUMBER",
+            "RJIN FLAG",
+            "CRIN ",
+            "RJIN",
+            "COMPANY STATUS",
+            "ADDRESS",
+            "CITY",
+            "STATE",
+            "ZIP ",
+            "PHONE",
+        ],
+        "GPAL.csv": ["GROUP NAME", "GROUP CODE"],
+        "GPNM.csv": [
+            "GROUP NAME",
+            "GROUP CODE",
+            "COMPANY CODE",
+            "FEIN NUMBER",
+            "COMPANY STATUS",
+            "STATE OF DOMICILE",
+            "COMPANY NAME",
+        ],
+    }
+    fields_by_header = {
+        "COMPANY NAME": b"Synthetic Company",
+        "GROUP NAME": b"Synthetic Group",
+        "COMPANY CODE": b"707",
+        "GROUP CODE": b"00707",
+        "FEIN NUMBER": b"01-2345678",
+        "COMPANY STATUS": b"1",
+        "STATE OF DOMICILE": b"CA",
+        "ADDRESS": b'"Street, \xa0\xd3\0"',
+    }
+    headers = headers_by_member[member]
+    source_record = b",".join(fields_by_header.get(header, b"") for header in headers)
+    member_bytes = b",".join(header.encode("ascii") for header in headers) + b"\r\n" + source_record + b"\r\n"
+    edition_by_field = {
+        "snapshot_id": _identity(6),
+        "edition_id": "2026-synthetic-edition",
+        "reporting_year": 2026,
+        "artifact_sha256": "a" * 64,
+        "member": member,
+        "member_sha256": hashlib.sha256(member_bytes).hexdigest(),
+        "layout": f"naic-cl-{member.removesuffix('.csv').lower()}-2026-v1",
+        "layout_pdf_sha256": "b" * 64,
+        "header_sha256": hashlib.sha256(_wire(headers)).hexdigest(),
+        "parser_version": "naic-company-listings-byte-projection-v1",
+    }
+    return member_bytes, edition_by_field, source_record
+
+
+@pytest.mark.parametrize("member", ["HLTH.csv", "GPAL.csv", "GPNM.csv"])
+def test_compiled_naic_preserves_member_evidence(member):
+    parse = _compiled_export("parse_naic_company_registry_member")
+    member_bytes, edition_by_field, source_record = _naic_member_fixture(member)
+    encoded = parse(member_bytes, _wire(edition_by_field))
+    assert type(encoded) is bytes
+    batch = json.loads(encoded)
+    assert batch["edition"] == edition_by_field
+    assert batch["counts"]["input_rows"] == len(batch["observations"]) == 1
+    observation = batch["observations"][0]
+    assert observation["source_record_key"] == f"{member}:row:2"
+    assert observation["normalized_naic_group"] == "707"
+    assert observation["normalized_naic_company"] == (None if member == "GPAL.csv" else "00707")
+    assert observation["valid_from"] is None and observation["valid_to"] is None
+    evidence = observation["source_evidence"]
+    assert member_bytes[evidence["source_byte_start"] : evidence["source_byte_end"]] == source_record
+    assert evidence["raw_record_sha256"] == hashlib.sha256(source_record).hexdigest()
+    for field in ("member_sha256", "artifact_sha256", "layout", "layout_pdf_sha256", "header_sha256", "parser_version"):
+        assert evidence[field] == edition_by_field[field]
+    if member == "HLTH.csv":
+        assert "ADDRESS" not in observation["raw_fields"]
+        assert bytes.fromhex(evidence["raw_fields_hex"]["ADDRESS"]) == b"Street, \xa0\xd3\0"
+    assert observation["status"] == ("accepted" if member == "GPAL.csv" else "unresolved")
+
+
+def test_compiled_naic_rejects_invalid_metadata():
+    parse = _compiled_export("parse_naic_company_registry_member")
+    member_bytes, edition_by_field, _ = _naic_member_fixture()
+    for edition_bytes in (b"{}", _wire({**edition_by_field, "unknown": True}), b"\xff"):
+        with pytest.raises(ValueError, match="edition metadata is invalid"):
+            parse(member_bytes, edition_bytes)
+    with pytest.raises(ValueError, match="edition metadata exceeds byte limit"):
+        parse(member_bytes, b" " * 65_537)
+    for field, code in (("member_sha256", "digest_mismatch"), ("header_sha256", "header_digest_mismatch")):
+        with pytest.raises(ValueError) as rejected:
+            parse(member_bytes, _wire({**edition_by_field, field: "0" * 64}))
+        assert json.loads(str(rejected.value))["code"] == code
+    with pytest.raises(ValueError, match="input_limit"):
+        parse(b"x" * (8 * 1024 * 1024 + 1), _wire(edition_by_field))
+    invalid_csv = member_bytes.split(b"\r\n", 1)[0] + b'\r\n"unterminated'
+    with pytest.raises(ValueError, match="invalid_csv"):
+        parse(invalid_csv, _wire({**edition_by_field, "member_sha256": hashlib.sha256(invalid_csv).hexdigest()}))
+
+
+def test_compiled_naic_refuses_output_expansion():
+    parse = _compiled_export("parse_naic_company_registry_member")
+    member_bytes, edition_by_field, _ = _naic_member_fixture()
+    header = member_bytes.split(b"\r\n", 1)[0]
+    projected_by_header = {
+        "COMPANY NAME": b"Synthetic Company",
+        "STATE OF DOMICILE": b"CA",
+        "GROUP CODE": b"00707",
+        "COMPANY CODE": b"707",
+        "FEIN NUMBER": b"01-2345678",
+        "COMPANY STATUS": b"1",
+    }
+    source_record = b",".join(
+        projected_by_header.get(field, b"x" * 4096) for field in header.decode("ascii").split(",")
+    )
+    single_member = header + b"\r\n" + source_record + b"\r\n"
+    single_edition_by_field = {**edition_by_field, "member_sha256": hashlib.sha256(single_member).hexdigest()}
+    observation = json.loads(parse(single_member, _wire(single_edition_by_field)))["observations"][0]
+    assert observation["status"] == "unresolved"
+    assert len(_wire(observation)) * 255 > 16 * 1024 * 1024
+    expanded_member = header + b"\r\n" + (source_record + b"\r\n") * 255
+    assert len(expanded_member) <= 8 * 1024 * 1024
+    expanded_edition_by_field = {**edition_by_field, "member_sha256": hashlib.sha256(expanded_member).hexdigest()}
+    with pytest.raises(ValueError, match="Company listing output exceeds byte limit"):
+        parse(expanded_member, _wire(expanded_edition_by_field))
+
+
+def test_compiled_naic_rejects_projection_bytes():
+    parse = _compiled_export("parse_naic_company_registry_member")
+    member_bytes, edition_by_field, _ = _naic_member_fixture()
+    member_bytes = member_bytes.replace(b"Synthetic Company", b"Synthetic \xd3 Company")
+    edition_by_field["member_sha256"] = hashlib.sha256(member_bytes).hexdigest()
+    observation = json.loads(parse(member_bytes, _wire(edition_by_field)))["observations"][0]
+    assert observation["status"] == "rejected"
+    assert "COMPANY NAME" not in observation["raw_fields"]
+    assert bytes.fromhex(observation["source_evidence"]["raw_fields_hex"]["COMPANY NAME"]) == b"Synthetic \xd3 Company"
+    assert any(issue["code"] == "invalid_ascii_projection" for issue in observation["issues"])
+
+
+def _review_assertion(record_key="record-1", object_id=10, start="2024-01-01", end=None):
+    return {
+        "subject_id": _identity(100),
+        "predicate": "reported_affiliation",
+        "scope": {"system": "group_kind", "value": "corporate_parent"},
+        "object_identifier": {"system": "group_uuid", "value": _identity(object_id)},
+        "valid_from": start,
+        "valid_to": end,
+        "evidence": {
+            "source_edition": {
+                "source_system": "synthetic",
+                "source_id": "example-source",
+                "edition_id": "example-edition",
+                "snapshot_id": _identity(200),
+            },
+            "record_key": record_key,
+            "original_identifier": {"system": "external_reference", "value": "source-17"},
+            "document_sha256": "a" * 64,
+        },
+        "source_label": "Synthetic source label",
+    }
+
+
+def test_compiled_assertions_preserve_raw_evidence():
+    classify = _compiled_export("classify_registry_assertions")
+    assertion_by_field = _review_assertion()
+    raw_assertion = json.dumps(assertion_by_field, indent=2).encode()
+    compact_assertion = _wire(assertion_by_field)
+    input_bytes = b"[" + raw_assertion + b"," + compact_assertion + b"]"
+    encoded = classify(input_bytes, "group_inclusive")
+    assert type(encoded) is bytes
+    assert raw_assertion in encoded and compact_assertion in encoded
+    batch = json.loads(encoded)
+    assert batch["policy"] == "group_inclusive"
+    assert batch["counts"] == {"input_rows": 2, "accepted_rows": 1, "duplicate_rows": 1, "review_required_rows": 0}
+    assert [entry["assertion"] for entry in batch["assertions"]] == [assertion_by_field] * 2
+    assert batch["assertions"][1]["duplicate_of"] == 0
+    assert encoded == classify(b"[" + compact_assertion + b"," + raw_assertion + b"]", "group_inclusive")
+    independent = _review_assertion("record-2")
+    independent["evidence"]["source_edition"]["source_id"] = "independent-source"
+    batch = json.loads(classify(_wire([assertion_by_field, independent]), "group_inclusive"))
+    assert batch["counts"]["accepted_rows"] == 2 and batch["reviews"] == []
+    contradictory = _review_assertion()
+    contradictory["evidence"]["document_sha256"] = "b" * 64
+    batch = json.loads(classify(_wire([assertion_by_field, contradictory]), "group_inclusive"))
+    assert batch["counts"]["review_required_rows"] == 2
+    assert [review["code"] for review in batch["reviews"]] == ["evidence_digest_conflict"]
+
+
+def test_compiled_assertions_select_interval_policy():
+    classify = _compiled_export("classify_registry_assertions")
+    first = _review_assertion(end="2024-02-01")
+    second = _review_assertion("record-2", 11, "2024-02-01", "2024-03-01")
+    group = json.loads(classify(_wire([first, second]), "group_inclusive"))
+    assert group["counts"]["review_required_rows"] == 2
+    assert group["reviews"][0]["code"] == "contradictory_overlapping_objects"
+    second["object_identifier"] = first["object_identifier"]
+    network = json.loads(classify(_wire([first, second]), "network_half_open"))
+    assert network["counts"]["accepted_rows"] == 2 and network["reviews"] == []
+    unknown = _review_assertion(start=None)
+    batch = json.loads(classify(_wire([unknown]), "group_inclusive"))
+    assert batch["assertions"][0]["assertion"]["valid_from"] is None
+    assert batch["reviews"][0]["code"] == "missing_effective_start"
+
+
+def test_compiled_assertions_reject_invalid_input():
+    classify = _compiled_export("classify_registry_assertions")
+    for policy in ("", "GroupInclusive", "group_inclusive ", "unknown"):
+        with pytest.raises(ValueError, match="registry_assertion_policy_invalid"):
+            classify(b"[]", policy)
+    for input_bytes, code in (
+        (b"\xff", "invalid_json"),
+        (b"[] trailing", "invalid_json"),
+        (_wire([{**_review_assertion(), "unknown": True}]), "invalid_row"),
+        (_wire({"rows": [_review_assertion()]}), "invalid_json"),
+        (b" " * (8 * 1024 * 1024 + 1), "input_limit"),
+    ):
+        with pytest.raises(ValueError) as rejected:
+            classify(input_bytes, "group_inclusive")
+        assert json.loads(str(rejected.value))["code"] == code
+    duplicate_key = _wire([_review_assertion()]).replace(b'"subject_id":', b'"subject_id":"bad","subject_id":', 1)
+    with pytest.raises(ValueError, match="invalid_row"):
+        classify(duplicate_key, "group_inclusive")
+    with pytest.raises(TypeError):
+        classify(_wire([]))

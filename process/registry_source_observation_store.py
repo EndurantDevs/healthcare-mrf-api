@@ -50,6 +50,7 @@ class RegistryObservationLanding:
     input_sha256: str
     parser_version: str
     expected_rows: int
+    member_manifest_json: str | None = None
 
     def __post_init__(self):
         _identifier(self.schema_name)
@@ -58,7 +59,7 @@ class RegistryObservationLanding:
             raise RegistryObservationError("Landing requires a positive native relation OID")
         if type(self.snapshot_id) is not UUID or self.snapshot_id.int == 0:
             raise RegistryObservationError("Source snapshot identity must be a nonzero UUID")
-        maximum = MAX_PLANFINDER_ROWS if (self.source_system, self.source_id) == ("cms", "plan-finder") else MAX_ROWS
+        maximum = source_row_limit(self)
         if type(self.expected_rows) is not int or not 0 <= self.expected_rows <= maximum:
             raise RegistryObservationError("Source landing exceeds its row bound")
         for field, maximum in (("source_system", 64), ("source_id", 128), ("edition_id", 128), ("parser_version", 128)):
@@ -67,6 +68,24 @@ class RegistryObservationLanding:
                 raise RegistryObservationError("Expected source metadata must be bounded nonblank text")
         if type(self.input_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", self.input_sha256) is None:
             raise RegistryObservationError("Expected source input digest is invalid")
+        if self.source_system == "naic":
+            from process.registry_naic_observations import validate_naic_manifest
+            from process.registry_naic_source import is_naic_source
+
+            if not is_naic_source(self):
+                raise RegistryObservationError("Company listing source identity is invalid")
+            validate_naic_manifest(self.member_manifest_json, self.input_sha256)
+        elif self.member_manifest_json is not None:
+            raise RegistryObservationError("Unexpected source member witness")
+
+
+def source_row_limit(source):
+    """Keep each source family within its existing or explicit edition bound."""
+    if (source.source_system, source.source_id) == ("cms", "plan-finder"):
+        return MAX_PLANFINDER_ROWS
+    if (source.source_system, source.source_id) == ("naic", "company-listings"):
+        return 3 * MAX_ROWS
+    return MAX_ROWS
 
 
 async def _verify_landing(connection: Any, landing: RegistryObservationLanding) -> str:
@@ -190,6 +209,10 @@ def _planfinder_content_checks(landing: RegistryObservationLanding, namespace: s
 
 
 def _valid_content_sql(landing: RegistryObservationLanding, namespace: str) -> str:
+    if landing.source_system == "naic":
+        from process.registry_naic_observations import naic_content_sql
+
+        return naic_content_sql(landing, namespace)
     checks = [
         "snapshot_id=$1",
         "source_row_number>0",
@@ -237,12 +260,12 @@ def _valid_content_sql(landing: RegistryObservationLanding, namespace: str) -> s
 async def _validate_contents(
     connection: Any, landing: RegistryObservationLanding, relation: str, namespace: str
 ) -> None:
+    parameters = (landing.snapshot_id,) if landing.source_system == "naic" else (landing.snapshot_id, _TRIM_CHARACTERS)
     accounting = await connection.fetchrow(
         f"SELECT COUNT(*) AS observed,COUNT(DISTINCT source_record_key) AS distinct_keys, "
         f"COUNT(*) FILTER (WHERE NOT ({_valid_content_sql(landing, namespace)})) AS invalid, "
         f"MIN(source_row_number) AS first_row,MAX(source_row_number) AS last_row FROM {relation}",
-        landing.snapshot_id,
-        _TRIM_CHARACTERS,
+        *parameters,
     )
     if (
         accounting["observed"] != landing.expected_rows
@@ -256,6 +279,14 @@ async def _validate_contents(
         or accounting["last_row"] != landing.expected_rows + 1
     ):
         raise RegistryObservationError("Plan Finder edition rows must be complete and contiguous")
+    if landing.source_system == "naic":
+        counts = await connection.fetch(
+            f"SELECT observation_json->'source_evidence'->>'member_name' AS member,COUNT(*) AS rows FROM {relation} GROUP BY 1"
+        )
+        if {member_count["member"] for member_count in counts} != {"HLTH.csv", "GPAL.csv", "GPNM.csv"} or any(
+            not 1 <= member_count["rows"] <= MAX_ROWS for member_count in counts
+        ):
+            raise RegistryObservationError("Company listing members exceed their independent bounds")
 
 
 async def _is_exact_replay(connection: Any, landing: RegistryObservationLanding, namespace: str, relation: str) -> bool:
@@ -273,6 +304,10 @@ async def _is_exact_replay(connection: Any, landing: RegistryObservationLanding,
 
 
 def _company_resolution_sql(namespace: str, relation: str, landing: RegistryObservationLanding) -> str:
+    if landing.source_system == "naic":
+        from process.registry_naic_observations import naic_resolution_sql
+
+        return naic_resolution_sql(namespace, relation)
     legal_name_field = _legal_name_field(landing)
     uses_successor = _uses_planfinder_identifier_semantics(landing)
     company_name_conflict = "" if uses_successor else '@.code == "conflicting_company_names_for_ein" || '
@@ -346,7 +381,14 @@ async def _resolved_landing(connection: Any, namespace: str, relation: str, land
     return staging
 
 
-async def _persist_identifiers(connection: Any, namespace: str, staging: str) -> None:
+async def _persist_identifiers(
+    connection: Any, namespace: str, staging: str, landing: RegistryObservationLanding
+) -> None:
+    raw_fields = (
+        ("FEIN NUMBER", "COMPANY CODE", "GROUP CODE")
+        if landing.source_system == "naic"
+        else ("federal_ein", "naic_company_code", "naic_group_code")
+    )
     await connection.execute(f"""INSERT INTO {namespace}.registry_identifier_observation
       (snapshot_id,source_record_key,identifier_system,identifier_value,entity_kind,raw_value,entity_id,resolution_status)
       SELECT s.snapshot_id,s.source_record_key,i.system,i.identifier,i.kind,i.raw_value,
@@ -354,15 +396,20 @@ async def _persist_identifiers(connection: Any, namespace: str, staging: str) ->
         CASE WHEN s.status='rejected' OR (i.kind='company' AND s.company_conflicting) THEN 'conflicting'
           WHEN i.entity_id IS NOT NULL THEN 'resolved' ELSE 'unresolved' END
       FROM {staging} s CROSS JOIN LATERAL (VALUES
-        ('ein',s.observation_json->>'normalized_ein','company',s.observation_json->'raw_fields'->>'federal_ein',s.company_id),
-        ('naic_company',s.observation_json->>'normalized_naic_company','company',s.observation_json->'raw_fields'->>'naic_company_code',s.naic_company_id),
-        ('naic_group',s.observation_json->>'normalized_naic_group','group',s.observation_json->'raw_fields'->>'naic_group_code',s.group_id)
+        ('ein',s.observation_json->>'normalized_ein','company',s.observation_json->'raw_fields'->>'{raw_fields[0]}',s.company_id),
+        ('naic_company',s.observation_json->>'normalized_naic_company','company',s.observation_json->'raw_fields'->>'{raw_fields[1]}',s.naic_company_id),
+        ('naic_group',s.observation_json->>'normalized_naic_group','group',s.observation_json->'raw_fields'->>'{raw_fields[2]}',s.group_id)
       ) i(system,identifier,kind,raw_value,entity_id) WHERE i.identifier IS NOT NULL""")
 
 
 async def _persist_relationships(
     connection: Any, namespace: str, staging: str, landing: RegistryObservationLanding
 ) -> None:
+    if landing.source_system == "naic":
+        from process.registry_naic_observations import persist_naic_relationships
+
+        await persist_naic_relationships(connection, namespace, staging)
+        return
     # Plan Finder discovers valid issuer fields independently of company/EIN validity.
     issuer_eligible = (
         "true" if (landing.source_system, landing.source_id) == ("cms", "plan-finder") else "status<>'rejected'"
@@ -431,7 +478,7 @@ async def persist_registry_source_observations(
             return await _accounting(connection, namespace, landing.snapshot_id, True)
         staging = await _resolved_landing(connection, namespace, relation, landing)
         await connection.execute(f"INSERT INTO {namespace}.registry_source_observation SELECT * FROM {relation}")
-        await _persist_identifiers(connection, namespace, staging)
+        await _persist_identifiers(connection, namespace, staging, landing)
         await _persist_relationships(connection, namespace, staging, landing)
         await connection.execute(f"DROP TABLE {staging}")
         return await _accounting(connection, namespace, landing.snapshot_id, False)
@@ -466,7 +513,7 @@ async def read_registry_issuer_evidence(
 
 async def registry_source_content_fingerprints(connection, namespace, edition):
     """Hash complete snapshot-scoped rows with bounded aggregate memory."""
-    maximum = MAX_PLANFINDER_ROWS if edition.source_id == "plan-finder" else MAX_ROWS
+    maximum = source_row_limit(edition)
     fingerprints = []
     for table, factor in (
         ("registry_source_observation", 1),

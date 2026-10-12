@@ -9,11 +9,13 @@ import warnings
 import zipfile
 from dataclasses import replace
 from datetime import date, datetime, timezone
+from uuid import uuid4
 
 import pytest
 
+from process import registry_source_import as source_import
 from process import registry_source_preparation as preparation
-from process.registry_source_admission import _source_header_sha256
+from process.registry_source_admission import RegistrySourceEdition, _source_header_sha256
 from process.registry_source_editions import RegistrySourceEditionCandidate
 from process.registry_source_fetch import (
     RegistrySourceFetchReceipt,
@@ -21,6 +23,7 @@ from process.registry_source_fetch import (
     RegistrySourceFetchSpec,
     fetch_registry_source,
 )
+from tests.registry_source_fixtures import _arguments
 from tests.test_cms_planfinder_workbook_input import _workbook
 from tests.test_registry_source_fetch import _source_http
 
@@ -134,6 +137,23 @@ async def test_genuine_fetch_receipt_and_conditional_replay_prepare_same_bytes(t
     prepared = preparation.prepare_registry_source_input(candidate, first, tmp_path / "inputs")
     replay = preparation.prepare_registry_source_input(candidate, second, tmp_path / "inputs")
     assert second.unchanged and prepared.input_path == replay.input_path
+    for prepared_input, fetched in ((prepared, first), (replay, second)):
+        spec = prepared_input.fetch.receipt.spec
+        edition = RegistrySourceEdition(
+            uuid4(),
+            spec.source_system,
+            spec.source_id,
+            spec.edition_id,
+            spec.source_url,
+            prepared_input.fetch.receipt.artifact_sha256,
+            prepared_input.input_sha256,
+            spec.parser_version,
+            spec.reporting_year,
+            spec.published_at,
+            retrieved_at=prepared_input.fetch.receipt.retrieved_at,
+        )
+        parsed = source_import._parser().parse_args(_arguments(prepared_input.input_path, edition))
+        assert source_import._edition(parsed).retrieved_at == fetched.receipt.retrieved_at
     assert replay.candidate.published_at is None and replay.fetch.receipt.etag == '"same"'
 
 

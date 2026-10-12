@@ -61,6 +61,8 @@ async def test_published_dispatch_uses_same_session_and_current_fence(monkeypatc
     session, context, document_by_field = _fixture()
     reader = AsyncMock(return_value=document_by_field)
     fence = AsyncMock()
+    binding = AsyncMock(return_value=document_by_field["command"]["approved_revision"] + 1)
+    monkeypatch.setattr(published, "_require_network_binding", binding)
     graph = AsyncMock(return_value=(context.graph_identity, [{"source_key": 0}]))
     monkeypatch.setattr(review, "read_registry_ptg_published_plan_scope", reader)
     monkeypatch.setattr(review, "_approved_association", fence)
@@ -71,6 +73,9 @@ async def test_published_dispatch_uses_same_session_and_current_fence(monkeypatc
         and fence.await_args.args[0] is session
         and graph.await_args.args[0] is session
     )
+    assert scope_by_field["approved_revision"] == document_by_field["command"]["approved_revision"] + 1
+    assert fence.await_args.args[2]["approved_revision"] == scope_by_field["approved_revision"]
+    assert binding.await_args.args[0] is session
     assert "company_key" not in scope_by_field and "cohort_id" not in scope_by_field
     assert scope_by_field["source_scope"]["plan_id"] == document_by_field["command"]["plan_id"]
     assert scope_by_field["evidence"]["selected_dense_source_keys"] == [0]
@@ -99,3 +104,21 @@ def test_published_ddl_null_labels_and_legacy_nonnull():
     sql = capture._ddl("synthetic_schema", is_published=True)[1]
     assert "CHECK(company_key IS NULL AND cohort_id IS NULL)" in sql
     assert "company_key text NOT NULL" not in sql
+
+
+@pytest.mark.asyncio
+async def test_missing_reviewed_mapping_stops_before_office_graph(monkeypatch):
+    session, context, document = _fixture()
+    monkeypatch.setattr(review, "read_registry_ptg_published_plan_scope", AsyncMock(return_value=document))
+    monkeypatch.setattr(review, "_approved_association", AsyncMock())
+    graph = AsyncMock(return_value=(context.graph_identity, [{"source_key": 0}]))
+    monkeypatch.setattr(authority, "_source_state", graph)
+    monkeypatch.setattr(
+        published,
+        "_require_network_binding",
+        AsyncMock(side_effect=ValueError("registry_ptg_published_office_network_unresolved")),
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="network_unresolved"):
+        await capture._scope(session, context)
+    assert graph.await_count == 0

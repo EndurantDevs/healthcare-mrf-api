@@ -2,6 +2,7 @@
 """Manual site evidence and native canonical identities on actual migrated tables."""
 
 import asyncio
+import json
 from dataclasses import replace
 from uuid import UUID, uuid4
 
@@ -9,6 +10,7 @@ import pytest
 from sqlalchemy import text
 
 from process import registry_record_store as store
+from process.network_custom_address_source import _APPROVED_CTE
 from process.registry_record_store import (
     RegistryAddressUnavailable,
     RegistryRecordCommand,
@@ -18,6 +20,10 @@ from process.registry_record_store import (
     list_registry_records,
 )
 from tests.test_manual_provider_identity_store_postgres import _actor, _apply, provider_db, serving_schema
+from tests.test_manual_provider_identity_store_postgres import _create as _provider
+from tests.test_registry_approval_store_postgres import _approve
+from tests.test_registry_approval_store_postgres import _command as _approval
+from tests.test_registry_record_store_postgres import _create as _network
 
 pytestmark = pytest.mark.asyncio
 
@@ -268,3 +274,152 @@ async def test_site_caller_rollback_preserves_evidence_and_history(location_db):
     assert tuple(
         await connection.fetchrow(f'SELECT draft_revision,approved_revision FROM "{schema}".registry_revision_control')
     ) == (1, 0)
+
+
+def _membership(network_id, provider_id, sites, *, system="manual"):
+    return RegistryRecordCommand(
+        "membership",
+        network_id,
+        "create",
+        0,
+        {
+            "memberships_json": [
+                {
+                    "network_id": network_id,
+                    "provider_system": system,
+                    "provider_id": provider_id,
+                    "location_id": str(site),
+                    "evidence_id": "example-review",
+                }
+                for site in sites
+            ]
+        },
+        "Explicit provider offices",
+        uuid4().hex,
+    )
+
+
+async def _pair_records(database):
+    _, schema, sessions, _ = database
+    actor = _actor()
+    network = await _apply(sessions, schema, _network("network"), actor)
+    provider = await _apply(sessions, schema, _provider(), actor)
+    sites = [await _apply(sessions, schema, _create(), actor) for _ in range(2)]
+    return actor, network, provider, sites
+
+
+async def test_membership_retains_only_exact_pair_with_projection_key_and_immutable_replay(location_db, monkeypatch):
+    connection, schema, sessions, _ = location_db
+    actor, network, provider, sites = await _pair_records(location_db)
+    command = _membership(network["record_id"], provider["record_id"], [sites[0]["record_id"]])
+    retained = await _apply(sessions, schema, command, actor)
+    bindings = await connection.fetch(f'SELECT * FROM "{schema}".manual_provider_location_binding')
+    assert len(bindings) == 1
+    binding = bindings[0]
+    assert (binding["provider_system"], binding["provider_id"], str(binding["location_id"])) == (
+        "manual",
+        provider["record_id"],
+        sites[0]["record_id"],
+    )
+    assert (binding["entity_type"], binding["entity_id"], binding["archived"], binding["revision"]) == (
+        "manual",
+        provider["record_id"],
+        False,
+        1,
+    )
+    assert sites[0]["record"]["canonical_address_json"] == sites[1]["record"]["canonical_address_json"]
+    approval = await _approve(
+        connection, schema, await _approval(connection, schema, network, provider, sites[0], retained), actor
+    )
+    projected = await connection.fetch(
+        _APPROVED_CTE.format(control=f'"{schema}"') + "SELECT * FROM custom", approval["approved_revision"]
+    )
+    assert len(projected) == 1 and projected[0]["location_key"] == binding["location_key"]
+    monkeypatch.setattr(store, "_encode", lambda _: pytest.fail("replay must precede native allocation"))
+    assert await _apply(sessions, schema, command, actor) == retained
+    assert await connection.fetch(f'SELECT * FROM "{schema}".manual_provider_location_binding') == bindings
+    history = await connection.fetchval(
+        f"SELECT record_json FROM \"{schema}\".registry_record_history WHERE record_kind='membership'"
+    )
+    assert json.loads(history)["memberships_json"] == command.fields["memberships_json"]
+
+
+async def test_npi_manual_office_retained_but_source_site_never_inserted(location_db):
+    connection, schema, sessions, _ = location_db
+    actor, network, _, sites = await _pair_records(location_db)
+    await connection.execute(f'INSERT INTO "{schema}".npi VALUES(1000000004)')
+    await connection.execute(
+        f'INSERT INTO "{schema}".registry_site_binding '
+        "(binding_id,source_generation,provider_system,provider_id,location_id,location_key,"
+        "address_row_sha256,source_receipt_json) VALUES($1,1,'npi','1000000004',$2,$3,$3,'{}'::jsonb)",
+        uuid4(),
+        UUID(sites[1]["record_id"]),
+        "a" * 64,
+    )
+    command = _membership(network["record_id"], "1000000004", [site["record_id"] for site in sites], system="npi")
+    await _apply(sessions, schema, command, actor)
+    bindings = await connection.fetch(f'SELECT * FROM "{schema}".manual_provider_location_binding')
+    assert len(bindings) == 1 and str(bindings[0]["location_id"]) == sites[0]["record_id"]
+    assert (bindings[0]["entity_type"], bindings[0]["entity_id"]) == ("npi", "1000000004")
+
+
+@pytest.mark.parametrize("conflict", ["location_key", "entity_type", "entity_id", "archived"])
+async def test_conflicting_binding_rolls_back_all_new_pairs_and_membership(location_db, conflict):
+    connection, schema, sessions, _ = location_db
+    actor, network, provider, sites = await _pair_records(location_db)
+    first = _membership(network["record_id"], provider["record_id"], [sites[0]["record_id"]])
+    original = await _apply(sessions, schema, first, actor)
+    assignment_by_field = {
+        "location_key": "location_key=repeat('b',64)",
+        "entity_type": "entity_type='other'",
+        "entity_id": "entity_id='other'",
+        "archived": "archived=true",
+    }
+    await connection.execute(f'UPDATE "{schema}".manual_provider_location_binding SET {assignment_by_field[conflict]}')
+    before = await connection.fetch(f'SELECT * FROM "{schema}".manual_provider_location_binding')
+    revision = await connection.fetchval(f'SELECT draft_revision FROM "{schema}".registry_revision_control')
+    correction = replace(
+        first,
+        operation="correct",
+        expected_revision=1,
+        idempotency_key=uuid4().hex,
+        fields=_membership(network["record_id"], provider["record_id"], [site["record_id"] for site in sites]).fields,
+    )
+    with pytest.raises(RegistryRecordConflict, match="manual_location_binding_conflict"):
+        await _apply(sessions, schema, correction, actor)
+    assert await connection.fetch(f'SELECT * FROM "{schema}".manual_provider_location_binding') == before
+    async with sessions() as session:
+        assert (
+            await get_registry_record(session, "membership", network["record_id"], schema=schema) == original["record"]
+        )
+    assert await connection.fetchval(f'SELECT draft_revision FROM "{schema}".registry_revision_control') == revision
+    assert (
+        await connection.fetchval(
+            f"SELECT count(*) FROM \"{schema}\".registry_record_history WHERE record_kind='membership'"
+        )
+        == 1
+    )
+
+
+async def test_binding_and_new_location_roll_back_with_caller_transaction(location_db):
+    connection, schema, sessions, _ = location_db
+    actor, network, provider, _ = await _pair_records(location_db)
+    revision = await connection.fetchval(f'SELECT draft_revision FROM "{schema}".registry_revision_control')
+    new_site = _create()
+    with pytest.raises(RuntimeError, match="caller rollback"):
+        async with sessions() as session, session.begin():
+            await apply_registry_record_command(session, new_site, actor, schema=schema, source_schema=schema)
+            await apply_registry_record_command(
+                session,
+                _membership(network["record_id"], provider["record_id"], [new_site.record_id]),
+                actor,
+                schema=schema,
+                source_schema=schema,
+            )
+            assert await session.scalar(text(f'SELECT count(*) FROM "{schema}".manual_provider_location_binding')) == 1
+            raise RuntimeError("caller rollback")
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".manual_provider_location_binding') == 0
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_membership_draft') == 0
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".manual_location_registry') == 2
+    assert await connection.fetchval(f'SELECT draft_revision FROM "{schema}".registry_revision_control') == revision
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_record_history') == revision

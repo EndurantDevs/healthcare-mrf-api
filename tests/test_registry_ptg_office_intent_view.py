@@ -448,3 +448,47 @@ async def test_prepared_unicode_reason_uses_native_capture_hash_and_keeps_select
     assert prepared["command_sha256"] == view.capture_digest(prepared["command"])
     assert prepared["command_sha256"] != intent._digest(prepared["command"])
     assert project(result)["intent"]["selector"]["reason"] == result["intent"]["command"]["selector"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_projector_preserves_original_review_with_later_verified_mapping_revision():
+    result = await internal_result(completed=True)
+    original_source = source_command()
+    later_revision = original_source["approved_revision"] + 3
+    _change_prepared_command(result, lambda command: command["source"].update(approved_revision=later_revision))
+    projected = project(result)
+    assert projected["preparation"]["command"]["source"]["approved_revision"] == later_revision
+    assert projected["source_command_sha256"] == view.capture_digest(original_source)
+    assert projected["scope_approval_sha256"] == selector()["scope_approval_sha256"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revision", [None, True, 0, "4", source_command()["approved_revision"] - 1])
+async def test_projector_rejects_invalid_or_older_mapping_revision(revision):
+    result = await internal_result(completed=True)
+    _change_prepared_command(result, lambda command: command["source"].update(approved_revision=revision))
+    with pytest.raises(ValueError):
+        project(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("network_id", 42),
+        ("binding_source_key", "other_source"),
+        ("legal_company_id", "11111111-1111-4111-8111-111111111111"),
+        ("coordinates", {**source_command()["coordinates"], "edition_id": "d" * 64}),
+        ("file_versions", [{**source_command()["file_versions"][0], "raw_sha256": "d" * 64}]),
+    ],
+)
+async def test_later_mapping_revision_never_releases_exact_source_checks(field, value):
+    result = await internal_result(completed=True)
+    _change_prepared_command(
+        result,
+        lambda command: command["source"].update(
+            approved_revision=source_command()["approved_revision"] + 3, **{field: value}
+        ),
+    )
+    with pytest.raises(ValueError):
+        project(result)

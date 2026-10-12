@@ -37,6 +37,7 @@ _SERVING_MIGRATIONS = (
     "20261010030000_registry_source_admission_receipt.py",
     "20261011010000_company_registry_group_assertions.py",
     "20261012010000_company_registry_name_origin.py",
+    "20261013010000_registry_custom_history_events.py",
 )
 
 
