@@ -70,6 +70,16 @@ ARG HLTHPRT_LOG_CFG=./logging.yaml
 ARG HLTHPRT_RELEASE="dev"
 ARG HLTHPRT_ENVIRONMENT=test
 ARG HLTHPRT_SOURCE_COMMIT
+ARG DRUG_SOURCE_COMMIT
+ARG DRUG_SOURCE_TREE
+ARG DRUG_SOURCE_BASE
+
+COPY config/drug_snapshot_runtime.json /opt/healthporta/build-identity/drug-runtime-source.json
+COPY scripts/drug_runtime_dependency.py /opt/scripts/drug_runtime_dependency.py
+RUN PYTHONDONTWRITEBYTECODE=1 /opt/venv/bin/python -I /opt/scripts/drug_runtime_dependency.py compose \
+        "${DRUG_SOURCE_COMMIT}" "${DRUG_SOURCE_TREE}" "${DRUG_SOURCE_BASE}" \
+    && PYTHONDONTWRITEBYTECODE=1 /opt/venv/bin/python -I /opt/scripts/drug_runtime_dependency.py verify-baked \
+        "${DRUG_SOURCE_COMMIT}" "${DRUG_SOURCE_TREE}" "${DRUG_SOURCE_BASE}"
 
 ARG HLTHPRT_DB_POOL_MIN_SIZE=1
 ARG HLTHPRT_DB_POOL_MAX_SIZE=10

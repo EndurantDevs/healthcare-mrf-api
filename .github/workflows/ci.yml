@@ -69,7 +69,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -133,7 +133,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -156,7 +156,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -188,11 +188,11 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@40c9f85d85b4120c3bb67bdab2ada75b5af17293
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@bf0e8780412ba6a4022f158154c433d53aed69a1
       with:
         dependencies: 'true'
     - name: Download exact-source Rust test binaries
@@ -272,11 +272,11 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@40c9f85d85b4120c3bb67bdab2ada75b5af17293
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@bf0e8780412ba6a4022f158154c433d53aed69a1
       with:
         dependencies: 'true'
     - name: Run complete validation stage
@@ -319,11 +319,11 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@40c9f85d85b4120c3bb67bdab2ada75b5af17293
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@bf0e8780412ba6a4022f158154c433d53aed69a1
       with:
         dependencies: 'true'
     - name: Run complete validation stage
@@ -353,11 +353,11 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@40c9f85d85b4120c3bb67bdab2ada75b5af17293
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@bf0e8780412ba6a4022f158154c433d53aed69a1
       with:
         rust: 'true'
         dependencies: 'true'
@@ -406,7 +406,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -453,11 +453,11 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@40c9f85d85b4120c3bb67bdab2ada75b5af17293
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@bf0e8780412ba6a4022f158154c433d53aed69a1
       with:
         dependencies: 'true'
     - name: Run complete validation stage
@@ -502,11 +502,11 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@40c9f85d85b4120c3bb67bdab2ada75b5af17293
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@bf0e8780412ba6a4022f158154c433d53aed69a1
       with:
         dependencies: 'true'
     - name: Run complete validation stage
@@ -561,11 +561,11 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@40c9f85d85b4120c3bb67bdab2ada75b5af17293
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@bf0e8780412ba6a4022f158154c433d53aed69a1
       with:
         rust: ${{ matrix.shard == 'core-services' || matrix.shard == 'core-snapshots' || matrix.shard == 'core-ptg' || matrix.shard == 'directory-source' || startsWith(matrix.shard, 'registry-')
           }}
@@ -722,7 +722,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -816,7 +816,7 @@ jobs:
       actions: read
       packages: write
     env:
-      CI_REVISION: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+      CI_REVISION: bf0e8780412ba6a4022f158154c433d53aed69a1
       PYTHONDONTWRITEBYTECODE: '1'
       IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
       MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
@@ -825,7 +825,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -900,7 +900,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+        ref: bf0e8780412ba6a4022f158154c433d53aed69a1
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -928,7 +928,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: 40c9f85d85b4120c3bb67bdab2ada75b5af17293
+  CI_REVISION: bf0e8780412ba6a4022f158154c433d53aed69a1
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'
