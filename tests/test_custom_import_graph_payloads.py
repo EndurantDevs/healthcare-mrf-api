@@ -8,6 +8,7 @@ import datetime as dt
 import decimal
 from dataclasses import replace
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -104,6 +105,41 @@ def oracle_decoder(monkeypatch):
         return decoder
 
     return install
+
+
+@pytest.mark.parametrize("capability", ["missing_module", "missing_export", "non_callable", "callable"])
+def test_decoder_capability_cache_accepts_only_callable_export(monkeypatch, capability):
+    decoder = Mock()
+    module = SimpleNamespace()
+    if capability in {"non_callable", "callable"}:
+        module.custom_import_graph_children_v1 = decoder if capability == "callable" else False
+    importer = Mock(return_value=module, side_effect=ImportError() if capability == "missing_module" else None)
+    monkeypatch.setattr(graph_payloads.importlib, "import_module", importer)
+    graph_payloads.native_decoder.cache_clear()
+    try:
+        expected = decoder if capability == "callable" else None
+        assert graph_payloads.native_decoder() is expected
+        assert graph_payloads.native_decoder() is expected
+        importer.assert_called_once_with("ptg2_address_canon")
+    finally:
+        graph_payloads.native_decoder.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("proof_index", "value", "message"),
+    [(2, "synthetic-other-child", "child identity"), (4, b"x" * 32, "payload digest")],
+)
+def test_native_proof_must_bind_to_stored_child(monkeypatch, proof_index, value, message):
+    request = _request(page_row_limit=256)
+    group = _group(request, [_rate("0000000001")])
+    registry = _registry(request.definition)
+    proof_parts = list(_native_proof(request, _proof(request, registry, group, group.children[0])))
+    proof_parts[proof_index] = value
+    decoder = Mock(return_value=[tuple(proof_parts)])
+    monkeypatch.setattr(graph_payloads, "native_decoder", lambda: decoder)
+    with pytest.raises(CandidateRunnerError, match=message):
+        sets._child_arguments(request, registry, (group,))
+    decoder.assert_called_once()
 
 
 @pytest.mark.parametrize("optional", ["missing", "null", "value"])
