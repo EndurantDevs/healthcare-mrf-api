@@ -128,6 +128,12 @@ from process.reference_family_dictionary import (
 from process.reference_family_dictionary import (
     validate_reference_dictionary_effects as validate_reference_dictionary_effects,
 )
+from process.reference_family_model_indexes import (
+    _create_model_indexes as _create_model_indexes,
+)
+from process.reference_family_model_indexes import (
+    _validate_declared_model_relationships as _validate_declared_model_relationships,
+)
 from process.reference_family_result_generation import (
     RELATION_NAMES_BY_IMPORTER,
     ReferenceFamilyServingGeneration,
@@ -4126,6 +4132,7 @@ async def _create_model_heaps(
     *,
     create_indexes: bool = True,
     ordinary_heaps: bool = False,
+    physical_names=None,
 ) -> None:
     """Create trusted model heaps within the caller's already authenticated namespace."""
     if spec.importer_id == "mrf" and STAGE_TABLE not in spec.table_names:
@@ -4138,6 +4145,8 @@ async def _create_model_heaps(
     metadata = MetaData(schema=schema_name)
     for model_type in spec.model_types:
         table = _clone_model_table(model_type.__table__, metadata, schema=schema_name)
+        if physical_names is not None:
+            table.name = physical_names[model_type.__tablename__]
         if ordinary_heaps:
             table.dialect_options["postgresql"]["partition_by"] = None
             owned_columns = _declared_owner_columns(spec, table.name)
@@ -4165,7 +4174,7 @@ async def _create_model_heaps(
         if not create_indexes:
             _defer_table_constraints(table)
         statement = str(CreateTable(table).compile(dialect=postgresql.dialect()))
-        await session.execute(text(statement))
+        await _execute_model_statement(session, text(statement))
         for sequence_name, column_name in explicit_sequences:
             await session.execute(
                 text(
@@ -4174,7 +4183,7 @@ async def _create_model_heaps(
                 )
             )
     if create_indexes:
-        await _create_model_indexes(session, spec, schema_name)
+        await _create_model_indexes(session, spec, schema_name, physical_names=physical_names)
 
 
 def _defer_table_constraints(table: Table) -> None:
@@ -4204,104 +4213,7 @@ async def _create_table_constraints(session: Any, table: Table, *, backing_index
     for constraint in sorted(
         constraints, key=lambda item: (type(item).__name__, str(item.name or ""), tuple(item.columns.keys()))
     ):
-        await session.execute(AddConstraint(constraint))
-
-
-async def _create_model_indexes(
-    session: Any, spec: ReferenceFamilySpec, schema_name: str, *, create_constraints: bool = False
-) -> None:
-    metadata = MetaData(schema=schema_name)
-    if create_constraints and spec.importer_id == "mrf" and STAGE_TABLE not in spec.table_names:
-        await _create_table_constraints(
-            session, Table(STAGE_TABLE, metadata, Column("address_key", postgresql.UUID, primary_key=True))
-        )
-    for model_type in spec.model_types:
-        _clone_model_table(model_type.__table__, metadata, schema=schema_name)
-    for model_type in spec.model_types:
-        table = metadata.tables[f"{schema_name}.{model_type.__tablename__}"]
-        if create_constraints:
-            if spec.importer_id == "provider-quality" and table.primary_key.columns:
-                table.primary_key.name = _index_name_for_table(table.name, f"{schema_name}_{table.name}_pkey")
-            await _create_table_constraints(session, table)
-        for statement in _declared_index_statements(model_type, table, schema_name, ()):
-            await session.execute(statement)
-        if model_type.__tablename__ == STAGE_TABLE:
-            await canonical_spatial_index(
-                session, schema_name, STAGE_TABLE, lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}"
-            )
-        if spec.importer_id == "provider-quality":
-            primary_elements = tuple(getattr(model_type, "__my_index_elements__", ()) or ())
-            if primary_elements:
-                primary_name = _index_name_for_table(
-                    model_type.__tablename__,
-                    f"{schema_name}_{model_type.__tablename__}_idx_primary",
-                )
-                await session.execute(
-                    text(
-                        f"CREATE UNIQUE INDEX {_quoted(primary_name)} ON {_quoted(schema_name)}."
-                        f"{_quoted(model_type.__tablename__)} ({', '.join(primary_elements)})"
-                    )
-                )
-        indexes = tuple(getattr(model_type, "__my_initial_indexes__", ()) or ()) + tuple(
-            getattr(model_type, "__my_additional_indexes__", ()) or ()
-        )
-        if spec.importer_id in {"mrf", "mrf-address"}:
-            # Ordinary publication retains initial and additional indexes only for these stages.
-            indexes = (
-                indexes
-                if model_type.__tablename__
-                in {"plan_benefits_marketplace", "mrf_address", "mrf_address_evidence", "plan_search_summary"}
-                else ()
-            )
-        for statement in _declared_index_statements(model_type, table, schema_name, indexes, native_indexes=False):
-            await session.execute(statement)
-    if create_constraints:
-        for table in metadata.tables.values():
-            await _create_table_constraints(session, table, backing_indexes=False)
-        await _validate_model_foreign_keys(session, metadata)
-        await _validate_declared_model_relationships(session, spec, schema_name)
-
-
-async def _validate_declared_model_relationships(session, spec, schema_name):
-    """Check closed typed scalar/array edges after every family index is complete."""
-    for child_model, child_name, parent_model, parent_name, is_array, allows_null in spec.relationships:
-        if (
-            child_model not in spec.model_types
-            or parent_model not in spec.model_types
-            or child_name not in child_model.__table__.columns
-            or parent_name not in parent_model.__table__.columns
-            or type(is_array) is not bool
-            or type(allows_null) is not bool
-        ):
-            raise ReferenceFamilyArchiveError("model relationship declaration differs")
-        child = child_model.__table__.columns[child_name]
-        parent = parent_model.__table__.columns[parent_name]
-        if (
-            isinstance(child.type, ARRAY) != is_array
-            or (allows_null and not child.nullable)
-            or not parent.primary_key
-            or len(parent_model.__table__.primary_key.columns) != 1
-        ):
-            raise ReferenceFamilyArchiveError("model relationship column shape differs")
-        child_table = f"{_quoted(schema_name)}.{_quoted(child_model.__tablename__)}"
-        parent_table = f"{_quoted(schema_name)}.{_quoted(parent_model.__tablename__)}"
-        child_column = f"c.{_quoted(child_name)}"
-        if is_array:
-            missing = (
-                f"EXISTS(SELECT 1 FROM unnest({child_column}) AS member(value) "
-                f"WHERE NOT EXISTS(SELECT 1 FROM {parent_table} p WHERE p.{_quoted(parent_name)}=member.value))"
-            )
-        else:
-            missing = f"NOT EXISTS(SELECT 1 FROM {parent_table} p WHERE p.{_quoted(parent_name)}={child_column})"
-        invalid = (
-            f"{child_column} IS NOT NULL AND ({missing})" if allows_null else f"{child_column} IS NULL OR ({missing})"
-        )
-        violates = await session.scalar(text(f"SELECT EXISTS(SELECT 1 FROM {child_table} c WHERE {invalid})"))
-        if violates is not False:
-            raise ReferenceFamilyArchiveError(
-                "staged declared model relationship differs: "
-                f"{child_model.__tablename__}.{child_name} -> {parent_model.__tablename__}.{parent_name}"
-            )
+        await _execute_model_statement(session, AddConstraint(constraint))
 
 
 async def _validate_model_foreign_keys(session: Any, metadata: MetaData) -> None:
@@ -4353,6 +4265,70 @@ async def complete_model_family_stage(
 
     await verify_model_family_stage_ownership(session, spec, ownership, include_identity=include_identity)
     await _create_model_indexes(session, spec, ownership.schema_name, create_constraints=True)
+
+
+async def _execute_model_statement(session, statement):
+    """Compile the same trusted model DDL for a session or its native driver."""
+    if callable(getattr(session, "is_in_transaction", None)):
+        if not session.is_in_transaction():
+            raise ReferenceFamilyArchiveError("model DDL requires a caller transaction")
+        return await session.execute(str(statement.compile(dialect=postgresql.dialect())))
+    return await session.execute(statement)
+
+
+def ndc_model_family_spec():
+    """Resolve the exact source-bound product/package model and indexed set edge."""
+    from drug_snapshot_runtime.ndc import RELATIONSHIPS, Package, Product
+
+    return ReferenceFamilySpec("ndc", (Product, Package), relationships=RELATIONSHIPS)
+
+
+async def precreate_ndc_model_heaps(connection, schema_name, physical_names):
+    """Use model DDL for the existing operation-owned NDC pair, without indexes."""
+    spec = ndc_model_family_spec()
+    await _require_ndc_model_targets(connection, spec, schema_name, physical_names)
+    await _create_model_heaps(
+        connection, spec, schema_name, create_indexes=False, ordinary_heaps=True, physical_names=physical_names
+    )
+
+
+async def complete_ndc_model_heaps(connection, schema_name, physical_names, relation_oids):
+    """Finish the exact NDC OIDs with the shared model index/set-check compiler."""
+    spec = ndc_model_family_spec()
+    await _require_ndc_model_targets(connection, spec, schema_name, physical_names)
+    if (
+        not isinstance(relation_oids, Mapping)
+        or set(relation_oids) != set(spec.table_names)
+        or any(type(oid) is not int or oid <= 0 for oid in relation_oids.values())
+    ):
+        raise ReferenceFamilyArchiveError("NDC model heap custody differs")
+    for table_name in spec.table_names:
+        physical = f"{_quoted(schema_name)}.{_quoted(physical_names[table_name])}"
+        await connection.execute(f"LOCK TABLE ONLY {physical} IN SHARE MODE NOWAIT")
+        if await connection.fetchval("SELECT pg_catalog.to_regclass($1)::oid", physical) != relation_oids[table_name]:
+            raise ReferenceFamilyArchiveError("NDC model heap custody differs")
+    await _create_model_indexes(connection, spec, schema_name, create_constraints=True, physical_names=physical_names)
+
+
+async def _require_ndc_model_targets(connection, spec, schema_name, physical_names):
+    """Admit only the existing closed operation table names on a native transaction."""
+    await _native_model_copy_driver(connection, ("execute", "fetchval"))
+    _schema_name(schema_name)
+    if not isinstance(physical_names, Mapping) or set(physical_names) != set(spec.table_names):
+        raise ReferenceFamilyArchiveError("NDC model heap targets differ")
+    identities = set()
+    for table in spec.table_names:
+        name = physical_names[table]
+        match = (
+            re.fullmatch(r"hp_ndc_a_([0-9a-f]{32})_" + table + r"|hp_ndc_" + table + r"_s_([0-9a-f]{32})", name)
+            if isinstance(name, str)
+            else None
+        )
+        if match is None:
+            raise ReferenceFamilyArchiveError("NDC model heap targets differ")
+        identities.add((match[1] is not None, match[1] or match[2]))
+    if len(identities) != 1:
+        raise ReferenceFamilyArchiveError("NDC model heap targets differ")
 
 
 async def validate_reference_family_stage(
