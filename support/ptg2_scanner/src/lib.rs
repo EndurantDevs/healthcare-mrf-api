@@ -11,6 +11,7 @@ pub mod config;
 pub mod contact_canon;
 pub mod copy_format;
 pub mod custom_import_graph;
+pub mod custom_import_graph_projection;
 pub mod custom_import_scalar;
 pub mod custom_import_source;
 pub mod custom_import_source_payload;
@@ -113,6 +114,7 @@ mod python_api {
     include!("python_hospital_price.rs");
     include!("python_custom_import.rs");
     include!("python_custom_import_graph.rs");
+    include!("python_custom_import_graph_projection.rs");
 
     #[pyfunction]
     fn encode_network_membership_batch(
@@ -650,6 +652,10 @@ mod python_api {
             m
         )?)?;
         m.add_function(wrap_pyfunction!(custom_import_graph_children_v1, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            custom_import_graph_projection_columns_v1,
+            m
+        )?)?;
         m.add_function(wrap_pyfunction!(
             custom_import_verified_scalar_frames_v1,
             m

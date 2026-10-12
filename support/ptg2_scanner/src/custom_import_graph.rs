@@ -193,7 +193,7 @@ pub fn graph_layout_bound(layout: &GraphLayout) -> Result<usize, &'static str> {
 }
 
 /// Accept only the exact plain-text form emitted by normalized v1 decimals.
-fn decimal_supported(value: &str, projected: bool) -> bool {
+pub(crate) fn decimal_supported(value: &str, projected: bool) -> bool {
     if value.is_empty() || value.len() > MAX_GRAPH_DECIMAL_BYTES {
         return false;
     }
