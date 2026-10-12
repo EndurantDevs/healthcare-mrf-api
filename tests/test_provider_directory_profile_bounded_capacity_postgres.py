@@ -268,6 +268,8 @@ async def test_bounded_artifact_windows_settle_below_the_whole_future_wal_foreca
         admission = _admission(bounded, start)
         token = fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(admission)
         try:
+            # This artifact-only fixture schedules no profile-target replacement.
+            await fhir._complete_profile_capacity_relation_class("profile_target")
             await fhir._preflight_provider_directory_artifact_scope_capacity(
                 fixture.schema,
                 fixture.relation_by_table,
