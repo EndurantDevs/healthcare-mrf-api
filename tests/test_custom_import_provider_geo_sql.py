@@ -23,6 +23,7 @@ from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_enti
 from api.endpoint import npi as npi_module
 from process.custom_import.read_core import PreparedNpiEntityRelation, ReadOrderTerm
 from tests.custom_import_postgres_support import transaction_session
+from tests.test_custom_import_provider_list import _scoped_import_context
 
 _FIRST_ADDRESS_KEY = "00000000-0000-0000-0000-000000000001"
 _SECOND_ADDRESS_KEY = "00000000-0000-0000-0000-000000000002"
@@ -98,6 +99,9 @@ def test_imported_geo_builder_dedupes_before_ordering_and_uses_typed_binds(direc
     page_sql = str(statements.page)
     assert native_parameters_by_name == {"in_long": 0.0, "in_lat": 0.0, "radius": 10.0}
     assert "SELECT DISTINCT ON (d.npi, a.address_key)" in count_sql
+    assert count_sql.index("native_eligible_geo AS MATERIALIZED") < count_sql.index(
+        "custom_import_provider_relation AS"
+    )
     assert "custom_import_provider_relation AS" in count_sql
     assert "LEFT JOIN custom_import_provider_relation AS imported" in page_sql
     assert page_sql.index("LEFT JOIN custom_import_provider_relation AS imported") < page_sql.index("LIMIT")
@@ -123,8 +127,19 @@ def test_imported_geo_filter_uses_one_correlated_membership_predicate(direction)
 
     assert count_sql.count(membership) == 1
     assert page_sql.count(membership) == 1
-    assert "WHERE imported.entity_value = d.npi::text" in page_sql
+    assert "WHERE imported.entity_value = native_eligible_geo.npi_code::text" in page_sql
+    native_eligibility = page_sql.split("custom_import_provider_relation AS", 1)[0]
+    assert "EXISTS (SELECT 1 FROM custom_import_provider_relation" not in native_eligibility
+    assert "LIMIT" not in native_eligibility
     assert ("LEFT JOIN custom_import_provider_relation AS imported" in page_sql) is (direction is not None)
+
+
+def test_geo_score_scope_uses_every_native_provider():
+    scope = geo_sql.native_geo_entity_scope()
+
+    assert len(scope.selected_columns) == 1
+    assert str(scope) == "SELECT DISTINCT native_eligible_geo.npi_code \nFROM native_eligible_geo"
+    assert isinstance(scope.selected_columns[0].type, geo_sql.BigInteger)
 
 
 @pytest.mark.parametrize("direction", ("asc", "desc"))
@@ -225,13 +240,27 @@ async def _empty_plan_scope(session, release_id):
     return None, {}
 
 
+def _assert_native_geo_scope(sql):
+    native_sql, score_sql = sql.split("custom_import_provider_relation AS", 1)
+    assert native_sql.count("native_eligible_geo AS MATERIALIZED") == 1
+    assert "ST_DWithin(" in native_sql and "LIMIT" not in native_sql
+    assert "native_eligible_geo.npi_code" in score_sql
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("view", ("", "card"))
 async def test_imported_geo_handler_uses_one_session_and_keeps_private_next_anchor(monkeypatch, view):
     session = SimpleNamespace(calls=[])
     cursor_calls = []
+    scopes = []
+    context = _context()
+
+    async def prepare_scope(native_entity_scope):
+        scopes.append(native_entity_scope)
+        return _scoped_import_context(context, native_entity_scope)
 
     async def prepare_cursor(**kwargs):
+        assert len(scopes) == 1
         cursor_calls.append(kwargs)
         return None
 
@@ -255,8 +284,9 @@ async def test_imported_geo_handler_uses_one_session_and_keeps_private_next_anch
     reply = await npi_module.get_near_npi(
         SimpleNamespace(args={}, ctx=SimpleNamespace(sa_session=session)),
         native_args=native_args,
-        import_context=_context(),
+        import_context=context,
         prepare_cursor=prepare_cursor,
+        native_scope_preparer=prepare_scope,
     )
     response_by_key = json.loads(reply.body)
 
@@ -265,6 +295,7 @@ async def test_imported_geo_handler_uses_one_session_and_keeps_private_next_anch
     assert cursor_calls[0]["query_parameters"]["in_long"] == 0.0
     assert cursor_calls[0]["limit"] == 2
     assert len(session.calls) == 1 and "AS _geo_total" in session.calls[0][0]
+    _assert_native_geo_scope(session.calls[0][0])
     assert response_by_key["total_count"] == 3
     assert response_by_key["next_cursor"] is None
     assert response_by_key["_custom_import_next_anchor"] == ["1000000003", _THIRD_ADDRESS_KEY]
@@ -450,6 +481,11 @@ async def _read_postgres_geo_page(
         session,
         cursor_anchor=cursor_anchor,
     )
+    context = _context(direction=direction, require_match=require_match)
+
+    async def prepare_scope(native_entity_scope):
+        return _scoped_import_context(context, native_entity_scope)
+
     reply = await npi_module.get_near_npi(
         request,
         native_args=RequestParameters(
@@ -460,8 +496,9 @@ async def _read_postgres_geo_page(
                 "limit": ["2"],
             }
         ),
-        import_context=_context(direction=direction, require_match=require_match),
+        import_context=context,
         prepare_cursor=prepare_cursor,
+        native_scope_preparer=prepare_scope,
     )
     return json.loads(reply.body)
 

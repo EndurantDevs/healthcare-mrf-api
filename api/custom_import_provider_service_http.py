@@ -18,6 +18,7 @@ from api.custom_import_provider_http import (
     _parse_provider_request,
     _provider_relation_query,
     _provider_response_limit,
+    _ProviderScopePreparer,
 )
 from api.custom_import_provider_service_sql import ProviderServiceImportQuery
 from process.custom_import.read_contracts import (
@@ -125,16 +126,25 @@ async def _read_service_payload(request, session, parsed, verified):
         target=pinned_target,
         query=query,
     )
+
+    scope_preparer = _ProviderScopePreparer(session, service, authorization, pinned_target, query, prepared)
     reply = await _service_page(
         request,
         native_args=parsed.native_args,
-        import_context=ProviderServiceImportQuery(prepared, query.require_match),
+        import_context=ProviderServiceImportQuery(prepared, query.require_match, scope_preparer.prepare),
     )
     if reply.status != 200 or len(reply.body) > transport._MAX_RESPONSE_BYTES:
         raise CustomImportReadUnavailableError("provider-service response is unavailable")
     response_by_field = _service_payload(reply.body, plan_release_id=parsed.native_args.get("plan_release_id"))
     await _hydrate_provider_rows(
-        session, service, authorization, pinned_target, prepared, parsed, query, response_by_field["items"]
+        session,
+        service,
+        authorization,
+        pinned_target,
+        scope_preparer.prepared,
+        parsed,
+        query,
+        response_by_field["items"],
     )
     await verify_published_generation(session, pinned_target)
     return response_by_field

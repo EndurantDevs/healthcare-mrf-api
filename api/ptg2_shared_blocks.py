@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import zlib
@@ -1093,28 +1094,43 @@ async def _stream_shared_blocks_direct(
     observed_keys: set[int] = set()
     observed_fragments_by_key: dict[int, set[int]] = {}
     previous_mapping_key: tuple[int, int] | None = None
-    async for raw_row in _iterate_shared_query_rows(query_result):
-        block_payload = _validated_payload(
-            _row_mapping(raw_row),
-            expected_kind=request.object_kind,
+    has_failed = False
+    try:
+        async for raw_row in _iterate_shared_query_rows(query_result):
+            block_payload = _validated_payload(
+                _row_mapping(raw_row),
+                expected_kind=request.object_kind,
+            )
+            mapping_key = (block_payload.block_key, block_payload.fragment_no)
+            if (
+                block_payload.block_key not in request.block_key_set
+                or block_payload.fragment_no < 0
+                or (request.has_fragment_filter and block_payload.fragment_no not in request.fragment_no_set)
+                or (previous_mapping_key is not None and mapping_key <= previous_mapping_key)
+            ):
+                raise PTG2SharedBlockError("shared PTG query returned an unexpected or unordered fragment")
+            previous_mapping_key = mapping_key
+            observed_keys.add(block_payload.block_key)
+            observed_fragments_by_key.setdefault(block_payload.block_key, set()).add(block_payload.fragment_no)
+            yield block_payload
+        _require_complete_direct_stream(
+            request,
+            observed_keys,
+            observed_fragments_by_key,
         )
-        mapping_key = (block_payload.block_key, block_payload.fragment_no)
-        if (
-            block_payload.block_key not in request.block_key_set
-            or block_payload.fragment_no < 0
-            or (request.has_fragment_filter and block_payload.fragment_no not in request.fragment_no_set)
-            or (previous_mapping_key is not None and mapping_key <= previous_mapping_key)
-        ):
-            raise PTG2SharedBlockError("shared PTG query returned an unexpected or unordered fragment")
-        previous_mapping_key = mapping_key
-        observed_keys.add(block_payload.block_key)
-        observed_fragments_by_key.setdefault(block_payload.block_key, set()).add(block_payload.fragment_no)
-        yield block_payload
-    _require_complete_direct_stream(
-        request,
-        observed_keys,
-        observed_fragments_by_key,
-    )
+    except BaseException:
+        has_failed = True
+        raise
+    finally:
+        close = getattr(query_result, "close", None)
+        if callable(close):
+            try:
+                closed_result = close()
+                if inspect.isawaitable(closed_result):
+                    await closed_result
+            except BaseException:
+                if not has_failed:
+                    raise
 
 
 async def _packed_direct_query_result(
@@ -2092,7 +2108,7 @@ async def fetch_shared_graph_members(
     max_total_members: int | None = None,
     retention_budget: GraphDecodedRetentionBudget | None = None,
 ) -> dict[int, tuple[int, ...]]:
-    """Resolve one dense graph direction after an optional bounded preflight."""
+    """Resolve one dense graph direction through unique selected chunks."""
 
     max_total_members = _normalized_graph_total_member_limit(max_total_members)
     if retention_budget is None:
@@ -2144,57 +2160,12 @@ async def _fetch_shared_graph_members_direct(
     request: _SharedGraphReadRequest,
     retention_budget: GraphDecodedRetentionBudget | None = None,
 ) -> dict[int, tuple[int, ...]]:
-    if retention_budget is not None or request.max_total_members is not None:
-        return await _fetch_shared_graph_members_preflight(
-            session,
-            request,
-            maximum_raw_bytes=None,
-            retention_budget=retention_budget,
-        )
-    schema = _quote_ident(request.schema_name)
-    query_result = await session.execute(
-        text(
-            f"""
-            SELECT owner.owner_key, owner.first_chunk, owner.member_offset,
-                   owner.member_count,
-                   {request.member_count_sql} AS selected_member_count,
-                   mapping.object_kind, mapping.block_key,
-                   mapping.fragment_no, mapping.entry_count AS mapping_entry_count,
-                   mapping.block_hash, block.format_version, block.codec,
-                   block.raw_byte_count, block.stored_byte_count, block.payload
-              FROM {schema}.ptg2_v3_snapshot_layout layout
-              JOIN {schema}.ptg2_v3_graph_owner owner
-                ON owner.snapshot_key = layout.snapshot_key
-              JOIN LATERAL generate_series(
-                   owner.first_chunk,
-                   owner.first_chunk + CASE
-                       WHEN {request.member_count_sql} = 0 THEN -1
-                       ELSE ((owner.member_offset + {request.member_count_sql} * :member_width - 1)
-                             / :chunk_bytes)::integer
-                   END
-              ) required_chunk(block_key) ON TRUE
-              JOIN {schema}.ptg2_v3_snapshot_block mapping
-                ON mapping.snapshot_key = owner.snapshot_key
-               AND mapping.object_kind = :object_kind
-               AND mapping.block_key = required_chunk.block_key
-              JOIN {schema}.ptg2_v3_block block
-                ON block.block_hash = mapping.block_hash
-             WHERE layout.snapshot_key = :snapshot_key
-               AND layout.state = 'sealed'
-               AND layout.generation = :generation
-               AND owner.direction = :direction
-               AND owner.owner_key = ANY(CAST(:owner_keys AS bigint[]))
-             ORDER BY owner.owner_key, mapping.block_key, mapping.fragment_no
-            """
-        ),
-        request.params_by_name,
-    )
-    graph_records = tuple(_row_mapping(graph_record) for graph_record in query_result)
-    locator_by_owner, chunks_by_owner = _indexed_direct_graph_records(
+    return await _fetch_shared_graph_members_preflight(
+        session,
         request,
-        graph_records,
+        maximum_raw_bytes=None,
+        retention_budget=retention_budget,
     )
-    return _decoded_direct_graph_members(request, locator_by_owner, chunks_by_owner)
 
 
 def _indexed_direct_graph_records(

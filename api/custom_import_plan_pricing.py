@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from sqlalchemy import text
+from sqlalchemy import BigInteger, bindparam, select, text, union_all
 from sqlalchemy.exc import IntegrityError
 
 from api import custom_import_plan_sql as plan_sql
@@ -98,28 +98,73 @@ async def _stage_imported_scores(session, import_context, compiled):
     await session.execute(plan_sql.plan_analyze_statement(plan_sql.IMPORTED))
 
 
-def _candidate_query(scope, import_context, serving):
-    """Join indexed imported identities to complete pinned native eligibility."""
+def _native_candidate_query(scope, serving):
+    """Share exact pinned native admission and its actual selective predicates."""
 
     parameters_by_name = {"shared_snapshot_key": serving._required_shared_snapshot_key(scope.serving_tables)}
     predicates = ["native.snapshot_key = :shared_snapshot_key"]
-    predicates.extend(serving._manifest_provider_predicates(scope.args, parameters_by_name, npi_sql="native.npi"))
+    provider_predicates = serving._manifest_provider_predicates(scope.args, parameters_by_name, npi_sql="native.npi")
+    predicates.extend(provider_predicates)
+    is_selective = bool(provider_predicates) or scope.location_context is not None
     if scope.args.get("npi") not in (None, "", "null"):
         predicates.append("native.npi = :provider_npi")
         parameters_by_name["provider_npi"] = int(scope.args["npi"])
+        is_selective = True
     location_join, location_columns = "", "NULL::double precision AS distance_miles, NULL::varchar AS location_hash"
     if scope.location_context is not None:
         location_sql = serving._unpaged_membership_location_sql(scope.location_context)
         location_join = f"JOIN ({location_sql}) location ON location.npi = native.npi"
         location_columns = "location.distance_miles, location.location_hash"
         parameters_by_name.update(scope.location_context.parameter_map)
+    sql = f"""
+        SELECT native.npi, {location_columns}
+          FROM {serving._ptg2_npi_scope_table(scope.serving_tables)} native
+          {location_join}
+         WHERE {" AND ".join(predicates)}
+    """
+    return sql, parameters_by_name, is_selective
+
+
+def _native_score_scope(scope_code_rows, serving):
+    """Narrow scores across every contributing binding without decoding memberships."""
+
+    statements, is_selective = [], False
+    for scope, _code_rows in scope_code_rows:
+        sql, parameters_by_name, is_binding_selective = _native_candidate_query(scope, serving)
+        is_selective = is_selective or is_binding_selective
+        native_sql = text(sql)
+        used_parameters = native_sql.compile().params
+        native = (
+            native_sql.bindparams(
+                *(
+                    bindparam(
+                        name,
+                        parameter_value,
+                        type_=BigInteger() if name in {"shared_snapshot_key", "provider_npi"} else None,
+                        unique=True,
+                    )
+                    for name, parameter_value in parameters_by_name.items()
+                    if name in used_parameters
+                )
+            )
+            .columns(npi=BigInteger())
+            .subquery()
+        )
+        statements.append(select(native.c.npi))
+    if not is_selective:
+        return None
+    native_union = union_all(*statements).subquery("native_plan_score_scope")
+    return select(native_union.c.npi).distinct()
+
+
+def _candidate_query(scope, import_context, serving):
+    """Join indexed imported identities to complete pinned native eligibility."""
+
+    native_sql, parameters_by_name, _selective = _native_candidate_query(scope, serving)
     require_match_sql = "WHERE imported.npi IS NOT NULL" if import_context.require_match else ""
     sql = f"""
         WITH eligible_native AS MATERIALIZED (
-            SELECT native.npi, {location_columns}
-              FROM {serving._ptg2_npi_scope_table(scope.serving_tables)} native
-              {location_join}
-             WHERE {" AND ".join(predicates)}
+            {native_sql}
         )
         SELECT native.npi, imported.npi IS NULL AS import_missing,
                native.distance_miles, native.location_hash, imported.import_rank
@@ -328,13 +373,17 @@ async def search_imported_plan_providers(session, args, pagination, selection, i
     ):
         raise PlanPricingProjectionUnsupported("imported provider scores require full provider entries")
     scopes = await _native_scopes(session, selection, args, serving)
-    compiled = compile_npi_entity_relation(import_context.prepared.statement)
     scope_code_rows = []
     for scope in scopes:
         code_rows = await load_sealed_code_rows(session, scope.serving_tables, scope.args)
         if code_rows:
             scope_code_rows.append((scope, code_rows))
     if scope_code_rows:
+        if import_context.native_scope_preparer is not None:
+            native_scope = _native_score_scope(scope_code_rows, serving)
+            if native_scope is not None:
+                import_context = await import_context.scope_native(native_scope)
+        compiled = compile_npi_entity_relation(import_context.prepared.statement)
         await _stage_imported_scores(session, import_context, compiled)
     needs_prices = any(args.get(name) for name in _PRICE_FILTERS) or (
         not import_context.prepared.normalized_order_terms

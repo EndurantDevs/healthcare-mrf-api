@@ -33,10 +33,12 @@ from process.custom_import.read_contracts import (
     CustomImportReadRequestError,
     CustomImportReadUnavailableError,
     ExtensionReadAuthorization,
+    PinnedReadTarget,
 )
 from process.custom_import.read_core import (
     CustomImportReadService,
     NpiEntityRelationQuery,
+    PreparedNpiEntityRelation,
     ReadFilter,
     ReadOrderTerm,
     _bounded_read_window,
@@ -70,6 +72,37 @@ class _ParsedProviderRequest:
     include_filter: bool = True
     maximum_family_rows: int = MAX_FULL_FAMILY_PAGE_SIZE
     network_binding: ProviderNetworkBinding | None = None
+
+
+@dataclass(repr=False)
+class _ProviderScopePreparer:
+    """Retain the scoped relation used by native search and family hydration."""
+
+    session: Any
+    service: CustomImportReadService
+    authorization: ExtensionReadAuthorization
+    pinned_target: PinnedReadTarget
+    query: NpiEntityRelationQuery
+    prepared: PreparedNpiEntityRelation
+
+    async def prepare(self, native_entity_scope):
+        """Restrict scores to complete native eligibility in the pinned snapshot."""
+
+        self.prepared = await self.service.scope_npi_entity_relation(
+            self.session,
+            authorization=self.authorization,
+            pinned_target=self.pinned_target,
+            prepared=self.prepared,
+            query=self.query,
+            native_entity_scope=native_entity_scope,
+        )
+        return self.prepared
+
+    async def prepare_provider_scope(self, native_entity_scope):
+        """Compile the scoped relation for provider list and address queries."""
+
+        prepared = await self.prepare(native_entity_scope)
+        return ProviderImportQuery(prepared, compile_npi_entity_relation(prepared.statement), self.query.require_match)
 
 
 def _provider_relation_query(
@@ -276,12 +309,19 @@ async def _read_provider_payload(request, session, parsed, verified):
         query=query,
     )
     context = ProviderImportQuery(prepared, compile_npi_entity_relation(prepared.statement), query.require_match)
-    reply = await _provider_page(request, native_args=parsed.native_args, import_context=context)
+
+    scope_preparer = _ProviderScopePreparer(session, service, authorization, pinned_target, query, prepared)
+    reply = await _provider_page(
+        request,
+        native_args=parsed.native_args,
+        import_context=context,
+        native_scope_preparer=scope_preparer.prepare_provider_scope,
+    )
     if reply.status != 200 or len(reply.body) > transport._MAX_RESPONSE_BYTES:
         raise CustomImportReadUnavailableError("provider response is unavailable")
     provider_payload = _provider_payload(reply.body)
     await _hydrate_provider_rows(
-        session, service, authorization, pinned_target, prepared, parsed, query, provider_payload["rows"]
+        session, service, authorization, pinned_target, scope_preparer.prepared, parsed, query, provider_payload["rows"]
     )
     await verify_published_generation(session, pinned_target)
     return provider_payload

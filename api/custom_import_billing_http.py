@@ -25,6 +25,7 @@ from api.custom_import_provider_http import (
     _parse_provider_request,
     _provider_relation_query,
     _provider_response_limit,
+    _ProviderScopePreparer,
 )
 from api.ptg2_billing_search_service import search_exact_billing_provider_page
 from process.custom_import.read_contracts import (
@@ -90,7 +91,23 @@ def _parse_billing_request(body):
     return _ParsedBillingRequest(provider, digest)
 
 
+def _billing_scope_callback(scope_preparer, access_state):
+    """Retain the exact prepared query and access state for native traversal."""
+
+    async def prepare_billing_scope(native_entity_scope):
+        """Reseal the retained query after complete native eligibility is known."""
+
+        scoped = await scope_preparer.prepare(native_entity_scope)
+        return _new_billing_import_query(
+            scoped, scope_preparer.query.require_match, scope_preparer.pinned_target, access_state
+        )
+
+    return prepare_billing_scope
+
+
 async def _read_billing_payload(session, parsed, verified, access, cursor_keyring, trusted_now):
+    """Compose native candidates and hydrate their scoped import in one read snapshot."""
+
     provider = parsed.provider
     pinned_target = await transport._resolve_pinned_target(session, parsed.target)
     service = CustomImportReadService(authorizer=transport._TransportAuthorizer(verified, pinned_target))
@@ -108,12 +125,15 @@ async def _read_billing_payload(session, parsed, verified, access, cursor_keyrin
     )
     access, access_state = validate_billing_search_endpoint_access_state(access, trusted_now=trusted_now)
     import_context = _new_billing_import_query(prepared, query.require_match, pinned_target, access_state)
+    scope_preparer = _ProviderScopePreparer(session, service, authorization, pinned_target, query, prepared)
+
     search_result = await search_exact_billing_provider_page(
         session,
         access=access,
         cursor_keyring=cursor_keyring,
         trusted_now=trusted_now,
         import_context=import_context,
+        native_scope_preparer=_billing_scope_callback(scope_preparer, access_state),
     )
     billing_payload = shape_billing_search_response(
         access,
@@ -131,7 +151,7 @@ async def _read_billing_payload(session, parsed, verified, access, cursor_keyrin
         service,
         authorization,
         pinned_target,
-        prepared,
+        scope_preparer.prepared,
         provider,
         query,
         billing_payload["items"],

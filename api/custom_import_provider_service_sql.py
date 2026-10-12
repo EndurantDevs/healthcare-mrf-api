@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
 
 from sanic.exceptions import InvalidUsage
 from sqlalchemy import Float, String, and_, case, cast, exists, func, or_, select
@@ -19,7 +20,12 @@ def _is_sha256(value: object) -> bool:
 
 
 def _require_unpaged(statement: Select, *, relation: str) -> None:
-    if statement._limit_clause is not None or statement._offset_clause is not None or statement._order_by_clauses:
+    if (
+        statement._limit_clause is not None
+        or statement._offset_clause is not None
+        or statement._fetch_clause is not None
+        or statement._order_by_clauses
+    ):
         raise CustomImportReadUnavailableError(f"{relation} is not unpaged")
 
 
@@ -29,10 +35,15 @@ class ProviderServiceImportQuery:
 
     prepared: PreparedNpiEntityRelation
     require_match: bool
+    native_scope_preparer: Callable[[Select], Awaitable[PreparedNpiEntityRelation]] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if type(self.prepared) is not PreparedNpiEntityRelation or type(self.require_match) is not bool:
             raise CustomImportReadUnavailableError("provider-service import query is invalid")
+        if self.native_scope_preparer is not None and not callable(self.native_scope_preparer):
+            raise CustomImportReadUnavailableError("provider-service native scope preparer is invalid")
         if self.prepared.effective_require_match is not None:
             object.__setattr__(self, "require_match", self.prepared.effective_require_match)
         if not isinstance(self.prepared.statement, Select):
@@ -49,6 +60,13 @@ class ProviderServiceImportQuery:
         )
         if tuple(self.prepared.statement.selected_columns.keys()) != expected_columns:
             raise CustomImportReadUnavailableError("provider-service import relation is invalid")
+
+    async def scope_native(self, native_entity_scope: Select) -> ProviderServiceImportQuery:
+        """Prepare imported predicates against this request's complete native eligibility."""
+
+        if self.native_scope_preparer is None:
+            return self
+        return replace(self, prepared=await self.native_scope_preparer(native_entity_scope))
 
 
 def provider_service_native_args(request_args, native_args, import_context):
@@ -98,6 +116,29 @@ class ProviderServiceClaimsStatements:
     page_statement: Select
 
 
+async def _prepare_provider_service_native_scope(grouped, import_context, min_claims, min_total_cost):
+    """Apply aggregate admission once before scores, count and pagination."""
+
+    if import_context is None:
+        return grouped, import_context
+    if type(import_context) is not ProviderServiceImportQuery:
+        raise CustomImportReadUnavailableError("provider-service import query is invalid")
+    if import_context.native_scope_preparer is None:
+        return grouped, import_context
+    if not isinstance(grouped, Select):
+        raise CustomImportReadUnavailableError("provider-service claims relation is invalid")
+    _require_unpaged(grouped, relation="provider-service claims relation")
+    aggregate = grouped.subquery("native_service_aggregates")
+    eligible = select(aggregate)
+    if min_claims is not None:
+        eligible = eligible.where(aggregate.c.total_services >= min_claims)
+    if min_total_cost is not None:
+        eligible = eligible.where(aggregate.c.total_allowed_amount >= min_total_cost)
+    native = eligible.cte("native_score_claims").prefix_with("MATERIALIZED")
+    scoped = await import_context.scope_native(select(native.c.npi).distinct())
+    return select(native), scoped
+
+
 def compose_provider_service_claims_relation(
     native_grouped_statement: Select,
     import_context: ProviderServiceImportQuery,
@@ -136,7 +177,7 @@ def compose_provider_service_claims_relation(
     return ProviderServiceClaimsRelation(statement, native_relation, tuple(import_order_terms))
 
 
-def build_provider_service_claims_statements(
+async def build_provider_service_claims_statements(
     native_grouped_statement: Select,
     import_context: ProviderServiceImportQuery | None,
     min_claims: float | None,
@@ -148,6 +189,9 @@ def build_provider_service_claims_statements(
 
     if import_context is None:
         return _native_claims_statements(native_grouped_statement, order_by, order)
+    native_grouped_statement, import_context = await _prepare_provider_service_native_scope(
+        native_grouped_statement, import_context, min_claims, min_total_cost
+    )
     return _imported_claims_statements(
         native_grouped_statement,
         import_context,

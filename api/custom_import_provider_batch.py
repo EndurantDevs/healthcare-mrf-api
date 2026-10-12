@@ -129,8 +129,16 @@ async def _read_batch_payload(request, session, parsed, verified):
         query.require_match,
         native_npis=tuple(parsed.native_batch["npis"]),
     )
+    scope_preparer = provider_http._ProviderScopePreparer(
+        session, service, authorization, pinned_target, query, prepared
+    )
     batch_payload = await provider_batch.read_native_batch(
-        request, parsed.native_batch, native_args=parsed.provider.native_args, session=session, import_context=context
+        request,
+        parsed.native_batch,
+        native_args=parsed.provider.native_args,
+        session=session,
+        import_context=context,
+        native_scope_preparer=scope_preparer.prepare_provider_scope,
     )
     providers = [
         provider_item["provider"] for provider_item in batch_payload["items"] if provider_item["status"] == 200
@@ -140,7 +148,7 @@ async def _read_batch_payload(request, session, parsed, verified):
         service,
         authorization,
         pinned_target,
-        prepared,
+        scope_preparer.prepared,
         parsed.provider,
         query,
         providers,
