@@ -2,7 +2,7 @@
 
 """Joined typed values for one selected family set and complete child key."""
 
-from sqlalchemy import and_, case, func, inspect, literal, select
+from sqlalchemy import and_, case, func, inspect, literal, select, true
 
 from db.models.custom_import import CustomImportChildRevision, CustomImportChildScalar, CustomImportFamilyChild
 from process.custom_import import read_core as core
@@ -133,32 +133,40 @@ def _left_child_statement(context, selected, keyed_children):
     member = context.model(CustomImportFamilyChild)
     revision = context.model(CustomImportChildRevision)
     identities = ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot")
-    child_source = (
-        inspect(member)
-        .selectable.join(
-            keyed_children,
-            and_(*(getattr(keyed_children.c, name) == getattr(member, name) for name in identities)),
+    member_columns = inspect(member).selectable.c
+    members = (
+        select(
+            member_columns.family_revision_id,
+            *(getattr(member_columns, name) for name in identities),
+            keyed_children.c.selected_key_value,
         )
-        .join(
-            inspect(revision).selectable,
-            and_(*(getattr(revision, name) == getattr(member, name) for name in identities)),
+        .select_from(
+            inspect(member).selectable.join(
+                keyed_children,
+                and_(*(getattr(keyed_children.c, name) == getattr(member_columns, name) for name in identities)),
+            )
         )
+        .where(
+            member_columns.family_revision_id == selected.c.family_revision_id,
+            member_columns.root_record_id == selected.c.root_record_id,
+            member_columns.dataset_id == context.target.dataset_id,
+            member_columns.schema_revision_id == context.target.schema_revision_id,
+            member_columns.collection_slot
+            == context.collection_slots_by_name[context.definition.query.child_collection],
+        )
+        .correlate(selected)
+        # Keep complete-key filtering ahead of revision lookups for each eligible root.
+        .offset(0)
+        .lateral("keyed_score_members")
     )
-    statement = (
-        select(selected.c.family_revision_id, selected.c.root_record_id, revision.child_revision_id)
-        .select_from(selected)
-        .outerjoin(
-            child_source,
-            and_(
-                selected.c.family_revision_id == member.family_revision_id,
-                selected.c.root_record_id == member.root_record_id,
-                member.dataset_id == context.target.dataset_id,
-                member.schema_revision_id == context.target.schema_revision_id,
-                member.collection_slot == context.collection_slots_by_name[context.definition.query.child_collection],
-            ),
-        )
+    child_source = members.join(
+        inspect(revision).selectable,
+        and_(*(getattr(revision, name) == getattr(members.c, name) for name in identities)),
     )
-    return statement, member, revision
+    statement = select(
+        selected.c.family_revision_id, selected.c.root_record_id, revision.child_revision_id
+    ).select_from(selected.outerjoin(child_source, true()))
+    return statement, members.c, revision
 
 
 def _child_values(context, selected, fields, selectors, *, retained_columns=(), preserve_roots=False):
@@ -171,7 +179,8 @@ def _child_values(context, selected, fields, selectors, *, retained_columns=(), 
     values_by_field, states_by_field = {}, {}
     for index, field in enumerate(fields):
         if keyed_children is not None and field.field_id == selectors[0].field.field_id:
-            typed_value, state = keyed_children.c.selected_key_value, literal("value")
+            typed_value = member.selected_key_value if preserve_roots else keyed_children.c.selected_key_value
+            state = literal("value")
             if preserve_roots:
                 state = case((revision.child_revision_id.is_not(None), "value"))
             values_by_field[field.field_id], states_by_field[field.field_id] = typed_value, state
@@ -420,9 +429,11 @@ def _derived_child_values(context, plan, entity_values, fields, selectors, deriv
         typed_value.label(f"root_value_{index}") for index, typed_value in enumerate(root_values_by_field.values())
     )
     columns.extend(state.label(f"root_state_{index}") for index, state in enumerate(root_states_by_field.values()))
-    roots = statement.with_only_columns(*columns, maintain_column_froms=True).cte("derived_root_score_values")
-    if entity_values is not None or not _derived_only(context, plan):
-        roots = roots.prefix_with("MATERIALIZED")
+    roots = (
+        statement.with_only_columns(*columns, maintain_column_froms=True)
+        .cte("derived_root_score_values")
+        .prefix_with("MATERIALIZED")
+    )
     retained_columns = [roots.c.entity_value, roots.c.group_value]
     retained_columns.extend(roots.c[f"root_value_{index}"] for index in range(len(root_values_by_field)))
     retained_columns.extend(roots.c[f"root_state_{index}"] for index in range(len(root_states_by_field)))

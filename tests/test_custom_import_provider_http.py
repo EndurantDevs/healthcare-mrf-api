@@ -5,6 +5,7 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from sqlalchemy import literal, select
 from api import custom_import_provider_http as provider_http
 from api import custom_import_read_http as transport
 from api.endpoint import extension_reads
+from api.provider_list_sql import _provider_native_entity_scope
 from process.custom_import.read_contracts import CustomImportReadRequestError, CustomImportReadUnavailableError
 from process.custom_import.read_core import EntityFamilySet, PreparedNpiEntityRelation, ReadChild, ReadFieldValue
 from tests import custom_import_grouped_support as grouped_fixture
@@ -135,7 +137,7 @@ def _install(
             session.events.append("hydrate")
             return imported_items or {}
 
-    async def page(request, *, native_args, import_context):
+    async def page(request, *, native_args, import_context, native_scope_preparer):
         assert request.path == provider_http.CUSTOM_IMPORT_PROVIDERS_PATH
         assert native_args.getlist("name_like") == ["Synthetic", "Example"]
         assert native_args.get("include_total") == "true"
@@ -313,6 +315,41 @@ async def test_signed_provider_page_uses_one_snapshot_and_checks_empty_result_fi
         "finality",
         "end",
     ]
+
+
+@pytest.mark.asyncio
+async def test_provider_scope_retains_exact_prepared_for_hydration(monkeypatch):
+    session = _Session()
+    _install(monkeypatch, session)
+    scopes = []
+
+    async def page(_request, *, native_scope_preparer, **kwargs):
+        preparer = native_scope_preparer.__self__
+        original = kwargs["import_context"].prepared
+        scoped = replace(original, statement=select(literal("1104212877").label("entity_value")))
+
+        async def scope(same_session, **arguments):
+            assert same_session is session and arguments["prepared"] is original
+            assert arguments["query"] is preparer.query
+            scopes.append(arguments["native_entity_scope"])
+            return scoped
+
+        async def hydrate(same_session, **arguments):
+            assert same_session is session and arguments["prepared"] is scoped
+            session.events.append("scoped_hydrate")
+            return {}
+
+        preparer.service.scope_npi_entity_relation = scope
+        preparer.service.hydrate_npi_page = hydrate
+        context = await native_scope_preparer(_provider_native_entity_scope())
+        assert context.prepared is scoped and preparer.prepared is scoped
+        return response.json({"rows": [], "total": 0})
+
+    monkeypatch.setattr(provider_http, "_provider_page", page)
+    reply = await provider_http.serve_custom_import_providers(_request(), session)
+
+    assert reply.status == 200 and len(scopes) == 1
+    assert "scoped_hydrate" in session.events and not session.rolled_back
 
 
 @pytest.mark.asyncio

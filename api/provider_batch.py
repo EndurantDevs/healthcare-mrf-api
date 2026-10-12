@@ -75,7 +75,9 @@ def _batch_shape_params(batch_params, native_args):
     return options_by_field
 
 
-async def read_native_batch(request, batch_params, *, native_args, session, import_context=None):
+async def read_native_batch(
+    request, batch_params, *, native_args, session, import_context=None, native_scope_preparer=None
+):
     """Match every requested identity before paging successful native providers."""
 
     params = _batch_shape_params(batch_params, native_args)
@@ -89,7 +91,14 @@ async def read_native_batch(request, batch_params, *, native_args, session, impo
     ]
     witness_by_npi = {}
     eligible_npis = await _batch_eligible_npis(
-        request, native_args, import_context, params["npis"], found_npis, session, witness_rows=witness_by_npi
+        request,
+        native_args,
+        import_context,
+        params["npis"],
+        found_npis,
+        session,
+        witness_rows=witness_by_npi,
+        native_scope_preparer=native_scope_preparer,
     )
     effective_order = bool(
         (import_context is not None and import_context.prepared.normalized_order_terms) or native_args.get("order_by")
@@ -172,7 +181,15 @@ def _filter_batch_address_state(state, native_args):
 
 
 async def _batch_eligible_npis(
-    request, native_args, import_context, requested, found_npis, session, *, witness_rows=None
+    request,
+    native_args,
+    import_context,
+    requested,
+    found_npis,
+    session,
+    *,
+    witness_rows=None,
+    native_scope_preparer=None,
 ):
     exact_npi = npi._normalize_exact_npi(native_args.get("npi"))
     if exact_npi is not None:
@@ -189,7 +206,11 @@ async def _batch_eligible_npis(
         )
         args.update(page=["1"], limit=[str(len(requested))], start=["0"], view=["card"])
         reply = await npi.list_providers(
-            request, native_args=args, import_context=import_context, native_npis=tuple(requested)
+            request,
+            native_args=args,
+            import_context=import_context,
+            native_npis=tuple(requested),
+            native_scope_preparer=native_scope_preparer,
         )
         if reply.status != 200:
             raise CustomImportReadUnavailableError("native batch eligibility is unavailable")

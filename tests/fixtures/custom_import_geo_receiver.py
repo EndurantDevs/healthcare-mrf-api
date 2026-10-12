@@ -7,6 +7,7 @@ import asyncio
 import dataclasses
 import json
 import sys
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -68,19 +69,59 @@ class SyntheticSession(_Session):
     def __init__(self, target):
         super().__init__()
         self.target = target
-
-    async def connection(self):
-        return SimpleNamespace(
+        self._transaction = None
+        self._connection_transaction = None
+        self._repeatable_read_only = False
+        self._connection = SimpleNamespace(
             dialect=postgresql.dialect(),
             sync_connection=SimpleNamespace(get_execution_options=lambda: {}),
+            get_transaction=lambda: self._connection_transaction,
+            get_nested_transaction=lambda: None,
         )
+
+    @asynccontextmanager
+    async def begin(self):
+        assert not self.in_transaction()
+        self._transaction = SimpleNamespace(is_active=True)
+        self._connection_transaction = SimpleNamespace(is_active=True)
+        self.already_active = True
+        try:
+            async with super().begin():
+                yield self
+        finally:
+            self._transaction.is_active = False
+            self._connection_transaction.is_active = False
+            self._transaction = self._connection_transaction = None
+            self.already_active = self._repeatable_read_only = False
+
+    def get_transaction(self):
+        return self._transaction
+
+    def get_nested_transaction(self):
+        return None
+
+    async def connection(self):
+        return self._connection
 
     async def execute(self, statement, parameters=None):
         """Implement the session protocol with synthetic persisted result rows."""
+        return self._synthetic_statement_result(statement, parameters)
+
+    def _synthetic_statement_result(self, statement, parameters):
+        """Return synthetic transaction settings, page rows, or persisted metadata."""
         query_sql = str(statement)
         if "current_setting('statement_timeout')" in query_sql:
-            return SimpleNamespace(one_or_none=lambda: SimpleNamespace(timeout_text="0", timeout_milliseconds=0))
+            return SimpleNamespace(
+                one_or_none=lambda: SimpleNamespace(
+                    timeout_text="0",
+                    timeout_milliseconds=0,
+                    transaction_isolation="repeatable read" if self._repeatable_read_only else "read committed",
+                    transaction_read_only="on" if self._repeatable_read_only else "off",
+                )
+            )
         if query_sql == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY":
+            assert self.in_transaction()
+            self._repeatable_read_only = True
             return _result([])
         if ".resolve_custom_import_generation_snapshot(" in query_sql:
             return self._generation_snapshot_result(query_sql, parameters)
@@ -92,14 +133,14 @@ class SyntheticSession(_Session):
             _FIXTURE_STATE.request_event_by_name["native_page"] = True
             anchor = parameters.get("__custom_import_geo_cursor_npi")
             start = 0 if anchor is None else _NPIS.index(str(anchor)) + 1
-            rows = [
+            geo_rows = [
                 _geo_row(int(npi), f"00000000-0000-4000-8000-{index + 1:012d}", 10.0)
                 for index, npi in enumerate(_NPIS)
                 if index >= start
             ]
-            for row in rows:
-                row._mapping.update(_geo_total=len(_NPIS), _geo_anchor_count=1)
-            return SimpleNamespace(all=lambda: rows[: parameters["__custom_import_geo_page_limit"]])
+            for geo_row in geo_rows:
+                geo_row._mapping.update(_geo_total=len(_NPIS), _geo_anchor_count=1)
+            return SimpleNamespace(all=lambda: geo_rows[: parameters["__custom_import_geo_page_limit"]])
 
         return self._persisted_result_rows(statement)
 

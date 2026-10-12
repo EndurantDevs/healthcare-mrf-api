@@ -20,6 +20,7 @@ from api.custom_import_provider_http import (
     _parse_provider_request,
     _provider_relation_query,
     _provider_response_limit,
+    _ProviderScopePreparer,
 )
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
 from process.custom_import.read_contracts import (
@@ -76,12 +77,14 @@ class _GeoCursorBinding:
     trusted_now: int
     query_fingerprint: str | None = None
     prior_cursor: GeoCursorState | None = None
+    scope_preparer: _ProviderScopePreparer | None = None
 
     async def prepare(self, *, session: Any, **effective_query: Any) -> tuple[str, str] | None:
         """Open the cursor only against the complete effective native query."""
 
         if session is not self.session or self.query_fingerprint is not None:
             raise CustomImportReadUnavailableError("provider geo snapshot is unavailable")
+        prepared = self.import_context.prepared if self.scope_preparer is None else self.scope_preparer.prepared
         self.query_fingerprint = hashlib.sha256(
             canonical_read_document(
                 {
@@ -90,7 +93,7 @@ class _GeoCursorBinding:
                         name: self.native_args.getlist(name) for name in self.native_args if name != "cursor"
                     },
                     "effective_query": effective_query,
-                    "import_query": self.import_context.prepared.query_fingerprint,
+                    "import_query": prepared.query_fingerprint,
                     "require_match": self.import_context.require_match,
                 }
             )
@@ -103,7 +106,7 @@ class _GeoCursorBinding:
             secret=self.secret,
             pinned_target=self.pinned_target,
             query_fingerprint=self.query_fingerprint,
-            authorization_scope_sha256=self.import_context.prepared.authorization_scope_sha256,
+            authorization_scope_sha256=prepared.authorization_scope_sha256,
             trusted_now=self.trusted_now,
         )
         return self.prior_cursor.anchor_npi, self.prior_cursor.anchor_address_key
@@ -184,6 +187,7 @@ async def _read_geo_payload(request, session, parsed, verified, cursor_secret, t
         query=query,
     )
     context = ProviderImportQuery(prepared, compile_npi_entity_relation(prepared.statement), query.require_match)
+    scope_preparer = _ProviderScopePreparer(session, service, authorization, pinned_target, query, prepared)
     binding = _GeoCursorBinding(
         session,
         pinned_target,
@@ -191,16 +195,21 @@ async def _read_geo_payload(request, session, parsed, verified, cursor_secret, t
         parsed.native_args,
         cursor_secret,
         int(transport._canonical_utc(trusted_now)[1].timestamp()),
+        scope_preparer=scope_preparer,
     )
     reply = await _geo_page(
-        request, native_args=parsed.native_args, import_context=context, prepare_cursor=binding.prepare
+        request,
+        native_args=parsed.native_args,
+        import_context=context,
+        prepare_cursor=binding.prepare,
+        native_scope_preparer=scope_preparer.prepare_provider_scope,
     )
     if reply.status != 200 or len(reply.body) > transport._MAX_RESPONSE_BYTES:
         raise CustomImportReadUnavailableError("provider geo response is unavailable")
     geo_payload = _geo_payload(reply.body, int(parsed.native_args.get("limit", "5")))
     geo_payload["next_cursor"] = binding.next_cursor(geo_payload.pop("_custom_import_next_anchor"))
     await _hydrate_provider_rows(
-        session, service, authorization, pinned_target, prepared, parsed, query, geo_payload["items"]
+        session, service, authorization, pinned_target, scope_preparer.prepared, parsed, query, geo_payload["items"]
     )
     await verify_published_generation(session, pinned_target)
     return geo_payload

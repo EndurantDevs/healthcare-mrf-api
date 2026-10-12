@@ -12384,7 +12384,7 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
                 provider_table.c.zip5,
             )
         )
-        claims_statements = build_provider_service_claims_statements(
+        claims_statements = await build_provider_service_claims_statements(
             grouped, import_context, min_claims, min_total_cost, order_by, order
         )
         count_result = await session.execute(claims_statements.count_statement)

@@ -345,3 +345,47 @@ async def test_by_service_import_context_rejects_nonclaims_branches(branch_args)
             native_args={"code": "99213", "code_system": "CPT", **branch_args},
             import_context=service_sql.ProviderServiceImportQuery(_prepared(), require_match=True),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("min_claims,min_cost", ((None, None), (10, None), (None, 20), (10, 20)))
+async def test_native_service_scope_filters_aggregates_before_scoring(min_claims, min_cost):
+    claims = Table(
+        "synthetic_claims",
+        MetaData(),
+        Column("npi", String),
+        Column("total_services", Float),
+        Column("total_allowed_amount", Float),
+    )
+    prepared = _prepared()
+    scope_preparer = AsyncMock(return_value=prepared)
+    context = service_sql.ProviderServiceImportQuery(prepared, True, scope_preparer)
+    grouped, scoped = await service_sql._prepare_provider_service_native_scope(
+        select(claims), context, min_claims, min_cost
+    )
+    scope = scope_preparer.await_args.args[0]
+    sql = _compiled(scope)
+    assert "native_score_claims AS MATERIALIZED" in sql
+    assert "SELECT DISTINCT native_score_claims.npi" in sql
+    assert ("total_services >=" in sql) is (min_claims is not None)
+    assert ("total_allowed_amount >=" in sql) is (min_cost is not None)
+    assert "LIMIT" not in sql and "OFFSET" not in sql
+    assert "SELECT native_score_claims.npi" in _compiled(grouped)
+    assert scoped.prepared is prepared and scoped.require_match is True
+
+
+def test_native_scope_preparer_rejects_noncallable():
+    with pytest.raises(CustomImportReadUnavailableError, match="native scope preparer"):
+        service_sql.ProviderServiceImportQuery(_prepared(), True, object())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window", ("limit", "offset", "fetch", "order_by"))
+async def test_scoped_service_rejects_paging_before_wrapping(window):
+    grouped = select(literal("1000000001").label("npi"))
+    grouped = getattr(grouped, window)(1 if window != "order_by" else grouped.selected_columns.npi)
+    scope_preparer = AsyncMock(return_value=_prepared())
+    context = service_sql.ProviderServiceImportQuery(_prepared(), True, scope_preparer)
+    with pytest.raises(CustomImportReadUnavailableError, match="not unpaged"):
+        await service_sql._prepare_provider_service_native_scope(grouped, context, None, None)
+    scope_preparer.assert_not_awaited()

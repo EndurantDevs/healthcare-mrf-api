@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from sqlalchemy import BigInteger, column, select, values
 from sqlalchemy.dialects import postgresql
 
 from process.custom_import import read_core
@@ -146,6 +147,223 @@ async def test_provider_hydration_reuses_verified_metadata_for_chunks_and_empty_
     assert read_core.verify_published_generation.await_count == 4
     assert service._prepared_read_context.context is context
     assert "definition" not in repr(service._prepared_read_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("public_bound", [None, ("1000000001",)])
+async def test_native_scope_reuses_context_and_preserves_query_identity(monkeypatch, grouped, public_bound):
+    context = _install_context(monkeypatch)
+    query = read_core.NpiEntityRelationQuery(entity_values=public_bound)
+    if grouped:
+        context, query = grouped_fixture.context(), grouped_fixture.query(entity_values=public_bound)
+        read_core._load_read_context.return_value = context
+    authorizer = Mock(wraps=query_fixture._Allow())
+    service = read_core.CustomImportReadService(authorizer=authorizer)
+    session = _transaction_session()
+    authorization = ExtensionReadAuthorization("synthetic")
+    prepared = await service.prepare_npi_entity_relation(
+        session, authorization=authorization, target=context.target, query=query
+    )
+    native_rows = (
+        values(column("npi_code", BigInteger))
+        .data([(1000000001 + index,) for index in range(201)])
+        .cte("eligible_native_providers")
+    )
+    scoped = await service.scope_npi_entity_relation(
+        session,
+        authorization=authorization,
+        pinned_target=context.target,
+        prepared=prepared,
+        query=query,
+        native_entity_scope=select(native_rows.c.npi_code),
+    )
+    assert scoped is not prepared
+    assert scoped.query_fingerprint == prepared.query_fingerprint
+    assert scoped.authorization_scope_sha256 == prepared.authorization_scope_sha256
+    assert scoped.normalized_order_terms == prepared.normalized_order_terms
+    assert scoped.effective_require_match == prepared.effective_require_match
+    assert query.entity_values is public_bound
+    compiled = scoped.statement.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "eligible_native_providers" in sql and "CAST(native_score_entities.npi_code AS VARCHAR)" in sql
+    assert "LIMIT" not in sql and "OFFSET" not in sql
+    assert all(1000000001 + index in compiled.params.values() for index in range(201))
+    if public_bound is not None:
+        assert list(public_bound) in compiled.params.values()
+    assert service._prepared_read_context.prepared is scoped
+    assert service._prepared_read_context.context is context
+    assert (
+        await service.hydrate_npi_page(
+            session,
+            authorization=authorization,
+            pinned_target=context.target,
+            prepared=scoped,
+            entity_values=(),
+            query=query,
+        )
+        == {}
+    )
+    read_core._load_read_context.assert_awaited_once_with(session, context.target)
+    assert authorizer.authorize.call_count == 3
+    read_core.verify_published_generation.assert_awaited_once_with(session, context.target)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "session",
+        "transaction",
+        "root_transaction",
+        "nested_transaction",
+        "connection_nested_transaction",
+        "inactive_transaction",
+        "inactive_root",
+        "missing_connection_transaction",
+        "missing_connection_nested_transaction",
+        "copied_prepared",
+        "other_service",
+        "target",
+        "read_committed",
+    ],
+)
+async def test_native_scope_rejects_foreign_or_stale_context(monkeypatch, changed):
+    context = _install_context(monkeypatch)
+    service = read_core.CustomImportReadService(authorizer=query_fixture._Allow())
+    session = _transaction_session()
+    authorization = ExtensionReadAuthorization("synthetic")
+    query = read_core.NpiEntityRelationQuery()
+    prepared = await service.prepare_npi_entity_relation(session, authorization=authorization, target=context.target)
+    pinned_target = context.target
+    if changed == "session":
+        session = _transaction_session()
+    elif changed in {"transaction", "root_transaction", "nested_transaction", "connection_nested_transaction"}:
+        setattr(session, changed, SimpleNamespace(is_active=True))
+    elif changed == "inactive_transaction":
+        session.transaction.is_active = False
+    elif changed == "inactive_root":
+        session.root_transaction.is_active = False
+    if changed == "missing_connection_transaction":
+        del session.connection.return_value.get_transaction
+    elif changed == "missing_connection_nested_transaction":
+        del session.connection.return_value.get_nested_transaction
+    if changed == "copied_prepared":
+        prepared = replace(prepared)
+    if changed == "other_service":
+        service = read_core.CustomImportReadService(authorizer=query_fixture._Allow())
+    if changed == "target":
+        pinned_target = replace(pinned_target, generation_id=pinned_target.generation_id + 1)
+    if changed == "read_committed":
+
+        @asynccontextmanager
+        async def read_committed(_session, *, timeout_ms):
+            yield False
+
+        monkeypatch.setattr(read_core, "_bounded_read_window", read_committed)
+    with pytest.raises(CustomImportReadUnavailableError, match="native scope context"):
+        await service.scope_npi_entity_relation(
+            session,
+            authorization=authorization,
+            pinned_target=pinned_target,
+            prepared=prepared,
+            query=query,
+            native_entity_scope=select(column("npi_code", BigInteger)),
+        )
+    assert service._prepared_read_context is None
+    read_core._load_read_context.assert_awaited_once()
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("changed", ["query", "scope", "authorization", "paged_scope", "missing_scope"])
+async def test_native_scope_rejects_changed_identity_before_storage(monkeypatch, grouped, changed):
+    context = _install_context(monkeypatch)
+    query = read_core.NpiEntityRelationQuery()
+    if grouped:
+        context, query = grouped_fixture.context(), grouped_fixture.query()
+        read_core._load_read_context.return_value = context
+    authorizer = Mock(wraps=query_fixture._Allow())
+    service = read_core.CustomImportReadService(authorizer=authorizer)
+    session = _transaction_session()
+    authorization = ExtensionReadAuthorization("synthetic")
+    prepared = await service.prepare_npi_entity_relation(
+        session, authorization=authorization, target=context.target, query=query
+    )
+    native_scope = select(column("npi_code", BigInteger))
+    error = CustomImportReadUnavailableError
+    if changed == "query":
+        query = replace(query, entity_values=("1000000001",))
+    elif changed == "scope":
+        authorizer.authorize.return_value = read_core.ExtensionReadScope("synthetic:changed")
+    elif changed == "authorization":
+        authorizer.authorize.side_effect = ValueError("revoked")
+        error = CustomImportReadAuthorizationError
+    elif changed == "paged_scope":
+        native_scope = native_scope.limit(1)
+        error = CustomImportReadRequestError
+    else:
+        native_scope = None
+        error = CustomImportReadRequestError
+    with pytest.raises(error):
+        await service.scope_npi_entity_relation(
+            session,
+            authorization=authorization,
+            pinned_target=context.target,
+            prepared=prepared,
+            query=query,
+            native_entity_scope=native_scope,
+        )
+    assert service._prepared_read_context is None
+    read_core._load_read_context.assert_awaited_once()
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["transaction", "cancelled", "restoration", "inactive_after_window"])
+async def test_failed_native_scope_never_retains_context(monkeypatch, failure):
+    context = _install_context(monkeypatch)
+    service = read_core.CustomImportReadService(authorizer=query_fixture._Allow())
+    session = _transaction_session()
+    authorization = ExtensionReadAuthorization("synthetic")
+    prepared = await service.prepare_npi_entity_relation(session, authorization=authorization, target=context.target)
+    error = CustomImportReadUnavailableError
+    if failure == "transaction":
+        prepare = read_core._prepare_single_family_relation
+
+        def changed_transaction(*args, **kwargs):
+            scoped = prepare(*args, **kwargs)
+            session.root_transaction = SimpleNamespace(is_active=True)
+            return scoped
+
+        monkeypatch.setattr(read_core, "_prepare_single_family_relation", changed_transaction)
+    else:
+        error = asyncio.CancelledError if failure == "cancelled" else CustomImportReadUnavailableError
+
+        @asynccontextmanager
+        async def failed_window(_session, *, timeout_ms):
+            if failure == "cancelled":
+                raise error()
+            yield True
+            if failure == "inactive_after_window":
+                session.root_transaction.is_active = False
+                return
+            raise error("restore failed")
+
+        monkeypatch.setattr(read_core, "_bounded_read_window", failed_window)
+    with pytest.raises(error):
+        await service.scope_npi_entity_relation(
+            session,
+            authorization=authorization,
+            pinned_target=context.target,
+            prepared=prepared,
+            query=read_core.NpiEntityRelationQuery(),
+            native_entity_scope=select(column("npi_code", BigInteger)),
+        )
+    assert service._prepared_read_context is None
+    read_core._load_read_context.assert_awaited_once()
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

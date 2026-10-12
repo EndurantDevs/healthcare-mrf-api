@@ -305,14 +305,17 @@ def _child_predicates(plan):
     )
 
 
-def prepare_relation(context, query, scope):
+def prepare_relation(context, query, scope, *, native_entity_scope=None):
     """Return one deduplicated NPI and one explicit-group ordering tuple."""
 
     from process.custom_import.grouped_query import relation_statement
 
     plan = normalize_plan(context, query, scope)
+    entity_values = query.entity_values
+    if native_entity_scope is not None:
+        entity_values = core._native_entity_values(native_entity_scope, entity_values)
     return core.PreparedNpiEntityRelation(
-        relation_statement(context, plan, query.entity_values),
+        relation_statement(context, plan, entity_values),
         plan.order_terms,
         plan.fingerprint,
         core._scope_digest(scope),

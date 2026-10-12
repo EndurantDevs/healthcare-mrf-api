@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import literal, select, text, union_all
+from sqlalchemy import BigInteger, String, cast, literal, select, text, union_all
 from sqlalchemy.dialects.postgresql import dialect
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
@@ -222,6 +222,208 @@ def test_native_candidates_keep_pinned_scope_and_indexed_imported_membership(mon
     assert "eligible_native AS MATERIALIZED" in sql
     assert f"LEFT JOIN pg_temp.{plan_sql.IMPORTED} imported ON imported.npi = native.npi" in sql
     assert parameters_by_name["shared_snapshot_key"] == 1
+
+
+def test_native_score_union_isolates_binding_parameters(monkeypatch):
+    monkeypatch.setattr(serving, "_manifest_provider_predicates", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(serving, "_ptg2_npi_scope_table", lambda _tables: "synthetic.native_npi_scope")
+    monkeypatch.setattr(
+        serving,
+        "_unpaged_membership_location_sql",
+        lambda _context: "SELECT CAST(:location_npi AS bigint) AS npi, :radius AS distance_miles, '' AS location_hash",
+    )
+    scopes = [
+        imported._NativeScope(
+            binding,
+            SimpleNamespace(shared_snapshot_key=index + 1, uses_shared_blocks=True),
+            {"npi": str(9000000001 + index)},
+            SimpleNamespace(
+                parameter_map={"location_npi": 9000000001 + index, "radius": index + 0.5, "limit": 25, "offset": 5000}
+            ),
+        )
+        for index, binding in enumerate(_selection(2).in_network_bindings)
+    ]
+    statement = imported._native_score_scope([(scope, [dict(code_key=1)]) for scope in scopes], serving)
+    compiled = statement.compile(dialect=dialect())
+    assert isinstance(statement.selected_columns.npi.type, BigInteger)
+    assert str(compiled).startswith("SELECT DISTINCT") and "UNION ALL" in str(compiled)
+    assert "LIMIT" not in str(compiled) and "OFFSET" not in str(compiled)
+    assert not any(name.startswith(("limit", "offset")) for name in compiled.params)
+    for name, expected in (
+        ("shared_snapshot_key", {1, 2}),
+        ("provider_npi", {9000000001, 9000000002}),
+        ("location_npi", {9000000001, 9000000002}),
+        ("radius", {0.5, 1.5}),
+    ):
+        assert {
+            parameter_value
+            for parameter_name, parameter_value in compiled.params.items()
+            if parameter_name.startswith(name + "_")
+        } == expected
+    assert all(isinstance(bind.type, BigInteger) for bind in compiled.binds.values() if "provider_npi" in bind.key)
+
+
+@pytest.mark.parametrize("selector", ("none", "npi", "provider", "location"))
+def test_native_score_scope_uses_actual_native_selectivity(monkeypatch, selector):
+    monkeypatch.setattr(
+        serving,
+        "_manifest_provider_predicates",
+        lambda *_args, **_kwargs: ["native.npi > 0"] if selector == "provider" else [],
+    )
+    monkeypatch.setattr(serving, "_ptg2_npi_scope_table", lambda _tables: "synthetic.native_npi_scope")
+    monkeypatch.setattr(
+        serving,
+        "_unpaged_membership_location_sql",
+        lambda _context: "SELECT 1000000001 AS npi, 0 AS distance_miles, '' AS location_hash",
+    )
+    scope = imported._NativeScope(
+        _selection().in_network_bindings[0],
+        SimpleNamespace(shared_snapshot_key=1, uses_shared_blocks=True),
+        {"npi": "1000000001"} if selector == "npi" else {},
+        SimpleNamespace(parameter_map={}) if selector == "location" else None,
+    )
+    assert (imported._native_score_scope([(scope, [dict(code_key=1)])], serving) is None) == (selector == "none")
+    assert imported._native_score_scope([], serving) is None
+
+
+def _install_score_scope_flow(monkeypatch, scopes, code_rows):
+    monkeypatch.setattr(imported, "_native_scopes", AsyncMock(return_value=scopes))
+    monkeypatch.setattr(imported, "load_sealed_code_rows", AsyncMock(side_effect=code_rows))
+    monkeypatch.setattr(serving, "_manifest_provider_predicates", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(serving, "_ptg2_npi_scope_table", lambda _tables: "synthetic.native_npi_scope")
+    monkeypatch.setattr(imported, "_stage_scope", AsyncMock())
+    monkeypatch.setattr(imported, "_select_native_entries", AsyncMock(return_value=(0, [])))
+    monkeypatch.setattr(imported, "_hydrate_selected_entries", AsyncMock(return_value=[]))
+    return SimpleNamespace(execute=AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_native_plan_scope_precedes_score_compile(monkeypatch):
+    scopes = [
+        imported._NativeScope(
+            binding,
+            SimpleNamespace(shared_snapshot_key=index + 1, uses_shared_blocks=True),
+            {"npi": str(1000000001 + index)} if index == 0 else {},
+            None,
+        )
+        for index, binding in enumerate(_selection(3).in_network_bindings)
+    ]
+    session = _install_score_scope_flow(monkeypatch, scopes, [[dict(code_key=1)], [], [dict(code_key=3)]])
+    query = _import_context()
+    events, prepared_scoped = [], []
+    compiler = imported.compile_npi_entity_relation
+
+    async def scope_scores(native_scope):
+        events.append("scope")
+        compiled = native_scope.compile(dialect=dialect())
+        assert {
+            parameter_value
+            for parameter_name, parameter_value in compiled.params.items()
+            if parameter_name.startswith("shared_snapshot_key_")
+        } == {1, 3}
+        assert "UNION ALL" in str(compiled) and "LIMIT" not in str(compiled) and "OFFSET" not in str(compiled)
+        native = native_scope.subquery()
+        prepared = replace(
+            query.prepared,
+            statement=query.prepared.statement.where(
+                query.prepared.statement.selected_columns.entity_value.in_(select(cast(native.c.npi, String)))
+            ),
+        )
+        prepared_scoped.append(prepared)
+        return prepared
+
+    def compile_scores(statement):
+        events.append("compile")
+        assert statement is prepared_scoped[0].statement
+        return compiler(statement)
+
+    async def stage_scores(_session, scoped, compiled):
+        events.append("stage")
+        assert scoped.prepared is prepared_scoped[0]
+        assert "native_plan_score_scope" in compiled.sql
+
+    scope_callback = AsyncMock(side_effect=scope_scores)
+    monkeypatch.setattr(imported, "compile_npi_entity_relation", compile_scores)
+    monkeypatch.setattr(imported, "_stage_imported_scores", AsyncMock(side_effect=stage_scores))
+    response = await imported.search_imported_plan_providers(
+        session,
+        {},
+        SimpleNamespace(offset=0, limit=2, page=1),
+        _selection(3),
+        replace(query, native_scope_preparer=scope_callback),
+    )
+    assert events == ["scope", "compile", "stage"]
+    scope_callback.assert_awaited_once()
+    assert [call.args[1] for call in imported._stage_scope.await_args_list] == [scopes[0], scopes[2]]
+    assert all(call.args[3].prepared is prepared_scoped[0] for call in imported._stage_scope.await_args_list)
+    assert response["pagination"]["total"] == 0 and response["pagination"]["total_is_exact"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ("no_selectivity", "no_callback", "no_code"))
+async def test_native_plan_preserves_score_first_fallback(monkeypatch, case):
+    scope = imported._NativeScope(
+        _selection().in_network_bindings[0],
+        SimpleNamespace(shared_snapshot_key=1, uses_shared_blocks=True),
+        {"npi": "1000000001"} if case != "no_selectivity" else {},
+        None,
+    )
+    session = _install_score_scope_flow(monkeypatch, [scope], [[] if case == "no_code" else [dict(code_key=1)]])
+    query = _import_context()
+    callback = AsyncMock(side_effect=AssertionError("fallback must not scope scores"))
+    query = replace(query, native_scope_preparer=None if case == "no_callback" else callback)
+    compile_scores = imported.compile_npi_entity_relation
+    compiler = AsyncMock() if case == "no_code" else None
+    events = []
+
+    def record_compile(statement):
+        events.append("compile")
+        assert statement is query.prepared.statement
+        return compile_scores(statement)
+
+    monkeypatch.setattr(imported, "compile_npi_entity_relation", compiler or record_compile)
+    monkeypatch.setattr(
+        imported, "_stage_imported_scores", AsyncMock(side_effect=lambda *_args: events.append("stage"))
+    )
+    await imported.search_imported_plan_providers(
+        session, {}, SimpleNamespace(offset=0, limit=2, page=1), _selection(), query
+    )
+    callback.assert_not_awaited()
+    if case == "no_code":
+        compiler.assert_not_called()
+        imported._stage_imported_scores.assert_not_awaited()
+        imported._stage_scope.assert_not_awaited()
+        assert events == []
+    else:
+        assert events == ["compile", "stage"]
+
+
+@pytest.mark.asyncio
+async def test_native_plan_scope_failure_stops_before_staging(monkeypatch):
+    scope = imported._NativeScope(
+        _selection().in_network_bindings[0],
+        SimpleNamespace(shared_snapshot_key=1, uses_shared_blocks=True),
+        {"npi": "1000000001"},
+        None,
+    )
+    session = _install_score_scope_flow(monkeypatch, [scope], [[dict(code_key=1)]])
+    callback = AsyncMock(side_effect=PlanPricingProjectionUnavailable("native scope unavailable"))
+    compiler = AsyncMock()
+    monkeypatch.setattr(imported, "compile_npi_entity_relation", compiler)
+    monkeypatch.setattr(imported, "_stage_imported_scores", AsyncMock())
+    with pytest.raises(PlanPricingProjectionUnavailable, match="native scope unavailable"):
+        await imported.search_imported_plan_providers(
+            session,
+            {},
+            SimpleNamespace(offset=0, limit=2, page=1),
+            _selection(),
+            replace(_import_context(), native_scope_preparer=callback),
+        )
+    callback.assert_awaited_once()
+    compiler.assert_not_called()
+    imported._stage_imported_scores.assert_not_awaited()
+    imported._stage_scope.assert_not_awaited()
+    session.execute.assert_not_awaited()
 
 
 def _typed_import_context(first_value, second_value, *, ordered=True, nulls="last"):

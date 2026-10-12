@@ -5,13 +5,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from sanic.exceptions import InvalidUsage
 from sanic.request.parameters import RequestParameters
-from sqlalchemy import Integer, literal, select, text
+from sqlalchemy import Integer, String, literal, select, text
 
 from api import provider_list_sql as provider_list_sql_module
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
@@ -157,16 +158,22 @@ async def _run_imported_page(
     *,
     direction: str | None,
     require_match: bool,
+    native_scope_preparer=None,
+    native_args=None,
 ) -> tuple[dict[str, Any], _TransactionConnection, _Session, ProviderImportQuery]:
     connection = _TransactionConnection()
     session = _Session(connection)
     context = _import_context(direction=direction, require_match=require_match)
+
+    async def prepare_scope(native_entity_scope):
+        return _scoped_import_context(context, native_entity_scope)
+
     _configure_imported_page_dependencies(monkeypatch)
     request = SimpleNamespace(
         args={"q": "ignored-by-signed-request"},
         ctx=SimpleNamespace(sa_session=session),
     )
-    native_args = RequestParameters(
+    native_args = native_args or RequestParameters(
         {
             "include_total": ["true"],
             "limit": ["1"],
@@ -179,10 +186,63 @@ async def _run_imported_page(
         request,
         native_args=native_args,
         import_context=context,
+        native_scope_preparer=prepare_scope if native_scope_preparer is None else native_scope_preparer,
     )
 
     assert session.events == ["page", "taxonomy", "status", "enrichment"]
     return json.loads(reply.body), connection, session, context
+
+
+def _scoped_import_context(context, native_entity_scope):
+    relation = context.prepared.statement.subquery()
+    native_entities = native_entity_scope.cte("native_test_entities")
+    statement = select(*relation.c).where(relation.c.entity_value.in_(select(native_entities.c[0].cast(String))))
+    prepared = replace(context.prepared, statement=statement)
+    return replace(context, prepared=prepared, compiled=compile_npi_entity_relation(statement))
+
+
+@pytest.mark.asyncio
+async def test_provider_scores_use_complete_native_eligibility(monkeypatch):
+    scopes = []
+    context = _import_context(direction="desc", require_match=True)
+
+    async def prepare_scope(native_entity_scope):
+        scopes.append(native_entity_scope)
+        return _scoped_import_context(context, native_entity_scope)
+
+    body, connection, _, _ = await _run_imported_page(
+        monkeypatch, direction="desc", require_match=True, native_scope_preparer=prepare_scope
+    )
+
+    assert body["total"] == 501
+    assert len(scopes) == 1 and len(scopes[0].selected_columns) == 1
+    page_sql = connection.calls[0][0]
+    native_sql, score_sql = page_sql.split("custom_import_provider_relation AS", 1)
+    assert native_sql.count("native_eligible_npis AS MATERIALIZED") == 1
+    assert "regexp_replace(COALESCE(c.telephone_number" in native_sql
+    assert "LIMIT" not in native_sql and "candidate_limit" not in native_sql
+    assert "native_eligible_npis.npi" in score_sql
+    assert "ROW_NUMBER() OVER" in score_sql
+
+
+@pytest.mark.asyncio
+async def test_national_score_search_keeps_import_first_planning(monkeypatch):
+    async def prepare_scope(_native_entity_scope):
+        raise AssertionError("national score query collected all native providers")
+
+    body, connection, _, _ = await _run_imported_page(
+        monkeypatch,
+        direction="desc",
+        require_match=True,
+        native_scope_preparer=prepare_scope,
+        native_args=RequestParameters({"include_total": ["true"], "limit": ["1"], "start": ["0"]}),
+    )
+
+    page_sql = connection.calls[0][0]
+    assert body["total"] == 501
+    assert "native_eligible_npis AS MATERIALIZED" not in page_sql
+    assert page_sql.index("custom_import_provider_relation AS") < page_sql.index("SELECT DISTINCT c.npi AS npi")
+    assert "(c.npi)::bigint IN (SELECT CASE" in page_sql
 
 
 @pytest.mark.asyncio
@@ -212,9 +272,13 @@ async def test_imported_order_page_keeps_native_rows_and_uses_one_transaction(
     assert "LEFT JOIN custom_import_provider_relation AS imported" in page_sql
     assert page_sql.index("LEFT JOIN custom_import_provider_relation AS imported") < page_sql.index("LIMIT :limit")
     assert ("WHERE imported.entity_value IS NOT NULL" in page_sql) is require_match
-    native_eligibility = page_sql.split("SELECT DISTINCT c.npi AS npi", 1)[1].split("AS eligible_npi", 1)[0]
-    assert ("(c.npi)::bigint IN (SELECT CASE" in native_eligibility) is require_match
-    assert ("EXISTS (SELECT 1 FROM custom_import_provider_relation" in native_eligibility) is require_match
+    native_eligibility = page_sql.split("native_eligible_npis AS MATERIALIZED", 1)[1].split(
+        "custom_import_provider_relation AS", 1
+    )[0]
+    assert "SELECT DISTINCT c.npi AS npi" in native_eligibility
+    assert "EXISTS (SELECT 1 FROM custom_import_provider_relation" not in native_eligibility
+    assert "LIMIT" not in native_eligibility
+    assert page_sql.index("native_eligible_npis AS MATERIALIZED") < page_sql.index("custom_import_provider_relation AS")
     assert "ROW_NUMBER() OVER" in page_sql
     assert "_provider_page_position" in page_sql
     assert "candidate_limit" not in count_parameters
@@ -243,9 +307,9 @@ async def test_imported_filter_page_uses_one_correlated_membership_predicate(
     page_sql = connection.calls[0][0]
     count_sql = page_sql
     predicate = "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported"
-    assert count_sql.count(predicate) == 1
-    assert page_sql.count(predicate) == 1
-    assert "(c.npi)::bigint IN (SELECT CASE" in page_sql
+    assert count_sql.count(predicate) == 0
+    assert page_sql.count(predicate) == 0
+    assert "WHERE imported.entity_value IS NOT NULL" in page_sql
     assert "matching_npis AS MATERIALIZED" in page_sql
     assert set(context.compiled.values) <= set(connection.calls[0][1])
     assert not any("SELECT COUNT(DISTINCT" in call[0] for call in connection.calls)
@@ -743,6 +807,10 @@ async def test_postgres_generated_provider_list_count_page_and_lateral_hydration
     monkeypatch,
 ):
     ordered_context, _ = _postgres_order_contexts("asc")
+
+    async def prepare_scope(native_entity_scope):
+        return _scoped_import_context(ordered_context, native_entity_scope)
+
     async with transaction_session() as session:
         await _seed_postgres_provider_list_tables(session)
         _configure_postgres_provider_list(monkeypatch)
@@ -750,6 +818,7 @@ async def test_postgres_generated_provider_list_count_page_and_lateral_hydration
             SimpleNamespace(args={}, ctx=SimpleNamespace(sa_session=session)),
             native_args=RequestParameters({"include_total": ["true"], "limit": ["4"], "start": ["0"]}),
             import_context=ordered_context,
+            native_scope_preparer=prepare_scope,
         )
         calls = session.info["provider_list_calls"]
 
@@ -772,6 +841,10 @@ async def test_postgres_imported_phone_keeps_overlay_and_rows_past_candidate_lim
     monkeypatch,
 ):
     phone_filter_context = _postgres_phone_filter_context()
+
+    async def prepare_scope(native_entity_scope):
+        return _scoped_import_context(phone_filter_context, native_entity_scope)
+
     async with transaction_session() as session:
         await _seed_postgres_phone_provider_list_tables(session)
         _configure_postgres_provider_list(monkeypatch)
@@ -791,6 +864,7 @@ async def test_postgres_imported_phone_keeps_overlay_and_rows_past_candidate_lim
                 }
             ),
             import_context=phone_filter_context,
+            native_scope_preparer=prepare_scope,
         )
         calls = session.info["provider_list_calls"]
 

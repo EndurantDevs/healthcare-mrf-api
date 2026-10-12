@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -184,6 +185,47 @@ async def test_native_service_npi_normalization_scopes_imports_without_changing_
         _request(_body(native_query={"code_system": "CPT", "code": "99213", "npi": raw, "limit": "2"})), session
     )
     assert reply.status == 200 and observed_scopes == [(expected, raw)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope_failure", (False, True))
+async def test_service_native_scope_updates_hydration_or_rolls_back(monkeypatch, scope_failure):
+    session = _Session()
+    page_items = [{"npi": "1104212877"}]
+    _install(monkeypatch, session, page_items=page_items)
+    read_service = service_http.CustomImportReadService
+    original_hydrate = read_service.hydrate_npi_page
+    observed_by_stage = {}
+
+    async def scope_relation(self, same_session, **kwargs):
+        assert same_session is session and kwargs["query"].require_match is True
+        observed_by_stage["original"] = kwargs["prepared"]
+        if scope_failure:
+            raise CustomImportReadUnavailableError("synthetic scoped read failure")
+        scoped = replace(kwargs["prepared"], statement=select(literal("1104212877").label("entity_value")))
+        observed_by_stage["scoped"] = scoped
+        return scoped
+
+    async def hydrate_scoped(self, same_session, **kwargs):
+        assert kwargs["prepared"] is observed_by_stage["scoped"]
+        assert kwargs["prepared"] is not observed_by_stage["original"]
+        observed_by_stage["hydrated"] = True
+        return await original_hydrate(self, same_session, **kwargs)
+
+    async def scoped_page(request, *, native_args, import_context):
+        scoped = await import_context.scope_native(select(literal("1104212877").label("npi")))
+        assert scoped.prepared is observed_by_stage["scoped"]
+        return response.json(
+            {"items": page_items, "pagination": {"total": 1}, "query": {"code_system": "CPT", "code": "99213"}}
+        )
+
+    monkeypatch.setattr(read_service, "scope_npi_entity_relation", scope_relation, raising=False)
+    monkeypatch.setattr(read_service, "hydrate_npi_page", hydrate_scoped)
+    monkeypatch.setattr(service_http, "_service_page", scoped_page)
+    reply = await service_http.serve_custom_import_provider_service(_request(), session)
+    assert reply.status == (503 if scope_failure else 200)
+    assert session.rolled_back is scope_failure
+    assert observed_by_stage.get("hydrated", False) is not scope_failure
 
 
 @pytest.mark.parametrize(

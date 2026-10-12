@@ -14,12 +14,30 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import text
 
 from api import custom_import_read_http as transport
 from process.custom_import.read_contracts import PinnedReadTarget
 from process.custom_import.read_identity import resolve_generation_snapshot
 from tests import test_custom_import_read_http as headers
 from tests.fixtures import custom_import_geo_receiver as fixture
+
+async def verify_transaction_protocol():
+    session = fixture.SyntheticSession({})
+    assert await fixture.read_core._read_transaction_identity(session) is None
+    async with session.begin():
+        assert session.in_transaction()
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        first = await fixture.read_core._read_transaction_identity(session)
+        assert first is not None and first[0] is not first[2]
+        assert fixture.read_core._is_same_read_transaction(
+            first, await fixture.read_core._read_transaction_identity(session)
+        )
+        assert (await fixture.read_core._current_statement_timeout(session))[2] is True
+    assert not session.in_transaction() and not first[0].is_active and not first[2].is_active
+    assert await fixture.read_core._read_transaction_identity(session) is None
+
+asyncio.run(verify_transaction_protocol())
 
 headers._install_keyring(pytest.MonkeyPatch())
 target = {

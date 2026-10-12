@@ -9,12 +9,14 @@ from types import MappingProxyType
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import text
+from sanic.exceptions import InvalidUsage
+from sqlalchemy import BigInteger, column, select, table, text
 
 from api.custom_import_provider_sql import ProviderImportQuery
-from api.provider_list_sql import _provider_list_parameters
+from api.provider_list_sql import _provider_list_connection, _provider_list_parameters
 
 _IMPORT_RELATION = "custom_import_provider_relation"
+_NATIVE_GEO_RELATION = "native_eligible_geo"
 _PAGE_LIMIT_PARAMETER = "__custom_import_geo_page_limit"
 _CURSOR_NPI_PARAMETER = "__custom_import_geo_cursor_npi"
 _CURSOR_ADDRESS_KEY_PARAMETER = "__custom_import_geo_cursor_address_key"
@@ -52,6 +54,19 @@ class ImportedGeoQuery:
     native_parameters: Mapping[str, object]
     limit: int
     cursor_anchor: tuple[str, str] | None
+
+
+async def _fetch_imported_geo_page(database, import_context, request_session, imported_statements):
+    """Check a signed cursor anchor and fetch one exact imported geo page."""
+
+    async with _provider_list_connection(database, import_context, request_session) as connection:
+        rows = await connection.all(imported_statements.page, **imported_statements.parameters)
+        if imported_statements.anchor is not None:
+            anchor_count_mapping = getattr(rows[0], "_mapping", {}) if rows else {}
+            anchor_count = anchor_count_mapping.get("_geo_anchor_count")
+            if int(anchor_count or 0) != 1:
+                raise InvalidUsage("custom-import geo cursor anchor is unavailable")
+        return rows
 
 
 def build_imported_geo_statements(
@@ -120,25 +135,29 @@ def _common_ctes(
     import_context: ProviderImportQuery,
     nearby: NearbySqlQuery,
 ) -> str:
+    native_cte = _native_eligible_geo_cte(nearby)
     relation_cte = f"{_IMPORT_RELATION} AS ({import_context.compiled.sql})"
-    eligible_cte = _eligible_geo_cte(
-        import_context,
-        nearby,
+    eligible_cte = (
+        f"eligible_geo AS MATERIALIZED (\n    SELECT * FROM {_NATIVE_GEO_RELATION}"
+        f"\n     WHERE TRUE{_membership_clause(import_context)}\n)"
     )
     selected_cte = _selected_geo_cte(import_context)
-    return f"{relation_cte},\n{eligible_cte},\n{selected_cte}"
+    return f"{native_cte},\n{relation_cte},\n{eligible_cte},\n{selected_cte}"
 
 
-def _eligible_geo_cte(
-    import_context: ProviderImportQuery,
-    nearby: NearbySqlQuery,
-) -> str:
+def native_geo_entity_scope():
+    """Use every native eligible address before imported filtering and paging."""
+
+    native_geo = table(_NATIVE_GEO_RELATION, column("npi_code", BigInteger))
+    return select(native_geo.c.npi_code).distinct()
+
+
+def _native_eligible_geo_cte(nearby: NearbySqlQuery) -> str:
     taxonomy_from, taxonomy_where = _taxonomy_filter_parts(nearby)
-    membership_clause = _membership_clause(import_context)
     address_key_columns = ",\n           ".join(
         f"a.{column} AS _geo_address_{column}" for column in _address_row_key_columns(nearby.address_table_sql)
     )
-    return f"""eligible_geo AS MATERIALIZED (
+    return f"""{_NATIVE_GEO_RELATION} AS MATERIALIZED (
     SELECT DISTINCT ON (d.npi, a.address_key)
            d.npi AS npi_code,
            a.address_key,
@@ -158,7 +177,7 @@ def _eligible_geo_cte(
        AND a.address_key IS NOT NULL{taxonomy_where}
        {nearby.geo_precision_clause}
        {nearby.geo_type_clause}
-       {nearby.extra_clause}{nearby.ilike_clause}{membership_clause}
+       {nearby.extra_clause}{nearby.ilike_clause}
      ORDER BY d.npi ASC,
               a.address_key ASC,
               Geography(ST_MakePoint((a.long)::double precision, (a.lat)::double precision))
@@ -241,7 +260,8 @@ def _membership_clause(import_context: ProviderImportQuery) -> str:
     if not import_context.require_match:
         return ""
     return (
-        f"\n       AND EXISTS (SELECT 1 FROM {_IMPORT_RELATION} AS imported WHERE imported.entity_value = d.npi::text)"
+        f"\n       AND EXISTS (SELECT 1 FROM {_IMPORT_RELATION} AS imported "
+        f"WHERE imported.entity_value = {_NATIVE_GEO_RELATION}.npi_code::text)"
     )
 
 

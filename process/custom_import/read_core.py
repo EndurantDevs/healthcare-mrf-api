@@ -34,10 +34,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import and_, exists, func, not_, select, text, tuple_
+from sqlalchemy import Integer, String, and_, exists, func, not_, select, text, tuple_
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
+from sqlalchemy.sql.selectable import CTE
 
 from db.models.custom_import import (
     CustomImportChildCollection,
@@ -549,16 +550,7 @@ class CustomImportReadService:
     ) -> PreparedNpiEntityRelation:
         """Normalize one validated query and construct its unpaged relation."""
 
-        _validate_npi_entity_relation_request(
-            query.filters,
-            query.order_terms,
-            context_filters=query.context_filters,
-            maximum_terms=_relation_predicate_limit(query),
-        )
-        if type(query.require_match) is not bool or type(query.require_exact_context) is not bool:
-            raise CustomImportReadRequestError("imported membership mode is invalid")
-        if query.entity_values is not None:
-            _validate_npi_page(query.entity_values)
+        _validate_npi_relation_query(query)
         async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms) as is_repeatable_read_only:
             transactions = await _read_transaction_identity(session) if is_repeatable_read_only else None
             context = await _load_read_context(session, pinned_target)
@@ -579,6 +571,58 @@ class CustomImportReadService:
         ):
             self._prepared_read_context = retained
         return prepared
+
+    async def scope_npi_entity_relation(
+        self,
+        session: AsyncSession,
+        *,
+        authorization: ExtensionReadAuthorization,
+        pinned_target: PinnedReadTarget,
+        prepared: PreparedNpiEntityRelation,
+        query: NpiEntityRelationQuery,
+        native_entity_scope: Select | CTE,
+    ) -> PreparedNpiEntityRelation:
+        """Intersect a prepared request with its complete trusted native eligibility."""
+
+        retained = self._prepared_read_context
+        self._prepared_read_context = None
+        authorization_scope = self._authorize(authorization, pinned_target)
+        if type(query) is not NpiEntityRelationQuery:
+            raise CustomImportReadRequestError("imported membership mode is invalid")
+        if native_entity_scope is None:
+            raise CustomImportReadRequestError("native entity scope must be an unpaged SQL relation")
+        _validate_npi_relation_query(query)
+        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms) as is_repeatable_read_only:
+            if not (
+                is_repeatable_read_only
+                and retained is not None
+                and retained.prepared is prepared
+                and retained.session is session
+                and retained.context.target == pinned_target
+                and _is_same_read_transaction(retained.transactions, await _read_transaction_identity(session))
+            ):
+                raise CustomImportReadUnavailableError("provider native scope context is unavailable")
+            context = retained.context
+            if context.definition.query.entity_selection is not None or query.grouped_entity_selection is not None:
+                from process.custom_import.grouped_read import prepare_relation
+
+                scoped = prepare_relation(context, query, authorization_scope, native_entity_scope=native_entity_scope)
+            else:
+                scoped = _prepare_single_family_relation(
+                    context, query, authorization_scope, native_entity_scope=native_entity_scope
+                )
+            if (
+                scoped.query_fingerprint != prepared.query_fingerprint
+                or scoped.authorization_scope_sha256 != prepared.authorization_scope_sha256
+                or scoped.normalized_order_terms != prepared.normalized_order_terms
+                or scoped.effective_require_match != prepared.effective_require_match
+                or not _is_same_read_transaction(retained.transactions, await _read_transaction_identity(session))
+            ):
+                raise CustomImportReadUnavailableError("provider native scope query identity is unavailable")
+        if any(transaction is not None and not transaction.is_active for transaction in retained.transactions):
+            raise CustomImportReadUnavailableError("provider native scope context is unavailable")
+        self._prepared_read_context = replace(retained, prepared=scoped)
+        return scoped
 
     async def hydrate_npi_page(
         self,
@@ -1023,7 +1067,45 @@ def _is_statement_timeout(error: DBAPIError) -> bool:
     return any(getattr(driver_error, attribute, None) == "57014" for attribute in ("sqlstate", "pgcode"))
 
 
-def _prepare_single_family_relation(context, query, authorization_scope):
+def _validate_npi_relation_query(query):
+    _validate_npi_entity_relation_request(
+        query.filters,
+        query.order_terms,
+        context_filters=query.context_filters,
+        maximum_terms=_relation_predicate_limit(query),
+    )
+    if type(query.require_match) is not bool or type(query.require_exact_context) is not bool:
+        raise CustomImportReadRequestError("imported membership mode is invalid")
+    if query.entity_values is not None:
+        _validate_npi_page(query.entity_values)
+
+
+def _native_entity_values(native_entity_scope, entity_values):
+    """Intersect a trusted complete SQL identity set without a Python page bound."""
+
+    if not isinstance(native_entity_scope, (Select, CTE)):
+        raise CustomImportReadRequestError("native entity scope must be an unpaged SQL relation")
+    statement = native_entity_scope
+    while isinstance(statement, CTE):
+        statement = statement.element
+    if any(getattr(statement, name, None) is not None for name in ("_limit_clause", "_offset_clause", "_fetch_clause")):
+        raise CustomImportReadRequestError("native entity scope must be an unpaged SQL relation")
+    columns = native_entity_scope.c if isinstance(native_entity_scope, CTE) else native_entity_scope.selected_columns
+    if len(columns) != 1 or not isinstance(columns[0].type, (Integer, String)):
+        raise CustomImportReadRequestError("native entity scope requires one text or integer NPI column")
+    source = (
+        native_entity_scope
+        if isinstance(native_entity_scope, CTE)
+        else native_entity_scope.cte("native_score_entities").prefix_with("MATERIALIZED")
+    )
+    canonical_value = source.c[0].cast(String)
+    statement = select(canonical_value.label("entity_value"))
+    if entity_values is not None:
+        statement = statement.where(canonical_value.in_(entity_values))
+    return statement
+
+
+def _prepare_single_family_relation(context, query, authorization_scope, *, native_entity_scope=None):
     """Keep ordinary query normalization and identity independent of context reuse."""
 
     normalized_context_filters, normalized_filters, normalized_order_terms = _normalized_npi_query(
@@ -1041,13 +1123,16 @@ def _prepare_single_family_relation(context, query, authorization_scope):
         context_filters=normalized_context_filters,
         entity_values=query.entity_values,
     )
+    entity_values = query.entity_values
+    if native_entity_scope is not None:
+        entity_values = _native_entity_values(native_entity_scope, entity_values)
     return PreparedNpiEntityRelation(
         statement=_npi_entity_relation_statement(
             context,
             normalized_filters,
             normalized_order_terms,
             context_filters=normalized_context_filters,
-            entity_values=query.entity_values,
+            entity_values=entity_values,
         ),
         normalized_order_terms=normalized_order_terms,
         query_fingerprint=query_sha256,

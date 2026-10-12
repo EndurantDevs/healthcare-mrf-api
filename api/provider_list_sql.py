@@ -10,7 +10,7 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import BigInteger, bindparam, text
+from sqlalchemy import BigInteger, bindparam, column, select, table, text
 from sqlalchemy.dialects.postgresql import ARRAY
 
 from api.custom_import_provider_sql import ProviderImportQuery, merge_native_params
@@ -26,6 +26,7 @@ from process.custom_import.read_core import _local_statement_timeout
 _LOGGER = logging.getLogger(__name__)
 
 _CUSTOM_IMPORT_PROVIDER_RELATION = "custom_import_provider_relation"
+_NATIVE_PROVIDER_RELATION = "native_eligible_npis"
 GEO_SERVICE_LOCATION_TYPES = ("primary", "secondary", "practice", "site")
 MIN_PROVIDER_LIST_PHONE_CANDIDATES = 100
 MAX_PROVIDER_LIST_PHONE_CANDIDATES = 500
@@ -310,6 +311,13 @@ def _provider_import_relation_cte(
     if import_context is None:
         return None
     return f"custom_import_provider_relation AS ({import_context.compiled.sql})"
+
+
+def _provider_native_entity_scope():
+    """Refer to the complete native provider CTE, never a candidate page."""
+
+    native_providers = table(_NATIVE_PROVIDER_RELATION, column("npi", BigInteger))
+    return select(native_providers.c.npi)
 
 
 def _provider_import_membership_clause(

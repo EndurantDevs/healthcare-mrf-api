@@ -7,6 +7,7 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from api import custom_import_provider_geo_cursor as geo_cursor
 from api import custom_import_read_http as transport
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
 from api.endpoint import extension_reads
+from api.provider_geo_sql import native_geo_entity_scope
 from process.custom_import.read_contracts import (
     MAX_CURSOR_TTL_SECONDS,
     CustomImportReadCursorError,
@@ -309,11 +311,12 @@ async def test_geo_inclusion_keeps_native_page_and_private_anchor(monkeypatch, i
         native_rows.append(_provider("1000000000", _ADDRESS_C))
     anchor_parts = [str(native_rows[-1]["npi"]), native_rows[-1]["address_key"]]
 
-    async def page(request, *, native_args, import_context, prepare_cursor):
+    async def page(request, *, native_args, import_context, prepare_cursor, native_scope_preparer):
         assert request.path == geo.CUSTOM_IMPORT_PROVIDER_GEO_PATH
         assert native_args.get("include_total") == "true"
         assert import_context.prepared is observed_calls_by_name["prepared"][0]
         assert import_context.require_match is require_match
+        assert callable(native_scope_preparer)
         assert await _prepare_geo_cursor(prepare_cursor, session, native_args) is None
         observed_bindings.append(prepare_cursor.__self__)
         return _geo_reply(native_rows, has_more=True, anchor=anchor_parts, total_count=4)
@@ -347,6 +350,40 @@ async def test_geo_inclusion_keeps_native_page_and_private_anchor(monkeypatch, i
 
 
 @pytest.mark.asyncio
+async def test_geo_scope_preserves_cursor_binding_and_exact_hydration(monkeypatch):
+    session = _Session()
+    observed = _install_geo_service(monkeypatch, session)
+    scoped_relations = []
+
+    async def page(_request, *, native_args, import_context, prepare_cursor, native_scope_preparer):
+        preparer = native_scope_preparer.__self__
+        original = import_context.prepared
+        scoped = replace(original, statement=select(literal("1104212877").label("entity_value")))
+
+        async def scope(same_session, **arguments):
+            assert same_session is session and arguments["prepared"] is original
+            assert arguments["query"] is preparer.query
+            assert "native_eligible_geo" in str(arguments["native_entity_scope"])
+            return scoped
+
+        preparer.service.scope_npi_entity_relation = scope
+        context = await native_scope_preparer(native_geo_entity_scope())
+        assert context.prepared is scoped and preparer.prepared is scoped
+        assert await _prepare_geo_cursor(prepare_cursor, session, native_args) is None
+        assert prepare_cursor.__self__.scope_preparer.prepared is scoped
+        assert scoped.query_fingerprint == original.query_fingerprint
+        scoped_relations.append(scoped)
+        return _geo_reply([])
+
+    monkeypatch.setattr(geo, "_geo_page", page)
+    reply = await geo.serve_custom_import_provider_geo(_request(), session)
+
+    assert reply.status == 200 and not session.rolled_back
+    assert observed["hydration"][0]["prepared"] is scoped_relations[0]
+    assert observed["hydration"][0]["entity_values"] == ()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("row_count", "field_bytes", "status"),
     [(25, 300, 200), (50, 300, 200), (25, 262144, 503)],
@@ -367,7 +404,7 @@ async def test_complete_geo_page_counts_each_address_in_finite_envelope(monkeypa
     observed = _install_geo_service(monkeypatch, session, imported_items={"1104212877": imported})
     provider_rows = [_provider(1104212877, str(uuid.UUID(int=index + 1))) for index in range(row_count)]
 
-    async def page(request, *, native_args, import_context, prepare_cursor):
+    async def page(request, *, native_args, import_context, prepare_cursor, native_scope_preparer):
         assert await _prepare_geo_cursor(prepare_cursor, session, native_args) is None
         return _geo_reply(provider_rows)
 
