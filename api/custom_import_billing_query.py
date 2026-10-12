@@ -211,18 +211,55 @@ def validate_billing_import_query(query, *, endpoint_access_state_sha256):
     return query
 
 
-def _candidate_statement(candidates, query):
-    """Order the complete native identity scope with typed configured values."""
+def _native_candidate_relation(candidates):
+    """Represent every native identity without discarding repeated provider NPIs."""
 
     candidate_npis = tuple(candidate.address.npi for candidate in candidates)
-    native = (
+    return (
         func.unnest(bindparam("billing_candidate_npis", candidate_npis, type_=ARRAY(BigInteger)))
         .table_valued(column("npi", BigInteger), with_ordinality="ordinal")
         .render_derived(name="billing_candidates")
     )
+
+
+def _validated_candidates(candidates):
+    """Require the complete typed native identity sequence before composition."""
+
+    if type(candidates) is not tuple or any(
+        type(candidate) is not BillingSearchProviderCandidate for candidate in candidates
+    ):
+        raise serving_unavailable()
+    candidate_keys = tuple(candidate.sort_key for candidate in candidates)
+    if candidate_keys != tuple(sorted(set(candidate_keys))):
+        raise serving_unavailable()
+    return candidates
+
+
+async def scope_billing_import_query(candidates, query, *, native_scope_preparer, endpoint_access_state_sha256):
+    """Reseal scores scoped to all native candidates without changing cursor authority."""
+
+    query = validate_billing_import_query(query, endpoint_access_state_sha256=endpoint_access_state_sha256)
+    native = _native_candidate_relation(_validated_candidates(candidates))
+    scoped_query = await native_scope_preparer(select(native.c.npi).distinct())
+    scoped_query = validate_billing_import_query(
+        scoped_query, endpoint_access_state_sha256=endpoint_access_state_sha256
+    )
+    if (
+        scoped_query.import_scope != query.import_scope
+        or scoped_query.require_match != query.require_match
+        or scoped_query.prepared.normalized_order_terms != query.prepared.normalized_order_terms
+    ):
+        raise serving_unavailable()
+    return scoped_query
+
+
+def _candidate_statement(candidates, query):
+    """Order the complete native identity scope with typed configured values."""
+
+    native = _native_candidate_relation(candidates)
     entity_scope = bindparam(
         "billing_candidate_entities",
-        tuple(dict.fromkeys(str(npi) for npi in candidate_npis)),
+        tuple(dict.fromkeys(str(candidate.address.npi) for candidate in candidates)),
         type_=ARRAY(String),
     )
     frozen_relation = (
@@ -258,13 +295,7 @@ async def compose_billing_candidates(session, candidates, query, *, endpoint_acc
     """Select/order all candidates before existing price hydration and paging."""
 
     query = validate_billing_import_query(query, endpoint_access_state_sha256=endpoint_access_state_sha256)
-    if type(candidates) is not tuple or any(
-        type(candidate) is not BillingSearchProviderCandidate for candidate in candidates
-    ):
-        raise serving_unavailable()
-    candidate_keys = tuple(candidate.sort_key for candidate in candidates)
-    if candidate_keys != tuple(sorted(set(candidate_keys))):
-        raise serving_unavailable()
+    candidates = _validated_candidates(candidates)
     result = await session.execute(_candidate_statement(candidates, query))
     ordinals = tuple(result.scalars().all())
     if (

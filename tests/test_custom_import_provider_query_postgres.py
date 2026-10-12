@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sanic.request import RequestParameters
-from sqlalchemy import MetaData, exists, func, literal, select, text, union_all
+from sqlalchemy import BigInteger, MetaData, String, cast, exists, func, literal, select, text, union_all
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from api import custom_import_plan_pricing as imported
@@ -423,7 +423,7 @@ async def test_provider_query_order_only_left_join_keeps_absent_native_npis_last
             query=NpiEntityRelationQuery(order_terms=(ReadOrderTerm("amount", direction, "last"),)),
         )
         native = _native_provider_relation()
-        claims_statements = build_provider_service_claims_statements(
+        claims_statements = await build_provider_service_claims_statements(
             _native_service_grouped_relation(native),
             ProviderServiceImportQuery(prepared, require_match=False),
             5,
@@ -609,6 +609,80 @@ async def test_membership_only_preserves_native_cost_order_and_multibinding_entr
     assert len(response["items"]) == 8
     assert len(set(response[imported.NATIVE_ENTRY_IDS])) == 8
     assert [entry["npi"] for entry in response["items"][:4]] == [1000000001, 1000000001, 1000000002, 1000000002]
+
+
+async def _selectively_scoped_plan_page(offset, limit):
+    """Execute the supplied native UNION, scoped score staging and complete native page."""
+
+    original = _import_context()
+    async with _plan_session() as session:
+        scoped_relations = []
+
+        async def prepare_native_scope(native_scope):
+            assert isinstance(native_scope.selected_columns.npi.type, BigInteger)
+            compiled = native_scope.compile()
+            assert "UNION ALL" in str(compiled) and "LIMIT" not in str(compiled) and "OFFSET" not in str(compiled)
+            assert {
+                parameter_value
+                for parameter_name, parameter_value in compiled.params.items()
+                if parameter_name.startswith("fixture_radius_")
+            } == {0.75, 1.75}
+            assert set((await session.scalars(native_scope)).all()) == {1000000001, 1000000002}
+            assert await session.scalar(text(f"SELECT COUNT(*) FROM pg_temp.{plan_sql.IMPORTED}")) == 0
+            native = native_scope.subquery()
+            prepared = replace(
+                original.prepared,
+                statement=original.prepared.statement.where(
+                    original.prepared.statement.selected_columns.entity_value.in_(select(cast(native.c.npi, String)))
+                ),
+            )
+            scoped_relations.append(prepared)
+            return prepared
+
+        response = await imported.search_imported_plan_providers(
+            session,
+            dict(code="27447", code_system="CPT", zip5="12345", rate="13", include_unverified_addresses="true"),
+            SimpleNamespace(offset=offset, limit=limit, page=offset + 1),
+            _selection(2),
+            replace(original, native_scope_preparer=prepare_native_scope),
+        )
+        assert (
+            len(scoped_relations) == 1 and scoped_relations[0].query_fingerprint == original.prepared.query_fingerprint
+        )
+        assert set((await session.scalars(text(f"SELECT npi FROM pg_temp.{plan_sql.IMPORTED}"))).all()) == {
+            1000000001,
+            1000000002,
+        }
+        return response
+
+
+@pytest.mark.asyncio
+async def test_selective_plan_scope_executes_multibinding_union_before_exact_page(monkeypatch):
+    """Preserve exact filtered groups, full completion and stable pages after genuine SQL scoping."""
+
+    _native_fixture(monkeypatch)
+    _install_location_fixture(monkeypatch, True)
+
+    async def binding_locations(_session, _tables, native_args, **_kwargs):
+        radius = 0.75 if native_args["snapshot_id"] == "snapshot-0" else 1.75
+        return SimpleNamespace(parameter_map={"fixture_radius": radius})
+
+    monkeypatch.setattr(serving, "_membership_location_query", binding_locations)
+    full = await _selectively_scoped_plan_page(0, 10)
+    assert full["pagination"]["total"] == 3 and full["pagination"]["total_is_exact"] is True
+    assert [(entry["npi"], entry["network"]) for entry in full["items"]] == [
+        (1000000002, "source-0"),
+        (1000000002, "source-1"),
+        (1000000001, "source-1"),
+    ]
+    assert len(set(full[imported.NATIVE_ENTRY_IDS])) == 3
+    assert all(len(entry["prices"]) == 1 and entry["prices"][0]["negotiated_rate"] == 13 for entry in full["items"])
+    for offset in range(4):
+        page = await _selectively_scoped_plan_page(offset, 1)
+        assert page["pagination"]["total"] == 3 and page["pagination"]["total_is_exact"] is True
+        assert page["pagination"]["has_more"] is (offset < 2)
+        assert page["items"] == full["items"][offset : offset + 1]
+        assert page[imported.NATIVE_ENTRY_IDS] == full[imported.NATIVE_ENTRY_IDS][offset : offset + 1]
 
 
 @pytest.mark.asyncio

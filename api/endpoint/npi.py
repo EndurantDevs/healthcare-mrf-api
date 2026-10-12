@@ -57,13 +57,16 @@ from api.provider_geo_sql import (
     ImportedGeoQuery,
     ImportedGeoStatements,
     NearbySqlQuery,
+    _fetch_imported_geo_page,
     build_imported_geo_statements,
     build_native_nearby_count_sql,
     build_native_nearby_sql,
+    native_geo_entity_scope,
     nearby_batch_identities,
 )
 from api.provider_list_sql import (
     _CUSTOM_IMPORT_PROVIDER_RELATION,
+    _NATIVE_PROVIDER_RELATION,
     MAX_PROVIDER_LIST_PHONE_CANDIDATES,
     MIN_PROVIDER_LIST_PHONE_CANDIDATES,
     _address_npi_filter,
@@ -86,6 +89,7 @@ from api.provider_list_sql import (
     _provider_list_parameters,
     _provider_list_phone_candidate_limit,
     _provider_list_statement,
+    _provider_native_entity_scope,
     _sql_with_ctes,
     _sql_with_prefix_ctes,
 )
@@ -8100,12 +8104,16 @@ def _append_unique_search_taxonomy(
 
 @blueprint.get("/all")
 @canonical_network_read
-async def list_providers(request, *, native_args=None, import_context=None, native_npis=None):
+async def list_providers(
+    request, *, native_args=None, import_context=None, native_npis=None, native_scope_preparer=None
+):
     """Search, count, or page through public NPI provider records."""
     if (native_args is None) != (import_context is None) and native_npis is None:
         raise sanic.exceptions.InvalidUsage("custom-import provider arguments are invalid")
     if import_context is not None and type(import_context) is not ProviderImportQuery:
         raise sanic.exceptions.InvalidUsage("custom-import provider context is invalid")
+    if native_scope_preparer is not None and import_context is None:
+        raise sanic.exceptions.InvalidUsage("custom-import provider scope is invalid")
     native_npis = None if native_npis is None else tuple(_normalize_npi_batch_npis(list(native_npis)))
     args = request.args if native_args is None else native_args
     is_count_only = str(args.get("count_only", "0")).strip() == "1"
@@ -9115,6 +9123,7 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
 
     async def get_results(start, limit, filters_by_name):
         """Return one provider result page for normalized search filters."""
+        page_import_context = import_context
         classification = filters_by_name.get("classification")
         section = filters_by_name.get("section")
         display_name = filters_by_name.get("display_name")
@@ -9155,7 +9164,7 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
                 include_service_locations=include_service_locations,
             )
         ]
-        if (import_context is not None or native_npis is not None) and (
+        if (page_import_context is not None or native_npis is not None) and (
             procedure_filter_unresolved or medication_filter_unresolved
         ):
             address_clauses.append("1=0")
@@ -9200,7 +9209,7 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
         if phone_digits:
             phone_candidates_cte = _address_phone_candidates_cte(
                 address_table_sql,
-                is_bounded=import_context is None and native_npis is None,
+                is_bounded=page_import_context is None and native_npis is None,
             )
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c")
@@ -9223,11 +9232,18 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
                 ")"
             )
         dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
-        import_relation_cte = _provider_import_relation_cte(import_context)
+        import_relation_cte = _provider_import_relation_cte(page_import_context)
+        scope_native_query = native_scope_preparer is not None and bool(
+            simple_filter_present or city or state or has_insurance or native_npis is not None
+        )
         import_match_clause = _provider_import_match_clause(
-            import_context,
+            None if scope_native_query else page_import_context,
             provider_npi_sql,
-            native_npis=native_npis,
+            native_npis=(
+                native_npis
+                if native_npis is not None or page_import_context is None
+                else page_import_context.native_npis
+            ),
         )
         eligible_address_clauses = list(address_clauses)
         if import_match_clause is not None:
@@ -9253,13 +9269,13 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
             else tuple(column.key for column in NPIAddress.__table__.columns)
         )
         search_npi_column_names = tuple(column.key for column in _npi_serving_columns())
-        use_import_order = bool(import_context is not None and import_context.prepared.normalized_order_terms)
+        use_import_order = bool(page_import_context is not None and page_import_context.prepared.normalized_order_terms)
         search_row_column_names = (
             ("npi_code",)
             + search_npi_column_names
             + projected_candidate_names
             + ("provider_address_total",)
-            + (("_provider_total",) if inline_name_taxonomy_total or import_context is not None else ())
+            + (("_provider_total",) if inline_name_taxonomy_total or page_import_context is not None else ())
             + (("_provider_page_position",) if use_import_order else ())
         )
         search_npi_projection = ", ".join(f"b.{column_name}" for column_name in search_npi_column_names)
@@ -9275,7 +9291,7 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
         filtered_npi_cte = None
         taxonomy_matched_npi_cte = None
         use_bounded_broad_name_page = (
-            import_context is None and native_npis is None and broad_name_total_deferred and order_by == "npi"
+            page_import_context is None and native_npis is None and broad_name_total_deferred and order_by == "npi"
         )
         if npi_where:
             filtered_npi_projection = "b.npi"
@@ -9374,28 +9390,13 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
             page_order_sql = "ORDER BY npi + 0" if plan_network_ids else "ORDER BY npi"
             sub_s_relevance_projection = ""
             result_order_sql = "ORDER BY sub_s.npi_code ASC"
-        if use_import_order:
-            import_order_sql = _provider_import_order_clause(
-                import_context,
-                "eligible_npi.npi",
-            )
-            import_membership_filter = "WHERE imported.entity_value IS NOT NULL" if import_context.require_match else ""
-            page_npis_sql = f"""
-            SELECT eligible_npi.*,
-                   ROW_NUMBER() OVER (
-                       ORDER BY {import_order_sql}
-                   ) AS _provider_page_position
-              FROM ({eligible_npis_sql}) AS eligible_npi
-         LEFT JOIN {_CUSTOM_IMPORT_PROVIDER_RELATION} AS imported
-                ON imported.entity_value = (eligible_npi.npi)::text
-             {import_membership_filter}
-             ORDER BY {import_order_sql}
-             LIMIT :limit OFFSET :start
-            """
-            sub_s_total_projection = ""
-            sub_s_page_position_projection = ", pn._provider_page_position AS _provider_page_position"
-            result_order_sql = "ORDER BY sub_s._provider_page_position ASC, sub_s.npi_code ASC"
-        elif inline_name_taxonomy_total:
+        native_eligible_cte = None
+        if scope_native_query:
+            native_eligible_cte = f"{_NATIVE_PROVIDER_RELATION} AS MATERIALIZED ({eligible_npis_sql})"
+            eligible_npis_sql = f"SELECT * FROM {_NATIVE_PROVIDER_RELATION}"
+            page_import_context = await native_scope_preparer(_provider_native_entity_scope())
+            import_relation_cte = _provider_import_relation_cte(page_import_context)
+        if inline_name_taxonomy_total:
             page_npis_sql = f"""
             SELECT eligible_npi.*,
                    COUNT(*) OVER () AS provider_total
@@ -9416,15 +9417,18 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
         imported_count_ctes = None
         final_projection = "sub_s.*"
         final_source = "sub_s"
-        if import_context is not None:
+        if page_import_context is not None:
             imported_count_ctes, page_npis_sql = _provider_import_count_page(
-                eligible_npis_sql, import_context, native_order=page_order_sql
+                eligible_npis_sql, page_import_context, native_order=page_order_sql
             )
             final_projection = "sub_s.*, provider_totals._provider_total"
             final_source = "provider_totals LEFT JOIN sub_s ON TRUE"
+            if use_import_order:
+                sub_s_page_position_projection = ", pn._provider_page_position AS _provider_page_position"
+                result_order_sql = "ORDER BY sub_s._provider_page_position ASC, sub_s.npi_code ASC"
         provider_page_query = _provider_list_statement(
             f"""
-        {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte, import_relation_cte, imported_count_ctes)}page_npis AS (
+        {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte, native_eligible_cte, import_relation_cte, imported_count_ctes)}page_npis AS (
             {page_npis_sql}
         ),
         sub_s AS (
@@ -9443,7 +9447,7 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
 
     SELECT {final_projection} FROM {final_source} {result_order_sql};
     """,
-            import_context,
+            page_import_context,
             native_npis=native_npis,
         )
 
@@ -9501,17 +9505,17 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
         }
         if order_by == "relevance":
             query_parameters_by_name["relevance_q"] = relevance_q
-        if phone_candidates_cte and import_context is None and native_npis is None:
+        if phone_candidates_cte and page_import_context is None and native_npis is None:
             query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                 limit,
                 start,
             )
         query_parameters_by_name = _provider_list_parameters(
             query_parameters_by_name,
-            import_context,
+            page_import_context,
             native_npis=native_npis,
         )
-        async with _provider_list_connection(db, import_context, request_session, native_npis=native_npis) as conn:
+        async with _provider_list_connection(db, page_import_context, request_session, native_npis=native_npis) as conn:
             rows_iter = await conn.all(
                 provider_page_query,
                 **query_parameters_by_name,
@@ -9563,7 +9567,7 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
                 return []
             async with _provider_list_connection(
                 db,
-                import_context,
+                page_import_context,
                 request_session,
                 native_npis=native_npis,
             ) as taxonomy_conn:
@@ -9587,13 +9591,17 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
                     [provider_result.get("npi") for provider_result in provider_results],
                     include_chain=include_chain_enrichment,
                     session=request_session
-                    if import_context is not None
+                    if page_import_context is not None
                     or native_npis is not None
                     or current_network_address_scope() is not None
                     else None,
                 )
             except Exception as exc:
-                if import_context is not None or native_npis is not None or current_network_address_scope() is not None:
+                if (
+                    page_import_context is not None
+                    or native_npis is not None
+                    or current_network_address_scope() is not None
+                ):
                     raise
                 logger.debug("Provider enrichment summary fetch failed: %s", exc)
                 return {}
@@ -9607,7 +9615,7 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
             )
         ]
         if (
-            import_context is not None
+            page_import_context is not None
             or native_npis is not None
             or current_network_address_scope() is not None
             or has_reader_session(db)
@@ -9617,7 +9625,7 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
                 location_candidates,
                 session=request_session,
                 use_request_session=True,
-                fail_closed=import_context is not None
+                fail_closed=page_import_context is not None
                 or native_npis is not None
                 or current_network_address_scope() is not None,
             )
@@ -9700,13 +9708,13 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
             try:
                 async with _provider_list_connection(
                     db,
-                    import_context,
+                    page_import_context,
                     request_session,
                     native_npis=native_npis,
                 ) as hydration_conn:
                     hydrated_rows = await hydration_conn.all(
                         text(f"SELECT c.* FROM {address_table_sql} AS c WHERE c.location_key = ANY(:location_keys)"),
-                        **_provider_list_parameters({"location_keys": selected_location_keys}, import_context),
+                        **_provider_list_parameters({"location_keys": selected_location_keys}, page_import_context),
                     )
                 allowed_hydrated_fields = (
                     {column.key for column in NPIAddress.__table__.columns}
@@ -9744,7 +9752,7 @@ async def list_providers(request, *, native_args=None, import_context=None, nati
                         hydrated_address_map
                     )
             except Exception as exc:
-                if import_context is not None:
+                if page_import_context is not None:
                     raise
                 logger.warning(
                     "NPI search location hydration failed; returning ranked candidates (%s)",
@@ -10390,26 +10398,11 @@ def _populate_near_provider_mapping(
     provider_by_field["npi"] = npi_value
 
 
-async def _fetch_imported_geo_page(
-    import_context: ProviderImportQuery,
-    request_session: Any,
-    imported_statements: ImportedGeoStatements,
-) -> list[Any]:
-    """Check a signed cursor anchor and fetch one exact imported geo page."""
-
-    async with _provider_list_connection(db, import_context, request_session) as connection:
-        rows = await connection.all(imported_statements.page, **imported_statements.parameters)
-        if imported_statements.anchor is not None:
-            anchor_count_mapping = getattr(rows[0], "_mapping", {}) if rows else {}
-            anchor_count = anchor_count_mapping.get("_geo_anchor_count")
-            if int(anchor_count or 0) != 1:
-                raise sanic.exceptions.InvalidUsage("custom-import geo cursor anchor is unavailable")
-        return rows
-
-
 @blueprint.get("/near/")
 @canonical_network_read
-async def get_near_npi(request, *, native_args=None, import_context=None, prepare_cursor=None):
+async def get_near_npi(
+    request, *, native_args=None, import_context=None, prepare_cursor=None, native_scope_preparer=None
+):
     """Return providers near coordinates under optional taxonomy filters."""
     if (native_args is None) != (import_context is None):
         raise sanic.exceptions.InvalidUsage("custom-import geo arguments are invalid")
@@ -10417,6 +10410,8 @@ async def get_near_npi(request, *, native_args=None, import_context=None, prepar
         raise sanic.exceptions.InvalidUsage("custom-import geo context is invalid")
     if (prepare_cursor is None) != (import_context is None):
         raise sanic.exceptions.InvalidUsage("custom-import geo cursor is invalid")
+    if native_scope_preparer is not None and import_context is None:
+        raise sanic.exceptions.InvalidUsage("custom-import geo scope is invalid")
     args = request.args if native_args is None else native_args
     request_session = _request_session(request)
     if import_context is not None and request_session is None:
@@ -10796,6 +10791,8 @@ async def get_near_npi(request, *, native_args=None, import_context=None, prepar
             geo_precision_clause=geo_precision_clause,
             geo_type_clause=geo_type_clause,
         )
+        if native_scope_preparer is not None:
+            import_context = await native_scope_preparer(native_geo_entity_scope())
         cursor_anchor = await prepare_cursor(
             session=request_session,
             address_table_sql=address_table_sql,
@@ -10823,6 +10820,7 @@ async def get_near_npi(request, *, native_args=None, import_context=None, prepar
         """Fetch an exact imported page or enough native KNN rows for one page."""
         if imported_statements is not None:
             return await _fetch_imported_geo_page(
+                db,
                 import_context,
                 request_session,
                 imported_statements,

@@ -30,7 +30,11 @@ from api.billing_search_selector_contract import (
     BILLING_SELECTOR_PROJECTION_UNAVAILABLE,
     BillingSearchSelectorResolution,
 )
-from api.custom_import_billing_query import compose_billing_candidates, validate_billing_import_query
+from api.custom_import_billing_query import (
+    compose_billing_candidates,
+    scope_billing_import_query,
+    validate_billing_import_query,
+)
 from api.plan_release_serving import PlanReleaseServingSelection
 from api.plan_release_serving_resolution import (
     PLAN_RELEASE_RESOLUTION_NOT_FOUND,
@@ -367,7 +371,7 @@ def _hydrated_page_result(provider_page, ready_page, cursor_keyring, composed_or
     )
 
 
-async def _search_ready_release(session, *, access, cursor_keyring, ready_page):
+async def _search_ready_release(session, *, access, cursor_keyring, ready_page, native_scope_preparer=None):
     """Compose the complete native identity scope before price hydration/page."""
 
     traversal = await _traverse_release(
@@ -388,10 +392,18 @@ async def _search_ready_release(session, *, access, cursor_keyring, ready_page):
     candidates = traversal.candidates
     composed_order = None
     if ready_page.import_context is not None:
+        import_context = ready_page.import_context
+        if native_scope_preparer is not None:
+            import_context = await scope_billing_import_query(
+                candidates,
+                import_context,
+                native_scope_preparer=native_scope_preparer,
+                endpoint_access_state_sha256=ready_page.endpoint_access_state_sha256,
+            )
         candidates, composed_order = await compose_billing_candidates(
             session,
             candidates,
-            ready_page.import_context,
+            import_context,
             endpoint_access_state_sha256=ready_page.endpoint_access_state_sha256,
         )
         if not candidates:
@@ -417,7 +429,13 @@ async def _search_ready_release(session, *, access, cursor_keyring, ready_page):
 
 
 async def _search_resolved_release(
-    session, access, cursor_keyring, trusted_now, endpoint_access_state_sha256, import_context
+    session,
+    access,
+    cursor_keyring,
+    trusted_now,
+    endpoint_access_state_sha256,
+    import_context,
+    native_scope_preparer=None,
 ):
     """Resolve immutable native pins before traversing the exact billing scope."""
 
@@ -448,7 +466,13 @@ async def _search_resolved_release(
         endpoint_access_state_sha256,
         import_context,
     )
-    return await _search_ready_release(session, access=access, cursor_keyring=cursor_keyring, ready_page=ready_page)
+    return await _search_ready_release(
+        session,
+        access=access,
+        cursor_keyring=cursor_keyring,
+        ready_page=ready_page,
+        **({"native_scope_preparer": native_scope_preparer} if native_scope_preparer is not None else {}),
+    )
 
 
 async def search_exact_billing_provider_page(
@@ -458,6 +482,7 @@ async def search_exact_billing_provider_page(
     cursor_keyring: BillingSearchCursorKeyring,
     trusted_now: object,
     import_context=None,
+    native_scope_preparer=None,
 ) -> BillingSearchServiceResult:
     """Serve one exact TIN-group-rate-NPI-address page without fallbacks."""
 
@@ -466,6 +491,8 @@ async def search_exact_billing_provider_page(
         trusted_now=trusted_now,
     )
     if type(cursor_keyring) is not BillingSearchCursorKeyring:
+        raise serving_unavailable()
+    if native_scope_preparer is not None and (import_context is None or not callable(native_scope_preparer)):
         raise serving_unavailable()
     if import_context is not None:
         import_context = validate_billing_import_query(
@@ -480,6 +507,7 @@ async def search_exact_billing_provider_page(
             trusted_now,
             endpoint_access_state_sha256,
             import_context,
+            native_scope_preparer,
         )
     except BillingSearchServingUnavailableError, BillingSearchResourceNotFoundError:
         raise

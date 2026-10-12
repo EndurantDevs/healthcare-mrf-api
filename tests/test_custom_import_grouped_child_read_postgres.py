@@ -10,9 +10,10 @@ from decimal import Decimal
 
 import pytest
 from sanic import response
-from sqlalchemy import BigInteger, Numeric, column, select, text, values
+from sqlalchemy import BigInteger, Numeric, String, column, select, text, values
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.orm import aliased
 
 from api import custom_import_provider_geo as geo_http
 from api import custom_import_provider_http as provider_http
@@ -84,6 +85,56 @@ async def test_stored_child_ambiguity_cannot_be_hidden_by_a_later_metric_filter(
             await values_connection.execute(statement)
     else:
         assert (await values_connection.execute(statement)).scalar_one() == 3
+
+
+@pytest.mark.asyncio
+async def test_selected_child_join_preserves_multiplicity_and_full_revision_ownership(values_connection):
+    context = fixture.context()
+    identities = ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot")
+    dataset, schema = context.target.dataset_id, context.target.schema_revision_id
+    collection = context.collection_slots_by_name["rates"]
+    owner = lambda child, root: (child, dataset, schema, root, collection)
+    members = (
+        values(column("family_revision_id", BigInteger), *(column(name, BigInteger) for name in identities))
+        .data([(10, *owner(30, 20)), (11, *owner(31, 21)), (12, *owner(32, 22)), (13, *owner(33, 23))])
+        .cte("synthetic_family_members")
+    )
+    revisions = (
+        values(*(column(name, BigInteger) for name in identities))
+        .data([owner(30, 20), owner(31, 21), (32, dataset + 1, schema, 22, collection), owner(33, 23)])
+        .cte("synthetic_child_revisions")
+    )
+    selected = (
+        values(column("family_revision_id", BigInteger), column("root_record_id", BigInteger))
+        .data([(10, 20), (10, 20), (11, 21), (12, 22), (13, 23)])
+        .cte("synthetic_selected_roots")
+    )
+    keys = (
+        values(*(column(name, BigInteger) for name in identities), column("selected_key_value", String))
+        .data([(*owner(30, 20), "chosen"), (*owner(32, 22), "chosen"), *[(*owner(33, 23), "chosen")] * 2])
+        .cte("synthetic_complete_keys")
+    )
+    context = replace(
+        context,
+        storage_models={
+            grouped_query.CustomImportFamilyChild: aliased(
+                grouped_query.CustomImportFamilyChild, members, adapt_on_names=True
+            ),
+            grouped_query.CustomImportChildRevision: aliased(
+                grouped_query.CustomImportChildRevision, revisions, adapt_on_names=True
+            ),
+        },
+    )
+    statement, _, _ = grouped_query._left_child_statement(context, selected, keys)
+    selected_rows = (await values_connection.execute(statement.order_by(selected.c.family_revision_id))).all()
+    assert [tuple(selected_row) for selected_row in selected_rows] == [
+        (10, 20, 30),
+        (10, 20, 30),
+        (11, 21, None),
+        (12, 22, None),
+        (13, 23, 33),
+        (13, 23, 33),
+    ]
 
 
 @pytest.fixture(autouse=True)
@@ -399,7 +450,8 @@ async def test_signed_child_pages_require_selected_episode_and_keep_complete_fam
     endpoint = geo_http.serve_custom_import_provider_geo if is_geo else provider_http.serve_custom_import_providers
     async with native._case(children=_children()) as (case, pinned_target), case.sessions() as session:
 
-        async def native_page(request, *, native_args, import_context, prepare_cursor=None):
+        async def native_page(request, *, native_args, import_context, prepare_cursor=None, native_scope_preparer=None):
+            assert callable(native_scope_preparer)
             if prepare_cursor is not None:
                 await prepare_cursor(session=session, coordinates=[40, -73])
             return await _signed_page_reply(session, import_context.prepared, is_geo=is_geo)
@@ -734,6 +786,52 @@ async def test_missing_group_child_preserves_root_reduction_and_same_family_memb
         assert [tuple(selected_row) for selected_row in (await native._relation(session, pinned_target, mixed))[1]] == [
             (native._A, Decimal("15"), Decimal("2"))
         ]
+        async with case.sessions() as scoped_session, scoped_session.begin():
+            await scoped_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            service = native._service(pinned_target)
+            prepared = await service.prepare_npi_entity_relation(
+                scoped_session, authorization=native._AUTHORIZATION, target=pinned_target, query=query
+            )
+            eligible = values(column("npi", String)).data([(native._A,), (native._B,)]).cte("native_scope")
+            scoped = await service.scope_npi_entity_relation(
+                scoped_session,
+                authorization=native._AUTHORIZATION,
+                pinned_target=pinned_target,
+                prepared=prepared,
+                query=query,
+                native_entity_scope=select(eligible.c.npi),
+            )
+            assert [tuple(scoped_row) for scoped_row in (await scoped_session.execute(scoped.statement))] == [
+                (native._A, Decimal("15"), 2, Decimal("2"), Decimal("9"))
+            ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("period", (None, 2024))
+async def test_rollup_only_child_context_keeps_sibling_roots_without_older_key_fallback(monkeypatch, period):
+    monkeypatch.setattr(native.fixture, "definition", scores._definition)
+    roots = native._roots()
+    monkeypatch.setattr(native, "_roots", lambda: [dict(row, weight=2) for row in roots])
+    child_rows = [
+        row
+        for row in _children()
+        if row["service_code"] != "chosen"
+        or (row["rate_npi"], row["rate_period"], row["rate_segment"])
+        not in {(native._A, 2024, "segment_b"), (native._B, 2025, "segment_a")}
+    ]
+    selectors = (_KEY,) if period is None else (_KEY, ReadFilter("period", "eq", period))
+    query = fixture.query(
+        context_filters=selectors,
+        filters=(ReadFilter("root_cost", "gt", 0),),
+        order_terms=(ReadOrderTerm("root_cost", "asc", "last"),),
+    )
+    async with native._case(children=child_rows) as (case, target), case.sessions() as session:
+        expected_rows = [(native._A, Decimal("15"))]
+        if period is not None:
+            expected_rows.append((native._B, Decimal("90")))
+        assert [tuple(row) for row in (await native._relation(session, target, query))[1]] == expected_rows
+        scoped = replace(query, entity_values=(native._B,))
+        assert [tuple(row) for row in (await native._relation(session, target, scoped))[1]] == expected_rows[1:]
 
 
 @pytest.mark.asyncio

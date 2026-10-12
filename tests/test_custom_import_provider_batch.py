@@ -3,6 +3,7 @@
 
 import json
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -10,7 +11,7 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 from sanic.exceptions import InvalidUsage
-from sqlalchemy import literal, select
+from sqlalchemy import String, literal, select
 
 from api import custom_import_provider_batch as batch
 from api import custom_import_read_http as transport
@@ -22,6 +23,7 @@ from process.custom_import.read_contracts import CustomImportReadRequestError, C
 from process.custom_import.read_core import PreparedNpiEntityRelation, ReadFieldValue, ReadOrderTerm
 from tests import test_custom_import_read_http as fixtures
 from tests.test_custom_import_provider_http import _Session
+from tests.test_custom_import_provider_list import _configure_imported_page_dependencies, _TransactionConnection
 from tests.test_npi_batch import _ranked_batch_addresses
 
 
@@ -53,6 +55,7 @@ def _request(body):
         method="POST",
         path=batch.CUSTOM_IMPORT_PROVIDER_BATCH_PATH,
         query_string="",
+        args={},
     )
 
 
@@ -88,7 +91,7 @@ def _install(monkeypatch, session, *, finality_failure=False):
         assert same_session is session and kwargs["timeout_ms"] > 0
         yield
 
-    async def native(request, params, *, native_args, session, import_context):
+    async def native(request, params, *, native_args, session, import_context, native_scope_preparer):
         assert tuple(params["npis"]) == import_context.native_npis
         items = [{"npi": identity, "status": 200, "provider": {"npi": identity}} for identity in params["npis"]]
         return {
@@ -110,6 +113,103 @@ def _install(monkeypatch, session, *, finality_failure=False):
     monkeypatch.setattr(provider_batch, "read_native_batch", native)
     monkeypatch.setattr(batch, "verify_published_generation", finality)
     return prepared_reads, hydrated_chunks
+
+
+def _install_scoped_batch(monkeypatch, session, *, fail_scope=False):
+    prepared_reads, chunks = _install(monkeypatch, session)
+    base_service = batch.CustomImportReadService
+    scopes = []
+
+    class ScopedBatchReadService(base_service):
+        async def scope_npi_entity_relation(self, same_session, **arguments):
+            query, prepared, target = prepared_reads[0]
+            assert same_session is session and arguments["prepared"] is prepared
+            assert arguments["query"] is query and arguments["pinned_target"] is target
+            assert query.entity_values == ("9000000000", "9000000001")
+            session.events.append("native_scope")
+            if fail_scope:
+                raise CustomImportReadUnavailableError("synthetic native scope failure")
+            native_entities = arguments["native_entity_scope"].cte("synthetic_batch_scope")
+            statement = prepared.statement.where(literal("9000000000").in_(select(native_entities.c[0].cast(String))))
+            scoped = replace(prepared, statement=statement)
+            scopes.append(scoped)
+            return scoped
+
+        async def hydrate_npi_page(self, same_session, **arguments):
+            assert arguments["prepared"] is scopes[0]
+            arguments["prepared"] = prepared_reads[0][1]
+            return await super().hydrate_npi_page(same_session, **arguments)
+
+    monkeypatch.setattr(batch, "CustomImportReadService", ScopedBatchReadService)
+    return scopes, chunks
+
+
+def _configure_filtered_native_batch(monkeypatch, session, reader):
+    class BatchConnection(_TransactionConnection):
+        async def all(self, statement, **parameters):
+            rows = await super().all(statement, **parameters)
+            for row in rows:
+                if hasattr(row, "_mapping"):
+                    row._mapping.update(npi=9000000000, npi_code=9000000000, _provider_total=1)
+            return rows
+
+    connection = BatchConnection()
+    session.all = connection.all
+    session.proxy_databases, session.proxy_inputs = [], []
+    _configure_imported_page_dependencies(monkeypatch)
+    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", AsyncMock(return_value={}))
+    state = provider_batch._NativeBatchState(
+        {identity: {"npi": identity} for identity in (9000000000, 9000000001)},
+        {identity: _ranked_batch_addresses(identity) for identity in (9000000000, 9000000001)},
+    )
+    monkeypatch.setattr(provider_batch, "read_native_batch", reader)
+    monkeypatch.setattr(provider_batch, "_prepare_native_batch", AsyncMock(return_value=state))
+    hydration = AsyncMock(return_value=[{"npi": 9000000000, "status": 200, "provider": {"npi": 9000000000}}])
+    monkeypatch.setattr(provider_batch, "_hydrate_native_batch", hydration)
+    return connection, hydration
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_filter", [False, True])
+async def test_filtered_batch_scopes_scores_before_paging_and_retains_hydration(monkeypatch, include_filter):
+    session = _Session()
+    reader = provider_batch.read_native_batch
+    scopes, chunks = _install_scoped_batch(monkeypatch, session)
+    connection, hydration = _configure_filtered_native_batch(monkeypatch, session, reader)
+    request = _request(_body(native_query={"state": "CA", "limit": "1"}, include_filter=include_filter))
+    request.ctx = SimpleNamespace(sa_session=session)
+    reply = await batch.serve_custom_import_provider_batch(request, session)
+
+    assert reply.status == 200 and len(scopes) == 1 and not session.rolled_back
+    payload = json.loads(reply.body)
+    assert (payload["requested"], payload["found"], payload["not_found"]) == (2, 1, 1)
+    assert payload["pagination"]["total"] == 1 and payload["pagination"]["limit"] == 1
+    assert chunks == ([("9000000000",)] if include_filter else [])
+    assert ("custom_import" in payload["items"][0]["provider"]) is include_filter
+    native_sql, score_sql = connection.calls[0][0].split("custom_import_provider_relation AS", 1)
+    assert "native_eligible_npis AS MATERIALIZED" in native_sql and "state_name = :state" in native_sql
+    assert "__native_batch_npis" in native_sql and "LIMIT" not in native_sql
+    assert "native_eligible_npis.npi" in score_sql
+    assert connection.calls[0][1]["__native_batch_npis"] == [9000000000, 9000000001]
+    assert session.events.index("native_scope") < session.events.index("page")
+    assert hydration.await_args.args[0] == [9000000000]
+
+
+@pytest.mark.asyncio
+async def test_filtered_batch_scope_failure_rolls_back_without_fallback(monkeypatch):
+    session = _Session()
+    reader = provider_batch.read_native_batch
+    scopes, chunks = _install_scoped_batch(monkeypatch, session, fail_scope=True)
+    connection, hydration = _configure_filtered_native_batch(monkeypatch, session, reader)
+    request = _request(_body(native_query={"state": "CA"}, include_filter=True))
+    request.ctx = SimpleNamespace(sa_session=session)
+    reply = await batch.serve_custom_import_provider_batch(request, session)
+
+    assert reply.status == 503 and session.rolled_back
+    assert "native_scope" in session.events
+    assert scopes == chunks == connection.calls == []
+    hydration.assert_not_awaited()
+    assert "items" not in json.loads(reply.body)
 
 
 @pytest.mark.asyncio

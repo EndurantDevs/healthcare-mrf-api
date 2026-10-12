@@ -1,10 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Full-scope composition feeds native price checks and positional pagination."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import String, cast, select
 
 from api import billing_search_pagination as pagination
 from api import ptg2_billing_search_service as service
@@ -82,17 +84,38 @@ def _install_native_scope(monkeypatch, access, candidates):
 
 
 @pytest.mark.asyncio
-async def test_complete_import_order_and_price_survivors_page_across_fresh_proofs(monkeypatch):
+@pytest.mark.parametrize("with_native_scope", (False, True))
+async def test_complete_import_order_and_price_survivors_page_across_fresh_proofs(monkeypatch, with_native_scope):
+    """Retain full native candidates and price survivors across independently sealed pages."""
+
     access = _endpoint_access(limit="2")
     candidates = tuple(_matched_result(access, npi=npi).providers[0].candidate for npi in NPI_VALUES[:4])
     _install_native_scope(monkeypatch, access, candidates)
     session = _OrdinalSession((3, 2, 1, 4))
+    prepared_scopes = []
+
+    def scope_callback(endpoint_access):
+        async def prepare_native_scope(native_scope):
+            assert len(session.candidate_scopes) == len(prepared_scopes)
+            prepared_scopes.append(native_scope.compile().params["billing_candidate_npis"])
+            prepared = _prepared()
+            scoped = prepared.statement.where(
+                prepared.statement.selected_columns.entity_value.in_(
+                    select(cast(native_scope.subquery().c.npi, String))
+                )
+            )
+            state = validate_billing_search_endpoint_access_state(endpoint_access, trusted_now=TRUSTED_NOW)[1]
+            return _new_billing_import_query(replace(prepared, statement=scoped), True, _TARGET, state)
+
+        return {"native_scope_preparer": prepare_native_scope} if with_native_scope else {}
+
     first = await service.search_exact_billing_provider_page(
         session,
         access=access,
         cursor_keyring=CURSOR_KEYRING,
         trusted_now=TRUSTED_NOW,
         import_context=_context(access),
+        **scope_callback(access),
     )
     first_payload = shape_billing_search_response(
         access,
@@ -110,6 +133,7 @@ async def test_complete_import_order_and_price_survivors_page_across_fresh_proof
         cursor_keyring=CURSOR_KEYRING,
         trusted_now=TRUSTED_NOW,
         import_context=_context(resumed_access),
+        **scope_callback(resumed_access),
     )
     assert tuple(provider.candidate.address.npi for provider in first.providers + second.providers) == (
         NPI_VALUES[2],
@@ -120,6 +144,32 @@ async def test_complete_import_order_and_price_survivors_page_across_fresh_proof
     assert session.candidate_scopes == [NPI_VALUES[:4], NPI_VALUES[:4]]
     assert first.import_scope == second.import_scope
     assert all(provider_row["rate_occurrences"] for provider_row in first_payload["items"])
+    assert prepared_scopes == ([NPI_VALUES[:4], NPI_VALUES[:4]] if with_native_scope else [])
+
+
+@pytest.mark.asyncio
+async def test_native_scope_failure_stops_before_composition_and_price_hydration(monkeypatch):
+    access = _endpoint_access()
+    candidates = (_matched_result(access).providers[0].candidate,)
+    _install_native_scope(monkeypatch, access, candidates)
+    session = _OrdinalSession((1,))
+    hydrate = AsyncMock()
+    monkeypatch.setattr(service.ptg2_billing_search_page, "hydrate_billing_search_page", hydrate)
+    callback = AsyncMock(side_effect=BillingSearchServingUnavailableError("synthetic unavailable"))
+
+    with pytest.raises(BillingSearchServingUnavailableError):
+        await service.search_exact_billing_provider_page(
+            session,
+            access=access,
+            cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
+            import_context=_context(access),
+            native_scope_preparer=callback,
+        )
+
+    callback.assert_awaited_once()
+    assert session.candidate_scopes == []
+    hydrate.assert_not_awaited()
 
 
 @pytest.mark.parametrize("native_empty", (False, True))

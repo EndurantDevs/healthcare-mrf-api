@@ -3,6 +3,7 @@
 """Real materializer and native SQL proof for bounded grouped root reads."""
 
 import json
+import re
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
@@ -13,6 +14,7 @@ import pytest
 from sanic import response
 from sanic.request.parameters import RequestParameters
 from sqlalchemy import BigInteger, cast, func, literal, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from api import custom_import_detail_batch as batch_http
@@ -21,7 +23,7 @@ from api import custom_import_provider_geo as geo_http
 from api import custom_import_provider_http as provider_http
 from api import custom_import_provider_service_http as service_http
 from api import custom_import_read_http as transport
-from api import provider_list_sql
+from api import provider_batch, provider_list_sql
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
 from api.endpoint import npi as native_npi
 from api.endpoint import pricing
@@ -42,6 +44,8 @@ from process.custom_import.read_core import (
 from process.custom_import.runner import run_candidate
 from process.custom_import.storage_layout import snapshot_schema
 from tests import custom_import_grouped_support as fixture
+from tests import test_custom_import_provider_geo_sql as geo_fixture
+from tests import test_custom_import_provider_list as list_fixture
 from tests import test_custom_import_provider_query_postgres as npi_fixture
 from tests import test_custom_import_read_core_postgres as read_fixture
 from tests import test_custom_import_read_http as http_fixture
@@ -166,13 +170,19 @@ def _children():
 
 
 @asynccontextmanager
-async def _case(*, children=None):
+async def _case(*, children=None, roots=None):
     async with isolated_publication_case() as case:
         seed = await runner_fixture._seed_case(case, "grouped", fixture.definition())
         execution_id, token = await runner_fixture._new_execution(case, seed, "grouped")
         result = await run_candidate(
             case.sessions,
-            runner_fixture._request(seed, execution_id, token, _roots(), _children() if children is None else children),
+            runner_fixture._request(
+                seed,
+                execution_id,
+                token,
+                _roots() if roots is None else roots,
+                _children() if children is None else children,
+            ),
         )
         assert result.status == "activated"
         assert result.accepted_family_count == 8 and result.rejection_count == 0
@@ -893,6 +903,308 @@ def _page_request(target, path, *, full_family):
     )
 
 
+_NATIVE_SCOPE_NPIS = ("1000000004", "1000000012", "1000000020", "1000000038", "1000000046")
+_NATIVE_SCOPE_ABSENT_NPI = "1000000053"
+_NATIVE_SEED_NPI_MAP = {str(1000000001 + ordinal): identity for ordinal, identity in enumerate(_NATIVE_SCOPE_NPIS)}
+
+
+def _native_schema_statement(session, statement):
+    """Translate only fixture-owned table schemas, preserving complete native SQL."""
+
+    schema = session.get_bind().get_execution_options()["schema_translate_map"]["mrf"]
+    translated = text(str(statement).replace("mrf.", f"{_quoted_publication_schema(schema)}."))
+    return translated.bindparams(*getattr(statement, "_bindparams", {}).values())
+
+
+class _NativeSeedSession:
+    def __init__(self, session):
+        self.session = session
+
+    async def execute(self, statement, parameters=None):
+        # The publication case already owns and created this isolated schema.
+        if str(statement) == "CREATE SCHEMA mrf":
+            return None
+        seed_sql = re.sub(r"\b100000000[1-5]\b", lambda match: _NATIVE_SEED_NPI_MAP[match.group()], str(statement))
+        statement = text(seed_sql).bindparams(*getattr(statement, "_bindparams", {}).values())
+        if isinstance(parameters, list):
+            parameters = [{**row, "npi": int(_NATIVE_SEED_NPI_MAP[str(row["npi"])])} for row in parameters]
+        return await self.session.execute(_native_schema_statement(self.session, statement), parameters)
+
+
+class _ScopedNativeProxy:
+    def __init__(self, _database, session, raw_connection):
+        assert raw_connection is None
+        self.session = session
+
+    async def all(self, statement, **parameters):
+        self.session.info.setdefault("scoped_native_sql", []).append((str(statement), dict(parameters)))
+        return (await self.session.execute(_native_schema_statement(self.session, statement), parameters)).all()
+
+
+@asynccontextmanager
+async def _native_scope_case(monkeypatch, *, is_geo):
+    npi_by_fixture_identity = dict(zip((_A, _B, _C), _NATIVE_SCOPE_NPIS[:3], strict=True))
+    root_rows = [{**row, "npi": npi_by_fixture_identity[row["npi"]]} for row in _roots()]
+    child_rows = [{**row, "rate_npi": npi_by_fixture_identity[row["rate_npi"]]} for row in _page_children()]
+    async with _case(roots=root_rows, children=child_rows) as (case, target):
+        async with case.sessions() as seed_session, seed_session.begin():
+            native_session = _NativeSeedSession(seed_session)
+            if is_geo:
+                try:
+                    await seed_session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+                except DBAPIError:
+                    pytest.skip("PostGIS is unavailable for native scoped GEO execution")
+                await geo_fixture._seed_geo_tables(native_session)
+            else:
+                await list_fixture._seed_postgres_provider_list_tables(native_session)
+            await native_session.execute(text("ALTER TABLE mrf.npi_address ADD COLUMN state_name text DEFAULT 'CA'"))
+            await native_session.execute(
+                text("UPDATE mrf.npi_address SET state_name = 'NY', lat = 1 WHERE npi = 1000000002")
+            )
+        list_fixture._configure_postgres_provider_list(monkeypatch)
+        monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _ScopedNativeProxy)
+        yield case, target
+
+
+def _scoped_page_query():
+    return fixture.query(
+        context_filters=(ReadFilter("segment", "eq", "segment_a"),),
+        order_terms=(ReadOrderTerm("score", "desc", "last"),),
+        require_match=False,
+        family_entitlement="full_family",
+    )
+
+
+async def _execute_scoped_native_page(session, pinned_target, *, is_geo, page_state, scoped):
+    service, query = _service(pinned_target), _scoped_page_query()
+    prepared = await service.prepare_npi_entity_relation(
+        session, authorization=_AUTHORIZATION, target=pinned_target, query=query
+    )
+    context = ProviderImportQuery(prepared, compile_npi_entity_relation(prepared.statement), query.require_match)
+    preparer = provider_http._ProviderScopePreparer(session, service, _AUTHORIZATION, pinned_target, query, prepared)
+    request = SimpleNamespace(args=RequestParameters({}), ctx=SimpleNamespace(sa_session=session))
+    native_parameters_by_name = {"include_total": ["true"], "limit": ["2" if is_geo else "1"]}
+    scope_parameters_by_name = {
+        "import_context": context,
+        "native_scope_preparer": preparer.prepare_provider_scope if scoped else None,
+    }
+    if is_geo:
+
+        async def prepare_cursor(**_kwargs):
+            return page_state
+
+        reply = await native_npi.get_near_npi(
+            request,
+            native_args=RequestParameters({**native_parameters_by_name, "lat": ["0"], "long": ["0"], "radius": ["10"]}),
+            prepare_cursor=prepare_cursor,
+            **scope_parameters_by_name,
+        )
+    else:
+        reply = await native_npi.list_providers(
+            request,
+            native_args=RequestParameters({**native_parameters_by_name, "state": ["CA"], "offset": [str(page_state)]}),
+            **scope_parameters_by_name,
+        )
+    assert reply.status == 200, reply.body
+    page_document = json.loads(reply.body)
+    provider_rows = page_document["items" if is_geo else "rows"]
+    families_by_npi = {}
+    if scoped:
+        assert preparer.prepared is not prepared and service._prepared_read_context.prepared is preparer.prepared
+        assert preparer.prepared.query_fingerprint == prepared.query_fingerprint
+        families_by_npi = await _hydrate_context_page(
+            service,
+            session,
+            pinned_target,
+            preparer.prepared,
+            query,
+            tuple(dict.fromkeys(str(provider_row["npi"]) for provider_row in provider_rows)),
+        )
+    return page_document, families_by_npi
+
+
+async def _native_page_pair(case, target, *, is_geo, page_state):
+    outputs = []
+    for scoped in (False, True):
+        async with case.sessions() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            outputs.append(
+                await _execute_scoped_native_page(session, target, is_geo=is_geo, page_state=page_state, scoped=scoped)
+            )
+            if scoped:
+                native_sql, score_sql = session.info["scoped_native_sql"][0][0].split(
+                    "custom_import_provider_relation AS", 1
+                )
+                native_relation = "native_eligible_geo" if is_geo else "native_eligible_npis"
+                assert f"{native_relation} AS MATERIALIZED" in native_sql and "LIMIT" not in native_sql
+                assert f"FROM {native_relation}" in score_sql
+    assert outputs[0][0] == outputs[1][0]
+    return outputs[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_geo", [False, True])
+async def test_postgres_scoped_native_pages_execute_full_ctes_and_preserve_payload(monkeypatch, is_geo):
+    async with _native_scope_case(monkeypatch, is_geo=is_geo) as (case, target):
+        page_state, identities, totals = None if is_geo else 0, [], []
+        for page_number in range(4):
+            payload, families = await _native_page_pair(case, target, is_geo=is_geo, page_state=page_state)
+            rows = payload["items" if is_geo else "rows"]
+            totals.append(payload["total_count" if is_geo else "total"])
+            identities.extend((str(row["npi"]), row.get("address_key")) for row in rows)
+            if page_number == 0:
+                assert set(families) == {_NATIVE_SCOPE_NPIS[0]}
+                assert sum(len(family.children) for _, family in families[_NATIVE_SCOPE_NPIS[0]].families) == 3
+            else:
+                assert families == {}
+            if is_geo and rows:
+                page_state = (str(rows[-1]["npi"]), rows[-1]["address_key"])
+            elif not is_geo:
+                page_state += 1
+        assert rows == []
+        assert totals == [5 if is_geo else 3] * 4
+        assert [identity[0] for identity in identities] == [
+            _NATIVE_SCOPE_NPIS[0],
+            _NATIVE_SCOPE_NPIS[2],
+            *(_NATIVE_SCOPE_NPIS[2:] if is_geo else [_NATIVE_SCOPE_NPIS[3]]),
+        ]
+        assert len(identities) == len(set(identities))
+
+
+def _track_native_scope_hydration(monkeypatch):
+    scopes, hydrations = [], []
+    original_scope = read_core.CustomImportReadService.scope_npi_entity_relation
+    original_hydrate = read_core.CustomImportReadService.hydrate_npi_page
+
+    async def scope(service, session, **arguments):
+        """Observe the genuine callback without replacing its prepared SQL."""
+        prepared = await original_scope(service, session, **arguments)
+        assert service._prepared_read_context.prepared is prepared
+        scopes.append((service, prepared))
+        return prepared
+
+    async def hydrate(service, session, **arguments):
+        """Require the scoped object retained by this exact request-owned service."""
+        assert scopes[-1] == (service, arguments["prepared"])
+        hydrations.append(arguments["entity_values"])
+        return await original_hydrate(service, session, **arguments)
+
+    monkeypatch.setattr(read_core.CustomImportReadService, "scope_npi_entity_relation", scope)
+    monkeypatch.setattr(read_core.CustomImportReadService, "hydrate_npi_page", hydrate)
+    return scopes, hydrations
+
+
+def _native_scoped_batch_request(target, session, *, offset, include_filter):
+    path = provider_batch_http.CUSTOM_IMPORT_PROVIDER_BATCH_PATH
+    document = json.loads(_page_request(target, path, full_family=True).body)
+    document.update(
+        native_query={"state": "CA", "limit": "1", "offset": str(offset), "view": "card"},
+        include_filter=include_filter,
+        native_batch={
+            "npis": [*_NATIVE_SCOPE_NPIS[:4], _NATIVE_SCOPE_ABSENT_NPI],
+            "address_limit": 0,
+            "address_offset": 0,
+            "include_sources": False,
+            "include_evidence": False,
+        },
+    )
+    body = transport._canonical_json_bytes(document)
+    request = http_fixture._Request(
+        body, http_fixture._resigned_provider_headers(body=body, path=path, target=document["target"]), path=path
+    )
+    request.args, request.ctx = RequestParameters({}), SimpleNamespace(sa_session=session)
+    return request
+
+
+def _configure_native_batch_projection(monkeypatch):
+    identities = tuple(int(identity) for identity in _NATIVE_SCOPE_NPIS[:4])
+    monkeypatch.setattr(
+        native_npi,
+        "_build_npi_identity_details_map",
+        AsyncMock(return_value={identity: {"npi": identity} for identity in identities}),
+    )
+    monkeypatch.setattr(
+        native_npi,
+        "_rank_npi_batch_addresses",
+        AsyncMock(return_value={identity: [] for identity in (*identities, int(_NATIVE_SCOPE_ABSENT_NPI))}),
+    )
+    monkeypatch.setattr(native_npi, "_fetch_other_names_map", AsyncMock(return_value={}))
+    monkeypatch.setattr(native_npi, "_fetch_provider_enrichment_summary_map", AsyncMock(return_value={}))
+
+
+async def _native_batch_baseline(session, target, request):
+    parsed = provider_batch_http._parse_batch_request(request.body)
+    query = replace(
+        _scoped_page_query(), entity_values=tuple(str(identity) for identity in parsed.native_batch["npis"])
+    )
+    prepared = await _service(target).prepare_npi_entity_relation(
+        session, authorization=_AUTHORIZATION, target=target, query=query
+    )
+    context = ProviderImportQuery(
+        prepared,
+        compile_npi_entity_relation(prepared.statement),
+        query.require_match,
+        tuple(parsed.native_batch["npis"]),
+    )
+    return await provider_batch.read_native_batch(
+        request, parsed.native_batch, native_args=parsed.provider.native_args, session=session, import_context=context
+    )
+
+
+def _strip_scoped_batch_imports(successes, *, offset, include_filter):
+    for provider_item in successes:
+        assert ("custom_import" in provider_item["provider"]) is include_filter
+        if include_filter:
+            family_set = provider_item["provider"].pop("custom_import")
+            if offset == 0:
+                assert family_set["projection"] == "full_family"
+                assert sum(len(family["children"]) for family in family_set["families"]) == 3
+            else:
+                assert family_set is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_filter", [False, True])
+async def test_postgres_filtered_batch_executes_native_scope_and_full_hydration(monkeypatch, include_filter):
+    http_fixture._install_keyring(monkeypatch)
+    _configure_native_batch_projection(monkeypatch)
+    scopes, hydrations = _track_native_scope_hydration(monkeypatch)
+    async with _native_scope_case(monkeypatch, is_geo=False) as (case, pinned_target):
+        for offset in range(4):
+            async with case.sessions() as session, session.begin():
+                await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+                baseline = await _native_batch_baseline(
+                    session,
+                    pinned_target,
+                    _native_scoped_batch_request(pinned_target, session, offset=offset, include_filter=False),
+                )
+            async with case.sessions() as session:
+                reply = await provider_batch_http.serve_custom_import_provider_batch(
+                    _native_scoped_batch_request(pinned_target, session, offset=offset, include_filter=include_filter),
+                    session,
+                )
+                assert reply.status == 200, reply.body
+                sql, parameters = session.info["scoped_native_sql"][0]
+                native_sql, score_sql = sql.split("custom_import_provider_relation AS", 1)
+                assert "native_eligible_npis AS MATERIALIZED" in native_sql and "state_name = :state" in native_sql
+                assert "LIMIT" not in native_sql and "native_eligible_npis.npi" in score_sql
+                assert parameters["__native_batch_npis"] == [
+                    int(identity) for identity in (*_NATIVE_SCOPE_NPIS[:4], _NATIVE_SCOPE_ABSENT_NPI)
+                ]
+            composed = json.loads(reply.body)
+            composed.pop("meta")
+            successes = [provider_item for provider_item in composed["items"] if provider_item["status"] == 200]
+            assert [provider_item["npi"] for provider_item in successes] == (
+                [int(_NATIVE_SCOPE_NPIS[index]) for index in (0, 2, 3)][offset : offset + 1]
+            )
+            _strip_scoped_batch_imports(successes, offset=offset, include_filter=include_filter)
+            assert composed == baseline and composed["pagination"]["total"] == 3
+        assert len(scopes) == 4
+        assert hydrations == (
+            [(_NATIVE_SCOPE_NPIS[0],), (_NATIVE_SCOPE_NPIS[2],), (_NATIVE_SCOPE_NPIS[3],), ()] if include_filter else []
+        )
+
+
 async def _native_page_reply(session, import_context, *, is_geo):
     identities = [(_A, 1), (_B, 1), (_C, 1)] + ([(_A, 2)] if is_geo else [])
     native_selects = [
@@ -937,7 +1249,7 @@ async def test_signed_full_pages_preserve_native_order_counts_absence_and_geo_re
     async with _case(children=_page_children()) as (case, target):
         seen_statements = []
 
-        async def native_page(request, *, native_args, import_context, prepare_cursor=None):
+        async def native_page(request, *, native_args, import_context, prepare_cursor=None, native_scope_preparer=None):
             seen_statements.append(str(import_context.prepared.statement))
             if prepare_cursor is not None:
                 await prepare_cursor(session=session, coordinates=[40, -73])

@@ -2,8 +2,10 @@
 """Configured billing reads require paired authority and bounded hydration."""
 
 import json
+from dataclasses import replace
 
 import pytest
+from sqlalchemy import literal, select
 
 from api import billing_search_http as native_http
 from api import custom_import_billing_http as billing
@@ -25,6 +27,46 @@ async def test_billing_filter_inclusion_is_independent_and_uses_one_snapshot(mon
     assert payload.get("data") is None
     assert session.prepared_count == 1
     assert session.events == ["begin", "snapshot", "bounded", "prepare", "search", "shape"] + (
+        ["hydrate"] if include_filter else []
+    ) + ["finality", "end"]
+    assert not session.active
+
+
+@pytest.mark.parametrize("include_filter", (False, True))
+@pytest.mark.asyncio
+async def test_billing_native_scope_and_hydration_reuse_latest_prepared_snapshot(monkeypatch, include_filter):
+    session = Session()
+    install_pipeline(monkeypatch, session)
+    read_service = billing.CustomImportReadService
+    native_search = billing.search_exact_billing_provider_page
+    scoped_relations = []
+
+    class ScopedReadService(read_service):
+        async def scope_npi_entity_relation(self, same_session, **kwargs):
+            assert same_session is session and session.active
+            self.authorizer.authorize(kwargs["authorization"], target=kwargs["pinned_target"])
+            scoped = replace(kwargs["prepared"], statement=kwargs["prepared"].statement.where(literal(True)))
+            scoped_relations.append(scoped)
+            session.events.append("scope")
+            return scoped
+
+        async def hydrate_npi_page(self, same_session, **kwargs):
+            assert kwargs["prepared"] is scoped_relations[-1]
+            return await super().hydrate_npi_page(same_session, **kwargs)
+
+    async def scoped_search(same_session, *, import_context, native_scope_preparer, **kwargs):
+        scoped_context = await native_scope_preparer(select(literal(1000000004).label("npi")))
+        assert scoped_context is not import_context and scoped_context.import_scope == import_context.import_scope
+        assert scoped_context.prepared is scoped_relations[-1]
+        return await native_search(same_session, import_context=scoped_context, **kwargs)
+
+    monkeypatch.setattr(billing, "CustomImportReadService", ScopedReadService)
+    monkeypatch.setattr(billing, "search_exact_billing_provider_page", scoped_search)
+    reply = await billing.serve_custom_import_billing_search(signed_request(include_filter=include_filter), session)
+
+    assert reply.status == 200 and len(scoped_relations) == 1 and session.prepared_count == 1
+    assert ("custom_import" in json.loads(reply.body)["items"][0]) is include_filter
+    assert session.events == ["begin", "snapshot", "bounded", "prepare", "scope", "search", "shape"] + (
         ["hydrate"] if include_filter else []
     ) + ["finality", "end"]
     assert not session.active
