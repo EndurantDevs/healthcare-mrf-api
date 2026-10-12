@@ -812,6 +812,31 @@ async def test_materialized_undo_refuses_forged_predecessor(monkeypatch, history
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "field,value,error",
+    [
+        ("company_id", None, "predecessor_invalid"),
+        ("company_id", UUID(COMPANY), "predecessor_invalid"),
+        ("company_id", str(UUID(int=23)), "predecessor_invalid"),
+        ("revision", None, "revision_conflict"),
+        ("revision", True, "revision_conflict"),
+        ("revision", "1", "revision_conflict"),
+        ("revision", 2, "revision_conflict"),
+    ],
+)
+async def test_correction_refuses_retained_identity_or_revision_before_any_write(field, value, error):
+    session = Session()
+    await _apply(session, _edit())
+    session.history[0]["record_json"][field] = value
+    before = copy.deepcopy((session.head, session.history, session.assertions, session.draft))
+    correction = _edit(operation="correct", expected_revision=1, idempotency_key="invalid-predecessor-identity")
+    correction.fields["assertions"]["expected_revision"] = 1
+    with pytest.raises(store.RegistryRecordConflict, match=error):
+        await _apply(session, correction)
+    assert (session.head, session.history, session.assertions, session.draft) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "family,entries",
     [
         ("role_assertions", [None]),

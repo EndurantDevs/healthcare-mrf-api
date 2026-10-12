@@ -1,76 +1,21 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Exercise the native encoder, binary COPY and durable set persistence together."""
 
-import csv
-import hashlib
-import io
 import json
 from dataclasses import replace
-from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
 from asyncpg import CheckViolationError
 
 from process import registry_source_admission as admission
-from process.registry_source_admission import RegistrySourceAdmissionError, RegistrySourceEdition, admit_cms_mlr_edition
+from process.registry_source_admission import RegistrySourceAdmissionError, admit_cms_mlr_edition
+from tests.registry_source_fixtures import _HEADERS as _HEADERS
+from tests.registry_source_fixtures import _edition as _edition
+from tests.registry_source_fixtures import _input as _input
 from tests.test_network_serving_schema_postgres import serving_schema
 
 pytest.importorskip("ptg2_address_canon")
-_HEADERS = (
-    "mr_submission_template_id",
-    "business_state",
-    "group_affiliation",
-    "company_pk",
-    "hios_issuer_id",
-    "company_name",
-    "company_address",
-    "domiciliary_state",
-    "naic_group_code",
-    "naic_company_code",
-    "federal_ein",
-    "am_best_number",
-    "dba_marketing_name",
-    "not_for_profit",
-    "created_date",
-    "merge_markets_ind_small_grp",
-    "fit_exempt",
-)
-
-
-def _input(company_name="Synthetic Company"):
-    output = io.StringIO(newline="")
-    writer = csv.DictWriter(output, fieldnames=_HEADERS, lineterminator="\r\n")
-    writer.writeheader()
-    for index, state in enumerate(("CA", "NY")):
-        writer.writerow(
-            {
-                "mr_submission_template_id": f"submission-{index}",
-                "business_state": state,
-                "group_affiliation": "Synthetic Group",
-                "hios_issuer_id": f"00{123 + index}",
-                "company_name": company_name,
-                "naic_group_code": "00707",
-                "naic_company_code": "00456",
-                "federal_ein": "01-2345678",
-            }
-        )
-    return output.getvalue().encode()
-
-
-def _edition(input_bytes):
-    return RegistrySourceEdition(
-        uuid4(),
-        "cms",
-        "commercial-mlr",
-        "2024",
-        "https://example.test/source.zip",
-        "a" * 64,
-        hashlib.sha256(input_bytes).hexdigest(),
-        "cms-header-v1",
-        2024,
-        datetime(2025, 9, 12, tzinfo=timezone.utc),
-    )
 
 
 @pytest.mark.asyncio

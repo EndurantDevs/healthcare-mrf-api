@@ -5,26 +5,19 @@ import asyncio
 import json
 import re
 import sys
-from dataclasses import asdict, replace
+from dataclasses import replace
 from uuid import uuid4
 
 import pytest
 
 from db.connection import Database
 from process import registry_source_import as source_import
+from tests.registry_source_fixtures import _arguments as _arguments
+from tests.registry_source_fixtures import _edition as _edition
+from tests.registry_source_fixtures import _input as _input
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
-from tests.test_registry_source_admission_postgres import _edition, _input
 
 pytest.importorskip("ptg2_address_canon")
-
-
-def _arguments(input_file, edition):
-    arguments = ["--input-file", str(input_file)]
-    for field, value in asdict(edition).items():
-        if field == "published_at":
-            value = value.isoformat() if value is not None else "unknown"
-        arguments.extend(("--" + field.replace("_", "-"), str(value)))
-    return arguments
 
 
 def _configured_pool(monkeypatch, engine, schema):

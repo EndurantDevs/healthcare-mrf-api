@@ -69,6 +69,9 @@ def _zip(members, *, compression=zipfile.ZIP_DEFLATED):
     with warnings.catch_warnings(), zipfile.ZipFile(output, "w", compression=compression) as archive:
         warnings.simplefilter("ignore", UserWarning)
         for name, content in members:
+            if isinstance(name, str):
+                name = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                name.compress_type = compression
             archive.writestr(name, content)
     return output.getvalue()
 
@@ -102,8 +105,10 @@ def _prepare(tmp_path, members=None, candidate=None, *, archive_bytes=None):
     return preparation.prepare_registry_source_input(candidate, fetched, tmp_path / "inputs"), fetched
 
 
-def test_mlr_exact_bytes_header_and_lookup_provenance_are_replay_stable(tmp_path):
+def test_mlr_exact_bytes_header_and_lookup_provenance_are_replay_stable(tmp_path, monkeypatch):
+    monkeypatch.setattr(zipfile.time, "localtime", lambda _seconds: (2000, 1, 1, 0, 0, 0, 5, 1, -1))
     prepared, fetched = _prepare(tmp_path)
+    monkeypatch.setattr(zipfile.time, "localtime", lambda _seconds: (2000, 1, 1, 0, 0, 2, 5, 1, -1))
     replay = preparation.prepare_registry_source_input(prepared.candidate, fetched, tmp_path / "inputs")
     assert replay == prepared and prepared.input_path.read_bytes() == _HEADER
     assert prepared.input_sha256 == hashlib.sha256(_HEADER).hexdigest()
