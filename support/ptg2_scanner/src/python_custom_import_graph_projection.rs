@@ -272,6 +272,181 @@ mod graph_projection_python_tests {
     use pyo3::ffi::c_str;
 
     #[test]
+    fn projection_export_rejects_malformed_layouts_and_recovers() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+            ptg2_address_canon(&module).unwrap();
+            let globals = PyDict::new(py);
+            globals.set_item("native", module).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+project = native.custom_import_graph_projection_columns_v1
+graph = ((True, (('key', 'string'),), (('parent', 0),), (0,)), ((False, 1, 1),))
+collection = (1, graph, (), ())
+layout = ((), (collection,))
+profile = (1, 'default', (), ())
+cases = [
+    (((),), 'scalar verification tuple shape differs'),
+    (((), ()), 'graph projection collection bound exceeded'),
+    (((), (collection,) * 9), 'graph projection collection bound exceeded'),
+    (((('string', False, 1),) * 21, (collection,)), 'graph projection root field bound exceeded'),
+    (((('string', 0, 1),), (collection,)), 'graph query nullable differs'),
+    (((('string', False),), (collection,)), 'scalar verification tuple shape differs'),
+    (((('string', False, True),), (collection,)), 'scalar verification identity requires an integer'),
+    (((('string', False, 32768),), (collection,)), 'graph query field slot differs'),
+    (((), ((1, graph, ()),)), 'scalar verification tuple shape differs'),
+    (((), ((1, (), (), ()),)), 'scalar verification tuple shape differs'),
+    (((), ((True, graph, (), ()),)), 'scalar verification identity requires an integer'),
+    (((), ((32768, graph, (), ()),)), 'graph collection slot differs'),
+    (((), ((1, graph, (), ((1, 'default', ()),)),)), 'scalar verification tuple shape differs'),
+    (((), ((1, graph, (), ((True, 'default', (), ()),)),)), 'scalar verification identity requires an integer'),
+    (((), ((1, graph, (), ((32768, 'default', (), ()),)),)), 'graph profile slot differs'),
+    (((), ((1, graph, (), ((1, '', (), ()),)),)), 'source field identity differs'),
+    (((), ((1, graph, (), (profile,) * 5),)), 'graph projection profile bound exceeded'),
+    (((), ((1, graph, (-1,), ()),)), 'source key index differs'),
+    (((), ((1, graph, (0, 0), ()),)), 'graph projection query binding differs'),
+    (((), ((1, graph, (0,) * 21, ()),)), 'graph projection index bound exceeded'),
+    (((), ((1, graph, (0,), ((1, 'default', (0,) * 4, ()),)),)), 'graph projection index bound exceeded'),
+    (((), ((1, graph, (0,), ((1, 'default', (), (0,) * 3),)),)), 'graph projection index bound exceeded'),
+]
+for invalid, message in cases:
+    try:
+        project(invalid, [], [None])
+    except ValueError as error:
+        assert str(error) == message, (message, str(error))
+    else:
+        raise AssertionError(message)
+    assert project(layout, [], [None]) == ((None,), ((),) * 10, ((),) * 4)
+"#
+                ),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn projection_export_rejects_invalid_envelopes_and_aggregate_input() {
+        Python::initialize();
+        Python::attach(|py| {
+            let globals = PyDict::new(py);
+            globals
+                .set_item(
+                    "project",
+                    wrap_pyfunction!(custom_import_graph_projection_columns_v1, py).unwrap(),
+                )
+                .unwrap();
+            py.run(
+                c_str!(
+                    r#"
+graph = ((True, (('key', 'string'),), (('parent', 0),), (0,)), ((False, 1, 1),))
+collection = (1, graph, (), ())
+layout = ((), (collection,))
+root = ('parent', b'r' * 32, 1, 2, b'f' * 32, ())
+row = (0, 0, 7, 'parent', b'r' * 32, 'child', b'c' * 32, b'p' * 32, '{}')
+cases = [
+    (layout, [None] * 65, [None], 'graph projection root bound exceeded'),
+    (layout, [root], [], 'graph projection row bound exceeded'),
+    (layout, [root], [None] * 65, 'graph projection row bound exceeded'),
+    (layout, [root[:5]], [None], 'scalar verification tuple shape differs'),
+    (layout, [root[:5] + ((('null', None),),)], [None], 'scalar verification tuple shape differs'),
+    (layout, [(None,) + root[1:]], [None], 'graph projection text differs'),
+    (layout, [(root[0], 'r' * 32) + root[2:]], [None], 'graph projection digest differs'),
+    (layout, [(root[0], b'r' * 31) + root[2:]], [None], 'graph projection digest differs'),
+    (layout, [root[:4] + (bytearray(32), ())], [None], 'graph projection digest differs'),
+    (layout, [root[:2] + (True,) + root[3:]], [None], 'scalar verification identity requires an integer'),
+    (layout, [root[:3] + (True,) + root[4:]], [None], 'scalar verification identity requires an integer'),
+    (layout, [root], [row[:8]], 'scalar verification tuple shape differs'),
+    (layout, [root], [(1,) + row[1:]], 'source key index differs'),
+    (layout, [root], [row[:1] + (1,) + row[2:]], 'source key index differs'),
+    (layout, [root], [row[:2] + (True,) + row[3:]], 'scalar verification identity requires an integer'),
+    (layout, [root], [row[:3] + (None,) + row[4:]], 'graph projection text differs'),
+    (layout, [root], [row[:4] + (b'r',) + row[5:]], 'graph projection digest differs'),
+    (layout, [root], [row[:5] + (None,) + row[6:]], 'graph projection text differs'),
+    (layout, [root], [row[:8] + (None,)], 'graph projection text differs'),
+    (layout, [root], [row[:6] + (b'c' * 33,) + row[7:]], 'graph projection digest differs'),
+    (layout, [root], [row[:7] + ('p' * 32,) + row[8:]], 'graph projection digest differs'),
+]
+wide_layout = (tuple(('string', True, slot) for slot in range(1, 21)), (collection,))
+wide_root = root[:5] + ((('value', 'x' * 2048),) * 20,)
+cases.append((wide_layout, [wide_root] * 4, [None], 'graph projection input byte bound exceeded'))
+for current_layout, roots, rows, message in cases:
+    try:
+        project(current_layout, roots, rows)
+    except ValueError as error:
+        assert str(error) == message, (message, str(error))
+    else:
+        raise AssertionError(message)
+    assert project(layout, [root], [None]) == ((None,), ((),) * 10, ((),) * 4)
+assert project(layout, [None], [None]) == ((None,), ((),) * 10, ((),) * 4)
+"#
+                ),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn projection_export_preserves_typed_columns_context_digest_and_row_order() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+            ptg2_address_canon(&module).unwrap();
+            let globals = PyDict::new(py);
+            globals.set_item("native", module).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import hashlib
+import json
+
+def document(contract, domain, fields):
+    canonical = json.dumps({'contract': contract, 'fields': fields}, separators=(',', ':'), ensure_ascii=False)
+    digest = hashlib.sha256(b'custom-import/v1\0candidate-runner/1\0' + domain + b'\0' + canonical.encode()).digest()
+    return canonical, digest
+
+def field(name, kind, value):
+    return {'field': name, 'value': {'state': 'value', 'type': kind, 'value': value}}
+
+fields = (('key', 'string'), ('count', 'integer'), ('active', 'boolean'), ('ratio', 'decimal'))
+source = (True, fields, (('parent', 0),), (0,))
+graph = (source, tuple((False, index + 3, index + 1) for index in range(4)))
+layout = ((('integer', False, 1), ('boolean', False, 2)), ((1, graph, (0, 1, 2, 3), ((1, 'typed', (5,), (0, 1)),)),))
+key = 'Ω😀'
+parent, parent_hash = document('custom-import-key/v1', b'root-key', [field('parent', 'string', key)])
+child, child_hash = document('custom-import-key/v1', b'child-key', [field('key', 'string', key)])
+payload, payload_hash = document('custom-import-record/v1', b'child-payload', [field(name, kind, value) for (name, kind), value in zip(fields, (key, 3, True, '1.25'))])
+root = (parent, parent_hash, 1, 2, b'f' * 32, (('value', -7), ('value', False)))
+row = (0, 0, 9, parent, parent_hash, child, child_hash, payload_hash, payload)
+spans, scalars, contexts = native.custom_import_graph_projection_columns_v1(layout, [root], [row, None, row[:2] + (10,) + row[3:]])
+assert spans[0][:4] == (0, 4, 0, 1) and spans[1] is None and spans[2][:4] == (4, 4, 1, 1)
+assert scalars[0] == (9,) * 4 + (10,) * 4
+assert scalars[1] == (3, 4, 5, 6) * 2
+assert scalars[2] == ('string', 'integer', 'boolean', 'decimal') * 2
+assert scalars[3] == ('value',) * 8
+assert scalars[4] == (key, None, None, None) * 2
+assert scalars[5] == (None, 3, None, None) * 2
+assert scalars[6] == (None, None, None, '1.25') * 2
+assert scalars[7] == (None, None, True, None) * 2
+assert scalars[8] == scalars[9] == (None,) * 8
+canonical = '{"dimensions":[{"field_slot":1,"field_type":"integer","value":-7,"value_state":"value"},{"field_slot":2,"field_type":"boolean","value":false,"value_state":"value"}],"profile_id":"typed","scope":"child"}'
+assert contexts == ((9, 10), (1, 1), (canonical, canonical), (hashlib.sha256(b'custom-import/v1\0winner-context\0' + canonical.encode()).digest(),) * 2)
+assert type(scalars[5][1]) is int and type(scalars[7][2]) is bool and type(scalars[6][3]) is str
+"#
+                ),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
     fn projection_admission_rechecks_mutated_inputs_and_releases_on_error() {
         Python::initialize();
         let slot = source_encoding_slot().unwrap();

@@ -167,3 +167,125 @@ fn dedicated_pool_has_only_the_bounded_native_workers() {
     let indices = pool.broadcast(|context| context.index());
     assert_eq!(indices, (0..expected).collect::<Vec<_>>());
 }
+
+#[test]
+fn projection_layout_rejects_ambiguous_slots_and_profile_indices() {
+    for invalid in 0..10 {
+        let (mut layout, roots, rows) = fixture(1);
+        match invalid {
+            0 => layout.collections.clear(),
+            1 => layout.roots[0].slot = 0,
+            2 => layout.roots[0].kind = "timestamp".into(),
+            3 => layout.collections[0].slot = 0,
+            4 => layout.collections[0].query_indices = vec![0, 0],
+            5 => layout.collections[0].query_indices = vec![2],
+            6 => layout.collections[0].profiles[0].slot = 0,
+            7 => layout.collections[0].profiles[0].id.clear(),
+            8 => layout.collections[0].profiles[0].selection = vec![3],
+            9 => layout.collections[0].profiles[0].dimensions = vec![0, 0],
+            _ => unreachable!(),
+        }
+        assert!(projection_layout_bound(&layout).is_err(), "case {invalid}");
+        assert!(projection_columns(&layout, &roots, &rows, 4096).is_err());
+    }
+}
+
+#[test]
+fn projection_batch_rejects_invalid_shapes_and_indices_before_workers() {
+    for invalid in 0..6 {
+        let (layout, mut roots, mut rows) = fixture(1);
+        let mut expected = "graph projection batch bound exceeded";
+        match invalid {
+            0 => rows.clear(),
+            1 => rows.resize_with(65, || None),
+            2 => roots.resize_with(65, || None),
+            3 => roots[0].as_mut().unwrap().cells.clear(),
+            4 => {
+                rows[0].as_mut().unwrap().collection = 1;
+                expected = "graph projection collection index differs";
+            }
+            5 => {
+                rows[0].as_mut().unwrap().root = 1;
+                expected = "graph projection root index differs";
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            projection_columns(&layout, &roots, &rows, 4096)
+                .err()
+                .as_deref(),
+            Some(expected),
+            "case {invalid}"
+        );
+    }
+}
+
+#[test]
+fn projection_distinguishes_typed_null_and_missing_context_values() {
+    let (mut layout, mut roots, rows) = fixture(1);
+    layout.roots = vec![
+        QueryField {
+            kind: "integer".into(),
+            nullable: true,
+            slot: 1,
+        },
+        QueryField {
+            kind: "boolean".into(),
+            nullable: true,
+            slot: 4,
+        },
+    ];
+    layout.collections[0].profiles[0].selection = vec![3];
+    layout.collections[0].profiles[0].dimensions = vec![0, 1];
+    for (cells, expected) in [
+        (
+            vec![SourceValue::Integer(-7), SourceValue::Boolean(false)],
+            r#"[{"field_slot":1,"field_type":"integer","value":-7,"value_state":"value"},{"field_slot":4,"field_type":"boolean","value":false,"value_state":"value"}]"#,
+        ),
+        (
+            vec![SourceValue::Null, SourceValue::Missing],
+            r#"[{"field_slot":1,"field_type":"integer","value":null,"value_state":"null"},{"field_slot":4,"field_type":"boolean","value":null,"value_state":"missing"}]"#,
+        ),
+    ] {
+        roots[0].as_mut().unwrap().cells = cells;
+        let result = projection_columns(&layout, &roots, &rows, 4096).unwrap();
+        let canonical =
+            format!(r#"{{"dimensions":{expected},"profile_id":"default","scope":"child"}}"#);
+        assert!(result.rows[0].is_some());
+        assert!(matches!(&result.contexts[2][0], ColumnValue::Text(value) if value == &canonical));
+        let hash: [u8; 32] = Sha256::digest([CONTEXT_PREFIX, canonical.as_bytes()].concat()).into();
+        assert!(matches!(&result.contexts[3][0], ColumnValue::Hash(value) if value == &hash));
+    }
+    layout.roots[1].nullable = false;
+    let result = projection_columns(&layout, &roots, &rows, 4096).unwrap();
+    assert_eq!(result.rows, vec![None]);
+    assert!(result.scalars.iter().all(Vec::is_empty));
+    assert!(result.contexts.iter().all(Vec::is_empty));
+}
+
+#[test]
+fn projection_falls_back_without_leaking_partial_columns() {
+    for invalid in 0..6 {
+        let (mut layout, mut roots, rows) = fixture(1);
+        match invalid {
+            0 => roots[0].as_mut().unwrap().entity_id = 0,
+            1 => roots[0].as_mut().unwrap().family_id = 0,
+            2 => roots[0].as_mut().unwrap().cells[0] = SourceValue::Boolean(true),
+            3 => roots[0].as_mut().unwrap().cells[0] = SourceValue::Null,
+            4 => {
+                roots[0].as_mut().unwrap().cells[0] = SourceValue::Text("\u{1}".repeat(2048));
+                layout.collections[0].profiles[0].dimensions = vec![0];
+            }
+            5 => layout.roots[0].kind = "integer".into(),
+            _ => unreachable!(),
+        }
+        let result = projection_columns(&layout, &roots, &rows, 4096).unwrap();
+        assert_eq!(result.rows, vec![None], "case {invalid}");
+        assert!(result.scalars.iter().all(Vec::is_empty));
+        assert!(result.contexts.iter().all(Vec::is_empty));
+        layout.collections[0].profiles.clear();
+        let scalars_only = projection_columns(&layout, &roots, &rows, 4096).unwrap();
+        assert_eq!(scalars_only.rows[0].unwrap().1, 2);
+        assert!(scalars_only.contexts.iter().all(Vec::is_empty));
+    }
+}

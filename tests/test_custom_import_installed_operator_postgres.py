@@ -52,6 +52,7 @@ from process.custom_import.snowflake_bundle import (
 from process.custom_import.snowflake_candidate import bundle_request_identity_sha256
 from process.custom_import.snowflake_python import _parquet_reader
 from process.custom_import.snowflake_source_binding import load_snowflake_source_binding
+from tests.custom_import_installed_acquisition import failure_metadata
 from tests.custom_import_postgres_support import POSTGRES_DSN_ENV, isolated_publication_case, seed_publication_graph
 from tests.test_custom_import_snowflake_operator_cli import _loaded_binding, _registration_document
 
@@ -153,7 +154,7 @@ async def _command(installed_application, case, *arguments, snowflake=False, std
         assert stdout == b""
         assert stderr == (canonical_json({"code": error, "status": "error"}) + "\n").encode()
         return None
-    assert process.returncode == 0
+    assert process.returncode == 0, failure_metadata(stdout, stderr)
     assert stderr == b""
     assert len(stdout.splitlines()) == 1
     return json.loads(stdout)

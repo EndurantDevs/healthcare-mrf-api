@@ -128,6 +128,27 @@ def test_physical_prefix_uses_ordinal_groups_real_eof_and_first_group_fallback()
     """)
 
 
+def test_decision_transport_filters_only_actions_without_narrowing_validation_or_accounting():
+    query = admission._queries()[1]
+    receipt = query.split("SELECT (SELECT f.problem FROM failures f ORDER BY f.occurrence_id,f.stage LIMIT 1)", 1)[1]
+    assert _compact(receipt) == _compact("""
+        fatal_code,
+        count(*)::integer rows_processed,coalesce(max(d.occurrence_id),:admission_after_occurrence_id) last_id,
+        count(*) FILTER (WHERE d.error_code IN ('root_not_object','root_key_missing','child_not_object','orphan_child')) errors,
+        coalesce(jsonb_agg(jsonb_build_object(
+            'occurrence_id',d.occurrence_id,'parent_id',d.parent_id,'record_kind',d.record_kind,
+            'pack_id',d.pack_id,'source_ordinal',d.source_ordinal,'collection_slot',d.collection_slot,
+            'initial_code',d.initial_code,'code',d.code,'rejection_id',d.rejection_id,
+            'own_action',coalesce(d.own_action,false),'root_record_id',d.root_record_id
+        ) ORDER BY d.occurrence_id) FILTER (WHERE d.own_action),'[]'::jsonb)
+      decisions FROM ordered_decisions d;
+    """)
+    assert query.count("FILTER (WHERE d.own_action)") == 1
+    apply = admission._queries()[2]
+    assert "FROM page_decisions d WHERE d.own_action AND d.code IS DISTINCT FROM d.initial_code" in apply
+    assert "WHERE d.own_action\n" in apply
+
+
 def test_apply_ctes_keep_ordered_rejections_targets_and_resolution_identity():
     historical = _leaf().split("    WITH\n    page_decisions AS MATERIALIZED (", 1)[1]
     ordinary = _unbound(admission._queries()[2]).split("page_decisions AS MATERIALIZED (", 1)[1]

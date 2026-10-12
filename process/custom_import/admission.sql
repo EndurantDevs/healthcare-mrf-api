@@ -340,7 +340,7 @@ SELECT (SELECT f.problem FROM failures f ORDER BY f.occurrence_id,f.stage LIMIT 
         'pack_id',d.pack_id,'source_ordinal',d.source_ordinal,'collection_slot',d.collection_slot,
         'initial_code',d.initial_code,'code',d.code,'rejection_id',d.rejection_id,
         'own_action',coalesce(d.own_action,false),'root_record_id',d.root_record_id
-    ) ORDER BY d.occurrence_id),'[]'::jsonb)
+    ) ORDER BY d.occurrence_id) FILTER (WHERE d.own_action),'[]'::jsonb)
   decisions FROM ordered_decisions d;
 
 -- statement boundary --
