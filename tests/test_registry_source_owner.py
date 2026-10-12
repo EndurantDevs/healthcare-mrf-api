@@ -8,14 +8,14 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, call
 
 import pytest
 
 from db import connection as database_connection
 from process import registry_management_permissions as permissions
 from process import registry_source_import as source_import
-from tests.test_registry_source_admission_postgres import _edition, _input
-from tests.test_registry_source_import_postgres import _arguments
+from tests.registry_source_fixtures import _arguments, _edition, _input
 
 
 @pytest.mark.parametrize(
@@ -265,3 +265,226 @@ async def test_source_cli_owner_gate_precedes_admission_and_teardown(monkeypatch
     assert not database.in_transaction and database.engine.echo is True
     captured = capsys.readouterr()
     assert captured.out == captured.err == ""
+
+
+@pytest.mark.asyncio
+async def test_source_owner_requires_transaction_before_catalog_access():
+    connection = OwnerConnection()
+    connection.is_in_transaction = lambda: False
+    connection.fetchrow = AsyncMock()
+    connection.fetchval = AsyncMock()
+    with pytest.raises(permissions.RegistryManagementPermissionError, match="caller transaction"):
+        await permissions.assume_registry_source_owner(connection, "example_owner", control_schema="example_registry")
+    connection.fetchrow.assert_not_awaited()
+    connection.fetchval.assert_not_awaited()
+    assert connection.statements == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["closed", "open", "error"])
+async def test_source_custody_restores_search_path_on_success_and_refusal(monkeypatch, outcome):
+    from process import registry_source_admission_receipt as admission
+
+    previous = '"example_path",public'
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=previous), execute=AsyncMock())
+    custody = AsyncMock(return_value={} if outcome == "closed" else None)
+    if outcome == "error":
+        custody.side_effect = RuntimeError("synthetic catalog failure")
+    monkeypatch.setattr(admission, "_custody", custody)
+    if outcome == "closed":
+        await permissions._require_source_custody(connection, "example_registry")
+    else:
+        expected = RuntimeError if outcome == "error" else permissions.RegistryManagementPermissionError
+        with pytest.raises(expected):
+            await permissions._require_source_custody(connection, "example_registry")
+    custody.assert_awaited_once_with(connection, "example_registry")
+    assert connection.execute.await_args_list == [
+        call("SELECT set_config('search_path','pg_catalog,pg_temp',true)"),
+        call("SELECT set_config('search_path',$1,true)", previous),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary,message",
+    [
+        ("transaction", "caller transaction"),
+        ("same namespace", "separate namespace"),
+        ("missing owner", "existing protected ownership"),
+        ("login owner", "existing protected ownership"),
+        ("missing namespace", "existing protected ownership"),
+        ("native identity", "native source custody identity"),
+    ],
+)
+async def test_provisioning_scope_refuses_unsafe_boundary_before_ddl(boundary, message):
+    owner, namespace = OwnerConnection(login=boundary == "login owner").owner, {"oid": 31, "nspowner": 17}
+    connection = SimpleNamespace(
+        is_in_transaction=lambda: boundary != "transaction",
+        fetchrow=AsyncMock(
+            side_effect=[
+                None if boundary == "missing owner" else owner,
+                None if boundary == "missing namespace" else namespace,
+            ]
+        ),
+        fetchval=AsyncMock(return_value=boundary != "native identity"),
+        execute=AsyncMock(),
+    )
+    target = "example_registry" if boundary == "same namespace" else "example_protected_registry"
+    with pytest.raises(permissions.RegistryManagementPermissionError, match=message):
+        await permissions._provisioning_scope(connection, "example_registry", target, "example_api", "example_owner")
+    connection.execute.assert_not_awaited()
+    if boundary in {"transaction", "same namespace"}:
+        connection.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("denied", ["database", "API namespace"])
+async def test_provisioning_operator_requires_database_and_old_api_read_privileges(denied):
+    async def has_privilege(query, *arguments):
+        if "has_database_privilege" in query:
+            return denied != "database"
+        if "has_schema_privilege($1,$2::oid" in query:
+            assert arguments == ("example_api", 31)
+            return denied != "API namespace"
+        return True
+
+    connection = SimpleNamespace(fetchval=AsyncMock(side_effect=has_privilege), execute=AsyncMock())
+    message = "create the registry namespace" if denied == "database" else "read the old registry namespace"
+    with pytest.raises(permissions.RegistryManagementPermissionError, match=message):
+        await permissions._require_provisioning_operator(
+            connection, {"oid": 31, "nspowner": 17}, OwnerConnection().owner, [{"relowner": 19}], [], "example_api"
+        )
+    connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("readable,writable", [(False, False), (True, True), (True, False)])
+async def test_read_bridge_requires_effective_select_without_effective_writes(readable, writable):
+    grants = [{"column_grant": False, "grantee": 18, "privilege_type": "SELECT", "is_grantable": False}]
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(side_effect=[18, readable, writable]), fetch=AsyncMock(return_value=grants)
+    )
+    if readable and not writable:
+        await permissions._verify_read_view_grants(connection, 41, "example_api", 17)
+    else:
+        message = "must be read only" if writable else "reads are unavailable"
+        with pytest.raises(permissions.RegistryManagementPermissionError, match=message):
+            await permissions._verify_read_view_grants(connection, 41, "example_api", 17)
+
+
+def _read_bridge_catalog():
+    return [
+        {
+            "oid": 100 + index,
+            "relname": name,
+            "relkind": "v",
+            "relpersistence": "p",
+            "relowner": 17,
+            "reloptions": ["security_invoker=true"],
+            "columns": list(columns),
+            "targets": [200 + index],
+            "rules": 1,
+            "triggers": False,
+            "definition": "SELECT " + ", ".join(columns) + f" FROM example_protected_registry.{name};",
+        }
+        for index, (name, columns) in enumerate(permissions._TABLES.items())
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("relkind", "r", "relation kind"),
+        ("relpersistence", "t", "relation kind"),
+        ("relowner", 18, "protected owner"),
+        ("reloptions", [], "view options"),
+        ("columns", [], "column order"),
+        ("targets", [999], "target identity"),
+        ("rules", 2, "rules or triggers"),
+        ("triggers", True, "rules or triggers"),
+        ("definition", "SELECT 1;", "canonical definition"),
+    ],
+)
+async def test_read_bridge_refuses_wrong_native_shape_before_grant_verification(monkeypatch, field, value, message):
+    catalog = _read_bridge_catalog()
+    target_by_name = {f'"example_protected_registry"."{row["relname"]}"': row["targets"][0] for row in catalog}
+    catalog[0][field] = value
+
+    async def native_identity(query, *arguments):
+        if "has_schema_privilege" in query:
+            return True
+        if "FROM pg_roles" in query:
+            return 17
+        return target_by_name[arguments[0]]
+
+    connection = SimpleNamespace(fetchval=AsyncMock(side_effect=native_identity))
+    grants = AsyncMock()
+    monkeypatch.setattr(permissions, "_read_view_catalog", AsyncMock(return_value=catalog))
+    monkeypatch.setattr(permissions, "_verify_read_view_grants", grants)
+    with pytest.raises(permissions.RegistryManagementPermissionError, match=message):
+        await permissions._verify_registry_read_views(
+            connection, "example_registry", "example_protected_registry", "example_api", "example_owner"
+        )
+    grants.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_registry_lock_refuses_catalog_identity_change_before_row_scan(monkeypatch):
+    tables = [{"relname": "company_registry", "oid": 41}]
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=31), execute=AsyncMock())
+    monkeypatch.setattr(permissions, "_catalog", AsyncMock(return_value=([{**tables[0], "oid": 42}], [])))
+    with pytest.raises(permissions.RegistryManagementPermissionError, match="objects changed while locking"):
+        await permissions._lock_empty_registry(connection, "example_registry", tables, [])
+    connection.execute.assert_awaited_once_with(
+        'LOCK TABLE "example_registry"."company_registry" IN ACCESS EXCLUSIVE MODE NOWAIT'
+    )
+    assert connection.fetchval.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_relation", [None, "table", "sequence"])
+async def test_registry_move_preserves_standalone_sequence_identity(monkeypatch, changed_relation):
+    tables = [{"relname": "company_registry", "oid": 41}]
+    sequences = [{"relname": "network_registry_identity_network_id_seq", "oid": 42}]
+    connection = SimpleNamespace(fetchval=AsyncMock(side_effect=[42, 32]), execute=AsyncMock())
+    moved = (
+        [{**tables[0], "oid": 99}] if changed_relation == "table" else tables,
+        [{**sequences[0], "oid": 99}] if changed_relation == "sequence" else sequences,
+    )
+    monkeypatch.setattr(permissions, "_catalog", AsyncMock(return_value=moved))
+    arguments = (connection, "example_registry", "example_protected_registry", "example_owner", tables, sequences)
+    if changed_relation is not None:
+        with pytest.raises(permissions.RegistryManagementPermissionError, match="native identities changed"):
+            await permissions._move_registry_objects(*arguments)
+    else:
+        await permissions._move_registry_objects(*arguments)
+    assert connection.execute.await_args_list[-1] == call(
+        'ALTER SEQUENCE "example_registry"."network_registry_identity_network_id_seq" SET SCHEMA "example_protected_registry"'
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_bridge_retirement_rolls_back_when_locked_view_identity_changes(monkeypatch):
+    connection = OperatorDatabase()
+    connection.fetchval = AsyncMock(return_value=True)
+    connection.execute = AsyncMock()
+    for name in ("_provisioning_scope", "verify_registry_management_permissions", "_require_source_custody"):
+        monkeypatch.setattr(permissions, name, AsyncMock())
+    monkeypatch.setattr(
+        permissions,
+        "_verify_registry_read_views",
+        AsyncMock(side_effect=[{"company_registry": 41}, {"company_registry": 42}]),
+    )
+    with pytest.raises(permissions.RegistryManagementPermissionError, match="views changed while locking"):
+        await permissions.retire_registry_read_views(
+            connection,
+            source_schema="example_registry",
+            target_schema="example_protected_registry",
+            api_role="example_api",
+            owner_role="example_owner",
+        )
+    connection.execute.assert_awaited_once_with(
+        'LOCK TABLE "example_registry"."company_registry" IN ACCESS SHARE MODE NOWAIT'
+    )
+    assert connection.events == ["begin", "rollback"]
