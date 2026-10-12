@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -15,7 +16,10 @@ from process.registry_issuer_resolution import (
     RegistryIssuerResolutionUnavailable,
     read_registry_issuer_resolutions,
 )
+from process.registry_source_admission import admit_cms_planfinder_edition
+from tests.test_cms_planfinder_workbook_input import _workbook
 from tests.test_network_serving_schema_postgres import serving_schema
+from tests.test_registry_planfinder_admission_postgres import _edition as _planfinder_edition
 
 pytestmark = pytest.mark.asyncio
 
@@ -122,6 +126,35 @@ async def test_source_labels_and_leading_zero_identity(serving_schema):
         assert "Editable draft" not in json.dumps(result)
         assert result["relationship_scope"] == "source_reporting_period"
         assert (await _read(connection, schema, ("00123",)))[0] == result
+
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+async def test_planfinder_issuer_labels_are_separate_from_company_labels(serving_schema, tmp_path, version):
+    connection, schema, _ = serving_schema
+    path, digest = _workbook(tmp_path, count=2)
+    edition = replace(_planfinder_edition(digest), parser_version="cms-planfinder-hios-2026-08-06-" + version)
+    async with connection.transaction():
+        receipt = await admit_cms_planfinder_edition(connection, path, edition, control_schema=schema)
+    assert receipt["resolved_issuers"] == 2
+    async with connection.transaction(isolation="repeatable_read"):
+        result = (await _read(connection, schema, (1234,)))[0]
+    assert result["issuer_id"] == 1234 and result["hios_issuer_id"] == "01234"
+    assert result["company_resolution_status"] == "resolved"
+    assert result["legal_company"]["source_labels"] == []
+    assert result["issuer_source_labels"] == ["Example Legal Company"]
+    assert all(row["company_label"] is None and row["company_label_origin"] is None for row in result["evidence"])
+    assert all(
+        row["issuer_label"] == "Example Legal Company" and row["issuer_label_origin"] == "source_issuer"
+        for row in result["evidence"]
+    )
+    head = await connection.fetchrow(
+        f'SELECT display_name,display_name_origin,aliases FROM "{schema}".company_registry'
+    )
+    assert tuple(head) == (
+        ("Company EIN 012345678", "identifier", "[]")
+        if version == "v2"
+        else ("Example Legal Company", "source_issuer", "[]")
+    )
 
 
 async def test_reporting_year_precedes_retrieval_and_explicit_period_never_falls_back(serving_schema):

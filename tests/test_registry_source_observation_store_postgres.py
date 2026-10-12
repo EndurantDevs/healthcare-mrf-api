@@ -606,3 +606,28 @@ async def test_landing_context_rejects_nil_and_unbounded_values(serving_schema, 
     landing = await _landing(connection, schema, [_assertion()])
     with pytest.raises(RegistryObservationError):
         replace(landing, **invalid_context)
+
+
+@pytest.mark.parametrize(
+    "source_system,source_id,parser,successor",
+    [
+        ("cms", "plan-finder", "cms-planfinder-hios-2026-08-06-v2", True),
+        ("cms", "plan-finder", "cms-planfinder-hios-2026-08-06-v1", False),
+        ("cms", "commercial-mlr", "cms-header-v1", False),
+        ("other", "plan-finder", "cms-planfinder-hios-2026-08-06-v2", False),
+    ],
+)
+async def test_source_role_sql_is_gated_to_exact_successor(source_system, source_id, parser, successor):
+    from process.registry_source_observation_store import _company_resolution_sql
+
+    landing = RegistryObservationLanding(
+        "pg_temp_1", "source_rows", 1, uuid4(), source_system, source_id, "example-edition", "a" * 64, parser, 2
+    )
+    statement = _company_resolution_sql('"example_registry"', '"source_rows"', landing)
+    assert ("source_identity_complete" in statement) is successor
+    assert ("COUNT(DISTINCT issuer_label)>1" in statement) is successor
+    assert ("Company EIN " in statement) is successor
+    assert ("conflicting_company_names_for_ein" in statement) is not successor
+    assert "COUNT(DISTINCT ein)>1" in statement
+    assert "ein_company_id<>naic_binding_id" in statement
+    assert "source_parent_key)>1" in statement if successor else "source_parent_key" not in statement

@@ -30,7 +30,6 @@ from tests.test_registry_ptg_office_preparation_postgres import _approved_site
 from tests.test_registry_ptg_scope_engine_postgres import (
     _app_authority,
     _approve_published_association,
-    _migration,
     _published_lock_provision,
     _published_review_setup,
     _seed_approved_company,
@@ -184,8 +183,6 @@ async def _prepare_control(fixture, custom, roles):
         await install_registry_management_permissions(
             connection, api_role=roles["management"], owner_role=custom.roles["owner"], control_schema=schema
         )
-        for statement in _migration("20261009010000_registry_ptg_producer_scope.py")._ddl(schema):
-            await connection.execute(statement)
         table = f'"{schema}".registry_ptg_producer_scope'
         await connection.execute(f'ALTER TABLE {table} OWNER TO "{custom.roles["owner"]}"')
         await connection.execute(f'GRANT SELECT,INSERT ON {table} TO "{fixture.source.roles[1]}"')
@@ -220,7 +217,7 @@ async def _source_review(fixture, custom, roles, tmp_path):
     )
     view.service = service
     _, _, intent, preview_request = await _published_review_setup(
-        view, tmp_path, document["ownership"], network, revision
+        view, tmp_path, document["ownership"], network, revision, existing_table=True
     )
     intent.update(
         plan_id="native-office-plan",

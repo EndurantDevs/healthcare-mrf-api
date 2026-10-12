@@ -248,12 +248,12 @@ async def test_runtime_observation_reads_migrated_postgres_snapshot(monkeypatch)
     monkeypatch.setattr(runtime, "build_baked_healthcare_source_commit", lambda: "d" * 40)
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     expected_heads = set(script.get_heads())
-    assert expected_heads == {"20261011010000_company_registry_group_assertions"}
+    assert expected_heads == {"20261012010000_company_registry_name_origin"}
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )
     assert script.get_revision(next(iter(expected_heads))).down_revision == (
-        "20261010030000_registry_source_admission_receipt"
+        "20261011010000_company_registry_group_assertions"
     )
     assert script.get_revision("20261010030000_registry_source_admission_receipt").down_revision == (
         "20261010020000_registry_ptg_office_retention"

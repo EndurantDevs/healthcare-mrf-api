@@ -138,7 +138,8 @@ def test_values_are_deeply_immutable():
 
 
 @pytest.mark.parametrize("level", ["command", "role", "identifier", "provenance"])
-def test_unknown_fields_refuse_closed_documents(level):
+@pytest.mark.parametrize("field", ["authorized", "correction_predecessors"])
+def test_unknown_fields_refuse_closed_documents(level, field):
     document = _command(identifier_assertions=[_identifier()])
     selected = {
         "command": document,
@@ -146,7 +147,7 @@ def test_unknown_fields_refuse_closed_documents(level):
         "identifier": document["identifier_assertions"][0],
         "provenance": document["role_assertions"][0]["provenance"],
     }[level]
-    selected["authorized"] = True
+    selected[field] = True
     with pytest.raises(values.CompanyRegistryAssertionValueError):
         _parse(document)
 

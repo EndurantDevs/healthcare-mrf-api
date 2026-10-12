@@ -176,5 +176,8 @@ def test_history_normalizes_only_absent_legacy_group_family():
     from process.registry_approval_store import _selected_history_json_sql
 
     statement = _selected_history_json_sql()
-    assert "'group_assertions','[]'::jsonb" in statement
-    assert "||history.record_json" in statement
+    company_branch = statement.split("WHEN selected.record_kind='company_links'", 1)[0]
+    defaults, retained_fields = company_branch.split("||", 1)
+    assert "'group_assertions','[]'::jsonb" in defaults
+    # The retained right operand preserves explicit families, including an empty one.
+    assert retained_fields.strip() == "(history.record_json-'correction_predecessors')"

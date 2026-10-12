@@ -351,3 +351,93 @@ async def test_concurrent_source_imports_share_one_durable_identity(serving_sche
         await asyncio.gather(*(writer.close() for writer in connections))
     assert await connection.fetchval(f'SELECT COUNT(*) FROM "{schema}".company_registry') == 1
     assert await connection.fetchval(f'SELECT COUNT(*) FROM "{schema}".company_group_registry') == 1
+
+
+def _source_role_workbook(tmp_path, conflict=None):
+    from tests.test_cms_planfinder_workbook_input import _add_issuer_row, _workbook
+
+    def second_issuer(documents):
+        namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+        sheet = documents["xl/worksheets/sheet1.xml"].find(namespace + "sheetData")
+        sheet.remove(sheet[-1])
+        overrides_by_column = {0: ("n", "9999", "0"), 1: ("inlineStr", "Second Issuer", "0")}
+        if conflict in {"issuer_name", "issuer_ein", "issuer_state"}:
+            overrides_by_column[0] = ("n", "1234", "0")
+        if conflict == "issuer_state":
+            overrides_by_column[1] = ("s", "19", "0")
+            overrides_by_column[3] = ("inlineStr", "FL", "0")
+        if conflict in {"issuer_ein", "parent_ein"}:
+            overrides_by_column[8] = ("n", "23456789", "0")
+        if conflict == "ein_parent":
+            overrides_by_column[12] = ("n", "38", "0")
+        if conflict == "missing_parent":
+            overrides_by_column[12] = ("n", None, "0")
+        if conflict == "zero_parent":
+            overrides_by_column[12] = ("n", "0", "0")
+        _add_issuer_row(sheet, 3, overrides_by_column)
+
+    return _workbook(tmp_path, count=2, mutation=second_issuer)
+
+
+async def _admit_source_role_workbook(connection, schema, prepared, digest, *, edition=None):
+    from dataclasses import replace
+
+    from process.registry_source_admission import admit_cms_planfinder_edition
+    from tests.test_registry_planfinder_admission_postgres import _edition
+
+    if edition is None:
+        edition = replace(_edition(digest), parser_version="cms-planfinder-hios-2026-08-06-v2")
+    async with connection.transaction():
+        receipt = await admit_cms_planfinder_edition(connection, prepared, edition, control_schema=schema)
+    return edition, receipt
+
+
+@pytest.mark.parametrize("existing", [False, True])
+async def test_planfinder_issuer_labels_do_not_become_company_names(serving_schema, tmp_path, existing):
+    connection, schema, _ = serving_schema
+    prepared, digest = _source_role_workbook(tmp_path)
+    retained = None
+    if existing:
+        landing = await _landing(connection, schema, [_assertion()])
+        company_id, _ = await _bindings(connection, schema, landing.snapshot_id)
+        retained = await connection.fetchrow(
+            f'SELECT * FROM "{schema}".company_registry WHERE company_id=$1', company_id
+        )
+    edition, receipt = await _admit_source_role_workbook(connection, schema, prepared, digest)
+    assert receipt["identity_materialization"]["companies_created"] == (0 if existing else 1)
+    assert receipt["identity_materialization"]["groups_created"] == 0
+    assert receipt["resolved_issuers"] == 2 and receipt["conflicting_issuers"] == 0
+    company = await connection.fetchrow(f'SELECT * FROM "{schema}".company_registry')
+    if existing:
+        assert company == retained
+    else:
+        assert company["display_name"] == "Company EIN 012345678"
+        assert company["display_name_origin"] == "identifier" and company["aliases"] == "[]"
+    labels = await connection.fetchval(
+        f"SELECT jsonb_agg(observation_json->'raw_fields'->>'issr_lgl_name' ORDER BY source_row_number) FROM \"{schema}\".registry_source_observation WHERE snapshot_id=$1",
+        edition.snapshot_id,
+    )
+    assert json.loads(labels) == ["Example Legal Company", "Second Issuer"]
+    _, replay = await _admit_source_role_workbook(connection, schema, prepared, digest, edition=edition)
+    assert replay["replayed"] and replay["identity_materialization"]["companies_created"] == 0
+    assert await connection.fetchrow(f'SELECT * FROM "{schema}".company_registry') == company
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    ["issuer_name", "issuer_ein", "issuer_state", "ein_parent", "parent_ein", "missing_parent", "zero_parent"],
+)
+async def test_planfinder_identifier_or_issuer_contradictions_do_not_allocate(serving_schema, tmp_path, conflict):
+    connection, schema, _ = serving_schema
+    prepared, digest = _source_role_workbook(tmp_path, conflict)
+    edition, receipt = await _admit_source_role_workbook(connection, schema, prepared, digest)
+    assert receipt["observations"] == 2
+    assert receipt["identity_materialization"]["companies_created"] == 0
+    assert await connection.fetchval(f'SELECT COUNT(*) FROM "{schema}".company_registry') == 0
+    assert (
+        await connection.fetchval(
+            f'SELECT COUNT(*) FROM "{schema}".registry_source_observation WHERE snapshot_id=$1', edition.snapshot_id
+        )
+        == 2
+    )
+    assert receipt["resolved_issuers"] == 0

@@ -316,11 +316,20 @@ async def _capture_context(scope_fixture, control_schema, roles):
 
 async def _grant_retained_reader(fixture, scope_fixture):
     publisher, retained_reader = scope_fixture.roles[2], fixture.roles["reader"]
-    await fixture.connection.execute(f'GRANT "{retained_reader}" TO "{publisher}"')
     await fixture.connection.execute(f'GRANT USAGE ON SCHEMA "{fixture.control_schema}" TO "{retained_reader}"')
     await fixture.connection.execute(
         f'GRANT SELECT ON ALL TABLES IN SCHEMA "{fixture.control_schema}" TO "{retained_reader}"'
     )
+    for table in (
+        "registry_ptg_producer_scope",
+        "registry_ptg_published_plan_scope",
+        "registry_ptg_office_approval",
+        "registry_ptg_office_hold",
+    ):
+        await fixture.connection.execute(
+            f'REVOKE SELECT ON "{fixture.control_schema}"."{table}" FROM "{retained_reader}"'
+        )
+    await fixture.connection.execute(f'GRANT "{retained_reader}" TO "{publisher}"')
 
 
 async def _cleanup_office_resources(

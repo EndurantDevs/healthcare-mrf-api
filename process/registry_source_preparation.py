@@ -38,7 +38,10 @@ _MAX_HEADER_BYTES = 64 * 1024
 _HEADER_MEMBER = "MR_Submission_Template_Header.csv"
 _LOOKUP_MEMBER = "MR_Submission_Sheet_Lookup.csv"
 _HIOS_MEMBER = re.compile(r"(20\d{2}-\d{2}-\d{2})-HIOS\.xlsx\Z")
-_PARSERS_BY_SOURCE = {"commercial-mlr": "cms-header-v1", "plan-finder": "cms-planfinder-hios-2026-08-06-v1"}
+_PARSERS_BY_SOURCE = {
+    "commercial-mlr": ("cms-header-v1",),
+    "plan-finder": ("cms-planfinder-hios-2026-08-06-v1", "cms-planfinder-hios-2026-08-06-v2"),
+}
 
 
 class RegistrySourcePreparationError(ValueError):
@@ -115,7 +118,7 @@ def _validate_identity(candidate, fetched):
             candidate.published_at,
         )
     )
-    _require(spec.parser_version == _PARSERS_BY_SOURCE[candidate.source_id])
+    _require(spec.parser_version in _PARSERS_BY_SOURCE[candidate.source_id])
     _require(spec.expected_sha256 in (None, receipt.artifact_sha256))
     _require(Path(fetched.artifact_path).name == receipt.artifact_sha256 + ".artifact")
     if candidate.source_id == "commercial-mlr":

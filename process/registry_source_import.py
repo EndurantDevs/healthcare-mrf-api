@@ -92,6 +92,7 @@ def _parser():
     parser.add_argument("--snapshot-id", type=UUID, required=True)
     parser.add_argument("--source-system", choices=("cms",), required=True)
     parser.add_argument("--source-id", choices=("commercial-mlr", "plan-finder"), required=True)
+    parser.add_argument("--protected-owner-role", help="explicit trusted operator role for a closed registry")
     for field in ("edition-id", "source-url", "artifact-sha256", "input-sha256", "parser-version"):
         parser.add_argument("--" + field, required=True)
     parser.add_argument("--reporting-year", type=int, required=True)
@@ -104,6 +105,7 @@ def _parser():
 def _edition(parsed):
     metadata_by_name = vars(parsed).copy()
     metadata_by_name.pop("input_file")
+    metadata_by_name.pop("protected_owner_role")
     return RegistrySourceEdition(**metadata_by_name)
 
 
@@ -166,13 +168,17 @@ async def _disconnect_database(database):
         raise
 
 
-async def _run_import(input_bytes, edition):
+async def _run_import(input_bytes, edition, protected_owner_role=None):
     database = Database()
     with _receipt_only_database_output(database):
         try:
             await database.connect()
             _set_engine_echo(database, False)
             async with database.acquire_driver() as connection, connection.transaction():
+                if protected_owner_role is not None:
+                    from process.registry_management_permissions import assume_registry_source_owner
+
+                    await assume_registry_source_owner(connection, protected_owner_role)
                 admit = admit_cms_planfinder_edition if edition.source_id == "plan-finder" else admit_cms_mlr_edition
                 admission_by_name = await admit(connection, input_bytes, edition)
                 receipt = _receipt_json(edition, admission_by_name)
@@ -198,7 +204,7 @@ def run_command(arguments=None):
         print(_error_json("invalid_arguments"), file=sys.stderr)
         return 2
     try:
-        receipt = asyncio.run(_run_import(input_bytes, edition))
+        receipt = asyncio.run(_run_import(input_bytes, edition, parsed.protected_owner_role))
     except KeyboardInterrupt, asyncio.CancelledError:
         print(_error_json("canceled"), file=sys.stderr)
         return 130

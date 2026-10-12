@@ -103,10 +103,10 @@ async def _stage_selection(connection, selection_json):
 
 
 def _selected_history_json_sql():
-    """Normalize only absent legacy fields when comparing immutable snapshots."""
+    """Compare product fields with legacy defaults, leaving retained audit metadata intact."""
     return """CASE WHEN selected.record_kind='company' THEN
             jsonb_build_object('role_assertions','[]'::jsonb,'identifier_assertions','[]'::jsonb,
-              'group_assertions','[]'::jsonb)||history.record_json
+              'group_assertions','[]'::jsonb,'display_name_origin','unknown')||(history.record_json-'correction_predecessors')
             WHEN selected.record_kind='company_links' AND NOT history.record_json ? 'network_assertions'
             THEN history.record_json||jsonb_build_object('network_assertions','[]'::jsonb)
             WHEN selected.record_kind='network' AND NOT history.record_json ? 'catalog_evidence_json'

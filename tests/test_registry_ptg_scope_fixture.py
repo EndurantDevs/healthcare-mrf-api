@@ -54,6 +54,10 @@ async def test_fixture_loads_company_assertions():
     first_group = statements.index(group_ddl[0])
     assert statements[first_group : first_group + len(group_ddl)] == group_ddl
     assert first_group > first_assertion
+    origin_ddl = fixture._migration("20261012010000_company_registry_name_origin.py")._ddl(schema)
+    first_origin = statements.index(origin_ddl[0])
+    assert statements[first_origin : first_origin + len(origin_ddl)] == origin_ddl
+    assert first_origin > first_group
     assert not any("GRANT" in statement and "company_registry_group_assertion" in statement for statement in statements)
     assert all("CREATE FUNCTION" not in statement and "CREATE TRIGGER" not in statement for statement in statements)
     assert (

@@ -50,6 +50,7 @@ async def record_db():
             "20261009020000_company_registry_assertions.py",
             "20261009030000_network_catalog_evidence.py",
             "20261011010000_company_registry_group_assertions.py",
+            "20261012010000_company_registry_name_origin.py",
         ]:
             path = Path(__file__).parents[1] / "alembic/versions" / filename
             spec = importlib.util.spec_from_file_location(filename.removesuffix(".py"), path)
@@ -93,6 +94,85 @@ def _create(kind="group", **changes):
 async def _apply(sessions, schema, command, actor):
     async with sessions() as session, session.begin():
         return await apply_registry_record_command(session, command, actor, schema=schema)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["manual", "source_company", "source_issuer", "identifier", "unknown"])
+async def test_company_name_origin_changes_only_with_display_name(record_db, origin):
+    connection, schema, sessions = record_db
+    company_id, actor = uuid4(), _actor()
+    await connection.execute(
+        f'INSERT INTO "{schema}".company_registry(company_id,display_name,roles,display_name_origin) '
+        "VALUES($1,'Source Company',ARRAY['employer'],$2)",
+        company_id,
+        origin,
+    )
+    correction = _create(
+        "company",
+        record_id=company_id,
+        operation="correct",
+        expected_revision=1,
+        fields={"display_name": " Source Company ", "aliases": ["Reviewed alias"], "roles": ["employer"]},
+    )
+    corrected = await _apply(sessions, schema, correction, actor)
+    assert corrected["record"]["display_name_origin"] == origin
+    assert await _apply(sessions, schema, correction, actor) == corrected
+    for operation, revision in (("archive", 2), ("restore", 3)):
+        lifecycle_record = await _apply(
+            sessions,
+            schema,
+            replace(
+                correction, operation=operation, expected_revision=revision, fields={}, idempotency_key=uuid4().hex
+            ),
+            actor,
+        )
+        assert lifecycle_record["record"]["display_name_origin"] == origin
+    rename = replace(
+        correction,
+        expected_revision=4,
+        fields={**correction.fields, "display_name": "Reviewed Company"},
+        idempotency_key=uuid4().hex,
+    )
+    with pytest.raises(RegistryRecordConflict, match="revision_conflict"):
+        await _apply(sessions, schema, replace(rename, expected_revision=3), actor)
+    renamed = await _apply(sessions, schema, rename, actor)
+    assert renamed["record"]["display_name"] == "Reviewed Company"
+    assert renamed["record"]["display_name_origin"] == "manual"
+    assert renamed["record"]["roles"] == ["employer"]
+    assert await _apply(sessions, schema, rename, actor) == renamed
+    history = json.loads(
+        await connection.fetchval(
+            f'SELECT record_json FROM "{schema}".registry_record_history '
+            "WHERE record_kind='company' AND record_key=$1 AND revision=2",
+            str(company_id),
+        )
+    )
+    assert history["display_name_origin"] == origin and history["display_name"] == "Source Company"
+
+
+@pytest.mark.asyncio
+async def test_company_name_origin_native_default_and_constraints(record_db):
+    connection, schema, _ = record_db
+    company_id = uuid4()
+    await connection.execute(
+        f'INSERT INTO "{schema}".company_registry(company_id,display_name,roles) '
+        "VALUES($1,'Legacy Company',ARRAY['employer'])",
+        company_id,
+    )
+    for value, refusal in (("guessed", asyncpg.CheckViolationError), (None, asyncpg.NotNullViolationError)):
+        with pytest.raises(refusal):
+            async with connection.transaction():
+                await connection.execute(
+                    f'UPDATE "{schema}".company_registry SET display_name_origin=$1 WHERE company_id=$2',
+                    value,
+                    company_id,
+                )
+    assert (
+        await connection.fetchval(
+            f'SELECT display_name_origin FROM "{schema}".company_registry WHERE company_id=$1', company_id
+        )
+        == "unknown"
+    )
 
 
 @pytest.mark.asyncio

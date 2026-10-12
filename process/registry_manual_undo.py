@@ -23,6 +23,7 @@ from process.registry_record_store import (
     RegistryRecordCommand,
     RegistryRecordConflict,
     _bounded_text,
+    _materialized_company_history,
     _record_identity,
     _record_table,
     _table,
@@ -97,6 +98,16 @@ async def _read_undo_history(session, command, schema):
             target_history.c.custom_revision,
             target_history.c.request_sha256,
             expected_history.c.custom_revision.label("expected_custom_revision"),
+            expected_history.c.request_sha256.label("expected_request_sha256"),
+            expected_history.c.record_json["correction_predecessors"]["company_revision"].astext.label(
+                "predecessor_revision"
+            ),
+            func.jsonb_typeof(expected_history.c.record_json["correction_predecessors"]["company_revision"]).label(
+                "predecessor_revision_type"
+            ),
+            (target_history.c.actor_json == expected_history.c.actor_json).label("same_actor"),
+            target_history.c.reason.label("target_reason"),
+            target_history.c.idempotency_key.label("target_idempotency_key"),
             expected_history.c.record_json[identity_column].astext.label("expected_identity"),
             func.jsonb_typeof(expected_history.c.record_json[identity_column]).label("expected_identity_type"),
             expected_history.c.record_json["revision"].astext.label("expected_record_revision"),
@@ -118,6 +129,35 @@ async def _read_undo_history(session, command, schema):
         .where(head.c[identity_column] == command.record_id)
     )
     history_by_field = (await session.execute(statement)).mappings().one_or_none()
+    _validate_undo_history(command, history_by_field)
+    return history_by_field, identity_column
+
+
+def _validate_undo_history(command, history_by_field):
+    is_bound_predecessor = False
+    if (
+        history_by_field is not None
+        and command.record_kind == "company"
+        and (command.target_revision, command.expected_revision) == (1, 2)
+        and history_by_field["custom_revision"] == history_by_field["expected_custom_revision"]
+        and history_by_field["predecessor_revision"] == str(command.target_revision)
+        and history_by_field["predecessor_revision_type"] == "number"
+        and history_by_field["same_actor"] is True
+        and type(history_by_field["record_json"]) is dict
+        and history_by_field["record_json"].get("company_id") == str(command.record_id)
+        and type(history_by_field["record_json"].get("revision")) is int
+        and history_by_field["record_json"]["revision"] == command.target_revision
+        and type(history_by_field["expected_request_sha256"]) is str
+        and re.fullmatch(r"[0-9a-f]{64}", history_by_field["expected_request_sha256"]) is not None
+    ):
+        baseline = _materialized_company_history(
+            {"request_sha256": history_by_field["expected_request_sha256"]}, history_by_field["record_json"]
+        )
+        is_bound_predecessor = (
+            history_by_field["request_sha256"] == baseline["request_sha256"]
+            and history_by_field["target_reason"] == baseline["reason"]
+            and history_by_field["target_idempotency_key"] == baseline["idempotency_key"]
+        )
     if (
         history_by_field is None
         or history_by_field["expected_identity"] != str(command.record_id)
@@ -127,13 +167,21 @@ async def _read_undo_history(session, command, schema):
         or history_by_field["current_revision"] < command.expected_revision
         or history_by_field["custom_revision"] is None
         or history_by_field["expected_custom_revision"] is None
-        or not 0
-        < history_by_field["custom_revision"]
-        < history_by_field["expected_custom_revision"]
-        <= 9223372036854775807
+        or not (
+            0
+            < history_by_field["custom_revision"]
+            < history_by_field["expected_custom_revision"]
+            <= 9223372036854775807
+            or (
+                is_bound_predecessor
+                and 0
+                < history_by_field["custom_revision"]
+                == history_by_field["expected_custom_revision"]
+                <= 9223372036854775807
+            )
+        )
     ):
         raise RegistryRecordConflict("registry_manual_undo_history_conflict")
-    return history_by_field, identity_column
 
 
 def _prepare_correction(command, history_by_field, identity_column):
@@ -228,12 +276,15 @@ async def prepare_registry_manual_undo(session, command: RegistryManualUndoComma
 
 async def _read_history_page(session, kind, record_id, limit, offset, schema):
     history = _table(RegistryRecordHistory, schema)
+    record_json = history.c.record_json
+    if kind == "company":
+        record_json = record_json.op("-")("correction_predecessors")
     page = (
         select(
             history.c.revision,
             history.c.custom_revision,
             history.c.reason,
-            history.c.record_json,
+            record_json.label("record_json"),
         )
         .where(history.c.record_kind == kind, history.c.record_key == str(record_id))
         .order_by(history.c.revision.desc())
