@@ -272,6 +272,90 @@ mod graph_projection_python_tests {
     use pyo3::ffi::c_str;
 
     #[test]
+    fn projection_wire_bounds_reject_before_output_and_keep_admission_reusable() {
+        Python::initialize();
+        Python::attach(|py| {
+            let globals = PyDict::new(py);
+            globals
+                .set_item(
+                    "project",
+                    pyo3::wrap_pyfunction!(custom_import_graph_projection_columns_v1, py)
+                        .unwrap(),
+                )
+                .unwrap();
+            py.run(
+                c_str!(r#"
+graph = ((True, (('key', 'string'),), (('parent', 0),), (0,)), ((False, 2, 1),))
+profile = (1, 'default', (), (0,))
+collection = (1, graph, (0,), (profile,))
+layout = ((('string', False, 1),), (collection,))
+root = ('parent', b'h' * 32, 1, 2, b'f' * 32, (('value', 'display'),))
+row = (0, 0, 1, 'parent', b'h' * 32, 'child', b'c' * 32, b'p' * 32, '{}')
+empty = ((None,), ((),) * 10, ((),) * 4)
+assert project(layout, [root], [None]) == empty
+cases = [
+    ((), [root], [None]),
+    ((layout[0] * 21, layout[1]), [root], [None]),
+    ((layout[0], ()), [root], [None]),
+    ((layout[0], layout[1] * 9), [root], [None]),
+    (((('string', 1, 1),), layout[1]), [root], [None]),
+    (((('string', False),), layout[1]), [root], [None]),
+    (((('string', False, 40000),), layout[1]), [root], [None]),
+    (((('timestamp', False, 1),), layout[1]), [root], [None]),
+    ((layout[0], ((40000, *collection[1:]),)), [root], [None]),
+    ((layout[0], (collection[:-1],)), [root], [None]),
+    ((layout[0], (collection, collection)), [root], [None]),
+    ((layout[0], ((1, graph, (0, 0), (profile,)),)), [root], [None]),
+    ((layout[0], ((1, graph, (0,), (profile,) * 5),)), [root], [None]),
+    ((layout[0], ((1, graph, (0,), (profile[:-1],)),)), [root], [None]),
+    ((layout[0], ((1, graph, (0,), ((1, '', (), (0,)),)),)), [root], [None]),
+    ((layout[0], ((1, graph, (0,), ((40000, *profile[1:]),)),)), [root], [None]),
+    ((layout[0], ((1, graph, (0,), ((1, 'default', (0,) * 4, (0,)),)),)), [root], [None]),
+    ((layout[0], ((1, graph, (0,), ((1, 'default', (), (0,) * 3),)),)), [root], [None]),
+    ((layout[0], ((1, graph, (0,), ((1, 'default', (), (0, 0)),)),)), [root], [None]),
+    (layout, [root] * 65, [None]),
+    (layout, [root], []),
+    (layout, [root], [None] * 65),
+    (layout, [root[:-1]], [None]),
+    (layout, [(*root[:5], ())], [None]),
+    (layout, [(*root[:5], (('value', False),))], [None]),
+    (layout, [(*root[:2], False, *root[3:])], [None]),
+    (layout, [(*root[:3], False, *root[4:])], [None]),
+    (layout, [(None, *root[1:])], [None]),
+    (layout, [(root[0], bytearray(32), *root[2:])], [None]),
+    (layout, [(root[0], b'short', *root[2:])], [None]),
+    (layout, [(*root[:4], b'short', root[5])], [None]),
+    (layout, [root], [row[:-1]]),
+    (layout, [root], [(False, *row[1:])]),
+    (layout, [root], [(*row[:2], False, *row[3:])]),
+    (layout, [root], [(*row[:3], None, *row[4:])]),
+    (layout, [root], [(*row[:4], b'short', *row[5:])]),
+    (layout, [root], [(*row[:5], None, *row[6:])]),
+    (layout, [root], [(*row[:6], b'short', *row[7:])]),
+    (layout, [root], [(*row[:7], b'short', row[8])]),
+    (layout, [root], [(*row[:8], None)]),
+]
+wide_layout = (tuple(('string', False, slot) for slot in range(1, 21)), ((1, graph, (), ()),))
+wide_root = (*root[:5], (('value', 'x' * 8192),) * 20)
+cases.append((wide_layout, [wide_root], [None]))
+for bad_layout, bad_roots, bad_rows in cases:
+    try:
+        project(bad_layout, bad_roots, bad_rows)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('malformed projection packet escaped')
+    assert project(layout, [root], [None]) == empty
+assert project(layout, [root], [row]) == empty
+"#),
+                Some(&globals),
+                Some(&globals),
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
     fn projection_admission_rechecks_mutated_inputs_and_releases_on_error() {
         Python::initialize();
         let slot = source_encoding_slot().unwrap();

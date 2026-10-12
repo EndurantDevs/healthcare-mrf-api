@@ -167,3 +167,96 @@ fn dedicated_pool_has_only_the_bounded_native_workers() {
     let indices = pool.broadcast(|context| context.index());
     assert_eq!(indices, (0..expected).collect::<Vec<_>>());
 }
+
+#[test]
+fn typed_root_contexts_preserve_states_and_unsupported_values_emit_nothing() {
+    for (kind, nullable, cell, expected) in [
+        (
+            "integer",
+            false,
+            SourceValue::Integer(i64::MIN),
+            Some("\"value\":-9223372036854775808"),
+        ),
+        (
+            "boolean",
+            false,
+            SourceValue::Boolean(false),
+            Some("\"value\":false"),
+        ),
+        (
+            "string",
+            true,
+            SourceValue::Missing,
+            Some("\"value_state\":\"missing\""),
+        ),
+        (
+            "string",
+            true,
+            SourceValue::Null,
+            Some("\"value_state\":\"null\""),
+        ),
+        ("string", false, SourceValue::Missing, None),
+        ("string", false, SourceValue::Null, None),
+        ("integer", false, SourceValue::Text("1".into()), None),
+        ("string", false, SourceValue::Text("bad\0text".into()), None),
+        ("string", false, SourceValue::Text("x".repeat(2_049)), None),
+        ("decimal", false, SourceValue::Text("NaN".into()), None),
+    ] {
+        let (mut layout, mut roots, rows) = fixture(1);
+        layout.roots[0].kind = kind.into();
+        layout.roots[0].nullable = nullable;
+        roots[0].as_mut().unwrap().cells[0] = cell;
+        let output = projection_columns(&layout, &roots, &rows, 4096).unwrap();
+        if let Some(expected) = expected {
+            assert!(output.rows[0].is_some());
+            assert!(
+                matches!(&output.contexts[2][0], ColumnValue::Text(value) if value.contains(expected))
+            );
+        } else {
+            assert_eq!(output.rows, vec![None]);
+            assert!(output.scalars.iter().all(Vec::is_empty));
+            assert!(output.contexts.iter().all(Vec::is_empty));
+        }
+    }
+}
+
+#[test]
+fn scalar_only_projection_and_invalid_context_owners_keep_their_boundaries() {
+    for (entity, family) in [(0, 2), (1, 0)] {
+        let (mut layout, mut roots, rows) = fixture(1);
+        roots[0].as_mut().unwrap().entity_id = entity;
+        roots[0].as_mut().unwrap().family_id = family;
+        let unsupported = projection_columns(&layout, &roots, &rows, 4096).unwrap();
+        assert_eq!(unsupported.rows, vec![None]);
+        assert!(unsupported.scalars.iter().all(Vec::is_empty));
+        assert!(unsupported.contexts.iter().all(Vec::is_empty));
+        layout.collections[0].profiles.clear();
+        let scalar_only = projection_columns(&layout, &roots, &rows, 4096).unwrap();
+        assert_eq!(scalar_only.rows[0].unwrap().1, 2);
+        assert_eq!(scalar_only.rows[0].unwrap().3, 0);
+        assert!(scalar_only.contexts.iter().all(Vec::is_empty));
+    }
+}
+
+#[test]
+fn invalid_packet_indices_and_escaped_contexts_do_not_escape_as_columns() {
+    let (mut layout, roots, rows) = fixture(1);
+    layout.collections.clear();
+    assert!(projection_columns(&layout, &roots, &rows, 4096).is_err());
+    for invalid_collection in [false, true] {
+        let (layout, roots, mut rows) = fixture(1);
+        let row = rows[0].as_mut().unwrap();
+        if invalid_collection {
+            row.collection = layout.collections.len();
+        } else {
+            row.root = roots.len();
+        }
+        assert!(projection_columns(&layout, &roots, &rows, 4096).is_err());
+    }
+    let (layout, mut roots, rows) = fixture(1);
+    roots[0].as_mut().unwrap().cells[0] = SourceValue::Text("\u{1}".repeat(2_048));
+    let unsupported = projection_columns(&layout, &roots, &rows, 4096).unwrap();
+    assert_eq!(unsupported.rows, vec![None]);
+    assert!(unsupported.scalars.iter().all(Vec::is_empty));
+    assert!(unsupported.contexts.iter().all(Vec::is_empty));
+}

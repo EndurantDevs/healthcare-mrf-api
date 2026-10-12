@@ -114,6 +114,21 @@ def test_adaptive_packets_keep_order_and_account_for_retained_columns(monkeypatc
     )
 
 
+def test_rejected_native_packets_keep_serial_columns_and_retained_accounting(monkeypatch):
+    request = _request(page_row_limit=256)
+    registry, groups = _registry(request.definition), source_groups(request, (2,))
+    expected = serial_arguments(monkeypatch, request, registry, groups)
+    projector = Mock(return_value=None)
+    monkeypatch.setattr(graph_payloads, "native_projector", lambda: projector)
+    monkeypatch.setattr(graph_payloads, "project_batch", projector)
+    assert sets._child_arguments(request, registry, groups) == expected
+    assert [len(call.args[2]) for call in projector.call_args_list] == [2, 1, 1]
+    assert [call.args[2][0].child for call in projector.call_args_list[1:]] == list(groups[0].children)
+    assert projector.call_args_list[0].kwargs["retained_bytes"] == 0
+    assert projector.call_args_list[1].kwargs["retained_bytes"] == 0
+    assert projector.call_args_list[2].kwargs["retained_bytes"] > 0
+
+
 @pytest.mark.parametrize("bound", [{"page_row_limit": 1}, {"page_byte_limit": 1}])
 def test_native_column_charges_preserve_logical_page_rejection(monkeypatch, bound):
     request = _request(**bound)
