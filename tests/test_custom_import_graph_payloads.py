@@ -22,6 +22,12 @@ from tests.test_custom_import_build_graph_sets import family_input
 from tests.test_custom_import_definition import _rate, _raw_definition
 
 
+@pytest.fixture(autouse=True)
+def isolate_decoder_capability(monkeypatch):
+    """Keep this file's eight-field decoder checks independent of batch projection."""
+    monkeypatch.setattr(graph_payloads, "native_projector", lambda: None)
+
+
 def _definition():
     raw = _raw_definition()
     for slot, (name, kind) in enumerate((("note", "string"), ("visits", "integer"), ("enabled", "boolean")), 6):

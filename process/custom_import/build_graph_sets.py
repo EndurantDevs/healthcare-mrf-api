@@ -69,6 +69,15 @@ class _ChildGroup:
     children: tuple[Child, ...]
 
 
+@dataclass
+class _SourceColumns:
+    scalar_columns: list[list[object]]
+    context_columns: list[list[object]]
+    scalar_bytes: int = 0
+    context_bytes: int = 0
+    retained_bytes: int = 0
+
+
 def _transpose(rows, first, stop, *, arrays=False):
     """Transpose the existing typed codec without serializing native values."""
     return tuple(
@@ -583,7 +592,143 @@ def _source_page_projections(request, registry, groups):
     return scalars, contexts
 
 
-def _child_arguments(request, registry, groups):
+def _legacy_source_columns(request, registry, groups):
+    """Keep the existing decoder/oracle when full native preparation is unavailable."""
+    scalars, contexts = _source_page_projections(request, registry, groups)
+    return (
+        tuple(tuple(row[index] for row in scalars) for index in range(len(_SCALAR_COLUMNS))),
+        tuple(
+            tuple(context[field] for context in contexts)
+            for field in ("context_child_revision_id", "profile_slot", "canonical_context_key")
+        ),
+    )
+
+
+def _serial_source_columns(request, registry, group, child):
+    """Consume an unsupported child at its original position through the complete oracle."""
+    collection = next(name for name, slot in registry.child_collection_slots.items() if slot == child.collection_slot)
+    scalars, contexts, scalar_bytes = _serial_child_projection(
+        request, registry, group, collection, child, fields_by_collection(request.definition)[collection]
+    )
+    context_bytes = sum(
+        len(value.encode("utf-8")) if isinstance(value, str) else len(value)
+        for context in contexts
+        for value in context.values()
+        if isinstance(value, (str, bytes, bytearray, memoryview))
+    )
+    scalar_columns = tuple(tuple(row[index] for row in scalars) for index in range(len(_SCALAR_COLUMNS)))
+    context_columns = tuple(
+        tuple(context[field] for context in contexts)
+        for field in ("context_child_revision_id", "profile_slot", "canonical_context_key")
+    )
+    return (
+        scalar_columns,
+        context_columns,
+        scalar_bytes,
+        context_bytes,
+        _retained_column_bytes(scalar_columns, context_columns),
+    )
+
+
+def _source_column_slice(prepared, span):
+    """Preserve typed columns and their native byte charges without building row models."""
+    start, count, context_start, context_count, scalar_bytes, context_bytes, argument_bytes = span
+    return (
+        tuple(column[start : start + count] for column in prepared.scalars),
+        tuple(column[context_start : context_start + context_count] for column in prepared.contexts[:3]),
+        scalar_bytes,
+        context_bytes,
+        4 * argument_bytes + 64 * (10 * count + 3 * context_count),
+    )
+
+
+def _retained_column_bytes(scalars, contexts):
+    """Reserve boxed Unicode and column containers before preparing another packet."""
+    arguments = tuple(("unused", column) for column in (*scalars, *contexts))
+    return 4 * _child_argument_bytes(arguments) + 64 * sum(len(column) for column in (*scalars, *contexts))
+
+
+def _retained_page_bytes(arguments, argument_bytes):
+    """Reuse wire accounting while reserving all previously retained page columns."""
+    return 4 * argument_bytes + 64 * sum(len(column) for column_kind, column in arguments if column_kind.endswith("[]"))
+
+
+def _append_source_columns(request, registry, packet, prepared, source_columns):
+    """Replay each native outcome before later packets or logical page cost checks."""
+    for position, (group, child) in enumerate(packet):
+        span = None if prepared is None else prepared.rows[position]
+        child_scalars, child_contexts, child_bytes, child_context_bytes, column_bytes = (
+            _serial_source_columns(request, registry, group, child)
+            if span is None
+            else _source_column_slice(prepared, span)
+        )
+        for target, column in zip(
+            (*source_columns.scalar_columns, *source_columns.context_columns),
+            (*child_scalars, *child_contexts),
+            strict=True,
+        ):
+            target.extend(column)
+        source_columns.scalar_bytes += child_bytes
+        source_columns.context_bytes += child_context_bytes
+        source_columns.retained_bytes += column_bytes
+
+
+def _can_project_sources(request, registry):
+    """Unsupported layout metadata cannot precede ordered child validation."""
+    if graph_payloads.native_projector() is None:
+        return False
+    try:
+        return graph_payloads._projection_layout(request.definition, registry.child_collection_slots) is not None
+    except (ValueError, TypeError, KeyError, AttributeError, StopIteration) as error:
+        if graph_payloads._has_allocation_failure(error):
+            raise
+        return False
+
+
+def _source_columns(request, registry, groups, *, retained_bytes=0):
+    """Prepare across families, keeping logical page bounds and ordered serial fallback."""
+    if not _can_project_sources(request, registry):
+        return _legacy_source_columns(request, registry, groups)
+    child_rows = tuple((group, child) for group in groups for child in group.children)
+    pending = deque(
+        child_rows[offset : offset + graph_payloads.MAX_ROWS]
+        for offset in range(0, len(child_rows), graph_payloads.MAX_ROWS)
+    )
+    source_columns = _SourceColumns(
+        [[] for _ in _SCALAR_COLUMNS], [[] for _ in range(3)], retained_bytes=retained_bytes
+    )
+    while pending:
+        packet = pending.popleft()
+        projection_records = tuple(
+            graph_payloads.ProjectionRecord(
+                child, group.state.source.record, group.state.family, group.state.source.values
+            )
+            for group, child in packet
+        )
+        prepared = graph_payloads.project_batch(
+            request.definition,
+            registry.child_collection_slots,
+            projection_records,
+            retained_bytes=source_columns.retained_bytes,
+        )
+        if prepared is None and len(packet) > 1 and source_columns.retained_bytes < 4_194_304:
+            midpoint = len(packet) // 2
+            pending.extendleft((packet[midpoint:], packet[:midpoint]))
+            continue
+        _append_source_columns(request, registry, packet, prepared, source_columns)
+        del prepared
+    graph._page_cost(
+        request,
+        (),
+        reserved_rows=3 * len(child_rows)
+        + len(source_columns.scalar_columns[0])
+        + len(source_columns.context_columns[0]),
+        reserved_bytes=source_columns.scalar_bytes + source_columns.context_bytes,
+    )
+    return tuple(map(tuple, source_columns.scalar_columns)), tuple(map(tuple, source_columns.context_columns))
+
+
+def _child_arguments(request, registry, groups, *, retained_bytes=0):
     current = groups[0].state.current
     child_roots = tuple(group.state.current.root_record_id for group in groups for _ in group.children)
     if current.selection_kind == "retained":
@@ -605,7 +750,7 @@ def _child_arguments(request, registry, groups):
             *_transpose(encoded_rows, 9, 13, arrays=True),
             ("integer[]", (len(child_roots),)),
         )
-    scalars, contexts = _source_page_projections(request, registry, groups)
+    scalars, contexts = _source_columns(request, registry, groups, retained_bytes=retained_bytes)
     return "append_custom_import_build_source_families_page", (
         ("bigint", current.build_id),
         ("bigint", request.execution_id),
@@ -624,13 +769,10 @@ def _child_arguments(request, registry, groups):
         ),
         ("bigint[]", child_roots),
         ("bigint[]", tuple(child.child_revision_id for group in groups for child in group.children)),
-        *(
-            (kind, tuple(scalar_row[index] for scalar_row in scalars))
-            for index, (kind, _field) in enumerate(_SCALAR_COLUMNS)
-        ),
-        ("bigint[]", tuple(context["context_child_revision_id"] for context in contexts)),
-        ("smallint[]", tuple(context["profile_slot"] for context in contexts)),
-        ("text[]", tuple(context["canonical_context_key"] for context in contexts)),
+        *((kind, scalars[index]) for index, (kind, _field) in enumerate(_SCALAR_COLUMNS)),
+        ("bigint[]", contexts[0]),
+        ("smallint[]", contexts[1]),
+        ("text[]", contexts[2]),
         ("integer[]", (len(child_roots),)),
     )
 
@@ -834,7 +976,7 @@ def _advance_child_tips(groups, tips_by_root_id, reserved_bytes_by_root_id):
 
 def _read_child_batch(session, request, registry, inputs, states, kind, row_limit, child_limit):
     """Preview bounded logical pages; only the returned native receipt is durable."""
-    pages, child_count = [], 0
+    pages, child_count, retained_bytes = [], 0, 0
     tips_by_root_id, reserved_bytes_by_root_id, spans_by_root_id = _child_reservations(request, inputs, states)
     held_bytes = sum(reserved_bytes_by_root_id.values())
     child_rows = _read_child_rows(
@@ -857,14 +999,16 @@ def _read_child_batch(session, request, registry, inputs, states, kind, row_limi
             row_limit,
             child_count,
         )
-        name, arguments = _child_arguments(request, registry, groups)
-        count = sum(len(group.children) for group in groups)
-        page_bytes = _child_argument_bytes(arguments) + sum(
+        name, arguments = _child_arguments(request, registry, groups, retained_bytes=retained_bytes)
+        page_bytes = _child_argument_bytes(arguments)
+        if kind == "source":
+            retained_bytes += _retained_page_bytes(arguments, page_bytes)
+        page_bytes += sum(
             len(group.children[-1].child_key_sha256 or b"") - len(group.state.current.last_child_key_sha256 or b"")
             for group in groups
             if group.children and kind == "source"
         )
-        if not count:
+        if not arguments[-1][1][0]:
             raise CandidateRunnerError("child set returned inconsistent durable progress")
         if held_bytes + page_bytes > MAX_BATCH_BYTES:
             if not pages:
@@ -873,7 +1017,7 @@ def _read_child_batch(session, request, registry, inputs, states, kind, row_limi
         graph._require_budget(session.info["custom_import_build_read_deadline"])
         pages.append((groups, arguments))
         held_bytes += page_bytes
-        child_count += count
+        child_count += arguments[-1][1][0]
         _advance_child_tips(groups, tips_by_root_id, reserved_bytes_by_root_id)
     if not pages:
         raise CandidateRunnerError("record projection fanout exceeds the admitted row page")
