@@ -31,7 +31,7 @@ from db.models.custom_import import (
     CustomImportSelectionProfile,
 )
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS, encode_landing_batch
-from process.custom_import.capture import iter_records
+from process.custom_import.capture import SealedCapture, iter_records
 from process.custom_import.capture_store import open_segmented_parquet_parts
 from process.custom_import.definition import CustomImportDefinition, SourceStream
 from process.custom_import.execution import MAX_LEASE_SECONDS, LeaseGrant, heartbeat_execution, lease_token_sha256
@@ -926,6 +926,23 @@ def _source_pages(context, part, policy, cursor):
         if encoder is not None and layout is not None:
             return iter_source_pages(encoder, layout, context, part, policy, cursor)
     return _iter_source_pages(context, part, policy, cursor)
+
+
+def _hosted_source_pages(context, part, policy, cursor):
+    """Select earlier columns only inside atomic hosted preparation after part verification."""
+    from process.custom_import import source_arrow_pages, source_column_preparation
+
+    if (
+        part.ordinal >= cursor[0]
+        and (part.ordinal != cursor[0] or not cursor[1])
+        and context.stream.format == "parquet"
+        and isinstance(part.capture, SealedCapture)
+        and source_column_preparation.native_column_encoder() is not None
+    ):
+        column_layout = source_column_preparation.compile_column_layout(context)
+        if column_layout is not None and source_arrow_pages.is_column_layout_bounded(column_layout):
+            return source_arrow_pages.iter_source_pages(context, column_layout, part, policy, cursor)
+    return _source_pages(context, part, policy, cursor)
 
 
 async def _next_source_page(pages):

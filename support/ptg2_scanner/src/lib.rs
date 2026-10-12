@@ -14,6 +14,7 @@ pub mod custom_import_graph;
 pub mod custom_import_graph_projection;
 pub mod custom_import_scalar;
 pub mod custom_import_source;
+pub mod custom_import_source_columns;
 pub mod custom_import_source_payload;
 pub mod dedupe;
 pub mod fhir_network_identity;
@@ -113,6 +114,7 @@ mod python_api {
 
     include!("python_hospital_price.rs");
     include!("python_custom_import.rs");
+    include!("python_custom_import_source_columns.rs");
     include!("python_custom_import_graph.rs");
     include!("python_custom_import_graph_projection.rs");
 
@@ -647,6 +649,9 @@ mod python_api {
         m.add_function(wrap_pyfunction!(hospital_price_decode_fact_block, m)?)?;
         m.add_function(wrap_pyfunction!(custom_import_scalar_frames_v1, m)?)?;
         m.add_function(wrap_pyfunction!(custom_import_source_documents_v1, m)?)?;
+        m.add_function(wrap_pyfunction!(custom_import_source_columns_v1, m)?)?;
+        m.add_class::<SourceColumnsPlan>()?;
+        m.add_function(wrap_pyfunction!(custom_import_source_columns_plan_v1, m)?)?;
         m.add_function(wrap_pyfunction!(
             custom_import_validate_source_payloads_v1,
             m
@@ -724,6 +729,11 @@ mod python_api {
                 assert!(module.hasattr("canonicalize_location_batch").unwrap());
                 assert!(module.hasattr("canonicalize_contact_batch").unwrap());
                 assert!(module.hasattr("custom_import_source_documents_v1").unwrap());
+                assert!(module.hasattr("custom_import_source_columns_v1").unwrap());
+                assert!(module
+                    .hasattr("custom_import_source_columns_plan_v1")
+                    .unwrap());
+                assert!(module.hasattr("_SourceColumnsPlan").unwrap());
                 assert!(module.hasattr("custom_import_graph_children_v1").unwrap());
                 assert!(module.hasattr("canon_version").unwrap());
                 assert!(module.hasattr("intersect_sorted_u32").unwrap());
