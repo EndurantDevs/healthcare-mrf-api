@@ -8,6 +8,7 @@ import datetime as dt
 import decimal
 from dataclasses import replace
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -134,26 +135,185 @@ def test_portable_column_adapter_preserves_complete_oracle_and_costs(monkeypatch
     assert len(projector.call_args.args[1]) == 1
 
 
-@pytest.mark.parametrize("corruption", ["prefix", "span", "columns", "digest", "decimal", "required_null"])
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "prefix",
+        "span",
+        "span_shape",
+        "span_type",
+        "columns",
+        "column_shape",
+        "unclaimed_columns",
+        "digest",
+        "decimal",
+        "decimal_empty",
+        "decimal_long",
+        "decimal_invalid",
+        "required_null",
+    ],
+)
 def test_malformed_projection_output_fails_closed(monkeypatch, corruption):
     request = _request()
     group, registry = _group(request, [_rate("0000000001")]), _registry(request.definition)
-    rows, scalars, contexts = oracle_encoded(request, registry, group)
+    row_spans, scalars, contexts = oracle_encoded(request, registry, group)
     if corruption == "prefix":
-        rows = ()
-    elif corruption == "span":
-        rows = ((1, *rows[0][1:]),)
-    elif corruption == "columns":
+        row_spans = ()
+    if corruption == "span":
+        row_spans = ((1, *row_spans[0][1:]),)
+    if corruption == "span_shape":
+        row_spans = ((0,),)
+    if corruption == "span_type":
+        row_spans = ((False, *row_spans[0][1:]),)
+    if corruption == "columns":
         scalars = ((), *scalars[1:])
+    if corruption == "column_shape":
+        scalars = scalars[:-1]
+    if corruption == "unclaimed_columns":
+        row_spans = (None,)
     if corruption == "digest":
         contexts = (*contexts[:3], (b"short",))
-    if corruption == "decimal":
-        scalars = (*scalars[:6], tuple("NaN" if value is not None else None for value in scalars[6]), *scalars[7:])
+    if corruption in {"decimal", "decimal_empty", "decimal_long", "decimal_invalid"}:
+        invalid_text_by_case = {
+            "decimal": "NaN",
+            "decimal_empty": "",
+            "decimal_long": "1" * 65,
+            "decimal_invalid": "bad",
+        }
+        scalars = (
+            *scalars[:6],
+            tuple(
+                invalid_text_by_case[corruption] if scalar_value is not None else None for scalar_value in scalars[6]
+            ),
+            *scalars[7:],
+        )
     if corruption == "required_null":
         scalars = (tuple(None for _ in scalars[0]), *scalars[1:])
-    monkeypatch.setattr(graph_payloads, "native_projector", lambda: Mock(return_value=(rows, scalars, contexts)))
+    monkeypatch.setattr(graph_payloads, "native_projector", lambda: Mock(return_value=(row_spans, scalars, contexts)))
     with pytest.raises(CandidateRunnerError):
         graph_payloads.project_batch(request.definition, registry.child_collection_slots, records_for(group))
+
+
+@pytest.mark.parametrize("capability", ["missing_module", "missing_export", "non_callable", "callable"])
+def test_projector_capability_cache_accepts_only_callable_export(monkeypatch, capability):
+    projector = Mock()
+    module = SimpleNamespace()
+    if capability in {"non_callable", "callable"}:
+        module.custom_import_graph_projection_columns_v1 = projector if capability == "callable" else False
+    importer = Mock(return_value=module, side_effect=ImportError() if capability == "missing_module" else None)
+    monkeypatch.setattr(graph_payloads.importlib, "import_module", importer)
+    graph_payloads.native_projector.cache_clear()
+    try:
+        expected = projector if capability == "callable" else None
+        assert graph_payloads.native_projector() is expected
+        assert graph_payloads.native_projector() is expected
+        importer.assert_called_once_with("ptg2_address_canon")
+    finally:
+        graph_payloads.native_projector.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("kind", "values", "expected"),
+    [
+        pytest.param("string", [], None, id="non_mapping"),
+        pytest.param("string", {}, (("missing", None),), id="missing"),
+        pytest.param("string", {"metric": None}, (("null", None),), id="null"),
+        pytest.param("decimal", {"metric": Decimal("12.500")}, (("value", "12.5"),), id="decimal"),
+        pytest.param("decimal", {"metric": Decimal("1E18")}, None, id="wide_decimal"),
+        pytest.param("decimal", {"metric": Decimal("1E-13")}, None, id="precise_decimal"),
+        pytest.param("decimal", {"metric": Decimal("Infinity")}, None, id="non_finite_decimal"),
+        pytest.param("integer", {"metric": -(1 << 63)}, (("value", -(1 << 63)),), id="integer_minimum"),
+        pytest.param("integer", {"metric": 1 << 63}, None, id="integer_overflow"),
+        pytest.param("integer", {"metric": True}, None, id="boolean_is_not_integer"),
+        pytest.param("string", {"metric": "x" * 4097}, None, id="character_limit"),
+        pytest.param("string", {"metric": "😀" * 1025}, None, id="utf8_byte_limit"),
+    ],
+)
+def test_root_context_cells_preserve_states_and_serial_domain(kind, values, expected):
+    field = replace(_request().definition.fields_by_id["display_name"], field_id="metric", value_type=kind)
+    assert graph_payloads._projection_root_cells((field,), values) == expected
+
+
+@pytest.mark.parametrize("unsupported", ["root_date", "unknown_collection", "boolean_slot", "wide_slot"])
+def test_unadmitted_projection_layout_never_dispatches(monkeypatch, unsupported):
+    raw = _raw_definition()
+    if unsupported == "root_date":
+        raw["schema"]["root"]["fields"].append(
+            {"id": "as_of", "slot": 8, "type": "date", "nullable": True, "projection_slot": 5}
+        )
+        raw["query"]["root_fields"].append("as_of")
+    request = _request(definition=CustomImportDefinition.from_mapping(raw))
+    group = _group(request, [_rate("0000000001")])
+    slots_by_collection = {"rates": 1}
+    if unsupported == "unknown_collection":
+        slots_by_collection["unused"] = 1
+    elif unsupported in {"boolean_slot", "wide_slot"}:
+        slots_by_collection["rates"] = True if unsupported == "boolean_slot" else 32768
+    projector = Mock(side_effect=AssertionError("unadmitted layout entered native"))
+    monkeypatch.setattr(graph_payloads, "native_projector", lambda: projector)
+    assert graph_payloads.project_batch(request.definition, slots_by_collection, records_for(group)) is None
+    projector.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("owner", "attribute", "value"),
+    [
+        pytest.param("root", "canonical_logical_key", 1, id="root_key_type"),
+        pytest.param("root", "logical_key_sha256", b"short", id="root_digest"),
+        pytest.param("family", "entity_binding_id", True, id="root_authority_type"),
+        pytest.param("child", "collection_slot", True, id="child_slot_type"),
+        pytest.param("child", "collection_slot", 99, id="unknown_child_slot"),
+        pytest.param("child", "child_revision_id", 1 << 63, id="child_id_overflow"),
+        pytest.param("child", "parent_key_sha256", b"short", id="child_parent_digest"),
+        pytest.param("child", "canonical_payload", 1, id="child_payload_type"),
+        pytest.param("child", "canonical_payload", "x" * 131073, id="child_encoding_bound"),
+    ],
+)
+def test_unadmitted_row_identity_is_left_for_serial_validation(monkeypatch, owner, attribute, value):
+    request = _request()
+    group, registry = _group(request, [_rate("0000000001")]), _registry(request.definition)
+    record = records_for(group)[0]
+    setattr(getattr(record, owner), attribute, value)
+    projector = Mock(return_value=((None,), ((),) * 10, ((),) * 4))
+    monkeypatch.setattr(graph_payloads, "native_projector", lambda: projector)
+    prepared = graph_payloads.project_batch(request.definition, registry.child_collection_slots, (record,))
+    assert prepared is not None and prepared.rows == (None,)
+    roots, children = projector.call_args.args[1:]
+    assert (roots if owner in {"root", "family"} else children) == [None]
+
+
+@pytest.mark.parametrize("allocation_chain", [False, True])
+def test_preparation_fallback_never_swallows_chained_allocation_failure(monkeypatch, allocation_chain):
+    request = _request()
+    group, registry = _group(request, [_rate("0000000001")]), _registry(request.definition)
+    failure = ValueError("synthetic preparation failure")
+    if allocation_chain:
+        failure.__cause__ = MemoryError("synthetic allocation failure")
+    projector = Mock(side_effect=AssertionError("failed preparation entered native"))
+    monkeypatch.setattr(graph_payloads, "native_projector", lambda: projector)
+    monkeypatch.setattr(graph_payloads, "_projection_inputs", Mock(side_effect=failure))
+    if allocation_chain:
+        with pytest.raises(ValueError) as caught:
+            graph_payloads.project_batch(request.definition, registry.child_collection_slots, records_for(group))
+        assert caught.value is failure
+    else:
+        assert (
+            graph_payloads.project_batch(request.definition, registry.child_collection_slots, records_for(group))
+            is None
+        )
+    projector.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [ValueError("bounded input"), TypeError("bounded input")])
+def test_native_input_rejection_preserves_cause_without_serial_retry(monkeypatch, failure):
+    request = _request()
+    group, registry = _group(request, [_rate("0000000001")]), _registry(request.definition)
+    projector = Mock(side_effect=failure)
+    monkeypatch.setattr(graph_payloads, "native_projector", lambda: projector)
+    with pytest.raises(CandidateRunnerError, match="rejected its bounded input") as caught:
+        graph_payloads.project_batch(request.definition, registry.child_collection_slots, records_for(group))
+    assert caught.value.__cause__ is failure
+    projector.assert_called_once()
 
 
 @pytest.mark.parametrize("failure", [MemoryError("allocation"), KeyboardInterrupt(), SystemExit(2)])
