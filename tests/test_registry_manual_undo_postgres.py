@@ -1,24 +1,36 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Historical undo preparation and actual draft correction on isolated native SQL."""
 
+import importlib.util
 import json
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
+from pathlib import Path
 from uuid import UUID, uuid4
 
+import asyncpg
 import pytest
 from sqlalchemy import event, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from db.models.company_group_registry import CompanyGroupRegistry
+from db.models.registry_revision import RegistryRecordHistory
 from process.network_serving_read import NetworkServingReadUnavailable
 from process.registry_approval_preview import preview_registry_approval
 from process.registry_approval_store import RegistryApprovalConflict
+from process.registry_custom_history import read_registry_custom_history
 from process.registry_manual_undo import (
     MAX_UNDO_SNAPSHOT_BYTES,
     RegistryManualUndoCommand,
     _prepare_correction,
     prepare_registry_manual_undo,
+)
+from process.registry_provider_batch import apply_registry_provider_batch
+from process.registry_publication_queue import (
+    claim_registry_publication_request,
+    enqueue_registry_publication,
+    finish_registry_publication_request,
 )
 from process.registry_record_store import RegistryRecordConflict, apply_registry_record_command
 from process.registry_retained_site_adoption import RetainedSiteAdoptionError
@@ -26,24 +38,32 @@ from tests.test_company_registry_assertions_postgres import _ACTOR as _assertion
 from tests.test_company_registry_assertions_postgres import _create as _assertion_company
 from tests.test_company_registry_assertions_postgres import _draft as _assertion_draft
 from tests.test_company_registry_assertions_postgres import _identifier as _assertion_identifier
-from tests.test_company_registry_assertions_postgres import assertion_db
+from tests.test_company_registry_assertions_postgres import assertion_db as assertion_db
 from tests.test_manual_location_identity_store_postgres import _create as _location
 from tests.test_manual_provider_identity_store_postgres import _create as _provider
-from tests.test_network_custom_address_source_postgres import custom_db
+from tests.test_manual_provider_identity_store_postgres import provider_db as provider_db
+from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_membership_draft_store_postgres import (
     _command as _membership_command,
 )
 from tests.test_network_membership_draft_store_postgres import (
     _seed as _membership_seed,
 )
-from tests.test_network_membership_draft_store_postgres import (
-    membership_db,
-)
-from tests.test_network_serving_schema_postgres import serving_schema
+from tests.test_network_membership_draft_store_postgres import membership_db as membership_db
+from tests.test_network_serving_schema_postgres import _candidate
+from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
+from tests.test_network_source_binding_store_postgres import _apply as binding_apply
+from tests.test_network_source_binding_store_postgres import _command as binding_command
+from tests.test_network_source_binding_store_postgres import _row as binding_row
+from tests.test_network_source_binding_store_postgres import _seed as binding_seed
+from tests.test_registry_approval_store_postgres import _approve, _command, _draft
 from tests.test_registry_approval_store_postgres import _command as _approval_command
 from tests.test_registry_company_links_postgres import _assertion, _links
-from tests.test_registry_record_store_postgres import _actor, _create, record_db
-from tests.test_registry_retained_site_adoption_postgres import retained_db
+from tests.test_registry_management_permissions_postgres import _install
+from tests.test_registry_management_permissions_postgres import permissions_db as permissions_db
+from tests.test_registry_record_store_postgres import _actor, _create
+from tests.test_registry_record_store_postgres import record_db as record_db
+from tests.test_registry_retained_site_adoption_postgres import retained_db as retained_db
 
 pytestmark = pytest.mark.asyncio
 
@@ -91,7 +111,7 @@ async def test_historical_content_creates_new_unapproved_draft_with_durable_prov
     assert not {"created_at", "archived", "revision", "canonical_address_json"} & preparation.command.fields.keys()
     with pytest.raises(FrozenInstanceError):
         preparation.provenance.target_revision = 2
-    result = await _apply(sessions, schema, preparation.command, actor)
+    result = await _apply(sessions, schema, preparation.command, actor, undo_provenance=preparation.provenance)
     assert result["revision"] == result["custom_revision"] == 3
     assert result["record"]["display_name"] == first["record"]["display_name"]
     assert result["record"]["created_at"] == first["record"]["created_at"]
@@ -112,21 +132,21 @@ async def test_retry_after_later_edit_replays_and_changed_target_reason_actor_co
     connection, schema, sessions = record_db
     actor, _, corrected, undo = await _seed(record_db)
     prepared = await _prepare(sessions, schema, undo, actor)
-    result = await _apply(sessions, schema, prepared.command, actor)
+    result = await _apply(sessions, schema, prepared.command, actor, undo_provenance=prepared.provenance)
     later = replace(corrected, expected_revision=3, idempotency_key=uuid4().hex)
     await _apply(sessions, schema, later, actor)
     retry = await _prepare(sessions, schema, undo, actor)
     assert retry.command == prepared.command and retry.provenance.current_revision == 4
-    assert await _apply(sessions, schema, retry.command, actor) == result
+    assert await _apply(sessions, schema, retry.command, actor, undo_provenance=retry.provenance) == result
     for change in [replace(undo, reason="Changed reason"), replace(undo, expected_revision=3, target_revision=2)]:
         changed = await _prepare(sessions, schema, change, actor)
         with pytest.raises(RegistryRecordConflict, match="idempotency_conflict"):
-            await _apply(sessions, schema, changed.command, actor)
+            await _apply(sessions, schema, changed.command, actor, undo_provenance=changed.provenance)
     with pytest.raises(RegistryRecordConflict, match="idempotency_conflict"):
-        await _apply(sessions, schema, retry.command, replace(actor, user_id=uuid4()))
+        await _apply(sessions, schema, retry.command, replace(actor, user_id=uuid4()), undo_provenance=retry.provenance)
     stale = await _prepare(sessions, schema, replace(undo, idempotency_key=uuid4().hex), actor)
     with pytest.raises(RegistryRecordConflict, match="revision_conflict"):
-        await _apply(sessions, schema, stale.command, actor)
+        await _apply(sessions, schema, stale.command, actor, undo_provenance=stale.provenance)
     assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_record_history') == 4
 
 
@@ -137,11 +157,11 @@ async def test_same_content_at_different_targets_still_has_distinct_audit_reques
     await _apply(sessions, schema, identical, actor)
     await _apply(sessions, schema, replace(identical, expected_revision=3, idempotency_key=uuid4().hex), actor)
     first = await _prepare(sessions, schema, replace(undo, expected_revision=4, target_revision=2), actor)
-    result = await _apply(sessions, schema, first.command, actor)
+    result = await _apply(sessions, schema, first.command, actor, undo_provenance=first.provenance)
     different = await _prepare(sessions, schema, replace(undo, expected_revision=4, target_revision=3), actor)
     assert first.command.fields == different.command.fields
     with pytest.raises(RegistryRecordConflict, match="idempotency_conflict"):
-        await _apply(sessions, schema, different.command, actor)
+        await _apply(sessions, schema, different.command, actor, undo_provenance=different.provenance)
     assert result["revision"] == 5
 
 
@@ -152,7 +172,7 @@ async def test_archive_state_is_separate_and_preparation_does_not_restore(record
     await _apply(sessions, schema, archived, actor)
     prepared = await _prepare(sessions, schema, replace(undo, expected_revision=3), actor)
     assert prepared.provenance.target_archived is False
-    result = await _apply(sessions, schema, prepared.command, actor)
+    result = await _apply(sessions, schema, prepared.command, actor, undo_provenance=prepared.provenance)
     assert result["record"]["archived"] is True
 
 
@@ -230,7 +250,7 @@ async def test_undo_draft_requires_separate_current_revision_preview(serving_sch
     sessions = async_sessionmaker(engine)
     actor, original, _, undo = await _seed((connection, schema, sessions))
     prepared = await _prepare(sessions, schema, undo, actor)
-    correction = await _apply(sessions, schema, prepared.command, actor)
+    correction = await _apply(sessions, schema, prepared.command, actor, undo_provenance=prepared.provenance)
     old_selection = await _approval_command(connection, schema, original)
     async with connection.transaction():
         with pytest.raises(RegistryApprovalConflict, match="selection_conflict"):
@@ -323,7 +343,7 @@ async def test_company_relationship_history_restores_explicit_assertions(record_
     undo = RegistryManualUndoCommand("company_links", command.record_id, 2, 1, "Reviewed relationships", uuid4().hex)
     prepared = await _prepare(sessions, schema, undo, actor)
     assert prepared.command.fields["network_assertions"] == original["record"]["network_assertions"]
-    correction = await _apply(sessions, schema, prepared.command, actor)
+    correction = await _apply(sessions, schema, prepared.command, actor, undo_provenance=prepared.provenance)
     assert correction["record"]["network_ids"] == original["record"]["network_ids"]
     assert correction["record"]["network_assertions"] == original["record"]["network_assertions"]
     assert correction["revision"] == 3
@@ -367,10 +387,19 @@ async def test_membership_history_revalidates_actual_office_targets(membership_d
             f'UPDATE "{schema}".manual_location_registry SET archived=true WHERE location_id=$1', UUID(sites[0])
         )
         with pytest.raises(ValueError, match="membership_target_invalid"):
-            await _apply(sessions, schema, prepared.command, actor, source_schema=source_schema)
+            await _apply(
+                sessions,
+                schema,
+                prepared.command,
+                actor,
+                undo_provenance=prepared.provenance,
+                source_schema=source_schema,
+            )
         assert await connection.fetchval(f'SELECT revision FROM "{schema}".network_membership_draft') == 2
     else:
-        correction = await _apply(sessions, schema, prepared.command, actor, source_schema=source_schema)
+        correction = await _apply(
+            sessions, schema, prepared.command, actor, undo_provenance=prepared.provenance, source_schema=source_schema
+        )
         assert correction["record"]["memberships_json"] == first["record"]["memberships_json"]
         assert correction["revision"] == 3
 
@@ -423,10 +452,12 @@ async def test_retained_site_revalidation_and_replay(retained_db):
     fields_by_name = {"source_generation": fixture.source.generation_id, **fixture.rows[0]}
     create = RegistryRecordCommand("site_binding", uuid4(), "create", 0, fields_by_name, "Reviewed office", uuid4().hex)
 
-    async def apply(command):
+    async def apply(command, *, undo_provenance=None):
         async with sessions() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-            return await apply_registry_record_command(session, command, actor, schema=fixture.control_schema)
+            return await apply_registry_record_command(
+                session, command, actor, schema=fixture.control_schema, undo_provenance=undo_provenance
+            )
 
     await apply(create)
     later_fields_by_name = {"source_generation": fixture.source.generation_id, **fixture.rows[1]}
@@ -438,11 +469,11 @@ async def test_retained_site_revalidation_and_replay(retained_db):
     undo = RegistryManualUndoCommand("site_binding", create.record_id, 2, 1, "Reviewed earlier office", uuid4().hex)
     prepared = await _prepare(sessions, fixture.control_schema, undo, actor)
     assert set(prepared.command.fields) == set(fields_by_name)
-    correction_receipt = await apply(prepared.command)
+    correction_receipt = await apply(prepared.command, undo_provenance=prepared.provenance)
     assert correction_receipt["record"]["location_id"] == fields_by_name["location_id"]
     await fixture.connection.execute(f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false')
     retry = await _prepare(sessions, fixture.control_schema, undo, actor)
-    assert await apply(retry.command) == correction_receipt
+    assert await apply(retry.command, undo_provenance=retry.provenance) == correction_receipt
     fresh = await _prepare(
         sessions,
         fixture.control_schema,
@@ -454,7 +485,7 @@ async def test_retained_site_revalidation_and_replay(retained_db):
         actor,
     )
     with pytest.raises((NetworkServingReadUnavailable, RetainedSiteAdoptionError)):
-        await apply(fresh.command)
+        await apply(fresh.command, undo_provenance=fresh.provenance)
     assert (
         await fixture.connection.fetchval(
             f"SELECT count(*) FROM \"{fixture.control_schema}\".registry_record_history WHERE record_kind='site_binding'"
@@ -582,11 +613,11 @@ async def test_company_group_undo_round_trip_preserves_history_and_replay(assert
     undo = RegistryManualUndoCommand("company", original.record_id, 2, 1, "Reviewed historical groups", uuid4().hex)
     preparation = await _prepare(fixture.sessions, fixture.schema, undo, _assertion_actor)
     assert preparation.command.fields["assertions"]["group_assertions"] == first["record"]["group_assertions"]
-    restored = await _assertion_draft(fixture, preparation.command)
+    restored = await _assertion_draft(fixture, preparation.command, undo_provenance=preparation.provenance)
     assert restored["revision"] == 3
     for family in ("roles", "role_assertions", "identifier_assertions", "group_assertions"):
         assert restored["record"][family] == first["record"][family]
-    assert await _assertion_draft(fixture, preparation.command) == restored
+    assert await _assertion_draft(fixture, preparation.command, undo_provenance=preparation.provenance) == restored
     historical_record_by_field = json.loads(
         await fixture.connection.fetchval(
             f"SELECT record_json::text FROM {fixture.namespace}.registry_record_history "
@@ -596,4 +627,425 @@ async def test_company_group_undo_round_trip_preserves_history_and_replay(assert
     )
     assert historical_record_by_field == first["record"]
     with pytest.raises(RegistryRecordConflict, match="revision_conflict"):
-        await _assertion_draft(fixture, replace(preparation.command, idempotency_key=uuid4().hex))
+        await _assertion_draft(
+            fixture, replace(preparation.command, idempotency_key=uuid4().hex), undo_provenance=preparation.provenance
+        )
+
+
+async def _audit(connection, schema, kind, identity, **kwargs):
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        return await read_registry_custom_history(connection, kind, identity, control_schema=schema, **kwargs)
+
+
+async def test_exact_operations_undo_reference_replay_and_missing_predecessor(serving_schema):
+    connection, schema, engine = serving_schema
+    sessions = async_sessionmaker(engine)
+    actor, creation = _actor(), _create()
+    await _apply(sessions, schema, creation, actor)
+    correction = replace(
+        creation,
+        operation="correct",
+        expected_revision=1,
+        fields={**creation.fields, "display_name": "Reviewed group"},
+        idempotency_key=uuid4().hex,
+    )
+    await _apply(sessions, schema, correction, actor)
+    undo = RegistryManualUndoCommand("group", creation.record_id, 2, 1, "Review earlier content", uuid4().hex)
+    async with sessions() as session, session.begin():
+        prepared = await prepare_registry_manual_undo(session, undo, actor, schema=schema)
+        receipt = await apply_registry_record_command(
+            session, prepared.command, actor, schema=schema, undo_provenance=prepared.provenance
+        )
+    async with sessions() as session, session.begin():
+        assert (
+            await apply_registry_record_command(
+                session, prepared.command, actor, schema=schema, undo_provenance=prepared.provenance
+            )
+            == receipt
+        )
+        with pytest.raises(ValueError, match="registry_manual_undo_provenance_required"):
+            await apply_registry_record_command(session, prepared.command, actor, schema=schema)
+    page = await _audit(connection, schema, "group", creation.record_id, limit=2)
+    assert page["has_more"] and [event["record_revision"] for event in page["events"]] == [3, 2]
+    first = page["events"][0]
+    assert first["operation"] == "correct" and first["draft_event"]["before_revision"] == 2
+    assert first["draft_event"]["operation_context"]["operation"] == "undo"
+    assert first["draft_event"]["operation_context"]["target_revision"] == 1
+    assert first["before_snapshot_retained"] is True
+    assert not any("before_record" in event["draft_event"] for event in page["events"])
+    await connection.execute(f'DELETE FROM "{schema}".registry_record_history WHERE revision=2')
+    missing = await _audit(connection, schema, "group", creation.record_id, limit=1)
+    assert missing["events"][0]["draft_event"]["before_revision"] == 2
+    assert missing["events"][0]["before_snapshot_retained"] is False
+    await connection.execute(f'UPDATE "{schema}".registry_record_history SET event_json=NULL WHERE revision=1')
+    legacy = await _audit(connection, schema, "group", creation.record_id, offset=1)
+    assert legacy["events"][0]["operation"] is None and legacy["events"][0]["draft_event"] is None
+    assert legacy["events"][0]["before_snapshot_retained"] is None
+
+
+async def test_late_history_refusal_rolls_back_head_control_and_preserves_caller_work(record_db):
+    connection, schema, sessions = record_db
+    actor, creation = _actor(), _create()
+    await _apply(sessions, schema, creation, actor)
+    await connection.execute(
+        f'ALTER TABLE "{schema}".registry_record_history ADD CONSTRAINT refuse_archive '
+        "CHECK(event_json IS NULL OR event_json->>'operation'<>'archive')"
+    )
+    archive = replace(creation, operation="archive", expected_revision=1, fields={}, idempotency_key=uuid4().hex)
+    prior_id = uuid4()
+    async with sessions() as session, session.begin():
+        await session.execute(
+            text(
+                f'INSERT INTO "{schema}".company_group_registry '
+                "(group_id,group_kind,display_name) VALUES (:identity,'corporate_parent','Earlier work')"
+            ),
+            {"identity": prior_id},
+        )
+        with pytest.raises(DBAPIError):
+            await apply_registry_record_command(session, archive, actor, schema=schema)
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".company_group_registry') == 2
+    assert tuple(
+        await connection.fetchrow(
+            f'SELECT revision,archived FROM "{schema}".company_group_registry WHERE group_id=$1', creation.record_id
+        )
+    ) == (1, False)
+    assert tuple(
+        await connection.fetchrow(f'SELECT draft_revision,approved_revision FROM "{schema}".registry_revision_control')
+    ) == (1, 0)
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_record_history') == 1
+
+
+async def test_actual_approval_selections_exclude_carried_forward_equal_typed_ids(serving_schema):
+    connection, schema, engine = serving_schema
+    actor, shared_id = _actor(), uuid4()
+    group = await _draft(engine, schema, replace(_create(), record_id=shared_id), actor)
+    company = await _draft(engine, schema, replace(_create("company"), record_id=shared_id), actor)
+    first = await _approve(connection, schema, await _command(connection, schema, group), actor)
+    await _approve(connection, schema, await _command(connection, schema, company), actor)
+    group_page = await _audit(connection, schema, "group", shared_id)
+    company_page = await _audit(connection, schema, "company", shared_id)
+    approvals = [event for event in group_page["events"] if event["lifecycle"] == "approved"]
+    assert len(approvals) == 1 and approvals[0]["event_revision"] == first["approved_revision"]
+    assert all(event["record"]["group_id"] == str(shared_id) for event in group_page["events"])
+    assert all(event["record"]["company_id"] == str(shared_id) for event in company_page["events"])
+    first_page = await _audit(connection, schema, "group", shared_id, limit=1)
+    second_page = await _audit(connection, schema, "group", shared_id, limit=1, offset=1)
+    assert first_page["has_more"] and not second_page["has_more"]
+    assert first_page["events"] + second_page["events"] == group_page["events"]
+    assert (await _audit(connection, schema, "group", shared_id, maximum_revision=0))["events"] == []
+
+
+async def test_additive_migration_preserves_existing_data_and_exact_model_columns(record_db):
+    connection, schema, sessions = record_db
+    creation = _create()
+    await _apply(sessions, schema, creation, _actor())
+    legacy_schema = "history_legacy_" + uuid4().hex
+    try:
+        await connection.execute(f'CREATE SCHEMA "{legacy_schema}"')
+        await connection.execute(
+            f'CREATE TABLE "{legacy_schema}".registry_record_history '
+            f'(LIKE "{schema}".registry_record_history INCLUDING ALL)'
+        )
+        await connection.execute(
+            f'ALTER TABLE "{legacy_schema}".registry_record_history DROP CONSTRAINT registry_history_event'
+        )
+        await connection.execute(f'ALTER TABLE "{legacy_schema}".registry_record_history DROP COLUMN event_json')
+        columns = [column for column in RegistryRecordHistory.__table__.columns.keys() if column != "event_json"]
+        await connection.execute(
+            f'INSERT INTO "{legacy_schema}".registry_record_history ({",".join(columns)}) '
+            f'SELECT {",".join(columns)} FROM "{schema}".registry_record_history'
+        )
+        before = await connection.fetchval(
+            f'SELECT to_jsonb(history)::text FROM "{legacy_schema}".registry_record_history history'
+        )
+        path = Path(__file__).parents[1] / "alembic/versions/20261013010000_registry_custom_history_events.py"
+        spec = importlib.util.spec_from_file_location("history_event_migration", path)
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        for statement in migration._ddl(legacy_schema):
+            await connection.execute(statement)
+        after = await connection.fetchval(
+            f"SELECT (to_jsonb(history)-'event_json')::text FROM \"{legacy_schema}\".registry_record_history history"
+        )
+        assert before == after
+        assert await connection.fetchval(f'SELECT event_json IS NULL FROM "{legacy_schema}".registry_record_history')
+        actual = await connection.fetch(
+            "SELECT attname::text FROM pg_attribute WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+            f'"{legacy_schema}".registry_record_history',
+        )
+        assert [column["attname"] for column in actual] == list(RegistryRecordHistory.__table__.columns.keys())
+        assert not await connection.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass($1) AND NOT tgisinternal)",
+            f'"{legacy_schema}".registry_record_history',
+        )
+    finally:
+        await connection.execute(f'DROP SCHEMA IF EXISTS "{legacy_schema}" CASCADE')
+        assert await connection.fetchval("SELECT to_regnamespace($1)", legacy_schema) is None
+
+
+async def test_derived_history_insert_grant_keeps_38_tables_and_denies_mutation(permissions_db):
+    fixture = permissions_db
+    installed = await _install(fixture)
+    assert len(installed["table_oids"]) == 38
+    table = f'"{fixture.schema}".registry_record_history'
+    role = fixture.roles_by_kind["api"]
+    assert await fixture.connection.fetchval("SELECT has_column_privilege($1,$2,'event_json','INSERT')", role, table)
+    assert not await fixture.connection.fetchval(
+        "SELECT has_column_privilege($1,$2,'event_json','UPDATE')", role, table
+    )
+    async with fixture.connection.transaction():
+        await fixture.connection.execute(f'SET LOCAL ROLE "{role}"')
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with fixture.connection.transaction():
+                await fixture.connection.execute(f"UPDATE {table} SET event_json=NULL")
+
+
+@pytest.mark.parametrize(
+    "kind,identity,kwargs",
+    [
+        ("network", True, {}),
+        ("network", uuid4(), {}),
+        ("group", 1, {}),
+        ("network", 1, {"limit": 51}),
+        ("network", 1, {"offset": -1}),
+        ("network", 1, {"minimum_revision": True}),
+        ("network", 1, {"maximum_revision": -1}),
+    ],
+)
+async def test_invalid_audit_bounds_stop_before_sql(record_db, kind, identity, kwargs):
+    connection, schema, _ = record_db
+    with pytest.raises(ValueError):
+        async with connection.transaction():
+            await read_registry_custom_history(connection, kind, identity, control_schema=schema, **kwargs)
+
+
+async def test_audit_output_overflow_refuses_without_returning_or_mutating_history(serving_schema):
+    connection, schema, engine = serving_schema
+    creation = _create()
+    await _draft(engine, schema, creation, _actor())
+    await connection.execute(
+        f'UPDATE "{schema}".registry_record_history SET record_json='
+        "jsonb_set(record_json,'{aliases}',jsonb_build_array(repeat('a',1048576)))"
+    )
+    before = await connection.fetchval(f'SELECT md5(record_json::text) FROM "{schema}".registry_record_history')
+    with pytest.raises(ValueError, match="output_limit"):
+        await _audit(connection, schema, "group", creation.record_id)
+    assert await connection.fetchval(f'SELECT md5(record_json::text) FROM "{schema}".registry_record_history') == before
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {},
+        {"operation": "guessed", "before_revision": 0, "operation_context": {}},
+        {"operation": "create", "before_revision": False, "operation_context": {}},
+        {"operation": "create", "before_revision": 1, "operation_context": {}},
+        {"operation": "create", "before_revision": 0, "operation_context": None},
+        {"operation": "create", "before_revision": 0, "operation_context": {}, "extra": True},
+        {"operation": "create", "before_revision": 0, "operation_context": {"padding": "a" * 16384}},
+    ],
+)
+async def test_native_metadata_shape_cannot_accept_guessed_or_mismatched_events(record_db, event):
+    connection, schema, sessions = record_db
+    await _apply(sessions, schema, _create(), _actor())
+    with pytest.raises(asyncpg.CheckViolationError):
+        async with connection.transaction():
+            await connection.execute(
+                f'UPDATE "{schema}".registry_record_history SET event_json=$1::jsonb', json.dumps(event)
+            )
+    assert (
+        json.loads(await connection.fetchval(f'SELECT event_json::text FROM "{schema}".registry_record_history'))[
+            "operation"
+        ]
+        == "create"
+    )
+
+
+async def test_network_lifecycle_preserves_integer_subject_and_refuses_wrong_snapshot_type(serving_schema):
+    connection, schema, engine = serving_schema
+    actor, command = _actor(), _create("network")
+    current = await _draft(engine, schema, command, actor)
+    identity = current["record_id"]
+    for operation in ("correct", "archive", "restore"):
+        command = replace(
+            command,
+            record_id=identity,
+            allocation_key=None,
+            operation=operation,
+            expected_revision=current["revision"],
+            idempotency_key=uuid4().hex,
+            fields={"display_name": "Reviewed Network", "aliases": []} if operation == "correct" else {},
+        )
+        current = await _draft(engine, schema, command, actor)
+    audit = await _audit(connection, schema, "network", identity)
+    assert type(audit["record_id"]) is int
+    assert [event["operation"] for event in audit["events"]] == ["restore", "archive", "correct", "create"]
+    assert [event["draft_event"]["before_revision"] for event in audit["events"]] == [3, 2, 1, 0]
+    await connection.execute(
+        f"UPDATE \"{schema}\".registry_record_history SET record_json=jsonb_set(record_json,'{{network_id}}','true') WHERE revision=4"
+    )
+    with pytest.raises(ValueError, match="snapshot_invalid"):
+        await _audit(connection, schema, "network", identity)
+
+
+async def test_specialized_binding_is_auditable_without_enabling_undo(serving_schema):
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    networks = await binding_seed(connection, schema)
+    row = binding_row(networks[0])
+    await binding_apply(connection, schema, binding_command([row]), actor)
+    identity = UUID(row["binding_id"])
+    audit = await _audit(connection, schema, "network_binding", identity)
+    assert audit["events"][0]["operation"] == "bind"
+    assert audit["events"][0]["record"]["evidence_sha256"] == row["evidence_sha256"]
+    async with async_sessionmaker(engine)() as session, session.begin():
+        with pytest.raises(ValueError, match="undo_request_invalid"):
+            await prepare_registry_manual_undo(
+                session,
+                RegistryManualUndoCommand("network_binding", identity, 2, 1, "Review", uuid4().hex),
+                actor,
+                schema=schema,
+            )
+
+
+async def test_completed_queue_receipt_requires_exact_manifest_and_custom_revision(serving_schema):
+    """Component fixture uses real queue stores, without claiming serving pipeline execution."""
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    draft = await _draft(engine, schema, _create(), actor)
+    command = await _command(connection, schema, draft)
+    async with connection.transaction():
+        queued = await enqueue_registry_publication(
+            connection,
+            command,
+            actor,
+            session_token_sha256="a" * 64,
+            expected_serving_generation=0,
+            control_schema=schema,
+        )
+        lease = await claim_registry_publication_request(
+            connection, operation_family="publication", control_schema=schema
+        )
+    approval = await _approve(connection, schema, command, actor)
+    candidate_id = uuid4()
+    await _candidate(connection, schema, candidate_id)
+    generation = await connection.fetchval(
+        f'INSERT INTO "{schema}".network_serving_manifest '
+        "(candidate_id,schema_revision,source_generations,approved_custom_revision,manifest_sha256) VALUES($1,1,'{}',$2,$3) RETURNING generation_id",
+        candidate_id,
+        approval["approved_revision"],
+        "b" * 64,
+    )
+    identity = UUID(draft["record_id"])
+    assert not any(
+        event["lifecycle"] == "publication" for event in (await _audit(connection, schema, "group", identity))["events"]
+    )
+    async with connection.transaction():
+        await finish_registry_publication_request(
+            connection,
+            UUID(queued["request_id"]),
+            lease["lease_id"],
+            state="completed",
+            result={
+                **{key: approval[key] for key in ("approved_revision", "previous_approved_revision", "selected_count")},
+                "serving_generation": generation,
+                "policy_revision": 7,
+            },
+            control_schema=schema,
+        )
+    events = (await _audit(connection, schema, "group", identity))["events"]
+    published_events = [event for event in events if event["lifecycle"] == "publication"]
+    assert len(published_events) == 1 and published_events[0]["publication"]["generation_id"] == generation
+    await connection.execute(
+        f"UPDATE \"{schema}\".registry_publication_request SET result_json=jsonb_set(result_json,'{{approved_revision}}','999999')"
+    )
+    assert not any(
+        event["lifecycle"] == "publication" for event in (await _audit(connection, schema, "group", identity))["events"]
+    )
+
+
+async def test_installed_legacy_grants_migrate_and_reconcile_without_expanding_custody(permissions_db):
+    """Existing column grants stay closed until the normal reconciler adds the new insert column."""
+    fixture = permissions_db
+    installed = await _install(fixture)
+    connection, schema = fixture.connection, fixture.schema
+    table = f'"{schema}".registry_record_history'
+    api_role = fixture.roles_by_kind["api"]
+    await connection.execute(f"ALTER TABLE {table} DROP CONSTRAINT registry_history_event")
+    await connection.execute(f"ALTER TABLE {table} DROP COLUMN event_json")
+    assert await connection.fetchval("SELECT has_column_privilege($1,$2,'revision','INSERT')", api_role, table)
+    path = Path(__file__).parents[1] / "alembic/versions/20261013010000_registry_custom_history_events.py"
+    spec = importlib.util.spec_from_file_location("history_grant_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    for statement in migration._ddl(schema):
+        await connection.execute(statement)
+    assert not await connection.fetchval("SELECT has_column_privilege($1,$2,'event_json','INSERT')", api_role, table)
+    reconciled = await _install(fixture)
+    assert reconciled["table_oids"] == installed["table_oids"] and len(reconciled["table_oids"]) == 38
+    assert await connection.fetchval("SELECT has_column_privilege($1,$2,'event_json','INSERT')", api_role, table)
+    assert not await connection.fetchval("SELECT has_column_privilege($1,$2,'event_json','UPDATE')", api_role, table)
+
+
+async def test_first_undo_apply_requires_provenance_before_sql_and_preserves_all_state(record_db):
+    connection, schema, sessions = record_db
+    actor, _, corrected, undo = await _seed(record_db)
+    prepared = await _prepare(sessions, schema, undo, actor)
+    assert prepared.command._undo_provenance_required is True
+
+    async def retained_state():
+        return (
+            await connection.fetchrow(
+                f'SELECT * FROM "{schema}".company_group_registry WHERE group_id=$1', corrected.record_id
+            ),
+            await connection.fetch(f'SELECT * FROM "{schema}".registry_revision_control ORDER BY id'),
+            await connection.fetch(
+                f'SELECT * FROM "{schema}".registry_record_history ORDER BY custom_revision, revision'
+            ),
+        )
+
+    before = await retained_state()
+    statements = []
+
+    def count(_connection, _cursor, statement, *_args):
+        statements.append(statement)
+
+    async with sessions() as session, session.begin():
+        engine = session.bind.sync_engine
+        event.listen(engine, "before_cursor_execute", count)
+        try:
+            with pytest.raises(ValueError, match="registry_manual_undo_provenance_required"):
+                await apply_registry_record_command(session, prepared.command, actor, schema=schema)
+        finally:
+            event.remove(engine, "before_cursor_execute", count)
+    assert statements == []
+    assert await retained_state() == before
+    receipt = await _apply(sessions, schema, prepared.command, actor, undo_provenance=prepared.provenance)
+    committed = await retained_state()
+    assert receipt["revision"] == 3 and receipt["custom_revision"] == 3
+    assert await _apply(sessions, schema, prepared.command, actor, undo_provenance=prepared.provenance) == receipt
+    assert await retained_state() == committed
+    event_document = json.loads(
+        await connection.fetchval(f'SELECT event_json::text FROM "{schema}".registry_record_history WHERE revision=3')
+    )
+    assert event_document["operation_context"]["operation"] == "undo"
+    assert event_document["operation_context"]["target_revision"] == 1
+
+
+async def test_provider_batch_refuses_prepared_undo_before_database(record_db):
+    connection, schema, sessions = record_db
+    actor, _, corrected, undo = await _seed(record_db, "provider")
+    prepared = await _prepare(sessions, schema, undo, actor)
+    assert prepared.command._undo_provenance_required is True
+    snapshot_query = (
+        f"SELECT to_jsonb(provider) AS provider,"
+        f'(SELECT jsonb_agg(history ORDER BY custom_revision) FROM "{schema}".registry_record_history history) AS history,'
+        f'(SELECT to_jsonb(control) FROM "{schema}".registry_revision_control control WHERE id=1) AS control '
+        f'FROM "{schema}".manual_provider_registry provider WHERE provider_id=$1'
+    )
+    before = await connection.fetchrow(snapshot_query, corrected.record_id)
+    with pytest.raises(ValueError, match="registry_manual_undo_provenance_required"):
+        await apply_registry_provider_batch(
+            object(), [prepared.command], [], actor, control_schema=schema, source_schema=schema
+        )
+    assert await connection.fetchrow(snapshot_query, corrected.record_id) == before

@@ -1,12 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Consume protected published-plan evidence for prepared exact offices only."""
 
+import json
 from dataclasses import asdict
 
 from sqlalchemy import text
 
 from process.network_address_projection import _identifier
-from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_approved_membership_source import pin_approved_membership_source
+from process.network_approved_source_bindings import APPROVED_NETWORK_BINDINGS_SQL, RegistryNetworkSourceCoordinates
 from process.registry_ptg_published_plan_contract import RegistryPTGPublishedPlanSourceSpecification
 
 
@@ -53,7 +55,7 @@ def _require_context(context, document_by_field, graph_by_field):
         raise ValueError("registry_ptg_published_office_source_changed")
 
 
-def _office_scope(document_by_field, actual_graph, selected_keys):
+def _office_scope(document_by_field, actual_graph, selected_keys, *, approved_revision=None):
     command_by_field = document_by_field["command"]
     identity_by_field = command_by_field["published_identity"]
     scope_by_field = {
@@ -76,6 +78,9 @@ def _office_scope(document_by_field, actual_graph, selected_keys):
                 "coordinates",
             )
         },
+        "approved_revision": (
+            command_by_field["approved_revision"] if approved_revision is None else approved_revision
+        ),
         "approval_sha256": document_by_field["approval_sha256"],
         "source_scope": scope_by_field,
         "binding_source_key": identity_by_field["source_key"],
@@ -88,10 +93,42 @@ def _office_scope(document_by_field, actual_graph, selected_keys):
     }
 
 
+async def _require_network_binding(session, context, scope_by_field):
+    """Require one reviewed exact source mapping in the current immutable map."""
+    from process.registry_ptg_office_capture import _driver
+
+    driver = await _driver(session)
+    namespace = _identifier(context.control_schema)
+    revision = await driver.fetchval(f"SELECT approved_revision FROM {namespace}.registry_revision_control WHERE id=1")
+    approved = await pin_approved_membership_source(
+        driver, approved_revision=revision, control_schema=context.control_schema
+    )
+    fragment = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=namespace)
+    matches = await driver.fetchval(
+        "WITH "
+        + fragment
+        + """ SELECT count(*)=1 AND coalesce(bool_and(
+          record_json->>'source_key'=$9 AND network_id=$10 AND approved_network_key IS NOT NULL
+          AND record_json->>'evidence_id'='published-plan-review:'||$11
+          AND record_json->>'evidence_sha256'=$12),false)
+          FROM approved_network_bindings WHERE record_json->'source_scope_json'=$8::jsonb""",
+        approved.approved_revision,
+        *context.coordinates.sql_parameters,
+        json.dumps(scope_by_field["source_scope"]),
+        scope_by_field["binding_source_key"],
+        scope_by_field["network_id"],
+        scope_by_field["source_scope"]["scope_id"],
+        scope_by_field["source_scope"]["approval_sha256"],
+    )
+    if matches is not True:
+        raise ValueError("registry_ptg_published_office_network_unresolved")
+    return approved.approved_revision
+
+
 async def published_office_scope(session, context):
     """Revalidate review, original source pin and current-company fence on the caller session."""
     from process.registry_ptg_cohort_authority import _source_state
-    from process.registry_ptg_published_plan_scope import _approved_association, read_registry_ptg_published_plan_scope
+    from process.registry_ptg_published_plan_scope import _approved_association
 
     await require_published_office_path(session)
     document_by_field = await _review_reader(context)(
@@ -104,14 +141,20 @@ async def published_office_scope(session, context):
     command_by_field = document_by_field["command"]
     graph_by_field = _graph_identity(command_by_field["published_identity"])
     _require_context(context, document_by_field, graph_by_field)
+    initial_scope = _office_scope(
+        document_by_field, graph_by_field, document_by_field["evidence"]["selected_source_keys"]
+    )
+    approved_revision = await _require_network_binding(session, context, initial_scope)
     await _approved_association(
-        session, _identifier(context.control_schema) + ".registry_ptg_published_plan_scope", command_by_field
+        session,
+        _identifier(context.control_schema) + ".registry_ptg_published_plan_scope",
+        {**command_by_field, "approved_revision": approved_revision},
     )
     actual_graph, source_records = await _source_state(session, context.source_specification, graph_by_field)
     selected_keys = document_by_field["evidence"]["selected_source_keys"]
     if selected_keys != [source_record["source_key"] for source_record in source_records]:
         raise ValueError("registry_ptg_published_office_source_changed")
-    return _office_scope(document_by_field, actual_graph, selected_keys)
+    return _office_scope(document_by_field, actual_graph, selected_keys, approved_revision=approved_revision)
 
 
 def _review_reader(context):

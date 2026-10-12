@@ -403,3 +403,126 @@ async def test_concurrent_corrections_have_one_winner(membership_db):
     )
     assert sum(isinstance(result, dict) for result in results) == 1
     assert sum(isinstance(result, RegistryRecordConflict) for result in results) == 1
+
+
+async def test_membership_detail_pins_global_revision_across_changes_and_gaps(membership_db):
+    """Global history gaps and later clear/archive edits retain exact office snapshots."""
+    connection, schema, sessions, _, _ = membership_db
+    actor, network_id, provider_id, sites = await _seed(membership_db)
+    creation = _command(network_id, [_member(network_id, provider_id, sites[0])])
+    first = await _apply(membership_db, creation, actor)
+    unrelated = await _apply(membership_db, _create("group"), actor)
+    correction = replace(
+        creation,
+        operation="correct",
+        expected_revision=1,
+        fields={"memberships_json": [_member(network_id, provider_id, site) for site in sites]},
+        idempotency_key=uuid4().hex,
+    )
+    second = await _apply(membership_db, correction, actor)
+    cleared = await _apply(
+        membership_db,
+        replace(correction, expected_revision=2, fields={"memberships_json": []}, idempotency_key=uuid4().hex),
+        actor,
+    )
+    archived = await _apply(
+        membership_db,
+        replace(creation, operation="archive", expected_revision=3, fields={}, idempotency_key=uuid4().hex),
+        actor,
+    )
+    history_query = (
+        f'SELECT to_jsonb(h)::text FROM "{schema}".registry_record_history h ORDER BY record_kind,record_key,revision'
+    )
+    history_before = await connection.fetch(history_query)
+    async with sessions() as session:
+        for custom_revision, expected in (
+            (0, None),
+            (first["custom_revision"] - 1, None),
+            (first["custom_revision"], first["record"]),
+            (unrelated["custom_revision"], first["record"]),
+            (second["custom_revision"], second["record"]),
+            (cleared["custom_revision"], cleared["record"]),
+            (archived["custom_revision"], archived["record"]),
+        ):
+            assert (
+                await store.get_registry_record(
+                    session, "membership", network_id, custom_revision=custom_revision, schema=schema
+                )
+                == expected
+            )
+        assert await store.get_registry_record(session, "membership", network_id, schema=schema) == archived["record"]
+        assert (
+            await store.get_registry_record(
+                session, "membership", 2147483647, custom_revision=first["custom_revision"], schema=schema
+            )
+            is None
+        )
+        with pytest.raises(ValueError, match="custom_revision_invalid"):
+            await store.get_registry_record(
+                session, "membership", network_id, custom_revision=archived["custom_revision"] + 1, schema=schema
+            )
+    assert history_before == await connection.fetch(history_query)
+    assert tuple(
+        await connection.fetchrow(f'SELECT draft_revision,approved_revision FROM "{schema}".registry_revision_control')
+    ) == (archived["custom_revision"], 0)
+
+
+async def test_membership_revision_page_preserves_selectors_and_pagination(membership_db):
+    _, schema, sessions, _, _ = membership_db
+    actor, network_id, provider_id, sites = await _seed(membership_db)
+    first = await _apply(membership_db, _command(network_id, [_member(network_id, provider_id, sites[0])]), actor)
+    other = await _apply(membership_db, _create("network"), actor)
+    second = await _apply(membership_db, _command(other["record_id"], []), actor)
+    await _apply(
+        membership_db,
+        replace(_command(network_id, []), operation="correct", expected_revision=1, idempotency_key=uuid4().hex),
+        actor,
+    )
+    async with sessions() as session:
+        read = store.list_registry_records
+        assert await read(session, "membership", custom_revision=0, schema=schema) == []
+        assert await read(session, "membership", custom_revision=first["custom_revision"], schema=schema) == [
+            first["record"]
+        ]
+        assert await read(session, "membership", custom_revision=second["custom_revision"], schema=schema) == [
+            first["record"],
+            second["record"],
+        ]
+        assert await read(
+            session, "membership", limit=1, offset=1, custom_revision=second["custom_revision"], schema=schema
+        ) == [second["record"]]
+        assert await read(
+            session, "membership", record_ids=[network_id], custom_revision=second["custom_revision"], schema=schema
+        ) == [first["record"]]
+        assert (
+            await read(session, "membership", record_ids=[], custom_revision=second["custom_revision"], schema=schema)
+            == []
+        )
+        assert (
+            await read(
+                session, "membership", record_ids=[2147483647], custom_revision=second["custom_revision"], schema=schema
+            )
+            == []
+        )
+        with pytest.raises(ValueError, match="selector_duplicate"):
+            await read(
+                session,
+                "membership",
+                record_ids=[network_id, network_id],
+                custom_revision=first["custom_revision"],
+                schema=schema,
+            )
+        for bounds in ({"limit": 101}, {"offset": -1}):
+            with pytest.raises(ValueError, match="page_invalid"):
+                await read(session, "membership", custom_revision=first["custom_revision"], schema=schema, **bounds)
+
+
+@pytest.mark.parametrize("custom_revision", [True, "1", -1, 1.0, 9223372036854775808])
+async def test_membership_revision_refuses_invalid_types_and_other_record_kinds(membership_db, custom_revision):
+    _, schema, sessions, _, _ = membership_db
+    async with sessions() as session:
+        for kind, revision in (("membership", custom_revision), ("network", 0)):
+            with pytest.raises(ValueError, match="custom_revision_invalid"):
+                await store.get_registry_record(session, kind, 1, custom_revision=revision, schema=schema)
+            with pytest.raises(ValueError, match="custom_revision_invalid"):
+                await store.list_registry_records(session, kind, custom_revision=revision, schema=schema)

@@ -25,6 +25,7 @@ pub mod hospital_price_selector_block;
 pub mod hospital_price_service_block;
 pub mod input;
 pub mod manifest;
+pub mod naic_company_registry;
 pub mod network_membership_codec;
 pub mod network_source_binding_values;
 pub mod normalize;
@@ -34,6 +35,7 @@ pub mod progress;
 pub mod provider_directory_projection;
 pub mod provider_graph_v4;
 pub mod rate_schedule_observe;
+pub mod registry_assertion_conflicts;
 pub mod registry_network_coverage;
 pub mod registry_network_evidence_values;
 pub mod registry_ptg_capture_input;
@@ -117,6 +119,7 @@ mod python_api {
     include!("python_custom_import_source_columns.rs");
     include!("python_custom_import_graph.rs");
     include!("python_custom_import_graph_projection.rs");
+    include!("python_registry.rs");
 
     #[pyfunction]
     fn encode_network_membership_batch(
@@ -172,27 +175,6 @@ mod python_api {
             encoded.row_count,
             PyBytes::new(py, &metadata).unbind(),
         ))
-    }
-
-    #[pyfunction]
-    fn validate_network_catalog_batch(py: Python<'_>, input: &[u8]) -> PyResult<Py<PyBytes>> {
-        let encoded = py.detach(|| {
-            let batch = crate::canonical_network_values::validate_network_catalog_batch(input)
-                .map_err(|error| {
-                    PyValueError::new_err(
-                        serde_json::to_string(&error).unwrap_or_else(|_| error.code.to_string()),
-                    )
-                })?;
-            let encoded = serde_json::to_vec(&batch)
-                .map_err(|_| PyValueError::new_err("Network catalog encoding failed"))?;
-            if encoded.len() > 16 * 1024 * 1024 {
-                return Err(PyValueError::new_err(
-                    "Network catalog output exceeds byte limit",
-                ));
-            }
-            Ok::<_, PyErr>(encoded)
-        })?;
-        Ok(PyBytes::new(py, &encoded).unbind())
     }
 
     fn location_canon_pool() -> PyResult<&'static ThreadPool> {
@@ -614,6 +596,12 @@ mod python_api {
         m.add_function(wrap_pyfunction!(encode_network_membership_batch, m)?)?;
         m.add_function(wrap_pyfunction!(encode_cms_mlr_observations, m)?)?;
         m.add_function(wrap_pyfunction!(encode_cms_planfinder_observations, m)?)?;
+        m.add_function(wrap_pyfunction!(parse_naic_company_registry_member, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            encode_naic_company_registry_observations,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(classify_registry_assertions, m)?)?;
         m.add_function(wrap_pyfunction!(validate_company_group_assertions, m)?)?;
         m.add_function(wrap_pyfunction!(validate_company_network_assertions, m)?)?;
         m.add_function(wrap_pyfunction!(encode_network_source_binding_batch, m)?)?;
@@ -673,6 +661,7 @@ mod python_api {
         use super::*;
 
         include!("python_hospital_price_tests.rs");
+        include!("python_registry_tests.rs");
 
         #[test]
         fn python_module_exports_real_address_contact_and_version_payloads() {

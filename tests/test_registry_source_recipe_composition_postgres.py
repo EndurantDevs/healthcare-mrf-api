@@ -386,3 +386,35 @@ async def test_native_copy_fault_rolls_back_complete_admitted_stage(reviewed_cms
         assert not await connection.fetchval(
             "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() AND (relname LIKE 'registry_recipe_raw_%' OR relname LIKE 'registry_source_page_%'))"
         )
+
+
+@pytest.mark.parametrize("reviewed_aca_source", ["raw_missing", "raw_foreign_source_url"], indirect=True)
+async def test_complete_aca_recipe_missing_raw_tail_rolls_back_all_staged_pages(reviewed_aca_source, monkeypatch):
+    import process.registry_source_recipe_composition as composition
+
+    original = composition._read_recipe_page
+    visited_outcomes = []
+
+    async def one_fact_page(connection, recipe, approved, cursor, control_schema, limit, office_source=None):
+        batch, next_cursor, _ = await original(connection, recipe, approved, cursor, control_schema, 1, office_source)
+        visited_outcomes.extend(batch.source_outcomes)
+        return batch, next_cursor, 1
+
+    monkeypatch.setattr(composition, "_read_recipe_page", one_fact_page)
+    fixture, _, _, _, coordinates, _ = reviewed_aca_source
+    connection, schema, source, _ = fixture
+    with pytest.raises(RegistrySourceCompositionError, match="unresolved"):
+        await _stage(connection, schema, (RegistrySourceMembershipRecipe(source, coordinates),))
+    assert [item.outcome for item in visited_outcomes] == ["accepted", "accepted", "unresolved"]
+    assert not await connection.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
+        "AND (relname LIKE 'registry_recipe_raw_%' OR relname LIKE 'registry_source_page_%'))"
+    )
+
+
+async def test_complete_aca_recipe_reports_retained_fact_totals(reviewed_aca_source):
+    fixture, _, _, _, coordinates, _ = reviewed_aca_source
+    connection, schema, source, _ = fixture
+    stage, members = await _stage(connection, schema, (RegistrySourceMembershipRecipe(source, coordinates),))
+    assert (stage.raw_source_rows, stage.accepted_raw_source_rows, stage.omitted_raw_source_rows) == (2, 2, 0)
+    assert len(members) == 2

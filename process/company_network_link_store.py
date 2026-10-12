@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field
+from datetime import date
 from uuid import UUID, uuid4
 
 from process.ext.address_fast import _fast_module
@@ -182,8 +183,11 @@ _WRITE_SQL = """WITH written AS (
   WHERE head.revision=excluded.revision-1 AND NOT head.archived RETURNING head.*
 ), history AS (
   INSERT INTO {namespace}.registry_record_history(record_kind,record_key,revision,custom_revision,record_json,
-    actor_json,reason,idempotency_key,request_sha256)
-  SELECT 'company_links',company_id::text,revision,$1,to_jsonb(written),$2::jsonb,$3,$4,$5 FROM written
+    actor_json,reason,idempotency_key,request_sha256,event_json)
+  SELECT 'company_links',written.company_id::text,written.revision,$1,to_jsonb(written),$2::jsonb,$3,$4,$5,
+    jsonb_build_object('operation','company_links_batch','before_revision',target.expected_revision,
+      'operation_context',jsonb_build_object('batch_id',$6::uuid,'idempotency_key',$7::text,'selection_group_id',$8::text))
+  FROM written JOIN {staging} target USING(company_id)
   RETURNING record_kind,record_key,revision,custom_revision,record_json
 ), receipt AS (
   SELECT count(*) AS written_count,jsonb_build_object('batch_id',$6::uuid,'custom_revision',$1::bigint,'records',
@@ -207,6 +211,7 @@ def _request_metadata(command, selected_targets, actor, reason, group_context):
         }
     )
     return {
+        "selection_group_id": group_context,
         "actor_json": actor_json,
         "actor_sha256": actor_sha256,
         "request_sha256": hashlib.sha256(request_json.encode()).hexdigest(),
@@ -226,6 +231,8 @@ async def _save_batch(connection, namespace, staging, selected_count, custom_rev
         "batch:" + str(batch_id),
         metadata["request_sha256"],
         batch_id,
+        metadata["idempotency_key"],
+        metadata["selection_group_id"],
     )
     if written["written_count"] != selected_count:
         raise RegistryRecordConflict("registry_company_link_batch_revision_conflict")
@@ -291,8 +298,59 @@ async def apply_company_network_link_batch(connection, command, actor: RegistryA
         )
 
 
-async def read_group_company_links(connection, group_id, *, company_ids=None, limit=50, offset=0, control_schema=None):
-    """Read one statement's bounded group page; supplied companies only narrow it."""
+_GROUP_SNAPSHOT_SQL = """WITH page AS MATERIALIZED (
+          SELECT company.company_id,to_jsonb(company) AS company,to_jsonb(links) AS links,links.network_ids AS linked_network_ids
+          FROM {namespace}.company_registry_links links
+          JOIN {namespace}.company_registry company USING(company_id)
+          WHERE links.group_id=$1 AND NOT links.archived
+            AND ($2::uuid[] IS NULL OR company.company_id=ANY($2::uuid[]))
+          ORDER BY company.company_id LIMIT $3 OFFSET $4
+        ), projected AS MATERIALIZED (
+          SELECT company_id,company,CASE WHEN $6::date IS NULL THEN links ELSE
+            links||jsonb_build_object('network_assertions',effective.assertions,
+              'network_ids',effective.network_ids) END AS links
+          FROM page CROSS JOIN LATERAL (
+            SELECT COALESCE(jsonb_agg(assertion ORDER BY ordinal),'[]'::jsonb) AS assertions,
+              COALESCE(jsonb_agg(DISTINCT assertion->'network_id' ORDER BY assertion->'network_id'),'[]'::jsonb)
+                AS network_ids
+            FROM jsonb_array_elements(page.links->'network_assertions') WITH ORDINALITY item(assertion,ordinal)
+            JOIN {namespace}.network_registry_record network
+              ON network.network_id=(assertion->>'network_id')::integer AND NOT network.archived
+            WHERE $6::date IS NOT NULL AND page.company->'archived'='false'::jsonb
+              AND COALESCE((assertion->>'valid_from')::date,'-infinity'::date)<=$6::date
+              AND COALESCE((assertion->>'valid_to')::date,'infinity'::date)>$6::date
+              AND (assertion->>'network_id')::integer=ANY(page.linked_network_ids)
+          ) effective
+        ), accounting AS (
+          SELECT COALESCE(sum(octet_length(company::text)+octet_length(links::text)),0) AS bytes FROM projected
+        ) SELECT control.draft_revision,to_jsonb(groups)::text AS group_json,
+          CASE WHEN accounting.bytes <= $5 THEN
+            COALESCE((SELECT jsonb_agg(jsonb_build_object('company',company,'links',links) ORDER BY company_id)
+              FROM projected),'[]'::jsonb)::text END AS records_json
+          FROM {namespace}.registry_revision_control control
+          JOIN {namespace}.company_group_registry groups ON groups.group_id=$1 AND NOT groups.archived
+          CROSS JOIN accounting WHERE control.id=1"""
+
+
+def _effective_date(effective_on):
+    if effective_on is None:
+        return None
+    if type(effective_on) is not str:
+        raise ValueError("registry_company_link_effective_date_invalid")
+    try:
+        selected_date = date.fromisoformat(effective_on)
+    except ValueError:
+        raise ValueError("registry_company_link_effective_date_invalid") from None
+    if selected_date.isoformat() != effective_on:
+        raise ValueError("registry_company_link_effective_date_invalid")
+    return selected_date
+
+
+async def read_group_company_links(
+    connection, group_id, *, company_ids=None, limit=50, offset=0, effective_on=None, control_schema=None
+):
+    """Read management history or explicit effective assertions on one scoped page."""
+    selected_date = _effective_date(effective_on)
     group_id = _uuid(group_id)
     if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or not 0 <= offset <= 1000000:
         raise ValueError("registry_company_link_group_page_invalid")
@@ -304,36 +362,25 @@ async def read_group_company_links(connection, group_id, *, company_ids=None, li
             raise ValueError("registry_company_link_group_scope_invalid")
     namespace = _namespace(control_schema)
     group_snapshot = await connection.fetchrow(
-        f"""WITH page AS MATERIALIZED (
-          SELECT company.company_id,to_jsonb(company) AS company,to_jsonb(links) AS links
-          FROM {namespace}.company_registry_links links
-          JOIN {namespace}.company_registry company USING(company_id)
-          WHERE links.group_id=$1 AND NOT links.archived
-            AND ($2::uuid[] IS NULL OR company.company_id=ANY($2::uuid[]))
-          ORDER BY company.company_id LIMIT $3 OFFSET $4
-        ), accounting AS (
-          SELECT COALESCE(sum(octet_length(company::text)+octet_length(links::text)),0) AS bytes FROM page
-        ) SELECT control.draft_revision,to_jsonb(groups)::text AS group_json,
-          CASE WHEN accounting.bytes <= $5 THEN
-            COALESCE((SELECT jsonb_agg(jsonb_build_object('company',company,'links',links) ORDER BY company_id)
-              FROM page),'[]'::jsonb)::text END AS records_json
-          FROM {namespace}.registry_revision_control control
-          JOIN {namespace}.company_group_registry groups ON groups.group_id=$1 AND NOT groups.archived
-          CROSS JOIN accounting WHERE control.id=1""",
+        _GROUP_SNAPSHOT_SQL.format(namespace=namespace),
         group_id,
         company_ids,
         limit,
         offset,
         _MAX_INPUT_BYTES - 131072,
+        selected_date,
     )
     if group_snapshot is None:
         return None
     if group_snapshot["records_json"] is None:
         raise RegistryAddressUnavailable("registry_company_link_group_response_limit")
-    return {
+    page_by_field = {
         "group": json.loads(group_snapshot["group_json"]),
         "draft_revision": group_snapshot["draft_revision"],
         "records": json.loads(group_snapshot["records_json"]),
         "limit": limit,
         "offset": offset,
     }
+    if selected_date is not None:
+        page_by_field["effective_on"] = selected_date.isoformat()
+    return page_by_field

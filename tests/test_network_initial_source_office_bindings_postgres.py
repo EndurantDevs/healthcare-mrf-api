@@ -22,7 +22,11 @@ from process.network_initial_source_office_bindings import (
     copy_initial_aca_office_bindings,
     pin_aca_office_address_source,
 )
-from process.network_legacy_membership_source import PinnedACAMembershipSource, read_aca_membership_batch
+from process.network_legacy_membership_source import (
+    PinnedACAMembershipSource,
+    read_aca_membership_batch,
+    read_aca_raw_fact_batch,
+)
 from process.network_membership_candidate_lifecycle import create_network_candidate
 from process.network_membership_copy import MembershipCopyTarget
 from tests.cms_registry_recipe_postgres_support import cms_recipe_database as cms_recipe_database
@@ -188,6 +192,11 @@ async def _archive(fixture):
         entries = [(index, 42 if index % 2 else 43, sites[(index - 1) % 2]) for index in range(1, count + 1)]
         await _insert_evidence(session, schema, entries)
         await _insert_reviewed_lineage(session, schema)
+        # This closed edition declares only the raw facts represented by its fixture entries.
+        await session.execute(
+            text(f'DELETE FROM "{schema}".plan_npi_raw WHERE NOT (checksum_network=ANY(CAST(:networks AS bigint[])))'),
+            {"networks": sorted({network for _, network, _ in entries})},
+        )
         for index, address in enumerate(raw):
             await session.execute(
                 text(f'''UPDATE "{schema}".mrf_address_evidence SET
@@ -990,3 +999,39 @@ async def test_admitted_cms_typed_office_native_source_sql(initial_cms_db):
                 await connection.execute(f'DROP TABLE "{schema}"."{name}"')
         for name in names:
             assert await connection.fetchval("SELECT to_regclass($1)", schema + "." + name) is None
+
+
+async def test_complete_raw_fact_office_pages_use_exact_evidence_and_replay_cursor(office_db):
+    fixture = office_db
+    cursor, pins = None, []
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        for checksum in (42, 43):
+            batch = await read_aca_raw_fact_batch(
+                fixture.connection,
+                fixture.source,
+                registry_schema=fixture.control,
+                approved_source=fixture.batch.approved_source,
+                binding_coordinates=fixture.coordinates,
+                after_source_position=cursor,
+                limit=1,
+            )
+            pin = await pin_aca_office_address_source(
+                fixture.connection,
+                batch,
+                fixture.address_source,
+                runtime_roles=(fixture.reader,),
+                after_source_position=cursor,
+                control_schema=fixture.control,
+            )
+            assert pin.office_count == 1 and batch.next_source_position.checksum_network == checksum
+            assert batch.accepted_evidence_checksums == ((1,) if checksum == 42 else (2,))
+            fixture.batch, fixture.address_pin = batch, pin
+            copy_target = await _target(fixture)
+            receipt = await _copy(fixture, copy_target, after_source_position=cursor)
+            assert receipt["office_count"] == 1
+            if cursor is not None:
+                with pytest.raises(InitialACAOfficeBindingError, match="cursor_differs"):
+                    await _copy(fixture, copy_target)
+            pins.append(pin.selected_offices_sha256)
+            cursor = batch.next_source_position
+    assert pins[0] != pins[1]

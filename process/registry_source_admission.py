@@ -9,7 +9,7 @@ import io
 import json
 import os
 import re
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -37,6 +37,7 @@ class RegistrySourceEdition:
     parser_version: str
     reporting_year: int
     published_at: datetime | None
+    retrieved_at: datetime | None = field(default=None, compare=False)
 
     def __post_init__(self):
         if type(self.snapshot_id) is not UUID or not self.snapshot_id.int:
@@ -48,22 +49,34 @@ class RegistrySourceEdition:
             ("source_url", 2048),
             ("parser_version", 128),
         ):
-            value = getattr(self, field)
+            field_value = getattr(self, field)
             if (
-                type(value) is not str
-                or not value.strip()
-                or len(value) > limit
-                or any(not character.isprintable() for character in value)
+                type(field_value) is not str
+                or not field_value.strip()
+                or len(field_value) > limit
+                or any(not character.isprintable() for character in field_value)
             ):
                 raise RegistrySourceAdmissionError("Source edition metadata is invalid")
-        if self.source_system != "cms" or self.source_id not in {"commercial-mlr", "plan-finder"}:
-            raise RegistrySourceAdmissionError("CMS admission requires its explicit source identity")
+        if (self.source_system, self.source_id) not in {
+            ("cms", "commercial-mlr"),
+            ("cms", "plan-finder"),
+            ("naic", "company-listings"),
+        }:
+            raise RegistrySourceAdmissionError("Admission requires its explicit source identity")
+        if self.source_system == "naic" and (
+            self.reporting_year != 2026 or self.parser_version != "naic-company-listings-byte-projection-v1"
+        ):
+            raise RegistrySourceAdmissionError("Company listing edition is unsupported")
         if type(self.reporting_year) is not int or not 2010 <= self.reporting_year <= 2100:
             raise RegistrySourceAdmissionError("Source reporting year is invalid")
         if self.published_at is not None and (
             type(self.published_at) is not datetime or self.published_at.utcoffset() is None
         ):
             raise RegistrySourceAdmissionError("Source publication date requires an explicit timezone")
+        if self.retrieved_at is not None and (
+            type(self.retrieved_at) is not datetime or self.retrieved_at.utcoffset() is None
+        ):
+            raise RegistrySourceAdmissionError("Source retrieval date requires an explicit timezone")
         for digest in (self.artifact_sha256, self.input_sha256):
             if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
                 raise RegistrySourceAdmissionError("Source digest is invalid")
@@ -108,12 +121,19 @@ def _encode_edition(input_bytes, edition):
 
 async def _register_edition(connection, namespace, edition):
     metadata_by_name = asdict(edition)
+    retrieved_at = metadata_by_name.pop("retrieved_at")
+    # A later fetch is not a new edition. Retain only the first supplied time;
+    # legacy callers with unknown fetch time keep the existing database default.
+    insert_by_name = dict(metadata_by_name)
+    if retrieved_at is not None:
+        insert_by_name["retrieved_at"] = retrieved_at
+    insert_columns = ",".join(insert_by_name)
     fields = tuple(metadata_by_name)
     columns = ",".join(fields)
-    placeholders = ",".join(f"${index}" for index in range(1, len(fields) + 1))
+    placeholders = ",".join(f"${index}" for index in range(1, len(insert_by_name) + 1))
     await connection.execute(
-        f"INSERT INTO {namespace}.registry_source_snapshot ({columns}) VALUES({placeholders}) ON CONFLICT(snapshot_id) DO NOTHING",
-        *metadata_by_name.values(),
+        f"INSERT INTO {namespace}.registry_source_snapshot ({insert_columns}) VALUES({placeholders}) ON CONFLICT(snapshot_id) DO NOTHING",
+        *insert_by_name.values(),
     )
     snapshot = await connection.fetchrow(
         f"SELECT {columns} FROM {namespace}.registry_source_snapshot WHERE snapshot_id=$1 FOR UPDATE",
@@ -336,8 +356,10 @@ async def read_registry_source_edition_identity(
 ) -> RegistrySourceEdition | None:
     """Read an exact edition's original identity, without asserting completion.
 
-    The provisional snapshot UUID may differ; all other immutable metadata must
-    match. Missing identities remain absent and are never registered here.
+    The provisional snapshot UUID and fetch time may differ; all immutable
+    edition metadata must match. The returned retrieval time is the first stored
+    time; legacy snapshots may contain the admission-time database default.
+    Missing identities remain absent and are never registered here.
     """
     if type(edition) is not RegistrySourceEdition or not connection.is_in_transaction():
         raise RegistrySourceAdmissionError("Source identity lookup requires a complete edition and caller transaction")

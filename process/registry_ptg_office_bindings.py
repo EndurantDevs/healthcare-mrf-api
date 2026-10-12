@@ -35,6 +35,7 @@ async def _offices(connection, batch, address_source, after, control_schema):
         raise ValueError("registry_ptg_office_binding_page_changed")
     records = [asdict(record) for record in batch.office_records]
     address = f"{_identifier(address_source.schema_name)}.{_identifier(address_source.table_name)}"
+    # The verified binding owns the site UUID; the complete row hash binds its address key.
     invalid = await connection.fetchval(
         f"""WITH selected AS MATERIALIZED (
       SELECT * FROM jsonb_to_recordset($1::jsonb) AS office(provider_system text,provider_id text,
@@ -42,7 +43,7 @@ async def _offices(connection, batch, address_source, after, control_schema):
     ) SELECT EXISTS(SELECT 1 FROM selected office LEFT JOIN {address} actual
       ON (actual.location_key,actual.entity_type,actual.entity_id)=
          (office.location_key,office.entity_type,office.entity_id)
-      WHERE actual.location_key IS NULL OR actual.address_key IS DISTINCT FROM office.location_id
+      WHERE actual.location_key IS NULL
         OR encode(sha256(convert_to(to_jsonb(actual)::text,'UTF8')),'hex') IS DISTINCT FROM office.address_row_sha256)""",
         _canonical(records).decode(),
     )

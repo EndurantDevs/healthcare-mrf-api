@@ -65,6 +65,7 @@ from process.ext.address_fast import _fast_module
 from process.network_membership_copy import MAX_INPUT_BYTES, MembershipCopyError, _encode
 from process.network_registry_identity import allocate_network_ids
 from process.provider_directory_projection_fhir_values import is_valid_npi
+from process.registry_manual_location_bindings import ManualLocationBindingConflict, retain_manual_location_bindings
 from process.registry_site_binding_store import resolve_site_binding_fields, validated_site_binding_fields
 
 _RECORD_MODELS = {
@@ -113,6 +114,7 @@ class RegistryRecordCommand:
     reason: str
     idempotency_key: str
     allocation_key: UUID | None = None
+    _undo_provenance_required: bool = False
 
 
 def _bounded_text(value, maximum, field):
@@ -343,6 +345,10 @@ def _validated_command(command):
         raise ValueError("registry_record_kind_invalid")
     if not isinstance(command.operation, str) or command.operation not in {"create", "correct", "archive", "restore"}:
         raise ValueError("registry_operation_invalid")
+    if type(command._undo_provenance_required) is not bool or (
+        command._undo_provenance_required and command.operation != "correct"
+    ):
+        raise ValueError("registry_manual_undo_marker_invalid")
     if type(command.expected_revision) is not int or not 0 <= command.expected_revision < 9223372036854775807:
         raise ValueError("registry_expected_revision_invalid")
     if command.operation == "create" and command.expected_revision != 0:
@@ -474,10 +480,10 @@ async def _append_record_history(
     record_by_field,
     control,
     history_table,
-    request_sha256,
-    company_history=(None, None),
+    request_metadata,
+    record_history=(None, None),
 ):
-    predecessors, materialized_snapshot = company_history
+    predecessors, materialized_snapshot = record_history
     custom_revision = await session.scalar(
         update(control)
         .where(control.c.id == 1)
@@ -496,38 +502,58 @@ async def _append_record_history(
         "actor_json": actor_document,
         "reason": command.reason.strip(),
         "idempotency_key": command.idempotency_key,
-        "request_sha256": request_sha256,
+        "request_sha256": request_metadata["request_sha256"],
+        "event_json": {
+            "operation": command.operation,
+            "before_revision": command.expected_revision,
+            "operation_context": request_metadata["operation_context"],
+        },
     }
     if materialized_snapshot is not None:
         await session.execute(
-            insert(history_table).values(**_materialized_company_history(history_by_column, materialized_snapshot))
+            insert(history_table).values(**_materialized_record_history(history_by_column, materialized_snapshot))
         )
     await session.execute(insert(history_table).values(**history_by_column))
     return _history_result(history_by_column)
 
 
-def _materialized_company_history(correction, snapshot):
+def _materialized_record_history(correction, snapshot):
     """Attribute baseline preservation to the correcting actor, not the source author."""
+    record_kind = correction.get("record_kind", "company")
     snapshot_json = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     digest = hashlib.sha256(
-        ("materialized-company-predecessor:" + correction["request_sha256"] + ":" + snapshot_json).encode()
+        (f"materialized-{record_kind}-predecessor:" + correction["request_sha256"] + ":" + snapshot_json).encode()
     ).hexdigest()
     return correction | {
         "revision": snapshot["revision"],
         "record_json": snapshot,
-        "reason": "Preserved materialized company before manual correction",
+        "reason": f"Preserved materialized {record_kind} before manual correction",
         "idempotency_key": "materialized:" + digest,
         "request_sha256": digest,
+        "event_json": {
+            "operation": "preserve_materialized",
+            "before_revision": None,
+            "operation_context": {"correction_request_sha256": correction["request_sha256"]},
+        },
     }
 
 
-async def _read_record_replay(session, history_table, command, record_id):
+async def _read_record_replay(session, history_table, command, record_id, request_metadata):
     statement = select(history_table).where(
         history_table.c.record_kind == command.record_kind,
         history_table.c.record_key == str(record_id),
         history_table.c.idempotency_key == command.idempotency_key,
     )
-    return (await session.execute(statement)).mappings().one_or_none()
+    replay = (await session.execute(statement)).mappings().one_or_none()
+    if replay is not None and (
+        replay["request_sha256"] != request_metadata["request_sha256"]
+        or (
+            replay["event_json"] is not None
+            and replay["event_json"]["operation_context"] != request_metadata["operation_context"]
+        )
+    ):
+        raise RegistryRecordConflict("registry_idempotency_conflict")
+    return replay
 
 
 async def _resolve_creation_identity(session, command, schema):
@@ -615,7 +641,24 @@ async def _validate_company_link_targets(session, command, fields, schema):
         raise ValueError("registry_company_links_target_invalid")
 
 
-async def apply_registry_record_command(session, command, actor, *, schema=None, source_schema=None):
+def _history_command_metadata(command, actor_document, undo_provenance):
+    """Seal the existing command digest and trusted optional undo context once."""
+    if command._undo_provenance_required and undo_provenance is None:
+        raise ValueError("registry_manual_undo_provenance_required")
+    context_by_field = {}
+    if undo_provenance is not None:
+        from process.registry_manual_undo import validated_undo_event_context
+
+        context_by_field = validated_undo_event_context(command, undo_provenance)
+    return {
+        "request_sha256": hashlib.sha256(_command_request(command, actor_document).encode()).hexdigest(),
+        "operation_context": context_by_field,
+    }
+
+
+async def apply_registry_record_command(
+    session, command, actor, *, schema=None, source_schema=None, undo_provenance=None
+):
     """Atomically retain one draft in the caller transaction and a savepoint.
 
     Retries must retain the caller's UUID or network allocation_key. Replay is
@@ -631,8 +674,7 @@ async def apply_registry_record_command(session, command, actor, *, schema=None,
             raise ValueError("registry_company_assertion_context_invalid")
     if not session.in_transaction() or session.new or session.dirty or session.deleted:
         raise ValueError("registry_requires_clean_caller_transaction")
-    request = _command_request(command, actor_document)
-    request_sha256 = hashlib.sha256(request.encode()).hexdigest()
+    request_metadata = _history_command_metadata(command, actor_document, undo_provenance)
     table, identity_column = _record_table(command.record_kind, schema)
     control = _table(RegistryRevisionControl, schema)
     history_table = _table(RegistryRecordHistory, schema)
@@ -642,10 +684,8 @@ async def apply_registry_record_command(session, command, actor, *, schema=None,
         if control_row != 1:
             raise RegistryRecordConflict("registry_control_unavailable")
         record_id = await _resolve_creation_identity(session, command, schema)
-        replay = await _read_record_replay(session, history_table, command, record_id)
+        replay = await _read_record_replay(session, history_table, command, record_id, request_metadata)
         if replay is not None:
-            if replay["request_sha256"] != request_sha256:
-                raise RegistryRecordConflict("registry_idempotency_conflict")
             return _history_result(replay)
         if command.record_kind == "company_links":
             await _validate_company_link_targets(session, command, fields, schema)
@@ -657,19 +697,21 @@ async def apply_registry_record_command(session, command, actor, *, schema=None,
             fields["canonical_address_json"] = _canonical_location_address(fields["address_json"])
         if command.record_kind == "site_binding" and command.operation != "archive":
             fields = await _resolve_site_binding(session, command, fields, schema)
-        assertions, company_history = None, (None, None)
+        assertions, record_history = None, (None, None)
         if command.record_kind == "company":
-            assertions, company_history = await _company_revision_assertions(
+            assertions, record_history = await _company_revision_assertions(
                 session, command, fields, history_table, schema
             )
             if command.operation != "archive":
                 await _validate_company_assertions(session, command, assertions, schema)
+        if command.record_kind == "group":
+            record_history = await _materialized_group_history(session, command, history_table, schema)
         record_snapshot = await _write_record_head(session, command, table, identity_column, record_id, fields)
         if assertions is not None:
             await _retain_company_assertions(session, record_snapshot, assertions, schema)
             record_snapshot.update(assertions)
         return await _append_record_history(
-            session, command, actor_document, record_snapshot, control, history_table, request_sha256, company_history
+            session, command, actor_document, record_snapshot, control, history_table, request_metadata, record_history
         )
 
 
@@ -705,7 +747,10 @@ async def _resolve_site_binding(session, command, fields_by_name, schema):
 
 def _command_request(command, actor_document):
     """Preserve exact JSON membership content while encoding command UUIDs."""
-    command_document = _snapshot(asdict(command))
+    command_document = asdict(command)
+    # Internal preparation state is not part of the retained request identity.
+    command_document.pop("_undo_provenance_required")
+    command_document = _snapshot(command_document)
     try:
         return json.dumps({"command": command_document, "actor": actor_document}, sort_keys=True, allow_nan=False)
     except TypeError, ValueError:
@@ -713,7 +758,7 @@ def _command_request(command, actor_document):
 
 
 async def _validate_membership_targets(session, command, fields, schema, source_schema):
-    """Encode once after replay, then validate every reference in one native set query."""
+    """Validate one native batch and retain its explicit manual-office pairs atomically."""
     if command.operation == "restore":
         memberships = _table(NetworkMembershipDraft, schema)
         membership_rows = await session.scalar(
@@ -729,7 +774,7 @@ async def _validate_membership_targets(session, command, fields, schema, source_
     if len(input_bytes) > MAX_INPUT_BYTES:
         raise ValueError("registry_membership_rows_invalid")
     try:
-        await asyncio.to_thread(_encode, input_bytes)
+        copy_bytes, row_count = await asyncio.to_thread(_encode, input_bytes)
     except MembershipCopyError as error:
         if str(error) == "Native membership encoder is unavailable":
             raise RegistryAddressUnavailable("registry_membership_native_unavailable") from None
@@ -755,6 +800,12 @@ async def _validate_membership_targets(session, command, fields, schema, source_
     )
     if valid is not True:
         raise ValueError("registry_membership_target_invalid")
+    connection = await session.connection()
+    driver = (await connection.get_raw_connection()).driver_connection
+    try:
+        await retain_manual_location_bindings(driver, copy_bytes, row_count, relations_by_name)
+    except ManualLocationBindingConflict as error:
+        raise RegistryRecordConflict(str(error)) from None
 
 
 _MEMBERSHIP_TARGETS_SQL = """WITH members AS MATERIALIZED (
@@ -782,8 +833,10 @@ AND NOT EXISTS (SELECT 1 FROM checked member WHERE
     WHEN 'npi' THEN member.has_source_binding OR EXISTS (SELECT 1 FROM {npis} npi WHERE npi.npi=member.provider_id::bigint)
     WHEN 'provider_directory' THEN member.has_binding OR member.has_source_binding
     ELSE false END)
-  OR NOT (member.has_binding OR member.has_source_binding OR EXISTS (SELECT 1 FROM {locations} location
-    WHERE location.location_id=member.location_id AND NOT location.archived)))
+  OR NOT (member.has_source_binding OR EXISTS (SELECT 1 FROM {locations} location
+    WHERE location.location_id=member.location_id AND NOT location.archived)
+    OR (member.has_binding AND NOT EXISTS (SELECT 1 FROM {locations} location
+      WHERE location.location_id=member.location_id))))
 """
 
 
@@ -811,10 +864,37 @@ async def _validate_provider_npi_claim(session, command, fields, schema, source_
         raise RegistryRecordConflict("registry_provider_npi_claimed")
 
 
-async def get_registry_record(session, record_kind, record_id, *, schema=None):
-    """Read a management draft head; public readers use approved composition."""
+async def _membership_revision_statement(session, custom_revision, schema):
+    """Pin membership history to a known global draft revision, including gaps."""
+    if type(custom_revision) is not int or not 0 <= custom_revision <= 9223372036854775807:
+        raise ValueError("registry_custom_revision_invalid")
+    control = _table(RegistryRevisionControl, schema)
+    draft_revision = await session.scalar(select(control.c.draft_revision).where(control.c.id == 1))
+    if draft_revision is None or custom_revision > draft_revision:
+        raise ValueError("registry_custom_revision_invalid")
+    history = _table(RegistryRecordHistory, schema)
+    return (
+        select(history.c.record_key, history.c.record_json)
+        .where(history.c.record_kind == "membership", history.c.custom_revision <= custom_revision)
+        .distinct(history.c.record_key)
+        .order_by(history.c.record_key, history.c.custom_revision.desc(), history.c.revision.desc())
+    )
+
+
+async def get_registry_record(session, record_kind, record_id, *, custom_revision=None, schema=None):
+    """Read a draft head or membership snapshot as of a global custom revision."""
     table, identity_column = _record_table(record_kind, schema)
     record_id = _record_identity(record_kind, record_id)
+    if custom_revision is not None:
+        if record_kind != "membership":
+            raise ValueError("registry_custom_revision_invalid")
+        statement = await _membership_revision_statement(session, custom_revision, schema)
+        row = (
+            (await session.execute(statement.where(statement.selected_columns.record_key == str(record_id))))
+            .mappings()
+            .one_or_none()
+        )
+        return None if row is None else row["record_json"]
     row = (await session.execute(select(table).where(table.c[identity_column] == record_id))).mappings().one_or_none()
     records = [] if row is None else [_snapshot(row)]
     if record_kind == "company":
@@ -822,7 +902,9 @@ async def get_registry_record(session, record_kind, record_id, *, schema=None):
     return records[0] if records else None
 
 
-async def list_registry_records(session, record_kind, *, limit=50, offset=0, record_ids=None, schema=None):
+async def list_registry_records(
+    session, record_kind, *, limit=50, offset=0, record_ids=None, custom_revision=None, schema=None
+):
     """Bounded management-only heads, ordered by durable identity."""
     if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or not 0 <= offset <= 1000000:
         raise ValueError("registry_page_invalid")
@@ -831,15 +913,28 @@ async def list_registry_records(session, record_kind, *, limit=50, offset=0, rec
     if record_ids is not None:
         if type(record_ids) not in {list, tuple} or len(record_ids) > 100:
             raise ValueError("registry_selector_invalid")
-        identities = tuple(_record_identity(record_kind, value) for value in record_ids)
+        identities = tuple(_record_identity(record_kind, identity) for identity in record_ids)
         if len(set(identities)) != len(identities):
             raise ValueError("registry_selector_duplicate")
         statement = statement.where(table.c[identity_column].in_(identities))
-    rows = (await session.execute(statement.order_by(table.c[identity_column]).limit(limit).offset(offset))).mappings()
-    records = [_snapshot(row) for row in rows]
+    if custom_revision is not None:
+        if record_kind != "membership":
+            raise ValueError("registry_custom_revision_invalid")
+        historical = await _membership_revision_statement(session, custom_revision, schema)
+        if record_ids is not None:
+            historical = historical.where(historical.selected_columns.record_key.in_(tuple(map(str, identities))))
+        latest = historical.subquery("membership_revision")
+        statement = (
+            select(latest.c.record_json).order_by(cast(latest.c.record_key, Integer)).limit(limit).offset(offset)
+        )
+        return list((await session.scalars(statement)).all())
+    record_rows = (
+        await session.execute(statement.order_by(table.c[identity_column]).limit(limit).offset(offset))
+    ).mappings()
+    record_documents = [_snapshot(record_fields) for record_fields in record_rows]
     if record_kind == "company":
-        await _attach_company_assertions(session, records, schema)
-    return records
+        await _attach_company_assertions(session, record_documents, schema)
+    return record_documents
 
 
 def _company_search_ids(record_ids):
@@ -860,7 +955,7 @@ def _company_search_ids(record_ids):
     return identities
 
 
-def _company_search_statement(query, limit, offset, record_ids, schema):
+def _registry_search_statement(record_kind, query, limit, offset, record_ids, schema):
     """Scope literal name/alias matches before durable ordering and pagination."""
     if type(query) is not str or any(unicodedata.category(character) == "Cc" for character in query):
         raise ValueError("registry_company_search_invalid")
@@ -870,12 +965,12 @@ def _company_search_statement(query, limit, offset, record_ids, schema):
     if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or not 0 <= offset <= 1000000:
         raise ValueError("registry_page_invalid")
     identities = _company_search_ids(record_ids)
-    table = _table(CompanyRegistry, schema)
+    table, identity_column = _record_table(record_kind, schema)
     pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     aliases = (
         func.jsonb_array_elements_text(table.c.aliases)
         .table_valued(column("alias", String))
-        .render_derived(name="company_aliases")
+        .render_derived(name="registry_aliases")
     )
     alias_match = (
         select(literal(1))
@@ -890,11 +985,22 @@ def _company_search_statement(query, limit, offset, record_ids, schema):
     except ValueError:
         exact_id = None
     if exact_id is not None and exact_id.int and str(exact_id) == query:
-        predicate = or_(predicate, table.c.company_id == exact_id)
+        predicate = or_(predicate, table.c[identity_column] == exact_id)
     statement = select(table).where(predicate)
     if identities is not None:
-        statement = statement.where(table.c.company_id.in_(identities))
-    return statement.order_by(table.c.company_id).limit(limit).offset(offset)
+        statement = statement.where(table.c[identity_column].in_(identities))
+    return statement.order_by(table.c[identity_column]).limit(limit).offset(offset)
+
+
+def _company_search_statement(query, limit, offset, record_ids, schema):
+    return _registry_search_statement("company", query, limit, offset, record_ids, schema)
+
+
+async def search_registry_groups(session, q, *, limit=50, offset=0, record_ids, schema=None):
+    """Search the complete authorized group set before bounded pagination."""
+    statement = _registry_search_statement("group", q, limit, offset, record_ids, schema)
+    rows = (await session.execute(statement)).mappings()
+    return [_snapshot(row) for row in rows]
 
 
 async def search_registry_companies(session, q, *, limit=50, offset=0, record_ids, schema=None):
@@ -939,6 +1045,27 @@ def _company_predecessors(command, retained_by_field):
             raise RegistryRecordConflict("registry_company_predecessor_invalid")
         predecessor_by_field[family] = sorted(identifiers)
     return predecessor_by_field
+
+
+async def _materialized_group_history(session, command, history, schema):
+    """Retain a source-materialized first group head before its first correction."""
+    if command.operation != "correct" or command.expected_revision != 1:
+        return None, None
+    retained = await session.scalar(
+        select(history.c.record_json).where(
+            history.c.record_kind == "group",
+            history.c.record_key == str(command.record_id),
+            history.c.revision == 1,
+        )
+    )
+    if retained is not None:
+        return None, None
+    snapshot = await get_registry_record(session, "group", command.record_id, schema=schema)
+    if snapshot is None or type(snapshot.get("revision")) is not int or snapshot["revision"] != 1:
+        raise RegistryRecordConflict("registry_record_revision_conflict")
+    if snapshot.get("group_id") != str(command.record_id):
+        raise RegistryRecordConflict("registry_group_predecessor_invalid")
+    return None, snapshot
 
 
 async def _company_revision_assertions(session, command, fields, history, schema):

@@ -211,6 +211,10 @@ async def materialize_registry_source_identities(
         # shortcut: ledger-wide allocation serializes sources; partition the ledger
         # only if measured concurrent imports justify an equivalent identity guard.
         await connection.execute(f"LOCK TABLE {namespace}.registry_identifier_binding IN SHARE ROW EXCLUSIVE MODE")
+        if landing.source_system == "naic":
+            from process.registry_naic_identity import materialize_naic_identities
+
+            return await materialize_naic_identities(connection, namespace, relation, landing)
         staging = await _source_candidates(connection, relation, landing)
         await _validate_binding_references(connection, namespace, staging)
         companies = await _company_candidates(connection, namespace, staging)

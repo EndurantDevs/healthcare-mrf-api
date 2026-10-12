@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 from contextlib import suppress
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import asyncpg
 import pytest
@@ -54,6 +55,8 @@ async def test_native_completion_lookup_retains_original_receipt_without_encoder
         edition = _planfinder_edition(digest)
         admit = admission.admit_cms_planfinder_edition
         header = admission._source_header_sha256(HEADERS)
+    retrieved_at = datetime(2024, 9, 12, 8, 30, 45, 123456, timezone(timedelta(hours=2)))
+    edition = replace(edition, retrieved_at=retrieved_at)
     baseline_path = await fixture.connection.fetchval("SELECT pg_catalog.current_setting('search_path')")
     original_path = "public, pg_temp, pg_catalog"
     async with fixture.connection.transaction():
@@ -62,13 +65,16 @@ async def test_native_completion_lookup_retains_original_receipt_without_encoder
         assert await fixture.connection.fetchval("SELECT pg_catalog.current_setting('search_path')") == original_path
         assert fixture.connection.is_in_transaction()
     assert await fixture.connection.fetchval("SELECT pg_catalog.current_setting('search_path')") == baseline_path
+    timestamp_sql = f'SELECT retrieved_at FROM "{fixture.schema}".registry_source_snapshot WHERE snapshot_id=$1'
+    assert await fixture.connection.fetchval(timestamp_sql, edition.snapshot_id) == retrieved_at
+    refetched = replace(edition, retrieved_at=retrieved_at + timedelta(days=1))
     monkeypatch.setattr(
         admission, "_encode_edition", lambda *_: pytest.fail("completed lookup invoked native encoding")
     )
     async with fixture.connection.transaction():
         await fixture.connection.execute("SELECT pg_catalog.set_config('search_path',$1,true)", original_path)
         observed = await admission.read_registry_source_admission_receipt(
-            fixture.connection, edition, header_sha256=header, control_schema=fixture.schema
+            fixture.connection, refetched, header_sha256=header, control_schema=fixture.schema
         )
         assert observed == receipt
         assert await fixture.connection.fetchval("SELECT pg_catalog.current_setting('search_path')") == original_path
@@ -91,6 +97,35 @@ async def test_native_completion_lookup_retains_original_receipt_without_encoder
         )
         assert await fixture.connection.fetchval("SELECT pg_catalog.current_setting('search_path')") == original_path
     assert await fixture.connection.fetchval("SELECT pg_catalog.current_setting('search_path')") == baseline_path
+
+
+@pytest.mark.asyncio
+async def test_native_refetch_replay_preserves_first_timestamp_and_sealed_manifest(permissions_db):
+    fixture = permissions_db
+    await _install(fixture)
+    input_bytes = _input()
+    retrieved_at = datetime(2024, 9, 12, 8, 30, 45, 123456, timezone(timedelta(hours=2)))
+    edition = replace(_edition(input_bytes), retrieved_at=retrieved_at)
+    async with fixture.connection.transaction():
+        await admission.admit_cms_mlr_edition(fixture.connection, input_bytes, edition, control_schema=fixture.schema)
+    manifest_sql = (
+        f'SELECT manifest_json,manifest_sha256 FROM "{fixture.schema}".registry_source_admission_receipt '
+        "WHERE snapshot_id=$1"
+    )
+    timestamp_sql = f'SELECT retrieved_at FROM "{fixture.schema}".registry_source_snapshot WHERE snapshot_id=$1'
+    original_manifest = await fixture.connection.fetchrow(manifest_sql, edition.snapshot_id)
+    assert original_manifest is not None
+    assert await fixture.connection.fetchval(timestamp_sql, edition.snapshot_id) == retrieved_at
+    async with fixture.connection.transaction():
+        replay = await admission.admit_cms_mlr_edition(
+            fixture.connection,
+            input_bytes,
+            replace(edition, retrieved_at=retrieved_at + timedelta(days=1)),
+            control_schema=fixture.schema,
+        )
+    assert replay["replayed"] is True
+    assert await fixture.connection.fetchval(timestamp_sql, edition.snapshot_id) == retrieved_at
+    assert await fixture.connection.fetchrow(manifest_sql, edition.snapshot_id) == original_manifest
 
 
 @pytest.mark.asyncio

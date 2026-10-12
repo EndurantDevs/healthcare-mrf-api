@@ -170,8 +170,11 @@ _WRITE_SQL = """WITH created AS (
     AND head.revision=target.expected_revision AND head.network_id=target.expected_network_id RETURNING head.*
 ), written AS (SELECT * FROM created UNION ALL SELECT * FROM changed), history AS (
   INSERT INTO {namespace}.registry_record_history(record_kind,record_key,revision,custom_revision,record_json,
-    actor_json,reason,idempotency_key,request_sha256)
-  SELECT 'network_binding',binding_id::text,revision,$1,to_jsonb(written),$2::jsonb,$3,$4,$5 FROM written
+    actor_json,reason,idempotency_key,request_sha256,event_json)
+  SELECT 'network_binding',written.binding_id::text,written.revision,$1,to_jsonb(written),$2::jsonb,$3,$4,$5,
+    jsonb_build_object('operation',target.operation,'before_revision',target.expected_revision,
+      'operation_context',jsonb_build_object('idempotency_key',$6::text))
+  FROM written JOIN {staging} target USING(binding_id)
   RETURNING record_key,revision,record_json
 ), receipt AS (
   SELECT count(*) AS written_count,jsonb_build_object('custom_revision',$1::bigint,'records',
@@ -191,6 +194,7 @@ async def _save(connection, namespace, staging, row_count, revision, metadata, k
         reason,
         "source-binding:" + uuid4().hex,
         request_sha256,
+        key,
     )
     if written["written_count"] != row_count:
         raise RegistryRecordConflict("registry_source_binding_revision_conflict")

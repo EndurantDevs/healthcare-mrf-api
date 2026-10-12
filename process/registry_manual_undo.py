@@ -23,7 +23,7 @@ from process.registry_record_store import (
     RegistryRecordCommand,
     RegistryRecordConflict,
     _bounded_text,
-    _materialized_company_history,
+    _materialized_record_history,
     _record_identity,
     _record_table,
     _table,
@@ -137,21 +137,27 @@ def _validate_undo_history(command, history_by_field):
     is_bound_predecessor = False
     if (
         history_by_field is not None
-        and command.record_kind == "company"
+        and command.record_kind in {"company", "group"}
         and (command.target_revision, command.expected_revision) == (1, 2)
         and history_by_field["custom_revision"] == history_by_field["expected_custom_revision"]
-        and history_by_field["predecessor_revision"] == str(command.target_revision)
-        and history_by_field["predecessor_revision_type"] == "number"
+        and (
+            command.record_kind == "group"
+            or (
+                history_by_field["predecessor_revision"] == str(command.target_revision)
+                and history_by_field["predecessor_revision_type"] == "number"
+            )
+        )
         and history_by_field["same_actor"] is True
         and type(history_by_field["record_json"]) is dict
-        and history_by_field["record_json"].get("company_id") == str(command.record_id)
+        and history_by_field["record_json"].get(_RECORD_MODELS[command.record_kind][1]) == str(command.record_id)
         and type(history_by_field["record_json"].get("revision")) is int
         and history_by_field["record_json"]["revision"] == command.target_revision
         and type(history_by_field["expected_request_sha256"]) is str
         and re.fullmatch(r"[0-9a-f]{64}", history_by_field["expected_request_sha256"]) is not None
     ):
-        baseline = _materialized_company_history(
-            {"request_sha256": history_by_field["expected_request_sha256"]}, history_by_field["record_json"]
+        baseline = _materialized_record_history(
+            {"record_kind": command.record_kind, "request_sha256": history_by_field["expected_request_sha256"]},
+            history_by_field["record_json"],
         )
         is_bound_predecessor = (
             history_by_field["request_sha256"] == baseline["request_sha256"]
@@ -226,6 +232,7 @@ def _prepare_correction(command, history_by_field, identity_column):
         fields_by_name,
         reason,
         command.idempotency_key,
+        _undo_provenance_required=True,
     )
     _validated_command(correction)
     return RegistryManualUndoPreparation(
@@ -372,3 +379,29 @@ async def read_registry_manual_history(session, kind, record_id, *, limit=50, of
     if len(json.dumps(history_by_field, ensure_ascii=False, separators=(",", ":")).encode()) > MAX_UNDO_SNAPSHOT_BYTES:
         raise RegistryAddressUnavailable("registry_manual_history_unavailable")
     return history_by_field
+
+
+def validated_undo_event_context(command, provenance):
+    """Bind only the trusted preparation result to its exact applied correction."""
+    if (
+        not isinstance(provenance, RegistryManualUndoProvenance)
+        or command.operation != "correct"
+        or (command.record_kind, command.record_id) != (provenance.record_kind, provenance.record_id)
+        or type(provenance.current_revision) is not int
+        or provenance.current_revision < command.expected_revision
+        or type(provenance.target_revision) is not int
+        or not 0 < provenance.target_revision < command.expected_revision
+        or type(provenance.target_custom_revision) is not int
+        or not 0 < provenance.target_custom_revision <= 9223372036854775807
+        or type(provenance.target_archived) is not bool
+        or type(provenance.target_request_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", provenance.target_request_sha256) is None
+    ):
+        raise ValueError("registry_manual_undo_event_invalid")
+    return {
+        "operation": "undo",
+        "target_revision": provenance.target_revision,
+        "target_custom_revision": provenance.target_custom_revision,
+        "target_request_sha256": provenance.target_request_sha256,
+        "target_archived": provenance.target_archived,
+    }

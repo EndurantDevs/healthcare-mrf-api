@@ -16,15 +16,19 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import registry_ptg_office_coordinator as coordinator
+from process.network_source_binding_store import COPY_COLUMNS as BINDING_COPY_COLUMNS
+from process.network_source_binding_store import NetworkSourceBindingBatchCommand, apply_network_source_binding_batch
 from process.ptg_parts.ptg2_candidate_attestation import shared_source_set_metadata
 from process.ptg_parts.result_archive_published_identity import validate_published_result_identity
 from process.registry_management_permissions import _TABLES, install_registry_management_permissions
 from process.registry_ptg_office_custody import RegistryPTGOfficeCustodyProfile
 from process.registry_ptg_office_preparation import RegistryPTGOfficePreparationService
 from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
+from process.registry_record_store import RegistryActor
 from tests import test_registry_ptg_office_capture_postgres as office_fixtures
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_ptg2_candidate_attestation import _audit_sample, _source_witness
+from tests.test_registry_approval_store_postgres import _approve, _command
 from tests.test_registry_ptg_office_capture_postgres import serving_schema as serving_schema
 from tests.test_registry_ptg_office_preparation_postgres import _approved_site
 from tests.test_registry_ptg_scope_engine_postgres import (
@@ -199,7 +203,63 @@ async def _prepare_control(fixture, custom, roles):
         await connection.execute(f'GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO "{role}"')
 
 
-async def _source_review(fixture, custom, roles, tmp_path):
+async def _approve_reviewed_source_binding(custom, roles, password, service, document, preview, approval):
+    """Write the exact original review through restricted native management, then approve."""
+    command = preview["command"]
+    scope_by_field = {
+        name: command[name] for name in ("review_type", "scope_id", "plan_id", "plan_market_type", "selection_mode")
+    }
+    scope_by_field.update(
+        snapshot_id=command["published_identity"]["snapshot_id"], approval_sha256=approval["approval_sha256"]
+    )
+    binding_by_field = {
+        **command["coordinates"],
+        "binding_id": str(uuid4()),
+        "source_key": command["published_identity"]["source_key"],
+        "source_scope_json": scope_by_field,
+        "network_id": command["network_id"],
+        "evidence_id": "published-plan-review:" + command["scope_id"],
+        "evidence_sha256": approval["approval_sha256"],
+        "operation": "bind",
+        "expected_revision": 0,
+        "expected_network_id": None,
+    }
+    actor = RegistryActor("platform_admin", UUID(document["actor"]["user_id"]), "system")
+    connection = await asyncpg.connect(
+        custom.engine.url.set(
+            drivername="postgresql", username=roles["management"], password=password
+        ).render_as_string(hide_password=False)
+    )
+    try:
+        async with connection.transaction(isolation="repeatable_read"):
+            written = await apply_network_source_binding_batch(
+                connection,
+                NetworkSourceBindingBatchCommand(
+                    json.dumps([binding_by_field]).encode(), "Reviewed exact published source", uuid4().hex
+                ),
+                actor,
+                control_schema=custom.control_schema,
+                published_plan_store=service.store,
+            )
+    finally:
+        await connection.close()
+    reviewed = await _approve(
+        custom.connection,
+        custom.control_schema,
+        await _command(custom.connection, custom.control_schema, *written["records"]),
+        actor,
+    )
+    assert reviewed["approved_revision"] > command["approved_revision"]
+    original = await custom.connection.fetchrow(
+        f'SELECT approval_sha256,approval_json FROM "{custom.control_schema}".registry_ptg_published_plan_scope WHERE scope_id=$1',
+        UUID(command["scope_id"]),
+    )
+    assert original["approval_sha256"] == approval["approval_sha256"]
+    assert json.loads(original["approval_json"])["command"] == command
+
+
+async def _source_review(fixture, custom, roles, password, tmp_path):
+    """Retain original source review, then approve its exact current-map binding."""
     document = deepcopy(fixture.source.document)
     view = SimpleNamespace(
         engine=custom.engine,
@@ -233,12 +293,12 @@ async def _source_review(fixture, custom, roles, tmp_path):
             key=lambda file_record: file_record["source_file_version_id"],
         ),
     )
-    preview_request["command"] = intent
     await custom.connection.execute(
-        f'GRANT SELECT ON "{custom.control_schema}".registry_ptg_published_plan_scope TO "{roles["publisher"]}"'
+        f'GRANT SELECT ON "{custom.control_schema}".registry_ptg_published_plan_scope TO "{roles["publisher"]}","{roles["management"]}"'
     )
-    preview = await service.preview(preview_request)
+    preview = await service.preview({**preview_request, "command": intent})
     approval = await service.approve({name: document[name] for name in ("actor", "session_token_sha256")} | preview)
+    await _approve_reviewed_source_binding(custom, roles, password, service, document, preview, approval)
     return service, {name: document[name] for name in ("actor", "session_token_sha256")} | {
         "source_command": preview["command"],
         "selector": {
@@ -403,7 +463,7 @@ async def coordinator_db(office_db, custom_db, tmp_path, monkeypatch, office_pub
         await _prepare_control(fixture, custom, roles_by_kind)
         async with _published_lock_provision(fixture.source, tmp_path):
             await _publisher_rights(fixture, custom, roles_by_kind)
-            scope, request = await _source_review(fixture, custom, roles_by_kind, tmp_path)
+            scope, request = await _source_review(fixture, custom, roles_by_kind, password, tmp_path)
             service = await _open_coordinator(fixture, custom, roles_by_kind, password, scope, resources)
             calls, acknowledgments = _observe_handoffs(fixture, custom, roles_by_kind, journal, monkeypatch)
             yield SimpleNamespace(
@@ -543,3 +603,126 @@ async def test_native_queue_profile_refuses_before_intent_insert(coordinator_db,
             await native.custom.connection.execute(
                 f'REVOKE UPDATE(command_json) ON "{native.custom.control_schema}".registry_publication_request FROM "{queue}"'
             )
+
+
+@pytest.mark.asyncio
+async def test_native_closed_reviewed_mapping_refuses_publisher_scope(coordinator_db):
+    """A real reviewed closure must refuse exact restricted Publisher source scope."""
+    from process import registry_ptg_office_capture as capture
+    from process import registry_ptg_office_preparation as preparation
+
+    native = coordinator_db
+    service = native.service.preparation
+    actor = RegistryActor("platform_admin", UUID(native.request["actor"]["user_id"]), "system")
+    async with native.service.management_sessions() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
+        binding_json = await driver.fetchval(
+            f'SELECT record_json::text FROM "{native.custom.control_schema}".registry_approved_record '
+            "WHERE approved_revision=(SELECT approved_revision FROM "
+            f'"{native.custom.control_schema}".registry_revision_control WHERE id=1) '
+            "AND record_kind='network_binding'"
+        )
+        retained = json.loads(binding_json)
+        closing_by_field = {
+            name: retained[name] for name in BINDING_COPY_COLUMNS if name in retained and name != "binding_key"
+        }
+        closing_by_field.update(
+            operation="close", expected_revision=retained["revision"], expected_network_id=retained["network_id"]
+        )
+        written = await apply_network_source_binding_batch(
+            driver,
+            NetworkSourceBindingBatchCommand(
+                json.dumps([closing_by_field]).encode(), "Close this exact reviewed source mapping", uuid4().hex
+            ),
+            actor,
+            control_schema=native.custom.control_schema,
+            published_plan_store=service.scope_service.store,
+        )
+    await _approve(
+        native.custom.connection,
+        native.custom.control_schema,
+        await _command(native.custom.connection, native.custom.control_schema, *written["records"]),
+        actor,
+    )
+    async with service.publisher_sessions() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        await session.execute(text("SET LOCAL search_path=pg_catalog,pg_temp"))
+        context, original = await preparation._source_context(
+            session, service, native.request["selector"], publisher=True
+        )
+        assert original == native.request["source_command"]
+        with pytest.raises(ValueError, match="registry_ptg_published_office_network_unresolved"):
+            await capture._scope(session, context)
+
+
+async def _publisher_source_scope(native):
+    """Resolve the real reviewed scope under the current association fence."""
+    from process import registry_ptg_office_capture as capture
+    from process import registry_ptg_office_preparation as preparation
+    from process.registry_company_approval_fence import registry_company_approval_transaction
+
+    service = native.service.preparation
+    async with registry_company_approval_transaction(
+        service.publisher_sessions, control_schema=native.custom.control_schema
+    ) as session:
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        await session.execute(text("SET LOCAL search_path=pg_catalog,pg_temp"))
+        context, original = await preparation._source_context(
+            session, service, native.request["selector"], publisher=True
+        )
+        assert original == native.request["source_command"]
+        return await capture._scope(session, context)
+
+
+@pytest.mark.asyncio
+async def test_native_approved_archived_company_links_refuse_publisher_scope(coordinator_db):
+    """An approved archive revokes association while retaining the original source review."""
+    from process.registry_ptg_producer_scope import RegistryPTGProducerScopeError
+    from process.registry_record_store import RegistryRecordCommand, apply_registry_record_command
+
+    native = coordinator_db
+    actor = RegistryActor("platform_admin", UUID(native.request["actor"]["user_id"]), "system")
+    namespace = '"' + native.custom.control_schema + '"'
+    company_id = UUID(native.request["source_command"]["legal_company_id"])
+    original_review = await native.custom.connection.fetchrow(
+        f"SELECT approval_sha256,approval_json FROM {namespace}.registry_ptg_published_plan_scope"
+    )
+    async with native.service.management_sessions() as session, session.begin():
+        revision = await session.scalar(
+            text(f"SELECT revision FROM {namespace}.company_registry_links WHERE company_id=:company"),
+            {"company": company_id},
+        )
+        archived = await apply_registry_record_command(
+            session,
+            RegistryRecordCommand(
+                "company_links", company_id, "archive", revision, {}, "Archive explicit association", uuid4().hex
+            ),
+            actor,
+            schema=native.custom.control_schema,
+        )
+    await _publisher_source_scope(native)
+    approved = await _approve(
+        native.custom.connection,
+        native.custom.control_schema,
+        await _command(native.custom.connection, native.custom.control_schema, archived),
+        actor,
+    )
+    retained = json.loads(
+        await native.custom.connection.fetchval(
+            f"SELECT record_json::text FROM {namespace}.registry_approved_record "
+            "WHERE approved_revision=$1 AND record_kind='company_links' AND record_key=$2",
+            approved["approved_revision"],
+            str(company_id),
+        )
+    )
+    assert retained["archived"] and native.request["source_command"]["network_id"] in retained["network_ids"]
+    with pytest.raises(RegistryPTGProducerScopeError, match="registry_ptg_scope_company_unapproved"):
+        await _publisher_source_scope(native)
+    assert (
+        await native.custom.connection.fetchrow(
+            f"SELECT approval_sha256,approval_json FROM {namespace}.registry_ptg_published_plan_scope"
+        )
+        == original_review
+    )
+    assert not native.calls

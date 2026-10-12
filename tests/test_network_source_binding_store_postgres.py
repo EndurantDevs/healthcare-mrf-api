@@ -140,10 +140,14 @@ async def test_rebind_close_reopen_retain_immutable_full_history(network_binding
         assert receipt["records"][0]["revision"] == old_revision + 1
         assert receipt["records"][0]["archived"] is archived
     history = await connection.fetch(
-        f'SELECT revision,record_json,actor_json,custom_revision,idempotency_key FROM "{schema}".registry_record_history '
+        f'SELECT revision,record_json,actor_json,custom_revision,idempotency_key,event_json FROM "{schema}".registry_record_history '
         "WHERE record_kind='network_binding' ORDER BY revision"
     )
     assert [entry["revision"] for entry in history] == [1, 2, 3, 4]
+    events = [json.loads(entry["event_json"]) for entry in history]
+    assert [event["operation"] for event in events] == ["bind", "rebind", "close", "rebind"]
+    assert [event["before_revision"] for event in events] == [0, 1, 2, 3]
+    assert all(event["operation_context"]["idempotency_key"] for event in events)
     documents = [json.loads(entry["record_json"]) for entry in history]
     assert [document["network_id"] for document in documents] == [networks[0], networks[1], networks[1], networks[0]]
     assert [document["archived"] for document in documents] == [False, False, True, False]

@@ -173,7 +173,7 @@ async def _approved_association(session, table, full):
             AND network.record_kind='network' AND network.record_key=:network
             AND network.record_json->>'network_id'=:network AND network.record_json->'archived'='false'::jsonb
             AND links.record_kind='company_links' AND links.record_key=:company
-            AND links.record_json->>'company_id'=:company
+            AND links.record_json->>'company_id'=:company AND links.record_json->'archived'='false'::jsonb
             AND links.record_json->'network_ids' @> CAST(:network_ids AS jsonb)
         )
     """),

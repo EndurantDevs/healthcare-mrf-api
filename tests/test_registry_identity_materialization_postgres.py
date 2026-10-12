@@ -93,6 +93,49 @@ async def test_ambiguous_group_labels_use_neutral_head_and_sorted_aliases(servin
     assert tuple(group_head) == ("NAIC group 707", '["Alpha Group", "Beta Group"]', "naic_group")
 
 
+async def test_same_naic_value_keeps_company_and_retained_group_namespaces_distinct(serving_schema):
+    connection, schema, _ = serving_schema
+    retained_landing = await _landing(connection, schema, [_assertion(group="12345")])
+    async with connection.transaction():
+        await _materialize(connection, schema, retained_landing)
+        await _persist(connection, schema, retained_landing)
+    retained_company_id = await connection.fetchval(f'SELECT company_id FROM "{schema}".company_registry')
+    retained_group_id = await connection.fetchval(f'SELECT group_id FROM "{schema}".company_group_registry')
+    assertion = _assertion(ein="023456789", group="12345")
+    assertion["normalized_naic_company"] = "12345"
+    assertion["raw_fields"]["naic_company_code"] = "12345"
+    landing = await _landing(connection, schema, [assertion], year=2025)
+    async with connection.transaction():
+        totals = await _materialize(connection, schema, landing)
+        persisted = await _persist(connection, schema, landing)
+        replayed = await _materialize(connection, schema, landing)
+        persisted_replay = await _persist(connection, schema, landing)
+    company_id = await connection.fetchval(
+        f'SELECT company_id FROM "{schema}".registry_issuer_company_assertion WHERE snapshot_id=$1',
+        landing.snapshot_id,
+    )
+    assert company_id is not None and len({company_id, retained_company_id, retained_group_id}) == 3
+    assert totals["companies_created"] == 1 and totals["groups_created"] == 0 and totals["bindings_created"] == 2
+    expected_bindings = [("company", "naic_company", company_id), ("group", "naic_group", retained_group_id)]
+    bindings = await connection.fetch(
+        f'SELECT entity_kind,identifier_system,entity_id FROM "{schema}".registry_identifier_binding '
+        "WHERE identifier_value='12345' ORDER BY identifier_system"
+    )
+    assert [tuple(binding) for binding in bindings] == expected_bindings
+    observations = await connection.fetch(
+        f'SELECT entity_kind,identifier_system,entity_id FROM "{schema}".registry_identifier_observation '
+        "WHERE snapshot_id=$1 AND identifier_value='12345' AND resolution_status='resolved' ORDER BY identifier_system",
+        landing.snapshot_id,
+    )
+    assert [tuple(observation) for observation in observations] == expected_bindings
+    assert persisted["resolved_identifiers"] == 3 and persisted["resolved_issuers"] == 1
+    assert persisted["resolved_groups"] == 1
+    assert await connection.fetchval(f'SELECT COUNT(*) FROM "{schema}".company_registry') == 2
+    assert await connection.fetchval(f'SELECT COUNT(*) FROM "{schema}".company_group_registry') == 1
+    assert replayed == dict(source_rows=1, companies_created=0, groups_created=0, bindings_created=0, replayed=True)
+    assert persisted_replay == persisted | {"replayed": True}
+
+
 @pytest.mark.parametrize("conflict", ["legal_names", "ein_many_naic", "naic_many_ein", "parser_fact"])
 async def test_source_strong_identifier_conflicts_do_not_allocate_companies(serving_schema, conflict):
     connection, schema, _ = serving_schema

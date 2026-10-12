@@ -281,7 +281,7 @@ _BATCH_SQL = """WITH selected AS MATERIALIZED ({alias_partition}),page AS MATERI
  FROM page LEFT JOIN selected alias ON alias.alias_value=page.checksum_network::text
  LEFT JOIN {registry_namespace}.network_registry_identity identity ON identity.network_id=alias.network_id
 ), encoded AS (
- SELECT jsonb_build_object('network_id',network_id,'provider_system','npi','provider_id',npi::text,
+ SELECT evidence_checksum,jsonb_build_object('network_id',network_id,'provider_system','npi','provider_id',npi::text,
    'location_id',address_key,'evidence_id',encode(sha256(convert_to(
      jsonb_build_array($9::text,to_jsonb(resolved))::text,'UTF8')),'hex')) AS membership
  FROM resolved WHERE NOT unresolved
@@ -289,21 +289,17 @@ _BATCH_SQL = """WITH selected AS MATERIALIZED ({alias_partition}),page AS MATERI
 SELECT ({alias_digest}) AS alias_sha256,(SELECT count(*) FROM page) AS source_rows,(SELECT max(evidence_checksum) FROM page) AS last_checksum,
  (SELECT count(*) FROM resolved WHERE unresolved) AS unresolved_rows,
  (SELECT count(*) FROM encoded) AS membership_rows,
+ (SELECT coalesce(jsonb_agg(DISTINCT evidence_checksum ORDER BY evidence_checksum),'[]'::jsonb)::text FROM encoded) AS accepted_evidence_checksums,
  CASE WHEN (SELECT coalesce(sum(octet_length(membership::text)),0)+2*count(*)+2 FROM encoded)<=8388608
  THEN (SELECT coalesce(jsonb_agg(membership ORDER BY membership::text),'[]'::jsonb)::text FROM encoded) END AS input_json"""
 
 
-_REVIEWED_SQL = """WITH {bindings},page AS MATERIALIZED (
- SELECT * FROM {source_namespace}.mrf_address_evidence
- WHERE import_id=$8 AND issuer_id=$9 AND year=$10 AND source_url=$11
-   AND ($12::bigint IS NULL OR evidence_checksum>$12) ORDER BY evidence_checksum LIMIT $13
-), expanded AS MATERIALIZED (
+_REVIEWED_SQL = """WITH {bindings},{raw_page}page AS MATERIALIZED ({page_sql}), expanded AS MATERIALIZED (
  SELECT page.*,provider.npi AS retained_npi,tier.plan_id AS retained_plan_id,
    plan.plan_id,plan.state AS plan_state,plan.issuer_id AS plan_issuer,plan.year AS plan_year,
    approved.network_id,approved.record_key AS binding_record_key
  FROM page LEFT JOIN {source_namespace}.plan_npi_raw provider
-   ON provider.npi=page.npi AND provider.checksum_network=page.checksum_network
-  AND provider.issuer_id=page.issuer_id AND provider.year=page.year AND provider.network_tier=page.network_tier
+   ON {provider_join}
  LEFT JOIN {source_namespace}.plan_networktier tier
    ON tier.checksum_network=provider.checksum_network AND tier.issuer_id=provider.issuer_id
   AND tier.year=provider.year AND tier.network_tier=provider.network_tier
@@ -323,16 +319,17 @@ _REVIEWED_SQL = """WITH {bindings},page AS MATERIALIZED (
    OR network_id IS NULL OR network_tier IS NULL OR network_tier=''
    OR source_record_id='' OR address_source<>'marketplace_provider' OR source_table<>'plan_npi_raw',true) AS unresolved
  FROM expanded
-), encoded AS (
- SELECT jsonb_build_object('network_id',network_id,'provider_system','npi','provider_id',npi::text,
+), {fact_status}encoded AS (
+ SELECT evidence_checksum,jsonb_build_object('network_id',network_id,'provider_system','npi','provider_id',npi::text,
    'location_id',address_key,'evidence_id',encode(sha256(convert_to(
      jsonb_build_array($14::text,to_jsonb(resolved))::text,'UTF8')),'hex')) AS membership
  FROM resolved WHERE NOT unresolved {encoded_filter}
 )
-SELECT (SELECT count(*) FROM page) AS source_rows,(SELECT max(evidence_checksum) FROM page) AS last_checksum,
+SELECT {source_rows} AS source_rows,(SELECT max(evidence_checksum) FROM page) AS last_checksum,
  (SELECT count(*) FROM resolved WHERE unresolved {unresolved_filter}) AS unresolved_rows,
- {omitted_summary}
+ {omitted_summary}{raw_summary}
  (SELECT count(*) FROM encoded) AS membership_rows,
+ (SELECT coalesce(jsonb_agg(DISTINCT evidence_checksum ORDER BY evidence_checksum),'[]'::jsonb)::text FROM encoded) AS accepted_evidence_checksums,
  CASE WHEN (SELECT count(*) FROM expanded)<=5000
  AND (SELECT coalesce(sum(octet_length(membership::text)),0)+2*count(*)+2 FROM encoded)<=8388608
  THEN (SELECT coalesce(jsonb_agg(membership ORDER BY membership::text),'[]'::jsonb)::text FROM encoded) END AS input_json"""
@@ -363,7 +360,7 @@ def _reviewed_descriptor(source, approved_source, coordinates, approved_only=Fal
     return descriptor_dict
 
 
-def _reviewed_generation(source, approved_source, coordinates, approved_only=False):
+def _reviewed_generation(source, approved_source, coordinates, approved_only=False, complete_raw_facts=False):
     recipe_dict = {
         "source_generation": source.generation_id,
         "approved_source": asdict(approved_source),
@@ -371,7 +368,24 @@ def _reviewed_generation(source, approved_source, coordinates, approved_only=Fal
     }
     if approved_only:
         recipe_dict["selection_policy"] = "approved-bindings-only"
+    if complete_raw_facts:
+        recipe_dict["fact_policy"] = "retained-raw-pk-v1"
     return hashlib.sha256(_canonical_json(recipe_dict)).hexdigest()
+
+
+@dataclass(frozen=True)
+class ACARawFactPosition:
+    generation_id: str
+    npi: int
+    checksum_network: int
+
+
+@dataclass(frozen=True)
+class ACARawFactOutcome:
+    npi: int
+    checksum_network: int
+    outcome: str
+    reason: str | None
 
 
 @dataclass(frozen=True)
@@ -387,6 +401,14 @@ class ACAMembershipBatch:
     binding_coordinates: RegistryNetworkSourceCoordinates | None = None
     approved_only: bool = False
     omitted_rows: int = 0
+    accepted_evidence_checksums: tuple[int, ...] = ()
+    complete_raw_facts: bool = False
+    after_source_position: ACARawFactPosition | None = None
+    next_source_position: ACARawFactPosition | None = None
+    accepted_source_rows: int = 0
+    unresolved_source_rows: int = 0
+    omitted_source_rows: int = 0
+    source_outcomes: tuple[ACARawFactOutcome, ...] = ()
 
     @property
     def generation_id(self):
@@ -394,10 +416,48 @@ class ACAMembershipBatch:
         _reviewed_descriptor(self.source, self.approved_source, self.binding_coordinates, self.approved_only)
         if self.approved_source is None and self.binding_coordinates is None:
             return self.source.generation_id
-        return _reviewed_generation(self.source, self.approved_source, self.binding_coordinates, self.approved_only)
+        return _reviewed_generation(
+            self.source, self.approved_source, self.binding_coordinates, self.approved_only, self.complete_raw_facts
+        )
 
 
-def _reviewed_sql(namespace, registry_schema, approved_only):
+def _raw_fact_selection_sql():
+    # Raw provenance is the admitted immutable relation and issuer/year, not an inferred URL.
+    raw_page = """raw_page AS MATERIALIZED (
+      SELECT npi,checksum_network,network_tier,issuer_id,year FROM {source}.plan_npi_raw
+      WHERE issuer_id=$9 AND year=$10 AND $12::bigint IS NULL
+      AND ($15::bigint IS NULL OR (npi,checksum_network)>($15,$16::bigint))
+      ORDER BY npi,checksum_network LIMIT $13),"""
+    page_sql = """SELECT evidence.*,raw.npi AS fact_npi,raw.checksum_network AS fact_checksum
+      FROM raw_page raw LEFT JOIN {source}.mrf_address_evidence evidence
+      ON evidence.npi=raw.npi AND evidence.checksum_network=raw.checksum_network
+      AND evidence.issuer_id=raw.issuer_id AND evidence.year=raw.year
+      AND evidence.network_tier=raw.network_tier
+      AND evidence.import_id=$8 AND evidence.source_url=$11 LIMIT 5001"""
+    provider_join = """provider.npi=page.fact_npi AND provider.checksum_network=page.fact_checksum
+      AND provider.issuer_id=$9 AND provider.year=$10"""
+    fact_status = """fact_status AS MATERIALIZED (
+      SELECT fact_npi,fact_checksum,
+        CASE WHEN bool_or(unresolved AND NOT omitted) THEN 'unresolved'
+          WHEN bool_or(NOT unresolved AND NOT omitted) THEN 'accepted' ELSE 'omitted' END AS outcome,
+        CASE WHEN bool_or(unresolved AND NOT omitted) THEN
+          CASE WHEN bool_or(address_key IS NULL OR address_key='00000000-0000-0000-0000-000000000000'::uuid
+            OR address_source IS DISTINCT FROM 'marketplace_provider' OR source_table IS DISTINCT FROM 'plan_npi_raw')
+          THEN 'missing_location' ELSE 'invalid_lineage' END END AS reason
+      FROM resolved GROUP BY fact_npi,fact_checksum),"""
+    raw_summary = """
+      (SELECT npi FROM raw_page ORDER BY npi DESC,checksum_network DESC LIMIT 1) AS last_npi,
+      (SELECT checksum_network FROM raw_page ORDER BY npi DESC,checksum_network DESC LIMIT 1) AS last_network,
+      (SELECT count(*) FROM fact_status WHERE outcome='accepted') AS accepted_source_rows,
+      (SELECT count(*) FROM fact_status WHERE outcome='unresolved') AS unresolved_source_rows,
+      (SELECT count(*) FROM fact_status WHERE outcome='omitted') AS omitted_source_rows,
+      (SELECT coalesce(jsonb_agg(jsonb_build_object('npi',fact_npi,'checksum_network',fact_checksum,
+        'outcome',outcome,'reason',reason) ORDER BY fact_npi,fact_checksum),'[]'::jsonb)::text FROM fact_status) AS source_outcomes,
+    """
+    return raw_page, page_sql, provider_join, fact_status, raw_summary
+
+
+def _reviewed_sql(namespace, registry_schema, approved_only, complete_raw_facts=False):
     complete_key = """COALESCE(retained_npi IS NOT NULL AND retained_plan_id IS NOT NULL AND plan_id IS NOT NULL
       AND checksum_network BETWEEN -2147483648 AND 2147483647
       AND plan_issuer BETWEEN 1 AND 99999 AND plan_year BETWEEN 2010 AND 2100
@@ -407,10 +467,30 @@ def _reviewed_sql(namespace, registry_schema, approved_only):
       AND plan_id ~ ('^'||lpad(plan_issuer::text,5,'0')||plan_state||'[0-9]{7}(-[0-9]{2})?$')
       AND network_tier IS NOT NULL AND network_tier<>'' AND source_record_id<>''
       AND address_source='marketplace_provider' AND source_table='plan_npi_raw',false)"""
+    if complete_raw_facts:
+        complete_key += " AND address_key IS NOT NULL AND address_key<>'00000000-0000-0000-0000-000000000000'::uuid"
+    raw_page = ""
+    page_sql = """SELECT * FROM {source}.mrf_address_evidence
+      WHERE import_id=$8 AND issuer_id=$9 AND year=$10 AND source_url=$11
+      AND ($12::bigint IS NULL OR evidence_checksum>$12) ORDER BY evidence_checksum LIMIT $13"""
+    provider_join = """provider.npi=page.npi AND provider.checksum_network=page.checksum_network
+      AND provider.issuer_id=page.issuer_id AND provider.year=page.year AND provider.network_tier=page.network_tier"""
+    fact_status = raw_summary = ""
+    if complete_raw_facts:
+        raw_page, page_sql, provider_join, fact_status, raw_summary = _raw_fact_selection_sql()
+    namespace_sql = _identifier(namespace)
     return _REVIEWED_SQL.format(
+        raw_page=raw_page.format(source=namespace_sql),
+        page_sql=page_sql.format(source=namespace_sql),
+        provider_join=provider_join,
+        source_rows="(SELECT count(*) FROM raw_page)" if complete_raw_facts else "(SELECT count(*) FROM page)",
+        fact_status=fact_status,
+        raw_summary=raw_summary,
         source_namespace=_identifier(namespace),
         bindings=APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_identifier(registry_schema)),
-        omission_columns=f"network_id IS NULL AND ({complete_key}) AS omitted," if approved_only else "",
+        omission_columns=f"network_id IS NULL AND ({complete_key}) AS omitted,"
+        if approved_only
+        else ("false AS omitted," if complete_raw_facts else ""),
         encoded_filter="AND NOT omitted" if approved_only else "",
         unresolved_filter="AND NOT omitted" if approved_only else "",
         omitted_summary="(SELECT count(*) FROM resolved WHERE omitted) AS omitted_rows," if approved_only else "",
@@ -418,25 +498,41 @@ def _reviewed_sql(namespace, registry_schema, approved_only):
 
 
 async def _read_reviewed(
-    connection, source, approved_source, coordinates, page_options, registry_schema, approved_only
+    connection,
+    source_pin,
+    approved_source,
+    coordinates,
+    page_options,
+    registry_schema,
+    approved_only,
 ):
+    after_evidence_checksum, limit, after_source_position, complete_raw_facts = page_options
     try:
         await require_approved_network_source_bindings(
             connection, approved_source, coordinates, control_schema=registry_schema
         )
     except ApprovedNetworkSourceBindingError:
         raise LegacyMembershipSourceError("Reviewed ACA bindings are unavailable") from None
-    generation = _reviewed_generation(source, approved_source, coordinates, approved_only)
+    generation = _reviewed_generation(source_pin, approved_source, coordinates, approved_only, complete_raw_facts)
     return await connection.fetchrow(
-        _reviewed_sql(source.prepared.ownership.schema_name, registry_schema, approved_only),
+        _reviewed_sql(source_pin.prepared.ownership.schema_name, registry_schema, approved_only, complete_raw_facts),
         approved_source.approved_revision,
         *coordinates.sql_parameters,
-        source.import_id,
-        source.issuer_id,
-        source.year,
-        source.source_url,
-        *page_options,
+        source_pin.import_id,
+        source_pin.issuer_id,
+        source_pin.year,
+        source_pin.source_url,
+        after_evidence_checksum,
+        limit,
         generation,
+        *(
+            (
+                None if after_source_position is None else after_source_position.npi,
+                None if after_source_position is None else after_source_position.checksum_network,
+            )
+            if complete_raw_facts
+            else ()
+        ),
     )
 
 
@@ -451,13 +547,47 @@ async def read_aca_membership_batch(
     binding_coordinates=None,
     approved_only=False,
 ):
-    """Read a bounded keyset page; unresolved rows cannot be copied.
+    """Read the compatible evidence-keyset page; unresolved rows cannot be copied."""
+    return await _read_aca_batch(
+        connection,
+        source_pin,
+        registry_schema,
+        approved_source,
+        binding_coordinates,
+        approved_only,
+        (after_evidence_checksum, limit, None, False),
+    )
 
-    Paired approved pins require the full sealed plan family and exact admitted
-    coordinates. Reviewed extraction never falls back to the legacy alias map.
-    Approved-only selection counts complete unmapped plan combinations in
-    ``omitted_rows`` while incomplete source lineage remains unresolved.
+
+async def read_aca_raw_fact_batch(
+    connection,
+    source_pin,
+    *,
+    registry_schema,
+    after_source_position=None,
+    limit=1000,
+    approved_source=None,
+    binding_coordinates=None,
+    approved_only=False,
+):
+    """Account retained raw PKs using paired full-archive pins and exact evidence.
+
+    Raw authority is the sealed relation and issuer/year, not a per-row source URL.
+    Original JSON duplicates and address ordinals are unavailable in this model.
     """
+    return await _read_aca_batch(
+        connection,
+        source_pin,
+        registry_schema,
+        approved_source,
+        binding_coordinates,
+        approved_only,
+        (None, limit, after_source_position, True),
+    )
+
+
+def _validate_aca_page(connection, source_pin, approved_source, binding_coordinates, approved_only, page_options):
+    after_evidence_checksum, limit, after_source_position, complete_raw_facts = page_options
     if type(source_pin) is not PinnedACAMembershipSource or not connection.is_in_transaction():
         raise LegacyMembershipSourceError("Pinned ACA reads require a caller transaction")
     if type(limit) is not int or not 1 <= limit <= MAX_ROWS:
@@ -467,6 +597,33 @@ async def read_aca_membership_batch(
     ):
         raise LegacyMembershipSourceError("ACA source cursor is invalid")
     descriptor = _reviewed_descriptor(source_pin, approved_source, binding_coordinates, approved_only)
+    if type(complete_raw_facts) is not bool or (complete_raw_facts and descriptor is None):
+        raise LegacyMembershipSourceError("Complete ACA facts require paired full archive pins")
+    if after_source_position is not None:
+        if not complete_raw_facts:
+            raise LegacyMembershipSourceError("ACA source position is invalid")
+        generation = _reviewed_generation(source_pin, approved_source, binding_coordinates, approved_only, True)
+        if (
+            type(after_source_position) is not ACARawFactPosition
+            or after_source_position.generation_id != generation
+            or type(after_source_position.npi) is not int
+            or not -(2**63) <= after_source_position.npi < 2**63
+            or type(after_source_position.checksum_network) is not int
+            or not -(2**63) <= after_source_position.checksum_network < 2**63
+        ):
+            raise LegacyMembershipSourceError("ACA source position is invalid")
+    if complete_raw_facts and after_evidence_checksum is not None:
+        raise LegacyMembershipSourceError("ACA source cursors cannot be mixed")
+    return descriptor
+
+
+async def _read_aca_batch(
+    connection, source_pin, registry_schema, approved_source, binding_coordinates, approved_only, page_options
+):
+    after_evidence_checksum, limit, _, _ = page_options
+    descriptor = _validate_aca_page(
+        connection, source_pin, approved_source, binding_coordinates, approved_only, page_options
+    )
     registry_namespace = _identifier(registry_schema)
     await _require_archive(connection, source_pin)
     if descriptor is not None:
@@ -475,7 +632,7 @@ async def read_aca_membership_batch(
             source_pin,
             approved_source,
             binding_coordinates,
-            (after_evidence_checksum, limit),
+            page_options,
             registry_schema,
             approved_only,
         )
@@ -486,6 +643,26 @@ async def read_aca_membership_batch(
     input_bytes = batch["input_json"].encode()
     if len(input_bytes) > MAX_INPUT_BYTES:
         raise LegacyMembershipBatchBoundsError("ACA membership batch exceeds bounds")
+    return _aca_batch_from_row(
+        source_pin, batch, approved_source, binding_coordinates, approved_only, page_options, input_bytes
+    )
+
+
+def _aca_batch_from_row(
+    source_pin, batch, approved_source, binding_coordinates, approved_only, page_options, input_bytes
+):
+    _, _, after_source_position, complete_raw_facts = page_options
+    outcomes = (
+        tuple(ACARawFactOutcome(**outcome_dict) for outcome_dict in json.loads(batch["source_outcomes"]))
+        if complete_raw_facts
+        else ()
+    )
+    if complete_raw_facts and (
+        batch["source_rows"]
+        != sum(batch[name] for name in ("accepted_source_rows", "unresolved_source_rows", "omitted_source_rows"))
+        or len(outcomes) != batch["source_rows"]
+    ):
+        raise LegacyMembershipSourceError("ACA raw fact accounting is incomplete")
     return ACAMembershipBatch(
         source_pin,
         batch["source_rows"],
@@ -498,6 +675,20 @@ async def read_aca_membership_batch(
         binding_coordinates,
         approved_only,
         batch["omitted_rows"] if approved_only else 0,
+        accepted_evidence_checksums=tuple(json.loads(batch["accepted_evidence_checksums"])),
+        complete_raw_facts=complete_raw_facts,
+        after_source_position=after_source_position,
+        next_source_position=ACARawFactPosition(
+            _reviewed_generation(source_pin, approved_source, binding_coordinates, approved_only, True),
+            batch["last_npi"],
+            batch["last_network"],
+        )
+        if complete_raw_facts and batch["source_rows"]
+        else None,
+        accepted_source_rows=batch["accepted_source_rows"] if complete_raw_facts else 0,
+        unresolved_source_rows=batch["unresolved_source_rows"] if complete_raw_facts else 0,
+        omitted_source_rows=batch["omitted_source_rows"] if complete_raw_facts else 0,
+        source_outcomes=outcomes,
     )
 
 

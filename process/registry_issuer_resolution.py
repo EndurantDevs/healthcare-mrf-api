@@ -49,7 +49,7 @@ WITH requested AS (
     c.company_id IS NOT NULL AS company_present,
     g.source_record_key IS NOT NULL AS group_assertion_present,g.group_id,
     g.resolution_status AS group_status,g.relationship_kind,g.valid_from AS group_valid_from,g.valid_to AS group_valid_to,
-    head.group_id IS NOT NULL AS group_present,head.group_kind
+    head.group_id IS NOT NULL AS group_present,NULL::text AS group_kind
   FROM chosen r JOIN {namespace}.registry_issuer_company_assertion a ON a.hios_issuer_id=r.hios
   JOIN {namespace}.registry_source_snapshot s ON s.snapshot_id=a.snapshot_id
     AND s.reporting_year IS NOT DISTINCT FROM r.reporting_year

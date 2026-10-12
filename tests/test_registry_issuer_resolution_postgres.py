@@ -498,3 +498,38 @@ async def test_missing_native_prerequisites_are_sanitized(serving_schema):
         ) as failure:
             await read_registry_issuer_resolutions(connection, (123,), control_schema=schema + "_absent")
     assert schema not in str(failure.value)
+
+
+async def test_pending_group_kind_correction_keeps_source_period_output(serving_schema):
+    """Editable group metadata never changes retained public source-period evidence."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from process.registry_record_store import RegistryActor, RegistryRecordCommand, apply_registry_record_command
+
+    connection, schema, engine = serving_schema
+    company_id, group_id = await _company_group(connection, schema)
+    snapshot_id = await _source(connection, schema)
+    await _evidence(connection, schema, snapshot_id, company_id, group_id)
+    async with connection.transaction(isolation="repeatable_read"):
+        before = await _read(connection, schema)
+    async with async_sessionmaker(engine)() as session, session.begin():
+        written = await apply_registry_record_command(
+            session,
+            RegistryRecordCommand(
+                "group",
+                group_id,
+                "correct",
+                1,
+                {"display_name": "Pending group correction", "group_kind": "corporate_parent", "aliases": []},
+                "Correct draft group metadata",
+                uuid4().hex,
+            ),
+            RegistryActor("platform_admin", uuid4(), "system"),
+            schema=schema,
+        )
+    assert written["record"]["group_kind"] == "corporate_parent"
+    assert await connection.fetchval(f'SELECT approved_revision FROM "{schema}".registry_revision_control') == 0
+    async with connection.transaction(isolation="repeatable_read"):
+        after = await _read(connection, schema)
+    assert after == before
+    assert after[0]["evidence"][0]["group_assertion"]["group_kind"] is None

@@ -69,7 +69,9 @@ def _edition(input_bytes):
 def _arguments(input_file, edition):
     arguments = ["--input-file", str(input_file)]
     for field, value in asdict(edition).items():
-        if field == "published_at":
+        if field == "retrieved_at" and value is None:
+            continue
+        if field in {"published_at", "retrieved_at"}:
             value = value.isoformat() if value is not None else "unknown"
         arguments.extend(("--" + field.replace("_", "-"), str(value)))
     return arguments

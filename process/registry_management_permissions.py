@@ -114,6 +114,9 @@ _INSERT_COLUMNS = {
     for model in _HEAD_MODELS
 }
 _INSERT_COLUMNS.update(
+    manual_provider_location_binding=tuple(
+        column for column in ManualProviderLocationBinding.__table__.columns.keys() if column != "created_at"
+    ),
     registry_network_binding_batch=tuple(
         column for column in RegistryNetworkBindingBatch.__table__.columns.keys() if column != "created_at"
     ),

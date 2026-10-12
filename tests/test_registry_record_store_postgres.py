@@ -23,6 +23,7 @@ from process.registry_record_store import (
     get_registry_record,
     list_registry_records,
     search_registry_companies,
+    search_registry_groups,
 )
 
 
@@ -51,6 +52,7 @@ async def record_db():
             "20261009030000_network_catalog_evidence.py",
             "20261011010000_company_registry_group_assertions.py",
             "20261012010000_company_registry_name_origin.py",
+            "20261013010000_registry_custom_history_events.py",
         ]:
             path = Path(__file__).parents[1] / "alembic/versions" / filename
             spec = importlib.util.spec_from_file_location(filename.removesuffix(".py"), path)
@@ -491,8 +493,6 @@ async def test_network_evidence_create_refusal_precedes_identity_allocation(reco
 
 @pytest.mark.asyncio
 async def test_network_evidence_retention_replay_and_archive(record_db):
-    import json
-
     _require_evidence_native()
     connection, schema, sessions = record_db
     create, actor = _create("network"), _actor()
@@ -681,7 +681,9 @@ async def test_network_evidence_historical_undo_rebinds_without_history_edits(re
     undo = RegistryManualUndoCommand("network", first["record_id"], 3, 2, "Reviewed historical evidence", uuid4().hex)
     async with sessions() as session, session.begin():
         preparation = await prepare_registry_manual_undo(session, undo, actor, schema=schema)
-        receipt = await apply_registry_record_command(session, preparation.command, actor, schema=schema)
+        receipt = await apply_registry_record_command(
+            session, preparation.command, actor, schema=schema, undo_provenance=preparation.provenance
+        )
     assert receipt["record"]["catalog_evidence_json"] == _network_evidence(first["record_id"], 3)
     assert (
         await connection.fetchval(f'SELECT record_json::text FROM "{schema}".registry_record_history WHERE revision=2')
@@ -690,7 +692,9 @@ async def test_network_evidence_historical_undo_rebinds_without_history_edits(re
     legacy_undo = replace(undo, expected_revision=4, target_revision=1, idempotency_key=uuid4().hex)
     async with sessions() as session, session.begin():
         preparation = await prepare_registry_manual_undo(session, legacy_undo, actor, schema=schema)
-        receipt = await apply_registry_record_command(session, preparation.command, actor, schema=schema)
+        receipt = await apply_registry_record_command(
+            session, preparation.command, actor, schema=schema, undo_provenance=preparation.provenance
+        )
     assert receipt["record"]["catalog_evidence_json"] is None
 
 
@@ -809,3 +813,39 @@ async def test_legacy_name_correction(record_db, kind):
     assert corrected["revision"] == 2
     assert corrected["record"]["display_name"] == "Corrected Réseau"
     assert corrected["record"]["aliases"] == ["😀" * 512]
+
+
+@pytest.mark.asyncio
+async def test_group_search_filters_complete_scope_before_paging(record_db):
+    _, schema, sessions = record_db
+    group_rows = [
+        {
+            "group_id": UUID(int=index),
+            "display_name": "Other Company",
+            "group_kind": "corporate_parent",
+            "aliases": ["Shared Needle"] if index >= 101 else [],
+            "revision": 1,
+        }
+        for index in range(1, 104)
+    ]
+    async with sessions() as session, session.begin():
+        from sqlalchemy import insert
+
+        from process.registry_record_store import CompanyGroupRegistry, _table
+
+        await session.execute(insert(_table(CompanyGroupRegistry, schema)), group_rows)
+    selectors = [str(UUID(int=index)) for index in range(1, 103)]
+    async with sessions() as session:
+        selected = await search_registry_groups(
+            session, "needle", limit=1, offset=1, record_ids=selectors, schema=schema
+        )
+        assert [group_record["group_id"] for group_record in selected] == [str(UUID(int=102))]
+        admin = await search_registry_groups(session, "NEEDLE", record_ids=None, schema=schema)
+        assert [group_record["group_id"] for group_record in admin] == [
+            str(UUID(int=index)) for index in range(101, 104)
+        ]
+        assert await search_registry_groups(session, "Needle", record_ids=[], schema=schema) == []
+        with pytest.raises(ValueError, match="selector_invalid"):
+            await list_registry_records(
+                session, "group", record_ids=[UUID(selector) for selector in selectors], schema=schema
+            )

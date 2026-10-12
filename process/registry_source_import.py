@@ -46,6 +46,7 @@ _IDENTITY_COUNTERS = (
     "group_candidates",
     "group_gaps",
     "unsupported_group_labels",
+    "unresolved_gpnm_companies",
 )
 _NATIVE_COUNTERS = (
     "input_rows",
@@ -90,14 +91,19 @@ def _parser():
     parser = _ReceiptArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--input-file", type=Path, required=True)
     parser.add_argument("--snapshot-id", type=UUID, required=True)
-    parser.add_argument("--source-system", choices=("cms",), required=True)
-    parser.add_argument("--source-id", choices=("commercial-mlr", "plan-finder"), required=True)
+    parser.add_argument("--source-system", choices=("cms", "naic"), required=True)
+    parser.add_argument("--source-id", choices=("commercial-mlr", "plan-finder", "company-listings"), required=True)
     parser.add_argument("--protected-owner-role", help="explicit trusted operator role for a closed registry")
     for field in ("edition-id", "source-url", "artifact-sha256", "input-sha256", "parser-version"):
         parser.add_argument("--" + field, required=True)
     parser.add_argument("--reporting-year", type=int, required=True)
     parser.add_argument(
         "--published-at", type=_publication_date, required=True, help="timezone-aware ISO date or unknown"
+    )
+    parser.add_argument(
+        "--retrieved-at",
+        type=_publication_date,
+        help="timezone-aware ISO fetch time from the retained receipt; omit when unknown",
     )
     return parser
 
@@ -151,6 +157,11 @@ def _receipt_json(edition, admission_by_name):
     )
     if "copy_batches" in admission_by_name:
         receipt_by_name.update(_aggregate_counters(admission_by_name, ("copy_batches",)))
+    if edition.source_system == "naic":
+        from process.registry_naic_observations import validate_naic_manifest
+
+        encoded_members = json.dumps(admission_by_name["source_members"], sort_keys=True, separators=(",", ":"))
+        receipt_by_name["source_members"] = validate_naic_manifest(encoded_members, edition.input_sha256)
     receipt = json.dumps(receipt_by_name, separators=(",", ":"), sort_keys=True)
     if len(receipt.encode()) > 8192:
         raise ValueError("Admission receipt exceeds its bound")
@@ -179,8 +190,15 @@ async def _run_import(input_bytes, edition, protected_owner_role=None):
                     from process.registry_management_permissions import assume_registry_source_owner
 
                     await assume_registry_source_owner(connection, protected_owner_role)
-                admit = admit_cms_planfinder_edition if edition.source_id == "plan-finder" else admit_cms_mlr_edition
-                admission_by_name = await admit(connection, input_bytes, edition)
+                if edition.source_system == "naic":
+                    from process.registry_naic_source import admit_naic_edition
+
+                    admission_by_name = await admit_naic_edition(connection, input_bytes)
+                else:
+                    admit = (
+                        admit_cms_planfinder_edition if edition.source_id == "plan-finder" else admit_cms_mlr_edition
+                    )
+                    admission_by_name = await admit(connection, input_bytes, edition)
                 receipt = _receipt_json(edition, admission_by_name)
             return receipt
         finally:
@@ -192,8 +210,13 @@ def run_command(arguments=None):
     parsed = _parser().parse_args(arguments)
     try:
         edition = _edition(parsed)
-        read_input = _read_planfinder_input if edition.source_id == "plan-finder" else _read_input
-        input_bytes = read_input(parsed.input_file, edition.input_sha256)
+        if edition.source_system == "naic":
+            from process.registry_naic_source import read_naic_input_manifest
+
+            input_bytes = read_naic_input_manifest(parsed.input_file, edition)
+        else:
+            read_input = _read_planfinder_input if edition.source_id == "plan-finder" else _read_input
+            input_bytes = read_input(parsed.input_file, edition.input_sha256)
     except _InputError as error:
         print(_error_json(str(error)), file=sys.stderr)
         return 1
