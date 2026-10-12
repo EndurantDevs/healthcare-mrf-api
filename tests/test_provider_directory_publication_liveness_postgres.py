@@ -288,12 +288,16 @@ async def test_profile_projection_counts_both_spans_and_final_budget_counts_inte
                     await database.status(
                         f'INSERT INTO "{schema}".wal_probe SELECT md5(i::text) FROM generate_series(1,2048) i'
                     )
-                await importer._validate_profile_delta_final_wal(
-                    admission,
-                    forecast,
-                    metadata_wal_start_lsn=metadata_start,
-                    bulk_wal_bytes=bulk_bytes,
-                )
+                if overrun == "final":
+                    # Exercise the whole-admission bound independently of checkpoint-sensitive span WAL.
+                    await importer._validate_profile_delta_total_wal(admission, forecast)
+                else:
+                    await importer._validate_profile_delta_final_wal(
+                        admission,
+                        forecast,
+                        metadata_wal_start_lsn=metadata_start,
+                        bulk_wal_bytes=bulk_bytes,
+                    )
                 if overrun == "final":
                     admission.geometry.reservation_bytes_by_storage_class["wal"] = (
                         await _wal_since(database, start) + 8192

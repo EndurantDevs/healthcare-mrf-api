@@ -24,6 +24,7 @@ MAX_LEDGER_TEXT_BYTES = 32 * 1024 * 1024
 MAX_NATIVE_INPUT_BYTES = 8 * 1024 * 1024
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 QUERY_TIMEOUT_SECONDS = 30
+_SOURCE_COORDINATE_FIELDS = ("source_system", "source_id", "dataset_schema", "dataset_id", "producer_id", "edition_id")
 
 
 class RegistryRequiredTargetCoverageError(ValueError):
@@ -373,7 +374,7 @@ async def _read(connection, snapshot_id, generation_id, control_schema):
     if candidate_entry is None or candidate_entry["candidate_id"] != UUID(manifest.candidate_id):
         raise RegistryRequiredTargetCoverageUnavailable("registry_required_target_coverage_manifest_invalid")
     candidate_by_field = dict(candidate_entry)
-    verify_registry_source_recipes(candidate_by_field)
+    recipes = verify_registry_source_recipes(candidate_by_field)
     bundle = await _read_review_bundle(connection, namespace, manifest.approved_custom_revision)
     query = _RESULT_SQL.replace("__COUNTS__", _sql(_COUNTS_SQL, namespace, _identifier(manifest.schema_name)))
     evidence_entry = await connection.fetchrow(
@@ -390,13 +391,45 @@ async def _read(connection, snapshot_id, generation_id, control_schema):
     if len(native_input) > MAX_NATIVE_INPUT_BYTES:
         raise RegistryRequiredTargetCoverageUnavailable("registry_required_target_coverage_limit")
     coverage = await asyncio.to_thread(_native, "build_registry_network_coverage", native_input)
-    report = _coverage_report(manifest, ledger, approved, candidate_by_field, bundle, evidence_entry, coverage)
+    report = _coverage_report(manifest, ledger, approved, candidate_by_field, bundle, evidence_entry, coverage, recipes)
     return await append_pricing_binding_metadata(
         connection, report, approved, control_schema=control_schema, max_report_bytes=MAX_REPORT_BYTES
     )
 
 
-def _coverage_report(manifest, ledger, approved, candidate_by_field, bundle, evidence_entry, coverage):
+def _reviewed_source_selection(target_evidence, recipes, selection_receipt):
+    """Compare reviewed coordinates only; inclusion grants no source-row coverage."""
+    selected_coordinates = {recipe.binding_coordinates.sql_parameters for recipe in recipes}
+    totals_by_status = {"ledger_targets": len(target_evidence), "selected": 0, "not_selected": 0, "not_assessed": 0}
+    target_diagnostics = []
+    for evidence in target_evidence:
+        reviewed_coordinates = {
+            tuple(review["decision"]["source_binding"][field] for field in _SOURCE_COORDINATE_FIELDS)
+            for review in evidence["review_provenance"]
+            if review["approved_exact_binding"] is True and review["decision"]["resolution_status"] == "resolved"
+        }
+        missing = sorted(reviewed_coordinates - selected_coordinates) if selection_receipt is not None else []
+        status = "not_assessed"
+        if selection_receipt is not None and reviewed_coordinates:
+            status = "not_selected" if missing else "selected"
+        totals_by_status[status] += 1
+        target_diagnostics.append(
+            {
+                "target_key": evidence["target_key"],
+                "status": status,
+                "reviewed_source_count": len(reviewed_coordinates),
+                "selected_source_count": len(reviewed_coordinates & selected_coordinates)
+                if selection_receipt is not None
+                else None,
+                "missing_sources": [
+                    dict(zip(_SOURCE_COORDINATE_FIELDS, coordinates, strict=True)) for coordinates in missing
+                ],
+            }
+        )
+    return {"assessment": "recipe_coordinates_only", "targets": target_diagnostics, "totals": totals_by_status}
+
+
+def _coverage_report(manifest, ledger, approved, candidate_by_field, bundle, evidence_entry, coverage, recipes):
     """Bind bounded native results to the exact source and serving identities consumed."""
     if (
         type(coverage) is not dict
@@ -408,6 +441,12 @@ def _coverage_report(manifest, ledger, approved, candidate_by_field, bundle, evi
         or coverage["totals"]["ledger_targets"] != ledger["target_count"]
     ):
         raise RegistryRequiredTargetCoverageUnavailable("registry_required_target_coverage_native_unavailable")
+    target_evidence = _json(evidence_entry["provenance"], MAX_REPORT_BYTES)
+    if type(target_evidence) is not list or [entry["target_key"] for entry in target_evidence] != [
+        coverage_target["target_key"] for coverage_target in coverage["targets"]
+    ]:
+        raise RegistryRequiredTargetCoverageUnavailable("registry_required_target_coverage_serving_invalid")
+    selection_receipt = verify_registry_source_selection_receipt(candidate_by_field)
     report_by_field = {
         "component": "registry_required_target_coverage",
         "revision": 1,
@@ -424,14 +463,16 @@ def _coverage_report(manifest, ledger, approved, candidate_by_field, bundle, evi
             "schema_id": str(candidate_by_field["schema_id"]),
             "producer_id": str(candidate_by_field["producer_id"]),
             "source_recipes": json.loads(candidate_by_field["source_recipes_json"]),
-            "source_selection": verify_registry_source_selection_receipt(candidate_by_field),
+            "source_selection": selection_receipt,
             "writer_closure": json.loads(candidate_by_field["writer_closure"]),
             "current_head_in_snapshot": candidate_by_field["current_head_in_snapshot"],
-            "target_evidence": _json(evidence_entry["provenance"], MAX_REPORT_BYTES),
+            "target_evidence": target_evidence,
+            "reviewed_source_selection": _reviewed_source_selection(target_evidence, recipes, selection_receipt),
         },
         "assessment": {
             "company_link": "active_approved_relationship_across_recorded_scopes",
             "source_status": "selected_serving_generation_lineage",
+            "reviewed_source_selection": "exact_recipe_coordinate_inclusion",
             "unselected_source_locations": "not_assessed",
             "pricing": "not_assessed",
         },
