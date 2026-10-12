@@ -5,6 +5,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +28,14 @@ SYNTHETIC_FIXTURES = {
     f"scripts/smoke/fixtures/formulary_fhir/{name}.json"
     for name in ("canary_expected_v1", "coverage_plan", "medication_a", "medication_b")
 }
+
+
+def test_quality_lock_matches_required_ruff_version():
+    settings = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    locked = re.search(r"^ruff==([^\s]+)", (ROOT / "requirements-quality.lock").read_text(), re.M)
+    assert locked is not None
+    assert settings["tool"]["ruff"]["required-version"] == f"=={locked.group(1)}"
+    assert (ROOT / "requirements-quality.in").read_text().strip() == f"ruff=={locked.group(1)}"
 
 
 def test_runtime_copy_boundary_keeps_production_imports():
