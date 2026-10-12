@@ -15,6 +15,8 @@ from process.registry_source_observation_store import (
     _legal_name_field,
     _lock_snapshot,
     _namespace,
+    _planfinder_identity_sql,
+    _uses_planfinder_identifier_semantics,
     _validate_contents,
     _verify_landing,
 )
@@ -26,13 +28,26 @@ class RegistryMaterializationError(RegistryObservationError):
 
 async def _source_candidates(connection: Any, relation: str, landing: RegistryObservationLanding) -> str:
     staging = _identifier("registry_identity_source_" + uuid4().hex)
+    if _uses_planfinder_identifier_semantics(landing):
+        await connection.execute(
+            f"CREATE TEMP TABLE {staging} ON COMMIT DROP AS "
+            f"SELECT source.*,''::text AS group_label,'identifier'::text AS display_name_origin "
+            f"FROM ({_planfinder_identity_sql(relation)}) source",
+            _TRIM_CHARACTERS,
+        )
+        return staging
     legal_name_field = _legal_name_field(landing)
+    origin = (
+        "source_issuer" if (landing.source_system, landing.source_id) == ("cms", "plan-finder") else "source_company"
+    )
     await connection.execute(
         f"""CREATE TEMP TABLE {staging} ON COMMIT DROP AS
         SELECT snapshot_id,source_record_key,source_row_number,status,issues_json,
           observation_json->>'normalized_ein' AS ein,
           observation_json->>'normalized_naic_company' AS naic_company,
           observation_json->>'normalized_naic_group' AS group_code,
+          true AS source_identity_complete,false AS source_identity_conflicting,
+          '{origin}'::text AS display_name_origin,
           CASE WHEN jsonb_typeof(observation_json->'raw_fields'->'{legal_name_field}')='string'
             THEN regexp_replace(btrim(translate(observation_json->'raw_fields'->>'{legal_name_field}',
               $1,repeat(' ',char_length($1)))),' +',' ','g') END AS legal_name,
@@ -67,10 +82,14 @@ async def _company_candidates(connection: Any, namespace: str, staging: str) -> 
         GROUP BY naic_company HAVING COUNT(DISTINCT ein)>1),
       grouped AS (
         SELECT ein,MIN(legal_name) AS legal_name,MIN(naic_company) AS naic_company,
+          MIN(display_name_origin) AS display_name_origin,
           (array_agg(source_record_key ORDER BY source_row_number))[1] AS evidence_key,
           COUNT(DISTINCT legal_name)=1 AND COUNT(DISTINCT naic_company)<=1
+            AND bool_and(source_identity_complete) AND NOT bool_or(source_identity_conflicting)
             AND NOT COALESCE(bool_or(naic_company IN (SELECT naic_company FROM naic_conflicts)),false)
-            AND NOT bool_or(jsonb_path_exists(issues_json,'$[*] ? (@.code == "conflicting_company_names_for_ein" || @.code == "conflicting_naic_codes_for_ein" || @.code == "conflicting_eins_for_naic_code")')) AS consistent,
+            AND NOT bool_or(display_name_origin<>'identifier' AND
+              jsonb_path_exists(issues_json,'$[*] ? (@.code == "conflicting_company_names_for_ein")'))
+            AND NOT bool_or(jsonb_path_exists(issues_json,'$[*] ? (@.code == "conflicting_naic_codes_for_ein" || @.code == "conflicting_eins_for_naic_code")')) AS consistent,
           bool_and(legal_name IS NOT NULL AND legal_name<>'' AND char_length(legal_name)<=512) AS supported_name
         FROM {staging} WHERE status<>'rejected' AND ein IS NOT NULL GROUP BY ein)
       SELECT c.*,e.entity_id AS company_id,false AS is_new,
@@ -106,8 +125,8 @@ async def _group_candidates(connection: Any, namespace: str, staging: str) -> st
 
 async def _insert_heads(connection: Any, namespace: str, companies: str, groups: str) -> tuple[int, int]:
     new_companies = await connection.fetchval(f"""WITH inserted AS (
-      INSERT INTO {namespace}.company_registry(company_id,display_name,roles,aliases)
-      SELECT company_id,legal_name,ARRAY['insurer']::varchar[],'[]'::jsonb FROM {companies} WHERE is_new RETURNING 1)
+      INSERT INTO {namespace}.company_registry(company_id,display_name,roles,aliases,display_name_origin)
+      SELECT company_id,legal_name,ARRAY['insurer']::varchar[],'[]'::jsonb,display_name_origin FROM {companies} WHERE is_new RETURNING 1)
       SELECT COUNT(*) FROM inserted""")
     new_groups = await connection.fetchval(f"""WITH inserted AS (
       INSERT INTO {namespace}.company_group_registry(group_id,group_kind,display_name,aliases)

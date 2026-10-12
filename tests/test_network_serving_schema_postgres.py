@@ -13,6 +13,32 @@ from alembic.operations import Operations
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+_SERVING_MIGRATIONS = (
+    "20261007010000_managed_network_registry.py",
+    "20261007020000_registry_revision_history.py",
+    "20261007030000_network_serving_control.py",
+    "20261007040000_registry_source_evidence.py",
+    "20261007050000_canonical_address_network_ids.py",
+    "20261007060000_registry_approved_selection.py",
+    "20261007070000_registry_company_links.py",
+    "20261007080000_manual_directory_registry.py",
+    "20261007090000_network_membership_drafts.py",
+    "20261007100000_registry_publication_requests.py",
+    "20261007110000_registry_site_bindings.py",
+    "20261007120000_company_network_assertions.py",
+    "20261007130000_registry_network_bindings.py",
+    "20261009010000_registry_ptg_producer_scope.py",
+    "20261009020000_company_registry_assertions.py",
+    "20261009030000_network_catalog_evidence.py",
+    "20261009040000_registry_ptg_published_plan_scope.py",
+    "20261007140000_registry_source_recipes.py",
+    "20261010010000_registry_ptg_office_approval.py",
+    "20261010020000_registry_ptg_office_retention.py",
+    "20261010030000_registry_source_admission_receipt.py",
+    "20261011010000_company_registry_group_assertions.py",
+    "20261012010000_company_registry_name_origin.py",
+)
+
 
 @pytest.fixture
 async def serving_schema():
@@ -26,28 +52,8 @@ async def serving_schema():
     os.environ.update({name: schema for name in previous_schema_by_name})
     try:
         await connection.execute(f'CREATE SCHEMA "{schema}"')
-        filenames = (
-            "20261007010000_managed_network_registry.py",
-            "20261007020000_registry_revision_history.py",
-            "20261007030000_network_serving_control.py",
-            "20261007040000_registry_source_evidence.py",
-            "20261007050000_canonical_address_network_ids.py",
-            "20261007060000_registry_approved_selection.py",
-            "20261007070000_registry_company_links.py",
-            "20261007080000_manual_directory_registry.py",
-            "20261007090000_network_membership_drafts.py",
-            "20261007100000_registry_publication_requests.py",
-            "20261007110000_registry_site_bindings.py",
-            "20261007120000_company_network_assertions.py",
-            "20261007130000_registry_network_bindings.py",
-            "20261009020000_company_registry_assertions.py",
-            "20261009030000_network_catalog_evidence.py",
-            "20261007140000_registry_source_recipes.py",
-            "20261010030000_registry_source_admission_receipt.py",
-            "20261011010000_company_registry_group_assertions.py",
-        )
         async with engine.begin() as sqlalchemy_connection:
-            for filename in filenames:
+            for filename in _SERVING_MIGRATIONS:
                 path = Path(__file__).parents[1] / "alembic/versions" / filename
                 spec = importlib.util.spec_from_file_location(filename.removesuffix(".py"), path)
                 migration = importlib.util.module_from_spec(spec)

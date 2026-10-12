@@ -41,7 +41,10 @@ WITH requested AS (
     a.valid_from,a.valid_to,r.business_state,r.reporting_year,
     s.source_system,s.source_id,s.edition_id,s.published_at,s.retrieved_at,s.input_sha256,s.parser_version,
     o.status AS observation_status,o.source_record_key IS NOT NULL AS observation_present,
-    o.observation_json->'raw_fields'->>'company_name' AS company_label,
+    CASE WHEN s.source_system='cms' AND s.source_id='plan-finder' THEN NULL
+      ELSE o.observation_json->'raw_fields'->>'company_name' END AS company_label,
+    CASE WHEN s.source_system='cms' AND s.source_id='plan-finder'
+      THEN o.observation_json->'raw_fields'->>'issr_lgl_name' END AS issuer_label,
     o.observation_json->'raw_fields'->>'group_affiliation' AS group_label,
     c.company_id IS NOT NULL AS company_present,
     g.source_record_key IS NOT NULL AS group_assertion_present,g.group_id,
@@ -72,6 +75,7 @@ WITH requested AS (
     bool_or(NOT observation_present OR observation_status='rejected') AS observation_gap,
     min(company_id::text) AS company_id,min(group_id::text) AS group_id,min(relationship_kind) AS relationship_kind,
     coalesce(jsonb_agg(DISTINCT company_label COLLATE "C" ORDER BY company_label COLLATE "C") FILTER(WHERE nullif(btrim(company_label),'') IS NOT NULL),'[]'::jsonb) AS company_labels,
+    coalesce(jsonb_agg(DISTINCT issuer_label COLLATE "C" ORDER BY issuer_label COLLATE "C") FILTER(WHERE nullif(btrim(issuer_label),'') IS NOT NULL),'[]'::jsonb) AS issuer_labels,
     coalesce(jsonb_agg(DISTINCT group_label COLLATE "C" ORDER BY group_label COLLATE "C") FILTER(WHERE nullif(btrim(group_label),'') IS NOT NULL),'[]'::jsonb) AS group_labels,
     jsonb_agg(jsonb_build_object(
       'snapshot_id',snapshot_id,'source_record_key',source_record_key,'state',state,'company_id',company_id,
@@ -79,6 +83,8 @@ WITH requested AS (
       'source_system',source_system,'source_id',source_id,'edition_id',edition_id,'reporting_year',reporting_year,
       'published_at',published_at,'retrieved_at',retrieved_at,'input_sha256',input_sha256,'parser_version',parser_version,
       'observation_status',observation_status,'company_label',company_label,'group_label',group_label,'company_present',company_present,
+      'company_label_origin',CASE WHEN nullif(btrim(company_label),'') IS NOT NULL THEN 'source_company' END,
+      'issuer_label',issuer_label,'issuer_label_origin',CASE WHEN nullif(btrim(issuer_label),'') IS NOT NULL THEN 'source_issuer' END,
       'group_assertion',CASE WHEN group_assertion_present THEN jsonb_build_object('group_id',group_id,
         'resolution_status',group_status,'relationship_kind',relationship_kind,'valid_from',group_valid_from,
         'valid_to',group_valid_to,'group_present',group_present,'group_kind',group_kind) END
@@ -96,6 +102,7 @@ WITH requested AS (
   SELECT r.ordinal,jsonb_build_object('issuer_id',r.hios::integer,'hios_issuer_id',r.hios,'business_state',r.business_state,
     'reporting_year',r.reporting_year,'relationship_scope','source_reporting_period',
     'company_resolution_status',r.company_status,'group_resolution_status',r.group_resolution_status,
+    'issuer_source_labels',coalesce(r.issuer_labels,'[]'::jsonb),
     'resolution_status',CASE WHEN r.company_status='missing' THEN 'missing'
       WHEN r.company_status='conflicting' OR r.group_resolution_status='conflicting' THEN 'conflicting'
       WHEN r.company_status<>'resolved' OR r.group_resolution_status<>'resolved' THEN 'unresolved' ELSE 'resolved' END,

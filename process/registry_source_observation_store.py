@@ -110,6 +110,52 @@ def _legal_name_field(landing: RegistryObservationLanding) -> str:
     return "issr_lgl_name" if (landing.source_system, landing.source_id) == ("cms", "plan-finder") else "company_name"
 
 
+def _uses_planfinder_identifier_semantics(landing: RegistryObservationLanding) -> bool:
+    return (landing.source_system, landing.source_id, landing.parser_version) == (
+        "cms",
+        "plan-finder",
+        "cms-planfinder-hios-2026-08-06-v2",
+    )
+
+
+def _planfinder_identity_fields_sql() -> str:
+    parent = "observation_json->'source_evidence'->'values'->>12"
+    return f"""observation_json->>'normalized_ein' AS ein,
+      observation_json->>'normalized_naic_company' AS naic_company,
+      observation_json->>'normalized_naic_group' AS group_code,
+      observation_json->>'hios' AS hios,observation_json->>'state' AS state,
+      NULLIF(regexp_replace(btrim(translate(observation_json->'raw_fields'->>'issr_lgl_name',
+        $1,repeat(' ',char_length($1)))),' +',' ','g'),'') AS issuer_label,
+      CASE WHEN {parent} ~ '^[0-9]{{1,19}}$' THEN
+        CASE WHEN ({parent})::numeric BETWEEN 1 AND 9223372036854775807
+          THEN ltrim({parent},'0') END END AS source_parent_key"""
+
+
+def _planfinder_identity_sql(relation: str) -> str:
+    """Check complete edition sets; parent keys corroborate EINs without allocating IDs."""
+    return f"""WITH source_fields AS (
+      SELECT l.*,{_planfinder_identity_fields_sql()} FROM {relation} l),
+    parent_conflicts AS (
+      SELECT source_parent_key FROM source_fields WHERE source_parent_key IS NOT NULL
+      GROUP BY source_parent_key HAVING COUNT(DISTINCT ein)>1),
+    issuer_conflicts AS (
+      SELECT hios FROM source_fields WHERE hios IS NOT NULL GROUP BY hios
+      HAVING COUNT(DISTINCT issuer_label)>1 OR COUNT(DISTINCT ein)>1 OR COUNT(DISTINCT state)>1
+        OR bool_or(jsonb_path_exists(issues_json,'$[*] ? (@.code == "conflicting_issuer_identity")'))),
+    ein_sets AS (
+      SELECT ein,COUNT(DISTINCT source_parent_key)=1 AND bool_and(source_parent_key IS NOT NULL) AS complete,
+        COUNT(DISTINCT source_parent_key)>1
+          OR COALESCE(bool_or(source_parent_key IN (SELECT source_parent_key FROM parent_conflicts)),false)
+          OR COALESCE(bool_or(hios IN (SELECT hios FROM issuer_conflicts)),false) AS conflicting
+      FROM source_fields WHERE ein IS NOT NULL GROUP BY ein)
+    SELECT f.*,COALESCE(e.complete,false) AS source_identity_complete,
+      COALESCE(e.conflicting,false) OR COALESCE(f.hios IN (SELECT hios FROM issuer_conflicts),false)
+        OR COALESCE(f.source_parent_key IN (SELECT source_parent_key FROM parent_conflicts),false)
+        AS source_identity_conflicting,
+      'Company EIN '||f.ein AS legal_name
+    FROM source_fields f LEFT JOIN ein_sets e USING(ein)"""
+
+
 def _planfinder_content_checks(landing: RegistryObservationLanding, namespace: str) -> list[str]:
     """Keep exact workbook layout, coordinates and edition evidence in set validation."""
     from process.cms_planfinder_workbook_input import HEADERS, LAYOUT
@@ -228,14 +274,31 @@ async def _is_exact_replay(connection: Any, landing: RegistryObservationLanding,
 
 def _company_resolution_sql(namespace: str, relation: str, landing: RegistryObservationLanding) -> str:
     legal_name_field = _legal_name_field(landing)
+    uses_successor = _uses_planfinder_identifier_semantics(landing)
+    company_name_conflict = "" if uses_successor else '@.code == "conflicting_company_names_for_ein" || '
+    source_conflict = " OR bool_or(source_identity_conflicting)" if uses_successor else ""
+    complete = "f.source_identity_complete AND " if uses_successor else ""
+    flagged_conflict = " OR source_identity_conflicting" if uses_successor else ""
+    source_relation_sql = f"({_planfinder_identity_sql(relation)})" if uses_successor else relation
+    company_name = (
+        "l.legal_name"
+        if uses_successor
+        else f"""NULLIF(regexp_replace(btrim(translate(
+      observation_json->'raw_fields'->>'{legal_name_field}',
+      $1,repeat(' ',char_length($1)))),' +',' ','g'),'')"""
+    )
+    decoded_fields = (
+        ""
+        if uses_successor
+        else f"""observation_json->>'hios' AS hios,
+      observation_json->>'state' AS state,observation_json->>'normalized_ein' AS ein,
+      observation_json->>'normalized_naic_company' AS naic_company,{company_name} AS legal_name,"""
+    )
     return f"""WITH decoded AS (
-      SELECT l.*,observation_json->>'hios' AS hios,observation_json->>'state' AS state,
-        observation_json->>'normalized_ein' AS ein,observation_json->>'normalized_naic_company' AS naic_company,
-        NULLIF(regexp_replace(btrim(translate(observation_json->'raw_fields'->>'{legal_name_field}',
-          $1,repeat(' ',char_length($1)))),' +',' ','g'),'') AS legal_name,
-        jsonb_path_exists(issues_json,'$[*] ? (@.code == "conflicting_company_names_for_ein" || @.code == "conflicting_naic_codes_for_ein" || @.code == "conflicting_eins_for_naic_code")') AS declared_company_conflict,
+      SELECT l.*,{decoded_fields}
+        jsonb_path_exists(issues_json,'$[*] ? ({company_name_conflict}@.code == "conflicting_naic_codes_for_ein" || @.code == "conflicting_eins_for_naic_code")') AS declared_company_conflict,
         jsonb_path_exists(issues_json,'$[*] ? (@.code == "conflicting_issuer_identity")') AS declared_issuer_conflict
-      FROM {relation} l),
+      FROM {source_relation_sql} l),
     bound AS (
       SELECT d.*,e.entity_id AS ein_company_id,n.entity_id AS naic_binding_id,g.entity_id AS group_id
       FROM decoded d LEFT JOIN {namespace}.registry_identifier_binding e
@@ -252,15 +315,15 @@ def _company_resolution_sql(namespace: str, relation: str, landing: RegistryObse
       SELECT ein FROM bound WHERE ein IS NOT NULL GROUP BY ein
       HAVING COUNT(DISTINCT legal_name)>1 OR COUNT(DISTINCT naic_company)>1
         OR bool_or(declared_company_conflict) OR bool_or(naic_company IN (SELECT naic_company FROM naic_conflicts))
-        OR bool_or(ein_company_id<>naic_binding_id)),
+        OR bool_or(ein_company_id<>naic_binding_id){source_conflict}),
     affected_naic AS (
       SELECT naic_company FROM naic_conflicts UNION SELECT naic_company FROM bound
         WHERE naic_company IS NOT NULL AND (ein IN (SELECT ein FROM ein_conflicts) OR declared_company_conflict)),
     flagged AS (
       SELECT b.*,COALESCE(ein IN (SELECT ein FROM ein_conflicts),false)
-        OR COALESCE(naic_company IN (SELECT naic_company FROM affected_naic),false) AS company_conflicting FROM bound b)
-    SELECT f.*,CASE WHEN status<>'rejected' AND NOT company_conflicting THEN ein_company_id END AS company_id,
-      CASE WHEN status<>'rejected' AND NOT company_conflicting AND ein_company_id=naic_binding_id
+        OR COALESCE(naic_company IN (SELECT naic_company FROM affected_naic),false)  {flagged_conflict} AS company_conflicting FROM bound b)
+    SELECT f.*,CASE WHEN status<>'rejected' AND {complete}NOT company_conflicting THEN ein_company_id END AS company_id,
+      CASE WHEN status<>'rejected' AND {complete}NOT company_conflicting AND ein_company_id=naic_binding_id
         THEN ein_company_id END AS naic_company_id FROM flagged f"""
 
 

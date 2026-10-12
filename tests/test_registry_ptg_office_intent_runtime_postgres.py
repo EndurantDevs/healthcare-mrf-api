@@ -328,6 +328,9 @@ async def test_native_list_denies_revoked_source_read_and_current_upstream_autho
     )
     await native.custom.connection.execute(f'REVOKE SELECT ON {relation} FROM "{reader}"')
     try:
+        assert not await native.custom.connection.fetchval(
+            "SELECT pg_catalog.has_table_privilege($1,$2,'SELECT')", reader, relation
+        )
         denied = await _post(installed, "office-intents", document)
         assert denied.status_code == 503 and denied.json == {"error": {"code": "registry_unavailable"}}
     finally:
