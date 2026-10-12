@@ -114,6 +114,43 @@ def test_adaptive_packets_keep_order_and_account_for_retained_columns(monkeypatc
     )
 
 
+@pytest.mark.parametrize("wide_context", [False, True], ids=["families", "wide-context"])
+def test_declined_native_packets_preserve_serial_columns_and_charges(monkeypatch, wide_context):
+    if wide_context:
+        request, registry, group = _wide_context_group()
+        groups = (replace(group, children=group.children[:1]),)
+    else:
+        request = _request()
+        registry, groups = _registry(request.definition), source_groups(request, (1, 1))
+    expected = serial_arguments(monkeypatch, request, registry, groups)
+    spans = tuple(span for group in groups for span in oracle_encoded(request, registry, group)[0])
+    records = tuple(
+        graph_payloads.ProjectionRecord(child, group.state.source.record, group.state.family, group.state.source.values)
+        for group in groups
+        for child in group.children
+    )
+    projector = Mock(return_value=None)
+    page_cost = Mock(wraps=graph._page_cost)
+    monkeypatch.setattr(graph_payloads, "native_projector", lambda: projector)
+    monkeypatch.setattr(graph_payloads, "project_batch", projector)
+    monkeypatch.setattr(graph, "_page_cost", page_cost)
+
+    assert sets._child_arguments(request, registry, groups) == expected
+    page_cost.assert_called_once_with(
+        request,
+        (),
+        reserved_rows=sum(3 + span[1] + span[3] for span in spans),
+        reserved_bytes=sum(span[4] + span[5] for span in spans),
+    )
+    assert projector.call_args_list[0].args[2] == records
+    singleton_calls = [call for call in projector.call_args_list if len(call.args[2]) == 1]
+    assert tuple(call.args[2][0] for call in singleton_calls) == records
+    retained_bytes = 0
+    for call, span in zip(singleton_calls, spans, strict=True):
+        assert call.kwargs == {"retained_bytes": retained_bytes}
+        retained_bytes += 4 * span[6] + 64 * (10 * span[1] + 3 * span[3])
+
+
 @pytest.mark.parametrize("bound", [{"page_row_limit": 1}, {"page_byte_limit": 1}])
 def test_native_column_charges_preserve_logical_page_rejection(monkeypatch, bound):
     request = _request(**bound)
