@@ -762,6 +762,28 @@ def _iter_parquet_records(
 ) -> Iterator[DecodedRecord]:
     """Decode bounded, flat Parquet rows without permitting external file references."""
 
+    with _validated_parquet_reader(
+        captured_bytes,
+        stream,
+        limits,
+        expected_decoded_bytes=expected_decoded_bytes,
+        expected_decoded_sha256=expected_decoded_sha256,
+        _cleanup_failures=_cleanup_failures,
+    ) as (parquet_reader, source_labels, expected_record_count):
+        yield from _iter_parquet_batch_records(parquet_reader, source_labels, expected_record_count, limits)
+
+
+@contextmanager
+def _validated_parquet_reader(
+    captured_bytes,
+    stream,
+    limits,
+    *,
+    expected_decoded_bytes,
+    expected_decoded_sha256,
+    _cleanup_failures=None,
+):
+    """Share the sealed payload, schema and raw-page guards between SOURCE readers."""
     decoded_payload = _bounded_parquet_payload(
         captured_bytes,
         stream.compression,
@@ -785,12 +807,36 @@ def _iter_parquet_records(
             schema,
             maximum_decoded_bytes=limits.maximum_decoded_bytes,
         )
-        yield from _iter_parquet_batch_records(
-            parquet_reader,
-            source_labels,
-            expected_record_count,
-            limits,
-        )
+        yield parquet_reader, source_labels, expected_record_count
+
+
+def iter_parquet_source_batches(capture, stream, *, limits, _cleanup_failures=None):
+    """Expose guarded one-row Arrow buffers before Python scalar conversion."""
+    verify_capture(capture, stream, limits=limits)
+    if stream.format != "parquet":
+        raise CaptureError("SOURCE column replay requires Parquet")
+    with _validated_parquet_reader(
+        capture.payload,
+        stream,
+        limits,
+        expected_decoded_bytes=capture.manifest.decoded_bytes,
+        expected_decoded_sha256=capture.manifest.decoded_sha256,
+        _cleanup_failures=_cleanup_failures,
+    ) as (reader, labels, expected_rows):
+        emitted = logical_bytes = 0
+        for batch in reader.iter_batches(batch_size=1, use_threads=False, use_pandas_metadata=False):
+            _validate_parquet_batch_schema(batch, labels)
+            logical_bytes += _nonnegative_parquet_integer(batch.nbytes)
+            if logical_bytes > limits.maximum_decoded_bytes:
+                raise CaptureError("Parquet source payload exceeds the decoded-byte limit")
+            if not batch.num_rows:
+                continue
+            if batch.num_rows != 1 or emitted >= expected_rows:
+                raise CaptureError("Parquet source payload has inconsistent row metadata")
+            emitted += 1
+            yield batch
+        if emitted != expected_rows:
+            raise CaptureError("Parquet source payload has inconsistent row metadata")
 
 
 @contextmanager

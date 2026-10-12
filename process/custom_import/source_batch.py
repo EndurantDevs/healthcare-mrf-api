@@ -379,7 +379,7 @@ async def _prepare_part(session_factory, context, part, policy, cursor, source_p
     if budget is None:
         budget = MAX_BATCH_ROWS, MAX_BATCH_BYTES, deadline
     _verify_part(context, part, policy, cursor)
-    pages = staging._source_pages(
+    pages = staging._hosted_source_pages(
         context,
         part,
         policy,

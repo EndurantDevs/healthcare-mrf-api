@@ -93,11 +93,11 @@ fn document(
 }
 
 /// Inputs have already passed the bounded ABI; no Python callbacks run here.
-pub fn source_documents(
+pub fn source_root_document(
     layout: &SourceLayout,
     cells: &[SourceValue],
-) -> Result<SourceDocuments, &'static str> {
-    let (root_key, root_hash) = document(
+) -> Result<(String, [u8; 32]), &'static str> {
+    document(
         "custom-import-key/v1",
         b"root-key",
         layout
@@ -105,7 +105,15 @@ pub fn source_documents(
             .iter()
             .map(|(name, index)| field_document(name, &layout.fields[*index].1, &cells[*index]))
             .collect(),
-    )?;
+    )
+}
+
+/// Inputs have already passed the bounded ABI; no Python callbacks run here.
+pub fn source_documents(
+    layout: &SourceLayout,
+    cells: &[SourceValue],
+) -> Result<SourceDocuments, &'static str> {
+    let (root_key, root_hash) = source_root_document(layout, cells)?;
     let (payload, payload_hash) = document(
         "custom-import-record/v1",
         if layout.child {
