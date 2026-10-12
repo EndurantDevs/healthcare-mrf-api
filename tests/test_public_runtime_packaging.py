@@ -47,6 +47,7 @@ def test_runtime_copy_boundary_keeps_production_imports():
         for copied_path in shlex.split(line)[1:-1]
     }
     assert {path for path in copies if path.startswith("scripts/")} == {
+        "scripts/drug_runtime_dependency.py",
         "scripts/provider_directory_support_contract.py",
         "scripts/validation/ptg2_v3_source_api_audit.py",
         "scripts/python_locks.py",
