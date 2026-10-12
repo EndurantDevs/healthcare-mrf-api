@@ -24,12 +24,17 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import registry_record_store as record_store
 from process.company_registry_assertion_values import CONTRACT
+from process.registry_approval_preview import preview_registry_approval
 from process.registry_approval_store import RegistryApprovalConflict, approve_registry_records
 from process.registry_management_permissions import (
     install_registry_management_permissions,
     verify_registry_management_permissions,
 )
-from process.registry_manual_undo import RegistryManualUndoCommand, prepare_registry_manual_undo
+from process.registry_manual_undo import (
+    RegistryManualUndoCommand,
+    prepare_registry_manual_undo,
+    read_registry_manual_history,
+)
 from process.registry_record_store import (
     RegistryActor,
     RegistryRecordCommand,
@@ -62,10 +67,15 @@ _MIGRATIONS = (
     "20261007120000_company_network_assertions.py",
     "20261007130000_registry_network_bindings.py",
     "20261007140000_registry_source_recipes.py",
+    "20261009010000_registry_ptg_producer_scope.py",
     "20261009020000_company_registry_assertions.py",
     "20261009030000_network_catalog_evidence.py",
+    "20261009040000_registry_ptg_published_plan_scope.py",
+    "20261010010000_registry_ptg_office_approval.py",
+    "20261010020000_registry_ptg_office_retention.py",
     "20261010030000_registry_source_admission_receipt.py",
     "20261011010000_company_registry_group_assertions.py",
+    "20261012010000_company_registry_name_origin.py",
 )
 
 
@@ -649,6 +659,53 @@ async def test_exact_company_approval_replay_returns_original_retained_selection
     assert await fixture.connection.fetchval(f"SELECT count(*) FROM {fixture.namespace}.registry_approval_history") == 1
 
 
+async def test_company_correction_predecessors_survive_approval_and_closed_reads(assertion_db):
+    fixture = assertion_db
+    original = _create(identifiers=[_identifier()])
+    first = await _draft(fixture, original)
+    correction = replace(
+        original,
+        operation="correct",
+        expected_revision=1,
+        idempotency_key=uuid4().hex,
+        fields=original.fields | {"assertions": original.fields["assertions"] | {"expected_revision": 1}},
+    )
+    corrected = await _draft(fixture, correction)
+    history_query = f"SELECT record_json::text FROM {fixture.namespace}.registry_record_history WHERE record_kind='company' AND record_key=$1 AND revision=2"
+    retained = json.loads(await fixture.connection.fetchval(history_query, str(original.record_id)))
+    predecessors = retained["correction_predecessors"]
+    assert predecessors == {
+        "company_revision": 1,
+        "role_assertions": [first["record"]["role_assertions"][0]["assertion_id"]],
+        "identifier_assertions": [first["record"]["identifier_assertions"][0]["assertion_id"]],
+        "group_assertions": [],
+    }
+    assert "correction_predecessors" not in corrected["record"]
+    command = await approval_command(fixture.connection, fixture.schema, corrected)
+    async with fixture.connection.transaction():
+        await approve_registry_records(fixture.connection, command, _ACTOR, control_schema=fixture.schema)
+    approved = json.loads(
+        await fixture.connection.fetchval(
+            f"SELECT record_json::text FROM {fixture.namespace}.registry_approved_record WHERE record_kind='company' AND record_key=$1 AND record_revision=2",
+            str(original.record_id),
+        )
+    )
+    assert approved == retained
+    command = await approval_command(fixture.connection, fixture.schema, corrected)
+    async with fixture.connection.transaction():
+        preview_by_field = await preview_registry_approval(
+            fixture.connection, command, _ACTOR, control_schema=fixture.schema
+        )
+    assert "correction_predecessors" not in preview_by_field["records"][0]["before"]
+    assert "correction_predecessors" not in preview_by_field["records"][0]["after"]
+    async with fixture.sessions() as session, session.begin():
+        page = await read_registry_manual_history(session, "company", original.record_id, schema=fixture.schema)
+    assert all("correction_predecessors" not in history_entry["record"] for history_entry in page["records"])
+    assert await _draft(fixture, correction) == corrected
+    assert await _draft(fixture, original) == first
+    assert json.loads(await fixture.connection.fetchval(history_query, str(original.record_id))) == retained
+
+
 @pytest.mark.parametrize("legacy,collision", [(False, False), (True, False), (False, True)])
 async def test_manual_undo_restores_historical_assertions_under_current_checks(assertion_db, legacy, collision):
     fixture = assertion_db
@@ -682,6 +739,16 @@ async def test_manual_undo_restores_historical_assertions_under_current_checks(a
     for key in ("roles", "role_assertions", "identifier_assertions"):
         assert restored["record"][key] == first["record"][key]
     assert restored["revision"] == 3
+    restored_history = json.loads(
+        await fixture.connection.fetchval(
+            f"SELECT record_json::text FROM {fixture.namespace}.registry_record_history WHERE record_kind='company' AND record_key=$1 AND revision=3",
+            str(original.record_id),
+        )
+    )
+    assert restored_history["correction_predecessors"]["company_revision"] == 2
+    assert restored_history["correction_predecessors"]["role_assertions"] == sorted(
+        entry["assertion_id"] for entry in later.fields["assertions"]["role_assertions"]
+    )
     target_record = json.loads(
         await fixture.connection.fetchval(
             f"SELECT record_json::text FROM {fixture.namespace}.registry_record_history WHERE record_kind='company' AND record_key=$1 AND revision=1",
@@ -984,6 +1051,7 @@ async def test_company_group_store_roundtrip_omission_clear_and_replay(assertion
 
 @pytest.mark.parametrize("retained_group", [False, True], ids=["no-typed-group", "retained-typed-group"])
 async def test_materialized_company_correction_preserves_omitted_groups(assertion_db, retained_group):
+    """Retain the exact materialized baseline and omitted typed groups under the restricted writer."""
     fixture = assertion_db
     command = await _admitted_group_edge(fixture)
     expected_groups = command.fields["assertions"]["group_assertions"] if retained_group else []
@@ -998,6 +1066,7 @@ async def test_materialized_company_correction_preserves_omitted_groups(assertio
                 {"role_assertions": [], "identifier_assertions": [], "group_assertions": expected_groups},
                 fixture.schema,
             )
+        materialized = await get_registry_record(session, "company", command.record_id, schema=fixture.schema)
     assert await fixture.connection.fetchval(f"SELECT count(*) FROM {fixture.namespace}.registry_record_history") == 0
     omitted = replace(
         command,
@@ -1011,7 +1080,9 @@ async def test_materialized_company_correction_preserves_omitted_groups(assertio
         },
         idempotency_key=uuid4().hex,
     )
+    await _verify_materialized_rollback(fixture, omitted)
     preserved = await _draft(fixture, omitted)
+    await _verify_materialized_predecessor(fixture, materialized, preserved)
     assert preserved["record"]["revision"] == 2
     assert preserved["record"]["group_assertions"] == expected_groups
     assert preserved["record"]["role_assertions"] == omitted.fields["assertions"]["role_assertions"]
@@ -1020,17 +1091,93 @@ async def test_materialized_company_correction_preserves_omitted_groups(assertio
     with pytest.raises(RegistryRecordConflict, match="revision_conflict"):
         await _draft(fixture, replace(omitted, idempotency_key=uuid4().hex))
     assert await _accounting(fixture) == before
+    await _verify_materialized_undo(fixture, materialized, omitted.record_id)
     clear = _with_groups(
         replace(
             omitted,
-            expected_revision=2,
-            fields=omitted.fields | {"assertions": omitted.fields["assertions"] | {"expected_revision": 2}},
+            expected_revision=3,
+            fields=omitted.fields | {"assertions": omitted.fields["assertions"] | {"expected_revision": 3}},
             idempotency_key=uuid4().hex,
         ),
         [],
     )
     assert (await _draft(fixture, clear))["record"]["group_assertions"] == []
     assert await _draft(fixture, omitted) == preserved
+
+
+async def _verify_materialized_undo(fixture, materialized, company_id):
+    history_query = (
+        f"SELECT revision,custom_revision,record_json::text,actor_json::text,reason,idempotency_key,request_sha256 "
+        f"FROM {fixture.namespace}.registry_record_history WHERE record_kind='company' AND record_key=$1 ORDER BY revision"
+    )
+    retained = await fixture.connection.fetch(history_query, str(company_id))
+    command = RegistryManualUndoCommand("company", company_id, 2, 1, "Restore materialized values", uuid4().hex)
+    # An unrelated equal-custom-revision row must not gain undo authority.
+    await fixture.connection.execute(
+        f"UPDATE {fixture.namespace}.registry_record_history SET record_json=record_json-'correction_predecessors' "
+        "WHERE record_kind='company' AND record_key=$1 AND revision=2",
+        str(company_id),
+    )
+    try:
+        async with fixture.sessions() as session, session.begin():
+            with pytest.raises(RegistryRecordConflict, match="undo_history_conflict"):
+                await prepare_registry_manual_undo(session, command, _ACTOR, schema=fixture.schema)
+    finally:
+        await fixture.connection.execute(
+            f"UPDATE {fixture.namespace}.registry_record_history SET record_json=$1::jsonb "
+            "WHERE record_kind='company' AND record_key=$2 AND revision=2",
+            retained[1]["record_json"],
+            str(company_id),
+        )
+    async with fixture.sessions() as session, session.begin():
+        preparation = await prepare_registry_manual_undo(session, command, _ACTOR, schema=fixture.schema)
+    restored = await _draft(fixture, preparation.command)
+    assert restored["revision"] == 3
+    for field in ("display_name", "roles", "aliases", "role_assertions", "identifier_assertions", "group_assertions"):
+        assert restored["record"][field] == materialized[field]
+    history = await fixture.connection.fetch(history_query, str(company_id))
+    assert history[:2] == retained
+    assert history[2]["actor_json"] == retained[0]["actor_json"]
+    assert history[2]["reason"] == preparation.command.reason
+    async with fixture.sessions() as session, session.begin():
+        replay = await prepare_registry_manual_undo(session, command, _ACTOR, schema=fixture.schema)
+    assert replay.command == preparation.command
+    assert await _draft(fixture, replay.command) == restored
+    assert await fixture.connection.fetch(history_query, str(company_id)) == history
+
+
+async def _verify_materialized_rollback(fixture, command):
+    """Real restricted-role history inserts remain inside the caller's savepoint."""
+    before = await _accounting(fixture)
+    async with fixture.sessions() as session, session.begin():
+        with pytest.raises(RuntimeError, match="synthetic-retention-rollback"):
+            async with session.begin_nested():
+                await apply_registry_record_command(session, command, _ACTOR, schema=fixture.schema)
+                assert (
+                    await session.scalar(text(f"SELECT count(*) FROM {fixture.namespace}.registry_record_history")) == 2
+                )
+                raise RuntimeError("synthetic-retention-rollback")
+    assert await _accounting(fixture) == before
+
+
+async def _verify_materialized_predecessor(fixture, materialized, preserved):
+    """Compare raw retained history, correction references and real actor attribution."""
+    retained = await fixture.connection.fetch(
+        f"SELECT revision,custom_revision,record_json::text,actor_json::text,reason,idempotency_key,request_sha256 "
+        f"FROM {fixture.namespace}.registry_record_history "
+        "WHERE record_kind='company' AND record_key=$1 ORDER BY revision",
+        str(preserved["record_id"]),
+    )
+    assert [history_entry["revision"] for history_entry in retained] == [1, 2]
+    assert json.loads(retained[0]["record_json"]) == materialized
+    assert retained[0]["custom_revision"] == retained[1]["custom_revision"] == preserved["custom_revision"]
+    assert retained[0]["actor_json"] == retained[1]["actor_json"]
+    assert retained[0]["reason"] == "Preserved materialized company before manual correction"
+    assert retained[0]["idempotency_key"] != retained[1]["idempotency_key"]
+    assert retained[0]["request_sha256"] != retained[1]["request_sha256"]
+    assert json.loads(retained[1]["record_json"])["correction_predecessors"]["group_assertions"] == sorted(
+        assertion["assertion_id"] for assertion in materialized["group_assertions"]
+    )
 
 
 @pytest.mark.parametrize("case", ["missing", "archived", "kind"])

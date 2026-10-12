@@ -13,11 +13,14 @@ from uuid import UUID
 import pytest
 from sqlalchemy import CheckConstraint, UniqueConstraint
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.schema import CreateColumn
+from sqlalchemy.schema import CreateColumn, CreateTable
 
+from db.models.company_registry import CompanyRegistry
 from db.models.company_registry_assertions import CompanyRegistryIdentifierAssertion, CompanyRegistryRoleAssertion
+from process import registry_approval_preview as preview
 from process import registry_approval_store as approval
 from process import registry_management_permissions as permissions
+from process import registry_manual_undo as undo
 from process import registry_record_store as store
 from process.registry_manual_undo import RegistryManualUndoCommand, _prepare_correction
 from tests.test_company_registry_assertion_values import COMPANY, _command, _group, _identifier, _role
@@ -94,9 +97,12 @@ class Session:
         return 1
 
     async def execute(self, statement, rows=None):
-        params = statement.compile(dialect=postgresql.dialect()).params
+        compiled = statement.compile(dialect=postgresql.dialect())
+        params = compiled.params
         table = getattr(statement, "table", None)
         if table is None:
+            if "undo_target" in str(compiled):
+                return self._undo_history_result(params)
             self.events.append("replay")
             matching_rows = [row for row in self.history if row["idempotency_key"] == params["idempotency_key_1"]]
             return Result(matching_rows)
@@ -116,6 +122,33 @@ class Session:
             self.events.append("insert-set")
             self.assertions.setdefault(name, []).extend(copy.deepcopy(rows))
         return Result([])
+
+    def _undo_history_result(self, params):
+        target_history = next(entry for entry in self.history if entry["revision"] == params["revision_1"])
+        expected_history = next(entry for entry in self.history if entry["revision"] == params["revision_2"])
+        snapshot = expected_history["record_json"]
+        predecessor = snapshot.get("correction_predecessors", {}).get("company_revision")
+        return Result(
+            [
+                {
+                    "current_revision": self.head["revision"],
+                    "record_json": copy.deepcopy(target_history["record_json"]),
+                    "custom_revision": target_history["custom_revision"],
+                    "request_sha256": target_history["request_sha256"],
+                    "expected_custom_revision": expected_history["custom_revision"],
+                    "expected_request_sha256": expected_history["request_sha256"],
+                    "predecessor_revision": str(predecessor) if predecessor is not None else None,
+                    "predecessor_revision_type": "number" if type(predecessor) is int else "string",
+                    "same_actor": target_history["actor_json"] == expected_history["actor_json"],
+                    "target_reason": target_history["reason"],
+                    "target_idempotency_key": target_history["idempotency_key"],
+                    "expected_identity": snapshot["company_id"],
+                    "expected_identity_type": "string",
+                    "expected_record_revision": str(snapshot["revision"]),
+                    "expected_revision_type": "number",
+                }
+            ]
+        )
 
     def _write_head(self, params):
         self.head = (
@@ -257,7 +290,8 @@ async def test_approval_compares_exact_assertion_revision_without_legacy_bypass(
             assert "ORDER BY assertion.assertion_id" in sql
             assert (
                 "jsonb_build_object('role_assertions','[]'::jsonb,'identifier_assertions','[]'::jsonb,"
-                "'group_assertions','[]'::jsonb)||history.record_json" in "".join(sql.split())
+                "'group_assertions','[]'::jsonb,'display_name_origin','unknown')||(history.record_json-'correction_predecessors')"
+                in "".join(sql.split())
             )
             assert "heads.record_json-'created_at'" in sql
             return valid
@@ -413,6 +447,9 @@ async def test_group_omission_clear_archive_and_restore_preserve_history():
     clear = _group_edit(operation="correct", expected_revision=4, idempotency_key="clear-groups")
     clear.fields["assertions"].update(expected_revision=4, group_assertions=[])
     assert (await _apply(session, clear))["record"]["group_assertions"] == []
+    assert session.history[-1]["record_json"]["correction_predecessors"]["group_assertions"] == [
+        _group()["assertion_id"]
+    ]
     assert session.history[0]["record_json"]["group_assertions"] == [_group()]
     omitted = copy.deepcopy(clear)
     del omitted.fields["assertions"]["group_assertions"]
@@ -524,3 +561,316 @@ async def test_malformed_retained_groups_refuse_before_any_write(invalid):
     with pytest.raises(store.RegistryRecordConflict, match="group_assertions_invalid"):
         await _apply(session, correction)
     assert (session.head, session.history, session.assertions, session.draft) == before
+
+
+def test_company_name_origin_is_bounded_native_metadata_with_unknown_legacy_default():
+    table = CompanyRegistry.__table__
+    column = table.c.display_name_origin
+    assert not column.nullable and column.type.length == 32
+    assert str(column.server_default.arg) == "unknown"
+    checks_by_name = {c.name: str(c.sqltext) for c in table.constraints if isinstance(c, CheckConstraint)}
+    assert checks_by_name["registry_company_name_origin"] == (
+        "display_name_origin IN ('manual','source_company','source_issuer','identifier','unknown')"
+    )
+    sql = str(CreateTable(table).compile(dialect=postgresql.dialect()))
+    assert "display_name_origin VARCHAR(32) DEFAULT 'unknown' NOT NULL" in sql
+    assert "CONSTRAINT registry_company_name_origin CHECK" in sql
+
+
+@pytest.mark.asyncio
+async def test_company_manual_creation_retains_origin_in_history_and_exact_replay():
+    session = Session()
+    command = _edit(assertions=False)
+    created = await _apply(session, command)
+    assert created["record"]["display_name_origin"] == "manual"
+    assert session.history[0]["record_json"]["display_name_origin"] == "manual"
+    assert await _apply(session, command) == created
+    assert len(session.history) == session.draft == 1
+    assert session.events[-2:] == ["control-lock", "replay"]
+
+
+class HeadStatementSession:
+    """Capture real PostgreSQL statements without claiming native SQL execution."""
+
+    def __init__(self, origin):
+        self.origin = origin
+        self.statements = []
+
+    async def execute(self, statement):
+        self.statements.append(statement)
+        return Result([{"company_id": UUID(COMPANY), "revision": 2, "display_name_origin": self.origin}])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["manual", "source_company", "source_issuer", "identifier", "unknown"])
+@pytest.mark.parametrize("name", [" Example Company ", "New company name"])
+async def test_company_name_correction_uses_same_cas_row_for_origin(origin, name):
+    command = _edit(
+        assertions=False,
+        operation="correct",
+        expected_revision=1,
+        fields={"display_name": name, "roles": ["network_operator"], "aliases": ["Alias"]},
+    )
+    session = HeadStatementSession(origin)
+    table, identity = store._record_table("company", "example_registry")
+    result = await store._write_record_head(
+        session,
+        command,
+        table,
+        identity,
+        command.record_id,
+        store._validated_command(command),
+    )
+    compiled = session.statements[0].compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert len(session.statements) == 1 and result["display_name_origin"] == origin
+    assert "display_name_origin=CASE WHEN" in sql and "display_name IS DISTINCT FROM" in sql
+    assert "ELSE example_registry.company_registry.display_name_origin END" in sql
+    assert "company_id =" in sql and "revision =" in sql
+    assert compiled.params["display_name"] == name.strip()
+    assert compiled.params["company_id_1"] == command.record_id
+    assert compiled.params["revision_1"] == command.expected_revision
+    assert compiled.params["revision"] == command.expected_revision + 1
+    assert list(compiled.params.values()).count("manual") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["archive", "restore"])
+async def test_company_archival_does_not_assign_name_origin(operation):
+    command = _edit(assertions=False, operation=operation, expected_revision=1, fields={})
+    session = HeadStatementSession("source_issuer")
+    table, identity = store._record_table("company", "example_registry")
+    await store._write_record_head(session, command, table, identity, command.record_id, {})
+    sql = str(session.statements[0].compile(dialect=postgresql.dialect())).split(" WHERE ")[0]
+    assert " SET " in sql and "display_name_origin=" not in sql
+
+
+@pytest.mark.asyncio
+async def test_correction_retains_predecessor_families_without_changing_wire_replay():
+    session = Session()
+    original = _edit()
+    first = await _apply(session, original)
+    retained = copy.deepcopy(session.history[0])
+    correction = _edit(operation="correct", expected_revision=1, idempotency_key="replace-assertions")
+    correction.fields["assertions"].update(expected_revision=1)
+    correction.fields["assertions"]["role_assertions"][0]["assertion_id"] = str(UUID(int=201))
+    correction.fields["assertions"]["identifier_assertions"][0]["assertion_id"] = str(UUID(int=202))
+    correction_result = await _apply(session, correction)
+    predecessors = session.history[1]["record_json"]["correction_predecessors"]
+    assert predecessors == {
+        "company_revision": 1,
+        "role_assertions": [first["record"]["role_assertions"][0]["assertion_id"]],
+        "identifier_assertions": [first["record"]["identifier_assertions"][0]["assertion_id"]],
+        "group_assertions": [],
+    }
+    assert session.history[0] == retained
+    assert session.history[1]["reason"] == correction.reason
+    assert "correction_predecessors" not in correction_result["record"]
+    assert await _apply(session, correction) == correction_result
+    assert await _apply(session, original) == first
+    assert len(session.history) == 2
+    assert session.history[0] == retained
+
+
+@pytest.mark.asyncio
+async def test_identifier_free_correction_records_empty_predecessor_families():
+    session = Session()
+    await _apply(session, _edit(assertions=False))
+    correction = _edit(assertions=False, operation="correct", expected_revision=1, idempotency_key="name-only")
+    await _apply(session, correction)
+    assert session.history[1]["record_json"]["correction_predecessors"] == {
+        "company_revision": 1,
+        "role_assertions": [],
+        "identifier_assertions": [],
+        "group_assertions": [],
+    }
+    assert "correction_predecessors" not in session.history[0]["record_json"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "cas", "history"])
+async def test_materialized_predecessor_retention_is_atomic(monkeypatch, failure):
+    class MaterializedSession(Session):
+        async def execute(self, statement, rows=None):
+            if getattr(getattr(statement, "table", None), "name", None) == "registry_record_history":
+                params = statement.compile(dialect=postgresql.dialect()).params
+                if failure == "history" and params["revision"] == 2:
+                    assert self.history[0]["revision"] == 1
+                    raise RuntimeError("synthetic-correction-history-failure")
+            return await super().execute(statement, rows)
+
+    session = MaterializedSession()
+    original = await _apply(session, _edit())
+    snapshot = copy.deepcopy(original["record"])
+    session.history.clear()
+    session.draft = 0
+    if failure == "cas":
+        session.head["revision"] = 2
+
+    async def materialized_read(*args, **kwargs):
+        return copy.deepcopy(snapshot)
+
+    monkeypatch.setattr(store, "get_registry_record", materialized_read)
+    correction = _edit(
+        assertions=False,
+        operation="correct",
+        expected_revision=1,
+        fields={"display_name": "Corrected Company", "roles": ["network_operator"], "aliases": ["Corrected"]},
+        idempotency_key="materialized",
+    )
+    before = copy.deepcopy((session.head, session.assertions))
+    if failure is not None:
+        with pytest.raises((store.RegistryRecordConflict, RuntimeError)):
+            await _apply(session, correction)
+        assert (session.head, session.assertions) == before
+        assert session.history == [] and session.draft == 0
+        return
+    correction_result = await _apply(session, correction)
+    baseline, corrected = session.history
+    assert baseline["record_json"] == snapshot
+    assert baseline["actor_json"] == corrected["actor_json"]
+    assert baseline["reason"] == "Preserved materialized company before manual correction"
+    assert baseline["idempotency_key"] != corrected["idempotency_key"]
+    assert baseline["request_sha256"] != corrected["request_sha256"]
+    assert baseline["custom_revision"] == corrected["custom_revision"] == 1
+    assert await _apply(session, correction) == correction_result
+    assert len(session.history) == 2
+    await _verify_materialized_undo_replay(session, snapshot)
+
+
+async def _verify_materialized_undo_replay(session, snapshot):
+    retained = copy.deepcopy(session.history)
+    command = RegistryManualUndoCommand("company", UUID(COMPANY), 2, 1, "Restore materialized values", "first-undo")
+    preparation = await undo.prepare_registry_manual_undo(session, command, ACTOR, schema="example_registry")
+    restored = await _apply(session, preparation.command)
+    assert restored["revision"] == 3
+    for field in ("display_name", "roles", "aliases", "role_assertions", "identifier_assertions", "group_assertions"):
+        assert restored["record"][field] == snapshot[field]
+    assert session.history[:2] == retained
+    assert session.history[2]["actor_json"] == retained[0]["actor_json"]
+    assert session.history[2]["reason"] == preparation.command.reason
+    replay = await undo.prepare_registry_manual_undo(session, command, ACTOR, schema="example_registry")
+    assert replay.command == preparation.command
+    assert await _apply(session, replay.command) == restored
+    assert session.history[:2] == retained and len(session.history) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "history_index,field_path,forged_value",
+    [
+        (1, ("record_json", "correction_predecessors"), {}),
+        (1, ("record_json", "correction_predecessors", "company_revision"), 2),
+        (1, ("record_json", "correction_predecessors", "company_revision"), "1"),
+        (0, ("request_sha256",), "0" * 64),
+        (0, ("reason",), "Unrelated history"),
+        (0, ("idempotency_key",), "unrelated-key"),
+        (0, ("actor_json", "user_id"), str(UUID(int=101))),
+        (0, ("record_json", "company_id"), str(UUID(int=102))),
+        (0, ("record_json", "revision"), 2),
+        (1, ("request_sha256",), "invalid"),
+        (0, ("custom_revision",), 2),
+    ],
+    ids=[
+        "missing-predecessor",
+        "wrong-predecessor",
+        "string-predecessor",
+        "digest",
+        "reason",
+        "key",
+        "actor",
+        "entity",
+        "revision",
+        "correction-digest",
+        "reversed-order",
+    ],
+)
+async def test_materialized_undo_refuses_forged_predecessor(monkeypatch, history_index, field_path, forged_value):
+    session = Session()
+    original = await _apply(session, _edit())
+    snapshot = copy.deepcopy(original["record"])
+    session.history.clear()
+    session.draft = 0
+
+    async def materialized_read(*args, **kwargs):
+        return copy.deepcopy(snapshot)
+
+    monkeypatch.setattr(store, "get_registry_record", materialized_read)
+    await _apply(
+        session, _edit(assertions=False, operation="correct", expected_revision=1, idempotency_key="materialized")
+    )
+    history_entry = session.history[history_index]
+    for field in field_path[:-1]:
+        history_entry = history_entry[field]
+    history_entry[field_path[-1]] = forged_value
+    before = copy.deepcopy((session.head, session.history, session.assertions, session.draft))
+    command = RegistryManualUndoCommand("company", UUID(COMPANY), 2, 1, "Restore materialized values", "denied-undo")
+    with pytest.raises(store.RegistryRecordConflict, match="undo_history_conflict"):
+        await undo.prepare_registry_manual_undo(session, command, ACTOR, schema="example_registry")
+    assert (session.head, session.history, session.assertions, session.draft) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "family,entries",
+    [
+        ("role_assertions", [None]),
+        ("role_assertions", [{"assertion_id": "invalid"}]),
+        ("identifier_assertions", [{"assertion_id": str(UUID(int=0))}]),
+        ("identifier_assertions", [{"assertion_id": str(UUID(int=23))}] * 2),
+        ("role_assertions", [{"assertion_id": str(UUID(int=23))}] * 33),
+    ],
+)
+async def test_invalid_predecessor_evidence_refuses_before_retaining_correction(family, entries):
+    session = Session()
+    await _apply(session, _edit())
+    session.history[0]["record_json"][family] = entries
+    before = copy.deepcopy((session.head, session.history, session.assertions, session.draft))
+    correction = _edit(operation="correct", expected_revision=1, idempotency_key="invalid-predecessor")
+    correction.fields["assertions"]["expected_revision"] = 1
+    with pytest.raises(store.RegistryRecordConflict, match="predecessor_invalid"):
+        await _apply(session, correction)
+    assert (session.head, session.history, session.assertions, session.draft) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested", [False, True])
+async def test_callers_cannot_supply_predecessor_metadata(nested):
+    session = Session()
+    command = _edit()
+    target = command.fields["assertions"] if nested else command.fields
+    target["correction_predecessors"] = {"company_revision": 1}
+    with pytest.raises(ValueError):
+        await _apply(session, command)
+    assert session.events == []
+
+
+@pytest.mark.asyncio
+async def test_history_and_preview_project_metadata_without_changing_retained_evidence():
+    statements = []
+
+    class HistoryReader:
+        async def execute(self, statement):
+            statements.append(statement.compile(dialect=postgresql.dialect()))
+
+            class Rows:
+                def mappings(self):
+                    return self
+
+                def all(self):
+                    return []
+
+            return Rows()
+
+    await undo._read_history_page(HistoryReader(), "company", UUID(COMPANY), 50, 0, "example_registry")
+    assert "correction_predecessors" in statements[0].params.values()
+    assert "record_json - " in str(statements[0])
+
+    class PreviewReader:
+        async def fetchval(self, sql, *_args):
+            assert "previous.record_json-'correction_predecessors'" in sql
+            assert "history.record_json-'correction_predecessors'" in sql
+            return "{}"
+
+    command = approval.RegistryApprovalCommand(1, 0, (), "Reviewed selection", "preview-key")
+    assert await preview._preview_document(PreviewReader(), '"example_registry"', '"selection"', command) == "{}"

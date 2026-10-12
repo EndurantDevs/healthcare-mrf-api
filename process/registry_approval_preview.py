@@ -36,7 +36,9 @@ async def _preview_document(connection, namespace, staging, command):
                 WHEN 'company_links' THEN 'company_id' WHEN 'provider' THEN 'provider_id'
                 WHEN 'location' THEN 'location_id' WHEN 'site_binding' THEN 'binding_id'
                 WHEN 'network_binding' THEN 'binding_id' ELSE 'network_id' END,
-              'record_revision',selected.revision,'before',previous.record_json,'after',history.record_json) AS record_json
+              'record_revision',selected.revision,
+              'before',CASE WHEN selected.record_kind='company' THEN previous.record_json-'correction_predecessors' ELSE previous.record_json END,
+              'after',CASE WHEN selected.record_kind='company' THEN history.record_json-'correction_predecessors' ELSE history.record_json END) AS record_json
           FROM {staging} selected JOIN {namespace}.registry_record_history history
             ON (history.record_kind,history.record_key,history.revision)=
                (selected.record_kind,selected.record_key,selected.revision)

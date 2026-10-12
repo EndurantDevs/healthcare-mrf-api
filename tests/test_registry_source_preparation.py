@@ -86,7 +86,7 @@ def _fetch_result(tmp_path, archive_bytes, candidate):
         candidate.source_id,
         candidate.edition_id,
         candidate.source_url,
-        preparation._PARSERS_BY_SOURCE[candidate.source_id],
+        preparation._PARSERS_BY_SOURCE[candidate.source_id][0],
         candidate.reporting_year,
         None,
         4 * 1024 * 1024,
@@ -269,6 +269,35 @@ def test_planfinder_uses_real_decoder_preserves_raw_workbook_and_period(tmp_path
     assert prepared.member_date == date(2026, 8, 6) and prepared.candidate.quarter == 4
     assert prepared.candidate.reporting_year == 2026 and prepared.candidate.published_at is None
     assert prepared.lookup_sha256 is None
+
+
+@pytest.mark.parametrize(
+    "parser_version,supported",
+    [
+        ("cms-planfinder-hios-2026-08-06-v1", True),
+        ("cms-planfinder-hios-2026-08-06-v2", True),
+        ("cms-planfinder-hios-2026-08-06-v3", False),
+        ("cms-header-v1", False),
+    ],
+)
+def test_planfinder_interpretation_is_explicit_and_preserves_retained_bytes(tmp_path, parser_version, supported):
+    workbook, digest = _workbook(tmp_path, count=2)
+    candidate = _candidate("plan-finder")
+    archive_bytes = _zip([("2026-08-06-HIOS.xlsx", workbook.read_bytes())])
+    fetched = _fetch_result(tmp_path, archive_bytes, candidate)
+    fetched = replace(
+        fetched, receipt=replace(fetched.receipt, spec=replace(fetched.receipt.spec, parser_version=parser_version))
+    )
+    if not supported:
+        with pytest.raises(preparation.RegistrySourcePreparationError):
+            preparation.prepare_registry_source_input(candidate, fetched, tmp_path / "inputs")
+        assert not list((tmp_path / "inputs").glob("*"))
+        return
+    prepared = preparation.prepare_registry_source_input(candidate, fetched, tmp_path / "inputs")
+    assert prepared.fetch.receipt.spec.parser_version == parser_version
+    assert prepared.input_path.read_bytes() == workbook.read_bytes() and prepared.input_sha256 == digest
+    assert fetched.artifact_path.read_bytes() == archive_bytes
+    assert preparation.prepare_registry_source_input(candidate, fetched, tmp_path / "inputs") == prepared
 
 
 @pytest.mark.parametrize("kind", ["ambiguous", "missing", "unsupported-date", "late-malformed", "size"])

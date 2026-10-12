@@ -18,6 +18,7 @@ from sqlalchemy import (
     String,
     and_,
     any_,
+    case,
     cast,
     column,
     func,
@@ -56,6 +57,8 @@ from db.models.registry_site_binding import RegistrySiteBinding
 from process.company_registry_assertion_values import (
     CONTRACT,
     MAX_GROUP_ASSERTIONS,
+    MAX_IDENTIFIER_ASSERTIONS,
+    MAX_ROLE_ASSERTIONS,
     validated_company_registry_assertions,
 )
 from process.ext.address_fast import _fast_module
@@ -411,27 +414,37 @@ def _validate_network_evidence_snapshot(snapshot):
 
 
 def _history_result(history):
-    record = history["record_json"]
+    record_by_field = history["record_json"]
+    if history["record_kind"] == "company" and "correction_predecessors" in record_by_field:
+        record_by_field = {key: value for key, value in record_by_field.items() if key != "correction_predecessors"}
     if history["record_kind"] == "network":
-        _validate_network_evidence_snapshot(record)
+        _validate_network_evidence_snapshot(record_by_field)
     return {
         "record_kind": history["record_kind"],
-        "record_id": record[_RECORD_MODELS[history["record_kind"]][1]],
+        "record_id": record_by_field[_RECORD_MODELS[history["record_kind"]][1]],
         "revision": history["revision"],
         "custom_revision": history["custom_revision"],
-        "record": record,
+        "record": record_by_field,
     }
 
 
 async def _write_record_head(session, command, table, identity_column, record_id, fields):
     if command.operation == "create":
+        values_by_column = dict(fields)
+        if command.record_kind == "company":
+            values_by_column["display_name_origin"] = "manual"
         statement = (
             pg_insert(table)
-            .values(**{identity_column: record_id}, **fields, archived=False, revision=1)
+            .values(**{identity_column: record_id}, **values_by_column, archived=False, revision=1)
             .on_conflict_do_nothing(index_elements=[table.c[identity_column]])
         )
     else:
         values_by_column = {**fields, "revision": command.expected_revision + 1}
+        if command.record_kind == "company" and command.operation == "correct":
+            values_by_column["display_name_origin"] = case(
+                (table.c.display_name.is_distinct_from(fields["display_name"]), "manual"),
+                else_=table.c.display_name_origin,
+            )
         if command.operation in {"archive", "restore"}:
             values_by_column["archived"] = command.operation == "archive"
         statement = (
@@ -440,7 +453,7 @@ async def _write_record_head(session, command, table, identity_column, record_id
             .values(**values_by_column)
         )
     try:
-        row = (await session.execute(statement.returning(*table.c))).mappings().one_or_none()
+        record_by_column = (await session.execute(statement.returning(*table.c))).mappings().one_or_none()
     except IntegrityError as error:
         native_error = error.orig.__cause__
         if (
@@ -449,12 +462,22 @@ async def _write_record_head(session, command, table, identity_column, record_id
         ):
             raise RegistryRecordConflict("registry_provider_npi_claimed") from error
         raise
-    if row is None:
+    if record_by_column is None:
         raise RegistryRecordConflict("registry_record_revision_conflict")
-    return _snapshot(row)
+    return _snapshot(record_by_column)
 
 
-async def _append_record_history(session, command, actor, record, control, history_table, request_sha256):
+async def _append_record_history(
+    session,
+    command,
+    actor_document,
+    record_by_field,
+    control,
+    history_table,
+    request_sha256,
+    company_history=(None, None),
+):
+    predecessors, materialized_snapshot = company_history
     custom_revision = await session.scalar(
         update(control)
         .where(control.c.id == 1)
@@ -464,17 +487,38 @@ async def _append_record_history(session, command, actor, record, control, histo
     identity_column = _RECORD_MODELS[command.record_kind][1]
     history_by_column = {
         "record_kind": command.record_kind,
-        "record_key": str(record[identity_column]),
-        "revision": record["revision"],
+        "record_key": str(record_by_field[identity_column]),
+        "revision": record_by_field["revision"],
         "custom_revision": custom_revision,
-        "record_json": record,
-        "actor_json": actor,
+        "record_json": record_by_field
+        if predecessors is None
+        else record_by_field | {"correction_predecessors": predecessors},
+        "actor_json": actor_document,
         "reason": command.reason.strip(),
         "idempotency_key": command.idempotency_key,
         "request_sha256": request_sha256,
     }
+    if materialized_snapshot is not None:
+        await session.execute(
+            insert(history_table).values(**_materialized_company_history(history_by_column, materialized_snapshot))
+        )
     await session.execute(insert(history_table).values(**history_by_column))
     return _history_result(history_by_column)
+
+
+def _materialized_company_history(correction, snapshot):
+    """Attribute baseline preservation to the correcting actor, not the source author."""
+    snapshot_json = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    digest = hashlib.sha256(
+        ("materialized-company-predecessor:" + correction["request_sha256"] + ":" + snapshot_json).encode()
+    ).hexdigest()
+    return correction | {
+        "revision": snapshot["revision"],
+        "record_json": snapshot,
+        "reason": "Preserved materialized company before manual correction",
+        "idempotency_key": "materialized:" + digest,
+        "request_sha256": digest,
+    }
 
 
 async def _read_record_replay(session, history_table, command, record_id):
@@ -613,9 +657,11 @@ async def apply_registry_record_command(session, command, actor, *, schema=None,
             fields["canonical_address_json"] = _canonical_location_address(fields["address_json"])
         if command.record_kind == "site_binding" and command.operation != "archive":
             fields = await _resolve_site_binding(session, command, fields, schema)
-        assertions = None
+        assertions, company_history = None, (None, None)
         if command.record_kind == "company":
-            assertions = await _company_revision_assertions(session, command, fields, history_table, schema)
+            assertions, company_history = await _company_revision_assertions(
+                session, command, fields, history_table, schema
+            )
             if command.operation != "archive":
                 await _validate_company_assertions(session, command, assertions, schema)
         record_snapshot = await _write_record_head(session, command, table, identity_column, record_id, fields)
@@ -623,7 +669,7 @@ async def apply_registry_record_command(session, command, actor, *, schema=None,
             await _retain_company_assertions(session, record_snapshot, assertions, schema)
             record_snapshot.update(assertions)
         return await _append_record_history(
-            session, command, actor_document, record_snapshot, control, history_table, request_sha256
+            session, command, actor_document, record_snapshot, control, history_table, request_sha256, company_history
         )
 
 
@@ -860,10 +906,46 @@ async def search_registry_companies(session, q, *, limit=50, offset=0, record_id
     return records
 
 
+def _company_predecessors(command, retained_by_field):
+    """Reference the complete prior snapshot, without inferring fact-to-fact matches."""
+    if type(retained_by_field) is not dict or retained_by_field.get("company_id") != str(command.record_id):
+        raise RegistryRecordConflict("registry_company_predecessor_invalid")
+    if type(retained_by_field.get("revision")) is not int or retained_by_field["revision"] != command.expected_revision:
+        raise RegistryRecordConflict("registry_record_revision_conflict")
+    predecessor_by_field = {"company_revision": command.expected_revision}
+    for family, maximum in (
+        ("role_assertions", MAX_ROLE_ASSERTIONS),
+        ("identifier_assertions", MAX_IDENTIFIER_ASSERTIONS),
+        ("group_assertions", MAX_GROUP_ASSERTIONS),
+    ):
+        entries = retained_by_field.get(family, [])
+        if type(entries) is not list or len(entries) > maximum:
+            if family == "group_assertions":
+                raise RegistryRecordConflict("registry_company_group_assertions_invalid")
+            raise RegistryRecordConflict("registry_company_predecessor_invalid")
+        identifiers = []
+        for entry in entries:
+            identifier = entry.get("assertion_id") if type(entry) is dict else None
+            try:
+                if type(identifier) is not str:
+                    raise ValueError
+                parsed = UUID(identifier)
+                if not parsed.int or str(parsed) != identifier:
+                    raise ValueError
+            except ValueError, AttributeError:
+                raise RegistryRecordConflict("registry_company_predecessor_invalid") from None
+            identifiers.append(identifier)
+        if len(identifiers) != len(set(identifiers)):
+            raise RegistryRecordConflict("registry_company_predecessor_invalid")
+        predecessor_by_field[family] = sorted(identifiers)
+    return predecessor_by_field
+
+
 async def _company_revision_assertions(session, command, fields, history, schema):
     document = fields.pop("assertions", None)
     retained_by_field = {}
-    if command.operation != "create" and (document is None or "group_assertions" not in document):
+    materialized_snapshot = None
+    if command.operation != "create":
         retained_by_field = await session.scalar(
             select(history.c.record_json).where(
                 history.c.record_kind == "company",
@@ -875,8 +957,11 @@ async def _company_revision_assertions(session, command, fields, history, schema
             retained_by_field = await get_registry_record(session, "company", command.record_id, schema=schema)
             if retained_by_field is not None and retained_by_field["revision"] != command.expected_revision:
                 retained_by_field = None
+            if command.operation == "correct":
+                materialized_snapshot = retained_by_field
         if retained_by_field is None:
             raise RegistryRecordConflict("registry_record_revision_conflict")
+    predecessors = _company_predecessors(command, retained_by_field) if command.operation == "correct" else None
     assertions_by_family = {
         key: (document if document is not None else retained_by_field).get(key, [])
         for key in ("role_assertions", "identifier_assertions")
@@ -900,7 +985,7 @@ async def _company_revision_assertions(session, command, fields, history, schema
     assertion_ids = [entry["assertion_id"] for family in assertions_by_family.values() for entry in family]
     if len(assertion_ids) != len(set(assertion_ids)):
         raise RegistryRecordConflict("registry_company_assertion_id_conflict")
-    return assertions_by_family
+    return assertions_by_family, (predecessors, materialized_snapshot)
 
 
 _COMPANY_ASSERTION_TARGETS_SQL = """WITH proposed AS MATERIALIZED (

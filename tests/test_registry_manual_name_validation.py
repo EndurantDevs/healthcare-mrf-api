@@ -110,3 +110,32 @@ def test_unsafe_undo_keeps_readable_history():
     prepared = _prepare_correction(command, clean_history, "group_id")
     assert store._validated_command(prepared.command)["display_name"] == "Corrected Réseau"
     assert history_by_field == original
+
+
+@pytest.mark.parametrize("origin", ["manual", "source_company", "source_issuer", "identifier", "unknown"])
+@pytest.mark.parametrize("operation", ["create", "correct"])
+def test_company_name_origin_is_not_an_editable_command_field(origin, operation):
+    command = store.RegistryRecordCommand(
+        "company",
+        uuid4(),
+        operation,
+        0 if operation == "create" else 1,
+        {"display_name": "Example Company", "roles": ["employer"], "aliases": [], "display_name_origin": origin},
+        "Reviewed company name",
+        uuid4().hex,
+    )
+    with pytest.raises(ValueError, match="registry_editable_fields_invalid"):
+        store._validated_command(command)
+
+
+def test_legacy_company_history_keeps_original_unclassified_shape():
+    record_by_field = {"company_id": str(uuid4()), "display_name": "Original source name", "revision": 1}
+    history_by_field = {
+        "record_kind": "company",
+        "revision": 1,
+        "custom_revision": 0,
+        "record_json": record_by_field,
+    }
+    replay = store._history_result(history_by_field)
+    assert replay["record"] is record_by_field
+    assert "display_name_origin" not in replay["record"]

@@ -692,6 +692,51 @@ async def test_company_group_history_normalizes_absence_without_hiding_null(serv
         assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_approval_history') == 0
 
 
+@pytest.mark.parametrize("origin", ["absent", None, "source_company"], ids=["legacy", "null", "mismatch"])
+async def test_company_name_origin_approval_preserves_legacy_history(serving_schema, origin):
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    company_draft = await _draft(engine, schema, _create("company"), actor)
+    await connection.execute(
+        f"UPDATE \"{schema}\".company_registry SET display_name_origin='unknown' WHERE company_id=$1",
+        UUID(company_draft["record_id"]),
+    )
+    expression = (
+        "record_json-'display_name_origin'"
+        if origin == "absent"
+        else ("record_json||jsonb_build_object('display_name_origin',$2::text)")
+    )
+    arguments = (company_draft["record_id"],) if origin == "absent" else (company_draft["record_id"], origin)
+    await connection.execute(
+        f'UPDATE "{schema}".registry_record_history SET record_json={expression} '
+        "WHERE record_kind='company' AND record_key=$1",
+        *arguments,
+    )
+    retained = await connection.fetchval(
+        f'SELECT record_json::text FROM "{schema}".registry_record_history '
+        "WHERE record_kind='company' AND record_key=$1",
+        company_draft["record_id"],
+    )
+    command = await _command(connection, schema, company_draft)
+    if origin == "absent":
+        assert (await _approve(connection, schema, command, actor))["selected_count"] == 1
+        approved = await _approved(connection, schema, command.expected_draft_revision + 1)
+        assert json.loads(approved[0]["record_json"]) == json.loads(retained)
+        assert "display_name_origin" not in json.loads(approved[0]["record_json"])
+    else:
+        with pytest.raises(RegistryApprovalConflict, match="selection_conflict"):
+            await _approve(connection, schema, command, actor)
+        assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_approval_history') == 0
+    assert (
+        await connection.fetchval(
+            f'SELECT record_json::text FROM "{schema}".registry_record_history '
+            "WHERE record_kind='company' AND record_key=$1",
+            company_draft["record_id"],
+        )
+        == retained
+    )
+
+
 async def test_company_group_approval_preserves_company_scoped_assertion_ids(serving_schema):
     connection, schema, engine = serving_schema
     actor = _actor()

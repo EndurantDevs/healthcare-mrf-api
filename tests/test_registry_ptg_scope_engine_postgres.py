@@ -221,6 +221,7 @@ async def _create_control_store(connection, control, roles, document):
         "20261009020000_company_registry_assertions.py",
         "20261009030000_network_catalog_evidence.py",
         "20261011010000_company_registry_group_assertions.py",
+        "20261012010000_company_registry_name_origin.py",
     ):
         for statement in _migration(filename)._ddl(control):
             await connection.exec_driver_sql(statement)
@@ -1198,7 +1199,7 @@ async def _approve_published_association(fixture):
     return network_id, receipt["approved_revision"]
 
 
-async def _published_review_setup(fixture, tmp_path, ownership, network_id, approved_revision):
+async def _published_review_setup(fixture, tmp_path, ownership, network_id, approved_revision, *, existing_table=False):
     table = f'"{fixture.control}".registry_ptg_published_plan_scope'
     registration = tmp_path / "published-scope-table-registration.json"
     registration.write_text(
@@ -1214,8 +1215,11 @@ async def _published_review_setup(fixture, tmp_path, ownership, network_id, appr
         )
     )
     async with fixture.engine.begin() as connection:
-        for statement in _migration("20261009040000_registry_ptg_published_plan_scope.py")._ddl(fixture.control):
-            await connection.exec_driver_sql(statement)
+        if existing_table:
+            assert await connection.scalar(text("SELECT to_regclass(:name)"), {"name": table}) is not None
+        else:
+            for statement in _migration("20261009040000_registry_ptg_published_plan_scope.py")._ddl(fixture.control):
+                await connection.exec_driver_sql(statement)
         await connection.exec_driver_sql(f'ALTER TABLE {table} OWNER TO "{fixture.roles[0]}"')
         await connection.exec_driver_sql(f'GRANT SELECT ON {table} TO "{fixture.roles[2]}"')
         await connection.exec_driver_sql(f'GRANT SELECT,INSERT ON {table} TO "{fixture.roles[1]}"')

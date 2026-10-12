@@ -18,6 +18,10 @@ class CompanyRegistry(Base):
     __runtime_schema_sync__ = False
     __table_args__ = (
         CheckConstraint("btrim(display_name) <> ''", name="registry_company_name"),
+        CheckConstraint(
+            "display_name_origin IN ('manual','source_company','source_issuer','identifier','unknown')",
+            name="registry_company_name_origin",
+        ),
         CheckConstraint("revision > 0", name="registry_company_revision"),
         CheckConstraint("jsonb_typeof(aliases) = 'array'", name="registry_company_aliases"),
         CheckConstraint(
@@ -35,6 +39,7 @@ class CompanyRegistry(Base):
     archived = Column(Boolean, nullable=False, server_default="false")
     revision = Column(BigInteger, nullable=False, server_default="1")
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    display_name_origin = Column(String(32), nullable=False, server_default="unknown")
 
 
 class HIOSIssuerRegistry(Base):
