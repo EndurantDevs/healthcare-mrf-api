@@ -10,7 +10,11 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
+from sqlalchemy import MetaData
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateTable
 
+from db.models import Issuer
 from process.registry_issuer_resolution import (
     RegistryIssuerResolutionError,
     RegistryIssuerResolutionUnavailable,
@@ -22,6 +26,18 @@ from tests.test_network_serving_schema_postgres import serving_schema
 from tests.test_registry_planfinder_admission_postgres import _edition as _planfinder_edition
 
 pytestmark = pytest.mark.asyncio
+_PRESERVED_REGISTRY_TABLES = (
+    "company_registry",
+    "company_group_registry",
+    "hios_issuer_registry",
+    "company_registry_identifier_assertion",
+    "company_registry_links",
+    "registry_identifier_binding",
+    "registry_issuer_company_assertion",
+    "registry_company_group_assertion",
+    "registry_source_snapshot",
+    "registry_source_observation",
+)
 
 
 async def _source(connection, schema, *, year=2024, retrieved=2026):
@@ -126,6 +142,96 @@ async def test_source_labels_and_leading_zero_identity(serving_schema):
         assert "Editable draft" not in json.dumps(result)
         assert result["relationship_scope"] == "source_reporting_period"
         assert (await _read(connection, schema, ("00123",)))[0] == result
+
+
+async def test_issuer_replacement_preserves_registry(serving_schema):
+    """Actual issuer OID replacement leaves custom records and normalized joins intact."""
+    connection, schema, _ = serving_schema
+    company_id, group_id = await _company_group(connection, schema)
+    snapshot_id = await _source(connection, schema)
+    evidence_key = await _evidence(connection, schema, snapshot_id, company_id, group_id)
+    await _seed_custom_issuer_links(connection, schema, company_id, group_id, snapshot_id, evidence_key)
+    original_oid = await _create_imported_issuer(connection, schema, "issuer", "Original imported issuer")
+    preserved = await _preserved_registry_snapshot(connection, schema)
+    async with connection.transaction(isolation="repeatable_read"):
+        expected_resolution = (await _read(connection, schema))[0]
+    assert expected_resolution["legal_company"]["company_id"] == str(company_id)
+    assert expected_resolution["reported_group"]["group_id"] == str(group_id)
+    for generation in (1, 2):
+        stage = "issuer_stage_" + str(generation)
+        imported_name = "Replacement imported issuer " + str(generation)
+        replacement_oid = await _create_imported_issuer(connection, schema, stage, imported_name)
+        async with connection.transaction():
+            await _replace_imported_issuer(connection, schema, stage)
+        assert replacement_oid != original_oid
+        assert await connection.fetchval("SELECT to_regclass($1)::oid::bigint", schema + ".issuer") == replacement_oid
+        assert await _preserved_registry_snapshot(connection, schema) == preserved
+        imported_issuer = await connection.fetchrow(f'SELECT issuer_id,issuer_name FROM "{schema}".issuer')
+        assert type(imported_issuer["issuer_id"]) is int and imported_issuer["issuer_name"] == imported_name
+        async with connection.transaction(isolation="repeatable_read"):
+            actual_resolution = (await _read(connection, schema, (imported_issuer["issuer_id"],)))[0]
+            assert actual_resolution == expected_resolution
+            assert actual_resolution["issuer_id"] == 123 and actual_resolution["hios_issuer_id"] == "00123"
+    # A FK to the original issuer object would prevent the second ordinary RESTRICT drop.
+    assert not await connection.fetchval("SELECT EXISTS(SELECT 1 FROM pg_class WHERE oid=$1::oid)", original_oid)
+
+
+async def _create_imported_issuer(connection, schema, table_name, issuer_name):
+    table = Issuer.__table__.to_metadata(MetaData(), schema=schema, name=table_name)
+    table.primary_key.name = table_name + "_idx_primary"
+    await connection.execute(str(CreateTable(table).compile(dialect=postgresql.dialect())))
+    await connection.execute(
+        f'INSERT INTO "{schema}"."{table_name}"(issuer_id,state,issuer_name) VALUES(123,\'CA\',$1)', issuer_name
+    )
+    return await connection.fetchval("SELECT to_regclass($1)::oid::bigint", schema + "." + table_name)
+
+
+async def _replace_imported_issuer(connection, schema, stage):
+    """Simulate the ordinary MRF publisher's issuer and primary-index rename order."""
+    await connection.execute(f'DROP TABLE IF EXISTS "{schema}".issuer_old RESTRICT')
+    await connection.execute(f'ALTER TABLE "{schema}".issuer RENAME TO issuer_old')
+    await connection.execute(f'ALTER TABLE "{schema}"."{stage}" RENAME TO issuer')
+    await connection.execute(f'ALTER INDEX "{schema}".issuer_idx_primary RENAME TO issuer_idx_primary_old')
+    await connection.execute(f'ALTER INDEX "{schema}"."{stage}_idx_primary" RENAME TO issuer_idx_primary')
+
+
+async def _seed_custom_issuer_links(connection, schema, company_id, group_id, snapshot_id, evidence_key):
+    await connection.execute(
+        f'INSERT INTO "{schema}".company_registry_identifier_assertion '
+        "(assertion_id,company_id,company_revision,identifier_system,identifier_scope,identifier_value,valid_from,provenance_kind,evidence_ref) "
+        "VALUES($1,$2,1,'ein','declared-jurisdiction-a','012345678',DATE '2024-01-01','manual_reference','reviewed-identifier')",
+        uuid4(),
+        company_id,
+    )
+    await connection.execute(
+        f'INSERT INTO "{schema}".company_registry_links(company_id,group_id) VALUES($1,$2)', company_id, group_id
+    )
+    for kind, system, identifier, entity_id in (
+        ("company", "ein", "012345678", company_id),
+        ("group", "naic_group", "707", group_id),
+    ):
+        await connection.execute(
+            f'INSERT INTO "{schema}".registry_identifier_binding '
+            "(entity_kind,identifier_system,identifier_value,entity_id,snapshot_id,evidence_key) VALUES($1,$2,$3,$4,$5,$6)",
+            kind,
+            system,
+            identifier,
+            entity_id,
+            snapshot_id,
+            evidence_key,
+        )
+
+
+async def _preserved_registry_snapshot(connection, schema):
+    snapshots = []
+    for table_name in _PRESERVED_REGISTRY_TABLES:
+        oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", schema + "." + table_name)
+        retained_rows = await connection.fetchval(
+            f'SELECT jsonb_agg(to_jsonb(retained) ORDER BY to_jsonb(retained)::text)::text FROM "{schema}"."{table_name}" retained'
+        )
+        assert oid is not None and retained_rows is not None
+        snapshots.append((table_name, oid, retained_rows))
+    return snapshots
 
 
 @pytest.mark.parametrize("version", ["v1", "v2"])
