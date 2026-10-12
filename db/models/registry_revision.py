@@ -45,6 +45,10 @@ class RegistryRecordHistory(Base):
         ),
         CheckConstraint("btrim(reason) <> '' AND btrim(idempotency_key) <> ''", name="registry_history_reason"),
         CheckConstraint("request_sha256 ~ '^[0-9a-f]{64}$'", name="registry_history_digest"),
+        CheckConstraint(
+            "event_json IS NULL OR COALESCE(jsonb_typeof(event_json)='object' AND event_json ?& ARRAY['operation','before_revision','operation_context'] AND (event_json - ARRAY['operation','before_revision','operation_context'])='{}'::jsonb AND event_json->>'operation' IN ('create','correct','archive','restore','company_links_batch','catalog_seed','bind','rebind','close','preserve_materialized') AND jsonb_typeof(event_json->'operation_context')='object' AND octet_length(event_json::text)<=16384 AND ((event_json->>'operation'='preserve_materialized' AND event_json->'before_revision'='null'::jsonb) OR (jsonb_typeof(event_json->'before_revision')='number' AND event_json->>'before_revision' ~ '^(0|[1-9][0-9]*)$' AND (event_json->>'before_revision')::numeric=revision-1)),false)",
+            name="registry_history_event",
+        ),
         Index("registry_history_custom_revision_idx", "custom_revision"),
         UniqueConstraint("record_kind", "record_key", "idempotency_key", name="registry_history_replay"),
         {"schema": _SCHEMA},
@@ -60,3 +64,4 @@ class RegistryRecordHistory(Base):
     idempotency_key = Column(String(128), nullable=False)
     request_sha256 = Column(String(64), nullable=False)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    event_json = Column(JSONB, nullable=True)

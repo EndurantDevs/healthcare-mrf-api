@@ -7,7 +7,8 @@ import hashlib
 import json
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -16,8 +17,10 @@ import pytest
 
 from process import registry_source_admission as admission
 from process import registry_source_admission_receipt as witness
+from process import registry_source_import as source_import
 from process import registry_source_observation_store as observations
 from process.registry_source_import import _COUNTERS, _IDENTITY_COUNTERS, _NATIVE_COUNTERS
+from tests.registry_source_fixtures import _arguments
 
 _HEADER = "b" * 64
 
@@ -92,6 +95,61 @@ def _connection(document=None):
         fetchrow=AsyncMock(side_effect=[asdict(_edition()), _row(document or _document())]),
         execute=AsyncMock(),
     )
+
+
+@pytest.mark.parametrize("retrieved_at", [None, datetime(2024, 9, 12, 8, 30, 45, 123456, timezone(timedelta(hours=2)))])
+def test_cli_retains_exact_known_fetch_time_and_preserves_unknown_callers(retrieved_at):
+    edition = replace(_edition(), retrieved_at=retrieved_at)
+    arguments = _arguments(Path("synthetic.csv"), edition)
+    parsed = source_import._parser().parse_args(arguments)
+    assert source_import._edition(parsed).retrieved_at == retrieved_at
+    assert ("--retrieved-at" in arguments) is (retrieved_at is not None)
+
+
+@pytest.mark.parametrize("retrieved_at", [datetime(2024, 9, 12), "2024-09-12", True])
+def test_fetch_time_requires_a_timezone_aware_datetime(retrieved_at):
+    with pytest.raises(admission.RegistrySourceAdmissionError, match="retrieval date"):
+        replace(_edition(), retrieved_at=retrieved_at)
+
+
+@pytest.mark.parametrize("source_id", ["commercial-mlr", "company-listings"])
+def test_source_namespace_and_supported_naic_edition_are_required(source_id):
+    with pytest.raises(admission.RegistrySourceAdmissionError):
+        replace(
+            _edition(),
+            source_system="naic",
+            source_id=source_id,
+            reporting_year=2025,
+            parser_version="naic-company-listings-byte-projection-v1",
+        )
+
+
+@pytest.mark.parametrize("retrieved_at", ["2024-09-12T08:30:00", "not-a-timestamp"])
+def test_cli_rejects_unzoned_or_invalid_fetch_time_before_input(retrieved_at):
+    arguments = _arguments(Path("missing.csv"), _edition()) + ["--retrieved-at", retrieved_at]
+    with pytest.raises(SystemExit) as caught:
+        source_import._parser().parse_args(arguments)
+    assert caught.value.code == 2
+
+
+@pytest.mark.asyncio
+async def test_refetch_time_preserves_original_identity_and_completed_receipt(monkeypatch):
+    first = replace(_edition(), retrieved_at=datetime(2024, 9, 12, tzinfo=timezone.utc))
+    refetched = replace(first, retrieved_at=first.retrieved_at + timedelta(days=1))
+    identity_connection = _connection()
+    identity_connection.fetchrow = AsyncMock(return_value=asdict(first))
+    original = await admission.read_registry_source_edition_identity(identity_connection, refetched)
+    assert original.retrieved_at == first.retrieved_at
+    document = _document(first)
+    connection = _connection(document)
+    connection.fetchrow.side_effect = [asdict(first), _row(document)]
+    monkeypatch.setattr(witness, "_custody", AsyncMock(return_value=document["custody"]))
+    monkeypatch.setattr(
+        observations, "registry_source_content_fingerprints", AsyncMock(return_value=document["content"])
+    )
+    observed = await admission.read_registry_source_admission_receipt(connection, refetched, header_sha256=_HEADER)
+    assert observed == document["receipt"]
+    assert "retrieved_at" not in document["edition"]
 
 
 def _path_connection(original_search_path):
@@ -593,3 +651,86 @@ def test_additive_seal_schema_matches_protected_model_and_requires_explicit_rete
         migration._ddl('invalid"schema')
     with pytest.raises(RuntimeError, match="retained-data"):
         migration.downgrade()
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "missing_members", "members_hash", "batches", "replay_type", "counter_type", "counter_shape"]
+)
+def test_naic_receipt_binds_all_members_and_complete_accounting(tmp_path, fault):
+    from tests.registry_naic_fixtures import prepared_listings
+
+    prepared = prepared_listings(tmp_path)
+    receipt_by_field = _receipt() | {
+        "observations": 3,
+        "accepted": 3,
+        "copy_batches": 3,
+        "source_members": prepared.manifest(),
+    }
+    receipt_by_field["native_counts"].update(input_rows=3, accepted_rows=3)
+    receipt_by_field["identity_materialization"]["source_rows"] = 3
+    if fault == "missing_members":
+        receipt_by_field.pop("source_members")
+    if fault == "members_hash":
+        receipt_by_field["source_members"][0]["member_sha256"] = "f" * 64
+    if fault == "batches":
+        receipt_by_field["copy_batches"] = 2
+    if fault == "replay_type":
+        receipt_by_field["identity_materialization"]["replayed"] = 1
+    if fault == "counter_type":
+        receipt_by_field["native_counts"]["input_rows"] = True
+    if fault == "counter_shape":
+        receipt_by_field["native_counts"] = []
+    if fault:
+        with pytest.raises(admission.RegistrySourceAdmissionError):
+            witness._admission_receipt(receipt_by_field, prepared.edition)
+    else:
+        assert witness._admission_receipt(receipt_by_field, prepared.edition) == receipt_by_field
+
+
+@pytest.mark.asyncio
+async def test_custody_decodes_exact_catalog_json_metadata():
+    expected = _document()["custody"]
+    encoded = expected | {name: json.dumps(expected[name]) for name in ("table_oids", "table_layouts")}
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(side_effect=[["pg_catalog", "public"], True]),
+        fetchrow=AsyncMock(return_value=encoded | {"closed": True}),
+    )
+    assert await witness._custody(connection, "synthetic") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["migration", "invalid_previous", "custody_drift", "exact_replay", "invalid_scope"])
+async def test_sealing_refuses_missing_or_changed_custody_without_overwriting(monkeypatch, fault):
+    document = _document()
+    connection = _connection()
+    connection.fetchrow.side_effect = None
+    connection.fetchrow.return_value = _row(document)
+    custody_by_field = copy.deepcopy(document["custody"])
+    content = AsyncMock(return_value=document["content"])
+    if fault == "migration":
+        connection.fetchval.return_value = None
+    if fault == "invalid_previous":
+        connection.fetchrow.return_value["manifest_sha256"] = "0" * 64
+    if fault == "custody_drift":
+        custody_by_field["database_oid"] += 1
+    if fault == "invalid_scope":
+        connection.fetchrow.return_value = None
+        custody_by_field["database_oid"] = True
+    monkeypatch.setattr(witness, "_custody", AsyncMock(return_value=custody_by_field))
+    monkeypatch.setattr(observations, "registry_source_content_fingerprints", content)
+    if fault == "invalid_scope":
+        with pytest.raises(admission.RegistrySourceAdmissionError, match="scope is invalid"):
+            await witness.seal_registry_source_admission(
+                connection, '"synthetic"', "synthetic", _edition(), _HEADER, _receipt()
+            )
+    else:
+        await witness.seal_registry_source_admission(
+            connection, '"synthetic"', "synthetic", _edition(), _HEADER, _receipt()
+        )
+    connection.execute.assert_not_awaited()
+    assert content.await_count == int(fault != "migration")
+
+
+def test_admission_witness_bound_refuses_before_hashing():
+    with pytest.raises(admission.RegistrySourceAdmissionError, match="exceeds its bound"):
+        witness._canonical({"oversized": "x" * witness._MAX_DOCUMENT_BYTES})

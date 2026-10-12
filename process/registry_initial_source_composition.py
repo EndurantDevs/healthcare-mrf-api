@@ -199,7 +199,7 @@ async def _pin_offices(connection, recipe, batch, address_source, runtime_roles,
             batch,
             address_source,
             runtime_roles=runtime_roles,
-            after_evidence_checksum=cursor,
+            after_source_position=cursor,
             control_schema=control_schema,
         )
     return await pin_cms_office_address_source(
@@ -230,7 +230,7 @@ async def _copy_offices(connection, recipe, batch, copy_target, pin, runtime_rol
             copy_target,
             pin,
             runtime_roles=runtime_roles,
-            after_evidence_checksum=cursor,
+            after_source_position=cursor,
             control_schema=control_schema,
         )
     return await copy_initial_cms_office_bindings(

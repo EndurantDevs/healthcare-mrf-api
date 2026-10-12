@@ -33,6 +33,7 @@ from process.registry_management_permissions import (
     retire_registry_read_views,
     verify_registry_management_permissions,
 )
+from process.registry_provider_batch import apply_registry_provider_batch
 from process.registry_ptg_producer_scope import (
     RegistryPTGProducerScopeError,
     RegistryPTGProducerScopeStore,
@@ -251,6 +252,45 @@ async def test_api_cannot_modify_protected_objects_or_immutable_columns(permissi
         await connection.execute("RESET ROLE")
 
 
+async def test_api_membership_retains_binding_with_insert_only_privileges(permissions_db):
+    fixture, actor = permissions_db, _actor()
+    await _install(fixture)
+    network = await _draft(fixture, create_record("network"), actor)
+    provider = await _draft(fixture, create_provider(), actor)
+    location = await _draft(fixture, create_location(), actor)
+    membership_by_field = {
+        "network_id": network["record_id"],
+        "provider_system": "manual",
+        "provider_id": provider["record_id"],
+        "location_id": location["record_id"],
+        "evidence_id": "example-review",
+    }
+    command = RegistryRecordCommand(
+        "membership",
+        network["record_id"],
+        "create",
+        0,
+        {"memberships_json": [membership_by_field]},
+        "Explicit office choice",
+        uuid4().hex,
+    )
+    retained = await _draft(fixture, command, actor)
+    assert retained["record"]["memberships_json"] == [membership_by_field]
+    binding = await fixture.connection.fetchrow(f'SELECT * FROM "{fixture.schema}".manual_provider_location_binding')
+    assert (binding["provider_id"], str(binding["location_id"])) == (provider["record_id"], location["record_id"])
+    assert await _draft(fixture, command, actor) == retained
+    await fixture.connection.execute(f'SET ROLE "{fixture.roles_by_kind["api"]}"')
+    try:
+        for assignment in ("archived=true", "revision=revision+1", "location_key=location_key"):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await fixture.connection.execute(
+                    f'UPDATE "{fixture.schema}".manual_provider_location_binding SET {assignment}'
+                )
+    finally:
+        await fixture.connection.execute("RESET ROLE")
+    assert await verify_registry_management_permissions(fixture.connection, **_arguments(fixture))
+
+
 async def test_api_role_can_save_and_replay_one_atomic_company_link_batch(permissions_db):
     fixture, actor = permissions_db, _actor()
     await _install(fixture)
@@ -298,6 +338,75 @@ async def test_api_role_can_save_and_replay_one_atomic_company_link_batch(permis
             async with connection.transaction():
                 await connection.execute(f'SET LOCAL ROLE "{fixture.roles_by_kind["api"]}"')
                 await connection.execute(statement)
+    assert await verify_registry_management_permissions(connection, **_arguments(fixture))
+
+
+async def _provider_batch(fixture, commands, references, actor):
+    return await apply_registry_provider_batch(
+        fixture.connection, commands, references, actor, control_schema=fixture.schema, source_schema=fixture.schema
+    )
+
+
+async def _provider_batch_state(connection, namespace):
+    return (
+        await connection.fetch(f"SELECT * FROM {namespace}.manual_provider_registry ORDER BY provider_id"),
+        await connection.fetch(f"SELECT * FROM {namespace}.registry_record_history ORDER BY record_key,revision"),
+        await connection.fetchrow(f"SELECT * FROM {namespace}.registry_revision_control WHERE id=1"),
+        await connection.fetch(f"SELECT * FROM {namespace}.registry_approved_record"),
+    )
+
+
+async def test_api_provider_batch_preserves_atomic_history(permissions_db):
+    fixture, actor = permissions_db, _actor()
+    await _install(fixture)
+    known = await _draft(fixture, create_provider(), actor)
+    connection, namespace = fixture.connection, f'"{fixture.schema}"'
+    await connection.execute(f"INSERT INTO {namespace}.npi VALUES(1000000004)")
+    assert await connection.fetchval(
+        "SELECT has_table_privilege($1,$2,'SELECT') AND NOT has_table_privilege($1,$2,'UPDATE')",
+        fixture.roles_by_kind["api"],
+        f"{namespace}.npi",
+    )
+    commands = [create_provider(), create_provider()]
+    references = [
+        {"provider_system": "manual", "provider_id": known["record_id"]},
+        {"provider_system": "npi", "provider_id": "1000000004"},
+    ]
+    correction = replace(
+        commands[0],
+        operation="correct",
+        expected_revision=1,
+        idempotency_key=uuid4().hex,
+        fields={**commands[0].fields, "display_name": "Corrected Provider"},
+    )
+    async with connection.transaction():
+        await connection.execute(f'SET LOCAL ROLE "{fixture.roles_by_kind["api"]}"')
+        assert await connection.fetchval("SELECT current_user") == fixture.roles_by_kind["api"]
+        receipt = await _provider_batch(fixture, commands, references, actor)
+        assert receipt["references"] == references
+        assert [entry["record_id"] for entry in receipt["records"]] == [str(command.record_id) for command in commands]
+        assert all(entry["revision"] == 1 and entry["custom_revision"] == 2 for entry in receipt["records"])
+        before = await _provider_batch_state(connection, namespace)
+        assert await _provider_batch(fixture, commands, references, actor) == receipt
+        assert await _provider_batch_state(connection, namespace) == before
+        corrected = await _provider_batch(fixture, [correction], references, actor)
+        assert corrected["records"][0]["record"]["display_name"] == "Corrected Provider"
+        assert corrected["records"][0]["revision"] == 2 and corrected["records"][0]["custom_revision"] == 3
+        before = await _provider_batch_state(connection, namespace)
+        assert await _provider_batch(fixture, commands, references, actor) == receipt
+        assert await _provider_batch(fixture, [correction], references, actor) == corrected
+        stale = replace(correction, idempotency_key=uuid4().hex)
+        with pytest.raises(RegistryRecordConflict, match="registry_record_revision_conflict"):
+            await _provider_batch(fixture, [create_provider(), stale], references, actor)
+        for statement in (
+            f"UPDATE {namespace}.registry_record_history SET reason=reason",
+            f"UPDATE {namespace}.registry_revision_control SET approved_revision=approved_revision",
+        ):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                async with connection.transaction():
+                    await connection.execute(statement)
+        assert await _provider_batch_state(connection, namespace) == before
+        assert await connection.fetchval(f"SELECT approved_revision FROM {namespace}.registry_revision_control") == 0
     assert await verify_registry_management_permissions(connection, **_arguments(fixture))
 
 

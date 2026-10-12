@@ -22,7 +22,7 @@ from process.network_fhir_source_custody import (
     require_retained_cms_fhir_source_custody,
 )
 from process.network_fhir_source_epoch import FHIRSourceEpochError, require_retained_cms_fhir_source_epoch
-from process.network_legacy_membership_source import LegacyMembershipBatchBoundsError, read_aca_membership_batch
+from process.network_legacy_membership_source import LegacyMembershipBatchBoundsError, read_aca_raw_fact_batch
 from process.network_membership_copy import COPY_COLUMNS, _encode
 from process.registry_ptg_office_membership import (
     PTGOfficeBatchBoundsError,
@@ -44,6 +44,9 @@ class RegistrySourceRecipeStage:
     omitted_rows: int
     generation_sha256: str
     source_generations: tuple[str, ...] = ()
+    raw_source_rows: int = 0
+    accepted_raw_source_rows: int = 0
+    omitted_raw_source_rows: int = 0
 
 
 async def _read_recipe_page(connection, recipe, approved, cursor, control_schema, limit, office_source=None):
@@ -65,10 +68,14 @@ async def _read_recipe_page(connection, recipe, approved, cursor, control_schema
                     connection, recipe.source_pin, after_resource=cursor, limit=limit, **options_by_name
                 )
                 return batch, batch.next_resource, limit
-            batch = await read_aca_membership_batch(
-                connection, recipe.source_pin, after_evidence_checksum=cursor, limit=limit, **options_by_name
+            batch = await read_aca_raw_fact_batch(
+                connection,
+                recipe.source_pin,
+                after_source_position=cursor,
+                limit=limit,
+                **options_by_name,
             )
-            return batch, batch.next_evidence_checksum, limit
+            return batch, batch.next_source_position, limit
         except FHIRMembershipBatchBoundsError, LegacyMembershipBatchBoundsError, PTGOfficeBatchBoundsError:
             if limit == 1:
                 raise
@@ -95,6 +102,7 @@ async def _stage_recipe(connection, recipe, approved, raw_table, control_schema,
     cursor, generation = None, None
     limit = 1000
     membership_rows = omitted_rows = 0
+    raw_source_rows = accepted_raw_source_rows = omitted_raw_source_rows = 0
     while True:
         batch, next_cursor, limit = await _read_recipe_page(
             connection, recipe, approved, cursor, control_schema, limit, office_source
@@ -105,10 +113,23 @@ async def _stage_recipe(connection, recipe, approved, raw_table, control_schema,
         await _copy_recipe_page(connection, batch, raw_table)
         membership_rows += batch.membership_rows
         omitted_rows += batch.omitted_rows
+        if getattr(batch, "complete_raw_facts", False):
+            raw_source_rows += batch.source_rows
+            accepted_raw_source_rows += batch.accepted_source_rows
+            omitted_raw_source_rows += batch.omitted_source_rows
+            if raw_source_rows != accepted_raw_source_rows + omitted_raw_source_rows:
+                raise RegistrySourceCompositionError("registry_source_composition_accounting_invalid")
         if not batch.source_rows:
             if batch.membership_rows or batch.omitted_rows:
                 raise RegistrySourceCompositionError("registry_source_composition_accounting_invalid")
-            return generation, membership_rows, omitted_rows
+            return (
+                generation,
+                membership_rows,
+                omitted_rows,
+                raw_source_rows,
+                accepted_raw_source_rows,
+                omitted_raw_source_rows,
+            )
         if next_cursor is None or next_cursor == cursor:
             raise RegistrySourceCompositionError("registry_source_composition_cursor_invalid")
         cursor = next_cursor
@@ -167,29 +188,55 @@ async def stage_registry_source_recipes(
     page_table = "registry_source_page_" + stage_id
     generations = []
     membership_rows = omitted_rows = 0
+    raw_source_rows = accepted_raw_source_rows = omitted_raw_source_rows = 0
     async with connection.transaction():
         await connection.execute(f"""CREATE TEMP TABLE {_identifier(raw_table)}(
           network_id integer NOT NULL,provider_system text NOT NULL,provider_id text NOT NULL,
           location_id uuid NOT NULL,evidence_id text NOT NULL)""")
         for recipe in recipes:
-            generation, row_count, omitted_count = await _stage_recipe(
-                connection, recipe, approved, raw_table, control_schema, office_authority
-            )
+            (
+                generation,
+                row_count,
+                omitted_count,
+                source_count,
+                accepted_count,
+                omitted_source_count,
+            ) = await _stage_recipe(connection, recipe, approved, raw_table, control_schema, office_authority)
             generations.append(generation)
             membership_rows += row_count
             omitted_rows += omitted_count
-        if await connection.fetchval(f"SELECT count(*) FROM pg_temp.{_identifier(raw_table)}") != membership_rows:
-            raise RegistrySourceCompositionError("registry_source_composition_accounting_invalid")
-        await connection.execute(f"""CREATE TEMP TABLE {_identifier(page_table)} AS
-          SELECT row_number() OVER(ORDER BY network_id,provider_system COLLATE "C",provider_id COLLATE "C",
-            location_id,evidence_id) AS ordinal,to_jsonb(member)::text AS input_json
-          FROM pg_temp.{_identifier(raw_table)} member""")
-        await connection.execute(f"ALTER TABLE pg_temp.{_identifier(page_table)} ADD PRIMARY KEY(ordinal)")
-        await connection.execute(f"DROP TABLE pg_temp.{_identifier(raw_table)}")
-    generation_sha256 = hashlib.sha256(
+            raw_source_rows += source_count
+            accepted_raw_source_rows += accepted_count
+            omitted_raw_source_rows += omitted_source_count
+        await _finish_source_stage(connection, raw_table, page_table, membership_rows)
+    generation_sha256 = _source_stage_generation(recipe_sha256, approved, generations, membership_rows, omitted_rows)
+    return RegistrySourceRecipeStage(
+        page_table,
+        membership_rows,
+        omitted_rows,
+        generation_sha256,
+        tuple(generations),
+        raw_source_rows,
+        accepted_raw_source_rows,
+        omitted_raw_source_rows,
+    )
+
+
+async def _finish_source_stage(connection, raw_table, page_table, membership_rows):
+    if await connection.fetchval(f"SELECT count(*) FROM pg_temp.{_identifier(raw_table)}") != membership_rows:
+        raise RegistrySourceCompositionError("registry_source_composition_accounting_invalid")
+    await connection.execute(f"""CREATE TEMP TABLE {_identifier(page_table)} AS
+      SELECT row_number() OVER(ORDER BY network_id,provider_system COLLATE "C",provider_id COLLATE "C",
+        location_id,evidence_id) AS ordinal,to_jsonb(member)::text AS input_json
+      FROM pg_temp.{_identifier(raw_table)} member""")
+    await connection.execute(f"ALTER TABLE pg_temp.{_identifier(page_table)} ADD PRIMARY KEY(ordinal)")
+    await connection.execute(f"DROP TABLE pg_temp.{_identifier(raw_table)}")
+
+
+def _source_stage_generation(recipe_sha256, approved, generations, membership_rows, omitted_rows):
+    return hashlib.sha256(
         json.dumps(
             [recipe_sha256, approved.generation_id, sorted(generations), membership_rows, omitted_rows],
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
-    return RegistrySourceRecipeStage(page_table, membership_rows, omitted_rows, generation_sha256, tuple(generations))

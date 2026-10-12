@@ -37,6 +37,7 @@ from process.registry_record_store import (
     get_registry_record,
     list_registry_records,
     search_registry_companies,
+    search_registry_groups,
 )
 from process.registry_source_site_catalog import (
     RegistrySourceSiteCatalogUnavailable,
@@ -96,15 +97,27 @@ def _path_identity(kind, value):
     return _identity(kind, value)
 
 
-def _list_query(request):
+def _list_query(request, *, allowed=None):
     query_by_name = parse_qs(request.query_string, keep_blank_values=True, strict_parsing=True)
     if (
         request.body
-        or set(query_by_name) - {"limit", "offset", "record_ids"}
+        or set(query_by_name) - ({"limit", "offset", "record_ids"} if allowed is None else allowed)
         or any(len(values) != 1 for values in query_by_name.values())
     ):
         raise ValueError("registry_page_invalid")
     return {key: values[0] for key, values in query_by_name.items()}
+
+
+def _custom_revision(query_by_name, kind):
+    if "custom_revision" not in query_by_name:
+        return None
+    value = query_by_name["custom_revision"]
+    if kind != "membership" or not value.isascii() or not value.isdecimal() or len(value) > 19:
+        raise ValueError("registry_custom_revision_invalid")
+    revision = int(value)
+    if str(revision) != value or revision > 9223372036854775807:
+        raise ValueError("registry_custom_revision_invalid")
+    return revision
 
 
 def _record_selectors(query_by_name, kind):
@@ -272,12 +285,36 @@ async def search_companies(request):
         return _error(503)
 
 
+@blueprint.post("/group/search")
+async def search_groups(request):
+    """Search within the trusted app's complete group authorization selector."""
+    require_control_auth(request)
+    try:
+        document = _body(request, maximum=262144)
+        if set(document) != {"q", "limit", "offset", "record_ids"}:
+            raise ValueError("registry_group_search_invalid")
+        async with request.ctx.sa_session.begin():
+            records = await search_registry_groups(
+                request.ctx.sa_session,
+                document["q"],
+                limit=document["limit"],
+                offset=document["offset"],
+                record_ids=document["record_ids"],
+            )
+        return response.json({"records": records}, headers=_HEADERS)
+    except ValueError, TypeError:
+        return _error(400)
+    except SQLAlchemyError, RegistryAddressUnavailable:
+        return _error(503)
+
+
 @blueprint.get("/<kind>")
 async def list_records(request, kind):
     """Return a bounded draft page to the trusted authorization layer."""
     require_control_auth(request)
     try:
-        query_by_name = _list_query(request)
+        query_by_name = _list_query(request, allowed={"limit", "offset", "record_ids", "custom_revision"})
+        custom_revision = _custom_revision(query_by_name, kind)
         async with request.ctx.sa_session.begin():
             records = await list_registry_records(
                 request.ctx.sa_session,
@@ -285,6 +322,7 @@ async def list_records(request, kind):
                 limit=int(query_by_name.get("limit", "50")),
                 offset=int(query_by_name.get("offset", "0")),
                 record_ids=_record_selectors(query_by_name, kind),
+                custom_revision=custom_revision,
             )
         return response.json({"records": records}, headers=_HEADERS)
     except ValueError:
@@ -298,11 +336,11 @@ async def read_record(request, kind, record_id):
     """Management reads may show pending corrections; directory reads may not."""
     require_control_auth(request)
     try:
-        if request.args:
-            raise ValueError("registry_detail_invalid")
+        query_by_name = _list_query(request, allowed={"custom_revision"})
+        custom_revision = _custom_revision(query_by_name, kind)
         identity = _path_identity(kind, record_id)
         async with request.ctx.sa_session.begin():
-            record = await get_registry_record(request.ctx.sa_session, kind, identity)
+            record = await get_registry_record(request.ctx.sa_session, kind, identity, custom_revision=custom_revision)
         return _error(404) if record is None else response.json({"record": record}, headers=_HEADERS)
     except ValueError:
         return _error(400)
@@ -374,7 +412,9 @@ async def undo_record(request, kind, record_id):
         async with request.ctx.sa_session.begin():
             await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
             prepared = await prepare_registry_manual_undo(request.ctx.sa_session, command, actor)
-            receipt = await apply_registry_record_command(request.ctx.sa_session, prepared.command, actor)
+            receipt = await apply_registry_record_command(
+                request.ctx.sa_session, prepared.command, actor, undo_provenance=prepared.provenance
+            )
         provenance = prepared.provenance
         return response.json(
             {
@@ -423,7 +463,12 @@ async def read_company_link_group_snapshot(request):
     require_control_auth(request)
     try:
         document = _body(request, maximum=256 * 1024)
-        if set(document) != {"group_id", "company_ids", "limit", "offset"}:
+        if set(document) not in (
+            {"group_id", "company_ids", "limit", "offset"},
+            {"group_id", "company_ids", "limit", "offset", "effective_on"},
+        ):
+            raise ValueError("registry_company_link_group_request_invalid")
+        if "effective_on" in document and type(document["effective_on"]) is not str:
             raise ValueError("registry_company_link_group_request_invalid")
         companies = document["company_ids"]
         if companies is not None and (type(companies) is not list or len(companies) > 5000):
@@ -438,6 +483,7 @@ async def read_company_link_group_snapshot(request):
                 company_ids=companies,
                 limit=document["limit"],
                 offset=document["offset"],
+                effective_on=document.get("effective_on"),
             )
         if group_links is None:
             return _error(404)

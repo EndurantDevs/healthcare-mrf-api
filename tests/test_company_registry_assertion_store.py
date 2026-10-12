@@ -3,7 +3,9 @@
 
 import asyncio
 import copy
+import hashlib
 import importlib.util
+import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -107,7 +109,7 @@ class Session:
             matching_rows = [row for row in self.history if row["idempotency_key"] == params["idempotency_key_1"]]
             return Result(matching_rows)
         name = table.name
-        if name == "company_registry":
+        if name in {"company_registry", "company_group_registry"}:
             self.events.append("head")
             if self.head is not None and self.head["revision"] != params.get("revision_1", 0):
                 return Result([])
@@ -127,6 +129,7 @@ class Session:
         target_history = next(entry for entry in self.history if entry["revision"] == params["revision_1"])
         expected_history = next(entry for entry in self.history if entry["revision"] == params["revision_2"])
         snapshot = expected_history["record_json"]
+        identity_column = store._RECORD_MODELS[expected_history["record_kind"]][1]
         predecessor = snapshot.get("correction_predecessors", {}).get("company_revision")
         return Result(
             [
@@ -142,7 +145,7 @@ class Session:
                     "same_actor": target_history["actor_json"] == expected_history["actor_json"],
                     "target_reason": target_history["reason"],
                     "target_idempotency_key": target_history["idempotency_key"],
-                    "expected_identity": snapshot["company_id"],
+                    "expected_identity": snapshot[identity_column],
                     "expected_identity_type": "string",
                     "expected_record_revision": str(snapshot["revision"]),
                     "expected_revision_type": "number",
@@ -161,10 +164,13 @@ class Session:
         ) | params
         self.head.pop("revision_1", None)
         self.head.pop("company_id_1", None)
+        self.head.pop("group_id_1", None)
 
 
-async def _apply(session, command):
-    return await store.apply_registry_record_command(session, command, ACTOR, schema="example_registry")
+async def _apply(session, command, *, undo_provenance=None):
+    return await store.apply_registry_record_command(
+        session, command, ACTOR, schema="example_registry", undo_provenance=undo_provenance
+    )
 
 
 @pytest.mark.asyncio
@@ -386,10 +392,10 @@ async def test_manual_undo_restores_target_assertion_families_and_evidence(legac
         session.valid = False
         before = copy.deepcopy((session.head, session.history, session.assertions))
         with pytest.raises(store.RegistryRecordConflict, match="assertion_target_conflict"):
-            await _apply(session, preparation.command)
+            await _apply(session, preparation.command, undo_provenance=preparation.provenance)
         assert (session.head, session.history, session.assertions) == before
         session.valid = True
-    restored = await _apply(session, preparation.command)
+    restored = await _apply(session, preparation.command, undo_provenance=preparation.provenance)
     for key in ("display_name", "roles", "aliases", "role_assertions", "identifier_assertions"):
         assert restored["record"][key] == first["record"][key]
     assert session.history[0]["record_json"] == first["record"]
@@ -742,7 +748,7 @@ async def _verify_materialized_undo_replay(session, snapshot):
     retained = copy.deepcopy(session.history)
     command = RegistryManualUndoCommand("company", UUID(COMPANY), 2, 1, "Restore materialized values", "first-undo")
     preparation = await undo.prepare_registry_manual_undo(session, command, ACTOR, schema="example_registry")
-    restored = await _apply(session, preparation.command)
+    restored = await _apply(session, preparation.command, undo_provenance=preparation.provenance)
     assert restored["revision"] == 3
     for field in ("display_name", "roles", "aliases", "role_assertions", "identifier_assertions", "group_assertions"):
         assert restored["record"][field] == snapshot[field]
@@ -751,7 +757,7 @@ async def _verify_materialized_undo_replay(session, snapshot):
     assert session.history[2]["reason"] == preparation.command.reason
     replay = await undo.prepare_registry_manual_undo(session, command, ACTOR, schema="example_registry")
     assert replay.command == preparation.command
-    assert await _apply(session, replay.command) == restored
+    assert await _apply(session, replay.command, undo_provenance=replay.provenance) == restored
     assert session.history[:2] == retained and len(session.history) == 3
 
 
@@ -899,3 +905,133 @@ async def test_history_and_preview_project_metadata_without_changing_retained_ev
 
     command = approval.RegistryApprovalCommand(1, 0, (), "Reviewed selection", "preview-key")
     assert await preview._preview_document(PreviewReader(), '"example_registry"', '"selection"', command) == "{}"
+
+
+def _materialized_group(monkeypatch, failure=None):
+    class GroupSession(Session):
+        async def execute(self, statement, rows=None):
+            if getattr(getattr(statement, "table", None), "name", None) == "registry_record_history":
+                params = statement.compile(dialect=postgresql.dialect()).params
+                if failure == "history" and params["revision"] == 2:
+                    assert self.history[0]["revision"] == 1
+                    raise RuntimeError("synthetic-group-history-failure")
+            return await super().execute(statement, rows)
+
+    session = GroupSession()
+    snapshot_by_field = {
+        "group_id": str(UUID(COMPANY)),
+        "group_kind": "naic_group",
+        "display_name": "Source Group",
+        "aliases": ["Source Alias"],
+        "revision": 1,
+        "archived": False,
+        "created_at": "2025-01-01T00:00:00+00:00",
+    }
+    session.head = copy.deepcopy(snapshot_by_field)
+    if failure == "cas":
+        session.head["revision"] = 2
+
+    async def materialized_read(_session, kind, identity, **_kwargs):
+        assert kind == "group" and identity == UUID(COMPANY)
+        return copy.deepcopy(snapshot_by_field)
+
+    monkeypatch.setattr(store, "get_registry_record", materialized_read)
+    command = store.RegistryRecordCommand(
+        "group",
+        UUID(COMPANY),
+        "correct",
+        1,
+        {"group_kind": "naic_group", "display_name": "Corrected Group", "aliases": ["Corrected"]},
+        "Reviewed group correction",
+        "materialized-group",
+    )
+    return session, snapshot_by_field, command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "cas", "history"])
+async def test_materialized_group_first_correction_undo_and_replay_are_atomic(monkeypatch, failure):
+    session, snapshot, correction = _materialized_group(monkeypatch, failure)
+    before = copy.deepcopy((session.head, session.history, session.assertions, session.draft))
+    if failure is not None:
+        with pytest.raises((store.RegistryRecordConflict, RuntimeError)):
+            await _apply(session, correction)
+        assert (session.head, session.history, session.assertions, session.draft) == before
+        return
+    corrected = await _apply(session, correction)
+    baseline, retained_correction = copy.deepcopy(session.history)
+    assert baseline["record_json"] == snapshot
+    assert baseline["reason"] == "Preserved materialized group before manual correction"
+    assert baseline["actor_json"] == retained_correction["actor_json"]
+    assert baseline["custom_revision"] == retained_correction["custom_revision"] == 1
+    assert "correction_predecessors" not in retained_correction["record_json"]
+    assert corrected["record"] == retained_correction["record_json"]
+    assert await _apply(session, correction) == corrected and len(session.history) == 2
+    undo_command = RegistryManualUndoCommand("group", UUID(COMPANY), 2, 1, "Restore source group", "group-undo")
+    prepared = await undo.prepare_registry_manual_undo(session, undo_command, ACTOR, schema="example_registry")
+    restored = await _apply(session, prepared.command, undo_provenance=prepared.provenance)
+    assert restored["revision"] == 3 and restored["custom_revision"] == 2
+    for field in ("group_kind", "display_name", "aliases", "created_at", "archived"):
+        assert restored["record"][field] == snapshot[field]
+    retained = copy.deepcopy(session.history)
+    assert retained[:2] == [baseline, retained_correction]
+    assert retained[2]["actor_json"] == baseline["actor_json"] and retained[2]["reason"] == prepared.command.reason
+    replay = await undo.prepare_registry_manual_undo(session, undo_command, ACTOR, schema="example_registry")
+    assert (
+        replay.command == prepared.command
+        and await _apply(session, replay.command, undo_provenance=replay.provenance) == restored
+    )
+    assert await _apply(session, correction) == corrected and session.history == retained
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("reason", "Unrelated history"),
+        ("idempotency_key", "unrelated"),
+        ("request_sha256", "a" * 64),
+        ("actor_json", {}),
+        ("group_id", str(UUID(int=999))),
+        ("revision", 2),
+    ],
+)
+async def test_materialized_group_undo_refuses_unbound_equal_revision_history(monkeypatch, field, value):
+    session, _snapshot, correction = _materialized_group(monkeypatch)
+    await _apply(session, correction)
+    target = session.history[0]
+    (target["record_json"] if field in {"group_id", "revision"} else target)[field] = value
+    before = copy.deepcopy((session.head, session.history, session.assertions, session.draft))
+    command = RegistryManualUndoCommand("group", UUID(COMPANY), 2, 1, "Restore source group", "denied-group-undo")
+    with pytest.raises(store.RegistryRecordConflict, match="undo_history_conflict"):
+        await undo.prepare_registry_manual_undo(session, command, ACTOR, schema="example_registry")
+    assert (session.head, session.history, session.assertions, session.draft) == before
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_internal_undo_marker_preserves_legacy_request_bytes(required):
+    command = store.RegistryRecordCommand(
+        "group",
+        UUID("11111111-1111-4111-8111-111111111111"),
+        "correct",
+        2,
+        {"display_name": "Reviewed group", "group_kind": "corporate_parent", "aliases": []},
+        "Reviewed correction",
+        "fixed-request",
+        _undo_provenance_required=required,
+    )
+    actor = store.RegistryActor("platform_admin", UUID("22222222-2222-4222-8222-222222222222"), "example-client")
+    store._validated_command(command)
+    request = store._command_request(command, store._validated_actor(actor))
+    assert "_undo_provenance_required" not in json.loads(request)["command"]
+    assert (
+        hashlib.sha256(request.encode()).hexdigest()
+        == "cdc6fd28a2e3487754e59a44d375f11e48470d9b8f462739d5ee0ba6c7d857dc"
+    )
+
+
+@pytest.mark.parametrize("marker,operation", [(None, "correct"), (0, "correct"), (1, "correct"), (True, "archive")])
+def test_invalid_internal_undo_marker_refuses_before_command_use(marker, operation):
+    command = replace(_edit(), operation=operation, _undo_provenance_required=marker)
+    with pytest.raises(ValueError, match="registry_manual_undo_marker_invalid"):
+        store._validated_command(command)

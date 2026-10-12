@@ -5,6 +5,8 @@ import asyncio
 import json
 from dataclasses import replace
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -19,7 +21,15 @@ from process.registry_approval_preview import preview_registry_approval
 from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_record_store import RegistryRecordCommand, RegistryRecordConflict, apply_registry_record_command
 from tests.test_network_serving_schema_postgres import serving_schema
-from tests.test_registry_approval_store_postgres import _actor, _approve, _approved, _command, _create, _draft
+from tests.test_registry_approval_store_postgres import (
+    _actor,
+    _approve,
+    _approved,
+    _command,
+    _CountedConnection,
+    _create,
+    _draft,
+)
 
 pytestmark = pytest.mark.asyncio
 _AUTH = {"Authorization": "Bearer synthetic-registry-service-token"}
@@ -686,3 +696,180 @@ async def test_control_http_group_snapshot_narrows_companies_and_rejects_invalid
     ):
         _, rejected = await app.asgi_client.post(path, json=invalid, headers=_AUTH)
         assert rejected.status == 400
+
+
+async def test_effective_group_links_use_explicit_half_open_periods_and_preserve_history(serving_schema):
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    company, group, networks = await _seed(engine, schema, actor)
+    networks += [await _draft(engine, schema, _create("network"), actor) for _ in range(3)]
+    assertions = [
+        _assertion(company, networks[0]),
+        _assertion(company, networks[1], valid_from=None, valid_to="2026-06-01"),
+        _assertion(company, networks[2], valid_from="2026-06-01", valid_to=None),
+        _assertion(company, networks[3], valid_from=None, valid_to=None, applicability="states", states=["NY"]),
+    ]
+    creation = replace(
+        _links(company, networks, group),
+        fields={
+            "network_ids": [network["record_id"] for network in networks],
+            "group_id": group["record_id"],
+            "network_assertions": assertions,
+        },
+    )
+    saved = await _draft(engine, schema, creation, actor)
+    before = await read_group_company_links(connection, UUID(group["record_id"]), control_schema=schema)
+    counted = _CountedConnection(connection)
+    for day, selected in (
+        ("2025-12-31", (1, 3)),
+        ("2026-01-01", (0, 1, 3)),
+        ("2026-06-01", (0, 2, 3)),
+        ("2027-01-01", (2, 3)),
+    ):
+        page = await read_group_company_links(
+            counted, UUID(group["record_id"]), effective_on=day, control_schema=schema
+        )
+        assert page["effective_on"] == day
+        actual = page["records"][0]["links"]
+        assert actual["network_ids"] == [networks[index]["record_id"] for index in selected]
+        expected_assertions = [
+            assertion
+            for assertion in saved["record"]["network_assertions"]
+            if assertion["network_id"] in actual["network_ids"]
+        ]
+        assert actual["network_assertions"] == expected_assertions
+    assert counted.statements == 4
+    assert before["records"][0]["links"]["network_ids"] == saved["record"]["network_ids"]
+    assert before["records"][0]["links"]["network_assertions"] == saved["record"]["network_assertions"]
+    assert "effective_on" not in before
+    assert await read_group_company_links(connection, UUID(group["record_id"]), control_schema=schema) == before
+    assert await connection.fetchval(f'SELECT approved_revision FROM "{schema}".registry_revision_control') == 0
+
+
+async def test_control_http_effective_group_snapshot_keeps_allowlist_before_page(company_links_app):
+    app, (connection, schema, engine) = company_links_app
+    actor = _actor()
+    first, group, networks = await _seed(engine, schema, actor)
+    second = await _draft(engine, schema, _create("company"), actor)
+    companies = sorted((first, second), key=lambda company: company["record_id"])
+    for company in companies:
+        await _draft(
+            engine,
+            schema,
+            replace(
+                _links(company, networks, group),
+                fields={
+                    "network_ids": [network["record_id"] for network in networks],
+                    "group_id": group["record_id"],
+                    "network_assertions": [_assertion(company, networks[0])],
+                },
+            ),
+            actor,
+        )
+    query_by_field = {
+        "group_id": group["record_id"],
+        "company_ids": [companies[1]["record_id"]],
+        "limit": 1,
+        "offset": 0,
+        "effective_on": "2026-01-01",
+    }
+    path = "/api/v1/registry/manage/company_links/group_snapshot"
+    _, denied = await app.asgi_client.post(path, json=query_by_field)
+    assert denied.status == 403
+    _, reply = await app.asgi_client.post(path, json=query_by_field, headers=_AUTH)
+    assert reply.status == 200
+    assert [entry["company"]["company_id"] for entry in reply.json["records"]] == [companies[1]["record_id"]]
+    assert reply.json["records"][0]["links"]["network_ids"] == [networks[0]["record_id"]]
+    _, expired = await app.asgi_client.post(path, json={**query_by_field, "effective_on": "2027-01-01"}, headers=_AUTH)
+    assert expired.status == 200 and expired.json["records"][0]["links"]["network_ids"] == []
+    assert expired.json["records"][0]["links"]["network_assertions"] == []
+    _, empty = await app.asgi_client.post(path, json={**query_by_field, "company_ids": []}, headers=_AUTH)
+    assert empty.status == 200 and empty.json["records"] == []
+    for invalid in (None, True, "20260101", "2026-W01-1", "2026-02-30", "2026-01-01T00:00:00"):
+        _, rejected = await app.asgi_client.post(path, json={**query_by_field, "effective_on": invalid}, headers=_AUTH)
+        assert rejected.status == 400
+
+
+@pytest.mark.parametrize(
+    "effective_on",
+    [
+        True,
+        20260101,
+        "",
+        "20260101",
+        "2026-W01-1",
+        "2026-02-30",
+        "2026-1-1",
+        " 2026-01-01",
+        "2026-01-01T00:00:00",
+        "0000-01-01",
+    ],
+)
+async def test_effective_group_date_rejects_noncanonical_values_before_sql(effective_on):
+    connection = SimpleNamespace(fetchrow=AsyncMock())
+    with pytest.raises(ValueError, match="effective_date_invalid"):
+        await read_group_company_links(connection, uuid4(), effective_on=effective_on)
+    connection.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.parametrize("archived_kind", ["group", "company_links"])
+async def test_effective_group_snapshot_excludes_archived_group_or_companion_head(serving_schema, archived_kind):
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    company, group, networks = await _seed(engine, schema, actor)
+    creation = replace(
+        _links(company, networks, group),
+        fields={
+            "network_ids": [network["record_id"] for network in networks],
+            "group_id": group["record_id"],
+            "network_assertions": [_assertion(company, networks[0])],
+        },
+    )
+    await _draft(engine, schema, creation, actor)
+    identity = UUID(group["record_id"] if archived_kind == "group" else company["record_id"])
+    await _draft(
+        engine,
+        schema,
+        RegistryRecordCommand(archived_kind, identity, "archive", 1, {}, "Explicit archive", uuid4().hex),
+        actor,
+    )
+    page = await read_group_company_links(
+        connection, UUID(group["record_id"]), effective_on="2026-06-01", control_schema=schema
+    )
+    assert page is None if archived_kind == "group" else page["records"] == []
+
+
+@pytest.mark.parametrize("archived_kind", ["company", "network"])
+async def test_effective_group_links_exclude_archived_targets_without_hiding_history(serving_schema, archived_kind):
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    company, group, networks = await _seed(engine, schema, actor)
+    creation = replace(
+        _links(company, networks, group),
+        fields={
+            "network_ids": [network["record_id"] for network in networks],
+            "group_id": group["record_id"],
+            "network_assertions": [_assertion(company, networks[0])],
+        },
+    )
+    await _draft(engine, schema, creation, actor)
+    history = await read_group_company_links(connection, UUID(group["record_id"]), control_schema=schema)
+    effective = await read_group_company_links(
+        connection, UUID(group["record_id"]), effective_on="2026-06-01", control_schema=schema
+    )
+    assert effective["records"][0]["links"]["network_ids"] == [networks[0]["record_id"]]
+    identity = UUID(company["record_id"]) if archived_kind == "company" else networks[0]["record_id"]
+    await _draft(
+        engine,
+        schema,
+        RegistryRecordCommand(archived_kind, identity, "archive", 1, {}, "Explicit archive", uuid4().hex),
+        actor,
+    )
+    after = await read_group_company_links(
+        connection, UUID(group["record_id"]), effective_on="2026-06-01", control_schema=schema
+    )
+    assert len(after["records"]) == 1
+    assert after["records"][0]["links"]["network_ids"] == []
+    assert after["records"][0]["links"]["network_assertions"] == []
+    default = await read_group_company_links(connection, UUID(group["record_id"]), control_schema=schema)
+    assert default["records"][0]["links"] == history["records"][0]["links"]

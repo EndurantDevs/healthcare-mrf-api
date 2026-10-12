@@ -163,3 +163,39 @@ async def test_route_accepts_large_scoped_body_and_returns_closed_records(monkey
     assert result.status == 200 and json.loads(result.body) == {"records": [{"company_id": str(UUID(int=1))}]}
     assert calls == [("Example", {key: value for key, value in document_by_field.items() if key != "q"})]
     assert result.headers["Cache-Control"] == "private, no-store"
+
+
+@pytest.mark.parametrize("scope", [None, [], [str(UUID(int=1))]])
+def test_group_search_uses_group_identity_and_scopes_before_paging(scope):
+    statement = store._registry_search_statement("group", " A%_\\é ", 2, 51, scope, "example_registry")
+    compiled = statement.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "company_group_registry" in sql and "group_id" in sql and "company_id" not in sql
+    assert sql.index("WHERE") < sql.index("ORDER BY") < sql.index("LIMIT") < sql.index("OFFSET")
+    assert sql.count("ILIKE") == 2 and "ESCAPE" in sql
+    if scope is not None:
+        assert [UUID(identity) for identity in scope] in compiled.params.values()
+
+
+@pytest.mark.asyncio
+async def test_group_search_route_keeps_closed_scoped_read(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-company-search")
+    calls = []
+
+    class Session:
+        @asynccontextmanager
+        async def begin(self):
+            yield
+
+    async def search(session, q, **parameters):
+        calls.append((q, parameters))
+        return [{"group_id": str(UUID(int=1))}]
+
+    monkeypatch.setattr(routes, "search_registry_groups", search)
+    document_by_field = {"q": "Example", "limit": 1, "offset": 51, "record_ids": [str(UUID(int=1))]}
+    request = _request(document_by_field)
+    request.ctx.sa_session = Session()
+    result = await routes.search_groups(request)
+    assert result.status == 200 and json.loads(result.body) == {"records": [{"group_id": str(UUID(int=1))}]}
+    assert calls == [("Example", {key: value for key, value in document_by_field.items() if key != "q"})]
+    assert (await routes.search_groups(_request(document_by_field | {"actor": "admin"}))).status == 400

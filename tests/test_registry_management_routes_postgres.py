@@ -3,7 +3,7 @@
 
 import copy
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from uuid import uuid4
 
 import pytest
@@ -28,6 +28,8 @@ from tests.test_company_registry_assertions_postgres import (
 from tests.test_company_registry_assertions_postgres import (
     assertion_db,
 )
+from tests.test_network_membership_draft_store_postgres import membership_db
+from tests.test_network_serving_schema_postgres import serving_schema
 from tests.test_registry_record_store_postgres import record_db
 
 _AUTH = {"Authorization": "Bearer synthetic-registry-service-token"}
@@ -42,6 +44,7 @@ async def registry_app(record_db, monkeypatch):
         "get_registry_record",
         "list_registry_records",
         "search_registry_companies",
+        "search_registry_groups",
         "verify_registry_targets",
         "prepare_registry_manual_undo",
         "read_registry_manual_history",
@@ -77,6 +80,17 @@ async def registry_app(record_db, monkeypatch):
         await request.ctx.sa_session.close()
 
     yield app, record_db
+
+
+@pytest.fixture
+async def membership_registry_app(membership_db, monkeypatch):
+    connection, schema, sessions, _, _ = membership_db
+    fixture = registry_app.__wrapped__((connection, schema, sessions), monkeypatch)
+    app, _ = await anext(fixture)
+    try:
+        yield app, membership_db
+    finally:
+        await fixture.aclose()
 
 
 def _network_create():
@@ -416,6 +430,7 @@ def _company_http_command(group_id):
     document_by_field = json.loads(json.dumps(asdict(command), default=str))
     del document_by_field["record_kind"]
     del document_by_field["allocation_key"]
+    del document_by_field["_undo_provenance_required"]
     document_by_field["actor"] = _network_create()["actor"]
     return document_by_field
 
@@ -482,6 +497,21 @@ async def _http_group_target(app):
     _, created = await app.asgi_client.post("/api/v1/registry/manage/group", headers=_AUTH, json=command_by_field)
     assert created.status == 200
     return command_by_field["record_id"]
+
+
+@pytest.mark.asyncio
+async def test_group_search_http_uses_native_fixture_schema_and_selector(registry_app):
+    app, _ = registry_app
+    group_id = await _http_group_target(app)
+    endpoint = "/api/v1/registry/manage/group/search"
+    body_by_field = {"q": "Example", "limit": 1, "offset": 0, "record_ids": [group_id]}
+    _, denied = await app.asgi_client.post(endpoint, json=body_by_field)
+    assert denied.status == 403
+    _, found = await app.asgi_client.post(endpoint, headers=_AUTH, json=body_by_field)
+    assert found.status == 200 and [record["group_id"] for record in found.json["records"]] == [group_id]
+    assert found.headers["Cache-Control"] == "private, no-store"
+    _, excluded = await app.asgi_client.post(endpoint, headers=_AUTH, json=body_by_field | {"record_ids": []})
+    assert excluded.status == 200 and excluded.json == {"records": []}
 
 
 async def _http_company_read(app, command):
@@ -594,3 +624,50 @@ async def test_company_group_http_live_insert_revocation_rolls_back(company_regi
         await install_assertion_permissions(fixture)
     _, restored = await app.asgi_client.post(endpoint, headers=_AUTH, json=correction)
     assert restored.status == 200 and restored.json["record"]["display_name"] == "Changed company"
+
+
+@pytest.mark.asyncio
+async def test_membership_http_custom_revision_propagates_without_head_fallback(membership_registry_app):
+    """An old exact office snapshot survives later clearing and unrelated revisions."""
+    from tests.test_network_membership_draft_store_postgres import _apply, _command, _member, _seed
+
+    app, database = membership_registry_app
+    actor, network_id, provider_id, sites = await _seed(database)
+    first = await _apply(database, _command(network_id, [_member(network_id, provider_id, sites[0])]), actor)
+    cleared = await _apply(
+        database,
+        replace(_command(network_id, []), operation="correct", expected_revision=1, idempotency_key=uuid4().hex),
+        actor,
+    )
+    endpoint = f"/api/v1/registry/manage/membership/{network_id}"
+    _, historical = await app.asgi_client.get(endpoint + f"?custom_revision={first['custom_revision']}", headers=_AUTH)
+    assert historical.status == 200 and historical.json == {"record": first["record"]}
+    _, head = await app.asgi_client.get(endpoint, headers=_AUTH)
+    assert head.status == 200 and head.json == {"record": cleared["record"]}
+    _, absent = await app.asgi_client.get(endpoint + "?custom_revision=0", headers=_AUTH)
+    assert absent.status == 404 and absent.json == {"error": {"code": "registry_record_not_found"}}
+    _, selected = await app.asgi_client.get(
+        f"/api/v1/registry/manage/membership?custom_revision={first['custom_revision']}&record_ids={network_id}&limit=1&offset=0",
+        headers=_AUTH,
+    )
+    assert selected.status == 200 and selected.json == {"records": [first["record"]]}
+    _, unauthorized = await app.asgi_client.get(endpoint + "?custom_revision=0")
+    assert unauthorized.status == 403
+    for query in (
+        "custom_revision=",
+        "custom_revision=01",
+        "custom_revision=-1",
+        "custom_revision=true",
+        "custom_revision=1.0",
+        "custom_revision=1&custom_revision=2",
+        "custom_revision=9223372036854775808",
+        f"custom_revision={cleared['custom_revision'] + 1}",
+        "source_revision=1",
+        "offset=1",
+    ):
+        _, invalid = await app.asgi_client.get(endpoint + "?" + query, headers=_AUTH)
+        assert invalid.status == 400
+    _, wrong_kind = await app.asgi_client.get(
+        f"/api/v1/registry/manage/network/{network_id}?custom_revision=0", headers=_AUTH
+    )
+    assert wrong_kind.status == 400

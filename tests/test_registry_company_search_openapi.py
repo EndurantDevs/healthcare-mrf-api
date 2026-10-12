@@ -3,22 +3,25 @@
 
 import re
 
+import pytest
+
 from tests.openapi_route_contract_support import load_openapi_document
 from tests.test_openapi_spec import OPENAPI_PATH
 
 
-def test_company_search_openapi_preserves_complete_scope_and_bounds():
+@pytest.mark.parametrize("kind, schema_name", [("company", "RegistryCompanySearch"), ("group", "RegistryGroupSearch")])
+def test_company_search_openapi_preserves_complete_scope_and_bounds(kind, schema_name):
     """Keep the dedicated trusted search contract separate from legacy writes."""
     spec = load_openapi_document(OPENAPI_PATH)
-    operation = spec["paths"]["/registry/manage/company/search"]["post"]
+    operation = spec["paths"][f"/registry/manage/{kind}/search"]["post"]
     schemas = spec["components"]["schemas"]
-    request_schema = schemas["RegistryCompanySearchRequest"]
+    request_schema = schemas[f"{schema_name}Request"]
     properties = request_schema["properties"]
     assert operation["security"] == [{"RegistryControlBearer": []}, {"RegistryControlHeader": []}]
     assert not operation.get("parameters")
     assert operation["requestBody"]["required"] is True
     assert operation["requestBody"]["content"]["application/json"]["schema"] == {
-        "$ref": "#/components/schemas/RegistryCompanySearchRequest"
+        "$ref": f"#/components/schemas/{schema_name}Request"
     }
     assert request_schema["additionalProperties"] is False
     assert request_schema["required"] == ["q", "limit", "offset", "record_ids"]
@@ -39,9 +42,42 @@ def test_company_search_openapi_preserves_complete_scope_and_bounds():
     assert set(operation["responses"]) == {"200", "400", "403", "503"}
     success = operation["responses"]["200"]
     assert success["headers"]["Cache-Control"] == {"$ref": "#/components/headers/DirectoryCacheControl"}
-    assert success["content"]["application/json"]["schema"] == {
-        "$ref": "#/components/schemas/RegistryCompanySearchPage"
-    }
-    page = schemas["RegistryCompanySearchPage"]
+    assert success["content"]["application/json"]["schema"] == {"$ref": f"#/components/schemas/{schema_name}Page"}
+    page = schemas[f"{schema_name}Page"]
     assert page["additionalProperties"] is False and page["required"] == ["records"]
     assert page["properties"]["records"]["maxItems"] == 100
+
+
+def test_group_company_links_optional_effective_date_is_explicit_and_canonical():
+    spec = load_openapi_document(OPENAPI_PATH)
+    operation = spec["paths"]["/registry/manage/company_links/group_snapshot"]["post"]
+    request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    assert request_schema["additionalProperties"] is False
+    assert request_schema["required"] == ["group_id", "company_ids", "limit", "offset"]
+    selector = request_schema["properties"]["effective_on"]
+    assert selector["type"] == "string" and selector["format"] == "date"
+    assert selector.get("nullable", False) is False
+    assert re.fullmatch(selector["pattern"], "2026-06-01")
+    for invalid in ("20260601", "2026-W01-1", "2026-6-1", "2026-06-01T00:00:00"):
+        assert re.fullmatch(selector["pattern"], invalid) is None
+    description = " ".join(operation["description"].split())
+    assert "valid_from <= effective_on < valid_to" in description
+    assert "unqualified network_ids" in description and "management history" in description
+    page = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    assert page["required"] == ["group", "records", "draft_revision", "limit", "offset"]
+    assert page["properties"]["effective_on"]["format"] == "date"
+
+
+@pytest.mark.parametrize("path", ["/registry/manage/{kind}", "/registry/manage/{kind}/{record_id}"])
+def test_membership_reads_document_the_optional_global_custom_revision(path):
+    spec = load_openapi_document(OPENAPI_PATH)
+    operation = spec["paths"][path]["get"]
+    parameter = next(item for item in operation["parameters"] if item["name"] == "custom_revision")
+    assert parameter["in"] == "query" and parameter["required"] is False
+    assert parameter["schema"] == {"type": "integer", "format": "int64", "minimum": 0, "maximum": 9223372036854775807}
+    description = " ".join(parameter["description"].split())
+    assert "Membership reads only" in description
+    assert "global custom revision" in description
+    assert "canonical nonnegative decimal text" in description
+    assert "other kinds reject" in description
+    assert "does not approve or publish drafts" in description

@@ -103,6 +103,20 @@ async def _state(connection, schema):
     )
 
 
+def _assert_batch_event(history, receipt, command):
+    """Require the original batch key and exact before revision in retained metadata."""
+    event = json.loads(history["event_json"])
+    assert event == {
+        "operation": "company_links_batch",
+        "before_revision": 0,
+        "operation_context": {
+            "batch_id": receipt["batch_id"],
+            "idempotency_key": command.idempotency_key,
+            "selection_group_id": str(command.selection_group_id) if command.selection_group_id else None,
+        },
+    }
+
+
 async def test_full_drafts_preserve_explicit_periods_scope_and_approved_map(serving_schema):
     connection, schema, engine = serving_schema
     actor = _actor()
@@ -146,10 +160,11 @@ async def test_full_drafts_preserve_explicit_periods_scope_and_approved_map(serv
     assert await _approved(connection, schema, approved["approved_revision"]) == before_map
     assert (await _state(connection, schema))[:2] == (receipt["custom_revision"], approved["approved_revision"])
     histories = await connection.fetch(
-        f"SELECT actor_json,reason,idempotency_key,record_json,custom_revision FROM \"{schema}\".registry_record_history WHERE record_kind='company_links'"
+        f"SELECT actor_json,reason,idempotency_key,record_json,custom_revision,event_json FROM \"{schema}\".registry_record_history WHERE record_kind='company_links'"
     )
     assert len(histories) == 2
     for history in histories:
+        _assert_batch_event(history, receipt, command)
         assert history["idempotency_key"] == "batch:" + receipt["batch_id"]
         assert json.loads(history["actor_json"])["user_id"] == str(actor.user_id)
         assert history["reason"] == command.reason and history["custom_revision"] == receipt["custom_revision"]

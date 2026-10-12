@@ -25,6 +25,7 @@ from process.network_legacy_membership_source import (
     capture_aca_reviewed_alias_digest,
     copy_aca_membership_batch,
     read_aca_membership_batch,
+    read_aca_raw_fact_batch,
 )
 from process.network_membership_candidate_lifecycle import _locked_candidate, create_network_candidate
 from process.network_membership_copy import MembershipCopyTarget
@@ -569,6 +570,58 @@ async def _seal_reviewed_archive(session, ownership, owner, reader):
     return owner_oid
 
 
+async def _insert_raw_fact_case(session, schema, case):
+    namespace = '"' + schema + '"'
+    if case == "raw_single_fact_oversized":
+        return
+    if case == "raw_many_missing":
+        await session.execute(
+            text(
+                f"INSERT INTO {namespace}.plan_npi_raw "
+                "(npi,checksum_network,network_tier,issuer_id,year) "
+                "SELECT 2000000000+i,42,'tier-42',7,2026 FROM generate_series(1,5000) i"
+            )
+        )
+        return
+    if case in {"raw_nil_location", "raw_null_location", "raw_invalid_origin"}:
+        assignment = {
+            "raw_nil_location": "address_key='00000000-0000-0000-0000-000000000000'",
+            "raw_null_location": "address_key=NULL",
+            "raw_invalid_origin": "source_table='unrelated'",
+        }[case]
+        await session.execute(
+            text(f"UPDATE {namespace}.mrf_address_evidence SET {assignment} WHERE evidence_checksum=1")
+        )
+        return
+    addresses = 'ARRAY[\'{"city":"Sample City"}\'::json]' if case == "raw_invalid_addresses" else "NULL"
+    await session.execute(
+        text(
+            f"INSERT INTO {namespace}.plan_npi_raw "
+            "(npi,checksum_network,network_tier,issuer_id,year,addresses) "
+            f"VALUES(1234567893,42,'tier-42',7,2026,{addresses})"
+        )
+    )
+    if case.startswith("raw_foreign_"):
+        field = case.removeprefix("raw_foreign_")
+        foreign_coordinate = {
+            "source_url": "https://foreign.example.test/providers",
+            "import_id": "foreign-import",
+            "issuer_id": 8,
+            "year": 2027,
+            "checksum_network": 99,
+            "network_tier": "foreign-tier",
+        }[field]
+        changes_by_field = {"evidence_checksum": 10001, "npi": 1234567893, field: foreign_coordinate}
+        await session.execute(
+            text(
+                f"INSERT INTO {namespace}.mrf_address_evidence "
+                f"SELECT (jsonb_populate_record(NULL::{namespace}.mrf_address_evidence,to_jsonb(e)||CAST(:changes AS jsonb))).* "
+                f"FROM {namespace}.mrf_address_evidence e WHERE evidence_checksum=1"
+            ),
+            {"changes": json.dumps(changes_by_field)},
+        )
+
+
 async def _freeze_reviewed_archive(engine, coordinates, source_metadata, entries, owner, case):
     schema = coordinates.dataset_schema
     async with AsyncSession(engine) as session, session.begin():
@@ -589,6 +642,8 @@ async def _freeze_reviewed_archive(engine, coordinates, source_metadata, entries
             }
             else None,
         )
+        if isinstance(case, str) and case.startswith("raw_"):
+            await _insert_raw_fact_case(session, schema, case)
         if case == "last_site":
             await session.execute(
                 text(f'UPDATE "{schema}".mrf_address_evidence SET address_key=NULL WHERE evidence_checksum=2')
@@ -655,8 +710,17 @@ async def _approved_aca_pin(connection, schema):
         return await pin_approved_membership_source(connection, approved_revision=revision, control_schema=schema)
 
 
+def _reviewed_source_count(case):
+    return (
+        case
+        if type(case) is int
+        else (5001 if case == "raw_single_fact_oversized" else 5000 if case == "bounded_expansion" else 2)
+    )
+
+
 @pytest.fixture
 async def reviewed_aca_source(serving_schema, request):
+    """Seal actual model heaps and paired reviewed bindings; remove every owned schema and role."""
     connection, schema, engine = serving_schema
     dataset_id = uuid4()
     coordinates = RegistryNetworkSourceCoordinates(
@@ -680,9 +744,11 @@ async def reviewed_aca_source(serving_schema, request):
         "runtime_roles": (reader,),
     }
     case = getattr(request, "param", 2)
-    count = case if type(case) is int else (5000 if case == "bounded_expansion" else 2)
+    count = _reviewed_source_count(case)
     sites = (uuid4(), uuid4())
     entries = [(index, 42 if index % 2 else 43, sites[(index - 1) % 2]) for index in range(1, count + 1)]
+    if case == "raw_single_fact_oversized":
+        entries = [(index, 42, sites[0]) for index in range(1, count + 1)]
     try:
         prepared, validation = await _freeze_reviewed_archive(
             engine, coordinates, source_metadata_dict, entries, owner, case
@@ -715,8 +781,9 @@ async def reviewed_aca_source(serving_schema, request):
 async def _read_reviewed_aca(fixture, *, pin=None, coordinates=None, **options):
     source_fixture, _, _, _, original_coordinates, original_pin = fixture
     connection, schema, source, _ = source_fixture
+    reader = read_aca_raw_fact_batch if options.pop("complete_raw_facts", False) else read_aca_membership_batch
     async with connection.transaction(isolation="repeatable_read"):
-        return await read_aca_membership_batch(
+        return await reader(
             connection,
             source,
             registry_schema=schema,
@@ -1142,3 +1209,167 @@ async def test_reviewed_requires_both_pins_and_full_plan_archive(aca_source):
                     approved_source=approved_source,
                     binding_coordinates=binding_coordinates,
                 )
+
+
+@pytest.mark.parametrize(
+    "reviewed_aca_source",
+    [
+        "raw_missing",
+        "raw_invalid_addresses",
+        "raw_foreign_source_url",
+        "raw_foreign_import_id",
+        "raw_foreign_issuer_id",
+        "raw_foreign_year",
+        "raw_foreign_checksum_network",
+        "raw_foreign_network_tier",
+    ],
+    indirect=True,
+)
+async def test_complete_raw_facts_account_missing_locations_and_refuse_copy(reviewed_aca_source):
+    batch = await _read_reviewed_aca(reviewed_aca_source, complete_raw_facts=True, approved_only=True)
+    assert (batch.source_rows, batch.accepted_source_rows, batch.unresolved_source_rows, batch.omitted_source_rows) == (
+        3,
+        2,
+        1,
+        0,
+    )
+    assert batch.membership_rows == 2 and batch.unresolved_rows == 1
+    missing = batch.source_outcomes[-1]
+    assert (missing.npi, missing.checksum_network, missing.outcome, missing.reason) == (
+        1234567893,
+        42,
+        "unresolved",
+        "missing_location",
+    )
+    assert batch.accepted_evidence_checksums == (1, 2)
+    with pytest.raises(LegacyMembershipSourceError, match="unresolved"):
+        await copy_aca_membership_batch(reviewed_aca_source[0][0], batch, None, require_candidate_authority=None)
+
+
+@pytest.mark.parametrize(
+    "reviewed_aca_source", ["raw_nil_location", "raw_null_location", "raw_invalid_origin"], indirect=True
+)
+async def test_complete_raw_facts_invalid_location_cannot_be_intentionally_omitted(reviewed_aca_source):
+    fixture, actor, _, rows, _, _ = reviewed_aca_source
+    connection, schema, _, _ = fixture
+    closed = (
+        await _write_aca_bindings(
+            connection,
+            schema,
+            actor,
+            [{**rows[0], "operation": "close", "expected_revision": 1, "expected_network_id": rows[0]["network_id"]}],
+        )
+    )["records"][0]
+    await _approve(connection, schema, await _command(connection, schema, closed), actor)
+    batch = await _read_reviewed_aca(
+        reviewed_aca_source,
+        pin=await _approved_aca_pin(connection, schema),
+        complete_raw_facts=True,
+        approved_only=True,
+    )
+    assert (batch.source_rows, batch.accepted_source_rows, batch.unresolved_source_rows, batch.omitted_source_rows) == (
+        2,
+        1,
+        1,
+        0,
+    )
+    assert batch.source_outcomes[0].reason == "missing_location" and batch.unresolved_rows == 1
+
+
+@pytest.mark.parametrize("reviewed_aca_source", ["raw_missing"], indirect=True)
+async def test_complete_raw_fact_keyset_reaches_missing_tail_and_is_generation_bound(reviewed_aca_source):
+    cursor, outcomes = None, []
+    while True:
+        batch = await _read_reviewed_aca(
+            reviewed_aca_source, complete_raw_facts=True, after_source_position=cursor, limit=1
+        )
+        if not batch.source_rows:
+            assert batch.input_bytes == b"[]" and batch.next_source_position is None
+            break
+        assert batch.source_rows == 1 and batch.next_source_position != cursor
+        outcomes.extend(batch.source_outcomes)
+        cursor = batch.next_source_position
+    assert [(item.npi, item.checksum_network) for item in outcomes] == [
+        (1000000491, 42),
+        (1000000491, 43),
+        (1234567893, 42),
+    ]
+    assert [item.outcome for item in outcomes] == ["accepted", "accepted", "unresolved"]
+    with pytest.raises(LegacyMembershipSourceError, match="position is invalid"):
+        await _read_reviewed_aca(
+            reviewed_aca_source, complete_raw_facts=True, after_source_position=replace(cursor, generation_id="0" * 64)
+        )
+    with pytest.raises(TypeError, match="after_evidence_checksum"):
+        await _read_reviewed_aca(reviewed_aca_source, complete_raw_facts=True, after_evidence_checksum=1)
+
+
+@pytest.mark.parametrize("reviewed_aca_source", ["expansion"], indirect=True)
+async def test_complete_raw_fact_counts_are_disjoint_from_plan_and_site_expansion(reviewed_aca_source):
+    batch = await _read_reviewed_aca(reviewed_aca_source, complete_raw_facts=True, approved_only=True)
+    assert (batch.source_rows, batch.accepted_source_rows, batch.membership_rows) == (2, 2, 3)
+    assert batch.unresolved_source_rows == batch.omitted_source_rows == 0
+    fixture, actor, _, binding_rows, _, _ = reviewed_aca_source
+    connection, schema, _, _ = fixture
+    closed = (
+        await _write_aca_bindings(
+            connection,
+            schema,
+            actor,
+            [
+                {
+                    **binding_row,
+                    "operation": "close",
+                    "expected_revision": 1,
+                    "expected_network_id": binding_row["network_id"],
+                }
+                for binding_row in (binding_rows[0], binding_rows[2])
+            ],
+        )
+    )["records"]
+    await _approve(connection, schema, await _command(connection, schema, *closed), actor)
+    omitted = await _read_reviewed_aca(
+        reviewed_aca_source,
+        complete_raw_facts=True,
+        approved_only=True,
+        pin=await _approved_aca_pin(connection, schema),
+    )
+    assert (
+        omitted.source_rows,
+        omitted.accepted_source_rows,
+        omitted.unresolved_source_rows,
+        omitted.omitted_source_rows,
+    ) == (2, 1, 0, 1)
+    assert omitted.membership_rows == 1 and omitted.omitted_rows == 2
+
+
+@pytest.mark.parametrize("reviewed_aca_source", ["raw_many_missing"], indirect=True)
+async def test_complete_raw_fact_pages_keep_constant_native_queries_and_bounds(reviewed_aca_source):
+    fixture, _, _, _, coordinates, approved = reviewed_aca_source
+    connection, schema, source, _ = fixture
+    for limit in (1, 5000):
+        counted = _CountedConnection(connection)
+        async with connection.transaction(isolation="repeatable_read"):
+            batch = await read_aca_raw_fact_batch(
+                counted,
+                source,
+                registry_schema=schema,
+                approved_source=approved,
+                binding_coordinates=coordinates,
+                limit=limit,
+            )
+        assert counted.statements == 4 and batch.source_rows == len(batch.source_outcomes) == limit
+        assert (
+            batch.source_rows == batch.accepted_source_rows + batch.unresolved_source_rows + batch.omitted_source_rows
+        )
+
+
+async def test_complete_raw_facts_never_queries_unsupported_address_archive(aca_source):
+    async with aca_source[0].transaction():
+        with pytest.raises(LegacyMembershipSourceError, match="paired full archive"):
+            await read_aca_raw_fact_batch(aca_source[0], aca_source[2], registry_schema=aca_source[1])
+
+
+@pytest.mark.parametrize("reviewed_aca_source", ["raw_single_fact_oversized"], indirect=True)
+async def test_complete_raw_fact_single_fact_location_expansion_cannot_exceed_bounds(reviewed_aca_source):
+    with pytest.raises(LegacyMembershipSourceError, match="batch exceeds bounds"):
+        await _read_reviewed_aca(reviewed_aca_source, complete_raw_facts=True, limit=1)

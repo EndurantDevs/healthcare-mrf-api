@@ -49,7 +49,8 @@ HIDDEN_RUNTIME_ALIASES = {
 }
 ROUTE_QUERY_PARAM_ADDITIONS = {
     # Registry parsers reject unknown/duplicate fields before reading a snapshot.
-    ("get", "/registry/manage/{kind}"): {"limit", "offset", "record_ids"},
+    ("get", "/registry/manage/{kind}"): {"limit", "offset", "record_ids", "custom_revision"},
+    ("get", "/registry/manage/{kind}/{record_id}"): {"custom_revision"},
     ("get", "/registry/manage/{kind}/{record_id}/history"): {"limit", "offset"},
     ("get", "/registry/publication/approved-companies"): {"limit", "offset", "approved_revision"},
     ("get", "/registry/serving/manifest"): {"network_generation"},
