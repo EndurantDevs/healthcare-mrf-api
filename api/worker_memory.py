@@ -9,8 +9,9 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from process.hospital_hpt_registry import warm_hospital_hpt_registry
+from sqlalchemy.orm import configure_mappers
 
+from process.hospital_hpt_registry import warm_hospital_hpt_registry
 
 logger = logging.getLogger(__name__)
 _FREEZE_ENV = "HLTHPRT_API_WORKER_GC_FREEZE_ENABLED"
@@ -104,6 +105,7 @@ def register_worker_memory_lifecycle(app: Any) -> None:
 
 
 async def _before_server_start(_app: Any) -> None:
+    configure_mappers()
     warm_hospital_hpt_registry()
 
 
