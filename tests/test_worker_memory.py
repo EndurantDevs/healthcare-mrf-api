@@ -148,6 +148,11 @@ async def test_worker_memory_listeners_are_worker_scoped(monkeypatch):
 
     monkeypatch.setattr(
         worker_memory,
+        "configure_mappers",
+        lambda: call_names.append("configure_mappers"),
+    )
+    monkeypatch.setattr(
+        worker_memory,
         "warm_hospital_hpt_registry",
         lambda: call_names.append("warm_registry"),
     )
@@ -171,4 +176,41 @@ async def test_worker_memory_listeners_are_worker_scoped(monkeypatch):
     await listener_by_event["before_server_start"](object())
     await listener_by_event["after_server_start"](object())
     await listener_by_event["before_server_stop"](object())
-    assert call_names == ["warm_registry", "freeze", "unfreeze"]
+    assert call_names == ["configure_mappers", "warm_registry", "freeze", "unfreeze"]
+
+
+@pytest.mark.asyncio
+async def test_worker_startup_propagates_mapper_configuration_failure(monkeypatch):
+    """Refuse startup before warming or freezing a broken ORM registry."""
+    call_names = []
+
+    def fail_configuration():
+        raise RuntimeError("invalid mapping")
+
+    monkeypatch.setattr(worker_memory, "configure_mappers", fail_configuration)
+    monkeypatch.setattr(worker_memory, "warm_hospital_hpt_registry", lambda: call_names.append("warm"))
+    with pytest.raises(RuntimeError, match="invalid mapping"):
+        await worker_memory._before_server_start(object())
+    assert call_names == []
+
+
+@pytest.mark.asyncio
+async def test_worker_startup_configures_loaded_mappers(monkeypatch):
+    """Prepare a real in-memory mapping before the worker accepts traffic."""
+    from sqlalchemy import Column, Integer, Table
+    from sqlalchemy.orm import registry
+
+    mappings = registry()
+
+    class WorkerRecord:
+        pass
+
+    table = Table("worker_record", mappings.metadata, Column("id", Integer, primary_key=True))
+    mappings.map_imperatively(WorkerRecord, table)
+    monkeypatch.setattr(worker_memory, "warm_hospital_hpt_registry", lambda: None)
+    try:
+        assert not WorkerRecord.__mapper__.configured
+        await worker_memory._before_server_start(object())
+        assert WorkerRecord.__mapper__.configured
+    finally:
+        mappings.dispose()

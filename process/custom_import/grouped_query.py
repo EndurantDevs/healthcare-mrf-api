@@ -9,7 +9,7 @@ from process.custom_import import read_core as core
 from process.custom_import.derived_query import reduce_expression
 
 
-def selected_identities(context, plan, entity_values=None):
+def selected_identities(context, plan, entity_values=None, *, entity_binding_ids=None):
     """Pin all selected family identities before evaluating score predicates."""
 
     from process.custom_import.grouped_read import selected_family_statement
@@ -18,14 +18,21 @@ def selected_identities(context, plan, entity_values=None):
     winner = context.model(core.CustomImportWinner)
     entity = context.model(core.CustomImportEntityBinding)
     statement = selected_family_statement(context, plan, materialize_default=True, entity_values=entity_values)
-    return statement.with_only_columns(
+    if entity_binding_ids is not None:
+        statement = statement.where(winner.entity_binding_id == entity_binding_ids.c.entity_binding_id)
+    statement = statement.with_only_columns(
         winner.family_revision_id,
         family.root_record_id,
         family.root_revision_id,
         entity.canonical_value.label("entity_value"),
         *statement.selected_columns[-2:],
         maintain_column_froms=True,
-    ).cte("selected_score_families")
+    )
+    if entity_binding_ids is not None:
+        # Keep complete-key candidates ahead of independent root selection.
+        families = statement.correlate(entity_binding_ids).offset(0).lateral("candidate_score_families")
+        statement = select(families).select_from(entity_binding_ids.join(families, true()))
+    return statement.cte("selected_score_families")
 
 
 def _root_values(context, selected, fields):
@@ -57,7 +64,7 @@ def _root_values(context, selected, fields):
     return statement, values_by_field, states_by_field
 
 
-def _keyed_children(context, selectors):
+def _keyed_children(context, selectors, *, name="complete_score_child_keys"):
     """Use the complete typed child key before loading sibling metric values."""
 
     if not selectors:
@@ -81,7 +88,7 @@ def _keyed_children(context, selectors):
             scalar.c.field_slot == predicate.field.field_slot,
             _comparison(predicate, typed_value, scalar.c.value_state),
         )
-        .cte("complete_score_child_keys")
+        .cte(name)
     )
 
 
@@ -417,10 +424,45 @@ def _joined_values(context, plan, entity_values=None):
     return selected, statement, values_by_field, states_by_field, derived_fields, child_identity
 
 
+def _child_candidate_ids(context, selectors):
+    """Keep every entity with a complete-key member before selecting its current roots."""
+
+    keys = _keyed_children(context, selectors, name="candidate_complete_score_keys").prefix_with("MATERIALIZED")
+    family = context.model(core.CustomImportFamilyRevision)
+    member = context.model(CustomImportFamilyChild)
+    revision = context.model(CustomImportChildRevision)
+    identities = ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot")
+    candidates = (
+        select(family.entity_binding_id)
+        .select_from(keys)
+        .join(
+            family,
+            and_(
+                family.dataset_id == keys.c.dataset_id,
+                family.schema_revision_id == keys.c.schema_revision_id,
+                family.root_record_id == keys.c.root_record_id,
+            ),
+        )
+        .join(
+            member,
+            and_(
+                member.family_revision_id == family.family_revision_id,
+                *(getattr(member, name) == getattr(keys.c, name) for name in identities),
+            ),
+        )
+        .join(revision, and_(*(getattr(revision, name) == getattr(keys.c, name) for name in identities)))
+        .distinct()
+        .cte("child_candidate_score_entities")
+        .prefix_with("MATERIALIZED")
+    )
+    return candidates
+
+
 def _derived_child_values(context, plan, entity_values, fields, selectors, derived_fields):
     """Reduce every configured group from one root-preserving complete-child join."""
 
-    selected = selected_identities(context, plan, entity_values)
+    candidates = _child_candidate_ids(context, selectors) if entity_values is None else None
+    selected = selected_identities(context, plan, entity_values, entity_binding_ids=candidates)
     statement, root_values_by_field, root_states_by_field = _root_values(
         context, selected, [field for field in fields if field.collection is None]
     )
