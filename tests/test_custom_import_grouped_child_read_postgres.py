@@ -10,7 +10,7 @@ from decimal import Decimal
 
 import pytest
 from sanic import response
-from sqlalchemy import BigInteger, Numeric, String, column, select, text, values
+from sqlalchemy import BigInteger, Numeric, String, case, column, func, literal, select, text, values
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import aliased
@@ -137,6 +137,170 @@ async def test_selected_child_join_preserves_multiplicity_and_full_revision_owne
     ]
 
 
+_CHILD_OWNER_COLUMNS = ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot")
+_FAMILY_OWNER_COLUMNS = (
+    "family_revision_id",
+    "dataset_id",
+    "schema_revision_id",
+    "root_record_id",
+    "root_revision_id",
+    "entity_binding_id",
+)
+
+
+def _candidate_owner_rows(context, ambiguous):
+    """Return valid owners and collisions in every family/member/revision identity."""
+    dataset, schema = context.target.dataset_id, context.target.schema_revision_id
+    collection = context.collection_slots_by_name["rates"]
+    family_rows = [
+        dict(zip(_FAMILY_OWNER_COLUMNS, family_fields, strict=True))
+        for family_fields in (
+            (10, dataset, schema, 20, 10, 200),
+            (11, dataset, schema, 21, 20, 200),
+            (12, dataset, schema, 22, 99, 300),
+        )
+    ]
+    owner_rows = [
+        dict(zip(_CHILD_OWNER_COLUMNS, (child, dataset, schema, 20, collection), strict=True))
+        for child in ((30, 31) if ambiguous else (30,))
+    ]
+    member_rows = [dict(family_revision_id=10, **owner_map) for owner_map in owner_rows]
+    revision_rows = [dict(owner_map) for owner_map in owner_rows]
+    for ordinal, (owner_kind, identity) in enumerate(
+        [("family", name) for name in ("dataset_id", "schema_revision_id", "root_record_id")]
+        + [("member", name) for name in ("family_revision_id", *_CHILD_OWNER_COLUMNS)]
+        + [("revision", name) for name in _CHILD_OWNER_COLUMNS],
+        start=1,
+    ):
+        owner_map = dict(
+            zip(_CHILD_OWNER_COLUMNS, (100 + ordinal, dataset, schema, 200 + ordinal, collection), strict=True)
+        )
+        family_map = dict(
+            zip(_FAMILY_OWNER_COLUMNS, (100 + ordinal, dataset, schema, 200 + ordinal, 99, 300 + ordinal), strict=True)
+        )
+        member_map = dict(family_revision_id=family_map["family_revision_id"], **owner_map)
+        revision_map = dict(owner_map)
+        {"family": family_map, "member": member_map, "revision": revision_map}[owner_kind][identity] += 1000
+        owner_rows.append(owner_map)
+        family_rows.append(family_map)
+        member_rows.append(member_map)
+        revision_rows.append(revision_map)
+    return family_rows, member_rows, revision_rows, owner_rows
+
+
+def _candidate_owner_values(name, field_names, owner_rows):
+    """Build integer identity VALUES without installing native schema objects."""
+    return (
+        values(*(column(field, BigInteger) for field in field_names))
+        .data([tuple(owner_map[field] for field in field_names) for owner_map in owner_rows])
+        .cte(name)
+    )
+
+
+def _candidate_sources(context, ambiguous):
+    """Expose collision rows through the same typed sources as configured reads."""
+    family_rows, member_rows, revision_rows, owner_rows = _candidate_owner_rows(context, ambiguous)
+    families = _candidate_owner_values("synthetic_families", _FAMILY_OWNER_COLUMNS, family_rows)
+    members = _candidate_owner_values(
+        "synthetic_family_members", ("family_revision_id", *_CHILD_OWNER_COLUMNS), member_rows
+    )
+    revisions = _candidate_owner_values("synthetic_child_revisions", _CHILD_OWNER_COLUMNS, revision_rows)
+    scalars = (
+        values(
+            *(column(name, BigInteger) for name in _CHILD_OWNER_COLUMNS),
+            column("field_slot", BigInteger),
+            column("value_state", String),
+            column("string_value", String),
+        )
+        .data(
+            [
+                (
+                    *(owner_map[name] for name in _CHILD_OWNER_COLUMNS),
+                    context.definition.fields_by_id["service_code"].field_slot,
+                    "value",
+                    "chosen",
+                )
+                for owner_map in owner_rows
+            ]
+        )
+        .cte("synthetic_child_scalars")
+    )
+    entities = (
+        values(column("entity_binding_id", BigInteger), column("canonical_value", String))
+        .data(
+            [
+                (family_map["entity_binding_id"], str(family_map["entity_binding_id"]))
+                for family_map in family_rows
+                if family_map["family_revision_id"] != 11
+            ]
+        )
+        .cte("synthetic_entities")
+    )
+    return families, members, revisions, scalars, entities
+
+
+def _candidate_context(context, ambiguous):
+    """Bind synthetic owners while retaining independent selected sibling roots."""
+    families, members, revisions, scalars, entities = _candidate_sources(context, ambiguous)
+    context = replace(
+        context,
+        storage_models={
+            read_core.CustomImportFamilyRevision: aliased(
+                read_core.CustomImportFamilyRevision, families, adapt_on_names=True
+            ),
+            read_core.CustomImportWinner: aliased(read_core.CustomImportWinner, families, adapt_on_names=True),
+            read_core.CustomImportEntityBinding: aliased(
+                read_core.CustomImportEntityBinding, entities, adapt_on_names=True
+            ),
+            grouped_query.CustomImportFamilyChild: aliased(
+                grouped_query.CustomImportFamilyChild, members, adapt_on_names=True
+            ),
+            grouped_query.CustomImportChildRevision: aliased(
+                grouped_query.CustomImportChildRevision, revisions, adapt_on_names=True
+            ),
+            grouped_query.CustomImportChildScalar: aliased(
+                grouped_query.CustomImportChildScalar, select(scalars).subquery(), adapt_on_names=True
+            ),
+        },
+    )
+    selected_roots = select(
+        families,
+        entities.c.canonical_value,
+        literal(2024).label("selected_value"),
+        literal("segment_a").label("group_value"),
+    ).select_from(families.join(entities, families.c.entity_binding_id == entities.c.entity_binding_id))
+    return context, selected_roots
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambiguous", (False, True))
+async def test_child_candidates_keep_exact_ownership_sibling_roots_and_ambiguity(
+    ambiguous, values_connection, monkeypatch
+):
+    """Reject wrong owners, retain childless siblings, and validate before filtering."""
+    context, selected_roots = _candidate_context(fixture.context(), ambiguous)
+    plan = grouped_read.normalize_plan(context, fixture.query(context_filters=(_KEY,)), ExtensionReadScope("synthetic"))
+    candidates = grouped_query._child_candidate_ids(context, plan.context_filters)
+    assert (await values_connection.execute(select(candidates))).scalars().all() == [200]
+    monkeypatch.setattr(grouped_read, "selected_family_statement", lambda *_args, **_kwargs: selected_roots)
+    eligible = grouped_query.selected_identities(context, plan, entity_binding_ids=candidates)
+    assert set((await values_connection.execute(select(eligible.c.family_revision_id))).scalars()) == {10, 11}
+    assert await values_connection.scalar(select(func.avg(eligible.c.root_revision_id))) == Decimal("15")
+    keys = grouped_query._keyed_children(context, plan.context_filters)
+    statement, _, revision = grouped_query._left_child_statement(context, eligible, keys)
+    amount = case((revision.child_revision_id == 30, 1), (revision.child_revision_id == 31, 9))
+    children = statement.add_columns(amount.label("amount")).cte("synthetic_prequalified_children")
+    validated = grouped_query._validated_stored_children(children, preserve_roots=True)
+    filtered = select(validated.c.child_revision_id, validated.c.validated_child_id).where(
+        (validated.c.amount < 2) | validated.c.amount.is_(None)
+    )
+    if ambiguous:
+        with pytest.raises(DBAPIError, match="more than one row"):
+            await values_connection.execute(filtered)
+    else:
+        assert set((await values_connection.execute(filtered)).all()) == {(30, 30), (None, None)}
+
+
 @pytest.fixture(autouse=True)
 def _child_definition(monkeypatch):
     monkeypatch.setattr(native.fixture, "definition", fixture.definition)
@@ -199,9 +363,17 @@ async def test_one_child_must_satisfy_every_predicate_in_the_selected_family():
 
 
 @pytest.mark.asyncio
-async def test_year_and_panel_are_selected_before_child_metrics_without_fallback():
-    async with native._case(children=_children()) as (case, target), case.sessions() as session:
+@pytest.mark.parametrize("derived", (False, True))
+async def test_year_and_panel_are_selected_before_child_metrics_without_fallback(monkeypatch, derived):
+    if derived:
+        monkeypatch.setattr(native.fixture, "definition", scores._definition)
+    children = _children()
+    older_child = next(child for child in children if child["rate_npi"] == native._A and child["rate_period"] == 2023)
+    children.append(dict(older_child, service_code="older_only"))
+    async with native._case(children=children) as (case, target), case.sessions() as session:
         query = fixture.query(context_filters=(_PANEL, _KEY), filters=(ReadFilter("amount", "gt", "90"),))
+        if derived:
+            query = replace(query, order_terms=(ReadOrderTerm("child_cost", "asc", "last"),))
         assert (await native._relation(session, target, query))[1] == []
         older = replace(query, context_filters=(_PANEL, _KEY, ReadFilter("period", "eq", 2023)))
         assert [row.entity_value for row in (await native._relation(session, target, older))[1]] == [native._A]
@@ -209,6 +381,12 @@ async def test_year_and_panel_are_selected_before_child_metrics_without_fallback
         assert [row.entity_value for row in (await native._relation(session, target, panel_b))[1]] == [native._A]
         missing_year = replace(query, context_filters=(_PANEL, _KEY, ReadFilter("period", "eq", 2022)))
         assert (await native._relation(session, target, missing_year))[1] == []
+        older_only = replace(query, context_filters=(_PANEL, ReadFilter("service_code", "eq", "older_only")))
+        assert (await native._relation(session, target, older_only))[1] == []
+        explicit_older = replace(
+            older_only, context_filters=older_only.context_filters + (ReadFilter("period", "eq", 2023),)
+        )
+        assert [row.entity_value for row in (await native._relation(session, target, explicit_older))[1]] == [native._A]
 
 
 @pytest.mark.asyncio
