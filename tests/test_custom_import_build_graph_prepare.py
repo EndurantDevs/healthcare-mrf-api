@@ -25,6 +25,7 @@ from db.models.custom_import import (
 from process.custom_import import build_graph as graph
 from process.custom_import import build_graph_prepare_page as prepare
 from process.custom_import import runner_codec, runner_graph
+from process.custom_import.build_graph_prepared import PreparedChildren
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.family import RootFamily
 from process.custom_import.runner_codec import (
@@ -428,7 +429,8 @@ def test_read_count_scales_with_root_pages_and_durable_resume(monkeypatch):
     assert all("root_record_id) >" in query for query in queries)
 
 
-def test_entire_root_reservation_shrinks_only_the_prefix(monkeypatch):
+@pytest.mark.parametrize("reuse_preparation", [False, True])
+def test_entire_root_reservation_shrinks_only_the_prefix(monkeypatch, reuse_preparation):
     request = _request(page_row_limit=8)
     first, second = root_row(request, 1), root_row(request, 2)
     rows = [first, second]
@@ -442,7 +444,14 @@ def test_entire_root_reservation_shrinks_only_the_prefix(monkeypatch):
         monkeypatch,
         [root_metadata(rows), rows, child_metadata([child]), *child_pages([child], 7)],
     )
-    result = prepare.prepare_family_page(session, request, _registry(request.definition), 7, 0)
+    prepared = PreparedChildren() if reuse_preparation else None
+    try:
+        result = prepare.prepare_family_page(session, request, _registry(request.definition), 7, 0, prepared=prepared)
+        if prepared is not None:
+            assert not prepared.enabled and prepared.file is None and not prepared.pending
+    finally:
+        if prepared is not None:
+            prepared.close()
     assert [item.plan.root_record_id for item in result] == [1]
     assert result[0].child_count == 1
     assert first[0].family_revision_id is None and second[0].family_revision_id is None

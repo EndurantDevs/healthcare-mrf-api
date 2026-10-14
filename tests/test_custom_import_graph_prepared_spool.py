@@ -50,6 +50,19 @@ def _resumed_state(count, *, last_id=None):
     )
 
 
+def _replace_frame(stream, payload, *, count=1, ordinal=0, position=0):
+    """Exercise semantic frame checks beyond an otherwise valid checksum."""
+    prefix = prepared.struct.pack("!QI", ordinal, count)
+    header = prepared._HEADER.pack(
+        b"CGP1", ordinal, len(payload), count, prepared.hashlib.sha256(prefix + payload).digest()
+    )
+    stream.file.seek(position)
+    stream.file.write(header + payload)
+    stream.file.truncate()
+    stream.byte_count = stream.file.tell()
+    stream.cached_frame = None
+
+
 def test_prepared_frames_bound_chunks_and_preserve_exact_rows(scratch):
     _append_children(scratch, 65)
     assert scratch.chunk_count == 2
@@ -168,3 +181,187 @@ def test_prepared_close_releases_the_owned_file_and_buffers(scratch):
     assert scratch.file is None
     assert scratch.cached_frame is None
     assert not scratch.pending
+
+
+def test_empty_and_disabled_streams_do_not_allocate_scratch(scratch):
+    assert scratch.rows(()) == ()
+    scratch.finish()
+    scratch.verify_tips((_resumed_state(0),), {1: "records"})
+    scratch.disable()
+    scratch.append(7, "records", object(), 1, ())
+    scratch.finish()
+    assert scratch.file is None
+    assert scratch.row_count == scratch.byte_count == 0
+
+
+def test_encoded_row_limit_discards_previously_prepared_rows(scratch):
+    _append_children(scratch, 1)
+    owned_file = scratch.file
+    child = SimpleNamespace(child_revision_id=2, collection_slot=1, child_key_sha256=(2).to_bytes(32, "big"))
+    scratch.append(7, "records", child, 162, (b"x" * prepared.MAX_INPUT_BYTES,))
+    assert not scratch.enabled
+    assert scratch.file is None and owned_file.closed
+    assert not scratch.pending
+
+
+def test_flush_rechecks_the_encoded_frame_limit(monkeypatch, scratch):
+    child = SimpleNamespace(child_revision_id=1, collection_slot=1, child_key_sha256=(1).to_bytes(32, "big"))
+    scratch.append(7, "records", child, 161, (((),) * 10, ((),) * 3, 0, 0, 0))
+    monkeypatch.setattr(prepared, "MAX_INPUT_BYTES", 1)
+    scratch.finish()
+    assert not scratch.enabled and scratch.file is None
+    assert not scratch.pending
+
+
+@pytest.mark.parametrize("position", [-1, 0, 1])
+def test_missing_frame_positions_fail_closed(scratch, position):
+    if position != 0:
+        _append_children(scratch, 1)
+        position = -1 if position < 0 else scratch.byte_count
+    with pytest.raises(CandidateRunnerError, match="frame is missing"):
+        scratch.frame(position)
+
+
+def test_truncated_frame_header_is_not_treated_as_an_empty_stream(scratch):
+    _append_children(scratch, 1)
+    scratch.file.truncate(prepared._HEADER.size - 1)
+    with pytest.raises(CandidateRunnerError, match="frame is truncated"):
+        scratch.frame(0)
+
+
+@pytest.mark.parametrize("count,ordinal", [(0, 0), (prepared.MAX_ROWS + 1, 0), (1, 1)])
+def test_frame_inventory_bounds_are_checked_before_decoding(scratch, count, ordinal):
+    _append_children(scratch, 1)
+    _replace_frame(scratch, b"\xc0", count=count, ordinal=ordinal)
+    with pytest.raises(CandidateRunnerError, match="frame bound differs"):
+        scratch.frame(0)
+
+
+@pytest.mark.parametrize("payload,message", [(b"\xc1", "encoding"), (b"\x80", "prefix"), (b"\x90", "prefix")])
+def test_checksummed_frames_still_require_valid_record_encoding(scratch, payload, message):
+    _append_children(scratch, 1)
+    _replace_frame(scratch, payload)
+    with pytest.raises(CandidateRunnerError, match=f"frame {message} differs"):
+        scratch.frame(0)
+    assert scratch.cached_frame is None
+
+
+def test_decode_allocation_cause_is_not_reclassified_as_corruption(monkeypatch, scratch):
+    _append_children(scratch, 1)
+
+    def refuse_decode(*_args, **_kwargs):
+        raise ValueError("synthetic decode allocation") from MemoryError("synthetic allocation")
+
+    monkeypatch.setattr(prepared, "unpackb", refuse_decode)
+    with pytest.raises(ValueError, match="synthetic decode allocation") as failure:
+        scratch.frame(0)
+    assert isinstance(failure.value.__cause__, MemoryError)
+    assert scratch.cached_frame is None
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {0: True},
+        {0: 0},
+        {1: 1},
+        {1: ""},
+        {1: "x" * 64},
+        {2: 0},
+        {3: False},
+        {4: "x" * 32},
+        {4: b"x" * 31},
+        {5: -1},
+        {6: None},
+        {7: ()},
+    ],
+)
+def test_checksummed_records_cannot_change_their_typed_identity(scratch, changes):
+    _append_children(scratch, 1)
+    record_parts = list(scratch.frame(0)[0][0])
+    for index, value in changes.items():
+        record_parts[index] = value
+    _replace_frame(scratch, prepared.packb((tuple(record_parts),), use_bin_type=True))
+    with pytest.raises(CandidateRunnerError, match="prepared child record differs"):
+        scratch.frame(0)
+    assert scratch.cached_frame is None
+
+
+@pytest.mark.parametrize("shape", ["mapping", "short"])
+def test_record_shape_is_checked_after_frame_decoding(scratch, shape):
+    _append_children(scratch, 1)
+    record = scratch.frame(0)[0][0]
+    changed = {"record": record} if shape == "mapping" else record[:-1]
+    _replace_frame(scratch, prepared.packb((changed,), use_bin_type=True))
+    with pytest.raises(CandidateRunnerError, match="prepared child record differs"):
+        scratch.frame(0)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{0: True}, {1: 2}, {2: b"parent"}, {3: b"x"}, {4: b"child"}, {5: b"x" * 32}, {6: None}, {7: "digest"}],
+)
+def test_fallback_records_keep_the_original_child_identity_and_types(scratch, changes):
+    _append_children(scratch, 1)
+    record_parts = list(scratch.frame(0)[0][0])
+    fallback_parts = [
+        record_parts[3],
+        record_parts[2],
+        "parent",
+        b"p" * 32,
+        "child",
+        record_parts[4],
+        "payload",
+        b"d" * 32,
+    ]
+    for index, value in changes.items():
+        fallback_parts[index] = value
+    record_parts[6], record_parts[7] = None, tuple(fallback_parts)
+    _replace_frame(scratch, prepared.packb((tuple(record_parts),), use_bin_type=True))
+    with pytest.raises(CandidateRunnerError, match="prepared child fallback differs"):
+        scratch.frame(0)
+
+
+@pytest.mark.parametrize("fallback", [{}, ()])
+def test_fallback_shape_is_not_accepted_as_a_child_record(scratch, fallback):
+    _append_children(scratch, 1)
+    record_parts = list(scratch.frame(0)[0][0])
+    record_parts[6], record_parts[7] = None, fallback
+    _replace_frame(scratch, prepared.packb((tuple(record_parts),), use_bin_type=True))
+    with pytest.raises(CandidateRunnerError, match="prepared child fallback differs"):
+        scratch.frame(0)
+
+
+def test_duplicate_rows_inside_one_frame_fail_closed(scratch):
+    _append_children(scratch, 1)
+    record = scratch.frame(0)[0][0]
+    _replace_frame(scratch, prepared.packb((record, record), use_bin_type=True), count=2)
+    with pytest.raises(CandidateRunnerError, match="not in source order"):
+        tuple(scratch.records())
+
+
+def test_missing_frame_ordinal_fails_even_when_rows_are_ordered(scratch):
+    _append_children(scratch, prepared.MAX_ROWS + 1)
+    records, next_position, _ordinal = scratch.frame(0)
+    last_records, _end, _ordinal = scratch.frame(next_position)
+    _replace_frame(scratch, prepared.packb(last_records, use_bin_type=True), ordinal=2, position=next_position)
+    scratch.chunk_count = 3
+    assert len(records) == prepared.MAX_ROWS
+    with pytest.raises(CandidateRunnerError, match="frame order differs"):
+        tuple(scratch.records())
+
+
+def test_rows_skip_unrequested_children_but_require_the_complete_prefix(scratch):
+    _append_children(scratch, 3)
+    rows = scratch.rows(_metadata((2,)))
+    assert [child.child_revision_id for _root, child, _valid in rows] == [2]
+    with pytest.raises(CandidateRunnerError, match="source prefix is incomplete"):
+        scratch.rows(_metadata((3, 4)))
+
+
+def test_committed_tip_verification_skips_other_roots_and_later_children(scratch):
+    _append_children(scratch, 4)
+    second = _resumed_state(1)
+    second.current.root_record_id = 8
+    with pytest.raises(CandidateRunnerError, match="prefix is shorter than durable progress"):
+        scratch.verify_tips((_resumed_state(1), second), {1: "records"})
