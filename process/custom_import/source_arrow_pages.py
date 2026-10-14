@@ -1,22 +1,18 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Batch guarded one-row Arrow buffers before SOURCE scalar dictionaries exist."""
+"""Prepare guarded Arrow windows before SOURCE scalar dictionaries exist."""
 
 import asyncio
-from contextlib import aclosing, closing
-from itertools import chain
+from contextlib import aclosing
 
 import pyarrow as pa
 
 from process.custom_import import source_column_preparation as columns
-from process.custom_import.capture import CaptureError, iter_parquet_source_batches
+from process.custom_import.capture import iter_parquet_source_batches
 from process.custom_import.source_preparation import (
     MAX_INPUT_BYTES,
-    MAX_OUTPUT_BYTES,
-    MAX_ROWS,
     MAX_TEXT_BYTES,
     _has_allocation_failure,
-    _layout_bytes,
 )
 
 
@@ -67,119 +63,63 @@ def _column_schema(schema):
     )
 
 
-def _next_column_preparation(encoder, context, layout, decoded, limits, ordinal):
-    batch, failure = _next_batch(decoded)
-    if failure is not None or batch is None:
-        return batch, None, failure
-    result = (
-        columns.column_row_result(encoder, layout, batch, context.request.page_byte_limit)
-        if _is_safe_column_batch(batch)
-        else None
-    )
-    if result is not None:
-        try:
-            columns._validate_column_outcome(result[0], limits, ordinal)
-        except CaptureError as error:
-            return None, None, error
-    return batch, result, None
-
-
-async def _oracle_rows(context, decoded, limits):
-    from process.custom_import import build_source as staging
-    from process.custom_import.source_preparation import _ordered_rows, native_encoder, native_layout
-
-    records = (columns._decoded_arrow_row(batch, 0, ordinal, limits) for ordinal, batch in enumerate(decoded, start=1))
-    encoder = native_encoder()
-    layout = native_layout(context.request.definition, context.stream)
-    with closing(records):
-        if encoder is None or layout is None:
-            fields = staging._stream_fields(context.request.definition, context.stream)
-            for row in records:
-                yield staging._prepare_decoded_row(context.request, context.stream, fields, row.values)
-            return
-        async with aclosing(_ordered_rows(encoder, layout, context, records)) as prepared:
-            async for row in prepared:
-                yield row
-
-
-def _column_packets(encoder, context, layout, decoded, limits):
-    """Reuse old scheduling charges while accepted documents are prepared in Rust."""
-    old_layout = layout[0], tuple((name, kind) for name, kind, *_ in layout[1]), layout[2], layout[3]
-    fixed_bytes = _layout_bytes(old_layout)
-    pending, ordinal = [], 1
-    input_bytes, output_bytes = fixed_bytes, 0
-    while True:
-        batch, result, failure = _next_column_preparation(encoder, context, layout, decoded, limits, ordinal)
-        is_eligible = result is not None and result[1] > 0
-        if pending and (
-            not is_eligible
-            or len(pending) == MAX_ROWS
-            or input_bytes + result[1] > MAX_INPUT_BYTES
-            or output_bytes + result[2] > MAX_OUTPUT_BYTES
-        ):
-            yield tuple(pending), None, None
-            pending.clear()
-            input_bytes, output_bytes = fixed_bytes, 0
-        if failure is not None:
-            raise failure
-        if batch is None:
-            return
-        if not is_eligible:
-            yield None, batch, (ordinal, None if result is None else result[0])
-        else:
-            pending.append((ordinal, result[0]))
-            input_bytes += result[1]
-            output_bytes += result[2]
-        ordinal += 1
-
-
-async def _next_column_packet(packets):
-    """Drain one bounded decoder/preparation handoff, including cancellation."""
+async def _next_column_batch(decoded):
+    """Drain one bounded decoder handoff before cancellation closes its reader."""
     from process.custom_import import build_source as staging
 
-    completed_packets = []
+    completed_batches = []
 
     async def complete():
-        """Retain the packet while cancellation waits for its worker."""
-        completed_packets.append(await asyncio.to_thread(next, packets, None))
+        """Retain the decoder result while cancellation drains its worker."""
+        completed_batches.append(await asyncio.to_thread(_next_batch, decoded))
 
     primary = await staging._drain_cleanup(complete(), None)
     if primary is not None:
         raise primary
-    return completed_packets[0]
+    batch, failure = completed_batches[0]
+    if failure is not None:
+        raise failure
+    return batch
 
 
 async def _ordered_column_rows(context, layout, decoded, limits):
-    first, failure = _next_batch(decoded)
-    if failure is not None:
-        raise failure
-    if first is None:
-        return
-    batches = chain((first,), decoded)
-    if not _column_schema(first.schema) or tuple(first.schema.names) != tuple(field[0] for field in layout[1]):
-        async with aclosing(_oracle_rows(context, batches, limits)) as prepared:
-            async for prepared_row in prepared:
-                yield prepared_row
-        return
     from process.custom_import import build_source as staging
 
+    first = await _next_column_batch(decoded)
+    if first is None:
+        return
     fields = staging._stream_fields(context.request.definition, context.stream)
-    encoder = columns.bind_column_encoder(layout)
-    with closing(_column_packets(encoder, context, layout, batches, limits)) as packets:
-        while (packet := await _next_column_packet(packets)) is not None:
-            native_rows, batch, barrier = packet
-            if native_rows is not None:
-                for ordinal, outcome in native_rows:
-                    yield columns.prepared_column_outcome(context, fields, None, 0, ordinal, limits, outcome)
-                continue
-            if barrier[1] is not None:
-                yield columns.prepared_column_outcome(context, fields, batch, 0, barrier[0], limits, barrier[1])
-                continue
-            async with aclosing(
-                columns.iter_arrow_batch_oracle(context, batch, limits, first_ordinal=barrier[0])
-            ) as prepared:
-                async for prepared_row in prepared:
-                    yield prepared_row
+    is_reordered = tuple(first.schema.names) != tuple(field[0] for field in layout[1])
+    use_oracle = (
+        not _column_schema(first.schema)
+        or tuple(first.schema.names) != tuple(field.field_id for field in fields)
+        # shortcut: reordered non-scale-zero integer transports use the oracle, widen after ordered error parity proof.
+        or (
+            is_reordered
+            and any(
+                field.value_type == "integer" and pa.types.is_decimal128(column.type) and column.type.scale != 0
+                for field, column in zip(fields, first.schema, strict=True)
+            )
+        )
+    )
+    column_indices = None if not is_reordered else tuple(first.schema.get_field_index(field[0]) for field in layout[1])
+    encoder = None if use_oracle else columns.bind_column_encoder(layout)
+    batch, ordinal = first, 1
+    del first
+    while batch is not None:
+        prepared_rows = (
+            columns.iter_arrow_batch_oracle(context, batch, limits, first_ordinal=ordinal)
+            if use_oracle or not _is_safe_column_batch(batch)
+            else columns.iter_arrow_batch_columns(
+                context, layout, batch, limits, first_ordinal=ordinal, prepare=encoder, column_indices=column_indices
+            )
+        )
+        async with aclosing(prepared_rows):
+            async for prepared_row in prepared_rows:
+                yield prepared_row
+        ordinal += batch.num_rows
+        del batch
+        batch = await _next_column_batch(decoded)
 
 
 async def iter_source_pages(context, layout, part, policy, cursor):

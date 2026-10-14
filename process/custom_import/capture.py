@@ -811,7 +811,7 @@ def _validated_parquet_reader(
 
 
 def iter_parquet_source_batches(capture, stream, *, limits, _cleanup_failures=None):
-    """Expose guarded one-row Arrow buffers before Python scalar conversion."""
+    """Expose guarded bounded Arrow windows before Python scalar conversion."""
     verify_capture(capture, stream, limits=limits)
     if stream.format != "parquet":
         raise CaptureError("SOURCE column replay requires Parquet")
@@ -824,16 +824,16 @@ def iter_parquet_source_batches(capture, stream, *, limits, _cleanup_failures=No
         _cleanup_failures=_cleanup_failures,
     ) as (reader, labels, expected_rows):
         emitted = logical_bytes = 0
-        for batch in reader.iter_batches(batch_size=1, use_threads=False, use_pandas_metadata=False):
+        for batch in reader.iter_batches(batch_size=64, use_threads=False, use_pandas_metadata=False):
             _validate_parquet_batch_schema(batch, labels)
             logical_bytes += _nonnegative_parquet_integer(batch.nbytes)
             if logical_bytes > limits.maximum_decoded_bytes:
                 raise CaptureError("Parquet source payload exceeds the decoded-byte limit")
             if not batch.num_rows:
                 continue
-            if batch.num_rows != 1 or emitted >= expected_rows:
+            if batch.num_rows > 64 or emitted + batch.num_rows > expected_rows:
                 raise CaptureError("Parquet source payload has inconsistent row metadata")
-            emitted += 1
+            emitted += batch.num_rows
             yield batch
         if emitted != expected_rows:
             raise CaptureError("Parquet source payload has inconsistent row metadata")

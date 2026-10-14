@@ -118,6 +118,33 @@ def _column_window(name, array):
     return name, kind, bit_offset, count, precision, scale, validity, offsets, data_window
 
 
+def _column_output_bound(layout, windows, row_count):
+    """Bound escaped native documents, including repeated raw/root/child keys.
+
+    This aggregates the native validator's per-row bound without scalar reads.
+    Null bitmap entries are conservatively charged as non-null values.
+    """
+    widths = tuple(
+        len(column[-1]) + row_count
+        if column[1] in {"utf8", "large_utf8"}
+        else (0 if column[1] == "null" else 80 * row_count)
+        for column in windows
+    )
+
+    def field_bytes(name, index):
+        """Charge the field envelope and maximally escaped UTF-8 bytes."""
+        return row_count * (192 + 6 * len(name.encode())) + 6 * widths[index]
+
+    fields, roots, children = layout[1:4]
+    bound = row_count * (512 + 192 * 3)
+    bound += sum(field_bytes(field[0], index) for index, field in enumerate(fields))
+    bound += sum(field_bytes(name, index) for name, index in roots)
+    bound += sum(192 * row_count + 6 * widths[index] for _name, index in roots)
+    if layout[0]:
+        bound += 192 * row_count + sum(field_bytes(fields[index][0], index) for index in children)
+    return bound
+
+
 def column_descriptors(layout, batch):
     """Copy logical windows only after the complete native input fits."""
     if layout is None or sys.byteorder != "little" or type(batch) is not pa.RecordBatch:
@@ -137,7 +164,7 @@ def column_descriptors(layout, batch):
     for column in windows:
         size += 128 + len(column[0].encode()) + len(column[1].encode())
         size += sum(len(value) for value in column[6:] if value is not None)
-    if size > MAX_INPUT_BYTES:
+    if size > MAX_INPUT_BYTES or _column_output_bound(layout, windows, batch.num_rows) > MAX_OUTPUT_BYTES:
         return None
     return tuple(
         (*column[:6], *(None if value is None else bytes(value) for value in column[6:])) for column in windows
@@ -183,7 +210,7 @@ async def prepare_arrow_batch_oracle(context, batch, limits, *, first_ordinal=1,
         return tuple([row async for row in rows])
 
 
-async def _native_column_outcomes(encoder, layout, columns, page_byte_limit):
+async def _native_column_outcomes(encoder, layout, columns, page_byte_limit, *, prepare=None):
     """Drain one off-loop native call before returning its bounded outcomes."""
     from process.custom_import.build_source import _drain_cleanup
 
@@ -191,7 +218,8 @@ async def _native_column_outcomes(encoder, layout, columns, page_byte_limit):
 
     async def complete():
         """Retain the native result while cancellation waits for completion."""
-        completed_batches.append(await asyncio.to_thread(encoder, layout, columns, page_byte_limit))
+        bound = partial(encoder, layout) if prepare is None else prepare
+        completed_batches.append(await asyncio.to_thread(bound, columns, page_byte_limit))
 
     primary = await _drain_cleanup(complete(), None)
     if primary is not None:
@@ -252,32 +280,6 @@ def _accepted_column_row(context, outcome):
     return _PreparedRow(raw_key, typed_key, outcome[4], outcome[5], outcome[6], outcome[7], None, outcome[8])
 
 
-def column_row_result(encoder, layout, batch, page_byte_limit):
-    """Classify one row natively before the scheduler requests its successor."""
-    descriptors = column_descriptors(layout, batch)
-    if descriptors is None:
-        return None
-    results = encoder(descriptors, page_byte_limit, include_preparation_bounds=True)
-    if results is None:
-        return None
-    if type(results) not in (list, tuple) or len(results) != 1:
-        raise CandidateRunnerError("source column encoder returned an incomplete row")
-    result = results[0]
-    if type(result) is not tuple or len(result) != 3:
-        raise CandidateRunnerError("source column encoder returned invalid preparation bounds")
-    outcome, input_bytes, output_bytes = result
-    if type(input_bytes) is not int or type(output_bytes) is not int or min(input_bytes, output_bytes) < 0:
-        raise CandidateRunnerError("source column encoder returned invalid preparation bounds")
-    if bool(input_bytes) != bool(output_bytes) or input_bytes > MAX_INPUT_BYTES or output_bytes > MAX_OUTPUT_BYTES:
-        raise CandidateRunnerError("source column encoder returned invalid preparation bounds")
-    if type(outcome) is not tuple or len(outcome) not in (3, 6, 10):
-        raise CandidateRunnerError("source column encoder returned an invalid row")
-    is_deferred = len(outcome) == 10 or outcome[:2] == ("preparation-error", "occurrence_byte_limit")
-    if bool(input_bytes) != is_deferred:
-        raise CandidateRunnerError("source column encoder returned invalid preparation bounds")
-    return outcome, input_bytes, output_bytes
-
-
 def _validate_column_outcome(outcome, limits, ordinal):
     if type(outcome) is not tuple or len(outcome) not in (3, 6, 10) or type(outcome[-1]) is not int or outcome[-1] < 0:
         raise CandidateRunnerError("source column encoder returned an invalid row")
@@ -295,23 +297,61 @@ def prepared_column_outcome(context, fields, batch, index, first_ordinal, limits
     return _accepted_column_row(context, outcome)
 
 
-async def iter_arrow_batch_columns(context, layout, batch, limits, *, first_ordinal=1):
+def _admitted_column_slices(layout, batch, column_indices):
+    """Split zero-copy Arrow slices before allocating admitted native buffers."""
+    offset = 0
+    while offset < batch.num_rows:
+        count = min(MAX_ROWS, batch.num_rows - offset)
+        while True:
+            window = batch.slice(offset, count)
+            selected = window if column_indices is None else window.select(column_indices)
+            descriptors = column_descriptors(layout, selected)
+            if descriptors is not None or count == 1:
+                break
+            count //= 2
+        yield offset, window, descriptors
+        offset += count
+
+
+async def iter_arrow_batch_columns(
+    context, layout, batch, limits, *, first_ordinal=1, prepare=None, column_indices=None
+):
     """Yield ordered native outcomes after the caller validates capture/schema.
 
     The caller retains part counters, reader cleanup and genuine EOF checks.
+    Declaration-order descriptors never replace retained-order rejection values.
     """
-    from process.custom_import.build_source import _stream_fields
-
     is_admitted = (
         first_ordinal >= 1
         and first_ordinal + batch.num_rows - 1 <= limits.maximum_records
         and batch.num_columns <= limits.maximum_fields_per_record
     )
-    columns = column_descriptors(layout, batch) if is_admitted else None
-    encoder = native_column_encoder() if columns is not None else None
+    encoder = native_column_encoder() if is_admitted else None
+    if encoder is None:
+        async with aclosing(
+            iter_arrow_batch_oracle(context, batch, limits, first_ordinal=first_ordinal)
+        ) as prepared_rows:
+            async for prepared_row in prepared_rows:
+                yield prepared_row
+        return
+    for offset, window, descriptors in _admitted_column_slices(layout, batch, column_indices):
+        async with aclosing(
+            _prepared_column_window(
+                context, layout, window, limits, first_ordinal + offset, encoder, prepare, descriptors
+            )
+        ) as prepared_rows:
+            async for prepared_row in prepared_rows:
+                yield prepared_row
+
+
+async def _prepared_column_window(context, layout, batch, limits, first_ordinal, encoder, prepare, descriptors):
+    from process.custom_import.build_source import _stream_fields
+
     native_outcomes = None
-    if encoder is not None:
-        native_outcomes = await _native_column_outcomes(encoder, layout, columns, context.request.page_byte_limit)
+    if descriptors is not None:
+        native_outcomes = await _native_column_outcomes(
+            encoder, layout, descriptors, context.request.page_byte_limit, prepare=prepare
+        )
     if native_outcomes is None:
         async with aclosing(
             iter_arrow_batch_oracle(context, batch, limits, first_ordinal=first_ordinal)

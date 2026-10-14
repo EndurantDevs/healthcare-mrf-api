@@ -416,9 +416,9 @@ def test_compiled_layout_retains_output_and_text_caps(encoder, plan_factory):
     layout = (False, (("value", "string", False, False),), (("first", 0), ("second", 0), ("third", 0)), (), None)
     plan = plan_factory(layout)
     for rows, width, declined in ((64, 1000, False), (64, 1600, True), (1, 4097, True), (1, 4096, False)):
-        batch = pa.record_batch([pa.array(["x" * width] * rows)], names=["value"])
-        descriptors = adapter.column_descriptors(layout, batch)
-        assert descriptors is not None
+        # Exercise native rejection independently of the adapter's earlier admission.
+        offsets = struct.pack(f"<{rows + 1}i", *(width * index for index in range(rows + 1)))
+        descriptors = (("value", "utf8", 0, rows, 0, 0, None, offsets, b"x" * (width * rows)),)
         expected = encoder(layout, descriptors, 1_048_576, include_preparation_bounds=True)
         assert (expected is None) == declined
         assert plan.prepare(descriptors, 1_048_576, include_preparation_bounds=True) == expected
