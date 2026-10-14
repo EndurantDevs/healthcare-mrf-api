@@ -146,7 +146,7 @@ async def _children_page(fixture, root_receipts):
     async with graph._session(fixture.case.sessions) as session:
         groups, name, arguments = await session.run_sync(
             lambda sync: sets._read_child_batch(
-                sync, fixture.request, fixture.registry, (fixture.prepared,), started, "retained", 64, 64
+                sync, fixture.request, fixture.registry, (fixture.prepared,), started, "retained", (64, 64)
             )
         )
     assert len(groups) == 1 and groups[0].children
