@@ -59,6 +59,19 @@ build and generation identities, not per-client tables or arbitrary runtime DDL.
 The storage layout must provide candidate isolation and the intended index
 lifecycle; an atomic publication pointer alone does not eliminate loading costs.
 
+GRAPH preparation can reuse canonical decoding for fingerprints and typed
+projections within one bounded family partition. Finish that partition's
+canonical validation before writing roots, then bind prepared columns to the
+returned family identities. Reuse must preserve original row/byte accounting,
+fresh provenance and ownership checks, and committed-prefix resume. Temporary
+preparation is disposable, bounded storage, never a durable cursor or permission
+to publish. Overflow uses the existing bounded path; I/O or integrity failures
+abort the attempt. Restart reconstructs preparation from immutable inputs.
+Workers require a writable system temporary directory with room for one
+256 MiB preparation stream per process. Container deployments with read-only
+root filesystems must provide bounded writable temporary storage before using
+this path; credentials and published snapshots do not belong in that storage.
+
 Use a fixed, model-defined table family in an engine-generated namespace. Keep
 canonical row shapes and stable logical/entity IDs; do not add a snapshot column
 to existing composite payload types or allocate replacement identity dictionaries.

@@ -490,7 +490,7 @@ def test_family_retry_requests_one_pending_page_after_the_durable_root(monkeypat
     family_page = Mock(return_value=chosen)
     monkeypatch.setattr(preparation, "prepare_family_page", family_page)
     assert graph._next_family_inputs(session, request, registry, 7, 10) is chosen
-    family_page.assert_called_once_with(session, request, registry, 7, 10, physical=True)
+    family_page.assert_called_once_with(session, request, registry, 7, 10, physical=True, prepared=None)
 
 
 def test_retained_copy_order_uses_membership_not_typed_hash():
