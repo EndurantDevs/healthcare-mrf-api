@@ -8,6 +8,7 @@ import copy
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import replace
 from decimal import Decimal
+from tempfile import TemporaryFile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -823,7 +824,7 @@ def test_source_retry_and_retained_entity_bindings_are_verified(monkeypatch, ret
 async def test_graph_caller_consumes_full_pages_and_heartbeats_per_page(monkeypatch, cancel):
     request = _request()
     inputs = [prepare._root_input(request, root_row(request, index, retained=True)) for index in range(1, 6)]
-    observed_cursors = []
+    observed_cursors, owned_handles = [], []
     pages = iter((tuple(inputs[:3]), tuple(inputs[3:]), ()))
 
     async def run_sync(callback):
@@ -839,7 +840,9 @@ async def test_graph_caller_consumes_full_pages_and_heartbeats_per_page(monkeypa
     async def write_context(*args):
         yield session, None
 
-    def next_page(_session, _request, _registry, _build_id, after):
+    def next_page(_session, _request, _registry, _build_id, after, *, prepared):
+        prepared.file = TemporaryFile(mode="w+b")
+        owned_handles.append(prepared.file)
         observed_cursors.append(after)
         return next(pages)
 
@@ -866,11 +869,13 @@ async def test_graph_caller_consumes_full_pages_and_heartbeats_per_page(monkeypa
         assert graph._consume_family_page.await_count == 1
         assert graph._heartbeat.await_count == 0
         assert graph._open_output.await_count == 0
+        assert all(handle.closed for handle in owned_handles)
         return
     assert await graph._build_graph(object(), request, 7) == 11
     assert observed_cursors == [0, 3, 5]
     assert graph._heartbeat.await_count == 2
     assert graph._consume_family_page.await_count == 2
+    assert all(handle.closed for handle in owned_handles)
     assert [
         [prepared_family.plan.root_record_id for prepared_family in call.args[-1]]
         for call in graph._consume_family_page.await_args_list

@@ -1280,18 +1280,18 @@ def _source_digest(session, request, build_id, capture_bundle_id):
     return digest.digest()
 
 
-def _next_family_inputs(session, request, registry, build_id, after_root_id):
+def _next_family_inputs(session, request, registry, build_id, after_root_id, *, prepared=None):
     # Keep shared read primitives in this module; import the preparation leaf
     # only after module initialization to avoid an import cycle.
     from process.custom_import.build_graph_prepare_page import prepare_family_page
 
-    return prepare_family_page(session, request, registry, build_id, after_root_id, physical=True)
+    return prepare_family_page(session, request, registry, build_id, after_root_id, physical=True, prepared=prepared)
 
 
-async def _consume_family_page(session_factory, request, registry, family_inputs):
+async def _consume_family_page(session_factory, request, registry, family_inputs, *, prepared=None):
     from process.custom_import.build_graph_sets import consume_family_page
 
-    await consume_family_page(session_factory, request, registry, family_inputs)
+    await consume_family_page(session_factory, request, registry, family_inputs, prepared=prepared)
 
 
 async def _build_graph(session_factory, request: SourceBuildRequest, build_id: int) -> int | None:
@@ -1319,13 +1319,24 @@ async def _build_graph(session_factory, request: SourceBuildRequest, build_id: i
         build = await _snapshot(session_factory, request, build_id)
     after_root_id = 0
     while True:
-        async with _session(session_factory) as session:
-            family_inputs = await session.run_sync(
-                lambda sync: _next_family_inputs(sync, request, registry, build_id, after_root_id)
+        from process.custom_import.build_graph_prepared import PreparedChildren
+
+        prepared = PreparedChildren()
+        try:
+            async with _session(session_factory) as session:
+                family_inputs = await session.run_sync(
+                    lambda sync: _next_family_inputs(
+                        sync, request, registry, build_id, after_root_id, prepared=prepared
+                    )
+                )
+            prepared.finish()
+            if not family_inputs:
+                break
+            await _consume_family_page(
+                session_factory, request, registry, family_inputs, prepared=prepared if prepared.enabled else None
             )
-        if not family_inputs:
-            break
-        await _consume_family_page(session_factory, request, registry, family_inputs)
+        finally:
+            prepared.close()
         after_root_id = family_inputs[-1].plan.root_record_id
         await _heartbeat(session_factory, request)
     return await _open_output(session_factory, request, build_id, build.capture_bundle_id)

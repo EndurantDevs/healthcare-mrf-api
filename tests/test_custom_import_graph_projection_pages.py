@@ -151,7 +151,7 @@ def test_child_projection_rejects_count_beyond_frozen_family_before_write(monkey
     monkeypatch.setattr(graph_payloads, "native_projector", lambda: None)
     with database.read_transaction(database.session, request, 7):
         with pytest.raises(CandidateRunnerError, match="inconsistent durable progress"):
-            sets._read_child_batch(database.session, request, registry, (source,), states, "source", 25, 64)
+            sets._read_child_batch(database.session, request, registry, (source,), states, "source", (25, 64))
     assert not database.read_open and not database.write_open
     assert not database.calls and not database.seen
     assert states[0].current.attached_child_count == 0
@@ -245,7 +245,7 @@ def test_compiled_logical_pages_reserve_prior_columns_before_native_dispatch(mon
 
     def read_pages():
         with database.read_transaction(database.session, request, 7):
-            return sets._read_child_batch(database.session, request, registry, inputs, states, "source", 25, 64)
+            return sets._read_child_batch(database.session, request, registry, inputs, states, "source", (25, 64))
 
     with monkeypatch.context() as serial:
         serial.setattr(graph_payloads, "native_projector", lambda: None)

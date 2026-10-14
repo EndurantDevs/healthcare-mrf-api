@@ -464,7 +464,7 @@ def _source_child_stream(session, request, registry, build_id, root_rows, *, phy
     )
 
 
-def _validated_child_documents(family_input, registry, collection, child_rows, child_counter, *, request=None):
+def _validated_children(family_input, registry, collection, child_rows, child_counter, *, request=None):
     """Keep canonical child and parent validation inside the ordered stream."""
 
     root_bytes = (
@@ -487,10 +487,28 @@ def _validated_child_documents(family_input, registry, collection, child_rows, c
         ):
             raise CandidateRunnerError("source child payload or parent digest does not match")
         next(child_counter)
-        yield bytes(child.child_key_sha256), child.canonical_child_key, child.canonical_payload
+        yield child
 
 
-def _source_input_with_digest(request, registry, family_input, child_groups, pending_groups, *, physical=False):
+def _validated_child_documents(request, registry, family_input, collection, children, prepared):
+    from process.custom_import.build_graph_sets import prepare_child_columns
+
+    fields = runner_codec.fields_by_collection(request.definition)[collection]
+    records = ((child, child.canonical_payload) for child in children)
+    for child, proof in graph_payloads.decode_records(request.definition, collection, records):
+        document = bytes(child.child_key_sha256), child.canonical_child_key, child.canonical_payload
+        if proof is None or document[:2] != (proof[3], proof[2]):
+            runner_codec._validate_child_document(request.definition, collection, fields, document)
+            proof = None
+        if prepared is not None and prepared.enabled:
+            columns = prepare_child_columns(request, registry, family_input, collection, child, proof)
+            prepared.append(family_input.plan.root_record_id, collection, child, graph._model_bytes((child,)), columns)
+        yield document
+
+
+def _source_input_with_digest(
+    request, registry, family_input, child_groups, pending_groups, *, physical=False, prepared=None
+):
     """Consume only this family's canonical collection groups, without buffering."""
 
     child_counter = count()
@@ -511,24 +529,20 @@ def _source_input_with_digest(request, registry, family_input, child_groups, pen
         if position != expected:
             return
         pending_groups.popleft()
-        yield from _validated_child_documents(
+        children = _validated_children(
             family_input, registry, collection, child_rows, child_counter, request=request if physical else None
         )
+        yield from _validated_child_documents(request, registry, family_input, collection, children, prepared)
 
     digest = runner_codec._family_hash_from_documents(
         request.definition,
         family_input.values,
-        {
-            collection.name: graph_payloads.validated_documents(
-                request.definition, collection.name, documents(collection.name)
-            )
-            for collection in request.definition.child_collections
-        },
+        {collection.name: documents(collection.name) for collection in request.definition.child_collections},
     )
     return replace(family_input, family_sha256=digest, child_count=next(child_counter))
 
 
-def _digest_page(session, request, registry, build_id, root_rows, *, physical=False):
+def _digest_page(session, request, registry, build_id, root_rows, *, physical=False, prepared=None):
     """Reduce all selected SOURCE roots and verify any immutable retry families."""
 
     family_inputs = []
@@ -543,7 +557,7 @@ def _digest_page(session, request, registry, build_id, root_rows, *, physical=Fa
             graph._require_budget(session.info["custom_import_build_read_deadline"])
             if family_input.plan.selection_kind == "source":
                 family_inputs[index] = family_input = _source_input_with_digest(
-                    request, registry, family_input, child_groups, pending_groups, physical=physical
+                    request, registry, family_input, child_groups, pending_groups, physical=physical, prepared=prepared
                 )
             current_family = root_rows[index][5]
             if current_family is not None and (
@@ -603,7 +617,7 @@ def _physical_family_rows(session, request, build_id, query, *, row_limit, reser
             return
 
 
-def prepare_family_page(session, request, registry, build_id, after_root_id, *, physical=False):
+def prepare_family_page(session, request, registry, build_id, after_root_id, *, physical=False, prepared=None):
     """Return a strict pending-root prefix; completion stays in durable BF root_rows.
 
     One joined root page and one globally bounded SOURCE child stream replace
@@ -644,12 +658,14 @@ def prepare_family_page(session, request, registry, build_id, after_root_id, *, 
         stream.close()
     while root_rows:
         try:
-            return _digest_page(session, request, registry, build_id, root_rows, physical=physical)
+            return _digest_page(session, request, registry, build_id, root_rows, physical=physical, prepared=prepared)
         except CandidateRunnerError as exc:
             # Another root's reservation must not reject a valid oversized
             # family. Retain a strict prefix and release the suffix, which is
             # read again after that prefix commits. No durable cursor moves.
             if physical or str(exc) != "one build record exceeds the admitted byte page" or len(root_rows) == 1:
                 raise
+            if prepared is not None:
+                prepared.disable()
             del root_rows[max(1, len(root_rows) // 2) :]
     return ()

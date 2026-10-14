@@ -47,6 +47,7 @@ from db.models.custom_import import (
 )
 from process.custom_import import build_graph as graph
 from process.custom_import import graph_payloads
+from process.custom_import.build_graph_prepared import _CHILD_FIELDS, PreparedChild
 from process.custom_import.build_graph_source_page import _SCALAR_COLUMNS
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
 from process.custom_import.execution import lease_token_sha256
@@ -443,24 +444,41 @@ def _children_statement(request, registry, states, candidate_models, base_models
     return statement, (plan.root_record_id, *order), (child,)
 
 
-def _read_child_rows(session, request, registry, states, child_limit, reserved_bytes):
+def _read_child_rows(
+    session, request, registry, states, child_limit, reserved_bytes, *, prepared=None, prepared_states=()
+):
     """One protected metadata/payload window; native array binding has no parameter fanout."""
     with graph._read_transaction(session, request, states[0].current.build_id) as (_build, deadline):
         candidate_models, base_models = graph._build_storage_models(session, states[0].current.build_id)
         statement, keys, models = _children_statement(request, registry, states, candidate_models, base_models)
         graph._prepare_read(session, request, deadline)
+        metadata_columns = (*keys, graph._variable_bytes(*models))
+        if prepared is not None:
+            metadata_columns += (statement.selected_columns.scope_valid,)
         metadata = session.execute(
-            statement.with_only_columns(*keys, graph._variable_bytes(*models), maintain_column_froms=True)
+            statement.with_only_columns(*metadata_columns, maintain_column_froms=True)
             .order_by(*keys)
             .limit(child_limit)
         ).all()
         # Leave room for the native logical-page arrays as well as the fetched models.
-        admitted = graph._admitted_keys(metadata, (MAX_BATCH_BYTES - reserved_bytes) // 2)
+        byte_metadata = [tuple(entry[:-1]) for entry in metadata] if prepared is not None else metadata
+        admitted = graph._admitted_keys(byte_metadata, (MAX_BATCH_BYTES - reserved_bytes) // 2)
         if not admitted:
             return ()
         child_ids = tuple(key[-1] for key in admitted)
         if len(child_ids) != len(set(child_ids)):
             raise CandidateRunnerError("child page identity or provenance differs")
+        if prepared is not None:
+            if any(entry[-1] is not True for entry in metadata[: len(admitted)]):
+                raise CandidateRunnerError("child page identity or provenance differs")
+            if not prepared.tips_verified:
+                prepared.verify_tips(
+                    prepared_states,
+                    {slot: name for name, slot in registry.child_collection_slots.items()},
+                    check_budget=lambda: graph._require_budget(deadline),
+                )
+                prepared.tips_verified = True
+            return prepared.rows(byte_metadata[: len(admitted)], check_budget=lambda: graph._require_budget(deadline))
         graph._prepare_read(session, request, deadline)
         child_rows = session.execute(
             statement.where(keys[-1] == any_(bindparam("child_ids", child_ids, type_=ARRAY(BigInteger)))).order_by(
@@ -630,6 +648,91 @@ def _serial_source_columns(request, registry, group, child):
     )
 
 
+def prepare_child_columns(request, registry, family_input, collection, child, proof):
+    """Reuse the canonical decoder's lanes; defer ordinary projection failures."""
+    if proof is None:
+        return None
+    if (proof[0], proof[1]) != (child.canonical_parent_key, bytes(child.parent_key_sha256)):
+        return None
+    if proof[4] != bytes(child.payload_sha256):
+        raise CandidateRunnerError("native child payload digest differs")
+    values_by_field, scalars, scalar_bytes = graph_payloads.projection_values(
+        fields_by_collection(request.definition)[collection], proof, child.child_revision_id
+    )
+    # These placeholders never enter scalar or canonical context bytes.
+    family = Family(family_revision_id=1, entity_binding_id=1, family_sha256=bytes(32))
+    try:
+        contexts = (
+            tuple(
+                graph._context_values(
+                    request,
+                    registry,
+                    family_input.plan.build_id,
+                    graph._candidate(request.definition, family, family_input.values, child, values_by_field),
+                )
+            )
+            if collection == request.definition.query.child_collection
+            else ()
+        )
+    except (graph.material.ScalarProjectionError, graph.material.WinnerMaterializationError) as error:
+        if graph_payloads._has_allocation_failure(error):
+            raise
+        return None
+    scalar_columns = tuple(tuple(scalar[index] for scalar in scalars) for index in range(10))
+    context_columns = tuple(
+        tuple(context[field] for context in contexts)
+        for field in ("context_child_revision_id", "profile_slot", "canonical_context_key")
+    )
+    context_bytes = sum(len(context["canonical_context_key"].encode("utf-8")) + 32 for context in contexts)
+    retained_bytes = _retained_column_bytes(scalar_columns, context_columns)
+    decimals = tuple(
+        None if decimal_value is None else graph_payloads._projection_decimal(decimal_value)
+        for decimal_value in scalar_columns[6]
+    )
+    if any(
+        decimal_value is not None and encoded is None
+        for decimal_value, encoded in zip(scalar_columns[6], decimals, strict=True)
+    ):
+        return None
+    wire_scalars = (
+        *scalar_columns[:6],
+        decimals,
+        *scalar_columns[7:],
+    )
+    return wire_scalars, context_columns, scalar_bytes, context_bytes, retained_bytes
+
+
+def _prepared_child_columns(request, registry, group, child):
+    record = child.record()
+    if record[6] is None:
+        return _serial_source_columns(
+            request, registry, group, Child(**dict(zip(_CHILD_FIELDS, record[7], strict=True)))
+        )
+    columns = record[6]
+    if type(columns) is not tuple or len(columns) != 5:
+        raise CandidateRunnerError("prepared child columns differ")
+    scalars, contexts, scalar_bytes, context_bytes, retained_bytes = columns
+    scalars = graph_payloads._projection_columns(
+        scalars, (int, int, str, str, str, int, str, bool, type(None), type(None)), 20, 4
+    )
+    contexts = graph_payloads._projection_columns(contexts, (int, int, str), 4, 3)
+    scalars = (*scalars[:6], graph_payloads._projection_decimal_column(scalars[6]), *scalars[7:])
+    if (
+        any(value != child.child_revision_id for value in (*scalars[0], *contexts[0]))
+        or any(type(value) is not int or value < 0 for value in columns[2:])
+        or scalar_bytes
+        != sum(len(value.encode("utf-8")) for column in scalars for value in column if isinstance(value, str))
+        or context_bytes != sum(len(value.encode("utf-8")) + 32 for value in contexts[2])
+        or retained_bytes != _retained_column_bytes(scalars, contexts)
+    ):
+        raise CandidateRunnerError("prepared child column accounting differs")
+    return scalars, contexts, scalar_bytes, context_bytes, retained_bytes
+
+
+def _child_model_bytes(child):
+    return child.byte_count if isinstance(child, PreparedChild) else graph._model_bytes((child,))
+
+
 def _source_column_slice(prepared, span):
     """Preserve typed columns and their native byte charges without building row models."""
     start, count, context_start, context_count, scalar_bytes, context_bytes, argument_bytes = span
@@ -658,7 +761,9 @@ def _append_source_columns(request, registry, packet, prepared, source_columns):
     for position, (group, child) in enumerate(packet):
         span = None if prepared is None else prepared.rows[position]
         child_scalars, child_contexts, child_bytes, child_context_bytes, column_bytes = (
-            _serial_source_columns(request, registry, group, child)
+            _prepared_child_columns(request, registry, group, child)
+            if isinstance(child, PreparedChild)
+            else _serial_source_columns(request, registry, group, child)
             if span is None
             else _source_column_slice(prepared, span)
         )
@@ -687,7 +792,8 @@ def _can_project_sources(request, registry):
 
 def _source_columns(request, registry, groups, *, retained_bytes=0):
     """Prepare across families, keeping logical page bounds and ordered serial fallback."""
-    if not _can_project_sources(request, registry):
+    replay = any(isinstance(child, PreparedChild) for group in groups for child in group.children)
+    if not replay and not _can_project_sources(request, registry):
         return _legacy_source_columns(request, registry, groups)
     child_rows = tuple((group, child) for group in groups for child in group.children)
     pending = deque(
@@ -699,19 +805,27 @@ def _source_columns(request, registry, groups, *, retained_bytes=0):
     )
     while pending:
         packet = pending.popleft()
-        projection_records = tuple(
-            graph_payloads.ProjectionRecord(
-                child, group.state.source.record, group.state.family, group.state.source.values
+        projection_records = (
+            ()
+            if replay
+            else tuple(
+                graph_payloads.ProjectionRecord(
+                    child, group.state.source.record, group.state.family, group.state.source.values
+                )
+                for group, child in packet
             )
-            for group, child in packet
         )
-        prepared = graph_payloads.project_batch(
-            request.definition,
-            registry.child_collection_slots,
-            projection_records,
-            retained_bytes=source_columns.retained_bytes,
+        prepared = (
+            None
+            if replay
+            else graph_payloads.project_batch(
+                request.definition,
+                registry.child_collection_slots,
+                projection_records,
+                retained_bytes=source_columns.retained_bytes,
+            )
         )
-        if prepared is None and len(packet) > 1 and source_columns.retained_bytes < 4_194_304:
+        if not replay and prepared is None and len(packet) > 1 and source_columns.retained_bytes < 4_194_304:
             midpoint = len(packet) // 2
             pending.extendleft((packet[midpoint:], packet[:midpoint]))
             continue
@@ -914,7 +1028,7 @@ def _logical_child_page(
     first_root, first_child, _valid = child_rows[offset]
     span = spans_by_root_id[first_root]
     while len(span) > 1 and (
-        sum(reserved_bytes_by_root_id[root_id] for root_id in span) + graph._model_bytes((first_child,))
+        sum(reserved_bytes_by_root_id[root_id] for root_id in span) + _child_model_bytes(first_child)
         > request.page_byte_limit
     ):
         midpoint = len(span) // 2
@@ -924,7 +1038,7 @@ def _logical_child_page(
     remaining_rows = child_rows[offset : offset + min(limit, request.page_row_limit - len(span))]
     remaining_rows = tuple(child_row for child_row in remaining_rows if child_row[0] <= span[-1])
     logical_keys = graph._admitted_keys(
-        [(index, graph._model_bytes((child,))) for index, (_root_id, child, _valid) in enumerate(remaining_rows)],
+        [(index, _child_model_bytes(child)) for index, (_root_id, child, _valid) in enumerate(remaining_rows)],
         request.page_byte_limit - sum(reserved_bytes_by_root_id[root_id] for root_id in span),
     )
     active_states = tuple(
@@ -974,8 +1088,8 @@ def _advance_child_tips(groups, tips_by_root_id, reserved_bytes_by_root_id):
         tips_by_root_id[root_id] = next_state
 
 
-def _read_child_batch(session, request, registry, inputs, states, kind, row_limit, child_limit):
-    """Preview bounded logical pages; only the returned native receipt is durable."""
+def _read_child_batch(session, request, registry, inputs, states, kind, row_limits, *, prepared=None):
+    """Preview logical/physical row bounds; only the returned native receipt is durable."""
     pages, child_count, retained_bytes = [], 0, 0
     tips_by_root_id, reserved_bytes_by_root_id, spans_by_root_id = _child_reservations(request, inputs, states)
     held_bytes = sum(reserved_bytes_by_root_id.values())
@@ -984,10 +1098,12 @@ def _read_child_batch(session, request, registry, inputs, states, kind, row_limi
         request,
         registry,
         tuple(state for state in states if not state.complete and state.current.selection_kind == kind),
-        min(child_limit, (MAX_BATCH_ROWS - len(states)) // _child_fanout(request, registry)),
+        min(row_limits[1], (MAX_BATCH_ROWS - len(states)) // _child_fanout(request, registry)),
         held_bytes,
+        prepared=prepared,
+        prepared_states=states,
     )
-    held_bytes += graph._model_bytes(tuple(child for _root_id, child, _valid in child_rows))
+    held_bytes += sum(_child_model_bytes(child_row[1]) for child_row in child_rows)
     while child_count < len(child_rows):
         groups = _logical_child_page(
             request,
@@ -996,7 +1112,7 @@ def _read_child_batch(session, request, registry, inputs, states, kind, row_limi
             reserved_bytes_by_root_id,
             tips_by_root_id,
             child_rows,
-            row_limit,
+            row_limits[0],
             child_count,
         )
         name, arguments = _child_arguments(request, registry, groups, retained_bytes=retained_bytes)
@@ -1025,7 +1141,7 @@ def _read_child_batch(session, request, registry, inputs, states, kind, row_limi
     return groups, name, arguments
 
 
-async def _consume_child_page(session_factory, request, registry, inputs, states):
+async def _consume_child_page(session_factory, request, registry, inputs, states, *, prepared=None):
     """Consume one bounded physical root window from its committed durable tips."""
     row_limit = _child_limit(request, registry)
     child_limit = MAX_BATCH_ROWS // _child_fanout(request, registry)
@@ -1041,7 +1157,14 @@ async def _consume_child_page(session_factory, request, registry, inputs, states
                 async with graph._session(session_factory) as session:
                     groups, name, arguments = await session.run_sync(
                         lambda sync: _read_child_batch(
-                            sync, request, registry, inputs, states, kind, row_limit, child_limit
+                            sync,
+                            request,
+                            registry,
+                            inputs,
+                            states,
+                            kind,
+                            (row_limit, child_limit),
+                            prepared=prepared if kind == "source" else None,
                         )
                     )
                 async with graph._page_session(session_factory, request, inputs[0].plan.build_id) as (session, _build):
@@ -1059,7 +1182,7 @@ async def _consume_child_page(session_factory, request, registry, inputs, states
             await graph._heartbeat(session_factory, request)
 
 
-async def consume_family_page(session_factory, request, registry, inputs):
+async def consume_family_page(session_factory, request, registry, inputs, *, prepared=None):
     """Coalesce roots and children without widening their logical page policies."""
     if not inputs:
         return
@@ -1072,4 +1195,4 @@ async def consume_family_page(session_factory, request, registry, inputs):
     ):
         raise CandidateRunnerError("family page identity or read budget differs")
     states = await _start_roots(session_factory, request, registry, inputs)
-    await _consume_child_page(session_factory, request, registry, inputs, states)
+    await _consume_child_page(session_factory, request, registry, inputs, states, prepared=prepared)
