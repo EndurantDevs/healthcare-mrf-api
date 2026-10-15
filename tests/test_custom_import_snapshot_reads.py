@@ -12,6 +12,8 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.sql import visitors
+from sqlalchemy.sql.selectable import Exists
 
 from db.models import custom_import as models
 from process.custom_import import grouped_read, read_core, read_identity
@@ -41,6 +43,23 @@ def _assert_routing(statement, family_id):
     return sql
 
 
+def _assert_finality_gates(statement, target):
+    gates = [node.element.element for node in visitors.iterate(statement) if isinstance(node, Exists)]
+    for model in (models.CustomImportGeneration, models.CustomImportGenerationSeal):
+        matching_gates = [gate for gate in gates if gate.get_final_froms() == [model.__table__]]
+        assert len(matching_gates) == 1
+        gate = matching_gates[0]
+        assert not gate._auto_correlate and not gate._correlate
+        expected_predicates = tuple(
+            getattr(model, name) == getattr(target, name)
+            for name in ("dataset_id", "generation_id", "definition_revision_id", "schema_revision_id")
+        )
+        if model is models.CustomImportGenerationSeal:
+            expected_predicates += (model.seal_contract == "custom-import-generation-seal/v1",)
+        assert len(gate._where_criteria) == len(expected_predicates)
+        assert all(actual.compare(required) for actual, required in zip(gate._where_criteria, expected_predicates))
+
+
 @pytest.mark.parametrize("family_id", [None, 17, 18])
 @pytest.mark.parametrize("child_context", [False, True])
 def test_winner_search_relation_and_order_share_one_storage_binding(family_id, child_context):
@@ -55,8 +74,9 @@ def test_winner_search_relation_and_order_share_one_storage_binding(family_id, c
     )
     sql = _assert_routing(statement, family_id)
     schema = "mrf" if family_id is None else snapshot_schema(family_id)
-    assert f"JOIN mrf.custom_import_generation ON" in sql
-    assert f"JOIN mrf.custom_import_generation_seal ON" in sql
+    _assert_finality_gates(statement, context.target)
+    assert "JOIN mrf.custom_import_generation ON" not in sql
+    assert "JOIN mrf.custom_import_generation_seal ON" not in sql
     assert (
         f"{schema}.custom_import_root_scalar.root_record_id = {schema}.custom_import_family_revision.root_record_id"
         in sql
