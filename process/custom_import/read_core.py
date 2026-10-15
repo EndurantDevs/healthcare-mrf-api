@@ -2009,33 +2009,37 @@ def _pinned_generation_winner_statement(winner_statement, context: _ReadContext)
     winner_model = context.model(CustomImportWinner)
 
     pinned_target = context.target
-    return (
-        winner_statement.join(
-            CustomImportGeneration,
-            and_(
-                CustomImportGeneration.dataset_id == winner_model.dataset_id,
-                CustomImportGeneration.generation_id == winner_model.generation_id,
-                CustomImportGeneration.definition_revision_id == winner_model.definition_revision_id,
-                CustomImportGeneration.schema_revision_id == winner_model.schema_revision_id,
-            ),
-        )
-        .join(
-            CustomImportGenerationSeal,
-            and_(
-                CustomImportGenerationSeal.generation_id == winner_model.generation_id,
-                CustomImportGenerationSeal.dataset_id == winner_model.dataset_id,
-                CustomImportGenerationSeal.definition_revision_id == winner_model.definition_revision_id,
-                CustomImportGenerationSeal.schema_revision_id == winner_model.schema_revision_id,
-            ),
-        )
+    generation_is_pinned = (
+        select(1)
         .where(
-            winner_model.dataset_id == pinned_target.dataset_id,
-            winner_model.generation_id == pinned_target.generation_id,
-            winner_model.definition_revision_id == pinned_target.definition_revision_id,
-            winner_model.schema_revision_id == pinned_target.schema_revision_id,
-            winner_model.profile_slot == context.profile_slot,
+            CustomImportGeneration.dataset_id == pinned_target.dataset_id,
+            CustomImportGeneration.generation_id == pinned_target.generation_id,
+            CustomImportGeneration.definition_revision_id == pinned_target.definition_revision_id,
+            CustomImportGeneration.schema_revision_id == pinned_target.schema_revision_id,
+        )
+        .correlate(None)
+        .exists()
+    )
+    seal_is_pinned = (
+        select(1)
+        .where(
+            CustomImportGenerationSeal.dataset_id == pinned_target.dataset_id,
+            CustomImportGenerationSeal.generation_id == pinned_target.generation_id,
+            CustomImportGenerationSeal.definition_revision_id == pinned_target.definition_revision_id,
+            CustomImportGenerationSeal.schema_revision_id == pinned_target.schema_revision_id,
             CustomImportGenerationSeal.seal_contract == "custom-import-generation-seal/v1",
         )
+        .correlate(None)
+        .exists()
+    )
+    return winner_statement.where(
+        winner_model.dataset_id == pinned_target.dataset_id,
+        winner_model.generation_id == pinned_target.generation_id,
+        winner_model.definition_revision_id == pinned_target.definition_revision_id,
+        winner_model.schema_revision_id == pinned_target.schema_revision_id,
+        winner_model.profile_slot == context.profile_slot,
+        generation_is_pinned,
+        seal_is_pinned,
     )
 
 

@@ -226,13 +226,14 @@ async def test_provider_scores_use_complete_native_eligibility(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_national_score_search_keeps_import_first_planning(monkeypatch):
+@pytest.mark.parametrize("direction", (None, "desc"))
+async def test_national_score_search_keeps_import_first_planning(monkeypatch, direction):
     async def prepare_scope(_native_entity_scope):
         raise AssertionError("national score query collected all native providers")
 
     body, connection, _, _ = await _run_imported_page(
         monkeypatch,
-        direction="desc",
+        direction=direction,
         require_match=True,
         native_scope_preparer=prepare_scope,
         native_args=RequestParameters({"include_total": ["true"], "limit": ["1"], "start": ["0"]}),
@@ -243,6 +244,10 @@ async def test_national_score_search_keeps_import_first_planning(monkeypatch):
     assert "native_eligible_npis AS MATERIALIZED" not in page_sql
     assert page_sql.index("custom_import_provider_relation AS") < page_sql.index("SELECT DISTINCT c.npi AS npi")
     assert "(c.npi)::bigint IN (SELECT CASE" in page_sql
+    assert "EXISTS (SELECT 1 FROM custom_import_provider_relation" not in page_sql
+    assert "ON imported.entity_value = eligible_npi.npi::text" in page_sql
+    assert page_sql.index("WHERE imported.entity_value IS NOT NULL") < page_sql.index("provider_totals AS")
+    assert page_sql.index("provider_totals AS") < page_sql.index("LIMIT :limit OFFSET :start")
 
 
 @pytest.mark.asyncio
@@ -531,8 +536,12 @@ def _postgres_membership_statements(context, predicate):
         "FROM provider_totals LEFT JOIN page_npis ON TRUE ORDER BY page_npis._provider_page_position",
         context,
     )
+    count_eligible = "SELECT DISTINCT COALESCE(c.npi, c.inferred_npi) AS npi FROM native AS c WHERE c.visible"
+    membership = npi_module._provider_import_membership_clause(context, "COALESCE(c.npi, c.inferred_npi)")
+    if membership:
+        count_eligible += f" AND {membership}"
     count_statement = npi_module._provider_list_statement(
-        prefix + f"eligible_npis AS ({eligible}) SELECT COUNT(*) FROM eligible_npis", context
+        prefix + f"eligible_npis AS ({count_eligible}) SELECT COUNT(*) FROM eligible_npis", context
     )
     return page_statement, count_statement
 

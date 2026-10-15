@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import Column, MetaData, Table, create_engine
+from sqlalchemy import Column, MetaData, Table, create_engine, inspect, select
 from sqlalchemy.orm import Session
 
 from db.models import custom_import as models
@@ -201,6 +201,77 @@ def _rows(session, context, query):
     return session.execute(grouped_read.prepare_relation(context, query, _SCOPE).statement).all()
 
 
+@pytest.mark.parametrize("family_id", [None, 17, 18])
+@pytest.mark.parametrize("column_name", ["dataset_id", "generation_id", "definition_revision_id", "schema_revision_id"])
+def test_pinned_winners_reject_foreign_identity(row_store, family_id, column_name):
+    session, contexts = row_store
+    context = contexts[family_id]
+    winner = context.model(models.CustomImportWinner)
+    statement = read_core._pinned_generation_winner_statement(select(winner), context)
+    assert len(session.scalars(statement).all()) == 3
+    table = inspect(winner).selectable
+    session.execute(table.update().values({column_name: getattr(context.target, column_name) + 1000}))
+    assert session.scalars(statement).all() == []
+
+
+@pytest.mark.parametrize("family_id", [None, 17, 18])
+@pytest.mark.parametrize("control", [models.CustomImportGeneration, models.CustomImportGenerationSeal])
+@pytest.mark.parametrize(
+    "column_name", [None, "dataset_id", "generation_id", "definition_revision_id", "schema_revision_id"]
+)
+def test_winners_require_exact_canonical_controls(row_store, family_id, control, column_name):
+    session, contexts = row_store
+    context = contexts[family_id]
+    statement = read_core._winner_statement(context)
+    assert len(session.execute(statement).all()) == 3
+    table = control.__table__
+    is_target_generation = table.c.generation_id == context.target.generation_id
+    mutation = table.delete().where(is_target_generation)
+    if column_name is not None:
+        mutation = (
+            table.update()
+            .where(is_target_generation)
+            .values({column_name: getattr(context.target, column_name) + 1000})
+        )
+    session.execute(mutation)
+    assert session.execute(statement).all() == []
+
+
+@pytest.mark.parametrize("family_id", [None, 17, 18])
+def test_winners_require_the_exact_seal_contract(row_store, family_id):
+    session, contexts = row_store
+    context = contexts[family_id]
+    statement = read_core._winner_statement(context)
+    assert len(session.execute(statement).all()) == 3
+    seal = models.CustomImportGenerationSeal.__table__
+    session.execute(
+        seal.update().where(seal.c.generation_id == context.target.generation_id).values(seal_contract="foreign/v1")
+    )
+    assert session.execute(statement).all() == []
+
+
+@pytest.mark.parametrize("family_id, expected_score", [(None, "99"), (17, "2"), (18, "7")])
+def test_default_period_rejects_foreign_definition(row_store, family_id, expected_score):
+    session, contexts = row_store
+    context = contexts[family_id]
+    query = fixture.query(
+        context_filters=(read_core.ReadFilter("segment", "eq", "segment_a"),),
+        order_terms=(read_core.ReadOrderTerm("score", "desc", "last"),),
+    )
+    expected_rows = [(_NPI, Decimal(expected_score))]
+    assert _rows(session, context, query) == expected_rows
+    winner = inspect(context.model(models.CustomImportWinner)).selectable
+    older_family = session.scalar(select(winner.c.family_revision_id).order_by(winner.c.family_revision_id).limit(1))
+    session.execute(
+        winner.update()
+        .where(winner.c.profile_slot == context.default_profile_slot)
+        .values(definition_revision_id=context.target.definition_revision_id + 1000, family_revision_id=older_family)
+    )
+    assert _rows(session, context, query) == []
+    explicit = replace(query, context_filters=query.context_filters + (read_core.ReadFilter("period", "eq", 2025),))
+    assert _rows(session, context, explicit) == expected_rows
+
+
 def test_grouped_selection_reads_each_exact_leaf_and_retains_legacy_storage(row_store):
     session, contexts = row_store
     query = fixture.query(
@@ -238,9 +309,9 @@ def test_grouped_winners_require_the_selected_family_entity_binding(row_store, f
         for model in (models.CustomImportEntityBinding, models.CustomImportFamilyRevision)
     }
     session.execute(
-        tables_by_model[models.CustomImportEntityBinding].insert().values(
-            entity_binding_id=777, dataset_id=1, adapter_id="npi", canonical_value="1000000004"
-        )
+        tables_by_model[models.CustomImportEntityBinding]
+        .insert()
+        .values(entity_binding_id=777, dataset_id=1, adapter_id="npi", canonical_value="1000000004")
     )
     family_table = tables_by_model[models.CustomImportFamilyRevision]
     session.execute(family_table.update().where(family_table.c.entity_binding_id == 501).values(entity_binding_id=777))
@@ -305,11 +376,12 @@ async def test_entity_locator_uses_the_context_entity_and_family_tables(row_stor
 
 
 @pytest.mark.asyncio
-async def test_snapshot_exact_count_offset_order_and_locator_use_same_relation(row_store):
+@pytest.mark.parametrize("family_id, offset, score", [(None, 20000, "99"), (17, 0, "2"), (18, 10000, "7")])
+async def test_snapshot_exact_count_offset_order_and_locator_use_same_relation(row_store, family_id, offset, score):
     session, contexts = row_store
     document = fixture.definition_document()
     document["query"].pop("entity_selection")
-    context = replace(contexts[17], definition=CustomImportDefinition.from_mapping(document))
+    context = replace(contexts[family_id], definition=CustomImportDefinition.from_mapping(document))
     request = read_core.SearchRequest(
         context.target,
         filters=(read_core.ReadFilter("segment", "eq", "segment_a"),),
@@ -324,11 +396,11 @@ async def test_snapshot_exact_count_offset_order_and_locator_use_same_relation(r
     assert await read_core._exact_count(asynchronous, statement) == 2
     first = await read_core._page_winner_rows(asynchronous, statement, context, plan, 0)
     second = await read_core._page_winner_rows(asynchronous, statement, context, plan, 1)
-    assert first[0][1].family_revision_id == 101 and second[0][1].family_revision_id == 102
+    assert first[0][1].family_revision_id == offset + 101 and second[0][1].family_revision_id == offset + 102
     locator = read_core._winner_locator(second[0][0], second[0][1])
     assert await read_core._selected_winner_row(asynchronous, context, locator) == second[0]
     items = await read_core._hydrate_search_page_items(asynchronous, context, first + second)
     assert [next(field.value for field in item.root_fields if field.field_id == "score") for item in items] == [
         Decimal("100"),
-        Decimal("2"),
+        Decimal(score),
     ]

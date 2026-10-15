@@ -385,7 +385,10 @@ def test_requested_npi_scope_is_typed_and_keeps_optional_imports(require_match):
     clause = provider_list_sql._provider_import_match_clause(context, "c.npi")
     assert clause.startswith("(c.npi) = ANY(:__native_batch_npis)")
     assert "IN (SELECT CASE" not in clause
-    assert ("EXISTS" in clause) is require_match
+    assert "EXISTS" not in clause
+    count_membership = provider_list_sql._provider_import_membership_clause(context, "c.npi")
+    assert count_membership.startswith(clause)
+    assert ("EXISTS" in count_membership) is require_match
     statement = provider_list_sql._provider_list_statement(
         "SELECT 1 WHERE " + clause, None, native_npis=context.native_npis
     )

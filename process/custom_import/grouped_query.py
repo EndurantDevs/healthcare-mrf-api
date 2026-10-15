@@ -134,8 +134,47 @@ def _child_statement(context, selected, keyed_children):
     return statement, member, revision
 
 
-def _left_child_statement(context, selected, keyed_children):
+def _owned_child_statement(context, selected, owned_members):
+    """Reuse owned child matches while preserving every selected root."""
+
+    member = owned_members.c
+    scoped_members = (
+        select(owned_members)
+        .where(
+            member.dataset_id == context.target.dataset_id,
+            member.schema_revision_id == context.target.schema_revision_id,
+            member.collection_slot == context.collection_slots_by_name[context.definition.query.child_collection],
+        )
+        .subquery("scoped_score_members")
+    )
+    member = scoped_members.c
+    ownership = and_(
+        member.family_revision_id == selected.c.family_revision_id,
+        member.root_record_id == selected.c.root_record_id,
+    )
+    pairs = (
+        select(
+            selected,
+            member.child_revision_id,
+            member.dataset_id,
+            member.schema_revision_id,
+            member.collection_slot,
+            member.selected_key_value,
+        )
+        .select_from(selected.join(scoped_members, ownership, full=True))
+        .cte("selected_root_member_pairs")
+        .prefix_with("MATERIALIZED")
+    )
+    # Keep the FULL JOIN barrier before dropping unmatched members to prevent repeated scans.
+    statement = select(pairs).where(pairs.c.family_revision_id.is_not(None))
+    return statement, pairs.c, pairs.c
+
+
+def _left_child_statement(context, selected, keyed_children, *, owned_members=None):
     """Keep each selected root even when its complete child key is absent."""
+
+    if owned_members is not None:
+        return _owned_child_statement(context, selected, owned_members)
 
     member = context.model(CustomImportFamilyChild)
     revision = context.model(CustomImportChildRevision)
@@ -176,13 +215,20 @@ def _left_child_statement(context, selected, keyed_children):
     return statement, members.c, revision
 
 
-def _child_values(context, selected, fields, selectors, *, retained_columns=(), preserve_roots=False):
-    keyed_children = _keyed_children(context, selectors)
+def _child_values(
+    context, selected, fields, selectors, *, retained_columns=(), preserve_roots=False, owned_members=None
+):
+    keyed_children = owned_members if owned_members is not None else _keyed_children(context, selectors)
     if keyed_children is not None and not preserve_roots:
         keyed_children = keyed_children.prefix_with("MATERIALIZED")
-    builder = _left_child_statement if preserve_roots else _child_statement
-    statement, member, revision = builder(context, selected, keyed_children)
-    statement = statement.add_columns(*retained_columns)
+    if preserve_roots:
+        statement, member, revision = _left_child_statement(
+            context, selected, keyed_children, owned_members=owned_members
+        )
+    else:
+        statement, member, revision = _child_statement(context, selected, keyed_children)
+    if owned_members is None:
+        statement = statement.add_columns(*retained_columns)
     values_by_field, states_by_field = {}, {}
     for index, field in enumerate(fields):
         if keyed_children is not None and field.field_id == selectors[0].field.field_id:
@@ -424,16 +470,21 @@ def _joined_values(context, plan, entity_values=None):
     return selected, statement, values_by_field, states_by_field, derived_fields, child_identity
 
 
-def _child_candidate_ids(context, selectors):
-    """Keep every entity with a complete-key member before selecting its current roots."""
+def _child_candidate_members(context, selectors):
+    """Keep every complete-key member with its full family and revision ownership."""
 
     keys = _keyed_children(context, selectors, name="candidate_complete_score_keys").prefix_with("MATERIALIZED")
     family = context.model(core.CustomImportFamilyRevision)
     member = context.model(CustomImportFamilyChild)
     revision = context.model(CustomImportChildRevision)
     identities = ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot")
-    candidates = (
-        select(family.entity_binding_id)
+    return (
+        select(
+            family.entity_binding_id,
+            member.family_revision_id,
+            *(getattr(member, name) for name in identities),
+            keys.c.selected_key_value,
+        )
         .select_from(keys)
         .join(
             family,
@@ -451,18 +502,36 @@ def _child_candidate_ids(context, selectors):
             ),
         )
         .join(revision, and_(*(getattr(revision, name) == getattr(keys.c, name) for name in identities)))
+        .cte("candidate_complete_score_members")
+        .prefix_with("MATERIALIZED")
+    )
+
+
+def _child_candidate_ids(context, selectors, *, owned_members=None):
+    """Keep every entity with a complete-key member before selecting its current roots."""
+
+    if owned_members is None:
+        owned_members = _child_candidate_members(context, selectors)
+    return (
+        select(owned_members.c.entity_binding_id)
         .distinct()
         .cte("child_candidate_score_entities")
         .prefix_with("MATERIALIZED")
     )
-    return candidates
 
 
 def _derived_child_values(context, plan, entity_values, fields, selectors, derived_fields):
     """Reduce every configured group from one root-preserving complete-child join."""
 
-    candidates = _child_candidate_ids(context, selectors) if entity_values is None else None
-    selected = selected_identities(context, plan, entity_values, entity_binding_ids=candidates)
+    owned_members = _child_candidate_members(context, selectors) if entity_values is None else None
+    selected = selected_identities(
+        context,
+        plan,
+        entity_values,
+        entity_binding_ids=(
+            _child_candidate_ids(context, selectors, owned_members=owned_members) if owned_members is not None else None
+        ),
+    )
     statement, root_values_by_field, root_states_by_field = _root_values(
         context, selected, [field for field in fields if field.collection is None]
     )
@@ -486,6 +555,7 @@ def _derived_child_values(context, plan, entity_values, fields, selectors, deriv
         selectors,
         retained_columns=tuple(retained_columns),
         preserve_roots=True,
+        owned_members=owned_members,
     )
     validated = _validated_stored_children(children, preserve_roots=True)
     values_by_field = {
