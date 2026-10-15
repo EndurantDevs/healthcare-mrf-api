@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
+import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from sanic import Blueprint, response
@@ -43,6 +45,7 @@ KEYRING_FILE_ENV = "HLTHPRT_CUSTOM_IMPORT_ADMISSION_KEYRING_FILE"
 ORIGIN_ENV = "HLTHPRT_CUSTOM_IMPORT_ADMISSION_ORIGIN"
 MAX_BODY_BYTES = 512
 MAX_BATCH_RESPONSE_SECONDS = 300
+BATCH_RESPONSE_MARGIN_SECONDS = 1
 blueprint = Blueprint("custom_import_admission", url_prefix="/control/v1")
 
 
@@ -215,7 +218,7 @@ def _reply(payload, status=200):
 
 
 def extend_batch_response_deadline(request, *, expires_at, trusted_now):
-    """Let verified batch work finish without changing other requests' deadlines."""
+    """Return one operation ceiling inside this verified request's HTTP deadline."""
 
     if getattr(request, "transport", None) is None:
         return
@@ -223,6 +226,10 @@ def extend_batch_response_deadline(request, *, expires_at, trusted_now):
     if getattr(protocol, "response_timeout", None) is not None:
         remaining = min(MAX_BATCH_RESPONSE_SECONDS, (expires_at - trusted_now).total_seconds())
         _set_response_timeout(protocol, max(request.app.config.RESPONSE_TIMEOUT, remaining))
+        deadline = protocol._time + protocol.response_timeout - BATCH_RESPONSE_MARGIN_SECONDS
+        if deadline <= time.monotonic():
+            raise LeaseAuthorityLost("batch response deadline elapsed")
+        return deadline
 
 
 def _set_response_timeout(protocol, seconds):
@@ -332,7 +339,7 @@ async def serve_admission_batch(
             trusted_now=trusted_now,
         )
         retained = await _retained_request(session_factory, verified)
-        extend_batch_response_deadline(
+        operation_deadline = extend_batch_response_deadline(
             request,
             expires_at=min(
                 verified.permit.expires_at,
@@ -341,13 +348,15 @@ async def serve_admission_batch(
             ),
             trusted_now=trusted_now,
         )
-        admission_result = await admission_sql.admit_source_batch(
-            session_factory,
-            retained,
-            verified.pins.build_id,
-            verified.pins.expected_after_occurrence_id,
-            admission_permit=verified.permit,
-        )
+        retained = replace(retained, operation_deadline=operation_deadline)
+        async with asyncio.timeout_at(operation_deadline):
+            admission_result = await admission_sql.admit_source_batch(
+                session_factory,
+                retained,
+                verified.pins.build_id,
+                verified.pins.expected_after_occurrence_id,
+                admission_permit=verified.permit,
+            )
         return _reply(_receipt(verified, admission_result))
     except AdmissionAuthorizationError:
         return _reply({"error": "admission_forbidden"}, 403)
