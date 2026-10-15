@@ -315,7 +315,11 @@ async def _read_provider_payload(request, session, parsed, verified):
         request,
         native_args=parsed.native_args,
         import_context=context,
-        native_scope_preparer=scope_preparer.prepare_provider_scope,
+        native_scope_preparer=(
+            scope_preparer.prepare_provider_scope
+            if query.context_filters or query.filters or prepared.normalized_order_terms
+            else None
+        ),
     )
     if reply.status != 200 or len(reply.body) > transport._MAX_RESPONSE_BYTES:
         raise CustomImportReadUnavailableError("provider response is unavailable")

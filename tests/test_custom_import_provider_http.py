@@ -353,6 +353,33 @@ async def test_provider_scope_retains_exact_prepared_for_hydration(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_bare_provider_membership_does_not_enumerate_the_native_population(monkeypatch):
+    session = _Session()
+    _install(monkeypatch, session, require_match=True)
+
+    async def prepare(service, same_session, *, query, **kwargs):
+        assert same_session is session
+        assert query.context_filters == query.filters == () and query.order_terms is None
+        session.events.append("prepare")
+        return PreparedNpiEntityRelation(select(literal("1104212877").label("entity_value")), (), "b" * 64, "c" * 64)
+
+    async def page(_request, *, native_args, import_context, native_scope_preparer):
+        assert native_args.get("state") == "CA" and native_args.get("limit") == "2"
+        assert import_context.require_match is True and native_scope_preparer is None
+        session.events.append("page")
+        return response.json({"rows": [], "total": 0})
+
+    monkeypatch.setattr(provider_http.CustomImportReadService, "prepare_npi_entity_relation", prepare)
+    monkeypatch.setattr(provider_http, "_provider_page", page)
+    reply = await provider_http.serve_custom_import_providers(
+        _request(_body(context=[], order=None, require_match=True, native_query={"state": "CA", "limit": "2"})),
+        session,
+    )
+    assert reply.status == 200 and not session.rolled_back
+    assert session.events[-3:] == ["hydrate", "finality", "end"]
+
+
+@pytest.mark.asyncio
 async def test_provider_hydration_preserves_order_native_values_and_absence(monkeypatch):
     session = _Session()
     imported_item = SimpleNamespace(
