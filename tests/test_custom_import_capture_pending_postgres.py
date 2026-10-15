@@ -434,8 +434,8 @@ async def test_dataset_retained_quota_includes_abandoned_attempts():
                         record_count=record_count,
                         arrow_byte_count=arrow,
                     )
-            except DBAPIError as exc:
-                assert "retained_quota" in str(exc)
+            except CaptureBundleConflict as exc:
+                assert "retained-byte quota" in str(exc)
                 is_quota_exhausted = True
                 break
         assert is_quota_exhausted

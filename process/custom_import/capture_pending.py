@@ -24,6 +24,7 @@ from db.models.custom_import import (
 )
 from process.custom_import import execution as lifecycle
 from process.custom_import.capture import CaptureError, CaptureManifest, SealedCapture, verify_capture
+from process.custom_import.capture_retention import validate_dataset_retained_bytes
 from process.custom_import.capture_store import (
     CaptureBundleConflict,
     CaptureBundleRegistration,
@@ -433,6 +434,12 @@ async def append_pending_parquet_part(
     )
     _check_budget(stored, increments_by_field, request.policy.stream_budget)
     _check_budget(bundle, increments_by_field, request.policy.bundle_budget)
+    await validate_dataset_retained_bytes(
+        session,
+        dataset_id=request.dataset_id,
+        new_byte_count=increments_by_field["byte_count"] + increments_by_field["manifest_byte_count"],
+        maximum_retained_bytes=request.policy.maximum_dataset_retained_bytes,
+    )
     await _fresh_remaining_seconds(session, request, bundle)
     await session.execute(
         insert(CustomImportCaptureParquetPart).values(

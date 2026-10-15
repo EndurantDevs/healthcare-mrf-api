@@ -123,6 +123,7 @@ class _Harness:
         monkeypatch.setattr(capture.lifecycle, "_lock_current_capture_binding", self.lock)
         monkeypatch.setattr(capture.lifecycle, "_database_now", self.now)
         monkeypatch.setattr(capture.lifecycle, "finish_execution", self.finish)
+        monkeypatch.setattr(capture, "require_capture_retention_read_access", self.retention_read_access)
         monkeypatch.setattr(capture, "begin_pending_parquet_bundle", self.begin)
         monkeypatch.setattr(capture, "append_pending_parquet_part", self.append)
         monkeypatch.setattr(capture, "mark_pending_parquet_eof", self.eof)
@@ -151,6 +152,10 @@ class _Harness:
         self.timeline.append("finish")
         self.finishes.append(authority)
         return SimpleNamespace(state=authority["terminal_state"], changed=True)
+
+    async def retention_read_access(self, session):
+        assert session.active
+        self.timeline.append("retention_read_access")
 
     async def begin(self, session, *, request):
         assert session.active
@@ -189,11 +194,13 @@ class _Harness:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rows", [(), (_shared_row(), _shared_row(key="b"))])
-async def test_capture_seals_only_source_with_compact_framed_receipts(monkeypatch, rows):
-    harness = _Harness(monkeypatch, rows)
-    result = await harness.run()
-    assert result == capture.SnowflakeCaptureResult("capture_sealed", 9, 23, 1)
+@pytest.mark.parametrize("source_rows", [(), (_shared_row(), _shared_row(key="b"))])
+async def test_capture_seals_only_source_with_compact_framed_receipts(monkeypatch, source_rows):
+    harness = _Harness(monkeypatch, source_rows)
+    capture_result = await harness.run()
+    assert capture_result == capture.SnowflakeCaptureResult("capture_sealed", 9, 23, 1)
+    assert harness.timeline.count("retention_read_access") == 1
+    assert harness.timeline.index("retention_read_access") < harness.timeline.index("authority")
     assert harness.timeline.index("authority") < harness.timeline.index("credentials")
     assert harness.timeline.index("reserve") < harness.timeline.index("credentials")
     assert harness.pending.request_identity_sha256 == harness.identity
@@ -215,7 +222,7 @@ async def test_capture_seals_only_source_with_compact_framed_receipts(monkeypatc
             "statement_sha256",
         }
         assert document["source"]["contract"] == "custom-import/snowflake-bundle/v2"
-        assert document["record_count"] == len(rows)
+        assert document["record_count"] == len(source_rows)
         assert "captures" not in document and "parts" not in document
         _assert_framing(receipt, harness.parts)
 
@@ -348,6 +355,35 @@ async def test_missing_capture_authority_never_opens_source(monkeypatch):
         await harness.run()
 
     assert "credentials" not in harness.timeline and harness.cursor.executed == []
+    assert harness.pending is None and harness.parts == [] and harness.receipts == ()
+    assert harness.finishes[0]["terminal_state"] == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_relation", ("custom_import_capture_usage", "custom_import_capture_raw_object"))
+@pytest.mark.parametrize("has_processing_policy", (False, True))
+async def test_missing_quota_read_access_never_creates_executor_or_opens_source(
+    monkeypatch, missing_relation, has_processing_policy
+):
+    harness = _Harness(monkeypatch)
+    if not has_processing_policy:
+        harness.request = replace(
+            harness.request, bundle_request=replace(harness.request.bundle_request, processing_policy=None)
+        )
+    failure = PermissionError(f"synthetic missing metadata read on {missing_relation}")
+    preflight = AsyncMock(side_effect=failure)
+    executor = Mock(side_effect=AssertionError("preflight refusal must not create an executor"))
+    monkeypatch.setattr(capture, "require_capture_retention_read_access", preflight)
+    monkeypatch.setattr(capture, "ThreadPoolExecutor", executor)
+
+    with pytest.raises(PermissionError) as caught:
+        await harness.run()
+
+    assert caught.value is failure
+    preflight.assert_awaited_once()
+    executor.assert_not_called()
+    assert "credentials" not in harness.timeline and harness.cursor.executed == []
+    assert "authority" not in harness.timeline and harness.timeline.count("reserve") == 1
     assert harness.pending is None and harness.parts == [] and harness.receipts == ()
     assert harness.finishes[0]["terminal_state"] == "failed"
 
@@ -567,6 +603,8 @@ async def test_finalization_failure_never_masks_primary_cleanup_or_cancellation(
 @pytest.mark.asyncio
 async def test_bound_capture_returns_without_source_or_credentials(monkeypatch):
     harness = _Harness(monkeypatch)
+    preflight = AsyncMock(side_effect=AssertionError("bound replay must not preflight new acquisition"))
+    monkeypatch.setattr(capture, "require_capture_retention_read_access", preflight)
     statement = harness.builder.build_statement(harness.request.bundle_request)
     identity = capture.segmented_bundle_request_identity_sha256(statement.request, statement, harness.policy)
     harness.submission = replace(harness.submission, capture_bundle_id=23)
@@ -594,6 +632,7 @@ async def test_bound_capture_returns_without_source_or_credentials(monkeypatch):
     with pytest.raises(capture.SnowflakeCaptureError, match="bound capture identity"):
         await harness.run()
     assert "credentials" not in harness.timeline and harness.cursor.executed == []
+    preflight.assert_not_awaited()
     assert len(harness.finishes) == 2
     assert all(finish["terminal_state"] == "failed" for finish in harness.finishes)
 

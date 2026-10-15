@@ -78,6 +78,7 @@ _MATERIALIZATION_CONTRACT_MIGRATION_PATH = (
     _ROOT / "alembic" / "versions" / "20261010010000_custom_import_materialization_contract.py"
 )
 _SEGMENTED_CAPTURE_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20261002000000_custom_import_segmented_capture.py"
+_RAW_CAPTURE_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20261017010000_custom_import_raw_objects.py"
 _SNAPSHOT_MIGRATION_NAMES = (
     "20261002010000_custom_import_bounded_build",
     "20261002020000_custom_import_processing_policy",
@@ -201,12 +202,16 @@ def install_query_projection_metadata(sync_connection, schema_name: str) -> None
 
 
 def install_segmented_capture_migration(sync_connection, schema_name: str) -> None:
-    """Install segmented capture once, after any historical finality reconstruction."""
+    """Install capture storage once, after any historical finality reconstruction."""
 
-    migration = _migration(_SEGMENTED_CAPTURE_MIGRATION_PATH, "custom_import_segmented_capture_test_migration")
-    migration._schema = lambda: schema_name
-    migration.op = Operations(MigrationContext.configure(sync_connection))
-    migration.upgrade()
+    for migration_path, module_name in (
+        (_SEGMENTED_CAPTURE_MIGRATION_PATH, "custom_import_segmented_capture_test_migration"),
+        (_RAW_CAPTURE_MIGRATION_PATH, "custom_import_raw_capture_test_migration"),
+    ):
+        migration = _migration(migration_path, module_name)
+        migration._schema = lambda: schema_name
+        migration.op = Operations(MigrationContext.configure(sync_connection))
+        migration.upgrade()
 
 
 @asynccontextmanager

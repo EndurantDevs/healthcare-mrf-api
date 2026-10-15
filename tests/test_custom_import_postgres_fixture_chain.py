@@ -132,6 +132,7 @@ def test_fixture_installs_snapshot_prerequisites_exactly_once(
     ]
     if segmented:
         expected_migrations.append("20261002000000_custom_import_segmented_capture")
+        expected_migrations.append("20261017010000_custom_import_raw_objects")
     expected_migrations.extend(expected_tail)
     expected_migrations.append("20261010010000_custom_import_materialization_contract")
     expected_migrations.append("20261015020000_custom_import_query_projections")
