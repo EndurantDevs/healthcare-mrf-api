@@ -7,6 +7,8 @@ service is required. IDs below are synthetic examples, not default targets.
 | Entry point | Commands | Purpose |
 | --- | --- | --- |
 | `custom_import_cli` | `validate` | Validate a definition from stdin without database access. |
+| `custom_import_cli` | `register` | Register an immutable definition from stdin. |
+| `custom_import_cli` | `execute`, `resume` with `--source https` | Run a bounded HTTPS/Parquet import or replay its exact retained capture. |
 | `custom_import_cli` | `status`, `captures` | Read exact retained lifecycle evidence. |
 | `custom_import_cli` | `cancel`, `activate`, `rollback` | Request cancellation or perform guarded publication. |
 | `custom_import_snowflake_operator` | `register`, `register-authority` | Register a canonical binding using local database authority or a fixed mounted capability. |
@@ -306,6 +308,73 @@ cleanup. Errors omit database diagnostics and record payloads. A connection
 cleanup failure can occur after commit: a failed command does not prove rollback.
 Reconcile exact state with `status` before another mutation.
 
-Use `--help` on the entry point or any command for its arguments. Generic
-resume, discovery, preview, and estimate remain unavailable from
-`custom_import_cli`.
+Use `--help` on the entry point or any command for its arguments. Discovery,
+preview, and estimate remain source-specific. Generic execution and resume
+currently support only the bounded HTTPS/Parquet path below.
+
+## Standalone HTTPS/Parquet execution
+
+Register the definition separately, then use its returned dataset, definition
+and schema revision IDs:
+
+```sh
+python -m custom_import_cli register --dataset-key example_dataset --format json < definition.json
+python -m custom_import_cli execute --source https \
+  --dataset-id 5 --definition-revision-id 7 --schema-revision-id 11 < request.json
+```
+
+The bounded JSON request must contain exactly `definition`, `objects`,
+`source_snapshot_token`, `idempotency_key`, `lease_token`, `limits`,
+`timeout_seconds`, and `complete_scope`. The definition must match the registered
+immutable revision. Each object contains exactly `stream_id`, `url`,
+`expected_sha256`, and `expected_bytes`. Supply exactly one complete Parquet
+object for each declared stream, with outer compression `none`; unknown,
+duplicate or missing streams are rejected. URLs must satisfy the existing
+public-address HTTPS transport checks. Source URLs and lease tokens belong in
+stdin, not command-line arguments or emitted receipts.
+
+Set `complete_scope` to `true` only for a complete declared source scope. Every
+stream uses the same nonempty `source_snapshot_token`. That token is the
+operator's upstream snapshot assertion: content hashes verify the selected
+objects, not the atomicity of an upstream export.
+
+`limits` is a mapping of `CaptureLimits` fields; `{}` uses the defaults. Limits
+may be tightened, not raised: the entire bundle is bounded by 64 MiB of captured
+content, 256 MiB of decoded content, and one million records. Arrow expansion
+and retained mapped-record content are also accounted. These logical limits
+are not a process RSS guarantee or high-volume throughput claim.
+The CLI accepts a positive integer `timeout_seconds` of at most 3600 seconds,
+matching the maximum lease window. This preparation deadline is shared across
+acquisition, durable readback, replay and initial family admission; it does not
+reset per object. Larger values are rejected before database access or execution
+reservation. Subsequent graph materialization uses the existing claimed runner
+and publication safeguards.
+
+A separate fenced heartbeat renews the lease while acquisition and replay yield.
+It is stopped and joined before the final admission renewal and claimed-runner
+handoff. Synchronous validation is not preemptible and must still pass the
+unchanged deadline and lease checks before publication.
+
+Acquisition is bound transactionally only after the complete bundle verifies.
+The runner reloads it in a fresh session and uses the existing family rejection,
+immutable generation and compare-and-swap publication behavior. Errors return
+fixed redacted receipts rather than source data or driver diagnostics.
+
+Resume an existing capture-bound active execution after its lease expires:
+
+```sh
+python -m custom_import_cli resume --source https \
+  --dataset-id 5 --definition-revision-id 7 --schema-revision-id 11 < request.json
+```
+
+Keep the same definition, object identities, snapshot token, limits, timeout and
+idempotency key; use a new lease token. A live lease returns `not_claimed`.
+Explicit resume rejects queued, terminal, unbound or mismatched executions and
+never reacquires the source. An interrupted unbound acquisition needs a new
+idempotency key. The same execution cannot silently refetch changing objects.
+With a new idempotency key, refreshed URLs or transport timeouts can reuse the
+same sealed content and snapshot token. Changed content for that token is rejected.
+
+This standalone operator path requires no external control service. It does not
+enable hosted HTTPS credentials, other durable formats, S3-compatible objects
+or uploads.
