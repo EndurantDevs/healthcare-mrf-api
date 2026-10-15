@@ -17,7 +17,7 @@ from db.models.company_registry import CompanyRegistry
 ROOT = Path(__file__).parents[1]
 REVISION = "20261012010000_company_registry_name_origin"
 PREDECESSOR = "20261011010000_company_registry_group_assertions"
-CURRENT_HEAD = "20261017210000_provider_directory_readiness_indexes"
+CURRENT_HEAD = "20261017010000_custom_import_raw_objects"
 
 
 def _migration(revision=REVISION):
@@ -111,15 +111,18 @@ def test_origin_migration_extends_the_sole_existing_head():
     script = ScriptDirectory.from_config(config)
     assert script.get_heads() == [CURRENT_HEAD]
     history = "20261013010000_registry_custom_history_events"
-    projection = "20261015020000_custom_import_query_projections"
-    assert script.get_revision(CURRENT_HEAD).down_revision == projection
-    assert script.get_revision(projection).down_revision == history
+    query_projections = "20261015020000_custom_import_query_projections"
+    readiness = "20261017210000_provider_directory_readiness_indexes"
+    assert script.get_revision(CURRENT_HEAD).down_revision == readiness
+    assert script.get_revision(readiness).down_revision == query_projections
+    assert script.get_revision(query_projections).down_revision == history
     assert script.get_revision(history).down_revision == REVISION
     assert script.get_revision(REVISION).down_revision == PREDECESSOR
     assert script.get_revision(PREDECESSOR).down_revision == "20261010030000_registry_source_admission_receipt"
     assert [step.revision.revision for step in script._upgrade_revs("head", PREDECESSOR)] == [
         REVISION,
         history,
-        projection,
+        query_projections,
+        readiness,
         CURRENT_HEAD,
     ]

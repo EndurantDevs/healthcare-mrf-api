@@ -36,6 +36,7 @@ from process.custom_import.capture_pending import (
     mark_pending_parquet_eof,
     seal_pending_parquet_bundle,
 )
+from process.custom_import.capture_retention import require_capture_retention_read_access
 from process.custom_import.capture_store import (
     _PARQUET_PART_SET_DOMAIN,
     CaptureReceipt,
@@ -866,6 +867,8 @@ async def _capture_reserved(
     if submission.state != "queued" or grant.fence != 1:
         unbound_result = await _unbound_capture_result(session_factory, request, grant)
         return SnowflakeCaptureResult(unbound_result.status, unbound_result.execution_id)
+    async with session_factory() as session, session.begin():
+        await require_capture_retention_read_access(session)
     attempt = _Attempt(await _acquisition_deadline(session_factory, request, grant, policy))
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="source-capture")
     owner = make_landing(attempt)

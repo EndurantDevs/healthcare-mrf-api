@@ -140,6 +140,7 @@ async def _append_setup(monkeypatch, request, header, bundle):
     monkeypatch.setattr(pending, "_lock_bundle", AsyncMock(return_value=(bundle, SimpleNamespace())))
     monkeypatch.setattr(pending, "_pending_stream", AsyncMock(return_value=header))
     monkeypatch.setattr(pending, "_fresh_remaining_seconds", AsyncMock(return_value=30))
+    monkeypatch.setattr(pending, "validate_dataset_retained_bytes", AsyncMock())
 
 
 async def test_exact_part_retry_has_no_insert_or_counter_charge(monkeypatch):
@@ -161,6 +162,7 @@ async def test_exact_part_retry_has_no_insert_or_counter_charge(monkeypatch):
         == 0
     )
     assert session.statements == []
+    pending.validate_dataset_retained_bytes.assert_not_awaited()
     session.existing.record_count = 1
     with pytest.raises(CaptureBundleConflict, match="retry"):
         await pending.append_pending_parquet_part(
@@ -172,6 +174,58 @@ async def test_exact_part_retry_has_no_insert_or_counter_charge(monkeypatch):
             record_count=0,
             arrow_byte_count=0,
         )
+
+
+async def test_new_part_checks_combined_retention_after_locks_before_insert(monkeypatch):
+    request = _request()
+    capture = _capture(request)
+    session = _Session()
+    await _append_setup(monkeypatch, request, _stream_header(), _bundle(request))
+
+    async def check_retention(checked_session, **arguments):
+        assert checked_session is session and session.statements == []
+        pending._lock_bundle.assert_awaited_once()
+        pending._pending_stream.assert_awaited_once()
+        assert arguments == dict(
+            dataset_id=request.dataset_id,
+            new_byte_count=len(capture.payload)
+            + len(pending.canonical_json(pending.asdict(capture.manifest)).encode("utf-8")),
+            maximum_retained_bytes=request.policy.maximum_dataset_retained_bytes,
+        )
+
+    pending.validate_dataset_retained_bytes.side_effect = check_retention
+    assert (
+        await pending.append_pending_parquet_part(
+            session,
+            request=request,
+            capture_bundle_id=5,
+            capture=capture,
+            ordinal=1,
+            record_count=0,
+            arrow_byte_count=0,
+        )
+        == 1
+    )
+    pending.validate_dataset_retained_bytes.assert_awaited_once()
+    assert len(session.statements) == 1 and session.statements[0].is_insert
+
+
+async def test_new_part_retention_failure_prevents_insert(monkeypatch):
+    request = _request()
+    session = _Session()
+    await _append_setup(monkeypatch, request, _stream_header(), _bundle(request))
+    pending.validate_dataset_retained_bytes.side_effect = CaptureBundleConflict("retained-byte quota")
+    with pytest.raises(CaptureBundleConflict, match="quota"):
+        await pending.append_pending_parquet_part(
+            session,
+            request=request,
+            capture_bundle_id=5,
+            capture=_capture(request),
+            ordinal=1,
+            record_count=0,
+            arrow_byte_count=0,
+        )
+    assert session.statements == []
 
 
 @pytest.mark.parametrize("ordinal,eof,expected", [(2, None, "contiguous"), (1, dt.datetime.now(dt.UTC), "EOF")])
