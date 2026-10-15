@@ -1071,6 +1071,45 @@ async def test_postgres_scoped_native_pages_execute_full_ctes_and_preserve_paylo
         assert len(identities) == len(set(identities))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_filter", [False, True])
+async def test_postgres_bare_import_sync_keeps_state_latest_selection_and_exact_pages(monkeypatch, include_filter):
+    http_fixture._install_keyring(monkeypatch)
+    path = provider_http.CUSTOM_IMPORT_PROVIDERS_PATH
+    async with _native_scope_case(monkeypatch, is_geo=False) as (case, pinned_target):
+        for offset in (0, 1):
+            document = json.loads(_page_request(pinned_target, path, full_family=True).body)
+            document.update(
+                native_query={"state": "CA", "limit": "1", "offset": str(offset)},
+                context=[],
+                filters=[],
+                order=None,
+                require_match=True,
+                include_filter=include_filter,
+            )
+            body = transport._canonical_json_bytes(document)
+            request = http_fixture._Request(
+                body,
+                http_fixture._resigned_provider_headers(body=body, path=path, target=document["target"]),
+                path=path,
+            )
+            async with case.sessions() as session:
+                request.args, request.ctx = RequestParameters({}), SimpleNamespace(sa_session=session)
+                reply = await provider_http.serve_custom_import_providers(request, session)
+                assert reply.status == 200, reply.body
+                page_payload = json.loads(reply.body)
+                assert page_payload["total"] == 1 and page_payload["offset"] == offset and page_payload["limit"] == 1
+                assert [str(provider_row["npi"]) for provider_row in page_payload["rows"]] == [_NATIVE_SCOPE_NPIS[0]][
+                    offset : offset + 1
+                ]
+                for provider_row in page_payload["rows"]:
+                    assert provider_row["state_name"] == "CA"
+                    assert ("custom_import" in provider_row) is include_filter
+                page_sql = session.info["scoped_native_sql"][0][0]
+                assert "native_eligible_npis AS MATERIALIZED" not in page_sql
+                assert "INTERSECT SELECT imported.entity_value" in page_sql
+
+
 def _track_native_scope_hydration(monkeypatch):
     scopes, hydrations = [], []
     original_scope = read_core.CustomImportReadService.scope_npi_entity_relation

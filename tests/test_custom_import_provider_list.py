@@ -245,8 +245,11 @@ async def test_national_score_search_keeps_import_first_planning(monkeypatch, di
     assert page_sql.index("custom_import_provider_relation AS") < page_sql.index("SELECT DISTINCT c.npi AS npi")
     assert "(c.npi)::bigint IN (SELECT CASE" in page_sql
     assert "EXISTS (SELECT 1 FROM custom_import_provider_relation" not in page_sql
-    assert "ON imported.entity_value = eligible_npi.npi::text" in page_sql
-    assert page_sql.index("WHERE imported.entity_value IS NOT NULL") < page_sql.index("provider_totals AS")
+    if direction is None:
+        assert "INTERSECT SELECT imported.entity_value" in page_sql
+    else:
+        assert "ON imported.entity_value = eligible_npi.npi::text" in page_sql
+        assert page_sql.index("WHERE imported.entity_value IS NOT NULL") < page_sql.index("provider_totals AS")
     assert page_sql.index("provider_totals AS") < page_sql.index("LIMIT :limit OFFSET :start")
 
 
@@ -314,7 +317,7 @@ async def test_imported_filter_page_uses_one_correlated_membership_predicate(
     predicate = "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported"
     assert count_sql.count(predicate) == 0
     assert page_sql.count(predicate) == 0
-    assert "WHERE imported.entity_value IS NOT NULL" in page_sql
+    assert "INTERSECT SELECT imported.entity_value" in page_sql
     assert "matching_npis AS MATERIALIZED" in page_sql
     assert set(context.compiled.values) <= set(connection.calls[0][1])
     assert not any("SELECT COUNT(DISTINCT" in call[0] for call in connection.calls)
@@ -573,6 +576,34 @@ async def test_postgres_required_membership_pushdown_preserves_exact_count_and_p
                     assert rows == (await session.execute(legacy_page, parameters)).all()
                     assert [row.npi for row in rows if row.npi is not None] == expected_npis[start : start + 2]
                     assert all(row._provider_total == len(expected_npis) for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_postgres_filter_only_pages_preserve_exact_text_membership_and_empty_totals():
+    original = _postgres_membership_context("asc", True, None)
+    context = ProviderImportQuery(replace(original.prepared, normalized_order_terms=()), original.compiled, True)
+    eligible = """SELECT npi FROM (VALUES
+        (1000000001::bigint), (1000000002), (1000000002), (1000000003),
+        (1000000004), (1000000005), (123456789), (0), (NULL)
+    ) AS native(npi)"""
+    ctes, page = provider_list_sql_module._provider_import_count_page(eligible, context)
+    statement = npi_module._provider_list_statement(
+        f"WITH {npi_module._provider_import_relation_cte(context)}, {ctes}, page_npis AS ({page}) "
+        "SELECT page_npis.npi, provider_totals._provider_total "
+        "FROM provider_totals LEFT JOIN page_npis ON TRUE ORDER BY page_npis.npi",
+        context,
+    )
+    async with transaction_session() as session:
+        for offset in (0, 2, 50):
+            rows = (
+                await session.execute(
+                    statement, npi_module._provider_list_parameters({"limit": 2, "start": offset}, context)
+                )
+            ).all()
+            assert [row.npi for row in rows if row.npi is not None] == [1000000002, 1000000003, 1000000004, 1000000005][
+                offset : offset + 2
+            ]
+            assert all(row._provider_total == 4 for row in rows)
 
 
 class _PostgresConnectionProxy:
