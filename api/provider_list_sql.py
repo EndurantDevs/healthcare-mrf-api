@@ -328,6 +328,24 @@ def _provider_import_membership_clause(
 ) -> str | None:
     """Return the imported-membership predicate for exact matching counts."""
 
+    prefilter = _provider_import_match_clause(import_context, provider_npi_sql, native_npis=native_npis)
+    predicates = [prefilter] if prefilter is not None else []
+    if import_context is not None and import_context.require_match:
+        predicates.append(
+            "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported "
+            f"WHERE imported.entity_value = ({provider_npi_sql})::text)"
+        )
+    return " AND ".join(predicates) or None
+
+
+def _provider_import_match_clause(
+    import_context: ProviderImportQuery | None,
+    provider_npi_sql: str,
+    *,
+    native_npis=None,
+) -> str | None:
+    """Prefilter page eligibility; the final text join enforces membership."""
+
     if native_npis is None and import_context is not None:
         native_npis = import_context.native_npis
     predicates = []
@@ -342,22 +360,7 @@ def _provider_import_membership_clause(
                 "THEN imported.entity_value::bigint END "
                 "FROM custom_import_provider_relation AS imported)"
             )
-        predicates.append(
-            "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported "
-            f"WHERE imported.entity_value = ({provider_npi_sql})::text)"
-        )
     return " AND ".join(predicates) or None
-
-
-def _provider_import_match_clause(
-    import_context: ProviderImportQuery | None,
-    provider_npi_sql: str,
-    *,
-    native_npis=None,
-) -> str | None:
-    """Scope native eligibility before deduplication, including imported ordering."""
-
-    return _provider_import_membership_clause(import_context, provider_npi_sql, native_npis=native_npis)
 
 
 def _provider_import_order_clause(

@@ -9,6 +9,9 @@ from dataclasses import replace
 import pytest
 from sqlalchemy import BigInteger, Boolean, String, column, literal, select, text, values
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.sql import visitors
+from sqlalchemy.sql.compiler import FROM_LINTING
+from sqlalchemy.sql.selectable import CTE
 
 from api import custom_import_provider_http as provider_http
 from api import custom_import_read_http as transport
@@ -27,6 +30,34 @@ def _context():
     document["query"]["sortable_fields"] = list(document["query"]["filterable_fields"])
     document["query"]["aliases"].update({"output_cost": "root_cost", "hidden_cost": "score"})
     return replace(fixture.context(), definition=CustomImportDefinition.from_mapping(document))
+
+
+def _assert_owned_member_barrier(statement, sql):
+    ctes_by_name = {node.name: node for node in visitors.iterate(statement) if isinstance(node, CTE)}
+    roots = ctes_by_name["derived_root_score_values"]
+    pairs = ctes_by_name["selected_root_member_pairs"]
+    children = ctes_by_name["selected_score_children"]
+    pair_sql, child_sql = sql.split("selected_root_member_pairs AS MATERIALIZED \n(", 1)[1].split(
+        "), \nselected_score_children AS \n(", 1
+    )
+    child_sql = child_sql.split("), \ncounted_score_children AS", 1)[0]
+    assert "FROM derived_root_score_values FULL OUTER JOIN" in pair_sql
+    for identity in ("family_revision_id", "root_record_id"):
+        assert f"scoped_score_members.{identity} = derived_root_score_values.{identity}" in pair_sql
+    for identity in ("dataset_id", "schema_revision_id", "collection_slot"):
+        assert f"candidate_complete_score_members.{identity} =" in pair_sql
+    assert "family_revision_id IS NOT NULL" not in pair_sql
+    assert "WHERE selected_root_member_pairs.family_revision_id IS NOT NULL" in child_sql
+    assert "derived_root_score_values" not in child_sql
+    assert "FROM selected_root_member_pairs" in child_sql
+    assert "SELECT DISTINCT" not in pair_sql and "SELECT DISTINCT" not in child_sql
+    for name in roots.c.keys():
+        assert name in pairs.c and name in children.c
+        assert f"derived_root_score_values.{name} AS {name}" in pair_sql
+        assert f"selected_root_member_pairs.{name} AS {name}" in child_sql
+    for scalar in re.findall(r"AS (score_child_\d+) ON", child_sql):
+        for identity in ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot"):
+            assert f"{scalar}.{identity} = selected_root_member_pairs.{identity}" in child_sql
 
 
 def test_output_metric_allowlist_preserves_raw_context_and_normalizes_aliases():
@@ -151,6 +182,7 @@ def test_native_scope_precedes_default_year_helper_and_all_group_reducers():
 )
 @pytest.mark.parametrize("entity_values", (None, (), ("1234567893",)))
 @pytest.mark.parametrize("snapshot", (False, True))
+@pytest.mark.filterwarnings("error:SELECT statement has a cartesian product:sqlalchemy.exc.SAWarning")
 def test_derived_child_relation_retains_roots_and_validates_before_reduction(
     entity_values, snapshot, value_type, selector_value
 ):
@@ -166,40 +198,44 @@ def test_derived_child_relation_retains_roots_and_validates_before_reduction(
     if snapshot:
         context = replace(context, storage_models=snapshot_models(1))
     prepared = grouped_read.prepare_relation(context, query, read_core.ExtensionReadScope("synthetic"))
-    sql = str(prepared.statement.compile(dialect=postgresql.dialect()))
+    sql = str(prepared.statement.compile(dialect=postgresql.dialect(), linting=FROM_LINTING))
     native_sql = compile_npi_entity_relation(prepared.statement).sql
     assert "jsonb_object_agg" not in native_sql and "jsonb_extract_path_text" not in native_sql
     assert "complete_score_child_identities AS MATERIALIZED" not in native_sql
     assert "complete_score_child_keys AS MATERIALIZED" not in sql
     assert "derived_root_score_values AS MATERIALIZED" in sql
     namespace = "ci_snapshot_1" if snapshot else "mrf"
-    assert "FROM derived_root_score_values LEFT OUTER JOIN (LATERAL (SELECT" in sql
     assert "selected_score_child_members" not in sql
-    for identity in ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot"):
-        assert f"complete_score_child_keys.{identity} = {namespace}.custom_import_family_child.{identity}" in sql
-        assert f"{namespace}.custom_import_child_revision.{identity} = keyed_score_members.{identity}" in sql
+    if entity_values is None:
+        _assert_owned_member_barrier(prepared.statement, sql)
+        assert "complete_score_child_keys AS" not in sql
+        assert "selected_root_member_pairs.selected_key_value AS" in sql
+    else:
+        assert "selected_root_member_pairs" not in sql and "candidate_complete_score_members" not in sql
+        assert "FROM derived_root_score_values LEFT OUTER JOIN (LATERAL (SELECT" in sql
+        for identity in ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot"):
+            assert f"complete_score_child_keys.{identity} = {namespace}.custom_import_family_child.{identity}" in sql
+            assert f"{namespace}.custom_import_child_revision.{identity} = keyed_score_members.{identity}" in sql
+        assert sql.count("complete_score_child_keys AS") == 1
+        assert "keyed_score_members.selected_key_value AS" in sql
+        for identity in ("family_revision_id", "root_record_id"):
+            assert f"{namespace}.custom_import_family_child.{identity} = derived_root_score_values.{identity}" in sql
     assert "count(selected_score_children.child_revision_id) OVER" in sql
     assert "validated_score_children AS MATERIALIZED" in sql
     assert "bool_or(" in sql and "selected_child_revision_id IS NOT NULL" in sql
     assert "selected_child_counts" not in sql
     assert "JOIN selected_score_children" not in sql and "JOIN derived_root_score_values" not in sql
-    assert sql.count("complete_score_child_keys AS") == 1
     assert ("candidate_complete_score_keys AS MATERIALIZED" in sql) is (entity_values is None)
     assert ("child_candidate_score_entities AS MATERIALIZED" in sql) is (entity_values is None)
     assert ("FROM child_candidate_score_entities JOIN LATERAL" in sql) is (entity_values is None)
     assert f"complete_child_key.{read_core._SCALAR_COLUMNS[value_type]} AS selected_key_value" in sql
-    assert "keyed_score_members.selected_key_value AS" in sql
-    assert sql.count("LIMIT ALL OFFSET") == (2 if entity_values is None else 1)
+    assert sql.count("LIMIT ALL OFFSET") == 1
     assert "LIMIT" not in sql.replace("LIMIT ALL OFFSET", "OFFSET")
-    assert (
-        f"{namespace}.custom_import_family_child.family_revision_id = derived_root_score_values.family_revision_id"
-        in sql
-    )
-    assert f"{namespace}.custom_import_family_child.root_record_id = derived_root_score_values.root_record_id" in sql
     assert f"{namespace}.custom_import_child_scalar AS score_child_4" not in sql
 
 
 @pytest.mark.parametrize("metric,raw_metric", (("root_cost", None), ("child_cost", None), ("root_cost", "amount")))
+@pytest.mark.filterwarnings("error:SELECT statement has a cartesian product:sqlalchemy.exc.SAWarning")
 def test_complete_key_join_preserves_selected_roots(metric, raw_metric):
     context = replace(fixture.context(), definition=scores._definition())
     selectors = (read_core.ReadFilter("service_code", "eq", "chosen"),)
@@ -213,19 +249,15 @@ def test_complete_key_join_preserves_selected_roots(metric, raw_metric):
         order_terms=(read_core.ReadOrderTerm(metric, "asc", "last"),),
     )
     prepared = grouped_read.prepare_relation(context, query, read_core.ExtensionReadScope("synthetic"))
-    compiled = prepared.statement.compile(dialect=postgresql.dialect())
+    compiled = prepared.statement.compile(dialect=postgresql.dialect(), linting=FROM_LINTING)
     sql = str(compiled)
     assert " ON true" in sql
     assert all(type(value) is not bool for value in compiled.params.values())
     assert "jsonb_object_agg" not in sql and "jsonb_extract_path_text" not in sql
-    assert "JOIN complete_score_child_keys ON" in sql
-    for identity in ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot"):
-        assert f"complete_score_child_keys.{identity} = mrf.custom_import_family_child.{identity}" in sql
-        assert f"mrf.custom_import_child_revision.{identity} = keyed_score_members.{identity}" in sql
+    _assert_owned_member_barrier(prepared.statement, sql)
     assert "FROM selected_score_families" in sql
-    assert "FROM derived_root_score_values LEFT OUTER JOIN" in sql
     assert "child_candidate_score_entities AS MATERIALIZED" in sql
-    assert sql.count("complete_score_child_keys AS") == 1
+    assert "complete_score_child_keys AS" not in sql
     assert "validated_score_children AS MATERIALIZED" in sql
 
 
@@ -248,29 +280,34 @@ def test_broad_child_candidates_precede_independent_group_selection(snapshot, pe
         context = replace(context, storage_models=snapshot_models(1))
     prepared = grouped_read.prepare_relation(context, query, read_core.ExtensionReadScope("synthetic"))
     sql = str(prepared.statement.compile(dialect=postgresql.dialect()))
+    members = sql.split("candidate_complete_score_members AS MATERIALIZED \n(", 1)[1].split(
+        "), \nchild_candidate_score_entities AS", 1
+    )[0]
     eligible, families = sql.split("child_candidate_score_entities AS MATERIALIZED \n(", 1)[1].split(
         "), \nselected_score_families AS \n(", 1
     )
     families = families.split("), \nderived_root_score_values AS", 1)[0]
     namespace = "ci_snapshot_1" if snapshot else "mrf"
-    assert eligible.startswith(f"SELECT DISTINCT {namespace}.custom_import_family_revision.entity_binding_id")
+    assert eligible.startswith("SELECT DISTINCT candidate_complete_score_members.entity_binding_id")
+    assert "FROM candidate_complete_score_members" in eligible
+    assert "SELECT DISTINCT" not in members and "GROUP BY" not in members and "LIMIT" not in members
     assert all(
-        token not in eligible
+        token not in members
         for token in ("custom_import_winner", "selected_score_families", "group_value", "score_root_", "score_child_")
     )
-    assert "FROM candidate_complete_score_keys JOIN" in eligible
+    assert "FROM candidate_complete_score_keys JOIN" in members
     for identity in ("dataset_id", "schema_revision_id", "root_record_id"):
         assert (
             f"{namespace}.custom_import_family_revision.{identity} = candidate_complete_score_keys.{identity}"
-            in eligible
+            in members
         )
     assert (
         f"{namespace}.custom_import_family_child.family_revision_id = "
-        f"{namespace}.custom_import_family_revision.family_revision_id" in eligible
+        f"{namespace}.custom_import_family_revision.family_revision_id" in members
     )
     for identity in ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot"):
         for owner in ("custom_import_family_child", "custom_import_child_revision"):
-            assert f"{namespace}.{owner}.{identity} = candidate_complete_score_keys.{identity}" in eligible
+            assert f"{namespace}.{owner}.{identity} = candidate_complete_score_keys.{identity}" in members
     assert "FROM child_candidate_score_entities JOIN LATERAL (SELECT" in families
     assert "candidate_score_families.group_value AS group_value" in families
     assert (
@@ -280,9 +317,9 @@ def test_broad_child_candidates_precede_independent_group_selection(snapshot, pe
     assert "candidate_complete_score_keys" not in families
     assert ("selected_entity_value.entity_binding_id" in families) is (period is None)
     assert "FROM selected_score_families LEFT OUTER JOIN" in sql
+    _assert_owned_member_barrier(prepared.statement, sql)
     assert sql.count("candidate_complete_score_keys AS MATERIALIZED") == 1
-    assert sql.count("complete_score_child_keys AS") == 1
-    assert sql.count("JOIN complete_score_child_keys ON") == 1
+    assert "complete_score_child_keys AS" not in sql
     assert "count(selected_score_children.child_revision_id) OVER" in sql
     assert "validated_score_children AS MATERIALIZED" in sql
 

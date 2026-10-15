@@ -87,8 +87,35 @@ async def test_stored_child_ambiguity_cannot_be_hidden_by_a_later_metric_filter(
         assert (await values_connection.execute(statement)).scalar_one() == 3
 
 
+def _selected_child_models(context, members, revisions):
+    families = select(
+        members.c.family_revision_id,
+        members.c.dataset_id,
+        members.c.schema_revision_id,
+        members.c.root_record_id,
+        literal(200).label("entity_binding_id"),
+    ).subquery("synthetic_member_families")
+    return replace(
+        context,
+        storage_models={
+            read_core.CustomImportFamilyRevision: aliased(
+                read_core.CustomImportFamilyRevision, families, adapt_on_names=True
+            ),
+            grouped_query.CustomImportFamilyChild: aliased(
+                grouped_query.CustomImportFamilyChild, members, adapt_on_names=True
+            ),
+            grouped_query.CustomImportChildRevision: aliased(
+                grouped_query.CustomImportChildRevision, revisions, adapt_on_names=True
+            ),
+        },
+    )
+
+
 @pytest.mark.asyncio
-async def test_selected_child_join_preserves_multiplicity_and_full_revision_ownership(values_connection):
+@pytest.mark.parametrize("reuse_members", (False, True))
+async def test_selected_child_join_preserves_multiplicity_and_full_revision_ownership(
+    reuse_members, values_connection, monkeypatch
+):
     context = fixture.context()
     identities = ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot")
     dataset, schema = context.target.dataset_id, context.target.schema_revision_id
@@ -114,19 +141,17 @@ async def test_selected_child_join_preserves_multiplicity_and_full_revision_owne
         .data([(*owner(30, 20), "chosen"), (*owner(32, 22), "chosen"), *[(*owner(33, 23), "chosen")] * 2])
         .cte("synthetic_complete_keys")
     )
-    context = replace(
-        context,
-        storage_models={
-            grouped_query.CustomImportFamilyChild: aliased(
-                grouped_query.CustomImportFamilyChild, members, adapt_on_names=True
-            ),
-            grouped_query.CustomImportChildRevision: aliased(
-                grouped_query.CustomImportChildRevision, revisions, adapt_on_names=True
-            ),
-        },
+    context = _selected_child_models(context, members, revisions)
+    monkeypatch.setattr(grouped_query, "_keyed_children", lambda *_args, **_kwargs: keys)
+    owned_members = grouped_query._child_candidate_members(context, (_KEY,)) if reuse_members else None
+    statement, _, _ = grouped_query._left_child_statement(context, selected, keys, owned_members=owned_members)
+    statement = statement.with_only_columns(
+        *(statement.selected_columns[name] for name in ("family_revision_id", "root_record_id", "child_revision_id")),
+        maintain_column_froms=True,
     )
-    statement, _, _ = grouped_query._left_child_statement(context, selected, keys)
-    selected_rows = (await values_connection.execute(statement.order_by(selected.c.family_revision_id))).all()
+    selected_rows = (
+        await values_connection.execute(statement.order_by(statement.selected_columns.family_revision_id))
+    ).all()
     assert [tuple(selected_row) for selected_row in selected_rows] == [
         (10, 20, 30),
         (10, 20, 30),
@@ -274,20 +299,22 @@ def _candidate_context(context, ambiguous):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ambiguous", (False, True))
+@pytest.mark.parametrize("reuse_members", (False, True))
 async def test_child_candidates_keep_exact_ownership_sibling_roots_and_ambiguity(
-    ambiguous, values_connection, monkeypatch
+    ambiguous, reuse_members, values_connection, monkeypatch
 ):
     """Reject wrong owners, retain childless siblings, and validate before filtering."""
     context, selected_roots = _candidate_context(fixture.context(), ambiguous)
     plan = grouped_read.normalize_plan(context, fixture.query(context_filters=(_KEY,)), ExtensionReadScope("synthetic"))
-    candidates = grouped_query._child_candidate_ids(context, plan.context_filters)
+    owned_members = grouped_query._child_candidate_members(context, plan.context_filters) if reuse_members else None
+    candidates = grouped_query._child_candidate_ids(context, plan.context_filters, owned_members=owned_members)
     assert (await values_connection.execute(select(candidates))).scalars().all() == [200]
     monkeypatch.setattr(grouped_read, "selected_family_statement", lambda *_args, **_kwargs: selected_roots)
     eligible = grouped_query.selected_identities(context, plan, entity_binding_ids=candidates)
     assert set((await values_connection.execute(select(eligible.c.family_revision_id))).scalars()) == {10, 11}
     assert await values_connection.scalar(select(func.avg(eligible.c.root_revision_id))) == Decimal("15")
     keys = grouped_query._keyed_children(context, plan.context_filters)
-    statement, _, revision = grouped_query._left_child_statement(context, eligible, keys)
+    statement, _, revision = grouped_query._left_child_statement(context, eligible, keys, owned_members=owned_members)
     amount = case((revision.child_revision_id == 30, 1), (revision.child_revision_id == 31, 9))
     children = statement.add_columns(amount.label("amount")).cte("synthetic_prequalified_children")
     validated = grouped_query._validated_stored_children(children, preserve_roots=True)

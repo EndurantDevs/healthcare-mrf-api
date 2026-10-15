@@ -35,7 +35,9 @@ def test_unpaged_default_selection_looks_up_the_guarded_helper_for_each_entity(e
         context, plan, materialize_default=True, entity_values=entity_values
     )
     lookups_by_identity = {
-        id(element): element for element in visitors.iterate(statement) if isinstance(element, ScalarSelect)
+        id(element): element
+        for element in visitors.iterate(statement)
+        if isinstance(element, ScalarSelect) and element._correlate
     }
     assert len(lookups_by_identity) == 1
     lookup = next(iter(lookups_by_identity.values())).element
@@ -54,10 +56,11 @@ def test_unpaged_default_selection_looks_up_the_guarded_helper_for_each_entity(e
         "custom_import_family_revision",
         "custom_import_root_revision",
         "custom_import_entity_binding",
-        "custom_import_generation",
-        "custom_import_generation_seal",
     ):
         assert f"JOIN mrf.{model}" in str(helper.element)
+    for model in ("custom_import_generation", "custom_import_generation_seal"):
+        assert f"FROM mrf.{model}" in str(helper.element)
+        assert f"JOIN mrf.{model} ON" not in str(helper.element)
     assert "helper_slot_6.root_record_id = mrf.custom_import_family_revision.root_record_id" in sql
     assert "LIMIT" not in sql
 
