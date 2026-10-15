@@ -339,18 +339,22 @@ def test_forecast_refuses_mutable_or_short_base_identifiers(tmp_path: Path) -> N
 
 
 def test_python_artifact_inventory_rejects_an_extra_producer_file(tmp_path: Path) -> None:
-    """The eight expected Python producers are an exact, not prefix, contract."""
+    """Accept every configured main producer, then reject an unexpected file."""
 
     baseline_path = tmp_path / artifacts.BASELINE_NAME
     baseline_path.write_text(json.dumps(_artifact_baseline()), encoding="utf-8")
     artifact_directory = tmp_path / "main"
     artifact_directory.mkdir()
-    for shard in ("0", "1", "2", "3"):
+    for shard in artifacts.SHARD_SPEC_BY_KIND["main"]["shards"]:
         coverage_name, provenance_name = artifacts.shard_file_names("main", shard)
         coverage_path = artifact_directory / coverage_name
         coverage_path.write_bytes(b"coverage")
         provenance = artifacts._expected_shard_provenance(tmp_path, "main", shard, coverage_path, BASE_SHA, HEAD_SHA)
         (artifact_directory / provenance_name).write_text(json.dumps(provenance), encoding="utf-8")
+    assert artifacts.verify_shard_artifacts(tmp_path, artifact_directory, "main", BASE_SHA, HEAD_SHA) == [
+        artifact_directory / artifacts.shard_file_names("main", shard)[0]
+        for shard in artifacts.SHARD_SPEC_BY_KIND["main"]["shards"]
+    ]
     (artifact_directory / "unexpected").write_text("x", encoding="utf-8")
 
     with pytest.raises(artifacts.CoverageForecastError, match="exact producer set"):
@@ -449,7 +453,7 @@ def test_cli_writes_rust_provenance_with_actual_producer_versions(
 
 
 def test_python_forecast_combines_only_the_bound_coverage_files(tmp_path: Path) -> None:
-    """The healthcare topology replays all four main, capacity, and PG producers."""
+    """The healthcare topology replays every configured main, capacity, and PG producer."""
 
     (tmp_path / artifacts.BASELINE_NAME).write_text(json.dumps(_artifact_baseline()), encoding="utf-8")
     (tmp_path / "test-coverage.ini").write_text(
@@ -472,12 +476,14 @@ def test_python_forecast_combines_only_the_bound_coverage_files(tmp_path: Path) 
 
     assert report_path.is_file()
     assert producer_files == {
-        "main": [f".coverage.main.{index}" for index in range(4)],
+        "main": [f".coverage.main.{index}" for index in range(6)],
         "capacity": [".coverage.capacity"],
         "postgres": [
             ".coverage.postgres.core-services",
             ".coverage.postgres.core-imports",
+            ".coverage.postgres.core-imports-2",
             ".coverage.postgres.core-snapshots",
+            ".coverage.postgres.core-snapshots-2",
             ".coverage.postgres.core-ptg",
             ".coverage.postgres.registry-0",
             ".coverage.postgres.registry-1",
@@ -487,6 +493,14 @@ def test_python_forecast_combines_only_the_bound_coverage_files(tmp_path: Path) 
             ".coverage.postgres.registry-5",
             ".coverage.postgres.registry-6",
             ".coverage.postgres.registry-7",
+            ".coverage.postgres.registry-8",
+            ".coverage.postgres.registry-9",
+            ".coverage.postgres.registry-10",
+            ".coverage.postgres.registry-11",
+            ".coverage.postgres.registry-12",
+            ".coverage.postgres.registry-13",
+            ".coverage.postgres.registry-14",
+            ".coverage.postgres.registry-15",
             ".coverage.postgres.directory-source",
             ".coverage.postgres.directory-storage",
             ".coverage.postgres.directory-address",

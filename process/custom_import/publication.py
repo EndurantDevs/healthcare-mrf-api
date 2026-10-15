@@ -189,6 +189,7 @@ class _Materialization:
     child_scalar_count: int
     materialization_contract: str = _MATERIALIZATION_CONTRACT
     verification_evidence: dict[str, Any] | None = None
+    query_projection_evidence: Any | None = None
 
 
 def _materialization_contract(value: Any) -> str:
@@ -1034,7 +1035,7 @@ async def _materialization(session: AsyncSession, generation: CustomImportGenera
     child_scalar_count = await _add_child_scalar_material(session, digest, generation, models=models)
     winner_count = await _add_winner_material(session, digest, generation, models=models)
     effective_output_sha256 = await _effective_output_materialization(session, generation, models=models)
-    return _Materialization(
+    materialization = _Materialization(
         source_bundle_sha256=source_bundle_sha256,
         materialization_sha256=digest.digest(),
         effective_output_sha256=effective_output_sha256,
@@ -1047,6 +1048,13 @@ async def _materialization(session: AsyncSession, generation: CustomImportGenera
         root_scalar_count=root_scalar_count,
         child_scalar_count=child_scalar_count,
     )
+    from process.custom_import.query_projection_binding import QueryProjectionUnavailable
+    from process.custom_import.query_projection_finality import bind_generation_materialization
+
+    try:
+        return await bind_generation_materialization(session, generation, materialization)
+    except QueryProjectionUnavailable as exc:
+        raise PublicationConflict(str(exc)) from exc
 
 
 async def _effective_output_materialization(
@@ -2233,6 +2241,15 @@ def _validate_generation_seal(
     materialization: _Materialization,
 ) -> None:
     _validate_generation_seal_identity(seal, generation)
+    from process.custom_import.query_projection_binding import QueryProjectionUnavailable
+    from process.custom_import.query_projection_evidence import read_seal_projection_evidence
+
+    try:
+        evidence = read_seal_projection_evidence(seal)
+    except QueryProjectionUnavailable as exc:
+        raise PublicationConflict(str(exc)) from exc
+    if evidence != materialization.query_projection_evidence:
+        raise PublicationConflict("generation seal query projection evidence differs")
     contract = _materialization_contract(materialization)
     _validate_verification_evidence(
         contract,
@@ -2288,7 +2305,20 @@ async def _validated_generation_seal(
     if seal is None:
         raise PublicationConflict("target generation is not sealed")
     _validate_generation_seal_identity(seal, generation)
+    await _validate_sealed_projection(session, generation, seal)
     return seal
+
+
+async def _validate_sealed_projection(session, generation, seal):
+    """Keep advertised projection failures inside the existing finality error contract."""
+
+    from process.custom_import.query_projection_binding import QueryProjectionUnavailable
+    from process.custom_import.query_projection_finality import validate_sealed_projection
+
+    try:
+        await validate_sealed_projection(session, generation, seal)
+    except QueryProjectionUnavailable as exc:
+        raise PublicationConflict(str(exc)) from exc
 
 
 def _generation_seal_request(
@@ -2320,6 +2350,7 @@ async def _replayed_generation_seal(
     existing_seal = await _locked_generation_seal(session, generation.generation_id)
     if existing_seal is None:
         return None
+    await _validate_sealed_projection(session, generation, existing_seal)
     return _generation_seal_replay(
         existing_seal,
         generation,
@@ -2426,6 +2457,11 @@ def _new_generation_seal(
         child_scalar_count=materialization.child_scalar_count,
         materialization_sha256=materialization.materialization_sha256,
         effective_output_sha256=materialization.effective_output_sha256,
+        **(
+            {}
+            if materialization.query_projection_evidence is None
+            else materialization.query_projection_evidence.seal_values()
+        ),
     )
 
 

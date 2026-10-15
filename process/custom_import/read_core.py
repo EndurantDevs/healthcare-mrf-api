@@ -424,6 +424,7 @@ class _ReadContext:
     collection_names_by_slot: Mapping[int, str]
     default_profile_slot: int | None = None
     storage_models: Mapping | None = None
+    projection_tables: Mapping | None = None
 
     def model(self, canonical_model):
         """Bind hot reads to this verified family without redirecting control rows."""
@@ -1172,22 +1173,31 @@ def _is_same_read_transaction(first, second) -> bool:
     )
 
 
-async def _load_read_context(session: AsyncSession, target: PinnedReadTarget) -> _ReadContext:
-    definition_row, schema_row = await _eligible_definition_rows(session, target)
+async def _load_read_context(session: AsyncSession, pinned_target: PinnedReadTarget) -> _ReadContext:
+    definition_row, schema_row = await _eligible_definition_rows(session, pinned_target)
     definition = verified_definition(definition_row, schema_row)
-    collection_slots = await _collection_slots(session, target, definition)
-    profile = await _exact_profile(session, target)
+    collection_slots = await _collection_slots(session, pinned_target, definition)
+    profile = await _exact_profile(session, pinned_target)
     profile_slot, profile_context_slot = _verified_profile(profile, definition, collection_slots)
-    await _verified_field_rows(session, target, definition, collection_slots)
-    snapshot_family_id = await resolve_generation_snapshot(session, target)
+    await _verified_field_rows(session, pinned_target, definition, collection_slots)
+    snapshot_family_id = await resolve_generation_snapshot(session, pinned_target)
+    from process.custom_import.query_projection_evidence import QueryProjectionUnavailable, read_projection_tables
+
+    try:
+        projection_tables = await read_projection_tables(
+            session, pinned_target, definition, snapshot_family_id=snapshot_family_id
+        )
+    except QueryProjectionUnavailable:
+        raise CustomImportReadUnavailableError("pinned query projection is unavailable") from None
     context = _ReadContext(
-        target=target,
+        target=pinned_target,
         definition=definition,
         profile_slot=profile_slot,
         profile_context_slot=profile_context_slot,
         collection_slots_by_name=collection_slots,
         collection_names_by_slot={slot: name for name, slot in collection_slots.items()},
         storage_models=None if snapshot_family_id is None else snapshot_models(snapshot_family_id),
+        projection_tables=projection_tables,
     )
     if definition.query.entity_selection is not None:
         from process.custom_import.grouped_read import bind_default_profile

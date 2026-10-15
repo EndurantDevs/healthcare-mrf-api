@@ -248,7 +248,9 @@ def _selected_value_relation(context, entity_values=None):
     )
 
 
-def selected_family_statement(context, plan, *, materialize_default=False, entity_values=None):
+def selected_family_statement(
+    context, plan, *, materialize_default=False, entity_values=None, default_selected_value=None
+):
     """Retain all configured groups at one independently resolved entity value."""
 
     winner_model = context.model(CustomImportWinner)
@@ -263,9 +265,11 @@ def selected_family_statement(context, plan, *, materialize_default=False, entit
     statement, group_expression = _join_root_scalar(statement, context, fields[selection.group_field_id])
     selected_value = literal(plan.selected_value)
     if plan.selected_value is None:
-        latest = _selected_value_relation(context, entity_values)
-        if materialize_default:
+        if default_selected_value is not None:
+            selected_value = default_selected_value
+        elif materialize_default:
             # Address the guarded helper by its indexed entity key instead of rescanning all entities.
+            latest = _selected_value_relation(context, entity_values)
             selected_value = (
                 select(latest.c.selected_value)
                 .where(latest.c.entity_binding_id == winner_model.entity_binding_id)
@@ -273,6 +277,7 @@ def selected_family_statement(context, plan, *, materialize_default=False, entit
                 .scalar_subquery()
             )
         else:
+            latest = _selected_value_relation(context, entity_values)
             statement = statement.join(latest, latest.c.entity_binding_id == winner_model.entity_binding_id)
             selected_value = latest.c.selected_value
     return statement.where(

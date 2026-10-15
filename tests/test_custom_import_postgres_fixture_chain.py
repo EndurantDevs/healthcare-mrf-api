@@ -11,6 +11,69 @@ import pytest
 from tests import custom_import_postgres_support as support
 
 
+class _ModelsOnlySession:
+    """Record fixture metadata and assign identities without database I/O."""
+
+    def __init__(self):
+        self.rows = []
+
+    def add(self, row):
+        self.rows.append(row)
+
+    def add_all(self, rows):
+        self.rows.extend(rows)
+
+    async def flush(self):
+        for ordinal, row in enumerate(self.rows, start=1):
+            for column in row.__table__.primary_key.columns:
+                if getattr(row, column.name) is None:
+                    setattr(row, column.name, ordinal)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_profile", [False, True])
+@pytest.mark.parametrize("context_slot", [None, 1])
+async def test_publication_fixture_has_parseable_definition_and_matching_schema(include_profile, context_slot):
+    from db.models import custom_import as models
+    from process.custom_import.definition import CustomImportDefinition
+
+    session = _ModelsOnlySession()
+    dataset, schema = await support._seed_identity_schema(session, "fixture", "shared")
+    revision = await support._seed_identity_definition(
+        session,
+        dataset,
+        schema,
+        "shared",
+        include_selection_profile=include_profile,
+        context_collection_slot=context_slot,
+    )
+    definition = CustomImportDefinition.from_json(revision.canonical_definition)
+    assert not definition.query.derived_fields
+    assert revision.canonical_definition == definition.canonical
+    assert revision.definition_sha256 == bytes.fromhex(definition.digest)
+    assert schema.canonical_schema == definition.schema_canonical
+    assert schema.schema_sha256 == bytes.fromhex(definition.schema_digest)
+    fields = [row for row in session.rows if isinstance(row, models.CustomImportField)]
+    assert [(row.field_slot, row.field_name, row.collection_slot) for row in fields] == [
+        (1, "synthetic_alpha", 1),
+        (2, "synthetic_beta", 1),
+    ]
+    profiles = [row for row in session.rows if isinstance(row, models.CustomImportSelectionProfile)]
+    assert [(row.profile_id, row.context_collection_slot) for row in profiles] == (
+        [("synthetic_profile", context_slot)] if include_profile else []
+    )
+
+
+@pytest.mark.asyncio
+async def test_publication_fixture_preserves_explicit_schema_override():
+    session = _ModelsOnlySession()
+    canonical_schema, schema_sha256 = '{"custom_schema":true}', b"s" * 32
+    _dataset, schema = await support._seed_identity_schema(
+        session, "fixture", "shared", canonical_schema=canonical_schema, schema_sha256=schema_sha256
+    )
+    assert (schema.canonical_schema, schema.schema_sha256) == (canonical_schema, schema_sha256)
+
+
 @pytest.mark.parametrize(
     "segmented,snapshots,migration_through,expected_tail",
     [
@@ -33,19 +96,27 @@ def test_fixture_installs_snapshot_prerequisites_exactly_once(
     monkeypatch, segmented, snapshots, migration_through, expected_tail
 ):
     installed_migrations = []
-    connection = object()
+    installed_metadata_revisions = []
+    has_snapshot_storage = "20261005030000_custom_import_snapshot_storage" in expected_tail
+    connection = SimpleNamespace(scalar=Mock(return_value="snapshot_family" if has_snapshot_storage else None))
     schema = "custom_import_publication_0123456789abcdef"
 
     def load(path, module_name):
         assert path.is_file()
         migration = SimpleNamespace()
 
-        def upgrade():
+        def record_install():
             assert migration._schema() == schema
             assert migration.op is connection
             installed_migrations.append(path.stem)
 
-        migration.upgrade = upgrade
+        def seal_metadata(selected_schema):
+            assert selected_schema == schema
+            installed_metadata_revisions.append(path.stem)
+            record_install()
+
+        migration.upgrade = record_install
+        migration._seal_metadata = seal_metadata
         return migration
 
     monkeypatch.setattr(support, "_migration", load)
@@ -63,8 +134,15 @@ def test_fixture_installs_snapshot_prerequisites_exactly_once(
         expected_migrations.append("20261002000000_custom_import_segmented_capture")
     expected_migrations.extend(expected_tail)
     expected_migrations.append("20261010010000_custom_import_materialization_contract")
+    expected_migrations.append("20261015020000_custom_import_query_projections")
     assert installed_migrations == expected_migrations
     assert len(installed_migrations) == len(set(installed_migrations))
+    assert installed_metadata_revisions == (
+        [] if has_snapshot_storage else ["20261015020000_custom_import_query_projections"]
+    )
+    connection.scalar.assert_called_once()
+    assert str(connection.scalar.call_args.args[0]) == "SELECT to_regclass(:relation)"
+    assert connection.scalar.call_args.args[1] == {"relation": f"{schema}.custom_import_snapshot_family"}
 
 
 def test_fixture_loads_the_actual_snapshot_read_and_write_functions():
@@ -202,23 +280,7 @@ async def test_native_read_fixture_uses_complete_canonical_materialization():
     from process.custom_import import runner_codec
     from tests import test_custom_import_snapshot_reads_postgres as native
 
-    class ModelsOnlySession:
-        def __init__(self):
-            self.rows = []
-
-        def add(self, row):
-            self.rows.append(row)
-
-        def add_all(self, rows):
-            self.rows.extend(rows)
-
-        async def flush(self):
-            for ordinal, row in enumerate(self.rows, start=1):
-                for column in row.__table__.primary_key.columns:
-                    if getattr(row, column.name) is None:
-                        setattr(row, column.name, ordinal)
-
-    session = ModelsOnlySession()
+    session = _ModelsOnlySession()
     seed = SimpleNamespace(
         dataset_id=1,
         definition_revision_id=2,

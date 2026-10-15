@@ -30,6 +30,7 @@ from process.custom_import.admission_authorization import (
     AdmissionKeyring,
     VerifiedAdmission,
     _origin,
+    _purpose,
     load_keyring,
     verify_request,
 )
@@ -54,12 +55,13 @@ def _unavailable():
     return AdmissionUnavailable("custom_import_admission_unavailable")
 
 
-def _contract_headers(headers, *, source=False):
+def _contract_headers(headers, *, source=False, projection=False):
     """Use the server's duplicate-preserving Header, never a collapsed mapping."""
 
     if not callable(getattr(headers, "getall", None)):
         raise AdmissionAuthorizationError("custom_import_admission_authorization_invalid")
-    expected_headers = tuple(name.replace("-Admission-", "-Source-") for name in _HEADERS) if source else _HEADERS
+    label, _path, _contract, _domain = _purpose(source, projection)
+    expected_headers = tuple(name.replace("-Admission-", f"-{label}-") for name in _HEADERS)
     expected_names = frozenset(name.lower() for name in expected_headers)
     pairs = list(headers.items())
     for name, _value in pairs:

@@ -21,6 +21,7 @@ from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 
 from db.models import custom_import as models
+from db.models.custom_import_query_projection import CustomImportQueryProjection
 from process.custom_import import materialization as materialize
 from process.custom_import import read_core, read_identity, runner_codec
 from process.custom_import.family import RootFamily
@@ -31,6 +32,35 @@ from tests import test_custom_import_grouped_child_read_postgres as child_fixtur
 from tests import test_custom_import_provider_hydration_postgres as native
 from tests import test_custom_import_read_core_postgres as read_fixture
 from tests import test_custom_import_runner_postgres as runner_fixture
+
+# Projection cases share this native suite's collection entrypoint.
+from tests.custom_import_candidate_selection_postgres import (
+    test_candidate_default_is_shared_without_losing_scalar_guards as test_candidate_default_is_shared_without_losing_scalar_guards,
+)
+from tests.custom_import_grouped_projection_postgres import (
+    projection_case as projection_case,
+)
+from tests.custom_import_grouped_projection_postgres import (
+    projection_helper as projection_helper,
+)
+from tests.custom_import_grouped_projection_postgres import (
+    test_duplicate_members_fail_before_metric as test_duplicate_members_fail_before_metric,
+)
+from tests.custom_import_grouped_projection_postgres import (
+    test_missing_projection_fails_before_filter as test_missing_projection_fails_before_filter,
+)
+from tests.custom_import_grouped_projection_postgres import (
+    test_mixed_filters_keep_exact_context as test_mixed_filters_keep_exact_context,
+)
+from tests.custom_import_grouped_projection_postgres import (
+    test_native_count_order_page_parity as test_native_count_order_page_parity,
+)
+from tests.custom_import_grouped_projection_postgres import (
+    test_nullable_projection_preserves_membership as test_nullable_projection_preserves_membership,
+)
+from tests.custom_import_grouped_projection_postgres import (
+    test_root_rollup_keeps_siblings_and_year as test_root_rollup_keeps_siblings_and_year,
+)
 from tests.custom_import_postgres_support import (
     FamilyMaterialSpec,
     attach_generation_family,
@@ -38,6 +68,81 @@ from tests.custom_import_postgres_support import (
     lease_digest,
     seed_family_material,
     seed_running_generation,
+)
+from tests.custom_import_query_projection_authority_postgres import (
+    test_interrupted_native_step_rolls_back_and_a_fresh_permit_retries as test_interrupted_native_step_rolls_back_and_a_fresh_permit_retries,
+)
+from tests.custom_import_query_projection_authority_postgres import (
+    test_native_worker_writes_close_while_registered_snapshot_readers_remain_allowed as test_native_worker_writes_close_while_registered_snapshot_readers_remain_allowed,
+)
+from tests.custom_import_query_projection_authority_postgres import (
+    test_signed_scope_rejections_leave_native_projection_state_untouched as test_signed_scope_rejections_leave_native_projection_state_untouched,
+)
+from tests.custom_import_query_projection_build_postgres import (
+    test_projection_resumes_context_pages_and_preserves_all_null_rows as test_projection_resumes_context_pages_and_preserves_all_null_rows,
+)
+from tests.custom_import_query_projection_build_postgres import (
+    test_writer_rejects_colliding_canonical_payloads_before_exceeding_byte_page as test_writer_rejects_colliding_canonical_payloads_before_exceeding_byte_page,
+)
+from tests.custom_import_query_projection_build_postgres import (
+    test_writer_rejects_one_canonical_child_key_with_different_hashes as test_writer_rejects_one_canonical_child_key_with_different_hashes,
+)
+from tests.custom_import_query_projection_build_postgres import (
+    test_writer_validates_exhausted_window_before_advancing_cursor as test_writer_validates_exhausted_window_before_advancing_cursor,
+)
+from tests.custom_import_query_projection_build_postgres import (
+    test_writer_validates_off_page_null_nonpositive_children_before_payload as test_writer_validates_off_page_null_nonpositive_children_before_payload,
+)
+from tests.custom_import_query_projection_build_postgres import (
+    test_writer_validates_skipped_entity_roots_before_later_child_page as test_writer_validates_skipped_entity_roots_before_later_child_page,
+)
+from tests.custom_import_query_projection_legacy_postgres import (
+    test_legacy_parity_failure_rolls_back_contexts_indexes_and_graph as test_legacy_parity_failure_rolls_back_contexts_indexes_and_graph,
+)
+from tests.custom_import_query_projection_legacy_postgres import (
+    test_legacy_projection_upgrade_activates_then_identical_output_is_no_change as test_legacy_projection_upgrade_activates_then_identical_output_is_no_change,
+)
+from tests.custom_import_query_projection_legacy_postgres import (
+    test_legacy_runner_persists_complete_context_pages_before_normal_publication as test_legacy_runner_persists_complete_context_pages_before_normal_publication,
+)
+from tests.custom_import_query_projection_migration_postgres import (
+    test_projection_migration_custody_numeric_boundaries_and_native_context_pages as test_projection_migration_custody_numeric_boundaries_and_native_context_pages,
+)
+from tests.custom_import_query_projection_sources_postgres import (
+    test_candidate_sources_keep_all_explicit_values_and_null_nonpositive_children as test_candidate_sources_keep_all_explicit_values_and_null_nonpositive_children,
+)
+from tests.custom_import_query_projection_sources_postgres import (
+    test_child_key_hash_consistency_checks_both_directions_at_the_exact_context as test_child_key_hash_consistency_checks_both_directions_at_the_exact_context,
+)
+from tests.custom_import_query_projection_sources_postgres import (
+    test_child_source_ignores_colliding_scalar_rows_from_other_owners as test_child_source_ignores_colliding_scalar_rows_from_other_owners,
+)
+from tests.custom_import_query_projection_sources_postgres import (
+    test_child_sources_exclude_each_mismatched_membership_and_revision_owner as test_child_sources_exclude_each_mismatched_membership_and_revision_owner,
+)
+from tests.custom_import_query_projection_sources_postgres import (
+    test_configured_ids_matching_envelope_names_keep_their_own_values as test_configured_ids_matching_envelope_names_keep_their_own_values,
+)
+from tests.custom_import_query_projection_sources_postgres import (
+    test_root_source_ignores_colliding_scalar_rows_from_other_owners as test_root_source_ignores_colliding_scalar_rows_from_other_owners,
+)
+from tests.custom_import_query_projection_sources_postgres import (
+    test_root_sources_exclude_each_mismatched_winner_family_and_root_owner as test_root_sources_exclude_each_mismatched_winner_family_and_root_owner,
+)
+from tests.custom_import_query_projection_sources_postgres import (
+    values_connection as values_connection,
+)
+from tests.custom_import_query_projection_values_postgres import (
+    test_native_ambiguity_cannot_hide_behind_nulls_weights_or_key_hashes as test_native_ambiguity_cannot_hide_behind_nulls_weights_or_key_hashes,
+)
+from tests.custom_import_query_projection_values_postgres import (
+    test_native_child_contexts_keep_distinct_complete_keys_and_null_values as test_native_child_contexts_keep_distinct_complete_keys_and_null_values,
+)
+from tests.custom_import_query_projection_values_postgres import (
+    test_native_contexts_keep_nulls_half_even_and_bigint_boundaries as test_native_contexts_keep_nulls_half_even_and_bigint_boundaries,
+)
+from tests.custom_import_query_projection_verify_postgres import (
+    test_native_comparison_preserves_nulls_values_and_multiplicity as test_native_comparison_preserves_nulls_values_and_multiplicity,
 )
 from tests.test_custom_import_snapshot_storage_postgres import _call
 
@@ -279,6 +384,7 @@ async def _grant_reader_access(connection, case, role):
         models.CustomImportSelectionProfile,
         models.CustomImportGeneration,
         models.CustomImportGenerationSeal,
+        CustomImportQueryProjection,
         models.CustomImportPublicationEvent,
     )
     await connection.execute(text(f'GRANT USAGE ON SCHEMA "{case.schema_name}" TO "{role}"'))

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
-from coverage_forecast_artifacts import CoverageForecastError, verify_shard_artifacts
+from coverage_forecast_artifacts import SHARD_SPEC_BY_KIND, CoverageForecastError, verify_shard_artifacts
 
 
 def _run_coverage(root: Path, arguments: list[str]) -> None:
@@ -32,13 +32,11 @@ def _verified_coverage_paths(
     base_sha: str,
     head_sha: str,
 ) -> list[Path]:
-    """Return only the eight valid coverage data files required by healthcare CI."""
+    """Return verified coverage data for every configured producer."""
 
     return [
         *verify_shard_artifacts(root, main_artifacts, "main", base_sha, head_sha),
-        *verify_shard_artifacts(
-            root, capacity_artifacts, "capacity", base_sha, head_sha
-        ),
+        *verify_shard_artifacts(root, capacity_artifacts, "capacity", base_sha, head_sha),
         *verify_shard_artifacts(root, postgres_artifacts, "postgres", base_sha, head_sha),
     ]
 
@@ -79,8 +77,10 @@ def combine_python_coverage(
             str(report_path),
         ],
     )
+    main_count = len(SHARD_SPEC_BY_KIND["main"]["shards"])
+    capacity_end = main_count + len(SHARD_SPEC_BY_KIND["capacity"]["shards"])
     return report_path, {
-        "main": [path.name for path in coverage_paths[:4]],
-        "capacity": [coverage_paths[4].name],
-        "postgres": [path.name for path in coverage_paths[5:]],
+        "main": [path.name for path in coverage_paths[:main_count]],
+        "capacity": [path.name for path in coverage_paths[main_count:capacity_end]],
+        "postgres": [path.name for path in coverage_paths[capacity_end:]],
     }

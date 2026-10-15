@@ -77,6 +77,7 @@ for include in (False, True):
     for ordinal, npi in enumerate(fixture._NPIS):
         reply, event = read_page(cursor)
         assert reply.status == 200 and event["transport_verified"] and event["native_page"]
+        assert event["legacy_projection"]
         assert event["hydration"] is include
         page = json.loads(reply.body)
         assert page["total_count"] == len(fixture._NPIS) and len(page["items"]) == 1

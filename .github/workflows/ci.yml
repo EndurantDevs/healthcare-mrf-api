@@ -69,7 +69,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -133,7 +133,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -156,7 +156,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -174,6 +174,11 @@ jobs:
   python-tests:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'python-tests (metadata only)' || matrix.label }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
@@ -188,19 +193,23 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
-      with:
-        dependencies: 'true'
+      uses: ./ci/scripts/healthcare/setup
     - name: Download exact-source Rust test binaries
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
         digest-mismatch: error
         path: rust-debug-binaries
+    - name: Prepare read-only common-test evidence
+      env:
+        GH_TOKEN: ${{ github.token }}
+      working-directory: ${{ github.workspace }}
+      run: python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" --source-repository "$SOURCE_REPOSITORY"
+        --step "$COMMON_TEST_STEP" --directory "$RUNNER_TEMP/common-test-evidence"
     - name: Run complete validation stage
       env:
         CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
@@ -230,34 +239,57 @@ jobs:
       run: '[[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
 
         printf ''%s=%s\n'' "$ARTIFACT_OUTPUT" "$ARTIFACT_ID" >> "$GITHUB_OUTPUT"'
+    - name: Upload verified common-test measurements
+      if: success() && env.COMMON_TEST_ARTIFACT_NAME != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ env.COMMON_TEST_ARTIFACT_NAME }}
+        path: ${{ runner.temp }}/common-test-measurements
+        if-no-files-found: error
+        retention-days: 1
     outputs:
       artifact_0: ${{ steps.coverage-output.outputs.artifact_0 }}
       artifact_1: ${{ steps.coverage-output.outputs.artifact_1 }}
       artifact_2: ${{ steps.coverage-output.outputs.artifact_2 }}
       artifact_3: ${{ steps.coverage-output.outputs.artifact_3 }}
+      artifact_4: ${{ steps.coverage-output.outputs.artifact_4 }}
+      artifact_5: ${{ steps.coverage-output.outputs.artifact_5 }}
     strategy:
       fail-fast: true
       matrix:
         include:
         - shard: '0'
-          label: Python tests (1/4)
+          label: Python tests (1/6)
           output: artifact_0
         - shard: '1'
-          label: Python tests (2/4)
+          label: Python tests (2/6)
           output: artifact_1
         - shard: '2'
-          label: Python tests (3/4)
+          label: Python tests (3/6)
           output: artifact_2
         - shard: '3'
-          label: Python tests (4/4)
+          label: Python tests (4/6)
           output: artifact_3
+        - shard: '4'
+          label: Python tests (5/6)
+          output: artifact_4
+        - shard: '5'
+          label: Python tests (6/6)
+          output: artifact_5
     env:
+      COMMON_TEST_EQUIVALENCE: 'true'
+      COMMON_TEST_STEP: Run complete validation stage
       CI_SHARD: ${{ matrix.shard }}
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   capacity-evidence:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'Capacity tests (metadata only)' || 'Capacity tests' }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
@@ -267,18 +299,25 @@ jobs:
       run:
         shell: bash
         working-directory: source
+    env:
+      COMMON_TEST_EQUIVALENCE: 'true'
+      COMMON_TEST_STEP: Run complete validation stage
     steps:
     - name: Check out pinned public CI
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
-      with:
-        dependencies: 'true'
+      uses: ./ci/scripts/healthcare/setup
+    - name: Prepare read-only common-test evidence
+      env:
+        GH_TOKEN: ${{ github.token }}
+      working-directory: ${{ github.workspace }}
+      run: python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" --source-repository "$SOURCE_REPOSITORY"
+        --step "$COMMON_TEST_STEP" --directory "$RUNNER_TEMP/common-test-evidence"
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" capacity
 
@@ -298,6 +337,14 @@ jobs:
         retention-days: 1
         if-no-files-found: error
       id: coverage-artifact
+    - name: Upload verified common-test measurements
+      if: success() && env.COMMON_TEST_ARTIFACT_NAME != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ env.COMMON_TEST_ARTIFACT_NAME }}
+        path: ${{ runner.temp }}/common-test-measurements
+        if-no-files-found: error
+        retention-days: 1
     outputs:
       artifact_id: ${{ steps.coverage-artifact.outputs.artifact-id }}
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
@@ -319,13 +366,11 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
-      with:
-        dependencies: 'true'
+      uses: ./ci/scripts/healthcare/setup
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" api-contract
 
@@ -353,14 +398,13 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+      uses: ./ci/scripts/healthcare/setup
       with:
         rust: 'true'
-        dependencies: 'true'
     - name: Install verified Rust validation tools
       run: 'tools_directory="$RUNNER_TEMP/healthcare-rust-tools"
 
@@ -406,7 +450,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -453,24 +497,13 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
-      with:
-        dependencies: 'true'
+      uses: ./ci/scripts/healthcare/setup
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" security
-
-
-        boorst_audit_file=$(mktemp "$RUNNER_TEMP/pytest-boorst-audit.XXXXXX")
-
-        trap ''rm -f -- "$boorst_audit_file"'' EXIT
-
-        python -I -c ''from importlib.metadata import version; print("pytest-boorst==" + version("pytest-boorst"))'' > "$boorst_audit_file"
-
-        python -I -m pip_audit --disable-pip --no-deps --strict -r "$boorst_audit_file"
 
         git diff --exit-code
 
@@ -502,13 +535,11 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
-      with:
-        dependencies: 'true'
+      uses: ./ci/scripts/healthcare/setup
     - name: Run complete validation stage
       env:
         HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
@@ -561,15 +592,14 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+      uses: ./ci/scripts/healthcare/setup
       with:
-        rust: ${{ matrix.shard == 'core-services' || matrix.shard == 'core-snapshots' || matrix.shard == 'core-ptg' || matrix.shard == 'directory-source' || startsWith(matrix.shard, 'registry-')
-          }}
-        dependencies: 'true'
+        rust: ${{ matrix.shard == 'core-services' || matrix.shard == 'core-snapshots' || matrix.shard == 'core-snapshots-2'
+          || matrix.shard == 'core-ptg' || matrix.shard == 'directory-source' || startsWith(matrix.shard, 'registry-') }}
     - name: Install PostgreSQL client
       run: "sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq\nsudo\
         \ apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --yes --no-install-recommends\
@@ -622,7 +652,9 @@ jobs:
     outputs:
       artifact_core_services: ${{ steps.coverage-output.outputs.artifact_core_services }}
       artifact_core_imports: ${{ steps.coverage-output.outputs.artifact_core_imports }}
+      artifact_core_imports_2: ${{ steps.coverage-output.outputs.artifact_core_imports_2 }}
       artifact_core_snapshots: ${{ steps.coverage-output.outputs.artifact_core_snapshots }}
+      artifact_core_snapshots_2: ${{ steps.coverage-output.outputs.artifact_core_snapshots_2 }}
       artifact_core_ptg: ${{ steps.coverage-output.outputs.artifact_core_ptg }}
       artifact_registry_0: ${{ steps.coverage-output.outputs.artifact_registry_0 }}
       artifact_registry_1: ${{ steps.coverage-output.outputs.artifact_registry_1 }}
@@ -632,6 +664,14 @@ jobs:
       artifact_registry_5: ${{ steps.coverage-output.outputs.artifact_registry_5 }}
       artifact_registry_6: ${{ steps.coverage-output.outputs.artifact_registry_6 }}
       artifact_registry_7: ${{ steps.coverage-output.outputs.artifact_registry_7 }}
+      artifact_registry_8: ${{ steps.coverage-output.outputs.artifact_registry_8 }}
+      artifact_registry_9: ${{ steps.coverage-output.outputs.artifact_registry_9 }}
+      artifact_registry_10: ${{ steps.coverage-output.outputs.artifact_registry_10 }}
+      artifact_registry_11: ${{ steps.coverage-output.outputs.artifact_registry_11 }}
+      artifact_registry_12: ${{ steps.coverage-output.outputs.artifact_registry_12 }}
+      artifact_registry_13: ${{ steps.coverage-output.outputs.artifact_registry_13 }}
+      artifact_registry_14: ${{ steps.coverage-output.outputs.artifact_registry_14 }}
+      artifact_registry_15: ${{ steps.coverage-output.outputs.artifact_registry_15 }}
       artifact_directory_source: ${{ steps.coverage-output.outputs.artifact_directory_source }}
       artifact_directory_storage: ${{ steps.coverage-output.outputs.artifact_directory_storage }}
       artifact_directory_address: ${{ steps.coverage-output.outputs.artifact_directory_address }}
@@ -647,9 +687,15 @@ jobs:
         - shard: core-imports
           label: Database tests (imports)
           output: artifact_core_imports
+        - shard: core-imports-2
+          label: Database tests (imports 2)
+          output: artifact_core_imports_2
         - shard: core-snapshots
           label: Database tests (snapshot imports)
           output: artifact_core_snapshots
+        - shard: core-snapshots-2
+          label: Database tests (snapshot imports 2)
+          output: artifact_core_snapshots_2
         - shard: core-ptg
           label: Database tests (PTG)
           output: artifact_core_ptg
@@ -677,6 +723,30 @@ jobs:
         - shard: registry-7
           label: Database tests (registry 8)
           output: artifact_registry_7
+        - shard: registry-8
+          label: Database tests (registry 9)
+          output: artifact_registry_8
+        - shard: registry-9
+          label: Database tests (registry 10)
+          output: artifact_registry_9
+        - shard: registry-10
+          label: Database tests (registry 11)
+          output: artifact_registry_10
+        - shard: registry-11
+          label: Database tests (registry 12)
+          output: artifact_registry_11
+        - shard: registry-12
+          label: Database tests (registry 13)
+          output: artifact_registry_12
+        - shard: registry-13
+          label: Database tests (registry 14)
+          output: artifact_registry_13
+        - shard: registry-14
+          label: Database tests (registry 15)
+          output: artifact_registry_14
+        - shard: registry-15
+          label: Database tests (registry 16)
+          output: artifact_registry_15
         - shard: directory-source
           label: Database tests (directory source)
           output: artifact_directory_source
@@ -697,6 +767,11 @@ jobs:
   measurement:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'Coverage results (metadata only)' || 'Coverage results' }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs:
@@ -722,7 +797,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -737,17 +812,28 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: python3 ci/scripts/source_identity.py
       working-directory: ${{ github.workspace }}
+    - name: Refresh current and original native test provenance
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 "$CI_ROOT/scripts/common_test_verify.py" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA"
+        --output "$RUNNER_TEMP/common-test-current-verification.json"
     - name: Download immutable measurement artifacts
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         artifact-ids: ${{ needs.python-tests.outputs.artifact_0 }},${{ needs.python-tests.outputs.artifact_1 }},${{ needs.python-tests.outputs.artifact_2
-          }},${{ needs.python-tests.outputs.artifact_3 }},${{ needs.capacity-evidence.outputs.artifact_id }},${{ needs.rust-scanner.outputs.artifact_id
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_services }},${{ needs.address-canonical-db-tests.outputs.artifact_core_imports
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_snapshots }},${{ needs.address-canonical-db-tests.outputs.artifact_core_ptg }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_0
+          }},${{ needs.python-tests.outputs.artifact_3 }},${{ needs.python-tests.outputs.artifact_4 }},${{ needs.python-tests.outputs.artifact_5
+          }},${{ needs.capacity-evidence.outputs.artifact_id }},${{ needs.rust-scanner.outputs.artifact_id }},${{ needs.address-canonical-db-tests.outputs.artifact_core_services
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_imports }},${{ needs.address-canonical-db-tests.outputs.artifact_core_imports_2
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_snapshots }},${{ needs.address-canonical-db-tests.outputs.artifact_core_snapshots_2
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_ptg }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_0
           }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_1 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_2
           }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_3 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_4
           }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_5 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_6
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_7 }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_7 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_8
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_9 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_10
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_11 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_12
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_13 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_14
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_15 }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source
           }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_storage }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_address
           }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_storage }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_publication
           }}
@@ -795,10 +881,12 @@ jobs:
         \ // .created_at), .id, .run_attempt])\n        | last\n        | if . == null then \"pending\"\n          elif .status\
         \ != \"completed\" then \"pending\"\n          elif .conclusion == \"success\" then \"success\"\n          else \"\
         failed\"\n          end'\n  )\"; then\n    validation_state=pending\n  fi\n  case \"$validation_state\" in\n    success)\
-        \ exit 0 ;;\n    failed)\n      printf 'No successful full validation exists for source %s at base %s.\\n' \"$SOURCE_SHA\"\
+        \ exit 0 ;;\n    failed)\n      printf 'METADATA_VALIDATION_DEPENDENCY_FAILED source=%s base=%s\\n' \"$SOURCE_SHA\"\
+        \ \"$BASE_SHA\" >&2\n      printf 'No successful full validation exists for source %s at base %s.\\n' \"$SOURCE_SHA\"\
         \ \"$BASE_SHA\" >&2\n      exit 1\n      ;;\n    pending)\n      if (( SECONDS >= deadline )); then\n        printf\
-        \ 'Timed out waiting for full validation of source %s at base %s.\\n' \"$SOURCE_SHA\" \"$BASE_SHA\" >&2\n        exit\
-        \ 1\n      fi\n      sleep 15\n      ;;\n    *)\n      printf 'Unexpected full-validation state: %s.\\n' \"$validation_state\"\
+        \ 'METADATA_VALIDATION_DEPENDENCY_FAILED source=%s base=%s\\n' \"$SOURCE_SHA\" \"$BASE_SHA\" >&2\n        printf 'Timed\
+        \ out waiting for full validation of source %s at base %s.\\n' \"$SOURCE_SHA\" \"$BASE_SHA\" >&2\n        exit 1\n\
+        \      fi\n      sleep 15\n      ;;\n    *)\n      printf 'Unexpected full-validation state: %s.\\n' \"$validation_state\"\
         \ >&2\n      exit 1\n      ;;\n  esac\ndone\n"
   dev-image-publication:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
@@ -816,7 +904,7 @@ jobs:
       actions: read
       packages: write
     env:
-      CI_REVISION: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+      CI_REVISION: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
       PYTHONDONTWRITEBYTECODE: '1'
       IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
       MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
@@ -825,7 +913,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -871,7 +959,7 @@ jobs:
         name: healthcare-public-image-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/public-image-receipt/image.json
         if-no-files-found: error
-        retention-days: 1
+        retention-days: 90
     - name: Reconcile DEV image publication
       if: always() && steps.image.outputs.publish == 'true'
       env:
@@ -900,7 +988,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -928,10 +1016,9 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: d5e5db0e19133e9d28aba54a04f07fcdb4d7430c
+  CI_REVISION: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'
-  PYTEST_BOORST: '1'
 run-name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
   && 'CI metadata update' || 'CI' }}

@@ -44,6 +44,9 @@ SOURCE_KEY_ID_HEADER = "X-Custom-Import-Source-Key-Id"
 SOURCE_SIGNATURE_HEADER = "X-Custom-Import-Source-Signature"
 _SIGNATURE_DOMAIN = b"CUSTOM_IMPORT_ADMISSION_PERMIT_V1\x00"
 _SOURCE_SIGNATURE_DOMAIN = b"CUSTOM_IMPORT_SOURCE_PERMIT_V1\x00"
+PROJECTION_PATH = "/control/v1/custom-import/query-projection-batch"
+PROJECTION_PERMIT_CONTRACT = "custom-import-query-projection-permit/v1"
+_PROJECTION_SIGNATURE_DOMAIN = b"CUSTOM_IMPORT_QUERY_PROJECTION_PERMIT_V1\x00"
 _BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
 _KEY_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 _IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -295,19 +298,35 @@ def load_keyring(document: bytes) -> AdmissionKeyring:
     return AdmissionKeyring(parsed["active_key_id"], tuple(sorted(keys)))
 
 
-def _permit(context: bytes, *, expected_origin: str, trusted_now: datetime, is_source: bool = False) -> AdmissionPermit:
+def _purpose(is_source=False, is_projection=False):
+    if type(is_source) is not bool or type(is_projection) is not bool or is_source and is_projection:
+        raise _fail()
+    if is_projection:
+        return "Projection", PROJECTION_PATH, PROJECTION_PERMIT_CONTRACT, _PROJECTION_SIGNATURE_DOMAIN
+    if is_source:
+        return "Source", SOURCE_PATH, SOURCE_PERMIT_CONTRACT, _SOURCE_SIGNATURE_DOMAIN
+    return "Admission", ADMISSION_PATH, PERMIT_CONTRACT, _SIGNATURE_DOMAIN
+
+
+def _permit(
+    context: bytes, *, expected_origin: str, trusted_now: datetime, is_source=False, is_projection=False
+) -> AdmissionPermit:
+    _label, path, contract, _domain = _purpose(is_source, is_projection)
     parsed = _object(context, 2_048)
     if parsed.keys() != _PERMIT_FIELDS:
         raise _fail()
     expected_by_name = {
-        "contract": SOURCE_PERMIT_CONTRACT if is_source else PERMIT_CONTRACT,
+        "contract": contract,
         "issuer": "custom-import-execution-controller",
         "audience": "custom-import-engine",
         "method": "POST",
-        "path": SOURCE_PATH if is_source else ADMISSION_PATH,
+        "path": path,
         "origin": _origin(expected_origin),
     }
-    if any(type(parsed[name]) is not str or parsed[name] != value for name, value in expected_by_name.items()):
+    if any(
+        type(parsed[name]) is not str or parsed[name] != expected_value
+        for name, expected_value in expected_by_name.items()
+    ):
         raise _fail()
     for name in ("dataset_id", "definition_revision_id", "schema_revision_id", "source_binding_revision_id"):
         _positive_id(parsed[name])
@@ -324,9 +343,9 @@ def _permit(context: bytes, *, expected_origin: str, trusted_now: datetime, is_s
     return AdmissionPermit(**{**parsed, "issued_at": issued, "expires_at": expires})
 
 
-def _signature_message(key_id: str, context: bytes, *, is_source: bool = False) -> bytes:
+def _signature_message(key_id: str, context: bytes, *, is_source=False, is_projection=False) -> bytes:
     encoded_id = key_id.encode("ascii")
-    domain = _SOURCE_SIGNATURE_DOMAIN if is_source else _SIGNATURE_DOMAIN
+    _label, _path, _contract, domain = _purpose(is_source, is_projection)
     return domain + len(encoded_id).to_bytes(2, "big") + encoded_id + len(context).to_bytes(8, "big") + context
 
 
@@ -338,15 +357,24 @@ def sign_permit(
     launch_expires_at: datetime,
     keyring: AdmissionKeyring,
     is_source: bool = False,
+    is_projection: bool = False,
 ) -> SignedPermit:
     """Issuer-only operation: cap the permit to the trusted signed launch expiry."""
 
-    permit = _permit(context, expected_origin=expected_origin, trusted_now=trusted_now, is_source=is_source)
+    permit = _permit(
+        context,
+        expected_origin=expected_origin,
+        trusted_now=trusted_now,
+        is_source=is_source,
+        is_projection=is_projection,
+    )
     if permit.expires_at > _trusted_utc(launch_expires_at):
         raise _fail()
     key_id = keyring.active_key_id
     signature = hmac.new(
-        keyring.key_for(key_id), _signature_message(key_id, context, is_source=is_source), hashlib.sha256
+        keyring.key_for(key_id),
+        _signature_message(key_id, context, is_source=is_source, is_projection=is_projection),
+        hashlib.sha256,
     ).digest()
     return SignedPermit(_base64url_encode(context), key_id, _base64url_encode(signature))
 
@@ -368,9 +396,12 @@ def encode_lease_bearer(token: str | bytes | bytearray | memoryview) -> str:
     return "Bearer " + _base64url_encode(value)
 
 
-def _headers(pairs: list[tuple[str, str]] | tuple[tuple[str, str], ...], *, is_source: bool = False) -> dict[str, str]:
+def _headers(
+    pairs: list[tuple[str, str]] | tuple[tuple[str, str], ...], *, is_source=False, is_projection=False
+) -> dict[str, str]:
+    label, _path, _contract, _domain = _purpose(is_source, is_projection)
     limits_by_name = {
-        name.replace("-admission-", "-source-") if is_source else name: limit for name, limit in _HEADER_LIMITS.items()
+        name.replace("-admission-", f"-{label.lower()}-"): limit for name, limit in _HEADER_LIMITS.items()
     }
     if type(pairs) not in (list, tuple) or len(pairs) != len(limits_by_name):
         raise _fail()
@@ -378,21 +409,21 @@ def _headers(pairs: list[tuple[str, str]] | tuple[tuple[str, str], ...], *, is_s
     for pair in pairs:
         if type(pair) not in (tuple, list) or len(pair) != 2:
             raise _fail()
-        name, value = pair
+        name, header_value = pair
         if type(name) is not str or len(name) > 64 or not name.isascii():
             raise _fail()
         name = name.lower()
         if (
             name not in limits_by_name
             or name in header_by_name
-            or type(value) is not str
-            or not 1 <= len(value) <= limits_by_name[name]
-            or not value.isascii()
-            or not value.isprintable()
-            or value != value.strip()
+            or type(header_value) is not str
+            or not 1 <= len(header_value) <= limits_by_name[name]
+            or not header_value.isascii()
+            or not header_value.isprintable()
+            or header_value != header_value.strip()
         ):
             raise _fail()
-        header_by_name[name] = value
+        header_by_name[name] = header_value
     if header_by_name.keys() != limits_by_name.keys() or header_by_name["content-type"] != "application/json":
         raise _fail()
     return header_by_name
@@ -407,27 +438,37 @@ def _verify_authority(
     trusted_now: datetime,
     expected_origin: str,
     keyring: AdmissionKeyring,
-    is_source: bool = False,
+    purpose: str = "admission",
 ) -> tuple[AdmissionPermit, LeaseToken]:
-    """Shared framing for the two fixed purposes, never caller-selected SQL."""
+    """Shared framing for three fixed purposes, never caller-selected SQL."""
 
-    expected_path = SOURCE_PATH if is_source else ADMISSION_PATH
+    if type(purpose) is not str or purpose not in {"admission", "source", "projection"}:
+        raise _fail()
+    is_source, is_projection = purpose == "source", purpose == "projection"
+    label, expected_path, _contract, _domain = _purpose(is_source, is_projection)
     if method != "POST" or path != expected_path or type(query_string) is not str or query_string:
         raise _fail()
-    header_by_name = _headers(headers, is_source=is_source)
-    key_id = header_by_name[(SOURCE_KEY_ID_HEADER if is_source else KEY_ID_HEADER).lower()]
+    header_by_name = _headers(headers, is_source=is_source, is_projection=is_projection)
+    prefix = f"x-custom-import-{label.lower()}-"
+    key_id = header_by_name[prefix + "key-id"]
     if _KEY_ID.fullmatch(key_id) is None:
         raise _fail()
-    context = _base64url_decode(header_by_name[(SOURCE_CONTEXT_HEADER if is_source else CONTEXT_HEADER).lower()], 2_048)
-    signature = _base64url_decode(
-        header_by_name[(SOURCE_SIGNATURE_HEADER if is_source else SIGNATURE_HEADER).lower()], 32
-    )
+    context = _base64url_decode(header_by_name[prefix + "context"], 2_048)
+    signature = _base64url_decode(header_by_name[prefix + "signature"], 32)
     expected_signature = hmac.new(
-        keyring.key_for(key_id), _signature_message(key_id, context, is_source=is_source), hashlib.sha256
+        keyring.key_for(key_id),
+        _signature_message(key_id, context, is_source=is_source, is_projection=is_projection),
+        hashlib.sha256,
     ).digest()
     if not hmac.compare_digest(signature, expected_signature):
         raise _fail()
-    permit = _permit(context, expected_origin=expected_origin, trusted_now=trusted_now, is_source=is_source)
+    permit = _permit(
+        context,
+        expected_origin=expected_origin,
+        trusted_now=trusted_now,
+        is_source=is_source,
+        is_projection=is_projection,
+    )
     authorization = header_by_name["authorization"]
     if not authorization.startswith("Bearer "):
         raise _fail()

@@ -278,7 +278,12 @@ async def run_segmented_snowflake_candidate(
         if generation_id is None:
             status = await _finish(session_factory, request, captured, policy, "failed")
             return _result(status, captured, counts)
-        output = await build_output(session_factory, build_request, staged_source.build_id)
+        output = await build_output(
+            session_factory,
+            build_request,
+            staged_source.build_id,
+            projection_transport=None if writer_transports is None else writer_transports.projection,
+        )
     except CancellationRequested:
         status = await _finish(session_factory, request, captured, policy, "canceled")
         return _result(status, captured, counts)
