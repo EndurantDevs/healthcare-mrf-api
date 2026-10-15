@@ -176,6 +176,7 @@ class AdmissionBatchTransport:
     _permit: authorization.AdmissionPermit = field(init=False, repr=False)
     _client: httpx.AsyncClient = field(init=False, repr=False, compare=False)
     _source: ClassVar[bool] = False
+    _projection: ClassVar[bool] = False
 
     def __post_init__(self):
         if (
@@ -194,6 +195,7 @@ class AdmissionBatchTransport:
                 expected_origin=self.expected_origin,
                 trusted_now=_utcnow(),
                 is_source=self._source,
+                is_projection=self._projection,
             )
             signature = authorization._base64url_decode(self.signed_permit.signature, 32)
             is_valid = (
@@ -286,7 +288,7 @@ class AdmissionBatchTransport:
         return _receipt(await self._exchange(request, body), pins)
 
     async def _exchange(self, request, body):
-        """One bounded POST for the hardcoded admission or SOURCE subclass."""
+        """One bounded POST for one of the three fixed writer purposes."""
 
         now = _utcnow()
         budget = min(
@@ -298,19 +300,18 @@ class AdmissionBatchTransport:
             raise LeaseAuthorityLost("admission authorization expired before handoff")
         if not 1 <= len(body) <= 512:
             raise _unavailable()
-        context_header = authorization.SOURCE_CONTEXT_HEADER if self._source else authorization.CONTEXT_HEADER
-        key_header = authorization.SOURCE_KEY_ID_HEADER if self._source else authorization.KEY_ID_HEADER
-        signature_header = authorization.SOURCE_SIGNATURE_HEADER if self._source else authorization.SIGNATURE_HEADER
+        label, path, _contract, _domain = authorization._purpose(self._source, self._projection)
+        prefix = f"X-Custom-Import-{label}-"
         headers_by_name = {
             "Authorization": authorization.encode_lease_bearer(request.lease_token),
             "Content-Type": "application/json",
-            context_header: self.signed_permit.context,
-            key_header: self.signed_permit.key_id,
-            signature_header: self.signed_permit.signature,
+            prefix + "Context": self.signed_permit.context,
+            prefix + "Key-Id": self.signed_permit.key_id,
+            prefix + "Signature": self.signed_permit.signature,
         }
         outbound = self._client.build_request(
             "POST",
-            self.expected_origin + (authorization.SOURCE_PATH if self._source else authorization.ADMISSION_PATH),
+            self.expected_origin + path,
             content=body,
             headers=headers_by_name,
             timeout=httpx.Timeout(budget, connect=min(5, budget)),
@@ -321,7 +322,9 @@ class AdmissionBatchTransport:
             async with asyncio.timeout(budget):
                 reply = await self._client.send(outbound, stream=True)
                 try:
-                    return await _bounded_response_body(reply, maximum=1_024 if self._source else 512)
+                    return await _bounded_response_body(
+                        reply, maximum=1_024 if self._source or self._projection else 512
+                    )
                 finally:
                     await reply.aclose()
         except httpx.HTTPError, OSError, TimeoutError, AdmissionTransportError:

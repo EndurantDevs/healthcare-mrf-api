@@ -18,7 +18,8 @@ PYTHON_DEPENDENCY_JOBS = {
     "worker-queue-smoke",
     "address-canonical-db-tests",
 }
-PYTHON_SETUP_ACTION = "EndurantDevs/endurant-ci/scripts/healthcare/setup@"
+LOCAL_SETUP_ACTION = "./ci/scripts/healthcare/setup"
+COMMON_TEST_JOBS = {"python-tests", "capacity-evidence"}
 JOB_LABELS = {
     "smoke": "portable import checks",
     "public-hygiene": "Repository checks",
@@ -39,17 +40,19 @@ JOB_LABELS = {
 }
 MATRIX_ROWS_BY_JOB = {
     "python-tests": [
-        {"shard": str(index), "label": f"Python tests ({index + 1}/4)", "output": f"artifact_{index}"}
-        for index in range(4)
+        {"shard": str(index), "label": f"Python tests ({index + 1}/6)", "output": f"artifact_{index}"}
+        for index in range(6)
     ],
     "address-canonical-db-tests": [
         {"shard": shard, "label": f"Database tests ({label})", "output": f"artifact_{shard.replace('-', '_')}"}
         for shard, label in (
             ("core-services", "services"),
             ("core-imports", "imports"),
+            ("core-imports-2", "imports 2"),
             ("core-snapshots", "snapshot imports"),
+            ("core-snapshots-2", "snapshot imports 2"),
             ("core-ptg", "PTG"),
-            *((f"registry-{index}", f"registry {index + 1}") for index in range(8)),
+            *((f"registry-{index}", f"registry {index + 1}") for index in range(16)),
             ("directory-source", "directory source"),
             ("directory-storage", "directory storage"),
             ("directory-address", "directory address"),
@@ -80,15 +83,9 @@ def _assert_job_actions(job_id, job, revision) -> None:
         action = step.get("uses")
         if not action:
             continue
-        if action == "./ci/scripts/healthcare/setup":
+        if action == LOCAL_SETUP_ACTION:
             assert has_pinned_checkout
-            assert job_id not in PYTHON_DEPENDENCY_JOBS
-            continue
-        if action.startswith(PYTHON_SETUP_ACTION):
-            assert has_pinned_checkout
-            assert job_id in PYTHON_DEPENDENCY_JOBS
-            assert re.fullmatch(r"[0-9a-f]{40}", action.removeprefix(PYTHON_SETUP_ACTION))
-            assert step["with"]["dependencies"] == "true"
+            assert "dependencies" not in step.get("with", {})
             continue
         assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", action)
         if not action.startswith("actions/checkout@"):
@@ -142,7 +139,7 @@ def _assert_smoke_job(workflow, workflow_text) -> None:
     assert ".venv/bin/python -m pytest -q" in commands
     assert "python -m pip install" not in "\n".join(step.get("run", "") for step in job["steps"])
     assert "test_process_" in commands or "tests/process/" in commands
-    assert workflow["env"]["PYTEST_BOORST"] == "1"
+    assert "PYTEST_BOORST" not in workflow["env"]
     assert "UV_FIND_LINKS" not in workflow["env"]
     assert "pytest pytest-asyncio 'pytest-boorst>=0.1.0a5,<1.0'" in commands
     assert "--upgrade-package pytest-boorst" in commands
@@ -192,6 +189,7 @@ def _assert_source_validation_job(workflow) -> None:
 
 
 def test_public_ci_is_hosted_read_only_and_runs_import_checks():
+    """Pin hosted stages, trusted artifacts and read-only source validation."""
     workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
     assert sorted(path.name for path in workflows.iterdir()) == ["artifact-cleanup.yml", "ci.yml"]
     text = (workflows / "ci.yml").read_text(encoding="utf-8")
@@ -224,6 +222,13 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
         ),
         "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
     }
+    _assert_hosted_job_policies(workflow, revision)
+    _assert_smoke_job(workflow, text)
+    _assert_source_validation_job(workflow)
+
+
+def _assert_hosted_job_policies(workflow, revision):
+    """Keep job permissions and metadata-only conditions within the trusted policy."""
     for job_id, job in workflow["jobs"].items():
         _assert_job_label(job_id, job)
         condition = "!cancelled()" if job_id in {"measurement", "source-validation"} else "success()"
@@ -245,33 +250,70 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
             }
         elif job_id == "artifact-cleanup":
             assert job["permissions"] == {"contents": "read", "actions": "write"}
+        elif job_id in COMMON_TEST_JOBS | {"measurement"}:
+            assert job["permissions"] == {
+                "contents": "read",
+                "pull-requests": "read",
+                "actions": "read",
+                "checks": "read",
+            }
         else:
             assert all(permission in {"read", "none"} for permission in job.get("permissions", {}).values())
+            assert "checks" not in job.get("permissions", {})
         _assert_job_actions(job_id, job, revision)
-    _assert_smoke_job(workflow, text)
-    _assert_source_validation_job(workflow)
 
 
-def test_existing_dependency_setup_updates_only_pytest_jobs_and_security():
+def test_qualified_stages_use_local_setup_and_scoped_common_test_evidence():
     path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
     workflow = yaml.safe_load(path.read_text())
     setup_by_job = {}
     for job_id, job in workflow["jobs"].items():
         for step in job.get("steps", []):
-            if step.get("uses", "").startswith(PYTHON_SETUP_ACTION):
+            if step.get("uses") == LOCAL_SETUP_ACTION:
                 assert step["name"] == "Prepare source and toolchain"
-                assert step["with"]["dependencies"] == "true"
+                assert "dependencies" not in step.get("with", {})
                 setup_by_job[job_id] = step["uses"]
-    assert set(setup_by_job) == PYTHON_DEPENDENCY_JOBS
+    assert set(setup_by_job) == PYTHON_DEPENDENCY_JOBS | {
+        "public-hygiene",
+        "readability-preflight",
+        "python-quality",
+        "container-package",
+    }
     assert len(set(setup_by_job.values())) == 1
     assert "scripts/pytest-tools@" not in path.read_text()
+    broker_jobs = set()
+    for job_id, job in workflow["jobs"].items():
+        brokers = [step for step in job.get("steps", []) if "common_test_broker.py" in step.get("run", "")]
+        if not brokers:
+            continue
+        broker_jobs.add(job_id)
+        [broker] = brokers
+        assert broker["name"] == "Prepare read-only common-test evidence"
+        assert broker["working-directory"] == "${{ github.workspace }}"
+        assert broker["env"] == {"GH_TOKEN": "${{ github.token }}"}
+        assert broker["run"] == (
+            'python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" '
+            '--source-repository "$SOURCE_REPOSITORY" --step "$COMMON_TEST_STEP" '
+            '--directory "$RUNNER_TEMP/common-test-evidence"'
+        )
+        assert job["env"]["COMMON_TEST_STEP"] == "Run complete validation stage"
+        stage = next(step for step in job["steps"] if step.get("name") == "Run complete validation stage")
+        assert "GH_TOKEN" not in workflow.get("env", {})
+        assert "GH_TOKEN" not in job.get("env", {})
+        assert "GH_TOKEN" not in stage.get("env", {})
+    assert broker_jobs == COMMON_TEST_JOBS
+    assert not any(
+        step.get("name") == "Upload verified common-test measurements"
+        for step in workflow["jobs"]["address-canonical-db-tests"]["steps"]
+    )
 
     security = workflow["jobs"]["security"]
     run = next(step["run"] for step in security["steps"] if step.get("name") == "Run complete validation stage")
-    assert run.startswith('bash "$CI_ROOT/scripts/healthcare/check" security')
-    assert 'version("pytest-boorst")' in run
-    assert "trap 'rm -f -- \"$boorst_audit_file\"' EXIT" in run
-    assert 'python -I -m pip_audit --disable-pip --no-deps --strict -r "$boorst_audit_file"' in run
+    assert run == (
+        'bash "$CI_ROOT/scripts/healthcare/check" security\n'
+        "git diff --exit-code\ngit diff --cached --exit-code\n"
+        'test -z "$(git ls-files --others --exclude-standard)"'
+    )
 
 
 def test_stale_artifact_cleanup_is_main_only_and_pinned():
@@ -364,7 +406,7 @@ def test_public_test_matrices_preserve_independent_database_shards():
         _assert_matrix_artifact_identity(job_id, job)
 
 
-def test_publisher_requires_every_matrix_result_and_twenty_three_immutable_artifacts():
+def test_publisher_requires_every_matrix_result_and_all_immutable_artifacts():
     workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
     workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
     jobs = workflow["jobs"]
@@ -380,7 +422,7 @@ def test_publisher_requires_every_matrix_result_and_twenty_three_immutable_artif
         step for step in publisher["steps"] if step.get("name") == "Download immutable measurement artifacts"
     )
     identities = [" ".join(selector.split()) for selector in download["with"]["artifact-ids"].split(",")]
-    expected_ids = [f"${{{{ needs.python-tests.outputs.artifact_{index} }}}}" for index in range(4)]
+    expected_ids = [f"${{{{ needs.python-tests.outputs.artifact_{index} }}}}" for index in range(6)]
     expected_ids.extend(
         [
             "${{ needs.capacity-evidence.outputs.artifact_id }}",
@@ -392,7 +434,7 @@ def test_publisher_requires_every_matrix_result_and_twenty_three_immutable_artif
         for matrix_row in MATRIX_ROWS_BY_JOB["address-canonical-db-tests"]
     )
     assert identities == expected_ids
-    assert len(set(identities)) == 23
+    assert len(set(identities)) == 35
     assert download["with"]["digest-mismatch"] == "error"
     assert download["with"]["merge-multiple"] is False
     assert jobs["source-validation"]["needs"] == ["measurement"]

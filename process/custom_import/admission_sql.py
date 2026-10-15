@@ -201,9 +201,16 @@ async def _admit_locked(session, build, expected_after_id, *, physical_row_cap: 
 async def _verify_admission_permit(session, request, permit: AdmissionPermit) -> None:
     """Bind the fixed admission purpose to retained rows under the page's locks."""
 
-    if type(permit) is not AdmissionPermit or (
-        permit.contract != PERMIT_CONTRACT
-        or permit.path != ADMISSION_PATH
+    await _verify_writer_permit(session, request, permit, (AdmissionPermit, PERMIT_CONTRACT, ADMISSION_PATH))
+
+
+async def _verify_writer_permit(session, request, permit, purpose):
+    """Recheck a fixed caller-owned purpose and all retained scope under page locks."""
+
+    permit_type, contract, path = purpose
+    if type(permit) is not permit_type or (
+        permit.contract != contract
+        or permit.path != path
         or permit.method != "POST"
         or permit.issuer != "custom-import-execution-controller"
         or permit.audience != "custom-import-engine"

@@ -116,6 +116,30 @@ or provider pagination. Repeated addresses of one provider share the same family
 Detail reads return all children of a selected family; opted-in grouped
 full-family list and geo pages also return all children, as described below.
 
+Configured numeric derived fields used by filtering, explicit sorting or default
+ordering are precomputed after import winners are finalized. Their definitions,
+aliases and response output paths remain configuration-owned. A derived field
+used only by a response template does not create a stored query column. Omitted
+`filterable_fields` retains the existing implicit filtering permissions; an
+explicit empty list disables those permissions.
+
+Each immutable snapshot stores one typed root result per entity and selection
+value, and one child result per complete child key and selection value. The same
+reducers preserve nulls, missing groups, nonpositive weights and twelve-place
+half-even rounding. Canonical family membership still determines eligibility:
+a present child can satisfy context selection even when its derived score is
+null, and a sibling group's score cannot supply a missing requested child.
+Default/latest selection and explicit selection keep their existing semantics.
+
+Projection coverage, typed values, indexes and content commitments are checked
+before normal snapshot publication. Reads bind that evidence to the exact
+generation, definition and projection capability version within the pinned read
+transaction. Existing snapshots without projection evidence retain their reducer
+query path. An advertised projection with missing or invalid evidence fails
+closed. Exact totals, stable pagination and independent `include`/`ext_filter`
+behavior are unchanged. A projection-only upgrade remains publishable even when
+the original imported scalar values are identical.
+
 Child membership and scalar values are hydrated in batches for the returned page.
 Each selected family may contain at most 1,000 children; all families are
 preflighted before hydration, and each membership/scalar batch contains at most

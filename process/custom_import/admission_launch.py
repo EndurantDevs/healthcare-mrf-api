@@ -20,8 +20,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from process.custom_import import admission_authorization as authorization
-from process.custom_import import admission_worker, source_worker
+from process.custom_import import admission_worker, query_projection_worker, source_worker
 from process.custom_import.processing_policy import ProcessingPolicy
+from process.custom_import.query_projection_values import configured_fields
 from process.custom_import.snowflake import _credential_file_identity, _validate_fixed_credential_directory
 from process.custom_import.snowflake_source_binding import LoadedSnowflakeSourceBinding
 
@@ -29,9 +30,11 @@ FIXED_ADMISSION_DIRECTORY = Path("/run/custom-import-operator")
 _LAUNCH_NAME = "admission-launch.json"
 _PERMIT_NAME = ".admission-permit.json"
 _SOURCE_PERMIT_NAME = ".source-permit.json"
+_PROJECTION_PERMIT_NAME = ".projection-permit.json"
 _WRITER_CA_NAME = ".writer-ca.pem"
 _MAX_CA_BYTES = 65_536
 _LAUNCH_CONTRACT = "custom-import/admission-launch/v1"
+_PROJECTION_LAUNCH_CONTRACT = "custom-import/admission-launch/v2"
 _LAUNCH_FIELDS = {
     "contract",
     "origin",
@@ -44,16 +47,19 @@ _LAUNCH_FIELDS = {
 
 @dataclass(frozen=True, slots=True)
 class WriterBatchTransports:
-    """The complete authenticated pair; neither permit can enable legacy mode."""
+    """The complete authenticated stage, preserving each independent purpose."""
 
     admission: admission_worker.AdmissionBatchTransport = field(repr=False)
     source: source_worker.SourceBatchTransport = field(repr=False)
+    projection: query_projection_worker.QueryProjectionBatchTransport | None = field(default=None, repr=False)
     _stack: AsyncExitStack = field(default_factory=AsyncExitStack, init=False, repr=False, compare=False)
 
     async def __aenter__(self):
         try:
             await self._stack.enter_async_context(self.admission)
             await self._stack.enter_async_context(self.source)
+            if self.projection is not None:
+                await self._stack.enter_async_context(self.projection)
         except BaseException:
             await self._stack.aclose()
             raise
@@ -67,6 +73,8 @@ class WriterBatchTransports:
 
         self.admission.require_candidate_binding(request)
         self.source.require_candidate_binding(request)
+        if self.projection is not None:
+            self.projection.require_candidate_binding(request)
 
 
 def _unavailable():
@@ -98,7 +106,7 @@ def _read_mount(directory, name, maximum):
 
 
 def _stage_files():
-    """Only a genuinely absent directory or all four absent files select legacy."""
+    """Only a genuinely absent directory or every absent file selects direct mode."""
 
     try:
         expected = os.stat(FIXED_ADMISSION_DIRECTORY, follow_symlinks=False)
@@ -117,13 +125,14 @@ def _stage_files():
             (_PERMIT_NAME, 4_096),
             (_SOURCE_PERMIT_NAME, 4_096),
             (_WRITER_CA_NAME, _MAX_CA_BYTES),
+            (_PROJECTION_PERMIT_NAME, 4_096),
         ):
             contents.append(_read_mount(directory, name, maximum))
         if _credential_file_identity(opened) != _credential_file_identity(os.fstat(directory)):
             _unavailable()
-        if contents == [None, None, None, None]:
+        if all(content is None for content in contents):
             return None
-        if None in contents:
+        if None in contents[:4]:
             _unavailable()
         return contents
     finally:
@@ -151,8 +160,9 @@ def _require_retained_scope(permit, loaded, idempotency_key):
         _unavailable()
 
 
-def _staged_permit(raw, launch, now, *, is_source=False):
-    digest_field = "source_permit_sha256" if is_source else "admission_permit_sha256"
+def _staged_permit(raw, launch, now, *, is_source=False, is_projection=False):
+    label, _path, _contract, _domain = authorization._purpose(is_source, is_projection)
+    digest_field = f"{label.lower()}_permit_sha256"
     if hashlib.sha256(raw).hexdigest() != launch[digest_field]:
         _unavailable()
     document = authorization._object(raw, 4_096)
@@ -170,6 +180,7 @@ def _staged_permit(raw, launch, now, *, is_source=False):
         expected_origin=launch["origin"],
         trusted_now=now,
         is_source=is_source,
+        is_projection=is_projection,
     )
     if permit.expires_at > authorization._canonical_utc(launch["expires_at"]):
         _unavailable()
@@ -194,49 +205,66 @@ def _writer_tls_context(raw, expected_digest):
     return context
 
 
-def load_admission_launch(
-    loaded: LoadedSnowflakeSourceBinding, *, idempotency_key: str
-) -> WriterBatchTransports | None:
-    """Return both fixed transports, or None only when every stage file is absent.
+def _stage_descriptor(raw, projection_bytes, loaded):
+    launch = authorization._object(raw, 2_048)
+    has_projection = launch.get("contract") == _PROJECTION_LAUNCH_CONTRACT
+    fields = _LAUNCH_FIELDS | ({"projection_permit_sha256"} if has_projection else set())
+    if launch.keys() != fields or launch["contract"] not in {_LAUNCH_CONTRACT, _PROJECTION_LAUNCH_CONTRACT}:
+        _unavailable()
+    if has_projection != (projection_bytes is not None) or not has_projection and configured_fields(loaded.definition):
+        _unavailable()
+    authorization._origin(launch["origin"])
+    expires_at = authorization._canonical_utc(launch["expires_at"])
+    now = admission_worker._utcnow()
+    if now >= expires_at:
+        _unavailable()
+    return launch, expires_at, now
 
-    The origin and original launch expiry come only from the independent fixed
-    stage. Permit parsing here does not replace server-side signature, retained
-    scope, lease, fence, cursor and pre-commit authorization checks.
-    """
 
-    try:
-        stage = _stage_files()
-        if stage is None:
-            return None
-        launch_bytes, permit_bytes, source_bytes, ca_bytes = stage
-        launch = authorization._object(launch_bytes, 2_048)
-        if launch.keys() != _LAUNCH_FIELDS or launch["contract"] != _LAUNCH_CONTRACT:
-            _unavailable()
-        origin = authorization._origin(launch["origin"])
-        expires_at = authorization._canonical_utc(launch["expires_at"])
-        now = admission_worker._utcnow()
-        if now >= expires_at:
-            _unavailable()
-        signed, permit = _staged_permit(permit_bytes, launch, now)
-        source_signed, source_permit = _staged_permit(source_bytes, launch, now, is_source=True)
-        if any(
-            getattr(permit, name) != getattr(source_permit, name)
+def _stage_transports(stage, loaded, idempotency_key):
+    launch_bytes, permit_bytes, source_bytes, ca_bytes, projection_bytes = stage
+    launch, expires_at, now = _stage_descriptor(launch_bytes, projection_bytes, loaded)
+    tls_context = _writer_tls_context(ca_bytes, launch["writer_ca_sha256"])
+    transports = []
+    retained_permit = None
+    for raw, transport_type, purpose in (
+        (permit_bytes, admission_worker.AdmissionBatchTransport, {}),
+        (source_bytes, source_worker.SourceBatchTransport, {"is_source": True}),
+        (projection_bytes, query_projection_worker.QueryProjectionBatchTransport, {"is_projection": True}),
+    ):
+        if raw is None:
+            continue
+        signed, permit = _staged_permit(raw, launch, now, **purpose)
+        if retained_permit is not None and any(
+            getattr(permit, name) != getattr(retained_permit, name)
             for name in asdict(permit)
             if name not in {"contract", "path"}
         ):
             _unavailable()
         _require_retained_scope(permit, loaded, idempotency_key)
-        tls_context = _writer_tls_context(ca_bytes, launch["writer_ca_sha256"])
-        return WriterBatchTransports(
-            admission_worker.AdmissionBatchTransport(
-                expected_origin=origin, signed_permit=signed, launch_expires_at=expires_at, tls_context=tls_context
-            ),
-            source_worker.SourceBatchTransport(
-                expected_origin=origin,
-                signed_permit=source_signed,
+        retained_permit = permit
+        transports.append(
+            transport_type(
+                expected_origin=launch["origin"],
+                signed_permit=signed,
                 launch_expires_at=expires_at,
                 tls_context=tls_context,
-            ),
+            )
         )
+    return WriterBatchTransports(*transports)
+
+
+def load_admission_launch(
+    loaded: LoadedSnowflakeSourceBinding, *, idempotency_key: str
+) -> WriterBatchTransports | None:
+    """Verify the complete fixed stage before any worker claim; absent stages stay direct.
+
+    Enabled query projections require launch v2 and its independent permit. The
+    server still verifies signature and exact retained authority on every step.
+    """
+
+    try:
+        stage = _stage_files()
+        return None if stage is None else _stage_transports(stage, loaded, idempotency_key)
     except OSError, ValueError, AttributeError, TypeError, admission_worker.AdmissionTransportError:
         _unavailable()

@@ -611,6 +611,11 @@ def _generation_seal_fixtures():
     )
     seal = SimpleNamespace(
         seal_contract=publication._GENERATION_SEAL_CONTRACT,
+        query_projection_contract=None,
+        query_projection_capability_sha256=None,
+        query_projection_sha256=None,
+        query_projection_root_count=None,
+        query_projection_child_count=None,
         generation_id=9,
         dataset_id=1,
         definition_revision_id=2,

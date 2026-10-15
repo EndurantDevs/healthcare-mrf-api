@@ -9,21 +9,44 @@ from process.custom_import import read_core as core
 from process.custom_import.derived_query import reduce_expression
 
 
-def selected_identities(context, plan, entity_values=None, *, entity_binding_ids=None):
+def selected_identities(context, plan, entity_values=None, *, entity_binding_ids=None, include_binding=False):
     """Pin all selected family identities before evaluating score predicates."""
 
-    from process.custom_import.grouped_read import selected_family_statement
+    from process.custom_import.grouped_read import _selected_value_relation, selected_family_statement
 
     family = context.model(core.CustomImportFamilyRevision)
     winner = context.model(core.CustomImportWinner)
     entity = context.model(core.CustomImportEntityBinding)
-    statement = selected_family_statement(context, plan, materialize_default=True, entity_values=entity_values)
+    default_selected_value = None
+    if entity_binding_ids is not None and plan.selected_value is None:
+        latest = _selected_value_relation(context, entity_values)
+        selected_value = (
+            select(latest.c.selected_value)
+            .where(latest.c.entity_binding_id == entity_binding_ids.c.entity_binding_id)
+            .correlate(entity_binding_ids)
+            .scalar_subquery()
+        )
+        # Resolve the guarded helper once before expanding each candidate's families.
+        entity_binding_ids = (
+            select(entity_binding_ids.c.entity_binding_id, selected_value.label("selected_value"))
+            .cte("candidate_selected_values")
+            .prefix_with("MATERIALIZED")
+        )
+        default_selected_value = entity_binding_ids.c.selected_value
+    statement = selected_family_statement(
+        context,
+        plan,
+        materialize_default=True,
+        entity_values=entity_values,
+        default_selected_value=default_selected_value,
+    )
     if entity_binding_ids is not None:
         statement = statement.where(winner.entity_binding_id == entity_binding_ids.c.entity_binding_id)
     statement = statement.with_only_columns(
         winner.family_revision_id,
         family.root_record_id,
         family.root_revision_id,
+        *((winner.entity_binding_id,) if include_binding else ()),
         entity.canonical_value.label("entity_value"),
         *statement.selected_columns[-2:],
         maintain_column_froms=True,
@@ -520,7 +543,16 @@ def _child_candidate_ids(context, selectors, *, owned_members=None):
     )
 
 
-def _derived_child_values(context, plan, entity_values, fields, selectors, derived_fields):
+def _retained_root_columns(roots, root_values, root_states, include_binding):
+    columns = [roots.c.entity_value, roots.c.group_value]
+    if include_binding:
+        columns.extend((roots.c.entity_binding_id, roots.c.selected_value))
+    columns.extend(roots.c[f"root_value_{index}"] for index in range(len(root_values)))
+    columns.extend(roots.c[f"root_state_{index}"] for index in range(len(root_states)))
+    return columns
+
+
+def _derived_child_values(context, plan, entity_values, fields, selectors, derived_fields, *, include_binding=False):
     """Reduce every configured group from one root-preserving complete-child join."""
 
     owned_members = _child_candidate_members(context, selectors) if entity_values is None else None
@@ -528,26 +560,25 @@ def _derived_child_values(context, plan, entity_values, fields, selectors, deriv
         context,
         plan,
         entity_values,
+        include_binding=include_binding,
         entity_binding_ids=(
             _child_candidate_ids(context, selectors, owned_members=owned_members) if owned_members is not None else None
         ),
     )
-    statement, root_values_by_field, root_states_by_field = _root_values(
+    statement, root_values, root_states = _root_values(
         context, selected, [field for field in fields if field.collection is None]
     )
-    columns = [selected]
-    columns.extend(
-        typed_value.label(f"root_value_{index}") for index, typed_value in enumerate(root_values_by_field.values())
-    )
-    columns.extend(state.label(f"root_state_{index}") for index, state in enumerate(root_states_by_field.values()))
     roots = (
-        statement.with_only_columns(*columns, maintain_column_froms=True)
+        statement.with_only_columns(
+            selected,
+            *(typed_value.label(f"root_value_{index}") for index, typed_value in enumerate(root_values.values())),
+            *(state.label(f"root_state_{index}") for index, state in enumerate(root_states.values())),
+            maintain_column_froms=True,
+        )
         .cte("derived_root_score_values")
         .prefix_with("MATERIALIZED")
     )
-    retained_columns = [roots.c.entity_value, roots.c.group_value]
-    retained_columns.extend(roots.c[f"root_value_{index}"] for index in range(len(root_values_by_field)))
-    retained_columns.extend(roots.c[f"root_state_{index}"] for index in range(len(root_states_by_field)))
+    retained_columns = _retained_root_columns(roots, root_values, root_states, include_binding)
     children, child_values_by_field, child_states_by_field = _child_values(
         context,
         roots,
@@ -558,12 +589,8 @@ def _derived_child_values(context, plan, entity_values, fields, selectors, deriv
         owned_members=owned_members,
     )
     validated = _validated_stored_children(children, preserve_roots=True)
-    values_by_field = {
-        field_id: validated.c[f"root_value_{index}"] for index, field_id in enumerate(root_values_by_field)
-    }
-    states_by_field = {
-        field_id: validated.c[f"root_state_{index}"] for index, field_id in enumerate(root_states_by_field)
-    }
+    values_by_field = {field_id: validated.c[f"root_value_{index}"] for index, field_id in enumerate(root_values)}
+    states_by_field = {field_id: validated.c[f"root_state_{index}"] for index, field_id in enumerate(root_states)}
     values_by_field.update(
         {field_id: validated.c[typed_value.name] for field_id, typed_value in child_values_by_field.items()}
     )
@@ -657,6 +684,10 @@ def relation_statement(context, plan, entity_values=None):
     """Return deduplicated eligible providers with their exact score ordering tuple."""
 
     fields, derived = _stored_fields(context, plan)
+    if derived and context.projection_tables is not None:
+        from process.custom_import.grouped_projection_query import relation_statement as projection_statement
+
+        return projection_statement(context, plan, entity_values, derived)
     selectors = [predicate for predicate in plan.context_filters if predicate.field.collection is not None]
     if selectors and not derived:
         return _stored_child_statement(context, plan, entity_values, fields, selectors)

@@ -3,9 +3,8 @@
 """OUTPUT reads bind immutable hot aliases inside their native read pages."""
 
 from contextlib import asynccontextmanager, contextmanager
-from itertools import count
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from sqlalchemy import inspect, select
@@ -301,19 +300,30 @@ async def test_snapshot_freeze_uses_real_captured_attempt_tuple(monkeypatch, fam
     )
 
 
-@pytest.mark.parametrize("phase", ["output", "verifying", "verified"])
-async def test_output_resumes_only_after_real_snapshot_freeze(monkeypatch, phase):
-    events = []
-    request = _request()
-    build = SimpleNamespace(phase=phase, generation_id=10)
-    generation = _generation(request)
-    session = SimpleNamespace(get=AsyncMock(return_value=generation), expunge=lambda _row: None)
-    steps = count()
+def _verification_session(generation):
+    """Model the generation read and open finality transaction without database I/O."""
+
+    session = SimpleNamespace(
+        get=AsyncMock(side_effect=(generation, None)),
+        expunge=lambda _row: None,
+        in_transaction=lambda: True,
+    )
 
     async def run_sync(operation):
         return operation(session)
 
     session.run_sync = run_sync
+    return session
+
+
+@pytest.mark.parametrize("phase", ["output", "verifying", "verified"])
+async def test_output_resumes_only_after_real_snapshot_freeze(monkeypatch, phase):
+    """Resume every output phase through snapshot freeze and finality before sealing."""
+
+    events = []
+    request = _request()
+    build = SimpleNamespace(phase=phase, generation_id=10)
+    session = _verification_session(_generation(request))
 
     @asynccontextmanager
     async def context(*_args, **_kwargs):
@@ -322,9 +332,6 @@ async def test_output_resumes_only_after_real_snapshot_freeze(monkeypatch, phase
     @asynccontextmanager
     async def page(*_args):
         yield session, build
-
-    async def snapshot(*_args):
-        return build if next(steps) == 0 else SimpleNamespace(phase="verified")
 
     async def freeze(*_args):
         events.append("snapshot freeze")
@@ -341,7 +348,7 @@ async def test_output_resumes_only_after_real_snapshot_freeze(monkeypatch, phase
 
     monkeypatch.setattr(output, "_replay", AsyncMock(return_value=None))
     monkeypatch.setattr(output, "_renew_while_reading", context)
-    monkeypatch.setattr(output, "_snapshot", snapshot)
+    monkeypatch.setattr(output, "_snapshot", AsyncMock(side_effect=(build, SimpleNamespace(phase="verified"))))
     monkeypatch.setattr(output, "_page_session", page)
     monkeypatch.setattr(output, "_session", context)
     monkeypatch.setattr(output, "load_registry", AsyncMock(return_value=object()))
@@ -359,6 +366,10 @@ async def test_output_resumes_only_after_real_snapshot_freeze(monkeypatch, phase
         "snapshot freeze",
         "serving indexes",
         "materialization",
+    ]
+    assert session.get.await_args_list == [
+        call(models.CustomImportGeneration, 10),
+        call(models.CustomImportGenerationSeal, 10),
     ]
 
 

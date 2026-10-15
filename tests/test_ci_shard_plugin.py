@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from scripts.ci.shard_pytest_nodeids import select_nodeids
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,8 +20,15 @@ def _run_pytest(tmp_path: Path, *arguments: str) -> subprocess.CompletedProcess[
     (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
     return subprocess.run(
         [
-            sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-            "-p", "scripts.ci.shard_pytest_nodeids", *arguments,
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "scripts.ci.shard_pytest_nodeids",
+            *arguments,
         ],
         cwd=tmp_path,
         env={
@@ -37,11 +43,8 @@ def _run_pytest(tmp_path: Path, *arguments: str) -> subprocess.CompletedProcess[
     )
 
 
-@pytest.mark.parametrize(("workers", "distribution"), [(1, "loadscope"), (4, "worksteal")])
-def test_xdist_shards_execute_the_legacy_sorted_assignment_once(
-    tmp_path: Path, workers: int, distribution: str,
-) -> None:
-    """Require identical worker collections and exact-once execution."""
+def _write_xdist_sample(tmp_path: Path) -> list[str]:
+    """Record collection and execution for the same synthetic node inventory."""
 
     (tmp_path / "conftest.py").write_text(
         "from pathlib import Path\n"
@@ -63,18 +66,41 @@ def test_xdist_shards_execute_the_legacy_sorted_assignment_once(
         "def test_alpha(): pass\n",
         encoding="utf-8",
     )
-    nodeids = [
-        "test_sample.py::test_zeta", "test_sample.py::test_alpha",
+    return [
+        "test_sample.py::test_zeta",
+        "test_sample.py::test_alpha",
         *(f"test_sample.py::test_values[{sample_number}]" for sample_number in range(16, 0, -1)),
     ]
+
+
+@pytest.mark.parametrize(
+    ("workers", "distribution", "shard_count"),
+    [(1, "loadscope", 2), (4, "worksteal", 2), (1, "loadscope", 6)],
+)
+def test_xdist_shards_execute_the_legacy_sorted_assignment_once(
+    tmp_path: Path,
+    workers: int,
+    distribution: str,
+    shard_count: int,
+) -> None:
+    """Require identical worker collections and exact-once execution."""
+
+    nodeids = _write_xdist_sample(tmp_path)
     executed_ids = []
-    for shard in range(2):
+    for shard in range(shard_count):
         pytest_result = _run_pytest(
-            tmp_path, "-n", str(workers), "--dist", distribution,
-            "--ci-shard-count", "2", "--ci-shard-index", str(shard),
+            tmp_path,
+            "-n",
+            str(workers),
+            "--dist",
+            distribution,
+            "--ci-shard-count",
+            str(shard_count),
+            "--ci-shard-index",
+            str(shard),
         )
         assert pytest_result.returncode == 0, pytest_result.stdout + pytest_result.stderr
-        expected = select_nodeids(nodeids, shard_count=2, shard_index=shard)
+        expected = select_nodeids(nodeids, shard_count=shard_count, shard_index=shard)
         collections = list(tmp_path.glob("collected-*.txt"))
         assert len(collections) == workers
         for path in collections:
@@ -104,13 +130,21 @@ def test_xdist_shards_execute_the_legacy_sorted_assignment_once(
     ],
 )
 def test_shard_errors_never_pass(
-    tmp_path: Path, source: str, arguments: tuple[str, ...], error: str,
+    tmp_path: Path,
+    source: str,
+    arguments: tuple[str, ...],
+    error: str,
 ) -> None:
     """Reject invalid selections and preserve collection and execution failures."""
 
     (tmp_path / "test_sample.py").write_text(source, encoding="utf-8")
     result = _run_pytest(
-        tmp_path, "--ci-shard-count", "1", "--ci-shard-index", "0", *arguments,
+        tmp_path,
+        "--ci-shard-count",
+        "1",
+        "--ci-shard-index",
+        "0",
+        *arguments,
     )
     assert result.returncode != 0
     assert error in result.stdout + result.stderr

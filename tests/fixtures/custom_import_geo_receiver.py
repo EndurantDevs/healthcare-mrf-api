@@ -32,7 +32,7 @@ from sqlalchemy.dialects import postgresql
 
 from api import custom_import_provider_geo as geo
 from api import custom_import_read_http as transport
-from db.models.custom_import import CustomImportGeneration
+from db.models.custom_import import CustomImportGeneration, CustomImportGenerationSeal
 from process.custom_import import publication, read_core
 from process.custom_import.definition import CustomImportDefinition, canonical_json, canonical_sha256
 from tests.test_custom_import_provider_geo_sql import _geo_row
@@ -162,6 +162,8 @@ class SyntheticSession(_Session):
     def _persisted_result_rows(self, statement):
         """Return synthetic metadata or identity rows for the requested query."""
         column_names = tuple(column["name"] for column in statement.column_descriptions)
+        if column_names == ("CustomImportGeneration", "CustomImportGenerationSeal", "CustomImportQueryProjection"):
+            return self._legacy_projection_rows()
         if column_names == ("set_config",):
             return _result([(None,)])
         if column_names == ("dataset_id",):
@@ -212,6 +214,27 @@ class SyntheticSession(_Session):
                 ]
             )
         return self._hydration_result_rows(statement, column_names)
+
+    def _legacy_projection_rows(self):
+        """Return an exact legacy producer with five explicit nullable projection markers."""
+
+        identity_by_name = dict(
+            dataset_id=11,
+            generation_id=self.target["generation_id"],
+            definition_revision_id=self.target["definition_revision_id"],
+            schema_revision_id=self.target["schema_revision_id"],
+            execution_id=41,
+            capture_bundle_id=42,
+        )
+        generation = CustomImportGeneration(**identity_by_name, producing_fence=1, producing_token_sha256=b"t" * 32)
+        seal = CustomImportGenerationSeal(
+            **identity_by_name,
+            seal_contract="custom-import-generation-seal/v1",
+            sealing_fence=1,
+            sealing_token_sha256=b"t" * 32,
+        )
+        _FIXTURE_STATE.request_event_by_name["legacy_projection"] = True
+        return _result([(generation, seal, None)])
 
     def _hydration_result_rows(self, statement, column_names):
         """Provide distinct persisted identities and field values for each NPI."""

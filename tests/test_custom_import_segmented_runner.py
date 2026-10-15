@@ -181,7 +181,7 @@ async def test_unknown_storage_error_is_not_relabelled_as_lease_loss(monkeypatch
 
 async def test_writer_transports_is_checked_before_capture_and_forwarded_unchanged(monkeypatch):
     flow = _install_flow(monkeypatch)
-    transport = SimpleNamespace(require_candidate_binding=Mock())
+    transport = SimpleNamespace(require_candidate_binding=Mock(), projection=object())
     await runner.run_segmented_snowflake_candidate(
         object(),
         flow.connector,
@@ -192,6 +192,7 @@ async def test_writer_transports_is_checked_before_capture_and_forwarded_unchang
     transport.require_candidate_binding.assert_called_once_with(flow.request)
     for stage in ("_build_request", "stage_segmented_source"):
         assert flow.calls[stage].await_args.kwargs == {"writer_transports": transport}
+    assert flow.calls["build_output"].await_args.kwargs == {"projection_transport": transport.projection}
 
 
 async def test_invalid_admission_launch_does_not_claim_capture_or_finish_execution(monkeypatch):
@@ -331,6 +332,7 @@ async def test_writer_expiry_stays_at_boundaries(monkeypatch, expired):
         require_candidate_binding=Mock(),
         admission=SimpleNamespace(bind_request=Mock(side_effect=bind_writer_expiry)),
         source=SimpleNamespace(bind_request=Mock(side_effect=bind_writer_expiry)),
+        projection=None,
     )
     lock_page = AsyncMock(side_effect=LeaseAuthorityLost("writer expired") if expired else None)
     retained_base = AsyncMock(side_effect=lambda session, request: request)
@@ -537,7 +539,7 @@ async def test_native_scalar_rejection_durably_fails_without_activation(monkeypa
     monkeypatch.setattr(scalar_digest, "native_verifier", lambda: native if adapter == "verifier" else None)
     monkeypatch.setattr(scalar_digest, "native_encoder", lambda: native if adapter == "encoder" else fallback)
     digests = _digests()
-    flow.calls["build_output"].side_effect = lambda *_args: output._scalar_material(
+    flow.calls["build_output"].side_effect = lambda *_args, projection_transport: output._scalar_material(
         read_session, request, _registry(request.definition), 7, _generation(request), digests, child=False
     )
 
