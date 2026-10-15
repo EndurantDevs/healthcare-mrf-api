@@ -141,7 +141,14 @@ async def _copy_response(
 
 
 async def _fetch_object(
-    url: URL, spool: BinaryIO, expected_sha256: str, expected_bytes: int, limits: CaptureLimits, timeout_seconds: float
+    url: URL,
+    spool: BinaryIO,
+    expected_sha256: str,
+    expected_bytes: int,
+    limits: CaptureLimits,
+    timeout_seconds: float,
+    *,
+    exact_url: bool = False,
 ) -> None:
     """Own one session and at most three same-origin redirects, without retries."""
     async with AsyncExitStack() as owned:
@@ -171,7 +178,7 @@ async def _fetch_object(
                     await _copy_response(response, spool, expected_sha256, expected_bytes, limits)
                     return
                 locations = response.headers.getall("Location", [])
-                if redirect_count == _MAX_REDIRECTS or len(locations) != 1 or not locations[0]:
+                if exact_url or redirect_count == _MAX_REDIRECTS or len(locations) != 1 or not locations[0]:
                     raise HttpsAcquisitionError("https_redirect_denied")
                 location = locations[0]
                 if "#" in location or any(ord(char) <= 32 or ord(char) == 127 for char in location):
@@ -179,6 +186,23 @@ async def _fetch_object(
                 url = _https_url(location, relative_to=url)
                 if (url.scheme, url.raw_host, url.port) != original_origin:
                     raise HttpsAcquisitionError("https_redirect_denied")
+
+
+def _acquisition_url(url_text: str, exact_url: bool) -> URL:
+    """Preserve signed octets only after normal authority validation."""
+    if not isinstance(exact_url, bool):
+        raise HttpsAcquisitionError("https_request_invalid")
+    checked_url = _https_url(url_text)
+    if not exact_url:
+        return checked_url
+    encoded_url = URL(url_text, encoded=True)
+    if (encoded_url.scheme, encoded_url.raw_host, encoded_url.port) != (
+        checked_url.scheme,
+        checked_url.raw_host,
+        checked_url.port,
+    ):
+        raise HttpsAcquisitionError("https_url_denied")
+    return encoded_url
 
 
 async def acquire_https(
@@ -190,11 +214,13 @@ async def acquire_https(
     expected_bytes: int,
     limits: CaptureLimits,
     timeout_seconds: float,
+    exact_url: bool = False,
 ) -> SealedCapture:
     """Acquire one expected HTTPS object and return its existing bounded capture.
 
     The deadline covers all redirects and body reads. Synchronous, byte-bounded
     sealing is checked against that same deadline before a result can escape.
+    Exact signed URLs preserve encoded path/query bytes and forbid redirects.
     Caller cancellation propagates after owned resources close. Failures expose
     stable codes only, suppressing URL, query, body and underlying driver errors.
     """
@@ -207,12 +233,14 @@ async def acquire_https(
         ):
             raise HttpsAcquisitionError("https_request_invalid")
         validate_snapshot_token(source_snapshot_token)
-        checked_url = _https_url(url)
+        checked_url = _acquisition_url(url, exact_url)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_seconds
         async with asyncio.timeout_at(deadline):
             with SpooledTemporaryFile(max_size=min(limits.maximum_compressed_bytes, 1024 * 1024), mode="w+b") as spool:
-                await _fetch_object(checked_url, spool, expected_sha256, expected_bytes, limits, timeout_seconds)
+                await _fetch_object(
+                    checked_url, spool, expected_sha256, expected_bytes, limits, timeout_seconds, exact_url=exact_url
+                )
                 capture = capture_stream(
                     spool, source_stream, source_snapshot_token=source_snapshot_token, limits=limits
                 )

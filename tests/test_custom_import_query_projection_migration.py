@@ -28,12 +28,15 @@ def test_projection_migration_extends_the_single_installed_head():
     script = ScriptDirectory.from_config(config)
     module = migration()
     assert module.down_revision == "20261013010000_registry_custom_history_events"
-    head = "20261017210000_provider_directory_readiness_indexes"
-    assert script.get_heads() == [head]
-    assert script.get_revision(head).down_revision == module.revision
+    readiness = "20261017210000_provider_directory_readiness_indexes"
+    raw_objects = "20261017010000_custom_import_raw_objects"
+    assert script.get_heads() == [raw_objects]
+    assert script.get_revision(raw_objects).down_revision == readiness
+    assert script.get_revision(readiness).down_revision == module.revision
     assert [step.revision.revision for step in script._upgrade_revs("head", module.down_revision)] == [
         module.revision,
-        head,
+        readiness,
+        raw_objects,
     ]
 
 
