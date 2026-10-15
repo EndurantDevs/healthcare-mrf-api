@@ -17,7 +17,7 @@ sys.modules[SPEC.name] = SHARDER
 SPEC.loader.exec_module(SHARDER)
 
 
-def test_two_shards_are_sorted_disjoint_and_exact_once() -> None:
+def test_shards_are_sorted_disjoint_and_exact_once() -> None:
     nodeids = [
         "tests/test_alpha.py::test_one",
         "tests/test_alpha.py::test_two",
@@ -26,13 +26,10 @@ def test_two_shards_are_sorted_disjoint_and_exact_once() -> None:
         "tests/test_gamma.py::test_five",
     ]
 
-    first = SHARDER.select_nodeids(nodeids, shard_count=2, shard_index=0)
-    second = SHARDER.select_nodeids(nodeids, shard_count=2, shard_index=1)
-
-    assert first == sorted(first)
-    assert second == sorted(second)
-    assert set(first).isdisjoint(second)
-    assert sorted((*first, *second)) == sorted(nodeids)
+    for count in (2, 6):
+        shards = [SHARDER.select_nodeids(nodeids, shard_count=count, shard_index=index) for index in range(count)]
+        assert all(shard == sorted(shard) for shard in shards)
+        assert sorted(node for shard in shards for node in shard) == sorted(nodeids)
 
 
 def test_collection_command_has_the_hard_test_process_limit() -> None:
@@ -111,7 +108,7 @@ def test_registry_cost_moves_preserve_all_other_assignments_and_exact_once() -> 
         if legacy == 2 and node.split("::", 1)[0] in balanced_files:
             expected = 7
         assert SHARDER.shard_index_for_nodeid(node, 8) == expected
-        for count in (1, 2, 4):
+        for count in (1, 2, 4, 6):
             assert SHARDER.shard_index_for_nodeid(node, count) == (
                 int.from_bytes(hashlib.sha256(node.encode()).digest(), byteorder="big") % count
             )

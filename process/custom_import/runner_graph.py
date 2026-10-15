@@ -730,6 +730,9 @@ async def persist_projections_and_winners(
         child_projections,
     )
     await persist_generation_winners(session, request, registry, generation, published_families)
+    from process.custom_import.query_projection_legacy import persist_legacy_query_projection
+
+    await persist_legacy_query_projection(session, request, registry, generation)
 
 
 async def persist_scalar_projection_batches(

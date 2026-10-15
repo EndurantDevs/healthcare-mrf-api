@@ -16,7 +16,7 @@ from sqlalchemy.sql import visitors
 from sqlalchemy.sql.selectable import Exists
 
 from db.models import custom_import as models
-from process.custom_import import grouped_read, read_core, read_identity
+from process.custom_import import grouped_read, query_projection_evidence, read_core, read_identity
 from process.custom_import.storage_layout import SNAPSHOT_MODELS, snapshot_models, snapshot_schema, snapshot_tables
 from tests import custom_import_grouped_child_support as grouped_child
 from tests import test_custom_import_grouped_read as grouped_rows
@@ -297,6 +297,7 @@ def _context_metadata(monkeypatch):
     monkeypatch.setattr(read_core, "_exact_profile", AsyncMock(return_value=None))
     monkeypatch.setattr(read_core, "_verified_profile", Mock(return_value=(1, 1)))
     monkeypatch.setattr(read_core, "_verified_field_rows", AsyncMock())
+    monkeypatch.setattr(query_projection_evidence, "read_projection_tables", AsyncMock(return_value=None))
     return context
 
 
@@ -353,6 +354,9 @@ async def test_authorization_and_snapshot_validation_precede_cached_search(monke
     cached = read_core.SearchPage(context.target, 0, (), None, 1100, plan.fingerprint, read_core._scope_digest(_SCOPE))
 
     async def cache_get(key):
+        query_projection_evidence.read_projection_tables.assert_awaited_once_with(
+            session, context.target, context.definition, snapshot_family_id=17
+        )
         events.append("cache")
         return cached
 

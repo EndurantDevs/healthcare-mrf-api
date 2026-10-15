@@ -98,6 +98,6 @@ def verify_request(
         trusted_now=trusted_now,
         expected_origin=expected_origin,
         keyring=keyring,
-        is_source=True,
+        purpose="source",
     )
     return VerifiedSource(SourcePermit(**asdict(permit)), batch_pins(admission._object(body, 512)), token)

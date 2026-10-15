@@ -94,6 +94,7 @@ from process.custom_import.build_source import _call as _typed_call
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
 from process.custom_import.compact_materialization import frozen_materialization as _frozen_materialization
 from process.custom_import.execution import lease_token_sha256
+from process.custom_import.query_projection_values import configured_fields
 from process.custom_import.runner_codec import (
     digest_text,
     fields_by_collection,
@@ -1389,6 +1390,9 @@ async def _replay(session_factory, request, build_id):
         seal = await publication._locked_generation_seal(session, build.generation_id)
         if seal is None:
             return None
+        from process.custom_import.query_projection_finality import validate_sealed_projection
+
+        await validate_sealed_projection(session, generation, seal, request.definition)
         if execution.state == "no_change":
             no_change_request = publication._NoChangeRequest(
                 request.dataset_id,
@@ -1432,7 +1436,9 @@ async def _freeze_output_snapshot(session_factory, request, build_id):
             raise CandidateRunnerError("output snapshot freeze returned an invalid family identity")
 
 
-async def build_output(session_factory, request: SourceBuildRequest, build_id: int) -> BuildOutputResult:
+async def build_output(
+    session_factory, request: SourceBuildRequest, build_id: int, *, projection_transport=None
+) -> BuildOutputResult:
     """Select all complete groups, _verify frozen content, and seal without activation."""
 
     replay = await _replay(session_factory, request, build_id)
@@ -1451,7 +1457,14 @@ async def build_output(session_factory, request: SourceBuildRequest, build_id: i
             await _prepare_snapshot_indexes(session_factory, request, build_id, "output")
             await _attach_families(session_factory, request, build_id)
             await _write_winners(session_factory, request, registry, build_id, generation)
+            from process.custom_import.query_projection_build import stage_query_projections
+            from process.custom_import.query_projection_finality import load_generation_evidence
+
+            await stage_query_projections(session_factory, request, build_id, transport=projection_transport)
             async with _page_session(session_factory, request, build_id) as (session, _build):
+                await _prepare_statement(session)
+                if configured_fields(request.definition):
+                    await load_generation_evidence(session, generation, request.definition, frozen=False)
                 await _call(session, "freeze_custom_import_build_output", (build_id,))
         await _freeze_output_snapshot(session_factory, request, build_id)
         await _prepare_snapshot_indexes(session_factory, request, build_id, "serving")
@@ -1476,4 +1489,9 @@ async def build_output(session_factory, request: SourceBuildRequest, build_id: i
                 return _frozen_materialization(sync_session, request, registry, build_id, generation, proof)
 
             materialization = await session.run_sync(_verify)
+            from process.custom_import.query_projection_finality import bind_generation_materialization
+
+            materialization = await bind_generation_materialization(
+                session, generation, materialization, request.definition
+            )
     return await _terminal_seal(session_factory, request, build_id, materialization)

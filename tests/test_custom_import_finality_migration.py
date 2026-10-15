@@ -158,7 +158,7 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
     revision = _plans_migration().revision
-    assert script.get_heads() == ["20261013010000_registry_custom_history_events"]
+    assert script.get_heads() == ["20261015020000_custom_import_query_projections"]
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )
@@ -210,6 +210,7 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
         "20261011010000_company_registry_group_assertions",
         "20261012010000_company_registry_name_origin",
         "20261013010000_registry_custom_history_events",
+        "20261015020000_custom_import_query_projections",
     )
 
 

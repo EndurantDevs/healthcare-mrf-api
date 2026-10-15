@@ -1707,6 +1707,19 @@ class CustomImportGenerationSeal(_CustomImportModel):
             "AND jsonb_typeof(verification_evidence) = 'object')",
             name="custom_import_generation_seal_materialization_check",
         ),
+        CheckConstraint(
+            "(query_projection_contract IS NULL AND query_projection_capability_sha256 IS NULL AND "
+            "query_projection_sha256 IS NULL AND query_projection_root_count IS NULL AND "
+            "query_projection_child_count IS NULL) OR "
+            "(query_projection_contract IS NOT NULL AND "
+            "query_projection_contract = 'custom-import/query-projection/v1' AND "
+            "query_projection_capability_sha256 IS NOT NULL AND query_projection_sha256 IS NOT NULL AND "
+            "query_projection_root_count IS NOT NULL AND query_projection_child_count IS NOT NULL AND "
+            "octet_length(query_projection_capability_sha256) = 32 AND "
+            "octet_length(query_projection_sha256) = 32 AND "
+            "query_projection_root_count >= 0 AND query_projection_child_count >= 0)",
+            name="custom_import_generation_seal_query_projection_check",
+        ),
     )
 
     generation_id = Column(BigInteger, primary_key=True)
@@ -1720,6 +1733,11 @@ class CustomImportGenerationSeal(_CustomImportModel):
         String(63), nullable=False, server_default=text("'custom-import/materialization/v1'")
     )
     verification_evidence = Column(JSONB(none_as_null=True))
+    query_projection_contract = Column(String(63))
+    query_projection_capability_sha256 = Column(LargeBinary(32))
+    query_projection_sha256 = Column(LargeBinary(32))
+    query_projection_root_count = Column(BigInteger)
+    query_projection_child_count = Column(BigInteger)
     sealing_fence = Column(BigInteger, nullable=False)
     sealing_token_sha256 = Column(LargeBinary(32), nullable=False)
     root_count = Column(BigInteger, nullable=False)

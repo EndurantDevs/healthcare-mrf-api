@@ -310,6 +310,8 @@ async def test_child_candidates_keep_exact_ownership_sibling_roots_and_ambiguity
     candidates = grouped_query._child_candidate_ids(context, plan.context_filters, owned_members=owned_members)
     assert (await values_connection.execute(select(candidates))).scalars().all() == [200]
     monkeypatch.setattr(grouped_read, "selected_family_statement", lambda *_args, **_kwargs: selected_roots)
+    selected_value = select(literal(200).label("entity_binding_id"), literal(2024).label("selected_value")).subquery()
+    monkeypatch.setattr(grouped_read, "_selected_value_relation", lambda *_args: selected_value)
     eligible = grouped_query.selected_identities(context, plan, entity_binding_ids=candidates)
     assert set((await values_connection.execute(select(eligible.c.family_revision_id))).scalars()) == {10, 11}
     assert await values_connection.scalar(select(func.avg(eligible.c.root_revision_id))) == Decimal("15")
@@ -927,7 +929,7 @@ async def test_reduced_scores_preserve_panel_membership_nulls_and_mixed_raw_metr
     async with native._case(children=_children()) as (case, pinned_target), case.sessions() as session:
         prepared, selected_rows = await native._relation(session, pinned_target, query)
         assert [tuple(selected_row) for selected_row in selected_rows] == [(native._A, Decimal("15"))]
-        assert "FROM derived_score_values" in str(prepared.statement)
+        assert "FROM projected_score_values" in str(prepared.statement)
         nullable = replace(
             query,
             context_filters=(ReadFilter("service_code", "eq", "nullable"),),
@@ -947,7 +949,7 @@ async def test_reduced_scores_preserve_panel_membership_nulls_and_mixed_raw_metr
             require_match=True,
         )
         prepared, selected_rows = await native._relation(session, pinned_target, mixed)
-        assert "JOIN derived_score_values" in str(prepared.statement)
+        assert "FROM projected_score_values" in str(prepared.statement)
         assert next(
             tuple(selected_row)[1:] for selected_row in selected_rows if selected_row.entity_value == native._A
         ) == (Decimal("15"), Decimal("9"))

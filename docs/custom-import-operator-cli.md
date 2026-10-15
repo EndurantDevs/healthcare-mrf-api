@@ -207,22 +207,32 @@ driver. No policy declaration grants database or source authorization.
 
 ### Optional trusted batch writer
 
-Restricted workers may use two fixed internal operations for SOURCE loading and
-family admission. The application derives bytes and configuration from the sealed
+Restricted workers use fixed internal operations for SOURCE loading, family
+admission and configured derived-query projections. The application derives bytes and configuration from the sealed
 capture; requests contain only retained execution/build/fence and cursor identities.
 SOURCE authorization, bounded COPY and ordinary set-based finalization share one
 transaction. Existing standalone operation remains available without this handoff.
 
-The launcher must authenticate and mount the complete immutable pair of
+The launcher must authenticate and mount the complete immutable set of
 purpose-separated permits, `admission-launch.json` and the fixed `.writer-ca.pem`
 certificate-only bundle before either `execute` or `resume`. The launch descriptor
-pins the exact CA bytes; both clients verify certificates and hostnames using only
+pins the exact CA bytes; all clients verify certificates and hostnames using only
 that bundle, without environment trust. A partial or invalid stage fails before
 source credentials or a claim; it never silently selects the local writer.
-Both permits retain their original
+All permits retain their original
 scope and expiry. Workers receive no signing keys or additional database authority.
 The engine endpoints are disabled without a dedicated keyring and fixed HTTPS
-origin, and public proxy listeners deny both operations.
+origin, and public proxy listeners deny these operations.
+
+`custom-import/admission-launch/v2` adds the fixed `.projection-permit.json`
+file and its digest to the launch descriptor. The projection permit authorizes
+only `/control/v1/custom-import/query-projection-batch`; SOURCE and admission
+permits cannot authorize it. New restricted launches with enabled numeric derived
+query fields require v2 before claiming an execution. Definitions without those
+capabilities may keep v1. Retained executions keep their original authenticated
+files, expiry and compatible worker image; a software upgrade does not reissue
+their authority. Deploy compatible endpoints, worker and launcher together before
+selecting v2 for new launches.
 
 An uncertain response permits one read of retained progress, not automatic resend
 or local fallback. Continue only from verified forward progress under the same

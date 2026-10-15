@@ -7,6 +7,7 @@ from db.models.company_registry import *
 from db.models.company_registry_assertions import *
 from db.models.company_registry_links import *
 from db.models.custom_import import *
+from db.models.custom_import_query_projection import *
 from db.models.custom_import_storage import *
 from db.models.facility_address_contribution import *
 from db.models.formulary_fhir import *

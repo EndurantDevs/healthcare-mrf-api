@@ -17,7 +17,7 @@ from db.models.company_registry import CompanyRegistry
 ROOT = Path(__file__).parents[1]
 REVISION = "20261012010000_company_registry_name_origin"
 PREDECESSOR = "20261011010000_company_registry_group_assertions"
-CURRENT_HEAD = "20261013010000_registry_custom_history_events"
+CURRENT_HEAD = "20261015020000_custom_import_query_projections"
 
 
 def _migration(revision=REVISION):
@@ -110,7 +110,13 @@ def test_origin_migration_extends_the_sole_existing_head():
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
     assert script.get_heads() == [CURRENT_HEAD]
-    assert script.get_revision(CURRENT_HEAD).down_revision == REVISION
+    history = "20261013010000_registry_custom_history_events"
+    assert script.get_revision(CURRENT_HEAD).down_revision == history
+    assert script.get_revision(history).down_revision == REVISION
     assert script.get_revision(REVISION).down_revision == PREDECESSOR
     assert script.get_revision(PREDECESSOR).down_revision == "20261010030000_registry_source_admission_receipt"
-    assert [step.revision.revision for step in script._upgrade_revs("head", PREDECESSOR)] == [REVISION, CURRENT_HEAD]
+    assert [step.revision.revision for step in script._upgrade_revs("head", PREDECESSOR)] == [
+        REVISION,
+        history,
+        CURRENT_HEAD,
+    ]

@@ -139,9 +139,9 @@ def _assert_forecast_outputs(
     assert forecast["reports"]["python"]["diff_coverage"]["covered"] == 1
     assert set(forecast["reports"]) == {"python", "rust"}
     assert {kind: len(files) for kind, files in forecast["inputs"]["python_producer_files"].items()} == {
-        "main": 4,
+        "main": 6,
         "capacity": 1,
-        "postgres": 17,
+        "postgres": 27,
     }
     baseline = json.loads((output / "baseline.json").read_text())
     assert baseline["source_sha"] == head_sha and baseline["machine_artifact_required"] is True

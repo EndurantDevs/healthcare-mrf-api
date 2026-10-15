@@ -55,6 +55,7 @@ from db.models.custom_import import (
     CustomImportSourceStream,
     CustomImportWinner,
 )
+from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.publication import (
     _capture_source_bundle_digest,
     seal_generation,
@@ -171,6 +172,7 @@ def _install_custom_import_migrations(
             migration.upgrade()
 
     install_materialization_contract_migration(sync_connection, schema_name)
+    install_query_projection_metadata(sync_connection, schema_name)
 
 
 def install_materialization_contract_migration(sync_connection, schema_name: str) -> None:
@@ -179,6 +181,23 @@ def install_materialization_contract_migration(sync_connection, schema_name: str
     migration._schema = lambda: schema_name
     migration.op = Operations(MigrationContext.configure(sync_connection))
     migration.upgrade()
+
+
+def install_query_projection_metadata(sync_connection, schema_name: str) -> None:
+    """Retain current seal columns even when qualifying historical writer DDL."""
+    path = _ROOT / "alembic" / "versions" / "20261015020000_custom_import_query_projections.py"
+    migration = _migration(path, "custom_import_query_projection_test_migration")
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(sync_connection))
+    if (
+        sync_connection.scalar(
+            text("SELECT to_regclass(:relation)"), {"relation": f"{schema_name}.custom_import_snapshot_family"}
+        )
+        is None
+    ):
+        migration._seal_metadata(schema_name)
+    else:
+        migration.upgrade()
 
 
 def install_segmented_capture_migration(sync_connection, schema_name: str) -> None:
@@ -387,16 +406,34 @@ async def _seed_publication_identity(
     )
 
 
+def _publication_definition() -> CustomImportDefinition:
+    """Reuse the real scalar fixture with the shared publication collection identity."""
+
+    from tests.test_custom_import_materialization_postgres import _definition_document
+
+    document = _definition_document()
+    document["schema"]["children"][0]["name"] = "synthetic_children"
+    document["streams"][1]["child"] = "synthetic_children"
+    document["query"]["child"]["collection"] = "synthetic_children"
+    document["selection_profiles"][0]["id"] = "synthetic_profile"
+    return CustomImportDefinition.from_mapping(document)
+
+
 async def _seed_identity_schema(
     session: AsyncSession,
     suffix: str,
     semantic: str,
     *,
-    canonical_schema: str = '{"synthetic":true}',
+    canonical_schema: str | None = None,
     schema_sha256: bytes | None = None,
 ) -> tuple[CustomImportDataset, CustomImportSchemaRevision]:
     """Create the dataset, schema revision, and fixed field definitions."""
 
+    if canonical_schema is None:
+        contract = _publication_definition()
+        canonical_schema = contract.schema_canonical
+        if schema_sha256 is None:
+            schema_sha256 = bytes.fromhex(contract.schema_digest)
     dataset = CustomImportDataset(dataset_key=f"synthetic_{suffix[:24]}")
     session.add(dataset)
     await session.flush()
@@ -473,14 +510,15 @@ async def _seed_identity_definition(
 ) -> CustomImportDefinitionRevision:
     """Create the definition revision and optionally its synthetic profile."""
 
+    contract = _publication_definition()
     definition = CustomImportDefinitionRevision(
         dataset_id=dataset.dataset_id,
         schema_revision_id=schema.schema_revision_id,
         revision_number=1,
         contract_version="custom-import/v1",
         refresh_mode="upsert",
-        canonical_definition='{"synthetic":true}',
-        definition_sha256=digest(f"definition:{semantic}"),
+        canonical_definition=contract.canonical,
+        definition_sha256=bytes.fromhex(contract.digest),
     )
     session.add(definition)
     await session.flush()

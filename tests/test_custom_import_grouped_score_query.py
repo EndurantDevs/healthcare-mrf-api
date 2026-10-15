@@ -227,7 +227,8 @@ def test_derived_child_relation_retains_roots_and_validates_before_reduction(
     assert "JOIN selected_score_children" not in sql and "JOIN derived_root_score_values" not in sql
     assert ("candidate_complete_score_keys AS MATERIALIZED" in sql) is (entity_values is None)
     assert ("child_candidate_score_entities AS MATERIALIZED" in sql) is (entity_values is None)
-    assert ("FROM child_candidate_score_entities JOIN LATERAL" in sql) is (entity_values is None)
+    assert ("FROM candidate_selected_values JOIN LATERAL" in sql) is (entity_values is None)
+    assert ("candidate_selected_values AS MATERIALIZED" in sql) is (entity_values is None)
     assert f"complete_child_key.{read_core._SCALAR_COLUMNS[value_type]} AS selected_key_value" in sql
     assert sql.count("LIMIT ALL OFFSET") == 1
     assert "LIMIT" not in sql.replace("LIMIT ALL OFFSET", "OFFSET")
@@ -259,6 +260,24 @@ def test_complete_key_join_preserves_selected_roots(metric, raw_metric):
     assert "child_candidate_score_entities AS MATERIALIZED" in sql
     assert "complete_score_child_keys AS" not in sql
     assert "validated_score_children AS MATERIALIZED" in sql
+
+
+def _assert_candidate_selection_scope(statement_sql, eligible_sql, family_sql, namespace, period):
+    candidate_relation = "candidate_selected_values" if period is None else "child_candidate_score_entities"
+    assert f"FROM {candidate_relation} JOIN LATERAL (SELECT" in family_sql
+    assert "candidate_score_families.group_value AS group_value" in family_sql
+    assert f"{namespace}.custom_import_winner.entity_binding_id = {candidate_relation}.entity_binding_id" in family_sql
+    assert "candidate_complete_score_keys" not in family_sql
+    assert "selected_entity_value.entity_binding_id" not in family_sql
+    if period is None:
+        assert "candidate_selected_values AS MATERIALIZED" in eligible_sql
+        assert (
+            "selected_entity_value.entity_binding_id = child_candidate_score_entities.entity_binding_id" in eligible_sql
+        )
+        assert f"{namespace}.custom_import_root_scalar" in eligible_sql
+        assert "root_slot_6.integer_value = candidate_selected_values.selected_value" in family_sql
+    else:
+        assert "candidate_selected_values" not in statement_sql
 
 
 @pytest.mark.parametrize("snapshot", (False, True))
@@ -308,14 +327,7 @@ def test_broad_child_candidates_precede_independent_group_selection(snapshot, pe
     for identity in ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot"):
         for owner in ("custom_import_family_child", "custom_import_child_revision"):
             assert f"{namespace}.{owner}.{identity} = candidate_complete_score_keys.{identity}" in members
-    assert "FROM child_candidate_score_entities JOIN LATERAL (SELECT" in families
-    assert "candidate_score_families.group_value AS group_value" in families
-    assert (
-        f"{namespace}.custom_import_winner.entity_binding_id = child_candidate_score_entities.entity_binding_id"
-        in families
-    )
-    assert "candidate_complete_score_keys" not in families
-    assert ("selected_entity_value.entity_binding_id" in families) is (period is None)
+    _assert_candidate_selection_scope(sql, eligible, families, namespace, period)
     assert "FROM selected_score_families LEFT OUTER JOIN" in sql
     _assert_owned_member_barrier(prepared.statement, sql)
     assert sql.count("candidate_complete_score_keys AS MATERIALIZED") == 1
