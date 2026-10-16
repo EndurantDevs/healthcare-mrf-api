@@ -102,7 +102,7 @@ jobs:
         \ \\\n  \"$binary_directory/\"\n"
     - name: Upload exact-source Rust test binaries
       id: rust-artifact
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: healthcare-rust-debug-${{ github.run_id }}-${{ github.run_attempt }}
         path: 'rust-debug-binaries/ptg2_scanner
@@ -199,7 +199,7 @@ jobs:
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
     - name: Download exact-source Rust test binaries
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       with:
         artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
         digest-mismatch: error
@@ -221,7 +221,7 @@ jobs:
 
         test -z "$(git ls-files --others --exclude-standard)"'
     - name: Upload main-suite coverage data
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: mrf-python-coverage-main-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: '${{ runner.temp }}/healthcare-artifacts/.coverage.main.${{ matrix.shard }}
@@ -241,7 +241,7 @@ jobs:
         printf ''%s=%s\n'' "$ARTIFACT_OUTPUT" "$ARTIFACT_ID" >> "$GITHUB_OUTPUT"'
     - name: Upload verified common-test measurements
       if: success() && env.COMMON_TEST_ARTIFACT_NAME != ''
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: ${{ env.COMMON_TEST_ARTIFACT_NAME }}
         path: ${{ runner.temp }}/common-test-measurements
@@ -327,7 +327,7 @@ jobs:
 
         test -z "$(git ls-files --others --exclude-standard)"'
     - name: Upload capacity coverage data
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: mrf-python-coverage-capacity-${{ github.run_id }}-${{ github.run_attempt }}
         path: '${{ runner.temp }}/healthcare-artifacts/.coverage.capacity
@@ -339,7 +339,7 @@ jobs:
       id: coverage-artifact
     - name: Upload verified common-test measurements
       if: success() && env.COMMON_TEST_ARTIFACT_NAME != ''
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: ${{ env.COMMON_TEST_ARTIFACT_NAME }}
         path: ${{ runner.temp }}/common-test-measurements
@@ -422,7 +422,7 @@ jobs:
 
         test -z "$(git ls-files --others --exclude-standard)"'
     - name: Upload Rust coverage data
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: mrf-rust-coverage-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/healthcare-artifacts/coverage-artifacts/rust
@@ -469,7 +469,7 @@ jobs:
     - name: Upload tested DEV image
       id: image-artifact
       if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: healthcare-public-image-staging-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/healthcare-public-image-staging-${{ github.run_id }}-${{ github.run_attempt }}/
@@ -614,7 +614,7 @@ jobs:
         \nfor tool in psql pg_dump pg_restore; do\n  \"/usr/lib/postgresql/18/bin/$tool\" --version | grep -Eq \"^$tool \\\
         \\(PostgreSQL\\\\) 18\\\\.\"\ndone\n"
     - name: Download exact-source Rust test binaries
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       with:
         artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
         digest-mismatch: error
@@ -631,7 +631,7 @@ jobs:
 
         test -z "$(git ls-files --others --exclude-standard)"'
     - name: Upload PostgreSQL coverage data
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: mrf-python-coverage-postgres-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: '${{ runner.temp }}/healthcare-artifacts/.coverage.postgres.${{ matrix.shard }}
@@ -818,7 +818,7 @@ jobs:
       run: python3 "$CI_ROOT/scripts/common_test_verify.py" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA"
         --output "$RUNNER_TEMP/common-test-current-verification.json"
     - name: Download immutable measurement artifacts
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       with:
         artifact-ids: ${{ needs.python-tests.outputs.artifact_0 }},${{ needs.python-tests.outputs.artifact_1 }},${{ needs.python-tests.outputs.artifact_2
           }},${{ needs.python-tests.outputs.artifact_3 }},${{ needs.python-tests.outputs.artifact_4 }},${{ needs.python-tests.outputs.artifact_5
@@ -844,7 +844,7 @@ jobs:
       run: python3 ci/scripts/healthcare/measurement.py
     - name: Upload public measurement
       id: measurement-artifact
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: healthcare-public-measurement-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/healthcare-public-measurement/
@@ -927,7 +927,7 @@ jobs:
       run: python3 ci/scripts/source_image.py prepare
     - name: Download validated image archive
       if: steps.image.outputs.publish == 'true'
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       with:
         artifact-ids: ${{ steps.image.outputs.artifact_id }}
         digest-mismatch: error
@@ -940,7 +940,7 @@ jobs:
       run: python3 ci/scripts/source_image.py stage
     - name: Upload DEV image publication intent
       if: steps.image.outputs.publish == 'true'
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: healthcare-public-image-intent-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/public-image-intent/intent.json
@@ -954,7 +954,7 @@ jobs:
     - name: Upload DEV image receipt
       if: steps.image.outputs.publish == 'true'
       id: receipt-artifact
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: healthcare-public-image-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/public-image-receipt/image.json
