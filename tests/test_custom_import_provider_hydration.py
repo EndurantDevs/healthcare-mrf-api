@@ -645,7 +645,7 @@ async def test_complete_family_children_are_correlated_and_batched():
         execute=AsyncMock(
             side_effect=(
                 SimpleNamespace(all=lambda: membership_rows),
-                SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: scalar_rows)),
+                SimpleNamespace(all=lambda: scalar_rows),
             )
         )
     )

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import Column, MetaData, Table, create_engine, inspect, select
+from sqlalchemy.engine import Row
 from sqlalchemy.orm import Session
 
 from db.models import custom_import as models
@@ -199,6 +200,28 @@ def row_store():
 
 def _rows(session, context, query):
     return session.execute(grouped_read.prepare_relation(context, query, _SCOPE).statement).all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family_id, offset", [(None, 20000), (17, 0), (18, 10000)])
+async def test_scalar_hydration_returns_plain_owned_rows(row_store, family_id, offset):
+    session, contexts = row_store
+    context = contexts[family_id]
+    asynchronous = SimpleNamespace(execute=AsyncMock(side_effect=session.execute))
+    for loader, revision_ids, fields in (
+        (read_core._root_scalar_rows, (offset + 302,), read_core._detail_root_fields(context.definition)),
+        (read_core._child_scalar_rows, (offset + 1011, offset + 1012), context.definition.child_fields),
+    ):
+        rows_by_key = await loader(asynchronous, context, revision_ids, fields)
+        assert rows_by_key and all(isinstance(row, Row) for row in rows_by_key.values())
+        for row in rows_by_key.values():
+            field = next(field for field in fields if field.field_slot == row.field_slot)
+            assert read_core._field_value(field, row).field_type == field.value_type
+        for identity in ("dataset_id", "schema_revision_id"):
+            foreign = replace(
+                context, target=replace(context.target, **{identity: getattr(context.target, identity) + 1})
+            )
+            assert await loader(asynchronous, foreign, revision_ids, fields) == {}
 
 
 @pytest.mark.parametrize("family_id", [None, 17, 18])
