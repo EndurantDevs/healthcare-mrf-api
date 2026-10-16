@@ -12,7 +12,7 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +36,9 @@ from process.custom_import.definition import (
 from process.custom_import.runner_registry import load_registry
 from process.custom_import.runner_types import CandidateRunnerError, CandidateRunRequest
 
+if TYPE_CHECKING:
+    from process.custom_import.segmented_capture_policy import SegmentedCapturePolicy
+
 __all__ = (
     "CaptureBundleConflict",
     "CaptureBundleRegistration",
@@ -46,6 +49,7 @@ __all__ = (
     "ReplayableParquetCapture",
     "SegmentedParquetPart",
     "load_replayable_parquet_bundle",
+    "load_segmented_cursor_headers",
     "open_replayable_parquet_parts",
     "open_segmented_parquet_parts",
     "open_segmented_cursor_part",
@@ -170,6 +174,18 @@ class _CaptureIdentity:
     dataset_id: int
     definition_revision_id: int
     schema_revision_id: int
+
+
+@dataclass(frozen=True)
+class _SegmentedCursorHeaders:
+    """Immutable read metadata, never a cursor, lease or stream EOF receipt."""
+
+    identity: _CaptureIdentity
+    capture_bundle_id: int
+    stream_slot: int
+    receipt: CaptureReceipt
+    part_count: int
+    policy: SegmentedCapturePolicy
 
 
 @dataclass(frozen=True)
@@ -1133,7 +1149,7 @@ async def _open_verified_parquet_parts(
         receipts_by_slot, metadata_by_slot, accounting_by_slot = await _load_parquet_part_metadata(
             session, identity, capture_bundle_id
         )
-        part_rows = await session.stream(_part_statement(capture_bundle_id, accounting_by_slot))
+        part_rows = await session.stream(_part_statement(capture_bundle_id, accounting_by_slot is not None))
     parts = _iter_replayable_parquet_parts(
         part_rows, capture_bundle_id, receipts_by_slot, metadata_by_slot, accounting_by_slot
     )
@@ -1146,7 +1162,7 @@ async def _open_verified_parquet_parts(
             await part_rows.close()
 
 
-def _part_statement(capture_bundle_id, accounting_by_slot):
+def _part_statement(capture_bundle_id, segmented):
     columns = [
         CustomImportCaptureParquetPart.capture_bundle_id,
         CustomImportCaptureParquetPart.stream_slot,
@@ -1155,7 +1171,7 @@ def _part_statement(capture_bundle_id, accounting_by_slot):
         CustomImportCaptureParquetPart.payload,
         CustomImportCaptureParquetPart.payload_sha256,
     ]
-    if accounting_by_slot is not None:
+    if segmented:
         columns.extend(
             (
                 CustomImportCaptureParquetPart.canonical_capture_manifest,
@@ -1249,6 +1265,46 @@ async def _segmented_parts(verified):
         )
 
 
+async def load_segmented_cursor_headers(
+    session: AsyncSession,
+    *,
+    capture_bundle_id: int,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    stream_slot: int,
+) -> _SegmentedCursorHeaders:
+    """Validate sealed headers once for one request's exact stream scope."""
+    identity = _identity(
+        dataset_id=dataset_id, definition_revision_id=definition_revision_id, schema_revision_id=schema_revision_id
+    )
+    capture_bundle_id = _positive_id(capture_bundle_id, "capture_bundle_id")
+    stream_slot = _positive_id(stream_slot, "stream_slot")
+    with session.no_autoflush:
+        receipts, metadata, accounting = await _load_parquet_part_metadata(session, identity, capture_bundle_id)
+    if accounting is None or stream_slot not in receipts:
+        raise CapturePayloadUnavailable("cursor replay requires an existing sealed v2 part")
+    return _SegmentedCursorHeaders(
+        identity,
+        capture_bundle_id,
+        stream_slot,
+        receipts[stream_slot],
+        metadata[stream_slot][0],
+        accounting[stream_slot].policy,
+    )
+
+
+def _validate_cursor_headers(headers, identity, capture_bundle_id, stream_slot, part_ordinal) -> None:
+    if not isinstance(headers, _SegmentedCursorHeaders) or (
+        headers.identity,
+        headers.capture_bundle_id,
+        headers.stream_slot,
+    ) != (identity, capture_bundle_id, stream_slot):
+        raise CaptureBundleConflict("cursor headers do not match the exact stream scope")
+    if not 1 <= part_ordinal <= headers.part_count:
+        raise CapturePayloadUnavailable("cursor replay requires an existing sealed v2 part")
+
+
 @asynccontextmanager
 async def open_segmented_cursor_part(
     session: AsyncSession,
@@ -1259,6 +1315,7 @@ async def open_segmented_cursor_part(
     schema_revision_id: int,
     stream_slot: int,
     part_ordinal: int,
+    headers: _SegmentedCursorHeaders | None = None,
 ) -> AsyncIterator[SegmentedParquetPart]:
     """Read only the durable cursor's part; closing this reader is not stream EOF.
 
@@ -1273,12 +1330,19 @@ async def open_segmented_cursor_part(
     capture_bundle_id = _positive_id(capture_bundle_id, "capture_bundle_id")
     stream_slot = _positive_id(stream_slot, "stream_slot")
     part_ordinal = _positive_id(part_ordinal, "part_ordinal")
+    if headers is None:
+        headers = await load_segmented_cursor_headers(
+            session,
+            capture_bundle_id=capture_bundle_id,
+            dataset_id=dataset_id,
+            definition_revision_id=definition_revision_id,
+            schema_revision_id=schema_revision_id,
+            stream_slot=stream_slot,
+        )
+    _validate_cursor_headers(headers, identity, capture_bundle_id, stream_slot, part_ordinal)
     with session.no_autoflush:
-        receipts, metadata, accounting = await _load_parquet_part_metadata(session, identity, capture_bundle_id)
-        if accounting is None or stream_slot not in receipts or not 1 <= part_ordinal <= metadata[stream_slot][0]:
-            raise CapturePayloadUnavailable("cursor replay requires an existing sealed v2 part")
         statement = (
-            _part_statement(capture_bundle_id, accounting)
+            _part_statement(capture_bundle_id, True)
             .where(
                 CustomImportCaptureParquetPart.stream_slot == stream_slot,
                 CustomImportCaptureParquetPart.part_ordinal == part_ordinal,
@@ -1293,10 +1357,7 @@ async def open_segmented_cursor_part(
             if part is not None:
                 raise CaptureBundleConflict("durable cursor has duplicate parts")
             part = _validated_cursor_part(
-                receipts[stream_slot],
-                part_row,
-                accounting[stream_slot].policy,
-                (capture_bundle_id, stream_slot, part_ordinal),
+                headers.receipt, part_row, headers.policy, (capture_bundle_id, stream_slot, part_ordinal)
             )
         if part is None:
             raise CapturePayloadUnavailable("durable cursor payload part is missing")
@@ -1429,7 +1490,9 @@ def _validated_cursor_part(receipt, part_row, policy, expected_identity):
 
 def _segment_metadata_statement(bundle_id, accounting, stream_slot):
     """Select seals/accounting only; never prior immutable payload bytes."""
-    statement = _part_statement(bundle_id, accounting).where(CustomImportCaptureParquetPart.stream_slot == stream_slot)
+    statement = _part_statement(bundle_id, accounting is not None).where(
+        CustomImportCaptureParquetPart.stream_slot == stream_slot
+    )
     return statement.with_only_columns(*(column for column in statement.selected_columns if column.name != "payload"))
 
 

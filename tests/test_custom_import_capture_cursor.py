@@ -8,7 +8,7 @@ import asyncio
 import hashlib
 import json
 import time
-from dataclasses import asdict, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -80,7 +80,7 @@ def _headers(monkeypatch, rows):
             },
         )
 
-    monkeypatch.setattr(store, "_load_parquet_part_metadata", load)
+    monkeypatch.setattr(store, "_load_parquet_part_metadata", AsyncMock(side_effect=load))
     return receipt, baseline
 
 
@@ -94,6 +94,87 @@ async def test_current_part_query_skips_all_previous_payloads_and_closes(monkeyp
     statement = str(session.statement.compile(dialect=dialect(), compile_kwargs={"literal_binds": True}))
     assert "stream_slot = 1" in statement and "part_ordinal = 2" in statement and "LIMIT 2" in statement
     assert session.rows.close_count == 1
+
+
+async def test_reused_headers_keep_part_reads_and_fresh_final_accounting(monkeypatch):
+    rows = [_part_row(1), _part_row(2)]
+    _headers(monkeypatch, rows)
+    headers = await store.load_segmented_cursor_headers(_PartReadSession([]), **_PART_IDS, stream_slot=1)
+    with pytest.raises(FrozenInstanceError):
+        headers.part_count = 3
+    for row in rows:
+        session = _PartReadSession([row])
+        async with store.open_segmented_cursor_part(
+            session, **_PART_IDS, stream_slot=1, part_ordinal=row[2], headers=headers
+        ) as part:
+            assert part.ordinal == row[2] and part.capture.payload == row[4]
+        assert session.rows.close_count == 1
+    assert store._load_parquet_part_metadata.await_count == 1
+    for _ in range(2):
+        session = _PartReadSession([row[:4] + row[5:] for row in rows])
+        await store.verify_segmented_stream_metadata(
+            session, **_PART_IDS, stream_slot=1, deadline=time.monotonic() + 60
+        )
+        assert session.rows.close_count == 1
+    assert store._load_parquet_part_metadata.await_count == 3
+
+
+@pytest.mark.parametrize("field", [*_PART_IDS, "stream_slot"])
+async def test_reused_headers_reject_every_foreign_scope_before_reading(monkeypatch, field):
+    _headers(monkeypatch, [_part_row(1)])
+    headers = await store.load_segmented_cursor_headers(_PartReadSession([]), **_PART_IDS, stream_slot=1)
+    scope_by_field = dict(_PART_IDS, stream_slot=1)
+    scope_by_field[field] += 1
+    session = _PartReadSession([])
+    with pytest.raises(store.CaptureBundleConflict, match="exact stream scope"):
+        async with store.open_segmented_cursor_part(session, **scope_by_field, part_ordinal=1, headers=headers):
+            pytest.fail("foreign headers must not yield a part")
+    assert session.rows is None and session.statement is None
+    assert store._load_parquet_part_metadata.await_count == 1
+
+
+@pytest.mark.parametrize("invalid", ["type", "ordinal"])
+async def test_reused_headers_do_not_bypass_type_or_part_bounds(monkeypatch, invalid):
+    _headers(monkeypatch, [_part_row(1)])
+    headers = await store.load_segmented_cursor_headers(_PartReadSession([]), **_PART_IDS, stream_slot=1)
+    session = _PartReadSession([])
+    with pytest.raises(store.CaptureStoreError):
+        async with store.open_segmented_cursor_part(
+            session,
+            **_PART_IDS,
+            stream_slot=1,
+            part_ordinal=2 if invalid == "ordinal" else 1,
+            headers=object() if invalid == "type" else headers,
+        ):
+            pytest.fail("invalid headers or part ordinal must not yield a part")
+    assert session.rows is None and session.statement is None
+
+
+@pytest.mark.parametrize("fault", ["missing", "duplicate", "payload", "manifest", "slot", "record_count"])
+async def test_reused_headers_still_reject_later_part_corruption(monkeypatch, fault):
+    rows = [_part_row(1), _part_row(2)]
+    _headers(monkeypatch, rows)
+    headers = await store.load_segmented_cursor_headers(_PartReadSession([]), **_PART_IDS, stream_slot=1)
+    async with store.open_segmented_cursor_part(
+        _PartReadSession(rows[:1]), **_PART_IDS, stream_slot=1, part_ordinal=1, headers=headers
+    ) as part:
+        assert part.ordinal == 1 and part.capture.payload == rows[0][4]
+    damaged_fields = list(rows[1])
+    index, value = {
+        "payload": (4, b"different"),
+        "manifest": (7, bytes(32)),
+        "slot": (1, 2),
+        "record_count": (10, True),
+    }.get(fault, (0, 9))
+    damaged_fields[index] = value
+    later = [] if fault == "missing" else [rows[1], rows[1]] if fault == "duplicate" else [tuple(damaged_fields)]
+    session = _PartReadSession(later)
+    with pytest.raises(store.CaptureStoreError):
+        async with store.open_segmented_cursor_part(
+            session, **_PART_IDS, stream_slot=1, part_ordinal=2, headers=headers
+        ):
+            pytest.fail("corrupt later part must not be yielded")
+    assert session.rows.close_count == 1 and store._load_parquet_part_metadata.await_count == 1
 
 
 @pytest.mark.parametrize("fault", ["missing", "duplicate", "payload", "manifest", "slot", "record_count"])
