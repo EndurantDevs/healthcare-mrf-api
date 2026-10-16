@@ -24,7 +24,11 @@ from db.models.custom_import import (
 )
 from process.custom_import import build_source as staging
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS, encode_landing_batch
-from process.custom_import.capture_store import open_segmented_cursor_part, verify_segmented_stream_metadata
+from process.custom_import.capture_store import (
+    load_segmented_cursor_headers,
+    open_segmented_cursor_part,
+    verify_segmented_stream_metadata,
+)
 from process.custom_import.execution import lease_token_sha256
 from process.custom_import.runner_registry import load_registry
 from process.custom_import.runner_types import CandidateRunnerError, LeaseAuthorityLost
@@ -550,15 +554,21 @@ async def _read_timeout(session, request, deadline):
     await staging._set_timeout(session, min(request.statement_timeout_ms, remaining_ms // 2))
 
 
-async def _fetch_closed_part(session_factory, identity_by_field, context, cursor, deadline):
+async def _fetch_closed_part(session_factory, identity_by_field, context, cursor, deadline, headers):
     """Return immutable bytes only after result/read transaction cleanup succeeds."""
     async with _read_session(session_factory) as session:
         await _read_timeout(session, context.request, deadline)
+        if headers is None:
+            headers = await load_segmented_cursor_headers(session, **identity_by_field, stream_slot=context.stream_slot)
         async with open_segmented_cursor_part(
-            session, **identity_by_field, stream_slot=context.stream_slot, part_ordinal=cursor.next_part_ordinal
+            session,
+            **identity_by_field,
+            stream_slot=context.stream_slot,
+            part_ordinal=cursor.next_part_ordinal,
+            headers=headers,
         ) as part:
             captured = part
-    return captured
+    return captured, headers
 
 
 async def _verify_metadata(session_factory, identity_by_field, context, deadline):
@@ -579,6 +589,7 @@ async def _read_parts(session_factory, context, policy, bundle_id, cursor, sourc
         schema_revision_id=request.schema_revision_id,
     )
     pages, closed_parts, row_count, byte_count = [], [], 0, 0
+    headers = None
     started = time.monotonic()
     # Leave half of the remaining request window for the fenced write/commit.
     soft_deadline = started + (deadline - started) / 2
@@ -589,7 +600,7 @@ async def _read_parts(session_factory, context, policy, bundle_id, cursor, sourc
             raise LeaseAuthorityLost("SOURCE read deadline elapsed")
         if (pages or closed_parts) and now >= soft_deadline:
             break
-        part = await _fetch_closed_part(session_factory, identity_by_field, context, cursor, deadline)
+        part, headers = await _fetch_closed_part(session_factory, identity_by_field, context, cursor, deadline, headers)
         new_pages, has_eof = await _prepare_part(
             session_factory,
             context,

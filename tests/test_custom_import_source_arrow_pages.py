@@ -199,7 +199,7 @@ def _hosted_call(monkeypatch, context, part, policy):
     monkeypatch.setattr(
         source_batch, "_load_context", AsyncMock(return_value=(context, policy, 9, time.monotonic() + 60, False))
     )
-    monkeypatch.setattr(source_batch, "_fetch_closed_part", AsyncMock(return_value=part))
+    monkeypatch.setattr(source_batch, "_fetch_closed_part", AsyncMock(return_value=(part, object())))
     monkeypatch.setattr(source_batch, "_verify_metadata", AsyncMock())
     commit = AsyncMock()
     monkeypatch.setattr(source_batch, "_commit", commit)
