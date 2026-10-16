@@ -104,6 +104,13 @@ def upgrade():
     """Add nullable seal evidence and a low-volume custody manifest."""
 
     schema = _schema()
+    # Bound metadata lock waits while preserving stricter session limits.
+    op.execute(
+        sa.text(
+            "SELECT set_config('lock_timeout', LEAST(NULLIF(setting::bigint, 0), 2000)::text, true) "
+            "FROM pg_settings WHERE name = 'lock_timeout'"
+        )
+    )
     _seal_metadata(schema)
     op.execute(CreateTable(_manifest_table(schema)))
     _read_privileges(schema)
