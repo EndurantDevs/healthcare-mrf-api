@@ -3,16 +3,23 @@
 
 import asyncio
 import json
-from dataclasses import replace
+import os
+from dataclasses import asdict, replace
 from uuid import UUID
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from api import provider_directory_cms_network_scope as scoped
 from api.provider_directory_cms_entities import read_cms_entities
 from api.provider_directory_entities_contract import CURSOR_KEY_ENV, DirectoryRead, DirectoryReadError
+from process.network_approved_membership_source import ApprovedMembershipSource
+from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_serving_read import PinnedNetworkServingManifest
 from process.provider_directory_resource_identity import bind_resource_identity_batch, source_resource_uuid
+from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests.provider_directory_cms_postgres_support import (
     NETWORK_ID,
     ORG_ID,
@@ -148,12 +155,16 @@ async def test_reviewed_old_id_returns_canonical_redirect_and_invalidates_genera
         before = await read(sessions, cms_query())
         async with sessions() as session, session.begin():
             await session.execute(
-                text("INSERT INTO provider_directory_entity_redirect_decision VALUES "
-                     "('00000000-0000-0000-0000-000000000077', 'cms-npd')")
+                text(
+                    "INSERT INTO provider_directory_entity_redirect_decision VALUES "
+                    "('00000000-0000-0000-0000-000000000077', 'cms-npd')"
+                )
             )
             await session.execute(
-                text("INSERT INTO provider_directory_entity_redirect VALUES "
-                     "('cms-npd', 'Organization', :old_id, :canonical_id)"),
+                text(
+                    "INSERT INTO provider_directory_entity_redirect VALUES "
+                    "('cms-npd', 'Organization', :old_id, :canonical_id)"
+                ),
                 {"old_id": old_id, "canonical_id": ORG_ID},
             )
         stale = replace(cms_query("organizations", "entity", old_id), generation_id=before["generation_id"])
@@ -162,19 +173,24 @@ async def test_reviewed_old_id_returns_canonical_redirect_and_invalidates_genera
         assert caught.value.status == 409
         detail = await read(sessions, cms_query("organizations", "entity", old_id))
         relations = await read(sessions, cms_query("organizations", "relationships", old_id))
-        assert detail == relations == {
-            "generation_id": detail["generation_id"],
-            "redirect": {
-                "source_id": "cms-npd",
-                "kind": "organizations",
-                "requested_id": old_id,
-                "canonical_id": ORG_ID,
-            },
-        }
+        assert (
+            detail
+            == relations
+            == {
+                "generation_id": detail["generation_id"],
+                "redirect": {
+                    "source_id": "cms-npd",
+                    "kind": "organizations",
+                    "requested_id": old_id,
+                    "canonical_id": ORG_ID,
+                },
+            }
+        )
         assert detail["generation_id"] != before["generation_id"]
         invalid_cursor = replace(
             cms_query("organizations", "relationships", old_id),
-            generation_id=detail["generation_id"], cursor="invalid",
+            generation_id=detail["generation_id"],
+            cursor="invalid",
         )
         with pytest.raises(DirectoryReadError) as caught:
             await read(sessions, invalid_cursor)
@@ -188,12 +204,16 @@ async def test_reviewed_redirect_does_not_resolve_to_unpublished_target(monkeypa
     async with cms_database(monkeypatch) as sessions:
         async with sessions() as session, session.begin():
             await session.execute(
-                text("INSERT INTO provider_directory_entity_redirect_decision VALUES "
-                     "('00000000-0000-0000-0000-000000000078', 'cms-npd')")
+                text(
+                    "INSERT INTO provider_directory_entity_redirect_decision VALUES "
+                    "('00000000-0000-0000-0000-000000000078', 'cms-npd')"
+                )
             )
             await session.execute(
-                text("INSERT INTO provider_directory_entity_redirect VALUES "
-                     "('cms-npd', 'Organization', :old_id, :canonical_id)"),
+                text(
+                    "INSERT INTO provider_directory_entity_redirect VALUES "
+                    "('cms-npd', 'Organization', :old_id, :canonical_id)"
+                ),
                 {"old_id": ORG_ID, "canonical_id": unpublished_id},
             )
         with pytest.raises(DirectoryReadError) as caught:
@@ -554,20 +574,7 @@ async def test_source_declared_network_without_binding_fails_coverage(monkeypatc
 async def test_old_plan_only_coverage_cannot_approve_a_new_network_role(monkeypatch):
     from process.provider_directory_cms_serving_coverage import build_cms_coverage
 
-    async def prepare(session):
-        await session.execute(text("DELETE FROM provider_directory_insurance_network_plan_evidence"))
-        await session.execute(text("DELETE FROM provider_directory_insurance_network_source_binding"))
-        await session.execute(text(
-            "UPDATE provider_directory_dataset_resource SET payload_json="
-            "jsonb_set(payload_json::jsonb, '{network_refs}', '[]'::jsonb) "
-            "WHERE resource_type='InsurancePlan'"
-        ))
-        await session.execute(text(
-            "UPDATE provider_directory_entity_release_evidence SET payload_json="
-            "'{\"type\":[{\"text\":\"ntwk\"}]}'::jsonb WHERE resource_type='Organization'"
-        ))
-
-    async with cms_database(monkeypatch, prepare=prepare, seal=False) as sessions:
+    async with cms_database(monkeypatch, prepare=_prepare_new_network_role, seal=False) as sessions:
         # Model a receipt retained from before the new-writer constraint existed.
         async with sessions() as session, session.begin():
             await session.execute(
@@ -598,16 +605,26 @@ async def test_old_plan_only_coverage_cannot_approve_a_new_network_role(monkeypa
             with pytest.raises(DirectoryReadError) as caught:
                 await build_cms_coverage(session)
         assert caught.value.status == 503
-        await change(sessions,
+        await change(
+            sessions,
             "INSERT INTO provider_directory_insurance_network_source_binding VALUES "
-            "('cms-npd','Organization','org-example','" + NETWORK_ID + "')")
+            "('cms-npd','Organization','org-example','" + NETWORK_ID + "')",
+        )
         async with sessions() as session:
             await build_cms_coverage(session)
-        assert [network_item["id"] for network_item in (await read(sessions, cms_query("networks")))["items"]] == [NETWORK_ID]
+        assert [network_item["id"] for network_item in (await read(sessions, cms_query("networks")))["items"]] == [
+            NETWORK_ID
+        ]
         async with sessions() as session:
-            versions = (await session.execute(text(
-                "SELECT proof_version FROM provider_directory_cms_serving_coverage ORDER BY proof_version"
-            ))).scalars().all()
+            versions = (
+                (
+                    await session.execute(
+                        text("SELECT proof_version FROM provider_directory_cms_serving_coverage ORDER BY proof_version")
+                    )
+                )
+                .scalars()
+                .all()
+            )
         assert versions == [1, 2]
 
 
@@ -933,9 +950,7 @@ async def _run_identity_contender(sessions, winner, winner_pid, winner_outcome):
     try:
         contender_task = asyncio.create_task(_contend_identity_insert(sessions, started, contender_by_field))
         await asyncio.wait_for(started.wait(), 3)
-        await asyncio.wait_for(
-            _wait_for_identity_block(winner, winner_pid, contender_by_field, contender_task), 3
-        )
+        await asyncio.wait_for(_wait_for_identity_block(winner, winner_pid, contender_by_field, contender_task), 3)
         if winner_outcome == "rollback":
             await winner.rollback()
         else:
@@ -971,13 +986,16 @@ async def test_identity_binder_reads_a_concurrent_insert_after_its_statement(mon
             await _run_identity_contender(sessions, winner, winner_pid, winner_outcome)
         if winner_outcome == "conflicting_commit":
             async with sessions() as session:
-                assert await session.scalar(
-                    text(
-                        "SELECT entity_id FROM provider_directory_resource_identity "
-                        "WHERE source_id='cms-npd' AND resource_type='InsurancePlan' "
-                        "AND resource_id='fresh-during-race'"
+                assert (
+                    await session.scalar(
+                        text(
+                            "SELECT entity_id FROM provider_directory_resource_identity "
+                            "WHERE source_id='cms-npd' AND resource_type='InsurancePlan' "
+                            "AND resource_id='fresh-during-race'"
+                        )
                     )
-                ) is None
+                    is None
+                )
 
 
 @pytest.mark.asyncio
@@ -1084,13 +1102,16 @@ async def test_binder_rejects_existing_conflicting_identity(monkeypatch):
                     resource_ids=["conflicting-plan", "fresh-with-conflict"],
                 )
             await session.rollback()
-            assert await session.scalar(
-                text(
-                    "SELECT entity_id FROM provider_directory_resource_identity "
-                    "WHERE source_id='cms-npd' AND resource_type='InsurancePlan' "
-                    "AND resource_id='fresh-with-conflict'"
+            assert (
+                await session.scalar(
+                    text(
+                        "SELECT entity_id FROM provider_directory_resource_identity "
+                        "WHERE source_id='cms-npd' AND resource_type='InsurancePlan' "
+                        "AND resource_id='fresh-with-conflict'"
+                    )
                 )
-            ) is None
+                is None
+            )
 
 
 @pytest.mark.asyncio
@@ -1109,3 +1130,583 @@ async def test_cancelled_read_releases_its_snapshot(monkeypatch):
                 await read_cms_entities(session, cms_query())
             assert not session.in_transaction()
             assert await session.scalar(text("SELECT 1")) == 1
+
+
+def _coordinates(schema, dataset="synthetic-dataset"):
+    return RegistryNetworkSourceCoordinates(
+        "fhir", "cms-npd", schema, dataset, "synthetic-producer", "synthetic-edition"
+    )
+
+
+async def _prepare(session):
+    await _add_plan(session)
+    for statement in (
+        "CREATE TABLE network_membership_source (network_id integer,provider_system text,provider_id text,location_id uuid,evidence_id text)",
+        "CREATE TABLE network_membership (LIKE network_membership_source)",
+        "CREATE TABLE provider_location_binding (provider_system text,provider_id text,location_id uuid,location_key text,entity_type text,entity_id text)",
+        "CREATE TABLE provider_directory_cms_npd_resource_witness (dataset_id text,source_id text,release_id text,resource_type text,resource_id text,normalized_payload_hash text,raw_payload_sha256 text,raw_payload_json jsonb)",
+    ):
+        await session.execute(text(statement))
+    coordinates = _coordinates(os.environ["HLTHPRT_DB_SCHEMA"])
+    descriptor_by_field = {
+        **asdict(coordinates),
+        "alias_scope": "synthetic-alias",
+        "source_key_kind": "organization_resource_id",
+    }
+    await session.execute(
+        text(
+            "UPDATE provider_directory_endpoint_dataset SET publication_metadata_summary_json="
+            "jsonb_set(publication_metadata_summary_json,'{network_bindings}',CAST(:value AS jsonb))"
+        ),
+        {"value": json.dumps(descriptor_by_field)},
+    )
+    await reseal(session)
+    await session.execute(
+        text(
+            "CREATE TABLE registry_approved_record (approved_revision bigint,record_kind text,"
+            "record_key text,record_revision bigint,custom_revision bigint,record_json jsonb)"
+        )
+    )
+    for kind, key, document in (
+        ("network", "1001", {"network_id": 1001, "archived": False}),
+        (
+            "network_binding",
+            "synthetic-binding",
+            {
+                **asdict(coordinates),
+                "network_id": 1001,
+                "archived": False,
+                "source_key": "org-example",
+                "source_scope_json": {
+                    "organization_id": "org-example",
+                    "legacy_uuid": NETWORK_ID,
+                    "alias_scope": "synthetic-alias",
+                },
+            },
+        ),
+    ):
+        await session.execute(
+            text("INSERT INTO registry_approved_record VALUES(7,:kind,:key,1,7,CAST(:document AS jsonb))"),
+            {"kind": kind, "key": key, "document": json.dumps(document)},
+        )
+
+
+@pytest.fixture
+def trusted_recipe(monkeypatch):
+    """Mock only the existing manifest/map authorities; source admission and scope SQL remain real."""
+    state_by_field = {"dataset": "synthetic-dataset"}
+
+    async def manifest(driver, *, generation_id=None):
+        if generation_id not in (None, 9):
+            raise ValueError("unavailable exact canonical pin")
+        return PinnedNetworkServingManifest(
+            9, "00000000-0000-0000-0000-000000000001", os.environ["HLTHPRT_DB_SCHEMA"], 1, {}, 7, "c" * 64, 1
+        )
+
+    async def recipes(driver, manifest):
+        schema = os.environ["HLTHPRT_DB_SCHEMA"]
+        oid = await driver.fetchval("SELECT to_regclass($1)::oid", schema + ".provider_directory_dataset_resource")
+        source = PinnedFHIRMembershipSource(
+            schema,
+            "cms-npd",
+            "synthetic-endpoint",
+            state_by_field["dataset"],
+            "b" * 64,
+            "a" * 64,
+            oid,
+            "synthetic-alias",
+            "2026-01-01",
+        )
+        return (RegistrySourceMembershipRecipe(source, _coordinates(schema, state_by_field["dataset"])),)
+
+    async def approved(driver, *, approved_revision):
+        assert approved_revision == 7
+        return ApprovedMembershipSource(7, "d" * 64)
+
+    monkeypatch.setattr(scoped, "resolve_network_serving_manifest", manifest)
+    monkeypatch.setattr(scoped, "resolve_retained_registry_source_recipes", recipes)
+    monkeypatch.setattr(scoped, "pin_retained_approved_membership_source", approved)
+    return state_by_field
+
+
+def _query(kind="plans", shape="entities", entity_id=None, limit=1):
+    return replace(
+        cms_query(kind, shape, entity_id, limit),
+        network_ids=(1001,),
+        network_generation=9,
+        access_scope_sha256="e" * 64,
+    )
+
+
+@pytest.mark.asyncio
+async def test_scope_filters_before_lookahead_and_both_relationship_ends(monkeypatch, trusted_recipe):
+    async with cms_database(monkeypatch, prepare=_prepare) as sessions:
+        legacy = await read(sessions, cms_query("plans", limit=100))
+        assert len(legacy["items"]) == 2
+        response_headers_by_name = {}
+        async with sessions() as session:
+            page = await read_cms_entities(session, _query(), response_headers=response_headers_by_name)
+        assert response_headers_by_name["X-Network-Generation"] == "9"
+        assert len(page["items"]) == 1 and page["next_cursor"] is None
+        assert page["generation_id"] != legacy["generation_id"]
+        selected_id = page["items"][0]["id"]
+        forbidden_id = next(item["id"] for item in legacy["items"] if item["id"] != selected_id)
+        with pytest.raises(DirectoryReadError) as error:
+            await read(sessions, _query(shape="entity", entity_id=forbidden_id))
+        assert error.value.status == 404
+        links = await read(sessions, _query(shape="relationships", entity_id=selected_id, limit=100))
+        assert links["items"]
+        assert {item["target_id"] for item in links["items"]} <= {ORG_ID, NETWORK_ID}
+        assert all(item["status"] == "resolved" for item in links["items"])
+        for entity_id in (forbidden_id,):
+            with pytest.raises(DirectoryReadError) as error:
+                await read(sessions, _query(shape="relationships", entity_id=entity_id))
+            assert error.value.status == 404
+
+
+@pytest.mark.asyncio
+async def test_wrong_selected_mapping_canonical_and_source_pins_fail_closed(monkeypatch, trusted_recipe):
+    async with cms_database(monkeypatch, prepare=_prepare) as sessions:
+        for query in (
+            replace(_query(), network_ids=(1002,)),
+            replace(_query(), network_generation=10),
+            replace(_query(), generation_id="gen_other"),
+        ):
+            with pytest.raises(DirectoryReadError) as error:
+                await read(sessions, query)
+            assert error.value.status in (409, 503)
+        trusted_recipe["dataset"] = "another-source-generation"
+        with pytest.raises(DirectoryReadError) as error:
+            await read(sessions, _query())
+        assert error.value.status == 503
+
+
+@pytest.mark.asyncio
+async def test_scoped_redirect_cannot_expose_an_unselected_target(monkeypatch, trusted_recipe):
+    async with cms_database(monkeypatch, prepare=_prepare) as sessions:
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text("INSERT INTO provider_directory_entity_redirect VALUES ('cms-npd','Organization',:old,:target)"),
+                {"old": UUID(ORG_ID), "target": UUID("00000000-0000-0000-0000-000000000099")},
+            )
+        with pytest.raises(DirectoryReadError) as error:
+            await read(sessions, _query("organizations", "entity", ORG_ID))
+        assert error.value.status == 503
+
+
+@pytest.mark.parametrize("kind", ("sites", "practitioner-roles", "payers"))
+@pytest.mark.asyncio
+async def test_unproved_scoped_records_are_excluded(monkeypatch, trusted_recipe, kind):
+    async with cms_database(monkeypatch, prepare=_prepare) as sessions:
+        assert (await read(sessions, _query(kind)))["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_shared_sql_predicate_filters_identity_alias_count_before_projection(monkeypatch, trusted_recipe):
+    from api.provider_directory_cms_generation import accepted_cms_generation
+    from api.provider_directory_cms_queries import cms_entity_rows
+
+    async def prepare(session):
+        await _prepare(session)
+        await session.execute(
+            text(
+                "INSERT INTO provider_directory_dataset_resource SELECT dataset_id,resource_type,"
+                "'unselected-alias',payload_hash,payload_json,acquired_resource_sha256 "
+                "FROM provider_directory_dataset_resource WHERE resource_type='Organization'"
+            )
+        )
+        await session.execute(
+            text(
+                "INSERT INTO provider_directory_entity_source_binding VALUES "
+                "('cms-npd','Organization','unselected-alias',:identity,NULL)"
+            ),
+            {"identity": UUID(ORG_ID)},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO provider_directory_entity_release_evidence SELECT source_id,resource_type,"
+                "'unselected-alias',release_id,payload_sha256,payload_json "
+                "FROM provider_directory_entity_release_evidence WHERE resource_type='Organization'"
+            )
+        )
+
+    # This deliberately inconsistent alias is a SQL component fixture, never a serving acceptance proof.
+    async with cms_database(monkeypatch, prepare=prepare, seal=False) as sessions:
+        async with sessions() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            generation = await accepted_cms_generation(session, None)
+            schema = '"' + os.environ["HLTHPRT_DB_SCHEMA"] + '"'
+            scope = await scoped.pin_cms_network_scope(session, schema, _query("organizations"), generation)
+            selected_generation_by_field = {**generation, **scope.parameters_by_name, "network_scope": scope}
+            entity_rows = await cms_entity_rows(session, schema, _query("organizations"), selected_generation_by_field)
+            assert len(entity_rows) == 1 and entity_rows[0]["identity_count"] == 1
+            with pytest.raises(DirectoryReadError):
+                await cms_entity_rows(session, schema, cms_query("organizations"), generation)
+
+
+@pytest.mark.asyncio
+async def test_relationship_continuation_keeps_the_same_source_and_canonical_scope(monkeypatch, trusted_recipe):
+    async with cms_database(monkeypatch, prepare=_prepare) as sessions:
+        plans = await read(sessions, _query())
+        query = _query(shape="relationships", entity_id=plans["items"][0]["id"])
+        first = await read(sessions, query)
+        assert len(first["items"]) == 1 and first["next_cursor"] is not None
+        continuation = replace(query, generation_id=first["generation_id"], cursor=first["next_cursor"])
+        second = await read(sessions, continuation)
+        assert len(second["items"]) == 1 and second["next_cursor"] is None
+        assert second["items"][0]["relationship_key"] != first["items"][0]["relationship_key"]
+        with pytest.raises(DirectoryReadError) as error:
+            await read(sessions, replace(continuation, access_scope_sha256="f" * 64))
+        assert error.value.status == 409
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text(
+                    "UPDATE registry_approved_record SET record_json="
+                    "jsonb_set(record_json,'{edition_id}','\"another-edition\"') "
+                    "WHERE record_kind='network_binding'"
+                )
+            )
+        with pytest.raises(DirectoryReadError) as error:
+            await read(sessions, continuation)
+        assert error.value.status == 503
+
+
+async def _add_unselected_office(session):
+    await session.execute(
+        text("""INSERT INTO provider_directory_dataset_resource
+        SELECT dataset_id,resource_type,'unselected-site',payload_hash,
+          jsonb_set(payload_json::jsonb,'{resource_id}','"unselected-site"'),acquired_resource_sha256
+        FROM provider_directory_dataset_resource WHERE resource_type='Location'""")
+    )
+    await session.execute(
+        text("""INSERT INTO provider_directory_entity_source_binding VALUES
+        ('cms-npd','Location','unselected-site',NULL,'00000000-0000-0000-0000-000000000019')""")
+    )
+    await session.execute(
+        text("""INSERT INTO provider_directory_entity_release_evidence
+        SELECT source_id,resource_type,'unselected-site',release_id,payload_sha256,payload_json
+        FROM provider_directory_entity_release_evidence WHERE resource_type='Location'""")
+    )
+    await session.execute(
+        text("""INSERT INTO provider_directory_dataset_resource
+        SELECT dataset_id,resource_type,'unselected-role',payload_hash,
+          jsonb_set(payload_json::jsonb,'{resource_id}','"unselected-role"'),acquired_resource_sha256
+        FROM provider_directory_dataset_resource WHERE resource_type='PractitionerRole'""")
+    )
+    await bind_resource_identity_batch(
+        session, source_id="cms-npd", resource_type="PractitionerRole", resource_ids=["unselected-role"]
+    )
+    await session.execute(
+        text("""UPDATE provider_directory_dataset_resource SET payload_json=
+        jsonb_set(payload_json::jsonb,'{location_refs}',CAST(:refs AS jsonb)) WHERE resource_type='PractitionerRole'"""),
+        {"refs": json.dumps(["Location/site-example", "Location/unselected-site"])},
+    )
+    metadata_by_field = await session.scalar(
+        text("SELECT publication_metadata_summary_json FROM provider_directory_endpoint_dataset")
+    )
+    for filename, kind in (("02-Location.ndjson", "Location"), ("07-PractitionerRole.ndjson", "PractitionerRole")):
+        metadata_by_field["source_release"]["files"][filename].update(row_count=2, distinct_count=2)
+        metadata_by_field["provider_directory_content_proof_admission_summary_v1"]["resource_counts"][kind] = 2
+    metadata_by_field["provider_directory_content_proof_admission_summary_v1"]["resource_count"] = 11
+    await session.execute(
+        text(
+            "UPDATE provider_directory_endpoint_dataset SET resource_count=11, publication_metadata_summary_json=CAST(:metadata AS jsonb)"
+        ),
+        {"metadata": json.dumps(metadata_by_field)},
+    )
+    await reseal(session)
+
+
+async def _prepare_membership(session):
+    await _prepare(session)
+    await session.execute(
+        text("""UPDATE provider_directory_dataset_resource SET payload_json=
+        payload_json::jsonb || jsonb_build_object('practitioner_ref','Practitioner/practitioner-example','active',true)
+        WHERE resource_type='PractitionerRole'""")
+    )
+    await session.execute(
+        text("""UPDATE provider_directory_dataset_resource SET payload_json=
+        payload_json::jsonb || jsonb_build_object('npi',1234567893) WHERE resource_type='Practitioner'""")
+    )
+    await _add_unselected_office(session)
+    await session.execute(
+        text("""INSERT INTO provider_directory_cms_npd_relationship VALUES
+        ('synthetic-dataset','cms-npd',repeat('a',64),'PractitionerRole','role-example',repeat('b',64),repeat('b',64),
+        'practitioner',0,1,'Practitioner/practitioner-example','resolved',NULL,NULL)""")
+    )
+    await session.execute(
+        text("""INSERT INTO provider_directory_cms_npd_resource_witness
+        SELECT dataset_id,'cms-npd',repeat('a',64),resource_type,resource_id,payload_hash,
+          acquired_resource_sha256,jsonb_build_object('resourceType',resource_type,'id',resource_id,
+            'identifier',CASE WHEN resource_type='Practitioner' THEN
+            '[{"system":"http://hl7.org/fhir/sid/us-npi","value":"1234567893"}]'::jsonb ELSE '[]'::jsonb END)
+        FROM provider_directory_dataset_resource""")
+    )
+    await session.execute(
+        text("""INSERT INTO network_membership_source VALUES
+        (1001,'npi','1234567893',:site,encode(sha256(convert_to(jsonb_build_array(
+          'synthetic-dataset','cms-npd',repeat('a',64),'PractitionerRole','role-example',repeat('b',64),
+          1001,'1234567893',CAST(:site AS uuid))::text,'UTF8')),'hex'))"""),
+        {"site": UUID(SITE_ID)},
+    )
+    await session.execute(text("INSERT INTO network_membership SELECT * FROM network_membership_source"))
+    await session.execute(
+        text(
+            "INSERT INTO provider_location_binding VALUES ('npi','1234567893',:site,repeat('d',64),'npi','1234567893')"
+        ),
+        {"site": UUID(SITE_ID)},
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_role_site_pair_and_relationships_are_selected(monkeypatch, trusted_recipe):
+    async with cms_database(monkeypatch, prepare=_prepare_membership) as sessions:
+        role_id = str(source_resource_uuid("cms-npd", "PractitionerRole", "role-example"))
+        for kind in ("sites", "practitioner-roles"):
+            assert (await read(sessions, cms_query(kind)))["next_cursor"] is not None
+        for kind, entity_id in (("sites", SITE_ID), ("practitioner-roles", role_id)):
+            page = await read(sessions, _query(kind))
+            assert [item["id"] for item in page["items"]] == [entity_id]
+            assert page["next_cursor"] is None
+            links = await read(sessions, _query(kind, "relationships", entity_id, 100))
+            assert links["items"]
+            assert {item["target_id"] for item in links["items"]} <= {
+                ORG_ID,
+                NETWORK_ID,
+                SITE_ID,
+                "1234567893",
+                str(source_resource_uuid("cms-npd", "InsurancePlan", "plan-example")),
+            }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "UPDATE network_membership SET location_id='00000000-0000-0000-0000-000000000099'",
+        "UPDATE provider_location_binding SET provider_id='wrong-provider'",
+        "UPDATE network_membership_source SET evidence_id=repeat('0',64)",
+        "UPDATE provider_directory_cms_npd_resource_witness SET release_id='wrong-release'",
+    ),
+)
+@pytest.mark.asyncio
+async def test_membership_requires_source_evidence_and_same_effective_office(monkeypatch, trusted_recipe, mutation):
+    async with cms_database(monkeypatch, prepare=_prepare_membership) as sessions:
+        await change(sessions, mutation)
+        for kind in ("sites", "practitioner-roles"):
+            assert (await read(sessions, _query(kind)))["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_scoped_payer_requires_selected_plan_issuer_before_seek(monkeypatch, trusted_recipe):
+    from tests.test_provider_directory_cms_payers import _add_second_payer, _review_payer
+
+    async def prepare(session):
+        await _prepare(session)
+        metadata_by_field = await session.scalar(
+            text("SELECT publication_metadata_summary_json FROM provider_directory_endpoint_dataset")
+        )
+        await _add_second_payer(session)
+        metadata_by_field["source_release"]["files"]["01-Organization.ndjson"].update(row_count=2, distinct_count=2)
+        metadata_by_field["provider_directory_content_proof_admission_summary_v1"]["resource_counts"][
+            "Organization"
+        ] = 2
+        metadata_by_field["provider_directory_content_proof_admission_summary_v1"]["resource_count"] = 10
+        await session.execute(
+            text(
+                "UPDATE provider_directory_endpoint_dataset SET resource_count=10, publication_metadata_summary_json=CAST(:metadata AS jsonb)"
+            ),
+            {"metadata": json.dumps(metadata_by_field)},
+        )
+        await session.execute(
+            text("""UPDATE provider_directory_dataset_resource SET payload_json=
+            jsonb_set(payload_json::jsonb,'{owned_by_ref}','"Organization/second-org"') WHERE resource_id='second-plan'""")
+        )
+        await session.execute(
+            text("""UPDATE provider_directory_dataset_resource SET payload_json=
+            jsonb_set(payload_json::jsonb,'{part_of_ref}','"Organization/second-org"') WHERE resource_id='org-example'""")
+        )
+        await reseal(session)
+
+    async with cms_database(monkeypatch, prepare=prepare) as sessions:
+        await _review_payer(sessions)
+        assert (await read(sessions, _query("organizations", limit=100)))["items"][0]["id"] == ORG_ID
+        assert (await read(sessions, cms_query("payers")))["next_cursor"] is not None
+        page = await read(sessions, _query("payers"))
+        assert [payer_entry["id"] for payer_entry in page["items"]] == ["existing_payer-17"]
+        assert page["next_cursor"] is None
+        links = await read(sessions, _query("payers", "relationships", "existing_payer-17"))
+        assert [payer_link["target_id"] for payer_link in links["items"]] == [ORG_ID]
+        with pytest.raises(DirectoryReadError) as error:
+            await read(sessions, _query("payers", "entity", "A_existing_payer"))
+        assert error.value.status == 404
+
+
+@pytest.mark.asyncio
+async def test_site_redirect_and_hidden_role_cannot_escape_scope(monkeypatch, trusted_recipe):
+    async with cms_database(monkeypatch, prepare=_prepare_membership) as sessions:
+        for kind, entity_id in (
+            ("sites", "00000000-0000-0000-0000-000000000019"),
+            ("practitioner-roles", str(source_resource_uuid("cms-npd", "PractitionerRole", "unselected-role"))),
+        ):
+            for shape in ("entity", "relationships"):
+                with pytest.raises(DirectoryReadError) as error:
+                    await read(sessions, _query(kind, shape, entity_id))
+                assert error.value.status == 404
+        await change(
+            sessions,
+            "INSERT INTO provider_directory_entity_redirect VALUES ('cms-npd','Location','"
+            + SITE_ID
+            + "','00000000-0000-0000-0000-000000000019')",
+        )
+        with pytest.raises(DirectoryReadError) as error:
+            await read(sessions, _query("sites", "entity", SITE_ID))
+        assert error.value.status == 503
+
+
+@pytest.mark.asyncio
+async def test_exact_non_npi_source_identity_can_prove_a_role_site_pair(monkeypatch, trusted_recipe):
+    from process.network_cms_provider_identity import CMSProviderIdentity
+
+    async def prepare(session):
+        await _prepare_membership(session)
+        provider_id = CMSProviderIdentity("cms-npd", "Practitioner", "practitioner-example").provider_id
+        await session.execute(
+            text(
+                "UPDATE provider_directory_dataset_resource SET payload_json=payload_json::jsonb-'npi' WHERE resource_type='Practitioner'"
+            )
+        )
+        await session.execute(
+            text(
+                "UPDATE provider_directory_cms_npd_resource_witness SET raw_payload_json=raw_payload_json-'identifier' WHERE resource_type='Practitioner'"
+            )
+        )
+        for table in ("network_membership_source", "network_membership", "provider_location_binding"):
+            await session.execute(text("DELETE FROM " + table))
+        await session.execute(
+            text("""INSERT INTO network_membership_source VALUES
+            (1001,'provider_directory',:provider_id,:site,encode(sha256(convert_to(jsonb_build_array(
+              'synthetic-dataset','cms-npd',repeat('a',64),'PractitionerRole','role-example',repeat('b',64),
+              1001,'provider_directory',CAST(:provider_id AS text),'Practitioner','practitioner-example',repeat('b',64),CAST(:site AS uuid))::text,'UTF8')),'hex'))"""),
+            {"provider_id": provider_id, "site": UUID(SITE_ID)},
+        )
+        await session.execute(text("INSERT INTO network_membership SELECT * FROM network_membership_source"))
+        await session.execute(
+            text(
+                "INSERT INTO provider_location_binding VALUES ('provider_directory',:provider_id,:site,repeat('d',64),'provider_directory',:provider_id)"
+            ),
+            {"provider_id": provider_id, "site": UUID(SITE_ID)},
+        )
+
+    async with cms_database(monkeypatch, prepare=prepare) as sessions:
+        assert [site_entry["id"] for site_entry in (await read(sessions, _query("sites")))["items"]] == [SITE_ID]
+        assert len((await read(sessions, _query("practitioner-roles")))["items"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_selected_plan_issuer_expands_exact_source_organization(monkeypatch, trusted_recipe):
+    from tests.test_provider_directory_cms_payers import _add_second_payer
+
+    async def prepare(session):
+        await _prepare(session)
+        metadata_by_field = await session.scalar(
+            text("SELECT publication_metadata_summary_json FROM provider_directory_endpoint_dataset")
+        )
+        await _add_second_payer(session)
+        metadata_by_field["source_release"]["files"]["01-Organization.ndjson"].update(row_count=2, distinct_count=2)
+        metadata_by_field["provider_directory_content_proof_admission_summary_v1"]["resource_counts"][
+            "Organization"
+        ] = 2
+        metadata_by_field["provider_directory_content_proof_admission_summary_v1"]["resource_count"] = 10
+        await session.execute(
+            text(
+                "UPDATE provider_directory_endpoint_dataset SET resource_count=10, publication_metadata_summary_json=CAST(:metadata AS jsonb)"
+            ),
+            {"metadata": json.dumps(metadata_by_field)},
+        )
+        await session.execute(
+            text("""UPDATE provider_directory_dataset_resource SET payload_json=
+            jsonb_set(payload_json::jsonb,'{owned_by_ref}','"Organization/second-org"') WHERE resource_id='plan-example'""")
+        )
+        await reseal(session)
+
+    async with cms_database(monkeypatch, prepare=prepare) as sessions:
+        assert [payer_entry["id"] for payer_entry in (await read(sessions, _query("payers")))["items"]] == [
+            "A_existing_payer"
+        ]
+        organizations = await read(sessions, _query("organizations", limit=100))
+        assert {organization_entry["id"] for organization_entry in organizations["items"]} == {
+            ORG_ID,
+            "00000000-0000-0000-0000-000000000011",
+        }
+
+
+@pytest.mark.asyncio
+async def test_missing_pinned_membership_heap_is_explicitly_unavailable(monkeypatch, trusted_recipe):
+    async with cms_database(monkeypatch, prepare=_prepare_membership) as sessions:
+        await change(sessions, "DROP TABLE network_membership_source")
+        with pytest.raises(DirectoryReadError) as error:
+            await read(sessions, _query("sites"))
+        assert error.value.status == 503
+
+
+@pytest.mark.asyncio
+async def test_scoped_control_rows_change_generation_without_count_change(monkeypatch, trusted_recipe):
+    async with cms_database(monkeypatch, prepare=_prepare) as sessions:
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text("INSERT INTO provider_directory_entity_redirect VALUES ('cms-npd','Organization',:old,:target)"),
+                {"old": UUID(ORG_ID), "target": UUID(SITE_ID)},
+            )
+        first = await read(sessions, _query())
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text(
+                    "UPDATE provider_directory_entity_redirect SET canonical_entity_id=:target WHERE old_entity_id=:old"
+                ),
+                {"old": UUID(ORG_ID), "target": UUID(NETWORK_ID)},
+            )
+        second = await read(sessions, _query())
+        assert first["generation_id"] != second["generation_id"]
+        with pytest.raises(DirectoryReadError) as stale:
+            await read(sessions, replace(_query(), generation_id=first["generation_id"]))
+        assert stale.value.status == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound", ["rows", "bytes"])
+async def test_scoped_control_digest_refuses_native_bounds(monkeypatch, trusted_recipe, bound):
+    async with cms_database(monkeypatch, prepare=_prepare) as sessions:
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text(
+                    "ALTER TABLE provider_directory_entity_redirect_decision ADD COLUMN old_entity_id uuid, ADD COLUMN review_actor text"
+                )
+            )
+            rows, size = (5001, 1) if bound == "rows" else (1, 1048576)
+            await session.execute(
+                text(
+                    "INSERT INTO provider_directory_entity_redirect_decision SELECT md5(unit::text)::uuid,'cms-npd',CAST(:old AS uuid),repeat('x',:size) FROM generate_series(1,:rows) unit"
+                ),
+                {"old": ORG_ID, "size": size, "rows": rows},
+            )
+        with pytest.raises(DirectoryReadError) as refused:
+            await read(sessions, _query())
+        assert refused.value.status == 503
+
+
+async def _prepare_new_network_role(session):
+    await session.execute(text("DELETE FROM provider_directory_insurance_network_plan_evidence"))
+    await session.execute(text("DELETE FROM provider_directory_insurance_network_source_binding"))
+    await session.execute(
+        text(
+            "UPDATE provider_directory_dataset_resource SET payload_json="
+            "jsonb_set(payload_json::jsonb, '{network_refs}', '[]'::jsonb) "
+            "WHERE resource_type='InsurancePlan'"
+        )
+    )
+    await session.execute(
+        text(
+            "UPDATE provider_directory_entity_release_evidence SET payload_json="
+            '\'{"type":[{"text":"ntwk"}]}\'::jsonb WHERE resource_type=\'Organization\''
+        )
+    )

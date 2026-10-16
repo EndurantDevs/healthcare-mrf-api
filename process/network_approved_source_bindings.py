@@ -127,8 +127,9 @@ _VALIDATION_SQL = """WITH {bindings},scoped AS MATERIALIZED (
       THEN record_json->'source_scope_json' ELSE '{{}}'::jsonb END AS scope
   ) document WHERE NOT COALESCE(CASE $2
     WHEN 'ptg' THEN (
-      (scope->>'review_type'='published_complete_snapshot_plan'
-        AND scope->>'selection_mode'='complete_snapshot_source_set'
+      ((scope->>'review_type',scope->>'selection_mode') IN (
+          ('published_complete_snapshot_plan','complete_snapshot_source_set'),
+          ('published_allowed_amount_plan','complete_allowed_snapshot_source_set'))
         AND (SELECT array_agg(key ORDER BY key) FROM jsonb_object_keys(scope) key)
           =ARRAY['approval_sha256','plan_id','plan_market_type','review_type','scope_id','selection_mode','snapshot_id']::text[]
         AND NOT EXISTS(SELECT 1 FROM jsonb_each(scope) field WHERE jsonb_typeof(field.value)<>'string')
@@ -137,7 +138,8 @@ _VALIDATION_SQL = """WITH {bindings},scoped AS MATERIALIZED (
         AND scope->>'approval_sha256' ~ '^[0-9a-f]{{64}}$'
         AND char_length(scope->>'snapshot_id') BETWEEN 1 AND 96
         AND char_length(scope->>'plan_id') BETWEEN 1 AND 64
-        AND char_length(scope->>'plan_market_type') BETWEEN 1 AND 32
+        AND char_length(scope->>'plan_market_type') BETWEEN
+          CASE WHEN scope->>'review_type'='published_allowed_amount_plan' THEN 0 ELSE 1 END AND 32
         AND scope->>'plan_market_type'=lower(scope->>'plan_market_type')
         AND NOT EXISTS(SELECT 1 FROM jsonb_each(scope) field WHERE
           btrim(field.value#>>'{{}}',$8)<>field.value#>>'{{}}' OR field.value#>>'{{}}' ~ '[[:cntrl:]]'))
@@ -233,8 +235,8 @@ async def require_approved_network_source_bindings(
             *coordinates.sql_parameters,
             _TRIM_CHARACTERS,
         )
-    except asyncpg.PostgresError, ApprovedMembershipSourceError:
-        raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_unavailable") from None
+    except (asyncpg.PostgresError, ApprovedMembershipSourceError) as error:
+        raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_unavailable") from error
     if checks is None or checks["invalid"]:
         raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_invalid")
     if checks["published_count"]:

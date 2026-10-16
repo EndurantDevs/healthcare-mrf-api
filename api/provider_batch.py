@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -87,7 +87,10 @@ async def read_native_batch(
         identity
         for identity in params["npis"]
         if state.addresses[identity]
-        or (npi.current_network_address_scope() is None and state.details.get(identity) is not None)
+        or (
+            (npi.current_network_address_scope() is None or npi.current_network_address_scope().network_ids is None)
+            and state.details.get(identity) is not None
+        )
     ]
     witness_by_npi = {}
     eligible_npis = await _batch_eligible_npis(
@@ -239,7 +242,9 @@ async def _batch_eligible_npis(
 
 
 async def _imported_batch_npis(context, found, session):
-    eligible = values(column("npi", String), name="native_batch_values").data([(str(value),) for value in found])
+    eligible = values(column("npi", String), name="native_batch_values").data(
+        [(str(value).zfill(10),) for value in found]
+    )
     imported = context.prepared.statement.subquery("batch_imported_values")
     statement = select(eligible.c.npi).select_from(
         eligible.outerjoin(imported, imported.c.entity_value == eligible.c.npi)
@@ -305,20 +310,29 @@ async def _hydrate_native_batch(npis, state, params, native_args, session, *, wi
         )
         if not was_found:
             raise CustomImportReadUnavailableError("native batch provider is unavailable")
-        provider = provider_item["provider"]
-        provider["provider_enrichment"]["ffs_visibility"] = npi._provider_enrichment_visibility(
+        provider_by_field = provider_item["provider"]
+        provider_by_field["provider_enrichment"]["ffs_visibility"] = npi._provider_enrichment_visibility(
             enrichment.get(identity), include_chain=include_chain
         )
         if identity in groups:
-            _apply_premise_groups(provider, groups[identity], hydrated[identity], params)
+            _apply_premise_groups(provider_by_field, groups[identity], hydrated[identity], params)
         if native_args.get("view") == "card":
             first_address = hydrated[identity][0] if hydrated[identity] else {}
             provider_item["provider"] = (
                 dict(witness_rows[identity])
                 if witness_rows and identity in witness_rows
-                else npi._provider_card_from_mapping({**provider, **first_address, "npi": identity})
+                else npi._provider_card_from_mapping({**provider_by_field, **first_address, "npi": identity})
             )
         provider_items.append(provider_item)
+    if native_args.get("view") != "card":
+        provider_rows = await npi._project_provider_network_metadata(
+            [provider_item["provider"] for provider_item in provider_items],
+            session=session,
+            include_sources=params["include_sources"],
+            include_evidence=params["include_evidence"],
+        )
+        for item_by_field, provider_by_field in zip(provider_items, provider_rows, strict=True):
+            item_by_field["provider"] = provider_by_field
     return provider_items
 
 
@@ -462,3 +476,20 @@ async def serve_native_batch(request):
         "view": "summary",
     }
     return response.json(payload, default=str)
+
+
+def native_batch_dba_names(
+    provider_detail_map: Mapping[str, Any],
+    other_names: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Retain reported DBA names before falling back to explicit alias records."""
+    existing_dba_names = [name for name in (provider_detail_map.get("do_business_as") or []) if name]
+    if existing_dba_names:
+        return list(dict.fromkeys(existing_dba_names))
+    return list(
+        dict.fromkeys(
+            entry.get("other_provider_identifier")
+            for entry in other_names
+            if entry.get("other_provider_identifier_type_code") == "3" and entry.get("other_provider_identifier")
+        )
+    )

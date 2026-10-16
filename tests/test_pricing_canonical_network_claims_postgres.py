@@ -150,7 +150,7 @@ async def claims_offices(validation_db, serving_schema, monkeypatch, request):
             await reader_engine.dispose()
 
 
-async def _claims(context, *, selected_network_ids=(42,), **filters):
+async def _claims(context, *, selected_network_ids=(42,), import_context=None, **filters):
     async with async_sessionmaker(context.engine)() as session, session.begin():
         if hasattr(context, "zip_schema"):
             await session.execute(text(f'SET LOCAL search_path TO "{context.zip_schema}", public'))
@@ -171,7 +171,12 @@ async def _claims(context, *, selected_network_ids=(42,), **filters):
         )
         with network_address_read_scope(context.pin, selected_network_ids):
             # The genuine pin was resolved above; only HTTP/control-token middleware is outside this component.
-            reply = await pricing.list_providers_by_procedure.__wrapped__(document)
+            if import_context is None:
+                reply = await pricing.list_providers_by_procedure.__wrapped__(document)
+            else:
+                reply = await pricing.list_providers_by_procedure.__wrapped__(
+                    document, native_args=document.args, import_context=import_context
+                )
         return json.loads(reply.body)
 
 
@@ -264,4 +269,31 @@ async def test_native_canonical_zip_matches_nearby_zcta_without_alternate_centro
     assert item["claims_geography"] == {"city": "Other City", "state": "NJ", "zip5": "07001"}
     assert page["evidence"]["matched_provider_count"] == 1
     beyond = await _claims(context, zip5="10001", zip_radius_miles="10", offset="1")
+    assert beyond["pagination"]["total"] == 1 and beyond["items"] == []
+
+
+async def test_native_import_relation_intersects_exact_network_offices_before_counts(claims_offices):
+    from sqlalchemy import literal, select
+
+    from api.custom_import_provider_service_sql import ProviderServiceImportQuery
+    from process.custom_import.read_core import PreparedNpiEntityRelation
+
+    imported_rows = (
+        select(literal("1111111111").label("entity_value"))
+        .union_all(select(literal("2222222222").label("entity_value")))
+        .subquery()
+    )
+    imported = ProviderServiceImportQuery(
+        PreparedNpiEntityRelation(select(imported_rows.c.entity_value), (), "a" * 64, "b" * 64), True
+    )
+    page = await _claims(claims_offices, import_context=imported, state="NY", zip5="10001", zip_radius_miles="0")
+    assert page["pagination"]["total"] == 1
+    assert [item["npi"] for item in page["items"]] == [1111111111]
+    assert [office["location_key"] for office in page["items"][0]["locations"]] == ["a" * 64]
+    hidden_only = ProviderServiceImportQuery(
+        PreparedNpiEntityRelation(select(literal("2222222222").label("entity_value")), (), "c" * 64, "d" * 64), True
+    )
+    hidden = await _claims(claims_offices, import_context=hidden_only)
+    assert hidden["pagination"]["total"] == 0 and hidden["items"] == []
+    beyond = await _claims(claims_offices, import_context=imported, offset="1")
     assert beyond["pagination"]["total"] == 1 and beyond["items"] == []

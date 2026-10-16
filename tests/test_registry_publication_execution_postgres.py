@@ -866,7 +866,14 @@ async def test_source_preview_actual_aca_latest_manual_diff_ready_without_public
         "removals",
         "unresolved_rows",
         "source_selection",
+        "diff_version",
+        "changes",
+        "samples",
+        "validation",
     }
+    assert result_by_name["diff_version"] == 1
+    assert result_by_name["validation"]["state"] == "ready"
+    assert all(result_by_name["validation"][field] is True for field in ("validated", "index_ready", "writer_closed"))
     assert (result_by_name["additions"], result_by_name["removals"], result_by_name["unresolved_rows"]) == (2, 1, 0)
     assert result_by_name["source_selection"] == {"mapped_rows": 2, "omitted_rows": 0}
     candidate = await fixture.connection.fetchrow(
@@ -1333,3 +1340,235 @@ async def test_revocation_during_company_fence_preserves_approval(pipeline_db, s
             await asyncio.gather(pending, return_exceptions=True)
     assert len(calls) == 3 and all(call == calls[0] for call in calls)
     await _assert_revoked_execution_unchanged(fixture, lease, before, history_count)
+
+
+async def _preview_diff_tables(fixture):
+    schemas = ["preview_diff_" + uuid4().hex for _ in range(2)]
+    for schema in schemas:
+        await fixture.connection.execute(f'CREATE SCHEMA "{schema}"')
+        fixture.additional_schemas.append(schema)
+        await fixture.connection.execute(
+            f'CREATE TABLE "{schema}".network_membership '
+            f'(LIKE "{fixture.copy_target.schema_name}".network_membership INCLUDING ALL)'
+        )
+    return schemas
+
+
+async def _copy_preview_rows(connection, schema, rows):
+    await connection.copy_records_to_table(
+        "network_membership",
+        schema_name=schema,
+        columns=("network_id", "provider_system", "provider_id", "location_id", "evidence_id"),
+        records=rows,
+    )
+
+
+async def test_source_preview_diff_compares_evidence_sets_and_exact_offices(publication_db):
+    fixture = publication_db
+    current, proposed = await _preview_diff_tables(fixture)
+    provider = str(uuid4())
+    office, removed, added = uuid4(), uuid4(), uuid4()
+    shared = (1, "manual", provider, office)
+    unchanged = (2, "manual", provider, office)
+    await _copy_preview_rows(
+        fixture.connection,
+        current,
+        [
+            (*shared, "old"),
+            (*unchanged, "x"),
+            (*unchanged, "y"),
+            (*unchanged, "x"),
+            (3, "manual", provider, removed, "office"),
+        ],
+    )
+    proposed_rows = [
+        (*shared, "new"),
+        (*unchanged, "y"),
+        (*unchanged, "x"),
+        (*unchanged, "y"),
+        (3, "manual", provider, added, "office"),
+    ]
+    await _copy_preview_rows(fixture.connection, proposed, proposed_rows)
+    receipt = await execution._source_rollback_difference(
+        fixture.connection, {"schema_name": proposed}, SimpleNamespace(schema_name=current)
+    )
+    assert (receipt["additions"], receipt["removals"], receipt["changes"]) == (1, 1, 1)
+    assert receipt["samples"] == {
+        "additions": [[3, "manual", provider, str(added)]],
+        "removals": [[3, "manual", provider, str(removed)]],
+        "changes": [[1, "manual", provider, str(office)]],
+    }
+    await _copy_preview_rows(fixture.connection, proposed, list(reversed(proposed_rows)))
+    assert (
+        await execution._source_rollback_difference(
+            fixture.connection, {"schema_name": proposed}, SimpleNamespace(schema_name=current)
+        )
+        == receipt
+    )
+
+
+@pytest.mark.parametrize("long_identity", [False, True])
+async def test_preview_samples_are_bounded(publication_db, long_identity):
+    fixture = publication_db
+    current, proposed = await _preview_diff_tables(fixture)
+    provider = "界" * 341 if long_identity else "source-provider"
+    office = uuid4()
+    unit = lambda number: (number, "provider_directory", provider, office)
+    await _copy_preview_rows(
+        fixture.connection, current, [(*unit(number), "old") for number in (*range(1, 36), *range(101, 136))]
+    )
+    await _copy_preview_rows(
+        fixture.connection, proposed, [(*unit(number), "new") for number in (*range(201, 236), *range(101, 136))]
+    )
+    receipt = await execution._source_rollback_difference(
+        fixture.connection, {"schema_name": proposed}, SimpleNamespace(schema_name=current)
+    )
+    assert all(receipt[category] == 35 for category in ("additions", "removals", "changes"))
+    assert len(execution._json(receipt["samples"]).encode("utf-8")) <= 60 * 1024
+    for category, start in (("additions", 201), ("removals", 1), ("changes", 101)):
+        samples = receipt["samples"][category]
+        assert len(samples) <= 20
+        assert samples == [
+            [number, "provider_directory", provider, str(office)] for number in range(start, start + len(samples))
+        ]
+    assert (
+        sum(map(len, receipt["samples"].values())) < 60
+        if long_identity
+        else all(len(sample_units) == 20 for sample_units in receipt["samples"].values())
+    )
+    assert (
+        await execution._source_rollback_difference(
+            fixture.connection, {"schema_name": proposed}, SimpleNamespace(schema_name=current)
+        )
+        == receipt
+    )
+
+
+def _invalid_preview_samples(result_by_name):
+    invalid_receipts = []
+    sample_unit_fields = [1, "manual", str(uuid4()), str(uuid4())]
+    malformed_units = [
+        [True, *sample_unit_fields[1:]],
+        [0, *sample_unit_fields[1:]],
+        [2**31, *sample_unit_fields[1:]],
+        [1, "other", *sample_unit_fields[2:]],
+        [1, "manual", "", sample_unit_fields[3]],
+        [1, "manual", "x" * 1025, sample_unit_fields[3]],
+        [*sample_unit_fields[:3], "00000000-0000-0000-0000-000000000000"],
+        sample_unit_fields[:3],
+    ]
+    invalid_receipts.extend({"samples": {"additions": [bad], "removals": [], "changes": []}} for bad in malformed_units)
+    invalid_receipts.extend(
+        [
+            {"samples": {"additions": [sample_unit_fields, sample_unit_fields], "removals": [], "changes": []}},
+            {
+                "samples": {
+                    "additions": [[2, *sample_unit_fields[1:]], sample_unit_fields],
+                    "removals": [],
+                    "changes": [],
+                }
+            },
+            {"samples": {"additions": [sample_unit_fields] * 21, "removals": [], "changes": []}, "additions": 21},
+            {"samples": {"additions": [sample_unit_fields], "removals": [sample_unit_fields], "changes": []}},
+            {"validation": {**result_by_name["validation"], "membership_rows": True}},
+            {"validation": {**result_by_name["validation"], "projected_locations": 2**53}},
+            {"validation": {**result_by_name["validation"], "membership_rows": 0}},
+        ]
+    )
+    oversized_by_category = {
+        category: [
+            [number + offset, "provider_directory", "界" * 341, sample_unit_fields[3]] for number in range(1, 21)
+        ]
+        for category, offset in (("additions", 0), ("removals", 100), ("changes", 200))
+    }
+    invalid_receipts.append({"samples": oversized_by_category, "additions": 20, "removals": 20, "changes": 20})
+    return invalid_receipts
+
+
+async def test_source_preview_retained_legacy_result_and_closed_diff_validation(source_preview):
+    history, command, _actor, _queued, lease = source_preview
+    fixture = history.fixture
+    result_by_name = await _complete_source_preview(source_preview, _reactivation_authority([]))
+    command, _actor = execution._retained_operation_record(lease, "prepare_source_rollback")
+    legacy_by_name = {
+        key: field_value
+        for key, field_value in result_by_name.items()
+        if key not in {"diff_version", "changes", "samples", "validation"}
+    }
+    execution._source_rollback_result(legacy_by_name, command, "completed")
+    invalid_receipts = [
+        {"diff_version": True},
+        {"diff_version": 2},
+        {"changes": True},
+        {"changes": 2**53},
+        {"samples": {"additions": [], "removals": []}},
+        {"samples": {"additions": [[True, "manual", str(uuid4()), str(uuid4())]], "removals": [], "changes": []}},
+        {"validation": {**result_by_name["validation"], "validated": 1}},
+        {"validation": {**result_by_name["validation"], "unknown_network_rows": 1}},
+        {"validation": {**result_by_name["validation"], "state": "sealed"}},
+        {"validation": {**result_by_name["validation"], "unexpected": True}},
+    ]
+    invalid_receipts.extend(_invalid_preview_samples(result_by_name))
+    for changed in invalid_receipts:
+        with pytest.raises(ValueError, match="source_rollback_result_invalid"):
+            execution._source_rollback_result({**result_by_name, **changed}, command, "completed")
+    with pytest.raises(ValueError, match="source_rollback_result_invalid"):
+        execution._source_rollback_result({**legacy_by_name, "changes": 0}, command, "completed")
+    await _assert_legacy_preview_status(fixture, lease, legacy_by_name)
+
+
+async def _assert_legacy_preview_status(fixture, lease, legacy_by_name):
+    await fixture.connection.execute(
+        f'UPDATE "{fixture.control_schema}".registry_publication_request SET result_json=$1::jsonb WHERE request_id=$2',
+        json.dumps(legacy_by_name),
+        lease["request_id"],
+    )
+    assert (
+        await read_registry_publication_request(
+            fixture.connection, lease["request_id"], control_schema=fixture.control_schema
+        )
+    )["result"] == legacy_by_name
+
+
+@pytest.mark.parametrize("damage", ["validation", "index_readiness", "writer_closure"])
+async def test_source_preview_malformed_candidate_never_claims_ready_or_changes_head(
+    source_preview, monkeypatch, damage
+):
+    history, _command, _actor, _queued, lease = source_preview
+    fixture = history.fixture
+    prepare = execution.prepare_network_candidate
+
+    async def damaged_prepare(*arguments, **options):
+        receipt = await prepare(*arguments, **options)
+        row = await fixture.connection.fetchrow(
+            f'SELECT candidate_id,validation_json FROM "{fixture.control_schema}".network_membership_candidate WHERE dataset_id=$1',
+            uuid5(lease["request_id"], "dataset"),
+        )
+        candidate_id = row["candidate_id"]
+        report = json.loads(row["validation_json"])
+        if damage == "validation":
+            report["valid"] = False
+        elif damage == "index_readiness":
+            report["serving_readiness"]["ready"] = False
+        else:
+            report.pop("writer_closure")
+        await fixture.connection.execute(
+            f'UPDATE "{fixture.control_schema}".network_membership_candidate SET validation_json=$1::jsonb WHERE candidate_id=$2',
+            json.dumps(report),
+            candidate_id,
+        )
+        return receipt
+
+    monkeypatch.setattr(execution, "prepare_network_candidate", damaged_prepare)
+    with pytest.raises(ValueError):
+        await _complete_source_preview(source_preview, _reactivation_authority([]))
+    assert (
+        await fixture.connection.fetchval(
+            f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control WHERE id=1'
+        )
+        == history.second.generation_id
+    )
+    status = await read_registry_publication_request(
+        fixture.connection, lease["request_id"], control_schema=fixture.control_schema
+    )
+    assert status["state"] == "running" and status["result"] is None

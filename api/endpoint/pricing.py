@@ -71,6 +71,7 @@ from api.plan_pricing_state_scan import (
     PlanPricingStateScanBudgetExceeded,
     is_plan_pricing_state_scan,
     search_plan_pricing_state_scan,
+    validate_state_scan_transport,
 )
 from api.plan_release_readiness import is_release_binding_serving_scope_exact
 from api.plan_release_serving import (
@@ -79,6 +80,7 @@ from api.plan_release_serving import (
     binding_query_args,
     has_conflicting_release_selectors,
     normalize_plan_release_id,
+    prepare_plan_release_bindings,
     resolve_plan_release_serving,
 )
 from api.plan_release_serving_resolution import (
@@ -88,6 +90,11 @@ from api.plan_release_serving_resolution import (
 from api.provider_demographic_filters import (
     normalize_provider_sex_code,
     provider_sex_exists_sql,
+)
+from api.provider_group_plan_network_read import (
+    group_plan_address_source,
+    group_plan_arguments,
+    group_plan_release_bindings,
 )
 from api.provider_service_code_coverage import add_provider_service_summary
 from api.provider_service_scope import (
@@ -6034,6 +6041,10 @@ async def _allowed_amount_address_table(
     session,
     args: Mapping[str, Any],
 ) -> str | None:
+    from api.provider_allowed_amount_policy import allowed_address_relation, current_network_address_scope
+
+    if current_network_address_scope() is not None:
+        return allowed_address_relation(PTG2_SCHEMA)
     if not _has_allowed_amount_address_filter(args):
         return None
     has_geo_filter = any(args.get(parameter_name) not in (None, "", "null") for parameter_name in ("lat", "long"))
@@ -6135,6 +6146,7 @@ def _allowed_amount_spatial_filter_sql(
     *,
     uses_unified_addresses: bool,
     parameter_map: dict[str, Any],
+    office_inputs=None,
 ) -> tuple[str, list[str]]:
     """Build spatial predicates shared by allowed-amount page and count SQL."""
 
@@ -6153,6 +6165,11 @@ def _allowed_amount_spatial_filter_sql(
         )
         zip_predicate = f"{zip_sql} = :allowed_zip5"
     if uses_unified_addresses and (zip_predicate or geo_predicates):
+        if office_inputs is not None:
+            from api.provider_allowed_amount_policy import allowed_spatial_predicate
+
+            coherence_sql = allowed_spatial_predicate(office_inputs, PTG2_SCHEMA, zip_predicate, geo_predicates)
+            return distance_sql, [coherence_sql] if coherence_sql else []
         coherence_sql = provider_address_location_filter_sql(
             "addr",
             schema_name=PTG2_SCHEMA,
@@ -6175,53 +6192,18 @@ def _allowed_amount_location_join_sql(
     address_predicates: list[str],
     address_rank_sql: str | None,
     distance_sql: str,
+    reference_join_sql: str = "",
 ) -> str:
-    """Render the indexed best-address lateral lookup."""
+    from api.provider_allowed_amount_policy import allowed_location_join_sql
 
-    zip5_sql = _ptg2_address_zip5_sql(
-        "addr",
-        unified=uses_unified_addresses,
+    return allowed_location_join_sql(
+        address_table=address_table,
+        zip5_sql=_ptg2_address_zip5_sql("addr", unified=uses_unified_addresses),
+        address_predicates=address_predicates,
+        address_rank_sql=address_rank_sql,
+        distance_sql=distance_sql,
+        reference_join_sql=reference_join_sql,
     )
-    address_rank_order_sql = f"{address_rank_sql},\n               " if address_rank_sql else ""
-    return f"""
-    LEFT JOIN LATERAL (
-        SELECT
-            addr.npi,
-            addr.state_name AS state,
-            addr.city_name AS city,
-            {zip5_sql} AS zip5,
-            {distance_sql} AS distance_miles,
-            jsonb_build_object(
-                'first_line', addr.first_line,
-                'second_line', addr.second_line,
-                'city', addr.city_name,
-                'state', addr.state_name,
-                'postal_code', addr.postal_code,
-                'country_code', addr.country_code,
-                'telephone_number', addr.telephone_number,
-                'fax_number', addr.fax_number,
-                'phone_number', addr.phone_number,
-                'phone_extension', addr.phone_extension,
-                'fax_number_digits', addr.fax_number_digits,
-                'fax_extension', addr.fax_extension,
-                'address_key', addr.address_key::text,
-                'lat', addr.lat,
-                'long', addr.long
-            )::text AS address_payload
-          FROM {address_table} addr
-         WHERE {" AND ".join(address_predicates)}
-         ORDER BY
-               {address_rank_order_sql}{distance_sql} ASC NULLS LAST,
-               CASE addr.type
-                   WHEN 'practice' THEN 0
-                   WHEN 'site' THEN 1
-                   WHEN 'primary' THEN 2
-                   ELSE 3
-               END,
-               addr.checksum
-         LIMIT 1
-    ) allowed_location ON TRUE
-    """
 
 
 def _allowed_amount_location_sql(
@@ -6229,12 +6211,13 @@ def _allowed_amount_location_sql(
     *,
     address_table: str | None,
     parameter_map: dict[str, Any],
+    office_inputs=None,
 ) -> tuple[str, str, str]:
     """Build one indexed per-NPI address lookup and its required-match clause."""
 
     if not address_table:
         return "", _ALLOWED_AMOUNT_EMPTY_LOCATION_SELECT_SQL, ""
-    uses_unified_addresses = _is_unified_address_table(address_table)
+    uses_unified_addresses = office_inputs is not None or _is_unified_address_table(address_table)
     parameter_map["allowed_address_types"] = (
         ["practice", "primary", "secondary", "site"] if uses_unified_addresses else ["primary", "secondary"]
     )
@@ -6243,7 +6226,12 @@ def _allowed_amount_location_sql(
         "addr.type = ANY(CAST(:allowed_address_types AS varchar[]))",
     ]
     if uses_unified_addresses and _has_allowed_amount_address_filter(args):
-        address_predicates.append(_ptg2_geo_assured_address_sql("addr"))
+        if office_inputs is not None:
+            from api.provider_allowed_amount_policy import allowed_geo_evidence
+
+            address_predicates.append(allowed_geo_evidence(office_inputs, PTG2_SCHEMA))
+        else:
+            address_predicates.append(_ptg2_geo_assured_address_sql("addr"))
     _append_allowed_amount_text_location_filters(
         args,
         parameter_map,
@@ -6253,18 +6241,26 @@ def _allowed_amount_location_sql(
         args,
         uses_unified_addresses=uses_unified_addresses,
         parameter_map=parameter_map,
+        office_inputs=office_inputs,
     )
     if uses_unified_addresses and _has_allowed_amount_address_filter(args) and not spatial_predicates:
         address_predicates.append(f"NOT {postal_box_address_sql('addr')}")
     address_predicates.extend(spatial_predicates)
+    from api.provider_allowed_amount_policy import allowed_geo_joins
+
     join_sql = _allowed_amount_location_join_sql(
         address_table=address_table,
         uses_unified_addresses=uses_unified_addresses,
         address_predicates=address_predicates,
         address_rank_sql=(None if _has_allowed_amount_address_filter(args) else address_display_rank_sql("addr")),
         distance_sql=distance_sql,
+        reference_join_sql=("\n" + allowed_geo_joins(office_inputs, PTG2_SCHEMA) if office_inputs is not None else ""),
     )
-    required_sql = "AND allowed_location.npi IS NOT NULL" if _has_allowed_amount_address_filter(args) else ""
+    required_sql = (
+        "AND allowed_location.npi IS NOT NULL"
+        if office_inputs is not None or _has_allowed_amount_address_filter(args)
+        else ""
+    )
     return join_sql, _ALLOWED_AMOUNT_LOCATION_SELECT_SQL, required_sql
 
 
@@ -6648,6 +6644,7 @@ def _allowed_amount_page_sql(
     *,
     address_table: str | None,
     parameter_map: dict[str, Any],
+    office_inputs=None,
 ) -> Any:
     """Build the exact provider page query after adding request parameters."""
 
@@ -6655,6 +6652,7 @@ def _allowed_amount_page_sql(
         args,
         address_table=address_table,
         parameter_map=parameter_map,
+        office_inputs=office_inputs,
     )
     replacement_sql_by_marker = {
         "__PROVIDER_NAME_SQL__": _ptg2_provider_name_sql("npi_data"),
@@ -6675,35 +6673,16 @@ def _allowed_amount_page_sql(
     page_sql = _ALLOWED_AMOUNT_PAGE_SQL_TEMPLATE
     for marker, replacement_sql in replacement_sql_by_marker.items():
         page_sql = page_sql.replace(marker, replacement_sql)
+    if office_inputs is not None:
+        for role in ("npi_taxonomy", "nucc_taxonomy", "npi"):
+            page_sql = page_sql.replace(f"{PTG2_SCHEMA}.{role} ", office_inputs.relation(role) + " ")
     return text(page_sql)
 
 
 def _allowed_amount_detail_sql() -> Any:
-    return text(
-        f"""
-        WITH {_ALLOWED_AMOUNT_SCOPE_CTES_SQL},
-        ranked_evidence AS (
-            SELECT
-                evidence.*,
-                ROW_NUMBER() OVER (
-                    PARTITION BY evidence.npi
-                    ORDER BY
-                          evidence.allowed_amount ASC NULLS LAST,
-                          evidence.billed_charge ASC NULLS LAST,
-                          evidence.source_key,
-                          evidence.snapshot_id,
-                          evidence.tin_type,
-                          evidence.tin_value
-                ) AS evidence_rank
-              FROM matching_evidence evidence
-             WHERE evidence.npi = ANY(CAST(:page_npis AS bigint[]))
-        )
-        SELECT *
-          FROM ranked_evidence
-         WHERE evidence_rank <= :detail_limit
-         ORDER BY npi, evidence_rank
-        """
-    )
+    from api.provider_allowed_amount_policy import allowed_detail_statement
+
+    return allowed_detail_statement(_ALLOWED_AMOUNT_SCOPE_CTES_SQL)
 
 
 def _allowed_amount_query_params(
@@ -6880,6 +6859,8 @@ def _allowed_amount_no_match_response(
 ) -> dict[str, Any]:
     """Return a resolved empty result for an exact canonical release."""
 
+    from api.provider_allowed_amount_policy import allowed_contributors
+
     plan_id, code, code_system, _npi_filter = search_scope
     binding_sources = [
         {
@@ -6889,7 +6870,7 @@ def _allowed_amount_no_match_response(
             "plan_market_type": binding.plan_market_type,
             "role": binding.role,
         }
-        for binding in selection.allowed_amount_bindings
+        for binding in allowed_contributors(selection, args)
     ]
     network_context = _allowed_amount_network_context(())
     query_by_field = _allowed_amount_response_query(
@@ -6939,7 +6920,13 @@ async def _allowed_amount_page_rows(
     search_scope: tuple[str, str, str, int | None],
     current_snapshots: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    from api.provider_allowed_amount_policy import allowed_office_inputs, allowed_policy_parameters
+
     plan_id, code, code_system, npi_filter = search_scope
+    try:
+        office_inputs = await allowed_office_inputs(session)
+    except PlanPricingProjectionUnavailable as error:
+        raise sanic.exceptions.ServiceUnavailable("Managed allowed offices are unavailable.") from error
     address_table = await _allowed_amount_address_table(session, args)
     if _has_allowed_amount_address_filter(args) and not address_table:
         return None
@@ -6952,10 +6939,12 @@ async def _allowed_amount_page_rows(
         npi=npi_filter,
         current_snapshots=current_snapshots,
     )
+    query_parameter_map = allowed_policy_parameters(query_parameter_map)
     page_query = _allowed_amount_page_sql(
         args,
         address_table=address_table,
         parameter_map=query_parameter_map,
+        office_inputs=office_inputs,
     )
     page_result = await session.execute(page_query, query_parameter_map)
     return (
@@ -7026,6 +7015,9 @@ async def _resolve_allowed_amount_route(
     *,
     release_selection: PlanReleaseServingSelection | None | object = (_RELEASE_SELECTION_UNSET),
 ) -> tuple[Mapping[str, Any], PlanReleaseServingSelection | None] | None:
+    from api import provider_allowed_amount_policy as allowed
+
+    is_managed = allowed.current_network_address_scope() is not None
     requested_release_id = str(args.get("plan_release_id") or "").strip()
     is_release_selection_supplied = release_selection is not _RELEASE_SELECTION_UNSET
     if is_release_selection_supplied and (
@@ -7033,8 +7025,10 @@ async def _resolve_allowed_amount_route(
         or not requested_release_id
         or release_selection.plan_release_id != requested_release_id
     ):
-        return None
+        return allowed.unavailable_route()
     if not requested_release_id:
+        if is_managed:
+            raise sanic.exceptions.ServiceUnavailable("Managed allowed release is unavailable.")
         return args, None
     if has_conflicting_release_selectors(args):
         return None
@@ -7042,15 +7036,20 @@ async def _resolve_allowed_amount_route(
         release_selection = await resolve_plan_release_serving(
             session,
             requested_release_id,
+            **({"projection_only": True} if is_managed else {}),
         )
-    if release_selection is None:
+    if release_selection is None or not isinstance(release_selection, PlanReleaseServingSelection):
+        return allowed.unavailable_route()
+    original_bindings = release_selection.allowed_amount_bindings
+    try:
+        allowed_bindings = await allowed.admitted_allowed_amount_bindings(session, release_selection)
+    except PlanPricingProjectionUnavailable as error:
+        raise sanic.exceptions.ServiceUnavailable("Managed allowed sources are unavailable.") from error
+    if not original_bindings:
         return None
-    if not isinstance(release_selection, PlanReleaseServingSelection):
-        return None
-    allowed_bindings = release_selection.allowed_amount_bindings
-    if not allowed_bindings:
-        return None
-    resolved_args_by_name = binding_query_args(args, allowed_bindings[0])
+    resolved_args_by_name = binding_query_args(args, allowed_bindings[0] if allowed_bindings else original_bindings[0])
+    if is_managed:
+        resolved_args_by_name["_managed_allowed_bindings"] = allowed_bindings
     resolved_args_by_name["_plan_release_allowed_bindings"] = [
         {
             "source_key": binding.source_key,
@@ -7069,6 +7068,8 @@ async def _allowed_amount_snapshot_rows(
     plan_id: str,
     release_selection: PlanReleaseServingSelection | None,
 ) -> list[dict[str, Any]]:
+    from api.provider_allowed_amount_policy import allowed_contributors
+
     if release_selection is not None:
         return [
             {
@@ -7077,7 +7078,7 @@ async def _allowed_amount_snapshot_rows(
                 "plan_id": binding.plan_id,
                 "plan_market_type": binding.plan_market_type,
             }
-            for binding in release_selection.allowed_amount_bindings
+            for binding in allowed_contributors(release_selection, resolved_args)
         ]
     return await _current_allowed_amount_snapshots_for_plan(
         session,
@@ -7135,6 +7136,10 @@ async def _search_ptg_allowed_amount_evidence(
         release_selection,
     )
     if not current_snapshots:
+        from api.provider_allowed_amount_policy import current_network_address_scope
+
+        if current_network_address_scope() is not None and release_selection is not None:
+            return _allowed_amount_release_response(None, resolved_args, pagination, release_selection, search_scope)
         return None
     page_search = await _allowed_amount_page_rows(
         session,
@@ -7673,61 +7678,51 @@ def _annotate_ptg2_result_state(
 
 
 @blueprint.get("/group-plan-providers", name="pricing.group_plan_providers")
-async def group_plan_providers(request):
-    """Enumerate ALL distinct in-network provider NPIs for an imported MRF/PTG
-    group plan, keyed by EIN plan_id + market_type, keyset-paginated by NPI.
-
-    Resolves ALL of the plan's published serving snapshots (one per network
-    source) via ptg2_current_plan_source and unions their shared NPI scopes. The
-    zip5 filter widens to zip_radius_miles (default 10) around the ZIP. The
-    PTG2 serving search itself hard-requires a procedure code, so this is the only
-    path that can answer "all providers for this group plan" for any API client.
-    """
+async def group_plan_providers(request, *, native_args=None):
+    """Enumerate distinct plan providers across admitted sources, keyset-paginated by NPI."""
+    args = group_plan_arguments(request, native_args)
     session = _get_session(request)
-    # Keep the parameter visible to the route/OpenAPI parity scanner; the
-    # shared validator below also checks incompatible raw selectors.
-    request.args.get("plan_release_id")
-    plan_release_id = _validated_plan_release_id(request.args)
-    plan_id = (request.args.get("plan_id") or "").strip()
+    managed_addresses = group_plan_address_source(PRICING_SCHEMA)
+    # Keep the release parameter visible to the OpenAPI scanner.
+    args.get("plan_release_id")
+    plan_release_id = _validated_plan_release_id(args)
+    plan_id = (args.get("plan_id") or "").strip()
     if not plan_id and not plan_release_id:
         raise InvalidUsage("plan_id (EIN) or plan_release_id is required")
-    market_type = (request.args.get("market_type") or "group").strip().lower()
+    market_type = (args.get("market_type") or "group").strip().lower()
     try:
-        limit = int(request.args.get("limit") or 200)
+        limit = int(args.get("limit") or 200)
     except TypeError, ValueError:
         limit = 200
     limit = max(1, min(limit, 1000))
-    cursor_raw = (request.args.get("cursor") or "").strip()
+    cursor_raw = (args.get("cursor") or "").strip()
     try:
         cursor_npi = int(cursor_raw) if cursor_raw else 0
     except TypeError, ValueError:
         cursor_npi = 0
-    include_enrichment = (request.args.get("enrich") or "").strip().lower() in (
+    include_enrichment = (args.get("enrich") or "").strip().lower() in (
         "1",
         "true",
         "yes",
     )
-    city = (request.args.get("city") or "").strip().lower()
-    state = (request.args.get("state") or "").strip().upper()
-    zip5 = _normalize_zip5(request.args.get("zip5"))
-    # This route expands a ZIP into nearby ZIP codes before address filtering.
-    # zip_radius_miles=0 restores exact matching. It does not use the
-    # point-coherence contract of search-by-procedure.
+    city = (args.get("city") or "").strip().lower()
+    state = (args.get("state") or "").strip().upper()
+    zip5 = _normalize_zip5(args.get("zip5"))
+    # Expand nearby ZIPs; radius zero restores exact matching without point-distance semantics.
     zip_radius_miles = _parse_zip_radius_miles(
-        request.args.get("zip_radius_miles"),
+        args.get("zip_radius_miles"),
         param="zip_radius_miles",
         default=10.0 if zip5 else 0.0,
     )
     include_mail_addresses = _parse_bool(
-        request.args.get("include_mail_addresses"),
+        args.get("include_mail_addresses"),
         "include_mail_addresses",
         default=False,
     )
-    provider_sex_code = normalize_provider_sex_code(request.args.get("provider_sex_code"))
-    specialty_filter = await _resolve_ptg_specialty_or_raise(session, request.args)
+    provider_sex_code = normalize_provider_sex_code(args.get("provider_sex_code"))
+    specialty_filter = await _resolve_ptg_specialty_or_raise(session, args)
     specialty_warning = None
-
-    requested_source_key = (request.args.get("source_key") or "").strip().lower()
+    requested_source_key = (args.get("source_key") or "").strip().lower()
     release_selection = None
     resolved_plan_ids = [plan_id] if plan_id else []
     resolved_market_types = [market_type] if market_type and not plan_release_id else []
@@ -7738,7 +7733,12 @@ async def group_plan_providers(request):
             plan_release_id,
         )
         release_bindings = release_selection.in_network_bindings if release_selection is not None else ()
-        snapshot_pairs = [(binding.source_key, binding.snapshot_id) for binding in release_bindings]
+        contributing_bindings = await group_plan_release_bindings(session, release_selection)
+        try:
+            release_selection = await prepare_plan_release_bindings(session, release_selection, contributing_bindings)
+        except PlanPricingProjectionUnavailable:
+            raise sanic.exceptions.ServiceUnavailable("Managed group directory sources are unavailable.") from None
+        snapshot_pairs = [(binding.source_key, binding.snapshot_id) for binding in contributing_bindings]
         if release_bindings:
             resolved_plan_ids = sorted({binding.plan_id for binding in release_bindings})
             resolved_market_types = sorted(
@@ -7782,16 +7782,14 @@ async def group_plan_providers(request):
             "exhausted": True,
             "query": {"status": ("no_match" if is_canonical_release_resolved else "no_route")},
         }
+        if managed_addresses is not None and (args.get("count") or "").strip().lower() in ("1", "true", "yes"):
+            no_route_by_field["providers"].update(total_distinct=0, total=0)
         if release_selection is not None:
-            annotate_plan_release_response(no_route_by_field, release_selection)
+            annotate_plan_release_response(
+                no_route_by_field, release_selection, contributing_bindings=contributing_bindings
+            )
         return response.json(no_route_by_field)
     selected_source_key, snapshot_id = snapshot_pairs[0]
-
-    # A plan served by multiple networks (e.g. a medical network plus a
-    # pharmacy carve-out) has one snapshot per source. Enumerating only the
-    # first snapshot silently presented a single network as "the plan's
-    # entire directory", so union the NPI scopes of every published
-    # snapshot instead.
     snapshots = []
     shared_snapshot_keys: list[int] = []
     npi_scope_table_by_snapshot_key: dict[int, str] = {}
@@ -7800,7 +7798,11 @@ async def group_plan_providers(request):
         for binding in (release_selection.in_network_bindings if release_selection is not None else ())
     }
     for pair_source_key, pair_snapshot_id in snapshot_pairs:
-        pair_tables = await snapshot_serving_tables(session, pair_snapshot_id)
+        pair_tables = (
+            release_selection.serving_tables_for_snapshot(pair_snapshot_id)
+            if managed_addresses is not None and release_selection is not None
+            else await snapshot_serving_tables(session, pair_snapshot_id)
+        )
         pair_plan_id = plan_id
         pair_market_type = market_type
         if release_selection is not None:
@@ -7847,14 +7849,7 @@ async def group_plan_providers(request):
         )
         + ")"
     )
-
-    # current_network_snapshots_for_plan resolves the plan's per-SOURCE serving
-    # snapshot, which for PTG group-plan imports is snapshot-scoped to a single
-    # plan (snapshot_scoped=true; the serving table carries only this plan_id). So
-    # the shared layout's NPI scope holds exactly the source's in-network provider
-    # NPIs. Enumerate them DISTINCT and keyset-paginate by NPI. The compact scope
-    # stays relational while high-cardinality membership remains compressed in
-    # PostgreSQL blocks.
+    # Each snapshot's compact NPI scope represents one complete source/plan binding.
     query_params_by_name = {
         "cursor_npi": max(cursor_npi, 0),
         "limit": limit,
@@ -7893,7 +7888,13 @@ async def group_plan_providers(request):
     uses_unified_addresses = False
     supports_array_coverage = False
     supports_plan_bridge = False
-    if has_location_filter:
+    needs_address_scope = has_location_filter or managed_addresses is not None
+    if managed_addresses is not None:
+        (address_table, uses_unified_addresses, supports_array_coverage, supports_plan_bridge), policy_parameters = (
+            managed_addresses
+        )
+        query_params_by_name.update(policy_parameters)
+    elif has_location_filter:
         (
             address_table,
             uses_unified_addresses,
@@ -7938,7 +7939,7 @@ async def group_plan_providers(request):
         query_params_by_name["location_zips"] = location_zips
         location_clauses.append(f"{zip5_expr} = ANY(:location_zips)")
     location_predicate = ""
-    if has_location_filter:
+    if needs_address_scope:
         location_where = "\n                      AND ".join(location_clauses)
         location_predicate = f"""EXISTS (
                     SELECT 1
@@ -7946,12 +7947,7 @@ async def group_plan_providers(request):
                      WHERE {location_where}
                 )"""
     location_where = f"\n               AND {location_predicate}" if location_predicate else ""
-
-    # Sparse filters (specialty AND a ZIP set) make the NPI-scope walk
-    # pathological: it scans millions of member NPIs probing per-row EXISTS
-    # before it collects LIMIT matches. Compute the small local-specialty
-    # candidate set first (zip-index + taxonomy-index hash join) and drive
-    # the member lookup from it instead.
+    # Drive sparse specialty/ZIP searches from local candidates to avoid a full member walk.
     use_local_candidates = bool(specialty_filter.is_active and location_zips)
     candidate_cte = ""
     if use_local_candidates:
@@ -7963,11 +7959,7 @@ async def group_plan_providers(request):
         )
         candidate_clauses = [clause for clause in location_clauses if clause != "addr.npi = gm.npi"]
         if uses_unified_addresses and specialty_filter.taxonomy_codes:
-            # Cheap in-index pre-filter: taxonomy_array && the requested codes
-            # lets the planner BitmapAnd the serving zip and taxonomy GIN
-            # indexes, so only rows matching BOTH are read from the heap
-            # (~1k rows instead of ~100k+ for a dense-metro radius). The
-            # precise primary-taxonomy EXISTS below still decides membership.
+            # The indexed array prefilter narrows the heap; exact primary-taxonomy EXISTS decides membership.
             taxonomy_code_keys = []
             for idx, code in enumerate(specialty_filter.taxonomy_codes):
                 key = f"cand_array_taxonomy_code_{idx}"
@@ -8026,10 +8018,11 @@ async def group_plan_providers(request):
         """
     provider_rows = (await session.execute(text(provider_sql), query_params_by_name)).fetchall()
     provider_npis = [int(provider_record.npi) for provider_record in provider_rows if provider_record.npi is not None]
-
     total_distinct = None
-    is_count_requested = (request.args.get("count") or "").strip().lower() in ("1", "true", "yes")
-    should_skip_exact_count = bool(has_location_filter and uses_unified_addresses and not use_local_candidates)
+    is_count_requested = (args.get("count") or "").strip().lower() in ("1", "true", "yes")
+    should_skip_exact_count = bool(
+        has_location_filter and uses_unified_addresses and not use_local_candidates and managed_addresses is None
+    )
     if is_count_requested and not should_skip_exact_count:
         if use_local_candidates:
             count_sql = f"""
@@ -8045,14 +8038,15 @@ async def group_plan_providers(request):
                  WHERE gm.npi BETWEEN :npi_min AND :npi_max{taxonomy_where}{provider_sex_where}{location_where}
                 """
         total_distinct = int((await session.execute(text(count_sql), query_params_by_name)).scalar() or 0)
-
     provider_items: list[dict[str, Any]] = [{"npi": npi} for npi in provider_npis]
     addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
-    if has_location_filter and provider_npis:
+    if needs_address_scope and provider_npis:
         address_parameters_by_name: dict[str, Any] = {
             "npis": provider_npis,
             "plan_ids": query_params_by_name["plan_ids"],
         }
+        if managed_addresses is not None:
+            address_parameters_by_name.update(policy_parameters)
         address_clauses = ["addr.npi = ANY(:npis)"]
         if not include_mail_addresses:
             address_clauses.append(f"addr.type IN ({_group_plan_provider_address_type_sql(address_types)})")
@@ -8178,7 +8172,6 @@ async def group_plan_providers(request):
         if item_addresses:
             provider_item["addresses"] = item_addresses
             provider_item["address"] = item_addresses[0]
-
     next_cursor = str(provider_npis[-1]) if len(provider_npis) == limit else None
     response_by_field = {
         "ok": True,
@@ -8207,9 +8200,9 @@ async def group_plan_providers(request):
             "zips_considered": len(location_zips) if location_zips else None,
             "include_mail_addresses": include_mail_addresses,
             "address_source": "unified"
-            if has_location_filter and uses_unified_addresses
-            else ("npi" if has_location_filter else None),
-            "address_types": list(address_types) if has_location_filter and not include_mail_addresses else None,
+            if needs_address_scope and uses_unified_addresses
+            else ("npi" if needs_address_scope else None),
+            "address_types": list(address_types) if needs_address_scope and not include_mail_addresses else None,
             "count_requested": is_count_requested,
             "count_exact": is_count_requested and not should_skip_exact_count,
             "plan_ids_considered": resolved_plan_ids,
@@ -8225,7 +8218,9 @@ async def group_plan_providers(request):
         "exhausted": next_cursor is None,
     }
     if release_selection is not None:
-        annotate_plan_release_response(response_by_field, release_selection)
+        annotate_plan_release_response(
+            response_by_field, release_selection, contributing_bindings=contributing_bindings
+        )
     return response.json(response_by_field)
 
 
@@ -11659,7 +11654,11 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
     args = request.args
     args = provider_service_native_args(args, native_args, import_context)
     canonical_network_clause = _canonical_network_procedure_clause(
-        args, import_context, provider_procedure_table.c.npi, query_string=getattr(request, "query_string", None)
+        args,
+        import_context,
+        provider_procedure_table.c.npi,
+        query_string=getattr(request, "query_string", None),
+        managed_native=native_args is not None,
     )
     if "billing_entity_ref" in args:
         if import_context is not None:
@@ -11671,10 +11670,8 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
     is_state_scan = is_plan_pricing_state_scan(args)
     if import_context is not None and is_state_scan:
         raise InvalidUsage("custom-import provider-service queries require the claims lane")
-    if is_state_scan and getattr(request, "path", BILLING_SEARCH_TRANSPORT_PATH) != BILLING_SEARCH_TRANSPORT_PATH:
-        raise InvalidUsage(
-            "Release-bound state scans require the canonical /api/v1/pricing/providers/search-by-procedure path"
-        )
+    if is_state_scan:
+        validate_state_scan_transport(request, native_args)
 
     # Keep pagination explicit so OpenAPI contract tests see both parameters.
     args.get("limit")

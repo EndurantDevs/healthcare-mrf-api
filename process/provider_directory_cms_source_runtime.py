@@ -85,7 +85,8 @@ class CMSRegistrySourceInvocation:
         ):
             raise ValueError("cms_registry_source_verified_inputs_required")
         policy = _request_policy(request)
-        _assert_selected_source(execution, request, policy)
+        profile_as_of = execution.attestation.desired_profile_as_of
+        _assert_selected_source(execution, request, policy, profile_as_of)
         bound = await self.runtime.authenticate_job(
             context=self.context, task=deepcopy(self.task), execution=execution, request=request, lease=lease
         )
@@ -100,7 +101,7 @@ class CMSRegistrySourceInvocation:
             or bound.retention_request.policy(bound.capture_id, bound.owner_role, bound.runtime_roles) != policy
         ):
             raise ValueError("cms_registry_source_policy_changed")
-        _assert_selected_source(execution, request, policy)
+        _assert_selected_source(execution, request, policy, profile_as_of)
         return bound
 
 
@@ -112,7 +113,7 @@ def _request_policy(request):
     return validated_registry_source_retention_policy(admission["registry_source_retention"])
 
 
-def _assert_selected_source(execution, request, policy):
+def _assert_selected_source(execution, request, policy, expected_profile_as_of):
     """Keep the authenticated policy on both captured executions' exact CMS selection."""
     selected = request.execution
     if type(selected) is not ProviderDirectoryProfileExecution or selected.generation != execution.generation:
@@ -123,7 +124,7 @@ def _assert_selected_source(execution, request, policy):
         cms = attestation.desired_cms_dataset
         if (
             attestation.proof_id != policy["selection_proof_id"]
-            or attestation.desired_profile_as_of != pin["as_of"]
+            or attestation.desired_profile_as_of != expected_profile_as_of
             or not isinstance(cms, Mapping)
             or any(cms.get(name) != pin[name] for name in ("source_id", "endpoint_id", "dataset_id"))
             or cms.get("dataset_hash") != pin["dataset_sha256"]

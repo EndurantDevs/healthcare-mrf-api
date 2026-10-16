@@ -631,3 +631,183 @@ async def test_plan_copy_rejects_unsupported_driver():
     with pytest.raises(PTG2ManifestArtifactError, match="COPY driver is unavailable"):
         await plan_staging.copy_plan_rows(session, "synthetic_copy", ("id",), iter([(1,)]))
     assert events == written_rows == []
+
+
+@pytest.mark.asyncio
+async def test_source_admission_precedes_membership_and_keeps_original_ordinal(monkeypatch):
+    selection = _selection(2)
+    events = []
+
+    async def admit(session, selected):
+        events.append("admission")
+        assert selected is selection
+        return (selection.in_network_bindings[1],)
+
+    async def location(session, tables, args, **options):
+        events.append("membership")
+        assert args["snapshot_id"] == "snapshot-1" and options["offset"] == 1
+        return SimpleNamespace(parameter_map={})
+
+    monkeypatch.setattr(imported, "admitted_plan_release_bindings", admit)
+    monkeypatch.setattr(serving, "_membership_location_query", location)
+    scopes = await imported._native_scopes(object(), selection, {"zip5": "12345"}, serving)
+    assert events == ["admission", "membership"]
+    assert len(scopes) == 1 and scopes[0].binding is selection.in_network_bindings[1]
+    assert scopes[0].binding.binding_ordinal == 1 and len(selection.bindings) == 2
+
+
+@pytest.mark.asyncio
+async def test_source_admission_failure_stops_before_native_code_or_scores(monkeypatch):
+    admission = AsyncMock(side_effect=PlanPricingProjectionUnavailable("managed plan source admission unavailable"))
+    code = AsyncMock(side_effect=AssertionError("denied source must not read codes"))
+    monkeypatch.setattr(imported, "admitted_plan_release_bindings", admission)
+    monkeypatch.setattr(imported, "load_sealed_code_rows", code)
+    session = SimpleNamespace(execute=AsyncMock(side_effect=AssertionError("denied source must not stage")))
+    with pytest.raises(PlanPricingProjectionUnavailable, match="source admission"):
+        await imported.search_imported_plan_providers(
+            session, {}, SimpleNamespace(offset=3, limit=2, page=2), _selection(), _import_context()
+        )
+    admission.assert_awaited_once()
+    code.assert_not_awaited()
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("require_match", [False, True])
+async def test_empty_admission_never_falls_back_to_original_bindings_or_scores(monkeypatch, require_match):
+    actual_native_scopes = imported._native_scopes
+    session = _install_score_scope_flow(monkeypatch, [], [])
+    monkeypatch.setattr(imported, "_native_scopes", actual_native_scopes)
+    admission = AsyncMock(return_value=())
+    monkeypatch.setattr(imported, "admitted_plan_release_bindings", admission)
+    scores = AsyncMock(side_effect=AssertionError("empty admission must not score"))
+    monkeypatch.setattr(imported, "_stage_imported_scores", scores)
+    context = replace(_import_context(require_match=require_match), native_scope_preparer=scores)
+    response = await imported.search_imported_plan_providers(
+        session, {}, SimpleNamespace(offset=3, limit=2, page=2), _selection(2), context
+    )
+    assert response["pagination"]["total"] == 0 and response["pagination"]["total_is_exact"] is True
+    imported.load_sealed_code_rows.assert_not_awaited()
+    imported._stage_scope.assert_not_awaited()
+    scores.assert_not_awaited()
+    assert imported._select_native_entries.await_args.args[1] == []
+    assert imported._select_native_entries.await_args.args[4].offset == 3
+
+
+def _contributor_selection():
+    selection = _selection(3)
+    bindings = tuple(
+        replace(binding, plan_id=f"plan-meta-{index}", binding_ordinal=7 * index + 3)
+        for index, binding in enumerate(selection.bindings)
+    )
+    return replace(selection, bindings=bindings)
+
+
+@pytest.mark.parametrize(
+    "flags", [{}, {"include_sources": "true"}, {"include_details": "true"}, {"include_debug": "true"}]
+)
+@pytest.mark.parametrize("positions,offset,total", [((), 0, 0), ((1,), 0, 0), ((0, 2), 7, 3), ((0, 1, 2), 7, 3)])
+def test_imported_metadata_uses_all_admitted_contributors_on_empty_pages(flags, positions, offset, total):
+    selection = _contributor_selection()
+    bindings = selection.bindings
+    contributing_bindings = tuple(bindings[position] for position in positions)
+    response = imported._plan_response(
+        selection,
+        flags,
+        SimpleNamespace(limit=2, offset=offset, page=4),
+        total,
+        [],
+        [],
+        serving,
+        contributing_bindings=contributing_bindings,
+    )
+    snapshots = [binding.snapshot_id for binding in contributing_bindings]
+    assert response["in_network_snapshot_ids"] == response["resolved_snapshot_ids"] == snapshots
+    assert response["query"]["in_network_snapshot_ids"] == response["query"]["resolved_snapshot_ids"] == snapshots
+    assert response["query"]["plan_ids"] == [binding.plan_id for binding in contributing_bindings]
+    assert response["query"]["snapshots"] == [
+        {
+            "source_key": binding.source_key,
+            "snapshot_id": binding.snapshot_id,
+            "plan_id": binding.plan_id,
+            "plan_market_type": binding.plan_market_type,
+        }
+        for binding in contributing_bindings
+    ]
+    encoded = json.dumps(response)
+    for index, binding in enumerate(bindings):
+        if index not in positions:
+            assert all(
+                identity not in encoded for identity in (binding.source_key, binding.plan_id, binding.snapshot_id)
+            )
+    assert response["items"] == [] and response[imported.NATIVE_ENTRY_IDS] == []
+    assert response["pagination"] == dict(
+        total=total, total_is_exact=True, limit=2, offset=offset, page=4, has_more=False
+    )
+    assert response["query"]["status"] == ("matched" if total else "no_match")
+    assert response["binding_set_digest"] == selection.binding_set_digest
+    assert selection.bindings is bindings and len(selection.network_tables_by_snapshot()) == 3
+    assert selection.response_metadata()["in_network_snapshot_ids"] == ["snapshot-0", "snapshot-1", "snapshot-2"]
+
+
+@pytest.mark.parametrize("include_sources", ["false", "true"])
+def test_contributor_metadata_preserves_native_entry_identity_and_total(include_sources):
+    selection = _contributor_selection()
+    binding = selection.bindings[1]
+    scope = imported._NativeScope(binding, None, {}, None)
+    entry = imported._NativeEntry(scope, {"npi": 1000000001}, ())
+    provider_by_field = {"npi": 1000000001, **_rate(binding.source_key, 11), "plan_id": binding.plan_id}
+    query_by_field = {"include_sources": include_sources}
+    pagination = SimpleNamespace(limit=2, offset=0, page=1)
+    original = imported._plan_response(
+        selection, query_by_field, pagination, 3, [entry], [dict(provider_by_field)], serving
+    )
+    admitted = imported._plan_response(
+        selection,
+        query_by_field,
+        pagination,
+        3,
+        [entry],
+        [dict(provider_by_field)],
+        serving,
+        contributing_bindings=(binding,),
+    )
+    assert admitted[imported.NATIVE_ENTRY_IDS] == original[imported.NATIVE_ENTRY_IDS]
+    assert admitted["items"] == original["items"] and admitted["pagination"] == original["pagination"]
+    assert admitted["in_network_snapshot_ids"] == [binding.snapshot_id]
+    assert admitted["query"]["plan_ids"] == [binding.plan_id]
+    assert admitted["binding_set_digest"] == original["binding_set_digest"] == selection.binding_set_digest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("positions,total,offset", [((), 0, 0), ((1,), 3, 7), ((0, 2), 3, 7), ((0, 1, 2), 3, 7)])
+async def test_imported_search_passes_admitted_scopes_to_empty_page_metadata(monkeypatch, positions, total, offset):
+    selection = _contributor_selection()
+    scopes = [imported._NativeScope(selection.bindings[position], None, {}, None) for position in positions]
+    session = _install_score_scope_flow(monkeypatch, scopes, [[dict(code_key=1)] for _scope in scopes])
+    monkeypatch.setattr(imported, "_stage_imported_scores", AsyncMock())
+    imported._select_native_entries.return_value = (total, [])
+    response = await imported.search_imported_plan_providers(
+        session,
+        {"include_sources": "true"},
+        SimpleNamespace(limit=2, offset=offset, page=4),
+        selection,
+        _import_context(),
+    )
+    expected_snapshots = [scope.binding.snapshot_id for scope in scopes]
+    assert response["in_network_snapshot_ids"] == response["query"]["resolved_snapshot_ids"] == expected_snapshots
+    assert response["query"]["plan_ids"] == [scope.binding.plan_id for scope in scopes]
+    assert response["pagination"]["total"] == total and response["items"] == []
+    assert len(selection.bindings) == 3 and len(selection.network_tables_by_snapshot()) == 3
+    assert response["binding_set_digest"] == selection.binding_set_digest
+
+
+def test_complete_contributors_preserve_unscoped_response_bytes():
+    selection = _contributor_selection()
+    query_by_field = {"include_sources": "true"}
+    pagination = SimpleNamespace(limit=2, offset=0, page=1)
+    original = imported._plan_response(selection, query_by_field, pagination, 0, [], [], serving)
+    explicit = imported._plan_response(
+        selection, query_by_field, pagination, 0, [], [], serving, contributing_bindings=selection.in_network_bindings
+    )
+    assert json.dumps(explicit, separators=(",", ":")) == json.dumps(original, separators=(",", ":"))

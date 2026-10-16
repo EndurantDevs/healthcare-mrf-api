@@ -11,6 +11,7 @@ import orjson
 from sanic.request.parameters import RequestParameters
 
 from api import billing_search_http as billing_http
+from api import custom_import_provider_collection as managed_collection
 from api import custom_import_read_http as transport
 from api.billing_search_endpoint_access import (
     authorize_billing_search_endpoint,
@@ -53,6 +54,11 @@ class _ParsedBillingRequest:
 
         return self.provider.target
 
+    @property
+    def managed_collection(self):
+        """Expose the signed policy to the shared transport verifier."""
+        return self.provider.managed_collection
+
 
 def _parse_billing_native_query(document):
     if type(document) is not dict or any(
@@ -83,12 +89,46 @@ def _parse_billing_request(body):
     ):
         raise transport._fail()
     provider_by_field = {name: value for name, value in document.items() if name != "billing_transport_context_sha256"}
+    is_managed = "managed_collection" in provider_by_field
+    if is_managed:
+        native = provider_by_field.get("native_query")
+        if type(native) is not dict or "billing_transport_context_sha256" in native:
+            raise transport._fail()
+        # The policy signs the native descriptor plus the separately signed billing receipt.
+        provider_by_field["native_query"] = native | {"billing_transport_context_sha256": digest}
     provider = _parse_provider_request(
         transport._canonical_json_bytes(provider_by_field),
-        native_query_parser=_parse_billing_native_query,
+        native_query_parser=_parse_managed_billing_native_query if is_managed else _parse_billing_native_query,
         maximum_family_rows=_BILLING_PAGE_SIZE,
+        allow_managed_collection=True,
+        collection_kind="billing-search",
     )
     return _ParsedBillingRequest(provider, digest)
+
+
+def _parse_managed_billing_native_query(document):
+    return _parse_billing_native_query(
+        {name: value for name, value in document.items() if name != "billing_transport_context_sha256"}
+    )
+
+
+async def _serve_managed_billing(request, parsed, verified, access, cursor_keyring, trusted_now):
+    from api.provider_billing_network_read import require_managed_billing_client
+
+    managed = parsed.managed_collection
+    require_managed_billing_client(access, managed.policy["client_id"])
+    async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000):
+        async with managed_collection.managed_import_collection_scope(request, managed) as (reader, manifest):
+            encoded = await _read_billing_payload(reader, parsed, verified, access, cursor_keyring, trusted_now)
+            payload = orjson.loads(encoded)
+            return managed_collection.managed_collection_response(
+                payload,
+                managed,
+                manifest,
+                maximum_bytes=_provider_response_limit(
+                    parsed.provider, len(payload["items"]), maximum_rows=_BILLING_PAGE_SIZE
+                ),
+            )
 
 
 def _billing_scope_callback(scope_preparer, access_state):
@@ -165,6 +205,42 @@ async def _read_billing_payload(session, parsed, verified, access, cursor_keyrin
     return encoded
 
 
+def _authorize_billing_request(request):
+    """Verify both signed descriptors before selecting a Reader."""
+    body = getattr(request, "body", None)
+    if type(body) is not bytes or not 1 <= len(body) <= managed_collection.MAX_MANAGED_BODY_BYTES:
+        raise transport._fail()
+    parsed = _parse_billing_request(body)
+    if parsed.managed_collection is None and len(body) > transport._MAX_BODY_BYTES:
+        raise transport._fail()
+    trusted_now = transport._trusted_now()
+    verified = transport._verify_provider_transport(
+        headers=request.headers,
+        body=body,
+        request=parsed,
+        trusted_now=trusted_now,
+        keyring=transport._keyring(),
+        path=CUSTOM_IMPORT_BILLING_SEARCH_PATH,
+        managed_collection=parsed.managed_collection is not None,
+    )
+    # This is the subordinate canonical GET descriptor, never the outer POST.
+    access = authorize_billing_search_endpoint(
+        parsed.provider.native_args,
+        request.headers,
+        method="GET",
+        path=BILLING_SEARCH_TRANSPORT_PATH,
+        trusted_now=trusted_now,
+        keyring=billing_http._transport_keyring(),
+    )
+    if not hmac.compare_digest(
+        parsed.billing_transport_context_sha256,
+        access.verified_transport.transport_context_sha256,
+    ):
+        raise transport._fail()
+    cursor_keyring = billing_http._cursor_keyring()
+    return parsed, verified, access, cursor_keyring, trusted_now
+
+
 async def serve_custom_import_billing_search(request, session):
     """Require both signed authorities before one pinned read-only composition."""
 
@@ -174,35 +250,12 @@ async def serve_custom_import_billing_search(request, session):
         or getattr(request, "query_string", "")
     ):
         return billing_http._error_response(404)
+    is_managed_mode = False
     try:
-        body = getattr(request, "body", None)
-        if type(body) is not bytes or not 1 <= len(body) <= transport._MAX_BODY_BYTES:
-            raise transport._fail()
-        parsed = _parse_billing_request(body)
-        trusted_now = transport._trusted_now()
-        verified = transport._verify_provider_transport(
-            headers=request.headers,
-            body=body,
-            request=parsed,
-            trusted_now=trusted_now,
-            keyring=transport._keyring(),
-            path=CUSTOM_IMPORT_BILLING_SEARCH_PATH,
-        )
-        # This is the subordinate canonical GET descriptor, never the outer POST.
-        access = authorize_billing_search_endpoint(
-            parsed.provider.native_args,
-            request.headers,
-            method="GET",
-            path=BILLING_SEARCH_TRANSPORT_PATH,
-            trusted_now=trusted_now,
-            keyring=billing_http._transport_keyring(),
-        )
-        if not hmac.compare_digest(
-            parsed.billing_transport_context_sha256,
-            access.verified_transport.transport_context_sha256,
-        ):
-            raise transport._fail()
-        cursor_keyring = billing_http._cursor_keyring()
+        parsed, verified, access, cursor_keyring, trusted_now = _authorize_billing_request(request)
+        is_managed_mode = parsed.managed_collection is not None
+        if is_managed_mode:
+            return await _serve_managed_billing(request, parsed, verified, access, cursor_keyring, trusted_now)
         if session is None or session.in_transaction():
             raise transport.CustomImportReadUnavailableError("fresh billing read session is required")
         async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), session.begin():
@@ -220,6 +273,8 @@ async def serve_custom_import_billing_search(request, session):
         )
         return billing_http._error_response(status)
     except Exception as failure:
+        if is_managed_mode and billing_http._failure_status(failure) == 503:
+            return managed_collection.managed_collection_error(failure)
         return billing_http._failure_response(failure)
     return transport._response(encoded, 200)
 

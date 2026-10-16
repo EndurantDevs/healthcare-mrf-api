@@ -25,6 +25,7 @@ from process.registry_required_target_review_references import (
     require_required_target_review_references,
 )
 from process.registry_source_observation_store import _namespace
+from process.uhc_flex_practitioner_async_safety import drain_operation
 
 _MAX_INPUT_BYTES = 8 * 1024 * 1024
 _MAX_COPY_BYTES = 16 * 1024 * 1024
@@ -239,7 +240,9 @@ async def _apply(connection, command, metadata, namespace, published_plan_store)
         return json.loads(replay["receipt_json"])
     if control["draft_revision"] > _MAX_REVISION:
         raise RegistryRecordConflict("registry_source_binding_control_unavailable")
-    copy_bytes, row_count = await asyncio.to_thread(_encode, command.input_bytes)
+    copy_bytes, row_count = await drain_operation(
+        asyncio.to_thread(_encode, command.input_bytes), preserve_cancellation=True
+    )
     staging = await _stage(connection, copy_bytes, row_count)
     status = await connection.fetchrow(_VALIDATION_SQL.format(namespace=namespace, staging=staging))
     if not status["targets_valid"]:

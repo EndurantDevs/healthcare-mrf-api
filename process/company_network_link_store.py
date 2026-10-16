@@ -11,6 +11,8 @@ from datetime import date
 from uuid import UUID, uuid4
 
 from process.ext.address_fast import _fast_module
+from process.registry_benefit_plan_metadata import collect_benefit_plan_ids, validate_benefit_plan_ids
+from process.registry_manual_undo import MAX_UNDO_SNAPSHOT_BYTES
 from process.registry_record_store import (
     RegistryActor,
     RegistryAddressUnavailable,
@@ -186,15 +188,21 @@ _WRITE_SQL = """WITH written AS (
     actor_json,reason,idempotency_key,request_sha256,event_json)
   SELECT 'company_links',written.company_id::text,written.revision,$1,to_jsonb(written),$2::jsonb,$3,$4,$5,
     jsonb_build_object('operation','company_links_batch','before_revision',target.expected_revision,
-      'operation_context',jsonb_build_object('batch_id',$6::uuid,'idempotency_key',$7::text,'selection_group_id',$8::text))
+      'operation_context',jsonb_build_object('batch_id',$6::uuid,'idempotency_key',$7::text,'selection_group_id',$8::text)||$9::jsonb)
   FROM written JOIN {staging} target USING(company_id)
   RETURNING record_kind,record_key,revision,custom_revision,record_json
 ), receipt AS (
-  SELECT count(*) AS written_count,jsonb_build_object('batch_id',$6::uuid,'custom_revision',$1::bigint,'records',
+  SELECT count(*) AS written_count,max(GREATEST(
+    octet_length(record_json::text)+octet_length($3::text)+256,
+    octet_length(jsonb_build_object('record_kind','company_links','record_id',record_key,
+      'current_revision',9223372036854775807::bigint,'limit',1,'offset',1000000,'has_more',false,
+      'records',jsonb_build_array(jsonb_build_object('revision',revision,
+        'custom_revision',9223372036854775807::bigint,'reason',$3::text,'record',record_json)))::text)
+    )) AS history_bytes,jsonb_build_object('batch_id',$6::uuid,'custom_revision',$1::bigint,'records',
     COALESCE(jsonb_agg(jsonb_build_object('record_kind',record_kind,'record_id',record_key,'revision',revision,
       'custom_revision',custom_revision,'record',record_json) ORDER BY record_key),'[]'::jsonb)) AS document FROM history
 )
-SELECT written_count,document::text AS receipt_json,octet_length(document::text) AS receipt_bytes FROM receipt"""
+SELECT written_count,history_bytes,document::text AS receipt_json,octet_length(document::text) AS receipt_bytes FROM receipt"""
 
 
 def _request_metadata(command, selected_targets, actor, reason, group_context):
@@ -233,9 +241,12 @@ async def _save_batch(connection, namespace, staging, selected_count, custom_rev
         batch_id,
         metadata["idempotency_key"],
         metadata["selection_group_id"],
+        _json(metadata.get("benefit_context", {})),
     )
     if written["written_count"] != selected_count:
         raise RegistryRecordConflict("registry_company_link_batch_revision_conflict")
+    if written["history_bytes"] > MAX_UNDO_SNAPSHOT_BYTES:
+        raise ValueError("registry_company_links_snapshot_limit")
     if written["receipt_bytes"] > _MAX_RECEIPT_BYTES:
         raise ValueError("registry_company_link_batch_receipt_limit")
     await connection.execute(
@@ -254,7 +265,29 @@ async def _save_batch(connection, namespace, staging, selected_count, custom_rev
     return json.loads(written["receipt_json"])
 
 
-async def apply_company_network_link_batch(connection, command, actor: RegistryActor, *, control_schema=None):
+async def _batch_replay(connection, namespace, metadata):
+    replay = await connection.fetchrow(
+        f"SELECT request_sha256,result_json::text AS receipt_json FROM {namespace}.registry_company_link_batch WHERE actor_sha256=$1 AND idempotency_key=$2",
+        metadata["actor_sha256"],
+        metadata["idempotency_key"],
+    )
+    if replay is None:
+        return None
+    if replay["request_sha256"] != metadata["request_sha256"]:
+        raise RegistryRecordConflict("registry_company_link_batch_idempotency_conflict")
+    return json.loads(replay["receipt_json"])
+
+
+async def _batch_assertions(selected_targets):
+    assertion_bytes = _json(
+        [assertion for selected_target in selected_targets for assertion in selected_target["network_assertions"]]
+    ).encode()
+    return await asyncio.to_thread(_native_assertions, assertion_bytes)
+
+
+async def apply_company_network_link_batch(
+    connection, command, actor: RegistryActor, *, control_schema=None, plan_metadata_client=None
+):
     """Save one selected batch; trusted callers recheck every live grant on retries.
 
     The caller owns the transaction. A savepoint preserves earlier caller work,
@@ -266,27 +299,33 @@ async def apply_company_network_link_batch(connection, command, actor: RegistryA
     namespace = _namespace(control_schema)
     if not connection.is_in_transaction():
         raise ValueError("registry_company_link_batch_requires_caller_transaction")
+    needs_metadata = any(
+        type(assertion) is dict and assertion.get("benefit_plan_ids")
+        for selected_target in selected_targets
+        for assertion in selected_target["network_assertions"]
+    )
     async with connection.transaction():
+        assertion_json = None
+        if needs_metadata:
+            replay = await _batch_replay(connection, namespace, metadata)
+            if replay is not None:
+                return replay
+            assertion_json = await _batch_assertions(selected_targets)
+            metadata["benefit_context"] = await validate_benefit_plan_ids(
+                collect_benefit_plan_ids(json.loads(assertion_json)), plan_metadata_client, actor
+            )
         control = await connection.fetchrow(
             f"SELECT draft_revision FROM {namespace}.registry_revision_control WHERE id=1 FOR UPDATE"
         )
         if control is None:
             raise RegistryRecordConflict("registry_control_unavailable")
-        replay = await connection.fetchrow(
-            f"SELECT request_sha256,result_json::text AS receipt_json FROM {namespace}.registry_company_link_batch WHERE actor_sha256=$1 AND idempotency_key=$2",
-            metadata["actor_sha256"],
-            metadata["idempotency_key"],
-        )
+        replay = await _batch_replay(connection, namespace, metadata)
         if replay is not None:
-            if replay["request_sha256"] != metadata["request_sha256"]:
-                raise RegistryRecordConflict("registry_company_link_batch_idempotency_conflict")
-            return json.loads(replay["receipt_json"])
+            return replay
         if control["draft_revision"] > _MAX_REVISION:
             raise RegistryRecordConflict("registry_company_link_batch_revision_exhausted")
-        assertion_bytes = _json(
-            [assertion for selected_target in selected_targets for assertion in selected_target["network_assertions"]]
-        ).encode()
-        assertion_json = await asyncio.to_thread(_native_assertions, assertion_bytes)
+        if assertion_json is None:
+            assertion_json = await _batch_assertions(selected_targets)
         staging = await _stage_targets(connection, target_json, assertion_json)
         status = await connection.fetchrow(_VALIDATION_SQL.format(staging=staging, namespace=namespace), group_context)
         if not status["targets_valid"]:

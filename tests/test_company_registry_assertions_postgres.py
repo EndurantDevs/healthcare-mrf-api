@@ -1291,6 +1291,18 @@ async def test_materialized_group_first_correction_preserves_baseline_and_undo(a
     async with fixture.sessions() as session, session.begin():
         materialized = await get_registry_record(session, "group", group_id, schema=fixture.schema)
     assert materialized["revision"] == 1 and materialized["group_kind"] == "naic_group"
+    source_evidence = materialized["source_evidence"]
+    assert len(source_evidence) == 1
+    assert (
+        source_evidence[0]["snapshot_id"]
+        == company_command.fields["assertions"]["group_assertions"][0]["provenance"]["snapshot_id"]
+    )
+    assert (source_evidence[0]["identifier_system"], source_evidence[0]["identifier_value"]) == ("naic_group", "707")
+    assert source_evidence[0]["snapshot_present"] is source_evidence[0]["observation_present"] is True
+    assert source_evidence[0]["observation_status"] == "accepted"
+    materialized_head_by_field = {
+        field: field_value for field, field_value in materialized.items() if field != "source_evidence"
+    }
     correction = RegistryRecordCommand(
         "group",
         group_id,
@@ -1310,7 +1322,8 @@ async def test_materialized_group_first_correction_preserves_baseline_and_undo(a
         str(group_id),
     )
     assert [history_entry["revision"] for history_entry in retained] == [1, 2]
-    assert json.loads(retained[0]["record_json"]) == materialized
+    assert json.loads(retained[0]["record_json"]) == materialized_head_by_field
+    assert all("source_evidence" not in json.loads(entry["record_json"]) for entry in retained)
     assert retained[0]["reason"] == "Preserved materialized group before manual correction"
     assert retained[0]["actor_json"] == retained[1]["actor_json"]
     assert retained[0]["custom_revision"] == retained[1]["custom_revision"] == corrected["custom_revision"]
@@ -1321,6 +1334,10 @@ async def test_materialized_group_first_correction_preserves_baseline_and_undo(a
     assert await _accounting(fixture) == before
     await _verify_materialized_group_undo(fixture, materialized, group_id)
     assert await _draft(fixture, correction) == corrected
+    async with fixture.sessions() as session, session.begin():
+        assert (await get_registry_record(session, "group", group_id, schema=fixture.schema))[
+            "source_evidence"
+        ] == source_evidence
 
 
 async def _verify_materialized_group_undo(fixture, materialized, group_id):

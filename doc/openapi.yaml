@@ -70,6 +70,8 @@ paths:
       parameters:
         - $ref: '#/components/parameters/DirectorySourceId'
         - $ref: '#/components/parameters/DirectoryGenerationId'
+        - $ref: '#/components/parameters/DirectoryNetworkIds'
+        - $ref: '#/components/parameters/RegistryNetworkGeneration'
         - $ref: '#/components/parameters/DirectoryLimit'
         - $ref: '#/components/parameters/DirectoryCursor'
       responses:
@@ -77,6 +79,8 @@ paths:
           description: One page from the accepted source generation.
           headers:
             Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+            X-Network-Generation: {$ref: '#/components/headers/RegistryNetworkGeneration'}
+            X-CMS-Retained-Publication: {$ref: '#/components/headers/DirectoryRetainedPublication'}
           content:
             application/json:
               schema:
@@ -95,11 +99,15 @@ paths:
       parameters:
         - $ref: '#/components/parameters/DirectorySourceId'
         - $ref: '#/components/parameters/DirectoryGenerationId'
+        - $ref: '#/components/parameters/DirectoryNetworkIds'
+        - $ref: '#/components/parameters/RegistryNetworkGeneration'
       responses:
         '200':
           description: The exact entity in the accepted source generation.
           headers:
             Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+            X-Network-Generation: {$ref: '#/components/headers/RegistryNetworkGeneration'}
+            X-CMS-Retained-Publication: {$ref: '#/components/headers/DirectoryRetainedPublication'}
           content:
             application/json:
               schema:
@@ -119,6 +127,8 @@ paths:
       parameters:
         - $ref: '#/components/parameters/DirectorySourceId'
         - $ref: '#/components/parameters/DirectoryGenerationId'
+        - $ref: '#/components/parameters/DirectoryNetworkIds'
+        - $ref: '#/components/parameters/RegistryNetworkGeneration'
         - $ref: '#/components/parameters/DirectoryLimit'
         - $ref: '#/components/parameters/DirectoryCursor'
       responses:
@@ -126,6 +136,8 @@ paths:
           description: One page of explicit relationships from the accepted source generation.
           headers:
             Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+            X-Network-Generation: {$ref: '#/components/headers/RegistryNetworkGeneration'}
+            X-CMS-Retained-Publication: {$ref: '#/components/headers/DirectoryRetainedPublication'}
           content:
             application/json:
               schema:
@@ -509,6 +521,9 @@ paths:
         Service-to-service provider-v2 read. The signed native query must contain
         code and code_system. Imported selection and ordering precede native
         claims thresholds, pagination, and exact totals.
+        Optional signed network_binding applies resolved canonical network IDs and exact
+        office membership before counts, pagination and import hydration in the same
+        pinned read. Unsupported plan, billing, source and snapshot selectors are refused.
       parameters:
         - $ref: '#/components/parameters/CustomImportProviderReadContext'
         - $ref: '#/components/parameters/CustomImportProviderReadKeyId'
@@ -525,6 +540,10 @@ paths:
           headers:
             Cache-Control:
               $ref: '#/components/headers/CustomImportReadCacheControl'
+            X-Network-Generation:
+              description: Present only when signed network_binding is supplied and verified.
+              schema:
+                $ref: '#/components/schemas/RegistryNetworkCatalogGeneration'
           content:
             application/json:
               schema:
@@ -682,15 +701,26 @@ paths:
     get:
       operationId: getPlanNetworkIdChecksum
       summary: Fetch network details by checksum
+      description: The path value remains a legacy checksum. Optional canonical selectors
+        require trusted control authorization and filter complete approved ACA plan coordinates
+        in the pinned revision before returning plans or issuer metadata. Numeric equality
+        between a checksum and a canonical network ID does not establish a mapping.
       parameters:
         - name: checksum
           in: path
           required: true
           schema:
             type: integer
+        - $ref: '#/components/parameters/DirectoryNetworkIds'
+        - $ref: '#/components/parameters/RegistryNetworkGeneration'
       responses:
         '200':
           description: Network entry and issuer metadata
+          headers:
+            X-Network-Generation:
+              $ref: '#/components/headers/RegistryNetworkGeneration'
+            Cache-Control:
+              $ref: '#/components/headers/DirectoryCacheControl'
           content:
             application/json:
               schema:
@@ -728,6 +758,56 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
   /plan/network/autocomplete:
+    post:
+      operationId: getApprovedPlanNetworkAutocomplete
+      summary: Autocomplete authorized approved ACA network metadata
+      description: |
+        Trusted control read using the complete registry-catalog-policy/v2 envelope.
+        Complete approved ACA plan, year, issuer, state and checksum coordinates
+        qualify raw plan metadata before limits. Global active checksum ambiguity
+        is checked before client network exclusions; hidden, unmapped and ambiguous
+        checksum keys cannot consume result capacity. Company and group exclusions
+        remain independent; this response contains no canonical organization documents.
+        Optional ZIP search and its national replacement use one pinned read-only
+        transaction. A ZIP page with fewer than the requested limit is replaced by
+        the authorized national page. Raw labels supply metadata, not provider-site
+        membership or pricing evidence. Query strings and v1 policy are refused.
+        Request and complete response are each bounded to 1 MiB; errors never retry
+        the unmanaged GET. The existing GET behavior remains unchanged.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+              - $ref: '#/components/schemas/RegistryCatalogPolicyEnvelopeV2'
+              - type: object
+                properties:
+                  query:
+                    $ref: '#/components/schemas/RegistryNetworkAutocompleteQuery'
+      responses:
+        '200':
+          description: Authorized metadata candidates; no matches returns an empty plans array.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/DirectoryCacheControl'
+            X-Network-Generation:
+              $ref: '#/components/headers/RegistryNetworkGeneration'
+            X-Network-Access-Scope:
+              $ref: '#/components/headers/RegistryNetworkAccessScope'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryNetworkAutocompleteResponse'
+        '400':
+          $ref: '#/components/responses/RegistryNetworkCatalogInvalid'
+        '403':
+          $ref: '#/components/responses/RegistryNetworkCatalogForbidden'
+        '503':
+          $ref: '#/components/responses/RegistryNetworkCatalogUnavailable'
     get:
       operationId: getPlanNetworkAutocomplete
       summary: Autocomplete plans by marketing name or plan ID
@@ -8306,10 +8386,373 @@ paths:
         publish_source_rollback with command_sha256. Completed preparation returns
         the exact candidate UUID and SHA256, source and expected serving generations,
         current approved custom revision, additions, removals, unresolved_rows and
-        source_selection counts. Preparation leaves the serving head unchanged.
+        source_selection counts. New preparation receipts also return diff_version 1,
+        changes, samples and validation. Counts compare exact network_id, provider_system,
+        provider_id and location_id membership units; changes compare distinct evidence-ID
+        sets for units present in both generations. Duplicate evidence and evidence order
+        do not change a unit. Samples contain exact four-element membership tuples,
+        stably ordered within additions, removals and changes, at most 20 per category
+        and 64 KiB of JSON in total; truncated samples retain prefixes. Validation reports
+        verified READY state, validated, index_ready, writer_closed and retained
+        membership_rows, distinct_memberships, projected_locations, orphan_bindings and
+        unknown_network_rows. Unresolved zero describes only a verified READY candidate;
+        refused candidates do not provide this preview or unresolved-input diagnostics.
+        Retained legacy preparation receipts omit the four new fields and remain valid.
+        Preparation leaves the serving head unchanged.
         Completed publication returns the preview request and exact candidate UUID
         and SHA256, previous and new serving generations, approved custom revision
         and manifest SHA256. Only explicit publication changes the serving head.
+  /registry/serving/providers/plans:
+    post:
+      operationId: readRegistryProviderPlans
+      summary: Read retained provider plans at authorized exact offices
+      description: Trusted full v2 policy read in one repeatable-read snapshot. Retained ACA source and approved
+        effective membership must both qualify the specific provider location before original address entries are
+        returned. Company and group visibility remain independent; issuer labels do not establish canonical company
+        identity. Existing providers without qualified ACA rows return empty arrays; unknown providers return 404.
+        Query strings and v1 policy are refused. Request and complete response are each bounded to 1 MiB. No unmanaged
+        retry.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+              - $ref: '#/components/schemas/RegistryCatalogPolicyEnvelopeV2'
+              - type: object
+                properties:
+                  query:
+                    $ref: '#/components/schemas/RegistryProviderPlansQuery'
+      responses:
+        '200':
+          description: Complete office-qualified legacy rows before gateway counts and pagination.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/DirectoryCacheControl'
+            X-Network-Generation:
+              $ref: '#/components/headers/RegistryNetworkGeneration'
+            X-Network-Access-Scope:
+              $ref: '#/components/headers/RegistryNetworkAccessScope'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryProviderPlansResponse'
+        '400':
+          $ref: '#/components/responses/RegistryNetworkCatalogInvalid'
+        '403':
+          $ref: '#/components/responses/RegistryNetworkCatalogForbidden'
+        '404':
+          $ref: '#/components/responses/RegistryNetworkCatalogNotFound'
+        '503':
+          $ref: '#/components/responses/RegistryNetworkCatalogUnavailable'
+  /registry/serving/providers/detail:
+    post:
+      operationId: readRegistryProviderDetail
+      summary: Read native provider detail under one complete access policy
+      description: Trusted control authentication and a fresh complete v2 client policy are required before obtaining
+        a Reader. Query strings, duplicate or unknown JSON fields and v1 policy are refused. The access-scope digest
+        is recomputed from the complete policy; client input alone is not authority. Network, company and group exclusions
+        qualify exact provider offices before counts, paging and hydration. One request-owned read-only repeatable-read
+        snapshot pins the approved network generation, revision and manifest. No unmanaged retry or current-table
+        fallback. Requests are at most 1 MiB; all responses are private, no-store. Successful complete responses are
+        at most 32 MiB. Optional taxonomy and office-qualified plan data share the same pin. Address source/evidence
+        flags preserve their native meanings; geocoding writes are disabled. Selectors confer no authority and denied
+        or ambiguous selections fail closed.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+              - {$ref: '#/components/schemas/RegistryCatalogPolicyEnvelopeV2'}
+              - type: object
+                properties:
+                  query: {$ref: '#/components/schemas/RegistryProviderDetailQuery'}
+      responses:
+        '200':
+          description: Complete policy-qualified result from one pinned serving manifest.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+            X-Network-Generation: {$ref: '#/components/headers/RegistryNetworkGeneration'}
+            X-Network-Access-Scope: {$ref: '#/components/headers/RegistryNetworkAccessScope'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RegistryProviderDetailResponse'}
+        '400': {$ref: '#/components/responses/RegistryNetworkCatalogInvalid'}
+        '403': {$ref: '#/components/responses/RegistryNetworkCatalogForbidden'}
+        '404': {$ref: '#/components/responses/RegistryNetworkCatalogNotFound'}
+        '409':
+          description: The pinned source, serving generation, policy-bound continuation or selector changed; restart
+            the read.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RegistryNetworkCatalogError'}
+        '503': {$ref: '#/components/responses/RegistryNetworkCatalogUnavailable'}
+  /registry/serving/providers/collection:
+    post:
+      operationId: readRegistryProviderCollection
+      summary: Read a native provider collection under one complete access policy
+      description: Trusted control authentication and a fresh complete v2 client policy are required before obtaining
+        a Reader. Query strings, duplicate or unknown JSON fields and v1 policy are refused. The access-scope digest
+        is recomputed from the complete policy; client input alone is not authority. Network, company and group exclusions
+        qualify exact provider offices before counts, paging and hydration. One request-owned read-only repeatable-read
+        snapshot pins the approved network generation, revision and manifest. No unmanaged retry or current-table
+        fallback. Requests are at most 1 MiB; all responses are private, no-store. Successful complete responses are
+        at most 32 MiB. List, geo, batch, by-service, group-plan and billing-search retain their native response shapes
+        and pagination. Canonical or uniquely resolved legacy network selectors are separate from native_query and
+        are authorized against the pinned manifest. Native continuation values are internal inputs; gateways must
+        bind public continuation to the current policy, selected query and serving manifest. Group-plan requires an
+        admitted plan release, limit at most 1000 and a positive internal NPI cursor at most 9999999999. Billing-search
+        also requires all three signed billing headers, the exact billing_transport_context_sha256, and independently
+        verified signed tenant/client authority before a Reader. Outer authorization uses the configured control
+        token and the recomputed policy digest.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+              - {$ref: '#/components/schemas/RegistryCatalogPolicyEnvelopeV2'}
+              - type: object
+                properties:
+                  query: {$ref: '#/components/schemas/RegistryProviderCollectionQuery'}
+      responses:
+        '200':
+          description: Complete policy-qualified result from one pinned serving manifest.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+            X-Network-Generation: {$ref: '#/components/headers/RegistryNetworkGeneration'}
+            X-Network-Access-Scope: {$ref: '#/components/headers/RegistryNetworkAccessScope'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RegistryProviderCollectionResponse'}
+        '400': {$ref: '#/components/responses/RegistryNetworkCatalogInvalid'}
+        '403': {$ref: '#/components/responses/RegistryNetworkCatalogForbidden'}
+        '404': {$ref: '#/components/responses/RegistryNetworkCatalogNotFound'}
+        '409':
+          description: The pinned source, serving generation, policy-bound continuation or selector changed; restart
+            the read.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RegistryNetworkCatalogError'}
+        '503': {$ref: '#/components/responses/RegistryNetworkCatalogUnavailable'}
+        '422':
+          description: Allowlisted by-service native scope refusal only; sanitized message is at most 300 characters,
+            fix_it.reason is bounded with an empty retry_options array.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+            X-Network-Access-Scope: {$ref: '#/components/headers/RegistryNetworkAccessScope'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RegistryProviderCollectionScopeRefusal'}
+      parameters:
+      - name: X-HealthPorta-Billing-Search-Context
+        in: header
+        required: false
+        description: Required only for kind billing-search; preserves the existing independently verified canonical
+          billing GET authorization.
+        schema: {$ref: '#/components/parameters/CustomImportProviderReadContext/schema'}
+      - name: X-HealthPorta-Billing-Search-Key-Id
+        in: header
+        required: false
+        description: Required only for kind billing-search; preserves the existing independently verified canonical
+          billing GET authorization.
+        schema: {$ref: '#/components/parameters/CustomImportProviderReadKeyId/schema'}
+      - name: X-HealthPorta-Billing-Search-Signature
+        in: header
+        required: false
+        description: Required only for kind billing-search; preserves the existing independently verified canonical
+          billing GET authorization.
+        schema: {$ref: '#/components/parameters/CustomImportProviderReadSignature/schema'}
+  /registry/serving/directory/entities:
+    post:
+      operationId: readRegistryDirectoryEntities
+      summary: Read retained directory entities under one complete access policy
+      description: Trusted control authentication and a fresh complete v2 client policy are required before obtaining
+        a Reader. Query strings, duplicate or unknown JSON fields and v1 policy are refused. The access-scope digest
+        is recomputed from the complete policy; client input alone is not authority. Network, company and group exclusions
+        qualify exact provider offices before counts, paging and hydration. One request-owned read-only repeatable-read
+        snapshot pins the approved network generation, revision and manifest. No unmanaged retry or current-table
+        fallback. Requests are at most 1 MiB; all responses are private, no-store. Complete responses are at most
+        4 MiB. The default exclusion policy is applied to original retained CMS entities before aggregation; explicit
+        network selectors are not accepted. Source generation_id is distinct from decimal network_generation. Continuations
+        bind source, kind, shape, entity, limit, serving generation and access policy, expire after 900 seconds and
+        cannot be reused after a scope change. No cursor is accepted for entity shape.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+              - {$ref: '#/components/schemas/RegistryCatalogPolicyEnvelopeV2'}
+              - type: object
+                properties:
+                  query: {$ref: '#/components/schemas/RegistryManagedDirectoryQuery'}
+      responses:
+        '200':
+          description: Complete policy-qualified result from one pinned serving manifest.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+            X-Network-Generation: {$ref: '#/components/headers/RegistryNetworkGeneration'}
+            X-Network-Access-Scope: {$ref: '#/components/headers/RegistryNetworkAccessScope'}
+            X-CMS-Retained-Publication: {$ref: '#/components/headers/DirectoryRetainedPublication'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RegistryManagedDirectoryResponse'}
+        '400': {$ref: '#/components/responses/RegistryNetworkCatalogInvalid'}
+        '403': {$ref: '#/components/responses/RegistryNetworkCatalogForbidden'}
+        '404':
+          description: Value-free hidden or missing reference; entity and relationship reads use provider_directory_entity_not_found.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RegistryManagedDirectoryError'}
+        '409':
+          description: The pinned source, serving generation, policy-bound continuation or selector changed; restart
+            the read.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RegistryNetworkCatalogError'}
+        '503': {$ref: '#/components/responses/RegistryNetworkCatalogUnavailable'}
+  /registry/serving/providers/profile:
+    post:
+      operationId: readRegistryProviderProfile
+      summary: Compose an authorized provider profile before aggregation
+      description: Requires a trusted full v2 policy and normalized public profile strings. Independent state and CMS
+        facts share one ordinary Reader snapshot with the canonical serving manifest. Directory role, office, network
+        and plan facts qualify before counts and evidence caps. The profile generation hash binds source identities,
+        the complete network manifest and access policy; it is distinct from the decimal network generation.
+        Requests and complete responses are bounded to 1 MiB. Missing retained source custody returns 503, without
+        current-table fallback or silently dropping an observed source. No unmanaged retry.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+              - $ref: '#/components/schemas/RegistryCatalogPolicyEnvelopeV2'
+              - type: object
+                properties:
+                  query:
+                    $ref: '#/components/schemas/RegistryProviderProfileQuery'
+      responses:
+        '200':
+          description: Categorized profile and optional page-filtered evidence.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/DirectoryCacheControl'
+            X-Network-Generation:
+              $ref: '#/components/headers/RegistryNetworkGeneration'
+            X-Network-Access-Scope:
+              $ref: '#/components/headers/RegistryNetworkAccessScope'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryProviderProfileResponse'
+        '400':
+          $ref: '#/components/responses/RegistryNetworkCatalogInvalid'
+        '403':
+          $ref: '#/components/responses/RegistryNetworkCatalogForbidden'
+        '404':
+          description: No reviewed profile facts are available for this NPI.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The profile or its authorization changed; restart category pagination.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderProfileGenerationConflict'
+        '503':
+          $ref: '#/components/responses/RegistryNetworkCatalogUnavailable'
+  /registry/serving/organizations:
+    post:
+      operationId: listRegistryServingOrganizations
+      summary: Read independently visible organizations from a pinned serving approval
+      description: Requires explicit v2 trusted policy; v1, unknown fields and query strings are refused.
+        Organization exclusions apply before count and pagination; group references have independent visibility.
+        Requests and complete responses are bounded to 1 MiB. Hidden or absent detail returns a value-free
+        404. No privacy activation is implied by this service contract.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+              - $ref: '#/components/schemas/RegistryCatalogPolicyEnvelopeV2'
+              - type: object
+                properties:
+                  query:
+                    $ref: '#/components/schemas/RegistryOrganizationCatalogListQuery'
+      responses:
+        '200':
+          $ref: '#/components/responses/RegistryOrganizationCatalogSuccess'
+        '400':
+          $ref: '#/components/responses/RegistryNetworkCatalogInvalid'
+        '403':
+          $ref: '#/components/responses/RegistryNetworkCatalogForbidden'
+        '503':
+          $ref: '#/components/responses/RegistryNetworkCatalogUnavailable'
+  /registry/serving/organizations/detail:
+    post:
+      operationId: readRegistryServingOrganization
+      summary: Read independently visible organizations from a pinned serving approval
+      description: Requires explicit v2 trusted policy; v1, unknown fields and query strings are refused.
+        Organization exclusions apply before count and pagination; group references have independent visibility.
+        Requests and complete responses are bounded to 1 MiB. Hidden or absent detail returns a value-free
+        404. No privacy activation is implied by this service contract.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+              - $ref: '#/components/schemas/RegistryCatalogPolicyEnvelopeV2'
+              - type: object
+                properties:
+                  query:
+                    $ref: '#/components/schemas/RegistryOrganizationCatalogDetailQuery'
+      responses:
+        '200':
+          $ref: '#/components/responses/RegistryOrganizationCatalogSuccess'
+        '400':
+          $ref: '#/components/responses/RegistryNetworkCatalogInvalid'
+        '403':
+          $ref: '#/components/responses/RegistryNetworkCatalogForbidden'
+        '503':
+          $ref: '#/components/responses/RegistryNetworkCatalogUnavailable'
+        '404':
+          $ref: '#/components/responses/RegistryNetworkCatalogNotFound'
   /registry/serving/catalog:
     post:
       operationId: listRegistryNetworkCatalog
@@ -8320,6 +8763,9 @@ paths:
         before totals and pagination. Benefit types describe explicit approved company-network
         assertions in the pinned revision, without temporal, provider coverage or pricing claims.
         Drafts and mutable registry heads cannot supply catalog metadata.
+        Opt-in v2 independently excludes company metadata before nested company disclosure
+        and declared benefit filtering/counts; excluded group targets are omitted independently.
+        Network access remains separate.
       security:
       - RegistryControlBearer: []
       - RegistryControlHeader: []
@@ -8329,7 +8775,9 @@ paths:
           application/json:
             schema:
               allOf:
-              - $ref: '#/components/schemas/RegistryNetworkCatalogPolicyEnvelope'
+              - oneOf:
+                - $ref: '#/components/schemas/RegistryNetworkCatalogPolicyEnvelope'
+                - $ref: '#/components/schemas/RegistryCatalogPolicyEnvelopeV2'
               - type: object
                 properties:
                   query:
@@ -8349,6 +8797,9 @@ paths:
       summary: Read one authorized canonical network
       description: Uses the same bounded server policy envelope as catalog listing.
         A hidden or absent identity returns a value-free 404. Query strings are refused.
+        Opt-in v2 independently excludes company metadata before nested company disclosure
+        and declared benefit filtering/counts; excluded group targets are omitted independently.
+        Network access remains separate.
       security:
       - RegistryControlBearer: []
       - RegistryControlHeader: []
@@ -8358,7 +8809,9 @@ paths:
           application/json:
             schema:
               allOf:
-              - $ref: '#/components/schemas/RegistryNetworkCatalogPolicyEnvelope'
+              - oneOf:
+                - $ref: '#/components/schemas/RegistryNetworkCatalogPolicyEnvelope'
+                - $ref: '#/components/schemas/RegistryCatalogPolicyEnvelopeV2'
               - type: object
                 properties:
                   query:
@@ -8377,11 +8830,18 @@ paths:
   /registry/serving/catalog/legacy:
     post:
       operationId: resolveRegistryNetworkCatalogLegacy
-      summary: Resolve an exact approved source-scoped legacy network reference
-      description: Requires complete source coordinates and matching source scope.
+      summary: Resolve approved legacy network references
+      description: A single reference requires complete source coordinates and matching source scope.
+        Alternatively, resolve one through 50 distinct typed values across approved source bindings
+        in one batch. Every value must resolve to exactly one active canonical network before
+        visibility exclusions; unknown, ambiguous, archived or hidden targets refuse the entire batch.
+        Successful batches return deduplicated networks with complete source bindings.
         ACA checksums and FHIR UUIDs remain distinct from canonical integer IDs.
         Global ambiguity is refused even when policy excludes one candidate.
         Query strings are refused. Names never provide an identity fallback.
+        Opt-in v2 independently excludes company metadata before nested company disclosure
+        and declared benefit filtering/counts; excluded group targets are omitted independently.
+        Network access remains separate.
       security:
       - RegistryControlBearer: []
       - RegistryControlHeader: []
@@ -8391,11 +8851,15 @@ paths:
           application/json:
             schema:
               allOf:
-              - $ref: '#/components/schemas/RegistryNetworkCatalogPolicyEnvelope'
+              - oneOf:
+                - $ref: '#/components/schemas/RegistryNetworkCatalogPolicyEnvelope'
+                - $ref: '#/components/schemas/RegistryCatalogPolicyEnvelopeV2'
               - type: object
                 properties:
                   query:
-                    $ref: '#/components/schemas/RegistryNetworkCatalogLegacyQuery'
+                    oneOf:
+                    - $ref: '#/components/schemas/RegistryNetworkCatalogLegacyQuery'
+                    - $ref: '#/components/schemas/RegistryNetworkCatalogLegacyBatchQuery'
       responses:
         '200':
           $ref: '#/components/responses/RegistryNetworkCatalogSuccess'
@@ -8595,6 +9059,9 @@ components:
     RegistryNetworkGeneration:
       description: Exact generation used for all response data or the verified absence.
       schema: {type: string, pattern: '^[1-9][0-9]{0,18}$'}
+    DirectoryRetainedPublication:
+      description: Present only after verifying the exact committed retained CMS source pair in trusted network-scoped mode.
+      schema: {type: string, enum: ['committed/v1']}
     DirectoryCacheControl:
       description: Source-bound responses must not be stored.
       schema:
@@ -8682,6 +9149,14 @@ components:
       schema:
         type: string
         pattern: '^[a-z0-9_-]{1,64}$'
+    DirectoryNetworkIds:
+      name: network_ids
+      in: query
+      description: Optional trusted network scope containing one to 100 distinct canonical positive int32 network IDs. Scoped reads require control authentication; scoped CMSDoctors reads remain unavailable.
+      schema:
+        type: string
+        maxLength: 1099
+        pattern: '^[1-9][0-9]{0,9}(,[1-9][0-9]{0,9}){0,99}$'
     DirectoryGenerationId:
       name: generation_id
       in: query
@@ -8818,6 +9293,19 @@ components:
         minLength: 1
         maxLength: 512
   responses:
+    RegistryOrganizationCatalogSuccess:
+      description: Complete independently authorized organization page from one retained serving approval.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/DirectoryCacheControl'
+        X-Network-Generation:
+          $ref: '#/components/headers/RegistryNetworkGeneration'
+        X-Network-Access-Scope:
+          $ref: '#/components/headers/RegistryNetworkAccessScope'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RegistryOrganizationCatalogPage'
     RegistryNetworkCatalogSuccess:
       description: Complete authorized catalog page in the exact retained generation.
       headers:
@@ -8989,6 +9477,426 @@ components:
           schema:
             $ref: '#/components/schemas/FHIRFormularyServingUnavailableResponse'
   schemas:
+    RegistryCatalogPolicyEnvelopeV2:
+      type: object
+      additionalProperties: false
+      required:
+      - contract_version
+      - client_id
+      - policy_revision
+      - excluded_network_ids
+      - organization_visibility_default
+      - excluded_company_ids
+      - excluded_group_ids
+      - access_scope_sha256
+      - query
+      properties:
+        contract_version:
+          type: string
+          enum:
+          - registry-catalog-policy/v2
+        client_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: At most 64 Unicode scalar characters; no surrounding whitespace, control characters
+            or invalid Unicode.
+        policy_revision:
+          type: string
+          pattern: ^(0|[1-9][0-9]{0,18})$
+          description: Canonical decimal string from zero through 9223372036854775807.
+        excluded_network_ids:
+          type: array
+          maxItems: 50000
+          uniqueItems: true
+          description: Sorted ascending; acquired by the trusted server from current client policy.
+          items:
+            type: integer
+            minimum: 1
+            maximum: 2147483647
+        organization_visibility_default:
+          type: string
+          enum:
+          - system_wide
+        excluded_company_ids:
+          type: array
+          maxItems: 50000
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+            pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+        excluded_group_ids:
+          type: array
+          maxItems: 50000
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+            pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+        access_scope_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        query:
+          type: object
+      description: Explicit opt-in; no failed v2 lookup falls back to v1. Each typed UUID array is sorted
+        ascending; the combined company and group exception count is at most 50000. Missing organization exceptions
+        allow by system_wide default. The trusted server obtains fresh current client policy; browser policy
+        is not authority. Recompute access_scope_sha256 over the other seven policy fields, excluding query
+        and digest, using lexicographically sorted keys, compact UTF-8 JSON and literal Unicode. Normalize
+        the canonical decimal-string policy_revision to JSON int64 solely for this v2 digest, preserving the
+        App integer-revision hash. The v1 decimal-string digest is unchanged. Entire requests are at most
+        1 MiB; complete response bounds are specified by each operation.
+    RegistryOrganizationCatalogListQuery:
+      type: object
+      additionalProperties: false
+      required:
+      - record_kind
+      properties:
+        record_kind:
+          type: string
+          enum:
+          - company
+          - group
+        network_generation:
+          $ref: '#/components/schemas/RegistryNetworkCatalogGeneration'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 50
+        offset:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          default: 0
+    RegistryOrganizationCatalogDetailQuery:
+      type: object
+      additionalProperties: false
+      required:
+      - record_kind
+      - record_id
+      properties:
+        record_kind:
+          type: string
+          enum:
+          - company
+          - group
+        record_id:
+          type: string
+          format: uuid
+          pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+        network_generation:
+          $ref: '#/components/schemas/RegistryNetworkCatalogGeneration'
+    RegistryOrganizationAssertionProvenance:
+      type: object
+      additionalProperties: false
+      required:
+      - kind
+      - evidence_ref
+      - snapshot_id
+      - source_record_key
+      properties:
+        kind:
+          type: string
+          enum:
+          - manual_reference
+          - source_reference
+        evidence_ref:
+          type: string
+          minLength: 1
+          maxLength: 128
+        snapshot_id:
+          type: string
+          format: uuid
+          nullable: true
+        source_record_key:
+          type: string
+          minLength: 1
+          maxLength: 128
+          nullable: true
+      description: Manual references have null snapshot/source coordinates; source references require both
+        coordinates. These are declared provenance, not serving access grants.
+    RegistryOrganizationRoleAssertion:
+      type: object
+      additionalProperties: false
+      required:
+      - assertion_id
+      - valid_from
+      - valid_to
+      - provenance
+      - role
+      properties:
+        assertion_id:
+          type: string
+          format: uuid
+          pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+        valid_from:
+          type: string
+          format: date
+        valid_to:
+          type: string
+          format: date
+          nullable: true
+        provenance:
+          $ref: '#/components/schemas/RegistryOrganizationAssertionProvenance'
+        role:
+          type: string
+          enum:
+          - insurer
+          - employer
+          - network_operator
+    RegistryOrganizationIdentifierAssertion:
+      type: object
+      additionalProperties: false
+      required:
+      - assertion_id
+      - valid_from
+      - valid_to
+      - provenance
+      - identifier_system
+      - identifier_scope
+      - identifier_value
+      properties:
+        assertion_id:
+          type: string
+          format: uuid
+          pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+        valid_from:
+          type: string
+          format: date
+        valid_to:
+          type: string
+          format: date
+          nullable: true
+        provenance:
+          $ref: '#/components/schemas/RegistryOrganizationAssertionProvenance'
+        identifier_system:
+          type: string
+          enum:
+          - ein
+          - naic_company
+          - external_reference
+        identifier_scope:
+          type: string
+          minLength: 1
+          maxLength: 128
+        identifier_value:
+          type: string
+          minLength: 1
+          maxLength: 64
+    RegistryOrganizationGroupAssertion:
+      type: object
+      additionalProperties: false
+      required:
+      - assertion_id
+      - valid_from
+      - valid_to
+      - provenance
+      - company_id
+      - group_id
+      - group_kind
+      - relationship_kind
+      properties:
+        assertion_id:
+          type: string
+          format: uuid
+          pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+        valid_from:
+          type: string
+          format: date
+          nullable: true
+        valid_to:
+          type: string
+          format: date
+          nullable: true
+        provenance:
+          $ref: '#/components/schemas/RegistryOrganizationAssertionProvenance'
+        company_id:
+          type: string
+          format: uuid
+          pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+        group_id:
+          type: string
+          format: uuid
+          pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+        group_kind:
+          type: string
+          enum:
+          - corporate_parent
+          - naic_group
+        relationship_kind:
+          type: string
+          minLength: 1
+          maxLength: 32
+      description: Only independently visible active group targets in the same retained approved revision
+        are returned; group membership does not confer company or network access.
+    RegistryServingCompany:
+      type: object
+      additionalProperties: false
+      required:
+      - company_id
+      - display_name
+      - display_name_origin
+      - roles
+      - aliases
+      - archived
+      - revision
+      - role_assertions
+      - identifier_assertions
+      - group_assertions
+      properties:
+        company_id:
+          type: string
+          format: uuid
+          pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 512
+        display_name_origin:
+          type: string
+          minLength: 1
+          maxLength: 64
+        roles:
+          type: array
+          maxItems: 3
+          uniqueItems: true
+          items:
+            type: string
+            enum:
+            - insurer
+            - employer
+            - network_operator
+        aliases:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 512
+        archived:
+          type: boolean
+          enum:
+          - false
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 9223372036854775807
+        role_assertions:
+          type: array
+          maxItems: 32
+          items:
+            $ref: '#/components/schemas/RegistryOrganizationRoleAssertion'
+        identifier_assertions:
+          type: array
+          maxItems: 128
+          items:
+            $ref: '#/components/schemas/RegistryOrganizationIdentifierAssertion'
+        group_assertions:
+          type: array
+          maxItems: 128
+          items:
+            $ref: '#/components/schemas/RegistryOrganizationGroupAssertion'
+    RegistryServingGroup:
+      type: object
+      additionalProperties: false
+      required:
+      - group_id
+      - group_kind
+      - display_name
+      - aliases
+      - archived
+      - revision
+      properties:
+        group_id:
+          type: string
+          format: uuid
+          pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+        group_kind:
+          type: string
+          enum:
+          - corporate_parent
+          - naic_group
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 512
+        aliases:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 512
+        archived:
+          type: boolean
+          enum:
+          - false
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 9223372036854775807
+    RegistryOrganizationCatalogPage:
+      type: object
+      additionalProperties: false
+      required:
+      - client_id
+      - policy_revision
+      - generation
+      - approved_custom_revision
+      - record_kind
+      - total
+      - offset
+      - limit
+      - items
+      properties:
+        client_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+        policy_revision:
+          type: string
+          pattern: ^(0|[1-9][0-9]{0,18})$
+        generation:
+          $ref: '#/components/schemas/RegistryNetworkCatalogGeneration'
+        approved_custom_revision:
+          type: string
+          pattern: ^(0|[1-9][0-9]{0,18})$
+          description: Canonical decimal string from zero through 9223372036854775807.
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9223372036854775807
+        offset:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        items:
+          type: array
+          maxItems: 100
+          items:
+            oneOf:
+            - $ref: '#/components/schemas/RegistryServingCompany'
+            - $ref: '#/components/schemas/RegistryServingGroup'
+        record_kind:
+          type: string
+          enum:
+          - company
+          - group
+      description: Exactly one selected organization kind from the pinned serving approval. Typed exclusions
+        apply before totals, deterministic UUID ordering, OFFSET and LIMIT. No inventory allowlist enumeration
+        or inherited organization/network authority. Detail pages have exactly one item, offset zero and limit
+        one.
     RegistryNetworkCatalogPolicyEnvelope:
       type: object
       additionalProperties: false
@@ -9062,6 +9970,914 @@ components:
           $ref: '#/components/schemas/RegistryNetworkCatalogSource'
         network_generation:
           $ref: '#/components/schemas/RegistryNetworkCatalogGeneration'
+    RegistryNetworkCatalogLegacyBatchQuery:
+      type: object
+      additionalProperties: false
+      required: [namespace, values]
+      description: Bounded reverse lookup across all active approved source contexts.
+        Scalar source and source_scope fields are not accepted. Each value must have
+        exactly one canonical target globally before client exclusions. Any unresolved,
+        ambiguous or denied value returns the same value-free 404 for the whole batch.
+      properties:
+        namespace: {type: string, enum: [checksum_network, legacy_fhir_uuid]}
+        values:
+          type: array
+          minItems: 1
+          maxItems: 50
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 36
+            description: Canonical signed int32 decimal for ACA, including zero;
+              negative zero and leading zeros are refused. FHIR requires a nonzero lowercase UUID.
+        network_generation:
+          $ref: '#/components/schemas/RegistryNetworkCatalogGeneration'
+    RegistryManagedNetworkSelector:
+      oneOf:
+      - type: object
+        additionalProperties: false
+        required: [namespace, values]
+        properties:
+          namespace:
+            type: string
+            enum: [canonical]
+          values:
+            type: array
+            minItems: 1
+            maxItems: 100
+            uniqueItems: true
+            items: {type: integer, minimum: 1, maximum: 2147483647}
+      - type: object
+        additionalProperties: false
+        required: [namespace, values]
+        properties:
+          namespace:
+            type: string
+            enum: [checksum_network, legacy_fhir_uuid]
+          values:
+            type: array
+            minItems: 1
+            maxItems: 50
+            uniqueItems: true
+            items: {type: string, minLength: 1, maxLength: 36}
+            description: Canonical signed int32 decimal (including zero, excluding negative zero and leading zeros),
+              or nonzero canonical lowercase UUID, according to namespace.
+      description: Closed typed selection only. Legacy values must each resolve uniquely across active approved source
+        contexts before exclusions. Any unresolved, ambiguous or denied selection returns the same value-free 404; no
+        partial selection.
+    RegistryProviderDetailQuery:
+      type: object
+      additionalProperties: false
+      required: [npi]
+      description: Normalized string options. address_limit all or 0 returns all ranked addresses and forbids address_offset.
+        Premise grouping forbids either address UUID and requires a finite address_limit from 1 through 5. Optional
+        network_generation is a positive canonical int64 decimal string.
+      properties:
+        npi: {type: string, pattern: '^[0-9]{10}$'}
+        include:
+          type: array
+          maxItems: 2
+          uniqueItems: true
+          items:
+            type: string
+            enum: [taxonomy, plans]
+        selector: {$ref: '#/components/schemas/RegistryManagedNetworkSelector'}
+        network_generation: {$ref: '#/components/schemas/RegistryNetworkCatalogGeneration'}
+        include_sources:
+          type: string
+          enum: ['true', 'false']
+        include_evidence:
+          type: string
+          enum: ['true', 'false']
+        debug:
+          type: string
+          enum: ['true', 'false']
+        extra_info:
+          type: string
+          enum: ['true', 'false']
+        address_key: {type: string, format: uuid, pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'}
+        address_site_key: {type: string, format: uuid, pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'}
+        address_grouping:
+          type: string
+          enum: [flat, premise]
+          default: flat
+        address_limit: {type: string, pattern: '^(all|0|[1-9][0-9]{0,2}|1000)$', default: '5'}
+        address_offset: {type: string, pattern: '^(0|[1-9][0-9]{0,5}|1000000)$'}
+    RegistryManagedNativeString:
+      type: string
+      maxLength: 2048
+      pattern: ^[^\u0000]*$
+      description: Native normalized query string without NUL; domain validation remains with the corresponding native
+        handler.
+    RegistryManagedListNativeQuery:
+      type: object
+      additionalProperties: false
+      description: At most 16 KiB combined UTF-8 field-name/value bytes; unknown names and embedded network scope fields
+        are rejected. Native handler validation and response shape are preserved.
+      properties:
+        address_grouping: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        address_key: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        address_limit: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        address_offset: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        address_site_key: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        city: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        classification: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        count_only: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        debug: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        display_name: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        entity_type_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        extra_info: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        first_name: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        format: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        has_insurance: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_address_total: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_evidence: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_sources: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_total: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        last_name: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        limit: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        medication_code_system: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        medication_codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        name_like:
+          oneOf:
+          - {$ref: '#/components/schemas/RegistryManagedNativeString'}
+          - type: array
+            minItems: 1
+            maxItems: 16
+            items: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        npi: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        offset: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        order_by: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        organization_name: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        page: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        page_size: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        phone: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        plan_release_id: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        postal_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        primary_only: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        procedure_code_system: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        procedure_codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        provider_sex_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        q: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        response_format: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        section: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        show: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        specialization: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        start: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        state: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        view: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        year: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        zip_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+    RegistryManagedGeoNativeQuery:
+      type: object
+      additionalProperties: false
+      description: At most 16 KiB combined UTF-8 field-name/value bytes; unknown names and embedded network scope fields
+        are rejected. Native handler validation and response shape are preserved.
+      properties:
+        classification: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        count_only: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        cursor: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        display_name: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        entity_type_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        exclude_npi: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_total: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        lat: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        limit: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        long: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        medication_code_system: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        medication_codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        plan_release_id: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        primary_only: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        procedure_code_system: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        procedure_codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        provider_sex_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        q: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        radius: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        section: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        specialization: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        view: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        year: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        zip_codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+    RegistryManagedBatchNativeQuery:
+      type: object
+      additionalProperties: false
+      description: At most 16 KiB combined UTF-8 field-name/value bytes; unknown names and embedded network scope fields
+        are rejected. Native handler validation and response shape are preserved.
+      properties:
+        address_grouping: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        address_key: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        address_site_key: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        city: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        classification: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        debug: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        display_name: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        entity_type_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        extra_info: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        first_name: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        has_insurance: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_evidence: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_sources: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_total: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        last_name: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        limit: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        medication_code_system: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        medication_codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        name_like: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        npi: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        offset: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        order_by: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        organization_name: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        page: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        page_size: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        phone: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        plan_release_id: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        postal_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        primary_only: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        procedure_code_system: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        procedure_codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        provider_sex_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        q: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        section: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        show: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        specialization: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        start: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        state: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        view: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        year: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        zip_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+    RegistryManagedByServiceNativeQuery:
+      type: object
+      additionalProperties: false
+      description: At most 16 KiB combined UTF-8 field-name/value bytes; unknown names and embedded network scope fields
+        are rejected. Native handler validation and response shape are preserved. A nonblank q or code is required;
+        limit must not exceed 200 (default 25), and native pagination aliases must agree.
+      anyOf:
+      - required: [q]
+        properties:
+          q: {type: string, pattern: '\S'}
+      - required: [code]
+        properties:
+          code: {type: string, pattern: '\S'}
+      properties:
+        billing_code_modifier: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        city: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        classification: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        code_system: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        cursor: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        expand_codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_allowed_amounts: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_code_details: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_debug: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_details: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_evidence: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_legacy_fields: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_providers: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_sources: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_subspecialties: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_unverified_addresses: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        lat: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        limit: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        long: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        market_type: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        min_claims: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        min_total_cost: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        mode: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        modifier: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        modifiers: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        negotiated_rate: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        negotiated_rate_tolerance: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        npi: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        offset: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        order: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        order_by: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        page: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        place_of_service: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        plan_external_id: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        plan_id: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        plan_id_type: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        plan_market_type: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        plan_release_id: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        pos: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        primary_only: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        provider_sex_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        q: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        radius: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        radius_miles: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        rate: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        rate_tolerance: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        service_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        snapshot_id: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        source_key: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        specialty: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        state: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        taxonomy_classification: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        taxonomy_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        taxonomy_codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        taxonomy_section: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        taxonomy_specialization: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        view: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        year: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        zip5: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        zip_radius_miles: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+    RegistryManagedGroupPlanNativeQuery:
+      type: object
+      additionalProperties: false
+      description: At most 16 KiB combined UTF-8 field-name/value bytes; unknown names and embedded network scope fields
+        are rejected. Native handler validation and response shape are preserved. plan_release_id must be a valid admitted
+        canonical plan release identifier.
+      properties:
+        city: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        classification: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        count: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        cursor: {type: string, maxLength: 2048, pattern: '^([0]*[1-9][0-9]{0,9})?$'}
+        enrich: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_mail_addresses: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_subspecialties: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        limit: {type: string, maxLength: 2048, pattern: '^([0]*([1-9][0-9]{0,2}|1000))?$'}
+        market_type: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        plan_id: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        plan_release_id: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        primary_only: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        provider_sex_code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        source_key: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        specialty: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        state: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        taxonomy_codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        zip5: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        zip_radius_miles: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+      required: [plan_release_id]
+    RegistryManagedBillingSearchNativeQuery:
+      type: object
+      additionalProperties: false
+      description: 'At most 16 KiB combined UTF-8 field-name/value bytes; unknown names and embedded network scope fields
+        are rejected. Native handler validation and response shape are preserved. plan_release_id must be a valid admitted
+        canonical plan release identifier. Exactly one location mode is required: zip5 (five digits) or canonical lat/long/radius_miles;
+        latitude is from -90 through 90, longitude from -180 through 180, and radius from 0 through 100 miles, inclusive.'
+      properties:
+        billing_entity_ref: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        billing_transport_context_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        code: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        code_system: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        cursor: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        include_evidence: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        lat: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        limit: {type: string, pattern: '^([1-9][0-9]?|100)$'}
+        long: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        modifiers: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        npi: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        place_of_service: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        plan_release_id: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        radius_miles: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        zip5: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+      required: [plan_release_id, billing_entity_ref, code, code_system, limit, billing_transport_context_sha256]
+      oneOf:
+      - required: [zip5]
+        not:
+          anyOf:
+          - required: [lat]
+          - required: [long]
+          - required: [radius_miles]
+      - required: [lat, long, radius_miles]
+        not:
+          required: [zip5]
+    RegistryProviderCollectionQuery:
+      description: Closed kind-specific query; serialized query at most 1 MiB and native fields at most 16 KiB. native_batch
+        occurs exactly for batch. Neither native_query nor native_batch supplies access-policy authority.
+      oneOf:
+      - type: object
+        additionalProperties: false
+        required: [kind, native_query]
+        properties:
+          kind:
+            type: string
+            enum: [list]
+          native_query: {$ref: '#/components/schemas/RegistryManagedListNativeQuery'}
+          selector: {$ref: '#/components/schemas/RegistryManagedNetworkSelector'}
+          network_generation: {$ref: '#/components/schemas/RegistryNetworkCatalogGeneration'}
+      - type: object
+        additionalProperties: false
+        required: [kind, native_query]
+        properties:
+          kind:
+            type: string
+            enum: [geo]
+          native_query: {$ref: '#/components/schemas/RegistryManagedGeoNativeQuery'}
+          selector: {$ref: '#/components/schemas/RegistryManagedNetworkSelector'}
+          network_generation: {$ref: '#/components/schemas/RegistryNetworkCatalogGeneration'}
+      - type: object
+        additionalProperties: false
+        required: [kind, native_query, native_batch]
+        properties:
+          kind:
+            type: string
+            enum: [batch]
+          native_query: {$ref: '#/components/schemas/RegistryManagedBatchNativeQuery'}
+          selector: {$ref: '#/components/schemas/RegistryManagedNetworkSelector'}
+          network_generation: {$ref: '#/components/schemas/RegistryNetworkCatalogGeneration'}
+          native_batch: {$ref: '#/components/schemas/RegistryProviderCollectionNativeBatch'}
+      - type: object
+        additionalProperties: false
+        required: [kind, native_query]
+        properties:
+          kind:
+            type: string
+            enum: [by-service]
+          native_query: {$ref: '#/components/schemas/RegistryManagedByServiceNativeQuery'}
+          selector: {$ref: '#/components/schemas/RegistryManagedNetworkSelector'}
+          network_generation: {$ref: '#/components/schemas/RegistryNetworkCatalogGeneration'}
+      - type: object
+        additionalProperties: false
+        required: [kind, native_query]
+        properties:
+          kind:
+            type: string
+            enum: [group-plan]
+          native_query: {$ref: '#/components/schemas/RegistryManagedGroupPlanNativeQuery'}
+          selector: {$ref: '#/components/schemas/RegistryManagedNetworkSelector'}
+          network_generation: {$ref: '#/components/schemas/RegistryNetworkCatalogGeneration'}
+      - type: object
+        additionalProperties: false
+        required: [kind, native_query]
+        properties:
+          kind:
+            type: string
+            enum: [billing-search]
+          native_query: {$ref: '#/components/schemas/RegistryManagedBillingSearchNativeQuery'}
+          selector: {$ref: '#/components/schemas/RegistryManagedNetworkSelector'}
+          network_generation: {$ref: '#/components/schemas/RegistryNetworkCatalogGeneration'}
+    RegistryProviderCollectionNativeBatch:
+      type: object
+      additionalProperties: false
+      required: [npis]
+      description: Between 1 and 100 distinct normalized 10-digit NPIs. Numeric strings are normalized before uniqueness
+        checking. address_limit defaults to 5; 0 or all means all. Premise grouping limits finite addresses to 1 through
+        5. Native query source/evidence flags must agree with these booleans.
+      properties:
+        npis:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            oneOf:
+            - {type: string, pattern: '^\s*[0-9]{10}\s*$'}
+            - {type: integer, minimum: 1000000000, maximum: 9999999999}
+        address_limit:
+          oneOf:
+          - {type: integer, minimum: 0, maximum: 1000}
+          - type: string
+            pattern: ^\s*[aA][lL][lL]\s*$
+            description: Case-insensitive all, allowing surrounding whitespace.
+        address_offset: {type: integer, minimum: 0, maximum: 1000000, default: 0}
+        include_sources: {type: boolean, default: false}
+        include_evidence: {type: boolean, default: false}
+    RegistryProviderDetailResponse:
+      type: object
+      additionalProperties: false
+      required: [client_id, policy_revision, generation, approved_custom_revision, manifest_sha256, data]
+      properties:
+        client_id: {type: string, minLength: 1, maxLength: 64}
+        policy_revision: {type: string, pattern: '^(0|[1-9][0-9]{0,18})$'}
+        generation: {$ref: '#/components/schemas/RegistryNetworkCatalogGeneration'}
+        approved_custom_revision: {type: string, pattern: '^(0|[1-9][0-9]{0,18})$'}
+        manifest_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        data:
+          type: object
+          additionalProperties: false
+          required: [npi]
+          properties:
+            npi: {$ref: '#/components/schemas/NpiRecord'}
+            taxonomy:
+              type: array
+              items: {$ref: '#/components/schemas/NpiTaxonomy'}
+            plans_by_npi:
+              type: object
+              additionalProperties: false
+              required: [npi_data, plan_data, issuer_data]
+              properties:
+                npi_data:
+                  type: array
+                  items: {type: object}
+                plan_data:
+                  type: array
+                  maxItems: 0
+                  items: {type: object}
+                issuer_data:
+                  type: array
+                  maxItems: 0
+                  items: {type: object}
+    RegistryProviderCollectionResponse:
+      type: object
+      additionalProperties: false
+      required: [client_id, policy_revision, generation, approved_custom_revision, manifest_sha256, data]
+      properties:
+        client_id: {type: string, minLength: 1, maxLength: 64}
+        policy_revision: {type: string, pattern: '^(0|[1-9][0-9]{0,18})$'}
+        generation: {$ref: '#/components/schemas/RegistryNetworkCatalogGeneration'}
+        approved_custom_revision: {type: string, pattern: '^(0|[1-9][0-9]{0,18})$'}
+        manifest_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        data:
+          oneOf:
+          - {type: object}
+          - type: array
+            items: {type: object}
+          description: Unmodified native result for the requested collection kind, after exact office qualification;
+            preserves that native API count, format and continuation contract.
+    RegistryManagedDirectoryQuery:
+      type: object
+      additionalProperties: false
+      required: [kind, source_id, shape]
+      description: 'Only source-specific kind pairs below are valid. entity_id is required exactly for entity or relationships:
+        UUID except payer IDs, which are 1-64 ASCII letters, digits, underscore or hyphen. A cursor requires generation_id
+        and is forbidden for entity shape. The URL-encoded source query is at most 4096 bytes. No selector, network_ids
+        or caller-supplied exclusions are accepted.'
+      properties:
+        kind:
+          type: string
+          enum: [organizations, sites, payers, plans, networks, practitioner-roles, medical-groups]
+        source_id:
+          type: string
+          enum: [cms-npd, cms-doctors]
+        shape:
+          type: string
+          enum: [entities, entity, relationships]
+        entity_id: {type: string}
+        generation_id: {type: string, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$'}
+        limit: {type: integer, minimum: 1, maximum: 100, default: 25}
+        cursor: {type: string, maxLength: 512, pattern: '^[A-Za-z0-9_-]+$'}
+        network_generation: {$ref: '#/components/schemas/RegistryNetworkCatalogGeneration'}
+      oneOf:
+      - properties:
+          source_id:
+            type: string
+            enum: [cms-npd]
+          kind:
+            type: string
+            enum: [organizations, sites, payers, plans, networks, practitioner-roles]
+      - properties:
+          source_id:
+            type: string
+            enum: [cms-doctors]
+          kind:
+            type: string
+            enum: [medical-groups, sites]
+      allOf:
+      - oneOf:
+        - properties:
+            shape:
+              enum: [entities]
+          not:
+            required: [entity_id]
+        - properties:
+            shape:
+              enum: [entity]
+          required: [entity_id]
+          not:
+            required: [cursor]
+        - properties:
+            shape:
+              enum: [relationships]
+          required: [entity_id]
+      - anyOf:
+        - not:
+            required: [cursor]
+        - required: [generation_id]
+    RegistryManagedDirectoryResponse:
+      type: object
+      additionalProperties: false
+      required: [client_id, policy_revision, generation, approved_custom_revision, manifest_sha256, data]
+      properties:
+        client_id: {type: string, minLength: 1, maxLength: 64}
+        policy_revision: {type: string, pattern: '^(0|[1-9][0-9]{0,18})$'}
+        generation: {$ref: '#/components/schemas/RegistryNetworkCatalogGeneration'}
+        approved_custom_revision: {type: string, pattern: '^(0|[1-9][0-9]{0,18})$'}
+        manifest_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        data:
+          anyOf:
+          - {$ref: '#/components/schemas/DirectoryEntityPage'}
+          - {$ref: '#/components/schemas/DirectoryEntityDetail'}
+          - {$ref: '#/components/schemas/DirectoryRelationshipPage'}
+          description: The original source-native page or entity, with its opaque source generation and encrypted continuation.
+            Page items are bounded by the request limit, at most 100.
+    RegistryManagedDirectoryError:
+      oneOf:
+      - {$ref: '#/components/schemas/RegistryNetworkCatalogError'}
+      - type: object
+        additionalProperties: false
+        required: [error]
+        properties:
+          error:
+            type: object
+            additionalProperties: false
+            required: [code]
+            properties:
+              code:
+                type: string
+                enum: [provider_directory_entity_not_found]
+    RegistryProviderCollectionScopeRefusal:
+      type: object
+      additionalProperties: false
+      required: [status, code, message, fix_it]
+      properties:
+        status:
+          type: integer
+          enum: [422]
+        code:
+          type: string
+          enum: [ptg2_provider_scope_refused, ptg2_online_work_budget_exceeded, ptg2_provider_filter_scope_required,
+            ptg2_location_scope_too_broad, ptg2_provider_filter_unsupported]
+        message: {type: string, minLength: 1, maxLength: 300}
+        fix_it:
+          type: object
+          additionalProperties: false
+          required: [reason, retry_options]
+          properties:
+            reason: {type: string, minLength: 1}
+            retry_options:
+              type: array
+              maxItems: 0
+              items: {type: object}
+    RegistryProviderProfileQuery:
+      type: object
+      additionalProperties: false
+      required: [npi]
+      description: Every field is a normalized string. Pagination and generation_id require category; category and
+        categories cannot be combined. The NPI checksum is validated in addition to its shape.
+      properties:
+        npi:
+          type: string
+          pattern: ^[12][0-9]{9}$
+        include_evidence:
+          type: string
+          enum: ['true', 'false']
+        include_sensitive:
+          type: string
+          enum: ['true', 'false']
+        categories:
+          type: string
+          minLength: 1
+          maxLength: 2048
+        category:
+          type: string
+          maxLength: 64
+        limit:
+          type: string
+          pattern: ^([1-9]|[1-4][0-9]|50)$
+        offset:
+          type: string
+          pattern: ^(0|[1-9][0-9]{0,5}|1000000)$
+        generation_id:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+    RegistryProviderProfileResponse:
+      type: object
+      additionalProperties: false
+      required: [client_id, policy_revision, generation, approved_custom_revision, npi, provider_profile]
+      properties:
+        client_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+        policy_revision:
+          type: string
+          pattern: ^(0|[1-9][0-9]{0,18})$
+        generation:
+          $ref: '#/components/schemas/RegistryNetworkCatalogGeneration'
+        approved_custom_revision:
+          type: string
+          pattern: ^(0|[1-9][0-9]{0,18})$
+        npi:
+          type: integer
+          minimum: 1000000000
+          maximum: 2999999999
+        provider_profile:
+          $ref: '#/components/schemas/ProviderProfileDocument'
+        provider_profile_evidence:
+          type: object
+          additionalProperties: true
+    RegistryProviderPlansQuery:
+      type: object
+      additionalProperties: false
+      required:
+      - npi
+      properties:
+        npi:
+          type: string
+          pattern: ^[0-9]{10}$
+        year:
+          type: integer
+          minimum: 2000
+          maximum: 2100
+        network_generation:
+          $ref: '#/components/schemas/RegistryNetworkCatalogGeneration'
+    RegistryProviderPlansRaw:
+      type: object
+      additionalProperties: false
+      required:
+      - npi
+      - checksum_network
+      - type
+      - last_updated_on
+      - network_tier
+      - name_or_facility_name
+      - prefix
+      - first_name
+      - middle_name
+      - last_name
+      - suffix
+      - accepting
+      - gender
+      - issuer_id
+      - year
+      - addresses
+      - specialty_or_facility_type
+      - languages
+      properties:
+        npi:
+          type: integer
+          format: int64
+        checksum_network:
+          type: integer
+          format: int64
+        type:
+          type: string
+          nullable: true
+        last_updated_on:
+          type: string
+          nullable: true
+        network_tier:
+          type: string
+          nullable: true
+        name_or_facility_name:
+          type: string
+          nullable: true
+        prefix:
+          type: string
+          nullable: true
+        first_name:
+          type: string
+          nullable: true
+        middle_name:
+          type: string
+          nullable: true
+        last_name:
+          type: string
+          nullable: true
+        suffix:
+          type: string
+          nullable: true
+        accepting:
+          type: string
+          nullable: true
+        gender:
+          type: string
+          nullable: true
+        issuer_id:
+          type: integer
+          nullable: true
+        year:
+          type: integer
+          nullable: true
+        addresses:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: true
+          description: Original source entries qualified by exact location evidence; other offices are omitted.
+        specialty_or_facility_type:
+          type: array
+          nullable: true
+          items:
+            type: string
+            nullable: true
+        languages:
+          type: array
+          nullable: true
+          items:
+            type: string
+            nullable: true
+    RegistryProviderPlansIssuer:
+      type: object
+      additionalProperties: false
+      required:
+      - state
+      - issuer_name
+      - issuer_marketing_name
+      - mrf_url
+      - data_contact_email
+      - issuer_id
+      properties:
+        state:
+          type: string
+          nullable: true
+        issuer_name:
+          type: string
+          nullable: true
+        issuer_marketing_name:
+          type: string
+          nullable: true
+        mrf_url:
+          type: string
+          nullable: true
+        data_contact_email:
+          type: string
+          nullable: true
+        issuer_id:
+          type: integer
+    RegistryProviderPlansResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - client_id
+      - policy_revision
+      - generation
+      - approved_custom_revision
+      - npi_data
+      - plan_data
+      - issuer_data
+      properties:
+        client_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+        policy_revision:
+          type: string
+          pattern: ^(0|[1-9][0-9]{0,18})$
+        generation:
+          $ref: '#/components/schemas/RegistryNetworkCatalogGeneration'
+        approved_custom_revision:
+          type: string
+          pattern: ^(0|[1-9][0-9]{0,18})$
+        npi_data:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+            - npi_info
+            - issuer_info
+            properties:
+              npi_info:
+                $ref: '#/components/schemas/RegistryProviderPlansRaw'
+              issuer_info:
+                $ref: '#/components/schemas/RegistryProviderPlansIssuer'
+        plan_data:
+          type: array
+          maxItems: 0
+          items:
+            type: object
+        issuer_data:
+          type: array
+          maxItems: 0
+          items:
+            type: object
+    RegistryNetworkAutocompleteQuery:
+      type: object
+      additionalProperties: false
+      required: [query, limit]
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Trimmed text without control characters; existing case-insensitive SQL wildcard matching is preserved.
+        limit: {type: integer, minimum: 1, maximum: 50}
+        zip_code: {type: string, pattern: '^[0-9]{5}$'}
+        network_generation:
+          $ref: '#/components/schemas/RegistryNetworkCatalogGeneration'
+    RegistryNetworkAutocompleteResponse:
+      type: object
+      additionalProperties: false
+      required: [client_id, policy_revision, generation, approved_custom_revision, plans]
+      properties:
+        client_id: {type: string, minLength: 1, maxLength: 64}
+        policy_revision: {type: string, pattern: '^(0|[1-9][0-9]{0,18})$'}
+        generation:
+          $ref: '#/components/schemas/RegistryNetworkCatalogGeneration'
+        approved_custom_revision: {type: string, pattern: '^(0|[1-9][0-9]{0,18})$'}
+        plans:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            additionalProperties: false
+            required: [plan_id, marketing_name, state, year, network_checksum]
+            properties:
+              plan_id: {type: string}
+              marketing_name: {type: string, nullable: true}
+              state: {type: string, minLength: 2, maxLength: 2}
+              year: {type: integer, minimum: 2010, maximum: 2100}
+              network_checksum:
+                type: object
+                minProperties: 1
+                description: Canonical signed-int32 decimal keys, including zero, with nullable raw tier labels. These are legacy checksums, not canonical network IDs.
+                additionalProperties: {type: string, nullable: true}
     RegistryNetworkCatalogGeneration:
       type: string
       pattern: '^[1-9][0-9]{0,18}$'
@@ -9185,7 +11001,7 @@ components:
             code:
               type: string
               enum: [network_catalog_request_invalid, network_catalog_forbidden,
-                network_catalog_not_found, network_catalog_unavailable]
+                network_catalog_not_found, network_catalog_source_changed, network_catalog_unavailable]
     RegistryNetworkProviderPage:
       type: object
       additionalProperties: false
@@ -9258,7 +11074,17 @@ components:
         resource_type: {type: string}
         record_key: {type: string}
         release_id: {type: string}
-        observed_at: {type: string, format: date-time}
+        observed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            Source publication time. Always non-null for current or unscoped
+            reads. An explicitly unknown value is allowed only for trusted
+            network-scoped CMS reads whose committed retained source pair has
+            been verified; those responses carry X-CMS-Retained-Publication
+            with the exact value committed/v1. Receipt creation time is never
+            substituted for source publication time.
     DirectoryEntity:
       type: object
       required: [id, kind, source_id, display_name, status, effective_start, effective_end, evidence]
@@ -16239,6 +18065,22 @@ components:
           minLength: 1
           maxLength: 1000
           description: Nonblank evidence without control characters.
+        benefit_plan_ids:
+          type: array
+          uniqueItems: true
+          maxItems: 512
+          description: Optional sorted permanent benefit plan family IDs. Omission or
+            an empty array retains the legacy assertion shape. Selected IDs must
+            identify active canonical or custom composite plans; pricing availability
+            does not affect eligibility. Retired and merged IDs are refused without
+            following replacements. Validation uses server configured metadata authority
+            and separately requires current direct client entitlement or active custom
+            association for client-owner writes; denied selections return 403. Exact
+            retained command replay precedes metadata and access reads. At most 5000 unique IDs per operation;
+            unavailable metadata configuration or service returns 503 for selected IDs.
+          items:
+            type: string
+            pattern: '^hpplan_[0-9A-HJKMNP-TV-Z]{26}$'
     RegistryCompanyLinkBatchTarget:
       type: object
       additionalProperties: false
@@ -16858,6 +18700,55 @@ components:
             when scoped. An empty result still requires live actor authorization.
           items:
             type: object
+    RegistryMembershipDraftFields:
+      type: object
+      additionalProperties: false
+      required: [memberships_json]
+      properties:
+        memberships_json:
+          type: array
+          maxItems: 5000
+          description: >-
+            Exact network/provider/location observations or commands. A document
+            without any explicit operation preserves legacy positive observations,
+            including duplicate evidence. Any explicit operation selects command
+            mode for the whole document; omitted operations then mean add, and each
+            exact network/provider-system/provider-id/location unit must be unique.
+            Saving commands retains a draft and does not publish membership changes.
+          items:
+            $ref: '#/components/schemas/RegistryMembershipCommandRow'
+    RegistryMembershipCommandRow:
+      type: object
+      additionalProperties: false
+      required: [network_id, provider_system, provider_id, location_id, evidence_id]
+      properties:
+        network_id:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 2147483647
+        provider_system:
+          type: string
+          enum: [npi, provider_directory, manual]
+        provider_id:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          description: Exact typed provider identity, at most 1024 UTF-8 bytes,
+            without control characters or leading/trailing whitespace.
+        location_id:
+          type: string
+          format: uuid
+        evidence_id:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          description: Nonempty reviewed evidence, at most 1024 UTF-8 bytes,
+            without control characters or leading/trailing whitespace.
+        operation:
+          type: string
+          enum: [add, remove]
+          default: add
     RegistryRecordCommand:
       type: object
       additionalProperties: false
@@ -16896,6 +18787,7 @@ components:
           description: Exact fields for the selected record kind. Site bindings accept
             RegistrySourceSiteFields only; source receipts are derived by the server.
             Network fields use RegistryNetworkDraftFields.
+            Membership fields use RegistryMembershipDraftFields.
             Company links accept network_ids, group_id and optional network_assertions.
             Omitting assertions preserves them on correction; an explicit empty array
             clears them. Supplied assertions use RegistryCompanyNetworkAssertion and

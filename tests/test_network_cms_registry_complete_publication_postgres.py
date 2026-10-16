@@ -18,6 +18,14 @@ from process import provider_directory_cms_npd as cms
 from process import provider_directory_cms_serving as serving
 from process import provider_directory_profile_capacity_preflight_contract as preflight
 from process import provider_directory_profile_capacity_runtime as capacity_runtime
+from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_registry_cms_prepared_pair import RegistryCMSRetentionRequest
+from process.provider_directory_cms_address import cms_address_preparation
+from process.provider_directory_cms_desired_fence import prepare_desired_fence
+from process.provider_directory_cms_native_inputs import capture_native_address_input_fence
+from process.provider_directory_cms_preflight import _register_inputs
+from process.provider_directory_cms_serving_receipt import capture_native_dependencies
 from tests import cms_npd_admission_postgres_support as source
 from tests import cms_registry_complete_publication_postgres_support as native
 from tests import provider_directory_cms_capacity_test_support as cms_signing
@@ -152,3 +160,113 @@ async def test_complete_publication_and_retained_pair(monkeypatch, tmp_path):
         async with native.retained_pair(database, proof) as pair:
             assert pair.proof == proof
             assert json.loads(pair.cms_receipt_payload) == receipt_payload
+
+
+async def _independent_profile_date(execution, profile_date):
+    """Attest a new Profile date against the same actual admitted CMS source."""
+    fhir = source.fhir
+    request = await native.selection.current_profile_selection_request(
+        fhir._provider_directory_profile_selection_catalog(),
+        desired_cms_dataset=execution.attestation.desired_cms_dataset,
+        expected_cms_incumbent=execution.attestation.expected_cms_incumbent,
+        desired_profile_as_of=profile_date,
+    )
+    execution = replace(
+        execution,
+        attestation=native.selection.validated_profile_selection_attestation(
+            await native.selection.attest_profile_selection(
+                request, fhir._provider_directory_profile_selection_catalog()
+            )
+        ),
+    )
+    return execution
+
+
+def _native_retention_policy(admission, dataset, execution, source_date):
+    """Use the source producer's real admitted OID, hashes and date."""
+    bindings = admission["network_bindings"]
+    pin = PinnedFHIRMembershipSource(
+        "mrf",
+        "cms-npd",
+        dataset.endpoint_id,
+        dataset.dataset_id,
+        dataset.dataset_hash,
+        admission["release_id"],
+        admission["resource_table_oid"],
+        bindings["alias_scope"],
+        source_date,
+    )
+    return RegistryCMSRetentionRequest(
+        pin,
+        RegistryNetworkSourceCoordinates(
+            *(
+                bindings[name]
+                for name in (
+                    "source_system",
+                    "source_id",
+                    "dataset_schema",
+                    "dataset_id",
+                    "producer_id",
+                    "edition_id",
+                )
+            )
+        ),
+        execution.attestation.proof_id,
+        admission["expected_admission_sha256"],
+        admission["expected_metadata_sha256"],
+        1024**2,
+        1024**2,
+    ).policy(uuid4(), "source_owner", ("source_reader",))
+
+
+async def test_native_retention_input_keeps_independent_source_and_profile_dates(monkeypatch, tmp_path):
+    """An actual admitted source keeps its date when a later Profile date is selected."""
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_STAGE", "true")
+    directory, acquired = source.retained_release(tmp_path)
+    async with source.admission_database(monkeypatch) as database:
+        with source.release_probe_client(directory) as client:
+            acquisition_result = await cms._run_acquired(
+                {"context": {}}, {}, "independent-dates", directory, acquired, client
+            )
+        await native.install_native_inputs(
+            database, monkeypatch, tmp_path, subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        )
+        execution = await native.attested_execution(database, acquisition_result, monkeypatch)
+        admission = acquisition_result["registry_source_admission"]
+        source_date = admission["semantic_projection_as_of"]
+        profile_date = (datetime.date.fromisoformat(source_date) + datetime.timedelta(days=1)).isoformat()
+        fhir = source.fhir
+        execution = await _independent_profile_date(execution, profile_date)
+        await _register_inputs(fhir)
+        fence = await prepare_desired_fence(fhir, execution, run_id=None, metrics={}, publish_targets={"profile"})
+        datasets = [cms_dataset for cms_dataset in fence.datasets if cms_dataset.source_id == "cms-npd"]
+        assert len(datasets) == 1
+        dataset = datasets[0]
+        assert dataset.semantic_projection_as_of == source_date != profile_date
+        async with database.session_factory() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            dependencies = await capture_native_dependencies(session, "mrf")
+            native_input_fence = await capture_native_address_input_fence(session, "mrf")
+        factory = cms_address_preparation(
+            fhir,
+            execution,
+            fence,
+            dependencies,
+            native_input_fence=native_input_fence,
+            run_id="run_" + uuid4().hex,
+            worker_count=1,
+            temp_file_limit_bytes_per_backend=64 * 1024**2,
+        )
+        policy = _native_retention_policy(admission, dataset, execution, source_date)
+        retained = factory.with_registry_source_retention(policy)
+        assert json.loads(retained.input_json)["profile_as_of"] == profile_date
+        assert json.loads(retained.input_json)["registry_source_retention"]["source_pin"]["as_of"] == source_date
+        changed = deepcopy(policy)
+        changed["source_pin"]["as_of"] = profile_date
+        with pytest.raises(ValueError, match="retention_scope_changed"):
+            factory.with_registry_source_retention(changed)
+        changed = json.loads(factory.input_json)
+        changed["profile_as_of"] = source_date
+        with pytest.raises(ValueError, match="retention_scope_changed"):
+            replace(factory, input_json=json.dumps(changed)).with_registry_source_retention(policy)

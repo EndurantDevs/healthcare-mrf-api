@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import suppress
 from dataclasses import dataclass, replace
 
 from sqlalchemy import text
@@ -274,7 +275,7 @@ async def _captured_owned_sequence(session, schema_name, expected_oids):
 async def _native_capture(
     session, schema_name: str, expected_oids: tuple, *, verify_content=True, stage_table_names=None
 ) -> tuple:
-    """Pin and capture exact seven-table native identity before comparing logical shape."""
+    """Preserve reader budgets while canonicalizing catalog names for cheap checks."""
     schema_name = receipt._schema_name(schema_name)
     models_by_table = receipt._models()
     names = tuple(sorted(model.__tablename__ for model in models_by_table))
@@ -291,7 +292,35 @@ async def _native_capture(
         if stage_table_names is None
         else receipt._validated_stage_table_names_by_source(stage_table_names)
     )
-    await receipt._normalize_receipt_session(session, schema_name)
+    if verify_content:
+        await receipt._normalize_receipt_session(session, schema_name)
+        return await _native_capture_catalog(
+            session, schema_name, expected_oids, table_names, verify_content=True, stage_table_names=stage_table_names
+        )
+    original_path = await session.scalar(text("SELECT current_setting('search_path')"))
+    try:
+        await session.execute(
+            text("SELECT pg_catalog.set_config('search_path',:path,true)"),
+            {"path": '"' + schema_name + '",pg_catalog'},
+        )
+        captured = await _native_capture_catalog(
+            session, schema_name, expected_oids, table_names, verify_content=False, stage_table_names=stage_table_names
+        )
+    except BaseException:
+        # An aborted transaction discards its local setting on rollback.
+        with suppress(Exception):
+            await session.execute(
+                text("SELECT pg_catalog.set_config('search_path',:path,true)"), {"path": original_path}
+            )
+        raise
+    await session.execute(text("SELECT pg_catalog.set_config('search_path',:path,true)"), {"path": original_path})
+    return captured
+
+
+async def _native_capture_catalog(
+    session, schema_name, expected_oids, table_names, *, verify_content, stage_table_names
+):
+    """Pin and capture exact seven-table native identity before comparing logical shape."""
     semantic = (
         await _source_semantic_receipt(session, schema_name, None if stage_table_names is None else table_names)
         if verify_content

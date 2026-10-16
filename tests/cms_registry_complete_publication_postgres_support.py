@@ -40,7 +40,7 @@ from tests import cms_npd_admission_postgres_support as source
 from tests import cms_registry_wal_support as wal_support
 from tests import provider_directory_profile_capacity_signing_guard_test_support as signing
 from tests import test_provider_directory_import_run_guards as run_guards
-from tests.test_network_cms_registry_source_pair_postgres import _publication_proof
+from tests.test_network_cms_registry_source_pair_postgres import _bounded_source_copy, _publication_proof
 from tests.test_provider_directory_cms_storage_continuation import _envelope as sign_storage
 from tests.test_provider_directory_profile_capacity_attestation import _signed_envelope
 from tests.test_provider_directory_profile_selection_attestation import _variant_registry_rows
@@ -510,7 +510,12 @@ async def retained_pair(database, proof):
                 await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
             created_roles.append(role)
         pair = await capture_registry_cms_source_pair(
-            database.session_factory, proof, capture_id=capture_id, owner_role=roles[0], runtime_roles=(roles[1],)
+            database.session_factory,
+            proof,
+            capture_id=capture_id,
+            owner_role=roles[0],
+            runtime_roles=(roles[1],),
+            source_copy=_bounded_source_copy(),
         )
         assert len(pair.address_receipt.tables) == 7
         assert pair.address_receipt.tables[0].row_count == 2

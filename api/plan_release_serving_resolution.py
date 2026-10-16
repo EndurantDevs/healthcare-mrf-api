@@ -101,9 +101,7 @@ class PlanReleaseServingResolution:
     def __post_init__(self) -> None:
         is_ready = self.state == PLAN_RELEASE_RESOLUTION_READY
         has_selection = type(self.selection) is PlanReleaseServingSelection
-        if self.state not in PLAN_RELEASE_RESOLUTION_STATES or (
-            is_ready != has_selection
-        ):
+        if self.state not in PLAN_RELEASE_RESOLUTION_STATES or (is_ready != has_selection):
             raise ValueError("invalid plan release serving resolution")
 
     def __repr__(self) -> str:
@@ -138,9 +136,7 @@ def _release_market_type_for_guard(
 
     market_types = {
         binding.plan_market_type.strip().lower()
-        for binding in (
-            selection.in_network_bindings if selection is not None else ()
-        )
+        for binding in (selection.in_network_bindings if selection is not None else ())
         if binding.plan_market_type.strip()
     }
     if "group" in market_types:
@@ -212,10 +208,11 @@ async def resolve_plan_release_serving_resolution(
     plan_release_id: Any,
     *,
     include_billing_tax_identity_source: bool = False,
+    projection_only: bool = False,
 ) -> PlanReleaseServingResolution:
     """Resolve one release while preserving absent versus unavailable state."""
 
-    if type(include_billing_tax_identity_source) is not bool:
+    if type(include_billing_tax_identity_source) is not bool or type(projection_only) is not bool:
         return _resolution(PLAN_RELEASE_RESOLUTION_UNAVAILABLE)
     normalized_release_id = normalize_plan_release_id(plan_release_id)
     if normalized_release_id is None:
@@ -233,6 +230,8 @@ async def resolve_plan_release_serving_resolution(
     selection = _selection_from_rows(normalized_release_id, release_rows)
     if selection is None:
         return _resolution(PLAN_RELEASE_RESOLUTION_UNAVAILABLE)
+    if projection_only:
+        return _resolution(PLAN_RELEASE_RESOLUTION_READY, selection)
     validated_selection = await _validate_release_bindings(
         session,
         selection,

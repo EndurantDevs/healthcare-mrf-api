@@ -421,3 +421,144 @@ async def test_cancellation_rolls_back_transfer(writer_db):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert await _owners_and_acl(fixture) == before
+
+
+async def _qualified_source_heap(fixture):
+    """Seed descriptor metadata for closure tests; admission/accounting are separate gates."""
+    from process.registry_source_retention import SOURCE_TABLE, SUMMARY_KEY, registry_source_retention_sha256
+    from tests.test_registry_source_retention import retention_receipt
+
+    namespace = f'"{fixture.copy_target.schema_name}"'
+    candidate = await fixture.connection.fetchrow(
+        f'SELECT source_generations,validation_json,expected_rows FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
+        fixture.copy_target.candidate_id,
+    )
+    count = candidate["expected_rows"]
+    receipt = retention_receipt(
+        source_rows=count, add_rows=0, remove_rows=0, suppressed_source_rows=0, effective_rows=count
+    )
+    generations_by_name = json.loads(candidate["source_generations"])
+    generations_by_name[SUMMARY_KEY] = registry_source_retention_sha256(receipt)
+    report_by_name = json.loads(candidate["validation_json"]) if candidate["validation_json"] else {}
+    report_by_name[SUMMARY_KEY] = receipt
+    if "batch_rows" in report_by_name:
+        report_by_name.update(batch_rows=0, batch_count=0)
+    await fixture.connection.execute(
+        f'DELETE FROM "{fixture.control_schema}".network_membership_batch WHERE candidate_id=$1',
+        fixture.copy_target.candidate_id,
+    )
+    if "source_generations" in report_by_name:
+        report_by_name["source_generations"] = generations_by_name
+    await fixture.connection.execute(
+        f"CREATE TABLE {namespace}.{SOURCE_TABLE} (LIKE {namespace}.network_membership INCLUDING CONSTRAINTS)"
+    )
+    await fixture.connection.execute(
+        f"INSERT INTO {namespace}.{SOURCE_TABLE} SELECT * FROM {namespace}.network_membership"
+    )
+    await fixture.connection.execute(
+        f'UPDATE "{fixture.control_schema}".network_membership_candidate SET source_generations=$2::jsonb,validation_json=$3::jsonb WHERE candidate_id=$1',
+        fixture.copy_target.candidate_id,
+        json.dumps(generations_by_name),
+        json.dumps(report_by_name),
+    )
+    if hasattr(fixture, "roles"):
+        await fixture.connection.execute(f'ALTER TABLE {namespace}.{SOURCE_TABLE} OWNER TO "{fixture.roles["loader"]}"')
+    return receipt
+
+
+async def test_qualified_source_closes_all_three_heaps_and_only_address_growth(writer_db):
+    fixture = writer_db
+    await _qualified_source_heap(fixture)
+    namespace = f'"{fixture.copy_target.schema_name}"'
+    await fixture.connection.execute(
+        f"CREATE INDEX retained_source_network ON {namespace}.network_membership_source(network_id)"
+    )
+    await fixture.connection.execute(f"GRANT ALL ON {namespace}.network_membership_source TO PUBLIC")
+    first = await _freeze(fixture)
+    assert set(first["relation_oids"]) == {
+        "network_membership",
+        "provider_location_binding",
+        "network_membership_source",
+    }
+    assert await _verify(fixture) == first
+    for role in (fixture.roles["loader"], fixture.roles["reader"]):
+        await fixture.observer.execute(f'SET ROLE "{role}"')
+        try:
+            assert await fixture.observer.fetchval(f"SELECT count(*) FROM {namespace}.network_membership_source") == 4
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await fixture.observer.execute(
+                    f"UPDATE {namespace}.network_membership_source SET evidence_id=evidence_id"
+                )
+        finally:
+            await fixture.observer.execute("RESET ROLE")
+    await fixture.connection.execute(f'SET ROLE "{fixture.roles["owner"]}"')
+    try:
+        await fixture.connection.execute(f"CREATE TABLE {namespace}.entity_address_unified(location_key text)")
+    finally:
+        await fixture.connection.execute("RESET ROLE")
+    extended = await _freeze(fixture)
+    assert set(extended["relation_oids"]) == set(first["relation_oids"]) | {"entity_address_unified"}
+    for name, oid in first["relation_oids"].items():
+        assert extended["relation_oids"][name] == oid
+    for key in ("index_oids", "index_table_oids"):
+        assert all(extended[key][name] == oid for name, oid in first[key].items())
+    assert await _verify(fixture) == extended
+
+
+@pytest.mark.parametrize("tamper", ["source_write", "owner_set", "missing", "extra", "source_oid", "source_index_oid"])
+async def test_qualified_source_inventory_and_privilege_drift_refuses(writer_db, tamper):
+    fixture = writer_db
+    await _qualified_source_heap(fixture)
+    namespace = f'"{fixture.copy_target.schema_name}"'
+    source_table = namespace + ".network_membership_source"
+    source_index = namespace + ".retained_source_network"
+    await fixture.connection.execute(f"CREATE INDEX retained_source_network ON {source_table}(network_id)")
+    await _freeze(fixture)
+    commands_by_tamper = {
+        "source_write": [f'GRANT UPDATE(evidence_id) ON {source_table} TO "{fixture.roles["loader"]}"'],
+        "owner_set": [f'GRANT "{fixture.roles["owner"]}" TO "{fixture.roles["reader"]}" WITH INHERIT FALSE, SET TRUE'],
+        "missing": [f"DROP TABLE {source_table}"],
+        "extra": [f"CREATE TABLE {namespace}.unexpected_source(id integer)"],
+        "source_index_oid": [
+            f"DROP INDEX {source_index}",
+            f"CREATE INDEX retained_source_network ON {source_table}(network_id)",
+        ],
+        "source_oid": [
+            f"DROP TABLE {source_table}",
+            f"CREATE TABLE {source_table} (LIKE {namespace}.network_membership INCLUDING CONSTRAINTS)",
+        ],
+    }
+    for statement in commands_by_tamper[tamper]:
+        await fixture.connection.execute(statement)
+    with pytest.raises(NetworkWriterClosureError):
+        await _verify(fixture)
+    with pytest.raises(NetworkWriterClosureError):
+        await _freeze(fixture)
+
+
+@pytest.mark.parametrize(
+    "tamper", ["unregistered_heap", "missing_heap", "missing_hash", "missing_receipt", "changed_hash"]
+)
+async def test_source_heap_requires_paired_verified_descriptor(writer_db, tamper):
+    fixture = writer_db
+    namespace = f'"{fixture.copy_target.schema_name}"'
+    if tamper == "unregistered_heap":
+        await fixture.connection.execute(f"CREATE TABLE {namespace}.network_membership_source(id integer)")
+    else:
+        await _qualified_source_heap(fixture)
+        if tamper == "missing_heap":
+            await fixture.connection.execute(f"DROP TABLE {namespace}.network_membership_source")
+        elif tamper == "missing_hash":
+            await fixture.connection.execute(
+                f"UPDATE \"{fixture.control_schema}\".network_membership_candidate SET source_generations=source_generations-'registry_source_retention'"
+            )
+        elif tamper == "missing_receipt":
+            await fixture.connection.execute(
+                f"UPDATE \"{fixture.control_schema}\".network_membership_candidate SET validation_json=validation_json-'registry_source_retention'"
+            )
+        else:
+            await fixture.connection.execute(
+                f"UPDATE \"{fixture.control_schema}\".network_membership_candidate SET source_generations=jsonb_set(source_generations,'{{registry_source_retention}}',to_jsonb(repeat('b',64)))"
+            )
+    with pytest.raises(ValueError):
+        await _freeze(fixture)

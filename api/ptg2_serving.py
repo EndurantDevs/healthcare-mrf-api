@@ -36,6 +36,7 @@ from api.code_systems import (
     catalog_code_system_lookup_values,
 )
 from api.endpoint.pagination import PaginationParams
+from api.network_address_scope import current_network_address_scope
 from api.plan_pricing_em_distance import search_plan_pricing_em_distance
 from api.plan_pricing_projection import (
     PlanPricingProjectionUnavailable,
@@ -58,6 +59,11 @@ from api.plan_pricing_projection_contract import (
     table as _plan_pricing_projection_table,
 )
 from api.plan_pricing_projection_read import (
+    _FACTORIZED_CARD_CANDIDATE_SQL,
+    _FACTORIZED_CARD_COMPLETION_SQL,
+    _factorized_card_binding_parameter,
+)
+from api.plan_pricing_projection_read import (
     _projection_query as _plan_pricing_projection_query,
 )
 from api.plan_pricing_projection_read import (
@@ -65,12 +71,17 @@ from api.plan_pricing_projection_read import (
 )
 from api.plan_release_serving import (
     PlanReleaseServingSelection,
+    PlanReleaseSnapshotBinding,
+    _empty_plan_release_pagination,
+    _plan_release_no_match_query,
     annotate_plan_release_response,
     binding_query_args,
     has_conflicting_release_selectors,
+    prepare_plan_release_bindings,
     resolve_plan_release_serving,
 )
 from api.provider_demographic_filters import provider_sex_exists_sql
+from api.provider_service_source_policy import admitted_plan_release_bindings
 from api.provider_specialty_filters import (
     provider_specialty_taxonomy_exists_sql,
     provider_specialty_taxonomy_semijoin_sql,
@@ -19633,7 +19644,13 @@ async def _search_provider_procedures_network(
     pagination,
     *,
     serving_tables: PTG2ServingTables | None = None,
+    session=None,
 ) -> tuple[str, str, dict[str, Any] | None]:
+    if session is not None:
+        response = await _search_ptg2_provider_procedures_snapshot(
+            session, npi, args, pagination, snapshot_id=snapshot_id, serving_tables=serving_tables
+        )
+        return source_key, snapshot_id, response
     async with sa_db.reader_session(independent=True) as network_session:
         response = await _search_ptg2_provider_procedures_snapshot(
             network_session,
@@ -19737,39 +19754,44 @@ async def _search_multi_ptg2_provider_procedures(
     pagination,
     *,
     release_selection: PlanReleaseServingSelection | None = None,
+    contributing_bindings: tuple[PlanReleaseSnapshotBinding, ...] | None = None,
 ) -> dict[str, Any] | None:
     """Combine one provider's priced procedures across every plan network."""
     fetch_count = max(1, int(pagination.offset) + int(pagination.limit) + 1)
     sub_pagination = PaginationParams(page=1, limit=fetch_count, offset=0, source="page")
 
-    binding_by_network = {
-        (binding.source_key, binding.snapshot_id): binding
-        for binding in (release_selection.in_network_bindings if release_selection is not None else ())
-    }
+    bindings = contributing_bindings
+    if bindings is None:
+        bindings = release_selection.in_network_bindings if release_selection is not None else ()
+    binding_by_network = {(binding.source_key, binding.snapshot_id): binding for binding in bindings}
 
     async def read_network(source_key: str, snapshot_id: str):
-        """Read one network through an independent database session."""
+        """Keep managed reads on their pinned session and legacy reads independent."""
         network_args = args
         if release_selection is not None:
             binding = binding_by_network.get((source_key, snapshot_id))
             if binding is None:
                 return source_key, snapshot_id, None
             network_args = binding_query_args(args, binding)
+        serving_tables = (
+            release_selection.serving_tables_for_snapshot(snapshot_id) if release_selection is not None else None
+        )
         return await _search_provider_procedures_network(
             source_key,
             snapshot_id,
             npi,
             network_args,
             sub_pagination,
-            serving_tables=(
-                release_selection.serving_tables_for_snapshot(snapshot_id) if release_selection is not None else None
-            ),
+            serving_tables=serving_tables,
+            **({"session": session} if current_network_address_scope() is not None else {}),
         )
 
-    network_responses = await _gather_ptg2_network_reads(
-        network_snapshots,
-        read_network,
-    )
+    if current_network_address_scope() is not None:
+        network_responses = [
+            await read_network(source_key, snapshot_id) for source_key, snapshot_id in network_snapshots
+        ]
+    else:
+        network_responses = await _gather_ptg2_network_reads(network_snapshots, read_network)
     response = _shape_multi_provider_procedure_response(
         network_responses,
         network_snapshots,
@@ -19777,53 +19799,8 @@ async def _search_multi_ptg2_provider_procedures(
         pagination,
     )
     if release_selection is not None:
-        return annotate_plan_release_response(response, release_selection)
+        return annotate_plan_release_response(response, release_selection, contributing_bindings=contributing_bindings)
     return response
-
-
-def _plan_release_no_match_query(
-    selection: PlanReleaseServingSelection,
-    args: Mapping[str, Any],
-    *,
-    npi: int | None = None,
-) -> dict[str, Any]:
-    release_bindings = selection.in_network_bindings
-    plan_ids = sorted({binding.plan_id for binding in release_bindings})
-    market_types = sorted({binding.plan_market_type for binding in release_bindings if binding.plan_market_type})
-    snapshots = [
-        {
-            "source_key": binding.source_key,
-            "snapshot_id": binding.snapshot_id,
-            "plan_id": binding.plan_id,
-            "plan_market_type": binding.plan_market_type,
-        }
-        for binding in release_bindings
-    ]
-    return {
-        "plan_id": plan_ids[0] if len(plan_ids) == 1 else None,
-        "plan_ids": plan_ids,
-        "plan_market_type": (market_types[0] if len(market_types) == 1 else None),
-        "plan_market_types": market_types,
-        "source": "ptg2",
-        "status": "no_match",
-        "source_key": (snapshots[0]["source_key"] if len(snapshots) == 1 else None),
-        "snapshot_id": (snapshots[0]["snapshot_id"] if len(snapshots) == 1 else None),
-        "snapshots": snapshots,
-        "code": args.get("code") or None,
-        "code_system": args.get("code_system") or None,
-        "q": args.get("q") or None,
-        "npi": npi,
-    }
-
-
-def _empty_plan_release_pagination(pagination) -> dict[str, Any]:
-    return {
-        "total": 0,
-        "limit": max(int(getattr(pagination, "limit", 25) or 25), 1),
-        "offset": max(int(getattr(pagination, "offset", 0) or 0), 0),
-        "page": max(int(getattr(pagination, "page", 1) or 1), 1),
-        "has_more": False,
-    }
 
 
 def _plan_release_no_match_response(
@@ -19832,6 +19809,7 @@ def _plan_release_no_match_response(
     pagination,
     *,
     npi: int | None = None,
+    contributing_bindings: tuple[PlanReleaseSnapshotBinding, ...] | None = None,
 ) -> dict[str, Any]:
     """Represent a valid exact release with zero matching priced rows."""
 
@@ -19841,9 +19819,12 @@ def _plan_release_no_match_response(
         "resolved": True,
         "items": [],
         "pagination": _empty_plan_release_pagination(pagination),
-        "query": _plan_release_no_match_query(selection, args, npi=npi),
+        "query": _plan_release_no_match_query(selection, args, npi=npi, contributing_bindings=contributing_bindings),
     }
-    return annotate_plan_release_response(response_by_field, selection) or response_by_field
+    return (
+        annotate_plan_release_response(response_by_field, selection, contributing_bindings=contributing_bindings)
+        or response_by_field
+    )
 
 
 def _plan_release_response_or_no_match(
@@ -19853,6 +19834,7 @@ def _plan_release_response_or_no_match(
     pagination,
     *,
     npi: int | None = None,
+    contributing_bindings: tuple[PlanReleaseSnapshotBinding, ...] | None = None,
 ) -> dict[str, Any]:
     """Keep matched data; normalize every valid empty release to no-match."""
 
@@ -19872,8 +19854,12 @@ def _plan_release_response_or_no_match(
             args,
             pagination,
             npi=npi,
+            contributing_bindings=contributing_bindings,
         )
-    return annotate_plan_release_response(response_by_field, selection) or response_by_field
+    return (
+        annotate_plan_release_response(response_by_field, selection, contributing_bindings=contributing_bindings)
+        or response_by_field
+    )
 
 
 async def _search_plan_release_provider_procedures(
@@ -19883,9 +19869,12 @@ async def _search_plan_release_provider_procedures(
     pagination,
     release_selection: PlanReleaseServingSelection,
 ) -> dict[str, Any]:
-    release_bindings = release_selection.in_network_bindings
+    release_bindings = await admitted_plan_release_bindings(session, release_selection)
+    release_selection = await prepare_plan_release_bindings(session, release_selection, release_bindings)
     if not release_bindings:
-        return _plan_release_no_match_response(release_selection, args, pagination, npi=npi)
+        return _plan_release_no_match_response(
+            release_selection, args, pagination, npi=npi, contributing_bindings=release_bindings
+        )
     network_snapshots = [(binding.source_key, binding.snapshot_id) for binding in release_bindings]
     if len(release_bindings) > 1:
         response_by_field = await _search_multi_ptg2_provider_procedures(
@@ -19895,6 +19884,7 @@ async def _search_plan_release_provider_procedures(
             args,
             pagination,
             release_selection=release_selection,
+            **({"contributing_bindings": release_bindings} if current_network_address_scope() is not None else {}),
         )
     else:
         binding = release_bindings[0]
@@ -19912,6 +19902,7 @@ async def _search_plan_release_provider_procedures(
         args,
         pagination,
         npi=npi,
+        contributing_bindings=release_bindings,
     )
 
 
@@ -20277,253 +20268,6 @@ _FACTORIZED_CARD_PROVIDER_FIELDS = (
     "zip5",
 )
 
-_FACTORIZED_CARD_CANDIDATE_SQL = """
-    WITH profile_window AS MATERIALIZED (
-        SELECT binding_ordinal, provider_set_key, membership_count,
-               minimum_negotiated_rate
-          FROM {profile_table}
-         WHERE projection_id = :projection_id
-           AND code_system = :code_system
-           AND code = :code
-         ORDER BY minimum_negotiated_rate, binding_ordinal,
-                  provider_set_key
-         LIMIT :provider_set_probe_limit
-    ), ranked_profiles AS MATERIALIZED (
-        SELECT profile_window.*,
-               ROW_NUMBER() OVER (
-                   ORDER BY minimum_negotiated_rate, binding_ordinal,
-                            provider_set_key
-               ) AS profile_rank,
-               SUM(membership_count) OVER (
-                   ORDER BY minimum_negotiated_rate, binding_ordinal,
-                            provider_set_key
-                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-               ) AS cumulative_memberships
-          FROM profile_window
-    ), admitted_profiles AS MATERIALIZED (
-        SELECT * FROM ranked_profiles
-         WHERE profile_rank <= :provider_set_limit
-           AND cumulative_memberships <= :membership_limit
-    ), unread_profile AS MATERIALIZED (
-        SELECT minimum_negotiated_rate
-          FROM ranked_profiles
-         WHERE profile_rank > :provider_set_limit
-            OR cumulative_memberships > :membership_limit
-         ORDER BY profile_rank
-         LIMIT 1
-    ), admission AS MATERIALIZED (
-        SELECT COUNT(*)::bigint AS provider_set_count,
-               COALESCE(MAX(cumulative_memberships), 0)::bigint
-                   AS membership_count,
-               COALESCE(BOOL_AND(membership_count > 0), TRUE)
-                   AS profiles_valid
-          FROM admitted_profiles
-    ), cells AS MATERIALIZED (
-        SELECT geo_cell FROM unnest(CAST(:geo_cells AS varchar[]))
-             AS requested(geo_cell)
-    ), eligible AS MATERIALIZED (
-        SELECT member.npi,
-               MIN(profile.minimum_negotiated_rate) AS minimum_rate
-          FROM admitted_profiles profile
-          JOIN {membership_table} member
-            ON member.projection_id = :projection_id
-           AND member.binding_ordinal = profile.binding_ordinal
-           AND member.provider_set_key = profile.provider_set_key
-          JOIN {provider_table} provider
-            ON provider.projection_id = member.projection_id
-           AND provider.npi = member.npi
-          JOIN cells ON cells.geo_cell = provider.geo_cell
-         WHERE TRUE {taxonomy_sql}
-         GROUP BY member.npi
-    ), boundary AS MATERIALIZED (
-        SELECT minimum_rate FROM eligible
-         ORDER BY minimum_rate, npi
-        OFFSET :boundary_offset LIMIT 1
-    ), metadata AS MATERIALIZED (
-        SELECT (SELECT COUNT(*) FROM eligible)::bigint
-                   AS total_lower_bound,
-               NOT EXISTS (SELECT 1 FROM unread_profile)
-                   AS profile_exhausted,
-               (SELECT minimum_negotiated_rate FROM unread_profile)
-                   AS unread_minimum_rate,
-               (SELECT minimum_rate FROM boundary) AS boundary_rate,
-               admission.provider_set_count,
-               admission.membership_count,
-               admission.profiles_valid
-          FROM admission
-    ), selected AS MATERIALIZED (
-        SELECT eligible.npi, eligible.minimum_rate
-          FROM eligible
-         WHERE NOT EXISTS (SELECT 1 FROM boundary)
-            OR eligible.minimum_rate <= (
-                SELECT minimum_rate FROM boundary
-            )
-         ORDER BY eligible.minimum_rate, eligible.npi
-         LIMIT :candidate_probe_limit
-    )
-    SELECT selected.npi, selected.minimum_rate,
-           metadata.total_lower_bound, metadata.profile_exhausted,
-           metadata.unread_minimum_rate, metadata.boundary_rate,
-           metadata.provider_set_count, metadata.membership_count,
-           metadata.profiles_valid
-      FROM metadata
-      LEFT JOIN selected ON TRUE
-     ORDER BY selected.minimum_rate NULLS LAST,
-              selected.npi NULLS LAST
-"""
-
-_FACTORIZED_CARD_COMPLETION_SQL = """
-    WITH selected AS MATERIALIZED (
-        SELECT npi FROM unnest(CAST(:selected_npis AS bigint[]))
-             AS requested(npi)
-    ), cells AS MATERIALIZED (
-        SELECT geo_cell, cell_rank
-          FROM unnest(CAST(:geo_cells AS varchar[])) WITH ORDINALITY
-               AS requested(geo_cell, cell_rank)
-    ), selected_memberships AS MATERIALIZED (
-        SELECT member.npi, member.binding_ordinal,
-               member.provider_set_key
-          FROM selected
-          JOIN {membership_table} member USING (npi)
-          JOIN {profile_table} profile
-            ON profile.projection_id = member.projection_id
-           AND profile.code_system = :code_system
-           AND profile.code = :code
-           AND profile.binding_ordinal = member.binding_ordinal
-           AND profile.provider_set_key = member.provider_set_key
-         WHERE member.projection_id = :projection_id
-         ORDER BY member.npi, member.binding_ordinal,
-                  member.provider_set_key
-         LIMIT :membership_probe_limit
-    ), profile_keys AS MATERIALIZED (
-        SELECT DISTINCT binding_ordinal, provider_set_key
-          FROM selected_memberships
-         ORDER BY binding_ordinal, provider_set_key
-         LIMIT :provider_set_probe_limit
-    ), scope_admission AS MATERIALIZED (
-        SELECT (SELECT COUNT(*) FROM selected_memberships)::bigint
-                   AS membership_count,
-               (SELECT COUNT(*) FROM profile_keys)::bigint
-                   AS provider_set_count
-    ), admitted_profile_keys AS MATERIALIZED (
-        SELECT profile_keys.*
-          FROM profile_keys
-         CROSS JOIN scope_admission
-         WHERE scope_admission.membership_count <= :membership_limit
-           AND scope_admission.provider_set_count <= :provider_set_limit
-    ), profile_scope AS MATERIALIZED (
-        SELECT profile.binding_ordinal, profile.provider_set_key,
-               cardinality(profile.negotiated_rates)::bigint
-                   AS rate_value_count
-          FROM admitted_profile_keys keys
-          JOIN {profile_table} profile
-            ON profile.projection_id = :projection_id
-           AND profile.code_system = :code_system
-           AND profile.code = :code
-           AND profile.binding_ordinal = keys.binding_ordinal
-           AND profile.provider_set_key = keys.provider_set_key
-    ), rate_admission AS MATERIALIZED (
-        SELECT COALESCE(SUM(rate_value_count), 0)::bigint
-                   AS rate_value_count
-          FROM profile_scope
-    ), admitted_profiles AS MATERIALIZED (
-        SELECT profile.binding_ordinal, profile.provider_set_key,
-               profile.minimum_negotiated_rate,
-               profile.maximum_negotiated_rate, profile.rate_count,
-               profile.negotiated_rates, profile.rate_multiplicities
-          FROM profile_scope scope
-          JOIN {profile_table} profile
-            ON profile.projection_id = :projection_id
-           AND profile.code_system = :code_system
-           AND profile.code = :code
-           AND profile.binding_ordinal = scope.binding_ordinal
-           AND profile.provider_set_key = scope.provider_set_key
-         CROSS JOIN rate_admission
-         WHERE rate_admission.rate_value_count <= :rate_value_limit
-    ), profile_validation AS MATERIALIZED (
-        SELECT COALESCE(BOOL_AND(
-                   cardinality(negotiated_rates) > 0
-                   AND cardinality(negotiated_rates)
-                       = cardinality(rate_multiplicities)
-                   AND minimum_negotiated_rate = negotiated_rates[1]
-                   AND maximum_negotiated_rate = negotiated_rates[
-                       cardinality(negotiated_rates)
-                   ]
-                   AND rate_count = (
-                       SELECT SUM(multiplicity)::bigint
-                         FROM unnest(rate_multiplicities)
-                              AS listed(multiplicity)
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                         FROM generate_subscripts(
-                             negotiated_rates, 1
-                         ) AS indexes(rate_index)
-                        WHERE rate_index > 1
-                          AND negotiated_rates[rate_index]
-                              <= negotiated_rates[rate_index - 1]
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                         FROM unnest(rate_multiplicities)
-                              AS listed(multiplicity)
-                        WHERE multiplicity <= 0
-                   )
-               ), TRUE) AS profiles_valid
-          FROM admitted_profiles
-    ), admission AS MATERIALIZED (
-        SELECT scope_admission.membership_count,
-               scope_admission.provider_set_count,
-               rate_admission.rate_value_count,
-               profile_validation.profiles_valid
-          FROM scope_admission
-         CROSS JOIN rate_admission
-         CROSS JOIN profile_validation
-    ), stats AS MATERIALIZED (
-        SELECT member.npi,
-               MIN(profile.minimum_negotiated_rate) AS minimum_rate,
-               MAX(profile.maximum_negotiated_rate) AS maximum_rate,
-               SUM(profile.rate_count)::bigint AS rate_count
-          FROM selected_memberships member
-          JOIN admitted_profiles profile USING (
-               binding_ordinal, provider_set_key
-          )
-         CROSS JOIN profile_validation
-         WHERE profile_validation.profiles_valid
-         GROUP BY member.npi
-    ), ranked_provider AS MATERIALIZED (
-        SELECT provider.npi, provider.geo_cell,
-               provider.entity_type_code, provider.taxonomy_codes,
-               provider.fragment,
-               ROW_NUMBER() OVER (
-                   PARTITION BY provider.npi
-                   ORDER BY cells.cell_rank, provider.geo_cell
-               ) AS address_rank
-          FROM selected
-          JOIN {provider_table} provider USING (npi)
-          JOIN cells ON cells.geo_cell = provider.geo_cell
-         CROSS JOIN admission
-         WHERE provider.projection_id = :projection_id
-           AND admission.membership_count <= :membership_limit
-           AND admission.provider_set_count <= :provider_set_limit
-           AND admission.rate_value_count <= :rate_value_limit
-           {taxonomy_sql}
-    )
-    SELECT selected.npi, stats.minimum_rate, stats.maximum_rate,
-           stats.rate_count, ranked_provider.geo_cell,
-           ranked_provider.entity_type_code,
-           ranked_provider.taxonomy_codes, ranked_provider.fragment,
-           admission.membership_count, admission.provider_set_count,
-           admission.rate_value_count, admission.profiles_valid
-      FROM selected
-     CROSS JOIN admission
-      LEFT JOIN stats USING (npi)
-      LEFT JOIN ranked_provider
-        ON ranked_provider.npi = selected.npi
-       AND ranked_provider.address_rank = 1
-     ORDER BY selected.npi
-"""
-
 
 def _uses_factorized_release_cards(
     args: Mapping[str, Any],
@@ -20626,16 +20370,27 @@ def _factorized_card_provider_fragment(
     return _FactorizedFrozenProviderCell(npi, geo_cell, fragment_by_field)
 
 
-def _factorized_card_candidate_query(taxonomy_sql: str) -> Any:
+def _factorized_card_candidate_query(taxonomy_sql: str, *, binding_ordinals: tuple[int, ...] | None = None) -> Any:
     """Build one release-wide bounded candidate query."""
 
-    return text(
+    binding_sql = (
+        ""
+        if binding_ordinals is None
+        else "\n      AND binding_ordinal = ANY(CAST(:allowed_binding_ordinals AS integer[]))"
+    )
+    statement = text(
         _FACTORIZED_CARD_CANDIDATE_SQL.format(
             profile_table=_plan_pricing_projection_table("plan_pricing_rate_profile"),
             membership_table=_plan_pricing_projection_table("plan_pricing_provider_membership"),
             provider_table=_plan_pricing_projection_table("plan_pricing_provider_cell"),
             taxonomy_sql=taxonomy_sql,
+            binding_sql=binding_sql,
         )
+    )
+    return (
+        statement
+        if binding_ordinals is None
+        else statement.bindparams(_factorized_card_binding_parameter(binding_ordinals))
     )
 
 
@@ -20730,15 +20485,20 @@ async def _factorized_card_candidates(
     selected_geo_cells: Sequence[str],
     args: Mapping[str, Any],
     target_count: int,
+    *,
+    binding_ordinals: tuple[int, ...] | None = None,
 ) -> _FactorizedCardCandidateSelection:
-    """Read one bounded candidate prefix across every release binding."""
+    """Read one bounded candidate prefix across admitted release bindings."""
 
-    if not selected_geo_cells:
+    if not selected_geo_cells or binding_ordinals == ():
         return _FactorizedCardCandidateSelection({}, 0, True)
     taxonomy_sql, taxonomy_parameters = _factorized_card_frozen_taxonomy(args)
     candidate_limit = max(_ptg2_manifest_location_match_limit(), target_count)
     candidate_result = await session.execute(
-        _factorized_card_candidate_query(taxonomy_sql),
+        _factorized_card_candidate_query(
+            taxonomy_sql,
+            **({"binding_ordinals": binding_ordinals} if binding_ordinals is not None else {}),
+        ),
         {
             "projection_id": projection_id,
             "code_system": code_identity[0],
@@ -20759,16 +20519,27 @@ async def _factorized_card_candidates(
     )
 
 
-def _factorized_card_completion_query(taxonomy_sql: str) -> Any:
+def _factorized_card_completion_query(taxonomy_sql: str, *, binding_ordinals: tuple[int, ...] | None = None) -> Any:
     """Build one exact selected-NPI completion and frozen-cell query."""
 
-    return text(
+    binding_sql = (
+        ""
+        if binding_ordinals is None
+        else "\n      AND member.binding_ordinal = ANY(CAST(:allowed_binding_ordinals AS integer[]))"
+    )
+    statement = text(
         _FACTORIZED_CARD_COMPLETION_SQL.format(
             profile_table=_plan_pricing_projection_table("plan_pricing_rate_profile"),
             membership_table=_plan_pricing_projection_table("plan_pricing_provider_membership"),
             provider_table=_plan_pricing_projection_table("plan_pricing_provider_cell"),
             taxonomy_sql=taxonomy_sql,
+            binding_sql=binding_sql,
         )
+    )
+    return (
+        statement
+        if binding_ordinals is None
+        else statement.bindparams(_factorized_card_binding_parameter(binding_ordinals))
     )
 
 
@@ -20875,14 +20646,19 @@ async def _factorized_card_complete_selected_npis(
     args: Mapping[str, Any],
     selected_npis: tuple[int, ...],
     expected_minimum_by_npi: Mapping[int, Decimal],
+    *,
+    binding_ordinals: tuple[int, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    """Complete selected NPIs once across all bindings and frozen cells."""
+    """Complete selected NPIs once across admitted bindings and frozen cells."""
 
-    if not selected_npis:
+    if not selected_npis or binding_ordinals == ():
         return []
     taxonomy_sql, taxonomy_parameters = _factorized_card_frozen_taxonomy(args)
     completion_result = await session.execute(
-        _factorized_card_completion_query(taxonomy_sql),
+        _factorized_card_completion_query(
+            taxonomy_sql,
+            **({"binding_ordinals": binding_ordinals} if binding_ordinals is not None else {}),
+        ),
         {
             "projection_id": projection_id,
             "code_system": code_identity[0],
@@ -20926,13 +20702,14 @@ def _factorized_card_response(
     candidate_selection: _FactorizedCardCandidateSelection,
     *,
     has_geo_cells: bool,
+    contributing_bindings: tuple[PlanReleaseSnapshotBinding, ...] | None = None,
 ) -> dict[str, Any]:
     """Shape one compact page with progressive or exact total metadata."""
 
     start = max(int(getattr(pagination, "offset", 0) or 0), 0)
     limit = max(int(getattr(pagination, "limit", 25) or 25), 1)
     page_item_list = card_items[start : start + limit]
-    query_by_field = _plan_release_no_match_query(release_selection, args)
+    query_by_field = _plan_release_no_match_query(release_selection, args, contributing_bindings=contributing_bindings)
     query_by_field |= _plan_pricing_projection_query(args, result_type="provider_cards")
     query_by_field.update(
         view="card",
@@ -20969,6 +20746,7 @@ def _factorized_card_response(
         annotate_plan_release_response(
             response_by_field,
             release_selection,
+            contributing_bindings=contributing_bindings,
         )
         or response_by_field
     )
@@ -20980,15 +20758,16 @@ async def _search_factorized_plan_release_cards(
     pagination: Any,
     release_selection: PlanReleaseServingSelection,
 ) -> dict[str, Any]:
-    """Serve compact V3 cards with two release-wide bounded SQL reads."""
+    """Serve compact cards with one source admission before both bounded reads."""
 
     projection_id = _factorized_card_projection_id(release_selection)
     code_identity = _factorized_card_code_identity(args)
-    selected_geo_cells = await _plan_pricing_projection_geo_cells(
-        session,
-        args,
-        result_type="provider_cards",
-    )
+    _uses_factorized_release_cards(args, pagination)
+    _factorized_card_frozen_taxonomy(args)
+    release_bindings = await admitted_plan_release_bindings(session, release_selection)
+    binding_ordinals = tuple(binding.binding_ordinal for binding in release_bindings)
+    binding_options = {"binding_ordinals": binding_ordinals} if current_network_address_scope() is not None else {}
+    selected_geo_cells = await _plan_pricing_projection_geo_cells(session, args, result_type="provider_cards")
     target_count = max(
         int(getattr(pagination, "offset", 0) or 0) + int(getattr(pagination, "limit", 25) or 25) + 1,
         1,
@@ -21000,13 +20779,11 @@ async def _search_factorized_plan_release_cards(
         selected_geo_cells,
         args,
         target_count,
+        **binding_options,
     )
     ordered_npi_list = sorted(
         candidate_selection.minimum_rate_by_npi,
-        key=lambda npi: (
-            candidate_selection.minimum_rate_by_npi[npi],
-            npi,
-        ),
+        key=lambda npi: (candidate_selection.minimum_rate_by_npi[npi], npi),
     )
     selected_npis = tuple(ordered_npi_list[:target_count])
     card_items = await _factorized_card_complete_selected_npis(
@@ -21017,6 +20794,7 @@ async def _search_factorized_plan_release_cards(
         args,
         selected_npis,
         candidate_selection.minimum_rate_by_npi,
+        **binding_options,
     )
     return _factorized_card_response(
         release_selection,
@@ -21025,6 +20803,7 @@ async def _search_factorized_plan_release_cards(
         card_items,
         candidate_selection,
         has_geo_cells=bool(selected_geo_cells),
+        contributing_bindings=release_bindings,
     )
 
 
@@ -21035,6 +20814,7 @@ async def _search_multi_ptg2_snapshots(
     pagination,
     *,
     release_selection: PlanReleaseServingSelection | None = None,
+    contributing_bindings: tuple[PlanReleaseSnapshotBinding, ...] | None = None,
 ) -> dict[str, Any] | None:
     """Union attributable network rows into one globally ordered plan page."""
     # Pull enough from each network to fill the requested page after the merge:
@@ -21054,6 +20834,7 @@ async def _search_multi_ptg2_snapshots(
         args,
         sub_pagination,
         release_selection,
+        **({"contributing_bindings": contributing_bindings} if contributing_bindings is not None else {}),
     )
     if network_responses is None:
         return None
@@ -21079,7 +20860,9 @@ async def _search_multi_ptg2_snapshots(
         total,
     )
     if release_selection is not None:
-        return annotate_plan_release_response(response_by_field, release_selection)
+        return annotate_plan_release_response(
+            response_by_field, release_selection, contributing_bindings=contributing_bindings
+        )
     return response_by_field
 
 
@@ -21169,23 +20952,21 @@ async def _read_multi_ptg2_snapshots(
     args: dict[str, Any],
     sub_pagination: PaginationParams,
     release_selection: PlanReleaseServingSelection | None,
+    *,
+    contributing_bindings: tuple[PlanReleaseSnapshotBinding, ...] | None = None,
 ) -> list[tuple[str, str, dict[str, Any] | None]] | None:
-    binding_by_network = {
-        (binding.source_key, binding.snapshot_id): binding
-        for binding in (release_selection.in_network_bindings if release_selection is not None else ())
-    }
+    bindings = contributing_bindings
+    if bindings is None:
+        bindings = release_selection.in_network_bindings if release_selection is not None else ()
+    binding_by_network = {(binding.source_key, binding.snapshot_id): binding for binding in bindings}
     if release_selection is None:
-        serving_tables_by_snapshot_id = await _network_tables_by_snapshot_id(
-            session,
-            network_snapshots,
-        )
+        serving_tables_by_snapshot_id = await _network_tables_by_snapshot_id(session, network_snapshots)
     else:
         if tuple(network_snapshots) != tuple(binding_by_network):
             return None
-        validated_serving_tables_by_snapshot_id = release_selection.network_tables_by_snapshot()
-        if validated_serving_tables_by_snapshot_id is None:
+        serving_tables_by_snapshot_id = release_selection.network_tables_by_snapshot(contributing_bindings=bindings)
+        if serving_tables_by_snapshot_id is None:
             return None
-        serving_tables_by_snapshot_id = validated_serving_tables_by_snapshot_id
     network_responses = []
     for source_key, snapshot_id in network_snapshots:
         network_args = args
@@ -21212,13 +20993,15 @@ async def _search_established_plan_release_index(
     release_selection: PlanReleaseServingSelection,
 ) -> dict[str, Any] | None:
     """Serve the unchanged full or legacy-card release contract."""
-
-    release_bindings = release_selection.in_network_bindings
-    serving_tables_by_snapshot_id = release_selection.network_tables_by_snapshot()
+    release_bindings = await admitted_plan_release_bindings(session, release_selection)
+    release_selection = await prepare_plan_release_bindings(session, release_selection, release_bindings)
+    serving_tables_by_snapshot_id = release_selection.network_tables_by_snapshot(contributing_bindings=release_bindings)
     if serving_tables_by_snapshot_id is None:
         return None
     if not release_bindings:
-        return _plan_release_no_match_response(release_selection, args, pagination)
+        return _plan_release_no_match_response(
+            release_selection, args, pagination, contributing_bindings=release_bindings
+        )
     network_snapshots = [(binding.source_key, binding.snapshot_id) for binding in release_bindings]
     if len(release_bindings) > 1:
         response_by_field = await _search_multi_ptg2_snapshots(
@@ -21227,6 +21010,7 @@ async def _search_established_plan_release_index(
             args,
             pagination,
             release_selection=release_selection,
+            **({"contributing_bindings": release_bindings} if current_network_address_scope() is not None else {}),
         )
     else:
         binding = release_bindings[0]
@@ -21245,6 +21029,7 @@ async def _search_established_plan_release_index(
         release_selection,
         args,
         pagination,
+        contributing_bindings=release_bindings,
     )
 
 
@@ -21348,7 +21133,7 @@ async def _search_selected_plan_release(
             pagination,
             selected_release,
         )
-    if selected_release.network_tables_by_snapshot() is None:
+    if current_network_address_scope() is None and selected_release.network_tables_by_snapshot() is None:
         selected_release = await resolve_plan_release_serving(
             session,
             selected_release.plan_release_id,

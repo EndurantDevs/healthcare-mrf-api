@@ -907,9 +907,15 @@ async def test_history_and_preview_project_metadata_without_changing_retained_ev
     assert await preview._preview_document(PreviewReader(), '"example_registry"', '"selection"', command) == "{}"
 
 
-def _materialized_group(monkeypatch, failure=None):
+def _materialized_group(failure=None):
     class GroupSession(Session):
         async def execute(self, statement, rows=None):
+            if getattr(statement, "is_select", False) and [
+                getattr(table, "name", None) for table in statement.get_final_froms()
+            ] == ["company_group_registry"]:
+                assert statement.compile(dialect=postgresql.dialect()).params == {"group_id_1": UUID(COMPANY)}
+                self.events.append("materialized-head-read")
+                return Result([copy.deepcopy(snapshot_by_field)])
             if getattr(getattr(statement, "table", None), "name", None) == "registry_record_history":
                 params = statement.compile(dialect=postgresql.dialect()).params
                 if failure == "history" and params["revision"] == 2:
@@ -931,11 +937,6 @@ def _materialized_group(monkeypatch, failure=None):
     if failure == "cas":
         session.head["revision"] = 2
 
-    async def materialized_read(_session, kind, identity, **_kwargs):
-        assert kind == "group" and identity == UUID(COMPANY)
-        return copy.deepcopy(snapshot_by_field)
-
-    monkeypatch.setattr(store, "get_registry_record", materialized_read)
     command = store.RegistryRecordCommand(
         "group",
         UUID(COMPANY),
@@ -950,15 +951,20 @@ def _materialized_group(monkeypatch, failure=None):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [None, "cas", "history"])
-async def test_materialized_group_first_correction_undo_and_replay_are_atomic(monkeypatch, failure):
-    session, snapshot, correction = _materialized_group(monkeypatch, failure)
+async def test_materialized_group_first_correction_undo_and_replay_are_atomic(failure):
+    session, snapshot, correction = _materialized_group(failure)
     before = copy.deepcopy((session.head, session.history, session.assertions, session.draft))
     if failure is not None:
         with pytest.raises((store.RegistryRecordConflict, RuntimeError)):
             await _apply(session, correction)
         assert (session.head, session.history, session.assertions, session.draft) == before
+        assert session.events.count("materialized-head-read") == 1
+        assert "head" in session.events and session.events[-1] == "rollback"
+        if failure == "history":
+            assert "history" in session.events
         return
     corrected = await _apply(session, correction)
+    assert session.events.count("materialized-head-read") == 1
     baseline, retained_correction = copy.deepcopy(session.history)
     assert baseline["record_json"] == snapshot
     assert baseline["reason"] == "Preserved materialized group before manual correction"
@@ -996,8 +1002,8 @@ async def test_materialized_group_first_correction_undo_and_replay_are_atomic(mo
         ("revision", 2),
     ],
 )
-async def test_materialized_group_undo_refuses_unbound_equal_revision_history(monkeypatch, field, value):
-    session, _snapshot, correction = _materialized_group(monkeypatch)
+async def test_materialized_group_undo_refuses_unbound_equal_revision_history(field, value):
+    session, _snapshot, correction = _materialized_group()
     await _apply(session, correction)
     target = session.history[0]
     (target["record_json"] if field in {"group_id", "revision"} else target)[field] = value

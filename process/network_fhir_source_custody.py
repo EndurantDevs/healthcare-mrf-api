@@ -856,7 +856,9 @@ async def capture_retained_cms_fhir_source_custody(connection, source_pin, *, ow
             catalog = await _catalog(connection, source_pin, owner_role, runtime_roles)
             proof = await _proof(connection, source_pin)
         return RetainedCMSFHIRSourceCustody(source_pin, owner_role, runtime_roles, proof, catalog)
-    except ValueError, TypeError, asyncpg.PostgresError, OSError, TimeoutError:
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError, ConnectionError) as error:
+        raise FHIRSourceCustodyError("fhir_source_custody_unavailable") from error
+    except ValueError, TypeError, OSError, TimeoutError:
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable") from None
 
 

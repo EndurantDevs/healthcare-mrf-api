@@ -170,3 +170,28 @@ async def test_archiving_used_office_requires_membership_removal_in_same_selecti
         for approved_record in approved_records
     }
     assert documents_by_kind["location"]["archived"] and documents_by_kind["membership"]["memberships_json"] == []
+
+
+@pytest.mark.parametrize("operation", ["add", "remove"])
+@pytest.mark.parametrize("target_kind", ["network", "provider", "location"])
+async def test_command_approval_checks_current_active_targets(provider_db, operation, target_kind):
+    connection, schema, sessions, _ = provider_db
+    actor, network, provider, location, membership = await _records(provider_db)
+    await _approve(
+        connection, schema, await _command(connection, schema, network, provider, location, membership), actor
+    )
+    await connection.execute(
+        f"UPDATE \"{schema}\".registry_approved_record SET record_json=jsonb_set(record_json,'{{memberships_json,0,operation}}',$1::jsonb) WHERE record_kind='membership'",
+        json.dumps(operation),
+    )
+    target = {"network": network, "provider": provider, "location": location}[target_kind]
+    identity = target["record_id"] if target_kind == "network" else UUID(target["record_id"])
+    archive = RegistryRecordCommand(target_kind, identity, "archive", 1, {}, "Retired exact target", uuid4().hex)
+    archived = await _apply(sessions, schema, archive, actor)
+    command = await _command(connection, schema, archived)
+    async with connection.transaction():
+        preview = await preview_registry_approval(connection, command, actor, control_schema=schema)
+    assert preview["membership_diagnostics"]["membership_rows"] == 1
+    assert preview["membership_diagnostics"][f"unapproved_{target_kind}_count"] == 1
+    with pytest.raises(RegistryApprovalConflict, match="membership_unresolved"):
+        await _approve(connection, schema, command, actor)

@@ -25,6 +25,7 @@ from process.registry_required_target_store import (
 )
 from process.registry_source_observation_store import _namespace
 from process.registry_source_selection_receipt import _unique_object
+from process.uhc_flex_practitioner_async_safety import drain_operation
 
 PARSER_VERSION = "registry-target-review-v1"
 EVIDENCE_PREFIX = "required-target-review:"
@@ -194,7 +195,9 @@ async def admit_registry_required_target_review(
     try:
         async with connection.transaction():
             ledger = await _read_ledger(connection, namespace, ledger_snapshot_id)
-            copy_bytes, descriptor = await asyncio.to_thread(_encode, input_bytes, ledger, edition, ledger_snapshot_id)
+            copy_bytes, descriptor = await drain_operation(
+                asyncio.to_thread(_encode, input_bytes, ledger, edition, ledger_snapshot_id), preserve_cancellation=True
+            )
             staging = await _stage(connection, namespace, copy_bytes, edition, ledger_snapshot_id, ledger, descriptor)
             replayed = await _is_replay_after_retention(
                 connection,

@@ -108,7 +108,6 @@ async def address_clone_identity(session, ownership, owner_role, runtime_roles, 
         + " IN ACCESS SHARE MODE NOWAIT"
     )
     await verify_entity_address_archive_stage_ownership(session, owner=ownership)
-    await _check_roles(connection, {"owner_role": owner_role, "loader_roles": [], "reader_roles": list(runtime_roles)})
     owner_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", owner_role)
     if (
         await connection.fetchval("SELECT nspowner FROM pg_namespace WHERE oid=$1::oid", ownership.schema_oid)

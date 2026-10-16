@@ -1122,3 +1122,24 @@ async def test_read_bridge_retirement_refuses_dependents_and_api(permissions_db)
         assert await _provision_registry(fixture, namespace)
     finally:
         await connection.execute(f'DROP SCHEMA IF EXISTS "{namespace}" CASCADE')
+
+
+async def test_installed_management_api_role_reads_exact_group_source_evidence(permissions_db):
+    from tests.test_registry_record_store_postgres import _retain_group_evidence
+
+    fixture = permissions_db
+    command = create_record()
+    await apply_record(fixture.sessions, fixture.schema, command, registry_actor())
+    reference = await _retain_group_evidence(fixture.connection, fixture.schema, command.record_id)
+    await _install(fixture)
+    assert await fixture.connection.fetchval(
+        "SELECT NOT rolsuper AND NOT rolcreaterole AND NOT rolbypassrls FROM pg_roles WHERE rolname=$1",
+        fixture.roles_by_kind["api"],
+    )
+    async with fixture.sessions() as session, session.begin():
+        await session.execute(text(f'SET LOCAL ROLE "{fixture.roles_by_kind["api"]}"'))
+        assert await session.scalar(text("SELECT current_user")) == fixture.roles_by_kind["api"]
+        record = await get_registry_record(session, "group", command.record_id, schema=fixture.schema)
+        assert record["source_evidence"] == [reference]
+        assert (await list_registry_records(session, "group", schema=fixture.schema)) == [record]
+    assert await verify_registry_management_permissions(fixture.connection, **_arguments(fixture))

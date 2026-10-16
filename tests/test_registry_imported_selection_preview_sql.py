@@ -34,7 +34,7 @@ def test_cms_aggregate_preserves_extractor_lineage_and_full_accounting():
     extracted = _extraction_sql(recipe.source_pin, '"synthetic_registry"', reviewed=True, approved_only=True)
     aggregated = preview._impact_sql(recipe, '"synthetic_registry"', '"synthetic_selection"', "synthetic_registry")
     # Compare every expansion, source-witness and resolution predicate against the existing extractor.
-    expected_body = extracted.split("providers AS (", 1)[1].split(", encoded AS (", 1)[0]
+    expected_body = extracted.split("providers AS (", 1)[1].split(", resource_edges AS (", 1)[0]
     expected_body = expected_body.replace(preview._FHIR_EXPANDED_PAGE, "\n", 1)
     expected_body = re.sub(
         r"\$(\d+)", lambda match: "$" + str(int(match[1]) - (3 if int(match[1]) > 11 else 0)), expected_body
@@ -45,6 +45,8 @@ def test_cms_aggregate_preserves_extractor_lineage_and_full_accounting():
     assert "page AS MATERIALIZED" in aggregated and "expanded AS MATERIALIZED" in aggregated
     assert "LIMIT" not in aggregated and "ORDER BY resource_type,resource_id" not in aggregated
     assert "encoded AS" not in aggregated and "input_json" not in aggregated
+    assert "resource_documents AS" not in aggregated and "resource_accounting AS" not in aggregated
+    assert max(map(int, re.findall(r"\$(\d+)", aggregated))) == 12
     assert "count(*) FILTER(WHERE NOT unresolved AND NOT omitted) AS mapped_rows" in aggregated
     assert "count(*) FILTER(WHERE omitted) AS omitted_rows" in aggregated
     assert "count(*) FILTER(WHERE unresolved AND NOT omitted) AS unresolved_rows" in aggregated

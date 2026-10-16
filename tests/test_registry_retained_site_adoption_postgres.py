@@ -228,7 +228,11 @@ async def test_native_tampering_fails_closed_and_caller_rollback_restores(retain
     assert len((await _resolve(fixture)).records) == 1
 
 
-@pytest.mark.parametrize("payload", [b"[]", b"{}", b"null", b"[NaN]", b"[{}]", b"[", b" " * (MAX_INPUT_BYTES + 1)])
+@pytest.mark.parametrize(
+    "payload",
+    [b"[]", b"{}", b"null", b"[NaN]", b"[{}]", b"[", b" " * (MAX_INPUT_BYTES + 1)],
+    ids=["empty-array", "object", "null", "nonfinite", "missing-fields", "truncated", "oversized-whitespace"],
+)
 async def test_strict_input_is_rejected_before_database(retained_db, payload):
     with pytest.raises(RetainedSiteAdoptionError):
         await resolve_retained_site_adoptions(None, retained_db.source, payload)

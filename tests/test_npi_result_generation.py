@@ -107,6 +107,7 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261012010000_company_registry_name_origin",
     "20261013010000_registry_custom_history_events",
     "20261015020000_custom_import_query_projections",
+    "20261016070000_registry_allowed_plan_scope",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -117,7 +118,10 @@ _SERVICE_NETWORK_UPGRADE_REVISIONS = (
 
 def _assert_current_registry_head(script: ScriptDirectory) -> None:
     """Require one registry head after the unchanged published custom-import chain."""
-    assert script.get_heads() == ["20261015020000_custom_import_query_projections"]
+    assert script.get_heads() == ["20261016070000_registry_allowed_plan_scope"]
+    assert script.get_revision("20261016070000_registry_allowed_plan_scope").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )
@@ -265,6 +269,7 @@ def test_profile_migrations_follow_custom_import_processing_policy() -> None:
         "20261012010000_company_registry_name_origin",
         "20261013010000_registry_custom_history_events",
         "20261015020000_custom_import_query_projections",
+        "20261016070000_registry_allowed_plan_scope",
     )
 
 

@@ -266,7 +266,7 @@ def _with_doctors_input(fhir, input_json, doctors, dependency_bindings):
     return _json(input_by_field)
 
 
-def _with_registry_source_retention_input(input_json, execution, raw_policy):
+def _with_registry_source_retention_input(input_json, execution, raw_policy, source_as_of):
     """Bind a closed retention request to this factory's actual fence and selection."""
     from process.provider_directory_cms_capacity_contract import validated_registry_source_retention_policy
 
@@ -277,7 +277,8 @@ def _with_registry_source_retention_input(input_json, execution, raw_policy):
     if (
         len(cms_pins) != 1
         or pin["schema_name"] != inputs["database_schema"]
-        or pin["as_of"] != inputs["profile_as_of"]
+        or pin["as_of"] != source_as_of
+        or inputs["profile_as_of"] != execution.attestation.desired_profile_as_of
         or policy["selection_proof_id"] != getattr(execution.attestation, "proof_id", None)
         or any(pin[name] != cms_pins[0][name] for name in ("source_id", "endpoint_id", "dataset_id"))
         or pin["dataset_sha256"] != cms_pins[0]["dataset_hash"]
@@ -297,6 +298,7 @@ class CMSAddressPreparation:
     run_id: str
     input_json: str
     doctors: Any = None
+    cms_source_as_of: str | None = None
 
     @property
     def input_hash(self) -> str:
@@ -322,6 +324,7 @@ class CMSAddressPreparation:
             self.run_id,
             _with_doctors_input(self.fhir, self.input_json, doctors, dependency_bindings),
             doctors,
+            self.cms_source_as_of,
         )
 
     def with_registry_source_retention(self, policy) -> CMSAddressPreparation:
@@ -330,8 +333,9 @@ class CMSAddressPreparation:
             self.fhir,
             self.execution,
             self.run_id,
-            _with_registry_source_retention_input(self.input_json, self.execution, policy),
+            _with_registry_source_retention_input(self.input_json, self.execution, policy, self.cms_source_as_of),
             self.doctors,
+            self.cms_source_as_of,
         )
 
     def _current_input(self, fence, expected):
@@ -349,7 +353,7 @@ class CMSAddressPreparation:
             input_json = _with_doctors_input(self.fhir, input_json, self.doctors, expected["desired_geo_bindings"])
         if "registry_source_retention" in expected:
             input_json = _with_registry_source_retention_input(
-                input_json, self.execution, expected["registry_source_retention"]
+                input_json, self.execution, expected["registry_source_retention"], _cms_source_as_of(fence)
             )
         return input_json
 
@@ -469,6 +473,12 @@ async def _new_context(run_id: str, schema: str) -> dict[str, Any]:
     return context_by_field
 
 
+def _cms_source_as_of(fence):
+    """Read the exact CMS date already bound by the authenticated desired fence."""
+    datasets = [dataset for dataset in fence.datasets if dataset.source_id == "cms-npd"]
+    return getattr(datasets[0], "semantic_projection_as_of", None) if len(datasets) == 1 else None
+
+
 def cms_address_preparation(
     fhir,
     execution,
@@ -496,6 +506,7 @@ def cms_address_preparation(
             worker_count,
             temp_file_limit_bytes_per_backend,
         ),
+        cms_source_as_of=_cms_source_as_of(fence),
     )
 
 

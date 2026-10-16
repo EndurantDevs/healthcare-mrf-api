@@ -12,6 +12,7 @@ from sanic.exceptions import InvalidUsage
 from sanic.request.parameters import RequestParameters
 from sqlalchemy import text
 
+from api import custom_import_provider_collection as managed_collection
 from api import custom_import_read_http as transport
 from api.custom_import_provider_network import (
     ProviderNetworkBinding,
@@ -72,6 +73,7 @@ class _ParsedProviderRequest:
     include_filter: bool = True
     maximum_family_rows: int = MAX_FULL_FAMILY_PAGE_SIZE
     network_binding: ProviderNetworkBinding | None = None
+    managed_collection: managed_collection.ManagedProviderCollection | None = None
 
 
 @dataclass(repr=False)
@@ -146,12 +148,17 @@ def _parse_native_query(document: object) -> RequestParameters:
     return args
 
 
-def _provider_document(body, *, allow_network_binding=False):
+def _provider_document(body, *, allow_network_binding=False, allow_managed_collection=False):
     document = transport._strict_json(body)
     base_keys = {"target", "native_query", "context", "filters", "order", "require_match"}
+    optional_fields = {"include_filter"}
+    if allow_network_binding:
+        optional_fields.add("network_binding")
+    if allow_managed_collection:
+        optional_fields.add("managed_collection")
     if (
         type(document) is not dict
-        or (set(document) - ({"include_filter", "network_binding"} if allow_network_binding else {"include_filter"}))
+        or (set(document) - optional_fields)
         not in (
             base_keys,
             base_keys | {"grouped_entity_selection"},
@@ -172,10 +179,19 @@ def _parse_provider_request(
     maximum_family_rows=MAX_FULL_FAMILY_PAGE_SIZE,
     allow_network_binding=False,
     network_document=None,
+    allow_managed_collection=False,
+    collection_kind="list",
 ) -> _ParsedProviderRequest:
     """Separate context selectors from whether imported membership is required."""
 
-    document = _provider_document(body, allow_network_binding=allow_network_binding)
+    document = _provider_document(
+        body, allow_network_binding=allow_network_binding, allow_managed_collection=allow_managed_collection
+    )
+    collection = managed_collection.parse_optional_managed_collection(
+        document,
+        kind=collection_kind,
+        native_batch=network_document.get("native_batch") if network_document is not None else None,
+    )
     network_binding = parse_provider_network_binding(document if network_document is None else network_document)
     if type(document["require_match"]) is not bool:
         raise CustomImportReadRequestError("imported membership mode is invalid")
@@ -183,15 +199,7 @@ def _parse_provider_request(
     if type(include_filter) is not bool:
         raise CustomImportReadRequestError("imported payload mode is invalid")
     grouped = document.get("grouped_entity_selection")
-    order = (
-        None
-        if document["order"] is None
-        else transport._parse_order_documents(
-            document["order"], maximum_terms=MAX_PROVIDER_ORDER_TERMS if grouped is not None else 3
-        )
-    )
-    if order is None and not document["require_match"]:
-        raise CustomImportReadRequestError("order-only queries require imported ordering")
+    order = _parse_provider_order(document, grouped)
     context = transport._parse_filter_documents(document["context"])
     filters = transport._parse_filter_documents(
         document["filters"], maximum_terms=MAX_PROVIDER_FILTER_TERMS if grouped is not None else 3
@@ -221,7 +229,21 @@ def _parse_provider_request(
         include_filter=include_filter,
         maximum_family_rows=maximum_family_rows,
         network_binding=network_binding,
+        managed_collection=collection,
     )
+
+
+def _parse_provider_order(document, grouped):
+    order = (
+        None
+        if document["order"] is None
+        else transport._parse_order_documents(
+            document["order"], maximum_terms=MAX_PROVIDER_ORDER_TERMS if grouped is not None else 3
+        )
+    )
+    if order is None and not document["require_match"]:
+        raise CustomImportReadRequestError("order-only queries require imported ordering")
+    return order
 
 
 def _validate_provider_predicates(context, filters, grouped, child):
@@ -261,11 +283,15 @@ async def serve_custom_import_providers(request: Any, session: Any):
         or getattr(request, "query_string", "")
     ):
         return transport._error(404)
+    is_managed_mode = False
     try:
         body = getattr(request, "body", None)
-        if type(body) is not bytes or not 1 <= len(body) <= transport._MAX_BODY_BYTES:
+        if type(body) is not bytes or not 1 <= len(body) <= managed_collection.MAX_MANAGED_BODY_BYTES:
             raise transport._fail()
-        parsed = _parse_provider_request(body, allow_network_binding=True)
+        parsed = _parse_provider_request(body, allow_network_binding=True, allow_managed_collection=True)
+        is_managed_mode = parsed.managed_collection is not None
+        if not is_managed_mode and len(body) > transport._MAX_BODY_BYTES:
+            raise transport._fail()
         verified = transport._verify_provider_transport(
             headers=request.headers,
             body=body,
@@ -273,7 +299,10 @@ async def serve_custom_import_providers(request: Any, session: Any):
             trusted_now=transport._trusted_now(),
             keyring=transport._keyring(),
             path=CUSTOM_IMPORT_PROVIDERS_PATH,
+            managed_collection=is_managed_mode,
         )
+        if is_managed_mode:
+            return await _serve_managed_provider_page(request, parsed, verified)
         if session is None or session.in_transaction():
             raise CustomImportReadUnavailableError("fresh provider read session is required")
         async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), session.begin():
@@ -289,8 +318,25 @@ async def serve_custom_import_providers(request: Any, session: Any):
                 return provider_network_response(encoded, manifest)
     except Exception as failure:
         transport._log_failure(failure)
+        if is_managed_mode:
+            return managed_collection.managed_collection_error(failure)
         status = 400 if isinstance(failure, InvalidUsage) else transport._failure_status(failure)
         return transport._error(status)
+
+
+async def _serve_managed_provider_page(request, parsed, verified):
+    async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000):
+        async with managed_collection.managed_import_collection_scope(request, parsed.managed_collection) as (
+            reader,
+            manifest,
+        ):
+            provider_payload = await _read_provider_payload(request, reader, parsed, verified)
+            return managed_collection.managed_collection_response(
+                provider_payload,
+                parsed.managed_collection,
+                manifest,
+                maximum_bytes=_provider_response_limit(parsed, len(provider_payload["rows"])),
+            )
 
 
 async def _read_provider_payload(request, session, parsed, verified):
@@ -321,6 +367,10 @@ async def _read_provider_payload(request, session, parsed, verified):
             else None
         ),
     )
+    if reply.status != 200 and parsed.managed_collection is not None:
+        from sanic.exceptions import SanicException
+
+        raise SanicException("Provider data is unavailable.", status_code=reply.status)
     if reply.status != 200 or len(reply.body) > transport._MAX_RESPONSE_BYTES:
         raise CustomImportReadUnavailableError("provider response is unavailable")
     provider_payload = _provider_payload(reply.body)

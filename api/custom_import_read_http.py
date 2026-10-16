@@ -68,6 +68,7 @@ CUSTOM_IMPORT_READ_MAX_TTL_SECONDS = 60
 
 _CACHE_CONTROL = "private, no-store"
 _MAX_BODY_BYTES = 16 * 1024
+_MAX_MANAGED_PROVIDER_BODY_BYTES = 1024 * 1024
 _MAX_RESPONSE_BYTES = MAX_FAMILY_RESPONSE_BYTES
 _MAX_CONTEXT_BYTES = 2048
 _MAX_CONTEXT_CHARACTERS = 3072
@@ -110,7 +111,9 @@ _UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", fla
 _DATASET_KEY = re.compile(r"[a-z][a-z0-9_]{0,62}", flags=re.ASCII)
 _ERRORS = {
     400: ("custom_import_read_request_invalid", "Invalid custom import read request."),
+    403: ("custom_import_read_forbidden", "Custom import read is not authorized."),
     404: ("resource_not_found", "Resource not found."),
+    409: ("custom_import_read_source_changed", "Custom import read source changed."),
     503: ("custom_import_read_unavailable", "Custom import read is temporarily unavailable."),
 }
 _ENTITY_ABSENT_ERROR = ("custom_import_entity_absent", "Requested custom import entity was not found.")
@@ -155,6 +158,14 @@ def custom_import_provider_body_sha256(body: bytes) -> str:
     """Return the provider-v2 framed digest for one canonical body."""
 
     if type(body) is not bytes or not 1 <= len(body) <= _MAX_BODY_BYTES:
+        raise _fail()
+    return _framed_sha256(_PROVIDER_BODY_HASH_DOMAIN, body)
+
+
+def managed_provider_body_sha256(body: bytes) -> str:
+    """Keep provider-v2 framing with the bounded managed-provider body allowance."""
+
+    if type(body) is not bytes or not 1 <= len(body) <= _MAX_MANAGED_PROVIDER_BODY_BYTES:
         raise _fail()
     return _framed_sha256(_PROVIDER_BODY_HASH_DOMAIN, body)
 
@@ -212,6 +223,12 @@ _GENERIC_TRANSPORT = _TransportContract(
 _PROVIDER_TRANSPORT = _TransportContract(
     CUSTOM_IMPORT_PROVIDER_TRANSPORT_CONTRACT,
     custom_import_provider_body_sha256,
+    custom_import_provider_signature_message,
+    _PROVIDER_SIGNATURE_DOMAIN,
+)
+_MANAGED_PROVIDER_TRANSPORT = _TransportContract(
+    CUSTOM_IMPORT_PROVIDER_TRANSPORT_CONTRACT,
+    managed_provider_body_sha256,
     custom_import_provider_signature_message,
     _PROVIDER_SIGNATURE_DOMAIN,
 )
@@ -723,9 +740,33 @@ def _verify_provider_transport(
     trusted_now: str,
     keyring: _Keyring,
     path: str,
+    managed_detail: bool = False,
+    managed_collection: bool = False,
 ) -> _VerifiedTransport:
     """Verify the provider-only v2 transport without changing generic reads."""
 
+    if (
+        type(managed_detail) is not bool
+        or type(managed_collection) is not bool
+        or (managed_detail and managed_collection)
+    ):
+        raise _fail()
+    if managed_detail:
+        from api.custom_import_provider_batch import CUSTOM_IMPORT_PROVIDER_BATCH_PATH
+
+        if path != CUSTOM_IMPORT_PROVIDER_BATCH_PATH or getattr(request, "managed_detail", None) is None:
+            raise _fail()
+    if managed_collection:
+        collection = getattr(request, "managed_collection", None)
+        path_by_kind = {
+            "list": "/api/v1/extensions/custom-import/providers",
+            "geo": "/api/v1/extensions/custom-import/providers/geo",
+            "batch": "/api/v1/extensions/custom-import/providers/batch",
+            "by-service": "/api/v1/extensions/custom-import/providers/by-service",
+            "billing-search": "/api/v1/extensions/custom-import/providers/billing-search",
+        }
+        if collection is None or path_by_kind.get(collection.query.kind) != path:
+            raise _fail()
     return _verify_transport(
         headers=headers,
         body=body,
@@ -733,7 +774,7 @@ def _verify_provider_transport(
         trusted_now=trusted_now,
         keyring=keyring,
         path=path,
-        transport_contract=_PROVIDER_TRANSPORT,
+        transport_contract=_MANAGED_PROVIDER_TRANSPORT if managed_detail or managed_collection else _PROVIDER_TRANSPORT,
     )
 
 
@@ -1022,6 +1063,7 @@ __all__ = (
     "CUSTOM_IMPORT_READ_TRANSPORT_KEYRING_ENV",
     "CUSTOM_IMPORT_PROVIDER_TRANSPORT_CONTRACT",
     "custom_import_provider_body_sha256",
+    "managed_provider_body_sha256",
     "custom_import_provider_signature_message",
     "custom_import_read_body_sha256",
     "custom_import_read_signature_message",

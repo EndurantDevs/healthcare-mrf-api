@@ -148,3 +148,43 @@ def test_shard_errors_never_pass(
     )
     assert result.returncode != 0
     assert error in result.stdout + result.stderr
+
+
+def test_sixteen_shard_publication_workers(tmp_path: Path) -> None:
+    nodeids = _write_xdist_sample(tmp_path)
+    publication_tests = tmp_path / "tests"
+    publication_tests.mkdir()
+    publication_file = publication_tests / "test_network_cms_registry_complete_publication_postgres.py"
+    publication_file.write_text(
+        "def test_complete_publication_and_retained_pair(): pass\n"
+        "def test_native_retention_input_keeps_independent_source_and_profile_dates(): pass\n",
+        encoding="utf-8",
+    )
+    publication = f"tests/{publication_file.name}::test_complete_publication_and_retained_pair"
+    nodeids.extend(
+        [
+            publication,
+            f"tests/{publication_file.name}::test_native_retention_input_keeps_independent_source_and_profile_dates",
+        ]
+    )
+    custody_file = publication_tests / "test_registry_publication_consumer_postgres.py"
+    custody_file.write_text(
+        "def test_provider_custody_timeout_retains_lease_and_resumes_exact_request(): pass\n", encoding="utf-8"
+    )
+    custody_retry = f"tests/{custody_file.name}::test_provider_custody_timeout_retains_lease_and_resumes_exact_request"
+    nodeids.append(custody_retry)
+    pytest_result = _run_pytest(
+        tmp_path, "-n", "2", "--dist", "loadscope", "--ci-shard-count", "16", "--ci-shard-index", "15"
+    )
+
+    assert pytest_result.returncode == 0, pytest_result.stdout + pytest_result.stderr
+    expected = select_nodeids(nodeids, shard_count=16, shard_index=15)
+    assert publication in expected
+    assert custody_retry in expected
+    collections = list(tmp_path.glob("collected-*.txt"))
+    assert len(collections) == 2
+    assert all(path.read_text(encoding="utf-8").splitlines() == expected for path in collections)
+    observed_ids = [
+        node for path in tmp_path.glob("observed-*.txt") for node in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert sorted(observed_ids) == expected

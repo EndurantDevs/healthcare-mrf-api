@@ -70,6 +70,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
             "plan-pricing-projection",
             "plan-pricing-prewarm",
             "plan-pricing-em-distance",
+            "plan-pricing-em-attribution",
         ),
     ),
     WorkerSpec("arq:MRF", "process.MRF", ("mrf",)),
@@ -1535,6 +1536,7 @@ def _single_job_worker_target(
         "plan-pricing-projection": "plan_pricing_projection",
         "plan-pricing-prewarm": "plan_pricing_prewarm",
         "plan-pricing-em-distance": "plan_pricing_em_distance",
+        "plan-pricing-em-attribution": "plan_pricing_em_attribution",
     }
     importer = str(payload.get("importer") or "").strip()
     if importer in projection_job_prefix_by_importer and run_id:

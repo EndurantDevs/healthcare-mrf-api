@@ -20,6 +20,7 @@ from process.registry_source_recipe_store import (
     registry_source_recipes_sha256,
     verify_registry_source_recipes,
 )
+from process.registry_source_retention import RegistrySourceRetentionError, verify_registry_source_retention
 
 SUMMARY_KEY = "registry_source_selection"
 MAX_RECEIPT_BYTES = 4096
@@ -195,7 +196,10 @@ def verify_registry_source_selection_receipt(candidate) -> dict | None:
             return None
         receipt = validate_registry_source_selection_receipt(report_by_name[SUMMARY_KEY])
         recipes = verify_registry_source_recipes(candidate)
-        if not _is_candidate_match(candidate, receipt, recipes):
+        retention = verify_registry_source_retention(candidate)
+        if not _is_candidate_match(candidate, receipt, recipes) or (
+            retention is not None and receipt["mapped_rows"] != retention["source_rows"]
+        ):
             raise ValueError
         return receipt
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError:
@@ -204,11 +208,23 @@ def verify_registry_source_selection_receipt(candidate) -> dict | None:
 
 def _is_candidate_replay(candidate, recipes, receipt, approved_source):
     stored_recipes = verify_registry_source_recipes(candidate)
+    try:
+        retention = verify_registry_source_retention(candidate)
+    except RegistrySourceRetentionError:
+        raise RegistrySourceSelectionConflict("registry_source_selection_conflict") from None
+    if retention is None:
+        expected_rows = receipt["mapped_rows"] + approved_source.total_rows
+    else:
+        expected_rows = retention["effective_rows"]
+        if receipt["mapped_rows"] != retention["source_rows"] or approved_source.total_rows != (
+            retention["add_rows"] + retention["remove_rows"]
+        ):
+            raise RegistrySourceSelectionConflict("registry_source_selection_conflict")
     if (
         candidate["state"] != "open"
         or canonical_registry_source_recipes(stored_recipes) != canonical_registry_source_recipes(recipes)
         or not _is_candidate_match(candidate, receipt, stored_recipes)
-        or candidate["expected_rows"] != receipt["mapped_rows"] + approved_source.total_rows
+        or candidate["expected_rows"] != expected_rows
     ):
         raise RegistrySourceSelectionConflict("registry_source_selection_conflict")
     report_by_name = _report(candidate)
@@ -263,7 +279,7 @@ async def record_registry_source_selection(
         return receipt
     except RegistrySourceSelectionError:
         raise
-    except asyncpg.PostgresError:
-        raise RegistrySourceSelectionError("registry_source_selection_unavailable") from None
-    except ValueError, TypeError, KeyError, UnicodeError, RecursionError:
-        raise RegistrySourceSelectionError("registry_source_selection_invalid") from None
+    except asyncpg.PostgresError as error:
+        raise RegistrySourceSelectionError("registry_source_selection_unavailable") from error
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError) as error:
+        raise RegistrySourceSelectionError("registry_source_selection_invalid") from error

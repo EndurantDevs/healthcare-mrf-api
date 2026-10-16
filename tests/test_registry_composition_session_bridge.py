@@ -71,9 +71,22 @@ def _bridge_owner(monkeypatch, failure=None):
 
 
 def _preparation(monkeypatch, driver, events, failure=None):
+    """Keep socket-free source and command stages aligned with the preparation contract."""
     approved = SimpleNamespace(generation_id="a" * 64, total_rows=0)
     artifact = SimpleNamespace(address_source=object(), generation_sha256="b" * 64)
     stage = SimpleNamespace(table_name="synthetic_stage")
+    commands = SimpleNamespace(add_table="synthetic_adds", remove_table="synthetic_removals")
+    retention_by_name = {
+        "component": "registry_source_retention",
+        "revision": 1,
+        "table_name": "network_membership_source",
+        "source_generation_sha256": "c" * 64,
+        "source_rows": 0,
+        "add_rows": 0,
+        "remove_rows": 0,
+        "suppressed_source_rows": 0,
+        "effective_rows": 0,
+    }
 
     async def pin(connection, **kwargs):
         assert connection is driver and driver.is_in_transaction()
@@ -93,6 +106,7 @@ def _preparation(monkeypatch, driver, events, failure=None):
 
     monkeypatch.setattr(composition, "pin_approved_membership_source", pin)
     monkeypatch.setattr(composition, "_composition_sources", AsyncMock(return_value=({}, 0, (), stage)))
+    monkeypatch.setattr(composition, "_composition_retention", AsyncMock(return_value=(commands, retention_by_name)))
     monkeypatch.setattr(composition, "_composition_artifact", AsyncMock(return_value=(artifact, None)))
     monkeypatch.setattr(composition, "create_network_candidate", AsyncMock(return_value={"state": "open"}))
     monkeypatch.setattr(composition, "_bindings", AsyncMock())
@@ -125,7 +139,10 @@ async def test_genuine_factory_prepares_on_fenced_session_then_copies_on_same_dr
     assert events.index("native_fence") < events.index("prepare") < events.index("prepare_commit")
     assert events.index("unlock") < events.index("copy") < events.index("close")
     assert "invalidate" not in events
-    driver.execute.assert_awaited_once_with('DROP TABLE pg_temp."synthetic_stage"')
+    assert driver.execute.await_args_list == [
+        ((f'DROP TABLE IF EXISTS pg_temp."{name}"',), {})
+        for name in ("synthetic_stage", "synthetic_adds", "synthetic_removals")
+    ]
 
 
 @pytest.mark.asyncio
@@ -148,7 +165,14 @@ async def test_original_failure_or_cancel_retires_real_owner_without_extra_check
 @pytest.mark.parametrize("failure", [RuntimeError("original copy failure"), asyncio.CancelledError()])
 async def test_copy_error_keeps_priority_over_stage_cleanup(monkeypatch, failure):
     driver = SimpleNamespace(execute=AsyncMock(side_effect=RuntimeError("cleanup failed")))
-    prepared = (object(), object(), object(), 0, "open", SimpleNamespace(table_name="synthetic_stage"))
+    prepared = (
+        object(),
+        object(),
+        "open",
+        SimpleNamespace(table_name="synthetic_stage"),
+        SimpleNamespace(add_table="synthetic_adds", remove_table="synthetic_removals"),
+        {},
+    )
     monkeypatch.setattr(composition, "_copy_composition", AsyncMock(side_effect=failure))
     with pytest.raises(type(failure)) as captured:
         await composition._complete_composition(driver, prepared, None, "synthetic_control")
@@ -157,8 +181,9 @@ async def test_copy_error_keeps_priority_over_stage_cleanup(monkeypatch, failure
 
 @pytest.mark.asyncio
 async def test_raw_caller_keeps_original_owned_preparation_and_completion(monkeypatch):
+    """Keep raw snapshot preparation and retained candidate completion separately owned."""
     events = []
-    driver = SimpleNamespace(is_in_transaction=lambda: False)
+    driver = SimpleNamespace(is_in_transaction=lambda: False, execute=AsyncMock())
 
     @asynccontextmanager
     async def transaction(**options_by_name):
@@ -168,12 +193,26 @@ async def test_raw_caller_keeps_original_owned_preparation_and_completion(monkey
         events.append("commit")
 
     driver.transaction = transaction
-    prepared = (object(), object(), object(), 0, "sealed", None)
+    prepared = (
+        object(),
+        object(),
+        "sealed",
+        SimpleNamespace(table_name="synthetic_stage"),
+        SimpleNamespace(add_table="synthetic_adds", remove_table="synthetic_removals"),
+        {},
+    )
     snapshot = AsyncMock(return_value=prepared)
+    seal, verify = AsyncMock(), AsyncMock()
     monkeypatch.setattr(composition, "_prepare_composition_snapshot", snapshot)
+    monkeypatch.setattr(composition, "seal_network_candidate", seal)
+    monkeypatch.setattr(composition, "verify_network_candidate_writer_closure", verify)
     actual = await composition.compose_registry_membership_candidate(driver, **_arguments())
-    assert actual == prepared[:2] and events == ["begin", "commit"]
+    assert actual == prepared[:2] and events == ["begin", "commit", "begin", "commit"]
     assert snapshot.await_args.args[0] is driver
+    seal.assert_awaited_once_with(
+        driver, prepared[0], control_schema="synthetic_control", source_stage=prepared[3], command_stage=prepared[4]
+    )
+    verify.assert_awaited_once_with(driver, prepared[0], control_schema="synthetic_control")
 
 
 @pytest.mark.asyncio

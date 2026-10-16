@@ -73,7 +73,7 @@ def _scope(monkeypatch, **selector):
 
 
 def _coordinates(importer="ptg-candidate-audit"):
-    """Use the actual four importer adapters, not a caller-selected queue/function."""
+    """Use the actual importer adapters, not a caller-selected queue/function."""
     from api.control_imports import _SINGLE_JOB_ADAPTERS
 
     adapter = _SINGLE_JOB_ADAPTERS[importer]
@@ -134,10 +134,11 @@ def _drifted_request(request, recorded, drift):
         "plan-pricing-projection",
         "plan-pricing-prewarm",
         "plan-pricing-em-distance",
+        "plan-pricing-em-attribution",
     ),
 )
 def test_shared_class_scopes_secrets_to_admitted_importer(monkeypatch, importer):
-    """The three sibling jobs retain ordinary credentials on the unchanged class."""
+    """Sibling jobs retain ordinary credentials on the shared class."""
     _scope(monkeypatch)
     request, recorded = _coordinates(importer)
     environment = _secrets(_admitted(request, recorded))

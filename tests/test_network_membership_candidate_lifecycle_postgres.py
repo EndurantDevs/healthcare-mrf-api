@@ -447,6 +447,42 @@ async def test_cancelled_final_batch_is_resumable(candidate_lifecycle):
     assert await _counts(fixture) == (2, 2, 2)
 
 
+async def test_disconnected_final_batch_is_resumable(candidate_lifecycle):
+    fixture = candidate_lifecycle
+    batch_id = uuid4()
+    async with fixture.writer.transaction():
+        await _create(fixture)
+        await _admit(fixture, uuid4())
+    writer = await asyncpg.connect(fixture.postgres_dsn)
+    paused_connection = PausedCopyConnection(writer)
+
+    async def transfer():
+        async with writer.transaction():
+            await _admit(fixture, batch_id, connection=paused_connection)
+
+    transfer_task = asyncio.create_task(transfer())
+    try:
+        await asyncio.wait_for(paused_connection.paused.wait(), 10)
+        assert await fixture.observer.fetchval("SELECT pg_terminate_backend($1)", writer.get_server_pid())
+        paused_connection.resume.set()
+        with pytest.raises((asyncpg.PostgresConnectionError, asyncpg.InterfaceError)):
+            await asyncio.wait_for(transfer_task, 10)
+    finally:
+        if not transfer_task.done():
+            transfer_task.cancel()
+        await asyncio.gather(transfer_task, return_exceptions=True)
+        await writer.close()
+    assert await fixture.writer.fetchval("SELECT 1") == 1
+    assert await _counts(fixture) == (1, 1, 1)
+    async with fixture.writer.transaction():
+        await _admit(fixture, batch_id)
+        sealed = await seal_network_candidate(
+            fixture.writer, fixture.copy_target, control_schema=fixture.control_schema
+        )
+        assert sealed["state"] == "sealed"
+    assert await _counts(fixture) == (2, 2, 2)
+
+
 async def test_concurrent_duplicate_batch_has_one_copy_and_receipt(candidate_lifecycle):
     fixture = candidate_lifecycle
     batch_id = uuid4()
@@ -527,3 +563,313 @@ async def test_missing_candidate_relation_is_not_recreated(candidate_lifecycle):
         assert not await fixture.writer.fetchval(
             "SELECT to_regnamespace($1) IS NOT NULL", fixture.copy_target.schema_name
         )
+
+
+async def _retention_stage(fixture, rows=2):
+    from process.registry_source_recipe_composition import RegistrySourceRecipeStage
+
+    table_name = "registry_source_page_" + uuid4().hex
+    await fixture.writer.execute(
+        f'CREATE TEMP TABLE "{table_name}"(ordinal bigint PRIMARY KEY,input_json text NOT NULL)'
+    )
+    document = json.loads(_membership_input())[0]
+    await fixture.writer.execute(
+        f'INSERT INTO pg_temp."{table_name}" SELECT n,$1 FROM generate_series(1,$2::bigint) n',
+        json.dumps(document),
+        rows,
+    )
+    return RegistrySourceRecipeStage(table_name, rows, 0, "a" * 64)
+
+
+async def test_registered_source_preserves_duplicates_and_requires_stage_before_seal(candidate_lifecycle):
+    from process.registry_source_retention import SUMMARY_KEY, retain_registry_source_memberships
+    from tests.test_registry_source_retention import retention_receipt
+
+    fixture = candidate_lifecycle
+    receipt = retention_receipt(add_rows=0, suppressed_source_rows=2, effective_rows=0)
+    async with fixture.writer.transaction():
+        created = await _create(
+            fixture, expected_rows=0, source_retention=receipt, source_generations={"custom_membership": "b" * 64}
+        )
+        assert json.loads(created["validation_json"])[SUMMARY_KEY] == receipt
+        assert (
+            await _create(
+                fixture, expected_rows=0, source_retention=receipt, source_generations={"custom_membership": "b" * 64}
+            )
+            == created
+        )
+        stage = await _retention_stage(fixture)
+        await retain_registry_source_memberships(
+            fixture.writer, fixture.copy_target, stage, control_schema=fixture.control_schema
+        )
+        await retain_registry_source_memberships(
+            fixture.writer, fixture.copy_target, stage, control_schema=fixture.control_schema
+        )
+        assert (
+            await fixture.writer.fetchval(
+                f'SELECT count(*) FROM "{fixture.copy_target.schema_name}".network_membership_source'
+            )
+            == 2
+        )
+        with pytest.raises(MembershipCandidateError, match="stage_required"):
+            await seal_network_candidate(fixture.writer, fixture.copy_target, control_schema=fixture.control_schema)
+        with pytest.raises(MembershipCandidateError, match="command stage"):
+            await seal_network_candidate(
+                fixture.writer, fixture.copy_target, source_stage=stage, control_schema=fixture.control_schema
+            )
+        commands = await _command_stage(fixture, remove_rows=1)
+        sealed = await seal_network_candidate(
+            fixture.writer,
+            fixture.copy_target,
+            source_stage=stage,
+            command_stage=commands,
+            control_schema=fixture.control_schema,
+        )
+        assert sealed["state"] == "sealed"
+        assert (
+            await seal_network_candidate(fixture.writer, fixture.copy_target, control_schema=fixture.control_schema)
+        )["state"] == "sealed"
+        with pytest.raises(MembershipCandidateError, match="closed"):
+            await retain_registry_source_memberships(
+                fixture.writer, fixture.copy_target, stage, control_schema=fixture.control_schema
+            )
+        await fixture.writer.execute(
+            f'DROP TABLE pg_temp."{stage.table_name}",pg_temp."{commands.add_table}",pg_temp."{commands.remove_table}"'
+        )
+
+
+@pytest.mark.parametrize("failure", ["stage_count", "native_row", "same_count_change", "raw_count"])
+async def test_source_construction_and_seal_refuse_incomplete_or_changed_source(candidate_lifecycle, failure):
+    from process.registry_source_retention import RegistrySourceRetentionError, retain_registry_source_memberships
+    from tests.test_registry_source_retention import retention_receipt
+
+    fixture = candidate_lifecycle
+    receipt = retention_receipt(add_rows=0, suppressed_source_rows=2, effective_rows=0)
+    async with fixture.writer.transaction():
+        await _create(fixture, expected_rows=0, source_retention=receipt)
+        stage = await _retention_stage(fixture, 1 if failure == "stage_count" else 2)
+        if failure == "native_row":
+            await fixture.writer.execute(f"UPDATE pg_temp.\"{stage.table_name}\" SET input_json='{{}}' WHERE ordinal=2")
+        if failure in {"stage_count", "native_row"}:
+            with pytest.raises(RegistrySourceRetentionError):
+                await retain_registry_source_memberships(
+                    fixture.writer, fixture.copy_target, stage, control_schema=fixture.control_schema
+                )
+            assert (
+                await fixture.writer.fetchval(
+                    f'SELECT count(*) FROM "{fixture.copy_target.schema_name}".network_membership_source'
+                )
+                == 0
+            )
+        else:
+            await retain_registry_source_memberships(
+                fixture.writer, fixture.copy_target, stage, control_schema=fixture.control_schema
+            )
+            source_relation = f'"{fixture.copy_target.schema_name}".network_membership_source'
+            await fixture.writer.execute(
+                f"UPDATE {source_relation} SET evidence_id='changed'"
+                if failure == "same_count_change"
+                else f"DELETE FROM {source_relation} WHERE ctid IN (SELECT ctid FROM {source_relation} LIMIT 1)"
+            )
+            with pytest.raises(MembershipCandidateError, match="retention"):
+                await seal_network_candidate(
+                    fixture.writer, fixture.copy_target, source_stage=stage, control_schema=fixture.control_schema
+                )
+        await fixture.writer.execute(f'DROP TABLE pg_temp."{stage.table_name}"')
+
+
+async def test_source_registration_is_immutable_and_rejects_orphan_digest(candidate_lifecycle):
+    from process.registry_source_retention import SUMMARY_KEY
+    from tests.test_registry_source_retention import retention_receipt
+
+    fixture = candidate_lifecycle
+    async with fixture.writer.transaction():
+        with pytest.raises(MembershipCandidateError):
+            await _create(fixture, source_generations={SUMMARY_KEY: "a" * 64})
+        receipt = retention_receipt()
+        await _create(fixture, source_retention=receipt)
+        with pytest.raises(MembershipCandidateError):
+            await _create(fixture)
+        with pytest.raises(MembershipCandidateError):
+            await _create(fixture, source_retention={**receipt, "source_generation_sha256": "b" * 64})
+        with pytest.raises(MembershipCandidateError):
+            await _create(fixture, source_retention=receipt, source_generations={SUMMARY_KEY: "b" * 64})
+
+
+async def test_source_options_unknown_key_refuses_before_connection_access():
+    with pytest.raises(MembershipCandidateError, match="source options"):
+        await create_network_candidate(
+            object(),
+            _copy_target(),
+            source_generations={},
+            approved_custom_revision=0,
+            expected_head=0,
+            expected_rows=0,
+            unknown_source_option=True,
+        )
+
+
+async def test_retention_verification_refuses_other_producer_and_missing_registered_heap(candidate_lifecycle):
+    from process.registry_source_retention import RegistrySourceRetentionError, verify_registry_source_retention_rows
+    from tests.test_registry_source_retention import retention_receipt
+
+    fixture = candidate_lifecycle
+    receipt = retention_receipt(source_rows=0, add_rows=0, remove_rows=0, suppressed_source_rows=0, effective_rows=0)
+    async with fixture.writer.transaction():
+        candidate = await _create(fixture, expected_rows=0, source_retention=receipt)
+        stage = await _retention_stage(fixture, 0)
+        with pytest.raises(RegistrySourceRetentionError, match="scope"):
+            await verify_registry_source_retention_rows(
+                fixture.writer, replace(fixture.copy_target, producer_id=str(uuid4())), candidate, source_stage=stage
+            )
+        await fixture.writer.execute(f'DROP TABLE "{fixture.copy_target.schema_name}".network_membership_source')
+        with pytest.raises(MembershipCandidateError, match="source relation is missing"):
+            await _create(fixture, expected_rows=0, source_retention=receipt)
+        await fixture.writer.execute(f'DROP TABLE pg_temp."{stage.table_name}"')
+
+
+@pytest.mark.parametrize("source_rows", [1, 5000])
+async def test_source_set_construction_uses_fixed_native_queries(candidate_lifecycle, source_rows):
+    from process.registry_source_retention import retain_registry_source_memberships
+    from tests.test_registry_source_retention import retention_receipt
+
+    fixture = candidate_lifecycle
+    receipt = retention_receipt(
+        source_rows=source_rows, add_rows=0, suppressed_source_rows=source_rows, effective_rows=0
+    )
+    async with fixture.writer.transaction():
+        await _create(fixture, expected_rows=0, source_retention=receipt)
+        stage = await _retention_stage(fixture, source_rows)
+        logged_queries = []
+        fixture.writer.add_query_logger(logged_queries.append)
+        try:
+            await retain_registry_source_memberships(
+                fixture.writer, fixture.copy_target, stage, control_schema=fixture.control_schema
+            )
+            await asyncio.sleep(0)
+            assert len(logged_queries) == 9
+        finally:
+            fixture.writer.remove_query_logger(logged_queries.append)
+        assert (
+            await fixture.writer.fetchval(
+                f'SELECT count(*) FROM "{fixture.copy_target.schema_name}".network_membership_source'
+            )
+            == source_rows
+        )
+        await fixture.writer.execute(f'DROP TABLE pg_temp."{stage.table_name}"')
+
+
+@pytest.mark.parametrize("replay", [False, True])
+async def test_qualified_admission_refuses_before_native_or_receipt_replay(candidate_lifecycle, monkeypatch, replay):
+    import process.network_membership_candidate_lifecycle as lifecycle
+    from tests.test_registry_source_retention import retention_receipt
+
+    fixture = candidate_lifecycle
+    receipt = retention_receipt(source_rows=0, add_rows=0, remove_rows=0, suppressed_source_rows=0, effective_rows=0)
+    batch_id = uuid4()
+    input_bytes = _membership_input(0)
+    async with fixture.writer.transaction():
+        await _create(fixture, expected_rows=0, source_retention=receipt)
+        if replay:
+            await fixture.writer.execute(
+                f'INSERT INTO "{fixture.control_schema}".network_membership_batch '
+                "(candidate_id,batch_id,row_count,input_sha256,copy_sha256,input_bytes,copy_bytes) VALUES($1,$2,0,$3,$3,$4,21)",
+                UUID(fixture.copy_target.candidate_id),
+                batch_id,
+                hashlib.sha256(input_bytes).hexdigest(),
+                len(input_bytes),
+            )
+
+    async def forbidden_native(*arguments, **options):
+        raise AssertionError("qualified admission reached the native COPY writer")
+
+    monkeypatch.setattr(lifecycle, "copy_network_membership_batch", forbidden_native)
+    async with fixture.writer.transaction():
+        with pytest.raises(MembershipCandidateError, match="set-based composition"):
+            await _admit(fixture, batch_id, input_bytes)
+    assert await _counts(fixture) == (0, 0, 0)
+    assert await fixture.writer.fetchval(
+        f'SELECT count(*) FROM "{fixture.control_schema}".network_membership_batch'
+    ) == int(replay)
+
+
+async def _command_stage(fixture, *, add_rows=0, remove_rows=0):
+    """Build exact native-shaped command heaps for the actual production verifier."""
+    from process.network_approved_membership_source import ApprovedMembershipSource
+    from process.registry_membership_composition_stage import RegistryMembershipCommandStage
+
+    suffix = uuid4().hex
+    names = ("registry_command_add_" + suffix, "registry_command_remove_" + suffix)
+    for name, count in zip(names, (add_rows, remove_rows), strict=True):
+        await fixture.writer.execute(
+            f'CREATE TEMP TABLE "{name}" (LIKE "{fixture.copy_target.schema_name}".network_membership INCLUDING CONSTRAINTS)'
+        )
+        if count:
+            await fixture.writer.execute(
+                f"INSERT INTO pg_temp.\"{name}\" SELECT 42,'manual',$2::text,'01234567-89ab-cdef-8123-456789abcdef'::uuid,'approved-command' FROM generate_series(1,$1::integer)",
+                count,
+                "added-clinician" if name == names[0] else "example-clinician",
+            )
+    return RegistryMembershipCommandStage(
+        ApprovedMembershipSource(9, "b" * 64, add_rows + remove_rows), *names, add_rows, remove_rows
+    )
+
+
+@pytest.mark.parametrize("damage", ["none", "zero_receipt", "effective_evidence", "command_scope"])
+async def test_qualified_seal_checks_actual_composition_and_stage_free_replay(candidate_lifecycle, damage):
+    from process.registry_source_retention import retain_registry_source_memberships
+    from tests.test_registry_source_retention import retention_receipt
+
+    fixture = candidate_lifecycle
+    receipt = retention_receipt(source_rows=2, add_rows=1, remove_rows=1, suppressed_source_rows=2, effective_rows=1)
+    async with fixture.writer.transaction():
+        await _create(
+            fixture, expected_rows=1, source_retention=receipt, source_generations={"custom_membership": "b" * 64}
+        )
+        stage = await _retention_stage(fixture)
+        await retain_registry_source_memberships(
+            fixture.writer, fixture.copy_target, stage, control_schema=fixture.control_schema
+        )
+        commands = await _command_stage(fixture, add_rows=1, remove_rows=1)
+        await fixture.writer.execute(
+            f'INSERT INTO "{fixture.copy_target.schema_name}".network_membership SELECT * FROM pg_temp."{commands.add_table}"'
+        )
+        await fixture.writer.execute(
+            f'UPDATE "{fixture.control_schema}".network_membership_candidate SET accepted_rows=1'
+        )
+        if damage == "zero_receipt":
+            await fixture.writer.execute(
+                f'INSERT INTO "{fixture.control_schema}".network_membership_batch (candidate_id,batch_id,row_count,input_sha256,copy_sha256,input_bytes,copy_bytes) VALUES($1,$2,0,$3,$3,2,21)',
+                UUID(fixture.copy_target.candidate_id),
+                uuid4(),
+                "a" * 64,
+            )
+        elif damage == "effective_evidence":
+            await fixture.writer.execute(
+                f"UPDATE \"{fixture.copy_target.schema_name}\".network_membership SET evidence_id='different-evidence'"
+            )
+        elif damage == "command_scope":
+            commands = replace(commands, source=replace(commands.source, generation_id="c" * 64))
+        seal_options_by_name = dict(source_stage=stage, command_stage=commands, control_schema=fixture.control_schema)
+        if damage == "none":
+            assert (await seal_network_candidate(fixture.writer, fixture.copy_target, **seal_options_by_name))[
+                "state"
+            ] == "sealed"
+            await fixture.writer.execute(
+                f'DROP TABLE pg_temp."{stage.table_name}",pg_temp."{commands.add_table}",pg_temp."{commands.remove_table}"'
+            )
+            assert (
+                await seal_network_candidate(fixture.writer, fixture.copy_target, control_schema=fixture.control_schema)
+            )["accepted_rows"] == 1
+        else:
+            with pytest.raises(MembershipCandidateError, match="batch accounting|effective_parity|command_scope"):
+                await seal_network_candidate(fixture.writer, fixture.copy_target, **seal_options_by_name)
+            assert (
+                await fixture.writer.fetchval(
+                    f'SELECT state FROM "{fixture.control_schema}".network_membership_candidate'
+                )
+                == "open"
+            )
+            await fixture.writer.execute(
+                f'DROP TABLE pg_temp."{stage.table_name}",pg_temp."{commands.add_table}",pg_temp."{commands.remove_table}"'
+            )

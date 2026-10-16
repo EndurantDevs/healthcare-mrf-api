@@ -9,10 +9,11 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from sanic.exceptions import InvalidUsage
+from sanic.exceptions import InvalidUsage, SanicException
 from sanic.request.parameters import RequestParameters
 from sqlalchemy import text
 
+from api import custom_import_provider_collection as managed_collection
 from api import custom_import_read_http as transport
 from api.custom_import_provider_geo_cursor import GeoCursorState, issue_geo_cursor, open_geo_cursor
 from api.custom_import_provider_http import (
@@ -23,6 +24,7 @@ from api.custom_import_provider_http import (
     _ProviderScopePreparer,
 )
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
+from api.network_address_scope import current_network_address_scope
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     MAX_CURSOR_TTL_SECONDS,
@@ -78,6 +80,7 @@ class _GeoCursorBinding:
     query_fingerprint: str | None = None
     prior_cursor: GeoCursorState | None = None
     scope_preparer: _ProviderScopePreparer | None = None
+    network_generation: int | None = None
 
     async def prepare(self, *, session: Any, **effective_query: Any) -> tuple[str, str] | None:
         """Open the cursor only against the complete effective native query."""
@@ -85,19 +88,23 @@ class _GeoCursorBinding:
         if session is not self.session or self.query_fingerprint is not None:
             raise CustomImportReadUnavailableError("provider geo snapshot is unavailable")
         prepared = self.import_context.prepared if self.scope_preparer is None else self.scope_preparer.prepared
-        self.query_fingerprint = hashlib.sha256(
-            canonical_read_document(
-                {
-                    "contract": "custom-import-provider-geo/v1",
-                    "native_query": {
-                        name: self.native_args.getlist(name) for name in self.native_args if name != "cursor"
-                    },
-                    "effective_query": effective_query,
-                    "import_query": prepared.query_fingerprint,
-                    "require_match": self.import_context.require_match,
-                }
-            )
-        ).hexdigest()
+        cursor_document_by_name = {
+            "contract": "custom-import-provider-geo/v1",
+            "native_query": {name: self.native_args.getlist(name) for name in self.native_args if name != "cursor"},
+            "effective_query": effective_query,
+            "import_query": prepared.query_fingerprint,
+            "require_match": self.import_context.require_match,
+        }
+        scope = current_network_address_scope()
+        if scope is not None:
+            self.network_generation = scope.manifest.generation_id
+            cursor_document_by_name["network_scope"] = {
+                "generation": self.network_generation,
+                "approved_custom_revision": scope.manifest.approved_custom_revision,
+                "manifest_sha256": scope.manifest.manifest_sha256,
+                "access_scope_sha256": scope.access_scope_sha256,
+            }
+        self.query_fingerprint = hashlib.sha256(canonical_read_document(cursor_document_by_name)).hexdigest()
         token = self.native_args.get("cursor")
         if token is None:
             return None
@@ -108,6 +115,7 @@ class _GeoCursorBinding:
             query_fingerprint=self.query_fingerprint,
             authorization_scope_sha256=prepared.authorization_scope_sha256,
             trusted_now=self.trusted_now,
+            network_generation=self.network_generation,
         )
         return self.prior_cursor.anchor_npi, self.prior_cursor.anchor_address_key
 
@@ -126,6 +134,7 @@ class _GeoCursorBinding:
             anchor_address_key=anchor[1],
             issued_at=self.prior_cursor.issued_at if self.prior_cursor else self.trusted_now,
             expires_at=self.prior_cursor.expires_at if self.prior_cursor else self.trusted_now + MAX_CURSOR_TTL_SECONDS,
+            network_generation=self.network_generation,
         )
         try:
             return issue_geo_cursor(state, secret=self.secret)
@@ -142,11 +151,20 @@ async def serve_custom_import_provider_geo(request: Any, session: Any):
         or getattr(request, "query_string", "")
     ):
         return transport._error(404)
+    is_managed_mode = False
     try:
         body = getattr(request, "body", None)
-        if type(body) is not bytes or not 1 <= len(body) <= transport._MAX_BODY_BYTES:
+        if type(body) is not bytes or not 1 <= len(body) <= managed_collection.MAX_MANAGED_BODY_BYTES:
             raise transport._fail()
-        parsed = _parse_provider_request(body, native_query_parser=_parse_geo_native_query)
+        parsed = _parse_provider_request(
+            body,
+            native_query_parser=_parse_geo_native_query,
+            allow_managed_collection=True,
+            collection_kind="geo",
+        )
+        is_managed_mode = parsed.managed_collection is not None
+        if not is_managed_mode and len(body) > transport._MAX_BODY_BYTES:
+            raise transport._fail()
         trusted_now = transport._trusted_now()
         verified = transport._verify_provider_transport(
             headers=request.headers,
@@ -155,8 +173,11 @@ async def serve_custom_import_provider_geo(request: Any, session: Any):
             trusted_now=trusted_now,
             keyring=transport._keyring(),
             path=CUSTOM_IMPORT_PROVIDER_GEO_PATH,
+            managed_collection=is_managed_mode,
         )
         cursor_secret = transport._cursor_secret()
+        if is_managed_mode:
+            return await _serve_managed_geo(request, parsed, verified, cursor_secret, trusted_now)
         if session is None or session.in_transaction():
             raise CustomImportReadUnavailableError("fresh provider geo read session is required")
         async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), session.begin():
@@ -169,8 +190,27 @@ async def serve_custom_import_provider_geo(request: Any, session: Any):
                 return transport._response(encoded, 200)
     except Exception as failure:
         transport._log_failure(failure)
+        if is_managed_mode:
+            if isinstance(failure, CustomImportReadCursorError):
+                return transport._error(409)
+            return managed_collection.managed_collection_error(failure)
         status = 400 if isinstance(failure, InvalidUsage) else transport._failure_status(failure)
         return transport._error(status)
+
+
+async def _serve_managed_geo(request, parsed, verified, cursor_secret, trusted_now):
+    async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000):
+        async with managed_collection.managed_import_collection_scope(request, parsed.managed_collection) as (
+            reader,
+            manifest,
+        ):
+            payload = await _read_geo_payload(request, reader, parsed, verified, cursor_secret, trusted_now)
+            return managed_collection.managed_collection_response(
+                payload,
+                parsed.managed_collection,
+                manifest,
+                maximum_bytes=_provider_response_limit(parsed, len(payload["items"])),
+            )
 
 
 async def _read_geo_payload(request, session, parsed, verified, cursor_secret, trusted_now):
@@ -204,6 +244,8 @@ async def _read_geo_payload(request, session, parsed, verified, cursor_secret, t
         prepare_cursor=binding.prepare,
         native_scope_preparer=scope_preparer.prepare_provider_scope,
     )
+    if reply.status != 200 and parsed.managed_collection is not None:
+        raise SanicException("Provider data is unavailable.", status_code=reply.status)
     if reply.status != 200 or len(reply.body) > transport._MAX_RESPONSE_BYTES:
         raise CustomImportReadUnavailableError("provider geo response is unavailable")
     geo_payload = _geo_payload(reply.body, int(parsed.native_args.get("limit", "5")))

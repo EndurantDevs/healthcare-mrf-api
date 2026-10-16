@@ -52,7 +52,10 @@ def _assert_registry_migration_chain():
     alembic_config = Config(str(REPOSITORY_ROOT / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(REPOSITORY_ROOT / "alembic"))
     script = ScriptDirectory.from_config(alembic_config)
-    assert script.get_heads() == ["20261015020000_custom_import_query_projections"]
+    assert script.get_heads() == ["20261016070000_registry_allowed_plan_scope"]
+    assert script.get_revision("20261016070000_registry_allowed_plan_scope").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )

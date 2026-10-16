@@ -4,12 +4,15 @@
 import hashlib
 import io
 import json
+import struct
 import tracemalloc
 import zipfile
+import zlib
 from xml.etree import ElementTree
 
 import pytest
 
+from process import cms_planfinder_rbis_input as plan_decoder
 from process import cms_planfinder_workbook_input as decoder
 
 _NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -314,3 +317,368 @@ def test_streaming_memory_and_full_row_accounting(tmp_path):
         tracemalloc.stop()
     assert count == 10_000 and maximum < decoder.MAX_BATCH_BYTES
     assert peak < 8 * 1024 * 1024
+
+
+def _plan_row(number=1, **changes):
+    values_by_header = {
+        "HIOS Plan ID": f"00123CA{number:07d}".encode(),
+        "Plan Marketing Name": b"Example Plan",
+        "HIOS Product ID": b"00123CA000",
+        "Network ID": b"CAN001",
+        "Plan Effective Date": b"2026-01-01",
+        "Plan Expiration Date": b"2026-12-31",
+        **changes,
+    }
+    return b"|".join(values_by_header.get(field, b"\xff") for field in plan_decoder.HEADERS) + b"\r\n"
+
+
+def _plan_artifact(tmp_path, rows=None, *, raw=None, missing=None, duplicate=False, damage=None):
+    if raw is None:
+        raw = b"|".join(field.encode() for field in plan_decoder.HEADERS) + b"\r\n"
+        raw += b"".join(rows if rows is not None else [_plan_row()])
+    digests_by_member = {"member_sha256": hashlib.sha256(raw).hexdigest()}
+    contents = raw
+    for level, member in enumerate(
+        (plan_decoder.PLAN_MEMBER, plan_decoder.PLAN_ARCHIVE_MEMBER, plan_decoder.RBIS_MEMBER)
+    ):
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("missing.dat" if missing == level else member, contents)
+            if duplicate and level == 0:
+                with pytest.warns(UserWarning, match="Duplicate name"):
+                    archive.writestr(member, contents)
+        contents = output.getvalue()
+        if damage is not None and damage[0] == level:
+            contents = _damaged_plan_member(contents, damage[1])
+        digests_by_member[("plan_archive_sha256", "rbis_sha256", "artifact_sha256")[level]] = hashlib.sha256(
+            contents
+        ).hexdigest()
+    path = tmp_path / "synthetic-plan-input.zip"
+    path.write_bytes(contents)
+    return path, digests_by_member
+
+
+def _plan_batches(path, digests_by_member, **options):
+    return list(
+        decoder.iter_cms_planfinder_plan_batches(
+            path, expected_artifact_sha256=digests_by_member["artifact_sha256"], **options
+        )
+    )
+
+
+def test_plan_batches_retain_every_source_position_hash_and_exact_field(tmp_path):
+    path, digests_by_member = _plan_artifact(tmp_path, [_plan_row(number) for number in range(1, 6)])
+    encoded = _plan_batches(path, digests_by_member, batch_size=2)
+    batches = [json.loads(batch) for batch in encoded]
+    assert [len(batch["rows"]) for batch in batches] == [2, 2, 1]
+    rows = [row for batch in batches for row in batch["rows"]]
+    assert [row["source_row"] for row in rows] == [2, 3, 4, 5, 6]
+    assert rows[0] == {
+        "source_row": 2,
+        "values": ["00123CA0000001", "Example Plan", "00123CA000", "CAN001", "2026-01-01", "2026-12-31"],
+    }
+    for batch in batches:
+        assert all(batch[key] == value for key, value in digests_by_member.items())
+        assert batch["headers"] == list(plan_decoder.SELECTED_HEADERS)
+        assert batch["member"] == plan_decoder.PLAN_MEMBER and batch["layout"] == plan_decoder.LAYOUT
+        assert "plan_year" not in batch and "checksum_network" not in batch and "network_id" not in batch
+    assert encoded == _plan_batches(path, digests_by_member, batch_size=2)
+    assert _plan_batches(*_plan_artifact(tmp_path, [])) == []
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("HIOS Plan ID", b"00123CA000000"),
+        ("HIOS Plan ID", b"00000CA0000001"),
+        ("HIOS Product ID", b"00124CA000"),
+        ("Network ID", b"42"),
+        ("Plan Marketing Name", b"\xff"),
+        ("Plan Marketing Name", b" "),
+        ("Plan Marketing Name", b"x" * 513),
+        ("Plan Marketing Name", b"bad\tlabel"),
+        ("Plan Effective Date", b"2026-02-30"),
+        ("Plan Effective Date", b"01/01/2026"),
+        ("Plan Expiration Date", b"2025-12-31"),
+        ("Plan Expiration Date", b""),
+    ],
+)
+def test_plan_selected_fields_refuse_malformed_identity_label_and_dates(tmp_path, field, value):
+    path, digests_by_member = _plan_artifact(tmp_path, [_plan_row(**{field: value})])
+    with pytest.raises(decoder.PlanFinderPlanInputError):
+        _plan_batches(path, digests_by_member)
+
+
+@pytest.mark.parametrize(
+    "raw", [b"", b"wrong header\n", b"|".join(field.encode() for field in plan_decoder.HEADERS) + b"\nshort|row\n"]
+)
+def test_plan_header_and_fixed_record_width_are_required(tmp_path, raw):
+    path, digests_by_member = _plan_artifact(tmp_path, raw=raw)
+    with pytest.raises(decoder.PlanFinderPlanInputError):
+        _plan_batches(path, digests_by_member)
+
+
+@pytest.mark.parametrize("missing", [0, 1, 2])
+def test_plan_container_requires_every_exact_nested_member(tmp_path, missing):
+    path, digests_by_member = _plan_artifact(tmp_path, missing=missing)
+    with pytest.raises(decoder.PlanFinderPlanInputError, match="missing"):
+        _plan_batches(path, digests_by_member)
+
+
+def test_plan_duplicate_zip_members_and_bad_artifact_pin_fail_closed(tmp_path):
+    path, digests_by_member = _plan_artifact(tmp_path, duplicate=True)
+    with pytest.raises(decoder.PlanFinderPlanInputError, match="membership"):
+        _plan_batches(path, digests_by_member)
+    path, digests_by_member = _plan_artifact(tmp_path)
+    for digest in ("b" * 64, "A" * 64):
+        with pytest.raises(decoder.PlanFinderPlanInputError, match="SHA256"):
+            _plan_batches(path, {**digests_by_member, "artifact_sha256": digest})
+    path.write_bytes(b"not a ZIP")
+    with pytest.raises(decoder.PlanFinderPlanInputError, match="malformed"):
+        _plan_batches(path, {"artifact_sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+
+
+@pytest.mark.parametrize(
+    "limit",
+    ["MAX_ARTIFACT_BYTES", "MAX_RBIS_BYTES", "MAX_PLAN_ARCHIVE_BYTES", "MAX_PLAN_BYTES", "MAX_LINE_BYTES", "MAX_ROWS"],
+)
+def test_plan_byte_record_and_row_bounds_refuse_instead_of_truncating(tmp_path, monkeypatch, limit):
+    path, digests_by_member = _plan_artifact(tmp_path, [_plan_row(1), _plan_row(2)])
+    monkeypatch.setattr(plan_decoder, limit, 1)
+    with pytest.raises(decoder.PlanFinderPlanInputError):
+        _plan_batches(path, digests_by_member, batch_size=1)
+
+
+@pytest.mark.parametrize("batch_size", [0, 5001, True, 1.5])
+def test_plan_batch_size_is_closed(tmp_path, batch_size):
+    path, digests_by_member = _plan_artifact(tmp_path)
+    with pytest.raises(decoder.PlanFinderPlanInputError, match="Batch size"):
+        _plan_batches(path, digests_by_member, batch_size=batch_size)
+
+
+def test_plan_byte_boundary_and_duplicate_conflict_across_batches(tmp_path, monkeypatch):
+    path, digests_by_member = _plan_artifact(tmp_path, [_plan_row(1), _plan_row(2), _plan_row(3)])
+    one_row_size = len(_plan_batches(path, digests_by_member, batch_size=1)[0])
+    monkeypatch.setattr(plan_decoder, "MAX_BATCH_BYTES", one_row_size)
+    batches = _plan_batches(path, digests_by_member)
+    assert [row["source_row"] for batch in batches for row in json.loads(batch)["rows"]] == [2, 3, 4]
+    assert all(len(batch) <= one_row_size for batch in batches)
+    monkeypatch.setattr(plan_decoder, "MAX_BATCH_BYTES", 1)
+    with pytest.raises(decoder.PlanFinderPlanInputError, match="One plan row"):
+        _plan_batches(path, digests_by_member)
+    monkeypatch.setattr(plan_decoder, "MAX_BATCH_BYTES", 8 * 1024 * 1024)
+    path, digests_by_member = _plan_artifact(tmp_path, [_plan_row(1), _plan_row(1)])
+    assert [
+        row["source_row"] for batch in _plan_batches(path, digests_by_member) for row in json.loads(batch)["rows"]
+    ] == [2, 3]
+    path, digests_by_member = _plan_artifact(
+        tmp_path, [_plan_row(1), _plan_row(2), _plan_row(1, **{"Plan Marketing Name": b"Other Plan"})]
+    )
+    iterator = decoder.iter_cms_planfinder_plan_batches(
+        path, expected_artifact_sha256=digests_by_member["artifact_sha256"], batch_size=1
+    )
+    assert json.loads(next(iterator))["rows"][0]["source_row"] == 2
+    with pytest.raises(decoder.PlanFinderPlanInputError, match="Conflicting duplicate"):
+        list(iterator)
+
+
+@pytest.mark.parametrize("terminal", ["cancel", "conflict"])
+def test_plan_candidate_exit_closes_all_retained_temporary_files(tmp_path, monkeypatch, terminal):
+    rows = [_plan_row(1), _plan_row(2), _plan_row(1, **{"Plan Marketing Name": b"Other Plan"})]
+    path, digests_by_member = _plan_artifact(tmp_path, rows)
+    temporary_file = plan_decoder.tempfile.TemporaryFile
+    files = []
+
+    def capture_file():
+        opened = temporary_file()
+        files.append(opened)
+        return opened
+
+    monkeypatch.setattr(plan_decoder.tempfile, "TemporaryFile", capture_file)
+    iterator = decoder.iter_cms_planfinder_plan_batches(
+        path, expected_artifact_sha256=digests_by_member["artifact_sha256"], batch_size=1
+    )
+    next(iterator)
+    assert len(files) == 4 and not any(opened.closed for opened in files)
+    if terminal == "cancel":
+        iterator.close()
+    else:
+        with pytest.raises(decoder.PlanFinderPlanInputError, match="Conflicting duplicate"):
+            list(iterator)
+    assert all(opened.closed for opened in files)
+
+
+def _damaged_plan_member(contents, failure):
+    archive = bytearray(contents)
+    if failure == "unsupported":
+        central = archive.index(b"PK\x01\x02")
+        archive[8:10] = archive[central + 10 : central + 12] = (99).to_bytes(2, "little")
+    elif failure in {"central_utf8", "local_utf8"}:
+        central = archive.index(b"PK\x01\x02")
+        flags_offset = central + 8 if failure == "central_utf8" else 6
+        flags = int.from_bytes(archive[flags_offset : flags_offset + 2], "little") | 0x800
+        archive[flags_offset : flags_offset + 2] = flags.to_bytes(2, "little")
+        archive[central + 46 if failure == "central_utf8" else 30] = 255
+    else:
+        name_size = int.from_bytes(archive[26:28], "little")
+        extra_size = int.from_bytes(archive[28:30], "little")
+        archive[30 + name_size + extra_size] = 7
+    return bytes(archive)
+
+
+@pytest.mark.parametrize("level", [0, 1, 2])
+@pytest.mark.parametrize("failure,expected_cause", [("deflate", zlib.error), ("unsupported", NotImplementedError)])
+def test_plan_decompression_errors_wrap_the_original_cause(tmp_path, level, failure, expected_cause):
+    path, digests_by_member = _plan_artifact(tmp_path, damage=(level, failure))
+    with pytest.raises(plan_decoder.PlanFinderPlanInputError, match="Plan container is malformed") as error:
+        _plan_batches(path, digests_by_member)
+    assert isinstance(error.value.__cause__, expected_cause)
+
+
+def _directory_fixture(count=1):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        for index in range(count):
+            archive.writestr(f"example-{index}.dat", b"payload")
+    return output.getvalue()
+
+
+def _with_zip64_directory(contents, *, extension=b""):
+    offset = contents.rindex(b"PK\x05\x06")
+    footer_fields = list(struct.unpack(zipfile.structEndArchive, contents[offset : offset + zipfile.sizeEndCentDir]))
+    record = struct.pack(
+        zipfile.structEndArchive64,
+        b"PK\x06\x06",
+        44 + len(extension),
+        45,
+        45,
+        0,
+        0,
+        footer_fields[3],
+        footer_fields[4],
+        footer_fields[5],
+        footer_fields[6],
+    )
+    locator = struct.pack(zipfile.structEndArchive64Locator, b"PK\x06\x07", 0, offset, 1)
+    footer_fields[3:7] = [65535, 65535, 0xFFFFFFFF, 0xFFFFFFFF]
+    return contents[:offset] + record + extension + locator + struct.pack(zipfile.structEndArchive, *footer_fields)
+
+
+def _write_directory_artifact(tmp_path, contents):
+    path = tmp_path / "synthetic-directory.zip"
+    path.write_bytes(contents)
+    return path, {"artifact_sha256": hashlib.sha256(contents).hexdigest()}
+
+
+@pytest.mark.parametrize("zip64", [False, True])
+@pytest.mark.parametrize("advertised_count", [1, 257])
+def test_plan_member_limit_precedes_zipfile_even_when_footer_lies(tmp_path, monkeypatch, zip64, advertised_count):
+    contents = bytearray(_directory_fixture(257))
+    end = contents.rindex(b"PK\x05\x06")
+    contents[end + 8 : end + 12] = advertised_count.to_bytes(2, "little") * 2
+    contents = _with_zip64_directory(bytes(contents)) if zip64 else bytes(contents)
+    artifact = _write_directory_artifact(tmp_path, contents)
+
+    def refuse_construction(*_args, **_kwargs):
+        pytest.fail("ZipFile was constructed before the member limit")
+
+    monkeypatch.setattr(plan_decoder.zipfile, "ZipFile", refuse_construction)
+    with pytest.raises(plan_decoder.PlanFinderPlanInputError, match="membership"):
+        _plan_batches(*artifact)
+
+
+@pytest.mark.parametrize("zip64", [False, True])
+def test_plan_directory_byte_limit_precedes_zipfile_allocation(tmp_path, monkeypatch, zip64):
+    contents = _directory_fixture()
+    if zip64:
+        contents = _with_zip64_directory(contents)
+    artifact = _write_directory_artifact(tmp_path, contents)
+    monkeypatch.setattr(plan_decoder, "MAX_ZIP_DIRECTORY_BYTES", 46)
+
+    def refuse_construction(*_args, **_kwargs):
+        pytest.fail("ZipFile was constructed before the directory byte limit")
+
+    monkeypatch.setattr(plan_decoder.zipfile, "ZipFile", refuse_construction)
+    with pytest.raises(plan_decoder.PlanFinderPlanInputError, match="directory exceeds its byte limit"):
+        _plan_batches(*artifact)
+
+
+def test_plan_oversized_advertised_directory_is_refused_without_reading_it(tmp_path, monkeypatch):
+    contents = bytearray(_directory_fixture())
+    end = contents.rindex(b"PK\x05\x06")
+    contents[end + 12 : end + 16] = (plan_decoder.MAX_ZIP_DIRECTORY_BYTES + 1).to_bytes(4, "little")
+    artifact = _write_directory_artifact(tmp_path, bytes(contents))
+
+    def refuse_construction(*_args, **_kwargs):
+        pytest.fail("ZipFile was constructed for an oversized advertised directory")
+
+    monkeypatch.setattr(plan_decoder.zipfile, "ZipFile", refuse_construction)
+    with pytest.raises(plan_decoder.PlanFinderPlanInputError, match="directory exceeds its byte limit"):
+        _plan_batches(*artifact)
+
+
+@pytest.mark.parametrize("failure", ["count", "length", "offset", "truncated", "signature", "zip64_locator"])
+def test_plan_inconsistent_directory_metadata_refuses_before_construction(tmp_path, monkeypatch, failure):
+    contents = bytearray(_directory_fixture())
+    central = contents.index(b"PK\x01\x02")
+    end = contents.rindex(b"PK\x05\x06")
+    if failure == "zip64_locator":
+        contents = bytearray(_with_zip64_directory(contents))
+        offset, size, replacement = contents.rindex(b"PK\x06\x07") + 8, 8, (len(contents) + 1).to_bytes(8, "little")
+    else:
+        mutations_by_failure = {
+            "count": (end + 8, 4, b"\0" * 4),
+            "length": (central + 28, 2, (65535).to_bytes(2, "little")),
+            "offset": (end + 16, 4, (end + 1).to_bytes(4, "little")),
+            "truncated": (end + 12, 4, (1).to_bytes(4, "little")),
+            "signature": (central, 1, b"\0"),
+        }
+        offset, size, replacement = mutations_by_failure[failure]
+    contents[offset : offset + size] = replacement
+    artifact = _write_directory_artifact(tmp_path, bytes(contents))
+
+    def refuse_construction(*_args, **_kwargs):
+        pytest.fail("ZipFile was constructed for inconsistent directory metadata")
+
+    monkeypatch.setattr(plan_decoder.zipfile, "ZipFile", refuse_construction)
+    with pytest.raises(plan_decoder.PlanFinderPlanInputError, match="directory|membership|malformed"):
+        _plan_batches(*artifact)
+
+
+@pytest.mark.parametrize("level", [0, 1, 2])
+@pytest.mark.parametrize("failure", ["central_utf8", "local_utf8"])
+def test_plan_actual_malformed_utf8_filenames_wrap_the_original_cause(tmp_path, level, failure):
+    artifact = _plan_artifact(tmp_path, damage=(level, failure))
+    with pytest.raises(plan_decoder.PlanFinderPlanInputError, match="Plan container is malformed") as error:
+        _plan_batches(*artifact)
+    assert isinstance(error.value.__cause__, UnicodeDecodeError)
+
+
+@pytest.mark.parametrize("variant", ["ordinary", "comment", "prefix", "zip64", "zip64_prefix", "zip64_extension"])
+def test_plan_directory_preflight_preserves_supported_containers_and_nested_batch_bytes(tmp_path, variant):
+    path, digests = _plan_artifact(tmp_path, [_plan_row(1), _plan_row(2)])
+    expected_batches = [json.loads(batch) for batch in _plan_batches(path, digests, batch_size=1)]
+    contents = path.read_bytes()
+    if variant.startswith("zip64"):
+        contents = _with_zip64_directory(
+            contents, extension=b"example extension" if variant == "zip64_extension" else b""
+        )
+    if variant in {"prefix", "zip64_prefix"}:
+        contents = b"synthetic executable prefix" + contents
+    elif variant == "comment":
+        contents = contents[:-2] + (65535).to_bytes(2, "little") + b"x" * 65535
+    artifact = _write_directory_artifact(tmp_path, contents)
+    actual_batches = [json.loads(batch) for batch in _plan_batches(*artifact, batch_size=1)]
+    for batch in expected_batches:
+        batch["artifact_sha256"] = artifact[1]["artifact_sha256"]
+    assert actual_batches == expected_batches
+
+
+def test_plan_directory_preflight_bounds_reads_and_accepts_the_exact_member_limit():
+    class BoundedReads(io.BytesIO):
+        def read(self, size=-1):
+            assert 0 <= size <= zipfile.ZIP_MAX_COMMENT + zipfile.sizeEndCentDir
+            return super().read(size)
+
+    stream = BoundedReads(_with_zip64_directory(_directory_fixture(256)))
+    plan_decoder._check_zip_directory(stream)

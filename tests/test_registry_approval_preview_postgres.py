@@ -811,7 +811,7 @@ async def test_cms_custody_drift_makes_entire_mixed_preview_unavailable(retained
     await _assert_staging_removed(fixture.connection)
 
 
-@pytest.mark.parametrize("changed", ["source", "expanded", "remaining_cursor"])
+@pytest.mark.parametrize("changed", ["source", "expanded", "accounting", "remaining_cursor"])
 async def test_cms_preview_denies_unrecognized_extraction_shapes(retained_cms_preview, monkeypatch, changed):
     """Exact SQL guards deny partial aggregation when the reviewed reader changes."""
     fixture, reviewed = retained_cms_preview
@@ -824,6 +824,8 @@ async def test_cms_preview_denies_unrecognized_extraction_shapes(retained_cms_pr
             return sql.replace("LIMIT $11", "LIMIT $11::bigint")
         if changed == "expanded":
             return sql.replace("LIMIT 5001", "LIMIT 5002")
+        if changed == "accounting":
+            return sql.replace(", resource_edges AS (", ", changed_edges AS (")
         return sql.replace("FROM page", "FROM page WHERE $9::text IS NULL")
 
     monkeypatch.setattr(imported_preview, "fhir_extraction_sql", changed_sql)

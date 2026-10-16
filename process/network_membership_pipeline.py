@@ -15,6 +15,7 @@ from process.network_membership_publication import (
     _lock_publication_controls,
     _publication_readiness,
     _retained_manifest,
+    _verify_provider_custody,
     publish_network_candidate,
 )
 from process.network_membership_serving_indexes import (
@@ -105,7 +106,7 @@ async def _prepare_phase(connection, copy_target, source, roles_by_group, contro
 
 
 async def _publish_phase(connection, copy_target, roles_by_group, control_schema):
-    async with connection.transaction():
+    async with connection.transaction(isolation="repeatable_read"):
         namespace = _identifier(control_schema)
         approved_revision, current_head = await _lock_publication_controls(connection, namespace)
         candidate = await _locked_candidate(connection, copy_target, namespace)
@@ -131,6 +132,7 @@ async def _published_replay(connection, copy_target, address_source, roles_by_gr
             raise NetworkMembershipPipelineError("Candidate is not published for retained replay")
         _validated_replay(candidate, _scope_report(candidate, address_source))
         readiness = _publication_readiness(candidate)
+        await _verify_provider_custody(connection, candidate, readiness[3])
         configured_roles = _role_names(**roles_by_group)
         if any(readiness[3][field] != expected for field, expected in configured_roles.items()):
             raise NetworkMembershipPipelineError("Configured writer roles differ from retained closure")

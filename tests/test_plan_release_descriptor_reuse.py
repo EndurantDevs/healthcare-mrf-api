@@ -194,9 +194,9 @@ def test_single_release_query_rejects_descriptor_for_another_snapshot(
     """Refuse a map that omits the selected binding before physical search."""
 
     binding = _network_binding(0, "snapshot-a", "source-a")
-    selection = SimpleNamespace(
-        in_network_bindings=(binding,),
-        network_tables_by_snapshot=lambda: {"snapshot-b": object()},
+    selection = _release_selection(
+        binding,
+        validated_serving_tables=(("snapshot-b", object()),),
     )
 
     async def fail_physical_search(*_args, **_kwargs):
