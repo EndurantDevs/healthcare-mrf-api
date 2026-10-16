@@ -553,9 +553,9 @@ def _complete_family_case(child_counts, actual_counts=None):
     session = SimpleNamespace(
         execute=AsyncMock(
             side_effect=[
-                SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: root_scalars)),
+                SimpleNamespace(all=lambda: root_scalars),
                 SimpleNamespace(all=lambda: memberships),
-                SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: child_scalars)),
+                SimpleNamespace(all=lambda: child_scalars),
             ]
         )
     )

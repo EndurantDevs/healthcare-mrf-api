@@ -35,6 +35,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import Integer, String, and_, exists, func, not_, select, text, tuple_
+from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
@@ -2305,25 +2306,27 @@ async def _root_scalar_rows(
     context: _ReadContext,
     root_revision_ids: tuple[int, ...],
     fields: tuple[Field, ...],
-) -> dict[tuple[int, int], CustomImportRootScalar]:
+) -> dict[tuple[int, int], Row]:
     root_scalar_model = context.model(CustomImportRootScalar)
 
     if not fields:
         return {}
     rows = (
-        (
-            await session.execute(
-                select(root_scalar_model).where(
-                    root_scalar_model.dataset_id == context.target.dataset_id,
-                    root_scalar_model.schema_revision_id == context.target.schema_revision_id,
-                    root_scalar_model.root_revision_id.in_(root_revision_ids),
-                    root_scalar_model.field_slot.in_(tuple(field.field_slot for field in fields)),
-                )
+        await session.execute(
+            select(
+                root_scalar_model.root_revision_id,
+                root_scalar_model.field_slot,
+                root_scalar_model.field_type,
+                root_scalar_model.value_state,
+                *(getattr(root_scalar_model, column_name) for column_name in _SCALAR_COLUMNS.values()),
+            ).where(
+                root_scalar_model.dataset_id == context.target.dataset_id,
+                root_scalar_model.schema_revision_id == context.target.schema_revision_id,
+                root_scalar_model.root_revision_id.in_(root_revision_ids),
+                root_scalar_model.field_slot.in_(tuple(field.field_slot for field in fields)),
             )
         )
-        .scalars()
-        .all()
-    )
+    ).all()
     return {(row.root_revision_id, row.field_slot): row for row in rows}
 
 
@@ -2332,25 +2335,27 @@ async def _child_scalar_rows(
     context: _ReadContext,
     child_revision_ids: tuple[int, ...],
     fields: tuple[Field, ...],
-) -> dict[tuple[int, int], CustomImportChildScalar]:
+) -> dict[tuple[int, int], Row]:
     child_scalar_model = context.model(CustomImportChildScalar)
 
     if not fields or not child_revision_ids:
         return {}
     rows = (
-        (
-            await session.execute(
-                select(child_scalar_model).where(
-                    child_scalar_model.dataset_id == context.target.dataset_id,
-                    child_scalar_model.schema_revision_id == context.target.schema_revision_id,
-                    child_scalar_model.child_revision_id.in_(child_revision_ids),
-                    child_scalar_model.field_slot.in_(tuple(field.field_slot for field in fields)),
-                )
+        await session.execute(
+            select(
+                child_scalar_model.child_revision_id,
+                child_scalar_model.field_slot,
+                child_scalar_model.field_type,
+                child_scalar_model.value_state,
+                *(getattr(child_scalar_model, column_name) for column_name in _SCALAR_COLUMNS.values()),
+            ).where(
+                child_scalar_model.dataset_id == context.target.dataset_id,
+                child_scalar_model.schema_revision_id == context.target.schema_revision_id,
+                child_scalar_model.child_revision_id.in_(child_revision_ids),
+                child_scalar_model.field_slot.in_(tuple(field.field_slot for field in fields)),
             )
         )
-        .scalars()
-        .all()
-    )
+    ).all()
     return {(row.child_revision_id, row.field_slot): row for row in rows}
 
 
@@ -2360,8 +2365,8 @@ def _selected_row_to_search_item(
     ],
     root_fields: tuple[Field, ...],
     child_fields: tuple[Field, ...],
-    root_rows_by_key: Mapping[tuple[int, int], CustomImportRootScalar],
-    child_rows_by_key: Mapping[tuple[int, int], CustomImportChildScalar],
+    root_rows_by_key: Mapping[tuple[int, int], Row],
+    child_rows_by_key: Mapping[tuple[int, int], Row],
 ) -> SearchItem:
     winner, family, root_revision, context_child = selected_row
     locator = _winner_locator(winner, family)
@@ -2697,7 +2702,7 @@ def _detail_child(
     child: CustomImportChildRevision,
     context: _ReadContext,
     fields_by_slot: Mapping[int, tuple[Field, ...]],
-    scalar_rows_by_key: Mapping[tuple[int, int], CustomImportChildScalar],
+    scalar_rows_by_key: Mapping[tuple[int, int], Row],
 ) -> ReadChild:
     fields = fields_by_slot.get(family_child.collection_slot)
     collection_name = context.collection_names_by_slot.get(family_child.collection_slot)

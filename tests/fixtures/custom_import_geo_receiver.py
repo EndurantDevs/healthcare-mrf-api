@@ -256,36 +256,33 @@ class SyntheticSession(_Session):
             )
         if column_names == ("CustomImportFamilyChild", "CustomImportChildRevision"):
             return self._family_membership_rows(statement)
-        if column_names == ("CustomImportRootScalar",):
+        scalar_columns = ("field_slot", "field_type", "value_state", *read_core._SCALAR_COLUMNS.values())
+        if column_names == ("root_revision_id", *scalar_columns):
             requested_ids = statement.compile().params["root_revision_id_1"]
-            return _result(
-                [
-                    (
-                        SimpleNamespace(
-                            root_revision_id=201 + index,
-                            field_slot=slot,
-                            field_type="string",
-                            value_state="value",
-                            string_value=scalar_text_value,
-                        ),
+            return SimpleNamespace(
+                all=lambda: [
+                    SimpleNamespace(
+                        root_revision_id=201 + index,
+                        field_slot=slot,
+                        field_type="string",
+                        value_state="value",
+                        string_value=scalar_text_value,
                     )
                     for index, npi in enumerate(_NPIS)
                     if 201 + index in requested_ids
                     for slot, scalar_text_value in ((1, npi), (2, "Synthetic Provider"))
                 ]
             )
-        if column_names == ("CustomImportChildScalar",):
+        if column_names == ("child_revision_id", *scalar_columns):
             requested_ids = statement.compile().params["child_revision_id_1"]
-            return _result(
-                [
-                    (
-                        SimpleNamespace(
-                            child_revision_id=301 + index,
-                            field_slot=slot,
-                            field_type=field_type,
-                            value_state="value",
-                            **scalar_value,
-                        ),
+            return SimpleNamespace(
+                all=lambda: [
+                    SimpleNamespace(
+                        child_revision_id=301 + index,
+                        field_slot=slot,
+                        field_type=field_type,
+                        value_state="value",
+                        **scalar_value,
                     )
                     for index, _npi in enumerate(_NPIS)
                     if 301 + index in requested_ids
