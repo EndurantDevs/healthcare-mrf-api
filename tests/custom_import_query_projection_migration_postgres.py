@@ -6,6 +6,8 @@ import hashlib
 from decimal import Decimal
 
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import insert, select, text
 from sqlalchemy.exc import DBAPIError
 
@@ -18,11 +20,66 @@ from process.custom_import.query_projection_storage import (
     query_projection_tables,
 )
 from tests.custom_import_postgres_support import isolated_publication_case
+from tests.test_custom_import_query_projection_migration import migration as projection_migration
 from tests.test_custom_import_query_projection_storage import _definition
 from tests.test_custom_import_query_projection_values import _source
 
 _FAMILY = 2**63 - 1
 _SCHEMA = "ci_snapshot_9223372036854775807"
+
+
+def _run_projection_migration(connection, schema, operation):
+    module = projection_migration()
+    module._schema = lambda: schema
+    module.op = Operations(MigrationContext.configure(connection))
+    getattr(module, operation)()
+
+
+async def _assert_projection_lock_timeout(case):
+    with pytest.raises(DBAPIError) as failure:
+        async with case.engine.begin() as connection:
+            await connection.execute(text("SET LOCAL statement_timeout='5s'"))
+            await connection.execute(text("SET LOCAL lock_timeout='0'"))
+            await connection.run_sync(_run_projection_migration, case.schema_name, "upgrade")
+    assert failure.value.orig.sqlstate == "55P03"
+
+
+@pytest.mark.asyncio
+async def test_projection_migration_lock_failure_rolls_back_and_preserves_stricter_limits():
+    async with isolated_publication_case() as case:
+        async with case.engine.begin() as connection:
+            await connection.run_sync(_run_projection_migration, case.schema_name, "downgrade")
+        async with case.engine.connect() as reader:
+            await reader.execute(text(f'SELECT 1 FROM "{case.schema_name}".custom_import_generation_seal LIMIT 0'))
+            try:
+                await _assert_projection_lock_timeout(case)
+            finally:
+                await reader.rollback()
+        async with case.engine.connect() as connection:
+            original_limit = await connection.scalar(text("SHOW lock_timeout"))
+            await connection.rollback()
+            async with connection.begin():
+                assert (
+                    await connection.scalar(
+                        text("SELECT to_regclass(:relation)"),
+                        {"relation": f"{case.schema_name}.custom_import_query_projection"},
+                    )
+                    is None
+                )
+                assert (
+                    await connection.scalar(
+                        text(
+                            "SELECT count(*) FROM information_schema.columns WHERE table_schema=:schema "
+                            "AND table_name='custom_import_generation_seal' AND column_name LIKE 'query_projection_%'"
+                        ),
+                        {"schema": case.schema_name},
+                    )
+                    == 0
+                )
+                await connection.execute(text("SET LOCAL lock_timeout='100ms'"))
+                await connection.run_sync(_run_projection_migration, case.schema_name, "upgrade")
+                assert await connection.scalar(text("SHOW lock_timeout")) == "100ms"
+            assert await connection.scalar(text("SHOW lock_timeout")) == original_limit
 
 
 async def _check_custody(connection, control_schema, definition):
