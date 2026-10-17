@@ -365,7 +365,12 @@ async def test_uncertain_commit_is_unavailable_without_retry_or_rollback_claim(m
     assert reply.status == 503 and json.loads(reply.body) == {"error": "admission_unavailable"}
     assert reply.headers["Cache-Control"] == "no-store" and session.durable == ["possibly-committed"]
     decision.assert_awaited_once()
-    assert b"DO-NOT-LOG" not in reply.body and caplog.records == []
+    assert b"DO-NOT-LOG" not in reply.body and "DO-NOT-LOG" not in caplog.text
+    assert len(caplog.records) == 1
+    assert (
+        caplog.records[0].getMessage().startswith("custom_import_batch_unavailable stage=admission_execute category=")
+    )
+    assert not caplog.records[0].exc_info and caplog.records[0].stack_info is None
 
 
 @pytest.mark.asyncio

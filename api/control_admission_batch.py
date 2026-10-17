@@ -19,6 +19,7 @@ from sanic import Blueprint, response
 from sanic.exceptions import BadRequest, PayloadTooLarge
 from sqlalchemy import and_, func, select, text
 
+from api.control_batch_diagnostics import BatchFailureStage, log_batch_failure
 from db.connection import db
 from db.models.custom_import import CustomImportBuildAttempt, CustomImportExecution
 from process.custom_import import admission_sql
@@ -295,7 +296,8 @@ async def admission_batch(request):
         return _reply({"error": "admission_body_too_large"}, 413)
     except BadRequest, AdmissionAuthorizationError:
         return _reply({"error": "admission_forbidden"}, 403)
-    except Exception:
+    except Exception as error:
+        log_batch_failure(BatchFailureStage.ADMISSION_RECEIVE, error)
         return _reply({"error": "admission_unavailable"}, 503)
     keyring, expected_origin = authority
     return await serve_admission_batch(
@@ -305,6 +307,27 @@ async def admission_batch(request):
         expected_origin=expected_origin,
         trusted_now=datetime.now(timezone.utc),
     )
+
+
+async def _load_admission_request(request, session_factory, verified, trusted_now):
+    """Keep the existing bounded preload and its response deadlines together."""
+
+    extend_batch_response_deadline(
+        request,
+        expires_at=min(verified.permit.expires_at, trusted_now + timedelta(seconds=5)),
+        trusted_now=trusted_now,
+    )
+    retained = await _retained_request(session_factory, verified)
+    extend_batch_response_deadline(
+        request,
+        expires_at=min(
+            verified.permit.expires_at,
+            retained.build_deadline_at,
+            trusted_now + timedelta(seconds=retained.lease_seconds),
+        ),
+        trusted_now=trusted_now,
+    )
+    return retained
 
 
 async def serve_admission_batch(
@@ -317,6 +340,7 @@ async def serve_admission_batch(
 ):
     """Serve one batch; unavailable outcomes require retained-state reconciliation."""
 
+    stage = BatchFailureStage.ADMISSION_AUTHORIZE
     try:
         verified = verify_request(
             headers=_contract_headers(request.headers),
@@ -328,21 +352,9 @@ async def serve_admission_batch(
             expected_origin=expected_origin,
             keyring=keyring,
         )
-        extend_batch_response_deadline(
-            request,
-            expires_at=min(verified.permit.expires_at, trusted_now + timedelta(seconds=5)),
-            trusted_now=trusted_now,
-        )
-        retained = await _retained_request(session_factory, verified)
-        extend_batch_response_deadline(
-            request,
-            expires_at=min(
-                verified.permit.expires_at,
-                retained.build_deadline_at,
-                trusted_now + timedelta(seconds=retained.lease_seconds),
-            ),
-            trusted_now=trusted_now,
-        )
+        stage = BatchFailureStage.ADMISSION_RETAINED
+        retained = await _load_admission_request(request, session_factory, verified, trusted_now)
+        stage = BatchFailureStage.ADMISSION_EXECUTE
         admission_result = await admission_sql.admit_source_batch(
             session_factory,
             retained,
@@ -350,6 +362,7 @@ async def serve_admission_batch(
             verified.pins.expected_after_occurrence_id,
             admission_permit=verified.permit,
         )
+        stage = BatchFailureStage.ADMISSION_RECEIPT
         return _reply(_receipt(verified, admission_result))
     except AdmissionAuthorizationError:
         return _reply({"error": "admission_forbidden"}, 403)
@@ -358,6 +371,8 @@ async def serve_admission_batch(
     except admission_sql.AdmissionError as error:
         if error.args == ("custom_import_build_progress_conflict",):
             return _reply({"error": "admission_progress_conflict"}, 409)
+        log_batch_failure(stage, error)
         return _reply({"error": "admission_unavailable"}, 503)
-    except Exception:
+    except Exception as error:
+        log_batch_failure(stage, error)
         return _reply({"error": "admission_unavailable"}, 503)

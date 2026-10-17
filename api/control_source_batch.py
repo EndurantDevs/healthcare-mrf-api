@@ -16,6 +16,7 @@ from sanic import Blueprint
 from sanic.exceptions import BadRequest, PayloadTooLarge
 
 from api import control_admission_batch as admission
+from api.control_batch_diagnostics import BatchFailureStage, log_batch_failure
 from db.connection import db
 from process.custom_import import source_authorization as authorization
 from process.custom_import.admission_authorization import AdmissionAuthorizationError
@@ -70,6 +71,7 @@ def _receipt(verified, result):
 async def serve_source_batch(request, session_factory, *, keyring, expected_origin, trusted_now):
     """Authenticate once and report only the fixed service's committed outcome."""
 
+    stage = BatchFailureStage.SOURCE_AUTHORIZE
     try:
         verified = authorization.verify_request(
             headers=admission._contract_headers(request.headers, source=True),
@@ -84,7 +86,9 @@ async def serve_source_batch(request, session_factory, *, keyring, expected_orig
         admission.extend_batch_response_deadline(
             request, expires_at=verified.permit.expires_at, trusted_now=trusted_now
         )
+        stage = BatchFailureStage.SOURCE_EXECUTE
         committed = await _source_operation(session_factory, verified)
+        stage = BatchFailureStage.SOURCE_RECEIPT
         return admission._reply(_receipt(verified, committed))
     except AdmissionAuthorizationError:
         return admission._reply({"error": "source_forbidden"}, 403)
@@ -92,8 +96,9 @@ async def serve_source_batch(request, session_factory, *, keyring, expected_orig
         return admission._reply({"error": "source_authority_lost"}, 409)
     except SourceProgressConflict:
         return admission._reply({"error": "source_progress_conflict"}, 409)
-    except Exception:
+    except Exception as error:
         # Includes uncertain COMMIT: never claim rollback or synthesize a cursor.
+        log_batch_failure(stage, error)
         return admission._reply({"error": "source_unavailable"}, 503)
 
 
@@ -111,7 +116,8 @@ async def source_batch(request):
         return admission._reply({"error": "source_body_too_large"}, 413)
     except BadRequest, AdmissionAuthorizationError:
         return admission._reply({"error": "source_forbidden"}, 403)
-    except Exception:
+    except Exception as error:
+        log_batch_failure(BatchFailureStage.SOURCE_RECEIVE, error)
         return admission._reply({"error": "source_unavailable"}, 503)
     keyring, origin = authority
     return await serve_source_batch(
