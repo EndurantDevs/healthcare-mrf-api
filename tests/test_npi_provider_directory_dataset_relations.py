@@ -1,6 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import pytest
+
 from api.endpoint import npi as npi_module
+from db.provider_directory_readiness import READINESS_INDEXES
 
 
 def _role_sql(*, use_relations: bool) -> str:
@@ -93,3 +96,42 @@ def test_role_sql_without_relations_is_legacy_only():
     assert "provider_directory_dataset_affiliation_organization" not in sql
     assert "provider_directory_organization_affiliation AS affiliation_locator" in sql
     assert "COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)" in sql
+
+
+@pytest.mark.parametrize("affiliation", [False, True])
+@pytest.mark.parametrize("available_indexes", [0, 1, 2])
+async def test_readiness_index_path_requires_both_capabilities(affiliation, available_indexes):
+    statements = []
+
+    class EvidenceResult:
+        def __init__(self, rows=()):
+            self.rows = rows
+
+        def all(self):
+            return self.rows
+
+    class EvidenceSession:
+        async def execute(self, statement, params=None):
+            statements.append(str(statement))
+            if params and "table_names" in params:
+                rows = [{"table_name": name, "is_available": True} for name in params["table_names"]]
+                rows.extend(
+                    {"table_name": name, "is_available": position < available_indexes}
+                    for position, name in enumerate(params["readiness_index_names"])
+                )
+                assert params["readiness_index_names"] == [name for _key, name in READINESS_INDEXES]
+                return EvidenceResult(rows)
+            return EvidenceResult()
+
+    fetch = (
+        npi_module._fetch_provider_directory_affiliation_evidence_map
+        if affiliation
+        else npi_module._fetch_provider_directory_role_evidence_map
+    )
+    assert await fetch([("source", "resource")], session=EvidenceSession()) == {}
+    sql = statements[-1]
+    metadata = sql.split("current_dataset_metadata AS MATERIALIZED (", 1)[1].split(
+        "), current_datasets AS MATERIALIZED (", 1
+    )[0]
+    assert ("publication_metadata_json" not in metadata) is (available_indexes == 2)
+    assert ("AS ready WHERE ready.dataset_id = dataset.dataset_id" in sql) is (available_indexes == 2)

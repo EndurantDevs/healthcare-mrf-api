@@ -15,6 +15,51 @@ from alembic.script import ScriptDirectory
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
 PLANS_MIGRATION_PATH = ROOT / "alembic" / "versions" / "20261005020000_custom_import_sealed_append_plans.py"
+_SEALED_APPEND_FOLLOWUP_REVISIONS = (
+    "20261005030000_source_profile_statement_pins",
+    "20261005100000_rooted_graph_set_validation",
+    "20261005110000_ptg_set_validation",
+    "20261005120000_practitioner_set_validation",
+    "20261005130000_provider_dataset_candidates",
+    "20261005030000_custom_import_snapshot_storage",
+    "20261005040000_custom_import_bulk_snapshot_writers",
+    "20261005050000_custom_import_legacy_snapshot_writers",
+    "20261005060000_custom_import_snapshot_finality",
+    "20261005070000_custom_import_materialization_storage",
+    "20261005080000_custom_import_writer_cutover",
+    "20261007000000_custom_import_rejection_anti_joins",
+    "20261006010000_nucc_reference_result_generation",
+    "20261009000000_custom_import_child_presence_decode",
+    "20261010000000_custom_import_admission_indexes",
+    "20261010010000_custom_import_materialization_contract",
+    "20261007010000_managed_network_registry",
+    "20261007020000_registry_revision_history",
+    "20261007030000_network_serving_control",
+    "20261007040000_registry_source_evidence",
+    "20261007050000_canonical_address_network_ids",
+    "20261007060000_registry_approved_selection",
+    "20261007070000_registry_company_links",
+    "20261007080000_manual_directory_registry",
+    "20261007090000_network_membership_drafts",
+    "20261007100000_registry_publication_requests",
+    "20261007110000_registry_site_bindings",
+    "20261007120000_company_network_assertions",
+    "20261007130000_registry_network_bindings",
+    "20261007140000_registry_source_recipes",
+    "20261007150000_provider_directory_content_cursor_index",
+    "20261009010000_registry_ptg_producer_scope",
+    "20261009020000_company_registry_assertions",
+    "20261009030000_network_catalog_evidence",
+    "20261009040000_registry_ptg_published_plan_scope",
+    "20261010010000_registry_ptg_office_approval",
+    "20261010020000_registry_ptg_office_retention",
+    "20261010030000_registry_source_admission_receipt",
+    "20261011010000_company_registry_group_assertions",
+    "20261012010000_company_registry_name_origin",
+    "20261013010000_registry_custom_history_events",
+    "20261015020000_custom_import_query_projections",
+    "20261017210000_provider_directory_readiness_indexes",
+)
 
 
 def _migration():
@@ -154,11 +199,12 @@ def test_sealed_append_plans_replace_only_an_existing_function(monkeypatch, oper
 
 
 def test_sealed_append_plans_extend_the_single_installed_migration_head():
+    """Preserve the complete sealed-append upgrade chain through the sole current head."""
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
     revision = _plans_migration().revision
-    assert script.get_heads() == ["20261015020000_custom_import_query_projections"]
+    assert script.get_heads() == ["20261017210000_provider_directory_readiness_indexes"]
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )
@@ -167,51 +213,7 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
     )
     assert tuple(
         step.revision.revision for step in script._upgrade_revs("head", "20261001110000_profile_initial_publication")
-    ) == (
-        revision,
-        "20261005030000_source_profile_statement_pins",
-        "20261005100000_rooted_graph_set_validation",
-        "20261005110000_ptg_set_validation",
-        "20261005120000_practitioner_set_validation",
-        "20261005130000_provider_dataset_candidates",
-        "20261005030000_custom_import_snapshot_storage",
-        "20261005040000_custom_import_bulk_snapshot_writers",
-        "20261005050000_custom_import_legacy_snapshot_writers",
-        "20261005060000_custom_import_snapshot_finality",
-        "20261005070000_custom_import_materialization_storage",
-        "20261005080000_custom_import_writer_cutover",
-        "20261007000000_custom_import_rejection_anti_joins",
-        "20261006010000_nucc_reference_result_generation",
-        "20261009000000_custom_import_child_presence_decode",
-        "20261010000000_custom_import_admission_indexes",
-        "20261010010000_custom_import_materialization_contract",
-        "20261007010000_managed_network_registry",
-        "20261007020000_registry_revision_history",
-        "20261007030000_network_serving_control",
-        "20261007040000_registry_source_evidence",
-        "20261007050000_canonical_address_network_ids",
-        "20261007060000_registry_approved_selection",
-        "20261007070000_registry_company_links",
-        "20261007080000_manual_directory_registry",
-        "20261007090000_network_membership_drafts",
-        "20261007100000_registry_publication_requests",
-        "20261007110000_registry_site_bindings",
-        "20261007120000_company_network_assertions",
-        "20261007130000_registry_network_bindings",
-        "20261007140000_registry_source_recipes",
-        "20261007150000_provider_directory_content_cursor_index",
-        "20261009010000_registry_ptg_producer_scope",
-        "20261009020000_company_registry_assertions",
-        "20261009030000_network_catalog_evidence",
-        "20261009040000_registry_ptg_published_plan_scope",
-        "20261010010000_registry_ptg_office_approval",
-        "20261010020000_registry_ptg_office_retention",
-        "20261010030000_registry_source_admission_receipt",
-        "20261011010000_company_registry_group_assertions",
-        "20261012010000_company_registry_name_origin",
-        "20261013010000_registry_custom_history_events",
-        "20261015020000_custom_import_query_projections",
-    )
+    ) == (revision, *_SEALED_APPEND_FOLLOWUP_REVISIONS)
 
 
 def test_sealed_append_plans_preserve_query_order_bindings_and_exact_dynamic_fallback():
