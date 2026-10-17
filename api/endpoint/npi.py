@@ -53,6 +53,11 @@ from api.npi_detail_cache_identity import (
 )
 from api.provider_demographic_filters import normalize_provider_sex_code
 from api.provider_detail_sql import _npi_detail_address_filters, _npi_detail_taxonomy_aggregate
+from api.provider_directory_dataset_sql import (
+    PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
+    PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL,
+    _provider_directory_current_resource_ctes_sql,
+)
 from api.provider_geo_sql import (
     ImportedGeoQuery,
     ImportedGeoStatements,
@@ -167,6 +172,7 @@ from db.models import (
     ProviderEnrollmentSNF,
     db,
 )
+from db.provider_directory_readiness import READINESS_INDEXES
 from process import provider_directory_profile as profile_artifact
 from process.ext.address_format import (
     ADDRESS_FORMAT_FUNCTION,
@@ -1036,7 +1042,6 @@ PROVIDER_DIRECTORY_VISIBILITY_TABLES = (
     "provider_directory_dataset_resource",
 )
 PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE = "provider_directory_dataset_network_plan"
-PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE = "provider_directory_dataset_insurance_plan"
 PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_COLUMNS = (
     "plan_active",
     "plan_identifier",
@@ -1046,35 +1051,6 @@ PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_REQUIREMENTS = tuple(
     for column_name in PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_COLUMNS
 )
 PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE = "provider_directory_dataset_affiliation_organization"
-PROVIDER_DIRECTORY_DATASET_RELATION_VERSION = "1"
-
-PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL = """
-    WITH requested_columns AS (
-        SELECT column_table_name, column_name
-          FROM unnest(
-               CAST(:column_table_names AS varchar[]),
-               CAST(:column_names AS varchar[])
-          ) AS requested(column_table_name, column_name)
-    )
-    SELECT requested.table_name,
-           to_regclass(:schema || '.' || requested.table_name)
-               IS NOT NULL AS is_available
-      FROM unnest(CAST(:table_names AS varchar[]))
-           AS requested(table_name)
-    UNION ALL
-    SELECT requested.column_table_name || '.' || requested.column_name,
-           EXISTS (
-               SELECT 1
-                 FROM pg_attribute
-                WHERE attrelid = to_regclass(
-                      :schema || '.' || requested.column_table_name
-                )
-                  AND attname = requested.column_name
-                  AND attnum > 0
-                  AND NOT attisdropped
-           ) AS is_available
-      FROM requested_columns AS requested
-"""
 
 
 # Provider address lists are paged by default; all or 0 returns the full ranked list.
@@ -1767,104 +1743,6 @@ def _provider_directory_plan_network_match_sql(
 
 def _insurance_plan_active_sql(alias: str) -> str:
     return f"COALESCE(NULLIF(LOWER(BTRIM({alias}.status)), ''), 'active') = 'active'"
-
-
-def _dataset_relation_ready_sql(metadata_key: str) -> str:
-    return f"""
-        COALESCE(dataset.{metadata_key}_metadata ->> 'complete', 'false') = 'true'
-        AND COALESCE(dataset.{metadata_key}_metadata ->> 'version', '') = '{PROVIDER_DIRECTORY_DATASET_RELATION_VERSION}'
-        AND COALESCE(dataset.{metadata_key}_metadata ->> 'dataset_id', '') = dataset.dataset_id"""
-
-
-def _provider_directory_current_plan_resources_sql(
-    schema: str,
-    has_dataset_insurance_plan: bool,
-) -> str:
-    """Read immutable plan payloads from the compact projection when available."""
-    if not has_dataset_insurance_plan:
-        return """
-    current_plan_resources AS NOT MATERIALIZED (
-        SELECT resource.*
-          FROM current_resources AS resource
-         WHERE resource.resource_type = 'InsurancePlan'
-    )
-        """
-    return f"""
-    current_plan_resources AS NOT MATERIALIZED (
-        SELECT source.source_id, source.canonical_api_base,
-               dataset.dataset_id, dataset.run_id,
-               dataset.published_at AS dataset_published_at,
-               dataset.dataset_network_plan_complete,
-               dataset.dataset_affiliation_organization_complete,
-               'InsurancePlan'::varchar AS resource_type,
-               resource.resource_id,
-               resource.payload_json::jsonb AS payload_json
-          FROM {schema}.provider_directory_source AS source
-          JOIN current_datasets AS dataset
-            ON dataset.endpoint_id = source.endpoint_id
-          JOIN {schema}.{PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE} AS resource
-            ON resource.dataset_id = dataset.dataset_id
-    )
-    """
-
-
-def _provider_directory_current_resource_ctes_sql(
-    schema: str,
-    has_dataset_insurance_plan: bool = False,
-) -> str:
-    """Resolve resources through the one current, fully published endpoint dataset."""
-    network_plan_ready_sql = _dataset_relation_ready_sql("dataset_network_plan")
-    affiliation_ready_sql = _dataset_relation_ready_sql("dataset_affiliation_organization")
-    return f"""
-    current_endpoint_counts AS MATERIALIZED (
-        SELECT dataset.endpoint_id
-          FROM {schema}.provider_directory_endpoint_dataset AS dataset
-         WHERE dataset.is_current IS TRUE
-      GROUP BY dataset.endpoint_id
-        HAVING COUNT(*) = 1
-    ), current_dataset_metadata AS MATERIALIZED (
-        SELECT dataset.endpoint_id, dataset.dataset_id,
-               COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id,
-               dataset.published_at,
-               dataset.publication_metadata_json::jsonb
-                   -> 'dataset_network_plan' AS dataset_network_plan_metadata,
-               dataset.publication_metadata_json::jsonb
-                   -> 'dataset_affiliation_organization' AS dataset_affiliation_organization_metadata
-          FROM {schema}.provider_directory_endpoint_dataset AS dataset
-          JOIN current_endpoint_counts AS current_endpoint
-            ON current_endpoint.endpoint_id = dataset.endpoint_id
-         WHERE dataset.is_current IS TRUE
-           AND dataset.endpoint_id IN (
-               SELECT requested_source.endpoint_id
-                 FROM {schema}.provider_directory_source AS requested_source
-                WHERE requested_source.source_id = ANY(:source_ids)
-           )
-           AND dataset.status = 'published'
-           AND dataset.published_at IS NOT NULL
-           AND dataset.superseded_at IS NULL
-           AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
-    ), current_datasets AS MATERIALIZED (
-        SELECT dataset.endpoint_id, dataset.dataset_id, dataset.run_id,
-               dataset.published_at,
-               ({network_plan_ready_sql}) AS dataset_network_plan_complete,
-               ({affiliation_ready_sql})
-                   AS dataset_affiliation_organization_complete
-          FROM current_dataset_metadata AS dataset
-    ), current_resources AS NOT MATERIALIZED (
-        SELECT source.source_id, source.canonical_api_base,
-               dataset.dataset_id, dataset.run_id,
-               dataset.published_at AS dataset_published_at,
-               dataset.dataset_network_plan_complete,
-               dataset.dataset_affiliation_organization_complete,
-               resource.resource_type, resource.resource_id,
-               resource.payload_json::jsonb AS payload_json
-          FROM {schema}.provider_directory_source AS source
-          JOIN current_datasets AS dataset
-            ON dataset.endpoint_id = source.endpoint_id
-          JOIN {schema}.provider_directory_dataset_resource AS resource
-            ON resource.dataset_id = dataset.dataset_id
-    ), {_provider_directory_current_plan_resources_sql(schema, has_dataset_insurance_plan)}
-    """
 
 
 _CURRENT_PROVIDER_DIRECTORY_TYPED_RESOURCE_MODELS = (
@@ -2948,12 +2826,14 @@ def _provider_directory_role_evidence_sql(
     has_dataset_affiliation_organization: bool = False,
     has_dataset_insurance_plan: bool = False,
     has_dataset_insurance_plan_scalars: bool = False,
+    has_dataset_readiness_indexes: bool = False,
 ) -> str:
     """Build exact-key role evidence SQL with dataset-gated relation fallbacks."""
     return _PROVIDER_DIRECTORY_ROLE_EVIDENCE_SQL_TEMPLATE.format(
         current_resource_ctes_sql=_provider_directory_current_resource_ctes_sql(
             schema,
             has_dataset_insurance_plan,
+            has_dataset_readiness_indexes,
         ),
         current_typed_resource_ctes_sql=_current_typed_resource_ctes_sql(),
         role_ctes_sql=_provider_directory_role_ctes_sql(
@@ -3437,6 +3317,7 @@ async def _fetch_provider_directory_role_evidence_map(
                 table_flags[PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE],
                 table_flags[PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE],
                 _has_provider_directory_plan_scalars(table_flags),
+                all(table_flags.get(index_name, False) for _key, index_name in READINESS_INDEXES),
             )
         ),
         session=session,
@@ -3466,6 +3347,7 @@ async def _provider_directory_evidence_tables(
                 "table_names": table_names,
                 "column_table_names": [table_name for table_name, _column_name in optional_columns],
                 "column_names": [column_name for _table_name, column_name in optional_columns],
+                "readiness_index_names": [index_name for _key, index_name in READINESS_INDEXES],
             },
         )
     except Exception:
@@ -3481,6 +3363,7 @@ async def _provider_directory_evidence_tables(
     optional_capability_names = [
         *optional_names,
         *(f"{table_name}.{column_name}" for table_name, column_name in optional_columns),
+        *(index_name for _key, index_name in READINESS_INDEXES),
     ]
     return {
         capability_name: availability_by_name.get(capability_name, False)
@@ -3764,11 +3647,13 @@ def _provider_directory_affiliation_evidence_sql(
     has_dataset_network_plan: bool = False,
     has_dataset_insurance_plan: bool = False,
     has_dataset_insurance_plan_scalars: bool = False,
+    has_dataset_readiness_indexes: bool = False,
 ) -> str:
     """Resolve exact affiliation network and plan evidence from current resources."""
     current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(
         schema,
         has_dataset_insurance_plan,
+        has_dataset_readiness_indexes,
     )
     affiliation_ctes_sql = _provider_directory_requested_affiliation_ctes_sql(schema)
     plan_resolution_cte_sql = _affiliation_plan_resolution_cte_sql(
@@ -3903,6 +3788,7 @@ async def _fetch_provider_directory_affiliation_evidence_map(
                 table_flags[PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE],
                 table_flags[PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE],
                 _has_provider_directory_plan_scalars(table_flags),
+                all(table_flags.get(index_name, False) for _key, index_name in READINESS_INDEXES),
             )
         ),
         session=session,
