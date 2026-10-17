@@ -27,7 +27,7 @@ from tests.test_reference_family_source_copy import (
     _nucc_completed_handoff,
     _nucc_stage_receipt,
 )
-from tests.test_reference_handoff_boundary import _cleanup_inputs
+from tests.test_reference_handoff_boundary import _cleanup_cancellation_inputs, _cleanup_inputs
 
 
 class _Rows(list):
@@ -1201,6 +1201,60 @@ async def test_cleanup_rechecks_exact_terminal_ledger_before_any_physical_lookup
     assert "FOR UPDATE NOWAIT" in query and "node_id=:node_id" in query
     if fault in {"absent", "params", "test"}:
         session.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ("replaced-attempt", "completed-handoff-cancellation"))
+@pytest.mark.parametrize(
+    "status,fault",
+    [("canceled", key) for key in ("run_id", "node_id", "handoff_sha256", "status", "phase_detail", "finished_at")]
+    + [("canceled", key) for key in ("attempt_id", "attempt_started_at", "params", "unfinished", "failed", "rewritten")]
+    + [("canceling", key) for key in ("phase", "message", "error", "finished", "running")],
+)
+async def test_cleanup_cancellation_cannot_change_original_observation(reason, status, fault):
+    run, handoff, abandonment = _cleanup_cancellation_inputs(reason, status)
+    observed = abandonment["observed_run"]
+    rewritten_by_field = {**observed, **{key: run[key] for key in ("status", "phase_detail", "finished_at")}}
+    changes_by_fault = {
+        **{
+            key: (observed, key, "foreign")
+            for key in ("run_id", "node_id", "handoff_sha256", "status", "phase_detail", "finished_at")
+        },
+        **{key: (observed["progress"], key, "foreign") for key in ("attempt_id", "attempt_started_at")},
+        "params": (run, "params", {"source": "foreign"}),
+        "rewritten": (abandonment, "observed_run", rewritten_by_field),
+        "message": (run["progress"], "message", "foreign"),
+        "unfinished": (run, "finished_at", None),
+        "failed": (run, "status", "failed"),
+        "phase": (run, "phase_detail", "foreign"),
+        "error": (run, "error", "synthetic failure"),
+        "finished": (run, "finished_at", "2026-10-02T00:01:00Z"),
+        "running": (run, "status", "running"),
+    }
+    target_fields, field, field_value = changes_by_fault[fault]
+    target_fields[field] = field_value
+
+    async def scalar(statement, _parameters=None):
+        sql = str(statement)
+        if "pg_database" in sql:
+            return handoff["database_oid"]
+        assert "relation.oid FROM pg_catalog.pg_class" in sql
+        return handoff["import_run_oid"]
+
+    session = SimpleNamespace(execute=AsyncMock(return_value=_Rows([run])), scalar=AsyncMock(side_effect=scalar))
+    with pytest.raises(archive.ReferenceFamilyArchiveError):
+        await archive._require_nucc_cleanup_run(session, handoff, abandonment)
+    session.execute.assert_awaited_once()
+    assert "FOR UPDATE NOWAIT" in str(session.execute.await_args.args[0])
+
+
+@pytest.mark.parametrize("status", ("canceled", "cancelled"))
+@pytest.mark.parametrize("message", (None, "cancel requested", "foreign"))
+def test_completed_cleanup_requires_canceled_marker(status, message):
+    run, handoff, abandonment = _cleanup_cancellation_inputs("completed-handoff-cancellation", status)
+    run["progress"]["message"] = message
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="cancellation is not authenticated"):
+        archive._require_nucc_cleanup_terminal(run, handoff, run["metrics"]["nucc_handoff"], abandonment["reason"])
 
 
 @pytest.mark.parametrize("fault", ("shape", "empty", "extra", "live", "relation", "oid", "database"))
