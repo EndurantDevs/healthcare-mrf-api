@@ -13,6 +13,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from process.uhc_flex_practitioner_async_safety import drain_operation
+
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 MAX_COPY_BYTES = 16 * 1024 * 1024
 MAX_ROWS = 5_000
@@ -56,6 +58,43 @@ class MembershipCopyReceipt:
     copy_sha256: str
     input_byte_count: int
     copy_byte_count: int
+
+
+@dataclass(frozen=True)
+class MembershipCommandPartition:
+    additions_copy_bytes: bytes
+    additions_count: int
+    removals_copy_bytes: bytes
+    removals_count: int
+
+
+def partition_network_membership_commands(input_bytes: bytes) -> MembershipCommandPartition:
+    """Validate bounded native command streams without parsing individual Python rows."""
+    if type(input_bytes) is not bytes or len(input_bytes) > MAX_INPUT_BYTES:
+        raise MembershipCopyError("Membership input must be bounded bytes")
+    try:
+        native = importlib.import_module("ptg2_address_canon")
+        partition = native.partition_network_membership_commands
+    except ImportError, AttributeError:
+        raise MembershipCopyError("Native membership command partitioner is unavailable") from None
+    result = partition(input_bytes)
+    if type(result) is not tuple or len(result) != 4:
+        raise MembershipCopyError("Native membership command partition shape is invalid")
+    additions, additions_count, removals, removals_count = result
+    for copy_bytes, row_count in ((additions, additions_count), (removals, removals_count)):
+        if (
+            type(copy_bytes) is not bytes
+            or type(row_count) is not int
+            or not 0 <= row_count <= MAX_ROWS
+            or not 21 <= len(copy_bytes) <= MAX_COPY_BYTES
+            or not copy_bytes.startswith(_COPY_HEADER)
+            or not copy_bytes.endswith(b"\xff\xff")
+            or (row_count == 0) != (len(copy_bytes) == 21)
+        ):
+            raise MembershipCopyError("Native membership command COPY framing or bounds are invalid")
+    if additions_count + removals_count > MAX_ROWS or len(additions) + len(removals) > MAX_COPY_BYTES:
+        raise MembershipCopyError("Native membership command partition exceeds total bounds")
+    return MembershipCommandPartition(additions, additions_count, removals, removals_count)
 
 
 CandidateAuthority = Callable[[Any, MembershipCopyTarget], Awaitable[MembershipCopyTarget]]
@@ -112,7 +151,9 @@ async def copy_network_membership_batch(
         verified = await require_candidate_authority(connection, copy_target)
         if type(verified) is not MembershipCopyTarget or verified != copy_target:
             raise MembershipCopyError("Candidate authority does not match the requested target")
-        copy_bytes, row_count = await asyncio.to_thread(_encode, input_bytes)
+        copy_bytes, row_count = await drain_operation(
+            asyncio.to_thread(_encode, input_bytes), preserve_cancellation=True
+        )
         copy_digest = hashlib.sha256(copy_bytes).hexdigest()
         with io.BytesIO(copy_bytes) as copy_source:
             status = await connection.copy_to_table(

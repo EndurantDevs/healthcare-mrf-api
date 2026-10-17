@@ -67,26 +67,29 @@ def _impact_sql(recipe, namespace, staging, control_schema):
     if type(recipe.source_pin) is PinnedFHIRMembershipSource:
         sql = fhir_extraction_sql(recipe.source_pin, namespace, reviewed=True, approved_only=True)
         source_page, expanded_page = _FHIR_SOURCE_PAGE, _FHIR_EXPANDED_PAGE
+        aggregate_marker = ", resource_edges AS ("
     else:
         sql = aca_reviewed_sql(recipe.binding_coordinates.dataset_schema, control_schema, True)
         source_page, expanded_page = _ACA_SOURCE_PAGE, _ACA_EXPANDED_PAGE
+        aggregate_marker = ", encoded AS ("
     approved = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=namespace)
     prospective_bindings = approved.replace(f"{namespace}.registry_approved_record", "prospective")
     prefix = "WITH " + approved + ","
     if (
         not sql.startswith(prefix)
         or sql.count(", encoded AS (") != 1
+        or sql.count(aggregate_marker) != 1
         or sql.count(source_page) != 1
         or sql.count(expanded_page) != 1
         or (type(recipe.source_pin) is PinnedFHIRMembershipSource and sql.count(", resolved AS MATERIALIZED (") != 1)
     ):
         raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
     sql = sql.replace(prefix, "WITH " + _prospective_sql(namespace, staging) + "," + prospective_bindings + ",", 1)
-    # Retain the reviewed adapter's complete lineage/omission conditions, without
-    # membership JSON or COPY paging: an aggregate must count the whole recipe.
+    # Retain complete lineage/omission checks, but omit outcome documents and
+    # their generation bind along with membership JSON and COPY paging.
     sql = sql.replace(source_page, "", 1).replace(expanded_page, "\n", 1)
     sql = (
-        sql.split(", encoded AS (", 1)[0]
+        sql.split(aggregate_marker, 1)[0]
         + """
       SELECT (SELECT count(*) FROM page) AS source_rows,count(*) AS expanded_rows,
         count(*) FILTER(WHERE NOT unresolved AND NOT omitted) AS mapped_rows,

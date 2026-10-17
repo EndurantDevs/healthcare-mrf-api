@@ -22,6 +22,7 @@ from process.network_membership_candidate_lifecycle import _control_namespace
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, MembershipCopyTarget, _encode
 from process.registry_source_recipe_composition import _require_recipe_custody
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+from process.uhc_flex_practitioner_async_safety import drain_operation
 
 
 class InitialCMSOfficeBindingError(ValueError):
@@ -72,7 +73,7 @@ async def _verify_batch(connection, batch, after_resource, control_schema):
     )
     if replay != batch:
         raise InitialCMSOfficeBindingError("initial_cms_office_batch_differs")
-    _, count = await asyncio.to_thread(_encode, batch.input_bytes)
+    _, count = await drain_operation(asyncio.to_thread(_encode, batch.input_bytes), preserve_cancellation=True)
     if count != batch.membership_rows:
         raise InitialCMSOfficeBindingError("initial_cms_office_accounting_invalid")
 
@@ -143,7 +144,9 @@ SELECT NOT EXISTS(SELECT 1 FROM checked WHERE valid IS DISTINCT FROM true)
 
 async def _canonicalize(addresses):
     native = importlib.import_module("ptg2_address_canon")
-    canonical = await asyncio.to_thread(native.canonicalize_batch, addresses)
+    canonical = await drain_operation(
+        asyncio.to_thread(native.canonicalize_batch, addresses), preserve_cancellation=True
+    )
     encoded = json.dumps(canonical, separators=(",", ":"), allow_nan=False)
     if len(encoded.encode()) > 2 * MAX_INPUT_BYTES:
         raise InitialCMSOfficeBindingError("initial_cms_office_canonical_bound_exceeded")

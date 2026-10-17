@@ -23,7 +23,7 @@ from process.network_cms_registry_source_pair import (
 from process.network_registry_cms_source_attempt import RegistryCMSSourceAttempt
 from tests import cms_npd_admission_postgres_support as support
 from tests.provider_directory_cms_capacity_test_support import cms_execution
-from tests.test_network_cms_registry_source_pair_postgres import _publish_pair
+from tests.test_network_cms_registry_source_pair_postgres import _bounded_source_copy, _publish_pair
 from tests.test_network_registry_cms_prepared_pair_postgres import _prepared_input, _publish_stages
 from tests.test_provider_directory_cms_resource_batch_postgres import cms_resource_template as cms_resource_template
 
@@ -60,6 +60,7 @@ async def prepared_capture(monkeypatch, tmp_path, request):
                     capture_id=capture_id,
                     owner_role=roles[0],
                     runtime_roles=(roles[1],),
+                    source_copy=_bounded_source_copy(),
                 )
             else:
                 prepared, factory, retention_request = await _prepared_input(

@@ -2220,3 +2220,7 @@ process_group.add_command(code_sets, name="code-sets")
 process_group.add_command(ms_drg, name="ms-drg")
 process_group.add_command(clinical_reference, name="clinical-reference")
 process_group.add_command(terminology_synonyms, name="terminology-synonyms")
+
+from process.registry_publication_worker import registry_publication_worker_command
+
+process_group.add_command(registry_publication_worker_command, name="registry-publication-worker")

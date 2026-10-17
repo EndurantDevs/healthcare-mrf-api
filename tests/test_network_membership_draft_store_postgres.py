@@ -197,12 +197,16 @@ async def test_unknown_or_wrong_namespace_targets(membership_db, changes):
     assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_membership_draft') == 0
 
 
-async def test_duplicate_pair_and_archived_targets(membership_db):
+async def test_duplicate_commands_and_archived_targets(membership_db):
     connection, schema, _, _, _ = membership_db
     actor, network_id, provider_id, sites = await _seed(membership_db)
     row = _member(network_id, provider_id, sites[0])
-    for rows in ([row, row], [row, {**row, "evidence_id": "different-evidence"}]):
-        with pytest.raises(ValueError, match="target_invalid"):
+    addition_by_field = {**row, "operation": "add"}
+    for rows in (
+        [addition_by_field, addition_by_field],
+        [addition_by_field, {**addition_by_field, "evidence_id": "different-evidence"}],
+    ):
+        with pytest.raises(ValueError, match="membership_rows_invalid"):
             await _apply(membership_db, _command(network_id, rows), actor)
     for table, column, identity in (
         ("manual_provider_registry", "provider_id", UUID(provider_id)),
@@ -294,9 +298,9 @@ async def test_replay_precedes_native_targets_and_lifecycle(membership_db, monke
     await connection.execute(f'UPDATE "{schema}".manual_provider_registry SET archived=true')
 
     def unavailable(_):
-        raise MembershipCopyError("Native membership encoder is unavailable")
+        raise MembershipCopyError("Native membership command partitioner is unavailable")
 
-    monkeypatch.setattr(store, "_encode", unavailable)
+    monkeypatch.setattr(store, "partition_network_membership_commands", unavailable)
     assert await _apply(membership_db, creation, actor) == first
     with pytest.raises(RegistryRecordConflict, match="idempotency_conflict"):
         await _apply(membership_db, replace(creation, reason="Changed retry"), actor)
@@ -336,7 +340,10 @@ async def test_whole_caller_rollback_and_savepoint(membership_db):
     assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_membership_draft') == 0
     assert await connection.fetchval(f'SELECT draft_revision FROM "{schema}".registry_revision_control') == before
     async with sessions() as session, session.begin():
-        invalid = replace(creation, fields={"memberships_json": [creation.fields["memberships_json"][0]] * 2})
+        invalid = replace(
+            creation,
+            fields={"memberships_json": [{**creation.fields["memberships_json"][0], "location_id": str(uuid4())}]},
+        )
         with pytest.raises(ValueError, match="target_invalid"):
             await store.apply_registry_record_command(
                 session, invalid, actor, schema=schema, source_schema=source_schema
@@ -356,13 +363,13 @@ async def test_native_bounds_and_fixed_query_count(membership_db, monkeypatch):
     )
     membership_rows = [_member(network_id, provider_id, site) for site in site_ids]
     sql_counts, native_counts = [], []
-    original_encoder = store._encode
+    original_encoder = store.partition_network_membership_commands
 
     def encode_once(input_bytes):
         native_counts.append(len(json.loads(input_bytes)))
         return original_encoder(input_bytes)
 
-    monkeypatch.setattr(store, "_encode", encode_once)
+    monkeypatch.setattr(store, "partition_network_membership_commands", encode_once)
     for row_count, operation, revision in ((1, "create", 0), (5000, "correct", 1)):
         statements = []
 

@@ -13,6 +13,7 @@ import asyncpg
 from process.network_address_projection import _identifier
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, _encode
 from process.network_serving_read import PinnedNetworkServingManifest, resolve_network_serving_manifest
+from process.uhc_flex_practitioner_async_safety import drain_operation
 
 
 class RetainedSiteAdoptionError(ValueError):
@@ -184,7 +185,7 @@ async def resolve_retained_site_adoptions(
         expected_source = json.dumps(asdict(source), sort_keys=True, separators=(",", ":"), allow_nan=False)
         generation_id = source.generation_id
         selection_rows, projected_bytes = _input_rows(input_bytes)
-        _, row_count = await asyncio.to_thread(_encode, projected_bytes)
+        _, row_count = await drain_operation(asyncio.to_thread(_encode, projected_bytes), preserve_cancellation=True)
         if row_count != len(selection_rows):
             raise RetainedSiteAdoptionError("Retained site adoption input is invalid")
         verified = await _verified_source(connection, generation_id, expected_source, control_schema)

@@ -84,7 +84,10 @@ def test_group_migration_extends_only_the_actual_current_receipt_head():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261015020000_custom_import_query_projections"]
+    assert script.get_heads() == ["20261016070000_registry_allowed_plan_scope"]
+    assert script.get_revision("20261016070000_registry_allowed_plan_scope").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
     assert script.get_revision(REVISION).down_revision == PREDECESSOR
     assert script.get_revision(PREDECESSOR).down_revision == "20261010020000_registry_ptg_office_retention"
     assert script._upgrade_revs("head", PREDECESSOR)[0].revision.revision == REVISION

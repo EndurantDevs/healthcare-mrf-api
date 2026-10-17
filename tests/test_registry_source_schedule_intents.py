@@ -55,14 +55,14 @@ def test_cms_weekly_latest_elapsed_window(clock, due):
         ("2024-03-01T03:00:00+00:00", "2024-03-01T03:00:00+00:00"),
     ],
 )
-@pytest.mark.parametrize("system,source_id", [("cms", "commercial-mlr"), ("naic", "company-directory")])
+@pytest.mark.parametrize("system,source_id", [("cms", "commercial-mlr"), ("naic", "company-listings")])
 def test_mlr_and_naic_monthly_calendar_window(clock, due, system, source_id):
     scope = _scope(source_system=system, source_id=source_id)
     batch = build_registry_source_schedule_intents([scope], _clock(clock))
     assert len(batch.intents) == 1 and batch.intents[0].due_at == _clock(due)
 
 
-@pytest.mark.parametrize("system,source_id", [("cms", "commercial-mlr"), ("naic", "company-directory")])
+@pytest.mark.parametrize("system,source_id", [("cms", "commercial-mlr"), ("naic", "company-listings")])
 def test_first_representable_window_has_no_underflow(system, source_id):
     scope = _scope(source_system=system, source_id=source_id)
     before = build_registry_source_schedule_intents([scope], datetime(1, 1, 1, 2, 59, tzinfo=timezone.utc))
@@ -131,7 +131,7 @@ def test_explicit_scope_policy_and_optional_year_never_collide():
         _scope(reporting_year=2025),
         _scope(edition_policy="fixed-year", reporting_year=2024),
         _scope(source_id="plan-finder"),
-        _scope(source_system="naic", source_id="company-directory"),
+        _scope(source_system="naic", source_id="company-listings"),
     ]
     batch = build_registry_source_schedule_intents(scopes, _clock())
     assert len(batch.intents) == 6 and len({intent.dedup_key for intent in batch.intents}) == 6
@@ -146,7 +146,7 @@ def test_explicit_scope_policy_and_optional_year_never_collide():
 
 def test_unavailable_and_unsupported_do_not_block_ready_sources():
     scopes = [
-        _scope(source_system="naic", source_id="company-directory", available=False),
+        _scope(source_system="naic", source_id="company-listings", available=False),
         _scope(),
         _scope(source_id="plan-finder"),
         _scope(source_system="manual", source_id="company"),
@@ -155,7 +155,7 @@ def test_unavailable_and_unsupported_do_not_block_ready_sources():
     batch = build_registry_source_schedule_intents(scopes, _clock())
     assert {intent.source_id for intent in batch.intents} == {"commercial-mlr", "plan-finder"}
     assert {(skip.source_system, skip.source_id, skip.reason) for skip in batch.skipped} == {
-        ("naic", "company-directory", "unavailable"),
+        ("naic", "company-listings", "unavailable"),
         ("manual", "company", "unsupported"),
         ("naic", "plan-finder", "unsupported"),
     }
@@ -263,3 +263,11 @@ def test_revalidation_never_mutates_caller_scope():
     object.__setattr__(scope, "last_checked_at", offset_check)
     batch = build_registry_source_schedule_intents([scope], _clock())
     assert len(batch.intents) == 1 and scope.last_checked_at is offset_check
+
+
+def test_company_directory_is_not_an_alias_for_listing_source():
+    scope = _scope(source_system="naic", source_id="company-directory")
+    batch = build_registry_source_schedule_intents([scope, _scope()], _clock())
+    assert len(batch.intents) == 1 and batch.intents[0].source_system == "cms"
+    assert len(batch.skipped) == 1
+    assert (batch.skipped[0].source_id, batch.skipped[0].reason) == ("company-directory", "unsupported")

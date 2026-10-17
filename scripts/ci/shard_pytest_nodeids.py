@@ -10,6 +10,35 @@ from pathlib import Path
 from typing import Sequence
 
 TEST_PROCESS_TIMEOUT_SECONDS = "295s"
+REGISTRY_TEST_SHARDS = {
+    "tests/test_cms_publication_source_session_postgres.py::test_default_pool_and_reader_privileges_are_preserved": 5,
+    "tests/test_cms_publication_source_session_postgres.py::test_owner_handle_stays_out_of_prepared_manifest[initial]": 4,
+    "tests/test_company_network_link_store_postgres.py::test_concurrent_identical_commands_return_one_immutable_batch": 3,
+    "tests/test_registry_publication_consumer_postgres.py::test_retained_recipe_database_failure_resumes_exact_request[recipe-isolation]": 4,
+    "tests/test_registry_publication_consumer_postgres.py::test_retained_recipe_database_failure_resumes_exact_request[recipe-manifest]": 4,
+    "tests/test_registry_publication_consumer_postgres.py::test_retained_recipe_database_failure_resumes_exact_request[selection-approved]": 4,
+    "tests/test_registry_publication_consumer_postgres.py::test_retained_recipe_database_failure_resumes_exact_request[selection-candidate]": 4,
+    "tests/test_registry_publication_consumer_postgres.py::test_retained_recipe_database_failure_resumes_exact_request[custody-timeout]": 1,
+    "tests/test_network_cms_registry_complete_publication_postgres.py::test_complete_publication_and_retained_pair": 2,
+    "tests/test_registry_approval_preview_postgres.py::test_complete_imported_counts_above_copy_page[rebind-1-10000-0]": 6,
+    "tests/test_registry_approval_preview_postgres.py::test_complete_imported_counts_above_copy_page[close-1-5000-5000]": 6,
+    "tests/test_cms_publication_source_session_postgres.py::test_prepared_owner_handle_is_optional_and_private": 0,
+    "tests/test_network_custom_address_source_postgres.py::test_bulk_approved_pairs_have_fixed_native_query_count": 2,
+    "tests/test_network_registry_cms_prepared_pair_postgres.py::test_native_wal_attribution_preserves_original_refusal": 5,
+    "tests/test_network_registry_cms_prepared_cleanup_postgres.py::test_native_dependency_refusal_rolls_back_both_drops[external_view]": 5,
+    "tests/test_network_registry_cms_prepared_cleanup_postgres.py::test_native_tampering_refuses_removal[address_acl]": 1,
+    "tests/test_network_registry_cms_prepared_cleanup_postgres.py::test_native_tampering_refuses_removal[raw_acl]": 0,
+    "tests/test_network_registry_cms_prepared_cleanup_postgres.py::test_native_catalog_identity_preserves_search_path_and_rejects_index_loss": 5,
+    "tests/test_network_registry_cms_prepared_cleanup_postgres.py::test_native_cleanup_requires_caller_isolation_and_uncontended_locks": 5,
+    "tests/test_registry_source_recipe_composition_postgres.py::test_generic_source_cannot_enter_production_stage": 2,
+    "tests/test_registry_source_import_postgres.py::test_module_entrypoint_admits_through_actual_configured_database": 4,
+    "tests/test_registry_approval_preview_postgres.py::test_cms_preview_counts_all_source_rows_above_both_native_page_limits[close-retained_cms_preview1]": 3,
+    "tests/test_network_registry_cms_prepared_cleanup_postgres.py::test_native_tampering_refuses_removal[comment]": 5,
+    "tests/test_network_membership_serving_indexes_postgres.py::test_large_candidate_uses_same_statement_count[20000]": 6,
+    "tests/test_network_registry_cms_prepared_pair_postgres.py::test_prepared_retention_native_binding[copy_bounds0]": 3,
+    "tests/test_network_registry_cms_prepared_cleanup_postgres.py::test_native_finalized_pair_is_preserved": 1,
+    "tests/test_network_registry_cms_prepared_cleanup_postgres.py::test_native_prepared_decode_and_exact_removal[tagged]": 3,
+}
 
 
 def pytest_addoption(parser) -> None:
@@ -94,20 +123,32 @@ def collect_nodeids(pytest_arguments: Sequence[str]) -> list[str]:
 def shard_index_for_nodeid(nodeid: str, shard_count: int) -> int:
     """Map one node ID to a stable shard index."""
 
+    if shard_count == 16 and nodeid in (
+        "tests/test_network_cms_registry_complete_publication_postgres.py::test_complete_publication_and_retained_pair",
+        "tests/test_registry_publication_consumer_postgres.py::test_provider_custody_timeout_retains_lease_and_resumes_exact_request",
+    ):
+        # Balance expensive publication proofs under the existing process limit.
+        return 15
     digest = hashlib.sha256(nodeid.encode("utf-8")).digest()
     shard_index = int.from_bytes(digest, byteorder="big") % shard_count
     if shard_count == 8:
         # Balance expensive proofs without changing the remaining hash assignment.
-        if nodeid == (
-            "tests/test_network_cms_registry_complete_publication_postgres.py"
-            "::test_complete_publication_and_retained_pair"
+        if nodeid in REGISTRY_TEST_SHARDS:
+            return REGISTRY_TEST_SHARDS[nodeid]
+        if shard_index == 1 and nodeid.split("::", 1)[0] == (
+            "tests/test_network_registry_cms_prepared_cleanup_postgres.py"
         ):
-            return 2
-        if nodeid == (
-            "tests/test_registry_approval_preview_postgres.py"
-            "::test_complete_imported_counts_above_copy_page[rebind-1-10000-0]"
+            return 7
+        if shard_index == 0 and nodeid.split("::", 1)[0] == (
+            "tests/test_network_registry_cms_prepared_cleanup_postgres.py"
         ):
-            return 6
+            return 5
+        if shard_index == 2 and nodeid.split("::", 1)[0] in (
+            "tests/test_registry_source_selection_receipt_postgres.py",
+            "tests/test_network_initial_source_office_bindings_postgres.py",
+            "tests/test_network_legacy_alias_adoption_postgres.py",
+        ):
+            return 1
         if shard_index == 2 and nodeid.split("::", 1)[0] in (
             "tests/test_registry_publication_execution_postgres.py",
             "tests/test_provider_directory_cms_resource_batch_postgres.py",

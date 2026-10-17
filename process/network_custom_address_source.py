@@ -12,7 +12,13 @@ import asyncpg
 
 from db.models.entity_address_unified import EntityAddressUnified
 from db.registry_schema import registry_schema
-from process.network_address_projection import PinnedAddressSource, _identifier
+from process.network_address_projection import (
+    NetworkAddressProjectionError,
+    PinnedAddressSource,
+    _copy_projection_rows,
+    _identifier,
+    _projection_columns,
+)
 from process.network_approved_site_source import copy_approved_site_rows, verify_approved_site_sources
 from process.network_membership_writer_closure import _NATIVE_WRITER_PRIVILEGES_SQL, _protected_owner
 
@@ -155,7 +161,8 @@ async def _closed(connection, schema_oid, owner_oid, runtime_roles, relation_nam
         raise NetworkCustomAddressSourceError("Native owner or runtime privileges are not closed")
 
 
-_APPROVED_CTE = """WITH approved AS MATERIALIZED (
+# Let exact kind/key predicates use the approved-record primary key.
+_APPROVED_CTE = """WITH approved AS NOT MATERIALIZED (
  SELECT * FROM {control}.registry_approved_record WHERE approved_revision=$1
    AND record_kind IN ('provider','location','membership','site_binding')
 ), pairs AS MATERIALIZED (
@@ -163,7 +170,8 @@ _APPROVED_CTE = """WITH approved AS MATERIALIZED (
  FROM approved head CROSS JOIN LATERAL jsonb_to_recordset(
    CASE WHEN head.record_kind='membership' AND head.record_json->'archived'='false'::jsonb
      THEN head.record_json->'memberships_json' ELSE '[]'::jsonb END)
-   AS member(network_id integer,provider_system text,provider_id text,location_id uuid,evidence_id text)
+   AS member(network_id integer,provider_system text,provider_id text,location_id uuid,evidence_id text,operation text)
+ WHERE coalesce(member.operation,'add')='add'
 ), custom AS MATERIALIZED (
  SELECT pair.*,location.record_json AS site,provider.record_json AS provider,
    encode(sha256(convert_to(jsonb_build_array('network_custom',pair.provider_system,pair.provider_id,pair.location_id)::text,'UTF8')),'hex') AS location_key
@@ -207,7 +215,19 @@ async def _approved_identity(connection, control, revision, *, retained=False):
     return summary
 
 
-async def _build_heaps(connection, schema_name, base_source, control, revision, npi_source):
+async def _verify_retained_rows(connection, base_table, address_table, copied_rows):
+    accounting = await connection.fetchrow(f"""SELECT
+      (SELECT count(*) FROM {base_table} WHERE row_origin<>'network_custom') AS expected_rows,
+      (SELECT count(*) FROM {address_table}) AS actual_rows,
+      EXISTS((SELECT * FROM {base_table} WHERE row_origin<>'network_custom'
+        EXCEPT ALL SELECT * FROM {address_table}) UNION ALL
+        (SELECT * FROM {address_table} EXCEPT ALL
+         SELECT * FROM {base_table} WHERE row_origin<>'network_custom')) AS differs""")
+    if copied_rows != accounting["expected_rows"] or copied_rows != accounting["actual_rows"] or accounting["differs"]:
+        raise NetworkCustomAddressSourceError("Retained address COPY accounting or full-row parity differs")
+
+
+async def _build_heaps(connection, schema_name, base_source, control, revision, npi_source, base_oid):
     site_sources = await verify_approved_site_sources(
         connection, approved_revision=revision, control_schema=control[1:-1]
     )
@@ -215,12 +235,20 @@ async def _build_heaps(connection, schema_name, base_source, control, revision, 
     address_table = namespace + ".entity_address_unified"
     base_table = f"{_identifier(base_source.schema_name)}.{_identifier(base_source.table_name)}"
     npi_table = f"{_identifier(npi_source.schema_name)}.{_identifier(npi_source.table_name)}" if npi_source else None
+    await connection.execute(f"LOCK TABLE {base_table} IN ACCESS SHARE MODE NOWAIT")
+    if await connection.fetchval("SELECT to_regclass($1)::oid::bigint", base_table) != base_oid:
+        raise NetworkCustomAddressSourceError("Retained address native identity differs")
+    # Validate the existing native key; retention keeps every original column.
+    await _projection_columns(connection, base_table)
     await connection.execute(f"CREATE SCHEMA {namespace}")
     await connection.execute(f"CREATE TABLE {address_table} (LIKE {base_table} INCLUDING DEFAULTS)")
     await connection.execute(f"ALTER TABLE {address_table} ADD PRIMARY KEY(location_key)")
-    await connection.execute(
-        f"INSERT INTO {address_table} SELECT * FROM {base_table} WHERE row_origin<>'network_custom'"
+    copied_rows = await _copy_projection_rows(
+        connection,
+        schema_name,
+        f"SELECT a.* FROM (SELECT * FROM {base_table} WHERE row_origin<>'network_custom') a",
     )
+    await _verify_retained_rows(connection, base_table, address_table, copied_rows)
     await connection.execute(f"""CREATE TABLE {namespace}.provider_location_binding(
       provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,
       location_key varchar(64) NOT NULL UNIQUE,entity_type text NOT NULL,entity_id text NOT NULL,
@@ -427,7 +455,13 @@ async def _prepare_artifact(connection, recipe, schema_name, control):
             raise NetworkCustomAddressSourceError("Retained composition recipe differs")
         return await verify_custom_address_source(connection, receipt)
     await _build_heaps(
-        connection, schema_name, recipe.base_source, control, recipe.approved_revision, recipe.npi_source
+        connection,
+        schema_name,
+        recipe.base_source,
+        control,
+        recipe.approved_revision,
+        recipe.npi_source,
+        recipe.source_oids[1],
     )
     await _prepare_office_lookup(connection, schema_name)
     owner_oid = await _freeze(connection, schema_name, recipe.owner_role, recipe.runtime_roles)
@@ -505,8 +539,8 @@ async def prepare_custom_address_source(
                 PinnedAddressSource(schema_name, "entity_address_unified", "prepared"),
             )
             return await _prepare_artifact(connection, recipe, schema_name, control)
-    except asyncpg.PostgresError:
-        raise NetworkCustomAddressSourceError("Composition native preparation failed") from None
+    except (asyncpg.PostgresError, NetworkAddressProjectionError) as error:
+        raise NetworkCustomAddressSourceError("Composition native preparation failed") from error
 
 
 def _from_document(document):

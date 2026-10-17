@@ -154,11 +154,11 @@ def test_sealed_append_plans_replace_only_an_existing_function(monkeypatch, oper
 
 
 def test_sealed_append_plans_extend_the_single_installed_migration_head():
+    """Preserve every upgrade step from the deployed profile revision to the sole head."""
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    revision = _plans_migration().revision
-    assert script.get_heads() == ["20261015020000_custom_import_query_projections"]
+    assert script.get_heads() == ["20261016070000_registry_allowed_plan_scope"]
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )
@@ -168,7 +168,7 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
     assert tuple(
         step.revision.revision for step in script._upgrade_revs("head", "20261001110000_profile_initial_publication")
     ) == (
-        revision,
+        _plans_migration().revision,
         "20261005030000_source_profile_statement_pins",
         "20261005100000_rooted_graph_set_validation",
         "20261005110000_ptg_set_validation",
@@ -211,6 +211,7 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
         "20261012010000_company_registry_name_origin",
         "20261013010000_registry_custom_history_events",
         "20261015020000_custom_import_query_projections",
+        "20261016070000_registry_allowed_plan_scope",
     )
 
 

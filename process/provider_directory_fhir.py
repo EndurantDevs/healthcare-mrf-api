@@ -17914,20 +17914,19 @@ def _artifact_dataset_scoped_state_from_row(
 ) -> dict[str, Any]:
     """Return exact dataset admission identity fields used only by Profile."""
 
+    cohort_complete = dataset_row_map.get("dataset_scoped_cohort_complete")
+    retry_exhausted = dataset_row_map.get("dataset_scoped_retry_exhausted_count")
+    semantic_as_of = _clean_text(dataset_row_map.get("dataset_scoped_projection_as_of"))
+    if dataset_row_map.get("source_id") == "cms-npd":
+        semantic_as_of = _dataset_semantic_projection_as_of(
+            dataset_row_map, _dataset_resource_hash_contract(dataset_row_map)
+        )
     return {
         "dataset_scoped_ready": (dataset_row_map.get("dataset_scoped_ready") is True),
         "dataset_scoped_variant": _clean_text(dataset_row_map.get("dataset_scoped_variant")),
-        "dataset_scoped_cohort_complete": (
-            dataset_row_map.get("dataset_scoped_cohort_complete")
-            if type(dataset_row_map.get("dataset_scoped_cohort_complete")) is bool
-            else None
-        ),
-        "dataset_scoped_retry_exhausted_count": (
-            dataset_row_map.get("dataset_scoped_retry_exhausted_count")
-            if type(dataset_row_map.get("dataset_scoped_retry_exhausted_count")) is int
-            else None
-        ),
-        "semantic_projection_as_of": _clean_text(dataset_row_map.get("dataset_scoped_projection_as_of")),
+        "dataset_scoped_cohort_complete": cohort_complete if type(cohort_complete) is bool else None,
+        "dataset_scoped_retry_exhausted_count": retry_exhausted if type(retry_exhausted) is int else None,
+        "semantic_projection_as_of": semantic_as_of,
         "source_authority_id": _clean_text(dataset_row_map.get("dataset_scoped_authority_id")),
         "admission_id": _clean_text(dataset_row_map.get("dataset_scoped_admission_id")),
         "operation_key": _clean_text(dataset_row_map.get("dataset_scoped_operation_key")),

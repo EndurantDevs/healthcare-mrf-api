@@ -134,3 +134,51 @@ async def test_database_failure_never_exposes_source_values(monkeypatch):
     result = await endpoint.list_entities(request, "medical-groups")
     assert result.status == 503
     assert b"synthetic-private-source-value" not in result.body
+
+
+@pytest.mark.parametrize(
+    "selector",
+    (
+        "network_ids=0",
+        "network_ids=1,1",
+        "network_ids=2147483648",
+        "network_ids=01",
+        "network_ids=1,,2",
+        "network_generation=1",
+        "network_ids=1&network_generation=00",
+        "network_ids=1&network_generation=9223372036854775808",
+    ),
+)
+def test_canonical_entity_selectors_remain_strict_and_distinct_from_source_generation(selector):
+    with pytest.raises(DirectoryReadError) as caught:
+        parse_directory_read("plans", None, "entities", "source_id=cms-npd&" + selector)
+    assert caught.value.status == 400
+
+
+def test_scoped_cursor_binds_source_canonical_generation_selected_ids_and_access_scope():
+    query = parse_directory_read("plans", None, "entities", "source_id=cms-npd&network_ids=2,1&network_generation=9")
+    assert query.network_ids == (1, 2) and query.network_generation == 9
+    query = replace(query, access_scope_sha256="a" * 64)
+    cursor = issue_directory_cursor(KEY, query, "gen_source", ENTITY_ID, now=100)
+    pinned = replace(query, cursor=cursor)
+    assert read_directory_cursor(KEY, pinned, "gen_source", now=101) == ENTITY_ID
+    for changed in ({"network_ids": (1,)}, {"network_generation": 10}, {"access_scope_sha256": "b" * 64}):
+        with pytest.raises(DirectoryReadError) as caught:
+            read_directory_cursor(KEY, replace(pinned, **changed), "gen_source", now=101)
+        assert caught.value.status == 409
+    with pytest.raises(DirectoryReadError):
+        read_directory_cursor(KEY, pinned, "gen_other_source", now=101)
+
+
+@pytest.mark.asyncio
+async def test_scoped_cms_doctors_never_uses_the_legacy_reader(monkeypatch):
+    async def should_not_read(*args):
+        pytest.fail("scoped request reached legacy source reader")
+
+    monkeypatch.setattr(endpoint, "require_control_auth", lambda request: None)
+    monkeypatch.setattr(endpoint, "read_medical_groups", should_not_read)
+    request = SimpleNamespace(
+        query_string="source_id=cms-doctors&network_ids=1", headers={}, ctx=SimpleNamespace(sa_session=None)
+    )
+    result = await endpoint.list_entities(request, "medical-groups")
+    assert result.status == 503 and result.headers["Cache-Control"] == "private, no-store"

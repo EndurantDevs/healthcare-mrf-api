@@ -20,6 +20,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
+import asyncpg
+
 from process.network_address_projection import _identifier
 from process.network_bootstrap_sources import _copy_native_batch, _CopyBatchTooLarge
 from process.network_custom_address_source import _require_transaction
@@ -841,6 +843,8 @@ async def capture_retained_cms_fhir_source_epoch(
             return epoch
     except FHIRSourceEpochError:
         raise
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError, ConnectionError) as error:
+        raise FHIRSourceEpochError("fhir_source_epoch_unavailable") from error
     except Exception:
         raise FHIRSourceEpochError("fhir_source_epoch_unavailable") from None
 
@@ -870,5 +874,7 @@ async def require_retained_cms_fhir_source_epoch(connection, source_pin, epoch, 
         return epoch
     except FHIRSourceEpochError:
         raise
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError, ConnectionError) as error:
+        raise FHIRSourceEpochError("fhir_source_epoch_unavailable") from error
     except Exception:
         raise FHIRSourceEpochError("fhir_source_epoch_unavailable") from None

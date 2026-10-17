@@ -8,13 +8,12 @@ from typing import Any, Mapping
 
 from sqlalchemy import text
 
-from api.plan_pricing_projection_contract import SCHEMA
+from api.plan_pricing_projection_contract import SCHEMA, PlanPricingProjectionUnavailable
 from api.plan_release_serving import (
     PlanReleaseServingSelection,
     annotate_plan_release_response,
 )
 from api.ptg2_response import _coerce_numeric_rate, _is_request_flag_enabled
-
 
 PROJECTION_CONTRACT = "plan_pricing_em_distance_v1"
 EM_CODES = ("99203", "99204", "99205", "99213", "99214", "99215")
@@ -59,7 +58,7 @@ def _radius(args: Mapping[str, Any]) -> float | None:
         raw_radius = args.get("radius_miles")
     try:
         radius = float(25 if raw_radius in (None, "", "null") else raw_radius)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return radius if 0 <= radius <= 25 else None
 
@@ -68,7 +67,7 @@ def _is_bounded_page(args: Mapping[str, Any]) -> bool:
     try:
         limit = int(args.get("limit") or 25)
         offset = int(args.get("offset") or 0)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return False
     return 1 <= limit <= 100 and 0 <= offset and offset + limit <= 200
 
@@ -86,22 +85,15 @@ def _request_code_index(args: Mapping[str, Any]) -> int | None:
     code_system = str(args.get("code_system") or "CPT").strip().upper()
     has_location = bool(
         str(args.get("zip5") or args.get("zip") or "").strip()
-        or (
-            args.get("lat") not in (None, "", "null")
-            and args.get("long") not in (None, "", "null")
-        )
+        or (args.get("lat") not in (None, "", "null") and args.get("long") not in (None, "", "null"))
     )
     if (
         code_system not in {"CPT", "HCPCS"}
         or code not in _CODE_INDEX
         or str(args.get("view") or "").strip().lower() != "card"
         or not _is_request_flag_enabled(args.get("include_providers"), default=True)
-        or str(args.get("order_by") or "").strip().lower()
-        not in {"distance", "distance_miles"}
-        or (
-            args.get("order") not in (None, "", "null")
-            and str(args.get("order")).strip().lower() != "asc"
-        )
+        or str(args.get("order_by") or "").strip().lower() not in {"distance", "distance_miles"}
+        or (args.get("order") not in (None, "", "null") and str(args.get("order")).strip().lower() != "asc")
         or not has_location
         or _radius(args) is None
         or not _is_bounded_page(args)
@@ -142,18 +134,14 @@ def em_distance_retry_option(
         return None
     retry_args_by_field = {key: args.get(key) for key in args}
     retry_args_by_field.update(retry_by_field)
-    return (
-        retry_by_field
-        if _request_code_index(retry_args_by_field) is not None
-        else None
-    )
+    return retry_by_field if _request_code_index(retry_args_by_field) is not None else None
 
 
 _PROJECTION_READY_SQL = f"""
 SELECT EXISTS (
     SELECT 1
-      FROM {_table('plan_pricing_em_distance_attachment')} attachment
-      JOIN {_table('plan_pricing_em_distance_candidate')} candidate
+      FROM {_table("plan_pricing_em_distance_attachment")} attachment
+      JOIN {_table("plan_pricing_em_distance_candidate")} candidate
         ON candidate.projection_id = attachment.projection_id
      WHERE attachment.serving_revision_id = :serving_revision_id
        AND candidate.serving_revision_id = :serving_revision_id
@@ -168,7 +156,25 @@ async def is_em_distance_projection_ready(
     session: Any,
     selection: PlanReleaseServingSelection,
 ) -> bool:
-    """Return whether this exact serving revision has the sealed projection."""
+    """Return readiness from the exact serving authorities active for this request."""
+
+    from api.network_address_scope import current_network_address_scope
+
+    scope = current_network_address_scope()
+    if scope is not None:
+        from api.plan_pricing_em_attribution import resolve_em_attribution
+        from api.provider_service_source_policy import admitted_plan_release_bindings
+        from process.network_em_provider_inputs import resolve_em_provider_inputs
+
+        try:
+            await admitted_plan_release_bindings(session, selection)
+            await resolve_em_attribution(session, selection)
+            connection = await session.connection()
+            driver = (await connection.get_raw_connection()).driver_connection
+            await resolve_em_provider_inputs(driver, scope.manifest)
+        except PlanPricingProjectionUnavailable:
+            return False
+        return True
 
     ready_result = await session.execute(
         text(_PROJECTION_READY_SQL),
@@ -194,14 +200,14 @@ WITH center AS MATERIALIZED (
                4326
            )::geography AS point
       FROM (SELECT 1) singleton
-      LEFT JOIN {_table('geo_zip_lookup')} zip ON zip.zip_code = :zip5
+      LEFT JOIN {_table("geo_zip_lookup")} zip ON zip.zip_code = :zip5
      WHERE (CAST(:latitude AS double precision) IS NOT NULL
             AND CAST(:longitude AS double precision) IS NOT NULL)
         OR zip.zip_code IS NOT NULL
 ), selected_projection AS MATERIALIZED (
     SELECT candidate.projection_id
-      FROM {_table('plan_pricing_em_distance_attachment')} attachment
-      JOIN {_table('plan_pricing_em_distance_candidate')} candidate
+      FROM {_table("plan_pricing_em_distance_attachment")} attachment
+      JOIN {_table("plan_pricing_em_distance_candidate")} candidate
         ON candidate.projection_id = attachment.projection_id
      WHERE attachment.serving_revision_id = :serving_revision_id
        AND candidate.serving_revision_id = :serving_revision_id
@@ -230,8 +236,8 @@ WITH center AS MATERIALIZED (
                rate.maximum_rates,
                rate.rate_counts,
                (location.point <-> center.point) / 1609.344 AS distance_miles
-          FROM {_table('plan_pricing_em_distance_location')} location
-          JOIN {_table('plan_pricing_em_distance_rate')} rate
+          FROM {_table("plan_pricing_em_distance_location")} location
+          JOIN {_table("plan_pricing_em_distance_rate")} rate
             ON rate.projection_id = location.projection_id
            AND rate.npi = location.npi
          WHERE location.projection_id = projection.projection_id
@@ -273,9 +279,7 @@ SELECT page.*, counts.candidate_count, counts.unique_count,
 """
 
 
-def _card_item(
-    card_row_by_field: Mapping[str, Any], code_index: int
-) -> dict[str, Any]:
+def _card_item(card_row_by_field: Mapping[str, Any], code_index: int) -> dict[str, Any]:
     minimum_rate_list = list(card_row_by_field.get("minimum_rates") or ())
     maximum_rate_list = list(card_row_by_field.get("maximum_rates") or ())
     rate_count_list = list(card_row_by_field.get("rate_counts") or ())
@@ -368,20 +372,27 @@ async def _progressive_page_rows(
     selection: PlanReleaseServingSelection,
     args: Mapping[str, Any],
     pagination: Any,
-    zip5: str | None,
-    latitude: float | None,
-    longitude: float | None,
+    location: tuple[str | None, float | None, float | None],
     code_index: int,
+    *,
+    page_sql: str | None = None,
+    extra_parameters: Mapping[str, Any] | None = None,
 ) -> tuple[list[Mapping[str, Any]], bool, bool, int] | None:
     """Read only enough nearest locations to prove the requested page."""
 
-    candidate_limit = max(
-        _INITIAL_LOCATION_WINDOW,
-        (int(pagination.offset) + int(pagination.limit) + 1) * 4,
-    )
+    if extra_parameters and set(extra_parameters) - {
+        "allowed_binding_ordinals",
+        "code_index",
+        "_canonical_network_ids",
+        "_network_excluded_ids",
+        "_network_approved_revision",
+    }:
+        raise ValueError("E&M page parameters cannot replace the bounded request")
+    zip5, latitude, longitude = location
+    candidate_limit = max(_INITIAL_LOCATION_WINDOW, (int(pagination.offset) + int(pagination.limit) + 1) * 4)
     while True:
         page_result = await session.execute(
-            text(_PAGE_SQL),
+            text(_PAGE_SQL if page_sql is None else page_sql),
             {
                 "serving_revision_id": selection.serving_revision_id,
                 "binding_set_digest": selection.binding_set_digest,
@@ -394,6 +405,7 @@ async def _progressive_page_rows(
                 "candidate_limit": candidate_limit,
                 "page_limit": int(pagination.limit) + 1,
                 "offset": int(pagination.offset),
+                **(extra_parameters or {}),
             },
         )
         page_rows_by_field = page_result.mappings().all()
@@ -402,22 +414,13 @@ async def _progressive_page_rows(
         unique_count = int(page_rows_by_field[0].get("unique_count") or 0)
         candidate_count = int(page_rows_by_field[0].get("candidate_count") or 0)
         is_window_exhausted = candidate_count < candidate_limit
-        has_page_boundary = unique_count > (
-            int(pagination.offset) + int(pagination.limit)
-        )
+        has_page_boundary = unique_count > (int(pagination.offset) + int(pagination.limit))
         if is_window_exhausted or has_page_boundary:
-            return (
-                page_rows_by_field,
-                is_window_exhausted,
-                has_page_boundary,
-                unique_count,
-            )
+            return page_rows_by_field, is_window_exhausted, has_page_boundary, unique_count
         if candidate_limit >= _MAX_LOCATION_WINDOW:
             from api.ptg2_serving import PTG2LocationScopeError
 
-            raise PTG2LocationScopeError(
-                "The E&M location window cannot prove a complete provider page."
-            )
+            raise PTG2LocationScopeError("The E&M location window cannot prove a complete provider page.")
         candidate_limit = min(candidate_limit * 2, _MAX_LOCATION_WINDOW)
 
 
@@ -438,35 +441,35 @@ async def search_plan_pricing_em_distance(
     try:
         latitude = None if zip5 else float(args.get("lat"))
         longitude = None if zip5 else float(args.get("long"))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
-    page_window = await _progressive_page_rows(
-        session,
-        selection,
-        args,
-        pagination,
-        zip5,
-        latitude,
-        longitude,
-        code_index,
-    )
+    from api.network_address_scope import current_network_address_scope
+
+    if current_network_address_scope() is not None:
+        from api.plan_pricing_em_managed import search_managed_em_distance
+
+        return await search_managed_em_distance(
+            session, selection, args, pagination, zip5, latitude, longitude, code_index
+        )
+    location = (zip5, latitude, longitude)
+    page_window = await _progressive_page_rows(session, selection, args, pagination, location, code_index)
     if page_window is None:
         return None
-    page_rows_by_field, is_window_exhausted, has_page_boundary, unique_count = (
-        page_window
-    )
+    page_rows_by_field, is_window_exhausted, has_page_boundary, unique_count = page_window
     card_list = [
         _card_item(card_row_by_field, code_index)
         for card_row_by_field in page_rows_by_field
         if card_row_by_field.get("npi") is not None
     ]
-    has_more = len(card_list) > int(pagination.limit) or (
-        not is_window_exhausted and not has_page_boundary
-    )
+    has_more = len(card_list) > int(pagination.limit) or (not is_window_exhausted and not has_page_boundary)
     card_list = card_list[: int(pagination.limit)]
-    total = unique_count if is_window_exhausted else max(
-        unique_count,
-        int(pagination.offset) + len(card_list) + int(has_more),
+    total = (
+        unique_count
+        if is_window_exhausted
+        else max(
+            unique_count,
+            int(pagination.offset) + len(card_list) + int(has_more),
+        )
     )
     return _projection_response(
         args,

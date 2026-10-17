@@ -2490,13 +2490,20 @@ async def test_get_npi_update_addr_coordinates_row_missing(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_canonical_stored_geocode_never_persists(monkeypatch):
+@pytest.mark.parametrize("with_profile", [False, True], ids=["absent-profile", "present-profile"])
+async def test_canonical_stored_geocode_never_persists(monkeypatch, with_profile):
     """Canonical detail may enrich stored coordinates without scheduling a global write."""
     from uuid import uuid4
 
+    from api import provider_profile_network_read
     from api.network_address_scope import network_address_read_scope
     from process.network_serving_read import PinnedNetworkServingManifest
 
+    profile_record = (
+        _cached_provider_profile_record("2026-07-30T15:00:00Z", "scoped-profile")[1518379601] if with_profile else None
+    )
+    scoped_profile = AsyncMock(return_value=profile_record)
+    monkeypatch.setattr(provider_profile_network_read, "read_address_scoped_directory_profile", scoped_profile)
     address_by_field = _archive_address_entry(1, "10 Main St")
     monkeypatch.setattr(npi_module, "_build_npi_details", _npi_details_builder([address_by_field]))
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
@@ -2520,6 +2527,11 @@ async def test_canonical_stored_geocode_never_persists(monkeypatch):
     assert response_body["address_list"][0]["lat"] == 41.0
     assert response_body["address_list"][0]["long"] == -87.0
     assert stored_query.await_count > 0
+    scoped_profile.assert_awaited_once_with(None, 1518379601, include_evidence=False)
+    if profile_record is None:
+        assert "provider_directory_profile" not in response_body
+    else:
+        assert response_body["provider_directory_profile"] == profile_record["profile"]
     download.assert_not_awaited()
     assert not app.tasks
 

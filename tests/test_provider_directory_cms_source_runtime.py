@@ -10,7 +10,9 @@ from uuid import UUID
 
 import pytest
 
+from process import provider_directory_profile_capacity_attestation as capacity_lease
 from process import provider_directory_profile_capacity_preflight_contract as preflight
+from process import provider_directory_profile_capacity_signing_guard as guard_contract
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.network_registry_cms_prepared_pair import RegistryCMSRetentionRequest
@@ -26,10 +28,12 @@ from tests.test_provider_directory_profile_capacity_attestation import _verify
 
 
 @pytest.fixture
-def source_case(monkeypatch):
+def source_case(monkeypatch, request):
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
     execution = cms_execution()
     policy = _retention_policy(execution)
+    if getattr(request, "param", None) is not None:
+        policy["source_pin"]["as_of"] = request.param
     guard = cms_guard(execution=execution)
     for name in ("control_plane_request", "healthcare_request"):
         guard[name]["cms_nonprofile_admission"]["registry_source_retention"] = deepcopy(policy)
@@ -279,3 +283,71 @@ async def test_specific_handles_remain_hidden_and_preserve_awaited_notification(
     session, pair = object(), object()
     await bound.notify_receipt(session, receipt_id=7, pair=pair)
     bound.notify_receipt.assert_awaited_once_with(session, receipt_id=7, pair=pair)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_case", ["2026-09-24"], indirect=True)
+async def test_source_epoch_can_differ_from_frozen_profile_date(source_case):
+    """Source time is authenticated by admission, separately from Profile time."""
+    source_as_of = "2026-09-24"
+    assert (
+        source_case.request.cms_nonprofile_admission["registry_source_retention"]["source_pin"]["as_of"] == source_as_of
+    )
+    assert source_case.bound.retention_request.source_pin.as_of == source_as_of
+    callback = AsyncMock(return_value=source_case.bound)
+    assert source_case.execution.attestation.desired_profile_as_of != source_as_of
+    assert await _bind(_invocation(callback), source_case) is source_case.bound
+    callback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_callback_cannot_move_both_profile_dates_together(source_case):
+    """A callback cannot change the frozen Profile epoch through shared payloads."""
+
+    async def authenticate(**arguments):
+        for execution in (arguments["execution"], arguments["request"].execution):
+            execution.attestation.payload["desired_profile_as_of"] = "2026-07-29"
+        return source_case.bound
+
+    with pytest.raises(ValueError, match="selection_changed"):
+        await _bind(_invocation(authenticate), source_case)
+    source_case.bound.notify_receipt.assert_not_awaited()
+
+
+@pytest.mark.parametrize("source_case", ["2026-09-24"], indirect=True)
+@pytest.mark.parametrize("changed_source_date", ["2026-09-25", "2026-07-29"])
+def test_changed_source_date_requires_a_new_signature(source_case, changed_source_date):
+    """Fresh hash links cannot authorize a change to an already signed source epoch."""
+    envelope = sign_guard(source_case.lease.signing_preflight_guard, cms=True)
+    body = envelope["lease"]
+    guard = body["signing_preflight_guard"]
+    for name in ("control_plane_request", "healthcare_request"):
+        guard[name]["cms_nonprofile_admission"]["registry_source_retention"]["source_pin"]["as_of"] = (
+            changed_source_date
+        )
+    rehash_guard(guard)
+    body["nonce"] = guard["healthcare_receipt"]["receipt_sha256"]
+    body["signing_preflight_guard_sha256"] = preflight.preflight_domain_sha256(
+        guard_contract.CAPACITY_SIGNING_PREFLIGHT_GUARD_DIGEST_DOMAIN, guard
+    )
+    body.pop("attestation_id")
+    body["attestation_id"] = capacity_lease.capacity_attestation_id(body)
+    with pytest.raises(capacity_lease.ProviderDirectoryCapacityLeaseError, match="invalid_signature"):
+        _verify(envelope, expected_capacity_geometry_hash=source_case.lease.capacity_geometry_hash)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_case", ["2026-09-24"], indirect=True)
+async def test_bound_source_date_must_equal_the_verified_policy(source_case):
+    changed = replace(
+        source_case.bound,
+        retention_request=replace(
+            source_case.bound.retention_request,
+            source_pin=replace(source_case.bound.retention_request.source_pin, as_of="2026-09-25"),
+        ),
+    )
+    callback = AsyncMock(return_value=changed)
+    with pytest.raises(ValueError, match="policy_changed"):
+        await _bind(_invocation(callback), source_case)
+    callback.assert_awaited_once()
+    source_case.bound.notify_receipt.assert_not_awaited()

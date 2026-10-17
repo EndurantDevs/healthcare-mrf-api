@@ -33,15 +33,10 @@ PROFILE_TABLE = "provider_directory_profile"
 PROFILE_EVIDENCE_TABLE = "provider_directory_profile_evidence"
 PROFILE_STAGE_PREFIX = "provider_directory_profile_stage"
 PROFILE_EVIDENCE_STAGE_PREFIX = "provider_directory_profile_evidence_stage"
-PROFILE_SPEC_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "specs/provider_directory_profile_sources.json"
-)
+PROFILE_SPEC_PATH = Path(__file__).resolve().parents[1] / "specs/provider_directory_profile_sources.json"
 PROFILE_SQL_PATH = Path(__file__).resolve().parent / "sql"
 PROFILE_SCHEMA_VERSION = 1
-PROFILE_BUILD_STRATEGY_VERSION = (
-    "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"
-)
+PROFILE_BUILD_STRATEGY_VERSION = "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"
 PROFILE_FACT_LIMIT = 100
 PROFILE_FACT_EVIDENCE_LIMIT = 25
 PROFILE_EVIDENCE_FACT_TYPES = (
@@ -95,18 +90,11 @@ def _render_sql_template(
     for token_name, replacement in replacements_by_token.items():
         token = "{{" + token_name + "}}"
         if token not in rendered_sql:
-            raise RuntimeError(
-                f"provider_directory_profile_sql_token_missing:{token_name}"
-            )
+            raise RuntimeError(f"provider_directory_profile_sql_token_missing:{token_name}")
         rendered_sql = rendered_sql.replace(token, str(replacement))
-    unresolved_tokens = sorted(
-        set(re.findall(r"\{\{[A-Z][A-Z0-9_]*\}\}", rendered_sql))
-    )
+    unresolved_tokens = sorted(set(re.findall(r"\{\{[A-Z][A-Z0-9_]*\}\}", rendered_sql)))
     if unresolved_tokens:
-        raise RuntimeError(
-            "provider_directory_profile_sql_tokens_unresolved:"
-            + ",".join(unresolved_tokens)
-        )
+        raise RuntimeError("provider_directory_profile_sql_tokens_unresolved:" + ",".join(unresolved_tokens))
     return rendered_sql
 
 
@@ -135,14 +123,10 @@ def valid_npi_sql(value_sql: str) -> str:
         divisor = 10 ** (10 - position)
         digit_sql = f"((({value_sql}) / {divisor}) % 10)"
         if position < 10 and position % 2:
-            digit_terms.append(
-                f"(({digit_sql} * 2) - CASE WHEN {digit_sql} >= 5 THEN 9 ELSE 0 END)"
-            )
+            digit_terms.append(f"(({digit_sql} * 2) - CASE WHEN {digit_sql} >= 5 THEN 9 ELSE 0 END)")
         else:
             digit_terms.append(digit_sql)
-    checksum_sql = "\n                + ".join(
-        [str(NPI_LUHN_PREFIX_DIGIT_SUM), *digit_terms]
-    )
+    checksum_sql = "\n                + ".join([str(NPI_LUHN_PREFIX_DIGIT_SUM), *digit_terms])
     return f"""(
             ({value_sql}) BETWEEN {NPI_MIN} AND {NPI_MAX}
             AND MOD(
@@ -199,18 +183,13 @@ def configured_retained_profile_source_ids(
     retained_entry_ids = set(source_spec["retained_entry_ids"])
     matrix = source_spec.get("verification_matrix")
     source_rows = matrix.get("sources") if isinstance(matrix, dict) else None
-    if not isinstance(source_rows, list) or any(
-        not isinstance(source_row, dict) for source_row in source_rows
-    ):
+    if not isinstance(source_rows, list) or any(not isinstance(source_row, dict) for source_row in source_rows):
         raise RuntimeError("provider_directory_profile_source_spec_invalid")
     retained_source_ids = [
-        source_row.get("source_id")
-        for source_row in source_rows
-        if source_row.get("entry_id") in retained_entry_ids
+        source_row.get("source_id") for source_row in source_rows if source_row.get("entry_id") in retained_entry_ids
     ]
     if len(retained_source_ids) != len(retained_entry_ids) or not all(
-        isinstance(source_id, str) and source_id in source_spec["source_ids"]
-        for source_id in retained_source_ids
+        isinstance(source_id, str) and source_id in source_spec["source_ids"] for source_id in retained_source_ids
     ):
         raise RuntimeError("provider_directory_profile_source_spec_invalid")
     return tuple(sorted(retained_source_ids))
@@ -225,9 +204,7 @@ def configured_dataset_scoped_profile_source_ids(
     dataset_scoped_entry_ids = set(source_spec["dataset_scoped_entry_ids"])
     matrix = source_spec.get("verification_matrix")
     source_rows = matrix.get("sources") if isinstance(matrix, dict) else None
-    if not isinstance(source_rows, list) or any(
-        not isinstance(source_row, dict) for source_row in source_rows
-    ):
+    if not isinstance(source_rows, list) or any(not isinstance(source_row, dict) for source_row in source_rows):
         raise RuntimeError("provider_directory_profile_source_spec_invalid")
     source_ids = [
         source_row.get("source_id")
@@ -235,8 +212,7 @@ def configured_dataset_scoped_profile_source_ids(
         if source_row.get("entry_id") in dataset_scoped_entry_ids
     ]
     if len(source_ids) != len(dataset_scoped_entry_ids) or not all(
-        isinstance(source_id, str) and source_id in source_spec["source_ids"]
-        for source_id in source_ids
+        isinstance(source_id, str) and source_id in source_spec["source_ids"] for source_id in source_ids
     ):
         raise RuntimeError("provider_directory_profile_source_spec_invalid")
     return tuple(sorted(source_ids))
@@ -250,18 +226,13 @@ def configured_dataset_scoped_profile_variant_groups(
     source_spec = load_profile_source_spec(path)
     matrix = source_spec.get("verification_matrix")
     source_rows = matrix.get("sources") if isinstance(matrix, dict) else None
-    if not isinstance(source_rows, list) or any(
-        not isinstance(source_row, dict) for source_row in source_rows
-    ):
+    if not isinstance(source_rows, list) or any(not isinstance(source_row, dict) for source_row in source_rows):
         raise RuntimeError("provider_directory_profile_source_spec_invalid")
     source_id_by_entry_id: dict[str, str] = {}
     for source_row in source_rows:
         entry_id = source_row.get("entry_id")
         source_id = source_row.get("source_id")
-        if (
-            isinstance(entry_id, str)
-            and entry_id in source_spec["dataset_scoped_entry_ids"]
-        ):
+        if isinstance(entry_id, str) and entry_id in source_spec["dataset_scoped_entry_ids"]:
             if (
                 entry_id in source_id_by_entry_id
                 or not isinstance(source_id, str)
@@ -272,13 +243,9 @@ def configured_dataset_scoped_profile_variant_groups(
     configured_groups: list[tuple[str, tuple[str, ...]]] = []
     for group in source_spec["dataset_scoped_variant_groups"]:
         try:
-            source_ids = tuple(
-                source_id_by_entry_id[entry_id] for entry_id in group["entry_ids"]
-            )
+            source_ids = tuple(source_id_by_entry_id[entry_id] for entry_id in group["entry_ids"])
         except KeyError as error:
-            raise RuntimeError(
-                "provider_directory_profile_source_spec_invalid"
-            ) from error
+            raise RuntimeError("provider_directory_profile_source_spec_invalid") from error
         configured_groups.append((group["group_id"], source_ids))
     return tuple(sorted(configured_groups))
 
@@ -372,9 +339,7 @@ def dataset_scoped_profile_source_ids_sql(
     source_ids = configured_dataset_scoped_profile_source_ids(path)
     if not source_ids:
         return "ARRAY[]::varchar[]"
-    values = ", ".join(
-        "'" + source_id.replace("'", "''") + "'" for source_id in source_ids
-    )
+    values = ", ".join("'" + source_id.replace("'", "''") + "'" for source_id in source_ids)
     return f"ARRAY[{values}]::varchar[]"
 
 
@@ -504,7 +469,7 @@ def profile_scope_source_ids_sql(source_ref: str) -> str:
                source.canonical_api_base,
                source.org_name,
                source.plan_name,
-               {profile_reviewed_source_authority_sql('source.source_id')} AS authority_id
+               {profile_reviewed_source_authority_sql("source.source_id")} AS authority_id
           FROM {source_ref} AS source
          WHERE source.endpoint_id IN (
                 SELECT configured.endpoint_id
@@ -522,9 +487,7 @@ def copy_existing_evidence_sql(
     target_ref: str,
 ) -> str:
     """Copy retained evidence for sources outside an incremental refresh."""
-    columns = ", ".join(
-        quote_identifier(column) for column in profile_evidence_columns()
-    )
+    columns = ", ".join(quote_identifier(column) for column in profile_evidence_columns())
     return f"""
         INSERT INTO {target_ref} ({columns})
         SELECT {columns}
@@ -680,18 +643,13 @@ _PROFILE_SCOPE_FACT_TYPES = {
     "SERVICE_FACT_SCOPE_SQL": ("service",),
     "ENDPOINT_FACT_SCOPE_SQL": ("endpoint",),
 }
-_PROFILE_QUALIFICATION_FACT_TYPES = frozenset(
-    {"taxonomy_qualification", "credential", "qualification"}
-)
+_PROFILE_QUALIFICATION_FACT_TYPES = frozenset({"taxonomy_qualification", "credential", "qualification"})
 
 
 def _validate_profile_evidence_request(
     request: _ProfileEvidenceSqlRequest,
 ) -> None:
-    if (
-        request.fact_type is not None
-        and request.fact_type not in PROFILE_EVIDENCE_FACT_TYPES
-    ):
+    if request.fact_type is not None and request.fact_type not in PROFILE_EVIDENCE_FACT_TYPES:
         raise ValueError(f"unsupported profile evidence fact type: {request.fact_type}")
     if request.role_bucket_count < 1:
         raise ValueError("profile role bucket count must be positive")
@@ -702,9 +660,7 @@ def _validate_profile_evidence_request(
 def _profile_evidence_write_bindings(
     request: _ProfileEvidenceSqlRequest,
 ) -> dict[str, str]:
-    evidence_columns = ", ".join(
-        quote_identifier(column) for column in profile_evidence_columns()
-    )
+    evidence_columns = ", ".join(quote_identifier(column) for column in profile_evidence_columns())
     result_sql = (
         """
         SELECT count(*)::bigint AS projected_rows,
@@ -718,15 +674,9 @@ def _profile_evidence_write_bindings(
         else f"SELECT {evidence_columns}\n          FROM normalized_facts"
     )
     return {
-        "WRITE_PREFIX_SQL": (
-            ""
-            if request.count_only
-            else f"INSERT INTO {request.target_ref} ({evidence_columns})"
-        ),
+        "WRITE_PREFIX_SQL": ("" if request.count_only else f"INSERT INTO {request.target_ref} ({evidence_columns})"),
         "RESULT_SQL": result_sql,
-        "CONFLICT_SQL": (
-            "" if request.count_only else "ON CONFLICT (evidence_key) DO NOTHING;"
-        ),
+        "CONFLICT_SQL": ("" if request.count_only else "ON CONFLICT (evidence_key) DO NOTHING;"),
     }
 
 
@@ -741,12 +691,9 @@ def _profile_evidence_reference_bindings(
         request.organization_ref,
         "provider_directory_organization_affiliation",
     )
-    affiliation_organization_ref = (
-        request.affiliation_organization_ref
-        or sibling_table_ref(
-            request.organization_ref,
-            "provider_directory_dataset_affiliation_organization",
-        )
+    affiliation_organization_ref = request.affiliation_organization_ref or sibling_table_ref(
+        request.organization_ref,
+        "provider_directory_dataset_affiliation_organization",
     )
     dataset_resource_ref = request.dataset_resource_ref or sibling_table_ref(
         request.practitioner_ref,
@@ -755,26 +702,24 @@ def _profile_evidence_reference_bindings(
     return {
         "SOURCE_REF": request.source_ref,
         "PRACTITIONER_REF": request.practitioner_ref,
+        "PRACTITIONER_TYPE_REF": request.practitioner_ref,
         "ROLE_REF": request.role_ref,
+        "ROLE_TYPE_REF": request.role_ref,
         "ORGANIZATION_REF": request.organization_ref,
+        "ORGANIZATION_TYPE_REF": request.organization_ref,
         "AFFILIATION_REF": affiliation_ref,
+        "AFFILIATION_TYPE_REF": affiliation_ref,
         "AFFILIATION_ORGANIZATION_REF": affiliation_organization_ref,
         "SERVICE_REF": request.service_ref,
+        "SERVICE_TYPE_REF": request.service_ref,
         "ENDPOINT_REF": endpoint_ref,
+        "ENDPOINT_TYPE_REF": endpoint_ref,
         "DATASET_RESOURCE_REF": dataset_resource_ref,
         "DATASET_SCOPED_SOURCE_IDS_SQL": (dataset_scoped_profile_source_ids_sql()),
-        "ROLE_PRACTITIONER_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
-            "role.practitioner_ref", "Practitioner"
-        ),
-        "ROLE_SERVICE_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
-            "service_reference.value", "HealthcareService"
-        ),
-        "ROLE_ENDPOINT_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
-            "endpoint_reference.value", "Endpoint"
-        ),
-        "ROLE_ORGANIZATION_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
-            "role.organization_ref", "Organization"
-        ),
+        "ROLE_PRACTITIONER_RESOURCE_ID_SQL": fhir_reference_resource_id_sql("role.practitioner_ref", "Practitioner"),
+        "ROLE_SERVICE_RESOURCE_ID_SQL": fhir_reference_resource_id_sql("service_reference.value", "HealthcareService"),
+        "ROLE_ENDPOINT_RESOURCE_ID_SQL": fhir_reference_resource_id_sql("endpoint_reference.value", "Endpoint"),
+        "ROLE_ORGANIZATION_RESOURCE_ID_SQL": fhir_reference_resource_id_sql("role.organization_ref", "Organization"),
     }
 
 
@@ -782,28 +727,21 @@ def _profile_branch_scope_sql(
     request: _ProfileEvidenceSqlRequest,
     branch_fact_types: tuple[str, ...] | frozenset[str],
 ) -> str:
-    return (
-        "TRUE"
-        if request.fact_type is None or request.fact_type in branch_fact_types
-        else "FALSE"
-    )
+    return "TRUE" if request.fact_type is None or request.fact_type in branch_fact_types else "FALSE"
 
 
 def _profile_evidence_scope_bindings(
     request: _ProfileEvidenceSqlRequest,
 ) -> dict[str, str]:
     bindings_by_name = {
-        token: _profile_branch_scope_sql(request, fact_types)
-        for token, fact_types in _PROFILE_SCOPE_FACT_TYPES.items()
+        token: _profile_branch_scope_sql(request, fact_types) for token, fact_types in _PROFILE_SCOPE_FACT_TYPES.items()
     }
     qualification_scope_sql = _profile_branch_scope_sql(
         request,
         _PROFILE_QUALIFICATION_FACT_TYPES,
     )
     if request.fact_type in _PROFILE_QUALIFICATION_FACT_TYPES:
-        qualification_scope_sql = (
-            "qualification.qualification_type = " f"'{request.fact_type}'"
-        )
+        qualification_scope_sql = f"qualification.qualification_type = '{request.fact_type}'"
     bindings_by_name["QUALIFICATION_FACT_SCOPE_SQL"] = qualification_scope_sql
     bindings_by_name["FACT_TYPE_SCOPE_SQL"] = (
         "TRUE" if request.fact_type is None else f"fact_type = '{request.fact_type}'"
@@ -834,12 +772,75 @@ def _profile_evidence_template_bindings(
         **_profile_evidence_reference_bindings(request),
         **_profile_evidence_scope_bindings(request),
         "ROLE_BUCKET_SQL": _profile_bucket_scope_sql("role", request.role_bucket_count),
-        "AFFILIATION_BUCKET_SQL": _profile_bucket_scope_sql(
-            "affiliation", request.role_bucket_count
-        ),
+        "AFFILIATION_BUCKET_SQL": _profile_bucket_scope_sql("affiliation", request.role_bucket_count),
         "CURRENT_EVIDENCE_SQL": current_profile_evidence_sql(),
         "VALID_NPI_SQL": valid_npi_sql("npi"),
+        **{token: "" for token in _PROFILE_READ_NPI_TOKENS},
     }
+
+
+_PROFILE_READ_NPI_TOKENS = (
+    "PRACTITIONER_NPI_SCOPE_SQL",
+    "DATASET_PRACTITIONER_NPI_SCOPE_SQL",
+    "ROLE_NPI_SCOPE_SQL",
+    "MEMBERSHIP_NPI_SCOPE_SQL",
+    "SERVICE_NPI_SCOPE_SQL",
+    "FACT_NPI_SCOPE_SQL",
+)
+
+
+def profile_evidence_select_sql(
+    *,
+    npi: int,
+    resource_type_refs: dict[str, str] | None = None,
+    **values_by_name: object,
+) -> str:
+    """Select one NPI's normalized evidence; bind the same NPI as ``profile_npi``.
+
+    Relation references are trusted SQL supplied by the scoped loader. Filtered
+    CTEs require separate qualified row-type references for dataset projection.
+    This renderer does not authorize sources or membership.
+    """
+    _assert_profile_read_npi(npi)
+    request = _ProfileEvidenceSqlRequest(target_ref="", **values_by_name)
+    _validate_profile_evidence_request(request)
+    bindings = _profile_evidence_template_bindings(request)
+    for resource, reference in (resource_type_refs or {}).items():
+        token = f"{resource.upper()}_TYPE_REF"
+        if token not in bindings or type(reference) is not str or not reference:
+            raise ValueError("invalid profile resource row type")
+        bindings[token] = reference
+    bound_npi = "CAST(:profile_npi AS bigint)"
+    membership_provider = fhir_reference_resource_id_sql("affiliation.participating_organization_ref", "Organization")
+    bindings.update(
+        WRITE_PREFIX_SQL="",
+        RESULT_SQL=(
+            "SELECT "
+            + ", ".join(quote_identifier(column) for column in profile_evidence_columns())
+            + " FROM normalized_facts"
+        ),
+        CONFLICT_SQL="",
+        PRACTITIONER_NPI_SCOPE_SQL=f"\n               AND practitioner.npi = {bound_npi}",
+        DATASET_PRACTITIONER_NPI_SCOPE_SQL=(
+            "\n               AND resource.payload_json::jsonb ->> 'npi' = CAST(:profile_npi AS text)"
+        ),
+        ROLE_NPI_SCOPE_SQL=f"\n               AND COALESCE(role.npi, practitioner.npi) = {bound_npi}",
+        MEMBERSHIP_NPI_SCOPE_SQL=(
+            "\n               AND EXISTS (SELECT 1 FROM organization_rows AS provider"
+            "\n                    WHERE provider.source_id = affiliation.source_id"
+            "\n                      AND provider.dataset_id = affiliation.dataset_id"
+            f"\n                      AND provider.npi = {bound_npi}"
+            f"\n                      AND provider.resource_id = {membership_provider})"
+        ),
+        SERVICE_NPI_SCOPE_SQL=f"\n               AND service.npi = {bound_npi}",
+        FACT_NPI_SCOPE_SQL=f"\n               AND npi = {bound_npi}",
+    )
+    return _render_sql_template("provider_directory_profile_evidence.sql", bindings)
+
+
+def _assert_profile_read_npi(npi: int) -> None:
+    if type(npi) is not int or not is_valid_npi(npi):
+        raise ValueError("invalid profile read NPI")
 
 
 def profile_evidence_insert_sql(**values_by_name: object) -> str:
@@ -855,11 +856,7 @@ def profile_evidence_insert_sql(**values_by_name: object) -> str:
 def _profile_evidence_public_signature() -> Signature:
     parameters = []
     for request_field in fields(_ProfileEvidenceSqlRequest):
-        default = (
-            Parameter.empty
-            if request_field.default is MISSING
-            else request_field.default
-        )
+        default = Parameter.empty if request_field.default is MISSING else request_field.default
         parameters.append(
             Parameter(
                 request_field.name,
@@ -903,10 +900,7 @@ def _assert_profile_npi_range(
     if (npi_start is None) != (npi_end is None):
         raise ValueError("profile NPI range requires both bounds")
     if npi_start is not None and (
-        npi_start < NPI_MIN
-        or npi_end is None
-        or npi_end <= npi_start
-        or npi_end > NPI_MAX + 1
+        npi_start < NPI_MIN or npi_end is None or npi_end <= npi_start or npi_end > NPI_MAX + 1
     ):
         raise ValueError("profile NPI range is outside the assignable bounds")
 
@@ -927,7 +921,7 @@ def _profile_insert_affected_npis_sql(
         )
     )
     if rebuild_all or old_evidence_ref is None:
-        return f"SELECT DISTINCT npi FROM {evidence_ref} WHERE TRUE" f"{npi_scope_sql}"
+        return f"SELECT DISTINCT npi FROM {evidence_ref} WHERE TRUE{npi_scope_sql}"
     return f"""
         SELECT npi
           FROM {old_evidence_ref}
@@ -953,9 +947,27 @@ def _profile_aggregate_sql(
     npi_start: int | None,
     count_only: bool,
 ) -> str:
-    profile_columns_sql = ", ".join(
-        quote_identifier(column) for column in profile_columns()
+    return _render_sql_template(
+        "provider_directory_profile_aggregate.sql",
+        _profile_aggregate_bindings(
+            target_ref=target_ref,
+            evidence_ref=evidence_ref,
+            affected_npis_sql=affected_npis_sql,
+            npi_start=npi_start,
+            count_only=count_only,
+        ),
     )
+
+
+def _profile_aggregate_bindings(
+    *,
+    target_ref: str,
+    evidence_ref: str,
+    affected_npis_sql: str,
+    npi_start: int | None,
+    count_only: bool,
+) -> dict[str, Any]:
+    profile_columns_sql = ", ".join(quote_identifier(column) for column in profile_columns())
     result_sql = (
         """
         SELECT count(*)::bigint AS projected_rows,
@@ -968,32 +980,47 @@ def _profile_aggregate_sql(
         if count_only
         else f"SELECT {profile_columns_sql} FROM profile_rows"
     )
-    return _render_sql_template(
-        "provider_directory_profile_aggregate.sql",
-        {
-            "WRITE_PREFIX_SQL": (
-                ""
-                if count_only
-                else f"INSERT INTO {target_ref} ({profile_columns_sql})"
-            ),
-            "AFFECTED_NPIS_SQL": affected_npis_sql,
-            "EVIDENCE_NPI_SCOPE_SQL": (_profile_evidence_npi_scope_sql(npi_start)),
-            "EVIDENCE_REF": evidence_ref,
-            "PROFILE_FACT_EVIDENCE_LIMIT": PROFILE_FACT_EVIDENCE_LIMIT,
-            "PROFILE_FACT_LIMIT": PROFILE_FACT_LIMIT,
-            "PROFILE_SCHEMA_VERSION": PROFILE_SCHEMA_VERSION,
-            "FACT_AUTHORITY_ID_SQL": profile_source_authority_sql(
-                "source_id",
-                "endpoint_id",
-            ),
-            "PROFILE_SOURCE_AUTHORITY_ID_SQL": profile_source_authority_sql(
-                "evidence.source_id",
-                "evidence.endpoint_id",
-            ),
-            "RESULT_SQL": result_sql,
-            "CONFLICT_SQL": (";" if count_only else "ON CONFLICT (npi) DO NOTHING;"),
-        },
+    return {
+        "WRITE_PREFIX_SQL": ("" if count_only else f"INSERT INTO {target_ref} ({profile_columns_sql})"),
+        "AFFECTED_NPIS_SQL": affected_npis_sql,
+        "EVIDENCE_NPI_SCOPE_SQL": (_profile_evidence_npi_scope_sql(npi_start)),
+        "EVIDENCE_REF": evidence_ref,
+        "PROFILE_FACT_EVIDENCE_LIMIT": PROFILE_FACT_EVIDENCE_LIMIT,
+        "PROFILE_FACT_LIMIT": PROFILE_FACT_LIMIT,
+        "PROFILE_SCHEMA_VERSION": PROFILE_SCHEMA_VERSION,
+        "FACT_AUTHORITY_ID_SQL": profile_source_authority_sql(
+            "source_id",
+            "endpoint_id",
+        ),
+        "PROFILE_SOURCE_AUTHORITY_ID_SQL": profile_source_authority_sql(
+            "evidence.source_id",
+            "evidence.endpoint_id",
+        ),
+        "RESULT_SQL": result_sql,
+        "CONFLICT_SQL": (";" if count_only else "ON CONFLICT (npi) DO NOTHING;"),
+    }
+
+
+def profile_select_sql(*, evidence_ref: str, npi: int) -> str:
+    """Aggregate one NPI's prequalified evidence; bind ``profile_npi`` and generation.
+
+    The trusted evidence relation must already contain only authorized values and
+    descriptors. All existing evidence/fact counts and caps follow this filter.
+    """
+    _assert_profile_read_npi(npi)
+    bindings = _profile_aggregate_bindings(
+        target_ref="",
+        evidence_ref=evidence_ref,
+        affected_npis_sql="SELECT CAST(:profile_npi AS bigint) AS npi",
+        npi_start=None,
+        count_only=False,
     )
+    bindings.update(
+        WRITE_PREFIX_SQL="",
+        EVIDENCE_NPI_SCOPE_SQL="WHERE evidence.npi = CAST(:profile_npi AS bigint)",
+        CONFLICT_SQL="",
+    )
+    return _render_sql_template("provider_directory_profile_aggregate.sql", bindings)
 
 
 def profile_insert_sql(
@@ -1028,13 +1055,9 @@ def _profile_delta_evidence_ref(
     affected_npi_ref: str,
 ) -> str:
     current_columns_sql = ", ".join(
-        f"current_evidence.{quote_identifier(column)}"
-        for column in profile_evidence_columns()
+        f"current_evidence.{quote_identifier(column)}" for column in profile_evidence_columns()
     )
-    delta_columns_sql = ", ".join(
-        f"delta_evidence.{quote_identifier(column)}"
-        for column in profile_evidence_columns()
-    )
+    delta_columns_sql = ", ".join(f"delta_evidence.{quote_identifier(column)}" for column in profile_evidence_columns())
     return f"""(
         SELECT {current_columns_sql}
           FROM {current_evidence_ref} AS current_evidence
@@ -1068,7 +1091,7 @@ def _profile_delta_affected_npis_sql(
             "CAST(:profile_npi_end AS bigint)"
         )
     )
-    return f"SELECT affected.npi FROM {affected_npi_ref} AS affected" f"{npi_scope_sql}"
+    return f"SELECT affected.npi FROM {affected_npi_ref} AS affected{npi_scope_sql}"
 
 
 def profile_delta_insert_sql(
@@ -1116,17 +1139,9 @@ def profile_source_dataset_pairs(
     selected_source_ids: Iterable[str],
 ) -> tuple[list[str], list[str]]:
     """Align selected source IDs with their immutable dataset IDs."""
-    dataset_id_by_source_id = {
-        str(dataset.source_id): str(dataset.dataset_id) for dataset in datasets
-    }
+    dataset_id_by_source_id = {str(dataset.source_id): str(dataset.dataset_id) for dataset in datasets}
     source_ids = sorted(set(selected_source_ids))
-    missing_source_ids = [
-        source_id
-        for source_id in source_ids
-        if source_id not in dataset_id_by_source_id
-    ]
+    missing_source_ids = [source_id for source_id in source_ids if source_id not in dataset_id_by_source_id]
     if missing_source_ids:
-        raise RuntimeError(
-            "provider_directory_profile_dataset_missing:" + ",".join(missing_source_ids)
-        )
+        raise RuntimeError("provider_directory_profile_dataset_missing:" + ",".join(missing_source_ids))
     return source_ids, [dataset_id_by_source_id[source_id] for source_id in source_ids]

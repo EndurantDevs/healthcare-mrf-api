@@ -13,7 +13,9 @@ from process import registry_ptg_office_membership as offices
 from process import registry_source_recipe_composition as composition
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_membership_copy import MAX_INPUT_BYTES
+from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 from process.registry_ptg_office_membership_contract import PinnedPTGOfficeMembershipSource
+from process.registry_ptg_office_retention import office_hold_document
 from process.registry_source_recipe_store import (
     RegistrySourceMembershipRecipe,
     canonical_registry_source_recipes,
@@ -113,13 +115,13 @@ async def test_consumed_stager_selects_ptg_and_preserves_cancel(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed", [None, "hold", "witness", "source_pin"])
 async def test_consumed_proof_reaches_real_whole_office_witness(monkeypatch, changed):
+    """Rebuild the retained office witness using its actual prepared approval revision."""
     from process import network_serving_read, registry_ptg_office_approval
     from process.ptg_parts import result_archive_published_authority
-    from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
-    from process.registry_ptg_office_retention import office_hold_document
     from tests.test_registry_ptg_office_retention import _verified
 
     prepared, witness = await _verified(monkeypatch)
+    approved_revision = json.loads(prepared.descriptor.manifest_json)["command"]["source"]["approved_revision"]
     pin = replace(
         _recipe().source_pin,
         capture_id=str(prepared.request.capture_id),
@@ -127,7 +129,7 @@ async def test_consumed_proof_reaches_real_whole_office_witness(monkeypatch, cha
     )
     source_pin_by_field = {"operation_id": "registry_ptg_office_review_" + prepared.request.capture_id.hex}
     document_by_field = {
-        "command": {"source": {"approved_revision": 4}},
+        "command": {"source": {"approved_revision": approved_revision}},
         "witness": witness.as_dict(),
         "source_pin": source_pin_by_field,
     }
@@ -152,7 +154,7 @@ async def test_consumed_proof_reaches_real_whole_office_witness(monkeypatch, cha
                 prepared.session,
                 prepared.driver,
                 pin,
-                SimpleNamespace(approved_revision=4),
+                SimpleNamespace(approved_revision=approved_revision),
                 object(),
                 "synthetic_control",
                 RegistryPTGGraphReadBudget(1048576),
@@ -163,7 +165,7 @@ async def test_consumed_proof_reaches_real_whole_office_witness(monkeypatch, cha
             prepared.session,
             prepared.driver,
             pin,
-            SimpleNamespace(approved_revision=4),
+            SimpleNamespace(approved_revision=approved_revision),
             object(),
             "synthetic_control",
             RegistryPTGGraphReadBudget(1048576),

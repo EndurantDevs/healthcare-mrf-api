@@ -321,6 +321,10 @@ async def _clone_entity_address_archive_source(
     snapshot = source_capture.postgres_snapshot
     if not _SNAPSHOT_TOKEN.fullmatch(snapshot):
         raise RuntimeError("entity-address archive source snapshot is invalid")
+    if source_copy is not None:
+        _require_copy_bundle(source_copy)
+        if copy_deadline is None or copy_deadline <= asyncio.get_running_loop().time():
+            raise TimeoutError("entity-address source COPY deadline exceeded")
     if source_capture.contract == CONTRACT:
         _require_copy_bundle(source_copy)
         if not callable(on_precreated):
@@ -340,13 +344,29 @@ async def _clone_entity_address_archive_source(
             on_precreated=on_precreated,
         )
         return
+    remaining = source_copy.max_bytes if source_copy is not None else None
+    models_by_table = {
+        model.__tablename__: model
+        for model in (entity_address_unified.EntityAddressUnified, *entity_address_unified.SUPPORT_TABLE_MODELS)
+    }
     for relation in source_capture.relations:
         source_ref = f"{_quoted_identifier(source_capture.schema_name)}.{_quoted_identifier(relation.table_name)}"
         stage_ref = f"{_quoted_identifier(stage_schema)}.{_quoted_identifier(relation.table_name)}"
         await session.execute(text(f"CREATE TABLE {stage_ref} (LIKE {source_ref} INCLUDING ALL)"))
         if relation.table_name == _EVIDENCE_TABLE_NAME:
             await _clone_entity_address_evidence_sequence(session, stage_schema=stage_schema)
-        await session.execute(text(f"INSERT INTO {stage_ref} SELECT * FROM {source_ref}"))
+        if source_copy is None:
+            await session.execute(text(f"INSERT INTO {stage_ref} SELECT * FROM {source_ref}"))
+        else:
+            remaining = await _copy_pinned_model_rows(
+                session,
+                models_by_table[relation.table_name],
+                source_schema=source_capture.schema_name,
+                target_schema=stage_schema,
+                copy_source_rows=source_copy.copy_rows,
+                max_bytes=remaining,
+                deadline=copy_deadline,
+            )
 
 
 async def _create_clone_model_indexes(session, schema, models):

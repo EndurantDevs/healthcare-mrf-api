@@ -675,6 +675,11 @@ def test_compiled_catalog_and_company_links_keep_typed_identity():
     }
     validated_by_field = json.loads(validate(_wire([assertion_by_field])))
     assert validated_by_field["assertions"] == [assertion_by_field] and validated_by_field["conflicts"] == []
+    selected_by_field = assertion_by_field | {"benefit_plan_ids": ["hpplan_" + "0" * 26]}
+    assert json.loads(validate(_wire([selected_by_field])))["assertions"] == [selected_by_field]
+    for invalid in (None, ["hpversion_" + "0" * 26], ["hpplan_" + "0" * 26] * 2):
+        with pytest.raises(ValueError):
+            validate(_wire([assertion_by_field | {"benefit_plan_ids": invalid}]))
     with pytest.raises(ValueError, match="invalid_row"):
         validate(_wire([{**assertion_by_field, "network_id": "42"}]))
 
@@ -1097,3 +1102,114 @@ def test_compiled_assertions_reject_invalid_input():
         classify(duplicate_key, "group_inclusive")
     with pytest.raises(TypeError):
         classify(_wire([]))
+
+
+def test_compiled_membership_command_partition_matches_facade_and_legacy():
+    from process.network_membership_copy import partition_network_membership_commands
+
+    partition = _compiled_export("partition_network_membership_commands")
+    encode = _compiled_export("encode_network_membership_batch")
+    addition_by_field = {
+        "network_id": 42,
+        "provider_system": "manual",
+        "provider_id": "000123",
+        "location_id": _identity(1),
+        "evidence_id": "review-1",
+    }
+    removal_by_field = {**addition_by_field, "location_id": _identity(2), "operation": "remove"}
+    payload = _wire([addition_by_field, removal_by_field])
+    adds, add_count, removes, remove_count = partition(payload)
+    assert add_count == remove_count == 1
+    assert (adds, add_count) == encode(_wire([addition_by_field]))
+    assert _copy_fields(removes, 5)[0][3] == UUID(_identity(2)).bytes
+    receipt = partition_network_membership_commands(payload)
+    assert (receipt.additions_copy_bytes, receipt.additions_count) == (adds, add_count)
+    assert (receipt.removals_copy_bytes, receipt.removals_count) == (removes, remove_count)
+    with pytest.raises(ValueError, match="invalid_row"):
+        encode(payload)
+    with pytest.raises(ValueError, match="duplicate_command"):
+        partition_network_membership_commands(_wire([addition_by_field, {**addition_by_field, "operation": "remove"}]))
+    empty = partition_network_membership_commands(b"[]")
+    assert empty.additions_count == empty.removals_count == 0
+    assert len(empty.additions_copy_bytes) == len(empty.removals_copy_bytes) == 21
+
+
+@pytest.mark.parametrize(
+    "native_result",
+    [None, (), (b"bad", 1, b"bad", 0), (b"", True, b"", 0), (b"", -1, b"", 0)],
+)
+def test_membership_command_facade_rejects_invalid_native_shape(monkeypatch, native_result):
+    from process.network_membership_copy import MembershipCopyError, partition_network_membership_commands
+
+    monkeypatch.setattr(ptg2_address_canon, "partition_network_membership_commands", lambda _input: native_result)
+    with pytest.raises(MembershipCopyError, match="shape|framing"):
+        partition_network_membership_commands(b"[]")
+
+
+def test_membership_command_facade_checks_bounds_before_native_call(monkeypatch):
+    from process.network_membership_copy import (
+        MAX_INPUT_BYTES,
+        MembershipCopyError,
+        partition_network_membership_commands,
+    )
+
+    def unexpected(_input):
+        pytest.fail("invalid input must not reach native partitioner")
+
+    monkeypatch.setattr(ptg2_address_canon, "partition_network_membership_commands", unexpected)
+    for invalid in ["[]", bytearray(b"[]"), b" " * (MAX_INPUT_BYTES + 1)]:
+        with pytest.raises(MembershipCopyError, match="bounded bytes"):
+            partition_network_membership_commands(invalid)
+
+
+def test_membership_command_facade_checks_combined_native_totals(monkeypatch):
+    from process.network_membership_copy import (
+        MAX_COPY_BYTES,
+        MembershipCopyError,
+        partition_network_membership_commands,
+    )
+
+    encode = _compiled_export("encode_network_membership_batch")
+    command_by_field = {
+        "network_id": 42,
+        "provider_system": "manual",
+        "provider_id": "p-1",
+        "location_id": _identity(1),
+        "evidence_id": "review-1",
+    }
+    wire, _ = encode(_wire([command_by_field]))
+    oversized = wire[:-2] + b"x" * (MAX_COPY_BYTES - len(wire)) + wire[-2:]
+    for native_result in [(wire, 2500, wire, 2501), (oversized, 1, wire, 1)]:
+        monkeypatch.setattr(ptg2_address_canon, "partition_network_membership_commands", lambda _input: native_result)
+        with pytest.raises(MembershipCopyError, match="total bounds"):
+            partition_network_membership_commands(b"[]")
+
+
+def test_compiled_membership_partition_keeps_legacy_duplicate_bytes_and_late_operation_fence():
+    from process.network_membership_copy import partition_network_membership_commands
+
+    partition = _compiled_export("partition_network_membership_commands")
+    encode = _compiled_export("encode_network_membership_batch")
+    legacy_by_field = {
+        "network_id": 42,
+        "provider_system": "manual",
+        "provider_id": "000123",
+        "location_id": _identity(1),
+        "evidence_id": "review-1",
+    }
+    rows = [legacy_by_field, legacy_by_field, {**legacy_by_field, "evidence_id": "review-2"}]
+    payload = _wire(rows)
+    adds, add_count, removes, remove_count = partition(payload)
+    assert (adds, add_count) == encode(payload)
+    assert (add_count, remove_count, len(removes)) == (3, 0, 21)
+    receipt = partition_network_membership_commands(payload)
+    assert receipt.additions_copy_bytes == adds and receipt.additions_count == 3
+    for operation in ("add", "remove"):
+        command_by_field = {**legacy_by_field, "network_id": 43, "operation": operation}
+        with pytest.raises(ValueError) as failure:
+            partition_network_membership_commands(_wire([*rows, command_by_field]))
+        assert json.loads(str(failure.value))["code"] == "duplicate_command"
+        assert json.loads(str(failure.value))["row_index"] == 1
+    for operation in (None, "legacy", "replace"):
+        with pytest.raises(ValueError, match="invalid_row"):
+            partition_network_membership_commands(_wire([{**legacy_by_field, "operation": operation}]))

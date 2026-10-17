@@ -30,6 +30,16 @@ from redis.exceptions import WatchError
 from sqlalchemy import and_, insert, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 
+from api.control_plan_pricing_em_attribution import (
+    ADAPTER as EM_ATTRIBUTION_ADAPTER,
+)
+from api.control_plan_pricing_em_attribution import (
+    IMPORTER as EM_ATTRIBUTION_IMPORTER,
+)
+from api.control_plan_pricing_em_attribution import (
+    em_attribution_registry_entry,
+    validate_em_attribution_params,
+)
 from api.control_workers import exact_worker_presence
 from db.models import ImportRun, PTG2ImportRun, PTG2Snapshot, db
 from process.control_lifecycle import (
@@ -131,6 +141,7 @@ ALL_STATUS_IDEMPOTENCY_IMPORTERS = frozenset(
         "plan-pricing-projection",
         "plan-pricing-prewarm",
         "plan-pricing-em-distance",
+        EM_ATTRIBUTION_IMPORTER,
     }
 )
 STALE_WORKER_RECONCILIATION_IMPORTERS = ALL_STATUS_IDEMPOTENCY_IMPORTERS
@@ -176,6 +187,7 @@ class _ImportRunEnsureState:
 _IMPORT_RUN_ENSURE_STATE = _ImportRunEnsureState()
 
 _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
+    EM_ATTRIBUTION_IMPORTER: EM_ATTRIBUTION_ADAPTER,
     "ptg": {"queue": "arq:PTG", "function": "ptg_control_start", "payload": "ptg_control", "job_prefix": "ptg_start"},
     "ptg-candidate-audit": {
         "queue": "arq:PTGCandidateAudit",
@@ -802,6 +814,7 @@ def importer_registry() -> list[dict[str, Any]]:
             _plan_pricing_projection_registry_entry(),
             _plan_pricing_prewarm_registry_entry(),
             _plan_pricing_em_distance_registry_entry(),
+            em_attribution_registry_entry(ENGINE_NAME),
         )
     )
     for importer in importers:
@@ -824,6 +837,7 @@ def _importer_family(importer: str) -> str:
         "plan-pricing-projection",
         "plan-pricing-prewarm",
         "plan-pricing-em-distance",
+        EM_ATTRIBUTION_IMPORTER,
         "mrf",
         "mrf-source-discovery",
         "hospital-prices",
@@ -3251,6 +3265,7 @@ async def create_import_run(
         importer,
         effective_params_by_name,
     )
+    validate_em_attribution_params(importer, effective_params_by_name)
     validated_hospital_params = await _validate_hospital_price_params(importer, effective_params_by_name)
     if validated_hospital_params is not None:
         effective_params_by_name = validated_hospital_params

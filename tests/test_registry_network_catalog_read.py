@@ -42,6 +42,8 @@ class BatchConnection:
         }
         self.parity = {"address_rows": 1, "changed_arrays": 0}
         self.page = {"total": 1, "bounded": True, "rows_json": json.dumps([network_document()])}
+        self.autocomplete = {"plan_count": 1, "bounded": True, "plans_json": json.dumps([autocomplete_document()])}
+        self.legacy_batch = {"complete": True, "network_ids": [7]}
         self.legacy = {"ambiguous": False, "permitted_count": 1, "network_id": 7}
 
     def is_in_transaction(self):
@@ -55,6 +57,10 @@ class BatchConnection:
             return {"validation_json": json.dumps(self.report)}
         if "AS changed_arrays" in sql:
             return self.parity
+        if "AS plan_count" in sql:
+            return self.autocomplete
+        if "AS complete" in sql:
+            return self.legacy_batch
         if "AS permitted_count" in sql:
             return self.legacy
         assert "registry_approved_record" in sql
@@ -418,3 +424,162 @@ async def test_declared_benefit_filter_is_pinned_authorized_and_before_count_and
             excluded_network_ids=(),
             control_schema="sample_control",
         )
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        (),
+        ("42", "42"),
+        ("-0",),
+        ("+1",),
+        ("01",),
+        ("2147483648",),
+        ("-2147483649",),
+        (1,),
+        tuple(str(n) for n in range(51)),
+    ],
+)
+def test_legacy_batch_rejects_noncanonical_or_unbounded_values(values):
+    with pytest.raises(catalog.RegistryNetworkCatalogError):
+        catalog.RegistryNetworkCatalogLegacyBatchSelector("checksum_network", values)
+
+
+def test_legacy_batch_preserves_signed_namespace_and_uuid_types():
+    values = ("-2147483648", "0", "2147483647")
+    assert catalog.RegistryNetworkCatalogLegacyBatchSelector("checksum_network", values).values == values
+    identifier = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    assert catalog.RegistryNetworkCatalogLegacyBatchSelector("legacy_fhir_uuid", (identifier,)).values == (identifier,)
+    for namespace, values in [
+        ("network_id", ("42",)),
+        ("legacy_fhir_uuid", (identifier.upper(),)),
+        ("legacy_fhir_uuid", ("00000000-0000-0000-0000-000000000000",)),
+    ]:
+        with pytest.raises(catalog.RegistryNetworkCatalogError):
+            catalog.RegistryNetworkCatalogLegacyBatchSelector(namespace, values)
+
+
+@pytest.mark.asyncio
+async def test_legacy_batch_one_reverse_query_deduplicates_before_one_page(batch_boundary):
+    connection, _, revisions = batch_boundary
+    selector = catalog.RegistryNetworkCatalogLegacyBatchSelector("checksum_network", ("42", "0"))
+    page = await catalog.resolve_registry_network_catalog_legacy(
+        connection, selector, excluded_network_ids=(2,), generation_id=9, control_schema="sample_control"
+    )
+    assert page["total"] == page["limit"] == 1 and page["items"][0]["network_id"] == 7
+    sql, parameters = connection.calls[-2]
+    assert parameters == (4, ("42", "0"), "checksum_network", (2,))
+    assert sql.index("count(DISTINCT matches.network_id)") < sql.index("NOT network_id=ANY")
+    assert connection.calls[-1][1][5] == (7,) and revisions == [4]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["unmapped", "partial_page", "hidden", "oversized"])
+async def test_legacy_batch_never_returns_partial_targets(batch_boundary, damage):
+    connection, _, _ = batch_boundary
+    if damage == "unmapped":
+        connection.legacy_batch["complete"] = False
+    elif damage == "partial_page":
+        connection.legacy_batch["network_ids"] = [7, 8]
+    elif damage == "hidden":
+        connection.page["rows_json"] = json.dumps([network_document(2)])
+    else:
+        connection.page["bounded"] = False
+    with pytest.raises(catalog.RegistryNetworkCatalogError):
+        await catalog.resolve_registry_network_catalog_legacy(
+            connection,
+            catalog.RegistryNetworkCatalogLegacyBatchSelector("checksum_network", ("42", "0")),
+            excluded_network_ids=(2,),
+            control_schema="sample_control",
+        )
+
+
+def autocomplete_document():
+    return {
+        "plan_id": "12345CA1234567",
+        "marketing_name": "Sample é",
+        "state": "CA",
+        "year": 2026,
+        "network_checksum": {"-17": None, "0": ""},
+    }
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"query": ""},
+        {"query": " x"},
+        {"query": "x "},
+        {"query": "x" * 129},
+        {"query": "x\u0085y"},
+        {"query": "x\ud800"},
+        {"query": 1},
+        {"limit": True},
+        {"limit": 0},
+        {"limit": 51},
+        {"zip_code": "１２３４５"},
+        {"zip_code": "1234"},
+        {"zip_code": 12345},
+        {"generation_id": True},
+        {"generation_id": 0},
+        {"generation_id": "9"},
+        {"generation_id": 9223372036854775808},
+    ],
+)
+def test_autocomplete_closed_display_query(changes):
+    with pytest.raises(catalog.RegistryNetworkCatalogError):
+        catalog.RegistryNetworkAutocompleteQuery(**({"query": "Sample"} | changes))
+
+
+def test_autocomplete_query_retains_unicode_wildcards_and_maximums():
+    query = catalog.RegistryNetworkAutocompleteQuery("É_%", 50, "00000", 9223372036854775807)
+    assert query.query == "É_%" and query.limit == 50
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_uses_one_pin_and_global_mapping_before_visibility(batch_boundary):
+    connection, _, pinned = batch_boundary
+    result = await catalog.read_registry_network_autocomplete(
+        connection,
+        catalog.RegistryNetworkAutocompleteQuery("Sample", generation_id=9),
+        excluded_network_ids=(2,),
+        control_schema="sample_control",
+    )
+    assert result == {"generation": "9", "approved_custom_revision": "4", "plans": [autocomplete_document()]}
+    assert pinned == [4]
+    sql, parameters = connection.calls[-1]
+    assert parameters == (4, (2,), "%sample%", 10, None, catalog.MAX_RESPONSE_BYTES, False)
+    assert sql.index("HAVING count(DISTINCT network_id)=1") < sql.index("NOT unique_checksum.network_id=ANY")
+    assert sql.index("NOT unique_checksum.network_id=ANY") < sql.index("LIMIT $4")
+    assert "tier.year=plan.year" in sql and "tier.issuer_id=plan.issuer_id" in sql
+    assert "plan.state" in sql and "plan_year" in sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"bounded": False},
+        {"plan_count": 2},
+        {"plans_json": "{}"},
+        {"plans_json": json.dumps([autocomplete_document() | {"unexpected": 1}])},
+        {"plans_json": json.dumps([autocomplete_document() | {"network_checksum": {"42": "ok", "-0": None}}])},
+        {"plans_json": json.dumps([autocomplete_document() | {"year": "2026"}])},
+        {"plans_json": json.dumps([autocomplete_document() | {"network_checksum": {"2147483648": "bad"}}])},
+    ],
+)
+async def test_autocomplete_refuses_unbounded_or_unclosed_result(batch_boundary, change):
+    connection, _, _ = batch_boundary
+    connection.autocomplete.update(change)
+    with pytest.raises(catalog.RegistryNetworkCatalogError):
+        await catalog.read_registry_network_autocomplete(
+            connection,
+            catalog.RegistryNetworkAutocompleteQuery("Sample"),
+            excluded_network_ids=(),
+            control_schema="sample_control",
+        )
+
+
+def test_autocomplete_accepts_valid_aca_plan_variant_without_truncating_labels():
+    document = autocomplete_document() | {"plan_id": "12345CA1234567-01", "marketing_name": "é" * 2000}
+    assert catalog._autocomplete_document(document) == document

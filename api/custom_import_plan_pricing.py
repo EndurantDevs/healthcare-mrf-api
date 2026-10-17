@@ -21,7 +21,8 @@ from api.plan_pricing_projection_contract import (
     PlanPricingProjectionUnsupported,
     row_mapping,
 )
-from api.plan_release_serving import annotate_plan_release_response, binding_query_args
+from api.plan_release_serving import annotate_plan_release_response, binding_query_args, prepare_plan_release_bindings
+from api.provider_service_source_policy import admitted_plan_release_bindings
 from api.ptg2_code_scope import load_sealed_code_rows
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
@@ -57,7 +58,9 @@ class _NativeEntry:
 
 async def _native_scopes(session, selection, args, serving):
     scopes = []
-    for binding in selection.in_network_bindings:
+    bindings = await admitted_plan_release_bindings(session, selection)
+    selection = await prepare_plan_release_bindings(session, selection, bindings)
+    for binding in bindings:
         serving_tables = selection.serving_tables_for_snapshot(binding.snapshot_id)
         if serving_tables is None:
             raise PlanPricingProjectionUnavailable("the selected release has no validated serving tables")
@@ -395,7 +398,16 @@ async def search_imported_plan_providers(session, args, pagination, selection, i
         await session.execute(plan_sql.plan_analyze_statement(table_name))
     total, selected = await _select_native_entries(session, scopes, import_context, args, pagination, needs_prices)
     provider_rates = await _hydrate_selected_entries(session, scopes, selected, serving)
-    return _plan_response(selection, args, pagination, total, selected, provider_rates, serving)
+    return _plan_response(
+        selection,
+        args,
+        pagination,
+        total,
+        selected,
+        provider_rates,
+        serving,
+        contributing_bindings=tuple(scope.binding for scope in scopes),
+    )
 
 
 async def _hydrate_selected_entries(session, scopes, selected, serving):
@@ -413,7 +425,9 @@ async def _hydrate_selected_entries(session, scopes, selected, serving):
     return [completed_by_entry[id(entry)] for entry in selected]
 
 
-def _plan_response(selection, args, pagination, total, selected, provider_rates, serving):
+def _plan_response(
+    selection, args, pagination, total, selected, provider_rates, serving, *, contributing_bindings=None
+):
     """Bind unique native identities and exact totals to the pinned release."""
     identities = [
         hashlib.sha256(
@@ -427,7 +441,7 @@ def _plan_response(selection, args, pagination, total, selected, provider_rates,
     if len(set(identities)) != len(identities):
         raise PTG2ManifestArtifactError("imported plan completion repeated a native entry")
     serving._hide_source_artifact_key_unless_requested(provider_rates, args)
-    query_by_field = serving._plan_release_no_match_query(selection, args)
+    query_by_field = serving._plan_release_no_match_query(selection, args, contributing_bindings=contributing_bindings)
     query_by_field["status"] = "matched" if total else "no_match"
     response_by_field = dict(
         items=provider_rates,
@@ -445,4 +459,6 @@ def _plan_response(selection, args, pagination, total, selected, provider_rates,
         result_state="matched" if total else "no_matching_rates",
     )
     response_by_field[NATIVE_ENTRY_IDS] = identities
-    return annotate_plan_release_response(serving._shape_ptg2_response(response_by_field, args), selection)
+    return annotate_plan_release_response(
+        serving._shape_ptg2_response(response_by_field, args), selection, contributing_bindings=contributing_bindings
+    )

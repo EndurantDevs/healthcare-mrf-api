@@ -13,7 +13,7 @@ from sanic.exceptions import InvalidUsage, NotFound
 from sqlalchemy import MetaData, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from api.endpoint import npi
+from api.endpoint import npi, plan
 from api.network_address_scope import (
     _request_selector,
     canonical_network_read,
@@ -26,7 +26,7 @@ from api.network_address_scope import (
 )
 from api.provider_geo_sql import nearby_row_tiebreaker
 from api.provider_list_sql import _is_unified_address_table, _provider_list_connection, _provider_list_parameters
-from db.models import EntityAddressUnified, NPIData, NPIDataTaxonomy, NPIDataTaxonomyGroup
+from db.models import EntityAddressUnified, Issuer, NPIData, NPIDataTaxonomy, NPIDataTaxonomyGroup, PlanNetworkTierRaw
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.test_network_address_projection_postgres import projection_db
 from tests.test_network_membership_publication_postgres import _candidate_writer_roles, _publish
@@ -399,3 +399,425 @@ async def test_nearby_continuation_binds_actual_manifest_and_current_access(serv
             with pytest.raises(InvalidUsage, match="cursor is invalid"):
                 npi._decode_nearby_cursor(cursor, npi._nearby_cursor_scope(query_by_name))
     assert npi._nearby_cursor_scope(query_by_name) == legacy_scope
+
+
+@pytest.fixture
+async def aca_metadata_db(serving_indexes_db, serving_schema, monkeypatch):
+    """Persist raw metadata and approved-map rows; bind fixture authority separately."""
+    _, schema, engine = serving_schema
+    monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", schema)
+    metadata = MetaData()
+    tiers = PlanNetworkTierRaw.__table__.to_metadata(metadata, schema=schema, name="scope_plan_tiers")
+    issuers = Issuer.__table__.to_metadata(metadata, schema=schema, name="scope_plan_issuers")
+    monkeypatch.setattr(plan, "plan_network_tier_table", tiers)
+    monkeypatch.setattr(plan, "issuer_table", issuers)
+    plan_ids = tuple("12345NY000000" + str(index) for index in (1, 2, 3))
+    async with engine.begin() as connection:
+        await connection.run_sync(metadata.create_all)
+        await connection.execute(
+            issuers.insert(),
+            [{"issuer_id": 12345, "issuer_name": "Example issuer", "issuer_marketing_name": "Example", "state": "NY"}],
+        )
+        await connection.execute(
+            tiers.insert(),
+            [
+                {
+                    "plan_id": plan_id,
+                    "year": 2026,
+                    "checksum_network": 42,
+                    "issuer_id": 12345,
+                    "network_tier": "Example-tier",
+                }
+                for plan_id in plan_ids
+            ],
+        )
+    manifest = replace(await _manifest(serving_indexes_db), approved_custom_revision=8)
+    fixture = SimpleNamespace(schema=schema, engine=engine, manifest=manifest, plan_ids=plan_ids)
+    await _insert_aca_metadata_binding(fixture, 8, plan_ids[0], 84)
+    await _insert_aca_metadata_binding(fixture, 8, plan_ids[1], 42)
+    return fixture
+
+
+def _aca_metadata_binding(plan_id, network_id):
+    return {
+        "network_id": network_id,
+        "archived": False,
+        "source_system": "aca",
+        "source_id": "example-aca",
+        "dataset_schema": "example_source",
+        "dataset_id": "example-dataset",
+        "producer_id": "example-producer",
+        "edition_id": "example-edition",
+        "source_key": plan_id,
+        "source_scope_json": {
+            "plan_id": plan_id,
+            "plan_year": 2026,
+            "issuer_id": "12345",
+            "state": "NY",
+            "checksum_network": 42,
+        },
+    }
+
+
+async def _insert_aca_metadata_binding(fixture, approved_revision, plan_id, network_id):
+    """Use migrated approved storage without claiming approval/publication authority."""
+    async with fixture.engine.begin() as connection:
+        await connection.execute(
+            text(
+                f'INSERT INTO "{fixture.schema}".registry_approved_record '
+                "(approved_revision,record_kind,record_key,record_revision,custom_revision,record_json) "
+                "VALUES(:revision,'network_binding',:key,1,1,CAST(:document AS jsonb))"
+            ),
+            {
+                "revision": approved_revision,
+                "key": str(uuid4()),
+                "document": json.dumps(_aca_metadata_binding(plan_id, network_id)),
+            },
+        )
+
+
+async def test_aca_metadata_distinguishes_checksum_and_exact_approved_plan(aca_metadata_db):
+    """A shared checksum cannot disclose another target or an unapproved raw plan."""
+    fixture = aca_metadata_db
+    async with async_sessionmaker(fixture.engine)() as session, session.begin():
+        request = SimpleNamespace(args={}, query_string="", ctx=SimpleNamespace(sa_session=session))
+        legacy = await plan.get_network_by_checksum(request, "42")
+        assert {(entry["plan_id"], entry["year"]) for entry in json.loads(legacy.body)["plans"]} == {
+            (plan_id, 2026) for plan_id in fixture.plan_ids
+        }
+        for network_id, plan_id in ((84, fixture.plan_ids[0]), (42, fixture.plan_ids[1])):
+            with network_address_read_scope(fixture.manifest, (network_id,)):
+                scoped = await plan.get_network_by_checksum(request, "42")
+                document = json.loads(scoped.body)
+                assert document["plans"] == [{"plan_id": plan_id, "year": 2026}]
+                assert document["checksum"] == 42 and document["issuer_state"] == "NY"
+                assert document["issuer"] == 12345
+        with network_address_read_scope(fixture.manifest, (99,)):
+            assert await plan._fetch_network_entry(session, 42) is None
+            with pytest.raises(NotFound):
+                await plan.get_network_by_checksum(request, "42")
+        assert current_network_address_scope() is None
+        assert (await plan.get_network_by_checksum(request, "42")).body == legacy.body
+
+
+async def test_aca_metadata_retains_bound_approval_after_current_revision_changes(aca_metadata_db):
+    """SQL uses the bound approved revision, not the mutable singleton head."""
+    fixture = aca_metadata_db
+    await _insert_aca_metadata_binding(fixture, 9, fixture.plan_ids[0], 42)
+    await _insert_aca_metadata_binding(fixture, 9, fixture.plan_ids[1], 84)
+    async with fixture.engine.begin() as connection:
+        await connection.execute(
+            text(f'UPDATE "{fixture.schema}".registry_revision_control SET draft_revision=9,approved_revision=9')
+        )
+    current = replace(fixture.manifest, generation_id=2, approved_custom_revision=9)
+    async with async_sessionmaker(fixture.engine)() as session, session.begin():
+        for manifest, plan_id in ((fixture.manifest, fixture.plan_ids[0]), (current, fixture.plan_ids[1])):
+            with network_address_read_scope(manifest, (84,)):
+                document = await plan._fetch_network_entry(session, 42)
+                assert document["plans"] == [{"plan_id": plan_id, "year": 2026}]
+        await session.execute(
+            text(
+                f'UPDATE "{fixture.schema}".registry_approved_record '
+                "SET record_json=jsonb_set(record_json,'{archived}','true') "
+                "WHERE approved_revision=9 AND record_json->>'network_id'='84'"
+            )
+        )
+        with network_address_read_scope(current, (84,)):
+            assert await plan._fetch_network_entry(session, 42) is None
+        with network_address_read_scope(fixture.manifest, (84,)):
+            assert (await plan._fetch_network_entry(session, 42))["plans"] == [
+                {"plan_id": fixture.plan_ids[0], "year": 2026}
+            ]
+
+
+async def test_aca_metadata_requires_every_scope_coordinate_and_active_source(aca_metadata_db):
+    """Actual SQL refuses each independent mismatch and never returns raw fallback."""
+    fixture = aca_metadata_db
+    approved = _aca_metadata_binding(fixture.plan_ids[0], 84)
+    mutations = [
+        ("plan_id", "12345NY0000099"),
+        ("plan_year", 2025),
+        ("issuer_id", "54321"),
+        ("state", "CA"),
+        ("checksum_network", -17),
+    ]
+    documents = [
+        approved | {"source_scope_json": approved["source_scope_json"] | {field: changed}}
+        for field, changed in mutations
+    ]
+    documents += [approved | {"network_id": 85}, approved | {"archived": True}, approved | {"source_system": "fhir"}]
+    async with async_sessionmaker(fixture.engine)() as session, session.begin():
+        with network_address_read_scope(fixture.manifest, (84,)):
+            assert (await plan._fetch_network_entry(session, 42))["plans"] == [
+                {"plan_id": fixture.plan_ids[0], "year": 2026}
+            ]
+            for document in documents:
+                await session.execute(
+                    text(
+                        f'UPDATE "{fixture.schema}".registry_approved_record SET record_json=CAST(:document AS jsonb) '
+                        "WHERE approved_revision=8 AND record_json->>'network_id' IN ('84','85')"
+                    ),
+                    {"document": json.dumps(document)},
+                )
+                assert await plan._fetch_network_entry(session, 42) is None, document
+            await session.execute(
+                text(
+                    f'UPDATE "{fixture.schema}".registry_approved_record SET record_json=CAST(:document AS jsonb) '
+                    "WHERE approved_revision=8 AND record_json->>'network_id'='84'"
+                ),
+                {"document": json.dumps(approved)},
+            )
+            assert (await plan._fetch_network_entry(session, 42))["plans"] == [
+                {"plan_id": fixture.plan_ids[0], "year": 2026}
+            ]
+
+
+@pytest.fixture
+async def default_address_db(validation_db, monkeypatch):
+    """Seed public and custom origins before projection, with independent publisher masks."""
+    from tests.test_network_membership_candidate_indexes_postgres import _project_validated
+    from tests.test_network_membership_serving_indexes_postgres import _full_source, _more_source_rows
+    from tests.test_network_membership_validation_postgres import _batch
+
+    fixture = validation_db
+    monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", fixture.control_schema)
+    await _full_source(fixture)
+    await fixture.connection.execute(
+        f'''UPDATE "{fixture.control_schema}".retained_addresses SET
+        address_source_mask=CASE location_key WHEN $1 THEN 128 WHEN $2 THEN 0 ELSE 61 END,
+        row_origin=CASE WHEN location_key IN ($1,$2) THEN 'base' ELSE 'network_custom' END''',
+        "a" * 64,
+        "b" * 64,
+    )
+    await _more_source_rows(fixture, 2)
+    await fixture.connection.execute(
+        f'''UPDATE "{fixture.control_schema}".retained_addresses SET
+        row_origin=CASE location_key WHEN $1 THEN 'base' ELSE 'ptg_overlay' END,
+        address_source_mask=CASE location_key WHEN $1 THEN 1048576 ELSE 0 END
+        WHERE location_key IN ($1,$2)''',
+        "0" * 63 + "1",
+        "0" * 63 + "2",
+    )
+    location = uuid4()
+    await fixture.connection.execute(
+        f'''INSERT INTO "{fixture.copy_target.schema_name}".provider_location_binding
+        VALUES('npi','provider-c',$1,$2,'npi','provider-c')''',
+        location,
+        "d" * 64,
+    )
+    await fixture.connection.execute(
+        f'''INSERT INTO "{fixture.copy_target.schema_name}".network_membership
+        VALUES(7,'npi','provider-c',$1,'archived-only')''',
+        location,
+    )
+    await fixture.connection.execute(
+        f'UPDATE "{fixture.control_schema}".network_membership_candidate SET expected_rows=5,accepted_rows=5'
+    )
+    await _batch(fixture, 1)
+    for revision, network_id, archived in ((8, 7, True), (8, 42, False), (8, 88, False), (9, 7, False)):
+        await fixture.connection.execute(
+            f'''INSERT INTO "{fixture.control_schema}".registry_approved_record
+            (approved_revision,record_kind,record_key,record_revision,custom_revision,record_json)
+            VALUES($1,'network',$2,1,1,$3::jsonb)''',
+            revision,
+            str(network_id),
+            json.dumps({"network_id": network_id, "archived": archived}),
+        )
+    await _project_validated(fixture)
+    return fixture
+
+
+@pytest.fixture
+async def default_scope_reader(default_address_db, serving_schema):
+    """Use an actual LOGIN without administrator-pool or SET ROLE inheritance."""
+    import secrets
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    fixture = default_address_db
+    _, _, engine = serving_schema
+    role = "default_scope_" + uuid4().hex
+    password = secrets.token_urlsafe(24)
+    reader_engine = None
+    try:
+        await fixture.connection.execute(f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'")
+        for schema in (fixture.control_schema, fixture.copy_target.schema_name):
+            await fixture.connection.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role}"')
+        await fixture.connection.execute(
+            f'GRANT SELECT ON "{fixture.control_schema}".registry_approved_record TO "{role}"'
+        )
+        await fixture.connection.execute(
+            f'GRANT SELECT ON "{fixture.copy_target.schema_name}".entity_address_unified TO "{role}"'
+        )
+        reader_engine = create_async_engine(engine.url.set(username=role, password=password))
+        yield reader_engine, role
+    finally:
+        if reader_engine is not None:
+            await reader_engine.dispose()
+        await fixture.connection.execute(f'DROP OWNED BY "{role}"')
+        await fixture.connection.execute(f'DROP ROLE IF EXISTS "{role}"')
+
+
+async def _assert_default_office_reads(session, relation, parameters, expected_keys):
+    """Check native counts, candidates and hydration against the same scoped offices."""
+    keys = (
+        (
+            await session.execute(
+                text(f"SELECT location_key FROM {relation} addresses ORDER BY location_key"), parameters
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert keys == expected_keys
+    statement = scoped_address_statement(select(func.count()).select_from(EntityAddressUnified.__table__))
+    assert await session.scalar(statement, parameters) == len(expected_keys)
+    candidates = await npi._fetch_npi_location_candidates_map([1111111111, 2222222222, 3333333333], session=session)
+    hydrated = await npi._fetch_npi_address_rows_map([1111111111, 2222222222, 3333333333], session=session)
+    for addresses_by_npi in (candidates, hydrated):
+        assert (
+            sorted(office["location_key"] for offices in addresses_by_npi.values() for office in offices)
+            == expected_keys
+        )
+    assert {office["telephone_number"] for office in hydrated[1111111111]} == {"212-555-0100"}
+
+
+async def test_default_scope_preserves_public_offices_and_filters_custom_memberships(
+    default_address_db, default_scope_reader
+):
+    fixture = default_address_db
+    engine, role = default_scope_reader
+    manifest = replace(await _manifest(fixture), approved_custom_revision=8)
+    async with async_sessionmaker(engine)() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        assert (await session.execute(text("SELECT session_user,current_user"))).one() == (role, role)
+        assert not await session.scalar(
+            text(
+                "SELECT rolsuper OR rolcreaterole OR rolcreatedb OR rolbypassrls FROM pg_roles WHERE rolname=current_user"
+            )
+        )
+        public_keys = ["0" * 63 + "1", "0" * 63 + "2", "a" * 64, "b" * 64]
+        for exclusions, expected in (
+            ((), public_keys + ["c" * 64]),
+            ((88,), public_keys),
+            ((42, 88), public_keys),
+        ):
+            with network_address_read_scope(
+                manifest, None, excluded_network_ids=exclusions, access_scope_sha256="a" * 64
+            ):
+                relation = scoped_address_relation_sql("mrf.entity_address_unified")
+                parameters = scoped_address_parameters({})
+                await _assert_default_office_reads(session, relation, parameters, expected)
+        with network_address_read_scope(manifest, (7,)):
+            relation = scoped_address_relation_sql("mrf.entity_address_unified")
+            keys = (
+                (
+                    await session.execute(
+                        text(f"SELECT location_key FROM {relation} addresses ORDER BY location_key"),
+                        scoped_address_parameters({}),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert keys == ["a" * 64, "d" * 64]
+        current = replace(manifest, approved_custom_revision=9)
+        with network_address_read_scope(current, None, excluded_network_ids=(), access_scope_sha256="b" * 64):
+            relation = scoped_address_relation_sql("mrf.entity_address_unified")
+            keys = (
+                (
+                    await session.execute(
+                        text(f"SELECT location_key FROM {relation} addresses ORDER BY location_key"),
+                        scoped_address_parameters({}),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert keys == public_keys + ["d" * 64]
+
+
+def _default_policy_manifest():
+    return PinnedNetworkServingManifest(
+        1,
+        "00000000-0000-0000-0000-000000000001",
+        "network_candidate_00000000000000000000000000000001",
+        1,
+        {},
+        8,
+        "c" * 64,
+        1,
+    )
+
+
+def test_default_scope_requires_closed_policy_and_keeps_nested_selected_identity():
+    manifest = _default_policy_manifest()
+    for invalid in (None, [], (True,), (0,), (-1,), (2147483648,), (42, 42), (88, 42), tuple(range(1, 50002))):
+        with pytest.raises(ValueError, match="scope_invalid"):
+            with network_address_read_scope(manifest, None, excluded_network_ids=invalid, access_scope_sha256="a" * 64):
+                pytest.fail("Invalid policy cannot bind a scope")
+    with network_address_read_scope(manifest, (42,)):
+        selected = current_network_address_scope()
+        selected_sql, selected_key = (
+            scoped_address_relation_sql("mrf.entity_address_unified"),
+            scoped_address_cache_key("detail"),
+        )
+        assert (
+            selected_sql
+            == '(SELECT * FROM "network_candidate_00000000000000000000000000000001".entity_address_unified WHERE canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[]))'
+        )
+        with network_address_read_scope(manifest, None, excluded_network_ids=(88,), access_scope_sha256="a" * 64):
+            assert current_network_address_scope().network_ids is None
+            assert scoped_address_cache_key("detail") != selected_key
+            assert scoped_address_parameters(scoped_address_parameters({})) == {
+                "_network_excluded_ids": [88],
+                "_network_approved_revision": 8,
+            }
+            for parameters in (
+                {"_canonical_network_ids": [42]},
+                {"_network_excluded_ids": [42]},
+                {"_network_approved_revision": 9},
+                {"_network_approved_revision": 8.0},
+                {"_network_excluded_ids": [88.0]},
+            ):
+                with pytest.raises(ValueError, match="reserved_parameter"):
+                    scoped_address_parameters(parameters)
+        assert current_network_address_scope() is selected
+        assert scoped_address_relation_sql("mrf.entity_address_unified") == selected_sql
+        assert scoped_address_cache_key("detail") == selected_key
+    assert current_network_address_scope() is None
+    with pytest.raises(ValueError, match="access_scope_invalid"):
+        with network_address_read_scope(manifest, None, excluded_network_ids=()):
+            pytest.fail("Default policy requires its verified digest")
+    with network_address_read_scope(
+        manifest, None, excluded_network_ids=tuple(range(1, 50001)), access_scope_sha256="a" * 64
+    ):
+        assert len(scoped_address_parameters({})["_network_excluded_ids"]) == 50000
+    keys = set()
+    for exclusions, digest, revision in (((), "a" * 64, 8), ((88,), "a" * 64, 8), ((), "b" * 64, 8), ((), "a" * 64, 9)):
+        with network_address_read_scope(
+            replace(manifest, approved_custom_revision=revision),
+            None,
+            excluded_network_ids=exclusions,
+            access_scope_sha256=digest,
+        ):
+            keys.add(scoped_address_cache_key("detail"))
+    assert len(keys) == 4
+
+
+async def test_default_aca_clause_uses_active_approved_identity_and_exact_coordinates(aca_metadata_db):
+    fixture = aca_metadata_db
+    async with fixture.engine.begin() as session:
+        for network_id, archived in ((42, True), (84, False)):
+            await session.execute(
+                text(f'''INSERT INTO "{fixture.schema}".registry_approved_record
+            (approved_revision,record_kind,record_key,record_revision,custom_revision,record_json)
+            VALUES(8,'network',:key,1,1,CAST(:document AS jsonb))'''),
+                {"key": str(network_id), "document": json.dumps({"network_id": network_id, "archived": archived})},
+            )
+        for exclusions, expected in (((), [fixture.plan_ids[0]]), ((84,), [])):
+            with network_address_read_scope(
+                fixture.manifest, None, excluded_network_ids=exclusions, access_scope_sha256="a" * 64
+            ):
+                result = await plan._fetch_network_entry(session, 42)
+                assert ([] if result is None else [entry["plan_id"] for entry in result["plans"]]) == expected

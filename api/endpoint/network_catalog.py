@@ -8,30 +8,56 @@ import unicodedata
 
 import asyncpg
 from sanic import Blueprint, response
-from sanic.exceptions import Forbidden
+from sanic.exceptions import Forbidden, SanicException
+from sanic.response import HTTPResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from api.control_auth import require_control_auth
+from api.provider_collection_network_contract import parse_managed_collection_query
+from api.provider_collection_network_read import ProviderCollectionServiceRefusal, read_managed_provider_collection
+from api.provider_detail_network_contract import parse_managed_detail_query
+from api.provider_detail_network_read import MAX_DETAIL_BYTES, read_managed_provider_detail
+from api.provider_directory_entities_contract import DirectoryReadError
+from api.provider_directory_managed_read import parse_managed_directory_query, read_managed_directory
+from api.provider_profile_network_contract import parse_managed_profile_query
+from api.provider_profile_network_read import read_managed_provider_profile
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.registry_catalog_policy import POLICY_V2, RegistryOrganizationVisibility
 from process.registry_network_catalog_read import (
     MAX_EXCLUSIONS,
     MAX_RESPONSE_BYTES,
+    RegistryNetworkAutocompleteQuery,
     RegistryNetworkCatalogError,
+    RegistryNetworkCatalogLegacyBatchSelector,
     RegistryNetworkCatalogLegacySelector,
     RegistryNetworkCatalogQuery,
+    read_registry_network_autocomplete,
     read_registry_network_catalog,
     read_registry_network_catalog_detail,
     resolve_registry_network_catalog_legacy,
+)
+from process.registry_provider_plan_read import RegistryProviderPlansQuery, read_registry_provider_plans
+from process.registry_serving_organization_read import (
+    RegistryOrganizationCatalogQuery,
+    read_registry_serving_organizations,
 )
 
 blueprint = Blueprint("network_catalog", url_prefix="/registry/serving", version=1)
 _HEADERS = {"Cache-Control": "private, no-store"}
 _SOURCE_FIELDS = {"source_system", "source_id", "dataset_schema", "dataset_id", "producer_id", "edition_id"}
+_MANAGED_PROVIDER_KINDS = {"provider-profile", "provider-detail", "provider-collection"}
 _CATALOG_PATHS = {
     "/api/v1/registry/serving/catalog",
     "/api/v1/registry/serving/catalog/detail",
     "/api/v1/registry/serving/catalog/legacy",
+    "/api/v1/registry/serving/organizations",
+    "/api/v1/registry/serving/organizations/detail",
+    "/api/v1/registry/serving/providers/plans",
+    "/api/v1/registry/serving/providers/profile",
+    "/api/v1/registry/serving/providers/detail",
+    "/api/v1/registry/serving/providers/collection",
+    "/api/v1/registry/serving/directory/entities",
 }
 
 
@@ -41,8 +67,9 @@ def register_network_catalog_private_responses(app):
 
 
 async def private_catalog_response(request, http_response):
-    """Apply catalog cache policy to the three exact paths, including method errors."""
-    if request.path in _CATALOG_PATHS:
+    """Keep protected catalog paths and autocomplete POST refusals private."""
+    path = request.path.removesuffix("/")
+    if path in _CATALOG_PATHS or (request.method == "POST" and path == "/api/v1/plan/network/autocomplete"):
         http_response.headers.update(_HEADERS)
 
 
@@ -52,14 +79,19 @@ async def private_response(_request, http_response):
     http_response.headers.update(_HEADERS)
 
 
-def _error(status):
+def _error(status, scope=None):
     code = {
         400: "network_catalog_request_invalid",
         403: "network_catalog_forbidden",
         404: "network_catalog_not_found",
+        409: "network_catalog_source_changed",
         503: "network_catalog_unavailable",
     }[status]
-    return response.json({"error": {"code": code}}, status=status, headers=_HEADERS)
+    return response.json(
+        {"error": {"code": code}},
+        status=status,
+        headers=_HEADERS | ({"X-Network-Access-Scope": scope} if scope else {}),
+    )
 
 
 def _decimal(value, minimum):
@@ -123,21 +155,122 @@ def _policy_parameters(document_by_field):
             raise ValueError("invalid exclusions")
         previous = excluded_id
     policy_by_field = {key: document_by_field[key] for key in ("client_id", "policy_revision", "excluded_network_ids")}
+    if "contract_version" in document_by_field:
+        return _v2_policy_parameters(document_by_field, excluded_ids)
     scope = hashlib.sha256(
         json.dumps(policy_by_field, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
     ).hexdigest()
     return policy_by_field, tuple(excluded_ids), scope
 
 
+def _v2_policy_parameters(document_by_field, excluded_ids):
+    if (
+        document_by_field["contract_version"] != POLICY_V2
+        or document_by_field["organization_visibility_default"] != "system_wide"
+    ):
+        raise ValueError("invalid policy version")
+    for name in ("excluded_company_ids", "excluded_group_ids"):
+        if type(document_by_field[name]) is not list:
+            raise ValueError("invalid exclusions")
+    RegistryOrganizationVisibility(
+        tuple(document_by_field["excluded_company_ids"]), tuple(document_by_field["excluded_group_ids"])
+    )
+    policy_by_field = {key: entry for key, entry in document_by_field.items() if key != "query"}
+    normalized_by_field = {key: entry for key, entry in policy_by_field.items() if key != "access_scope_sha256"}
+    normalized_by_field["policy_revision"] = _decimal(policy_by_field["policy_revision"], 0)
+    scope = hashlib.sha256(
+        json.dumps(normalized_by_field, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+    if document_by_field["access_scope_sha256"] != scope:
+        raise ValueError("invalid policy digest")
+    return policy_by_field, tuple(excluded_ids), scope
+
+
+def _organization_selector(query_by_field, kind):
+    common_fields = {"network_generation"}
+    required_fields = {"record_kind"} | ({"record_id"} if kind == "organization-detail" else set())
+    allowed_fields = required_fields | common_fields | ({"limit", "offset"} if kind == "organization-list" else set())
+    _object(query_by_field, allowed=allowed_fields, required=required_fields)
+    if type(query_by_field["record_kind"]) is not str or query_by_field["record_kind"] not in {"company", "group"}:
+        raise ValueError("invalid organization kind")
+    generation = _decimal(query_by_field["network_generation"], 1) if "network_generation" in query_by_field else None
+    selector_by_field = {"record_kind": query_by_field["record_kind"]}
+    if kind == "organization-detail":
+        from process.registry_network_catalog_read import _uuid
+
+        selector_by_field["record_ids"] = (_uuid(query_by_field["record_id"]),)
+        selector_by_field.update(limit=1, offset=0)
+    else:
+        selector_by_field.update(
+            limit=_integer(query_by_field.get("limit", 50), 100),
+            offset=_decimal(str(query_by_field.get("offset", 0)), 0),
+        )
+        if type(query_by_field.get("offset", 0)) is not int or selector_by_field["offset"] > 1000000:
+            raise ValueError("invalid organization offset")
+    return selector_by_field, generation
+
+
+def _autocomplete_selector(query_by_field):
+    """Keep discovery inputs closed without fabricating selected network IDs."""
+    _object(
+        query_by_field,
+        allowed={"query", "limit", "zip_code", "network_generation"},
+        required={"query", "limit"},
+    )
+    if "zip_code" in query_by_field and type(query_by_field["zip_code"]) is not str:
+        raise ValueError("invalid ZIP")
+    generation = _decimal(query_by_field["network_generation"], 1) if "network_generation" in query_by_field else None
+    return RegistryNetworkAutocompleteQuery(
+        query=query_by_field["query"],
+        limit=query_by_field["limit"],
+        zip_code=query_by_field.get("zip_code"),
+        generation_id=generation,
+    ), generation
+
+
+def _provider_plans_selector(query_by_field):
+    """Keep complete office-qualified reads independent of public pagination."""
+    _object(query_by_field, allowed={"npi", "year", "network_generation"}, required={"npi"})
+    if "year" in query_by_field and type(query_by_field["year"]) is not int:
+        raise ValueError("invalid year")
+    generation = _decimal(query_by_field["network_generation"], 1) if "network_generation" in query_by_field else None
+    return RegistryProviderPlansQuery(query_by_field["npi"], query_by_field.get("year"), generation), generation
+
+
+def _provider_selector(query_by_field, kind):
+    """Preserve each provider read's closed query contract."""
+    if kind == "provider-plans":
+        return _provider_plans_selector(query_by_field)
+    if kind == "provider-profile":
+        return parse_managed_profile_query(query_by_field), None
+    if kind == "provider-detail":
+        return parse_managed_detail_query(query_by_field), None
+    if kind == "provider-collection":
+        return parse_managed_collection_query(query_by_field), None
+    raise ValueError("invalid provider read")
+
+
 def _query_selector(query_by_field, kind):
     """Keep canonical and legacy selectors distinct and source coordinates complete."""
     common_fields = {"network_generation"}
+    if kind == "directory":
+        return parse_managed_directory_query(query_by_field), None
+    if kind == "autocomplete":
+        return _autocomplete_selector(query_by_field)
+    if kind.startswith("provider-"):
+        return _provider_selector(query_by_field, kind)
+    if kind.startswith("organization"):
+        return _organization_selector(query_by_field, kind)
     if kind == "list":
         _object(
             query_by_field, allowed=common_fields | {"limit", "offset", "search", "archived", "source", "benefit_code"}
         )
     elif kind == "detail":
         _object(query_by_field, allowed=common_fields | {"network_id"}, required={"network_id"})
+    elif "values" in query_by_field:
+        _object(query_by_field, allowed=common_fields | {"namespace", "values"}, required={"namespace", "values"})
+        if type(query_by_field["values"]) is not list:
+            raise ValueError("invalid legacy batch")
     else:
         _object(
             query_by_field,
@@ -161,6 +294,10 @@ def _query_selector(query_by_field, kind):
         )
     elif kind == "detail":
         selector = _integer(query_by_field["network_id"], 2147483647)
+    elif "values" in query_by_field:
+        selector = RegistryNetworkCatalogLegacyBatchSelector(
+            query_by_field["namespace"], tuple(query_by_field["values"])
+        )
     else:
         if type(query_by_field["source_scope"]) is not dict:
             raise ValueError("invalid source scope")
@@ -183,10 +320,50 @@ def _parameters(request, kind):
         request.body.decode("utf-8"), object_pairs_hook=_unique_pairs, parse_constant=_invalid_constant
     )
     fields = {"client_id", "policy_revision", "excluded_network_ids", "query"}
+    if type(document_by_field) is dict and "contract_version" in document_by_field:
+        fields |= {
+            "contract_version",
+            "organization_visibility_default",
+            "excluded_company_ids",
+            "excluded_group_ids",
+            "access_scope_sha256",
+        }
+    elif kind.startswith("organization") or kind in {
+        "autocomplete",
+        "provider-plans",
+        "provider-profile",
+        "provider-detail",
+        "provider-collection",
+        "directory",
+    }:
+        raise ValueError("full policy version required")
     _object(document_by_field, allowed=fields, required=fields)
     policy_by_field, excluded_ids, scope = _policy_parameters(document_by_field)
     selector, generation = _query_selector(document_by_field["query"], kind)
     return policy_by_field, excluded_ids, selector, generation, scope
+
+
+async def _read_catalog_page(driver, kind, selector, generation, excluded, options):
+    if kind == "autocomplete":
+        return await read_registry_network_autocomplete(driver, selector, excluded_network_ids=excluded)
+    if kind == "provider-plans":
+        return await read_registry_provider_plans(driver, selector, excluded_network_ids=excluded)
+    if kind.startswith("organization"):
+        return await read_registry_serving_organizations(
+            driver, RegistryOrganizationCatalogQuery(**selector, generation_id=generation), **options
+        )
+    if kind == "list":
+        return await read_registry_network_catalog(driver, selector, excluded_network_ids=excluded, **options)
+    reader = read_registry_network_catalog_detail if kind == "detail" else resolve_registry_network_catalog_legacy
+    return await reader(driver, selector, excluded_network_ids=excluded, generation_id=generation, **options)
+
+
+async def _read_managed_provider_page(request, kind, selector, excluded, scope, options):
+    """Keep provider composition on its request-owned Reader snapshot."""
+    if kind == "provider-profile":
+        return await read_managed_provider_profile(selector, excluded_network_ids=excluded, access_scope_sha256=scope)
+    reader = read_managed_provider_detail if kind == "provider-detail" else read_managed_provider_collection
+    return await reader(request, selector, excluded_network_ids=excluded, access_scope_sha256=scope, **options)
 
 
 async def _catalog_response(request, kind):
@@ -197,41 +374,86 @@ async def _catalog_response(request, kind):
         return _error(403)
     try:
         policy_by_field, excluded, selector, generation, scope = _parameters(request, kind)
+    except DirectoryReadError as error:
+        return _error(error.status)
     except ValueError, TypeError, UnicodeError, RecursionError:
         return _error(400)
     try:
-        session = request.ctx.sa_session
-        async with session.begin():
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-            await session.execute(text("SET LOCAL lock_timeout='1s'"))
-            connection = await session.connection()
-            driver = (await connection.get_raw_connection()).driver_connection
-            if kind == "list":
-                page = await read_registry_network_catalog(driver, selector, excluded_network_ids=excluded)
-            elif kind == "detail":
-                page = await read_registry_network_catalog_detail(
-                    driver, selector, excluded_network_ids=excluded, generation_id=generation
-                )
-            else:
-                page = await resolve_registry_network_catalog_legacy(
-                    driver, selector, excluded_network_ids=excluded, generation_id=generation
-                )
+        visibility = _catalog_visibility(policy_by_field)
+        options = {} if visibility is None else {"organization_policy": visibility}
+        if kind == "directory":
+            return await read_managed_directory(
+                request, selector, policy=policy_by_field, exclusions=excluded, access_scope_sha256=scope
+            )
+        if kind in _MANAGED_PROVIDER_KINDS:
+            if kind == "provider-collection" and selector.kind == "billing-search":
+                options["client_id"] = policy_by_field["client_id"]
+            page = await _read_managed_provider_page(request, kind, selector, excluded, scope, options)
+            if isinstance(page, HTTPResponse):
+                page.headers.update(_HEADERS | {"X-Network-Access-Scope": scope})
+                return page if len(page.body) <= MAX_RESPONSE_BYTES else _error(503, scope)
+        else:
+            session = request.ctx.sa_session
+            async with session.begin():
+                await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+                await session.execute(text("SET LOCAL lock_timeout='1s'"))
+                connection = await session.connection()
+                driver = (await connection.get_raw_connection()).driver_connection
+                page = await _read_catalog_page(driver, kind, selector, generation, excluded, options)
+        if kind == "organization-detail" and (page["total"] != 1 or len(page["items"]) != 1):
+            return _error(404, scope)
         _decimal(page["generation"], 1)
         http_response = response.json(
             {"client_id": policy_by_field["client_id"], "policy_revision": policy_by_field["policy_revision"]} | page,
             headers=_HEADERS | {"X-Network-Generation": page["generation"], "X-Network-Access-Scope": scope},
         )
-        if len(http_response.body) > MAX_RESPONSE_BYTES:
-            return _error(503)
+        maximum = MAX_DETAIL_BYTES if kind in {"provider-detail", "provider-collection"} else MAX_RESPONSE_BYTES
+        if len(http_response.body) > maximum:
+            return _error(503, scope if visibility is not None else None)
         return http_response
+    except ProviderCollectionServiceRefusal as error:
+        if visibility is not None and kind == "provider-collection" and selector.kind == "by-service":
+            return response.json(error.document, status=422, headers=_HEADERS | {"X-Network-Access-Scope": scope})
+        return _error(503, scope if visibility is not None else None)
     except RegistryNetworkCatalogError as error:
-        if str(error) == "registry_network_catalog_request_invalid":
-            return _error(400)
-        if str(error) == "registry_network_catalog_detail_denied":
-            return _error(404)
-        return _error(503)
+        return _catalog_reader_error(error, kind, visibility, scope)
+    except DirectoryReadError as error:
+        return _directory_error(error, selector, scope) if kind == "directory" else _error(error.status, scope)
+    except SanicException as error:
+        if error.status_code == 409 and visibility is not None and kind in _MANAGED_PROVIDER_KINDS:
+            return _error(409, scope)
+        return _error(error.status_code if error.status_code in {400, 403, 404, 503} else 503, scope)
     except asyncpg.PostgresError, asyncpg.InterfaceError, SQLAlchemyError, OSError, KeyError, TypeError, ValueError:
-        return _error(503)
+        return _error(503, scope if visibility is not None else None)
+
+
+def _catalog_reader_error(error, kind, visibility, scope):
+    code = str(error)
+    if code == "registry_network_catalog_source_changed" and (
+        kind == "directory" or (visibility is not None and kind in _MANAGED_PROVIDER_KINDS)
+    ):
+        return _error(409, scope)
+    status = {
+        "registry_network_catalog_request_invalid": 400,
+        "registry_network_catalog_detail_denied": 404,
+    }.get(code, 503)
+    return _error(status, scope if visibility is not None else None)
+
+
+def _catalog_visibility(policy):
+    if "contract_version" not in policy:
+        return None
+    return RegistryOrganizationVisibility(tuple(policy["excluded_company_ids"]), tuple(policy["excluded_group_ids"]))
+
+
+def _directory_error(error, query, scope):
+    if error.status == 404 and query.shape != "entities":
+        return response.json(
+            {"error": {"code": "provider_directory_entity_not_found"}},
+            status=404,
+            headers=_HEADERS | {"X-Network-Access-Scope": scope},
+        )
+    return _error(error.status, scope)
 
 
 @blueprint.post("/catalog")
@@ -250,3 +472,45 @@ async def network_catalog_detail(request):
 async def network_catalog_legacy(request):
     """Resolve one exact source-scoped legacy identity without canonical guessing."""
     return await _catalog_response(request, "legacy")
+
+
+@blueprint.post("/organizations")
+async def organization_catalog_page(request):
+    """Return default-visible organizations from the pinned serving approval."""
+    return await _catalog_response(request, "organization-list")
+
+
+@blueprint.post("/organizations/detail")
+async def organization_catalog_detail(request):
+    """Return one exact independently authorized organization."""
+    return await _catalog_response(request, "organization-detail")
+
+
+@blueprint.post("/providers/plans")
+async def provider_plans(request):
+    """Read source-qualified plans at authorized exact provider offices."""
+    return await _catalog_response(request, "provider-plans")
+
+
+@blueprint.post("/providers/profile")
+async def provider_profile(request):
+    """Compose source-qualified profiles under the verified current policy."""
+    return await _catalog_response(request, "provider-profile")
+
+
+@blueprint.post("/providers/detail")
+async def provider_detail(request):
+    """Compose native detail and exact memberships under one verified policy."""
+    return await _catalog_response(request, "provider-detail")
+
+
+@blueprint.post("/providers/collection")
+async def provider_collection(request):
+    """Read a provider collection under one verified policy and serving snapshot."""
+    return await _catalog_response(request, "provider-collection")
+
+
+@blueprint.post("/directory/entities")
+async def directory_entities(request):
+    """Read original Source entities under the authenticated complete default policy."""
+    return await _catalog_response(request, "directory")

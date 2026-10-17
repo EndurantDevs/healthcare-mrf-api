@@ -1091,3 +1091,40 @@ async def test_publication_preserves_queue_audit(publication_db):
                     )
         receipt = await _publish(fixture)
         assert receipt["generation_id"] > 0
+
+
+@pytest.fixture
+async def qualified_publication_db(indexed_db):
+    """Real publication guards with seeded qualification and the existing serving fixture."""
+    from tests.test_network_membership_writer_closure_postgres import _qualified_source_heap
+
+    fixture = indexed_db
+    fixture.additional_schemas = []
+    await _qualified_source_heap(fixture)
+    async with fixture.connection.transaction():
+        await prepare_network_candidate_indexes(
+            fixture.connection, fixture.copy_target, fixture.address_source, control_schema=fixture.control_schema
+        )
+        await _synthetic_serving_receipt(fixture)
+    async with _candidate_writer_roles(fixture):
+        yield fixture
+
+
+async def test_qualified_publication_requires_exact_four_heap_closure(qualified_publication_db):
+    fixture = qualified_publication_db
+    report = json.loads(
+        await fixture.connection.fetchval(
+            f'SELECT validation_json FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
+            fixture.copy_target.candidate_id,
+        )
+    )
+    assert set(report["writer_closure"]["relation_oids"]) == {
+        "network_membership",
+        "provider_location_binding",
+        "network_membership_source",
+        "entity_address_unified",
+    }
+    async with fixture.connection.transaction():
+        manifest = await _publish(fixture)
+    assert manifest["source_generations"]["registry_source_retention"]
+    assert (await _snapshot(fixture))["generation_id"] == manifest["generation_id"]

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import network_registry_cms_prepared_address as clone
+from tests.test_network_registry_cms_prepared_pair_postgres import _retention_catalog_url
 
 
 def _prepared(rows=4):
@@ -175,3 +176,33 @@ async def test_native_row_accounting_must_reach_exact_receipt(monkeypatch):
             connection, _prepared(), "retained", ("entity_address_unified", "stage", 42), 2, (1, 130)
         )
     assert copy.await_count == 1
+
+
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+asyncpg"])
+@pytest.mark.parametrize("host,is_ci", [("127.0.0.1", False), ("localhost", False), ("postgres", True)])
+def test_retention_catalog_accepts_only_owned_database(driver, host, is_ci, monkeypatch):
+    monkeypatch.setenv("CI", "true" if is_ci else "false")
+    url = _retention_catalog_url(f"{driver}://fixture@{host}:5440/hc_network_registry_{'a' * 32}")
+    assert url.drivername == "postgresql+asyncpg"
+    assert url.host == host and url.database == "hc_network_registry_" + "a" * 32
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "invalid",
+        "sqlite:///hc_network_registry_" + "a" * 32,
+        "postgresql://fixture@127.0.0.1:5440/postgres",
+        "postgresql://fixture@127.0.0.1:5440/hc_network_registry_short",
+        "postgresql://fixture@127.0.0.1:5440/hc_network_registry_" + "A" * 32,
+        "postgresql://fixture@remote.example:5440/hc_network_registry_" + "a" * 32,
+        "postgresql://fixture@postgres:5440/hc_network_registry_" + "a" * 32,
+        "postgresql://fixture@127.0.0.1/hc_network_registry_" + "a" * 32,
+        "postgresql://fixture@127.0.0.1:0/hc_network_registry_" + "a" * 32,
+        "postgresql://fixture@127.0.0.1:5440/hc_network_registry_" + "a" * 32 + "?options=unsafe",
+    ],
+)
+def test_retention_catalog_refuses_unowned_database(configured, monkeypatch):
+    monkeypatch.setenv("CI", "false")
+    with pytest.raises(ValueError, match="^retention_catalog_database_not_disposable$"):
+        _retention_catalog_url(configured)

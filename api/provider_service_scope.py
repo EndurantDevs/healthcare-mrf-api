@@ -9,13 +9,16 @@ from urllib.parse import parse_qs
 from sanic.exceptions import InvalidUsage, ServiceUnavailable
 from sqlalchemy import Float, String, and_, case, cast, column, func, literal, or_, select, table, text
 
-from api.network_address_scope import current_network_address_scope
+from api.custom_import_provider_service_sql import ProviderServiceImportQuery
+from api.network_address_scope import current_network_address_scope, scoped_address_parameters
 
 
-def _canonical_network_procedure_clause(args, import_context, provider_npi, *, query_string=None, location_filter=None):
+def _canonical_network_procedure_clause(
+    args, import_context, provider_npi, *, query_string=None, location_filter=None, managed_native=False
+):
     """Restrict claims providers to the pinned network before count and pagination."""
     network_scope = current_network_address_scope()
-    if network_scope is None:
+    if network_scope is None or network_scope.network_ids is None:
         return None
     raw_args = parse_qs(query_string or "", keep_blank_values=True)
     unsupported_fields = (
@@ -26,7 +29,18 @@ def _canonical_network_procedure_clause(args, import_context, provider_npi, *, q
         "source_key",
         "snapshot_id",
     )
-    if import_context is not None or any(name in args or name in raw_args for name in unsupported_fields):
+    if (
+        managed_native
+        and (import_context is None or type(import_context) is ProviderServiceImportQuery)
+        and "billing_entity_ref" not in args
+        and "billing_entity_ref" not in raw_args
+        and any(args.get(name) for name in unsupported_fields[1:])
+    ):
+        # The managed plan readers apply reviewed source and retained-office predicates.
+        return None
+    if (import_context is not None and type(import_context) is not ProviderServiceImportQuery) or any(
+        name in args or name in raw_args for name in unsupported_fields
+    ):
         raise InvalidUsage("Canonical network procedure queries support the claims lane only.")
     addresses = network_scope.address_relation
     return (
@@ -37,7 +51,7 @@ def _canonical_network_procedure_clause(args, import_context, provider_npi, *, q
             location_filter if location_filter is not None else literal(True),
         )
         .exists()
-        .params(_canonical_network_ids=list(network_scope.network_ids))
+        .params(**scoped_address_parameters({}))
     )
 
 
@@ -204,7 +218,7 @@ def _procedure_office_query(scope, locations):
             )
         )
         .select_from(locations)
-        .params(_canonical_network_ids=list(scope.network_ids))
+        .params(**scoped_address_parameters({}))
     )
     return query
 

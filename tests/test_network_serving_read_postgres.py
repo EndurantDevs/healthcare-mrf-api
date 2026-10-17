@@ -5,6 +5,7 @@ import json
 from dataclasses import FrozenInstanceError
 from uuid import uuid4
 
+import asyncpg
 import pytest
 
 from process.network_address_projection import _identifier
@@ -24,6 +25,7 @@ from tests.test_network_membership_publication_postgres import (
     _snapshot,
     _write_report,
     publication_db,
+    qualified_publication_db,
 )
 from tests.test_network_membership_serving_indexes_postgres import _prepare, serving_indexes_db
 from tests.test_network_membership_validation_postgres import validation_db
@@ -319,3 +321,60 @@ async def test_positive_legacy_42_does_not_expand_canonical_selector(read_compon
     )
     assert [row["location_key"] for row in canonical] == ["a" * 64]
     assert [row["location_key"] for row in legacy] == ["a" * 64, "c" * 64]
+
+
+@pytest.fixture
+async def qualified_read_db(qualified_publication_db):
+    fixture = qualified_publication_db
+    async with fixture.connection.transaction():
+        fixture.read_manifest = await _publish(fixture)
+    yield fixture
+
+
+async def test_qualified_current_and_retained_reader_pins_include_fixed_source_heap(qualified_read_db):
+    fixture = qualified_read_db
+    first = await _resolve(fixture)
+    assert await _resolve(fixture, first.generation_id) == first
+    assert "registry_source_retention" in first.source_generations
+    await fixture.observer.execute(f'SET ROLE "{fixture.writer_roles["reader"]}"')
+    try:
+        assert not await fixture.observer.fetchval(
+            "SELECT pg_has_role(current_user,$1::name,'SET')", fixture.writer_roles["owner"]
+        )
+        assert await _resolve(fixture, connection=fixture.observer) == first
+        assert await _resolve(fixture, first.generation_id, fixture.observer) == first
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await fixture.observer.execute(
+                f'UPDATE "{fixture.copy_target.schema_name}".network_membership_source SET evidence_id=evidence_id'
+            )
+    finally:
+        await fixture.observer.execute("RESET ROLE")
+
+
+@pytest.mark.parametrize(
+    "tamper", ["source_write", "owner_set", "extra_heap", "missing_heap", "source_oid", "orphan_hash"]
+)
+async def test_qualified_current_and_retained_resolvers_refuse_source_tampering(qualified_read_db, tamper):
+    fixture = qualified_read_db
+    namespace = _identifier(fixture.copy_target.schema_name)
+    source_table = namespace + ".network_membership_source"
+    commands_by_tamper = {
+        "source_write": [f'GRANT UPDATE ON {source_table} TO "{fixture.writer_roles["loader"]}"'],
+        "owner_set": [
+            f'GRANT "{fixture.writer_roles["owner"]}" TO "{fixture.writer_roles["reader"]}" WITH INHERIT FALSE, SET TRUE'
+        ],
+        "extra_heap": [f"CREATE TABLE {namespace}.unregistered_source(id integer)"],
+        "missing_heap": [f"DROP TABLE {source_table}"],
+        "source_oid": [
+            f"DROP TABLE {source_table}",
+            f"CREATE TABLE {source_table} (LIKE {namespace}.network_membership INCLUDING CONSTRAINTS)",
+        ],
+        "orphan_hash": [
+            f"UPDATE \"{fixture.control_schema}\".network_membership_candidate SET validation_json=validation_json-'registry_source_retention'"
+        ],
+    }
+    for statement in commands_by_tamper[tamper]:
+        await fixture.connection.execute(statement)
+    for generation in (None, fixture.read_manifest["generation_id"]):
+        with pytest.raises(NetworkServingReadUnavailable):
+            await _resolve(fixture, generation)

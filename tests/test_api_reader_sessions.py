@@ -136,9 +136,16 @@ class ReaderSession(_FakeSession):
         super().__init__()
         self.identity = identity
         self.info = {}
+        self.modes = ("repeatable read", "on")
 
     async def execute(self, statement, params=None):
         self._in_tx = True
+        if (
+            str(statement)
+            == "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')"
+        ):
+            self.executed.append((statement, params))
+            return _FakeResult(self.modes)
         if str(statement) == "SELECT session_user, current_user":
             self.executed.append((statement, params))
             return _FakeResult(self.identity)
@@ -600,3 +607,108 @@ async def test_optional_count_expired_cumulative_budget_never_returns_total(monk
         await provider_list_sql._provider_list_count(connection, "count query", {}, session, deadline=1.5)
     assert connection.all.await_count == int(has_started)
     assert session.execute.await_count == (3 if has_started else 0)
+
+
+async def test_reader_temporary_setup_precedes_identity_and_read_only_verification(monkeypatch):
+    session = ReaderSession()
+    database = reader_database(monkeypatch, [session])
+
+    async def setup(fresh):
+        assert fresh is session and not session.info and not database.has_reader_session()
+        assert [str(statement) for statement, _ in session.executed] == ["SET TRANSACTION READ WRITE"]
+        await fresh.execute("CREATE TEMP TABLE prepared(value int) ON COMMIT DROP")
+
+    async with database.reader_session(temporary_setup=setup) as acquired:
+        assert acquired is session and session.info["api_reader_verified"]
+        assert current_session() is session
+        assert [str(statement) for statement, _ in session.executed] == [
+            "SET TRANSACTION READ WRITE",
+            "CREATE TEMP TABLE prepared(value int) ON COMMIT DROP",
+            "SET TRANSACTION READ ONLY",
+            "SELECT session_user, current_user",
+            "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')",
+        ]
+    assert session.committed and session.closed and not session.info and not database.has_reader_session()
+
+
+async def test_reader_temporary_setup_refuses_reuse_and_allows_explicit_independent(monkeypatch):
+    parent, child = ReaderSession(), ReaderSession()
+    database = reader_database(monkeypatch, [parent, child])
+    setup = AsyncMock()
+    async with database.reader_session():
+        with pytest.raises(RuntimeError, match="fresh Reader"):
+            async with database.reader_session(temporary_setup=setup):
+                pytest.fail("reused Reader accepted setup")
+        setup.assert_not_awaited()
+        assert len(parent.executed) == 1
+        async with database.reader_session(independent=True, temporary_setup=setup) as acquired:
+            assert acquired is child and current_session() is child
+            setup.assert_awaited_once_with(child)
+        assert current_session() is parent and not parent.closed
+    assert parent.closed and child.closed and not database.has_reader_session()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("setup failed"), asyncio.CancelledError()])
+async def test_reader_temporary_setup_failure_rolls_back_before_verification(monkeypatch, failure):
+    session = ReaderSession()
+    database = reader_database(monkeypatch, [session])
+    with pytest.raises(type(failure)) as caught:
+        async with database.reader_session(temporary_setup=AsyncMock(side_effect=failure)):
+            pytest.fail("failed setup yielded a Reader")
+    assert caught.value is failure
+    assert [str(statement) for statement, _ in session.executed] == ["SET TRANSACTION READ WRITE"]
+    assert session.rolled_back and session.closed and not session.committed and not session.info
+    assert not database.has_reader_session()
+
+
+@pytest.mark.parametrize("modes", [("read committed", "on"), ("repeatable read", "off")])
+async def test_prepared_reader_refuses_unverified_transaction_modes(monkeypatch, modes):
+    session = ReaderSession()
+    session.modes = modes
+    database = reader_database(monkeypatch, [session])
+    with pytest.raises(RuntimeError, match="repeatable read and read only"):
+        async with database.reader_session(temporary_setup=AsyncMock()):
+            pytest.fail("wrong transaction mode yielded a verified Reader")
+    assert session.rolled_back and session.closed and not session.info and not database.has_reader_session()
+
+
+@pytest.mark.parametrize("stage", ["setup", "commit"])
+async def test_prepared_reader_preserves_primary_error_when_rollback_and_close_fail(monkeypatch, stage):
+    failure = RuntimeError("original failure")
+    session = ReaderSession()
+    session.rollback = AsyncMock(side_effect=RuntimeError("rollback failure"))
+    session.close = AsyncMock(side_effect=RuntimeError("close failure"))
+    if stage == "commit":
+        session.commit = AsyncMock(side_effect=failure)
+    database = reader_database(monkeypatch, [session])
+    with pytest.raises(RuntimeError, match="No SQLAlchemy session bound"):
+        current_session()
+    with pytest.raises(RuntimeError) as caught:
+        async with database.reader_session(
+            temporary_setup=AsyncMock(side_effect=failure if stage == "setup" else None)
+        ):
+            assert stage == "commit"
+    assert caught.value is failure and str(failure) == "original failure"
+    assert not session.info and not database.has_reader_session()
+    with pytest.raises(RuntimeError, match="No SQLAlchemy session bound"):
+        current_session()
+    session.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("body failed"), asyncio.CancelledError()])
+async def test_prepared_reader_body_failure_preserves_error_and_cleans_context(monkeypatch, failure):
+    session = ReaderSession()
+    database = reader_database(monkeypatch, [session])
+    with pytest.raises(type(failure)) as caught:
+        async with database.reader_session(temporary_setup=AsyncMock()):
+            raise failure
+    assert caught.value is failure and session.closed and session.rolled_back and not session.committed
+    assert not session.info and not database.has_reader_session()
+
+
+async def test_reader_rejects_invalid_temporary_setup_before_connect(monkeypatch):
+    database = reader_database(monkeypatch, [])
+    with pytest.raises(TypeError, match="async callable"):
+        async with database.reader_session(temporary_setup=object()):
+            pytest.fail("invalid setup yielded a Reader")
+    database._connect_reader.assert_not_awaited()

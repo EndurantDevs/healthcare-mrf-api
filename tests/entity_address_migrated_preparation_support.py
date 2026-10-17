@@ -21,16 +21,19 @@ from tests.test_entity_address_alias_guard_postgres import _admin_url, _owned_gu
 from tests.test_provider_directory_profile_capacity_adoption_postgres import _upgrade_disposable_schema_to_head
 
 _SCHEMA = "migrated_address"
+_HEAD = "20261016070000_registry_allowed_plan_scope"
 
 
 async def _migrated_tables(resources, monkeypatch):
+    """Migrate an isolated schema, seed inputs and provision its genuine roles."""
     database_name = await resources.admin.fetchval("SELECT current_database()")
     url = _admin_url().set(database=database_name, drivername="postgresql+asyncpg")
     engine = create_async_engine(url, pool_size=1, max_overflow=0, hide_parameters=True)
     database = Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
     try:
         script = ScriptDirectory.from_config(Config("alembic.ini"))
-        assert script.get_heads() == ["20261015020000_custom_import_query_projections"]
+        assert script.get_heads() == [_HEAD]
+        assert script.get_revision(_HEAD).down_revision == "20261015020000_custom_import_query_projections"
         assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
             "20261010000000_custom_import_admission_indexes"
         )
@@ -64,9 +67,7 @@ async def _migrated_tables(resources, monkeypatch):
         monkeypatch.setenv("DB_SCHEMA", _SCHEMA)
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", _SCHEMA)
         await _upgrade_disposable_schema_to_head(url.render_as_string(hide_password=False), _SCHEMA)
-        assert await database.scalar(f'SELECT version_num FROM "{_SCHEMA}".alembic_version') == (
-            "20261015020000_custom_import_query_projections"
-        )
+        assert await database.scalar(f'SELECT version_num FROM "{_SCHEMA}".alembic_version') == _HEAD
         metadata = MetaData(schema=_SCHEMA)
         for model in preparation.destination.restore._models():
             model.__table__.to_metadata(metadata, schema=_SCHEMA)

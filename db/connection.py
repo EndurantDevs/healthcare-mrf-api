@@ -595,8 +595,10 @@ class Database:
         return reader
 
     @asynccontextmanager
-    async def reader_session(self, *, independent: bool = False) -> AsyncIterator[AsyncSession]:
+    async def reader_session(self, *, independent: bool = False, temporary_setup=None) -> AsyncIterator[AsyncSession]:
         """Own a genuine Reader transaction, or reuse this task's exact Reader."""
+        if temporary_setup is not None and not callable(temporary_setup):
+            raise TypeError("Reader temporary setup must be an async callable")
         binding = _READER.get()
         if (
             binding
@@ -604,28 +606,75 @@ class Database:
             and binding.owner_task is asyncio.current_task()
             and not independent
         ):
+            if temporary_setup is not None:
+                raise RuntimeError("Temporary setup requires a fresh Reader session")
             yield binding.session
             return
         if self._transaction_binding() is not None:
             raise RuntimeError("Cannot open a Reader inside a Writer transaction")
         reader = await self._connect_reader()
-        async with reader.session() as session:
+        scope = reader.session() if temporary_setup is None else self._prepared_reader_session(reader, temporary_setup)
+        async with scope as session:
             reader_context_token = None
             try:
                 identity_result = await session.execute(sa_text("SELECT session_user, current_user"))
                 if tuple(identity_result.first()) != (reader._reader_login[0], reader._reader_login[0]):
                     raise RuntimeError("Reader session login identity differs")
+                if temporary_setup is not None:
+                    modes = await session.execute(
+                        sa_text(
+                            "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')"
+                        )
+                    )
+                    if tuple(modes.first()) != ("repeatable read", "on"):
+                        raise RuntimeError("Prepared Reader must remain repeatable read and read only")
                 session.info["api_reader_verified"] = True
                 reader_context_token = _READER.set(_TransactionBinding(id(self), session, asyncio.current_task()))
                 yield session
             except asyncio.CancelledError:
-                if session.in_transaction():
+                if temporary_setup is None and session.in_transaction():
                     await session.rollback()
                 raise
             finally:
                 if reader_context_token is not None:
                     _READER.reset(reader_context_token)
                 session.info.pop("api_reader_verified", None)
+
+    @asynccontextmanager
+    async def _prepared_reader_session(self, reader, temporary_setup):
+        """Prepare fixed TEMP objects before the first query and preserve primary failures."""
+        assert reader.session_factory is not None
+        session = reader.session_factory()
+        session_token = _SESSION.set(session)
+        primary_failure = None
+        try:
+            await session.execute(sa_text("SET TRANSACTION READ WRITE"))
+            await temporary_setup(session)
+            await session.execute(sa_text("SET TRANSACTION READ ONLY"))
+            yield session
+            if session.in_transaction():
+                await session.commit()
+        except BaseException as failure:
+            primary_failure = failure
+            await self._rollback_reader_failure(session, failure)
+            raise
+        finally:
+            try:
+                await session.close()
+            except BaseException as cleanup_failure:
+                if primary_failure is None:
+                    raise
+                primary_failure.add_note("Reader cleanup failed: " + type(cleanup_failure).__name__)
+            finally:
+                _SESSION.reset(session_token)
+
+    @staticmethod
+    async def _rollback_reader_failure(session, failure):
+        if session.in_transaction():
+            try:
+                await session.rollback()
+            except BaseException as rollback_failure:
+                failure.add_note("Reader rollback failed: " + type(rollback_failure).__name__)
 
     async def _close_request_session(self, request, *, success):
         """Release the request owner even when pinning or response handling fails."""

@@ -1,10 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Retain one committed CMS source/address pair behind native closed custody."""
 
+import asyncio
 import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass, fields, replace
+from datetime import date, datetime
 from uuid import UUID
 
 from sqlalchemy import text
@@ -24,8 +26,10 @@ from process.entity_address_snapshot_receipt import (
     capture_entity_address_archive_receipt as capture_entity_address_archive_receipt,
 )
 from process.entity_address_snapshot_source import (
+    _clone_entity_address_archive_source,
+    _require_copy_bundle,
+    capture_entity_address_archive_source,
     entity_address_archive_stage_schema,
-    export_entity_address_archive_stage,
 )
 from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
@@ -136,6 +140,21 @@ class RegistryCMSPublicationProof:
         return document
 
 
+def _is_profile_identity(receipt_payload, proof):
+    """Bind the independent Profile epoch to its immutable generation and proof."""
+    profile = receipt_payload["profile"]
+    profile_as_of = profile["profile_as_of"]
+    try:
+        return (
+            profile["generation_id"] == proof.profile_generation_id
+            and profile["selection_proof_id"] == proof.selection_proof_id
+            and type(profile_as_of) is str
+            and date.fromisoformat(profile_as_of).isoformat() == profile_as_of
+        )
+    except ValueError:
+        return False
+
+
 @dataclass(frozen=True)
 class RegistryCMSRetainedSourcePair:
     proof: RegistryCMSPublicationProof
@@ -164,7 +183,7 @@ class RegistryCMSRetainedSourcePair:
             or self.runtime_roles != epoch.runtime_roles
             or tuple(receipt_payload["cms"][field] for field in _CMS_FIELDS) != self.proof.cms_authority
             or receipt_payload["selection"]["proof_id"] != self.proof.selection_proof_id
-            or receipt_payload["profile"]["profile_as_of"] != self.proof.source_pin.as_of
+            or not _is_profile_identity(receipt_payload, self.proof)
         ):
             raise ValueError("registry_cms_source_pair_invalid")
         if self.witness_json is not None:
@@ -215,7 +234,7 @@ async def _publication(session, proof, *, current):
         or receipt_row["publication_xid"] != proof.publication_xid
         or receipt_row["profile_generation_id"] != proof.profile_generation_id
         or receipt_payload["selection"]["proof_id"] != proof.selection_proof_id
-        or receipt_payload["profile"]["profile_as_of"] != proof.source_pin.as_of
+        or not _is_profile_identity(receipt_payload, proof)
     ):
         raise ValueError("registry_cms_publication_unavailable")
     if current and await serving.read_serving_receipt(session, proof.source_pin.schema_name) != {
@@ -287,6 +306,121 @@ async def require_registry_cms_source_pair(session, pair, *, verify_content=True
 async def require_registry_cms_source_pair_connection(connection, pair, *, verify_content=True):
     """Validate on the exact native publisher transaction without opening another."""
     return await require_registry_cms_source_pair(NativeReceiptSession(connection), pair, verify_content=verify_content)
+
+
+@dataclass(frozen=True)
+class ResolvedRegistryCMSReadPair:
+    """Authenticated retained pair; an absent source publication time stays absent."""
+
+    pair: RegistryCMSRetainedSourcePair
+    source_published_at: datetime | None
+
+
+async def resolve_committed_registry_cms_source_pair(session, recipe):
+    """Resolve bounded committed evidence without widening caller read budgets."""
+    if (
+        type(recipe) is not RegistrySourceMembershipRecipe
+        or type(recipe.source_pin) is not PinnedFHIRMembershipSource
+        or recipe.source_pin.source_id != "cms-npd"
+        or recipe.source_pin.retained_epoch is None
+    ):
+        raise ValueError("registry_cms_source_pair_invalid")
+    connection = await native_driver(session)
+    if (
+        not connection.is_in_transaction()
+        or await connection.fetchval("SHOW transaction_isolation") not in {"repeatable read", "serializable"}
+        or await connection.fetchval("SHOW transaction_read_only") != "on"
+    ):
+        raise ValueError("registry_cms_source_pair_read_transaction_required")
+    epoch = recipe.source_pin.retained_epoch
+    schema = entity_address_archive_stage_schema(epoch.epoch_id)
+    pair, schema_oid = await _read_committed_pair(connection, schema)
+    if (
+        pair.recipe != recipe
+        or pair.address_ownership.schema_name != schema
+        or pair.address_ownership.schema_oid != schema_oid
+        or epoch.admission_sha256 != pair.proof.expected_admission_sha256
+        or epoch.metadata_sha256 != pair.proof.expected_metadata_sha256
+    ):
+        raise ValueError("registry_cms_source_pair_invalid")
+    await require_retained_cms_fhir_source_epoch(connection, pair.proof.source_pin, epoch, verify_content=False)
+    _, catalog = await address_clone_identity(
+        session, pair.address_ownership, pair.owner_role, pair.runtime_roles, verify_content=False
+    )
+    if catalog != pair.address_catalog_sha256:
+        raise ValueError("registry_cms_source_pair_invalid")
+    if await _publication(session, pair.proof, current=False) != json.loads(pair.cms_receipt_payload):
+        raise ValueError("registry_cms_source_pair_invalid")
+    if pair.witness_json is not None:
+        await require_registry_cms_address_copy_witness(
+            session, json.loads(pair.witness_json), clone_ownership=pair.address_ownership, verify_content=False
+        )
+    return ResolvedRegistryCMSReadPair(pair, await _retained_source_publication_time(connection, pair))
+
+
+async def _read_committed_pair(connection, schema):
+    """Bound protected catalog evidence before transferring or decoding it."""
+    metadata_record = await connection.fetchrow(
+        """SELECT oid::bigint AS schema_oid,
+        CASE WHEN octet_length(obj_description(oid,'pg_namespace')) <= $2
+        THEN obj_description(oid,'pg_namespace') END AS comment
+        FROM pg_catalog.pg_namespace WHERE nspname=$1""",
+        schema,
+        65536 + max(len(_COMMENT), len(_COMMENT_V2)),
+    )
+    comment = metadata_record["comment"] if metadata_record is not None else None
+    prefix = next(
+        (
+            prefix_candidate
+            for prefix_candidate in (_COMMENT, _COMMENT_V2)
+            if comment and comment.startswith(prefix_candidate)
+        ),
+        None,
+    )
+    if prefix is None:
+        raise ValueError("registry_cms_source_pair_unavailable")
+    try:
+        pair = decode_registry_cms_source_pair(json.loads(comment[len(prefix) :]))
+    except ValueError, TypeError, KeyError, RecursionError:
+        raise ValueError("registry_cms_source_pair_invalid") from None
+    if comment != _pair_comment(pair) + _json(pair.as_dict()):
+        raise ValueError("registry_cms_source_pair_invalid")
+    return pair, metadata_record["schema_oid"]
+
+
+async def _retained_source_publication_time(connection, pair):
+    """Read exact copied metadata; receipt time is not source publication time."""
+    pin = pair.recipe.source_pin
+    metadata_record = await connection.fetchrow(
+        f"""SELECT endpoint_id,dataset_hash,acquisition_root_run_id,status,published_at,
+        content_proof_admission_sha256,publication_metadata_sha256,
+        CASE WHEN pg_column_size(publication_metadata_summary_json->'network_bindings') <= 8192
+        THEN publication_metadata_summary_json->'network_bindings' END AS bindings,
+        publication_metadata_summary_json->>'semantic_projection_as_of' AS semantic_as_of
+        FROM {_identifier(pin.read_schema_name)}.provider_directory_endpoint_dataset WHERE dataset_id=$1""",
+        pin.dataset_id,
+    )
+    declaration_by_field = {
+        **asdict(pair.proof.binding_coordinates),
+        "source_key_kind": "organization_resource_id",
+        "alias_scope": pin.alias_scope,
+    }
+    bindings = metadata_record["bindings"] if metadata_record is not None else None
+    if isinstance(bindings, str):
+        bindings = json.loads(bindings)
+    if (
+        metadata_record is None
+        or metadata_record["endpoint_id"] != pin.endpoint_id
+        or metadata_record["dataset_hash"] != pin.dataset_sha256
+        or metadata_record["acquisition_root_run_id"] != pair.proof.cms_authority[4]
+        or metadata_record["content_proof_admission_sha256"] != pair.proof.expected_admission_sha256
+        or metadata_record["publication_metadata_sha256"] != pair.proof.expected_metadata_sha256
+        or metadata_record["status"] not in {"validated", "published", "superseded"}
+        or bindings != declaration_by_field
+        or metadata_record["semantic_as_of"] != pin.as_of
+    ):
+        raise ValueError("registry_cms_source_pair_invalid")
+    return metadata_record["published_at"]
 
 
 def decode_registry_cms_source_pair(document):
@@ -368,8 +502,11 @@ async def _retained_pair(session, proof, schema, owner_role, runtime_roles):
     return pair
 
 
-async def capture_registry_cms_source_pair(session_factory, proof, *, capture_id, owner_role, runtime_roles):
-    """Retain a pinned complete pair; caller authenticates dispatch and Profile ancestry."""
+async def capture_registry_cms_source_pair(
+    session_factory, proof, *, capture_id, owner_role, runtime_roles, source_copy=None
+):
+    """Retain one exact seven-table pair with trusted native COPY bounds."""
+    _require_copy_bundle(source_copy)
     if (
         type(proof) is not RegistryCMSPublicationProof
         or type(capture_id) is not UUID
@@ -387,10 +524,10 @@ async def capture_registry_cms_source_pair(session_factory, proof, *, capture_id
             text("SELECT pg_advisory_xact_lock(:key)"),
             {"key": int.from_bytes(capture_id.bytes[:8], "big", signed=True)},
         )
-        return await _capture_pair(session_factory, proof, capture_id, owner_role, runtime_roles)
+        return await _capture_pair(session_factory, proof, capture_id, owner_role, runtime_roles, source_copy)
 
 
-async def _capture_pair(session_factory, proof, capture_id, owner_role, runtime_roles):
+async def _capture_pair(session_factory, proof, capture_id, owner_role, runtime_roles, source_copy):
     """Serialize deterministic replay and recover only an exact stamped unfinished clone."""
     schema = entity_address_archive_stage_schema(capture_id)
     async with session_factory() as session, session.begin():
@@ -419,19 +556,8 @@ async def _capture_pair(session_factory, proof, capture_id, owner_role, runtime_
         ownership.append(await capture_created_entity_address_archive_stage(session, dataset_id=capture_id))
         await _stamp_stage(session, schema, proof, owner_role, runtime_roles, ownership[0])
 
-    async def copied(_capture):
-        """Retain the pinned native clone without a portable dump."""
-        return None
-
     try:
-        await export_entity_address_archive_stage(
-            session_factory,
-            schema_name=proof.source_pin.schema_name,
-            dataset_id=capture_id,
-            archive_copy=copied,
-            stage_created=created,
-            source_captured=captured,
-        )
+        await _copy_compatibility_address(session_factory, proof, capture_id, source_copy, captured, created)
         return await _freeze_pair(
             session_factory,
             proof,
@@ -446,6 +572,23 @@ async def _capture_pair(session_factory, proof, capture_id, owner_role, runtime_
         if ownership:
             await drain_operation(_cleanup_capture(session_factory, ownership[0]), preserve_cancellation=True)
         raise
+
+
+async def _copy_compatibility_address(session_factory, proof, capture_id, source_copy, captured, created):
+    """Copy the legacy seven-table family under the exact committed source snapshot."""
+    async with session_factory() as source_session, source_session.begin():
+        source = await capture_entity_address_archive_source(source_session, schema_name=proof.source_pin.schema_name)
+        await captured(source_session, source)
+        async with session_factory() as clone_session, clone_session.begin():
+            async with asyncio.timeout(source_copy.timeout) as deadline:
+                await _clone_entity_address_archive_source(
+                    clone_session,
+                    source_capture=source,
+                    stage_schema=entity_address_archive_stage_schema(capture_id),
+                    source_copy=source_copy,
+                    copy_deadline=deadline.when(),
+                )
+                await created(clone_session)
 
 
 async def _stamp_stage(session, schema, proof, owner_role, runtime_roles, ownership):

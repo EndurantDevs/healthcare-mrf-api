@@ -14,6 +14,14 @@ from process.network_address_projection import (
     _membership_accounting,
 )
 from process.network_membership_copy import MembershipCopyTarget
+from process.registry_source_retention import (
+    SUMMARY_KEY as RETENTION_KEY,
+)
+from process.registry_source_retention import (
+    RegistrySourceRetentionError,
+    verify_registry_source_retention,
+    verify_registry_source_retention_rows,
+)
 
 
 class NetworkMembershipValidationError(ValueError):
@@ -46,6 +54,27 @@ def _validated_sources(candidate):
     return generations_by_source
 
 
+def _em_provider_receipt(candidate):
+    from process.network_em_provider_inputs import _receipt
+
+    generations_by_source = _validated_sources(candidate)
+    validation_by_field = _json_object(candidate["validation_json"])
+    has_marker = "em_provider_inputs" in generations_by_source
+    has_receipt = type(validation_by_field) is dict and "em_provider_inputs" in validation_by_field
+    if not has_marker and not has_receipt:
+        return None
+    try:
+        if not has_marker or not has_receipt:
+            raise ValueError
+        receipt_by_field = validation_by_field["em_provider_inputs"]
+        _receipt(receipt_by_field)
+        if generations_by_source["em_provider_inputs"] != receipt_by_field["receipt_sha256"]:
+            raise ValueError
+    except ValueError, TypeError, KeyError:
+        raise NetworkMembershipValidationError("Candidate provider inputs differ from their immutable scope") from None
+    return receipt_by_field
+
+
 def _scope_report(candidate, address_source):
     from process.registry_initial_source_composition import (
         SUMMARY_KEY as INITIAL_SUMMARY_KEY,
@@ -61,13 +90,17 @@ def _scope_report(candidate, address_source):
     )
 
     candidate_by_field = dict(candidate)
+    provider_receipt = _em_provider_receipt(candidate_by_field)
     try:
         source_selection = verify_registry_source_selection_receipt(candidate_by_field)
         initial_source_offices = verify_initial_source_office_receipt(candidate_by_field)
-    except RegistrySourceSelectionError, RegistryInitialSourceError:
+        source_retention = verify_registry_source_retention(candidate_by_field)
+    except RegistrySourceSelectionError, RegistryInitialSourceError, RegistrySourceRetentionError:
         raise NetworkMembershipValidationError("Candidate source selection differs from its immutable scope") from None
     identity_fields = ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
     return {
+        **({"em_provider_inputs": provider_receipt} if provider_receipt is not None else {}),
+        **({RETENTION_KEY: source_retention} if source_retention is not None else {}),
         **({SUMMARY_KEY: source_selection} if source_selection is not None else {}),
         **({INITIAL_SUMMARY_KEY: initial_source_offices} if initial_source_offices is not None else {}),
         **{field: str(candidate[field]) for field in identity_fields},
@@ -96,6 +129,13 @@ def _validated_replay(candidate, scope_report):
     if (
         type(original_report) is not dict
         or original_report.get("valid") is not True
+        or (
+            RETENTION_KEY in scope_report
+            and any(
+                type(original_report.get(field)) is not int or original_report[field] != 0
+                for field in ("batch_rows", "batch_count")
+            )
+        )
         or any(
             type(original_report.get(field)) is not type(expected) or original_report.get(field) != expected
             for field, expected in scope_report.items()
@@ -129,7 +169,10 @@ def _validation_report(scope_report, address_counts, native_counts):
         accounting_errors.append("raw_accepted_count_mismatch")
     if scope_report["accepted_rows"] != scope_report["expected_rows"]:
         accounting_errors.append("accepted_expected_count_mismatch")
-    if native_counts["batch_rows"] != native_counts["raw_rows"]:
+    if RETENTION_KEY in scope_report:
+        if native_counts["batch_rows"] != 0 or native_counts["batch_count"] != 0:
+            accounting_errors.append("qualified_batch_accounting_nonzero")
+    elif native_counts["batch_rows"] != native_counts["raw_rows"]:
         accounting_errors.append("batch_raw_count_mismatch")
     report_by_field = {
         **scope_report,
@@ -152,6 +195,11 @@ def _validation_report(scope_report, address_counts, native_counts):
 async def _validate_sealed(connection, copy_target, address_source, control_schema):
     candidate = await _lock_candidate(connection, copy_target, address_source, control_schema)
     scope_report = _scope_report(candidate, address_source)
+    if RETENTION_KEY in scope_report:
+        try:
+            await verify_registry_source_retention_rows(connection, copy_target, candidate)
+        except RegistrySourceRetentionError as error:
+            raise NetworkMembershipValidationError(str(error)) from error
     if candidate["state"] == "validated":
         return _validated_replay(candidate, scope_report)
     candidate_schema = _identifier(copy_target.schema_name)

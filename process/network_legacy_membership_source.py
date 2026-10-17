@@ -511,8 +511,8 @@ async def _read_reviewed(
         await require_approved_network_source_bindings(
             connection, approved_source, coordinates, control_schema=registry_schema
         )
-    except ApprovedNetworkSourceBindingError:
-        raise LegacyMembershipSourceError("Reviewed ACA bindings are unavailable") from None
+    except ApprovedNetworkSourceBindingError as error:
+        raise LegacyMembershipSourceError("Reviewed ACA bindings are unavailable") from error
     generation = _reviewed_generation(source_pin, approved_source, coordinates, approved_only, complete_raw_facts)
     return await connection.fetchrow(
         _reviewed_sql(source_pin.prepared.ownership.schema_name, registry_schema, approved_only, complete_raw_facts),

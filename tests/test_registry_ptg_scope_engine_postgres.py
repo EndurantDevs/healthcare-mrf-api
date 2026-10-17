@@ -1375,3 +1375,16 @@ async def _rediscovery_reader_write_denials(fixture, table):
             with pytest.raises(DBAPIError):
                 async with session.begin_nested():
                     await session.execute(text(statement))
+
+
+@pytest.mark.parametrize("manifest_storage", ["json", "jsonb"])
+@pytest.mark.parametrize("plan_market_type", ["group", ""])
+@pytest.mark.asyncio
+async def test_native_allowed_review_migration_writer_and_listing(
+    tmp_path, monkeypatch, manifest_storage, plan_market_type
+):
+    from tests.allowed_plan_postgres_support import test_allowed_review_native_migration_writer_and_listing
+
+    await test_allowed_review_native_migration_writer_and_listing(
+        tmp_path, monkeypatch, manifest_storage, plan_market_type
+    )

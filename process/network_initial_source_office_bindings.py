@@ -21,6 +21,7 @@ from process.network_legacy_membership_source import (
 )
 from process.network_membership_candidate_lifecycle import _control_namespace, _locked_candidate, _require_open
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, MembershipCopyTarget, _encode
+from process.uhc_flex_practitioner_async_safety import drain_operation
 
 
 class InitialACAOfficeBindingError(ValueError):
@@ -193,7 +194,7 @@ async def _verify_batch(connection, batch, control_schema, after, after_source_p
     )
     if replay != batch:
         raise InitialACAOfficeBindingError("initial_aca_office_batch_differs")
-    _, rows = await asyncio.to_thread(_encode, batch.input_bytes)
+    _, rows = await drain_operation(asyncio.to_thread(_encode, batch.input_bytes), preserve_cancellation=True)
     if rows != batch.membership_rows:
         raise InitialACAOfficeBindingError("initial_aca_office_batch_accounting_invalid")
 
@@ -266,7 +267,9 @@ async def _canonical_bindings(connection, office_records):
     native = importlib.import_module("ptg2_address_canon")
     source_addresses = [tuple(office["evidence_address"]) for office in office_records]
     retained_addresses = [tuple(office["address"]) for office in office_records]
-    canonical_addresses = await asyncio.to_thread(native.canonicalize_batch, source_addresses + retained_addresses)
+    canonical_addresses = await drain_operation(
+        asyncio.to_thread(native.canonicalize_batch, source_addresses + retained_addresses), preserve_cancellation=True
+    )
     canonical_json = json.dumps(canonical_addresses, separators=(",", ":"), allow_nan=False)
     if len(canonical_json.encode()) > 2 * MAX_INPUT_BYTES:
         raise InitialACAOfficeBindingError("initial_aca_office_canonical_bound_exceeded")

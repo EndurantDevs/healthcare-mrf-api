@@ -69,7 +69,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -133,7 +133,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -156,7 +156,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -193,7 +193,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -307,7 +307,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -366,7 +366,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -398,7 +398,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -450,7 +450,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -497,7 +497,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -535,7 +535,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -592,7 +592,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -797,7 +797,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -904,7 +904,7 @@ jobs:
       actions: read
       packages: write
     env:
-      CI_REVISION: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+      CI_REVISION: 540ba5e1b45df35a4848e26742ed12f90e69370b
       PYTHONDONTWRITEBYTECODE: '1'
       IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
       MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
@@ -913,7 +913,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -988,7 +988,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: 540ba5e1b45df35a4848e26742ed12f90e69370b
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -1016,7 +1016,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+  CI_REVISION: 540ba5e1b45df35a4848e26742ed12f90e69370b
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'

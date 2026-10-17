@@ -16,6 +16,7 @@ import asyncpg
 
 from process.registry_source_observation_store import _namespace
 from process.registry_source_selection_receipt import _unique_object
+from process.uhc_flex_practitioner_async_safety import drain_operation
 
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -251,7 +252,9 @@ async def admit_registry_required_targets(connection, input_bytes, edition, *, c
     if not connection.is_in_transaction():
         raise RegistryRequiredTargetError("registry_required_target_transaction_required")
     namespace = _namespace(control_schema)
-    copy_bytes, descriptor = await asyncio.to_thread(_encode, input_bytes, edition)
+    copy_bytes, descriptor = await drain_operation(
+        asyncio.to_thread(_encode, input_bytes, edition), preserve_cancellation=True
+    )
     try:
         async with connection.transaction():
             staging = await _stage(connection, namespace, copy_bytes, edition, descriptor)

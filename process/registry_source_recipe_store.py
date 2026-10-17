@@ -346,5 +346,5 @@ async def resolve_retained_registry_source_recipes(connection, pinned_manifest, 
         if candidate is None:
             raise RegistrySourceRecipeError("registry_source_recipes_unavailable")
         return verify_registry_source_recipes(dict(candidate))
-    except ValueError, TypeError, KeyError, UnicodeError, RecursionError, asyncpg.PostgresError:
-        raise RegistrySourceRecipeError("registry_source_recipes_unavailable") from None
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, asyncpg.PostgresError) as error:
+        raise RegistrySourceRecipeError("registry_source_recipes_unavailable") from error
