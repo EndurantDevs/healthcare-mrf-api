@@ -35,6 +35,7 @@ from process.custom_import.capture import SealedCapture, iter_records
 from process.custom_import.capture_store import open_segmented_parquet_parts
 from process.custom_import.definition import CustomImportDefinition, SourceStream
 from process.custom_import.execution import MAX_LEASE_SECONDS, LeaseGrant, heartbeat_execution, lease_token_sha256
+from process.custom_import.failure_diagnostics import FailurePhase, failure_identifiers, failure_phase
 from process.custom_import.family import FamilyRejection, _canonical_child_key, _key, _parent_key, _record_error
 from process.custom_import.family_raw_key import raw_family_key_evidence
 from process.custom_import.materialization import DefinitionIdentity, selection_profile_models
@@ -1200,15 +1201,21 @@ async def stage_segmented_source(
         raise TypeError("source staging requires SourceBuildRequest")
     if writer_transports is not None:
         request = writer_transports.source.bind_request(writer_transports.admission.bind_request(request))
-    build_id, registry = await _begin_build(session_factory, request)
-    if writer_transports is not None:
-        await _stage_source_handoff(session_factory, request, build_id, registry, writer_transports.source)
-    else:
-        direct_admission = await _stage_local_source(session_factory, request, build_id, registry)
-    await _prepare_snapshot_indexes(session_factory, request, build_id, "admission")
-    if writer_transports is not None:
-        return await _stage_admission_handoff(session_factory, request, build_id, writer_transports.admission)
-    return await _admit_local_pages(session_factory, request, build_id, direct_admission)
+    with failure_phase(FailurePhase.BEGIN_BUILD):
+        failure_identifiers(execution_id=request.execution_id)
+        build_id, registry = await _begin_build(session_factory, request)
+        failure_identifiers(build_id=build_id)
+    with failure_phase(FailurePhase.SOURCE):
+        if writer_transports is not None:
+            await _stage_source_handoff(session_factory, request, build_id, registry, writer_transports.source)
+        else:
+            direct_admission = await _stage_local_source(session_factory, request, build_id, registry)
+    with failure_phase(FailurePhase.ADMISSION_INDEX):
+        await _prepare_snapshot_indexes(session_factory, request, build_id, "admission")
+    with failure_phase(FailurePhase.ADMISSION):
+        if writer_transports is not None:
+            return await _stage_admission_handoff(session_factory, request, build_id, writer_transports.admission)
+        return await _admit_local_pages(session_factory, request, build_id, direct_admission)
 
 
 async def _stage_local_source(session_factory, request, build_id, registry):
