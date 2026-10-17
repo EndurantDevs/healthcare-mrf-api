@@ -174,8 +174,10 @@ async def test_unavailable_diagnostics_keep_private_values(monkeypatch, caplog, 
     assert reply.headers["Cache-Control"] == "no-store"
     assert len(caplog.records) == 1
     log_entry = caplog.records[0]
-    assert log_entry.getMessage() == f"custom_import_batch_unavailable stage=source_{stage} category=database"
-    assert log_entry.args == (f"source_{stage}", "database")
+    assert log_entry.getMessage() == (
+        f"custom_import_batch_unavailable stage=source_{stage} category=database database_reason=unknown"
+    )
+    assert log_entry.args == (f"source_{stage}", "database", "unknown")
     assert not log_entry.exc_info and log_entry.exc_text is None and log_entry.stack_info is None
     assert not any(sentinel in caplog.text for sentinel in ("synthetic-", "synthetic_sql"))
     assert request.body == b"" or request.body.decode() not in caplog.text

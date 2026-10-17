@@ -44,6 +44,7 @@ from process.custom_import.capture_store import (
     _load_parquet_part_metadata,
 )
 from process.custom_import.definition import canonical_json
+from process.custom_import.failure_diagnostics import failure_identifiers, record_failure
 from process.custom_import.family import validate_source_snapshot_tokens
 from process.custom_import.runner_types import SessionFactory
 from process.custom_import.segmented_capture_policy import SegmentedCapturePolicy
@@ -716,6 +717,7 @@ async def _acquire_claimed(session_factory, request, grant, identity, owner, exe
         )
     except BaseException as exc:
         primary = exc
+        record_failure(exc)
         if bundle_id is not None:
             primary.add_note(
                 f"Capture bundle {bundle_id} remains unpublished; retained pending storage may require cleanup."
@@ -786,6 +788,7 @@ async def acquire_segmented_snowflake_capture(
     submission, grant = await _reserve_bundle_execution(
         session_factory, request, statement, identity, processing_policy=processing_policy
     )
+    failure_identifiers(execution_id=grant.execution_id if grant is not None else submission.execution_id)
     if grant is None:
         return SnowflakeCaptureResult("not_claimed", submission.execution_id)
     if grant.state != "running":

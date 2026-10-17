@@ -23,6 +23,7 @@ from process.custom_import.build_source import (
 )
 from process.custom_import.capture_pending import SEGMENTED_PAYLOAD_CONTRACT
 from process.custom_import.execution import finish_execution
+from process.custom_import.failure_diagnostics import FailurePhase, failure_identifiers, failure_phase
 from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.publication import PublicationConflict, activate_generation
 from process.custom_import.runner_registry import load_current_pointer
@@ -239,6 +240,24 @@ async def _activate(session_factory, request, output):
         return None
 
 
+async def _capture_for_build(session_factory, connector, request, policy):
+    """Record a normally obtained execution identifier before entering the build."""
+
+    with failure_phase(FailurePhase.CAPTURE):
+        captured = await acquire_segmented_snowflake_capture(
+            session_factory,
+            request,
+            statement_builder=connector,
+            adapter=connector._adapter,
+            credential_provider=connector._credential_provider,
+            policy=policy.capture,
+            driver_timeout_seconds=policy.driver_timeout_seconds,
+            processing_policy=policy,
+        )
+        failure_identifiers(execution_id=captured.execution_id)
+        return captured
+
+
 async def run_segmented_snowflake_candidate(
     session_factory,
     connector,
@@ -256,34 +275,30 @@ async def run_segmented_snowflake_candidate(
         writer_transports.require_candidate_binding(request)
     if isinstance(request.lease_token, (bytearray, memoryview)):
         request = replace(request, lease_token=bytes(request.lease_token))
-    captured = await acquire_segmented_snowflake_capture(
-        session_factory,
-        request,
-        statement_builder=connector,
-        adapter=connector._adapter,
-        credential_provider=connector._credential_provider,
-        policy=policy.capture,
-        driver_timeout_seconds=policy.driver_timeout_seconds,
-        processing_policy=policy,
-    )
+    captured = await _capture_for_build(session_factory, connector, request, policy)
     counts = SourceOutcomeCounts(0, 0)
     if captured.status not in {"capture_sealed", "capture_bound"}:
         return _result(captured.status, captured, counts)
     handoff = {} if writer_transports is None else {"writer_transports": writer_transports}
     try:
-        build_request = await _build_request(session_factory, request, captured, policy, **handoff)
+        with failure_phase(FailurePhase.BEGIN_BUILD):
+            build_request = await _build_request(session_factory, request, captured, policy, **handoff)
         staged_source = await stage_segmented_source(session_factory, build_request, **handoff)
-        counts = await count_source_outcomes(session_factory, build_request, staged_source.build_id)
-        generation_id = await build_graph(session_factory, build_request, staged_source.build_id)
+        with failure_phase(FailurePhase.COUNTS):
+            failure_identifiers(build_id=staged_source.build_id)
+            counts = await count_source_outcomes(session_factory, build_request, staged_source.build_id)
+        with failure_phase(FailurePhase.GRAPH):
+            generation_id = await build_graph(session_factory, build_request, staged_source.build_id)
         if generation_id is None:
             status = await _finish(session_factory, request, captured, policy, "failed")
             return _result(status, captured, counts)
-        output = await build_output(
-            session_factory,
-            build_request,
-            staged_source.build_id,
-            projection_transport=None if writer_transports is None else writer_transports.projection,
-        )
+        with failure_phase(FailurePhase.OUTPUT):
+            output = await build_output(
+                session_factory,
+                build_request,
+                staged_source.build_id,
+                projection_transport=None if writer_transports is None else writer_transports.projection,
+            )
     except CancellationRequested:
         status = await _finish(session_factory, request, captured, policy, "canceled")
         return _result(status, captured, counts)
@@ -296,5 +311,6 @@ async def run_segmented_snowflake_candidate(
         return _result(status, captured, counts)
     if output.no_change is not None:
         return _result("no_change", captured, counts, output, output.no_change)
-    publication = await _activate(session_factory, build_request, output)
+    with failure_phase(FailurePhase.ACTIVATE):
+        publication = await _activate(session_factory, build_request, output)
     return _result("sealed_unpublished" if publication is None else "activated", captured, counts, output, publication)

@@ -19,8 +19,11 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+import custom_import_snowflake_operator as operator_entrypoint
 import process.custom_import.snowflake_operator_cli as operator_cli
 import process.custom_import.snowflake_source_binding as source_binding
 from db.connection import Database, current_session
@@ -35,6 +38,7 @@ from process.custom_import.build_graph import _session as build_session
 from process.custom_import.definition import MAX_DEFINITION_BYTES, CustomImportDefinition
 from process.custom_import.definition_store import DefinitionRegistrationError
 from process.custom_import.execution import ExecutionSubmission
+from process.custom_import.failure_diagnostics import FailurePhase, failure_identifiers, failure_phase
 from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.runner import CandidateRunResult
 from tests.custom_import_postgres_support import isolated_publication_case
@@ -323,6 +327,167 @@ class _Adapter:
         raise AssertionError("synthetic composition must not contact a source")
 
 
+def _assert_failure(
+    output, *, phase, category, reason="not_applicable", execution_id=None, build_id=None, code="failed"
+):
+    expected_by_field = {
+        "code": code,
+        "status": "error",
+        "diagnostic": {
+            "contract_version": "custom-import-failure/v1",
+            "phase": phase,
+            "category": category,
+            "database_reason": reason,
+            "execution_id": execution_id,
+            "build_id": build_id,
+        },
+    }
+    assert output.out == ""
+    assert output.err == json.dumps(expected_by_field, separators=(",", ":"), sort_keys=True) + "\n"
+
+
+def _diagnostic_cli_flow(monkeypatch, command, phase):
+    loaded = _loaded_binding()
+    database = _resume_database(loaded)
+    _install_resume_preflight(monkeypatch, database, loaded)
+    driver = Exception("synthetic driver payload")
+    driver.sqlstate = "42501"
+    error = DBAPIError("synthetic SQL", {"synthetic": "parameters"}, driver)
+
+    @asynccontextmanager
+    async def admission(*_args, **_kwargs):
+        if phase == "admission_stage":
+            raise error
+        yield None
+
+    async def run(*_args, **_kwargs):
+        failure_identifiers(execution_id=41, build_id=19)
+        with failure_phase(FailurePhase.SOURCE):
+            if phase == "source":
+                raise error
+        return CandidateRunResult(status="sealed_unpublished", execution_id=41)
+
+    monkeypatch.setattr(operator_cli, "load_admission_launch", admission)
+    monkeypatch.setattr(operator_cli, "run_snowflake_bundle_candidate", run)
+    monkeypatch.setattr(operator_cli, "FixedLocalKeyPairCredentialProvider", _CredentialProvider)
+    monkeypatch.setattr(operator_cli, "SnowflakePythonConnectorAdapter", _Adapter)
+    if phase == "binding":
+        monkeypatch.setattr(operator_cli, "load_snowflake_source_binding", AsyncMock(side_effect=error))
+    if phase == "connect":
+        monkeypatch.setattr(database, "connect", AsyncMock(side_effect=SQLAlchemyTimeoutError("synthetic pool")))
+    cleanup = error if phase == "disconnect" else RuntimeError("synthetic secondary cleanup")
+    monkeypatch.setattr(database, "disconnect", AsyncMock(side_effect=cleanup))
+    name = "_run_retained_snowflake_binding" if command == "execute" else "_run_resumed_snowflake_binding"
+    operation = getattr(operator_cli, name)
+
+    async def invoke(**arguments):
+        return await operation(**arguments, database=database)
+
+    monkeypatch.setattr(operator_cli, name, invoke)
+    return database
+
+
+@pytest.mark.parametrize("command", ["execute", "resume"])
+@pytest.mark.parametrize("phase", ["connect", "binding", "admission_stage", "source", "disconnect"])
+def test_cli_reports_database_boundary_without_secondary_cleanup_or_private_values(monkeypatch, capsys, command, phase):
+    database = _diagnostic_cli_flow(monkeypatch, command, phase)
+    assert (
+        operator_cli.run_command(
+            f"{command} --definition-revision-id 32 --source-binding-revision-id 34 "
+            "--idempotency-key synthetic-resume".split()
+        )
+        == 1
+    )
+    execution_id = (
+        41
+        if phase in {"source", "disconnect"}
+        else (40 if command == "resume" and phase == "admission_stage" else None)
+    )
+    _assert_failure(
+        capsys.readouterr(),
+        phase="resume_validation" if phase == "binding" and command == "resume" else phase,
+        category="database",
+        reason="connection_pool_timeout" if phase == "connect" else "insufficient_privilege",
+        execution_id=execution_id,
+        build_id=19 if execution_id == 41 else None,
+    )
+    database.disconnect.assert_awaited_once()
+    if phase == "connect":
+        assert database.sessions == []
+
+
+@pytest.mark.parametrize("command,cleanup_target", [("execute", "session"), ("resume", "session"), ("resume", "begin")])
+def test_cli_keeps_load_failure_when_session_cleanup_also_fails(monkeypatch, capsys, command, cleanup_target):
+    database = _diagnostic_cli_flow(monkeypatch, command, "binding")
+    target = database if cleanup_target == "session" else database.resume_session
+    context = getattr(target, cleanup_target)
+
+    @asynccontextmanager
+    async def failing_cleanup():
+        try:
+            async with context() as session:
+                yield session
+        finally:
+            raise SQLAlchemyTimeoutError("synthetic secondary session cleanup")
+
+    monkeypatch.setattr(target, cleanup_target, failing_cleanup)
+    assert (
+        operator_cli.run_command(
+            f"{command} --definition-revision-id 32 --source-binding-revision-id 34 "
+            "--idempotency-key synthetic-resume".split()
+        )
+        == 1
+    )
+    _assert_failure(
+        capsys.readouterr(),
+        phase="binding" if command == "execute" else "resume_validation",
+        category="database",
+        reason="insufficient_privilege",
+    )
+
+
+@pytest.mark.parametrize("command", ["execute", "resume", "register"])
+def test_entrypoint_task_cancellation_keeps_exit_and_worker_diagnostic(monkeypatch, capsys, command):
+    async def canceled(**_arguments):
+        failure_identifiers(execution_id=41, build_id=19)
+        with failure_phase(FailurePhase.SOURCE):
+            raise asyncio.CancelledError("synthetic cancellation payload")
+
+    name_by_command = {
+        "execute": "_run_retained_snowflake_binding",
+        "resume": "_run_resumed_snowflake_binding",
+        "register": "_register_snowflake_binding",
+    }
+    monkeypatch.setattr(operator_cli, name_by_command[command], canceled)
+    arguments = (
+        []
+        if command == "register"
+        else ("--definition-revision-id 32 --source-binding-revision-id 34 --idempotency-key synthetic-run".split())
+    )
+    monkeypatch.setattr(sys, "argv", ["custom_import_snowflake_operator", command, *arguments])
+    assert operator_entrypoint.main() == 1
+    output = capsys.readouterr()
+    if command == "register":
+        assert output.out == "" and output.err == '{"code":"failed","status":"error"}\n'
+    else:
+        _assert_failure(output, phase="source", category="canceled", execution_id=41, build_id=19)
+
+
+@pytest.mark.parametrize("command", ["register", "preflight"])
+def test_nonworker_task_cancellation_propagates_without_receipt(monkeypatch, capsys, command):
+    cancellation = asyncio.CancelledError("synthetic cancellation payload")
+    operation = "_register_snowflake_binding" if command == "register" else "_preflight_retained_snowflake_binding"
+    monkeypatch.setattr(operator_cli, operation, AsyncMock(side_effect=cancellation))
+    arguments = [] if command == "register" else "--definition-revision-id 32 --source-binding-revision-id 34".split()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        operator_cli.run_command([command, *arguments])
+
+    assert caught.value is cancellation
+    output = capsys.readouterr()
+    assert output.out == output.err == ""
+
+
 @pytest.mark.asyncio
 async def test_operator_composes_only_retained_configuration_and_generated_sql(monkeypatch):
     database = _Database()
@@ -520,8 +685,12 @@ def test_operator_cli_suppresses_noisy_execute_lifecycle_output(
             assert captured_output.err == ""
             assert captured_output.out == '{"execution_id":41,"status":"sealed_unpublished"}\n'
         else:
-            assert captured_output.out == ""
-            assert captured_output.err == f'{{"code":"{error_code}","status":"error"}}\n'
+            _assert_failure(
+                captured_output,
+                code=error_code,
+                phase={"connect": "connect", "run": "capture", None: "disconnect"}[failure_stage],
+                category="canceled" if failure is KeyboardInterrupt else "runtime",
+            )
             assert "synthetic" not in captured_output.err
         assert database.observed_echoes == ([] if failure_stage == "connect" else [False, False])
         assert database.connected == database.disconnected == 1 and database.engine.echo is True
@@ -618,9 +787,16 @@ def test_resume_cli_emits_an_optional_generation_identifier(monkeypatch, capsys)
     assert captured_output.out == '{"execution_id":41,"generation_id":19,"status":"sealed_unpublished"}\n'
 
 
-def test_resume_cli_redacts_invalid_candidate_output(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    "result,execution_id",
+    [
+        (CandidateRunResult(status="invalid", execution_id=41), 41),
+        (SimpleNamespace(status="sealed_unpublished", execution_id="synthetic receipt payload"), None),
+    ],
+)
+def test_resume_cli_redacts_invalid_candidate_output(monkeypatch, capsys, result, execution_id):
     async def resume(**_operation_keywords):
-        return CandidateRunResult(status="invalid", execution_id=41)
+        return result
 
     monkeypatch.setattr(operator_cli, "_run_resumed_snowflake_binding", resume)
 
@@ -638,9 +814,7 @@ def test_resume_cli_redacts_invalid_candidate_output(monkeypatch, capsys):
 
     captured_output = capsys.readouterr()
     assert exit_code == 1
-    assert captured_output.out == ""
-    assert captured_output.err == '{"code":"failed","status":"error"}\n'
-    assert "invalid" not in captured_output.err
+    _assert_failure(captured_output, phase="receipt", category="invalid_state", execution_id=execution_id)
 
 
 @pytest.mark.parametrize(
@@ -717,8 +891,7 @@ def test_resume_cli_redacts_unavailable_or_ambiguous_failures(monkeypatch, capsy
     )
 
     captured_output = capsys.readouterr()
-    assert captured_output.out == ""
-    assert captured_output.err == '{"code":"failed","status":"error"}\n'
+    _assert_failure(captured_output, phase="unknown", category="runtime")
     assert "synthetic-private-input" not in captured_output.err
 
 
@@ -766,8 +939,7 @@ def test_resume_cli_keeps_cancellation_when_cleanup_fails(monkeypatch, capsys):
     )
 
     captured_output = capsys.readouterr()
-    assert captured_output.out == ""
-    assert captured_output.err == '{"code":"canceled","status":"error"}\n'
+    _assert_failure(captured_output, code="canceled", phase="resume_validation", category="canceled")
     assert database.connected == database.disconnected == 1
     assert database.engine.echo is True
 

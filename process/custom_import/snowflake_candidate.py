@@ -41,6 +41,12 @@ from process.custom_import.execution import (
     lease_token_sha256,
     reserve_execution,
 )
+from process.custom_import.failure_diagnostics import (
+    FailurePhase,
+    failure_identifiers,
+    failure_phase,
+    record_failure,
+)
 from process.custom_import.family import (
     SourceSnapshotError,
     assemble_root_families,
@@ -821,15 +827,29 @@ async def _run_claimed_bundle_candidate(
         roots=replay.roots,
         children_by_collection=replay.children_by_collection,
     )
-    admitted = reject_duplicate_canonical_root_keys(
-        candidate_request.definition,
-        assemble_root_families(
+    with failure_phase(FailurePhase.ADMISSION):
+        admitted = reject_duplicate_canonical_root_keys(
             candidate_request.definition,
-            candidate_request.roots,
-            candidate_request.children_by_collection,
-        ),
-    )
+            assemble_root_families(
+                candidate_request.definition,
+                candidate_request.roots,
+                candidate_request.children_by_collection,
+            ),
+        )
     return await run_claimed_candidate(session_factory, candidate_request, grant, admitted)
+
+
+async def _prepare_acquired_captures(session_factory, request, grant, acquisition):
+    """Preserve acquisition failure before fencing and translating a bundle refusal."""
+
+    try:
+        return await asyncio.to_thread(_prepared_bundle_captures, acquisition)
+    except Exception as exc:
+        record_failure(exc)
+        await _fence_source_capture_failure(session_factory, request, grant)
+        if isinstance(exc, SnowflakeBundleError):
+            raise SnowflakeCandidateError("Snowflake bundle acquisition cannot be retained") from exc
+        raise
 
 
 async def run_snowflake_bundle_candidate(
@@ -853,6 +873,7 @@ async def run_snowflake_bundle_candidate(
     submission, grant = await _reserve_bundle_execution(
         session_factory, request, prepared_statement, request_identity_sha256
     )
+    failure_identifiers(execution_id=grant.execution_id if grant is not None else submission.execution_id)
     if grant is None:
         return CandidateRunResult(status="not_claimed", execution_id=submission.execution_id)
     if grant.state != "running":
@@ -867,20 +888,15 @@ async def run_snowflake_bundle_candidate(
         grant = renewed_grant
         try:
             acquisition = await asyncio.to_thread(_acquired_bundle, acquire, request, prepared_statement)
-        except Exception:
+        except Exception as error:
+            record_failure(error)
             await _fence_source_capture_failure(session_factory, request, grant)
             raise
         renewed_grant = await _renew_bundle_lease(session_factory, request, grant)
         if renewed_grant is None or renewed_grant.state != "running":
             return await _reservation_unavailable_result(session_factory, request, grant)
         grant = renewed_grant
-        try:
-            captures = await asyncio.to_thread(_prepared_bundle_captures, acquisition)
-        except Exception as exc:
-            await _fence_source_capture_failure(session_factory, request, grant)
-            if isinstance(exc, SnowflakeBundleError):
-                raise SnowflakeCandidateError("Snowflake bundle acquisition cannot be retained") from exc
-            raise
+        captures = await _prepare_acquired_captures(session_factory, request, grant, acquisition)
         renewed_grant = await _renew_bundle_lease(session_factory, request, grant)
         if renewed_grant is None or renewed_grant.state != "running":
             return await _reservation_unavailable_result(session_factory, request, grant)

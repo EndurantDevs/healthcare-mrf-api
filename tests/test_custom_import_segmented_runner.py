@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
 from process.custom_import import build_output as output
 from process.custom_import import execution as lifecycle
@@ -18,6 +20,7 @@ from process.custom_import import operator as operator_evidence
 from process.custom_import import scalar_digest
 from process.custom_import import snowflake_operator_cli as operator_cli
 from process.custom_import import snowflake_segmented_runner as runner
+from process.custom_import.failure_diagnostics import FailurePhase, failure_context, failure_phase
 from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.runner_types import CancellationRequested, CandidateRunnerError, LeaseAuthorityLost
 from process.custom_import.snowflake_capture import SnowflakeCaptureResult
@@ -177,6 +180,57 @@ async def test_unknown_storage_error_is_not_relabelled_as_lease_loss(monkeypatch
         await _run(flow)
     flow.calls["_finish"].assert_not_awaited()
     flow.calls["_activate"].assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "stage,phase,execution_id,build_id",
+    [
+        ("acquire_segmented_snowflake_capture", "capture", None, None),
+        ("_build_request", "begin_build", 9, None),
+        ("count_source_outcomes", "counts", 9, 19),
+        ("build_graph", "graph", 9, 19),
+        ("build_output", "output", 9, 19),
+        ("_activate", "activate", 9, 19),
+    ],
+)
+async def test_segmented_failure_diagnostic_uses_the_active_boundary(monkeypatch, stage, phase, execution_id, build_id):
+    flow = _install_flow(monkeypatch)
+    error = SQLAlchemyError("synthetic database failure")
+    error.sqlstate = "57014"
+    flow.calls[stage].side_effect = error
+    with failure_context() as diagnostic:
+        with pytest.raises(SQLAlchemyError):
+            await _run(flow)
+        snapshot = diagnostic.snapshot(error)
+    assert snapshot["phase"] == phase
+    assert snapshot["category"] == "database" and snapshot["database_reason"] == "query_canceled"
+    assert snapshot["execution_id"] == execution_id and snapshot["build_id"] == build_id
+    flow.calls["_finish"].assert_not_awaited()
+
+
+@pytest.mark.parametrize("error", [CancellationRequested, LeaseAuthorityLost, CandidateRunnerError])
+async def test_handled_runner_outcome_does_not_label_a_later_disconnect_failure(monkeypatch, error):
+    flow = _install_flow(monkeypatch)
+    flow.calls["build_output"].side_effect = error("synthetic handled outcome")
+    with failure_context() as diagnostic:
+        with failure_phase(FailurePhase.CAPTURE):
+            await _run(flow)
+        assert diagnostic.failure is None
+        with pytest.raises(OSError), failure_phase(FailurePhase.DISCONNECT):
+            raise OSError("synthetic cleanup failure")
+        snapshot = diagnostic.snapshot(RuntimeError())
+    assert snapshot["phase"] == "disconnect" and snapshot["category"] == "io"
+
+
+async def test_terminal_cleanup_preserves_original_runner_failure(monkeypatch):
+    flow = _install_flow(monkeypatch)
+    flow.calls["build_output"].side_effect = CandidateRunnerError("synthetic original failure")
+    flow.calls["_finish"].side_effect = SQLAlchemyError("synthetic cleanup failure")
+    with failure_context() as diagnostic:
+        with pytest.raises(SQLAlchemyError):
+            await _run(flow)
+        snapshot = diagnostic.snapshot(RuntimeError())
+    assert snapshot["phase"] == "output" and snapshot["category"] == "runtime"
 
 
 async def test_writer_transports_is_checked_before_capture_and_forwarded_unchanged(monkeypatch):
@@ -602,7 +656,19 @@ def test_operator_reports_post_capture_failure_without_private_details(monkeypat
         == 1
     )
     output = capsys.readouterr()
-    assert output.out == "" and output.err == '{"code":"failed","status":"error"}\n'
+    assert output.out == ""
+    assert json.loads(output.err) == {
+        "code": "failed",
+        "status": "error",
+        "diagnostic": {
+            "contract_version": "custom-import-failure/v1",
+            "phase": "output",
+            "category": "runtime",
+            "database_reason": "not_applicable",
+            "execution_id": 1,
+            "build_id": 19,
+        },
+    }
 
 
 @pytest.mark.parametrize("authority", ["expired", "preempted", "wrong_token", "canceling_stale"])

@@ -24,6 +24,7 @@ from process.custom_import.capture import CaptureError, capture_stream
 from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.execution import ExecutionSubmission, LeaseGrant
+from process.custom_import.failure_diagnostics import failure_context
 from process.custom_import.processing_policy import BuildPolicy, ProcessingPolicy
 from process.custom_import.segmented_capture_policy import SegmentedCapturePolicy
 from process.custom_import.snowflake import SnowflakeConnectorError
@@ -372,6 +373,25 @@ async def test_unavailable_capture_reservation_never_opens_source(monkeypatch, s
     assert result.status == {"not_claimed": "not_claimed", "canceling": "canceled", "unbound": "lease_lost"}[state]
     assert unavailable.await_count == (state == "canceling")
     assert unbound.await_count == (state == "unbound")
+    assert harness.timeline == ["reserve"] and harness.cursor.executed == []
+    assert harness.parts == [] and harness.receipts == () and harness.finishes == []
+
+
+@pytest.mark.parametrize("has_grant", [False, True])
+async def test_reservation_diagnostic_uses_available_identity(monkeypatch, has_grant):
+    harness = _Harness(monkeypatch)
+    if has_grant:
+        harness.grant = replace(harness.grant, state="canceling")
+        harness.submission = None
+    else:
+        harness.grant = None
+    unavailable = AsyncMock(return_value=SimpleNamespace(status="canceled", execution_id=9))
+    monkeypatch.setattr(capture, "_reservation_unavailable_result", unavailable)
+    with failure_context() as diagnostic:
+        result = await harness.run()
+        assert diagnostic.execution_id == result.execution_id == 9
+    assert result.status == ("canceled" if has_grant else "not_claimed")
+    assert unavailable.await_count == has_grant
     assert harness.timeline == ["reserve"] and harness.cursor.executed == []
     assert harness.parts == [] and harness.receipts == () and harness.finishes == []
 
