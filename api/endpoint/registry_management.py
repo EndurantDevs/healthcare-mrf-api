@@ -10,7 +10,7 @@ from sanic import Blueprint, response
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from api.control_auth import require_control_auth
+from api.control_auth import require_registry_auth
 from process.company_network_link_store import (
     CompanyLinkBatchCommand,
     CompanyLinkBatchTarget,
@@ -213,7 +213,7 @@ def _error(status):
 @blueprint.post("/targets/verify")
 async def verify_targets(request):
     """Verify bounded exact identities for the app's independent grant policy."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         document = _body(request)
         if set(document) - {"boundary"} != {"targets"}:
@@ -232,7 +232,7 @@ async def verify_targets(request):
 @blueprint.post("/source-sites")
 async def read_source_sites(request):
     """Return offices for one exact provider from an explicitly pinned generation."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         document = _body(request)
         if not {"source_generation", "provider_system", "provider_id"} <= set(document) or set(document) - {
@@ -265,7 +265,7 @@ async def read_source_sites(request):
 @blueprint.post("/company/search")
 async def search_companies(request):
     """Search within the trusted app's complete company authorization selector."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         document = _body(request, maximum=262144)
         if set(document) != {"q", "limit", "offset", "record_ids"}:
@@ -288,7 +288,7 @@ async def search_companies(request):
 @blueprint.post("/group/search")
 async def search_groups(request):
     """Search within the trusted app's complete group authorization selector."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         document = _body(request, maximum=262144)
         if set(document) != {"q", "limit", "offset", "record_ids"}:
@@ -311,7 +311,7 @@ async def search_groups(request):
 @blueprint.get("/<kind>")
 async def list_records(request, kind):
     """Return a bounded draft page to the trusted authorization layer."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         query_by_name = _list_query(request, allowed={"limit", "offset", "record_ids", "custom_revision"})
         custom_revision = _custom_revision(query_by_name, kind)
@@ -334,7 +334,7 @@ async def list_records(request, kind):
 @blueprint.get("/<kind>/<record_id>")
 async def read_record(request, kind, record_id):
     """Management reads may show pending corrections; directory reads may not."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         query_by_name = _list_query(request, allowed={"custom_revision"})
         custom_revision = _custom_revision(query_by_name, kind)
@@ -351,7 +351,7 @@ async def read_record(request, kind, record_id):
 @blueprint.post("/<kind>")
 async def write_record(request, kind):
     """Retain one authorized correction and its actor without publishing it."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         command, actor = _command(_body(request), kind)
         async with request.ctx.sa_session.begin():
@@ -370,7 +370,7 @@ async def write_record(request, kind):
 @blueprint.get("/<kind>/<record_id>/history", ignore_body=False)
 async def read_record_history(request, kind, record_id):
     """Return bounded full manual revisions to the authorization layer."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         query = _list_query(request)
         if "record_ids" in query:
@@ -395,7 +395,7 @@ async def read_record_history(request, kind, record_id):
 @blueprint.post("/<kind>/<record_id>/undo")
 async def undo_record(request, kind, record_id):
     """Save historical editable content as an ordinary unapproved correction."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         document = _body(request, maximum=65536)
         if set(document) != {"expected_revision", "target_revision", "reason", "idempotency_key", "actor"}:
@@ -440,7 +440,7 @@ async def undo_record(request, kind, record_id):
 @blueprint.post("/company_links/batch")
 async def write_company_link_batch(request):
     """Retain one explicit selected-company batch through a native set-based save."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         command, actor = _batch_command(_body(request, maximum=8 * 1024 * 1024))
         async with request.ctx.sa_session.begin():
@@ -460,7 +460,7 @@ async def write_company_link_batch(request):
 @blueprint.post("/company_links/group_snapshot")
 async def read_company_link_group_snapshot(request):
     """Read one group page narrowed by the authorization layer's exact companies."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         document = _body(request, maximum=256 * 1024)
         if set(document) not in (
@@ -499,7 +499,7 @@ async def read_company_link_group_snapshot(request):
 @blueprint.post("/source_bindings/batch")
 async def write_source_binding_batch(request):
     """Persist a whole reviewed source set without advancing approved search."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         document = _body(request, maximum=8 * 1024 * 1024)
         if set(document) != {"rows", "reason", "idempotency_key", "actor"} or type(document["rows"]) is not list:
@@ -532,7 +532,7 @@ async def write_source_binding_batch(request):
 @blueprint.post("/source_bindings/query")
 async def read_source_binding_page(request):
     """Return exact network and optional source-key draft evidence for review."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         document = _body(request)
         if set(document) != {"network_id", "source_system", "binding_key", "limit", "offset"}:

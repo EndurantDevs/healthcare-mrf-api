@@ -234,6 +234,13 @@ Set the database credentials and Redis URL in `.env` to your local services.
 until you configure your own `HLTHPRT_CONTROL_API_TOKEN`; regular imports use
 the CLI directly. Most import-specific settings in `.env.example` are optional.
 
+Registry service clients may use a separate `HLTHPRT_REGISTRY_CONTROL_API_TOKEN`.
+This credential is accepted only on Registry management, publication, serving and
+Registry PTG-scope routes; it cannot authorize general importer actions.
+Existing operator credentials remain valid on Registry routes. Configure the
+client and receiver with the same dedicated secret through your runtime secret
+store; leave the setting blank when separate Registry access is not needed.
+
 Create a dedicated application role using your PostgreSQL administrator (shown
 as `postgres`), put its password in `.env`, then create the local database and
 run the bundled ZIP import. This reads the public
