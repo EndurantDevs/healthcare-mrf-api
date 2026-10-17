@@ -2992,40 +2992,40 @@ def _nucc_abandonment(handoff, abandonment):
 
 async def _require_nucc_cleanup_run(session, handoff, abandonment):
     """Lock the genuine actual run/history and its retained abandonment preimage."""
-    run = (
-        (
-            await session.execute(
-                text(
-                    "SELECT * FROM mrf.import_run WHERE run_id=:run_id AND node_id=:node_id "
-                    "AND engine='healthcare-mrf-api' AND importer='nucc' AND octet_length(metrics::text)<=393216 "
-                    "AND octet_length(params::text)<=131072 FOR UPDATE NOWAIT"
-                ),
-                handoff,
-            )
-        )
-        .mappings()
-        .one_or_none()
+    locked = await session.execute(
+        text(
+            "SELECT * FROM mrf.import_run WHERE run_id=:run_id AND node_id=:node_id "
+            "AND engine='healthcare-mrf-api' AND importer='nucc' AND octet_length(metrics::text)<=393216 "
+            "AND octet_length(params::text)<=131072 FOR UPDATE NOWAIT"
+        ),
+        handoff,
     )
+    run = locked.mappings().one_or_none()
     if run is None or type(run["params"]) is not dict or run["params"].get("test") or run["params"].get("test_mode"):
         raise ReferenceFamilyArchiveError("NUCC cleanup run differs")
     await _require_nucc_native_location(session, handoff, run)
     metrics = run["metrics"] or {}
-    observed = abandonment["observed_run"]
     current = validate_nucc_native_handoff(metrics.get("nucc_handoff"))
+    observed_by_field = {
+        "run_id": handoff["run_id"],
+        "node_id": handoff["node_id"],
+        "status": run["status"],
+        "progress": {key: (run["progress"] or {}).get(key) for key in ("attempt_id", "attempt_started_at")},
+        "handoff_sha256": current["handoff_sha256"],
+        "phase_detail": run["phase_detail"],
+        "finished_at": str(run["finished_at"]) if run["finished_at"] else None,
+    }
+    if abandonment["reason"] in {"replaced-attempt", "completed-handoff-cancellation"}:
+        observed_by_field.update(
+            status="finalizing" if abandonment["reason"] == "replaced-attempt" else "canceling",
+            phase_detail=NUCC_HANDOFF_PHASE if abandonment["reason"] == "replaced-attempt" else "cancel requested",
+            finished_at=None,
+        )
     if (
         metrics.get("nucc_native_publication") is not None
         or (metrics.get("nucc_native_abandonments") or {}).get(abandonment["preparation_id"]) != abandonment
         or (metrics.get("nucc_native_candidate_cleanups") or {}).get(abandonment["preparation_id"]) is not None
-        or observed
-        != {
-            "run_id": handoff["run_id"],
-            "node_id": handoff["node_id"],
-            "status": run["status"],
-            "progress": {key: (run["progress"] or {}).get(key) for key in ("attempt_id", "attempt_started_at")},
-            "handoff_sha256": current["handoff_sha256"],
-            "phase_detail": run["phase_detail"],
-            "finished_at": str(run["finished_at"]) if run["finished_at"] else None,
-        }
+        or abandonment["observed_run"] != observed_by_field
         or any(
             current[key] != handoff[key]
             for key in ("run_id", "node_id", "schema_name", "database_oid", "import_run_oid")
@@ -3043,33 +3043,29 @@ def _require_nucc_cleanup_terminal(run, handoff, current, reason):
         current["attempt_started_at"],
     ):
         raise ReferenceFamilyArchiveError("NUCC cleanup attempt differs")
+    is_canceled = run["status"] in {"canceled", "cancelled"} and run["finished_at"] is not None
+    is_unfinished = run["finished_at"] is None and run["error"] is None
+    is_fenced = (
+        run["status"] == "canceling"
+        and run["phase_detail"] == progress.get("message") == "cancel requested"
+        and is_unfinished
+    )
     if reason == "replaced-attempt":
+        is_finalizing = run["status"] == "finalizing" and run["phase_detail"] == NUCC_HANDOFF_PHASE and is_unfinished
         if (
             current["attempt_id"] == handoff["attempt_id"]
             or current["attempt_started_at"] == handoff["attempt_started_at"]
-            or run["status"] != "finalizing"
-            or run["phase_detail"] != NUCC_HANDOFF_PHASE
-            or run["finished_at"] is not None
-            or run["error"] is not None
+            or not (is_finalizing or is_fenced or is_canceled)
             or _nucc_source_contract(current, run["params"]) != current["source_contract_sha256"]
         ):
             raise ReferenceFamilyArchiveError("NUCC replacement is not authenticated")
         return
     if current != handoff:
         raise ReferenceFamilyArchiveError("NUCC cleanup handoff differs")
-    is_canceled = (
-        reason == "terminal-cancellation"
-        and run["status"] in {"canceled", "cancelled"}
-        and run["finished_at"] is not None
-    )
-    is_fenced = (
-        reason == "completed-handoff-cancellation"
-        and run["status"] == "canceling"
-        and run["phase_detail"] == progress.get("message") == "cancel requested"
-        and run["finished_at"] is None
-        and run["error"] is None
-    )
-    if not (is_canceled or is_fenced):
+    is_canceled = is_canceled and (reason == "terminal-cancellation" or progress.get("message") == "canceled")
+    if reason not in {"terminal-cancellation", "completed-handoff-cancellation"} or not (
+        is_canceled or reason == "completed-handoff-cancellation" and is_fenced
+    ):
         raise ReferenceFamilyArchiveError("NUCC cancellation is not authenticated")
 
 

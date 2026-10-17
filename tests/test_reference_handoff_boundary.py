@@ -342,6 +342,50 @@ def _cleanup_inputs():
     return run_by_field, handoff, abandonment_by_field
 
 
+def _cleanup_cancellation_inputs(reason, status):
+    run, handoff, abandonment = _cleanup_inputs()
+    current = handoff
+    if reason == "replaced-attempt":
+        stage = deepcopy(handoff["precreated_stage"])
+        stage.update(attempt_id="synthetic:" + "2" * 32, attempt_started_at="2026-10-02T00:00:00+00:00")
+        stage["import_date"] = archive._nucc_attempt(
+            {
+                "control_run_id": stage["run_id"],
+                "context": {
+                    "_control_attempt_id": stage["attempt_id"],
+                    "_control_attempt_started_at": stage["attempt_started_at"],
+                },
+            }
+        )[3]
+        stage["stage"].update(table_name="nucc_taxonomy_" + stage["import_date"], relation_oid=51, relfilenode=52)
+        stage["source_contract_sha256"] = archive._nucc_source_contract(stage, run["params"])
+        stage["stage_sha256"] = archive.nucc_native_digest(
+            {key: field_value for key, field_value in stage.items() if key != "stage_sha256"}
+        )
+        current = _nucc_completed_handoff(stage)
+    abandonment["reason"] = reason
+    abandonment["observed_run"] = {
+        "run_id": current["run_id"],
+        "node_id": current["node_id"],
+        "status": "finalizing" if reason == "replaced-attempt" else "canceling",
+        "progress": {key: current[key] for key in ("attempt_id", "attempt_started_at")},
+        "handoff_sha256": current["handoff_sha256"],
+        "phase_detail": archive.NUCC_HANDOFF_PHASE if reason == "replaced-attempt" else "cancel requested",
+        "finished_at": None,
+    }
+    run["metrics"]["nucc_handoff"] = current
+    run.update(
+        status=status,
+        phase_detail="cancel requested" if status == "canceling" else "canceled",
+        finished_at=None if status == "canceling" else "2026-10-02T00:01:00Z",
+        progress={
+            **abandonment["observed_run"]["progress"],
+            "message": "cancel requested" if status == "canceling" else "canceled",
+        },
+    )
+    return run, handoff, abandonment
+
+
 @pytest.mark.parametrize("reason", ["terminal-cancellation", "completed-handoff-cancellation", "replaced-attempt"])
 @pytest.mark.parametrize("failure", [None, "progress", "status", "finish", "identity", "source"])
 def test_cleanup_requires_authenticated_terminal_or_replacement_state(reason, failure):
@@ -411,8 +455,20 @@ def _cleanup_catalog_session(run, handoff, failure):
 @pytest.mark.parametrize(
     "failure", [None, "first_reference", "late_reference", "transaction", "xact", "serving", "owner"]
 )
-async def test_cleanup_rechecks_custody_and_references_before_one_restrict_drop(monkeypatch, failure):
-    run, handoff, abandonment = _cleanup_inputs()
+@pytest.mark.parametrize(
+    "cancellation",
+    [None]
+    + [
+        (reason, status)
+        for reason in ("replaced-attempt", "completed-handoff-cancellation")
+        for status in ("canceling", "canceled", "cancelled")
+    ],
+)
+async def test_cleanup_rechecks_custody_and_references_before_one_restrict_drop(monkeypatch, failure, cancellation):
+    run, handoff, abandonment = (
+        _cleanup_inputs() if cancellation is None else _cleanup_cancellation_inputs(*cancellation)
+    )
+    original_run, original_abandonment = deepcopy(run), deepcopy(abandonment)
     session, transaction_state = _cleanup_catalog_session(run, handoff, failure)
     monkeypatch.setattr(archive, "_nucc_native_publisher_owner", AsyncMock(return_value=53))
     monkeypatch.setattr(archive, "_relation_oid", AsyncMock(return_value=handoff["import_run_oid"]))
@@ -442,6 +498,8 @@ async def test_cleanup_rechecks_custody_and_references_before_one_restrict_drop(
         assert receipt["stage"] == handoff["stage"]
         assert receipt["abandonment_sha256"] == archive.nucc_native_digest(abandonment)
     queries = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert run == original_run and abandonment == original_abandonment
+    assert not any(query.startswith("UPDATE") for query in queries)
     drops = [query for query in queries if query.startswith("DROP")]
     assert drops == ([] if failure else [f'DROP TABLE "mrf"."{handoff["stage"]["table_name"]}" RESTRICT'])
     assert queries[-1] == "SELECT set_config('search_path',:path,true)"
