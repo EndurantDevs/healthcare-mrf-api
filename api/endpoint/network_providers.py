@@ -9,7 +9,7 @@ from sanic import Blueprint, response
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from api.control_auth import require_control_auth
+from api.control_auth import require_registry_auth
 from api.network_address_scope import network_address_read_scope
 from api.network_provider_read import (
     NetworkOfficeSelection,
@@ -100,7 +100,7 @@ def _error(status, generation_id=None):
 
 async def _provider_response(request, *, provider_system=None, provider_id=None):
     """Pin and read one complete result in a request-owned read-only transaction."""
-    require_control_auth(request)
+    require_registry_auth(request)
     is_detail = provider_system is not None
     try:
         parameters_by_name = _parameters(request, is_detail=is_detail)

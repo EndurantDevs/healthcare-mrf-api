@@ -10,7 +10,7 @@ from sanic import Blueprint, response
 from sanic.exceptions import Forbidden
 from sqlalchemy.exc import SQLAlchemyError
 
-from api.control_auth import require_control_auth
+from api.control_auth import require_registry_auth
 from api.endpoint.registry_management import _unique_object
 from process.registry_ptg_scope_engine import (
     SCOPE_DEADLINE_HEADER,
@@ -197,7 +197,7 @@ def _validation_reply(operation, error):
 
 async def _execute_scope(request, operation):
     try:
-        require_control_auth(request)
+        require_registry_auth(request)
     except Forbidden:
         return _reply({"error": {"code": "registry_service_auth_required"}}, 401)
     try:

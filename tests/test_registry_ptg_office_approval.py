@@ -208,7 +208,7 @@ async def test_existing_control_route_consumes_installed_method(monkeypatch):
         headers={},
         app=SimpleNamespace(ctx=SimpleNamespace(registry_ptg_scope_engine=service)),
     )
-    monkeypatch.setattr(routes, "require_control_auth", lambda request: None)
+    monkeypatch.setattr(routes, "require_registry_auth", lambda request: None)
     result = await routes.approve_registry_ptg_offices(request)
     assert result.status == 200 and json.loads(result.body)["state"] == "reviewed"
     assert "retain" in events

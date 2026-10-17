@@ -327,7 +327,7 @@ async def test_actual_management_caller_uses_rr_driver_and_server_store(monkeypa
         ctx=SimpleNamespace(sa_session=session),
         app=SimpleNamespace(ctx=SimpleNamespace(registry_ptg_scope_engine=SimpleNamespace(store=store))),
     )
-    monkeypatch.setattr(routes, "require_control_auth", lambda request: None)
+    monkeypatch.setattr(routes, "require_registry_auth", lambda request: None)
     apply = AsyncMock(return_value={"records": []})
     monkeypatch.setattr(routes, "apply_network_source_binding_batch", apply)
     reply = await routes.write_source_binding_batch(request)
