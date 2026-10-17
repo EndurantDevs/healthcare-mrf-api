@@ -7,10 +7,11 @@ import json
 import sys
 from dataclasses import asdict, replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sanic.compat import Header
+from sqlalchemy.exc import StatementError
 
 from api import control_admission_batch as admission
 from api import control_source_batch as service
@@ -137,9 +138,47 @@ async def test_failure_is_metadata_only_no_retry_or_rollback_claim(monkeypatch, 
     monkeypatch.setattr(service, "_source_operation", operation)
     reply = await _serve(request)
     assert reply.status == status and json.loads(reply.body) == {"error": code}
-    assert reply.headers["Cache-Control"] == "no-store" and not caplog.records
+    assert reply.headers["Cache-Control"] == "no-store"
+    if status == 503:
+        assert len(caplog.records) == 1
+        assert (
+            caplog.records[0].getMessage().startswith("custom_import_batch_unavailable stage=source_execute category=")
+        )
+    else:
+        assert not caplog.records
+    assert "do-not-log" not in caplog.text
     assert b"rollback" not in reply.body and b"do-not-log" not in reply.body
     operation.assert_awaited_once()
+
+
+@pytest.mark.parametrize("stage", ["receive", "authorize", "execute", "receipt"])
+async def test_unavailable_diagnostics_keep_private_values(monkeypatch, caplog, stage):
+    request, _ = _wire()
+    error = StatementError("synthetic-message", "SELECT synthetic_sql", {"field": "synthetic-payload"}, None)
+    request.headers.add("X-Synthetic-Diagnostic", "synthetic-header")
+    monkeypatch.setattr(service, "_source_operation", AsyncMock(return_value=_committed()))
+    if stage == "receive":
+        request = _streaming(b"synthetic-body")
+        monkeypatch.setattr(admission, "_receive_admission_body", AsyncMock(side_effect=error))
+        reply = await service.source_batch(request)
+    else:
+        patched_module, patched_attribute = {
+            "authorize": (service.authorization, "verify_request"),
+            "execute": (service, "_source_operation"),
+            "receipt": (service, "_receipt"),
+        }[stage]
+        replacement = AsyncMock(side_effect=error) if stage == "execute" else Mock(side_effect=error)
+        monkeypatch.setattr(patched_module, patched_attribute, replacement)
+        reply = await _serve(request)
+    assert reply.status == 503 and json.loads(reply.body) == {"error": "source_unavailable"}
+    assert reply.headers["Cache-Control"] == "no-store"
+    assert len(caplog.records) == 1
+    log_entry = caplog.records[0]
+    assert log_entry.getMessage() == f"custom_import_batch_unavailable stage=source_{stage} category=database"
+    assert log_entry.args == (f"source_{stage}", "database")
+    assert not log_entry.exc_info and log_entry.exc_text is None and log_entry.stack_info is None
+    assert not any(sentinel in caplog.text for sentinel in ("synthetic-", "synthetic_sql"))
+    assert request.body == b"" or request.body.decode() not in caplog.text
 
 
 async def test_cancelled_handler_does_not_synthesize_receipt(monkeypatch):

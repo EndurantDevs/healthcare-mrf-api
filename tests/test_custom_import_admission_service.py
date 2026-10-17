@@ -8,10 +8,11 @@ import json
 from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sanic.compat import Header
+from sqlalchemy.exc import StatementError
 
 import api.control_admission_batch as service
 import process.custom_import.admission_authorization as auth
@@ -287,6 +288,44 @@ async def test_lost_ack_retry_returns_original_cursor_conflict(monkeypatch):
     operation.assert_awaited_once()
 
 
+@pytest.mark.parametrize("stage", ["receive", "authorize", "retained", "execute", "receipt"])
+async def test_unavailable_diagnostics_keep_private_values(monkeypatch, caplog, stage):
+    wire, verified, ring = _wire()
+    error = StatementError("synthetic-message", "SELECT synthetic_sql", {"field": "synthetic-payload"}, None)
+    wire.headers.add("X-Synthetic-Diagnostic", "synthetic-header")
+    monkeypatch.setattr(
+        service,
+        "_retained_request",
+        AsyncMock(return_value=_request(authorization_expires_at=verified.permit.expires_at)),
+    )
+    monkeypatch.setattr(
+        admission, "admit_source_batch", AsyncMock(return_value=admission.AdmissionResult("graph", 1, 1, 0))
+    )
+    if stage == "receive":
+        wire = _streaming_request(b"synthetic-body")
+        monkeypatch.setattr(service, "_receive_admission_body", AsyncMock(side_effect=error))
+        reply = await service.admission_batch(wire)
+    else:
+        patched_module, patched_attribute = {
+            "authorize": (service, "verify_request"),
+            "retained": (service, "_retained_request"),
+            "execute": (admission, "admit_source_batch"),
+            "receipt": (service, "_receipt"),
+        }[stage]
+        replacement = AsyncMock(side_effect=error) if stage in {"retained", "execute"} else Mock(side_effect=error)
+        monkeypatch.setattr(patched_module, patched_attribute, replacement)
+        reply = await service.serve_admission_batch(wire, None, keyring=ring, expected_origin=ORIGIN, trusted_now=NOW)
+    assert reply.status == 503 and json.loads(reply.body) == {"error": "admission_unavailable"}
+    assert reply.headers["Cache-Control"] == "no-store"
+    assert len(caplog.records) == 1
+    log_entry = caplog.records[0]
+    assert log_entry.getMessage() == f"custom_import_batch_unavailable stage=admission_{stage} category=database"
+    assert log_entry.args == (f"admission_{stage}", "database")
+    assert not log_entry.exc_info and log_entry.exc_text is None and log_entry.stack_info is None
+    assert not any(sentinel in caplog.text for sentinel in ("synthetic-", "synthetic_sql"))
+    assert wire.body == b"" or wire.body.decode() not in caplog.text
+
+
 def _authority_document():
     return canonical(
         {
@@ -498,7 +537,10 @@ def test_service_never_emits_a_noop_or_inconsistent_zero_row_ack(phase, cursor, 
         service._receipt(verified, admission.AdmissionResult(phase, cursor, count, 0))
 
 
-async def test_admission_unknown_commit_is_metadata_only_no_retry(monkeypatch, caplog):
+@pytest.mark.parametrize(
+    "error", [RuntimeError("uncertain COMMIT do-not-log"), admission.AdmissionError("synthetic-do-not-log")]
+)
+async def test_admission_unknown_commit_is_metadata_only_no_retry(monkeypatch, caplog, error):
     wire, verified, ring = _wire()
     monkeypatch.setattr(
         service,
@@ -509,9 +551,12 @@ async def test_admission_unknown_commit_is_metadata_only_no_retry(monkeypatch, c
             )
         ),
     )
-    operation = AsyncMock(side_effect=RuntimeError("uncertain COMMIT do-not-log"))
+    operation = AsyncMock(side_effect=error)
     monkeypatch.setattr(admission, "admit_source_batch", operation)
     reply = await service.serve_admission_batch(wire, None, keyring=ring, expected_origin=ORIGIN, trusted_now=NOW)
     assert reply.status == 503 and json.loads(reply.body) == {"error": "admission_unavailable"}
-    assert reply.headers["Cache-Control"] == "no-store" and not caplog.records
+    assert reply.headers["Cache-Control"] == "no-store"
+    assert len(caplog.records) == 1
+    assert caplog.records[0].getMessage() == "custom_import_batch_unavailable stage=admission_execute category=runtime"
+    assert "do-not-log" not in caplog.text
     operation.assert_awaited_once()
