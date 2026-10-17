@@ -20,6 +20,7 @@ from sanic.request import Request
 from api import control_admission_batch as admission
 from api import control_source_batch as source
 from process.custom_import import admission_sql
+from process.custom_import import build_source as staging
 from process.custom_import.runner_types import LeaseAuthorityLost
 from tests import test_custom_import_admission_service as admission_fixture
 from tests import test_custom_import_source_service as source_fixture
@@ -211,10 +212,46 @@ async def test_shorter_retained_deadline_rearms_the_provisional_timer(batch_serv
 
     monkeypatch.setattr(admission, "_retained_request", delayed_read)
     reply = await _post(state)
-    assert reply.status_code == 503
-    assert state.attempted == 1 and state.cancelled and not state.committed
+    assert reply.status_code == 409
+    assert state.attempted == 0 and not state.cancelled and not state.committed
     assert state.observations[-1][2] == 0.6
     assert state.app.config.RESPONSE_TIMEOUT == _DEFAULT_TIMEOUT
+
+
+async def test_operation_expires_before_http_without_committed_receipt(batch_server, monkeypatch):
+    state = batch_server
+    monkeypatch.setattr(admission, "MAX_BATCH_RESPONSE_SECONDS", 1.2)
+    monkeypatch.setattr(admission, "BATCH_RESPONSE_MARGIN_SECONDS", 0.2)
+    timeouts = []
+
+    async def record_timeout(_session, milliseconds):
+        timeouts.append(milliseconds)
+
+    async def bounded_batch(*args, **kwargs):
+        deadline = (
+            admission_fixture._request().operation_deadline if state.kind == "source" else args[1].operation_deadline
+        )
+        state.attempted += 1
+        session = SimpleNamespace(info={staging._WINDOW: staging._PageWindow(deadline, 900_000)})
+        await staging._prepare_statement(session)
+        assert 0 < timeouts[-1] < 600
+        try:
+            await asyncio.sleep(max(0, deadline - staging.time.monotonic()) + 0.01)
+        except asyncio.CancelledError:
+            state.cancelled = True
+            raise
+        pytest.fail("expired work must not reach a write or committed receipt")
+
+    monkeypatch.setattr(staging, "_set_timeout", record_timeout)
+    monkeypatch.setattr(admission_sql, "admit_source_batch", bounded_batch)
+    monkeypatch.setattr(source, "_source_operation", bounded_batch)
+    reply = await _post(state)
+    assert reply.status_code == 503
+    assert reply.json() == {"error": f"{state.kind}_unavailable"}
+    assert state.attempted == 1 and not state.committed and state.cancelled
+    assert len(timeouts) == 1
+    assert state.observations[-1][2] == 1.2
+    assert admission_fixture._request().operation_deadline is None
 
 
 async def test_long_batch_preserves_lease_authority_failure_without_receipt(batch_server):
