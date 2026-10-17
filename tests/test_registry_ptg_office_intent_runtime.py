@@ -165,7 +165,7 @@ async def test_signed_prepare_dispatches_only_coordinator_and_projects_original_
         return result
 
     monkeypatch.setattr(coordinator.RegistryPTGOfficeIntentCoordinator, "prepare", prepare)
-    monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
+    monkeypatch.setattr(routes, "require_registry_auth", lambda _request: None)
     reply = await routes.prepare_registry_ptg_offices(request(app, document))
     assert reply.status == 200 and len(calls) == 1 and calls[0][0] is app.ctx.registry_ptg_office_coordinator
     payload = json.loads(reply.body)
@@ -179,7 +179,7 @@ async def test_legacy_direct_handle_prepare_refuses_even_with_installed_coordina
     app, _ = durable_app
     execute = AsyncMock()
     monkeypatch.setattr(coordinator.RegistryPTGOfficeIntentCoordinator, "prepare", execute)
-    monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
+    monkeypatch.setattr(routes, "require_registry_auth", lambda _request: None)
     assert (await routes.prepare_registry_ptg_offices(request(app, legacy_envelope()))).status == 400
     execute.assert_not_awaited()
 
@@ -191,7 +191,7 @@ async def test_prepare_post_handoff_failures_are_unknown_without_replacement(dur
     document, result = await prepare_documents()
     calls = AsyncMock(return_value=result)
     monkeypatch.setattr(coordinator.RegistryPTGOfficeIntentCoordinator, "prepare", calls)
-    monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
+    monkeypatch.setattr(routes, "require_registry_auth", lambda _request: None)
     if failure == "projection":
         monkeypatch.setattr(
             view,
@@ -225,14 +225,14 @@ async def test_signed_list_route_and_authentication(durable_app, monkeypatch):
     }
     calls = AsyncMock(return_value=reply_by_field)
     monkeypatch.setattr(coordinator.RegistryPTGOfficeIntentCoordinator, "list", calls)
-    monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
+    monkeypatch.setattr(routes, "require_registry_auth", lambda _request: None)
     reply = await routes.read_registry_ptg_office_intents(request(app, list_envelope()))
     assert reply.status == 200 and json.loads(reply.body) == reply_by_field and calls.await_count == 1
 
     def denied(_request):
         raise Forbidden("denied")
 
-    monkeypatch.setattr(routes, "require_control_auth", denied)
+    monkeypatch.setattr(routes, "require_registry_auth", denied)
     assert (await routes.read_registry_ptg_office_intents(request(app, list_envelope()))).status == 401
     assert calls.await_count == 1
 
@@ -242,7 +242,7 @@ async def test_publisher_only_configuration_keeps_reader_and_refuses_durable_pre
     app, _ = _app(_office_configuration())
     await runtime._start_runtime(app)
     try:
-        monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
+        monkeypatch.setattr(routes, "require_registry_auth", lambda _request: None)
         document, _ = await prepare_documents()
         assert (await routes.prepare_registry_ptg_offices(request(app, document))).status == 503
         assert routes._operation_service(app, "read_offices")[0] is app.ctx.registry_ptg_office_preparation
@@ -431,7 +431,7 @@ async def test_signed_list_rejects_nonclosed_inputs_before_dispatch(durable_app,
     mutation(document)
     calls = AsyncMock()
     monkeypatch.setattr(coordinator.RegistryPTGOfficeIntentCoordinator, "list", calls)
-    monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
+    monkeypatch.setattr(routes, "require_registry_auth", lambda _request: None)
     reply = await routes.read_registry_ptg_office_intents(request(app, document))
     assert reply.status == 400
     calls.assert_not_awaited()
@@ -480,7 +480,7 @@ async def test_signed_list_refuses_nonplatform_actor_before_dispatch(durable_app
     document["actor"]["client_id"] = "synthetic_client"
     calls = AsyncMock()
     monkeypatch.setattr(coordinator.RegistryPTGOfficeIntentCoordinator, "list", calls)
-    monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
+    monkeypatch.setattr(routes, "require_registry_auth", lambda _request: None)
     reply = await routes.read_registry_ptg_office_intents(request(app, document))
     assert reply.status == 403 and json.loads(reply.body) == {"error": {"code": "registry_access_denied"}}
     calls.assert_not_awaited()
@@ -494,7 +494,7 @@ async def test_list_native_driver_errors_are_sanitized_unavailable(durable_app, 
     app, _ = durable_app
     calls = AsyncMock(side_effect=failure)
     monkeypatch.setattr(coordinator.RegistryPTGOfficeIntentCoordinator, "list", calls)
-    monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
+    monkeypatch.setattr(routes, "require_registry_auth", lambda _request: None)
     reply = await routes.read_registry_ptg_office_intents(request(app, list_envelope()))
     assert reply.status == 503 and json.loads(reply.body) == {"error": {"code": "registry_unavailable"}}
     assert calls.await_count == 1
