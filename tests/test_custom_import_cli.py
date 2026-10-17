@@ -4,16 +4,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import subprocess
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from io import BytesIO, StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import log as sqlalchemy_log
@@ -24,7 +27,8 @@ from process.custom_import.definition_store import RegisteredDefinition
 from process.custom_import.execution import ExecutionTransition
 from process.custom_import.operator import CurrentGenerationStatus, ExecutionStatus, GenerationStatus, LeaseStatus
 from process.custom_import.publication import PublicationReceipt
-from tests.test_custom_import_operator import _Session, _execution_evidence_row, _without_optional_evidence_row
+from process.custom_import.runner_types import CandidateRunResult
+from tests.test_custom_import_operator import _execution_evidence_row, _Session, _without_optional_evidence_row
 
 FIXTURES = Path(__file__).with_name("fixtures") / "custom_import"
 
@@ -107,6 +111,68 @@ class _LifecycleDatabase:
 
     def transaction(self):
         return _LifecycleTransaction(self)
+
+
+class _CandidateDatabase(_LifecycleDatabase):
+    def __init__(self, **kwargs):
+        super().__init__(self._fresh_session, **kwargs)
+        self.sessions = []
+
+    @asynccontextmanager
+    async def _fresh_session(self):
+        session = object()
+        self.sessions.append(session)
+        self.events.append("session_open")
+        try:
+            yield session
+        finally:
+            self.events.append("session_close")
+
+    def transaction(self):
+        raise AssertionError("candidate coordinator must own its transactions")
+
+
+def _https_arguments(command="execute"):
+    return [
+        command,
+        "--source",
+        "https",
+        "--dataset-id",
+        "5",
+        "--definition-revision-id",
+        "7",
+        "--schema-revision-id",
+        "11",
+    ]
+
+
+def _https_document():
+    definition = json.loads((FIXTURES / "v1_valid.json").read_bytes())
+    definition["refresh_mode"] = "snapshot"
+    for stream in definition["streams"]:
+        stream.update(format="parquet", compression="none")
+    return {
+        "definition": definition,
+        "objects": [
+            {
+                "stream_id": stream["id"],
+                "url": f"https://downloads.example/{stream['id']}.parquet?sample=synthetic-marker",
+                "expected_sha256": "a" * 64,
+                "expected_bytes": 32,
+            }
+            for stream in definition["streams"]
+        ],
+        "source_snapshot_token": "synthetic-snapshot",
+        "idempotency_key": "synthetic-execution",
+        "lease_token": "synthetic-owner",
+        "limits": {},
+        "timeout_seconds": 5,
+        "complete_scope": True,
+    }
+
+
+def _document_stream(document):
+    return BytesIO(json.dumps(document).encode())
 
 
 def _lifecycle_arguments(arguments):
@@ -508,6 +574,7 @@ def _publication_result(event_kind, request, *, replayed=False):
 
 @pytest.mark.asyncio
 async def test_publication_commands_forward_pointer_preconditions(monkeypatch):
+    """Forward exact initial, replacement and rollback guards in sequence."""
     session = object()
     database = _LifecycleDatabase(session)
     calls = []
@@ -522,30 +589,35 @@ async def test_publication_commands_forward_pointer_preconditions(monkeypatch):
 
     monkeypatch.setattr(cli, "activate_generation", activate)
     monkeypatch.setattr(cli, "rollback_generation", rollback)
-    initial = await _lifecycle_receipt(
-        ["activate", "--dataset-id", "5", "--target-generation-id", "19", "--expected-pointer-version", "0"],
-        database,
-    )
-    nonempty = await _lifecycle_receipt(
-        [
-            "activate", "--dataset-id", "5", "--target-generation-id", "20", "--expected-generation-id", "19",
-            "--expected-pointer-version", "1",
-        ],
-        database,
-    )
-    rollback_receipt = await _lifecycle_receipt(
-        [
-            "rollback", "--dataset-id", "5", "--target-generation-id", "19", "--expected-generation-id", "20",
-            "--expected-pointer-version", "2",
-        ],
-        database,
-    )
+    cases = (("activate", 19, None, 0), ("activate", 20, 19, 1), ("rollback", 19, 20, 2))
+    receipts = []
+    for command, generation_id, expected, version in cases:
+        arguments = [
+            command,
+            "--dataset-id",
+            "5",
+            "--target-generation-id",
+            str(generation_id),
+            "--expected-pointer-version",
+            str(version),
+        ]
+        if expected is not None:
+            arguments.extend(("--expected-generation-id", str(expected)))
+        receipts.append(await _lifecycle_receipt(arguments, database))
 
-    assert [receipt["committed_pointer_version"] for receipt in (initial, nonempty, rollback_receipt)] == [1, 2, 3]
+    assert [receipt["committed_pointer_version"] for receipt in receipts] == [1, 2, 3]
     assert calls == [
-        ("activate", session, {"dataset_id": 5, "target_generation_id": 19, "expected_generation_id": None, "expected_pointer_version": 0}),
-        ("activate", session, {"dataset_id": 5, "target_generation_id": 20, "expected_generation_id": 19, "expected_pointer_version": 1}),
-        ("rollback", session, {"dataset_id": 5, "target_generation_id": 19, "expected_generation_id": 20, "expected_pointer_version": 2}),
+        (
+            command,
+            session,
+            {
+                "dataset_id": 5,
+                "target_generation_id": generation_id,
+                "expected_generation_id": expected,
+                "expected_pointer_version": version,
+            },
+        )
+        for command, generation_id, expected, version in cases
     ]
     assert database.events == ["connect", "begin", "commit", "disconnect"] * 3
 
@@ -804,7 +876,9 @@ def test_lifecycle_logging_scope_preserves_pool_handler_and_removes_new_echo_han
     pool_output = StringIO()
     pool_handler = logging.StreamHandler(pool_output)
     previous_disable = logging.root.manager.disable
-    database = _LifecycleDatabase(object(), echo_loggers=(engine_logger, pool_logger), emit_output=True, new_engine=True)
+    database = _LifecycleDatabase(
+        object(), echo_loggers=(engine_logger, pool_logger), emit_output=True, new_engine=True
+    )
 
     async def inspect_execution(*_arguments, **_keywords):
         return _execution_status(datetime(2026, 1, 2, tzinfo=UTC))
@@ -861,6 +935,432 @@ def test_module_cli_help_lists_lifecycle_commands(tmp_path):
 
     assert completed.returncode == 0
     assert completed.stderr == b""
-    for command in (b"status", b"captures", b"cancel", b"activate", b"rollback"):
+    for command in (b"status", b"captures", b"cancel", b"activate", b"rollback", b"register", b"execute", b"resume"):
         assert command in completed.stdout
-    assert b"resume" not in completed.stdout
+
+
+@pytest.mark.parametrize("command", ("execute", "resume"))
+@pytest.mark.parametrize("timeout_seconds", (5, 3600))
+def test_https_dispatch_owns_fresh_sessions(monkeypatch, capsys, command, timeout_seconds):
+    database = _CandidateDatabase(emit_output=True)
+    document = _https_document()
+    document["timeout_seconds"] = timeout_seconds
+    calls = []
+
+    async def run_candidate(session_factory, request, *, resume):
+        calls.append((request, resume))
+        assert database.events == ["connect"]
+        assert database.engine.echo is False
+        async with session_factory() as first_session:
+            assert first_session is database.sessions[0]
+        async with session_factory() as second_session:
+            assert second_session is not first_session
+        print("synthetic-source-output")
+        print("synthetic-source-error", file=sys.stderr)
+        return CandidateRunResult("activated", 17, 19, 2, 0, seal=object(), publication=object())
+
+    monkeypatch.setattr(cli, "db", database)
+    monkeypatch.setattr(cli, "run_https_candidate", run_candidate)
+    exit_code = cli.run_command(_https_arguments(command), stream=_document_stream(document))
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "status": "activated",
+        "execution_id": 17,
+        "generation_id": 19,
+        "accepted_family_count": 2,
+        "rejection_count": 0,
+    }
+    request, resume = calls[0]
+    assert resume is (command == "resume")
+    assert (request.dataset_id, request.definition_revision_id, request.schema_revision_id) == (5, 7, 11)
+    assert json.loads(request.definition.canonical) == document["definition"]
+    assert request.objects[0].url == document["objects"][0]["url"]
+    assert request.source_snapshot_token == document["source_snapshot_token"]
+    assert request.idempotency_key == document["idempotency_key"]
+    assert request.lease_token == document["lease_token"]
+    assert request.timeout_seconds == timeout_seconds and request.complete_scope is True
+    assert database.events == [
+        "connect",
+        "session_open",
+        "session_close",
+        "session_open",
+        "session_close",
+        "disconnect",
+    ]
+    assert database.disconnected_echo is True
+
+
+@pytest.mark.parametrize("command", ("execute", "resume"))
+def test_https_preparation_ceiling_rejects_before_database_access(monkeypatch, capsys, command):
+    document = _https_document()
+    document["timeout_seconds"] = 3601
+    database = _CandidateDatabase()
+    operation = AsyncMock()
+    monkeypatch.setattr(cli, "db", database)
+    monkeypatch.setattr(cli, "run_https_candidate", operation)
+
+    assert cli.run_command(_https_arguments(command), stream=_document_stream(document)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == '{"code":"failed","status":"error"}\n'
+    assert database.events == []
+    operation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["execute", "resume", "register"])
+async def test_invalid_prepared_input_rolls_back_and_disconnects_without_dispatch(monkeypatch, capsys, command):
+    database = _LifecycleDatabase(object(), emit_output=True)
+    operation = AsyncMock()
+    monkeypatch.setattr(cli, "run_https_candidate", operation)
+    monkeypatch.setattr(cli, "register_definition_from_stdin", operation)
+    arguments = (
+        ["register", "--dataset-key", "synthetic_dataset", "--format", "json"]
+        if command == "register"
+        else _https_arguments(command)
+    )
+    previous_disable = logging.root.manager.disable
+    with pytest.raises(cli._DefinitionInputError, match="^(source request|definition) is unavailable$"):
+        await cli._run_lifecycle_command(_lifecycle_arguments(arguments), database=database, prepared=object())
+    operation.assert_not_awaited()
+    assert database.events == (
+        ["connect", "begin", "rollback", "disconnect"] if command == "register" else ["connect", "disconnect"]
+    )
+    assert database.disconnected_echo is True and database.engine.echo is True
+    assert logging.root.manager.disable == previous_disable
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+@pytest.mark.parametrize("status", sorted(cli._RUN_STATUSES))
+def test_candidate_receipt_allowlists_terminal_fields(status):
+    rendered = cli._candidate_receipt(CandidateRunResult(status, 17, seal=object(), publication=object()))
+    assert json.loads(rendered) == {
+        "status": status,
+        "execution_id": 17,
+        "accepted_family_count": 0,
+        "rejection_count": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"status": "synthetic-private-result"},
+        {"status": []},
+        {"execution_id": True},
+        {"execution_id": 0},
+        {"generation_id": "19"},
+        {"generation_id": cli._MAX_BIGINT + 1},
+        {"accepted_family_count": -1},
+        {"accepted_family_count": False},
+        {"rejection_count": "synthetic-private-result"},
+    ),
+)
+def test_https_rejects_invalid_receipts(monkeypatch, capsys, changes):
+    database = _CandidateDatabase()
+
+    async def run_candidate(*_arguments, **_keywords):
+        return replace(CandidateRunResult("activated", 17, 19), **changes)
+
+    monkeypatch.setattr(cli, "db", database)
+    monkeypatch.setattr(cli, "run_https_candidate", run_candidate)
+    assert cli.run_command(_https_arguments(), stream=_document_stream(_https_document())) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == '{"code":"failed","status":"error"}\n'
+    assert database.events == ["connect", "disconnect"]
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    (
+        ((), []),
+        (("unknown",), "synthetic-marker"),
+        (("definition",), {}),
+        (("definition", "unknown"), True),
+        (("definition", "streams", 0, "format"), "csv"),
+        (("definition", "streams", 0, "compression"), "gzip"),
+        (("objects",), {}),
+        (("objects",), []),
+        (("objects",), [{}]),
+        (("objects", 0), None),
+        (("objects", 0, "unknown"), True),
+        (("objects", 0, "stream_id"), "unknown"),
+        (("objects", 1, "stream_id"), "providers"),
+        (("objects", 0, "url"), "http://downloads.example/sample"),
+        (("objects", 0, "url"), "https://user:synthetic-marker@downloads.example/sample"),
+        (("objects", 0, "expected_sha256"), "g" * 64),
+        (("objects", 0, "expected_bytes"), True),
+        (("objects", 0, "expected_bytes"), 0),
+        (("objects", 0, "expected_bytes"), "32"),
+        (("objects", 0, "expected_bytes"), 64 * 1024 * 1024 + 1),
+        (("source_snapshot_token",), ""),
+        (("source_snapshot_token",), []),
+        (("idempotency_key",), ""),
+        (("idempotency_key",), 17),
+        (("idempotency_key",), "a" * 129),
+        (("idempotency_key",), "synthetic\nmarker"),
+        (("lease_token",), ""),
+        (("lease_token",), []),
+        (("limits",), []),
+        (("limits", "unknown"), 1),
+        (("limits", "maximum_records"), True),
+        (("limits", "maximum_records"), 1_000_001),
+        (("limits", "maximum_compressed_bytes"), 63),
+        (("timeout_seconds",), 0),
+        (("timeout_seconds",), True),
+        (("timeout_seconds",), 1.5),
+        (("complete_scope",), False),
+        (("complete_scope",), 1),
+    ),
+)
+def test_https_rejects_invalid_envelopes(monkeypatch, capsys, path, value):
+    document = _https_document()
+    if path:
+        container = document
+        for key in path[:-1]:
+            container = container[key]
+        container[path[-1]] = value
+    else:
+        document = value
+    database = _CandidateDatabase()
+    monkeypatch.setattr(cli, "db", database)
+
+    assert cli.run_command(_https_arguments(), stream=_document_stream(document)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == '{"code":"failed","status":"error"}\n'
+    assert database.events == []
+
+
+@pytest.mark.parametrize("missing_key", sorted(cli._HTTPS_INPUT_KEYS))
+def test_https_requires_complete_envelope(monkeypatch, capsys, missing_key):
+    document = _https_document()
+    del document[missing_key]
+    database = _CandidateDatabase()
+    monkeypatch.setattr(cli, "db", database)
+
+    assert cli.run_command(_https_arguments("resume"), stream=_document_stream(document)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == '{"code":"failed","status":"error"}\n'
+    assert database.events == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"definition":{},"definition":{}}',
+        b'{"objects":[{"url":"synthetic-marker","url":"synthetic-marker"}]}',
+        b'{"limits":{"maximum_records":1,"maximum_records":2}}',
+        b'{"definition":{"revision":{"schema":1,"schema":2}}}',
+        b'{"timeout_seconds":NaN}',
+        b"\xff",
+        b"{",
+        b"x" * (cli.MAX_DEFINITION_BYTES + 1),
+        b"[" * 40 + b"0" + b"]" * 40,
+        b"[" + b",".join([b"0"] * 10_001) + b"]",
+    ),
+)
+def test_https_rejects_malformed_json(monkeypatch, capsys, payload):
+    database = _CandidateDatabase()
+    monkeypatch.setattr(cli, "db", database)
+
+    assert cli.run_command(_https_arguments(), stream=BytesIO(payload)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == '{"code":"failed","status":"error"}\n'
+    assert database.events == []
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["execute"],
+        ["execute", "--source", "s3"],
+        [*_https_arguments(), "--url", "https://downloads.example/synthetic-marker"],
+        [*_https_arguments(), "--lease-token", "synthetic-marker"],
+        [*_https_arguments(), "--dataset-id", "0"],
+        [*_https_arguments(), "--definition-revision-id", "-1"],
+        [*_https_arguments(), "--schema-revision-id", str(cli._MAX_BIGINT + 1)],
+        ["register", "--dataset-key", "INVALID", "--format", "json"],
+        ["register", "--dataset-key", "synthetic_dataset", "--format", "json", "--input", "synthetic-marker"],
+    ),
+)
+def test_stdin_commands_reject_extra_arguments(monkeypatch, capsys, arguments):
+    monkeypatch.setattr(cli, "db", object())
+    with pytest.raises(SystemExit) as caught:
+        cli.run_command(arguments)
+    captured = capsys.readouterr()
+    assert caught.value.code == 2
+    assert captured.out == ""
+    assert captured.err == '{"code":"invalid_arguments","status":"error"}\n'
+
+
+@pytest.mark.parametrize("command", ("execute", "resume", "register"))
+def test_stdin_commands_reject_tty(monkeypatch, capsys, command):
+    database = _LifecycleDatabase(object())
+    monkeypatch.setattr(cli, "db", database)
+    arguments = (
+        [command, "--dataset-key", "synthetic_dataset", "--format", "json"]
+        if command == "register"
+        else _https_arguments(command)
+    )
+    assert cli.run_command(arguments, stream=_TtyBytes()) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == '{"code":"failed","status":"error"}\n'
+    assert database.events == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "exit_code", "code"),
+    (
+        (RuntimeError("synthetic-source-error"), 1, "failed"),
+        (asyncio.CancelledError("synthetic-source-cancel"), 130, "canceled"),
+        (KeyboardInterrupt("synthetic-source-interrupt"), 130, "canceled"),
+    ),
+)
+def test_https_failure_closes_and_restores(monkeypatch, capsys, failure, exit_code, code):
+    database = _CandidateDatabase(disconnect_error=RuntimeError("synthetic-disconnect-error"))
+    previous_disable = logging.root.manager.disable
+
+    async def run_candidate(session_factory, *_arguments, **_keywords):
+        async with session_factory():
+            print("synthetic-source-output")
+            if isinstance(failure, asyncio.CancelledError):
+                asyncio.current_task().cancel()
+                await asyncio.sleep(0)
+            raise failure
+
+    monkeypatch.setattr(cli, "db", database)
+    monkeypatch.setattr(cli, "run_https_candidate", run_candidate)
+    assert cli.run_command(_https_arguments(), stream=_document_stream(_https_document())) == exit_code
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {"code": code, "status": "error"}
+    assert database.events == ["connect", "session_open", "session_close", "disconnect"]
+    assert database.disconnected_echo is True
+    assert logging.root.manager.disable == previous_disable
+
+
+@pytest.mark.parametrize("definition_format", ("json", "yaml"))
+@pytest.mark.parametrize("created", (True, False))
+def test_register_dispatch_reuses_transaction(monkeypatch, capsys, definition_format, created):
+    session = object()
+    database = _LifecycleDatabase(session, emit_output=True)
+    calls = []
+
+    async def register(injected_session, dataset_key, definition):
+        assert database.events == ["connect", "begin"]
+        assert database.engine.echo is False
+        calls.append((injected_session, dataset_key, definition.digest))
+        print("synthetic-registry-output")
+        return RegisteredDefinition(5, 7, 11, created)
+
+    monkeypatch.setattr(cli, "db", database)
+    monkeypatch.setattr("process.custom_import.definition_store.register_definition", register)
+    exit_code = cli.run_command(
+        ["register", "--dataset-key", "synthetic_dataset", "--format", definition_format],
+        stream=BytesIO((FIXTURES / f"v1_valid.{definition_format}").read_bytes()),
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "status": "registered",
+        "dataset_id": 5,
+        "definition_revision_id": 7,
+        "schema_revision_id": 11,
+        "created": created,
+    }
+    assert calls == [
+        (
+            session,
+            "synthetic_dataset",
+            cli.CustomImportDefinition.from_json((FIXTURES / "v1_valid.json").read_bytes()).digest,
+        )
+    ]
+    assert database.events == ["connect", "begin", "commit", "disconnect"]
+    assert database.disconnected_echo is True
+
+
+@pytest.mark.parametrize("definition_format", ("json", "yaml"))
+def test_register_rejects_definition_before_connect(monkeypatch, capsys, definition_format):
+    database = _LifecycleDatabase(object())
+    monkeypatch.setattr(cli, "db", database)
+    assert (
+        cli.run_command(
+            ["register", "--dataset-key", "synthetic_dataset", "--format", definition_format], stream=BytesIO(b"{}")
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == '{"code":"failed","status":"error"}\n'
+    assert database.events == []
+
+
+@pytest.mark.parametrize(
+    "result",
+    (
+        object(),
+        RegisteredDefinition(True, 7, 11, True),
+        RegisteredDefinition(5, 0, 11, True),
+        RegisteredDefinition(5, 7, 11, "synthetic-marker"),
+    ),
+)
+def test_register_invalid_receipt_rolls_back(monkeypatch, capsys, result):
+    database = _LifecycleDatabase(object())
+
+    async def register(*_arguments, **_keywords):
+        return result
+
+    monkeypatch.setattr(cli, "db", database)
+    monkeypatch.setattr("process.custom_import.definition_store.register_definition", register)
+    assert (
+        cli.run_command(
+            ["register", "--dataset-key", "synthetic_dataset", "--format", "json"],
+            stream=BytesIO((FIXTURES / "v1_valid.json").read_bytes()),
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == '{"code":"failed","status":"error"}\n'
+    assert database.events == ["connect", "begin", "rollback", "disconnect"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "exit_code", "code"),
+    (
+        (cli.DefinitionRegistrationConflict("synthetic-registry-conflict"), 1, "conflict"),
+        (asyncio.CancelledError("synthetic-registry-cancel"), 130, "canceled"),
+    ),
+)
+def test_register_failure_rolls_back(monkeypatch, capsys, failure, exit_code, code):
+    database = _LifecycleDatabase(object(), disconnect_error=RuntimeError("synthetic-disconnect-error"))
+
+    async def register(*_arguments, **_keywords):
+        raise failure
+
+    monkeypatch.setattr(cli, "db", database)
+    monkeypatch.setattr("process.custom_import.definition_store.register_definition", register)
+    assert (
+        cli.run_command(
+            ["register", "--dataset-key", "synthetic_dataset", "--format", "json"],
+            stream=BytesIO((FIXTURES / "v1_valid.json").read_bytes()),
+        )
+        == exit_code
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {"code": code, "status": "error"}
+    assert database.events == ["connect", "begin", "rollback", "disconnect"]

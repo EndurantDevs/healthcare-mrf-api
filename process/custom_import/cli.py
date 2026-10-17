@@ -6,20 +6,34 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import json
 import logging
 import os
 import re
 import sys
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from io import BytesIO
 from typing import TYPE_CHECKING, Any, Sequence
 
 from db.connection import db
-from process.custom_import.definition import MAX_DEFINITION_BYTES, CustomImportDefinition
+from process.custom_import.capture_limits import CaptureLimits
+from process.custom_import.definition import MAX_DEFINITION_BYTES, CustomImportDefinition, load_json_definition
+from process.custom_import.definition_store import (
+    DefinitionRegistrationConflict,
+    RegisteredDefinition,
+    _normalized_dataset_key,
+)
 from process.custom_import.execution import (
     ExecutionNotFound,
     ExecutionTransition,
+    _idempotency_key,
     request_cancellation,
+)
+from process.custom_import.https_candidate import (
+    HttpsCandidateRequest,
+    HttpsObject,
+    https_request_identity_sha256,
+    run_https_candidate,
 )
 from process.custom_import.operator import (
     CurrentGenerationStatus,
@@ -38,18 +52,40 @@ from process.custom_import.publication import (
     activate_generation,
     rollback_generation,
 )
+from process.custom_import.runner_types import CandidateRunResult
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
-
-    from process.custom_import.definition_store import RegisteredDefinition
-
 
 _SAFE_ERROR_CODES = frozenset(
     {"canceled", "conflict", "failed", "invalid_arguments", "invalid_definition", "not_found"}
 )
 _MAX_BIGINT = 2**63 - 1
 _MISSING = object()
+_HTTPS_INPUT_KEYS = frozenset(
+    {
+        "definition",
+        "objects",
+        "source_snapshot_token",
+        "idempotency_key",
+        "lease_token",
+        "limits",
+        "timeout_seconds",
+        "complete_scope",
+    }
+)
+_HTTPS_OBJECT_KEYS = frozenset({"stream_id", "url", "expected_sha256", "expected_bytes"})
+_RUN_STATUSES = frozenset(
+    {
+        "activated",
+        "candidate_rejected",
+        "canceled",
+        "lease_lost",
+        "no_change",
+        "not_claimed",
+        "sealed_unpublished",
+    }
+)
 
 
 class _DefinitionInputError(ValueError):
@@ -76,6 +112,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True, parser_class=_RedactedArgumentParser)
     validate = commands.add_parser("validate", allow_abbrev=False)
     validate.add_argument("--format", choices=("json", "yaml"), required=True)
+    _add_stdin_commands(commands)
 
     status = commands.add_parser("status", allow_abbrev=False, help="read one execution or generation")
     status.add_argument("--dataset-id", required=True, type=_positive_identifier)
@@ -107,6 +144,17 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_stdin_commands(commands: Any) -> None:
+    register = commands.add_parser("register", allow_abbrev=False, help="register one immutable definition from stdin")
+    register.add_argument("--dataset-key", required=True, type=_normalized_dataset_key)
+    register.add_argument("--format", choices=("json", "yaml"), required=True)
+    for command in ("execute", "resume"):
+        candidate = commands.add_parser(command, allow_abbrev=False, help="run a bounded HTTPS request from stdin")
+        candidate.add_argument("--source", choices=("https",), required=True)
+        for identifier in ("dataset-id", "definition-revision-id", "schema-revision-id"):
+            candidate.add_argument(f"--{identifier}", required=True, type=_positive_identifier)
+
+
 def _positive_identifier(value: str) -> int:
     if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]{0,18}", value, flags=re.ASCII) is None:
         raise argparse.ArgumentTypeError("invalid")
@@ -130,11 +178,7 @@ def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
 
     parser = _parser()
     parsed = parser.parse_args(arguments)
-    if (
-        parsed.command == "activate"
-        and parsed.expected_generation_id is None
-        and parsed.expected_pointer_version != 0
-    ):
+    if parsed.command == "activate" and parsed.expected_generation_id is None and parsed.expected_pointer_version != 0:
         parser.error("invalid")
     return parsed
 
@@ -164,6 +208,85 @@ def load_definition_from_stdin(definition_format: str, *, stream: Any | None = N
     if definition_format == "yaml":
         return CustomImportDefinition.from_yaml(payload)
     raise _DefinitionInputError("definition format is invalid")
+
+
+def _https_objects(value: Any) -> tuple[HttpsObject, ...]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, dict) or set(item) != _HTTPS_OBJECT_KEYS for item in value
+    ):
+        raise _DefinitionInputError("source objects are invalid")
+    return tuple(HttpsObject(**item) for item in value)
+
+
+def _https_request_from_stdin(parsed: argparse.Namespace, stream: Any | None) -> HttpsCandidateRequest:
+    document = load_json_definition(_read_stdin(stream))
+    if not isinstance(document, dict) or set(document) != _HTTPS_INPUT_KEYS:
+        raise _DefinitionInputError("source request is invalid")
+    if not isinstance(document["limits"], dict):
+        raise _DefinitionInputError("source limits are invalid")
+    request = HttpsCandidateRequest(
+        dataset_id=parsed.dataset_id,
+        definition_revision_id=parsed.definition_revision_id,
+        schema_revision_id=parsed.schema_revision_id,
+        definition=CustomImportDefinition.from_mapping(document["definition"]),
+        objects=_https_objects(document["objects"]),
+        source_snapshot_token=document["source_snapshot_token"],
+        idempotency_key=_idempotency_key(document["idempotency_key"]),
+        lease_token=document["lease_token"],
+        limits=CaptureLimits(**document["limits"]),
+        timeout_seconds=document["timeout_seconds"],
+        complete_scope=document["complete_scope"],
+    )
+    https_request_identity_sha256(request)
+    return request
+
+
+def _prepare_stdin(parsed: argparse.Namespace, stream: Any | None) -> HttpsCandidateRequest | bytes | None:
+    if parsed.command in {"execute", "resume"}:
+        return _https_request_from_stdin(parsed, stream)
+    if parsed.command == "register":
+        payload = _read_stdin(stream)
+        load_definition_from_stdin(parsed.format, stream=BytesIO(payload))
+        return payload
+    return None
+
+
+def _receipt_integer(value: Any, *, minimum: int = 1) -> int:
+    if type(value) is not int or not minimum <= value <= _MAX_BIGINT:
+        raise ValueError("receipt integer is invalid")
+    return value
+
+
+def _candidate_receipt(result: CandidateRunResult) -> str:
+    if (
+        not isinstance(result, CandidateRunResult)
+        or type(result.status) is not str
+        or result.status not in _RUN_STATUSES
+    ):
+        raise ValueError("candidate receipt is invalid")
+    receipt_by_key = {
+        "status": result.status,
+        "execution_id": _receipt_integer(result.execution_id),
+        "accepted_family_count": _receipt_integer(result.accepted_family_count, minimum=0),
+        "rejection_count": _receipt_integer(result.rejection_count, minimum=0),
+    }
+    if result.generation_id is not None:
+        receipt_by_key["generation_id"] = _receipt_integer(result.generation_id)
+    return _receipt_json(receipt_by_key)
+
+
+def _registration_receipt(result: RegisteredDefinition) -> str:
+    if not isinstance(result, RegisteredDefinition) or type(result.created) is not bool:
+        raise ValueError("registration receipt is invalid")
+    return _receipt_json(
+        {
+            "status": "registered",
+            "dataset_id": _receipt_integer(result.dataset_id),
+            "definition_revision_id": _receipt_integer(result.definition_revision_id),
+            "schema_revision_id": _receipt_integer(result.schema_revision_id),
+            "created": result.created,
+        }
+    )
 
 
 def validation_receipt(definition: CustomImportDefinition) -> str:
@@ -324,16 +447,18 @@ def _set_engine_echo(database: Any, value: bool) -> None:
 
 
 def _logging_handler_snapshot() -> dict[logging.Logger, tuple[logging.Handler, ...]]:
-    loggers = (logging.getLogger(), *(
-        logger for logger in logging.Logger.manager.loggerDict.values() if isinstance(logger, logging.Logger)
-    ))
+    loggers = (
+        logging.getLogger(),
+        *(logger for logger in logging.Logger.manager.loggerDict.values() if isinstance(logger, logging.Logger)),
+    )
     return {logger: tuple(logger.handlers) for logger in loggers}
 
 
 def _remove_added_handlers(handler_snapshot: dict[logging.Logger, tuple[logging.Handler, ...]]) -> None:
-    loggers = (logging.getLogger(), *(
-        logger for logger in logging.Logger.manager.loggerDict.values() if isinstance(logger, logging.Logger)
-    ))
+    loggers = (
+        logging.getLogger(),
+        *(logger for logger in logging.Logger.manager.loggerDict.values() if isinstance(logger, logging.Logger)),
+    )
     for logger in loggers:
         previous_handlers = handler_snapshot.get(logger, ())
         for handler in tuple(logger.handlers):
@@ -410,8 +535,27 @@ async def _lifecycle_receipt(session: Any, parsed: argparse.Namespace) -> str:
     raise ValueError("lifecycle command is invalid")
 
 
-async def _run_lifecycle_command(parsed: argparse.Namespace, *, database: Any | None = None) -> str:
-    """Run exactly one lifecycle operation in a fresh caller-owned transaction."""
+async def _database_receipt(database: Any, parsed: argparse.Namespace, prepared: Any) -> str:
+    if parsed.command in {"execute", "resume"}:
+        if not isinstance(prepared, HttpsCandidateRequest):
+            raise _DefinitionInputError("source request is unavailable")
+        result = await run_https_candidate(database.session, prepared, resume=parsed.command == "resume")
+        return _candidate_receipt(result)
+    async with database.transaction() as session:
+        if parsed.command == "register":
+            if not isinstance(prepared, bytes):
+                raise _DefinitionInputError("definition is unavailable")
+            registered = await register_definition_from_stdin(
+                session, dataset_key=parsed.dataset_key, definition_format=parsed.format, stream=BytesIO(prepared)
+            )
+            return _registration_receipt(registered)
+        return await _lifecycle_receipt(session, parsed)
+
+
+async def _run_lifecycle_command(
+    parsed: argparse.Namespace, *, database: Any | None = None, prepared: Any = None
+) -> str:
+    """Own database cleanup while each operation owns its transaction boundary."""
 
     database = db if database is None else database
     with _receipt_only_database_output(database):
@@ -423,8 +567,7 @@ async def _run_lifecycle_command(parsed: argparse.Namespace, *, database: Any | 
             engine = getattr(database, "engine", None)
             previous_echo = getattr(engine, "echo", _MISSING)
             _set_engine_echo(database, False)
-            async with database.transaction() as session:
-                return await _lifecycle_receipt(session, parsed)
+            return await _database_receipt(database, parsed, prepared)
         except BaseException:
             has_body_failure = True
             raise
@@ -460,17 +603,18 @@ def run_command(arguments: Sequence[str] | None = None, *, stream: Any | None = 
         if parsed.command == "validate":
             rendered = validation_receipt(load_definition_from_stdin(parsed.format, stream=stream))
         else:
-            rendered = asyncio.run(_run_lifecycle_command(parsed))
-    except KeyboardInterrupt:
+            prepared = _prepare_stdin(parsed, stream)
+            rendered = asyncio.run(_run_lifecycle_command(parsed, prepared=prepared))
+    except KeyboardInterrupt, asyncio.CancelledError:
         print(_error_json("canceled"), file=sys.stderr)
         return 130
-    except (OperatorObjectNotFound, ExecutionNotFound):
+    except OperatorObjectNotFound, ExecutionNotFound:
         print(_error_json("not_found"), file=sys.stderr)
         return 1
-    except PublicationConflict:
+    except PublicationConflict, DefinitionRegistrationConflict:
         print(_error_json("conflict"), file=sys.stderr)
         return 1
-    except (OSError, TypeError, ValueError):
+    except OSError, TypeError, ValueError:
         print(_error_json("invalid_definition" if parsed.command == "validate" else "failed"), file=sys.stderr)
         return 1
     except Exception:
