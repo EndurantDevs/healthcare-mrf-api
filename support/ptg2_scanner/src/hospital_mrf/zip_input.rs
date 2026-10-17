@@ -57,7 +57,7 @@ fn import_zip_payload(
         }
         members.push((
             index,
-            member.name().to_owned(),
+            member.name().map_err(zip_error)?.into_owned(),
             member.size(),
             member.compression(),
             member.encrypted(),
