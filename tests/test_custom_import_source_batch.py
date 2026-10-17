@@ -874,6 +874,11 @@ def _read_flow(monkeypatch, *, fault=None, has_eof=True, is_final=True):
             raise RuntimeError("synthetic metadata drift")
 
     monkeypatch.setattr(staging, "_set_timeout", AsyncMock())
+    monkeypatch.setattr(
+        step,
+        "load_segmented_cursor_headers",
+        AsyncMock(side_effect=RuntimeError("synthetic headers") if fault == "headers" else None, return_value=object()),
+    )
     monkeypatch.setattr(step, "open_segmented_cursor_part", part_reader)
     monkeypatch.setattr(step, "_prepare_part", AsyncMock(return_value=((), has_eof)))
     monkeypatch.setattr(step, "verify_segmented_stream_metadata", verify)
@@ -891,7 +896,7 @@ async def test_actual_final_eof_checks_metadata_and_closes_every_reader(monkeypa
     )
 
 
-@pytest.mark.parametrize("fault", ["part", "metadata", "transaction", "session"])
+@pytest.mark.parametrize("fault", ["headers", "part", "metadata", "transaction", "session"])
 async def test_failed_reader_or_metadata_cleanup_never_reaches_commit(monkeypatch, fault):
     sessions, events = _read_flow(monkeypatch, fault=fault)
     commit = AsyncMock()
@@ -964,6 +969,7 @@ def _coalesced_reader(monkeypatch, *, part_count=100, rows_per_part=1024, failur
     @asynccontextmanager
     async def reader(*arguments, **keywords):
         ordinal = keywords["part_ordinal"]
+        assert keywords["headers"] is not None
         assert not events or events[-1][0] == "session_closed"
         if part_refs is not None:
             assert all(reference() is None for reference in part_refs)
@@ -992,6 +998,9 @@ def _coalesced_reader(monkeypatch, *, part_count=100, rows_per_part=1024, failur
     monkeypatch.setattr(staging, "_set_timeout", AsyncMock())
     monkeypatch.setattr(staging, "_hosted_source_pages", pages)
     monkeypatch.setattr(step, "_verify_part", lambda *_: None)
+    monkeypatch.setattr(
+        step, "load_segmented_cursor_headers", AsyncMock(side_effect=lambda *_args, **_kwargs: object())
+    )
     monkeypatch.setattr(step, "open_segmented_cursor_part", reader)
     monkeypatch.setattr(step, "verify_segmented_stream_metadata", AsyncMock())
     return sessions, context, events
@@ -1017,8 +1026,19 @@ async def test_many_small_parts_coalesce_to_one_bounded_copy_and_finalization(mo
     assert harness.earlier_parts == list(range(1, 98))
     assert harness.events.count("source_bulk_authorize") == harness.events.count("copy") == 1
     assert harness.events.count("ordinary_finalize") == 1
+    step.load_segmented_cursor_headers.assert_awaited_once()
     assert "finish_custom_import_build_source_part" not in harness.events
     step.verify_segmented_stream_metadata.assert_not_awaited()
+
+
+async def test_each_source_request_loads_its_own_headers(monkeypatch):
+    sessions, context, _ = _coalesced_reader(monkeypatch, part_count=2, rows_per_part=256)
+    results = []
+    for _ in range(2):
+        results.append(await step._read_parts(sessions, context, _policy(), 9, _CURSOR, _PERMIT, time.monotonic() + 60))
+    assert results[0] == results[1]
+    assert step.load_segmented_cursor_headers.await_count == 2
+    assert step.verify_segmented_stream_metadata.await_count == 2
 
 
 @pytest.mark.parametrize("rows_per_part", [0, 256])
