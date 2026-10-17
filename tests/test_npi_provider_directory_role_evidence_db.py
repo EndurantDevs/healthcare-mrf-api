@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import hashlib
 import json
 import os
 
@@ -13,9 +14,7 @@ from db.models import db
 def _requires_test_database():
     database = os.getenv("HLTHPRT_DB_DATABASE", "")
     if "test" not in database.lower():
-        pytest.skip(
-            "DB-backed role-evidence SQL test requires a disposable test database"
-        )
+        pytest.skip("DB-backed role-evidence SQL test requires a disposable test database")
 
 
 async def _insert_dataset_resource(
@@ -26,8 +25,8 @@ async def _insert_dataset_resource(
     resource_id: str,
     resource_payload: dict,
 ) -> None:
-    payload_hash = f"hash-{dataset_id}-{resource_type}-{resource_id}"
     payload_json = json.dumps(resource_payload)
+    payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
     await session.execute(
         text(
             f"INSERT INTO {schema}.provider_directory_dataset_resource "
@@ -60,9 +59,7 @@ async def _insert_dataset_resource(
         )
 
 
-async def _insert_endpoint_rows(
-    session, schema: str, endpoint_rows: list[tuple[str, str]]
-) -> None:
+async def _insert_endpoint_rows(session, schema: str, endpoint_rows: list[tuple[str, str]]) -> None:
     for endpoint_id, api_base in endpoint_rows:
         await session.execute(
             text(
@@ -80,9 +77,7 @@ async def _insert_endpoint_rows(
         )
 
 
-async def _insert_source_rows(
-    session, schema: str, source_rows: list[tuple[str, str]]
-) -> None:
+async def _insert_source_rows(session, schema: str, source_rows: list[tuple[str, str]]) -> None:
     for source_id, endpoint_id in source_rows:
         await session.execute(
             text(
@@ -191,6 +186,14 @@ async def _insert_catalog_rows(
         )
 
 
+def _affiliation_resource_row(suffix: str) -> tuple[str, str, dict]:
+    return (
+        "OrganizationAffiliation",
+        f"affiliation-{suffix}",
+        {"active": True, "network_refs": [f"Organization/network-{suffix}"]},
+    )
+
+
 def _complete_resource_rows() -> list[tuple[str, str, dict]]:
     return [
         ("Organization", "network-edge", {"active": True, "name": "Edge Network"}),
@@ -242,6 +245,8 @@ def _complete_resource_rows() -> list[tuple[str, str, dict]]:
                 "insurance_plan_refs": ["InsurancePlan/plan-edge"],
             },
         ),
+        _affiliation_resource_row("edge"),
+        _affiliation_resource_row("zero"),
     ]
 
 
@@ -271,6 +276,7 @@ def _fallback_resource_rows() -> list[tuple[str, str, dict]]:
                 "insurance_plan_refs": [],
             },
         ),
+        _affiliation_resource_row("fallback"),
     ]
 
 
@@ -368,8 +374,8 @@ async def _insert_fixture_relation_rows(
     )
 
 
-async def _insert_relation_fixture(session, schema: str) -> dict[str, list[str]]:
-    """Insert mixed relation-ready and legacy-fallback datasets for execution tests."""
+async def _insert_relation_fixture(session, schema: str, *, should_publish: bool = True) -> dict[str, list[str]]:
+    """Load mixed datasets, deferring publication when more fixture rows are needed."""
     fixture_ids = _relation_fixture_ids()
     dataset_ids = fixture_ids["dataset_ids"]
     complete_resource_rows = _complete_resource_rows()
@@ -388,14 +394,15 @@ async def _insert_relation_fixture(session, schema: str) -> dict[str, list[str]]
         fallback_resource_rows,
     )
     await _insert_fixture_relation_rows(session, schema, fixture_ids)
-    await _publish_dataset_rows(
-        session,
-        schema,
-        [
-            (dataset_ids[0], len(complete_resource_rows)),
-            (dataset_ids[1], len(fallback_resource_rows)),
-        ],
-    )
+    if should_publish:
+        await _publish_dataset_rows(
+            session,
+            schema,
+            [
+                (dataset_ids[0], len(complete_resource_rows)),
+                (dataset_ids[1], len(fallback_resource_rows)),
+            ],
+        )
     return fixture_ids
 
 
@@ -484,8 +491,7 @@ async def test_role_evidence_executes_relation_fallback_and_zero_edge_contracts(
                 "plan-fallback",
             ) in evidence_key_set
             assert not any(
-                source_id == "pdfhir_relation_zero_test"
-                and evidence_type == "insurance_plan"
+                source_id == "pdfhir_relation_zero_test" and evidence_type == "insurance_plan"
                 for source_id, _role_id, evidence_type, _resource_id in evidence_key_set
             )
             assert (
@@ -494,5 +500,141 @@ async def test_role_evidence_executes_relation_fallback_and_zero_edge_contracts(
                 "network",
                 "network-edge",
             ) in evidence_key_set
+        finally:
+            await fixture_savepoint.rollback()
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_affiliation_evidence_executes_relation_fallback_and_zero_edge_contracts():
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    sql = npi_module._provider_directory_affiliation_evidence_sql(
+        schema,
+        has_catalog=True,
+        has_dataset_network_plan=True,
+        has_dataset_insurance_plan=True,
+    )
+
+    async with db.transaction() as session:
+        fixture_savepoint = await session.begin_nested()
+        try:
+            fixture = await _insert_relation_fixture(session, schema)
+            edge, zero, _unrequested_alias, fallback = fixture["source_ids"]
+            evidence_rows = await db.all(
+                sql,
+                source_ids=[edge, zero, fallback],
+                affiliation_ids=["affiliation-edge", "affiliation-zero", "affiliation-fallback"],
+            )
+            mappings = [entry._mapping for entry in evidence_rows]
+            assert [
+                (
+                    entry["source_id"],
+                    entry["affiliation_id"],
+                    entry["evidence_type"],
+                    entry["resource_id"],
+                )
+                for entry in mappings
+            ] == [
+                (edge, "affiliation-edge", "affiliation", "affiliation-edge"),
+                (fallback, "affiliation-fallback", "affiliation", "affiliation-fallback"),
+                (zero, "affiliation-zero", "affiliation", "affiliation-zero"),
+                (edge, "affiliation-edge", "insurance_plan", "plan-edge"),
+                (edge, "affiliation-edge", "network", "network-edge"),
+                (fallback, "affiliation-fallback", "insurance_plan", "plan-fallback"),
+                (fallback, "affiliation-fallback", "network", "network-fallback"),
+                (zero, "affiliation-zero", "network", "network-zero"),
+            ]
+            affiliations = [entry for entry in mappings if entry["evidence_type"] == "affiliation"]
+            assert [entry["plan_returned"] for entry in affiliations] == [1, 1, 0]
+            assert [entry["plan_total"] for entry in affiliations] == [1, 1, 0]
+            assert all(entry["plan_truncated"] is False for entry in affiliations)
+            assert all(entry["catalog_complete"] is True for entry in affiliations)
+            assert all(entry["evidence_row_total"] == 8 for entry in mappings)
+        finally:
+            await fixture_savepoint.rollback()
+
+
+async def _insert_endpoint_subset_fixture(session, schema: str) -> str:
+    fixture = await _insert_relation_fixture(session, schema, should_publish=False)
+    local_dataset, foreign_dataset = fixture["dataset_ids"]
+    local_payload_map = {
+        "active": True,
+        "network_refs": ["https://relation-fallback.test/fhir/Organization/network-edge"],
+    }
+    foreign_payload_map = {
+        "active": True,
+        "network_refs": ["https://relation-complete.test/fhir/Organization/network-edge"],
+    }
+    local_resources = [
+        ("PractitionerRole", "role-subset", local_payload_map),
+        ("OrganizationAffiliation", "affiliation-subset", local_payload_map),
+    ]
+    foreign_resources = [
+        ("Organization", "network-edge", {"active": True, "name": "Foreign Network"}),
+        (
+            "InsurancePlan",
+            "plan-edge",
+            {
+                "status": "active",
+                "name": "Foreign Plan",
+                "plan_identifier": "foreign-plan",
+                "network_refs": foreign_payload_map["network_refs"],
+            },
+        ),
+        ("PractitionerRole", "role-subset", foreign_payload_map),
+        ("OrganizationAffiliation", "affiliation-subset", foreign_payload_map),
+        ("PractitionerRole", "role-foreign-only", foreign_payload_map),
+        ("OrganizationAffiliation", "affiliation-foreign-only", foreign_payload_map),
+    ]
+    await _insert_resource_rows(session, schema, local_dataset, local_resources)
+    await _insert_resource_rows(session, schema, foreign_dataset, foreign_resources)
+    await _insert_catalog_rows(session, schema, [(fixture["source_ids"][3], "network-edge", "Foreign Network")])
+    await _publish_dataset_rows(
+        session,
+        schema,
+        [
+            (local_dataset, len(_complete_resource_rows()) + len(local_resources)),
+            (foreign_dataset, len(_fallback_resource_rows()) + len(foreign_resources)),
+        ],
+    )
+    return fixture["source_ids"][0]
+
+
+@pytest.mark.parametrize("evidence_kind", ["role", "affiliation"])
+@pytest.mark.asyncio(loop_scope="session")
+async def test_evidence_subset_does_not_cross_endpoint_datasets(evidence_kind):
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    builder = (
+        npi_module._provider_directory_role_evidence_sql
+        if evidence_kind == "role"
+        else npi_module._provider_directory_affiliation_evidence_sql
+    )
+    sql = builder(schema, has_catalog=True, has_dataset_network_plan=True, has_dataset_insurance_plan=True)
+
+    async with db.transaction() as session:
+        fixture_savepoint = await session.begin_nested()
+        try:
+            local_source = await _insert_endpoint_subset_fixture(session, schema)
+            evidence_rows = await db.all(
+                sql,
+                source_ids=[local_source],
+                **{f"{evidence_kind}_ids": [f"{evidence_kind}-subset", f"{evidence_kind}-foreign-only"]},
+            )
+            mappings = [entry._mapping for entry in evidence_rows]
+            assert [(entry["evidence_type"], entry["resource_id"], entry["name"]) for entry in mappings] == [
+                (evidence_kind, f"{evidence_kind}-subset", None),
+                ("insurance_plan", "plan-edge", None),
+                ("network", "network-edge", "Edge Network"),
+            ]
+            plan = next(entry for entry in mappings if entry["evidence_type"] == "insurance_plan")
+            assert plan["identifier"] == "edge-plan"
+            plan_payload = plan["plan_payload_json"]
+            if isinstance(plan_payload, str):
+                plan_payload = json.loads(plan_payload)
+            assert plan_payload == {"status": "active", "name": "Edge Plan"}
+            assert all(entry["source_id"] == local_source for entry in mappings)
+            assert all(entry[f"{evidence_kind}_id"] == f"{evidence_kind}-subset" for entry in mappings)
+            assert all(entry["evidence_row_total"] == 3 for entry in mappings)
         finally:
             await fixture_savepoint.rollback()

@@ -1771,22 +1771,9 @@ def _insurance_plan_active_sql(alias: str) -> str:
 
 def _dataset_relation_ready_sql(metadata_key: str) -> str:
     return f"""
-        COALESCE(
-            dataset.publication_metadata_json::jsonb
-                -> '{metadata_key}' ->> 'complete',
-            'false'
-        ) = 'true'
-        AND COALESCE(
-            dataset.publication_metadata_json::jsonb
-                -> '{metadata_key}' ->> 'version',
-            ''
-        ) = '{PROVIDER_DIRECTORY_DATASET_RELATION_VERSION}'
-        AND COALESCE(
-            dataset.publication_metadata_json::jsonb
-                -> '{metadata_key}' ->> 'dataset_id',
-            ''
-        ) = dataset.dataset_id
-    """
+        COALESCE(dataset.{metadata_key}_metadata ->> 'complete', 'false') = 'true'
+        AND COALESCE(dataset.{metadata_key}_metadata ->> 'version', '') = '{PROVIDER_DIRECTORY_DATASET_RELATION_VERSION}'
+        AND COALESCE(dataset.{metadata_key}_metadata ->> 'dataset_id', '') = dataset.dataset_id"""
 
 
 def _provider_directory_current_plan_resources_sql(
@@ -1835,21 +1822,34 @@ def _provider_directory_current_resource_ctes_sql(
          WHERE dataset.is_current IS TRUE
       GROUP BY dataset.endpoint_id
         HAVING COUNT(*) = 1
-    ), current_datasets AS MATERIALIZED (
+    ), current_dataset_metadata AS MATERIALIZED (
         SELECT dataset.endpoint_id, dataset.dataset_id,
                COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id,
                dataset.published_at,
-               ({network_plan_ready_sql}) AS dataset_network_plan_complete,
-               ({affiliation_ready_sql})
-                   AS dataset_affiliation_organization_complete
+               dataset.publication_metadata_json::jsonb
+                   -> 'dataset_network_plan' AS dataset_network_plan_metadata,
+               dataset.publication_metadata_json::jsonb
+                   -> 'dataset_affiliation_organization' AS dataset_affiliation_organization_metadata
           FROM {schema}.provider_directory_endpoint_dataset AS dataset
           JOIN current_endpoint_counts AS current_endpoint
             ON current_endpoint.endpoint_id = dataset.endpoint_id
          WHERE dataset.is_current IS TRUE
+           AND dataset.endpoint_id IN (
+               SELECT requested_source.endpoint_id
+                 FROM {schema}.provider_directory_source AS requested_source
+                WHERE requested_source.source_id = ANY(:source_ids)
+           )
            AND dataset.status = 'published'
            AND dataset.published_at IS NOT NULL
            AND dataset.superseded_at IS NULL
            AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
+    ), current_datasets AS MATERIALIZED (
+        SELECT dataset.endpoint_id, dataset.dataset_id, dataset.run_id,
+               dataset.published_at,
+               ({network_plan_ready_sql}) AS dataset_network_plan_complete,
+               ({affiliation_ready_sql})
+                   AS dataset_affiliation_organization_complete
+          FROM current_dataset_metadata AS dataset
     ), current_resources AS NOT MATERIALIZED (
         SELECT source.source_id, source.canonical_api_base,
                dataset.dataset_id, dataset.run_id,
