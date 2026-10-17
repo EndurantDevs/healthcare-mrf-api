@@ -11,14 +11,16 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.dialects.postgresql import dialect
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 import process.custom_import.build_source as staging
 from process.custom_import.capture import capture_stream
 from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.failure_diagnostics import failure_context
 from process.custom_import.family import assemble_root_families
 from process.custom_import.runner_codec import fields_by_collection, record_payload
 from process.custom_import.runner_types import CandidateRegistry, CandidateRunnerError, LeaseAuthorityLost
@@ -60,6 +62,34 @@ def _root(npi="1003000126", score=Decimal("1.00")):
 
 def _child(npi="1003000126", key="a", amount=Decimal("2.00")):
     return dict(detail_npi=npi, detail_id=key, amount=amount)
+
+
+@pytest.mark.parametrize("handoff", [False, True])
+@pytest.mark.parametrize("phase", ["begin_build", "source", "admission_index", "admission"])
+async def test_staging_diagnostic_keeps_the_exact_boundary_and_known_identifiers(monkeypatch, handoff, phase):
+    request = _request()
+    transport = SimpleNamespace(bind_request=Mock(return_value=request))
+    transports = SimpleNamespace(source=transport, admission=transport) if handoff else None
+    name_by_phase = {
+        "begin_build": "_begin_build",
+        "source": "_stage_source_handoff" if handoff else "_stage_local_source",
+        "admission_index": "_prepare_snapshot_indexes",
+        "admission": "_stage_admission_handoff" if handoff else "_admit_local_pages",
+    }
+    calls_by_name = {
+        name: AsyncMock(return_value=(19, object()) if stage == "begin_build" else None)
+        for stage, name in name_by_phase.items()
+    }
+    for name, call in calls_by_name.items():
+        monkeypatch.setattr(staging, name, call)
+    calls_by_name[name_by_phase[phase]].side_effect = SQLAlchemyTimeoutError("synthetic pool failure")
+    with failure_context() as diagnostic:
+        with pytest.raises(SQLAlchemyTimeoutError) as caught:
+            await staging.stage_segmented_source(object(), request, writer_transports=transports)
+        snapshot = diagnostic.snapshot(caught.value)
+    assert snapshot["phase"] == phase
+    assert snapshot["category"] == "database" and snapshot["database_reason"] == "connection_pool_timeout"
+    assert snapshot["execution_id"] == 4 and snapshot["build_id"] == (None if phase == "begin_build" else 19)
 
 
 @pytest.mark.parametrize(

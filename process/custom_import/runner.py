@@ -28,6 +28,7 @@ from process.custom_import.execution import (
     heartbeat_execution,
     lease_token_sha256,
 )
+from process.custom_import.failure_diagnostics import FailurePhase, failure_phase
 from process.custom_import.family import FamilyBuildResult, FamilyRejection, assemble_root_families
 from process.custom_import.publication import (
     GenerationSealReceipt,
@@ -179,12 +180,14 @@ async def run_claimed_candidate(
     if is_candidate_rejected(request, admitted):
         return await _finish_rejected_candidate(session_factory, request, grant, admitted)
     try:
-        materialized = await _materialize_candidate(session_factory, request, grant, admitted)
+        with failure_phase(FailurePhase.GRAPH):
+            materialized = await _materialize_candidate(session_factory, request, grant, admitted)
     except _CancellationRequested:
         return await _finish_canceled_candidate(session_factory, request, grant, admitted)
     except _LeaseLost:
         return lease_lost_result(request, admitted)
-    return await finalize_materialized_candidate(session_factory, request, grant, admitted, materialized)
+    with failure_phase(FailurePhase.OUTPUT):
+        return await finalize_materialized_candidate(session_factory, request, grant, admitted, materialized)
 
 
 def is_candidate_rejected(request: CandidateRunRequest, admitted: FamilyBuildResult) -> bool:
@@ -277,7 +280,8 @@ async def seal_and_activate_candidate(
         if terminal_outcome is not None:
             return terminal_outcome
         raise
-    publication = await _activate(session_factory, request, materialized)
+    with failure_phase(FailurePhase.ACTIVATE):
+        publication = await _activate(session_factory, request, materialized)
     if publication is None:
         return materialized_result("sealed_unpublished", request, materialized, seal=seal)
     return materialized_result("activated", request, materialized, seal=seal, publication=publication)

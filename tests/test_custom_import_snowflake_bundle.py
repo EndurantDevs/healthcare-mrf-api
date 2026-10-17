@@ -25,6 +25,7 @@ import process.custom_import.snowflake_candidate as snowflake_candidate
 from process.custom_import.capture import CaptureLimits, iter_records
 from process.custom_import.capture_store import CaptureReceipt, ReplayableParquetCapture
 from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.failure_diagnostics import FailurePhase, failure_context, failure_phase
 from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.snowflake import (
     SnowflakeApprovedRelation,
@@ -2344,6 +2345,40 @@ async def test_preparation_failure_fences_without_retaining_or_replaying(monkeyp
     register.assert_not_awaited()
     replay.assert_not_awaited()
     _assert_fenced_failure(transitions, b"owner")
+
+
+@pytest.mark.parametrize("stage", ["_acquired_bundle", "_prepared_bundle_captures"])
+async def test_bundle_failure_diagnostic_survives_fencing_failure(monkeypatch, stage):
+    connector = _connector(_Adapter(lambda: _result(query_id="synthetic-fencing-failure")[0]))
+    bundle = connector.prepare_request(_definition(), bindings=_bindings())
+    request = SnowflakeBundleCandidateRequest(1, 1, 1, _definition(), bundle, "synthetic-prepare", b"owner")
+    sessions, _transitions = _fenced_failure_dependencies(monkeypatch, transition_state="failed")
+    primary = MemoryError("synthetic acquisition payload")
+    cleanup = OSError("synthetic fencing payload")
+    fence = AsyncMock(side_effect=cleanup)
+    register, replay = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(snowflake_candidate, stage, Mock(side_effect=primary))
+    monkeypatch.setattr(snowflake_candidate, "_fence_source_capture_failure", fence)
+    monkeypatch.setattr(snowflake_candidate, "_register_bundle_captures", register)
+    monkeypatch.setattr(snowflake_candidate, "_load_bundle_replay", replay)
+
+    with failure_context() as diagnostic:
+        with pytest.raises(OSError) as caught, failure_phase(FailurePhase.CAPTURE):
+            await run_snowflake_bundle_candidate(sessions, connector, request)
+        snapshot = diagnostic.snapshot(caught.value)
+
+    assert caught.value is cleanup
+    assert snapshot == {
+        "contract_version": "custom-import-failure/v1",
+        "phase": "capture",
+        "category": "memory",
+        "database_reason": "not_applicable",
+        "execution_id": 1,
+        "build_id": None,
+    }
+    fence.assert_awaited_once()
+    register.assert_not_awaited()
+    replay.assert_not_awaited()
 
 
 @pytest.mark.asyncio

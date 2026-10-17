@@ -5,7 +5,7 @@
 import logging
 from enum import StrEnum
 
-from sqlalchemy.exc import SQLAlchemyError
+from process.custom_import.failure_diagnostics import classify_failure
 
 logger = logging.getLogger(__name__)
 
@@ -23,25 +23,15 @@ class BatchFailureStage(StrEnum):
 
 
 def log_batch_failure(stage: BatchFailureStage, error: Exception) -> None:
-    """Never inspect exception values, request data, or uncertain commit state."""
+    """Never log exception text, request data, or uncertain commit state."""
 
-    for kind, category in (
-        (MemoryError, "memory"),
-        (TimeoutError, "timeout"),
-        (SQLAlchemyError, "database"),
-        (OSError, "io"),
-        ((ValueError, TypeError, KeyError), "invalid_state"),
-        (RuntimeError, "runtime"),
-    ):
-        if isinstance(error, kind):
-            break
-    else:
-        category = "unexpected"
     try:
+        category, database_reason = classify_failure(error)
         logger.error(
-            "custom_import_batch_unavailable stage=%s category=%s",
+            "custom_import_batch_unavailable stage=%s category=%s database_reason=%s",
             stage.value,
             category,
+            database_reason,
             exc_info=False,
             stack_info=False,
         )

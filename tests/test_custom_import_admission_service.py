@@ -319,8 +319,10 @@ async def test_unavailable_diagnostics_keep_private_values(monkeypatch, caplog, 
     assert reply.headers["Cache-Control"] == "no-store"
     assert len(caplog.records) == 1
     log_entry = caplog.records[0]
-    assert log_entry.getMessage() == f"custom_import_batch_unavailable stage=admission_{stage} category=database"
-    assert log_entry.args == (f"admission_{stage}", "database")
+    assert log_entry.getMessage() == (
+        f"custom_import_batch_unavailable stage=admission_{stage} category=database database_reason=unknown"
+    )
+    assert log_entry.args == (f"admission_{stage}", "database", "unknown")
     assert not log_entry.exc_info and log_entry.exc_text is None and log_entry.stack_info is None
     assert not any(sentinel in caplog.text for sentinel in ("synthetic-", "synthetic_sql"))
     assert wire.body == b"" or wire.body.decode() not in caplog.text
@@ -557,6 +559,8 @@ async def test_admission_unknown_commit_is_metadata_only_no_retry(monkeypatch, c
     assert reply.status == 503 and json.loads(reply.body) == {"error": "admission_unavailable"}
     assert reply.headers["Cache-Control"] == "no-store"
     assert len(caplog.records) == 1
-    assert caplog.records[0].getMessage() == "custom_import_batch_unavailable stage=admission_execute category=runtime"
+    assert caplog.records[0].getMessage() == (
+        "custom_import_batch_unavailable stage=admission_execute category=runtime database_reason=not_applicable"
+    )
     assert "do-not-log" not in caplog.text
     operation.assert_awaited_once()

@@ -302,9 +302,25 @@ checks. A stale pointer fails with a redacted conflict receipt; inspect current
 state before choosing new preconditions. Commands never automatically retry.
 
 Success emits a compact JSON receipt after transaction commit and connection
-cleanup. Errors omit database diagnostics and record payloads. A connection
+cleanup. Errors omit raw database diagnostics and record payloads. A connection
 cleanup failure can occur after commit: a failed command does not prove rollback.
 Reconcile exact state with `status` before another mutation.
+
+Only `custom_import_snowflake_operator execute` and `resume` add a `diagnostic`
+object to their existing error envelope. Its `contract_version` is
+`custom-import-failure/v1`; `phase`, `category`, and `database_reason` are closed
+labels, and `execution_id` and `build_id` are known positive identifiers or
+`null`. Phases identify operation boundaries such as `connect`, `capture`,
+`source`, `admission`, `graph`, `output`, `activate`, and `disconnect`.
+Database reasons use allowlisted PostgreSQL SQLSTATE names or
+`connection_pool_timeout`, `unknown`, and `not_applicable`. In particular,
+`query_canceled` does not establish that a statement timed out; pool acquisition
+timeout is reported separately. Categories are `canceled`, `memory`, `timeout`,
+`database`, `io`, `invalid_state`, `runtime`, and `unexpected`.
+No exception text, SQL, row text, credentials,
+or traceback is emitted. Identifiers are diagnostic context, not authorization
+or evidence of successful commit. Registration, inspection, argument errors,
+and successful receipts retain their existing formats.
 
 Use `--help` on the entry point or any command for its arguments. Generic
 resume, discovery, preview, and estimate remain unavailable from

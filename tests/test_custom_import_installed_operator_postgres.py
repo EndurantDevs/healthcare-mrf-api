@@ -114,7 +114,9 @@ async def _communicate_with_cleanup(process, stdin_payload):
         raise
 
 
-async def _command(installed_application, case, *arguments, snowflake=False, stdin_payload=None, error=None):
+async def _command(
+    installed_application, case, *arguments, snowflake=False, stdin_payload=None, error=None, diagnostic=None
+):
     installed, outside = installed_application
     url = case.engine.url
     assert url.host in {"127.0.0.1", "localhost", "::1"}
@@ -152,7 +154,10 @@ async def _command(installed_application, case, *arguments, snowflake=False, std
     if error is not None:
         assert process.returncode == 1
         assert stdout == b""
-        assert stderr == (canonical_json({"code": error, "status": "error"}) + "\n").encode()
+        expected_by_field = {"code": error, "status": "error"}
+        if diagnostic is not None:
+            expected_by_field["diagnostic"] = diagnostic
+        assert stderr == (canonical_json(expected_by_field) + "\n").encode()
         return None
     assert process.returncode == 0, failure_metadata(stdout, stderr)
     assert stderr == b""
@@ -439,6 +444,18 @@ async def _resume(installed, case, loaded, key, *, error=None):
         key,
         snowflake=True,
         error=error,
+        diagnostic=(
+            {
+                "contract_version": "custom-import-failure/v1",
+                "phase": "resume_validation",
+                "category": "runtime",
+                "database_reason": "not_applicable",
+                "execution_id": None,
+                "build_id": None,
+            }
+            if error is not None
+            else None
+        ),
     )
 
 

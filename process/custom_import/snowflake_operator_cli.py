@@ -12,7 +12,7 @@ import re
 import secrets
 import sys
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +33,12 @@ from process.custom_import.cli import _MISSING, _read_stdin, _receipt_only_datab
 from process.custom_import.definition import CustomImportDefinition, canonical_json, load_json_definition
 from process.custom_import.definition_store import DefinitionRegistrationError, _normalized_dataset_key
 from process.custom_import.execution import IdempotencyConflict, lookup_execution_request
+from process.custom_import.failure_diagnostics import (
+    FailurePhase,
+    failure_context,
+    failure_identifiers,
+    failure_phase,
+)
 from process.custom_import.family import RootFamily
 from process.custom_import.registration_authority_operator import register_authority
 from process.custom_import.runner import CandidateRunResult
@@ -729,6 +735,35 @@ def _run_preflight_command(parsed: argparse.Namespace, limits: SnowflakePrefligh
     )
 
 
+@asynccontextmanager
+async def _connected_worker_database(database):
+    """Keep receipt-only output and the primary failure through connection cleanup."""
+
+    with _receipt_only_database_output(database):
+        engine = None
+        previous_echo = _MISSING
+        has_primary_failure = False
+        try:
+            with failure_phase(FailurePhase.CONNECT):
+                await database.connect()
+            engine = getattr(database, "engine", None)
+            previous_echo = getattr(engine, "echo", _MISSING)
+            _set_engine_echo(database, False)
+            yield
+        except BaseException:
+            has_primary_failure = True
+            raise
+        finally:
+            if previous_echo is not _MISSING:
+                engine.echo = previous_echo
+            try:
+                with failure_phase(FailurePhase.DISCONNECT):
+                    await database.disconnect()
+            except Exception:
+                if not has_primary_failure:
+                    raise
+
+
 async def _run_retained_snowflake_binding(
     *,
     definition_revision_id: int,
@@ -738,34 +773,20 @@ async def _run_retained_snowflake_binding(
 ) -> CandidateRunResult:
     """Run only the immutable source configuration loaded under database authority."""
 
-    with _receipt_only_database_output(database):
-        engine = None
-        previous_echo = _MISSING
-        has_primary_failure = False
-        try:
-            await database.connect()
-            engine = getattr(database, "engine", None)
-            previous_echo = getattr(engine, "echo", _MISSING)
-            _set_engine_echo(database, False)
+    async with _connected_worker_database(database):
+        with failure_phase(FailurePhase.BINDING):
             async with database.session() as session:
-                loaded = await load_snowflake_source_binding(
-                    session,
-                    definition_revision_id=definition_revision_id,
-                    source_binding_revision_id=source_binding_revision_id,
-                )
+                # Freeze the load failure before session rollback or close can fail.
+                with failure_phase(FailurePhase.BINDING):
+                    loaded = await load_snowflake_source_binding(
+                        session,
+                        definition_revision_id=definition_revision_id,
+                        source_binding_revision_id=source_binding_revision_id,
+                    )
+        with failure_phase(FailurePhase.ADMISSION_STAGE):
             async with load_admission_launch(loaded, idempotency_key=idempotency_key) or nullcontext() as handoff:
-                return await _execute_loaded_candidate(database, loaded, idempotency_key, handoff)
-        except BaseException:
-            has_primary_failure = True
-            raise
-        finally:
-            if previous_echo is not _MISSING:
-                engine.echo = previous_echo
-            try:
-                await database.disconnect()
-            except Exception:
-                if not has_primary_failure:
-                    raise
+                with failure_phase(FailurePhase.CAPTURE):
+                    return await _execute_loaded_candidate(database, loaded, idempotency_key, handoff)
 
 
 async def _execute_loaded_candidate(database, loaded, idempotency_key, writer_transports):
@@ -962,6 +983,7 @@ async def _require_exact_resumable_execution(
         database_time,
     ):
         raise _ResumeUnavailableError("execution is unavailable")
+    failure_identifiers(execution_id=execution_submission.execution_id)
 
 
 async def _run_resumed_snowflake_binding(
@@ -973,44 +995,36 @@ async def _run_resumed_snowflake_binding(
 ) -> CandidateRunResult:
     """Replay only an exact expired source capture; never acquire a new source."""
 
-    with _receipt_only_database_output(database):
-        engine = None
-        previous_echo = _MISSING
-        has_primary_failure = False
-        try:
-            await database.connect()
-            engine = getattr(database, "engine", None)
-            previous_echo = getattr(engine, "echo", _MISSING)
-            _set_engine_echo(database, False)
+    async with _connected_worker_database(database):
+        with failure_phase(FailurePhase.RESUME_VALIDATION):
             async with database.session() as session, session.begin():
-                bundle_connector, candidate_request, processing_policy, loaded = await _resumable_snowflake_candidate(
-                    session,
-                    definition_revision_id=definition_revision_id,
-                    source_binding_revision_id=source_binding_revision_id,
-                    idempotency_key=idempotency_key,
-                )
+                # Freeze validation failure before transaction/session cleanup can fail.
+                with failure_phase(FailurePhase.RESUME_VALIDATION):
+                    (
+                        bundle_connector,
+                        candidate_request,
+                        processing_policy,
+                        loaded,
+                    ) = await _resumable_snowflake_candidate(
+                        session,
+                        definition_revision_id=definition_revision_id,
+                        source_binding_revision_id=source_binding_revision_id,
+                        idempotency_key=idempotency_key,
+                    )
+        with failure_phase(FailurePhase.ADMISSION_STAGE):
             async with load_admission_launch(loaded, idempotency_key=idempotency_key) or nullcontext() as handoff:
-                candidate_result = await _run_configured_candidate(
-                    database,
-                    bundle_connector,
-                    candidate_request,
-                    processing_policy,
-                    writer_transports=handoff,
-                )
+                with failure_phase(FailurePhase.CAPTURE):
+                    candidate_result = await _run_configured_candidate(
+                        database,
+                        bundle_connector,
+                        candidate_request,
+                        processing_policy,
+                        writer_transports=handoff,
+                    )
+        with failure_phase(FailurePhase.RESUME_VALIDATION):
             if candidate_result.status == "not_claimed":
                 raise _ResumeUnavailableError("execution lease is unavailable")
-            return candidate_result
-        except BaseException:
-            has_primary_failure = True
-            raise
-        finally:
-            if previous_echo is not _MISSING:
-                engine.echo = previous_echo
-            try:
-                await database.disconnect()
-            except Exception:
-                if not has_primary_failure:
-                    raise
+        return candidate_result
 
 
 def _run_authority_registration(*, stream: Any | None = None) -> str:
@@ -1023,6 +1037,36 @@ def _run_authority_registration(*, stream: Any | None = None) -> str:
 
 def run_command(arguments: Sequence[str] | None = None, *, stream: Any | None = None) -> int:
     """Register or run a retained binding while emitting only compact safe receipts."""
+
+    with failure_context() as diagnostic:
+        return _run_command(arguments, stream=stream, diagnostic=diagnostic)
+
+
+def _command_error_json(code, command, error, diagnostic):
+    if command not in {"execute", "resume"}:
+        return _error_json(code)
+    document = json.loads(_error_json(code))
+    document["diagnostic"] = diagnostic.snapshot(error)
+    return json.dumps(document, separators=(",", ":"), sort_keys=True)
+
+
+def _run_worker_command(parsed):
+    operation = _run_retained_snowflake_binding if parsed.command == "execute" else _run_resumed_snowflake_binding
+    candidate_result = asyncio.run(
+        operation(
+            definition_revision_id=parsed.definition_revision_id,
+            source_binding_revision_id=parsed.source_binding_revision_id,
+            idempotency_key=parsed.idempotency_key,
+        )
+    )
+    with failure_phase(FailurePhase.RECEIPT):
+        if isinstance(candidate_result, CandidateRunResult):
+            failure_identifiers(execution_id=candidate_result.execution_id)
+        return _receipt(candidate_result)
+
+
+def _run_command(arguments, *, stream, diagnostic):
+    """Keep non-worker command envelopes byte-exact."""
 
     parser = _parser()
     parsed = parser.parse_args(arguments)
@@ -1039,45 +1083,34 @@ def run_command(arguments: Sequence[str] | None = None, *, stream: Any | None = 
                 if parsed.command == "register-authority"
                 else asyncio.run(_register_snowflake_binding(stream=stream))
             )
-        elif parsed.command == "execute":
-            candidate_result = asyncio.run(
-                _run_retained_snowflake_binding(
-                    definition_revision_id=parsed.definition_revision_id,
-                    source_binding_revision_id=parsed.source_binding_revision_id,
-                    idempotency_key=parsed.idempotency_key,
-                )
-            )
-            rendered = _receipt(candidate_result)
-        elif parsed.command == "resume":
-            candidate_result = asyncio.run(
-                _run_resumed_snowflake_binding(
-                    definition_revision_id=parsed.definition_revision_id,
-                    source_binding_revision_id=parsed.source_binding_revision_id,
-                    idempotency_key=parsed.idempotency_key,
-                )
-            )
-            rendered = _receipt(candidate_result)
+        elif parsed.command in {"execute", "resume"}:
+            rendered = _run_worker_command(parsed)
         else:
             rendered = _run_preflight_command(parsed, preflight_limits)
         print(rendered)
         return 0
-    except KeyboardInterrupt:
-        print(_error_json("canceled"), file=sys.stderr)
+    except KeyboardInterrupt as error:
+        print(_command_error_json("canceled", parsed.command, error, diagnostic), file=sys.stderr)
         return 130
-    except SnowflakeInspectionError as exc:
-        print(_error_json(exc.code), file=sys.stderr)
+    except asyncio.CancelledError as error:
+        if parsed.command not in {"execute", "resume"}:
+            raise
+        print(_command_error_json("failed", parsed.command, error, diagnostic), file=sys.stderr)
         return 1
-    except DefinitionRegistrationError, SnowflakeSourceBindingError:
+    except SnowflakeInspectionError as exc:
+        print(_command_error_json(exc.code, parsed.command, exc, diagnostic), file=sys.stderr)
+        return 1
+    except (DefinitionRegistrationError, SnowflakeSourceBindingError) as error:
         code = (
             "invalid_registration"
             if parsed.command in {"register", "register-authority"}
             else "source_binding_unavailable"
         )
-        print(_error_json(code), file=sys.stderr)
+        print(_command_error_json(code, parsed.command, error, diagnostic), file=sys.stderr)
         return 1
-    except _ResumeUnavailableError:
-        print(_error_json("failed"), file=sys.stderr)
+    except _ResumeUnavailableError as error:
+        print(_command_error_json("failed", parsed.command, error, diagnostic), file=sys.stderr)
         return 1
-    except Exception:
-        print(_error_json("failed"), file=sys.stderr)
+    except Exception as error:
+        print(_command_error_json("failed", parsed.command, error, diagnostic), file=sys.stderr)
         return 1
