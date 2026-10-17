@@ -12,7 +12,7 @@ from sanic.exceptions import Forbidden
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from api.control_auth import require_control_auth
+from api.control_auth import require_registry_auth
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.registry_network_catalog_read import (
     MAX_EXCLUSIONS,
@@ -192,7 +192,7 @@ def _parameters(request, kind):
 async def _catalog_response(request, kind):
     """Authorize first, then pin approved metadata in one read-only snapshot."""
     try:
-        require_control_auth(request)
+        require_registry_auth(request)
     except Forbidden:
         return _error(403)
     try:

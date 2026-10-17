@@ -8,7 +8,7 @@ from sanic import Blueprint, response
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from api.control_auth import require_control_auth
+from api.control_auth import require_registry_auth
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
 
 blueprint = Blueprint("network_serving", url_prefix="/registry/serving", version=1)
@@ -40,7 +40,7 @@ def _error(status):
 @blueprint.get("/manifest", ignore_body=False)
 async def serving_manifest(request):
     """Return only one verified immutable identity through a read-only native pin."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         generation_id = _generation(request)
     except ValueError:

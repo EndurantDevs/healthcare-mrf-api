@@ -105,7 +105,7 @@ async def test_absent_configuration_keeps_service_unavailable_without_database(m
     assert getattr(app.ctx, "registry_ptg_scope_engine", None) is None
     assert boundary.engines == []
     request = SimpleNamespace(app=app, body=b"{}", args={}, query_string="", headers={})
-    monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
+    monkeypatch.setattr(routes, "require_registry_auth", lambda _request: None)
     monkeypatch.setattr(routes, "_body", lambda _request, _operation: {})
     assert (await routes.preview_registry_ptg_scope(request)).status == 503
 

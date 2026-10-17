@@ -10,7 +10,7 @@ from sanic import Blueprint, response
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from api.control_auth import require_control_auth
+from api.control_auth import require_registry_auth
 from api.endpoint.registry_management import _error, _unique_object, _uuid
 from process.registry_approval_preview import preview_registry_approval
 from process.registry_approval_store import (
@@ -203,7 +203,7 @@ def _source_rollback_publication_command(request):
 @blueprint.post("/source-rollback/publish")
 async def queue_source_rollback_publication(request):
     """Queue explicit reviewed publication; HTTP keeps its ordinary API privileges."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         command_by_name, actor, session_hash = _source_rollback_publication_command(request)
         async with request.ctx.sa_session.begin():
@@ -225,7 +225,7 @@ async def queue_source_rollback_publication(request):
 @blueprint.post("/source-rollback/preview")
 async def queue_source_rollback_preview(request):
     """Queue a reviewed retained-source preview; do not switch the serving head."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         command, actor, session_hash = _retained_operation_command(request, "prepare_source_rollback")
         command_by_name = validated_registry_source_rollback_preview_command(
@@ -253,7 +253,7 @@ async def queue_source_rollback_preview(request):
 @blueprint.post("/reactivate")
 async def queue_reactivation(request):
     """Queue a distinct administrator command without entering the publisher role."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         command, actor, session_hash = _reactivation_command(request)
         async with request.ctx.sa_session.begin():
@@ -275,7 +275,7 @@ async def queue_reactivation(request):
 @blueprint.get("/state", ignore_body=False)
 async def publication_state(request):
     """Read current draft, approved and serving heads through trusted control auth."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         if request.body or getattr(request, "query_string", "") or request.args:
             raise ValueError("registry_publication_request_invalid")
@@ -294,7 +294,7 @@ async def publication_state(request):
 @blueprint.post("/<operation>")
 async def request_publication(request, operation):
     """Preview or queue one selection; HTTP never enters the publisher role."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         if operation not in {"preview", "queue"}:
             raise ValueError("registry_publication_operation_invalid")
@@ -332,7 +332,7 @@ async def request_publication(request, operation):
 @blueprint.get("/requests/<request_id>", ignore_body=False)
 async def publication_request(request, request_id):
     """Read a controller status receipt for the authenticated application layer."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         if request.body or getattr(request, "query_string", "") or request.args:
             raise ValueError("registry_publication_request_invalid")
@@ -349,7 +349,7 @@ async def publication_request(request, request_id):
 @blueprint.get("/approved-companies", ignore_body=False)
 async def approved_companies(request):
     """Read the current retained company map through existing service authority."""
-    require_control_auth(request)
+    require_registry_auth(request)
     try:
         query_by_field = parse_qs(request.query_string, keep_blank_values=True, strict_parsing=True)
         if (
