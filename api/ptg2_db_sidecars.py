@@ -16,31 +16,35 @@ from typing import AbstractSet, Any, Callable, Iterable, Mapping
 from sqlalchemy import text
 
 from api.ptg2_candidate_audit_capacity import (
-    CandidateAuditDecodedRetentionBudget,
     INTEGER_KEY_ORDERING_BYTES,
     INTEGER_KEY_ORDERING_MEMBERSHIP_BYTES,
     INTEGER_KEY_SET_BYTES,
     INTEGER_KEY_SET_MEMBERSHIP_BYTES,
     INTEGER_KEY_TUPLE_BYTES,
     INTEGER_KEY_TUPLE_MEMBERSHIP_BYTES,
+    CandidateAuditDecodedRetentionBudget,
     retain_unique_integer_key_set,
     retain_unique_integer_keys,
 )
 from api.ptg2_candidate_audit_maps import (
     INTEGER_MAP_BUCKET_BYTES as _AUDIT_INTEGER_MAP_BUCKET_BYTES,
+)
+from api.ptg2_candidate_audit_maps import (
     INTEGER_MAP_BYTES as _AUDIT_INTEGER_MAP_BYTES,
+)
+from api.ptg2_candidate_audit_maps import (
     INTEGER_SET_MEMBERSHIP_BYTES as _AUDIT_INTEGER_SET_MEMBERSHIP_BYTES,
 )
 from api.ptg2_shared_blocks import (
+    _SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES,
+    _SHARED_MAPPING_RECORD_RETAINED_BYTES,
     PTG2_SHARED_PROJECTION_GENERATIONS,
     PTG2SharedBlockError,
     SharedGraphReadLimitError,
     SharedMappingReadLimitError,
-    _SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES,
-    _SHARED_MAPPING_RECORD_RETAINED_BYTES,
-    _SharedMappingAccumulator,
     _require_complete_shared_mapping,
     _shared_block_read_request,
+    _SharedMappingAccumulator,
     _stream_shared_mapping_records,
     claim_shared_block_processing,
     claim_shared_logical_payload_processing,
@@ -66,7 +70,6 @@ from process.ptg_parts.ptg2_v4_finalizer_range_reader import (
     load_v4_finalizer_range_keys,
 )
 
-
 _ProviderCodeRequests = Mapping[int, tuple[int, ...]]
 _FORWARD_OCCURRENCE_RETAINED_BYTES = 256
 _FORWARD_PRICE_KEY_RETAINED_BYTES = 48
@@ -81,27 +84,18 @@ _FORWARD_OCCURRENCE_BATCH_FROZEN_ROW_RETAINED_BYTES = 8
 # three-slot tuple (72, rounded to 80), worst-case list growth attributed per
 # row (32), and a transient three-slot coordinate tuple (also rounded to 80).
 _FORWARD_FANOUT_ROW_RETAINED_BYTES = 288
-_FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES = (
-    _FORWARD_FANOUT_ROW_RETAINED_BYTES
-)
+_FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES = _FORWARD_FANOUT_ROW_RETAINED_BYTES
 # The compact logical-block index and one transient mapping read share the
 # existing 64 MiB price-membership envelope. The per-block allowance covers
 # both persistent dictionaries, compact digests, and one incoming identity.
 PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK = 512
-MAX_PRICE_MEMBERSHIP_ALIAS_RETAINED_BYTES = (
-    _SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES
-)
+MAX_PRICE_MEMBERSHIP_ALIAS_RETAINED_BYTES = _SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES
 MAX_PRICE_MEMBERSHIP_CACHED_BLOCKS = (
-    MAX_PRICE_MEMBERSHIP_ALIAS_RETAINED_BYTES
-    // PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK
+    MAX_PRICE_MEMBERSHIP_ALIAS_RETAINED_BYTES // PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK
 )
 MAX_PRICE_MEMBERSHIP_CACHED_FRAGMENTS = 131_072
-PRICE_MEMBERSHIP_TRANSIENT_BYTES_PER_FRAGMENT = (
-    3 * _SHARED_MAPPING_RECORD_RETAINED_BYTES
-)
-_PRICE_MEMBERSHIP_PHYSICAL_IDENTITY_DOMAIN = (
-    b"healthporta.ptg2.price-membership-physical.v1\x00"
-)
+PRICE_MEMBERSHIP_TRANSIENT_BYTES_PER_FRAGMENT = 3 * _SHARED_MAPPING_RECORD_RETAINED_BYTES
+_PRICE_MEMBERSHIP_PHYSICAL_IDENTITY_DOMAIN = b"healthporta.ptg2.price-membership-physical.v1\x00"
 # The coordinate index retains a resize-safe dict base, then one dict slot,
 # three-slot key tuple, and empty list for every logical fragment coordinate.
 _FORWARD_COORDINATE_MAP_RETAINED_BYTES = 224
@@ -132,9 +126,7 @@ def forward_price_row_retention_upper_bound(rate_count: int) -> int:
     if type(rate_count) is not int or rate_count < 0:
         raise ValueError("forward rate count must not be negative")
     parse_and_mutable_bytes = (
-        _FORWARD_FANOUT_ROW_RETAINED_BYTES
-        + _FORWARD_OCCURRENCE_RETAINED_BYTES
-        + _FORWARD_PRICE_KEY_RETAINED_BYTES
+        _FORWARD_FANOUT_ROW_RETAINED_BYTES + _FORWARD_OCCURRENCE_RETAINED_BYTES + _FORWARD_PRICE_KEY_RETAINED_BYTES
     )
     frozen_peak_bytes = (
         _FORWARD_OCCURRENCE_RETAINED_BYTES
@@ -159,10 +151,7 @@ def _forward_code_key_retention_peaks(
         + INTEGER_KEY_ORDERING_BYTES
         + code_count * INTEGER_KEY_ORDERING_MEMBERSHIP_BYTES
     )
-    retained_tuple_bytes = (
-        INTEGER_KEY_TUPLE_BYTES
-        + code_count * INTEGER_KEY_TUPLE_MEMBERSHIP_BYTES
-    )
+    retained_tuple_bytes = INTEGER_KEY_TUPLE_BYTES + code_count * INTEGER_KEY_TUPLE_MEMBERSHIP_BYTES
     return normalized_peak_bytes, retained_tuple_bytes
 
 
@@ -174,13 +163,8 @@ def _forward_visit_retention_upper_bound(
 ) -> int:
     """Bound request, physical-fragment, and mutable-row workspace."""
 
-    request_workspace_bytes = (
-        _FORWARD_REQUEST_BASE_RETAINED_BYTES
-        + code_count
-        * (
-            _FORWARD_REQUEST_CODE_RETAINED_BYTES
-            + 2 * _FORWARD_FILTER_MAP_ENTRY_RETAINED_BYTES
-        )
+    request_workspace_bytes = _FORWARD_REQUEST_BASE_RETAINED_BYTES + code_count * (
+        _FORWARD_REQUEST_CODE_RETAINED_BYTES + 2 * _FORWARD_FILTER_MAP_ENTRY_RETAINED_BYTES
     )
     physical_row_workspace_bytes = rate_count * (
         _FORWARD_DISCOVERED_SHARD_RETAINED_BYTES
@@ -218,17 +202,10 @@ def forward_price_index_retention_upper_bound(
     retained_row_bytes = forward_price_row_retention_upper_bound(rate_count)
     if filter_coordinate_count is None:
         filter_coordinate_count = rate_count
-    if (
-        type(filter_coordinate_count) is not int
-        or filter_coordinate_count < 0
-    ):
-        raise ValueError(
-            "forward filter coordinate count must not be negative"
-        )
+    if type(filter_coordinate_count) is not int or filter_coordinate_count < 0:
+        raise ValueError("forward filter coordinate count must not be negative")
     filter_coordinate_count = max(rate_count, filter_coordinate_count)
-    normalized_code_peak_bytes, retained_code_tuple_bytes = (
-        _forward_code_key_retention_peaks(code_count)
-    )
+    normalized_code_peak_bytes, retained_code_tuple_bytes = _forward_code_key_retention_peaks(code_count)
     visit_peak_bytes = _forward_visit_retention_upper_bound(
         rate_count,
         code_count,
@@ -284,21 +261,12 @@ class ForwardReadBudget:
     def __post_init__(self) -> None:
         limits = (self.maximum_fragments, self.maximum_raw_payload_bytes)
         if any(isinstance(limit, bool) or int(limit) <= 0 for limit in limits):
-            raise PTG2ManifestArtifactError(
-                "PTG2 forward physical scan budget is invalid"
-            )
+            raise PTG2ManifestArtifactError("PTG2 forward physical scan budget is invalid")
         self.maximum_fragments = int(self.maximum_fragments)
-        self.maximum_raw_payload_bytes = int(
-            self.maximum_raw_payload_bytes
-        )
+        self.maximum_raw_payload_bytes = int(self.maximum_raw_payload_bytes)
         if self.maximum_row_capacity is not None:
-            if (
-                isinstance(self.maximum_row_capacity, bool)
-                or int(self.maximum_row_capacity) <= 0
-            ):
-                raise PTG2ManifestArtifactError(
-                    "PTG2 forward row-capacity budget is invalid"
-                )
+            if isinstance(self.maximum_row_capacity, bool) or int(self.maximum_row_capacity) <= 0:
+                raise PTG2ManifestArtifactError("PTG2 forward row-capacity budget is invalid")
             self.maximum_row_capacity = int(self.maximum_row_capacity)
 
     def claim(self, raw_payload_bytes: int) -> None:
@@ -312,9 +280,7 @@ class ForwardReadBudget:
             or next_fragment_count > self.maximum_fragments
             or next_raw_payload_bytes > self.maximum_raw_payload_bytes
         ):
-            raise ForwardReadBudgetExceeded(
-                "PTG2 forward read exceeds its sealed physical scan budget"
-            )
+            raise ForwardReadBudgetExceeded("PTG2 forward read exceeds its sealed physical scan budget")
         self.fragment_count = next_fragment_count
         self.raw_payload_bytes = next_raw_payload_bytes
 
@@ -336,9 +302,7 @@ class ForwardReadBudget:
             or next_fragment_count > self.maximum_fragments
             or next_raw_payload_bytes > self.maximum_raw_payload_bytes
         ):
-            raise ForwardReadBudgetExceeded(
-                "PTG2 forward read exceeds its sealed physical scan budget"
-            )
+            raise ForwardReadBudgetExceeded("PTG2 forward read exceeds its sealed physical scan budget")
         self.fragment_count = next_fragment_count
         self.raw_payload_bytes = next_raw_payload_bytes
 
@@ -352,12 +316,8 @@ class ForwardReadBudget:
 
         normalized_read_rows = int(read_rows)
         normalized_result_rows = int(result_rows)
-        next_read_capacity = (
-            self.active_read_row_capacity + normalized_read_rows
-        )
-        next_result_capacity = (
-            self.active_result_row_capacity + normalized_result_rows
-        )
+        next_read_capacity = self.active_read_row_capacity + normalized_read_rows
+        next_result_capacity = self.active_result_row_capacity + normalized_result_rows
         if (
             normalized_read_rows < 0
             or normalized_result_rows < 0
@@ -365,9 +325,7 @@ class ForwardReadBudget:
             or next_read_capacity > self.maximum_row_capacity
             or next_result_capacity > self.maximum_row_capacity
         ):
-            raise ForwardReadBudgetExceeded(
-                "PTG2 forward read exceeds its sealed row-capacity budget"
-            )
+            raise ForwardReadBudgetExceeded("PTG2 forward read exceeds its sealed row-capacity budget")
         self.active_read_row_capacity = next_read_capacity
         self.active_result_row_capacity = next_result_capacity
         self.peak_read_row_capacity = max(
@@ -551,12 +509,8 @@ class _ForwardFanoutCapture:
         for view in exact_views:
             self._retain(view, provider_set_key, price_key, source_key)
         for view in self.fallback_views:
-            is_provider_match = (
-                view.provider_filter is None or provider_set_key in view.provider_filter
-            )
-            is_source_match = (
-                view.source_filter is None or source_key in view.source_filter
-            )
+            is_provider_match = view.provider_filter is None or provider_set_key in view.provider_filter
+            is_source_match = view.source_filter is None or source_key in view.source_filter
             if is_provider_match and is_source_match:
                 self._retain(view, provider_set_key, price_key, source_key)
 
@@ -586,9 +540,7 @@ class _ForwardFanoutCapture:
             )
         try:
             coordinate = (view.code_key, view.block_key, view.fragment_no)
-            self.retained_by_coordinate[coordinate].append(
-                (provider_set_key, price_key, source_key)
-            )
+            self.retained_by_coordinate[coordinate].append((provider_set_key, price_key, source_key))
         except BaseException:
             if self.retention_budget is not None:
                 self.retention_budget.release(_FORWARD_FANOUT_ROW_RETAINED_BYTES)
@@ -619,14 +571,8 @@ def _safe_qualified_table_name(value: str) -> str:
     """Validate names used by out-of-slice V3 decoder modules."""
 
     parts = str(value or "").split(".", 1)
-    if (
-        len(parts) != 2
-        or not _IDENTIFIER_RE.fullmatch(parts[0])
-        or not _IDENTIFIER_RE.fullmatch(parts[1])
-    ):
-        raise PTG2ManifestArtifactError(
-            f"unsafe PTG2 serving binary table name: {value!r}"
-        )
+    if len(parts) != 2 or not _IDENTIFIER_RE.fullmatch(parts[0]) or not _IDENTIFIER_RE.fullmatch(parts[1]):
+        raise PTG2ManifestArtifactError(f"unsafe PTG2 serving binary table name: {value!r}")
     return f"{_quote_ident(parts[0])}.{_quote_ident(parts[1])}"
 
 
@@ -650,9 +596,7 @@ def _normalized_code_key(code_key: int) -> int:
 
 def _normalized_price_item_count(item_count: int) -> int:
     if isinstance(item_count, bool) or int(item_count) < 0:
-        raise PTG2ManifestArtifactError(
-            "PTG2 shared price dictionary item count is invalid"
-        )
+        raise PTG2ManifestArtifactError("PTG2 shared price dictionary item count is invalid")
     return int(item_count)
 
 
@@ -664,14 +608,10 @@ def _normalized_provider_set_filter(
     normalized_keys: set[int] = set()
     for provider_set_key in provider_set_keys:
         if isinstance(provider_set_key, bool):
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 provider-set key is out of range"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 provider-set key is out of range")
         normalized_key = int(provider_set_key)
         if normalized_key < 0 or normalized_key > _SERVING_BINARY_MAX_DENSE_KEY:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 provider-set key is out of range"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 provider-set key is out of range")
         normalized_keys.add(normalized_key)
     return tuple(sorted(normalized_keys))
 
@@ -680,20 +620,12 @@ def _prepare_provider_set_filter(
     provider_set_keys: Iterable[int] | None,
 ) -> _PreparedProviderSetFilter:
     normalized_keys = _normalized_provider_set_filter(provider_set_keys)
-    return _PreparedProviderSetFilter(
-        keys=(
-            None
-            if normalized_keys is None
-            else frozenset(normalized_keys)
-        )
-    )
+    return _PreparedProviderSetFilter(keys=(None if normalized_keys is None else frozenset(normalized_keys)))
 
 
 def _normalized_provider_shard_span(provider_shard_span: int | None) -> int:
     normalized_span = (
-        _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN_DEFAULT
-        if provider_shard_span is None
-        else int(provider_shard_span)
+        _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN_DEFAULT if provider_shard_span is None else int(provider_shard_span)
     )
     if (
         isinstance(provider_shard_span, bool)
@@ -701,9 +633,7 @@ def _normalized_provider_shard_span(provider_shard_span: int | None) -> int:
         or normalized_span > 1 << 24
         or normalized_span & (normalized_span - 1)
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 provider shard span must be a bounded power of two"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 provider shard span must be a bounded power of two")
     return normalized_span
 
 
@@ -718,9 +648,7 @@ def _forward_provider_shard_block_key(
     provider_set_key: int,
     provider_shard_span: int | None = None,
 ) -> int:
-    normalized_provider_keys = _normalized_provider_set_filter(
-        (provider_set_key,)
-    )
+    normalized_provider_keys = _normalized_provider_set_filter((provider_set_key,))
     assert normalized_provider_keys is not None
     normalized_span = _normalized_provider_shard_span(provider_shard_span)
     lower_bound, _upper_bound = _forward_code_block_bounds(code_key)
@@ -735,15 +663,11 @@ def _forward_provider_range_for_block(
     lower_bound, upper_bound = _forward_code_block_bounds(code_key)
     normalized_block_key = int(block_key)
     if normalized_block_key < lower_bound or normalized_block_key >= upper_bound:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 provider-shard block key is outside its code range"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 provider-shard block key is outside its code range")
     shard_no = normalized_block_key - lower_bound
     normalized_span = _normalized_provider_shard_span(provider_shard_span)
     if shard_no > _SERVING_BINARY_MAX_DENSE_KEY // normalized_span:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 provider-shard block key has an invalid shard number"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 provider-shard block key has an invalid shard number")
     provider_key_min = shard_no * normalized_span
     return (
         provider_key_min,
@@ -757,14 +681,7 @@ def _computed_forward_shard_keys(
     provider_shard_span: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     normalized_span = _normalized_provider_shard_span(provider_shard_span)
-    shard_numbers = tuple(
-        sorted(
-            {
-                provider_set_key // normalized_span
-                for provider_set_key in provider_set_keys
-            }
-        )
-    )
+    shard_numbers = tuple(sorted({provider_set_key // normalized_span for provider_set_key in provider_set_keys}))
     shard_keys_by_code: dict[int, tuple[int, ...]] = {}
     for code_key in code_keys:
         normalized_code_key = _normalized_code_key(code_key)
@@ -801,9 +718,7 @@ async def _packed_finalizer_block_keys_by_range(
             )
 
     claim_block_key = (
-        retain_block_key
-        if temporary_retention is not None and temporary_retention.budget is not None
-        else None
+        retain_block_key if temporary_retention is not None and temporary_retention.budget is not None else None
     )
     try:
         return await load_v4_finalizer_range_keys(
@@ -877,9 +792,7 @@ async def _collect_forward_shard_keys(
     """Validate and group streamed relational shard coordinates."""
 
     requested_code_set = set(normalized_code_keys)
-    shard_keys_by_code: dict[int, list[int]] = {
-        code_key: [] for code_key in normalized_code_keys
-    }
+    shard_keys_by_code: dict[int, list[int]] = {code_key: [] for code_key in normalized_code_keys}
     observed_pairs: set[tuple[int, int]] = set()
     async for raw_row in _iterate_forward_query_rows(shard_query_result):
         if temporary_retention is not None and temporary_retention.budget is not None:
@@ -891,9 +804,7 @@ async def _collect_forward_shard_keys(
         code_key = int(shard_row.get("code_key"))
         block_key = int(shard_row.get("block_key"))
         if code_key not in requested_code_set:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 shard discovery returned an unexpected code key"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 shard discovery returned an unexpected code key")
         _forward_provider_range_for_block(
             code_key,
             block_key,
@@ -901,15 +812,10 @@ async def _collect_forward_shard_keys(
         )
         pair = (code_key, block_key)
         if pair in observed_pairs:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 shard discovery returned a duplicate block key"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 shard discovery returned a duplicate block key")
         observed_pairs.add(pair)
         shard_keys_by_code[code_key].append(block_key)
-    return {
-        code_key: tuple(block_keys)
-        for code_key, block_keys in shard_keys_by_code.items()
-    }
+    return {code_key: tuple(block_keys) for code_key, block_keys in shard_keys_by_code.items()}
 
 
 async def _discover_forward_shard_keys(
@@ -923,9 +829,7 @@ async def _discover_forward_shard_keys(
 ) -> dict[int, tuple[int, ...]]:
     """Discover every immutable provider shard in exact code-key ranges."""
 
-    normalized_code_keys = tuple(
-        sorted({_normalized_code_key(code_key) for code_key in code_keys})
-    )
+    normalized_code_keys = tuple(sorted({_normalized_code_key(code_key) for code_key in code_keys}))
     if not normalized_code_keys:
         return {}
     packed_keys = await _packed_finalizer_block_keys_by_range(
@@ -982,15 +886,9 @@ async def _forward_shard_keys_for_read(
     options: _ForwardLookupOptions | _ForwardBatchOptions,
     code_keys: Iterable[int],
 ) -> tuple[dict[int, tuple[int, ...]], tuple[int, ...] | None, bool]:
-    normalized_code_keys = tuple(
-        sorted({_normalized_code_key(code_key) for code_key in code_keys})
-    )
-    provider_filter = _normalized_provider_set_filter(
-        options.provider_set_keys
-    )
-    provider_shard_span = _normalized_provider_shard_span(
-        options.provider_shard_span
-    )
+    normalized_code_keys = tuple(sorted({_normalized_code_key(code_key) for code_key in code_keys}))
+    provider_filter = _normalized_provider_set_filter(options.provider_set_keys)
+    provider_shard_span = _normalized_provider_shard_span(options.provider_shard_span)
     if provider_filter is not None:
         return (
             _computed_forward_shard_keys(
@@ -1017,15 +915,11 @@ async def _forward_shard_keys_for_read(
 def _id_text(raw: bytes | bytearray | memoryview) -> str:
     value = bytes(raw)
     if len(value) != 16:
-        raise PTG2ManifestArtifactError(
-            f"128-bit ids must be 16 bytes; got {len(value)}"
-        )
+        raise PTG2ManifestArtifactError(f"128-bit ids must be 16 bytes; got {len(value)}")
     return value.hex()
 
 
-def _read_uvarint(
-    payload: bytes | bytearray | memoryview, offset: int
-) -> tuple[int, int]:
+def _read_uvarint(payload: bytes | bytearray | memoryview, offset: int) -> tuple[int, int]:
     cursor = int(offset)
     result = 0
     shift = 0
@@ -1054,22 +948,12 @@ def _decode_serving_binary_payload(record: Mapping[str, Any]) -> bytes:
         try:
             raw_payload = zlib.decompress(payload)
         except zlib.error as exc:
-            raise PTG2ManifestArtifactError(
-                "PTG2 serving block payload is corrupt"
-            ) from exc
+            raise PTG2ManifestArtifactError("PTG2 serving block payload is corrupt") from exc
     else:
-        raise PTG2ManifestArtifactError(
-            f"unsupported PTG2 serving block payload compression: {compression}"
-        )
+        raise PTG2ManifestArtifactError(f"unsupported PTG2 serving block payload compression: {compression}")
     expected_raw_bytes = record.get("raw_payload_bytes")
-    if (
-        expected_raw_bytes is not None
-        and int(expected_raw_bytes) >= 0
-        and len(raw_payload) != int(expected_raw_bytes)
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 serving block raw payload byte count mismatch"
-        )
+    if expected_raw_bytes is not None and int(expected_raw_bytes) >= 0 and len(raw_payload) != int(expected_raw_bytes):
+        raise PTG2ManifestArtifactError("PTG2 serving block raw payload byte count mismatch")
     return raw_payload
 
 
@@ -1147,9 +1031,7 @@ async def _serving_binary_payload_rows_for_keys(
     """Shared-only adapter retained for the decoder modules outside this slice."""
 
     if _unsupported_table_name:
-        raise PTG2ManifestArtifactError(
-            "per-snapshot serving binary tables are unsupported; reimport the snapshot"
-        )
+        raise PTG2ManifestArtifactError("per-snapshot serving binary tables are unsupported; reimport the snapshot")
     return await _shared_serving_binary_payload_rows_for_keys(
         session,
         shared_snapshot_key=_required_shared_snapshot_key(shared_snapshot_key),
@@ -1182,33 +1064,28 @@ def _shared_dictionary_values_for_keys(
     if not ordered_fragments:
         raise PTG2ManifestArtifactError("PTG2 shared serving dictionary is missing")
     _validate_dictionary_keys(requested_keys, item_count)
-    required_fragments = {
-        item_key // entries_per_fragment for item_key in requested_keys
-    }
+    keys_by_fragment: dict[int, list[int]] = {}
+    for item_key in requested_keys:
+        keys_by_fragment.setdefault(item_key // entries_per_fragment, []).append(item_key)
+    required_fragments = set(keys_by_fragment)
     values_by_key: dict[int, str] = {}
     observed_fragments: set[int] = set()
-    for block_hash, physical_aliases in _dictionary_fragments_by_hash(
-        ordered_fragments
-    ).items():
+    for block_hash, physical_aliases in _dictionary_fragments_by_hash(ordered_fragments).items():
         alias_values, alias_fragment_nos = _dictionary_alias_values(
             block_hash,
             physical_aliases,
-            requested_keys,
+            keys_by_fragment,
             required_fragments,
             item_count=item_count,
             entries_per_fragment=entries_per_fragment,
             schema_name=schema_name,
         )
         if observed_fragments.intersection(alias_fragment_nos):
-            raise PTG2ManifestArtifactError(
-                "PTG2 shared serving dictionary returned an unexpected fragment"
-            )
+            raise PTG2ManifestArtifactError("PTG2 shared serving dictionary returned an unexpected fragment")
         observed_fragments.update(alias_fragment_nos)
         values_by_key.update(alias_values)
     if observed_fragments != required_fragments:
-        raise PTG2ManifestArtifactError(
-            "PTG2 shared serving dictionary is missing a requested fragment"
-        )
+        raise PTG2ManifestArtifactError("PTG2 shared serving dictionary is missing a requested fragment")
     if set(values_by_key) != set(requested_keys):
         raise PTG2ManifestArtifactError("PTG2 serving dictionary key is out of range")
     return values_by_key
@@ -1238,7 +1115,7 @@ def _dictionary_fragments_by_hash(
 def _dictionary_alias_values(
     block_hash: bytes,
     physical_aliases: list[Mapping[str, Any]],
-    requested_keys: tuple[int, ...],
+    keys_by_fragment: Mapping[int, list[int]],
     required_fragments: set[int],
     *,
     item_count: int,
@@ -1251,24 +1128,15 @@ def _dictionary_alias_values(
     representative = physical_aliases[0]
     fragment_bytes = _decode_serving_binary_payload(representative)
     entry_count = int(representative.get("entry_count") or 0)
-    if any(
-        int(alias.get("entry_count") or 0) != entry_count
-        for alias in physical_aliases[1:]
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 shared serving dictionary fragment is malformed"
-        )
+    if any(int(alias.get("entry_count") or 0) != entry_count for alias in physical_aliases[1:]):
+        raise PTG2ManifestArtifactError("PTG2 shared serving dictionary fragment is malformed")
     requested_offsets = {
         item_key % entries_per_fragment
         for fragment_row in physical_aliases
-        for item_key in requested_keys
-        if int(fragment_row.get("block_no") or 0)
-        == item_key // entries_per_fragment
+        for item_key in keys_by_fragment.get(int(fragment_row.get("block_no") or 0), ())
     }
     value_by_offset = {
-        item_offset: _id_text(
-            fragment_bytes[item_offset * 16 : (item_offset + 1) * 16]
-        )
+        item_offset: _id_text(fragment_bytes[item_offset * 16 : (item_offset + 1) * 16])
         for item_offset in requested_offsets
     }
     values_by_key: dict[int, str] = {}
@@ -1276,21 +1144,13 @@ def _dictionary_alias_values(
     for fragment_row in physical_aliases:
         fragment_no = int(fragment_row.get("block_no") or 0)
         if fragment_no in fragment_nos or fragment_no not in required_fragments:
-            raise PTG2ManifestArtifactError(
-                "PTG2 shared serving dictionary returned an unexpected fragment"
-            )
+            raise PTG2ManifestArtifactError("PTG2 shared serving dictionary returned an unexpected fragment")
         fragment_nos.add(fragment_no)
         item_offset = fragment_no * entries_per_fragment
         expected_entry_count = min(entries_per_fragment, item_count - item_offset)
-        if (
-            expected_entry_count <= 0
-            or entry_count != expected_entry_count
-            or len(fragment_bytes) != entry_count * 16
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 shared serving dictionary fragment is malformed"
-            )
-        for item_key in requested_keys:
+        if expected_entry_count <= 0 or entry_count != expected_entry_count or len(fragment_bytes) != entry_count * 16:
+            raise PTG2ManifestArtifactError("PTG2 shared serving dictionary fragment is malformed")
+        for item_key in keys_by_fragment[fragment_no]:
             if item_offset <= item_key < item_offset + entry_count:
                 values_by_key[item_key] = value_by_offset[item_key - item_offset]
     return values_by_key, fragment_nos
@@ -1310,23 +1170,13 @@ async def _serving_binary_dictionary_values_for_keys(
     if not requested_keys:
         return {}
     if isinstance(item_count, bool) or int(item_count) < 0:
-        raise PTG2ManifestArtifactError(
-            "PTG2 shared price dictionary item count is invalid"
-        )
-    if (
-        isinstance(block_bytes, bool)
-        or int(block_bytes) < 16
-        or int(block_bytes) % 16 != 0
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 shared price dictionary block size is invalid"
-        )
+        raise PTG2ManifestArtifactError("PTG2 shared price dictionary item count is invalid")
+    if isinstance(block_bytes, bool) or int(block_bytes) < 16 or int(block_bytes) % 16 != 0:
+        raise PTG2ManifestArtifactError("PTG2 shared price dictionary block size is invalid")
     normalized_item_count = int(item_count)
     entries_per_fragment = int(block_bytes) // 16
     _validate_dictionary_keys(requested_keys, normalized_item_count)
-    requested_fragments = tuple(
-        sorted({item_key // entries_per_fragment for item_key in requested_keys})
-    )
+    requested_fragments = tuple(sorted({item_key // entries_per_fragment for item_key in requested_keys}))
     fragment_rows = await _shared_serving_binary_payload_rows_for_keys(
         session,
         shared_snapshot_key=shared_snapshot_key,
@@ -1359,9 +1209,7 @@ def _decode_forward_occurrences(
         cursor,
         source_count=source_count,
         source_bits=source_bits,
-        occurrence_consumer=lambda price_key, source_key: occurrences.append(
-            (price_key, source_key)
-        ),
+        occurrence_consumer=lambda price_key, source_key: occurrences.append((price_key, source_key)),
     )
     return occurrences, cursor
 
@@ -1377,21 +1225,15 @@ def _dense_source_vector_view(
     """Validate one packed source vector without expanding it."""
 
     if int(source_bits) != dense_source_key_bits(source_count):
-        raise PTG2SharedBlockError(
-            "PTG2 v3 grouped by-code source vector width is invalid"
-        )
+        raise PTG2SharedBlockError("PTG2 v3 grouped by-code source vector width is invalid")
     total_bits = int(entry_count) * int(source_bits)
     byte_count = (total_bits + 7) // 8
     end = int(offset) + byte_count
     if end > len(payload):
-        raise PTG2SharedBlockError(
-            "PTG2 v3 grouped by-code source vector is truncated"
-        )
+        raise PTG2SharedBlockError("PTG2 v3 grouped by-code source vector is truncated")
     encoded = memoryview(payload)[int(offset) : end]
     if total_bits % 8 and encoded and int(encoded[-1]) >> (total_bits % 8):
-        raise PTG2SharedBlockError(
-            "PTG2 v3 grouped by-code source vector has non-zero padding bits"
-        )
+        raise PTG2SharedBlockError("PTG2 v3 grouped by-code source vector has non-zero padding bits")
     return encoded, end
 
 
@@ -1409,9 +1251,7 @@ def _dense_source_key_at(
             source_key |= 1 << source_bit
         bit_offset += 1
     if source_key >= int(source_count):
-        raise PTG2SharedBlockError(
-            "PTG2 v3 grouped by-code source key is out of range"
-        )
+        raise PTG2SharedBlockError("PTG2 v3 grouped by-code source key is out of range")
     return source_key
 
 
@@ -1429,18 +1269,11 @@ def _visit_single_source_forward_occurrences(
 
     for price_index in range(price_key_count):
         price_key, cursor = read_strict_uvarint(fragment_bytes, cursor)
-        if price_key > 2**32 - 1 or (
-            price_item_count is not None
-            and price_key >= int(price_item_count)
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 grouped by-code price key is out of range"
-            )
+        if price_key > 2**32 - 1 or (price_item_count is not None and price_key >= int(price_item_count)):
+            raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code price key is out of range")
         occurrence = (price_key, 0)
         if previous_occurrence is not None and occurrence < previous_occurrence:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 grouped by-code occurrences are not ordered"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code occurrences are not ordered")
         previous_occurrence = occurrence
         if price_index == 0 and first_occurrence_consumer is not None:
             first_occurrence_consumer(price_key, 0)
@@ -1468,13 +1301,8 @@ def _validated_forward_price_key_array(
     price_key_array = array("I")
     for _price_index in range(price_key_count):
         price_key, cursor = read_strict_uvarint(fragment_bytes, cursor)
-        if price_key > 2**32 - 1 or (
-            price_item_count is not None
-            and price_key >= int(price_item_count)
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 grouped by-code price key is out of range"
-            )
+        if price_key > 2**32 - 1 or (price_item_count is not None and price_key >= int(price_item_count)):
+            raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code price key is out of range")
         price_key_array.append(price_key)
     return price_key_array, cursor
 
@@ -1494,9 +1322,7 @@ def _visit_forward_occurrences(
 
     price_key_count, cursor = read_strict_uvarint(fragment_bytes, cursor)
     if price_key_count <= 0:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 grouped by-code occurrence count is invalid"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code occurrence count is invalid")
     if source_count == 1 and source_bits == 0:
         return _visit_single_source_forward_occurrences(
             fragment_bytes,
@@ -1529,9 +1355,7 @@ def _visit_forward_occurrences(
         )
         occurrence = (price_key, source_key)
         if previous_occurrence is not None and occurrence < previous_occurrence:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 grouped by-code occurrences are not ordered"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code occurrences are not ordered")
         previous_occurrence = occurrence
         if occurrence_index == 0 and first_occurrence_consumer is not None:
             first_occurrence_consumer(price_key, source_key)
@@ -1546,22 +1370,13 @@ def _require_forward_provider_key(
     validation: _ForwardFragmentValidation,
 ) -> None:
     if (
-        previous_provider_set_key is not None
-        and provider_set_key < previous_provider_set_key
+        previous_provider_set_key is not None and provider_set_key < previous_provider_set_key
     ) or provider_set_key > 2**31 - 1:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 grouped by-code provider sets are not ordered"
-        )
-    if (
-        validation.provider_key_min is not None
-        and provider_set_key < int(validation.provider_key_min)
-    ) or (
-        validation.provider_key_max is not None
-        and provider_set_key >= int(validation.provider_key_max)
+        raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code provider sets are not ordered")
+    if (validation.provider_key_min is not None and provider_set_key < int(validation.provider_key_min)) or (
+        validation.provider_key_max is not None and provider_set_key >= int(validation.provider_key_max)
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 provider set is outside its forward shard"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 provider set is outside its forward shard")
 
 
 def _forward_provider_consumers(
@@ -1613,11 +1428,7 @@ def _visit_forward_provider(
     provider_consumers = _forward_provider_consumers(
         provider_set_key,
         validation.source_filter,
-        (
-            occurrence_consumer
-            if provider_filter is None or provider_set_key in provider_filter
-            else None
-        ),
+        (occurrence_consumer if provider_filter is None or provider_set_key in provider_filter else None),
         first_occurrence_consumer,
     )
     source_count, source_bits = source_shape
@@ -1630,9 +1441,7 @@ def _visit_forward_provider(
         first_occurrence_consumer=provider_consumers[1],
         price_item_count=validation.price_item_count,
         previous_occurrence=(
-            fragment_cursor.occurrence
-            if fragment_cursor.provider_set_key == provider_set_key
-            else None
+            fragment_cursor.occurrence if fragment_cursor.provider_set_key == provider_set_key else None
         ),
     )
     return cursor, _ForwardFragmentCursor(provider_set_key, previous_occurrence)
@@ -1658,9 +1467,7 @@ def _visit_forward_fragment_unchecked(
     )
     entry_count = int(fragment_row.get("entry_count") or 0)
     if entry_count <= 0:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 grouped by-code fragment has an invalid entry count"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code fragment has an invalid entry count")
     provider_set_key = 0
     for provider_index in range(entry_count):
         cursor, fragment_cursor = _visit_forward_provider(
@@ -1679,13 +1486,9 @@ def _visit_forward_fragment_unchecked(
         assert fragment_cursor.provider_set_key is not None
         provider_set_key = fragment_cursor.provider_set_key
     if cursor != len(fragment_bytes):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 grouped by-code fragment has trailing bytes"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code fragment has trailing bytes")
     if fragment_cursor.occurrence is None:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 grouped by-code fragment has no occurrences"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code fragment has no occurrences")
     return fragment_cursor, source_count
 
 
@@ -1716,14 +1519,12 @@ def _decode_forward_fragment_unchecked(
             provider_key_min=provider_key_min,
             provider_key_max=provider_key_max,
         ),
-        occurrence_consumer=lambda provider_key, price_key, source_key: (
-            decoded_keys.append((provider_key, price_key, source_key))
+        occurrence_consumer=lambda provider_key, price_key, source_key: decoded_keys.append(
+            (provider_key, price_key, source_key)
         ),
     )
     if fragment_cursor.provider_set_key is None or fragment_cursor.occurrence is None:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 grouped by-code fragment has no ordering state"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code fragment has no ordering state")
     return (
         decoded_keys,
         fragment_cursor.provider_set_key,
@@ -1760,9 +1561,7 @@ def _decode_serving_binary_by_code_record(
     except PTG2ManifestArtifactError:
         raise
     except Exception as exc:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 grouped by-code fragment is corrupt"
-        ) from exc
+        raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code fragment is corrupt") from exc
 
 
 def _visit_serving_binary_by_code_record(
@@ -1786,9 +1585,7 @@ def _visit_serving_binary_by_code_record(
     except PTG2ManifestArtifactError:
         raise
     except Exception as exc:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 grouped by-code fragment is corrupt"
-        ) from exc
+        raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code fragment is corrupt") from exc
 
 
 def _decode_serving_binary_code_records(
@@ -1801,16 +1598,14 @@ def _decode_serving_binary_code_records(
     price_item_count: int | None = None,
     source_keys: Iterable[int] | None = None,
 ) -> list[tuple[int, int, int]]:
-    decoded_keys, _source_count = (
-        _decode_code_records_with_source_count(
-            fragment_rows,
-            provider_set_keys=provider_set_keys,
-            expected_source_count=expected_source_count,
-            provider_key_min=provider_key_min,
-            provider_key_max=provider_key_max,
-            price_item_count=price_item_count,
-            source_keys=source_keys,
-        )
+    decoded_keys, _source_count = _decode_code_records_with_source_count(
+        fragment_rows,
+        provider_set_keys=provider_set_keys,
+        expected_source_count=expected_source_count,
+        provider_key_min=provider_key_min,
+        provider_key_max=provider_key_max,
+        price_item_count=price_item_count,
+        source_keys=source_keys,
     )
     return decoded_keys
 
@@ -1834,8 +1629,8 @@ def _decode_code_records_with_source_count(
         provider_key_max=provider_key_max,
         price_item_count=price_item_count,
         source_keys=source_keys,
-        occurrence_consumer=lambda provider_key, price_key, source_key: (
-            decoded_keys.append((provider_key, price_key, source_key))
+        occurrence_consumer=lambda provider_key, price_key, source_key: decoded_keys.append(
+            (provider_key, price_key, source_key)
         ),
     )
     return decoded_keys, observed_source_count
@@ -1850,22 +1645,13 @@ def _normalized_source_filter(
     normalized_source_keys: set[int] = set()
     for raw_source_key in source_keys:
         if isinstance(raw_source_key, bool):
-            raise PTG2ManifestArtifactError(
-                "PTG2 batch source filter contains an invalid source key"
-            )
+            raise PTG2ManifestArtifactError("PTG2 batch source filter contains an invalid source key")
         try:
             source_key = int(raw_source_key)
         except (TypeError, ValueError) as exc:
-            raise PTG2ManifestArtifactError(
-                "PTG2 batch source filter contains an invalid source key"
-            ) from exc
-        if source_key < 0 or (
-            expected_source_count is not None
-            and source_key >= int(expected_source_count)
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 batch source filter contains an invalid source key"
-            )
+            raise PTG2ManifestArtifactError("PTG2 batch source filter contains an invalid source key") from exc
+        if source_key < 0 or (expected_source_count is not None and source_key >= int(expected_source_count)):
+            raise PTG2ManifestArtifactError("PTG2 batch source filter contains an invalid source key")
         normalized_source_keys.add(source_key)
     return frozenset(normalized_source_keys)
 
@@ -1879,14 +1665,9 @@ def _ordered_forward_fragments(
             key=lambda fragment_row: int(fragment_row.get("block_no") or 0),
         )
     )
-    fragment_numbers = tuple(
-        int(fragment_row.get("block_no") or 0)
-        for fragment_row in ordered_fragments
-    )
+    fragment_numbers = tuple(int(fragment_row.get("block_no") or 0) for fragment_row in ordered_fragments)
     if fragment_numbers != tuple(range(len(ordered_fragments))):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 grouped by-code fragments are not contiguous"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code fragments are not contiguous")
     return ordered_fragments
 
 
@@ -1924,26 +1705,17 @@ def _visit_code_records_with_source_count(
     fragment_cursor = _ForwardFragmentCursor()
     observed_source_count: int | None = None
     for fragment_row in ordered_fragments:
-        fragment_cursor, fragment_source_count = (
-            _visit_serving_binary_by_code_record(
-                fragment_row,
-                provider_filter=provider_filter.keys,
-                fragment_cursor=fragment_cursor,
-                validation=fragment_validation,
-                occurrence_consumer=occurrence_consumer,
-            )
+        fragment_cursor, fragment_source_count = _visit_serving_binary_by_code_record(
+            fragment_row,
+            provider_filter=provider_filter.keys,
+            fragment_cursor=fragment_cursor,
+            validation=fragment_validation,
+            occurrence_consumer=occurrence_consumer,
         )
-        if (
-            largest_source_key is not None
-            and largest_source_key >= fragment_source_count
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 batch source filter contains an invalid source key"
-            )
+        if largest_source_key is not None and largest_source_key >= fragment_source_count:
+            raise PTG2ManifestArtifactError("PTG2 batch source filter contains an invalid source key")
         if observed_source_count not in (None, fragment_source_count):
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 grouped by-code fragments disagree on source_count"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code fragments disagree on source_count")
         observed_source_count = fragment_source_count
     return observed_source_count
 
@@ -1971,8 +1743,8 @@ def _decode_forward_shards_for_code(
             provider_shard_span=provider_shard_span,
             source_keys=source_keys,
         ),
-        occurrence_consumer=lambda provider_key, price_key, source_key: (
-            decoded_keys.append((provider_key, price_key, source_key))
+        occurrence_consumer=lambda provider_key, price_key, source_key: decoded_keys.append(
+            (provider_key, price_key, source_key)
         ),
     )
     return decoded_keys
@@ -1987,20 +1759,14 @@ def _visit_forward_shards_for_code(
     """Validate one code's selected shards and stream retained occurrences."""
 
     normalized_code_key = _normalized_code_key(options.code_key)
-    prepared_provider_filter = _prepare_provider_set_filter(
-        options.provider_set_keys
-    )
-    expected_keys = tuple(
-        sorted({int(key) for key in options.expected_block_keys})
-    )
+    prepared_provider_filter = _prepare_provider_set_filter(options.provider_set_keys)
+    expected_keys = tuple(sorted({int(key) for key in options.expected_block_keys}))
     expected_key_set = set(expected_keys)
     fragments_by_block: dict[int, list[Mapping[str, Any]]] = {}
     for fragment_row in fragment_rows:
         block_key = int(fragment_row.get("block_key") or 0)
         if block_key not in expected_key_set:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 forward read returned an unexpected shard block"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 forward read returned an unexpected shard block")
         _forward_provider_range_for_block(
             normalized_code_key,
             block_key,
@@ -2010,12 +1776,10 @@ def _visit_forward_shards_for_code(
 
     observed_source_count: int | None = None
     for block_key in sorted(fragments_by_block):
-        provider_key_min, provider_key_max = (
-            _forward_provider_range_for_block(
-                normalized_code_key,
-                block_key,
-                options.provider_shard_span,
-            )
+        provider_key_min, provider_key_max = _forward_provider_range_for_block(
+            normalized_code_key,
+            block_key,
+            options.provider_shard_span,
         )
         shard_source_count = _visit_code_records_with_source_count(
             fragments_by_block[block_key],
@@ -2028,9 +1792,7 @@ def _visit_forward_shards_for_code(
             source_keys=options.source_keys,
         )
         if observed_source_count not in (None, shard_source_count):
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 forward shards disagree on source_count"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 forward shards disagree on source_count")
         observed_source_count = shard_source_count
 
 
@@ -2041,9 +1803,7 @@ async def _shared_provider_counts_for_keys(
     schema_name: str,
     provider_set_keys: Iterable[int],
 ) -> dict[int, int]:
-    requested_keys = tuple(
-        sorted({int(provider_set_key) for provider_set_key in provider_set_keys})
-    )
+    requested_keys = tuple(sorted({int(provider_set_key) for provider_set_key in provider_set_keys}))
     if not requested_keys:
         return {}
     schema = _quote_ident(schema_name)
@@ -2064,13 +1824,10 @@ async def _shared_provider_counts_for_keys(
     provider_counts_by_key = {
         int(count_row["provider_set_key"]): int(count_row["provider_count"])
         for count_row in (_row_mapping(raw_row) for raw_row in query_result)
-        if count_row.get("provider_set_key") is not None
-        and count_row.get("provider_count") is not None
+        if count_row.get("provider_set_key") is not None and count_row.get("provider_count") is not None
     }
     if set(provider_counts_by_key) != set(requested_keys):
-        raise PTG2ManifestArtifactError(
-            "PTG2 shared provider-set dictionary key is missing"
-        )
+        raise PTG2ManifestArtifactError("PTG2 shared provider-set dictionary key is missing")
     return provider_counts_by_key
 
 
@@ -2082,9 +1839,7 @@ async def _provider_counts_for_decoded_keys(
     decoded_keys: Iterable[tuple[int, int, int]],
     provider_counts_by_key: Mapping[int, int] | None,
 ) -> dict[int, int]:
-    needed_keys = {
-        provider_set_key for provider_set_key, _price_key, _source_key in decoded_keys
-    }
+    needed_keys = {provider_set_key for provider_set_key, _price_key, _source_key in decoded_keys}
     if provider_counts_by_key is None:
         return await _shared_provider_counts_for_keys(
             session,
@@ -2098,9 +1853,7 @@ async def _provider_counts_for_decoded_keys(
         if int(provider_set_key) in needed_keys
     }
     if set(filtered_counts_by_key) != needed_keys:
-        raise PTG2ManifestArtifactError(
-            "PTG2 shared provider-set dictionary key is missing"
-        )
+        raise PTG2ManifestArtifactError("PTG2 shared provider-set dictionary key is missing")
     return filtered_counts_by_key
 
 
@@ -2118,9 +1871,7 @@ async def _lookup_forward_references(
         decoded_keys=decoded_keys,
         provider_counts_by_key=options.provider_counts_by_key,
     )
-    needed_price_keys = {
-        price_key for _provider_set_key, price_key, _source_key in decoded_keys
-    }
+    needed_price_keys = {price_key for _provider_set_key, price_key, _source_key in decoded_keys}
     price_ids_by_key = await _serving_binary_dictionary_values_for_keys(
         session,
         shared_snapshot_key=options.shared_snapshot_key,
@@ -2157,15 +1908,7 @@ def _materialize_forward_rows(
 def _flatten_forward_shard_keys(
     shard_keys_by_code: Mapping[int, Iterable[int]],
 ) -> tuple[int, ...]:
-    return tuple(
-        sorted(
-            {
-                int(block_key)
-                for block_keys in shard_keys_by_code.values()
-                for block_key in block_keys
-            }
-        )
-    )
+    return tuple(sorted({int(block_key) for block_keys in shard_keys_by_code.values() for block_key in block_keys}))
 
 
 def _group_forward_fragments_by_code(
@@ -2174,9 +1917,7 @@ def _group_forward_fragments_by_code(
     provider_shard_span: int | None = None,
 ) -> dict[int, list[Mapping[str, Any]]]:
     code_by_block: dict[int, int] = {}
-    fragments_by_code: dict[int, list[Mapping[str, Any]]] = {
-        int(code_key): [] for code_key in shard_keys_by_code
-    }
+    fragments_by_code: dict[int, list[Mapping[str, Any]]] = {int(code_key): [] for code_key in shard_keys_by_code}
     for code_key, block_keys in shard_keys_by_code.items():
         normalized_code_key = _normalized_code_key(code_key)
         for block_key in block_keys:
@@ -2191,16 +1932,12 @@ def _group_forward_fragments_by_code(
                 normalized_code_key,
             )
             if previous_code_key != normalized_code_key:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 v3 forward shard is assigned to multiple codes"
-                )
+                raise PTG2ManifestArtifactError("PTG2 v3 forward shard is assigned to multiple codes")
     for fragment_row in fragment_rows:
         block_key = int(fragment_row.get("block_key") or 0)
         code_key = code_by_block.get(block_key)
         if code_key is None:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 forward read returned an unexpected shard block"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 forward read returned an unexpected shard block")
         fragments_by_code[code_key].append(fragment_row)
     return fragments_by_code
 
@@ -2213,16 +1950,12 @@ async def lookup_code_rows_from_db(
     """Read all strict provider shards needed for one code lookup."""
 
     options = _ForwardLookupOptions(**read_options)
-    price_item_count = _normalized_price_item_count(
-        options.price_dictionary_item_count
-    )
+    price_item_count = _normalized_price_item_count(options.price_dictionary_item_count)
     normalized_code_key = _normalized_code_key(code_key)
-    shard_keys_by_code, provider_filter, require_all = (
-        await _forward_shard_keys_for_read(
-            session,
-            options,
-            (normalized_code_key,),
-        )
+    shard_keys_by_code, provider_filter, require_all = await _forward_shard_keys_for_read(
+        session,
+        options,
+        (normalized_code_key,),
     )
     block_keys = shard_keys_by_code[normalized_code_key]
     if not block_keys:
@@ -2241,9 +1974,7 @@ async def lookup_code_rows_from_db(
         for fragment_row in fragment_rows:
             decoded_payload = fragment_row.get("_decoded_payload")
             raw_payload_bytes = (
-                len(decoded_payload)
-                if decoded_payload is not None
-                else int(fragment_row.get("raw_payload_bytes") or 0)
+                len(decoded_payload) if decoded_payload is not None else int(fragment_row.get("raw_payload_bytes") or 0)
             )
             options.scan_budget.claim(raw_payload_bytes)
     decoded_keys = _decode_forward_shards_for_code(
@@ -2255,9 +1986,7 @@ async def lookup_code_rows_from_db(
         price_item_count=price_item_count,
         provider_shard_span=options.provider_shard_span,
     )
-    provider_counts_by_key, price_ids_by_key = await _lookup_forward_references(
-        session, options, decoded_keys
-    )
+    provider_counts_by_key, price_ids_by_key = await _lookup_forward_references(session, options, decoded_keys)
     return _materialize_forward_rows(
         normalized_code_key,
         decoded_keys,
@@ -2302,9 +2031,7 @@ class _ForwardPrefixCollector:
     descending: bool
     limit: int
     expected_block_keys: set[int]
-    retained_occurrences: list[_RetainedForwardPrefixOccurrence] = field(
-        default_factory=list
-    )
+    retained_occurrences: list[_RetainedForwardPrefixOccurrence] = field(default_factory=list)
     occurrence_ordinal: int = 0
     current_block_key: int | None = None
     previous_provider_set_key: int | None = None
@@ -2338,38 +2065,27 @@ class _ForwardPrefixCollector:
             heapq.heapreplace(self.retained_occurrences, candidate)
 
     def _start_block(self, block_key: int) -> None:
-        if (
-            self.current_block_key is not None
-            and block_key <= self.current_block_key
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 forward shard blocks are not ordered"
-            )
+        if self.current_block_key is not None and block_key <= self.current_block_key:
+            raise PTG2ManifestArtifactError("PTG2 v3 forward shard blocks are not ordered")
         self.current_block_key = block_key
         self.expected_fragment_no = 0
         self.previous_provider_set_key = None
         self.previous_occurrence = None
-        self.provider_key_min, self.provider_key_max = (
-            _forward_provider_range_for_block(
-                self.code_key,
-                block_key,
-                self.provider_shard_span,
-            )
+        self.provider_key_min, self.provider_key_max = _forward_provider_range_for_block(
+            self.code_key,
+            block_key,
+            self.provider_shard_span,
         )
 
     def consume(self, fragment: Any) -> None:
         """Validate and visit one ordered streamed forward fragment."""
 
         if fragment.block_key not in self.expected_block_keys:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 forward stream returned an unexpected shard block"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 forward stream returned an unexpected shard block")
         if fragment.block_key != self.current_block_key:
             self._start_block(fragment.block_key)
         if fragment.fragment_no != self.expected_fragment_no:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 provider-shard fragments are not contiguous"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 provider-shard fragments are not contiguous")
         self.expected_fragment_no += 1
         fragment_cursor, fragment_source_count = _visit_serving_binary_by_code_record(
             {
@@ -2393,9 +2109,7 @@ class _ForwardPrefixCollector:
         self.previous_provider_set_key = fragment_cursor.provider_set_key
         self.previous_occurrence = fragment_cursor.occurrence
         if self.observed_source_count not in (None, fragment_source_count):
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 grouped by-code fragments disagree on source_count"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code fragments disagree on source_count")
         self.observed_source_count = fragment_source_count
 
     def selected_keys(self) -> list[tuple[int, int, int]]:
@@ -2413,15 +2127,12 @@ class _ForwardPrefixCollector:
                 ) in self.retained_occurrences
             ),
             key=lambda item: (
-                _forward_prefix_rank(
-                    item[0], item[1], item[2], descending=self.descending
-                ),
+                _forward_prefix_rank(item[0], item[1], item[2], descending=self.descending),
                 item[3],
             ),
         )
         return [
-            (provider_set_key, price_key, source_key)
-            for provider_set_key, price_key, source_key, _ordinal in selected
+            (provider_set_key, price_key, source_key) for provider_set_key, price_key, source_key, _ordinal in selected
         ]
 
 
@@ -2454,9 +2165,7 @@ def _forward_response_rank(
     descending: bool,
 ) -> tuple[int, int, int, int]:
     if row.price_key is None or row.provider_count is None:
-        raise PTG2ManifestArtifactError(
-            "PTG2 bounded forward row is missing a dense rank field"
-        )
+        raise PTG2ManifestArtifactError("PTG2 bounded forward row is missing a dense rank field")
     return (
         -row.price_key if descending else row.price_key,
         row.provider_set_key,
@@ -2475,13 +2184,9 @@ def _forward_prefix_collector(
 ) -> _ForwardPrefixCollector:
     return _ForwardPrefixCollector(
         code_key=code_key,
-        provider_filter=(
-            set(provider_filter) if provider_filter is not None else None
-        ),
+        provider_filter=(set(provider_filter) if provider_filter is not None else None),
         source_count=options.source_count,
-        price_item_count=_normalized_price_item_count(
-            options.price_dictionary_item_count
-        ),
+        price_item_count=_normalized_price_item_count(options.price_dictionary_item_count),
         provider_shard_span=options.provider_shard_span,
         descending=descending,
         limit=limit,
@@ -2535,12 +2240,10 @@ async def lookup_code_prefix_rows_from_db(
     normalized_limit = int(limit)
     options = _ForwardLookupOptions(**read_options)
     normalized_code_key = _normalized_code_key(code_key)
-    shard_keys_by_code, normalized_provider_filter, require_all = (
-        await _forward_shard_keys_for_read(
-            session,
-            options,
-            (normalized_code_key,),
-        )
+    shard_keys_by_code, normalized_provider_filter, require_all = await _forward_shard_keys_for_read(
+        session,
+        options,
+        (normalized_code_key,),
     )
     block_keys = shard_keys_by_code[normalized_code_key]
     if not block_keys:
@@ -2608,9 +2311,7 @@ async def has_serving_binary_code_block(
     """Return whether a sealed layout has a shard in the code-key range."""
 
     normalized_code_key = _normalized_code_key(code_key)
-    lower_bound, upper_bound = _forward_code_block_bounds(
-        normalized_code_key
-    )
+    lower_bound, upper_bound = _forward_code_block_bounds(normalized_code_key)
     packed_keys = await _packed_finalizer_block_keys_by_range(
         session,
         shared_snapshot_key=shared_snapshot_key,
@@ -2643,9 +2344,7 @@ async def has_serving_binary_code_block(
             """
         ),
         {
-            "snapshot_key": _required_shared_snapshot_key(
-                shared_snapshot_key
-            ),
+            "snapshot_key": _required_shared_snapshot_key(shared_snapshot_key),
             "shared_projection_generations": PTG2_SHARED_PROJECTION_GENERATIONS,
             "object_kind": _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND,
             "lower_bound": lower_bound,
@@ -2662,9 +2361,7 @@ def _budgeted_forward_input_length(value: Any, *, category: str) -> int:
     """Return a non-consuming size for one budgeted internal filter."""
 
     if not isinstance(value, Sized):
-        raise PTG2ManifestArtifactError(
-            f"PTG2 budgeted {category} must expose a bounded size"
-        )
+        raise PTG2ManifestArtifactError(f"PTG2 budgeted {category} must expose a bounded size")
     return len(value)
 
 
@@ -2745,28 +2442,23 @@ def _claim_forward_request_workspace(
         return
     code_count = len(code_keys)
     temporary_retention.claim(
-        _FORWARD_REQUEST_BASE_RETAINED_BYTES
-        + code_count * _FORWARD_REQUEST_CODE_RETAINED_BYTES,
+        _FORWARD_REQUEST_BASE_RETAINED_BYTES + code_count * _FORWARD_REQUEST_CODE_RETAINED_BYTES,
         category="the decoded forward request workspace",
     )
     temporary_retention.claim(
-        _forward_filter_map_entry_count(options)
-        * _FORWARD_FILTER_MAP_ENTRY_RETAINED_BYTES,
+        _forward_filter_map_entry_count(options) * _FORWARD_FILTER_MAP_ENTRY_RETAINED_BYTES,
         category="decoded forward filter-map entries",
     )
     temporary_retention.claim(
-        _forward_provider_filter_copy_count(options, code_count)
-        * _FORWARD_PROVIDER_FILTER_COPY_RETAINED_BYTES,
+        _forward_provider_filter_copy_count(options, code_count) * _FORWARD_PROVIDER_FILTER_COPY_RETAINED_BYTES,
         category="decoded forward provider-filter copies",
     )
     temporary_retention.claim(
-        _forward_source_filter_copy_count(options)
-        * _FORWARD_SOURCE_FILTER_COPY_RETAINED_BYTES,
+        _forward_source_filter_copy_count(options) * _FORWARD_SOURCE_FILTER_COPY_RETAINED_BYTES,
         category="decoded forward source-filter copies",
     )
     temporary_retention.claim(
-        _forward_occurrence_filter_count(options)
-        * _FORWARD_OCCURRENCE_WORKSPACE_RETAINED_BYTES,
+        _forward_occurrence_filter_count(options) * _FORWARD_OCCURRENCE_WORKSPACE_RETAINED_BYTES,
         category="decoded forward occurrence-filter workspace",
     )
 
@@ -2782,23 +2474,15 @@ def _normalized_batch_provider_filters(
             return None
         return {code_key: provider_filter for code_key in code_keys}
     if options.provider_set_keys is not None:
-        raise PTG2ManifestArtifactError(
-            "PTG2 batch provider filters must use one filter mode"
-        )
+        raise PTG2ManifestArtifactError("PTG2 batch provider filters must use one filter mode")
     normalized_filters_by_code: dict[int, tuple[int, ...]] = {}
     for raw_code_key, provider_set_keys in filters_by_code.items():
         code_key = _normalized_code_key(raw_code_key)
         if code_key in normalized_filters_by_code:
-            raise PTG2ManifestArtifactError(
-                "PTG2 batch provider filters contain a duplicate code key"
-            )
-        normalized_filters_by_code[code_key] = (
-            _normalized_provider_set_filter(provider_set_keys) or ()
-        )
+            raise PTG2ManifestArtifactError("PTG2 batch provider filters contain a duplicate code key")
+        normalized_filters_by_code[code_key] = _normalized_provider_set_filter(provider_set_keys) or ()
     if set(normalized_filters_by_code) != set(code_keys):
-        raise PTG2ManifestArtifactError(
-            "PTG2 batch provider filters must cover exactly the requested codes"
-        )
+        raise PTG2ManifestArtifactError("PTG2 batch provider filters must cover exactly the requested codes")
     return normalized_filters_by_code
 
 
@@ -2810,33 +2494,23 @@ def _normalized_batch_source_filters(
     if source_filters_by_code is None:
         return None
     if isinstance(options.source_count, bool):
-        raise PTG2ManifestArtifactError(
-            "PTG2 batch source filter requires a valid source count"
-        )
+        raise PTG2ManifestArtifactError("PTG2 batch source filter requires a valid source count")
     try:
         source_count = int(options.source_count)
         dense_source_key_bits(source_count)
     except (TypeError, ValueError, PTG2SharedBlockError) as exc:
-        raise PTG2ManifestArtifactError(
-            "PTG2 batch source filter requires a valid source count"
-        ) from exc
+        raise PTG2ManifestArtifactError("PTG2 batch source filter requires a valid source count") from exc
     normalized_filters_by_code: dict[int, frozenset[int]] = {}
     for raw_code_key, source_keys in source_filters_by_code.items():
         code_key = _normalized_code_key(raw_code_key)
         if code_key in normalized_filters_by_code:
-            raise PTG2ManifestArtifactError(
-                "PTG2 batch source filters contain a duplicate code key"
-            )
+            raise PTG2ManifestArtifactError("PTG2 batch source filters contain a duplicate code key")
         source_filter = _normalized_source_filter(source_keys, source_count)
         if not source_filter:
-            raise PTG2ManifestArtifactError(
-                "PTG2 batch source filter must not be empty"
-            )
+            raise PTG2ManifestArtifactError("PTG2 batch source filter must not be empty")
         normalized_filters_by_code[code_key] = source_filter
     if set(normalized_filters_by_code) != set(code_keys):
-        raise PTG2ManifestArtifactError(
-            "PTG2 batch source filters must cover exactly the requested codes"
-        )
+        raise PTG2ManifestArtifactError("PTG2 batch source filters must cover exactly the requested codes")
     return normalized_filters_by_code
 
 
@@ -2849,47 +2523,30 @@ def _normalized_batch_occurrence_filters(
     if options.occurrence_keys is None:
         return None
     if isinstance(options.source_count, bool):
-        raise PTG2ManifestArtifactError(
-            "PTG2 batch occurrence filter requires a valid source count"
-        )
+        raise PTG2ManifestArtifactError("PTG2 batch occurrence filter requires a valid source count")
     try:
         source_count = int(options.source_count)
         dense_source_key_bits(source_count)
     except (TypeError, ValueError, PTG2SharedBlockError) as exc:
-        raise PTG2ManifestArtifactError(
-            "PTG2 batch occurrence filter requires a valid source count"
-        ) from exc
-    normalized_filters_by_code: dict[int, set[tuple[int, int]]] = {
-        code_key: set() for code_key in code_keys
-    }
+        raise PTG2ManifestArtifactError("PTG2 batch occurrence filter requires a valid source count") from exc
+    normalized_filters_by_code: dict[int, set[tuple[int, int]]] = {code_key: set() for code_key in code_keys}
     for raw_occurrence_key in options.occurrence_keys:
         try:
             raw_code_key, raw_provider_set_key, raw_source_key = raw_occurrence_key
         except (TypeError, ValueError) as exc:
-            raise PTG2ManifestArtifactError(
-                "PTG2 batch occurrence filter has an invalid coordinate"
-            ) from exc
+            raise PTG2ManifestArtifactError("PTG2 batch occurrence filter has an invalid coordinate") from exc
         code_key = _normalized_code_key(raw_code_key)
         if code_key not in normalized_filters_by_code:
-            raise PTG2ManifestArtifactError(
-                "PTG2 batch occurrence filter contains an unexpected code key"
-            )
+            raise PTG2ManifestArtifactError("PTG2 batch occurrence filter contains an unexpected code key")
         provider_filter = _normalized_provider_set_filter((raw_provider_set_key,))
         source_filter = _normalized_source_filter((raw_source_key,), source_count)
         if not provider_filter or not source_filter:
-            raise PTG2ManifestArtifactError(
-                "PTG2 batch occurrence filter must not be empty"
-            )
-        normalized_filters_by_code[code_key].add(
-            (provider_filter[0], next(iter(source_filter)))
-        )
+            raise PTG2ManifestArtifactError("PTG2 batch occurrence filter must not be empty")
+        normalized_filters_by_code[code_key].add((provider_filter[0], next(iter(source_filter))))
     if any(not occurrence_filter for occurrence_filter in normalized_filters_by_code.values()):
-        raise PTG2ManifestArtifactError(
-            "PTG2 batch occurrence filters must cover exactly the requested codes"
-        )
+        raise PTG2ManifestArtifactError("PTG2 batch occurrence filters must cover exactly the requested codes")
     return {
-        code_key: frozenset(occurrence_filter)
-        for code_key, occurrence_filter in normalized_filters_by_code.items()
+        code_key: frozenset(occurrence_filter) for code_key, occurrence_filter in normalized_filters_by_code.items()
     }
 
 
@@ -2913,9 +2570,7 @@ async def _forward_batch_shards_and_filters(
             shared_snapshot_key=options.shared_snapshot_key,
             schema_name=options.schema_name,
             code_keys=code_keys,
-            provider_shard_span=_normalized_provider_shard_span(
-                options.provider_shard_span
-            ),
+            provider_shard_span=_normalized_provider_shard_span(options.provider_shard_span),
             **discovery_options_by_name,
         )
         return shard_keys_by_code, {code_key: None for code_key in code_keys}, True
@@ -2947,27 +2602,18 @@ class _MutableForwardOccurrenceBatch:
     ) -> None:
         """Claim and append one occurrence within the total result bound."""
 
-        if (
-            self.max_occurrences is not None
-            and self.occurrence_count >= self.max_occurrences
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 forward occurrence result exceeds its limit"
-            )
+        if self.max_occurrences is not None and self.occurrence_count >= self.max_occurrences:
+            raise PTG2ManifestArtifactError("PTG2 forward occurrence result exceeds its limit")
         if self.retention_budget is not None:
             self.retention_budget.claim(
                 _FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES,
                 category="a forward occurrence result row",
             )
         try:
-            self.occurrences_by_code[code_key].append(
-                (provider_set_key, price_key, source_key)
-            )
+            self.occurrences_by_code[code_key].append((provider_set_key, price_key, source_key))
         except BaseException:
             if self.retention_budget is not None:
-                self.retention_budget.release(
-                    _FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES
-                )
+                self.retention_budget.release(_FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES)
             raise
         self.occurrence_count += 1
 
@@ -2975,11 +2621,7 @@ class _MutableForwardOccurrenceBatch:
         """Release every mutable result claim after an incomplete visit."""
 
         if self.retention_budget is not None:
-            self.retention_budget.release(
-                _mutable_forward_occurrence_batch_retained_bytes(
-                    self.occurrences_by_code
-                )
-            )
+            self.retention_budget.release(_mutable_forward_occurrence_batch_retained_bytes(self.occurrences_by_code))
 
 
 def _new_mutable_forward_occurrence_batch(
@@ -3021,9 +2663,7 @@ async def _decoded_forward_batch_keys(
 ) -> dict[int, list[tuple[int, int, int]]]:
     """Visit bounded forward keys into one fully claimed mutable result."""
 
-    if max_occurrences is not None and (
-        type(max_occurrences) is not int or max_occurrences < 0
-    ):
+    if max_occurrences is not None and (type(max_occurrences) is not int or max_occurrences < 0):
         raise ValueError("PTG2 forward occurrence limit must not be negative")
     mutable_batch = _new_mutable_forward_occurrence_batch(
         code_keys,
@@ -3051,8 +2691,7 @@ def _mutable_forward_occurrence_batch_retained_bytes(
 
     return (
         _FORWARD_OCCURRENCE_BATCH_MAP_RETAINED_BYTES
-        + len(decoded_by_code)
-        * _FORWARD_OCCURRENCE_BATCH_MUTABLE_CODE_RETAINED_BYTES
+        + len(decoded_by_code) * _FORWARD_OCCURRENCE_BATCH_MUTABLE_CODE_RETAINED_BYTES
         + sum(len(occurrences) for occurrences in decoded_by_code.values())
         * _FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES
     )
@@ -3067,13 +2706,9 @@ def forward_occurrence_batch_retained_bytes(
         return 0
     return (
         _FORWARD_OCCURRENCE_BATCH_MAP_RETAINED_BYTES
-        + len(occurrences_by_code)
-        * _FORWARD_OCCURRENCE_BATCH_FROZEN_CODE_RETAINED_BYTES
+        + len(occurrences_by_code) * _FORWARD_OCCURRENCE_BATCH_FROZEN_CODE_RETAINED_BYTES
         + sum(len(occurrences) for occurrences in occurrences_by_code.values())
-        * (
-            _FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES
-            + _FORWARD_OCCURRENCE_BATCH_FROZEN_ROW_RETAINED_BYTES
-        )
+        * (_FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES + _FORWARD_OCCURRENCE_BATCH_FROZEN_ROW_RETAINED_BYTES)
     )
 
 
@@ -3084,14 +2719,10 @@ def _freeze_forward_occurrence_batch(
     """Freeze a mutable occurrence result while charging its allocation peak."""
 
     if retention_budget is None:
-        return {
-            code_key: tuple(occurrences)
-            for code_key, occurrences in decoded_by_code.items()
-        }
+        return {code_key: tuple(occurrences) for code_key, occurrences in decoded_by_code.items()}
     frozen_container_bytes = (
         _FORWARD_OCCURRENCE_BATCH_MAP_RETAINED_BYTES
-        + len(decoded_by_code)
-        * _FORWARD_OCCURRENCE_BATCH_FROZEN_CODE_RETAINED_BYTES
+        + len(decoded_by_code) * _FORWARD_OCCURRENCE_BATCH_FROZEN_CODE_RETAINED_BYTES
         + sum(len(occurrences) for occurrences in decoded_by_code.values())
         * _FORWARD_OCCURRENCE_BATCH_FROZEN_ROW_RETAINED_BYTES
     )
@@ -3100,17 +2731,13 @@ def _freeze_forward_occurrence_batch(
         category="the frozen forward occurrence result",
     )
     try:
-        frozen_by_code = {
-            code_key: tuple(occurrences)
-            for code_key, occurrences in decoded_by_code.items()
-        }
+        frozen_by_code = {code_key: tuple(occurrences) for code_key, occurrences in decoded_by_code.items()}
     except BaseException:
         retention_budget.release(frozen_container_bytes)
         raise
     mutable_container_bytes = (
         _FORWARD_OCCURRENCE_BATCH_MAP_RETAINED_BYTES
-        + len(decoded_by_code)
-        * _FORWARD_OCCURRENCE_BATCH_MUTABLE_CODE_RETAINED_BYTES
+        + len(decoded_by_code) * _FORWARD_OCCURRENCE_BATCH_MUTABLE_CODE_RETAINED_BYTES
     )
     decoded_by_code.clear()
     retention_budget.release(mutable_container_bytes)
@@ -3139,16 +2766,8 @@ def _forward_batch_fragment_views(
             if filters_by_code[code_key] is None
             else frozenset(int(key) for key in filters_by_code[code_key] or ())
         )
-        source_filter = (
-            None
-            if source_filters_by_code is None
-            else source_filters_by_code[code_key]
-        )
-        occurrence_filter = (
-            None
-            if occurrence_filters_by_code is None
-            else occurrence_filters_by_code[code_key]
-        )
+        source_filter = None if source_filters_by_code is None else source_filters_by_code[code_key]
+        occurrence_filter = None if occurrence_filters_by_code is None else occurrence_filters_by_code[code_key]
         views.extend(
             _forward_code_fragment_views(
                 code_key,
@@ -3218,20 +2837,13 @@ def _validate_forward_occurrence_scope(
 
     if occurrence_filter is None:
         return
-    exact_provider_filter = frozenset(
-        provider_set_key for provider_set_key, _source_key in occurrence_filter
-    )
+    exact_provider_filter = frozenset(provider_set_key for provider_set_key, _source_key in occurrence_filter)
     if provider_filter is None or exact_provider_filter != provider_filter:
-        raise PTG2ManifestArtifactError(
-            "PTG2 batch occurrence filter must equal its provider scope"
-        )
+        raise PTG2ManifestArtifactError("PTG2 batch occurrence filter must equal its provider scope")
     if source_filter is not None and any(
-        source_key not in source_filter
-        for _provider_set_key, source_key in occurrence_filter
+        source_key not in source_filter for _provider_set_key, source_key in occurrence_filter
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 batch occurrence filter exceeds its source scope"
-        )
+        raise PTG2ManifestArtifactError("PTG2 batch occurrence filter exceeds its source scope")
 
 
 def _validate_forward_batch_occurrence_scopes(
@@ -3249,16 +2861,8 @@ def _validate_forward_batch_occurrence_scopes(
     if occurrence_filters_by_code is None:
         return
     for code_key in code_keys:
-        provider_filter = (
-            None
-            if filters_by_code is None
-            else frozenset(filters_by_code[code_key])
-        )
-        source_filter = (
-            None
-            if source_filters_by_code is None
-            else source_filters_by_code[code_key]
-        )
+        provider_filter = None if filters_by_code is None else frozenset(filters_by_code[code_key])
+        source_filter = None if source_filters_by_code is None else source_filters_by_code[code_key]
         _validate_forward_occurrence_scope(
             provider_filter,
             source_filter,
@@ -3281,9 +2885,7 @@ def _forward_block_occurrence_filter(
         if provider_key_min <= provider_set_key < provider_key_max
     )
     if not block_filter:
-        raise PTG2ManifestArtifactError(
-            "PTG2 batch occurrence filter is empty for a requested shard"
-        )
+        raise PTG2ManifestArtifactError("PTG2 batch occurrence filter is empty for a requested shard")
     return block_filter
 
 
@@ -3298,9 +2900,7 @@ def _validated_forward_rows_by_block(
     for fragment_row in fragment_rows:
         block_key = int(fragment_row.get("block_key") or 0)
         if block_key not in expected_key_set:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 forward read returned an unexpected shard block"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 forward read returned an unexpected shard block")
         _forward_provider_range_for_block(
             code_key,
             block_key,
@@ -3318,9 +2918,7 @@ def _forward_fragment_physical_identity(
     raw_block_hash = view.fragment_row.get("_block_hash")
     if isinstance(raw_block_hash, (bytes, bytearray, memoryview)) and raw_block_hash:
         return ("physical", bytes(raw_block_hash))
-    raise PTG2ManifestArtifactError(
-        "PTG2 v3 forward fragment is missing its physical block identity"
-    )
+    raise PTG2ManifestArtifactError("PTG2 v3 forward fragment is missing its physical block identity")
 
 
 def _retained_forward_rows_by_coordinate(
@@ -3375,9 +2973,7 @@ def _parse_forward_batch_physical_fragments_once(
 
     views_by_identity = _forward_views_by_physical_identity(views)
     parsed_by_identity: dict[tuple[Any, ...], _ParsedForwardFragment] = {}
-    retained_by_coordinate, retained_coordinate_bytes = (
-        _retained_forward_rows_by_coordinate(views, retention_budget)
-    )
+    retained_by_coordinate, retained_coordinate_bytes = _retained_forward_rows_by_coordinate(views, retention_budget)
     try:
         for identity, physical_views in views_by_identity.items():
             parsed_by_identity[identity] = _parse_physical_forward_fragment_once(
@@ -3389,12 +2985,9 @@ def _parse_forward_batch_physical_fragments_once(
             )
     except BaseException:
         if retention_budget is not None:
-            retained_row_count = sum(
-                len(retained_rows) for retained_rows in retained_by_coordinate.values()
-            )
+            retained_row_count = sum(len(retained_rows) for retained_rows in retained_by_coordinate.values())
             retention_budget.release(
-                retained_coordinate_bytes
-                + retained_row_count * _FORWARD_FANOUT_ROW_RETAINED_BYTES
+                retained_coordinate_bytes + retained_row_count * _FORWARD_FANOUT_ROW_RETAINED_BYTES
             )
         raise
     return parsed_by_identity, retained_by_coordinate
@@ -3430,15 +3023,10 @@ def _forward_fanout_capture(
             exact_views_by_occurrence.setdefault(occurrence_key, []).append(view)
     return _ForwardFanoutCapture(
         exact_views_by_occurrence={
-            occurrence_key: tuple(views)
-            for occurrence_key, views in exact_views_by_occurrence.items()
+            occurrence_key: tuple(views) for occurrence_key, views in exact_views_by_occurrence.items()
         },
         fallback_views=tuple(fallback_views),
-        provider_filter_set=(
-            None
-            if is_provider_scope_unrestricted
-            else frozenset(provider_filter_set)
-        ),
+        provider_filter_set=(None if is_provider_scope_unrestricted else frozenset(provider_filter_set)),
         retained_by_coordinate=retained_by_coordinate,
         retention_budget=retention_budget,
     )
@@ -3467,9 +3055,7 @@ def _parse_physical_forward_fragment_once(
     representative = physical_views[0]
     raw_block_hash = representative.fragment_row.get("_block_hash")
     if not isinstance(raw_block_hash, (bytes, bytearray, memoryview)) or not raw_block_hash:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 forward fragment is missing its physical block identity"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 forward fragment is missing its physical block identity")
     claim_shared_block_processing(
         schema_name=options.schema_name,
         block_hash=bytes(raw_block_hash),
@@ -3496,9 +3082,7 @@ def _parse_physical_forward_fragment_once(
         or last_cursor.provider_set_key is None
         or last_cursor.occurrence is None
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 grouped by-code fragment has no occurrences"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code fragment has no occurrences")
     return _ParsedForwardFragment(
         first_provider_set_key=fanout_capture.first_provider_set_key,
         first_occurrence=fanout_capture.first_occurrence,
@@ -3510,9 +3094,7 @@ def _parse_physical_forward_fragment_once(
 def _emit_forward_batch_logical_views(
     views: tuple[_ForwardBatchFragmentView, ...],
     parsed_by_identity: Mapping[tuple[Any, ...], _ParsedForwardFragment],
-    retained_by_coordinate: Mapping[
-        tuple[int, int, int], Iterable[tuple[int, int, int]]
-    ],
+    retained_by_coordinate: Mapping[tuple[int, int, int], Iterable[tuple[int, int, int]]],
     occurrence_consumer: Callable[[int, int, int, int], None],
 ) -> None:
     """Validate each logical ordering context and emit its physical fan-out."""
@@ -3525,9 +3107,7 @@ def _emit_forward_batch_logical_views(
             parsed.first_provider_set_key < view.provider_key_min
             or int(parsed.last_cursor.provider_set_key) >= view.provider_key_max
         ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 provider set is outside its forward shard"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 provider set is outside its forward shard")
         block_identity = (view.code_key, view.block_key)
         previous_cursor = previous_cursor_by_block.get(block_identity)
         if previous_cursor is not None:
@@ -3536,18 +3116,14 @@ def _emit_forward_batch_logical_views(
                 parsed.first_provider_set_key == previous_provider_set_key
                 and parsed.first_occurrence < previous_cursor.occurrence
             ):
-                raise PTG2ManifestArtifactError(
-                    "PTG2 v3 grouped by-code occurrences are not ordered"
-                )
+                raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code occurrences are not ordered")
         previous_cursor_by_block[block_identity] = parsed.last_cursor
         observed_source_count = observed_source_count_by_code.setdefault(
             view.code_key,
             parsed.source_count,
         )
         if observed_source_count != parsed.source_count:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 grouped by-code fragments disagree on source_count"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 grouped by-code fragments disagree on source_count")
         for provider_set_key, price_key, source_key in retained_by_coordinate[
             (view.code_key, view.block_key, view.fragment_no)
         ]:
@@ -3615,19 +3191,16 @@ async def _visit_forward_batch_keys_with_retention(
         occurrence_filters_by_code,
         temporary_retention,
     )
-    parsed_by_identity, retained_by_coordinate = (
-        _parse_forward_batch_physical_fragments_once(
-            views,
-            options=options,
-            price_item_count=price_item_count,
-            retention_budget=retention_budget,
-        )
+    parsed_by_identity, retained_by_coordinate = _parse_forward_batch_physical_fragments_once(
+        views,
+        options=options,
+        price_item_count=price_item_count,
+        retention_budget=retention_budget,
     )
     retained_coordinate_bytes = 0
     if retention_budget is not None:
         retained_coordinate_bytes = (
-            _FORWARD_COORDINATE_MAP_RETAINED_BYTES
-            + len(retained_by_coordinate) * _FORWARD_COORDINATE_RETAINED_BYTES
+            _FORWARD_COORDINATE_MAP_RETAINED_BYTES + len(retained_by_coordinate) * _FORWARD_COORDINATE_RETAINED_BYTES
         )
     try:
         _emit_forward_batch_logical_views(
@@ -3638,12 +3211,9 @@ async def _visit_forward_batch_keys_with_retention(
         )
     finally:
         if retention_budget is not None:
-            retained_row_count = sum(
-                len(retained_rows) for retained_rows in retained_by_coordinate.values()
-            )
+            retained_row_count = sum(len(retained_rows) for retained_rows in retained_by_coordinate.values())
             retention_budget.release(
-                retained_coordinate_bytes
-                + retained_row_count * _FORWARD_FANOUT_ROW_RETAINED_BYTES
+                retained_coordinate_bytes + retained_row_count * _FORWARD_FANOUT_ROW_RETAINED_BYTES
             )
 
 
@@ -3664,19 +3234,15 @@ async def _fetch_forward_batch_fragment_views(
         source_filters_by_code,
         occurrence_filters_by_code,
     )
-    shard_keys_by_code, filters_by_code, requires_all = (
-        await _forward_batch_shards_and_filters(
-            session,
-            options,
-            code_keys,
-            filters_by_code,
-            temporary_retention,
-        )
+    shard_keys_by_code, filters_by_code, requires_all = await _forward_batch_shards_and_filters(
+        session,
+        options,
+        code_keys,
+        filters_by_code,
+        temporary_retention,
     )
     if requires_all and any(not shard_keys_by_code[code_key] for code_key in code_keys):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 forward artifact is missing referenced code shards"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 forward artifact is missing referenced code shards")
     block_keys = _flatten_forward_shard_keys(shard_keys_by_code)
     if not block_keys:
         return ()
@@ -3717,9 +3283,7 @@ async def lookup_binary_code_batch_from_db(
     """Read and decode a fresh batch of strict V3 forward code blocks."""
 
     options = _ForwardBatchOptions(**read_options)
-    normalized_code_keys = tuple(
-        sorted({_normalized_code_key(code_key) for code_key in code_keys})
-    )
+    normalized_code_keys = tuple(sorted({_normalized_code_key(code_key) for code_key in code_keys}))
     if not normalized_code_keys:
         return {}
     decoded_by_code = await _decoded_forward_batch_keys(
@@ -3727,12 +3291,8 @@ async def lookup_binary_code_batch_from_db(
         normalized_code_keys,
         options,
     )
-    all_decoded_keys = [
-        entry for entries in decoded_by_code.values() for entry in entries
-    ]
-    provider_counts_by_key, price_ids_by_key = await _lookup_forward_references(
-        session, options, all_decoded_keys
-    )
+    all_decoded_keys = [entry for entries in decoded_by_code.values() for entry in entries]
+    provider_counts_by_key, price_ids_by_key = await _lookup_forward_references(session, options, all_decoded_keys)
     return {
         code_key: _materialize_forward_rows(
             code_key,
@@ -3754,9 +3314,7 @@ async def _lookup_forward_occurrences_batch_claimed(
 ) -> dict[int, tuple[tuple[int, int, int], ...]]:
     """Own normalized-code claims while building one occurrence result."""
 
-    if max_occurrences is not None and (
-        type(max_occurrences) is not int or max_occurrences < 0
-    ):
+    if max_occurrences is not None and (type(max_occurrences) is not int or max_occurrences < 0):
         raise ValueError("PTG2 forward occurrence limit must not be negative")
     options = _ForwardBatchOptions(**read_options)
     normalized_code_keys, retained_code_key_bytes = retain_unique_integer_keys(
@@ -3780,9 +3338,7 @@ async def _lookup_forward_occurrences_batch_claimed(
         return _freeze_forward_occurrence_batch(decoded_by_code, retention_budget)
     except BaseException:
         if retention_budget is not None and decoded_by_code is not None:
-            retention_budget.release(
-                _mutable_forward_occurrence_batch_retained_bytes(decoded_by_code)
-            )
+            retention_budget.release(_mutable_forward_occurrence_batch_retained_bytes(decoded_by_code))
         raise
     finally:
         if retention_budget is not None:
@@ -3804,9 +3360,7 @@ async def lookup_forward_occurrences_batch_from_db(
     :func:`forward_occurrence_batch_retained_bytes` when the result dies.
     """
 
-    retention_entry_bytes = (
-        0 if retention_budget is None else retention_budget.retained_bytes
-    )
+    retention_entry_bytes = 0 if retention_budget is None else retention_budget.retained_bytes
     try:
         return await _lookup_forward_occurrences_batch_claimed(
             session,
@@ -3816,13 +3370,8 @@ async def lookup_forward_occurrences_batch_from_db(
             read_options=read_options,
         )
     except BaseException:
-        if (
-            retention_budget is not None
-            and retention_budget.retained_bytes > retention_entry_bytes
-        ):
-            retention_budget.release(
-                retention_budget.retained_bytes - retention_entry_bytes
-            )
+        if retention_budget is not None and retention_budget.retained_bytes > retention_entry_bytes:
+            retention_budget.release(retention_budget.retained_bytes - retention_entry_bytes)
         raise
 
 
@@ -3857,17 +3406,13 @@ async def lookup_forward_price_index_from_db(
         if retention_budget is not None:
             retention_budget.release(retained_code_key_bytes)
     try:
-        frozen_price_keys_by_occurrence, retained_freeze_peak_bytes = (
-            _build_frozen_forward_price_index(
-                price_keys_by_occurrence,
-                retention_budget,
-            )
+        frozen_price_keys_by_occurrence, retained_freeze_peak_bytes = _build_frozen_forward_price_index(
+            price_keys_by_occurrence,
+            retention_budget,
         )
     except BaseException:
         if retention_budget is not None:
-            retention_budget.release(
-                _mutable_forward_index_retained_bytes(price_keys_by_occurrence)
-            )
+            retention_budget.release(_mutable_forward_index_retained_bytes(price_keys_by_occurrence))
         raise
     price_keys_by_occurrence.clear()
     if retention_budget is not None:
@@ -3956,9 +3501,7 @@ async def _mutable_forward_price_index(
         )
     except BaseException:
         if retention_budget is not None:
-            retention_budget.release(
-                _mutable_forward_index_retained_bytes(price_keys_by_occurrence)
-            )
+            retention_budget.release(_mutable_forward_index_retained_bytes(price_keys_by_occurrence))
         raise
     return price_keys_by_occurrence
 
@@ -3969,8 +3512,7 @@ def _mutable_forward_index_retained_bytes(
     """Return the claims owned by one partially built mutable index."""
 
     return len(price_keys_by_occurrence) * _FORWARD_OCCURRENCE_RETAINED_BYTES + sum(
-        len(price_keys) * _FORWARD_PRICE_KEY_RETAINED_BYTES
-        for price_keys in price_keys_by_occurrence.values()
+        len(price_keys) * _FORWARD_PRICE_KEY_RETAINED_BYTES for price_keys in price_keys_by_occurrence.values()
     )
 
 
@@ -3980,11 +3522,9 @@ def _freeze_forward_price_index(
 ) -> dict[tuple[int, int, int], tuple[int, ...]]:
     """Compatibility wrapper that releases its frozen-map peak claim."""
 
-    frozen_price_keys_by_occurrence, retained_result_bytes = (
-        _build_frozen_forward_price_index(
-            price_keys_by_occurrence,
-            retention_budget,
-        )
+    frozen_price_keys_by_occurrence, retained_result_bytes = _build_frozen_forward_price_index(
+        price_keys_by_occurrence,
+        retention_budget,
     )
     if retention_budget is not None:
         retention_budget.release(retained_result_bytes)
@@ -3999,10 +3539,7 @@ def _build_frozen_forward_price_index(
 
     if retention_budget is None:
         return (
-            {
-                occurrence_key: tuple(price_keys)
-                for occurrence_key, price_keys in price_keys_by_occurrence.items()
-            },
+            {occurrence_key: tuple(price_keys) for occurrence_key, price_keys in price_keys_by_occurrence.items()},
             0,
         )
     retained_result_bytes = _FORWARD_RESULT_MAP_RETAINED_BYTES
@@ -4014,8 +3551,7 @@ def _build_frozen_forward_price_index(
     try:
         for occurrence_key, price_keys in price_keys_by_occurrence.items():
             occurrence_bytes = (
-                _FORWARD_RESULT_OCCURRENCE_RETAINED_BYTES
-                + len(price_keys) * _FORWARD_RESULT_PRICE_KEY_RETAINED_BYTES
+                _FORWARD_RESULT_OCCURRENCE_RETAINED_BYTES + len(price_keys) * _FORWARD_RESULT_PRICE_KEY_RETAINED_BYTES
             )
             retention_budget.claim(
                 occurrence_bytes,
@@ -4048,9 +3584,7 @@ def _logical_block_physical_hashes(
 
     block_numbers = tuple(sorted(fragments_by_number))
     if block_numbers != tuple(range(len(block_numbers))):
-        raise PTG2ManifestArtifactError(
-            f"PTG2 v3 {artifact_kind} block {block_key} has non-contiguous block fragments"
-        )
+        raise PTG2ManifestArtifactError(f"PTG2 v3 {artifact_kind} block {block_key} has non-contiguous block fragments")
     physical_hashes: list[bytes] = []
     for block_number in block_numbers:
         raw_block_hash = fragments_by_number[block_number].get("_block_hash")
@@ -4114,9 +3648,7 @@ def _logical_blocks_by_physical_identity(
         list[tuple[int, _SharedLogicalBlock]],
     ] = {}
     for block_key, logical_block in logical_blocks.items():
-        blocks_by_identity.setdefault(logical_block.physical_hashes, []).append(
-            (block_key, logical_block)
-        )
+        blocks_by_identity.setdefault(logical_block.physical_hashes, []).append((block_key, logical_block))
     return blocks_by_identity
 
 
@@ -4156,17 +3688,13 @@ def _fragments_by_logical_key(
 ) -> dict[int, dict[int, Mapping[str, Any]]]:
     """Index unique returned fragments under the exact requested logical keys."""
 
-    fragments_by_key: dict[int, dict[int, Mapping[str, Any]]] = {
-        block_key: {} for block_key in requested_keys
-    }
+    fragments_by_key: dict[int, dict[int, Mapping[str, Any]]] = {block_key: {} for block_key in requested_keys}
     for fragment_row in fragment_rows:
         block_key = int(fragment_row.get("block_key") or 0)
         fragment_no = int(fragment_row.get("block_no") or 0)
         fragments = fragments_by_key.get(block_key)
         if fragments is None or fragment_no < 0 or fragment_no in fragments:
-            raise PTG2ManifestArtifactError(
-                "PTG2 shared V3 query returned an invalid block fragment"
-            )
+            raise PTG2ManifestArtifactError("PTG2 shared V3 query returned an invalid block fragment")
         fragments[fragment_no] = fragment_row
     return fragments_by_key
 
@@ -4263,12 +3791,10 @@ async def lookup_provider_code_intersections_from_db(
     else:
         normalized_provider_keys = _requested_keys(provider_set_keys)
         normalized_code_keys = _requested_keys(requested_code_keys)
-    requested_code_key_set, retained_code_set_bytes = (
-        retain_unique_integer_key_set(
-            normalized_code_keys,
-            decoded_retention_budget,
-            category="provider-code intersection",
-        )
+    requested_code_key_set, retained_code_set_bytes = retain_unique_integer_key_set(
+        normalized_code_keys,
+        decoded_retention_budget,
+        category="provider-code intersection",
     )
     try:
         return await _lookup_provider_code_keys_from_db(
@@ -4293,9 +3819,7 @@ def _validated_prepared_keys(
     """Accept one already normalized dimension without copying it."""
 
     if not isinstance(integer_keys, tuple):
-        raise PTG2ManifestArtifactError(
-            f"PTG2 prepared {category} keys must be an immutable tuple"
-        )
+        raise PTG2ManifestArtifactError(f"PTG2 prepared {category} keys must be an immutable tuple")
     previous_key: int | None = None
     for integer_key in integer_keys:
         if (
@@ -4303,9 +3827,7 @@ def _validated_prepared_keys(
             or integer_key < 0
             or (previous_key is not None and integer_key <= previous_key)
         ):
-            raise PTG2ManifestArtifactError(
-                f"PTG2 prepared {category} keys must be unique sorted nonnegative integers"
-            )
+            raise PTG2ManifestArtifactError(f"PTG2 prepared {category} keys must be unique sorted nonnegative integers")
         previous_key = integer_key
     return integer_keys
 
@@ -4346,36 +3868,22 @@ def _freeze_provider_code_requests(
 
     requested_keys = _requested_keys(code_keys_by_provider_set)
     if requested_keys and requested_keys[-1] > 0x7FFFFFFF:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 serving keys must fit in signed PostgreSQL integers"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 serving keys must fit in signed PostgreSQL integers")
     normalized_code_keys_by_provider_set: dict[int, tuple[int, ...]] = {}
     observed_membership_count = 0
     for provider_set_key in requested_keys:
-        normalized_code_keys = tuple(
-            sorted(code_keys_by_provider_set[provider_set_key])
-        )
+        normalized_code_keys = tuple(sorted(code_keys_by_provider_set[provider_set_key]))
         if normalized_code_keys and normalized_code_keys[0] < 0:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 serving keys cannot be negative"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 serving keys cannot be negative")
         if normalized_code_keys and normalized_code_keys[-1] > 0x7FFFFFFF:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 serving keys must fit in signed PostgreSQL integers"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 serving keys must fit in signed PostgreSQL integers")
         observed_membership_count += len(normalized_code_keys)
-        normalized_code_keys_by_provider_set[provider_set_key] = (
-            normalized_code_keys
-        )
+        normalized_code_keys_by_provider_set[provider_set_key] = normalized_code_keys
     if observed_membership_count != membership_count:
-        raise PTG2ManifestArtifactError(
-            "PTG2 provider-code request membership count is inconsistent"
-        )
+        raise PTG2ManifestArtifactError("PTG2 provider-code request membership count is inconsistent")
     return _ValidatedProviderCodeRequests(
         provider_set_keys=requested_keys,
-        code_keys_by_provider_set=MappingProxyType(
-            normalized_code_keys_by_provider_set
-        ),
+        code_keys_by_provider_set=MappingProxyType(normalized_code_keys_by_provider_set),
         membership_count=membership_count,
     )
 
@@ -4385,13 +3893,9 @@ def _postgres_integer_key(source_key: int) -> int:
 
     normalized_key = int(source_key)
     if normalized_key < 0:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 serving keys cannot be negative"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 serving keys cannot be negative")
     if normalized_key > 0x7FFFFFFF:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 serving keys must fit in signed PostgreSQL integers"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 serving keys must fit in signed PostgreSQL integers")
     return normalized_key
 
 
@@ -4414,13 +3918,11 @@ def _validate_provider_code_request_capacity(
         and len(distinct_code_keys) >= max_distinct_code_keys
     ):
         raise PTG2ManifestArtifactError(
-            distinct_code_limit_error_message
-            or "PTG2 provider-code requested key scope exceeds its limit"
+            distinct_code_limit_error_message or "PTG2 provider-code requested key scope exceeds its limit"
         )
     if max_memberships is not None and membership_count >= max_memberships:
         raise PTG2ManifestArtifactError(
-            membership_limit_error_message
-            or "PTG2 provider-code intersections exceed their retention limit"
+            membership_limit_error_message or "PTG2 provider-code intersections exceed their retention limit"
         )
 
 
@@ -4435,25 +3937,16 @@ def _normalize_provider_code_requests(
     """Normalize an untrusted provider-to-code request map exactly once."""
 
     if max_memberships is not None and max_memberships < 1:
-        raise PTG2ManifestArtifactError(
-            "PTG2 provider-code retention limit must be positive"
-        )
+        raise PTG2ManifestArtifactError("PTG2 provider-code retention limit must be positive")
     code_keys_by_provider_set: dict[int, set[int]] = {}
     distinct_code_keys = set() if max_distinct_code_keys is not None else None
     membership_count = 0
-    for source_provider_set_key, source_code_keys in (
-        requested_code_keys_by_provider_set.items()
-    ):
+    for source_provider_set_key, source_code_keys in requested_code_keys_by_provider_set.items():
         provider_set_key = _postgres_integer_key(source_provider_set_key)
-        normalized_code_keys = code_keys_by_provider_set.get(
-            provider_set_key
-        )
+        normalized_code_keys = code_keys_by_provider_set.get(provider_set_key)
         for source_code_key in source_code_keys:
             code_key = _postgres_integer_key(source_code_key)
-            if (
-                normalized_code_keys is not None
-                and code_key in normalized_code_keys
-            ):
+            if normalized_code_keys is not None and code_key in normalized_code_keys:
                 continue
             _validate_provider_code_request_capacity(
                 code_key,
@@ -4462,15 +3955,11 @@ def _normalize_provider_code_requests(
                 max_memberships=max_memberships,
                 membership_limit_error_message=membership_limit_error_message,
                 max_distinct_code_keys=max_distinct_code_keys,
-                distinct_code_limit_error_message=(
-                    distinct_code_limit_error_message
-                ),
+                distinct_code_limit_error_message=(distinct_code_limit_error_message),
             )
             if normalized_code_keys is None:
                 normalized_code_keys = set()
-                code_keys_by_provider_set[provider_set_key] = (
-                    normalized_code_keys
-                )
+                code_keys_by_provider_set[provider_set_key] = normalized_code_keys
             normalized_code_keys.add(code_key)
             if distinct_code_keys is not None:
                 distinct_code_keys.add(code_key)
@@ -4528,31 +4017,20 @@ async def _lookup_provider_code_keys_from_db(
         provider_code_selection,
     )
 
-    if (
-        requested_code_key_set is not None
-        and requested_code_keys_by_provider_set is not None
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 provider-code selection modes are mutually exclusive"
-        )
+    if requested_code_key_set is not None and requested_code_keys_by_provider_set is not None:
+        raise PTG2ManifestArtifactError("PTG2 provider-code selection modes are mutually exclusive")
     requested_code_selection = (
-        provider_code_selection(requested_code_key_set)
-        if requested_code_key_set is not None
-        else None
+        provider_code_selection(requested_code_key_set) if requested_code_key_set is not None else None
     )
     retention_budget = (
-        _ProviderCodeRetentionBudget(max_retained_memberships)
-        if max_retained_memberships is not None
-        else None
+        _ProviderCodeRetentionBudget(max_retained_memberships) if max_retained_memberships is not None else None
     )
     logical_blocks = await _shared_logical_blocks_by_key(
         session,
         shared_snapshot_key=shared_snapshot_key,
         schema_name=schema_name,
         artifact_kind=PTG2_SERVING_BINARY_V3_PROVIDER_SET_CODES_KIND,
-        block_keys=_block_keys_for(
-            requested_keys, PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN
-        ),
+        block_keys=_block_keys_for(requested_keys, PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN),
     )
     return _provider_code_keys_from_aliases(
         logical_blocks,
@@ -4619,18 +4097,14 @@ class _ProviderCodeRetentionBudget:
 
     def __post_init__(self) -> None:
         if self.maximum_memberships < 1:
-            raise PTG2ManifestArtifactError(
-                "PTG2 provider-code retention limit must be positive"
-            )
+            raise PTG2ManifestArtifactError("PTG2 provider-code retention limit must be positive")
 
     def claim(self, membership_count: int) -> None:
         """Claim final logical memberships before retaining decoded tuples."""
 
         self.retained_memberships += membership_count
         if self.retained_memberships > self.maximum_memberships:
-            raise PTG2ManifestArtifactError(
-                "PTG2 provider-code intersections exceed their retention limit"
-            )
+            raise PTG2ManifestArtifactError("PTG2 provider-code intersections exceed their retention limit")
 
 
 def _requested_alias_counts(
@@ -4642,9 +4116,7 @@ def _requested_alias_counts(
     alias_count_by_offset: dict[int, int] = {}
     for block_key, _alias_block in physical_aliases:
         for requested_offset in requested_offsets_by_block.get(block_key, ()):
-            alias_count_by_offset[requested_offset] = (
-                alias_count_by_offset.get(requested_offset, 0) + 1
-            )
+            alias_count_by_offset[requested_offset] = alias_count_by_offset.get(requested_offset, 0) + 1
     return alias_count_by_offset
 
 
@@ -4662,9 +4134,7 @@ def _requested_code_keys_by_representative_offset(
         block_start = block_key * block_span
         for requested_offset in requested_offsets_by_block.get(block_key, ()):
             provider_set_key = block_start + requested_offset
-            requested_code_keys_by_offset.setdefault(
-                requested_offset, set()
-            ).update(
+            requested_code_keys_by_offset.setdefault(requested_offset, set()).update(
                 requested_code_keys_by_provider_set[provider_set_key]
             )
     return requested_code_keys_by_offset
@@ -4679,9 +4149,7 @@ def _ordered_code_intersection(
     retained_code_keys: list[int] = []
     code_index = 0
     requested_index = 0
-    while code_index < len(code_keys) and requested_index < len(
-        requested_code_keys
-    ):
+    while code_index < len(code_keys) and requested_index < len(requested_code_keys):
         code_key = code_keys[code_index]
         requested_code_key = requested_code_keys[requested_index]
         if code_key == requested_code_key:
@@ -4753,9 +4221,7 @@ def _provider_code_decode_plan(
         if selection is None:
             selection = provider_code_selection(normalized_code_keys)
             selection_by_code_keys[normalized_code_keys] = selection
-        selections_by_provider_set[
-            representative_start + requested_offset
-        ] = selection
+        selections_by_provider_set[representative_start + requested_offset] = selection
     return _ProviderCodeDecodePlan(
         selections_by_provider_set,
         None,
@@ -4779,9 +4245,7 @@ def _provider_retention_callback(
         """Charge one decoded representative across its requested aliases."""
 
         requested_offset = provider_set_key - representative_start
-        retention_budget.claim(
-            len(code_keys) * alias_count_by_offset[requested_offset]
-        )
+        retention_budget.claim(len(code_keys) * alias_count_by_offset[requested_offset])
 
     return claim_retained_code_keys
 
@@ -4839,13 +4303,10 @@ def _claim_decoded_provider_code_bucket(
     """Claim one provider/code bucket before inserting it in the result."""
 
     if provider_set_key in code_keys_by_provider:
-        raise PTG2ManifestArtifactError(
-            "PTG2 provider-code artifact contains a duplicate provider key"
-        )
+        raise PTG2ManifestArtifactError("PTG2 provider-code artifact contains a duplicate provider key")
     if retention_budget is not None:
         retention_budget.claim(
-            _PROVIDER_CODE_DECODED_BUCKET_BYTES
-            + len(code_keys) * _PROVIDER_CODE_DECODED_MEMBERSHIP_BYTES,
+            _PROVIDER_CODE_DECODED_BUCKET_BYTES + len(code_keys) * _PROVIDER_CODE_DECODED_MEMBERSHIP_BYTES,
             category="a decoded provider/code bucket",
         )
 
@@ -4868,13 +4329,9 @@ def _decoded_provider_code_offsets(
         logical_block.payload,
         block_key=representative_key,
         entry_count=logical_block.entry_count,
-        requested_provider_set_keys={
-            representative_start + offset for offset in alias_count_by_offset
-        },
+        requested_provider_set_keys={representative_start + offset for offset in alias_count_by_offset},
         requested_code_selection=requested_code_selection,
-        requested_code_selections_by_provider_set=(
-            decode_plan.selections_by_provider_set
-        ),
+        requested_code_selections_by_provider_set=(decode_plan.selections_by_provider_set),
         claim_retained_code_keys=decode_plan.retention_callback,
     )
     return {
@@ -4918,9 +4375,7 @@ def _retain_provider_code_alias_group(
         code_keys_by_offset,
         context.requested_offsets_by_block,
         block_span=context.block_span,
-        requested_code_keys_by_provider_set=(
-            context.requested_code_keys_by_provider_set
-        ),
+        requested_code_keys_by_provider_set=(context.requested_code_keys_by_provider_set),
         retention_budget=context.retention_budget,
         decoded_retention_budget=context.decoded_retention_budget,
     )
@@ -4975,8 +4430,7 @@ def _provider_code_keys_from_aliases(
             decoded_retention_budget.release(
                 _PROVIDER_CODE_DECODED_MAP_BYTES
                 + sum(
-                    _PROVIDER_CODE_DECODED_BUCKET_BYTES
-                    + len(code_keys) * _PROVIDER_CODE_DECODED_MEMBERSHIP_BYTES
+                    _PROVIDER_CODE_DECODED_BUCKET_BYTES + len(code_keys) * _PROVIDER_CODE_DECODED_MEMBERSHIP_BYTES
                     for code_keys in code_keys_by_provider.values()
                 )
             )
@@ -4994,9 +4448,7 @@ def _retain_provider_code_groups(
 ) -> None:
     """Decode and retain every distinct provider-code alias group."""
 
-    physical_alias_groups = _logical_blocks_by_physical_identity(
-        logical_blocks
-    ).values()
+    physical_alias_groups = _logical_blocks_by_physical_identity(logical_blocks).values()
     for physical_aliases in physical_alias_groups:
         _retain_provider_code_alias_group(
             code_keys_by_provider,
@@ -5006,9 +4458,7 @@ def _retain_provider_code_groups(
 
 
 lookup_shared_provider_code_keys_from_db = lookup_provider_code_keys_from_db
-lookup_shared_provider_code_intersections_from_db = (
-    lookup_provider_code_intersections_from_db
-)
+lookup_shared_provider_code_intersections_from_db = lookup_provider_code_intersections_from_db
 lookup_shared_provider_code_map_from_db = lookup_provider_code_map_from_db
 
 
@@ -5023,9 +4473,7 @@ def _price_keys_for_membership_aliases(
         price_key
         for block_key, _alias_block in physical_aliases
         for price_key in requested_key_set
-        if block_key * block_span
-        <= price_key
-        < (block_key + 1) * block_span
+        if block_key * block_span <= price_key < (block_key + 1) * block_span
     }
 
 
@@ -5037,10 +4485,7 @@ def _claim_price_membership_retention(
 
     if retention_budget is None:
         return 0
-    membership_bytes = (
-        _PRICE_MEMBERSHIP_OWNER_RETAINED_BYTES
-        + len(atom_keys) * _PRICE_MEMBERSHIP_RETAINED_BYTES
-    )
+    membership_bytes = _PRICE_MEMBERSHIP_OWNER_RETAINED_BYTES + len(atom_keys) * _PRICE_MEMBERSHIP_RETAINED_BYTES
     retention_budget.claim(
         membership_bytes,
         category="a decoded price-to-atom membership",
@@ -5066,12 +4511,8 @@ _PriceMembershipAliasOwner = tuple[_PriceMembershipBlockKey, int]
 
 @dataclass
 class _PriceMembershipAliasCache:
-    identity_by_block: dict[
-        _PriceMembershipBlockKey, _PriceMembershipBlockIdentity
-    ] = field(default_factory=dict)
-    owner_by_identity: dict[
-        _PriceMembershipAliasKey, _PriceMembershipAliasOwner
-    ] = field(default_factory=dict)
+    identity_by_block: dict[_PriceMembershipBlockKey, _PriceMembershipBlockIdentity] = field(default_factory=dict)
+    owner_by_identity: dict[_PriceMembershipAliasKey, _PriceMembershipAliasOwner] = field(default_factory=dict)
     metadata_record_count: int = 0
     maximum_fragment_count: int = 0
 
@@ -5093,12 +4534,9 @@ def _price_membership_read_plan(
     )
 
     if maximum_selected_atom_count is not None and (
-        type(maximum_selected_atom_count) is not int
-        or maximum_selected_atom_count < 0
+        type(maximum_selected_atom_count) is not int or maximum_selected_atom_count < 0
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 price hydration has an invalid atom limit"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 price hydration has an invalid atom limit")
     requested_keys = _requested_keys(price_keys)
     effective_span = _effective_block_span(
         block_span,
@@ -5132,10 +4570,7 @@ async def _preflight_price_membership_aliases_from_db(
         maximum_selected_atom_count=None,
     )
     active_cache = cache or _PriceMembershipAliasCache()
-    if (
-        active_cache.metadata_record_count < 0
-        or active_cache.maximum_fragment_count < 0
-    ):
+    if active_cache.metadata_record_count < 0 or active_cache.maximum_fragment_count < 0:
         raise ValueError("price-membership metadata count is invalid")
     cache_keys = tuple(
         (
@@ -5146,11 +4581,7 @@ async def _preflight_price_membership_aliases_from_db(
         )
         for block_key in read_plan.block_keys
     )
-    missing_cache_keys = tuple(
-        cache_key
-        for cache_key in cache_keys
-        if cache_key not in active_cache.identity_by_block
-    )
+    missing_cache_keys = tuple(cache_key for cache_key in cache_keys if cache_key not in active_cache.identity_by_block)
     if missing_cache_keys:
         await _retain_missing_price_membership_identities(
             session,
@@ -5209,25 +4640,15 @@ def _price_membership_read_record_limit(
     """Reserve the final compact index before one bounded metadata read."""
 
     final_block_count = cached_block_count + missing_block_count
-    retained_index_bytes = (
-        final_block_count
-        * PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK
-    )
-    remaining_bytes = (
-        MAX_PRICE_MEMBERSHIP_ALIAS_RETAINED_BYTES * 4 // 5
-        - retained_index_bytes
-    )
-    maximum_records = (
-        remaining_bytes // PRICE_MEMBERSHIP_TRANSIENT_BYTES_PER_FRAGMENT
-    )
+    retained_index_bytes = final_block_count * PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK
+    remaining_bytes = MAX_PRICE_MEMBERSHIP_ALIAS_RETAINED_BYTES * 4 // 5 - retained_index_bytes
+    maximum_records = remaining_bytes // PRICE_MEMBERSHIP_TRANSIENT_BYTES_PER_FRAGMENT
     if (
         final_block_count > MAX_PRICE_MEMBERSHIP_CACHED_BLOCKS
         or (missing_block_count > 0 and maximum_records < 1)
         or maximum_fragment_count > maximum_records
     ):
-        raise ManifestReadLimitError(
-            "price-membership identity index exceeds its bounded limit"
-        )
+        raise ManifestReadLimitError("price-membership identity index exceeds its bounded limit")
     return maximum_records
 
 
@@ -5238,34 +4659,17 @@ def _retain_price_membership_identities(
 ) -> None:
     """Validate and incrementally retain fresh block identities."""
 
-    fresh_record_count = sum(
-        fresh_identity_by_block[cache_key[3]][2] for cache_key in cache_keys
-    )
-    if (
-        cache.metadata_record_count + fresh_record_count
-        > MAX_PRICE_MEMBERSHIP_CACHED_FRAGMENTS
-    ):
-        raise ManifestReadLimitError(
-            "price-membership metadata exceeds its bounded limit"
-        )
-    pending_owner_by_identity: dict[
-        _PriceMembershipAliasKey, _PriceMembershipAliasOwner
-    ] = {}
+    fresh_record_count = sum(fresh_identity_by_block[cache_key[3]][2] for cache_key in cache_keys)
+    if cache.metadata_record_count + fresh_record_count > MAX_PRICE_MEMBERSHIP_CACHED_FRAGMENTS:
+        raise ManifestReadLimitError("price-membership metadata exceeds its bounded limit")
+    pending_owner_by_identity: dict[_PriceMembershipAliasKey, _PriceMembershipAliasOwner] = {}
     for cache_key in cache_keys:
         cached_identity = fresh_identity_by_block[cache_key[3]]
         physical_identity, entry_count, _record_count = cached_identity
         alias_identity = (*cache_key[:3], physical_identity)
-        existing_owner = cache.owner_by_identity.get(
-            alias_identity
-        ) or pending_owner_by_identity.get(alias_identity)
-        if (
-            existing_owner is not None
-            and existing_owner[0] != cache_key
-            and (entry_count or existing_owner[1])
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 price-membership block has an incompatible physical alias"
-            )
+        existing_owner = cache.owner_by_identity.get(alias_identity) or pending_owner_by_identity.get(alias_identity)
+        if existing_owner is not None and existing_owner[0] != cache_key and (entry_count or existing_owner[1]):
+            raise PTG2ManifestArtifactError("PTG2 v3 price-membership block has an incompatible physical alias")
         pending_owner_by_identity[alias_identity] = (cache_key, entry_count)
     for cache_key in cache_keys:
         cached_identity = fresh_identity_by_block[cache_key[3]]
@@ -5274,9 +4678,7 @@ def _retain_price_membership_identities(
         cache.identity_by_block[cache_key] = cached_identity
         cache.owner_by_identity[alias_identity] = (cache_key, entry_count)
         cache.metadata_record_count += record_count
-        cache.maximum_fragment_count = max(
-            cache.maximum_fragment_count, record_count
-        )
+        cache.maximum_fragment_count = max(cache.maximum_fragment_count, record_count)
 
 
 async def _price_membership_block_identities(
@@ -5290,9 +4692,7 @@ async def _price_membership_block_identities(
     """Read and release complete bounded metadata for requested blocks."""
 
     if maximum_records < 1:
-        raise ManifestReadLimitError(
-            "shared PTG snapshot fragment metadata exceeds its bounded limit"
-        )
+        raise ManifestReadLimitError("shared PTG snapshot fragment metadata exceeds its bounded limit")
     request = _shared_block_read_request(
         schema_name=schema_name,
         snapshot_key=shared_snapshot_key,
@@ -5301,9 +4701,7 @@ async def _price_membership_block_identities(
         fragment_nos=None,
         require_all=True,
     )
-    retention_budget = CandidateAuditDecodedRetentionBudget(
-        maximum_bytes=_SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES
-    )
+    retention_budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=_SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES)
     accumulator = _SharedMappingAccumulator(request, set(), retention_budget)
     try:
         async for raw_mapping_record in _stream_shared_mapping_records(
@@ -5314,18 +4712,12 @@ async def _price_membership_block_identities(
             accumulator.append(raw_mapping_record, maximum_records)
         selection = accumulator.selection()
         _require_complete_shared_mapping(request, selection)
-        records_by_block: dict[int, list[dict[str, Any]]] = {
-            block_key: [] for block_key in block_keys
-        }
+        records_by_block: dict[int, list[dict[str, Any]]] = {block_key: [] for block_key in block_keys}
         for mapping_record in selection.mapping_records:
-            records_by_block[int(mapping_record["block_key"])].append(
-                mapping_record
-            )
+            records_by_block[int(mapping_record["block_key"])].append(mapping_record)
         return {
             block_key: (
-                *_validated_price_membership_identity(
-                    tuple(records_by_block[block_key]), artifact_kind, block_key
-                ),
+                *_validated_price_membership_identity(tuple(records_by_block[block_key]), artifact_kind, block_key),
                 len(records_by_block[block_key]),
             )
             for block_key in block_keys
@@ -5345,33 +4737,17 @@ def _validated_price_membership_identity(
 ) -> tuple[bytes, int]:
     """Validate one ordered fragment sequence and copy its compact identity."""
 
-    fragment_nos = tuple(
-        int(mapping_record["fragment_no"])
-        for mapping_record in mapping_records
-    )
+    fragment_nos = tuple(int(mapping_record["fragment_no"]) for mapping_record in mapping_records)
     if fragment_nos != tuple(range(len(fragment_nos))):
-        raise PTG2ManifestArtifactError(
-            f"PTG2 v3 {artifact_kind} block {block_key} "
-            "has non-contiguous fragments"
-        )
+        raise PTG2ManifestArtifactError(f"PTG2 v3 {artifact_kind} block {block_key} has non-contiguous fragments")
     entry_count = int(mapping_records[0].get("mapping_entry_count") or 0)
     if entry_count < 0 or any(
-        int(mapping_record.get("mapping_entry_count") or 0) != 0
-        for mapping_record in mapping_records[1:]
+        int(mapping_record.get("mapping_entry_count") or 0) != 0 for mapping_record in mapping_records[1:]
     ):
-        raise PTG2ManifestArtifactError(
-            f"PTG2 v3 {artifact_kind} block {block_key} "
-            "has invalid fragment entry counts"
-        )
-    physical_hashes = tuple(
-        memoryview(mapping_record["block_hash"]).tobytes()
-        for mapping_record in mapping_records
-    )
+        raise PTG2ManifestArtifactError(f"PTG2 v3 {artifact_kind} block {block_key} has invalid fragment entry counts")
+    physical_hashes = tuple(memoryview(mapping_record["block_hash"]).tobytes() for mapping_record in mapping_records)
     if any(len(physical_hash) != 32 for physical_hash in physical_hashes):
-        raise PTG2ManifestArtifactError(
-            f"PTG2 v3 {artifact_kind} block {block_key} "
-            "has an invalid physical identity"
-        )
+        raise PTG2ManifestArtifactError(f"PTG2 v3 {artifact_kind} block {block_key} has an invalid physical identity")
     physical_identity = hashlib.sha256()
     physical_identity.update(_PRICE_MEMBERSHIP_PHYSICAL_IDENTITY_DOMAIN)
     physical_identity.update(len(physical_hashes).to_bytes(8, "big"))
@@ -5419,27 +4795,16 @@ def _decode_price_membership_alias_group(
         "requested_price_keys": group_requested_keys,
     }
     if remaining_selected_atom_count is not None:
-        decode_arguments_by_name["maximum_selected_atom_count"] = (
-            remaining_selected_atom_count
-        )
+        decode_arguments_by_name["maximum_selected_atom_count"] = remaining_selected_atom_count
     decoded_memberships = decode_membership_block(
         logical_block.payload,
         **decode_arguments_by_name,
     )
     if len(physical_aliases) > 1 and logical_block.entry_count:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 price-membership block has an incompatible physical alias"
-        )
-    decoded_atom_count = sum(
-        len(atom_keys) for atom_keys in decoded_memberships.values()
-    )
-    if (
-        remaining_selected_atom_count is not None
-        and decoded_atom_count > remaining_selected_atom_count
-    ):
-        raise ManifestReadLimitError(
-            "PTG2 v3 price hydration exceeds its atom limit"
-        )
+        raise PTG2ManifestArtifactError("PTG2 v3 price-membership block has an incompatible physical alias")
+    decoded_atom_count = sum(len(atom_keys) for atom_keys in decoded_memberships.values())
+    if remaining_selected_atom_count is not None and decoded_atom_count > remaining_selected_atom_count:
+        raise ManifestReadLimitError("PTG2 v3 price hydration exceeds its atom limit")
     return decoded_memberships, decoded_atom_count
 
 
@@ -5455,27 +4820,21 @@ def _retained_price_memberships(
     retained_membership_bytes = 0
     remaining_selected_atom_count = maximum_selected_atom_count
     try:
-        for physical_aliases in _logical_blocks_by_physical_identity(
-            logical_blocks
-        ).values():
-            decoded_memberships, decoded_atom_count = (
-                _decode_price_membership_alias_group(
-                    physical_aliases,
-                    requested_key_set,
-                    read_plan.effective_span,
-                    read_plan.expected_bits,
-                    schema_name,
-                    remaining_selected_atom_count,
-                    read_plan.decode_membership_block,
-                )
+        for physical_aliases in _logical_blocks_by_physical_identity(logical_blocks).values():
+            decoded_memberships, decoded_atom_count = _decode_price_membership_alias_group(
+                physical_aliases,
+                requested_key_set,
+                read_plan.effective_span,
+                read_plan.expected_bits,
+                schema_name,
+                remaining_selected_atom_count,
+                read_plan.decode_membership_block,
             )
             if remaining_selected_atom_count is not None:
                 remaining_selected_atom_count -= decoded_atom_count
             for price_key, atom_keys in decoded_memberships.items():
                 if price_key in memberships_by_price_key:
-                    raise PTG2ManifestArtifactError(
-                        "PTG2 v3 price-membership artifact contains a duplicate key"
-                    )
+                    raise PTG2ManifestArtifactError("PTG2 v3 price-membership artifact contains a duplicate key")
                 retained_membership_bytes += _claim_price_membership_retention(
                     retention_budget,
                     atom_keys,
@@ -5554,13 +4913,8 @@ def _decode_price_atom_block(
             maximum_entry_count=block_span,
         )
     except Exception as exc:
-        raise PTG2ManifestArtifactError(
-            f"PTG2 v3 price-atom block {block_key} is corrupt"
-        ) from exc
-    return {
-        first_atom_key + atom_offset: price_atom
-        for atom_offset, price_atom in atoms_by_offset.items()
-    }
+        raise PTG2ManifestArtifactError(f"PTG2 v3 price-atom block {block_key} is corrupt") from exc
+    return {first_atom_key + atom_offset: price_atom for atom_offset, price_atom in atoms_by_offset.items()}
 
 
 async def lookup_shared_price_atoms_from_db(
@@ -5586,17 +4940,9 @@ async def lookup_shared_price_atoms_from_db(
 
     requested_keys = _requested_keys(atom_keys)
     expected_bits = _expected_atom_key_bits(atom_key_bits)
-    if (
-        expected_bits is not None
-        and requested_keys
-        and requested_keys[-1] >= 1 << expected_bits
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 atom key exceeds the manifest atom-key width"
-        )
-    effective_span = _effective_block_span(
-        block_span, PTG2_SERVING_BINARY_V3_ATOM_KEY_BLOCK_SPAN
-    )
+    if expected_bits is not None and requested_keys and requested_keys[-1] >= 1 << expected_bits:
+        raise PTG2ManifestArtifactError("PTG2 v3 atom key exceeds the manifest atom-key width")
+    effective_span = _effective_block_span(block_span, PTG2_SERVING_BINARY_V3_ATOM_KEY_BLOCK_SPAN)
     logical_blocks = await _shared_logical_blocks_by_key(
         session,
         shared_snapshot_key=shared_snapshot_key,
@@ -5623,9 +4969,7 @@ class _RetainedPriceAtoms:
         """Claim and retain one unique rebased atom."""
 
         if atom_key in self.atoms_by_key:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 price-atom artifact contains a duplicate key"
-            )
+            raise PTG2ManifestArtifactError("PTG2 v3 price-atom artifact contains a duplicate key")
         if self.retention_budget is not None:
             self.retention_budget.claim(
                 _PRICE_ATOM_RETAINED_BYTES,
@@ -5663,14 +5007,10 @@ def _retain_price_atom_alias_group(
         block_key=representative_key,
         entry_count=logical_block.entry_count,
         block_span=block_span,
-        requested_keys={
-            representative_start + requested_offset
-            for requested_offset in requested_offsets
-        },
+        requested_keys={representative_start + requested_offset for requested_offset in requested_offsets},
     )
     atoms_by_offset = {
-        atom_key - representative_start: price_atom
-        for atom_key, price_atom in decoded_by_representative_key.items()
+        atom_key - representative_start: price_atom for atom_key, price_atom in decoded_by_representative_key.items()
     }
     for block_key, _alias_block in physical_aliases:
         block_start = block_key * block_span
@@ -5692,9 +5032,7 @@ def _price_atoms_from_aliases(
 
     retained_atoms = _RetainedPriceAtoms(retention_budget, {})
     try:
-        for physical_aliases in _logical_blocks_by_physical_identity(
-            logical_blocks
-        ).values():
+        for physical_aliases in _logical_blocks_by_physical_identity(logical_blocks).values():
             _retain_price_atom_alias_group(
                 retained_atoms,
                 physical_aliases,
@@ -5783,17 +5121,13 @@ async def lookup_shared_provider_pages_from_db(
         shared_snapshot_key=shared_snapshot_key,
         schema_name=schema_name,
         artifact_kind=PTG2_SERVING_BINARY_V3_PROVIDER_SET_PAGE_KIND,
-        block_keys=_block_keys_for(
-            requested_keys, PTG2_SERVING_BINARY_V3_PROVIDER_PAGE_BLOCK_SPAN
-        ),
+        block_keys=_block_keys_for(requested_keys, PTG2_SERVING_BINARY_V3_PROVIDER_PAGE_BLOCK_SPAN),
     )
     if not logical_blocks:
         return None
     requested_key_set = set(requested_keys)
     pages_by_provider_key: dict[int, Any] = {}
-    for physical_aliases in _logical_blocks_by_physical_identity(
-        logical_blocks
-    ).values():
+    for physical_aliases in _logical_blocks_by_physical_identity(logical_blocks).values():
         representative_key, logical_block = physical_aliases[0]
         _claim_logical_block_processing(
             logical_block,
