@@ -15,6 +15,7 @@ from sanic.compat import Header
 from sqlalchemy.exc import DataError, InterfaceError, OperationalError, StatementError
 
 from api import control_admission_batch as admission
+from api import control_batch_diagnostics as diagnostics
 from api import control_source_batch as service
 from process.custom_import import source_authorization as source
 from process.custom_import import source_worker
@@ -311,7 +312,7 @@ async def test_source_retry_inspection_failure_preserves_original_error(monkeypa
     failure = _disconnected()
     state = _install_retry_step(monkeypatch, [failure, _committed()])
     inspect_attribute = Mock(side_effect=RuntimeError("synthetic-inspection-failure"))
-    monkeypatch.setattr(service, "getattr_static", inspect_attribute)
+    monkeypatch.setattr(diagnostics, "getattr_static", inspect_attribute)
 
     with pytest.raises(InterfaceError) as caught:
         await service._source_operation(state.factory, verified)
