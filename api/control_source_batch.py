@@ -9,17 +9,15 @@ credential, user-selected query or uploaded row is accepted by this handler.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import asdict
 from datetime import datetime, timezone
-from inspect import getattr_static
 
 from sanic import Blueprint
 from sanic.exceptions import BadRequest, PayloadTooLarge
 from sqlalchemy.exc import InterfaceError, OperationalError
 
 from api import control_admission_batch as admission
-from api.control_batch_diagnostics import BatchFailureStage, log_batch_failure
+from api.control_batch_diagnostics import BatchFailureStage, can_retry_batch_operation, log_batch_failure
 from db.connection import db
 from process.custom_import import source_authorization as authorization
 from process.custom_import.admission_authorization import AdmissionAuthorizationError
@@ -31,20 +29,6 @@ blueprint = Blueprint("custom_import_source", url_prefix="/control/v1")
 
 class SourceProgressConflict(RuntimeError):
     """The original cursor is no longer current; no retry is authorized."""
-
-
-def _can_retry_source_operation(error):
-    """Require a known invalidated connection and completed, uncanceled cleanup."""
-
-    try:
-        task = asyncio.current_task()
-        return (
-            getattr_static(error, "connection_invalidated", False) is True
-            and getattr_static(error, "_custom_import_retry_blocked", False) is False
-            and (task is None or not task.cancelling())
-        )
-    except Exception:
-        return False
 
 
 async def _source_operation(session_factory, verified):
@@ -67,7 +51,7 @@ async def _source_operation(session_factory, verified):
         except SourceCursorConflict:
             raise SourceProgressConflict("custom_import_source_progress_conflict") from None
         except (InterfaceError, OperationalError) as error:
-            if attempt or not _can_retry_source_operation(error):
+            if attempt or not can_retry_batch_operation(error):
                 raise
             log_batch_failure(BatchFailureStage.SOURCE_EXECUTE, error, is_retry=True)
 
