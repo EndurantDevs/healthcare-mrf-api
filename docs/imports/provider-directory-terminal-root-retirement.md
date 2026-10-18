@@ -30,6 +30,11 @@ Before previewing, prove all of the following:
 
 Keep the gate disabled except for the single preview/apply session:
 
+The command must run through a trusted launcher that binds the issued SOURCE
+transaction factory before calling this parser's `operation_runner`. Direct
+standalone execution cannot infer publisher authority from an ordinary database
+session. The same enablement gate applies before the launcher opens credentials.
+
 ```bash
 export HLTHPRT_PROVIDER_DIRECTORY_TERMINAL_ROOT_RETIREMENT_ENABLED=true
 ```

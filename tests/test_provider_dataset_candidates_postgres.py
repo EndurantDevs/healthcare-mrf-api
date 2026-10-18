@@ -5,7 +5,6 @@
 import json
 import uuid
 from contextlib import asynccontextmanager
-from importlib import import_module
 
 import asyncpg
 import pytest
@@ -19,7 +18,6 @@ from db.migration_provider_directory_terminal_root_retirement_guards import (
 )
 from process import uhc_flex_practitioner_publication_materialization as practitioner_materialization
 from process import uhc_flex_practitioner_publication_store as practitioner_store
-from process.provider_directory_projection_stage import _copy_driver
 from process.uhc_flex_practitioner_publication import build_uhc_flex_practitioner_dataset_identity
 from process.uhc_flex_practitioner_publication_store import _insert_building_headers
 from tests.formulary_fhir_twin_admission_pg_support import (
@@ -29,6 +27,12 @@ from tests.formulary_fhir_twin_admission_pg_support import (
     load_migration,
     quoted,
     run_migration,
+)
+from tests.provider_directory_historical_publication_pg_support import (
+    _copy_historical_candidate as _copy_historical_dataset,
+)
+from tests.provider_directory_historical_publication_pg_support import (
+    _historical_candidate as _historical_dataset_storage,
 )
 from tests.test_provider_directory_rooted_graph_bulk_postgres import _claim
 from tests.test_provider_directory_rooted_graph_publication_postgres import _lifecycle_scope, _publish_legacy_root
@@ -479,7 +483,7 @@ async def _install_candidate_index_probe(context):
                 JOIN pg_index index_record ON index_record.indexrelid=command.objid
                 JOIN pg_class candidate ON candidate.oid=index_record.indrelid
                 WHERE command.command_tag='CREATE INDEX' AND candidate.relnamespace='{schema}'::regnamespace
-                  AND candidate.relname LIKE 'pd_ds_%')
+                  AND (candidate.relname LIKE 'pd_ds_%' OR candidate.relname LIKE 'pdgs_%'))
                AND EXISTS (SELECT FROM pg_locks lock JOIN pg_class parent ON parent.oid=lock.relation
                 WHERE lock.pid=pg_backend_pid() AND lock.granted AND parent.relnamespace='{schema}'::regnamespace
                   AND parent.relname LIKE 'provider_directory_%'
@@ -491,7 +495,7 @@ async def _install_candidate_index_probe(context):
                 SELECT relation.oid, EXISTS(SELECT FROM pg_inherits WHERE inhrelid=relation.oid),
                        ARRAY(SELECT indexrelid FROM pg_index WHERE indrelid=relation.oid ORDER BY indexrelid)
                   FROM pg_class relation WHERE relnamespace='{schema}'::regnamespace AND relkind='r'
-                   AND (relname LIKE 'pd_ds_%' OR relname LIKE 'pd_uhc_flex_pr_%'
+                   AND (relname LIKE 'pd_ds_%' OR relname LIKE 'pdgs_%' OR relname LIKE 'pd_uhc_flex_pr_%'
                         OR relname LIKE 'pdrgw_%' OR relname LIKE 'pdrgr_%' OR relname LIKE 'pdrge_%')
                    AND EXISTS(SELECT FROM pg_index WHERE indrelid=relation.oid)
                 ON CONFLICT(relation_oid,attached) DO UPDATE SET index_oids=
@@ -500,32 +504,62 @@ async def _install_candidate_index_probe(context):
         CREATE EVENT TRIGGER "{event_name}" ON ddl_command_end
             EXECUTE FUNCTION {schema}.observe_candidate_indexes();
     """)
+    if hasattr(context, "component"):
+        for role in (context.component.owner, context.component.builder):
+            await context.connection.execute(
+                f"GRANT SELECT,INSERT,UPDATE ON TABLE {schema}.candidate_index_audit TO {quoted(role)}"
+            )
     return event_name
 
 
-@pytest.mark.asyncio
-async def test_candidate_attach_reuses_every_prepared_native_index(monkeypatch):
-    async with _lifecycle_scope(monkeypatch) as context:
-        resource = f"{context.schema}.{TABLES[0]}"
-        await context.connection.execute(
-            f"ALTER TABLE {resource} ADD CONSTRAINT synthetic_resource_identity UNIQUE(dataset_id,resource_type,resource_id,payload_hash) DEFERRABLE INITIALLY DEFERRED"
+async def _indexed_candidate_relations(context):
+    """Inventory real candidate heaps independently of the event-trigger observations."""
+    return {
+        row["oid"]
+        for row in await context.connection.fetch(
+            "SELECT oid FROM pg_class WHERE relnamespace=$1::regnamespace AND relkind='r' "
+            "AND relname ~ '^(pd_ds_|pdgs_|pd_uhc_flex_pr_|pdrgw_|pdrgr_|pdrge_)' "
+            "AND EXISTS(SELECT FROM pg_index WHERE indrelid=pg_class.oid)",
+            context.schema_name,
         )
-        await context.connection.execute(f"CREATE INDEX synthetic_resource_hash ON {resource}(payload_hash)")
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_source", (False, True), ids=("historical", "current-source"))
+async def test_candidate_attach_reuses_every_prepared_native_index(monkeypatch, current_source):
+    """Preserve historical index variants and every supported current Source heap's OIDs."""
+    async with _lifecycle_scope(monkeypatch, request_failure_budget=current_source) as context:
+        if not current_source:
+            resource = f"{context.schema}.{TABLES[0]}"
+            await context.connection.execute(
+                f"ALTER TABLE {resource} ADD CONSTRAINT synthetic_resource_identity UNIQUE(dataset_id,resource_type,resource_id,payload_hash) DEFERRABLE INITIALLY DEFERRED"
+            )
+            await context.connection.execute(f"CREATE INDEX synthetic_resource_hash ON {resource}(payload_hash)")
+        initial_relations = await _indexed_candidate_relations(context)
         event_name = await _install_candidate_index_probe(context)
         try:
             await _claim(context)
         finally:
             await context.connection.execute(f'DROP EVENT TRIGGER "{event_name}"')
         observations = await context.connection.fetch(f"""
-            SELECT before.relation_oid::regclass::text AS relation,
+            SELECT before.relation_oid, before.relation_oid::regclass::text AS relation, native.relname,
                    before.index_oids AS before_indexes, after.index_oids AS after_indexes
               FROM {context.schema}.candidate_index_audit before
+              JOIN pg_class native ON native.oid=before.relation_oid
               LEFT JOIN {context.schema}.candidate_index_audit after
                 ON after.relation_oid=before.relation_oid AND after.attached
              WHERE NOT before.attached ORDER BY relation
         """)
-        assert len(observations) == 7
+        expected_relations = await _indexed_candidate_relations(context) - initial_relations
+        assert len(expected_relations) >= 7
+        assert {observation["relation_oid"] for observation in observations} == expected_relations
+        dataset_prefix = "pdgs_" if current_source else "pd_ds_"
+        assert sum(observation["relname"].startswith(dataset_prefix) for observation in observations) == (
+            5 if current_source else 2
+        )
         for observation in observations:
+            assert observation["before_indexes"]
             assert observation["before_indexes"] == observation["after_indexes"], observation["relation"]
 
 
@@ -536,11 +570,11 @@ async def test_candidate_attach_has_bounded_lock_wait(monkeypatch):
             await context.connection.execute(
                 f"LOCK TABLE ONLY {context.schema}.{TABLES[0]} IN SHARE UPDATE EXCLUSIVE MODE"
             )
-            with pytest.raises(DBAPIError) as failure:
+            with pytest.raises(asyncpg.LockNotAvailableError) as failure:
                 async with context.database.transaction():
                     await context.database.scalar("SELECT set_config('statement_timeout','4s',true)")
                     await _publish_legacy_root(context.database)
-            assert failure.value.orig.sqlstate == "55P03"
+            assert failure.value.sqlstate == "55P03"
         assert await context.database.scalar("SELECT current_setting('lock_timeout')") == "0"
         assert await _publish_legacy_root(context.database)
 
@@ -637,23 +671,6 @@ async def test_sealed_provider_candidate_rejects_global_write_role(monkeypatch):
             with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="candidate_immutable"):
                 async with connection.transaction():
                     await connection.execute(f"INSERT INTO {candidate} DEFAULT VALUES")
-
-
-@asynccontextmanager
-async def _historical_dataset_storage(_database, _dataset_id, *, kind):
-    """Use the old retained tables only while constructing the historical fixture."""
-    assert kind == "practitioner"
-    yield
-
-
-async def _copy_historical_dataset(database, table, columns, records):
-    driver = await _copy_driver(database._transaction_binding().session)
-    directory = import_module("process.provider_directory_fhir")
-    status = await driver.copy_records_to_table(
-        table, schema_name=directory._schema(), columns=columns, records=records
-    )
-    assert status == f"COPY {len(records)}"
-    return len(records)
 
 
 @pytest.mark.asyncio

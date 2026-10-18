@@ -147,7 +147,9 @@ async def _load_edition_landing(connection, namespace, input_bytes, edition):
     """COPY one native batch into a connection-private landing with exact accounting."""
     from process.registry_source_observation_store import RegistryObservationLanding
 
-    copy_bytes, row_count, metadata = await asyncio.to_thread(_encode_edition, input_bytes, edition)
+    copy_bytes, row_count, metadata = await drain_operation(
+        asyncio.to_thread(_encode_edition, input_bytes, edition), preserve_cancellation=True
+    )
     table_name = "registry_landing_" + uuid4().hex
     await connection.execute(
         f'CREATE TEMP TABLE "{table_name}" (LIKE {namespace}.registry_source_observation INCLUDING ALL) ON COMMIT DROP'

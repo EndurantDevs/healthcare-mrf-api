@@ -174,16 +174,14 @@ def test_cms_unreviewed_tax_identifier_remains_source_evidence(value):
 
 @pytest.mark.asyncio
 async def test_resource_id_backfill_excludes_cms_in_scoped_and_unscoped_runs(monkeypatch):
-    status = AsyncMock(return_value="UPDATE 0")
-    monkeypatch.setattr(importer.db, "status", status)
+    from process import provider_directory_output_npi_backfill as repair
 
     for source_ids in (["cms-npd"], ["cms-npd", "source-a"], None):
-        result = await importer.backfill_provider_directory_resource_id_npis("mrf", source_ids=source_ids)
-        assert result == {"Practitioner": 0, "Organization": 0}
-    assert status.await_count == 6
-    for call in status.await_args_list:
-        assert "resource.source_id <> :cms_npd_source_id" in call.args[0]
-        assert call.kwargs["cms_npd_source_id"] == "cms-npd"
+        selector = repair._selector(importer, "mrf", None, source_ids, None)
+        for target in repair.TARGETS:
+            inputs, _expected, _count, params_by_name = repair.npi_projection(importer, target, selector)
+            assert "r.source_id<>:cms_npd_source_id" in inputs
+            assert params_by_name["cms_npd_source_id"] == "cms-npd"
 
 
 @pytest.mark.asyncio

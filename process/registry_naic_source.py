@@ -196,8 +196,8 @@ def _retain_naic_members(fetched, receipt, root, layout_paths):
     return members
 
 
-def prepare_naic_source_input(fetched, input_dir, layout_paths, *, snapshot_id):
-    """Retain exact members and bind caller-supplied layout bytes, without admission."""
+def _naic_fetch_receipt(fetched, snapshot_id):
+    """Validate the closed source and real fetch metadata before retaining bytes."""
     from process.registry_source_fetch import RegistrySourceFetchReceipt, RegistrySourceFetchResult
 
     if (
@@ -205,7 +205,6 @@ def prepare_naic_source_input(fetched, input_dir, layout_paths, *, snapshot_id):
         or type(fetched.receipt) is not RegistrySourceFetchReceipt
         or type(snapshot_id) is not UUID
         or not snapshot_id.int
-        or set(layout_paths) != set(MEMBERS)
     ):
         raise RegistrySourceAdmissionError("Company listing preparation metadata is invalid")
     receipt = replace(fetched.receipt, spec=replace(fetched.receipt.spec))
@@ -217,6 +216,15 @@ def prepare_naic_source_input(fetched, input_dir, layout_paths, *, snapshot_id):
         2026,
     ):
         raise RegistrySourceAdmissionError("Company listing preparation identity differs")
+    return receipt
+
+
+def prepare_naic_source_input(fetched, input_dir, layout_paths, *, snapshot_id):
+    """Retain exact members and bind caller-supplied layout bytes, without admission."""
+    if set(layout_paths) != set(MEMBERS):
+        raise RegistrySourceAdmissionError("Company listing preparation metadata is invalid")
+    receipt = _naic_fetch_receipt(fetched, snapshot_id)
+    spec = receipt.spec
     root = Path(input_dir).absolute()
     root.mkdir(parents=True, exist_ok=True)
     if root.resolve(strict=True) != root:
@@ -237,6 +245,52 @@ def prepare_naic_source_input(fetched, input_dir, layout_paths, *, snapshot_id):
         receipt.retrieved_at,
     )
     return RegistryNaicPreparedInput(edition, tuple(members))
+
+
+def _retain_naic_layout(stage, root, digest, size):
+    from process.registry_source_preparation import _verified_file
+
+    path = root / (digest + ".pdf")
+    try:
+        path.hardlink_to(stage)
+    except FileExistsError:
+        with _verified_file(path, digest, size, size):
+            return path
+    return path
+
+
+def _archive_layout_paths(archive, cleanup, root):
+    from process.registry_source_preparation import _members, _stage_member
+
+    members_by_name = _members(archive)
+    required = set(MEMBERS) | {name.removesuffix(".csv") + ".pdf" for name in MEMBERS}
+    if not required <= members_by_name.keys():
+        raise RegistrySourceAdmissionError("Company listing archive members are incomplete")
+    paths_by_member = {}
+    for name in MEMBERS:
+        member = members_by_name[name.removesuffix(".csv") + ".pdf"]
+        stage, digest, size = cleanup.enter_context(_stage_member(archive, member, root, MAX_MEMBER_BYTES))
+        paths_by_member[name] = _retain_naic_layout(stage, root, digest, size)
+    return paths_by_member
+
+
+def prepare_naic_source_archive(fetched, input_dir, *, snapshot_id):
+    """Bind the three fixed layout PDFs from the same verified listing archive."""
+    from process.registry_source_preparation import _bounded_directory, _verified_file
+
+    receipt = _naic_fetch_receipt(fetched, snapshot_id)
+    root = Path(input_dir).absolute()
+    root.mkdir(parents=True, exist_ok=True)
+    if root.resolve(strict=True) != root:
+        raise RegistrySourceAdmissionError("Company listing input directory is invalid")
+    with ExitStack() as cleanup:
+        with _verified_file(
+            fetched.artifact_path, receipt.artifact_sha256, receipt.artifact_bytes, receipt.spec.max_bytes
+        ) as stream:
+            _bounded_directory(stream)
+            with zipfile.ZipFile(stream) as archive:
+                layout_paths = _archive_layout_paths(archive, cleanup, root)
+    return prepare_naic_source_input(fetched, root, layout_paths, snapshot_id=snapshot_id)
 
 
 def read_naic_input_manifest(path, edition):

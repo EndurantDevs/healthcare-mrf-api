@@ -433,7 +433,7 @@ def _resolved_command(specification, frozen, schema_name, intent, ownership, act
 
 
 async def _resolved_source(session, schema_name, intent, ownership, actor):
-    if intent.get("review_type") == "published_complete_snapshot_plan":
+    if intent.get("review_type") in {"published_complete_snapshot_plan", "published_allowed_amount_plan"}:
         from process.registry_ptg_published_plan_scope import resolve_published_plan
 
         return await resolve_published_plan(session, schema_name, intent, ownership, actor)
@@ -595,7 +595,10 @@ class RegistryPTGScopeEngineService:
             raise
 
     async def _approve(self, envelope, deadline, state_by_field):
-        if envelope["command"].get("review_type") == "published_complete_snapshot_plan":
+        if envelope["command"].get("review_type") in {
+            "published_complete_snapshot_plan",
+            "published_allowed_amount_plan",
+        }:
             from process.registry_ptg_published_plan_scope import approve_published_plan
 
             return await approve_published_plan(self, envelope, deadline, state_by_field)

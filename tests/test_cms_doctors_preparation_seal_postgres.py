@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Real post-finalization write seals survive native publication and retained predecessors."""
+"""Native ACL/catalog custody survives publication and retained predecessors."""
 
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import pytest
@@ -9,8 +10,9 @@ from sqlalchemy.exc import DBAPIError
 
 from process import cms_doctors_preparation as preparation
 from process import reference_family_archive as archive
+from tests.cms_doctors_component_postgres_support import ordinary_doctors_reader
 from tests.cms_doctors_preparation_postgres_support import doctors_database, stage_family
-from tests.test_provider_directory_cms_serving_receipt_postgres import _apply
+from tests.cms_doctors_preparation_postgres_support import doctors_source_template as doctors_source_template
 
 
 @pytest.mark.asyncio
@@ -24,69 +26,95 @@ from tests.test_provider_directory_cms_serving_receipt_postgres import _apply
         "TRUNCATE {relation}",
     ],
 )
-async def test_each_finalized_table_rejects_all_data_writes_in_replica_sessions(monkeypatch, table_index, statement):
-    """The seal protects rows through its ALWAYS statement trigger, even for zero affected rows."""
+async def test_each_finalized_table_denies_unprivileged_data_writes(monkeypatch, table_index, statement):
+    """Read-write Reader transactions are denied by ACLs, with no payload hook."""
     async with doctors_database(monkeypatch, cms_active=False) as fixture:
         ctx = await stage_family(fixture.database, fixture.schema)
         async with preparation.prepare_cms_doctors_generation(ctx) as prepared:
             _target, stage, oid = prepared.stage_oids[table_index]
             relation = f'"{fixture.schema}"."{stage}"'
-            with pytest.raises(DBAPIError, match="cms_doctors_prepared_read_only"):
-                async with fixture.database.transaction() as session:
-                    await session.execute(text("SET LOCAL session_replication_role='replica'"))
+            async with ordinary_doctors_reader(fixture.database) as session:
+                with pytest.raises(DBAPIError) as denied:
                     await session.execute(text(statement.format(relation=relation)))
+                assert denied.value.orig.sqlstate == "42501"
             assert await fixture.database.scalar("SELECT to_regclass(:name)::oid::bigint", name=relation) == oid
             assert await fixture.database.scalar(f"SELECT count(*) FROM {relation}") == 1
+            assert not await fixture.database.scalar(
+                "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=:oid AND NOT tgisinternal)", oid=oid
+            )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["ordinary", "after", "events", "args", "when", "body", "security", "settings"])
-async def test_changed_seal_contract_rejects_native_apply(monkeypatch, change):
-    """A named trigger alone cannot stand in for the exact immutable native guard."""
+@pytest.mark.parametrize("change", ["update", "column", "truncate", "owner", "index", "column_shape", "rls", "rule"])
+async def test_changed_native_custody_rejects_apply(monkeypatch, change):
+    """Changing effective writer authority or native storage invalidates the seal."""
     async with doctors_database(monkeypatch, cms_active=False) as fixture:
         ctx = await stage_family(fixture.database, fixture.schema)
         async with preparation.prepare_cms_doctors_generation(ctx) as prepared:
-            async with fixture.database.transaction() as session:
-                await _tamper_seal(session, prepared, change)
-            with pytest.raises(RuntimeError, match="seal.*changed"):
-                async with fixture.database.transaction():
-                    await preparation.apply_prepared_cms_doctors_generation(prepared)
+            async with _changed_native_custody(fixture, prepared, change):
+                await _assert_custody_rejected(fixture, prepared, change)
             assert (
                 await fixture.database.scalar(f'SELECT city FROM "{fixture.schema}".doctor_clinician_address')
                 == "incumbent"
             )
+            async with fixture.database.transaction() as session:
+                await preparation.assert_prepared_cms_doctors_seal(session, prepared)
 
 
-async def _tamper_seal(session, prepared, change):
-    """Mutate one owned fixture guard without affecting any shared schema."""
-    _target, stage, _oid = prepared.stage_oids[0]
-    relation = f'"{prepared.schema}"."{stage}"'
-    function = f'"{prepared.schema}".cms_doctors_prepared_immutable()'
-    trigger = preparation._SEAL_TRIGGER
-    if change == "body":
-        await session.execute(
-            text(
-                f"CREATE OR REPLACE FUNCTION {function} RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END;$$"
-            )
-        )
-    elif change in {"security", "settings"}:
-        clause = "SECURITY DEFINER" if change == "security" else "RESET ALL"
-        await session.execute(text(f"ALTER FUNCTION {function} {clause}"))
-    elif change == "ordinary":
-        await session.execute(text(f"ALTER TABLE {relation} ENABLE TRIGGER {trigger}"))
+@asynccontextmanager
+async def _changed_native_custody(fixture, prepared, change):
+    relation = f'"{fixture.schema}"."{prepared.stage_oids[0][1]}"'
+    reader, owner = fixture.component.reader, fixture.component.owner
+    async with fixture.engine.connect() as admin:
+        actor = await admin.scalar(text("SELECT session_user"))
+        await admin.rollback()
+        alter, restore = {
+            "update": (f'GRANT UPDATE ON {relation} TO "{reader}"', f'REVOKE UPDATE ON {relation} FROM "{reader}"'),
+            "column": (
+                f'GRANT INSERT(city) ON {relation} TO "{reader}"',
+                f'REVOKE INSERT(city) ON {relation} FROM "{reader}"',
+            ),
+            "truncate": (
+                f'GRANT TRUNCATE ON {relation} TO "{reader}"',
+                f'REVOKE TRUNCATE ON {relation} FROM "{reader}"',
+            ),
+            "owner": (f'ALTER TABLE {relation} OWNER TO "{actor}"', f'ALTER TABLE {relation} OWNER TO "{owner}"'),
+            "index": (
+                f"CREATE INDEX extra_custody_index ON {relation} (city)",
+                f'DROP INDEX "{fixture.schema}".extra_custody_index',
+            ),
+            "column_shape": (
+                f"ALTER TABLE {relation} ADD COLUMN extra text",
+                f"ALTER TABLE {relation} DROP COLUMN extra",
+            ),
+            "rls": (
+                f"ALTER TABLE {relation} ENABLE ROW LEVEL SECURITY",
+                f"ALTER TABLE {relation} DISABLE ROW LEVEL SECURITY",
+            ),
+            "rule": (
+                f"CREATE RULE changed_custody AS ON DELETE TO {relation} DO INSTEAD NOTHING",
+                f"DROP RULE changed_custody ON {relation}",
+            ),
+        }[change]
+        await admin.execute(text(alter))
+        await admin.commit()
+        try:
+            yield
+        finally:
+            await admin.execute(text(restore))
+            await admin.commit()
+
+
+async def _assert_custody_rejected(fixture, prepared, change):
+    if change == "owner":
+        with pytest.raises(DBAPIError) as denied:
+            async with fixture.database.transaction():
+                await preparation.apply_prepared_cms_doctors_generation(prepared)
+        assert denied.value.orig.sqlstate == "42501"
     else:
-        await session.execute(text(f"DROP TRIGGER {trigger} ON {relation}"))
-        timing = "AFTER" if change == "after" else "BEFORE"
-        events = "INSERT" if change == "events" else "INSERT OR UPDATE OR DELETE OR TRUNCATE"
-        arguments = "'extra'" if change == "args" else ""
-        condition = "WHEN (true)" if change == "when" else ""
-        await session.execute(
-            text(
-                f"CREATE TRIGGER {trigger} {timing} {events} ON {relation} FOR EACH STATEMENT {condition} "
-                f"EXECUTE FUNCTION {function[:-1]}{arguments})"
-            )
-        )
-        await session.execute(text(f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER {trigger}"))
+        with pytest.raises(RuntimeError, match="ordinary mutation|cms_doctors_immutable_"):
+            async with fixture.database.transaction():
+                await preparation.apply_prepared_cms_doctors_generation(prepared)
 
 
 @pytest.mark.asyncio
@@ -119,16 +147,19 @@ async def test_future_import_has_mutable_new_heaps_and_retained_generations_stay
                 await _assert_named_family_sealed(fixture, prepared, "")
                 if expected_generation == 3:
                     await _assert_named_family_sealed(fixture, prepared, "_old")
-        with pytest.raises(DBAPIError, match="depend"):
-            async with fixture.database.engine.begin() as connection:
-                await connection.run_sync(lambda sync: _apply(sync, "20260930130000", "downgrade"))
+        assert not await fixture.database.scalar(
+            "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=ANY(CAST(:oids AS oid[])) AND NOT tgisinternal)",
+            oids=[oid for _, _, oid in prepared.stage_oids],
+        )
 
 
 async def _assert_named_family_sealed(fixture, prepared, suffix):
-    """Every surviving heap carries the trigger across the native table rename."""
+    """Every surviving heap remains closed to ordinary write authority after rename."""
     for target, _stage, _oid in prepared.stage_oids:
-        with pytest.raises(DBAPIError, match="cms_doctors_prepared_read_only"):
-            await fixture.database.status(f'DELETE FROM "{fixture.schema}"."{target}{suffix}" WHERE FALSE')
+        async with ordinary_doctors_reader(fixture.database) as session:
+            with pytest.raises(DBAPIError) as denied:
+                await session.execute(text(f'DELETE FROM "{fixture.schema}"."{target}{suffix}" WHERE FALSE'))
+            assert denied.value.orig.sqlstate == "42501"
 
 
 @pytest.mark.asyncio
@@ -146,7 +177,7 @@ async def _assert_fresh_restore(fixture, prepared):
     """Create and clean the exact native UUID stage through its existing ownership lifecycle."""
     ownership = None
     try:
-        async with fixture.database.transaction() as session:
+        async with fixture.database.session_factory() as session, session.begin():
             ownership = await archive.precreate_reference_family_restore(
                 session, importer_id="cms-doctors", dataset_id=uuid4()
             )
@@ -157,7 +188,7 @@ async def _assert_fresh_restore(fixture, prepared):
             await archive.complete_reference_family_restore(session, ownership)
     finally:
         if ownership is not None:
-            async with fixture.database.transaction() as session:
+            async with fixture.database.session_factory() as session, session.begin():
                 await archive.cleanup_reference_family_stage(session, ownership)
                 assert (
                     await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": ownership.schema_name})
@@ -166,18 +197,16 @@ async def _assert_fresh_restore(fixture, prepared):
 
 
 @pytest.mark.asyncio
-async def test_migration_does_not_retroactively_seal_incumbent_tables(monkeypatch):
-    """An old generation retains its existing mutation contract until replaced."""
+async def test_current_incumbent_is_closed_before_successor_preparation(monkeypatch):
+    """The current operator cut closes incumbent ACLs without adding statement hooks."""
     async with doctors_database(monkeypatch, cms_active=False) as fixture:
-        assert (
-            await fixture.database.status(f"UPDATE \"{fixture.schema}\".doctor_clinician_address SET city='historical'")
-            == 1
-        )
-        async with fixture.database.engine.begin() as connection:
-            await connection.run_sync(lambda sync: _apply(sync, "20260930130000", "downgrade"))
-        assert (
-            await fixture.database.scalar(
-                "SELECT to_regprocedure(:name)", name=f'"{fixture.schema}".cms_doctors_prepared_immutable()'
+        for table in ("doctor_clinician_address", "cms_doctor_education", "cms_doctor_group_site"):
+            relation = f'"{fixture.schema}"."{table}"'
+            async with ordinary_doctors_reader(fixture.database) as session:
+                with pytest.raises(DBAPIError) as denied:
+                    await session.execute(text(f"DELETE FROM {relation} WHERE FALSE"))
+                assert denied.value.orig.sqlstate == "42501"
+            assert not await fixture.database.scalar(
+                "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=to_regclass(:relation) AND NOT tgisinternal)",
+                relation=relation,
             )
-            is None
-        )

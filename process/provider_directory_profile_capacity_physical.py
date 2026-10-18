@@ -14,6 +14,7 @@ from process.provider_directory_profile_capacity_target import (
     _checked_add,
 )
 from process.provider_directory_profile_capacity_types import (
+    _SCRATCH_RELATION_NAMES,
     METADATA_DATA_UPPER_BOUND_BYTES,
     METADATA_PAYLOAD_UPPER_BOUND_BYTES,
     METADATA_WAL_UPPER_BOUND_BYTES,
@@ -25,8 +26,8 @@ from process.provider_directory_profile_capacity_types import (
     ProviderDirectoryProfileRelationByteCaps,
     ProviderDirectoryProfileScratchInput,
     ProviderDirectoryProfileScratchProjection,
-    _SCRATCH_RELATION_NAMES,
 )
+
 
 def project_profile_scratch_capacity(
     geometry: ProviderDirectoryProfileCapacityGeometry,
@@ -37,7 +38,7 @@ def project_profile_scratch_capacity(
     """Project one scratch wave before PostgreSQL can emit data or WAL."""
 
     verified_geometry = revalidate_capacity_geometry(geometry)
-    _validate_scratch_input(scratch_input)
+    _validate_scratch_input(verified_geometry, scratch_input)
     relation_cap = _scratch_relation_cap(
         verified_geometry,
         scratch_input.relation_name,
@@ -73,6 +74,7 @@ def project_profile_scratch_capacity(
 
 
 def _validate_scratch_input(
+    geometry: ProviderDirectoryProfileCapacityGeometry,
     scratch_input: ProviderDirectoryProfileScratchInput,
 ) -> None:
     if (
@@ -82,9 +84,7 @@ def _validate_scratch_input(
         )
         or scratch_input.relation_name not in _SCRATCH_RELATION_NAMES
         or any(
-            not isinstance(scratch_metric, int)
-            or isinstance(scratch_metric, bool)
-            or scratch_metric < 0
+            not isinstance(scratch_metric, int) or isinstance(scratch_metric, bool) or scratch_metric < 0
             for scratch_metric in (
                 scratch_input.inserted_rows,
                 scratch_input.inserted_logical_bytes,
@@ -93,20 +93,15 @@ def _validate_scratch_input(
         )
         or not isinstance(scratch_input.main_index_pages, tuple)
         or not isinstance(scratch_input.toast_index_pages, tuple)
-        or not scratch_input.main_index_pages
-        or any(
-            not isinstance(index_pages, int)
-            or isinstance(index_pages, bool)
-            or index_pages < 1
-            for index_pages in (
-                scratch_input.main_index_pages
-                + scratch_input.toast_index_pages
-            )
-        )
         or (
-            scratch_input.inserted_rows == 0
-            and scratch_input.inserted_logical_bytes != 0
+            not scratch_input.main_index_pages
+            and (not geometry.bounded_admission or scratch_input.relation_name != "artifact_scope")
         )
+        or any(
+            not isinstance(index_pages, int) or isinstance(index_pages, bool) or index_pages < 1
+            for index_pages in (scratch_input.main_index_pages + scratch_input.toast_index_pages)
+        )
+        or (scratch_input.inserted_rows == 0 and scratch_input.inserted_logical_bytes != 0)
     ):
         raise _error("scratch_projection_input_invalid")
 
@@ -116,11 +111,7 @@ def _scratch_relation_cap(
     relation_name: str,
 ) -> ProviderDirectoryProfileRelationByteCaps:
     relation_cap = next(
-        (
-            candidate
-            for candidate in geometry.relation_byte_caps
-            if candidate.relation_name == relation_name
-        ),
+        (candidate for candidate in geometry.relation_byte_caps if candidate.relation_name == relation_name),
         None,
     )
     if relation_cap is None:
@@ -135,11 +126,7 @@ def _inserted_toast_chunks_upper(
     if not scratch_input.inserted_rows:
         return 0
     return _checked_add(
-        (
-            scratch_input.inserted_logical_bytes
-            + geometry.postgres_toast_max_chunk_size_bytes
-            - 1
-        )
+        (scratch_input.inserted_logical_bytes + geometry.postgres_toast_max_chunk_size_bytes - 1)
         // geometry.postgres_toast_max_chunk_size_bytes,
         scratch_input.inserted_rows * scratch_input.toastable_column_count,
     )
@@ -154,11 +141,7 @@ def _scratch_growth_bytes(
         scratch_input.inserted_rows,
         inserted_toast_chunks_upper,
     )
-    auxiliary_growth_pages = (
-        2 * _checked_add(inserted_heap_pages, 2)
-        if inserted_heap_pages
-        else 0
-    )
+    auxiliary_growth_pages = 2 * _checked_add(inserted_heap_pages, 2) if inserted_heap_pages else 0
     index_growth_pages = _checked_add(
         _btree_insert_growth_pages(
             scratch_input.main_index_pages,
@@ -189,11 +172,7 @@ def _scratch_wal_bytes(
         scratch_input.inserted_rows,
         inserted_toast_chunks_upper,
     )
-    heap_page_touches = (
-        3 * _checked_add(inserted_heap_pages, 4)
-        if inserted_heap_pages
-        else 0
-    )
+    heap_page_touches = 3 * _checked_add(inserted_heap_pages, 4) if inserted_heap_pages else 0
     index_page_touches = _checked_add(
         _btree_wal_page_touches(
             scratch_input.main_index_pages,
@@ -206,11 +185,7 @@ def _scratch_wal_bytes(
             deleted_entries=0,
         ),
     )
-    wal_bytes = (
-        3
-        * geometry.postgres_block_size_bytes
-        * _checked_add(heap_page_touches, index_page_touches)
-    )
+    wal_bytes = 3 * geometry.postgres_block_size_bytes * _checked_add(heap_page_touches, index_page_touches)
     return wal_bytes
 
 
@@ -221,15 +196,9 @@ def _assert_scratch_projection_caps(
     wal_bytes: int,
 ) -> None:
     if growth_bytes > relation_cap.max_scratch_bytes:
-        raise _error(
-            "scratch_projection_growth_exceeded:"
-            + relation_cap.relation_name
-        )
+        raise _error("scratch_projection_growth_exceeded:" + relation_cap.relation_name)
     if wal_bytes > relation_cap.max_wal_bytes:
-        raise _error(
-            "scratch_projection_wal_exceeded:"
-            + relation_cap.relation_name
-        )
+        raise _error("scratch_projection_wal_exceeded:" + relation_cap.relation_name)
 
 
 def _metadata_mutation_projection(
@@ -256,9 +225,7 @@ def _validate_metadata_mutation(
         )
         or mutation.operation not in {"insert", "update"}
         or not mutation.relation_name
-        or not 0
-        <= mutation.payload_upper_bytes
-        <= METADATA_PAYLOAD_UPPER_BOUND_BYTES
+        or not 0 <= mutation.payload_upper_bytes <= METADATA_PAYLOAD_UPPER_BOUND_BYTES
         or mutation.deleted_toast_chunks < 0
         or not mutation.main_index_pages
     ):
@@ -270,9 +237,7 @@ def _metadata_toast_chunk_count(
     mutation: ProviderDirectoryProfileMetadataMutationInput,
 ) -> int:
     return (
-        mutation.payload_upper_bytes
-        + geometry.postgres_toast_max_chunk_size_bytes
-        - 1
+        mutation.payload_upper_bytes + geometry.postgres_toast_max_chunk_size_bytes - 1
     ) // geometry.postgres_toast_max_chunk_size_bytes
 
 
@@ -298,9 +263,7 @@ def _metadata_growth_bytes(
             new_toast_chunks,
         ),
     )
-    return _checked_add(
-        growth_pages * geometry.postgres_block_size_bytes
-    )
+    return _checked_add(growth_pages * geometry.postgres_block_size_bytes)
 
 
 def _metadata_wal_bytes(
@@ -329,9 +292,7 @@ def _metadata_wal_bytes(
             deleted_entries=mutation.deleted_toast_chunks,
         ),
     )
-    return _checked_add(
-        3 * geometry.postgres_block_size_bytes * wal_page_touches
-    )
+    return _checked_add(3 * geometry.postgres_block_size_bytes * wal_page_touches)
 
 
 def project_profile_delta_metadata_capacity(
@@ -348,41 +309,28 @@ def project_profile_delta_metadata_capacity(
     verified_geometry = revalidate_capacity_geometry(geometry)
     from process.provider_directory_profile_initial_contract import InitialCapacityGeometry
 
-    expected_relations = ("serving_generation", "initial_receipt") if isinstance(
-        verified_geometry, InitialCapacityGeometry
-    ) else ("build_checkpoint", "serving_generation", "delta_receipt")
+    expected_relations = (
+        ("serving_generation", "initial_receipt")
+        if isinstance(verified_geometry, InitialCapacityGeometry)
+        else ("build_checkpoint", "serving_generation", "delta_receipt")
+    )
     if (
         not isinstance(mutations, tuple)
-        or tuple(
-            metadata_mutation.relation_name
-            for metadata_mutation in mutations
-        )
-        != expected_relations
+        or tuple(metadata_mutation.relation_name for metadata_mutation in mutations) != expected_relations
         or not isinstance(pending_commit_items, int)
         or isinstance(pending_commit_items, bool)
         or pending_commit_items < 0
     ):
         raise _error("metadata_projection_input_invalid")
-    relation_projections = tuple(
-        _metadata_mutation_projection(verified_geometry, mutation)
-        for mutation in mutations
-    )
-    data_bytes = _checked_add(
-        *(projection[0] for projection in relation_projections)
-    )
-    wal_bytes = _checked_add(
-        *(projection[1] for projection in relation_projections)
-    )
+    relation_projections = tuple(_metadata_mutation_projection(verified_geometry, mutation) for mutation in mutations)
+    data_bytes = _checked_add(*(projection[0] for projection in relation_projections))
+    wal_bytes = _checked_add(*(projection[1] for projection in relation_projections))
     commit_envelope_bytes = _checked_add(
-        verified_geometry.postgres_block_size_bytes
-        * _checked_add(1, pending_commit_items)
+        verified_geometry.postgres_block_size_bytes * _checked_add(1, pending_commit_items)
     )
     if data_bytes > verified_geometry.metadata_data_upper_bound_bytes:
         raise _error("metadata_projection_data_exceeded")
-    if (
-        wal_bytes + commit_envelope_bytes
-        > verified_geometry.metadata_wal_upper_bound_bytes
-    ):
+    if wal_bytes + commit_envelope_bytes > verified_geometry.metadata_wal_upper_bound_bytes:
         raise _error("metadata_projection_wal_exceeded")
     return ProviderDirectoryProfileMetadataProjection(
         data_bytes=data_bytes,

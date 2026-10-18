@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import hmac
 import json
+from dataclasses import dataclass
 
 from api.billing_search_selector_contract import (
     BILLING_SELECTOR_MATCHED,
@@ -53,6 +53,7 @@ class _PreparedBindingSelector:
 @dataclass(frozen=True, slots=True, repr=False)
 class _PreparedSelector:
     bindings: tuple[_PreparedBindingSelector, ...]
+    denied_coordinates: tuple[tuple[int, str], ...] = ()
 
 
 def _framed_sha256(domain: bytes, *values: bytes) -> str:
@@ -70,15 +71,18 @@ def _opaque_ref_component(reference: str) -> str:
 
 def _source_pinned_binding_pins(
     selection: PlanReleaseServingSelection,
+    *,
+    contributing_bindings=None,
 ) -> tuple[BillingSearchBindingPin, ...]:
     if not selection.includes_billing_tax_identity_source:
         raise serving_unavailable()
-    tables_by_snapshot = selection.network_tables_by_snapshot()
+    options = {} if contributing_bindings is None else {"contributing_bindings": contributing_bindings}
+    tables_by_snapshot = selection.network_tables_by_snapshot(**options)
     if tables_by_snapshot is None:
         raise serving_unavailable()
     return tuple(
         BillingSearchBindingPin(binding, tables_by_snapshot[binding.snapshot_id])
-        for binding in selection.in_network_bindings
+        for binding in (selection.in_network_bindings if contributing_bindings is None else contributing_bindings)
     )
 
 
@@ -92,14 +96,12 @@ def _prepared_opaque_bindings(
     try:
         decode_billing_entity_ref(reference)
         selector_component = _opaque_ref_component(reference)
-    except (PTG2BillingAssociationDataError, UnicodeError):
+    except PTG2BillingAssociationDataError, UnicodeError:
         raise _resource_not_found() from None
     return tuple(
         _PreparedBindingSelector(
             pin=pin,
-            billing_entity_ref=(
-                reference if pin.source_publication is not None else None
-            ),
+            billing_entity_ref=(reference if pin.source_publication is not None else None),
             selector_component_sha256=selector_component,
         )
         for pin in pins
@@ -110,6 +112,7 @@ def _prepared_entity_ref_selector_or_state(
     billing_entity_ref: object,
     authorized_plan_release_id: object,
     source_pinned_selection: object,
+    contributing_bindings=None,
 ) -> tuple[str, _PreparedSelector | None]:
     pins = None
     try:
@@ -120,9 +123,19 @@ def _prepared_entity_ref_selector_or_state(
             authorized_plan_release_id,
         ):
             return _PREPARATION_NOT_FOUND, None
-        pins = _source_pinned_binding_pins(source_pinned_selection)
+        pins = _source_pinned_binding_pins(source_pinned_selection, contributing_bindings=contributing_bindings)
+        denied_coordinates = (
+            ()
+            if contributing_bindings is None
+            else tuple(
+                (binding.binding_ordinal, binding.snapshot_id)
+                for binding in source_pinned_selection.in_network_bindings
+                if binding not in contributing_bindings
+            )
+        )
         return _PREPARATION_READY, _PreparedSelector(
             bindings=_prepared_opaque_bindings(billing_entity_ref, pins),
+            denied_coordinates=denied_coordinates,
         )
     except BillingSearchSelectorNotFoundError:
         return _PREPARATION_NOT_FOUND, None
@@ -196,19 +209,21 @@ def _selector_scope_digest(
     prepared: _PreparedSelector,
     resolved: tuple[BillingSearchSelectorBindingScope, ...],
 ) -> str:
+    components_by_coordinate = {
+        (candidate.pin.binding.binding_ordinal, candidate.pin.binding.snapshot_id): candidate.selector_component_sha256
+        for candidate in prepared.bindings
+    }
     scope_fields_by_name = {
         "bindings": [
             {
                 "binding_ordinal": binding.binding_ordinal,
-                "component_sha256": candidate.selector_component_sha256,
+                "component_sha256": components_by_coordinate.get(
+                    (binding.binding_ordinal, binding.snapshot_id), prepared.bindings[0].selector_component_sha256
+                ),
                 "snapshot_id": binding.snapshot_id,
                 "state": binding.state,
             }
-            for candidate, binding in zip(
-                prepared.bindings,
-                resolved,
-                strict=True,
-            )
+            for binding in resolved
         ],
         "selector_kind": "billing_entity_ref",
     }
@@ -254,10 +269,14 @@ async def _resolve_prepared_selector(
         if resolved is None:
             raise serving_unavailable()
         resolved_bindings.append(resolved)
-    resolved_scopes = tuple(resolved_bindings)
-    if resolved_scopes and all(
-        binding.state == BILLING_SELECTOR_NO_MATCH for binding in resolved_scopes
-    ):
+    resolved_bindings.extend(
+        BillingSearchSelectorBindingScope(ordinal, snapshot_id, BILLING_SELECTOR_NO_MATCH)
+        for ordinal, snapshot_id in prepared.denied_coordinates
+    )
+    resolved_scopes = tuple(
+        sorted(resolved_bindings, key=lambda binding: (binding.binding_ordinal, binding.snapshot_id))
+    )
+    if resolved_scopes and all(binding.state == BILLING_SELECTOR_NO_MATCH for binding in resolved_scopes):
         raise _resource_not_found()
     resolution = _completed_resolution_or_none(prepared, resolved_scopes)
     if resolution is None:
@@ -272,6 +291,7 @@ async def resolve_billing_search_entity_ref_selector(
     authorized_plan_release_id: object,
     source_pinned_selection: object,
     schema_name: str = PTG2_SCHEMA,
+    contributing_bindings=None,
 ) -> BillingSearchSelectorResolution:
     """Resolve one authorized opaque reference against source-pinned snapshots."""
 
@@ -279,6 +299,7 @@ async def resolve_billing_search_entity_ref_selector(
         billing_entity_ref,
         authorized_plan_release_id,
         source_pinned_selection,
+        contributing_bindings,
     )
     del authorized_plan_release_id, billing_entity_ref, source_pinned_selection
     if state == _PREPARATION_NOT_FOUND:

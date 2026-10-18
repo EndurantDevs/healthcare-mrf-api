@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Real approved custom composition, exact offices and durable native batch retry."""
+"""Real approved custom composition, exact offices and atomic native retry."""
 
 import asyncio
 import hashlib
@@ -10,9 +10,11 @@ from uuid import UUID, uuid4, uuid5
 
 import pytest
 from sqlalchemy import MetaData
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from db.models import NPIData
 from process import registry_candidate_composition as composition
+from process import registry_membership_composition_stage as command_stages
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_legacy_membership_source import PinnedACAMembershipSource
@@ -35,7 +37,7 @@ from process.registry_initial_source_composition import (
     validate_initial_source_office_receipt,
     verify_initial_source_office_receipt,
 )
-from process.registry_record_store import _history_result
+from process.registry_record_store import RegistryRecordCommand, _history_result, apply_registry_record_command
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests.test_network_custom_address_source_postgres import _draft, _seed, custom_db
 from tests.test_network_initial_source_office_bindings_postgres import (
@@ -70,22 +72,23 @@ async def _remove_candidates(fixture, copy_targets, request_id):
 
 
 async def _interrupt_after_source_copy(fixture, monkeypatch, composition_by_name, *, cancel=False):
-    original_copy = composition.copy_approved_membership_batch
+    original_copy = composition.materialize_registry_composition
 
     async def fail_custom_copy(*args, **kwargs):
+        await original_copy(*args, **kwargs)
         if cancel:
             raise asyncio.CancelledError
         raise RuntimeError("synthetic interruption")
 
-    monkeypatch.setattr(composition, "copy_approved_membership_batch", fail_custom_copy)
+    monkeypatch.setattr(composition, "materialize_registry_composition", fail_custom_copy)
     with pytest.raises(asyncio.CancelledError if cancel else RuntimeError):
         await compose_registry_membership_candidate(fixture.connection, **composition_by_name)
     unfinished = await fixture.connection.fetchrow(
         f'SELECT state,accepted_rows,expected_rows FROM "{fixture.control_schema}".network_membership_candidate WHERE dataset_id=$1',
         uuid5(composition_by_name["request_id"], "dataset"),
     )
-    assert tuple(unfinished) == ("open", 1, 2)
-    monkeypatch.setattr(composition, "copy_approved_membership_batch", original_copy)
+    assert tuple(unfinished) == ("open", 0, 2)
+    monkeypatch.setattr(composition, "materialize_registry_composition", original_copy)
 
 
 async def _imported_candidate(fixture, copy_targets):
@@ -143,8 +146,24 @@ async def _imported_candidate(fixture, copy_targets):
         return await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
 
 
+async def _allow_composition_owner(fixture):
+    database = await fixture.connection.fetchval("SELECT quote_ident(current_database())")
+    await fixture.connection.execute(f'GRANT CREATE ON DATABASE {database} TO "{fixture.roles["owner"]}"')
+
+
+def _assert_manual_retention(candidate):
+    retention = composition.verify_registry_source_retention(candidate)
+    assert (
+        retention["source_rows"],
+        retention["add_rows"],
+        retention["remove_rows"],
+        retention["effective_rows"],
+    ) == (0, 1, 0, 1)
+
+
 async def test_approved_manual_composition_seals_without_publishing_and_replays(custom_db):
     fixture = custom_db
+    await _allow_composition_owner(fixture)
     seed = await _seed(fixture)
     request_id = uuid4()
     copy_targets = []
@@ -195,8 +214,9 @@ async def test_approved_manual_composition_seals_without_publishing_and_replays(
                 f'SELECT count(*) FROM "{fixture.control_schema}".network_membership_batch WHERE candidate_id=$1',
                 UUID(copy_target.candidate_id),
             )
-            == 1
+            == 0
         )
+        _assert_manual_retention(candidate)
     finally:
         await _remove_candidates(fixture, copy_targets, request_id)
 
@@ -241,7 +261,7 @@ async def test_retained_import_composes_latest_custom_and_cleans_source_pages(cu
         assert str(members[1]["location_id"]) == seed.first["record_id"]
         assert members[0]["evidence_id"] == "e" * 64 and members[1]["evidence_id"].startswith("approved-custom:")
         assert not await fixture.connection.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() AND relname LIKE 'registry_source_page_%')"
+            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() AND (relname LIKE 'registry_source_page_%' OR relname LIKE 'registry_command_%'))"
         )
         await prepare_and_publish_network_candidate(
             fixture.connection, copy_target, addresses, **_roles(fixture), control_schema=fixture.control_schema
@@ -358,7 +378,7 @@ async def test_actual_initial_aca_recipes_compose_manual_publish_and_replay(init
         }
         assert not await fixture.connection.fetchval(
             "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
-            "AND (relname LIKE 'registry_source_page_%' OR relname LIKE 'initial_aca_offices_%'))"
+            "AND ((relname LIKE 'registry_source_page_%' OR relname LIKE 'registry_command_%') OR relname LIKE 'initial_aca_offices_%'))"
         )
     finally:
         await _remove_candidates(fixture, copy_targets, arguments["request_id"])
@@ -393,7 +413,7 @@ async def test_initial_aca_failure_rolls_back_complete_preparation(initial_compo
         )
         assert not await fixture.connection.fetchval(
             "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
-            "AND (relname LIKE 'registry_recipe_%' OR relname LIKE 'registry_source_page_%' OR relname LIKE 'initial_aca_offices_%'))"
+            "AND (relname LIKE 'registry_recipe_%' OR (relname LIKE 'registry_source_page_%' OR relname LIKE 'registry_command_%') OR relname LIKE 'initial_aca_offices_%'))"
         )
         assert (
             await fixture.connection.fetchval(
@@ -929,22 +949,23 @@ async def test_selected_old_aca_source_keeps_latest_manual_and_pinned_readers(ro
 async def test_source_rollback_interruption_resumes_exact_batches(rollback_composition, monkeypatch, cancel):
     history = rollback_composition
     fixture = history.fixture
-    original = composition.copy_approved_membership_batch
+    original = composition.materialize_registry_composition
 
     async def fail_custom_copy(*arguments, **options):
+        await original(*arguments, **options)
         raise asyncio.CancelledError if cancel else RuntimeError("synthetic interruption")
 
-    monkeypatch.setattr(composition, "copy_approved_membership_batch", fail_custom_copy)
+    monkeypatch.setattr(composition, "materialize_registry_composition", fail_custom_copy)
     with pytest.raises(asyncio.CancelledError if cancel else RuntimeError):
         await compose_registry_membership_candidate(fixture.connection, **history.arguments_by_name)
     unfinished = await fixture.connection.fetchrow(
         f'SELECT state,accepted_rows,expected_rows FROM "{fixture.control_schema}".network_membership_candidate WHERE dataset_id=$1',
         uuid5(history.arguments_by_name["request_id"], "dataset"),
     )
-    assert tuple(unfinished) == ("open", 2, 3)
+    assert tuple(unfinished) == ("open", 0, 3)
     assert not await fixture.connection.fetchval(
         "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
-        "AND relname LIKE 'registry_source_page_%')"
+        "AND (relname LIKE 'registry_source_page_%' OR relname LIKE 'registry_command_%'))"
     )
     assert (
         await fixture.connection.fetchval(
@@ -952,7 +973,7 @@ async def test_source_rollback_interruption_resumes_exact_batches(rollback_compo
         )
         == history.second.generation_id
     )
-    monkeypatch.setattr(composition, "copy_approved_membership_batch", original)
+    monkeypatch.setattr(composition, "materialize_registry_composition", original)
     copy_target, addresses = await compose_registry_membership_candidate(
         fixture.connection, **history.arguments_by_name
     )
@@ -1164,3 +1185,401 @@ async def test_source_roundtrip_keeps_approved_organization_override_exact_membe
     finally:
         for request_id in requests:
             await _remove_candidates(fixture, copy_targets, request_id)
+
+
+async def _approve_composition_source_offices(fixture, source_manifest, copy_target, source_members, actor):
+    site_records = []
+    for member in source_members:
+        binding = await fixture.connection.fetchrow(
+            "SELECT binding.*,encode(sha256(convert_to(to_jsonb(address)::text,'UTF8')),'hex') AS address_hash "
+            f'FROM "{copy_target.schema_name}".provider_location_binding binding '
+            f'JOIN "{copy_target.schema_name}".entity_address_unified address '
+            "ON (address.location_key,address.entity_type,address.entity_id)="
+            "(binding.location_key,binding.entity_type,binding.entity_id) "
+            "WHERE (binding.provider_system,binding.provider_id,binding.location_id)=($1,$2,$3)",
+            member["provider_system"],
+            member["provider_id"],
+            member["location_id"],
+        )
+        binding_by_field = dict(
+            source_generation=source_manifest.generation_id,
+            provider_system=member["provider_system"],
+            provider_id=member["provider_id"],
+            location_id=str(member["location_id"]),
+            location_key=binding["location_key"],
+            address_row_sha256=binding["address_hash"],
+        )
+        site_command = RegistryRecordCommand(
+            "site_binding", uuid4(), "create", 0, binding_by_field, "Review retained office", uuid4().hex
+        )
+        sessions = async_sessionmaker(fixture.engine.execution_options(isolation_level="REPEATABLE READ"))
+        async with sessions() as session, session.begin():
+            site_records.append(
+                await apply_registry_record_command(
+                    session,
+                    site_command,
+                    actor,
+                    schema=fixture.control_schema,
+                    source_schema=fixture.source_schema,
+                )
+            )
+    await _approve(
+        fixture.connection,
+        fixture.control_schema,
+        await _command(fixture.connection, fixture.control_schema, *site_records),
+        actor,
+    )
+
+
+async def _approve_composition_intent(fixture, actor, command):
+    membership_record = await _draft(fixture, command, actor)
+    approval = await _approve(
+        fixture.connection,
+        fixture.control_schema,
+        await _command(fixture.connection, fixture.control_schema, membership_record),
+        actor,
+    )
+    return membership_record, approval["approved_revision"]
+
+
+async def _compose_intent_candidate(context, revision, source_manifest, head, recipes=()):
+    fixture, copy_targets, requests, network_id = context
+    request = uuid4()
+    requests.append(request)
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        approved = await pin_approved_membership_source(
+            fixture.connection, approved_revision=revision, control_schema=fixture.control_schema
+        )
+    fixture.composition_ids.append(uuid5(request, "address:" + approved.generation_id))
+    arguments_by_name = dict(
+        request_id=request,
+        approved_revision=revision,
+        expected_head=head,
+        source_manifest=source_manifest,
+        writer_roles=_roles(fixture),
+        control_schema=fixture.control_schema,
+        address_sources=RegistryCompositionAddressSources(
+            fixture.base
+            if recipes
+            else PinnedAddressSource(
+                source_manifest.schema_name, "entity_address_unified", source_manifest.manifest_sha256
+            ),
+            replacement_source_recipes=recipes,
+        ),
+    )
+    candidate, addresses = await compose_registry_membership_candidate(fixture.connection, **arguments_by_name)
+    copy_targets.append(candidate)
+    assert await compose_registry_membership_candidate(fixture.connection, **arguments_by_name) == (
+        candidate,
+        addresses,
+    )
+    members = await fixture.connection.fetch(
+        f'SELECT * FROM "{candidate.schema_name}".network_membership WHERE network_id=$1',
+        network_id,
+    )
+    retained = await fixture.connection.fetch(
+        f'SELECT * FROM "{candidate.schema_name}".network_membership_source WHERE network_id=$1',
+        network_id,
+    )
+    await _publish_composition_target(fixture, candidate, addresses)
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        manifest = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
+    return manifest, members, retained
+
+
+async def _assert_composition_intent_chain(
+    context, original, command, unit_by_field, office_a, office_b, replacement_aca_source, actor
+):
+    fixture = context[0]
+    membership_record, revision = await _approve_composition_intent(fixture, actor, command)
+    current, members, retained = await _compose_intent_candidate(context, revision, original, original.generation_id)
+    assert len(retained) == 2 and len(members) == 3
+    assert sum(member["location_id"] == office_a["location_id"] for member in members) == 2
+    command = replace(
+        command,
+        operation="correct",
+        expected_revision=membership_record["revision"],
+        fields={"memberships_json": [{**unit_by_field, "operation": "remove"}]},
+        idempotency_key=uuid4().hex,
+    )
+    membership_record, revision = await _approve_composition_intent(fixture, actor, command)
+    current, members, retained = await _compose_intent_candidate(context, revision, current, current.generation_id)
+    assert len(retained) == 2 and [member["location_id"] for member in members] == [office_b["location_id"]]
+    current, members, retained = await _compose_intent_candidate(
+        context, revision, current, current.generation_id, (replacement_aca_source,)
+    )
+    assert len(retained) == 1 and retained[0]["location_id"] == office_a["location_id"] and not members
+    # Roll back the raw source edition while retaining the latest approved remove.
+    current, members, retained = await _compose_intent_candidate(context, revision, original, current.generation_id)
+    assert len(retained) == 2 and [member["location_id"] for member in members] == [office_b["location_id"]]
+    clear = RegistryRecordCommand(
+        "membership",
+        office_a["network_id"],
+        "correct",
+        membership_record["revision"],
+        {"memberships_json": []},
+        "Clear reviewed intent",
+        uuid4().hex,
+    )
+    _, revision = await _approve_composition_intent(fixture, actor, clear)
+    current, members, retained = await _compose_intent_candidate(context, revision, current, current.generation_id)
+    assert len(retained) == 2 and {member["location_id"] for member in members} == {
+        office_a["location_id"],
+        office_b["location_id"],
+    }
+
+
+async def test_exact_remove_survives_source_refresh_rollback_and_clear(initial_composition, replacement_aca_source):
+    """Approved intent suppresses one exact raw office, and clearing restores it."""
+    from tests.test_network_membership_draft_store_postgres import _command as membership_command
+
+    fixture = initial_composition
+    copy_targets, requests = [], []
+    seed, initial = await _initial_arguments(fixture)
+    requests.append(initial["request_id"])
+    try:
+        copy_target, addresses = await compose_registry_membership_candidate(fixture.connection, **initial)
+        copy_targets.append(copy_target)
+        await _publish_composition_target(fixture, copy_target, addresses)
+        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+            original = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
+        source_members = await fixture.connection.fetch(
+            f'SELECT * FROM "{copy_target.schema_name}".network_membership_source ORDER BY location_id'
+        )
+        assert len(source_members) == 2
+        await _approve_composition_source_offices(fixture, original, copy_target, source_members, seed.actor)
+        # Replacement edition contains the first canonical office only.
+        office_a_id = await fixture.connection.fetchval(
+            f'SELECT address_key FROM "{fixture.source_schema}".entity_address_unified WHERE second_line=$1',
+            "Suite 2",
+        )
+        office_a = next(member for member in source_members if member["location_id"] == office_a_id)
+        office_b = next(member for member in source_members if member["location_id"] != office_a["location_id"])
+        unit_by_field = {
+            key: str(field_value) if key == "location_id" else field_value
+            for key, field_value in dict(office_a).items()
+        }
+        unit_by_field["evidence_id"] = "reviewed-office-intent"
+        context = (fixture, copy_targets, requests, office_a["network_id"])
+        command = membership_command(office_a["network_id"], [{**unit_by_field, "operation": "add"}])
+
+        await _assert_composition_intent_chain(
+            context, original, command, unit_by_field, office_a, office_b, replacement_aca_source, seed.actor
+        )
+        assert not await fixture.connection.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
+            "AND (relname LIKE 'registry_source_page_%' OR relname LIKE 'registry_command_%'))"
+        )
+    finally:
+        for request in requests:
+            await _remove_candidates(fixture, copy_targets, request)
+
+
+async def _approved_command_source(fixture):
+    seed = await _seed(fixture)
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        return await pin_approved_membership_source(
+            fixture.connection, approved_revision=seed.revision, control_schema=fixture.control_schema
+        )
+
+
+async def test_command_stage_scope_and_transaction_refusals_preserve_approved_source(custom_db):
+    fixture, request_id = custom_db, uuid4()
+    approved_source = await _approved_command_source(fixture)
+    token = uuid4().hex
+    stage = command_stages.RegistryMembershipCommandStage(
+        approved_source,
+        "registry_command_add_" + token,
+        "registry_command_remove_" + token,
+        approved_source.total_rows,
+        0,
+    )
+    for changes_by_field, message in (
+        ({"add_rows": True}, "registry_composition_command_stage_invalid"),
+        ({"add_table": "public.network_membership"}, "registry_composition_command_stage_invalid"),
+        ({"remove_table": "registry_command_remove_" + uuid4().hex}, "registry_composition_command_stage_invalid"),
+        ({"add_rows": approved_source.total_rows + 1}, "registry_composition_command_accounting_invalid"),
+    ):
+        with pytest.raises(command_stages.RegistrySourceRetentionError, match=message):
+            replace(stage, **changes_by_field)
+    with pytest.raises(command_stages.RegistrySourceRetentionError, match="registry_composition_command_stage_invalid"):
+        await command_stages.stage_approved_membership_commands(fixture.connection, approved_source, UUID(int=0))
+    with pytest.raises(command_stages.RegistrySourceRetentionError, match="registry_composition_requires_transaction"):
+        await command_stages.stage_approved_membership_commands(fixture.connection, approved_source, request_id)
+    with pytest.raises(command_stages.RegistrySourceRetentionError, match="registry_composition_command_stage_invalid"):
+        await command_stages.build_registry_source_retention(fixture.connection, None, stage)
+    with pytest.raises(command_stages.RegistrySourceRetentionError, match="registry_composition_requires_transaction"):
+        await command_stages.materialize_registry_composition(fixture.connection, None, stage)
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        assert (
+            await pin_approved_membership_source(
+                fixture.connection,
+                approved_revision=approved_source.approved_revision,
+                control_schema=fixture.control_schema,
+            )
+            == approved_source
+        )
+    assert not await fixture.connection.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
+        "AND relname LIKE 'registry_command_%')"
+    )
+
+
+@pytest.mark.parametrize("damage", ["source", "digest", "copy_status", "copy_position"])
+async def test_command_stage_real_document_and_copy_faults_rollback_heaps(custom_db, monkeypatch, damage):
+    fixture, request_id = custom_db, uuid4()
+    approved_source = await _approved_command_source(fixture)
+    read_commands = command_stages.read_approved_membership_commands
+    copy_statuses = []
+
+    async def changed_document(*args, **kwargs):
+        batch = await read_commands(*args, **kwargs)
+        if batch is not None and damage in {"source", "digest"}:
+            return replace(
+                batch,
+                **(
+                    {"source": replace(approved_source, generation_id="0" * 64)}
+                    if damage == "source"
+                    else {"input_sha256": "0" * 64}
+                ),
+            )
+        return batch
+
+    class CopyConnection:
+        def __getattr__(self, name):
+            return getattr(fixture.connection, name)
+
+        async def copy_to_table(self, *args, **kwargs):
+            copy_status = await fixture.connection.copy_to_table(*args, **kwargs)
+            copy_statuses.append(copy_status)
+            if damage == "copy_position":
+                kwargs["source"].seek(0)
+            return "COPY 0" if damage == "copy_status" else copy_status
+
+    monkeypatch.setattr(command_stages, "read_approved_membership_commands", changed_document)
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        await fixture.connection.execute("CREATE TEMP TABLE command_caller_work(value integer)")
+        await fixture.connection.execute("INSERT INTO command_caller_work VALUES(7)")
+        message = (
+            "registry_composition_command_stage_invalid"
+            if damage in {"source", "digest"}
+            else "registry_composition_command_copy_invalid"
+        )
+        with pytest.raises(command_stages.RegistrySourceRetentionError, match=message):
+            await command_stages.stage_approved_membership_commands(
+                CopyConnection(), approved_source, request_id, control_schema=fixture.control_schema
+            )
+        assert copy_statuses == ([] if damage in {"source", "digest"} else [f"COPY {approved_source.total_rows}"])
+        assert await fixture.connection.fetchval("SELECT value FROM command_caller_work") == 7
+        assert not await fixture.connection.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
+            "AND relname LIKE 'registry_command_%')"
+        )
+        monkeypatch.setattr(command_stages, "read_approved_membership_commands", read_commands)
+        stage = await command_stages.stage_approved_membership_commands(
+            fixture.connection, approved_source, request_id, control_schema=fixture.control_schema
+        )
+        assert (
+            await fixture.connection.fetchval(f'SELECT count(*) FROM pg_temp."{stage.add_table}"')
+            == approved_source.total_rows
+        )
+        await command_stages.drop_registry_command_stage(fixture.connection, stage)
+        assert await fixture.connection.fetchval("SELECT value FROM command_caller_work") == 7
+
+
+async def _assert_refused_materialization(fixture, copy_target, stage):
+    table = f'"{copy_target.schema_name}".network_membership'
+    with pytest.raises(command_stages.RegistrySourceRetentionError, match="registry_composition_effective_not_empty"):
+        async with fixture.connection.transaction():
+            await fixture.connection.execute(f'INSERT INTO {table} SELECT * FROM pg_temp."{stage.add_table}"')
+            await command_stages.materialize_registry_composition(
+                fixture.connection, copy_target, stage, control_schema=fixture.control_schema
+            )
+    assert await fixture.connection.fetchval(f"SELECT count(*) FROM {table}") == 0
+
+    class MisreportedInsert:
+        def __getattr__(self, name):
+            return getattr(fixture.connection, name)
+
+        async def execute(self, sql, *args):
+            status = await fixture.connection.execute(sql, *args)
+            return "INSERT 0 0" if sql.startswith("INSERT INTO " + table) else status
+
+    with pytest.raises(
+        command_stages.RegistrySourceRetentionError, match="registry_composition_command_accounting_invalid"
+    ):
+        async with fixture.connection.transaction():
+            await command_stages.materialize_registry_composition(
+                MisreportedInsert(), copy_target, stage, control_schema=fixture.control_schema
+            )
+    assert await fixture.connection.fetchval(f"SELECT count(*) FROM {table}") == 0
+    assert (await _initial_candidate(fixture, copy_target))["accepted_rows"] == 0
+
+
+async def _checked_command_retention(fixture, source_stage, stage):
+    for damaged in (replace(source_stage, table_name="public.network_membership"), None):
+        with pytest.raises(
+            command_stages.RegistrySourceRetentionError, match="registry_source_retention_stage_invalid"
+        ):
+            await command_stages.build_registry_source_retention(fixture.connection, damaged, stage)
+    with pytest.raises(
+        command_stages.RegistrySourceRetentionError, match="registry_composition_command_accounting_invalid"
+    ):
+        await command_stages.build_registry_source_retention(
+            fixture.connection, replace(source_stage, membership_rows=source_stage.membership_rows + 1), stage
+        )
+    return await command_stages.build_registry_source_retention(fixture.connection, source_stage, stage)
+
+
+async def test_command_stage_native_accounting_materialization_and_exact_cleanup(custom_db):
+    fixture, request_id = custom_db, uuid4()
+    approved_source = await _approved_command_source(fixture)
+    identity = uuid4()
+    copy_target = MembershipCopyTarget(
+        *(str(uuid4()) for _ in range(3)), str(identity), "network_candidate_" + identity.hex
+    )
+    try:
+        async with fixture.connection.transaction(isolation="repeatable_read"):
+            _, _, _, source_stage = await composition._composition_sources(
+                fixture.connection, None, approved_source, request_id, fixture.control_schema
+            )
+            stage = await command_stages.stage_approved_membership_commands(
+                fixture.connection, approved_source, request_id, control_schema=fixture.control_schema
+            )
+            retention = await _checked_command_retention(fixture, source_stage, stage)
+            candidate = await create_network_candidate(
+                fixture.connection,
+                copy_target,
+                source_generations={
+                    "custom_membership": approved_source.generation_id,
+                    composition.RETENTION_KEY: composition.registry_source_retention_sha256(retention),
+                },
+                approved_custom_revision=approved_source.approved_revision,
+                expected_head=0,
+                expected_rows=retention["effective_rows"],
+                source_retention=retention,
+                control_schema=fixture.control_schema,
+            )
+            with pytest.raises(
+                command_stages.RegistrySourceRetentionError, match="registry_source_retention_scope_invalid"
+            ):
+                await command_stages.verify_registry_composition_rows(
+                    fixture.connection, replace(copy_target, dataset_id=str(uuid4())), candidate, stage
+                )
+            await _assert_refused_materialization(fixture, copy_target, stage)
+            table = f'"{copy_target.schema_name}".network_membership'
+            await command_stages.materialize_registry_composition(
+                fixture.connection, copy_target, stage, control_schema=fixture.control_schema
+            )
+            assert (await _initial_candidate(fixture, copy_target))["accepted_rows"] == approved_source.total_rows
+            assert await fixture.connection.fetchval(f"SELECT count(*) FROM {table}") == approved_source.total_rows
+            await command_stages.drop_registry_command_stage(fixture.connection, stage)
+            for name in (stage.add_table, stage.remove_table):
+                assert await fixture.connection.fetchval("SELECT to_regclass($1)", f'pg_temp."{name}"') is None
+            assert (
+                await fixture.connection.fetchval("SELECT to_regclass($1)", f'pg_temp."{source_stage.table_name}"')
+                is not None
+            )
+            await fixture.connection.execute(f'DROP TABLE pg_temp."{source_stage.table_name}"')
+    finally:
+        await _remove_candidates(fixture, [copy_target], request_id)

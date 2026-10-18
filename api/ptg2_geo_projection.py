@@ -105,7 +105,8 @@ def _held_inheritance_sql(canonical_name):
     """A TIGER held leaf may inherit only its fixed canonical extension parent."""
     allowed_parent = (
         f" AND inhparent IS DISTINCT FROM to_regclass('{canonical_name}')"
-        if canonical_name in {"tiger.zip_state", "tiger.zcta5"} else ""
+        if canonical_name in {"tiger.zip_state", "tiger.zcta5"}
+        else ""
     )
     return (
         "NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits WHERE inhparent=held.oid "
@@ -148,8 +149,7 @@ def projection_dependency_lock_sql(schema_name: str, *, dependency_bindings=None
         ]
         return f"LOCK TABLE {', '.join(relations)} IN ACCESS SHARE MODE;"
     relations = (
-        f"{dependency_schema or schema_name}.{table_name}"
-        for dependency_schema, table_name in _PROJECTION_DEPENDENCIES
+        f"{dependency_schema or schema_name}.{table_name}" for dependency_schema, table_name in _PROJECTION_DEPENDENCIES
     )
     return f"LOCK TABLE {', '.join(relations)} IN ACCESS SHARE MODE;"
 
@@ -165,8 +165,10 @@ def projection_stored_bindings_sql(schema_name: str, column: str) -> tuple[str, 
         raise ValueError("geo projection binding column is invalid")
     names = [f"{schema or schema_name}.{table}" for schema, table in _PROJECTION_DEPENDENCIES]
     safe_object = f"CASE WHEN jsonb_typeof({column})='object' THEN {column} ELSE '{{}}'::jsonb END"
-    checks = [f"(SELECT count(*) FROM jsonb_object_keys({safe_object}))=6",
-              f"(SELECT count(DISTINCT value->>'relation_oid') FROM jsonb_each({safe_object}))=6"]
+    checks = [
+        f"(SELECT count(*) FROM jsonb_object_keys({safe_object}))=6",
+        f"(SELECT count(DISTINCT value->>'relation_oid') FROM jsonb_each({safe_object}))=6",
+    ]
     pairs = []
     for name in names:
         entry = f"({column}->'{name}')"
@@ -175,8 +177,13 @@ def projection_stored_bindings_sql(schema_name: str, column: str) -> tuple[str, 
             f"AND {entry}->>'table_name' ~ '^[A-Za-z_][A-Za-z0-9_]{{0,62}}$' "
             f"THEN to_regclass(format('%I.%I',{entry}->>'schema_name',{entry}->>'table_name')) END"
         )
-        pairs.extend((repr(name), f"jsonb_build_array(COALESCE(({physical})::oid::bigint,-1), "
-                     f"COALESCE(pg_relation_filenode({physical})::bigint,-1))"))
+        pairs.extend(
+            (
+                repr(name),
+                f"jsonb_build_array(COALESCE(({physical})::oid::bigint,-1), "
+                f"COALESCE(pg_relation_filenode({physical})::bigint,-1))",
+            )
+        )
         checks.append(
             f"(jsonb_typeof({entry})='object' AND "
             f"{entry} - ARRAY['schema_name','table_name','relation_oid','relfilenode']='{{}}'::jsonb "
@@ -260,8 +267,8 @@ def projection_external_evidence_ctes_sql(schema_name: str, *, dependency_bindin
           JOIN {mrf_relation} AS source_mrf
             ON source_mrf.npi = projection_target.npi
            AND source_mrf.address_key = projection_target.address_key
-           AND {independent_issuer_sql('source_mrf.source_issuer_names')}
-           AND {mrf_lineage_complete_sql('source_mrf')}
+           AND {independent_issuer_sql("source_mrf.source_issuer_names")}
+           AND {mrf_lineage_complete_sql("source_mrf")}
          WHERE projection_target.address_key IS NOT NULL
     ),"""
 
@@ -343,11 +350,11 @@ def mrf_lineage_complete_sql(alias: str) -> str:
     alias = _sql_identifier(alias, field_name="MRF address alias")
     return f"""(
         (
-            {nonblank_array_value_sql(f'{alias}.source_import_ids')}
+            {nonblank_array_value_sql(f"{alias}.source_import_ids")}
             OR {alias}.date_added IS NOT NULL
         )
         AND (
-            {nonblank_array_value_sql(f'{alias}.source_import_dates')}
+            {nonblank_array_value_sql(f"{alias}.source_import_dates")}
             OR {alias}.date_added IS NOT NULL
         )
     )"""
@@ -396,15 +403,18 @@ def evidence_level_from_source_id_sql(source_id_sql: str) -> str:
     END"""
 
 
-def _legacy_nppes_evidence_sql(alias: str, schema_name: str) -> str:
+def _legacy_nppes_evidence_sql(alias: str, schema_name: str, *, dependency_bindings=None) -> str:
     """Build the original record-complete NPPES predicate."""
 
+    relation = projection_dependency_relation_sql(
+        schema_name, f"{schema_name}.npi_address", dependency_bindings=dependency_bindings
+    )
     return f"""(
         ({alias}.address_source_mask & 1) <> 0
         AND {alias}.address_key IS NOT NULL
         AND EXISTS (
             SELECT 1
-              FROM {schema_name}.npi_address AS geo_nppes
+              FROM {relation} AS geo_nppes
              WHERE geo_nppes.npi = {alias}.npi
                AND geo_nppes.address_key = {alias}.address_key
                AND geo_nppes.date_added IS NOT NULL
@@ -412,16 +422,19 @@ def _legacy_nppes_evidence_sql(alias: str, schema_name: str) -> str:
     )"""
 
 
-def _legacy_mrf_evidence_sql(alias: str, schema_name: str) -> str:
+def _legacy_mrf_evidence_sql(alias: str, schema_name: str, *, dependency_bindings=None) -> str:
     """Build the original multi-issuer MRF predicate."""
 
+    relation = projection_dependency_relation_sql(
+        schema_name, f"{schema_name}.mrf_address", dependency_bindings=dependency_bindings
+    )
     return f"""EXISTS (
         SELECT 1
-          FROM {schema_name}.mrf_address AS geo_mrf
+          FROM {relation} AS geo_mrf
          WHERE geo_mrf.npi = {alias}.npi
            AND geo_mrf.address_key = {alias}.address_key
-           AND {independent_issuer_sql('geo_mrf.source_issuer_names')}
-           AND {mrf_lineage_complete_sql('geo_mrf')}
+           AND {independent_issuer_sql("geo_mrf.source_issuer_names")}
+           AND {mrf_lineage_complete_sql("geo_mrf")}
     )"""
 
 
@@ -429,24 +442,37 @@ def _legacy_cms_evidence_sql(
     alias: str,
     schema_name: str,
     unified_table_name: str,
+    *,
+    dependency_bindings=None,
+    unified_schema_name: str | None = None,
 ) -> str:
     """Build the original CMS predicate with its exact NPPES anchor."""
 
+    doctor_relation = projection_dependency_relation_sql(
+        schema_name, f"{schema_name}.doctor_clinician_address", dependency_bindings=dependency_bindings
+    )
+    npi_relation = projection_dependency_relation_sql(
+        schema_name, f"{schema_name}.npi_address", dependency_bindings=dependency_bindings
+    )
+    unified_relation = f"{schema_name}.{unified_table_name}"
+    if unified_schema_name is not None:
+        unified_schema_name = _sql_identifier(unified_schema_name, field_name="unified address schema")
+        unified_relation = f'"{unified_schema_name}"."{unified_table_name}"'
     return f"""(
         ({alias}.address_source_mask & 4) <> 0
         AND {alias}.address_key IS NOT NULL
         AND {alias}.premise_key IS NOT NULL
         AND EXISTS (
             SELECT 1
-              FROM {schema_name}.doctor_clinician_address AS geo_doctor
+              FROM {doctor_relation} AS geo_doctor
              WHERE geo_doctor.npi = {alias}.npi
                AND geo_doctor.address_key = {alias}.address_key
                AND geo_doctor.updated_at IS NOT NULL
         )
         AND EXISTS (
             SELECT 1
-              FROM {schema_name}.{unified_table_name} AS geo_nppes_anchor
-              JOIN {schema_name}.npi_address AS geo_nppes_anchor_source
+              FROM {unified_relation} AS geo_nppes_anchor
+              JOIN {npi_relation} AS geo_nppes_anchor_source
                 ON geo_nppes_anchor_source.npi = geo_nppes_anchor.npi
                AND geo_nppes_anchor_source.address_key = geo_nppes_anchor.address_key
                AND geo_nppes_anchor_source.date_added IS NOT NULL
@@ -465,6 +491,8 @@ def legacy_evidence_source_id_sql(
     *,
     schema_name: str,
     unified_table_name: str = "entity_address_unified",
+    dependency_bindings=None,
+    unified_schema_name: str | None = None,
 ) -> str:
     """Return the exact pre-projection evidence classifier for one address."""
 
@@ -475,12 +503,14 @@ def legacy_evidence_source_id_sql(
         field_name="unified address table",
     )
     return evidence_source_id_case_sql(
-        nppes_condition_sql=_legacy_nppes_evidence_sql(alias, schema_name),
-        mrf_condition_sql=_legacy_mrf_evidence_sql(alias, schema_name),
+        nppes_condition_sql=_legacy_nppes_evidence_sql(alias, schema_name, dependency_bindings=dependency_bindings),
+        mrf_condition_sql=_legacy_mrf_evidence_sql(alias, schema_name, dependency_bindings=dependency_bindings),
         cms_condition_sql=_legacy_cms_evidence_sql(
             alias,
             schema_name,
             unified_table_name,
+            dependency_bindings=dependency_bindings,
+            unified_schema_name=unified_schema_name,
         ),
     )
 
@@ -494,9 +524,7 @@ def projected_evidence_level_sql(
     """Prefer a valid stored evidence class and otherwise evaluate legacy SQL."""
 
     alias = _sql_identifier(alias, field_name="unified address alias")
-    projected_level = evidence_level_from_source_id_sql(
-        f"{alias}.geo_evidence_source_id"
-    )
+    projected_level = evidence_level_from_source_id_sql(f"{alias}.geo_evidence_source_id")
     return f"""CASE
         WHEN {projected_evidence_available_sql(alias, schema_name=schema_name)}
         THEN {projected_level}

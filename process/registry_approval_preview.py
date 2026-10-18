@@ -16,6 +16,7 @@ from process.registry_approval_store import (
 from process.registry_approved_company_groups import approved_company_group_diagnostics
 from process.registry_approved_membership import approved_membership_diagnostics
 from process.registry_imported_selection_preview import MAX_PREVIEW_COUNT, preview_imported_registry_selection
+from process.registry_ptg_office_membership import require_ptg_office_authority
 from process.registry_record_store import RegistryActor, _validated_actor
 from process.registry_source_observation_store import _namespace
 
@@ -65,7 +66,7 @@ async def _preview_document(connection, namespace, staging, command):
 
 
 async def preview_registry_approval(
-    connection, command: RegistryApprovalCommand, actor: RegistryActor, *, control_schema=None
+    connection, command: RegistryApprovalCommand, actor: RegistryActor, *, control_schema=None, office_authority=None
 ):
     """Compare exact selected versions without changing durable registry data.
 
@@ -77,10 +78,15 @@ async def preview_registry_approval(
     namespace = _namespace(control_schema)
     if not connection.is_in_transaction():
         raise ValueError("registry_approval_requires_caller_transaction")
+    control_lock = " FOR SHARE"
+    if office_authority is not None:
+        await require_ptg_office_authority(connection, namespace[1:-1], office_authority)
+        # The pre-snapshot shared approval fence protects the read-only source role.
+        control_lock = ""
     async with connection.transaction():
         selection_json = await _canonical_selection(connection, selection_json)
         control = await connection.fetchrow(
-            f"SELECT draft_revision,approved_revision,coalesce((SELECT generation_id FROM {namespace}.network_serving_control WHERE id=1),0) AS serving_generation FROM {namespace}.registry_revision_control WHERE id=1 FOR SHARE"
+            f"SELECT draft_revision,approved_revision,coalesce((SELECT generation_id FROM {namespace}.network_serving_control WHERE id=1),0) AS serving_generation FROM {namespace}.registry_revision_control WHERE id=1{control_lock}"
         )
         if control is None:
             raise RegistryApprovalConflict("registry_control_unavailable")
@@ -96,12 +102,19 @@ async def preview_registry_approval(
             connection, namespace, staging, command.expected_approved_revision
         )
         source_selection = await preview_imported_registry_selection(
-            connection, command, staging, control["serving_generation"], control_schema=control_schema
+            connection,
+            command,
+            staging,
+            control["serving_generation"],
+            control_schema=control_schema,
+            office_authority=office_authority,
         )
         company_groups = await approved_company_group_diagnostics(
             connection, namespace, staging, command.expected_approved_revision
         )
         await connection.execute(f"DROP TABLE {staging}")
+        if office_authority is not None:
+            await require_ptg_office_authority(connection, namespace[1:-1], office_authority)
         if preview_json is None:
             raise ValueError("registry_approval_preview_too_large")
         preview = json.loads(preview_json)

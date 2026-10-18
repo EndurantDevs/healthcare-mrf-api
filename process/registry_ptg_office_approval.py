@@ -65,7 +65,7 @@ async def _approved_source_review(session, *, scope_id, client_id, approval_sha2
     from process.registry_ptg_published_plan_scope import _read_protected_published_scope
 
     table = await _protected_store(session, store, write=True, table_name=SOURCE_TABLE)
-    return await _read_protected_published_scope(session, table, scope_id, client_id, approval_sha256)
+    return await _read_protected_published_scope(session, table, scope_id, client_id, approval_sha256, pin_writer=True)
 
 
 def _reader_roles(service):

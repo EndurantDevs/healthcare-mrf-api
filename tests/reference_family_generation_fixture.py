@@ -68,8 +68,13 @@ class ReferenceSourceCustody:
         self.schemas.add(ownership.schema_name)
         assert ownership.dataset_id not in self.precreated
         for table, oid in ownership.relation_oids:
+            owner = (
+                "CAST(:owner AS regrole)::oid"
+                if ownership.importer_id == "cms-doctors"
+                else "current_user::regrole::oid"
+            )
             assert await session.scalar(
-                text("SELECT relowner=current_user::regrole::oid FROM pg_class WHERE oid=:oid"), {"oid": oid}
+                text(f"SELECT relowner={owner} FROM pg_class WHERE oid=:oid"), {"oid": oid, "owner": self.owner}
             )
             assert not await session.scalar(text(f'SELECT EXISTS(SELECT 1 FROM "{ownership.schema_name}"."{table}")'))
             assert not await session.scalar(
@@ -172,13 +177,30 @@ class ReferenceSourceCustody:
 
 
 @asynccontextmanager
-async def native_reference_source(sessions, *, readers=()):
+async def native_reference_source(sessions, *, readers=(), owner=None):
     """Use a distinct registered NOLOGIN clone owner; never grant payload writes to Readers."""
-    owner = "reference_clone_owner_" + uuid4().hex
+    is_created = owner is None
+    owner = owner or "reference_clone_owner_" + uuid4().hex
     custody = ReferenceSourceCustody(owner, readers)
     try:
         async with sessions.begin() as session:
-            await session.execute(text(f'CREATE ROLE "{owner}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT'))
+            if is_created:
+                await session.execute(
+                    text(f'CREATE ROLE "{owner}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT')
+                )
+            else:
+                assert (
+                    await session.scalar(
+                        text(
+                            "SELECT NOT r.rolcanlogin AND NOT r.rolsuper AND NOT r.rolcreatedb AND NOT r.rolcreaterole "
+                            "AND NOT r.rolreplication AND NOT r.rolbypassrls "
+                            "AND session_user=current_user AND pg_has_role(session_user,r.oid,'SET') "
+                            "FROM pg_roles r WHERE r.rolname=:owner"
+                        ),
+                        {"owner": owner},
+                    )
+                    is True
+                )
         yield custody
     finally:
         async with sessions.begin() as session:
@@ -190,11 +212,15 @@ async def native_reference_source(sessions, *, readers=()):
                     from process import reference_family_archive as archive
 
                     ownership = next(
-                        value[1] for value in custody.precreated.values() if value[1].schema_name == schema
+                        precreated_entry[1]
+                        for precreated_entry in custody.precreated.values()
+                        if precreated_entry[1].schema_name == schema
                     )
                     await archive.verify_reference_family_stage_ownership(session, ownership)
                     expected = await session.scalar(text("SELECT CAST(:owner AS regrole)::oid"), {"owner": owner})
                     assert actual == expected
                     await session.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-            if await session.scalar(text("SELECT 1 FROM pg_roles WHERE rolname=:owner"), {"owner": owner}):
+            if is_created and await session.scalar(
+                text("SELECT 1 FROM pg_roles WHERE rolname=:owner"), {"owner": owner}
+            ):
                 await session.execute(text(f'DROP ROLE "{owner}"'))

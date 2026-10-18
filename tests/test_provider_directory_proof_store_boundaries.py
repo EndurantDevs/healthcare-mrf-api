@@ -19,14 +19,15 @@ from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
     resource_payload_sha256_for_contract,
 )
+from tests.provider_directory_proof_memory_support import proof_memory_authority as proof_memory_authority
 from tests.test_provider_directory_proof_store import (
     DATASET_ID,
     ENDPOINT_ID,
     ROOT_RUN_ID,
     SELECTED_RESOURCES,
     SOURCE_IDS,
-    _MemoryProofConnection,
     _dataset_resource,
+    _MemoryProofConnection,
 )
 
 
@@ -109,9 +110,7 @@ def test_batch_shard_rejects_conflicts_empty_lineage_and_mixed_families():
 def test_row_mapping_accepts_none_mapping_and_record_wrapper():
     assert proof_store._row_mapping(None) == {}
     assert proof_store._row_mapping({"a": 1}) == {"a": 1}
-    assert proof_store._row_mapping(SimpleNamespace(_mapping={"b": 2})) == {
-        "b": 2
-    }
+    assert proof_store._row_mapping(SimpleNamespace(_mapping={"b": 2})) == {"b": 2}
     assert proof_store._row_mapping(object()) == {}
 
 
@@ -209,11 +208,9 @@ def _semantic_resource(resource_type, resource_id, payload):
         resource_id,
         payload,
     )
-    resource_row_by_field["payload_hash"] = (
-        resource_payload_sha256_for_contract(
-            payload,
-            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-        )
+    resource_row_by_field["payload_hash"] = resource_payload_sha256_for_contract(
+        payload,
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
     )
     return resource_row_by_field
 
@@ -316,9 +313,7 @@ async def test_stored_semantic_proof_rejects_extra_resource_family():
             selected_resources=["Practitioner"],
             options=ProviderDirectoryStoredProofOptions(
                 proof_resource_scope=["Practitioner"],
-                expected_resource_hash_contract=(
-                    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-                ),
+                expected_resource_hash_contract=(SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
                 expected_semantic_projection_as_of="2026-08-09",
             ),
         )
@@ -359,9 +354,7 @@ async def test_persisted_shard_replay_rejects_mutated_stored_fields():
         [resource_row_by_field],
         dataset_id=DATASET_ID,
     )
-    connection.shards[(DATASET_ID, descriptor_by_field["shard_id"])][
-        "endpoint_id"
-    ] = "changed"
+    connection.shards[(DATASET_ID, descriptor_by_field["shard_id"])]["endpoint_id"] = "changed"
 
     with pytest.raises(ProviderDirectoryProofStoreError, match="replay changed"):
         await persist_dataset_proof_shard(

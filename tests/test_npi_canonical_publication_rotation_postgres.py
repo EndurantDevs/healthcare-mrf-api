@@ -34,9 +34,9 @@ from tests.npi_canonical_publication_postgres_support import (
     CANONICAL_TABLES,
     canonical_relation_state,
     create_canonical_stage_tables,
-    npi_publication_schema,
     rotate_canonical_stage_tables,
 )
+from tests.nppes_candidate_postgres_support import nppes_candidate_publication_schema as npi_publication_schema
 from tests.provider_profile_snapshot_postgres_support import grant_profile_reader, profile_reader
 from tests.public_evidence_nppes_admission_postgres_support import (
     admit_chain,
@@ -84,8 +84,8 @@ async def _insert_running_attempt(
     }
     await connection.execute(
         f"INSERT INTO {qualified(schema_name, 'import_run')} "
-        "(run_id, importer, status, phase_detail, heartbeat_at, progress, metrics) "
-        "VALUES ($1, 'npi', 'running', 'process_data running', "
+        "(run_id, engine, importer, status, phase_detail, heartbeat_at, progress, metrics) "
+        "VALUES ($1, 'python', 'npi', 'running', 'process_data running', "
         "transaction_timestamp() AT TIME ZONE 'UTC', $2::json, '{}'::json)",
         RUN_ID,
         json.dumps(progress_by_name),
@@ -535,6 +535,12 @@ async def test_npi_rotation_completes_with_continuous_snapshot_readers(tmp_path,
                 entered.set()
 
         try:
+            reader_role = fixture.database._reader_database._reader_login[0]
+            assert not await connection.fetchval(
+                "SELECT has_table_privilege($1, $2, 'SELECT') OR has_any_column_privilege($1, $2, 'SELECT')",
+                reader_role,
+                qualified(schema, "cms_native_input_revision"),
+            )
             setup = await _prepare_rotation(connection, schema, tmp_path)
             await grant_profile_reader(fixture.database, schema, setup.stage_table_by_live.values())
             tasks = [asyncio.create_task(read()) for _ in range(3)]

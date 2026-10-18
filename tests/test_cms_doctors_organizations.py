@@ -40,6 +40,8 @@ def _mock_publication(monkeypatch, failure):
         return record_call
 
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "source_transaction", _unit_source_transaction)
+    monkeypatch.setattr(cms_doctors, "_create_stage_indexes", AsyncMock())
     monkeypatch.setattr(cms_doctors.db, "scalar", AsyncMock(return_value=20000))
     for name, attribute in (
         ("education", "validate_education_stage"),
@@ -55,6 +57,12 @@ def _mock_publication(monkeypatch, failure):
     monkeypatch.setattr(cms_doctors, "mark_control_run", AsyncMock())
     monkeypatch.setattr(cms_doctors, "print_time_info", Mock())
     return calls
+
+
+@asynccontextmanager
+async def _unit_source_transaction(*args, **kwargs):
+    """Unit boundary only; native principal and physical session need integration proof."""
+    yield object()
 
 
 @pytest.mark.asyncio
@@ -89,37 +97,17 @@ async def test_unowned_group_stage_cannot_create_identities():
 
 
 @pytest.mark.asyncio
-async def test_cancellation_rolls_back_only_current_identity_batch(monkeypatch):
-    events = []
-
-    @asynccontextmanager
-    async def transaction():
-        yield object()
-
-    @asynccontextmanager
-    async def binding_session():
-        try:
-            yield object()
-        except ImportCancelledError:
-            events.append("rollback")
-            raise
-        events.append("commit")
-
-    async def check_cancel(ctx, task):
-        assert task == {"run_id": "synthetic-run"}
-        if events.count("bind") == 2:
-            raise ImportCancelledError("cancelled")
-
-    async def bind_batch(session, *, org_pac_ids):
-        events.append("bind")
-
-    monkeypatch.setattr(organizations.db, "transaction", transaction)
-    monkeypatch.setattr(organizations.db, "session", binding_session)
-    monkeypatch.setattr(organizations, "_lock_group_stage", AsyncMock(return_value=1))
-    monkeypatch.setattr(organizations, "validate_group_site_stage", AsyncMock())
-    monkeypatch.setattr(organizations, "_read_group_page", AsyncMock(side_effect=[["001"], ["002"]]))
-    monkeypatch.setattr(organizations, "bind_cms_doctors_group_batch", bind_batch)
-    monkeypatch.setattr(organizations, "raise_if_cancelled", check_cancel)
-    with pytest.raises(ImportCancelledError):
-        await organizations.bind_group_site_organizations(_publication_context(), "bindingcancel", "mrf", {})
-    assert events == ["bind", "commit", "bind", "rollback"]
+@pytest.mark.parametrize("failure", [ImportCancelledError("cancelled"), RuntimeError("preparation failed")])
+async def test_private_identity_failure_cleans_cohort_without_global_publication(monkeypatch, failure):
+    calls = _mock_publication(monkeypatch, None)
+    cleanup = AsyncMock()
+    monkeypatch.setattr(cms_doctors, "bind_cms_doctors_sites", AsyncMock(side_effect=failure))
+    monkeypatch.setattr(cms_doctors, "discard_doctors_identities", cleanup)
+    monkeypatch.setattr(cms_doctors, "discard_group_site_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "discard_education_stage", AsyncMock())
+    ctx = _publication_context()
+    with pytest.raises(type(failure)):
+        await cms_doctors.publish_cms_doctors_generation(ctx)
+    assert calls == ["education", "group", "artifact", "binding"]
+    cms_doctors._publish_cms_doctors_stage.assert_not_awaited()
+    cleanup.assert_awaited_once_with(cms_doctors.db, ctx)

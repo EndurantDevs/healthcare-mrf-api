@@ -444,3 +444,60 @@ fn batch_bounds_and_malformed_input_reject_without_partial_results() {
     let cleared = validate_company_network_assertions(b"[]").unwrap();
     assert!(cleared.assertions.is_empty() && cleared.conflicts.is_empty());
 }
+
+#[test]
+fn omitted_and_empty_benefit_selections_preserve_legacy_output() {
+    let legacy = validate(&[row()]).unwrap();
+    assert_eq!(serde_json::to_value(&legacy.assertions[0]).unwrap(), row());
+    let mut empty = row();
+    empty["benefit_plan_ids"] = json!([]);
+    assert_eq!(validate(&[empty]).unwrap(), legacy);
+}
+
+#[test]
+fn selected_benefits_are_exact_sorted_permanent_family_ids() {
+    let identities: Vec<_> = (0..512)
+        .map(|index| format!("hpplan_{index:026}"))
+        .collect();
+    let mut assertion = row();
+    assertion["benefit_plan_ids"] = json!(identities);
+    let validated = validate(&[assertion.clone()]).unwrap();
+    assert_eq!(validated.assertions[0].benefit_plan_ids, identities);
+    assert_eq!(
+        serde_json::to_value(&validated.assertions[0]).unwrap(),
+        assertion
+    );
+    for invalid in [
+        json!(null),
+        json!(true),
+        json!("hpplan_00000000000000000000000000"),
+        json!([true]),
+        json!([format!("hpversion_{}", "0".repeat(26))]),
+        json!([format!("hprelease_{}", "0".repeat(26))]),
+        json!([format!("hpplan_{}", "i".repeat(26))]),
+        json!([format!("hpplan_{}", "I".repeat(26))]),
+        json!([format!("hpplan_{}", "0".repeat(25))]),
+        json!([format!("hpplan_{} ", "0".repeat(26))]),
+        json!([identities[0], identities[0]]),
+        json!([identities[1], identities[0]]),
+        json!((0..513)
+            .map(|index| format!("hpplan_{index:026}"))
+            .collect::<Vec<_>>()),
+    ] {
+        assertion["benefit_plan_ids"] = invalid;
+        assert!(validate(&[assertion.clone()]).is_err());
+    }
+}
+
+#[test]
+fn distinct_benefit_selections_do_not_bypass_existing_overlap_review() {
+    let mut first = row();
+    first["benefit_plan_ids"] = json!([format!("hpplan_{}", "0".repeat(26))]);
+    let mut second = row();
+    second["benefit_plan_ids"] = json!([format!("hpplan_{}", "1".repeat(26))]);
+    let output = validate(&[first.clone(), second.clone()]).unwrap();
+    assert_eq!(output.assertions.len(), 2);
+    assert_eq!(output.conflicts.len(), 1);
+    assert_eq!(output.conflicts[0].code, "overlapping_periods");
+    assert_eq!(output, validate(&[second, first]).unwrap());
+}

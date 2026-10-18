@@ -6,19 +6,23 @@ import importlib
 import json
 import os
 from compression import zstd
-from contextlib import aclosing
+from contextlib import aclosing, asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 from uuid import uuid4
 
 import asyncpg
 import pytest
 import pytest_asyncio
+from asyncpg.prepared_stmt import PreparedStatement
 from sqlalchemy import event
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 
+from db.plan_release_storage import storage_relation
 from process import provider_directory_cms_npd as cms
 from process import provider_directory_cms_serving_coverage as coverage
+from process import provider_directory_generic_source_storage as source_storage
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.network_fhir_source_custody import (
     FHIRSourceCustodyError,
@@ -26,39 +30,71 @@ from process.network_fhir_source_custody import (
     require_retained_cms_fhir_source_custody,
 )
 from process.provider_directory_cms_resource_batch import persist_cms_dataset_rows
-from process.provider_directory_source_local_publication import publish_validated_source_local_dataset
+from process.provider_directory_generic_candidate import GenericCandidateError
+from process.provider_directory_generic_source_completion import complete_generic_source_candidate
+from process.provider_directory_generic_source_policy import (
+    bind_generic_source_transaction_factory,
+    bound_publisher,
+    source_transaction,
+)
 from tests import cms_npd_admission_postgres_support as support
-from tests.test_cms_npd_candidate_coverage_postgres import _stage
+from tests.cms_retained_legacy_postgres_support import (
+    assert_legacy_candidate_coverage,
+    publish_legacy_retained_source,
+    stage_legacy_retained_source,
+)
 
 fhir = support.fhir
 
 
-@pytest_asyncio.fixture(scope="module", loop_scope="module", autouse=True)
-async def cms_resource_template(request):
-    """Register exact native database cleanup before migration or test writes."""
+@asynccontextmanager
+async def _cms_source_scope():
+    """Keep a strict owned admission URL and the Source template lifetime together."""
+    from tests.provider_directory_source_postgres_support import source_component_templates
+
     configured = os.getenv("NETWORK_REGISTRY_TEST_DSN")
     if not configured:
         pytest.skip("set NETWORK_REGISTRY_TEST_DSN for the native CMS resource proof")
     source_url = make_url(configured).set(drivername="postgresql+asyncpg")
     assert source_url.host in {"127.0.0.1", "localhost"} and source_url.port is not None
-    async with support._owned_database(source_url) as (database_url, _admin):
+    async with support._owned_database(source_url) as (database_url, _admin), source_component_templates():
         with pytest.MonkeyPatch.context() as settings:
             settings.setenv(support._DSN_ENV, database_url.render_as_string(hide_password=False))
-            async with aclosing(support.cms_admission_template.__wrapped__(request)) as baseline:
-                await anext(baseline)
-                yield
+            assert support._database_url() == database_url
+            yield
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def cms_source_template():
+    """Keep the Source envelope without building an unused ordinary admission database."""
+    async with _cms_source_scope():
+        yield
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module", autouse=True)
+async def cms_resource_template(request):
+    """Register exact native database cleanup before migration or test writes."""
+    async with _cms_source_scope():
+        async with aclosing(support.cms_admission_template.__wrapped__(request)) as baseline:
+            await anext(baseline)
+            yield
 
 
 @pytest_asyncio.fixture
 async def resource_candidate(monkeypatch, tmp_path):
-    """Acquire a synthetic edition and create its actual isolated mutable parent."""
+    """Acquire through real Publisher/Owner roles after the administrator cut."""
     directory, receipt = support.retained_release(tmp_path)
-    async with support.admission_database(monkeypatch) as database:
-        endpoint_id = await cms._register_source(fhir)
-        candidate = await cms._admission_candidate(
-            fhir, endpoint_id, "resource-copy-proof", cms.release_identity(receipt), {}
-        )
-        yield database, candidate, directory
+    async with support.protected_admission_database(monkeypatch) as administrator:
+        component = administrator._source_component
+        database = component.database
+        assert database is fhir.db and database.engine is not component.admin_engine
+        async with bind_generic_source_transaction_factory(component.factory):
+            async with source_transaction(database):
+                endpoint_id = await cms._register_source(fhir)
+                candidate = await cms._admission_candidate(
+                    fhir, endpoint_id, "resource-copy-proof", cms.release_identity(receipt), {}
+                )
+            yield database, candidate, directory
 
 
 async def _write(candidate, resources):
@@ -69,19 +105,88 @@ async def _write(candidate, resources):
 
 
 async def _snapshot(database, candidate):
-    return await database.all(
-        "SELECT r.resource_type,r.resource_id,r.payload_hash,r.payload_json::text,"
-        "w.raw_payload_json::text,w.raw_payload_sha256,w.normalized_payload_hash "
-        "FROM mrf.provider_directory_dataset_resource r "
-        "LEFT JOIN mrf.provider_directory_cms_npd_resource_witness w "
-        "USING(dataset_id,resource_type,resource_id) WHERE r.dataset_id=:dataset_id "
-        "ORDER BY r.resource_type,r.resource_id",
-        dataset_id=candidate.dataset_id,
-    )
+    """Inspect genuine completion, then roll back its DDL and exact loading binding."""
+    async with source_transaction(database):
+        publisher = bound_publisher()
+        connection, policy = publisher.connection, publisher.policy
+        identity = source_storage.candidate_identity(fhir, candidate)
+        before = await source_storage._locked(connection, policy, identity)
+        probe = connection.transaction()
+        await probe.start()
+        try:
+            completed = await complete_generic_source_candidate(database, fhir, candidate)
+            resource = storage_relation(policy.schema, completed["tables"][source_storage.RESOURCE]["name"])
+            witness = storage_relation(policy.schema, completed["tables"][source_storage.WITNESS]["name"])
+            snapshot_rows = await database.all(
+                "SELECT r.resource_type,r.resource_id,r.payload_hash,r.payload_json::text,"
+                "w.raw_payload_json::text,w.raw_payload_sha256,w.normalized_payload_hash "
+                f"FROM {resource} r LEFT JOIN {witness} w "
+                "USING(dataset_id,resource_type,resource_id) WHERE r.dataset_id=:dataset_id "
+                "ORDER BY r.resource_type,r.resource_id",
+                dataset_id=candidate.dataset_id,
+            )
+            for root in (source_storage.RESOURCE, source_storage.WITNESS):
+                assert (
+                    await connection.fetchval(
+                        f"SELECT count(*) FROM {storage_relation(policy.schema, root)} WHERE dataset_id=$1",
+                        candidate.dataset_id,
+                    )
+                    == 0
+                )
+            return snapshot_rows
+        finally:
+            await probe.rollback()
+            assert await source_storage._locked(connection, policy, identity) == before
+            await source_storage._verify_tables(connection, policy, before)
 
 
 def _forbid_values(*_args, **_kwargs):
     raise AssertionError("CMS batches must not use VALUES fallback")
+
+
+@contextmanager
+def _native_operation_counters(database, monkeypatch):
+    """Observe top-level native SQL/COPY and the original SQLAlchemy metric separately."""
+    copied_tables, statements, native_statements = [], [], []
+    native_depth = ContextVar("cms_copy_operation_depth", default=0)
+    original_copy = asyncpg.Connection.copy_records_to_table
+
+    async def tracked_copy(connection, table, *args, **kwargs):
+        copied_tables.append(table)
+        token = native_depth.set(native_depth.get() + 1)
+        try:
+            return await original_copy(connection, table, *args, **kwargs)
+        finally:
+            native_depth.reset(token)
+
+    def track_statement(_connection, _cursor, statement, _params, _context, _many):
+        statements.append(statement)
+
+    def track_native(original, *, prepared=False):
+        async def tracked(connection, *args, **kwargs):
+            if native_depth.get() == 0:
+                native_statements.append(connection.get_query() if prepared else args[0])
+            token = native_depth.set(native_depth.get() + 1)
+            try:
+                return await original(connection, *args, **kwargs)
+            finally:
+                native_depth.reset(token)
+
+        return tracked
+
+    with monkeypatch.context() as observations:
+        observations.setattr(asyncpg.Connection, "copy_records_to_table", tracked_copy)
+        for method in ("execute", "executemany", "fetch", "fetchrow", "fetchval"):
+            observations.setattr(asyncpg.Connection, method, track_native(getattr(asyncpg.Connection, method)))
+        for method in ("executemany", "fetch", "fetchrow", "fetchval"):
+            observations.setattr(
+                PreparedStatement, method, track_native(getattr(PreparedStatement, method), prepared=True)
+            )
+        event.listen(database.engine.sync_engine, "before_cursor_execute", track_statement)
+        try:
+            yield copied_tables, statements, native_statements
+        finally:
+            event.remove(database.engine.sync_engine, "before_cursor_execute", track_statement)
 
 
 async def test_one_and_thousand_resources_have_fixed_native_operations(
@@ -91,21 +196,14 @@ async def test_one_and_thousand_resources_have_fixed_native_operations(
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT", "false")
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS", "2000")
     monkeypatch.setattr(fhir, "_upsert_rows_values", _forbid_values)
-    original_copy = fhir._copy_upsert_rows
-    copied_models = []
-    statements = []
-
-    async def tracked_copy(model, *args, **kwargs):
-        copied_models.append(model.__tablename__)
-        return await original_copy(model, *args, **kwargs)
-
-    def track_statement(_connection, _cursor, statement, _params, _context, _many):
-        statements.append(statement)
-
-    monkeypatch.setattr(fhir, "_copy_upsert_rows", tracked_copy)
-    event.listen(database.engine.sync_engine, "before_cursor_execute", track_statement)
-    try:
-        operation_counts = []
+    async with source_transaction(database):
+        publisher = bound_publisher()
+        binding = await source_storage._locked(
+            publisher.connection, publisher.policy, source_storage.candidate_identity(fhir, candidate)
+        )
+        expected_tables = [binding["tables"][key]["name"] for key in ("resource_input", "witness_input")]
+    operation_counts, native_counts = [], []
+    with _native_operation_counters(database, monkeypatch) as (copied_tables, statements, native_statements):
         for batch_size in (1, 1_000):
             resources = [
                 {
@@ -117,22 +215,21 @@ async def test_one_and_thousand_resources_have_fixed_native_operations(
                 for ordinal in range(batch_size)
             ]
             statements.clear()
-            copied_models.clear()
+            copied_tables.clear()
+            native_statements.clear()
             await _write(candidate, resources)
-            operation_counts.append(len(statements) + len(copied_models))
-            assert copied_models == [
-                "provider_directory_dataset_resource",
-                "provider_directory_cms_npd_resource_witness",
-            ]
+            operation_counts.append(len(statements) + len(copied_tables))
+            native_counts.append(len(native_statements) + len(copied_tables))
+            assert copied_tables == expected_tables
             assert not any(
                 "INSERT INTO" in statement and "VALUES" in statement and "dataset_resource" in statement
-                for statement in statements
+                for statement in (*statements, *native_statements)
             )
+        record_property("sql_and_copy_operation_counts", json.dumps(operation_counts))
+        record_property("native_sql_and_copy_operation_counts", json.dumps(native_counts))
         assert operation_counts[0] == operation_counts[1]
         assert operation_counts[0] <= 20
-        record_property("sql_and_copy_operation_counts", json.dumps(operation_counts))
-    finally:
-        event.remove(database.engine.sync_engine, "before_cursor_execute", track_statement)
+        assert native_counts[0] == native_counts[1]
     snapshot = await _snapshot(database, candidate)
     assert len(snapshot) == 1_001 and all(stored_row[2] == stored_row[6] for stored_row in snapshot)
     assert all(json.loads(stored_row[4])["partOf"] == {"reference": "Location/parent"} for stored_row in snapshot)
@@ -168,25 +265,26 @@ async def test_all_eight_families_preserve_raw_and_normalized_payloads(resource_
 @pytest.mark.parametrize("failure_phase", ["before_copy", "after_normalized_copy", "after_witness_copy"])
 async def test_copy_errors_propagate_and_rollback_without_fallback(resource_candidate, monkeypatch, failure_phase):
     database, candidate, _directory = resource_candidate
-    original_copy = fhir._copy_upsert_rows
+    original_copy = asyncpg.Connection.copy_records_to_table
     monkeypatch.setattr(fhir, "_upsert_rows_values", _forbid_values)
 
-    async def failed_copy(model, *args, **kwargs):
+    async def failed_copy(connection, table, *args, **kwargs):
         if failure_phase == "before_copy":
             raise RuntimeError("synthetic_copy_failure")
-        result = await original_copy(model, *args, **kwargs)
+        result = await original_copy(connection, table, *args, **kwargs)
         if (
             failure_phase == "after_normalized_copy"
-            and model is fhir.ProviderDirectoryDatasetResource
+            and table.endswith("_ri")
             or failure_phase == "after_witness_copy"
-            and model is cms.ProviderDirectoryCMSNPDResourceWitness
+            and table.endswith("_wi")
         ):
             raise RuntimeError("synthetic_copy_failure")
         return result
 
-    monkeypatch.setattr(fhir, "_copy_upsert_rows", failed_copy)
-    with pytest.raises(RuntimeError, match="synthetic_copy_failure"):
-        await _write(candidate, [{"resourceType": "Location", "id": "office"}])
+    with monkeypatch.context() as failures:
+        failures.setattr(asyncpg.Connection, "copy_records_to_table", failed_copy)
+        with pytest.raises(RuntimeError, match="synthetic_copy_failure"):
+            await _write(candidate, [{"resourceType": "Location", "id": "office"}])
     assert await _snapshot(database, candidate) == []
     assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_dataset_proof_shard") == 0
 
@@ -196,13 +294,15 @@ async def test_raw_conflict_and_caller_rollback_preserve_all_tables(resource_can
     resource_by_field = {"resourceType": "Location", "id": "office", "name": "Example", "unmapped": "First"}
     await _write(candidate, [resource_by_field])
     baseline = await _snapshot(database, candidate)
-    with pytest.raises(RuntimeError, match="cms_npd_witness_payload_conflict"):
-        await _write(
-            candidate, [{**resource_by_field, "id": "new-office"}, {**resource_by_field, "unmapped": "Changed"}]
-        )
+    with pytest.raises(GenericCandidateError, match="witness_replay_conflict"):
+        async with source_transaction(database):
+            await _write(
+                candidate, [{**resource_by_field, "id": "new-office"}, {**resource_by_field, "unmapped": "Changed"}]
+            )
+            await _snapshot(database, candidate)
     assert await _snapshot(database, candidate) == baseline
     with pytest.raises(RuntimeError, match="synthetic_caller_rollback"):
-        async with database.transaction():
+        async with source_transaction(database):
             await _write(candidate, [{**resource_by_field, "id": "new-office"}])
             raise RuntimeError("synthetic_caller_rollback")
     assert await _snapshot(database, candidate) == baseline
@@ -215,7 +315,7 @@ async def test_candidate_hash_and_projection_fences_remain_required(resource_can
         replace(candidate, resource_hash_contract=fhir.LEGACY_RESOURCE_HASH_CONTRACT),
         replace(candidate, semantic_projection_as_of="2024-01-01"),
     ):
-        with pytest.raises(RuntimeError, match="(hash_contract|projection_date)_changed"):
+        with pytest.raises(GenericCandidateError, match="acquisition_changed"):
             await _write(altered, [resource_by_field])
     assert await _snapshot(database, candidate) == []
 
@@ -227,9 +327,10 @@ async def test_native_driver_error_is_not_a_values_fallback(resource_candidate, 
     async def failed_driver_copy(_connection, _table_name, **_kwargs):
         raise OSError("synthetic_native_copy_failure")
 
-    monkeypatch.setattr(asyncpg.Connection, "copy_records_to_table", failed_driver_copy)
-    with pytest.raises(OSError, match="synthetic_native_copy_failure"):
-        await _write(candidate, [{"resourceType": "Location", "id": "office"}])
+    with monkeypatch.context() as failures:
+        failures.setattr(asyncpg.Connection, "copy_records_to_table", failed_driver_copy)
+        with pytest.raises(OSError, match="synthetic_native_copy_failure"):
+            await _write(candidate, [{"resourceType": "Location", "id": "office"}])
     assert await _snapshot(database, candidate) == []
 
 
@@ -249,7 +350,7 @@ async def test_late_invalid_raw_evidence_rolls_back_the_complete_batch(resource_
 async def test_changed_edition_cannot_attach_witnesses_to_another_release(resource_candidate):
     database, candidate, _directory = resource_candidate
     altered_candidate = replace(candidate, source_release={**candidate.source_release, "vector_sha256": "0" * 64})
-    with pytest.raises(DBAPIError, match="cms_npd_resource_witness_immutable"):
+    with pytest.raises(GenericCandidateError, match="acquisition_changed"):
         await _write(altered_candidate, [{"resourceType": "Location", "id": "office"}])
     assert await _snapshot(database, candidate) == []
 
@@ -257,9 +358,10 @@ async def test_changed_edition_cannot_attach_witnesses_to_another_release(resour
 async def test_batch_requires_the_same_caller_transaction(resource_candidate):
     database, candidate, _directory = resource_candidate
     model, parsed_by_field = cms._parse_batch_row(fhir, {"resourceType": "Location", "id": "office"}, candidate)
-    async with database.session() as session:
-        with pytest.raises(RuntimeError, match="cms_npd_resource_batch_transaction_missing"):
-            await persist_cms_dataset_rows(fhir, session, model, [parsed_by_field], candidate)
+    async with source_transaction(database):
+        async with database.session_factory() as other_session:
+            with pytest.raises(RuntimeError, match="cms_npd_resource_batch_transaction_missing"):
+                await persist_cms_dataset_rows(fhir, other_session, model, [parsed_by_field], candidate)
     assert await _snapshot(database, candidate) == []
 
 
@@ -283,7 +385,7 @@ async def test_stream_preappend_bounds_and_cancellation_rollback(resource_candid
     monkeypatch.setattr(cms, "_persist_source_batch", tracked_persist)
     monkeypatch.setattr(fhir, "_raise_if_resource_import_cancelled", cancelled)
     with pytest.raises(asyncio.CancelledError, match="synthetic_cancelled"):
-        async with database.transaction():
+        async with source_transaction(database):
             await cms._stream_file(fhir, path, candidate, "Location", {}, {})
     assert batch_counts == [1]
     assert await _snapshot(database, candidate) == []
@@ -334,18 +436,9 @@ async def test_retained_cms_custody_native_closure(monkeypatch, tmp_path, damage
     async with support.admission_database(
         monkeypatch, migration_prefixes=support.LEGACY_MIGRATION_PREFIXES
     ) as database:
-        candidate, release, digest = await _stage(monkeypatch, tmp_path)
-        await publish_validated_source_local_dataset(
-            fhir,
-            candidate,
-            "cms-npd",
-            before_cutover=lambda session: coverage.validate_cms_candidate_coverage(
-                session, candidate.dataset_id, release
-            ),
-            before_cutover_timeout_seconds=60,
-            after_promotion=lambda: coverage.seal_cms_candidate_coverage(fhir, candidate, release, digest),
-        )
-        await coverage.prepare_cms_candidate_coverage(fhir, candidate, release, digest)
+        candidate, release, digest = await stage_legacy_retained_source(monkeypatch, tmp_path, database)
+        await publish_legacy_retained_source(database, candidate, release, digest)
+        await assert_legacy_candidate_coverage(database, candidate, release, digest)
         async with database.session() as session:
             driver = (await (await session.connection()).get_raw_connection()).driver_connection
             try:
@@ -636,8 +729,8 @@ async def test_native_retained_cms_epoch_closes_independent_custody(monkeypatch,
                 'ALTER COLUMN resource_id TYPE varchar(256) COLLATE "en-x-icu"'
             )
             monkeypatch.setattr(fhir, "ENDPOINT_DATASET_HASH_BATCH_SIZE", 2)
-        candidate, release, digest = await _stage(monkeypatch, tmp_path)
-        await coverage.prepare_cms_candidate_coverage(fhir, candidate, release, digest)
+        candidate, release, digest = await stage_legacy_retained_source(monkeypatch, tmp_path, database)
+        await assert_legacy_candidate_coverage(database, candidate, release, digest)
         async with database.session() as session:
             driver = (await (await session.connection()).get_raw_connection()).driver_connection
             await session.commit()
@@ -676,22 +769,13 @@ async def test_native_retained_cms_epoch_closes_independent_custody(monkeypatch,
 
 async def test_native_epoch_full_profile_keeps_live_publication_guard(monkeypatch, tmp_path):
     """Epoch admission does not substitute for the fresh live CMS composite receipt."""
-    async with support.admission_database(monkeypatch):
-        candidate, release, digest = await _stage(monkeypatch, tmp_path)
+    async with support.admission_database(monkeypatch) as database:
+        candidate, release, digest = await stage_legacy_retained_source(monkeypatch, tmp_path, database)
         with pytest.raises(DBAPIError, match="cms_serving_fresh_receipt_required"):
-            await publish_validated_source_local_dataset(
-                fhir,
-                candidate,
-                "cms-npd",
-                before_cutover=lambda session: coverage.validate_cms_candidate_coverage(
-                    session, candidate.dataset_id, release
-                ),
-                before_cutover_timeout_seconds=60,
-                after_promotion=lambda: coverage.seal_cms_candidate_coverage(fhir, candidate, release, digest),
-            )
+            await publish_legacy_retained_source(database, candidate, release, digest)
 
 
-@pytest.mark.parametrize("damage", [None, "payload", "seal", "current"])
+@pytest.mark.parametrize("damage", [None, "binding", "seal", "current"])
 async def test_registry_admission_handoff_preserves_independent_completion(monkeypatch, tmp_path, damage):
     """Emit actual completed proof inputs, replay exactly, and reject changed proof material."""
     directory, acquired = support.retained_release(tmp_path)
@@ -705,40 +789,46 @@ async def test_registry_admission_handoff_preserves_independent_completion(monke
         return seal
 
     monkeypatch.setattr(fhir, "_store_validated_endpoint_dataset", observed_store)
-    async with support.admission_database(monkeypatch) as database:
-        with support.release_probe_client(directory) as client:
-            initial = await cms._run_acquired({"context": {}}, {}, "registry-proof", directory, acquired, client)
-            receipt = initial["registry_source_admission"]
-            seal = completed_seals[-1]
-            assert receipt["expected_admission_sha256"] == seal.proof_sha256
-            assert receipt["expected_metadata_sha256"] == seal.metadata_sha256
-            assert receipt["network_bindings"] == seal.metadata_summary["network_bindings"]
-            assert set(receipt) == {
-                "version",
-                "network_bindings",
-                "endpoint_id",
-                "dataset_sha256",
-                "release_id",
-                "resource_table_oid",
-                "semantic_projection_as_of",
-                "expected_admission_sha256",
-                "expected_metadata_sha256",
-            }
-            assert set(initial["cms_serving_candidate"]) == {
-                "version",
-                "status",
-                "desired_cms_dataset",
-                "expected_cms_incumbent",
-                "release_id",
-                "proof_version",
-            }
-            assert initial["cms_serving_candidate"]["desired_cms_dataset"]["is_current"] is False
-            assert len(json.dumps(receipt).encode()) <= 4096
-            await _assert_registry_handoff_retry(monkeypatch, directory, acquired, client, receipt, initial, damage)
-            assert len(completed_seals) == 1
-        assert (
-            await database.scalar("SELECT count(*) FROM mrf.provider_directory_endpoint_dataset WHERE is_current") == 0
-        )
+    async with support.protected_admission_database(monkeypatch) as database:
+        async with bind_generic_source_transaction_factory(database._source_component.factory):
+            await _assert_registry_admission_handoff(
+                monkeypatch, directory, acquired, database, completed_seals, damage
+            )
+
+
+async def _assert_registry_admission_handoff(monkeypatch, directory, acquired, database, completed_seals, damage):
+    """Keep admission and replay on their original protected SOURCE factory."""
+    with support.release_probe_client(directory) as client:
+        initial = await cms._run_acquired({"context": {}}, {}, "registry-proof", directory, acquired, client)
+        receipt = initial["registry_source_admission"]
+        seal = completed_seals[-1]
+        assert receipt["expected_admission_sha256"] == seal.proof_sha256
+        assert receipt["expected_metadata_sha256"] == seal.metadata_sha256
+        assert receipt["network_bindings"] == seal.metadata_summary["network_bindings"]
+        assert set(receipt) == {
+            "version",
+            "network_bindings",
+            "endpoint_id",
+            "dataset_sha256",
+            "release_id",
+            "resource_table_oid",
+            "semantic_projection_as_of",
+            "expected_admission_sha256",
+            "expected_metadata_sha256",
+        }
+        assert set(initial["cms_serving_candidate"]) == {
+            "version",
+            "status",
+            "desired_cms_dataset",
+            "expected_cms_incumbent",
+            "release_id",
+            "proof_version",
+        }
+        assert initial["cms_serving_candidate"]["desired_cms_dataset"]["is_current"] is False
+        assert len(json.dumps(receipt).encode()) <= 4096
+        await _assert_registry_handoff_retry(monkeypatch, directory, acquired, client, receipt, initial, damage)
+        assert len(completed_seals) == 1
+    assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_endpoint_dataset WHERE is_current") == 0
 
 
 async def _assert_registry_handoff_retry(monkeypatch, directory, acquired, client, receipt, initial, damage):
@@ -751,33 +841,50 @@ async def _assert_registry_handoff_retry(monkeypatch, directory, acquired, clien
         assert replay["registry_source_admission"] == receipt
     else:
         _damage_registry_handoff(monkeypatch, damage)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(GenericCandidateError, match="admission_replay_changed"):
             await cms._run_acquired({"context": {}}, {}, "registry-damaged", directory, acquired, client)
 
 
 def _damage_registry_handoff(monkeypatch, damage):
-    """Alter actual queried proof material while keeping native storage and guards intact."""
+    """Change the genuine sealed SOURCE result at its immutable replay boundary."""
     if damage == "seal":
-        backfill = importlib.import_module("process.provider_directory_admission_backfill")
+        original_seal = cms._source_registry_replay_seal
 
-        original_seal = backfill._validated_row_seal
+        def changed_seal(candidate, row):
+            return original_seal(candidate, {**dict(row), "seal_valid": False})
 
-        async def changed_seal(*args):
-            """Use the real native metadata copy then inject a mismatched computed digest."""
-            seal = await original_seal(*args)
-            return replace(seal, metadata_sha256="0" * 64)
-
-        monkeypatch.setattr(backfill, "_validated_row_seal", changed_seal)
+        monkeypatch.setattr(cms, "_source_registry_replay_seal", changed_seal)
     else:
-        original_page = fhir._endpoint_dataset_content_page
+        from copy import deepcopy
 
-        async def changed_page(*args, **kwargs):
-            """Keep the actual native query and change its returned payload commitment."""
-            rows = await original_page(*args, **kwargs)
-            if rows:
-                resource_by_field = dict(rows[0]._mapping)
-                resource_by_field["payload_hash"] = "0" * 64
-                return [resource_by_field, *rows[1:]]
-            return rows
+        from process import network_fhir_source_custody as custody
 
-        monkeypatch.setattr(fhir, "_endpoint_dataset_content_page", changed_page)
+        original_custody = custody._generic_partitioned_custody
+
+        async def changed_binding(*args, **kwargs):
+            observed = deepcopy(await original_custody(*args, **kwargs))
+            observed["binding"]["identity"]["acquisition_root_run_id"] += "-changed"
+            return observed
+
+        monkeypatch.setattr(custody, "_generic_partitioned_custody", changed_binding)
+
+
+async def test_native_metadata_first_toast_write_and_larger_growth(monkeypatch):
+    """Run the shared native regression under the enrolled resource template."""
+    from tests import test_provider_directory_cms_complete_publication_regressions as regressions
+
+    await regressions.test_native_metadata_first_toast_write_and_larger_growth(monkeypatch)
+
+
+async def test_native_receipt_first_write_and_growth(monkeypatch):
+    """Run the shared native regression under the enrolled resource template."""
+    from tests import test_provider_directory_cms_complete_publication_regressions as regressions
+
+    await regressions.test_native_receipt_first_write_and_growth(monkeypatch)
+
+
+async def test_native_scope_declared_gin_and_catalog_drift(monkeypatch):
+    """Run the shared native regression under the enrolled resource template."""
+    from tests import test_provider_directory_cms_complete_publication_regressions as regressions
+
+    await regressions.test_native_scope_declared_gin_and_catalog_drift(monkeypatch)

@@ -31,7 +31,13 @@ def validated_published_plan_binding_scope(scope):
     """Validate a distinct closed namespace without inventing cohort fields."""
     if type(scope) is not dict or set(scope) != _SCOPE_FIELDS:
         raise ValueError("registry_published_plan_binding_invalid")
-    if scope["review_type"] != REVIEW_TYPE or scope["selection_mode"] != SELECTION_MODE:
+    from process.registry_ptg_allowed_plan_contract import REVIEW_TYPE as allowed_review
+    from process.registry_ptg_allowed_plan_contract import SELECTION_MODE as allowed_selection
+
+    if (scope["review_type"], scope["selection_mode"]) not in {
+        (REVIEW_TYPE, SELECTION_MODE),
+        (allowed_review, allowed_selection),
+    }:
         raise ValueError("registry_published_plan_binding_invalid")
     _uuid(scope["scope_id"])
     _digest(scope["approval_sha256"])
@@ -40,7 +46,13 @@ def validated_published_plan_binding_scope(scope):
         ("plan_id", 64),
         ("plan_market_type", 32),
     ):
-        _text(scope[name], maximum, characters=True)
+        if not (
+            name == "plan_market_type"
+            and scope["review_type"] == allowed_review
+            and type(scope[name]) is str
+            and scope[name] == ""
+        ):
+            _text(scope[name], maximum, characters=True)
     if scope["plan_market_type"] != scope["plan_market_type"].lower():
         raise ValueError("registry_published_plan_binding_invalid")
     return dict(scope)
@@ -169,13 +181,25 @@ def _review_commands(documents_json):
         }:
             raise ValueError("registry_published_plan_binding_review_changed")
         command = validated_command(document["command"])
-        authority = validate_ptg_published_result_source_authority(document["evidence"]["source_authority"])
+        selection_mode = SELECTION_MODE
+        validate_authority = validate_ptg_published_result_source_authority
+        if command["review_type"] == "published_allowed_amount_plan":
+            from process.ptg_parts.result_archive_allowed_authority import validated_allowed_authority
+            from process.registry_ptg_allowed_plan_contract import SELECTION_MODE as allowed_selection
+
+            selection_mode = allowed_selection
+            validate_authority = lambda receipt: validated_allowed_authority(receipt).as_dict()
+        authority = validate_authority(document["evidence"]["source_authority"])
         if (
             document_digest(document) != entry["approval_sha256"]
             or document != _document(command, document["actor"], document["evidence"])
             or command["scope_id"] != entry["scope_id"]
             or authority["identity"] != command["published_identity"]
-            or document["evidence"]["selection_mode"] != SELECTION_MODE
+            or (
+                command["review_type"] == "published_allowed_amount_plan"
+                and authority["operation_id"] != "registry_ptg_published_review_" + command["scope_id"].replace("-", "")
+            )
+            or document["evidence"]["selection_mode"] != selection_mode
             or not _complete_source_keys(
                 document["evidence"]["selected_source_keys"],
                 command["published_identity"]["source_count"],

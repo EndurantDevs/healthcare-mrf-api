@@ -11,7 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from typing import TYPE_CHECKING
 
 from process.network_address_projection import _identifier
 from process.network_approved_membership_source import ApprovedMembershipSource
@@ -33,6 +34,9 @@ from process.reference_family_archive import (
     validate_reference_family_manifest,
     validate_reference_family_validation_receipt,
 )
+
+if TYPE_CHECKING:
+    from process.registry_aca_global_epoch import PinnedACAGlobalEpoch
 
 
 class LegacyMembershipSourceError(ValueError):
@@ -81,6 +85,8 @@ class PinnedACAMembershipSource:
     alias_scope: str
     reviewed_alias_sha256: str
     runtime_roles: tuple[str, ...]
+    retained_successor: PinnedACAMembershipSource | None = None
+    retained_epoch: PinnedACAGlobalEpoch | None = None
 
     def __post_init__(self):
         _validated_archive(self)
@@ -119,6 +125,7 @@ class PinnedACAMembershipSource:
         aca_checksum_scope(self.issuer_id, self.year, self.alias_scope)
         if self.prepared.manifest.source_metadata.get("network_membership") != self.coordinates:
             raise LegacyMembershipSourceError("ACA source admission coordinates differ")
+        _validate_successor(self)
 
     @property
     def coordinates(self):
@@ -140,32 +147,161 @@ class PinnedACAMembershipSource:
     @property
     def generation_id(self):
         """Bind full archive identity, release and reviewed alias namespace."""
-        return hashlib.sha256(
-            _canonical_json(
-                {
-                    "coordinates": self.coordinates,
-                    "manifest": self.prepared.manifest.as_dict(),
-                    "validation": self.validation.as_dict(),
-                    "dataset_id": str(self.prepared.ownership.dataset_id),
-                    "auxiliary_oid": self.prepared.ownership.auxiliary_oid,
-                    "sequence_oids": self.prepared.ownership.sequence_oids,
-                }
-            )
-        ).hexdigest()
+        generation_by_name = {
+            "coordinates": self.coordinates,
+            "manifest": self.prepared.manifest.as_dict(),
+            "validation": self.validation.as_dict(),
+            "dataset_id": str(self.prepared.ownership.dataset_id),
+            "auxiliary_oid": self.prepared.ownership.auxiliary_oid,
+            "sequence_oids": self.prepared.ownership.sequence_oids,
+        }
+        if self.retained_successor is not None:
+            generation_by_name["retained_successor"] = self.retained_successor.generation_id
+        if self.retained_epoch is not None:
+            generation_by_name["retained_epoch"] = self.retained_epoch.generation_id
+        return hashlib.sha256(_canonical_json(generation_by_name)).hexdigest()
+
+
+def _validate_successor(source):
+    if source.retained_epoch is not None:
+        _validate_retained_epoch(source)
+        return
+    successor = source.retained_successor
+    if successor is None:
+        return
+    if (
+        type(successor) is not PinnedACAMembershipSource
+        or successor.retained_successor is not None
+        or successor.retained_epoch is not None
+    ):
+        raise LegacyMembershipSourceError("ACA successor must be one flat admitted archive")
+    original = _aca_binding_coordinates(source)
+    current = _aca_binding_coordinates(successor)
+    if (source.source_id, source.issuer_id, source.year) != (
+        successor.source_id,
+        successor.issuer_id,
+        successor.year,
+    ) or any(getattr(original, key) != getattr(current, key) for key in ("source_system", "source_id", "producer_id")):
+        raise LegacyMembershipSourceError("ACA successor logical source differs")
+
+
+@dataclass(frozen=True)
+class ACAGlobalEpochReadScope:
+    """A physical epoch view; issuer/year are original scope, not rewritten provenance."""
+
+    epoch: PinnedACAGlobalEpoch
+    issuer_id: int
+    year: int
+    import_id: None = None
+    source_url: None = None
+
+    def __post_init__(self):
+        from process.registry_aca_global_epoch import PinnedACAGlobalEpoch
+
+        if (
+            type(self.epoch) is not PinnedACAGlobalEpoch
+            or type(self.issuer_id) is not int
+            or not 0 < self.issuer_id <= 2147483647
+            or type(self.year) is not int
+            or not 1900 <= self.year <= 9999
+            or self.import_id is not None
+            or self.source_url is not None
+        ):
+            raise LegacyMembershipSourceError("ACA global read scope differs")
+
+    @property
+    def prepared(self):
+        """Return the genuine retained epoch prepared archive."""
+        return self.epoch.prepared
+
+    @property
+    def validation(self):
+        """Return the complete typed epoch validation receipt."""
+        return self.epoch.validation
+
+    @property
+    def runtime_roles(self):
+        """Return the frozen explicit native reader census."""
+        return self.epoch.runtime_roles
+
+    @property
+    def coordinates(self):
+        """Return a physical diagnostic identity without invented source coordinates."""
+        return {"global_epoch": self.epoch.generation_id, "issuer_id": self.issuer_id, "year": self.year}
+
+
+def _validate_retained_epoch(source):
+    from process.registry_aca_global_epoch import PinnedACAGlobalEpoch
+
+    epoch = source.retained_epoch
+    if source.retained_successor is not None or type(epoch) is not PinnedACAGlobalEpoch:
+        raise LegacyMembershipSourceError("ACA physical authorities are mutually exclusive")
+    _aca_binding_coordinates(source)
+    original = source.prepared.manifest.source_serving_generation
+    current = epoch.prepared.manifest.source_serving_generation
+    if original is None or current is None or original.origin_lineage_id != current.origin_lineage_id:
+        raise LegacyMembershipSourceError("ACA global epoch origin lineage differs")
+
+
+def with_aca_global_epoch(anchor, epoch):
+    """Attach one global physical epoch without inventing per-scope source metadata."""
+    return replace(anchor, retained_successor=None, retained_epoch=epoch)
+
+
+def _aca_binding_coordinates(source):
+    descriptor = source.prepared.manifest.source_metadata.get("network_bindings")
+    keys = {*RegistryNetworkSourceCoordinates.__dataclass_fields__, "source_key_kind"}
+    if type(descriptor) is not dict or set(descriptor) != keys or descriptor["source_key_kind"] != "hios_plan_id":
+        raise LegacyMembershipSourceError("ACA successor binding descriptor differs")
+    coordinates = RegistryNetworkSourceCoordinates(
+        **{key: value for key, value in descriptor.items() if key != "source_key_kind"}
+    )
+    if coordinates.sql_parameters[:4] != (
+        "aca",
+        source.source_id,
+        source.prepared.ownership.schema_name,
+        str(source.prepared.ownership.dataset_id),
+    ):
+        raise LegacyMembershipSourceError("ACA successor binding descriptor differs")
+    return coordinates
+
+
+def aca_physical_source(source):
+    """Return one flat physical pin; this structural accessor confers no SQL authority."""
+    if type(source) is not PinnedACAMembershipSource:
+        raise LegacyMembershipSourceError("Pinned ACA source is required")
+    _validate_successor(source)
+    if source.retained_epoch is not None:
+        return ACAGlobalEpochReadScope(source.retained_epoch, source.issuer_id, source.year)
+    return source if source.retained_successor is None else source.retained_successor
+
+
+def with_aca_successor(anchor, successor):
+    """Keep the original approved anchor and replace only its single physical attachment."""
+    if (
+        type(successor) is not PinnedACAMembershipSource
+        or successor.retained_successor is not None
+        or successor.retained_epoch is not None
+    ):
+        raise LegacyMembershipSourceError("ACA successor must be one flat admitted archive")
+    if aca_physical_source(anchor) == successor:
+        return anchor
+    return replace(anchor, retained_successor=successor, retained_epoch=None)
 
 
 def _validated_archive(source_pin):
-    if (
-        type(source_pin.prepared) is not ReferenceFamilyPreparedSource
-        or type(source_pin.validation) is not ReferenceFamilyValidationReceipt
-    ):
+    return _validated_native_archive(source_pin.prepared, source_pin.validation)
+
+
+def _validated_native_archive(prepared, validation):
+    if type(prepared) is not ReferenceFamilyPreparedSource or type(validation) is not ReferenceFamilyValidationReceipt:
         raise LegacyMembershipSourceError("Admitted ACA archive is required")
     try:
-        manifest = validate_reference_family_manifest(source_pin.prepared.manifest)
-        validation = validate_reference_family_validation_receipt(source_pin.validation)
+        manifest = validate_reference_family_manifest(prepared.manifest)
+        validation = validate_reference_family_validation_receipt(validation)
     except ReferenceFamilyArchiveError, ValueError:
         raise LegacyMembershipSourceError("ACA archive receipt differs") from None
-    ownership = source_pin.prepared.ownership
+    ownership = prepared.ownership
     if (
         manifest.importer_id not in {"mrf", "mrf-address"}
         or ownership.importer_id != manifest.importer_id
@@ -206,15 +342,56 @@ SELECT owner.*,n.oid::bigint AS schema_oid,n.nspowner=$3::oid AS owner_matches,
 
 
 async def _require_archive(connection, source_pin):
-    ownership, validation = _validated_archive(source_pin)
+    """Prove both immutable archives when one original anchor carries a successor."""
+    physical = aca_physical_source(source_pin)
+    original = (
+        source_pin if physical is source_pin else replace(source_pin, retained_successor=None, retained_epoch=None)
+    )
+    await _require_flat_archive(connection, original)
+    if type(physical) is ACAGlobalEpochReadScope:
+        from process.network_cms_registry_address_capture import NativeReceiptSession
+        from process.registry_aca_global_epoch import require_registry_aca_global_epoch
+
+        epoch = await require_registry_aca_global_epoch(
+            NativeReceiptSession(connection), physical.prepared, runtime_roles=physical.runtime_roles
+        )
+        if epoch != physical.epoch:
+            raise LegacyMembershipSourceError("ACA protected global epoch differs")
+    elif physical is not source_pin:
+        from process.network_cms_registry_address_capture import NativeReceiptSession
+        from process.registry_aca_source_recipe import require_registry_aca_source_recipe
+
+        recipe = await require_registry_aca_source_recipe(
+            NativeReceiptSession(connection), physical.prepared, runtime_roles=physical.runtime_roles
+        )
+        if recipe.source_pin != physical or recipe.binding_coordinates != _aca_binding_coordinates(physical):
+            raise LegacyMembershipSourceError("ACA successor protected recipe differs")
+
+
+async def _require_flat_archive(connection, source_pin):
     if source_pin.prepared.manifest.source_metadata.get("network_membership") != source_pin.coordinates:
         raise LegacyMembershipSourceError("ACA source admission coordinates differ")
+    await _require_native_archive(connection, source_pin.prepared, source_pin.validation, source_pin.runtime_roles)
+
+
+async def _require_native_archive(connection, prepared, validation, runtime_roles):
+    """Prove a full native archive without assigning any logical membership identity."""
+    ownership, validation = _validated_native_archive(prepared, validation)
+    if (
+        type(runtime_roles) is not tuple
+        or not 1 <= len(runtime_roles) <= 32
+        or any(type(role) is not str for role in runtime_roles)
+        or tuple(sorted(set(runtime_roles))) != runtime_roles
+    ):
+        raise LegacyMembershipSourceError("ACA runtime roles are invalid")
+    for role in runtime_roles:
+        _identifier(role)
     catalog = await connection.fetchrow(
         _CATALOG_SQL.format(namespace=_identifier(ownership.schema_name), privilege_sql=_NATIVE_WRITER_PRIVILEGES_SQL),
         ownership.schema_name,
         ownership.schema_oid,
         validation.sealed_owner_oid,
-        list(source_pin.runtime_roles),
+        list(runtime_roles),
     )
     if (
         catalog is None
@@ -294,6 +471,61 @@ SELECT ({alias_digest}) AS alias_sha256,(SELECT count(*) FROM page) AS source_ro
  THEN (SELECT coalesce(jsonb_agg(membership ORDER BY membership::text),'[]'::jsonb)::text FROM encoded) END AS input_json"""
 
 
+_ACA_TRANSPORT_SQL = """, anchor_maps AS MATERIALIZED (
+ SELECT binding.* FROM approved_network_bindings binding WHERE EXISTS(
+   SELECT 1 FROM {anchor}.plan plan JOIN {anchor}.plan_networktier tier
+     ON tier.plan_id=plan.plan_id AND tier.issuer_id=plan.issuer_id AND tier.year=plan.year
+   WHERE binding.record_json->>'source_key'=plan.plan_id
+     AND binding.record_json->'source_scope_json'=jsonb_build_object(
+       'issuer_id',lpad(plan.issuer_id::text,5,'0'),'state',plan.state,'plan_year',plan.year,
+       'plan_id',plan.plan_id,'checksum_network',tier.checksum_network))
+), successor_guard AS (
+ SELECT (SELECT count(*) FROM anchor_maps)<>(SELECT count(*) FROM approved_network_bindings)
+   OR EXISTS(SELECT 1 FROM anchor_maps GROUP BY record_json->>'source_key',
+       record_json->'source_scope_json'->>'issuer_id',record_json->'source_scope_json'->>'state',
+       record_json->'source_scope_json'->>'plan_year' HAVING count(DISTINCT network_id)>1) AS invalid
+), transported_network_bindings AS MATERIALIZED (
+ SELECT encode(sha256(convert_to(array_agg(record_key ORDER BY record_key)::text,'UTF8')),'hex') AS record_key,
+   network_id,jsonb_build_object('source_key',record_json->>'source_key',
+     'source_scope_json',(record_json->'source_scope_json')-'checksum_network') AS record_json
+ FROM anchor_maps GROUP BY network_id,record_json->>'source_key',(record_json->'source_scope_json')-'checksum_network'
+)"""
+
+
+@dataclass(frozen=True)
+class ACAReviewedBindingProjection:
+    cte_sql: str
+    relation_name: str
+    scope_without_checksum: bool
+    invalid_sql: str
+
+
+def _binding_projection(binding_cte, anchor_namespace):
+    if anchor_namespace is None:
+        return ACAReviewedBindingProjection(binding_cte, "approved_network_bindings", False, "false")
+    return ACAReviewedBindingProjection(
+        binding_cte + _ACA_TRANSPORT_SQL.format(anchor=_identifier(anchor_namespace)),
+        "transported_network_bindings",
+        True,
+        "(SELECT invalid FROM successor_guard)",
+    )
+
+
+def reviewed_aca_binding_projection(source_pin, *, registry_schema, binding_cte=None):
+    """Share exact native anchor projection and evidence identity with trusted SQL callers."""
+    aca_physical_source(source_pin)
+    if binding_cte is None:
+        binding_cte = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_identifier(registry_schema))
+    if type(binding_cte) is not str or not binding_cte.startswith("approved_network_bindings AS MATERIALIZED ("):
+        raise LegacyMembershipSourceError("ACA approved binding SQL differs")
+    anchor = (
+        source_pin.prepared.ownership.schema_name
+        if source_pin.retained_successor is not None or source_pin.retained_epoch is not None
+        else None
+    )
+    return _binding_projection(binding_cte, anchor)
+
+
 _REVIEWED_SQL = """WITH {bindings},{raw_page}page AS MATERIALIZED ({page_sql}), expanded AS MATERIALIZED (
  SELECT page.*,provider.npi AS retained_npi,tier.plan_id AS retained_plan_id,
    plan.plan_id,plan.state AS plan_state,plan.issuer_id AS plan_issuer,plan.year AS plan_year,
@@ -325,7 +557,7 @@ _REVIEWED_SQL = """WITH {bindings},{raw_page}page AS MATERIALIZED ({page_sql}), 
      jsonb_build_array($14::text,to_jsonb(resolved))::text,'UTF8')),'hex')) AS membership
  FROM resolved WHERE NOT unresolved {encoded_filter}
 )
-SELECT {source_rows} AS source_rows,(SELECT max(evidence_checksum) FROM page) AS last_checksum,
+SELECT {successor_check}{source_rows} AS source_rows,(SELECT max(evidence_checksum) FROM page) AS last_checksum,
  (SELECT count(*) FROM resolved WHERE unresolved {unresolved_filter}) AS unresolved_rows,
  {omitted_summary}{raw_summary}
  (SELECT count(*) FROM encoded) AS membership_rows,
@@ -342,6 +574,8 @@ def _reviewed_descriptor(source, approved_source, coordinates, approved_only=Fal
     if approved_source is None and coordinates is None:
         if approved_only:
             raise LegacyMembershipSourceError("Reviewed ACA source coordinates are invalid")
+        if source.retained_successor is not None or source.retained_epoch is not None:
+            raise LegacyMembershipSourceError("ACA successor requires approved original bindings")
         return None
     if (
         type(approved_source) is not ApprovedMembershipSource
@@ -457,7 +691,17 @@ def _raw_fact_selection_sql():
     return raw_page, page_sql, provider_join, fact_status, raw_summary
 
 
-def _reviewed_sql(namespace, registry_schema, approved_only, complete_raw_facts=False):
+def _reviewed_sql(
+    namespace,
+    registry_schema,
+    approved_only,
+    complete_raw_facts=False,
+    *,
+    anchor_namespace=None,
+    binding_projection=None,
+    global_epoch=False,
+):
+    """Build bounded raw/evidence membership SQL from a verified physical source view."""
     complete_key = """COALESCE(retained_npi IS NOT NULL AND retained_plan_id IS NOT NULL AND plan_id IS NOT NULL
       AND checksum_network BETWEEN -2147483648 AND 2147483647
       AND plan_issuer BETWEEN 1 AND 99999 AND plan_year BETWEEN 2010 AND 2100
@@ -479,7 +723,16 @@ def _reviewed_sql(namespace, registry_schema, approved_only, complete_raw_facts=
     if complete_raw_facts:
         raw_page, page_sql, provider_join, fact_status, raw_summary = _raw_fact_selection_sql()
     namespace_sql = _identifier(namespace)
-    return _REVIEWED_SQL.format(
+    if binding_projection is None:
+        binding_projection = _binding_projection(
+            APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_identifier(registry_schema)), anchor_namespace
+        )
+    if type(binding_projection) is not ACAReviewedBindingProjection or type(global_epoch) is not bool:
+        raise LegacyMembershipSourceError("ACA binding projection differs")
+    sql = _REVIEWED_SQL.format(
+        successor_check=binding_projection.invalid_sql + " AS successor_invalid,"
+        if binding_projection.scope_without_checksum
+        else "",
         raw_page=raw_page.format(source=namespace_sql),
         page_sql=page_sql.format(source=namespace_sql),
         provider_join=provider_join,
@@ -487,7 +740,7 @@ def _reviewed_sql(namespace, registry_schema, approved_only, complete_raw_facts=
         fact_status=fact_status,
         raw_summary=raw_summary,
         source_namespace=_identifier(namespace),
-        bindings=APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_identifier(registry_schema)),
+        bindings=binding_projection.cte_sql,
         omission_columns=f"network_id IS NULL AND ({complete_key}) AS omitted,"
         if approved_only
         else ("false AS omitted," if complete_raw_facts else ""),
@@ -495,6 +748,26 @@ def _reviewed_sql(namespace, registry_schema, approved_only, complete_raw_facts=
         unresolved_filter="AND NOT omitted" if approved_only else "",
         omitted_summary="(SELECT count(*) FROM resolved WHERE omitted) AS omitted_rows," if approved_only else "",
     )
+
+    return _project_reviewed_sql(sql, binding_projection, global_epoch, complete_raw_facts)
+
+
+def _project_reviewed_sql(sql, binding_projection, global_epoch, complete_raw_facts):
+    """Apply trusted binding projection and the explicit global physical predicates."""
+    if binding_projection.scope_without_checksum:
+        sql = sql.replace(
+            "LEFT JOIN approved_network_bindings approved",
+            "LEFT JOIN " + binding_projection.relation_name + " approved",
+            1,
+        )
+        sql = sql.replace(
+            "'plan_id',plan.plan_id,'checksum_network',page.checksum_network)", "'plan_id',plan.plan_id)", 1
+        )
+    if global_epoch:
+        prefix = "evidence." if complete_raw_facts else ""
+        sql = sql.replace(prefix + "import_id=$8", "($8::text IS NULL OR " + prefix + "import_id=$8)")
+        sql = sql.replace(prefix + "source_url=$11", "($11::text IS NULL OR " + prefix + "source_url=$11)")
+    return sql
 
 
 async def _read_reviewed(
@@ -511,17 +784,25 @@ async def _read_reviewed(
         await require_approved_network_source_bindings(
             connection, approved_source, coordinates, control_schema=registry_schema
         )
-    except ApprovedNetworkSourceBindingError:
-        raise LegacyMembershipSourceError("Reviewed ACA bindings are unavailable") from None
+    except ApprovedNetworkSourceBindingError as error:
+        raise LegacyMembershipSourceError("Reviewed ACA bindings are unavailable") from error
     generation = _reviewed_generation(source_pin, approved_source, coordinates, approved_only, complete_raw_facts)
-    return await connection.fetchrow(
-        _reviewed_sql(source_pin.prepared.ownership.schema_name, registry_schema, approved_only, complete_raw_facts),
+    physical = aca_physical_source(source_pin)
+    page_by_name = await connection.fetchrow(
+        _reviewed_sql(
+            physical.prepared.ownership.schema_name,
+            registry_schema,
+            approved_only,
+            complete_raw_facts,
+            binding_projection=reviewed_aca_binding_projection(source_pin, registry_schema=registry_schema),
+            global_epoch=type(physical) is ACAGlobalEpochReadScope,
+        ),
         approved_source.approved_revision,
         *coordinates.sql_parameters,
-        source_pin.import_id,
-        source_pin.issuer_id,
-        source_pin.year,
-        source_pin.source_url,
+        physical.import_id,
+        physical.issuer_id,
+        physical.year,
+        physical.source_url,
         after_evidence_checksum,
         limit,
         generation,
@@ -534,6 +815,12 @@ async def _read_reviewed(
             else ()
         ),
     )
+
+    if (source_pin.retained_successor is not None or source_pin.retained_epoch is not None) and page_by_name[
+        "successor_invalid"
+    ]:
+        raise LegacyMembershipSourceError("ACA successor approved anchor is unavailable or ambiguous")
+    return page_by_name
 
 
 async def read_aca_membership_batch(

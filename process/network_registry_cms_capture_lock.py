@@ -74,14 +74,18 @@ async def _finish_connection(connection, key, has_failed, retirement):
 
 
 @asynccontextmanager
-async def registry_cms_capture_transaction(source_session_factory, *, capture_id, fhir=None):
-    """Yield one owned RR session after taking the signed capture's native lock.
+async def registry_cms_capture_transaction(
+    source_session_factory, *, capture_id, fhir=None, isolation="repeatable read"
+):
+    """Yield the original session after taking the signed capture's native lock.
 
     The trusted factory must own a one-connection native publisher pool. Callers
     must leave commit/rollback to this context. This lock grants no cleanup or
     terminal-owner authority. A failed or cancelled outcome retires its physical
     connection; committed retained candidates still require a fresh probe.
     """
+    if isolation not in {"read committed", "repeatable read"}:
+        raise ValueError("registry_cms_capture_isolation_invalid")
     engine = _source_engine(source_session_factory, capture_id)
     key = int.from_bytes(capture_id.bytes[:8], "big", signed=True)
     connection = engine.connect()
@@ -95,7 +99,7 @@ async def registry_cms_capture_transaction(source_session_factory, *, capture_id
         await connection.commit()
         if acquired is not True:
             raise ValueError("registry_cms_capture_busy")
-        await connection.execution_options(isolation_level="REPEATABLE READ")
+        await connection.execution_options(isolation_level=isolation.upper())
         if fhir is None:
             async with source_session_factory(bind=connection) as session, session.begin():
                 yield session

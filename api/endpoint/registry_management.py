@@ -22,6 +22,7 @@ from process.network_source_binding_store import (
     apply_network_source_binding_batch,
     list_network_source_bindings,
 )
+from process.registry_benefit_plan_metadata import RegistryBenefitPlanAccessDenied
 from process.registry_manual_undo import (
     RegistryManualUndoCommand,
     prepare_registry_manual_undo,
@@ -203,6 +204,7 @@ def _batch_command(document):
 def _error(status):
     error_codes_by_status = {
         400: "registry_request_invalid",
+        403: "registry_access_denied",
         404: "registry_record_not_found",
         409: "registry_revision_conflict",
         503: "registry_unavailable",
@@ -327,7 +329,7 @@ async def list_records(request, kind):
         return response.json({"records": records}, headers=_HEADERS)
     except ValueError:
         return _error(400)
-    except SQLAlchemyError:
+    except SQLAlchemyError, RegistryAddressUnavailable:
         return _error(503)
 
 
@@ -344,7 +346,7 @@ async def read_record(request, kind, record_id):
         return _error(404) if record is None else response.json({"record": record}, headers=_HEADERS)
     except ValueError:
         return _error(400)
-    except SQLAlchemyError:
+    except SQLAlchemyError, RegistryAddressUnavailable:
         return _error(503)
 
 
@@ -357,8 +359,15 @@ async def write_record(request, kind):
         async with request.ctx.sa_session.begin():
             if kind == "site_binding":
                 await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-            result = await apply_registry_record_command(request.ctx.sa_session, command, actor)
+            result = await apply_registry_record_command(
+                request.ctx.sa_session,
+                command,
+                actor,
+                plan_metadata_client=getattr(request.app.ctx, "registry_plan_metadata_client", None),
+            )
         return response.json(result, headers=_HEADERS)
+    except RegistryBenefitPlanAccessDenied:
+        return _error(403)
     except RegistryRecordConflict:
         return _error(409)
     except ValueError, TypeError:
@@ -413,7 +422,11 @@ async def undo_record(request, kind, record_id):
             await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
             prepared = await prepare_registry_manual_undo(request.ctx.sa_session, command, actor)
             receipt = await apply_registry_record_command(
-                request.ctx.sa_session, prepared.command, actor, undo_provenance=prepared.provenance
+                request.ctx.sa_session,
+                prepared.command,
+                actor,
+                undo_provenance=prepared.provenance,
+                plan_metadata_client=getattr(request.app.ctx, "registry_plan_metadata_client", None),
             )
         provenance = prepared.provenance
         return response.json(
@@ -429,6 +442,8 @@ async def undo_record(request, kind, record_id):
             },
             headers=_HEADERS,
         )
+    except RegistryBenefitPlanAccessDenied:
+        return _error(403)
     except RegistryRecordConflict:
         return _error(409)
     except ValueError, TypeError:
@@ -447,8 +462,15 @@ async def write_company_link_batch(request):
             await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             connection = await request.ctx.sa_session.connection()
             driver = (await connection.get_raw_connection()).driver_connection
-            result = await apply_company_network_link_batch(driver, command, actor)
+            result = await apply_company_network_link_batch(
+                driver,
+                command,
+                actor,
+                plan_metadata_client=getattr(request.app.ctx, "registry_plan_metadata_client", None),
+            )
         return response.json(result, headers=_HEADERS)
+    except RegistryBenefitPlanAccessDenied:
+        return _error(403)
     except RegistryRecordConflict:
         return _error(409)
     except ValueError, TypeError:

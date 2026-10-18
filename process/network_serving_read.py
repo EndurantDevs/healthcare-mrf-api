@@ -12,8 +12,9 @@ from uuid import UUID
 import asyncpg
 
 from db.registry_schema import registry_schema
-from process.network_address_projection import _identifier
+from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_membership_publication import (
+    _candidate_custody,
     _publication_readiness,
     _publication_writer_closure,
     _retained_manifest,
@@ -146,15 +147,20 @@ def _verified_writer_closure(candidate, catalog):
     return address_table_oid
 
 
-def _pinned_manifest(entry):
+def _pinned_manifest(entry, *, custody=None):
     candidate = json.loads(entry["candidate_json"])
     manifest = json.loads(entry["manifest_json"])
     readiness = _publication_readiness(candidate)
     retained = _retained_manifest(manifest, readiness, replayed=True)
     if retained["schema_name"] != "network_candidate_" + UUID(retained["candidate_id"]).hex:
         raise NetworkServingReadUnavailable("Network serving schema identity differs")
-    address_table_oid = _verified_writer_closure(candidate, json.loads(entry["catalog_json"]))
-    return PinnedNetworkServingManifest(
+    if custody is None:
+        address_table_oid = _verified_writer_closure(candidate, json.loads(entry["catalog_json"]))
+    else:
+        if custody["receipt"]["index_definition_sha256"] != readiness[2]["index_definition_sha256"]:
+            raise NetworkServingReadUnavailable("Sealed native index definitions differ from validation")
+        address_table_oid = custody["receipt"]["closure"]["relation_oids"]["entity_address_unified"]
+    pinned = PinnedNetworkServingManifest(
         **{
             field: retained[field]
             for field in (
@@ -169,10 +175,14 @@ def _pinned_manifest(entry):
         },
         address_table_oid=address_table_oid,
     )
+    if custody is not None:
+        # Keep custody proof outside serialized retained/public manifest contracts.
+        object.__setattr__(pinned, "_custody_seal_sha256", custody["seal_sha256"])
+    return pinned
 
 
 async def resolve_network_serving_manifest(connection, *, generation_id: int | None = None, control_schema=None):
-    """Pin the current or explicitly retained manifest in one read-only query.
+    """Pin the current or retained manifest and verify its physical custody.
 
     The caller owns the transaction and uses this same identity for every query
     in the request. An unavailable canonical generation never selects legacy data.
@@ -186,8 +196,46 @@ async def resolve_network_serving_manifest(connection, *, generation_id: int | N
         entry = await _read_manifest(connection, namespace, generation_id)
         if entry is None:
             raise NetworkServingReadUnavailable("Network serving manifest is unavailable")
-        return _pinned_manifest(entry)
+        candidate = json.loads(entry["candidate_json"])
+        custody = await _candidate_custody(connection, candidate, namespace[1:-1])
+        return _pinned_manifest(entry, custody=custody)
     except (ValueError, TypeError, KeyError, asyncpg.PostgresError) as error:
         if isinstance(error, NetworkServingReadUnavailable):
             raise
         raise NetworkServingReadUnavailable("Network serving manifest verification failed") from error
+
+
+async def resolve_retained_network_address_source(connection, address_source, *, control_schema):
+    """Verify retained physical custody without granting serving eligibility."""
+    if (
+        type(address_source) is not PinnedAddressSource
+        or address_source.table_name != "entity_address_unified"
+        or re.fullmatch(r"network_candidate_[0-9a-f]{32}", address_source.schema_name) is None
+        or re.fullmatch(r"[0-9a-f]{64}", address_source.generation_id) is None
+        or not connection.is_in_transaction()
+    ):
+        raise NetworkServingReadUnavailable("Retained network address source is invalid")
+    try:
+        namespace = _identifier(control_schema)
+        generation_id = await connection.fetchval(
+            f"SELECT manifest.generation_id FROM {namespace}.network_serving_manifest manifest "
+            f"JOIN {namespace}.network_membership_candidate candidate USING(candidate_id) "
+            "WHERE candidate.schema_name=$1 AND manifest.manifest_sha256=$2",
+            address_source.schema_name,
+            address_source.generation_id,
+        )
+        if generation_id is None:
+            raise NetworkServingReadUnavailable("Retained network address source is unavailable")
+        entry = await _read_manifest(connection, namespace, generation_id, include_ineligible=True)
+        if entry is None:
+            raise NetworkServingReadUnavailable("Retained network address manifest is unavailable")
+        candidate = json.loads(entry["candidate_json"])
+        custody = await _candidate_custody(connection, candidate, control_schema)
+        pinned = _pinned_manifest(entry, custody=custody)
+        if pinned.schema_name != address_source.schema_name or pinned.manifest_sha256 != address_source.generation_id:
+            raise NetworkServingReadUnavailable("Retained network address source changed")
+        return pinned
+    except (ValueError, TypeError, KeyError, asyncpg.PostgresError) as error:
+        if isinstance(error, NetworkServingReadUnavailable):
+            raise
+        raise NetworkServingReadUnavailable("Retained network address verification failed") from error

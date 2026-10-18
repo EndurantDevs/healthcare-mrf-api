@@ -1,12 +1,14 @@
 //! Explicit company-network relationships with bounded, half-open coverage periods.
 
 use crate::network_membership_codec::uuid_bytes;
+use crate::registry_network_evidence_values::registry_id;
 use serde::de::{self, DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::fmt;
 
 pub const MAX_ROWS: usize = 5_000;
+pub const MAX_BENEFIT_PLAN_IDS: usize = 512;
 pub const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVIDENCE_CHARACTERS: usize = 1_000;
 const JURISDICTIONS: &str = "AL AK AZ AR CA CO CT DE DC FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY AS GU MP PR VI";
@@ -47,6 +49,8 @@ pub struct CompanyNetworkAssertion {
     pub valid_from: Option<String>,
     pub valid_to: Option<String>,
     pub evidence_text: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub benefit_plan_ids: Vec<String>,
 }
 
 /// Indices refer to the sorted output; each connected overlap remains for review.
@@ -109,6 +113,8 @@ struct AssertionRow<'a> {
     #[serde(borrow)]
     valid_to: &'a RawValue,
     evidence_text: String,
+    #[serde(default)]
+    benefit_plan_ids: Vec<String>,
 }
 
 /// Validate atomically, sort deterministically, and retain overlapping evidence.
@@ -234,6 +240,19 @@ fn validate_row(
     {
         return Err(failure("invalid_states", Some(index), Some("states")));
     }
+    let benefit_plan_ids = row.benefit_plan_ids;
+    if benefit_plan_ids.len() > MAX_BENEFIT_PLAN_IDS
+        || benefit_plan_ids
+            .iter()
+            .any(|plan_id| !registry_id(plan_id, "hpplan_"))
+        || benefit_plan_ids.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(failure(
+            "invalid_benefit_plan_ids",
+            Some(index),
+            Some("benefit_plan_ids"),
+        ));
+    }
     let valid_from = validate_date(row.valid_from, index, "valid_from")?;
     let valid_to = validate_date(row.valid_to, index, "valid_to")?;
     if matches!((&valid_from, &valid_to), (Some(start), Some(end)) if start >= end) {
@@ -259,6 +278,7 @@ fn validate_row(
         valid_from,
         valid_to,
         evidence_text: row.evidence_text,
+        benefit_plan_ids,
     })
 }
 

@@ -4,7 +4,7 @@
 import copy
 import json
 from dataclasses import asdict, replace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sanic import Blueprint, Sanic
@@ -671,3 +671,47 @@ async def test_membership_http_custom_revision_propagates_without_head_fallback(
         f"/api/v1/registry/manage/network/{network_id}?custom_revision=0", headers=_AUTH
     )
     assert wrong_kind.status == 400
+
+
+@pytest.mark.asyncio
+async def test_group_evidence_http_default_shape_and_bounds_fail_closed(registry_app):
+    from tests.test_registry_record_store_postgres import _retain_group_evidence
+
+    app, (connection, schema, _) = registry_app
+    group_id = await _http_group_target(app)
+    reference = await _retain_group_evidence(connection, schema, UUID(group_id))
+    path = "/api/v1/registry/manage/group/" + group_id
+    _, denied = await app.asgi_client.get(path)
+    assert denied.status == 403
+    for method, endpoint, kwargs, field in [
+        (app.asgi_client.get, path, {}, "record"),
+        (app.asgi_client.get, "/api/v1/registry/manage/group", {}, "records"),
+        (
+            app.asgi_client.post,
+            "/api/v1/registry/manage/group/search",
+            {"json": {"q": "Example", "limit": 1, "offset": 0, "record_ids": [group_id]}},
+            "records",
+        ),
+    ]:
+        _, found = await method(endpoint, headers=_AUTH, **kwargs)
+        assert found.status == 200 and found.headers["Cache-Control"] == "private, no-store"
+        group_document = found.json[field] if field == "record" else found.json[field][0]
+        assert group_document["source_evidence"] == [reference]
+    await connection.execute(f'DELETE FROM "{schema}".registry_identifier_binding')
+    await connection.execute(
+        f'INSERT INTO "{schema}".registry_identifier_binding '
+        "SELECT 'group','naic_group',n::text,$1,$2,'group:'||n FROM generate_series(1,5001) n",
+        UUID(group_id),
+        UUID(reference["snapshot_id"]),
+    )
+    for endpoint in [path, "/api/v1/registry/manage/group"]:
+        _, refused = await app.asgi_client.get(endpoint, headers=_AUTH)
+        assert refused.status == 503 and refused.headers["Cache-Control"] == "private, no-store"
+        assert "source_evidence" not in refused.text
+    _, refused = await app.asgi_client.post(
+        "/api/v1/registry/manage/group/search",
+        headers=_AUTH,
+        json={"q": "Example", "limit": 1, "offset": 0, "record_ids": [group_id]},
+    )
+    assert refused.status == 503 and refused.headers["Cache-Control"] == "private, no-store"
+    assert "source_evidence" not in refused.text

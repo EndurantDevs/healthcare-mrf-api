@@ -542,7 +542,7 @@ async def test_imported_preview_rejects_unrecognized_paging(retained_aca_preview
     monkeypatch.setattr(
         imported_preview,
         "aca_reviewed_sql",
-        lambda *arguments: original_sql(*arguments).replace("LIMIT 5001", "LIMIT 5002"),
+        lambda *arguments, **options: original_sql(*arguments, **options).replace("LIMIT 5001", "LIMIT 5002"),
     )
     with pytest.raises(RegistryImportedSelectionUnavailable, match="selection_unavailable"):
         await _repeatable_preview(fixture, command)
@@ -565,7 +565,7 @@ async def test_complete_imported_counts_above_copy_page(expanded_aca_preview, op
         "omitted_rows": omitted,
         "unresolved_rows": 0,
     }
-    assert counted.statements == 17
+    assert counted.statements == 21  # Includes the fixed retained-candidate custody reads.
     assert preview["unresolved_count"] == 0
     assert await _durable_state(fixture.connection, fixture.control_schema) == initial_state
     await _assert_staging_removed(fixture.connection)
@@ -585,7 +585,7 @@ async def test_imported_preview_query_count_is_fixed_per_recipe(retained_aca_pre
         "omitted_rows": 0,
         "unresolved_rows": 0,
     }
-    assert counted.statements == 17
+    assert counted.statements == 21  # Includes the fixed retained-candidate custody reads.
 
 
 async def test_bootstrap_binding_preview_has_no_invented_source_count(office_db):
@@ -765,26 +765,40 @@ async def test_mixed_closed_aca_and_cms_preview_counts_complete_recipes(retained
 class _CMSCountedConnection(_CountedConnection):
     """Include native catalog set queries in the complete preview call count."""
 
+    def __init__(self, connection):
+        super().__init__(connection)
+        self.office_selection_queries = []
+
     async def fetch(self, *arguments):
         self.statements += 1
+        if "previous FULL JOIN effective USING(record_key)" in arguments[0]:
+            self.office_selection_queries.append(arguments)
         return await self.connection.fetch(*arguments)
 
 
 @pytest.mark.parametrize("retained_cms_preview", [{}, {"rows": 5002}], indirect=True)
 @pytest.mark.parametrize("operation", ["rebind", "close"])
-async def test_cms_preview_counts_all_source_rows_above_both_native_page_limits(retained_cms_preview, operation):
+async def test_cms_preview_counts_all_source_rows_above_both_native_page_limits(
+    retained_cms_preview, operation, record_property
+):
     """Retained source facts beyond keyset and expansion pages remain fully accounted."""
     fixture, reviewed = retained_cms_preview
     command = await _pending_cms_command(fixture, reviewed, operation)
-    source = reviewed[0][2]
+    source_pin = reviewed[0][2]
     count = await fixture.connection.fetchval(
         "SELECT count(*) FROM mrf.provider_directory_dataset_resource WHERE dataset_id=$1 AND resource_type='PractitionerRole'",
-        source.dataset_id,
+        source_pin.dataset_id,
     )
     counted = _CMSCountedConnection(fixture.connection)
+    preview_queries = []
     original_jit = await fixture.connection.fetchval("SHOW jit")
     async with fixture.connection.transaction(isolation="repeatable_read"):
-        preview = await preview_registry_approval(counted, command, _actor(), control_schema=fixture.control_schema)
+        fixture.connection.add_query_logger(preview_queries.append)
+        try:
+            preview = await preview_registry_approval(counted, command, _actor(), control_schema=fixture.control_schema)
+        finally:
+            await asyncio.sleep(0)
+            fixture.connection.remove_query_logger(preview_queries.append)
         assert await fixture.connection.fetchval("SHOW jit") == "off"
     assert await fixture.connection.fetchval("SHOW jit") == original_jit
     assert preview["source_selection"] == {
@@ -793,7 +807,25 @@ async def test_cms_preview_counts_all_source_rows_above_both_native_page_limits(
         "omitted_rows": count if operation == "close" else 0,
         "unresolved_rows": 0,
     }
-    assert counted.statements == 27
+    record_property("preview_statement_count", counted.statements)
+    record_property("preview_native_statement_count", len(preview_queries))
+    record_property(
+        "preview_transaction_boundaries",
+        json.dumps(
+            {
+                prefix: sum(query.query.startswith(prefix) for query in preview_queries)
+                for prefix in ("SAVEPOINT", "ROLLBACK TO", "RELEASE SAVEPOINT")
+            },
+            sort_keys=True,
+        ),
+    )
+    assert counted.statements <= 51  # Preserve the existing complete native epoch and custody ceiling.
+    assert counted.statements == 49  # Rollback-only setting scopes remove redundant reads and restores.
+    assert len(counted.office_selection_queries) == 1
+    selection_sql, *_parameters, limit = counted.office_selection_queries[0]
+    assert "LIMIT $3" in selection_sql and limit == 101
+    assert "registry_approved_record" in selection_sql and "registry_record_history" in selection_sql
+    assert "office_assertion" not in selection_sql and "network_membership_source" not in selection_sql
 
 
 @pytest.mark.parametrize("retained_cms_preview", [{"mixed": True}], indirect=True)
@@ -801,7 +833,7 @@ async def test_cms_custody_drift_makes_entire_mixed_preview_unavailable(retained
     """A lost protected source owner cannot expose partial ACA counts as complete."""
     fixture, reviewed = retained_cms_preview
     command = await _pending_cms_command(fixture, reviewed, "close")
-    owner = reviewed[0][2].custody_owner_role
+    owner = reviewed[0][2].retained_epoch.owner_role
     try:
         await fixture.connection.execute(f'ALTER ROLE "{owner}" LOGIN')
         preview = await _repeatable_preview(fixture, command)
@@ -811,7 +843,7 @@ async def test_cms_custody_drift_makes_entire_mixed_preview_unavailable(retained
     await _assert_staging_removed(fixture.connection)
 
 
-@pytest.mark.parametrize("changed", ["source", "expanded", "remaining_cursor"])
+@pytest.mark.parametrize("changed", ["source", "expanded", "accounting", "remaining_cursor"])
 async def test_cms_preview_denies_unrecognized_extraction_shapes(retained_cms_preview, monkeypatch, changed):
     """Exact SQL guards deny partial aggregation when the reviewed reader changes."""
     fixture, reviewed = retained_cms_preview
@@ -824,6 +856,8 @@ async def test_cms_preview_denies_unrecognized_extraction_shapes(retained_cms_pr
             return sql.replace("LIMIT $11", "LIMIT $11::bigint")
         if changed == "expanded":
             return sql.replace("LIMIT 5001", "LIMIT 5002")
+        if changed == "accounting":
+            return sql.replace(", resource_edges AS (", ", changed_edges AS (")
         return sql.replace("FROM page", "FROM page WHERE $9::text IS NULL")
 
     monkeypatch.setattr(imported_preview, "fhir_extraction_sql", changed_sql)

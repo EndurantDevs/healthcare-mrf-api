@@ -43,7 +43,6 @@ from process.ext.address_pub28 import (
 from process.live_progress import enqueue_live_progress
 from process.ptg_parts.rust_scanner import _ptg2_rust_scanner_binary
 
-
 logger = logging.getLogger(__name__)
 
 ADDRESS_CANON_RUST_MATERIALIZE_ENV = "HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE"
@@ -62,8 +61,7 @@ SPACED_UNIT_SUFFIX_PREFIXES = frozenset({"ste"})
 
 
 UNIT_DESIGNATOR_PATTERN = "|".join(
-    re.escape(value)
-    for value in sorted(PUB28_UNIT_DESIGNATOR_MAP, key=len, reverse=True)
+    re.escape(value) for value in sorted(PUB28_UNIT_DESIGNATOR_MAP, key=len, reverse=True)
 )
 UNIT_RE = re.compile(
     rf"^\s*({UNIT_DESIGNATOR_PATTERN})\.?\s*(?:#\s*)?"
@@ -453,10 +451,7 @@ def street_suffixless_norm(line1: str | None, line2: str | None) -> str | None:
     stop = len(tokens)
     if len(tokens) >= 2 and _is_street_suffix_token(tokens[-1]):
         stop -= 1
-    cleaned = "".join(
-        _street_token_norm_context(token, index, tokens)
-        for index, token in enumerate(tokens[:stop])
-    )
+    cleaned = "".join(_street_token_norm_context(token, index, tokens) for index, token in enumerate(tokens[:stop]))
     return cleaned or None
 
 
@@ -473,14 +468,9 @@ def street_directionless_norm(line1: str | None, line2: str | None) -> str | Non
     """Normalize a street after removing its recognized edge direction."""
     tokens = _street_tokens(line1, line2)
     direction_index = _edge_direction_index(tokens)
-    retained_tokens = [
-        token
-        for index, token in enumerate(tokens)
-        if index != direction_index
-    ]
+    retained_tokens = [token for index, token in enumerate(tokens) if index != direction_index]
     cleaned = "".join(
-        _street_token_norm_context(token, index, retained_tokens)
-        for index, token in enumerate(retained_tokens)
+        _street_token_norm_context(token, index, retained_tokens) for index, token in enumerate(retained_tokens)
     )
     return cleaned or None
 
@@ -562,16 +552,18 @@ def identity_key_v1(
         identity_city = city_value
     else:
         return None
-    return "|".join([
-        CURRENT_ADDRESS_IDENTITY_PREFIX,
-        street or "",
-        unit,
-        identity_city,
-        state_value,
-        zip_value,
-        country_value,
-        precision,
-    ])
+    return "|".join(
+        [
+            CURRENT_ADDRESS_IDENTITY_PREFIX,
+            street or "",
+            unit,
+            identity_city,
+            state_value,
+            zip_value,
+            country_value,
+            precision,
+        ]
+    )
 
 
 def premise_identity_key_v1(
@@ -589,16 +581,18 @@ def premise_identity_key_v1(
     country_value = country_code(country)
     if country_value != "US" or not street or not state_value or not zip_value:
         return None
-    return "|".join([
-        CURRENT_ADDRESS_IDENTITY_PREFIX,
-        street,
-        "",
-        "",
-        state_value,
-        zip_value,
-        country_value,
-        "street",
-    ])
+    return "|".join(
+        [
+            CURRENT_ADDRESS_IDENTITY_PREFIX,
+            street,
+            "",
+            "",
+            state_value,
+            zip_value,
+            country_value,
+            "street",
+        ]
+    )
 
 
 def key_from_identity(identity: str | None) -> uuid.UUID | None:
@@ -910,8 +904,7 @@ async def _is_rust_canon_version_current(binary: Path) -> bool:
     is_version_current = _is_canon_version_match(payload)
     if not is_version_current:
         logger.warning(
-            "Rust address canonicalizer version mismatch; falling back to SQL "
-            "(rust=%s python=%s)",
+            "Rust address canonicalizer version mismatch; falling back to SQL (rust=%s python=%s)",
             payload,
             current_canon_version(),
         )
@@ -944,8 +937,7 @@ async def _run_rust_address_canonicalizer(
         stderr_text = stderr.decode("utf-8", errors="replace")[-2000:]
         stdout_text = stdout.decode("utf-8", errors="replace")[-1000:]
         raise RuntimeError(
-            "Rust address canonicalizer failed with exit code "
-            f"{process.returncode}: {stderr_text or stdout_text}"
+            f"Rust address canonicalizer failed with exit code {process.returncode}: {stderr_text or stdout_text}"
         )
 
 
@@ -1106,9 +1098,7 @@ async def _stamp_address_key_shard(
     if not update_existing:
         source_filters.append("address_key IS NULL")
     if shards > 1:
-        source_filters.append(
-            "mod(abs(hashtext(ctid::text)::bigint), :shards) = :shard"
-        )
+        source_filters.append("mod(abs(hashtext(ctid::text)::bigint), :shards) = :shard")
     source_filter = f"WHERE {' AND '.join(source_filters)}" if source_filters else ""
     update_filter = (
         "target.address_key IS DISTINCT FROM stamped.computed_address_key"
@@ -1189,6 +1179,15 @@ async def _record_stamp_progress(
         )
 
 
+async def _run_address_shards(operation, shard_count, **kwargs):
+    """Keep transaction work on its owner while independent sessions fan out."""
+    if hasattr(db, "_transaction_binding") and db._transaction_binding() is not None:
+        for shard in range(shard_count):
+            await operation(shard, **kwargs)
+    else:
+        await asyncio.gather(*(operation(shard, **kwargs) for shard in range(shard_count)))
+
+
 async def stamp_address_keys(
     staging_table: str,
     field_map: Mapping[str, str],
@@ -1244,7 +1243,7 @@ async def stamp_address_keys(
             await _record_stamp_progress(progress_lock, progress_by_metric, rowcount, shards)
             await asyncio.sleep(0)
 
-    await asyncio.gather(*(_stamp_shard(shard) for shard in range(shards)))
+    await _run_address_shards(_stamp_shard, shards)
     return progress_by_metric["updated"]
 
 
@@ -1490,20 +1489,16 @@ async def propagate_child_address_keys(
             )
             return 0
 
-    await asyncio.gather(
-        *(
-            _propagate_child_address_key_shard(
-                shard,
-                child=child,
-                parent=parent,
-                shards=shards,
-                cancel_check=cancel_check,
-                semaphore=semaphore,
-                progress_lock=progress_lock,
-                progress_by_metric=progress_by_metric,
-            )
-            for shard in range(shards)
-        )
+    await _run_address_shards(
+        _propagate_child_address_key_shard,
+        shards,
+        child=child,
+        parent=parent,
+        shards=shards,
+        cancel_check=cancel_check,
+        semaphore=semaphore,
+        progress_lock=progress_lock,
+        progress_by_metric=progress_by_metric,
     )
     return progress_by_metric["updated"]
 
@@ -1592,9 +1587,9 @@ def _zip_restore_match_ctes_sql(
                 z.zcta5ce AS zip5
               FROM normalized
               JOIN tiger.zcta5 AS z
-                ON ST_Covers(
+                ON public.ST_Covers(
                     z.the_geom,
-                    ST_SetSRID(ST_Point(normalized.longitude, normalized.latitude), 4269)
+                    public.ST_SetSRID(public.ST_Point(normalized.longitude, normalized.latitude), 4269)
                 )
               JOIN {qschema}.geo_zip_lookup AS zip_lookup
                 ON zip_lookup.zip_code = z.zcta5ce
@@ -1842,7 +1837,7 @@ async def _restore_zip_shards(
             )
             await asyncio.sleep(0)
 
-    await asyncio.gather(*(_restore_shard(shard) for shard in range(shards)))
+    await _run_address_shards(_restore_shard, shards)
     restored = progress_by_metric["restored"]
     logger.info("Restored %d missing ZIPs for %s.%s from coordinates.", restored, schema, staging_table)
     return restored
@@ -1895,24 +1890,13 @@ async def _select_canonical_archive_table(schema: str, requested: str) -> str:
 async def _validated_active_alias_state(session: Any, schema: str) -> Any:
     """Lock alias promotion and return a supported singleton state row."""
     await session.execute(text(address_alias_sql.alias_advisory_xact_lock_sql()))
-    state = (
-        await session.execute(
-            text(address_alias_sql.active_alias_generation_sql(schema=schema))
-        )
-    ).first()
+    state = (await session.execute(text(address_alias_sql.active_alias_generation_sql(schema=schema)))).first()
     if state is None:
         raise RuntimeError("Address alias singleton state is missing")
     if int(state.schema_version) != address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION:
-        raise RuntimeError(
-            f"Unsupported address alias schema version: {state.schema_version}"
-        )
-    if (
-        int(state.active_ruleset_version)
-        != address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION
-    ):
-        raise RuntimeError(
-            f"Unsupported address alias ruleset: {state.active_ruleset_version}"
-        )
+        raise RuntimeError(f"Unsupported address alias schema version: {state.schema_version}")
+    if int(state.active_ruleset_version) != address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION:
+        raise RuntimeError(f"Unsupported address alias ruleset: {state.active_ruleset_version}")
     return state
 
 
@@ -1920,12 +1904,7 @@ async def _existing_address_alias_count(session: Any) -> int:
     """Count distinct approved source keys materialized in the temp table."""
     return int(
         (
-            await session.execute(
-                text(
-                    "SELECT count(DISTINCT source_address_key) "
-                    "FROM address_existing_aliases;"
-                )
-            )
+            await session.execute(text("SELECT count(DISTINCT source_address_key) FROM address_existing_aliases;"))
         ).scalar()
         or 0
     )
@@ -1940,9 +1919,7 @@ async def _apply_persisted_address_aliases(
 ) -> dict[str, int]:
     """Project already-approved aliases into the transient effective key set."""
     state = await _validated_active_alias_state(session, schema)
-    await session.execute(
-        text("DROP TABLE IF EXISTS pg_temp.address_existing_aliases;")
-    )
+    await session.execute(text("DROP TABLE IF EXISTS pg_temp.address_existing_aliases;"))
     await session.execute(
         text(
             address_alias_sql.existing_address_aliases_sql(
@@ -2013,9 +1990,7 @@ async def _snapshot_strict_source_observations(
                       AND ({strict_source_predicate})
               )
         """
-    await session.execute(
-        text("DROP TABLE IF EXISTS pg_temp.address_strict_source_observations;")
-    )
+    await session.execute(text("DROP TABLE IF EXISTS pg_temp.address_strict_source_observations;"))
     await session.execute(
         text(
             f"""
@@ -2320,14 +2295,16 @@ async def resolve_into_archive(
         staged = int((await session.execute(text(f"SELECT count(*) FROM {staging};"))).scalar() or 0)
         keyed_rows = int((await session.execute(text(f"SELECT count(*) FROM {keyed_table};"))).scalar() or 0)
         mismatch = (
-            await session.execute(text(f"""
+            await session.execute(
+                text(f"""
                 SELECT rn, staged_address_key, computed_address_key, identity_key
                   FROM {keyed_table}
                  WHERE staged_address_key IS NOT NULL
                    AND staged_address_key IS DISTINCT FROM computed_address_key
                  ORDER BY rn
                  LIMIT 1;
-            """))
+            """)
+            )
         ).first()
         if mismatch:
             _emit_progress(
@@ -2367,17 +2344,16 @@ async def resolve_into_archive(
             pct=20,
             message="materialized deduplicated canonical address keys",
             keyed_rows=keyed_rows,
-            persisted_aliases=int(
-                alias_stats_by_kind.get("persisted_aliases_applied") or 0
-            ),
+            persisted_aliases=int(alias_stats_by_kind.get("persisted_aliases_applied") or 0),
         )
         await session.execute(text(f"CREATE INDEX ON {keyed_table} (address_key) WHERE address_key IS NOT NULL;"))
         await session.execute(text(f"CREATE INDEX ON {keyed_table} (premise_key) WHERE premise_key IS NOT NULL;"))
         await session.execute(text(f"ANALYZE {keyed_table};"))
 
-        null_key_rows = int((
-            await session.execute(text(f"SELECT count(*) FROM {keyed_table} WHERE address_key IS NULL;"))
-        ).scalar() or 0)
+        null_key_rows = int(
+            (await session.execute(text(f"SELECT count(*) FROM {keyed_table} WHERE address_key IS NULL;"))).scalar()
+            or 0
+        )
         raw_coverage = (await session.execute(text(coverage_sql))).scalar() or {}
         if isinstance(raw_coverage, str):
             coverage_map = json.loads(raw_coverage)
@@ -2399,13 +2375,11 @@ async def resolve_into_archive(
         else:
             reason_buckets_by_reason = dict(raw_reason_buckets)
         reason_buckets_by_reason = {
-            str(key): int(metric_value or 0)
-            for key, metric_value in reason_buckets_by_reason.items()
+            str(key): int(metric_value or 0) for key, metric_value in reason_buckets_by_reason.items()
         }
-        reason_buckets_by_reason.update({
-            str(key): int(metric_value or 0)
-            for key, metric_value in alias_stats_by_kind.items()
-        })
+        reason_buckets_by_reason.update(
+            {str(key): int(metric_value or 0) for key, metric_value in alias_stats_by_kind.items()}
+        )
         reason_buckets_by_reason.update(
             {
                 "canonical_materializer_rust": int(rust_materialized),
@@ -2413,9 +2387,7 @@ async def resolve_into_archive(
                 "canonical_materialized_key_rows": keyed_rows,
             }
         )
-        distinct_keys = int((
-            await session.execute(text(f"SELECT count(*) FROM ({dedup_cte}) d;"))
-        ).scalar() or 0)
+        distinct_keys = int((await session.execute(text(f"SELECT count(*) FROM ({dedup_cte}) d;"))).scalar() or 0)
         _emit_progress(
             phase="address archive resolve",
             unit="phase",
@@ -2426,7 +2398,8 @@ async def resolve_into_archive(
         )
 
         batch_collision = (
-            await session.execute(text(f"""
+            await session.execute(
+                text(f"""
                 SELECT address_key,
                        min(identity_key) AS first_identity_key,
                        max(identity_key) AS second_identity_key,
@@ -2436,7 +2409,8 @@ async def resolve_into_archive(
                  GROUP BY address_key
                 HAVING count(DISTINCT identity_key) > 1
                  LIMIT 1;
-            """))
+            """)
+            )
         ).first()
         if batch_collision:
             _emit_progress(
@@ -2456,7 +2430,8 @@ async def resolve_into_archive(
             )
 
         collision = (
-            await session.execute(text(f"""
+            await session.execute(
+                text(f"""
                 SELECT s.address_key, s.identity_key, c.identity_key AS existing_identity_key
                 FROM (
                     SELECT DISTINCT address_key, identity_key
@@ -2466,7 +2441,8 @@ async def resolve_into_archive(
                 JOIN {archive} c USING (address_key)
                 WHERE c.identity_key IS DISTINCT FROM s.identity_key
                 LIMIT 1;
-            """))
+            """)
+            )
         ).first()
         if collision:
             _emit_progress(
@@ -2495,8 +2471,10 @@ async def resolve_into_archive(
         if cancel_check:
             await cancel_check()
 
-        inserted = int((
-            await session.execute(text(f"""
+        inserted = int(
+            (
+                await session.execute(
+                    text(f"""
                 WITH dedup AS ({dedup_cte}),
                 inserted AS (
                     INSERT INTO {archive} AS target (
@@ -2553,13 +2531,17 @@ async def resolve_into_archive(
                     RETURNING 1
                 )
                 SELECT count(*) FROM inserted;
-            """), {
-                "source_bit": source_bit,
-                "priority": priority,
-                "formatted_address_version": ADDRESS_FORMAT_VERSION,
-                "formatted_address_source": ADDRESS_FORMAT_SOURCE,
-            })
-        ).scalar() or 0)
+            """),
+                    {
+                        "source_bit": source_bit,
+                        "priority": priority,
+                        "formatted_address_version": ADDRESS_FORMAT_VERSION,
+                        "formatted_address_source": ADDRESS_FORMAT_SOURCE,
+                    },
+                )
+            ).scalar()
+            or 0
+        )
         _emit_progress(
             phase="address archive resolve",
             unit="phase",
@@ -2572,8 +2554,10 @@ async def resolve_into_archive(
         if cancel_check:
             await cancel_check()
 
-        provenance_updates = int((
-            await session.execute(text(f"""
+        provenance_updates = int(
+            (
+                await session.execute(
+                    text(f"""
                 WITH dedup AS ({dedup_cte}),
                 updated AS (
                     UPDATE {archive} c
@@ -2627,13 +2611,17 @@ async def resolve_into_archive(
                     RETURNING 1
                 )
                 SELECT count(*) FROM updated;
-            """), {
-                "source_bit": source_bit,
-                "priority": priority,
-                "formatted_address_version": ADDRESS_FORMAT_VERSION,
-                "formatted_address_source": ADDRESS_FORMAT_SOURCE,
-            })
-        ).scalar() or 0)
+            """),
+                    {
+                        "source_bit": source_bit,
+                        "priority": priority,
+                        "formatted_address_version": ADDRESS_FORMAT_VERSION,
+                        "formatted_address_source": ADDRESS_FORMAT_SOURCE,
+                    },
+                )
+            ).scalar()
+            or 0
+        )
         strict_source_updates = int(
             (
                 await session.execute(
@@ -2666,7 +2654,8 @@ async def resolve_into_archive(
         reason_buckets_by_reason["strict_source_updates"] = strict_source_updates
         gate_sample_limit = max(0, min(int(gate_sample_limit or 0), 100))
         if gate_sample_limit:
-            sample_rows_result = await session.execute(text(f"""
+            sample_rows_result = await session.execute(
+                text(f"""
                 SELECT
                     address_key::text AS address_key,
                     source_bits,
@@ -2685,7 +2674,9 @@ async def resolve_into_archive(
                   AND source_bits <> :source_bit
                 ORDER BY last_seen_at DESC, address_key
                 LIMIT :limit;
-            """), {"source_bit": source_bit, "limit": gate_sample_limit})
+            """),
+                {"source_bit": source_bit, "limit": gate_sample_limit},
+            )
             gate_sample_rows = [dict(archive_row._mapping) for archive_row in sample_rows_result]
         else:
             gate_sample_rows = []
@@ -2808,7 +2799,8 @@ async def migrate_legacy_archive_to_v2(
 
         await session.execute(text(f"DROP TABLE IF EXISTS {keyed_temp_table};"))
         await session.execute(text(f"DROP TABLE IF EXISTS {raw_temp_table};"))
-        await session.execute(text(f"""
+        await session.execute(
+            text(f"""
             CREATE TEMP TABLE {raw_table} ON COMMIT DROP AS
             SELECT
                 row_number() OVER (ORDER BY checksum, ctid) AS rn,
@@ -2827,9 +2819,11 @@ async def migrate_legacy_archive_to_v2(
                 date_added,
                 place_id
             FROM {legacy};
-        """))
+        """)
+        )
         await session.execute(text(f"CREATE INDEX ON {raw_table} (rn);"))
-        await session.execute(text(f"""
+        await session.execute(
+            text(f"""
             CREATE TEMP TABLE {keyed_table} (
                 checksum bigint,
                 address_key uuid,
@@ -2856,7 +2850,8 @@ async def migrate_legacy_archive_to_v2(
                 geo_source text,
                 date_added date
             ) ON COMMIT DROP;
-        """))
+        """)
+        )
         legacy_rows = int((await session.execute(text(f"SELECT count(*) FROM {raw_table};"))).scalar() or 0)
         batch_size = int(os.getenv("HLTHPRT_ADDRESS_ARCHIVE_MIGRATE_BATCH_ROWS", "25000") or 25000)
         batch_size = max(1000, min(batch_size, 100000))
@@ -2882,13 +2877,16 @@ async def migrate_legacy_archive_to_v2(
             if cancel_check:
                 await cancel_check()
             raw_rows = (
-                await session.execute(text(f"""
+                await session.execute(
+                    text(f"""
                     SELECT *
                     FROM {raw_table}
                     WHERE rn > :last_rn
                     ORDER BY rn
                     LIMIT :limit;
-                """), {"last_rn": last_rn, "limit": batch_size})
+                """),
+                    {"last_rn": last_rn, "limit": batch_size},
+                )
             ).all()
             if not raw_rows:
                 break
@@ -2902,44 +2900,63 @@ async def migrate_legacy_archive_to_v2(
                 postal_code = migration_payload.get("postal_code")
                 country = migration_payload.get("country_code") or "US"
                 identity_key = identity_key_v1(first_line, second_line, city_name, state_name, postal_code, country)
-                premise_identity = premise_identity_key_v1(first_line, second_line, city_name, state_name, postal_code, country)
+                premise_identity = premise_identity_key_v1(
+                    first_line, second_line, city_name, state_name, postal_code, country
+                )
                 postal_digits = re.sub(r"[^0-9]", "", str(postal_code or ""))
-                keyed_rows.append({
-                    "checksum": migration_payload.get("checksum"),
-                    "address_key": str(key_from_identity(identity_key)) if identity_key else None,
-                    "identity_key": identity_key,
-                    "premise_key": str(key_from_identity(premise_identity)) if premise_identity else None,
-                    "line1_norm": street_norm(first_line, second_line),
-                    "unit_norm": unit_norm(first_line, second_line),
-                    "city_norm": city_norm(city_name),
-                    "state_code": _clamp_text(state_code(state_name), 32),
-                    "zip5": zip5_norm(postal_code),
-                    "zip4": postal_digits[5:9] or None,
-                    "country_code": country_code(country),
-                    "first_line": str(first_line).strip() if first_line is not None and str(first_line).strip() else None,
-                    "second_line": str(second_line).strip() if second_line is not None and str(second_line).strip() else None,
-                    "city_name": str(city_name).strip() if city_name is not None and str(city_name).strip() else None,
-                    "state_name": str(state_name).strip() if state_name is not None and str(state_name).strip() else None,
-                    "postal_code": str(postal_code).strip() if postal_code is not None and str(postal_code).strip() else None,
-                    "telephone_number": str(migration_payload.get("telephone_number")).strip()
-                    if migration_payload.get("telephone_number") is not None and str(migration_payload.get("telephone_number")).strip()
-                    else None,
-                    "fax_number": str(migration_payload.get("fax_number")).strip()
-                    if migration_payload.get("fax_number") is not None and str(migration_payload.get("fax_number")).strip()
-                    else None,
-                    "formatted_address": str(migration_payload.get("formatted_address")).strip()
-                    if migration_payload.get("formatted_address") is not None and str(migration_payload.get("formatted_address")).strip()
-                    else None,
-                    "lat": migration_payload.get("lat"),
-                    "long": migration_payload.get("long"),
-                    "place_id": str(migration_payload.get("place_id")).strip()
-                    if migration_payload.get("place_id") is not None and str(migration_payload.get("place_id")).strip()
-                    else None,
-                    "geo_source": "google"
-                    if migration_payload.get("place_id") is not None and str(migration_payload.get("place_id")).strip()
-                    else None,
-                    "date_added": migration_payload.get("date_added"),
-                })
+                keyed_rows.append(
+                    {
+                        "checksum": migration_payload.get("checksum"),
+                        "address_key": str(key_from_identity(identity_key)) if identity_key else None,
+                        "identity_key": identity_key,
+                        "premise_key": str(key_from_identity(premise_identity)) if premise_identity else None,
+                        "line1_norm": street_norm(first_line, second_line),
+                        "unit_norm": unit_norm(first_line, second_line),
+                        "city_norm": city_norm(city_name),
+                        "state_code": _clamp_text(state_code(state_name), 32),
+                        "zip5": zip5_norm(postal_code),
+                        "zip4": postal_digits[5:9] or None,
+                        "country_code": country_code(country),
+                        "first_line": str(first_line).strip()
+                        if first_line is not None and str(first_line).strip()
+                        else None,
+                        "second_line": str(second_line).strip()
+                        if second_line is not None and str(second_line).strip()
+                        else None,
+                        "city_name": str(city_name).strip()
+                        if city_name is not None and str(city_name).strip()
+                        else None,
+                        "state_name": str(state_name).strip()
+                        if state_name is not None and str(state_name).strip()
+                        else None,
+                        "postal_code": str(postal_code).strip()
+                        if postal_code is not None and str(postal_code).strip()
+                        else None,
+                        "telephone_number": str(migration_payload.get("telephone_number")).strip()
+                        if migration_payload.get("telephone_number") is not None
+                        and str(migration_payload.get("telephone_number")).strip()
+                        else None,
+                        "fax_number": str(migration_payload.get("fax_number")).strip()
+                        if migration_payload.get("fax_number") is not None
+                        and str(migration_payload.get("fax_number")).strip()
+                        else None,
+                        "formatted_address": str(migration_payload.get("formatted_address")).strip()
+                        if migration_payload.get("formatted_address") is not None
+                        and str(migration_payload.get("formatted_address")).strip()
+                        else None,
+                        "lat": migration_payload.get("lat"),
+                        "long": migration_payload.get("long"),
+                        "place_id": str(migration_payload.get("place_id")).strip()
+                        if migration_payload.get("place_id") is not None
+                        and str(migration_payload.get("place_id")).strip()
+                        else None,
+                        "geo_source": "google"
+                        if migration_payload.get("place_id") is not None
+                        and str(migration_payload.get("place_id")).strip()
+                        else None,
+                        "date_added": migration_payload.get("date_added"),
+                    }
+                )
             await session.execute(insert_sql, keyed_rows)
             last_rn = int(raw_rows[-1]._mapping["rn"])
             materialized += len(raw_rows)
@@ -2955,13 +2972,18 @@ async def migrate_legacy_archive_to_v2(
 
         keyable_rows = int((await session.execute(text(f"SELECT count(*) FROM ({valid_source}) valid;"))).scalar() or 0)
         non_keyable_rows = legacy_rows - keyable_rows
-        legacy_geocoded_keys = int((
-            await session.execute(text(f"""
+        legacy_geocoded_keys = int(
+            (
+                await session.execute(
+                    text(f"""
                 SELECT count(DISTINCT address_key)
                 FROM ({valid_source}) valid
                 WHERE lat IS NOT NULL AND long IS NOT NULL;
-            """))
-        ).scalar() or 0)
+            """)
+                )
+            ).scalar()
+            or 0
+        )
         _emit_progress(
             phase="address archive v2 migration",
             unit="phase",
@@ -2976,7 +2998,8 @@ async def migrate_legacy_archive_to_v2(
         if not dry_run:
             if cancel_check:
                 await cancel_check()
-            upsert_result = await session.execute(text(f"""
+            upsert_result = await session.execute(
+                text(f"""
                 WITH ranked AS ({ranked_cte}),
                 upserted AS (
                     INSERT INTO {archive} AS target (
@@ -3120,10 +3143,12 @@ async def migrate_legacy_archive_to_v2(
                     count(*) FILTER (WHERE inserted)::bigint AS inserted_rows,
                     count(*) FILTER (WHERE NOT inserted)::bigint AS updated_rows
                 FROM upserted;
-            """), {
-                "formatted_address_version": ADDRESS_FORMAT_VERSION,
-                "formatted_address_source": ADDRESS_FORMAT_SOURCE,
-            })
+            """),
+                {
+                    "formatted_address_version": ADDRESS_FORMAT_VERSION,
+                    "formatted_address_source": ADDRESS_FORMAT_SOURCE,
+                },
+            )
             upsert_row = upsert_result.first()
             if upsert_row:
                 upserted_rows = int(upsert_row.upserted_rows or 0)
@@ -3181,7 +3206,8 @@ async def migrate_legacy_archive_to_v2(
             if cancel_check:
                 await cancel_check()
             await session.execute(text(f"TRUNCATE TABLE {checksum_map}, {checksum_collision};"))
-            await session.execute(text(f"""
+            await session.execute(
+                text(f"""
                 WITH valid AS ({valid_source}),
                 counted AS (
                     SELECT checksum, count(DISTINCT address_key) AS address_keys
@@ -3194,8 +3220,10 @@ async def migrate_legacy_archive_to_v2(
                 FROM valid
                 JOIN counted USING (checksum)
                 WHERE counted.address_keys = 1;
-            """))
-            await session.execute(text(f"""
+            """)
+            )
+            await session.execute(
+                text(f"""
                 WITH valid AS ({valid_source}),
                 counted AS (
                     SELECT checksum, count(DISTINCT address_key) AS address_keys
@@ -3208,7 +3236,8 @@ async def migrate_legacy_archive_to_v2(
                 FROM valid
                 JOIN counted USING (checksum)
                 WHERE counted.address_keys > 1;
-            """))
+            """)
+            )
             _emit_progress(
                 phase="address archive v2 migration",
                 unit="phase",
@@ -3218,8 +3247,10 @@ async def migrate_legacy_archive_to_v2(
                 message="rebuilt checksum bridge",
             )
 
-        represented_missing_keys = int((
-            await session.execute(text(f"""
+        represented_missing_keys = int(
+            (
+                await session.execute(
+                    text(f"""
                 WITH legacy_keys AS (
                     SELECT DISTINCT address_key FROM ({valid_source}) valid
                 )
@@ -3227,10 +3258,15 @@ async def migrate_legacy_archive_to_v2(
                 WHERE NOT EXISTS (
                     SELECT 1 FROM {archive} v2 WHERE v2.address_key = legacy_keys.address_key
                 );
-            """))
-        ).scalar() or 0)
-        geocoded_missing_keys = int((
-            await session.execute(text(f"""
+            """)
+                )
+            ).scalar()
+            or 0
+        )
+        geocoded_missing_keys = int(
+            (
+                await session.execute(
+                    text(f"""
                 WITH legacy_keys AS (
                     SELECT DISTINCT address_key
                     FROM ({valid_source}) valid
@@ -3244,16 +3280,22 @@ async def migrate_legacy_archive_to_v2(
                       AND v2.lat IS NOT NULL
                       AND v2.long IS NOT NULL
                 );
-            """))
-        ).scalar() or 0)
+            """)
+                )
+            ).scalar()
+            or 0
+        )
         checksum_map_rows = int((await session.execute(text(f"SELECT count(*) FROM {checksum_map};"))).scalar() or 0)
-        checksum_collision_rows = int((await session.execute(text(f"SELECT count(*) FROM {checksum_collision};"))).scalar() or 0)
-        checksum_collision_checksums = int((
-            await session.execute(text(f"SELECT count(DISTINCT checksum) FROM {checksum_collision};"))
-        ).scalar() or 0)
+        checksum_collision_rows = int(
+            (await session.execute(text(f"SELECT count(*) FROM {checksum_collision};"))).scalar() or 0
+        )
+        checksum_collision_checksums = int(
+            (await session.execute(text(f"SELECT count(DISTINCT checksum) FROM {checksum_collision};"))).scalar() or 0
+        )
 
         if sample_limit:
-            sample_result = await session.execute(text(f"""
+            sample_result = await session.execute(
+                text(f"""
                 SELECT
                     address_key::text AS address_key,
                     source_bits,
@@ -3271,7 +3313,9 @@ async def migrate_legacy_archive_to_v2(
                 WHERE source_bits & 1 <> 0
                 ORDER BY (place_id IS NOT NULL) DESC, date_added DESC NULLS LAST, address_key
                 LIMIT :limit;
-            """), {"limit": sample_limit})
+            """),
+                {"limit": sample_limit},
+            )
             sample_rows = [dict(archive_row._mapping) for archive_row in sample_result]
         else:
             sample_rows = []
@@ -3400,17 +3444,10 @@ async def _archive_swap_preflight(
         tables,
     )
     legacy_fingerprint = await _legacy_archive_fingerprint(session, tables.current)
-    archive_rows = int(
-        (await session.execute(text(f"SELECT count(*) FROM {tables.archive};"))).scalar()
-        or 0
-    )
-    checksum_map_rows = int(
-        (await session.execute(text(f"SELECT count(*) FROM {tables.checksum_map};"))).scalar()
-        or 0
-    )
+    archive_rows = int((await session.execute(text(f"SELECT count(*) FROM {tables.archive};"))).scalar() or 0)
+    checksum_map_rows = int((await session.execute(text(f"SELECT count(*) FROM {tables.checksum_map};"))).scalar() or 0)
     checksum_collision_rows = int(
-        (await session.execute(text(f"SELECT count(*) FROM {tables.checksum_collision};"))).scalar()
-        or 0
+        (await session.execute(text(f"SELECT count(*) FROM {tables.checksum_collision};"))).scalar() or 0
     )
     missing_map_targets = int(
         (
@@ -3452,9 +3489,7 @@ def _require_archive_swap_preflight(
     if preflight.checksum_map_rows <= 0:
         raise RuntimeError(f"{tables.schema}.{options.checksum_map_table} is empty")
     if preflight.missing_map_targets:
-        raise RuntimeError(
-            f"checksum bridge has {preflight.missing_map_targets} missing canonical target(s)"
-        )
+        raise RuntimeError(f"checksum bridge has {preflight.missing_map_targets} missing canonical target(s)")
 
 
 async def _is_archive_swap_applied(
@@ -3467,18 +3502,8 @@ async def _is_archive_swap_applied(
         return False
     if preflight.backup_exists and options.allow_replace_backup:
         await session.execute(text(f"DROP TABLE {tables.backup};"))
-    await session.execute(
-        text(
-            f"ALTER TABLE {tables.current} "
-            f"RENAME TO {_quote_ident(options.backup_table)};"
-        )
-    )
-    await session.execute(
-        text(
-            f"ALTER TABLE {tables.archive} "
-            f"RENAME TO {_quote_ident(options.current_table)};"
-        )
-    )
+    await session.execute(text(f"ALTER TABLE {tables.current} RENAME TO {_quote_ident(options.backup_table)};"))
+    await session.execute(text(f"ALTER TABLE {tables.archive} RENAME TO {_quote_ident(options.current_table)};"))
     return True
 
 
@@ -3491,10 +3516,7 @@ async def _verify_archive_swap(
     legacy_table = tables.backup if is_swapped else tables.current
     current_table = tables.current if is_swapped else tables.archive
     after_fingerprint = await _legacy_archive_fingerprint(session, legacy_table)
-    current_rows = int(
-        (await session.execute(text(f"SELECT count(*) FROM {current_table};"))).scalar()
-        or 0
-    )
+    current_rows = int((await session.execute(text(f"SELECT count(*) FROM {current_table};"))).scalar() or 0)
     if dict(after_fingerprint) != dict(preflight.legacy_fingerprint):
         raise RuntimeError("legacy archive fingerprint changed during swap")
     if current_rows != preflight.archive_rows:
@@ -3577,12 +3599,16 @@ async def _legacy_archive_fingerprint(session: Any, table: str) -> dict[str, Any
             )
         )
     ).first()
-    return dict(row._mapping) if row is not None else {
-        "rows": 0,
-        "checksum_min": None,
-        "checksum_max": None,
-        "checksum_sum": None,
-    }
+    return (
+        dict(row._mapping)
+        if row is not None
+        else {
+            "rows": 0,
+            "checksum_min": None,
+            "checksum_max": None,
+            "checksum_sum": None,
+        }
+    )
 
 
 def _repeated_bare_line2_unit_decision(l1: str, l2: str) -> _UnitDecision | None:

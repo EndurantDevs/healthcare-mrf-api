@@ -4,31 +4,32 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import importlib.util
 import json
+from contextlib import AsyncExitStack
+from copy import deepcopy
 from pathlib import Path
 
 import asyncpg
 import pytest
 
 from process import (
-    provider_directory_fhir_subset_terminal_disposition_v4_selection
-    as v4_selection,
+    provider_directory_fhir_subset_terminal_disposition_v4_selection as v4_selection,
 )
 from process.provider_directory_fhir_subset_completion import (
     build_subset_completion_proof,
+)
+from process.provider_directory_fhir_subset_identity import (
+    SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
+    SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
 )
 from process.provider_directory_fhir_subset_terminal_disposition_store import (
     sync_v4_terminal_disposition,
 )
 from tests.provider_directory_fhir_subset_abandonment_pg_support import (
+    _current_writer,
     close_abandonment_scenario,
-    runtime_database,
-)
-from process.provider_directory_fhir_subset_identity import (
-    SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
-    SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+    historical_checkpoint_catalog,
 )
 from tests.provider_directory_fhir_subset_activation_support import (
     single_root_activation_inputs,
@@ -37,48 +38,49 @@ from tests.provider_directory_fhir_subset_completion_support import (
     PAGE_COUNT,
     build_subset_contract,
 )
+from tests.provider_directory_fhir_subset_terminal_disposition_v4_pg_support import (
+    seed_direct_v4_terminal_root,
+)
 from tests.provider_directory_reviewed_root_policy_pg import (
     _activate_policy_source,
-    _install_policy_predecessors,
     _insert_policy_source,
+    _install_policy_predecessors,
     _terminalize_candidate,
 )
 from tests.provider_directory_reviewed_subset_activation_pg_support import (
     flush_deferred_fixture_events,
 )
-from tests.provider_directory_fhir_subset_terminal_disposition_v4_pg_support import (
-    seed_direct_v4_terminal_root,
+from tests.provider_directory_subset_completion_pg_concurrency import (
+    create_committed_subset_schema,
 )
 from tests.provider_directory_subset_completion_pg_setup import (
     MigrationSqlCapture,
     insert_subset_candidate,
     insert_valid_subset_resources,
 )
-from tests.tin_npi_connector_postgres_support import TransactionalSchema
 from tests.test_provider_directory_reviewed_subset_direct_v4_disposition_postgres import (
     SYNTHETIC_MARKER_SHA256,
     _install_terminal_stack,
+)
+from tests.test_provider_directory_reviewed_subset_direct_v4_disposition_postgres import (
     _object_identity_by_kind as _direct_object_identity,
 )
 from tests.test_provider_directory_reviewed_subset_terminal_disposition_postgres import (
     _load_migration as _load_terminal_disposition_migration,
+)
+from tests.test_provider_directory_reviewed_subset_terminal_disposition_postgres import (
     _load_scope_binding_migration,
 )
-from tests.provider_directory_subset_completion_pg_concurrency import (
-    create_committed_subset_schema,
-)
-
+from tests.tin_npi_connector_postgres_support import TransactionalSchema
 
 MIGRATION_DIRECTORY = Path(__file__).resolve().parents[1] / "alembic/versions"
-BOUNDED_MIGRATION_PATH = MIGRATION_DIRECTORY / (
-    "20260810000000_provider_directory_reviewed_subset_bounded_drift.py"
-)
-MIGRATION_PATH = MIGRATION_DIRECTORY / (
-    "20260810130000_provider_directory_reviewed_subset_terminal_window.py"
-)
+BOUNDED_MIGRATION_PATH = MIGRATION_DIRECTORY / ("20260810000000_provider_directory_reviewed_subset_bounded_drift.py")
+MIGRATION_PATH = MIGRATION_DIRECTORY / ("20260810130000_provider_directory_reviewed_subset_terminal_window.py")
 DIRECT_DISPOSITION_MIGRATION_PATH = MIGRATION_DIRECTORY / (
     "20260810110000_provider_directory_reviewed_subset_direct_v4_disposition.py"
 )
+
+
 def _load_migration(path, module_name):
     module_spec = importlib.util.spec_from_file_location(module_name, path)
     assert module_spec is not None and module_spec.loader is not None
@@ -93,15 +95,16 @@ async def _run_migration(scenario, migration, action: str) -> None:
     if hasattr(migration, "_bounded"):
         migration._bounded().op = capture
     getattr(migration, action)()
-    for statement_index, statement in enumerate(capture.statements):
-        try:
-            await scenario.connection.execute(statement)
-        except Exception as error:
-            raise AssertionError(
-                f"failed migration {migration.revision} {action} "
-                f"statement {statement_index} at "
-                f"{getattr(error, 'position', None)}: {error}"
-            ) from error
+    async with historical_checkpoint_catalog(scenario):
+        for statement_index, statement in enumerate(capture.statements):
+            try:
+                await scenario.connection.execute(statement)
+            except Exception as error:
+                raise AssertionError(
+                    f"failed migration {migration.revision} {action} "
+                    f"statement {statement_index} at "
+                    f"{getattr(error, 'position', None)}: {error}"
+                ) from error
 
 
 async def _install_direct_predecessor(scenario):
@@ -175,7 +178,8 @@ async def _function_identity_by_name(scenario, migration) -> dict[str, tuple]:
 
 def _assert_function_security(function_identity_by_name) -> None:
     assert all(
-        function_identity[1:] == (
+        function_identity[1:]
+        == (
             True,
             ("search_path=pg_catalog",),
             False,
@@ -240,9 +244,7 @@ def _profile_proof_by_field(
             "pages_processed": checkpoint_pages + 1,
             "processed_rows": 0,
             "terminal_page_start_offset": checkpoint_pages * PAGE_COUNT,
-            "logical_window_end_offset": (
-                checkpoint_pages + 1
-            ) * PAGE_COUNT,
+            "logical_window_end_offset": (checkpoint_pages + 1) * PAGE_COUNT,
             "terminal_page_entries": 0,
             "sparse_pages": checkpoint_pages + 1,
             "empty_pages": checkpoint_pages + 1,
@@ -280,9 +282,7 @@ async def _prove_profile_boundaries(scenario, migration) -> None:
     )
     assert await _is_proof_valid(scenario, migration, percentage_bound)
     percentage_over_bound = deepcopy(percentage_bound)
-    percentage_over_bound["resources"]["PractitionerRole"][
-        "advertised_post"
-    ] -= 1
+    percentage_over_bound["resources"]["PractitionerRole"]["advertised_post"] -= 1
     assert not await _is_proof_valid(
         scenario,
         migration,
@@ -349,11 +349,13 @@ async def _prove_profile_guarded_lifecycle(scenario, migration) -> None:
         """
     )
     await flush_deferred_fixture_events(scenario)
-    assert await scenario.connection.fetchval(
-        f"SELECT {scenario.quoted_schema}."
-        f'"{activation._ACTIVATION_VALID_FUNCTION}"($1)',
-        source_record["source_id"],
-    ) is True
+    assert (
+        await scenario.connection.fetchval(
+            f'SELECT {scenario.quoted_schema}."{activation._ACTIVATION_VALID_FUNCTION}"($1)',
+            source_record["source_id"],
+        )
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -381,10 +383,13 @@ async def test_terminal_window_profile_is_oid_stable_closed_and_guarded(
         _assert_function_security(before_identity_by_name)
         async with scenario.connection.transaction():
             await _run_migration(scenario, migration, "upgrade")
-        assert await _function_identity_by_name(
-            scenario,
-            migration,
-        ) == before_identity_by_name
+        assert (
+            await _function_identity_by_name(
+                scenario,
+                migration,
+            )
+            == before_identity_by_name
+        )
         assert await _direct_object_identity(scenario, direct) == direct_identity
         await _prove_profile_boundaries(scenario, migration)
         await _prove_profile_guarded_lifecycle(scenario, migration)
@@ -398,10 +403,13 @@ async def test_terminal_window_profile_is_oid_stable_closed_and_guarded(
             assert "terminal_window_downgrade_blocked" in str(cause)
         else:
             raise AssertionError("terminal-window evidence permitted downgrade")
-        assert await _function_identity_by_name(
-            scenario,
-            migration,
-        ) == before_identity_by_name
+        assert (
+            await _function_identity_by_name(
+                scenario,
+                migration,
+            )
+            == before_identity_by_name
+        )
     finally:
         await scenario.close()
 
@@ -431,10 +439,13 @@ async def test_clean_terminal_window_downgrade_restores_v4(monkeypatch):
         await _run_migration(scenario, migration, "upgrade")
         async with scenario.connection.transaction():
             await _run_migration(scenario, migration, "downgrade")
-        assert await _function_identity_by_name(
-            scenario,
-            migration,
-        ) == before_identity_by_name
+        assert (
+            await _function_identity_by_name(
+                scenario,
+                migration,
+            )
+            == before_identity_by_name
+        )
         assert await _direct_object_identity(scenario, direct) == direct_identity
         definitions = await _function_definitions(scenario, migration)
         assert definitions == predecessor_definitions
@@ -466,9 +477,10 @@ async def test_direct_v4_replay_survives_terminal_window_round_trip(
         "DIRECT_V4_TERMINAL_MARKER_SHA256",
         SYNTHETIC_MARKER_SHA256,
     )
-    database = runtime_database()
+    writer_scope = AsyncExitStack()
     try:
         await _install_terminal_stack(scenario)
+        database = await writer_scope.enter_async_context(_current_writer(scenario, monkeypatch))
         await seed_direct_v4_terminal_root(scenario)
         async with scenario.connection.transaction():
             await _run_migration(scenario, direct, "upgrade")
@@ -479,20 +491,19 @@ async def test_direct_v4_replay_survives_terminal_window_round_trip(
         async with scenario.connection.transaction():
             await _run_migration(scenario, migration, "upgrade")
         assert await _direct_object_identity(scenario, direct) == direct_identity
+        assert (await sync_v4_terminal_disposition(database, "source-a")).disposed is False
         assert (
-            await sync_v4_terminal_disposition(database, "source-a")
-        ).disposed is False
-        assert await scenario.connection.fetchval(
-            f'SELECT {scenario.quoted_schema}."{direct._DIRECT_VALID}"($1)',
-            "dataset-a",
-        ) is True
+            await scenario.connection.fetchval(
+                f'SELECT {scenario.quoted_schema}."{direct._DIRECT_VALID}"($1)',
+                "dataset-a",
+            )
+            is True
+        )
 
         async with scenario.connection.transaction():
             await _run_migration(scenario, migration, "downgrade")
         assert await _direct_object_identity(scenario, direct) == direct_identity
-        assert (
-            await sync_v4_terminal_disposition(database, "source-a")
-        ).disposed is False
+        assert (await sync_v4_terminal_disposition(database, "source-a")).disposed is False
     finally:
-        await database.engine.dispose()
+        await writer_scope.aclose()
         await close_abandonment_scenario(scenario)

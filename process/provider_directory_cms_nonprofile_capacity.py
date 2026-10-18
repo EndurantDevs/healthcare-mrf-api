@@ -13,7 +13,7 @@ import importlib
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -444,6 +444,18 @@ class _CapacityProducer:
 
     async def check_phase(self, request: NonprofileAdmissionCheck) -> NonprofileAdmissionReceipt:
         """Consume once and recheck signed storage, runtime, identity and WAL."""
+        from process.provider_directory_cms_nonprofile_observation import active_observations
+
+        scope = active_observations(producer=self)
+        if scope is None:
+            return await self._check_phase(request)
+        if request.phase == "pre_scratch" or self.resumed_profile is not None:
+            raise _error("retention_phase_changed")
+        await scope.verify_transaction()
+        return await self._check_phase(request, scope=scope)
+
+    async def _check_phase(self, request, *, observers=None, scope=None):
+        """Keep the signed phase checks while observing controls on their owner."""
         if request.phase not in _PHASES or request.lease != self.lease or request.plan != self.plan:
             raise _error("phase_identity_changed")
         if self._cutover_active and (
@@ -455,6 +467,14 @@ class _CapacityProducer:
             self.lease, run_id=self.run_id, phase=request.phase, requested_at=started_at
         )
         envelope = await self.fresh_storage_envelope(storage_request)
+        if scope is not None:
+            async with scope.observers() as observed:
+                return await self._finish_phase(request, storage_request, envelope, observers=observed)
+        return await self._finish_phase(request, storage_request, envelope, observers=observers)
+
+    async def _finish_phase(self, request, storage_request, envelope, *, observers=None):
+        """Observe the original actors only after authority transport has completed."""
+        controls = self.fhir.db if observers is None else observers.controls
         observation = await _database_observation(self.fhir, self.plan)
         now = await self.fhir._profile_capacity_preflight_clock()
         fresh = verify_storage_continuation(
@@ -467,14 +487,14 @@ class _CapacityProducer:
         self._assert_refresh(fresh, now)
         _assert_runtime_storage(self.plan, self.lease, observation)
         _assert_paired_reservation(self.lease, self.profile_lease, self.plan.minimum_remaining_bytes, storage=fresh)
-        runtime = await observe_profile_runtime(self.fhir.db)
+        runtime = await observe_profile_runtime(controls)
         assert_capacity_lease_matches_runtime_observation(self.lease, runtime)
         assert_capacity_lease_matches_runtime_observation(self.profile_lease, runtime)
         if request.phase == "pre_scratch":
             await self._consume(runtime)
         else:
-            await self._assert_consumption()
-        await self._assert_physical(request, observation)
+            await self._assert_consumption(**({} if observers is None else {"database": controls}))
+        await self._assert_physical(request, observation, **({} if observers is None else {"observers": observers}))
         if await self.fhir._profile_capacity_preflight_clock() >= fresh.expires_at:
             raise _error("continuation_expired_during_check")
         self.last_observed_at = fresh.observed_at
@@ -506,8 +526,12 @@ class _CapacityProducer:
         if self.consumption_by_field:
             raise _error("same_run_replay_unsupported")
         fhir, schema = self.fhir, self.fhir._schema()
-        async with fhir.db.transaction():
-            await fhir.db.status("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
+        from process.provider_directory_generic_source_policy import is_source_storage_required
+        from process.provider_directory_profile_scope_copy import preflight_transaction
+
+        async with preflight_transaction(fhir, isolation="serializable", readonly=False):
+            if not is_source_storage_required():
+                await fhir.db.status("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
             await fhir._lock_profile_capacity_preflight_state(schema)
             await fhir._lock_provider_directory_profile_capacity_control_run(schema=schema, run_id=self.run_id)
             await fhir.assert_profile_selection_current_in_transaction(
@@ -587,14 +611,15 @@ class _CapacityProducer:
             values_by_field, self.profile_lease, await self.fhir._profile_capacity_preflight_clock()
         )
 
-    async def _assert_consumption(self) -> None:
+    async def _assert_consumption(self, *, database=None) -> None:
         """Require the same immutable full original lease bytes for every later phase."""
         if not self.consumption_by_field:
             raise _error("consumption_missing")
         table = self.fhir._unscoped_qt(
             self.fhir._schema(), self.fhir.ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__
         )
-        rows = await self.fhir.db.all(
+        database = self.fhir.db if database is None else database
+        rows = await database.all(
             f"SELECT * FROM {table} WHERE run_id=:run_id AND admission_purpose='cms_nonprofile';", run_id=self.run_id
         )
         identities = [
@@ -693,58 +718,150 @@ class _CapacityProducer:
                 raise _error("native_identity_changed")
             source_oids.add(source_layout.oid)
             clone_oids.add(annotation.oid)
-            native_by_coordinate[coordinate] = source_layout
+            native_by_coordinate[coordinate] = self._native_source_policy(annotation, request)
         return native_by_coordinate
 
-    async def _assert_physical(self, request: NonprofileAdmissionCheck, observation: Mapping[str, Any]) -> None:
+    def _native_source_policy(self, annotation, request):
+        """Keep historical finished recipes separate from issued SOURCE phase authority."""
+        if annotation.source_input is not None:
+            from process.network_registry_cms_prepared_address_pin import PinnedRegistryCMSAddressInput
+
+            if type(annotation.source_input) is not PinnedRegistryCMSAddressInput:
+                raise _error("native_identity_changed")
+            annotation.source_input.require_annotation(annotation, final=request.phase.startswith("cutover"))
+            return annotation
+        if annotation.phase != "finished":
+            raise _error("native_identity_changed")
+        return annotation.source_layout
+
+    async def _native_catalog_observations(self, relations, native_by_coordinate, *, observers=None):
+        """Read fresh native catalogs together only on their original executing backend."""
+        from process import provider_directory_cms_native_layout as native_layout
+
+        groups_by_executor = {}
+        for relation in relations:
+            if (relation.schema, relation.relation) not in native_by_coordinate:
+                continue
+            database = None if observers is None else observers.database_for(relation)
+            database = self.fhir.db if database is None else database
+            groups_by_executor.setdefault(id(database), (database, []))[1].append(relation)
+        catalog_by_identity = {}
+        for database, group in groups_by_executor.values():
+            captured = await native_layout.observe_native_catalog_batch(self.fhir, group, database=database)
+            expected_identities = {(relation.schema, relation.relation, relation.oid) for relation in group}
+            if set(captured) != expected_identities or catalog_by_identity.keys() & captured.keys():
+                raise _error("native_identity_changed")
+            catalog_by_identity.update(captured)
+        return catalog_by_identity
+
+    async def _assert_physical(
+        self, request: NonprofileAdmissionCheck, observation: Mapping[str, Any], *, observers=None
+    ) -> None:
         """Measure aggregate native relations and conservative cluster-wide emitted WAL."""
+        from process import provider_directory_cms_native_layout as native_layout
+
         data_bytes = sum(relation.total_bytes for relation in request.relations)
         if data_bytes > dict(self.plan.reservation_bytes)["data"]:
             raise _error("data_budget_exceeded")
-        await self._assert_wal_budget(request)
+        await self._assert_wal_budget(request, **({} if observers is None else {"controls": observers.controls}))
         raw_by_coordinate = self._raw_relation_policies(request)
         native_by_coordinate = self._native_relation_policies(request)
-        for relation in request.relations:
-            raw_state = raw_by_coordinate.get((relation.schema, relation.relation))
-            native_source = native_by_coordinate.get((relation.schema, relation.relation))
-            layout = await self._capture_relation_layout(relation, raw_state, native_source)
-            if layout.relation_oid != relation.oid or layout.effective_tablespace_oids != (
-                observation["data_tablespace_oid"],
-            ):
-                raise _error("physical_tablespace_changed")
+        scratch_relations = tuple(
+            relation
+            for relation in request.relations
+            if (relation.schema, relation.relation) not in raw_by_coordinate
+            and (relation.schema, relation.relation) not in native_by_coordinate
+        )
+        # Keep catalog reads on one backend without replacing an existing SOURCE/Ret binding.
+        transaction = (
+            nullcontext()
+            if not request.relations or self.fhir.db._transaction_binding() is not None
+            else self.fhir.db.transaction()
+        )
+        async with (
+            transaction,
+            native_layout.scratch_layout_batch(
+                self.fhir, scratch_relations, database_for=None if observers is None else observers.database_for
+            ) as scratch_layouts,
+        ):
+            native_catalogs = await self._native_catalog_observations(
+                request.relations, native_by_coordinate, observers=observers
+            )
+            for relation in request.relations:
+                raw_state = raw_by_coordinate.get((relation.schema, relation.relation))
+                native_source = native_by_coordinate.get((relation.schema, relation.relation))
+                arguments = (
+                    {}
+                    if observers is None
+                    else {
+                        "database": observers.database_for(relation),
+                        "source_input": observers.scope.source_input,
+                    }
+                )
+                identity = (relation.schema, relation.relation, relation.oid)
+                if identity in native_catalogs:
+                    arguments["observed_catalog"] = native_catalogs[identity]
+                layout = scratch_layouts.get((relation.schema, relation.relation))
+                if layout is None:
+                    layout = await self._capture_relation_layout(relation, raw_state, native_source, **arguments)
+                if layout.relation_oid != relation.oid or layout.effective_tablespace_oids != (
+                    observation["data_tablespace_oid"],
+                ):
+                    raise _error("physical_tablespace_changed")
 
-    async def _capture_relation_layout(self, relation: OwnedRelation, raw_state: tuple | None, native_source=None):
+    async def _capture_relation_layout(
+        self,
+        relation: OwnedRelation,
+        raw_state: tuple | None,
+        native_source=None,
+        *,
+        database=None,
+        source_input=None,
+        observed_catalog=None,
+    ):
         """Select a verified raw layout or retain the existing native/Profile checks."""
         from process import provider_directory_cms_archive as archive
         from process import provider_directory_cms_native_layout as native_layout
 
+        arguments = {} if database is None else {"database": database}
+
         if native_source is not None:
+            if observed_catalog is not None:
+                arguments["observed_catalog"] = observed_catalog
+            if type(native_source) is RetainedNativeRelation:
+                return await native_layout.capture_retained_native_phase(
+                    self.fhir, relation, native_source, self.plan.native_address_targets, **arguments
+                )
             return await native_layout.capture_retained_native_layout(
-                self.fhir, relation, native_source, self.plan.native_address_targets
+                self.fhir, relation, native_source, self.plan.native_address_targets, **arguments
             )
         if raw_state is not None:
             from process.provider_directory_cms_raw_layout import capture_retained_raw_layout
 
             raw_relation, policy = raw_state
-            return await capture_retained_raw_layout(self.fhir, relation, policy, raw_relation.index_names)
+            if source_input is not None:
+                arguments["source_input"] = source_input
+            return await capture_retained_raw_layout(self.fhir, relation, policy, raw_relation.index_names, **arguments)
         if archive.is_archive_relation(relation.relation):
-            return await archive.capture_archive_layout(self.fhir, relation)
+            return await archive.capture_archive_layout(self.fhir, relation, **arguments)
         if native_layout.is_native_relation(relation.relation, self.plan.native_address_targets):
-            return await native_layout.capture_native_layout(self.fhir, relation, self.plan.native_address_targets)
+            return await native_layout.capture_native_layout(
+                self.fhir, relation, self.plan.native_address_targets, **arguments
+            )
         if native_layout.is_scope_relation(self.fhir, relation.relation):
-            return await native_layout.capture_scope_layout(self.fhir, relation)
+            return await native_layout.capture_scope_layout(self.fhir, relation, **arguments)
         return await self.fhir._provider_directory_profile_relation_storage_fingerprint(
-            relation.oid, expected_persistence=relation.persistence
+            relation.oid, expected_persistence=relation.persistence, **arguments
         )
 
-    async def _assert_wal_budget(self, request: NonprofileAdmissionCheck) -> None:
+    async def _assert_wal_budget(self, request: NonprofileAdmissionCheck, *, controls=None) -> None:
         """Spend each CMS phase once, excluding only the separately admitted Profile window."""
         wal_bytes = await self._current_wal_bytes()
         if self.resumed_profile is not None:
             profile = self.fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get()
             if profile is not self.resumed_profile:
                 raise _error("paired_profile_admission_changed")
-            await self._assert_active_profile(profile)
+            await self._assert_active_profile(profile, **({} if controls is None else {"database": controls}))
             if self.cutover_wal_start_bytes is None:
                 await self.fhir._assert_provider_directory_profile_wal_budget(profile)
                 if request.phase == "cutover":
@@ -752,7 +869,9 @@ class _CapacityProducer:
         elif request.phase == "cutover":
             raise _error("paired_profile_preparation_required")
         elif self.paused_profile is not None:
-            await self._assert_active_profile(self.paused_profile.admission)
+            await self._assert_active_profile(
+                self.paused_profile.admission, **({} if controls is None else {"database": controls})
+            )
         remaining_logging = self._remaining_logging_wal(request.phase, wal_bytes)
         if request.phase == "pre_logging":
             measured_by_coordinate = {(relation.schema, relation.relation): relation for relation in request.relations}
@@ -814,14 +933,15 @@ class _CapacityProducer:
             return 0
         return self.plan.logging_wal_upper_bound_bytes - spent
 
-    async def _assert_active_profile(self, profile: Any) -> None:
+    async def _assert_active_profile(self, profile: Any, *, database=None) -> None:
         """Exclude a Profile window only after verifying its exact durable admission."""
         if profile.run_id != self.run_id or profile.lease.lease_digest != self.profile_lease.lease_digest:
             raise _error("active_profile_changed")
         table = self.fhir._unscoped_qt(
             self.fhir._schema(), self.fhir.ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__
         )
-        row = await self.fhir.db.first(
+        database = self.fhir.db if database is None else database
+        row = await database.first(
             f"SELECT attestation_id,lease_digest,selection_proof_id FROM {table} "
             "WHERE run_id=:run_id AND admission_purpose='profile';",
             run_id=self.run_id,

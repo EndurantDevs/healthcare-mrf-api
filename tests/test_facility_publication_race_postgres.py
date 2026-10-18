@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.models import db
 from process.facility_address_contribution_capture import require_local_family_publication
+from tests.test_provider_directory_cms_serving_receipt_postgres import _apply, _migration
 
 anchors = importlib.import_module("process.facility_anchors")
 
@@ -28,7 +29,8 @@ def _dsn() -> str:
     url = make_url(raw)
     if (
         (url.drivername, url.username, url.host) != ("postgresql", "postgres", "127.0.0.1")
-        or url.port not in {5432, 5440}
+        or url.port is None
+        or not 1 <= url.port <= 65535
     ):
         pytest.fail("facility publication test requires a dedicated local PostgreSQL database")
     if not re.fullmatch(r"hc_facility_publication_[0-9a-f]{32}", url.database or ""):
@@ -61,6 +63,8 @@ async def _seed_worker_stage(connection, schema: str) -> None:
         text(f"INSERT INTO \"{schema}\".facility_anchor_20260923 VALUES ('Hospital',1,1,'One Way','City','NY','10001')")
     )
     await connection.execute(text(f'CREATE TABLE "{schema}".facility_address_contribution_20260923 (kind text)'))
+    await connection.run_sync(lambda session: _apply(session.connection(), "20260930120000"))
+    await connection.execute(text(_migration("20261019130000")._counter_sql(schema)))
 
 
 @pytest.mark.asyncio
@@ -167,6 +171,7 @@ async def test_worker_swap_failure_rolls_back_resolver_and_geocode(monkeypatch):
     monkeypatch.setattr(anchors, "DEFAULT_MIN_ROWS", 0)
     monkeypatch.setattr(anchors, "DEFAULT_MIN_HOSPITAL_COORD_COVERAGE", 0.0)
     monkeypatch.setattr(anchors, "source_enabled", lambda importer_id: True)
+    effects = []
 
     async def no_backfill(*args):
         return 0
@@ -178,10 +183,12 @@ async def test_worker_swap_failure_rolls_back_resolver_and_geocode(monkeypatch):
 
     async def resolve(*args, **kwargs):
         assert kwargs["zip_restore_complete"] is True
+        effects.append("resolved")
         async with db.transaction():
             await db.status(f"UPDATE \"{schema}\".address_archive SET value='resolved' WHERE id=1")
 
     async def geocode(*args, **kwargs):
+        effects.append("geocoded")
         async with db.transaction():
             await db.status(f"UPDATE \"{schema}\".address_archive SET value='geocoded' WHERE id=1")
         return 1
@@ -197,12 +204,14 @@ async def test_worker_swap_failure_rolls_back_resolver_and_geocode(monkeypatch):
             await _seed_family(session, schema)
             await _seed_worker_stage(session, schema)
         before_oid = await db.scalar(f"SELECT to_regclass('{schema}.facility_anchor')::oid::bigint")
-        with pytest.raises(DBAPIError, match="does not exist"):
+        with pytest.raises(DBAPIError, match="facility_address_contribution_20260923_pkey.*does not exist"):
             await anchors.publish_facility_anchors_generation({"import_date": "20260923", "context": {"run": 1}})
+        assert effects == ["resolved", "geocoded"]
         assert await db.scalar(f'SELECT value FROM "{schema}".address_archive WHERE id=1') == "before"
         assert await db.scalar(f"SELECT to_regclass('{schema}.facility_anchor')::oid::bigint") == before_oid
         assert await db.scalar(f"SELECT to_regclass('{schema}.facility_anchor_20260923') IS NOT NULL") is True
         assert await db.scalar(f'SELECT count(*) FROM "{schema}".reference_family_result_generation') == 1
+        assert await db.scalar(f'SELECT count(*) FROM "{schema}".cms_native_input_revision') == 0
     finally:
         await db.status(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         await db.disconnect()

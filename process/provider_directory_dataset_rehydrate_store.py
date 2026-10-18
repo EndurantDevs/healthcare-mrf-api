@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 
+from process.provider_directory_dataset_rehydrate_scope import _json_object
 from process.provider_directory_dataset_rehydrate_types import (
     CANONICAL_TABLE,
     CHECKPOINT_TABLE,
@@ -19,7 +20,6 @@ from process.provider_directory_dataset_rehydrate_types import (
     _record_fields,
     _table_ref,
 )
-from process.provider_directory_dataset_rehydrate_scope import _json_object
 
 
 async def _load_checkpoint(
@@ -41,18 +41,12 @@ async def _load_checkpoint(
     checkpoint_fields = _record_fields(checkpoint_record)
     if (
         _clean_text(checkpoint_fields.get("endpoint_id")) != context.scope.endpoint_id
-        or _clean_text(checkpoint_fields.get("dataset_hash"))
-        != context.scope.dataset_hash
+        or _clean_text(checkpoint_fields.get("dataset_hash")) != context.scope.dataset_hash
     ):
-        raise DatasetRehydrationError(
-            "provider_directory_dataset_rehydrate_checkpoint_scope_mismatch"
-        )
+        raise DatasetRehydrationError("provider_directory_dataset_rehydrate_checkpoint_scope_mismatch")
     return RehydrationCheckpoint(
         state=_clean_text(checkpoint_fields.get("state")),
-        last_resource_id=_clean_text(
-            checkpoint_fields.get("last_resource_id")
-        )
-        or None,
+        last_resource_id=_clean_text(checkpoint_fields.get("last_resource_id")) or None,
         expected_count=int(checkpoint_fields.get("expected_input_count") or 0),
         input_count=int(checkpoint_fields.get("input_count") or 0),
         mapped_count=int(checkpoint_fields.get("mapped_count") or 0),
@@ -94,7 +88,7 @@ async def _save_checkpoint(
                 input_count=EXCLUDED.input_count,
                 mapped_count=EXCLUDED.mapped_count,
                 rejected_count=EXCLUDED.rejected_count,
-                evidence_json=EXCLUDED.evidence_json,
+                evidence_json={_table_ref(context.runtime.schema, CHECKPOINT_TABLE)}.evidence_json || EXCLUDED.evidence_json,
                 error=EXCLUDED.error,
                 updated_at=now(),
                 completed_at=CASE
@@ -121,11 +115,7 @@ async def _sync_canonical_payload_hashes(
     """Preserve each validated immutable dataset hash in canonical output."""
 
     resource_ids = sorted(
-        {
-            _clean_text(typed_row_by_field.get("resource_id"))
-            for typed_row_by_field in typed_rows
-        }
-        - {""}
+        {_clean_text(typed_row_by_field.get("resource_id")) for typed_row_by_field in typed_rows} - {""}
     )
     if not resource_ids:
         return
@@ -162,8 +152,26 @@ def _checkpoint_key(context: ResourceContext) -> dict[str, str]:
 
 async def _load_resource_proof(context: ResourceContext) -> ResourceProof:
     """Count exact typed, canonical-hash, and source-edge output membership."""
+    return await _read_resource_proof(context, _resource_proof_sql(context))
+
+
+async def _load_pinned_resource_proof(context, pinned_source, directory):
+    """Read output membership against only the exact actively pinned SOURCE child."""
+    if (
+        context.runtime.database is not directory.db
+        or context.runtime.schema != directory._schema()
+        or context.model is not directory.RESOURCE_MODELS_BY_TYPE.get(context.resource_type)
+        or context.scope != pinned_source.scope
+        or context.resource_type not in context.scope.resource_types
+    ):
+        raise DatasetRehydrationError("provider_directory_dataset_rehydrate_proof_scope_changed")
+    relation = pinned_source.source_relation(directory)
+    return await _read_resource_proof(context, _resource_proof_sql(context, retained_relation=relation))
+
+
+async def _read_resource_proof(context, statement):
     proof_record = await context.runtime.database.first(
-        _resource_proof_sql(context),
+        statement,
         source_id=context.scope.source_id,
         dataset_id=context.scope.dataset_id,
         resource_type=context.resource_type,
@@ -178,17 +186,15 @@ async def _load_resource_proof(context: ResourceContext) -> ResourceProof:
         canonical_hash_count=int(proof_fields.get("canonical_hash_count") or 0),
         canonical_extra_count=int(proof_fields.get("canonical_extra_count") or 0),
         source_edge_count=int(proof_fields.get("source_edge_count") or 0),
-        source_edge_extra_count=int(
-            proof_fields.get("source_edge_extra_count") or 0
-        ),
+        source_edge_extra_count=int(proof_fields.get("source_edge_extra_count") or 0),
     )
 
 
-def _resource_proof_sql(context: ResourceContext) -> str:
+def _resource_proof_sql(context: ResourceContext, *, retained_relation=None) -> str:
     """Build the independent exact-membership proof query."""
     schema = context.runtime.schema
     typed_table = _table_ref(schema, context.model.__tablename__)
-    dataset_table = _table_ref(schema, DATASET_RESOURCE_TABLE)
+    dataset_table = retained_relation or _table_ref(schema, DATASET_RESOURCE_TABLE)
     canonical_table = _table_ref(schema, CANONICAL_TABLE)
     source_edge_table = _table_ref(schema, SOURCE_EDGE_TABLE)
     return f"""

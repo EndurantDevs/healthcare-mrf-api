@@ -27,10 +27,26 @@ from arq.constants import (
 )
 from arq.jobs import deserialize_job as arq_deserialize_job
 from redis.exceptions import WatchError
-from sqlalchemy import and_, insert, or_, select, text, update
+from sqlalchemy import and_, cast, insert, literal, or_, select, text, update
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 
-from api.control_workers import exact_worker_presence
+from api import provider_directory_cms_registry_stop as cms_registry_stop
+from api.control_plan_pricing_em_attribution import (
+    ADAPTER as EM_ATTRIBUTION_ADAPTER,
+)
+from api.control_plan_pricing_em_attribution import (
+    IMPORTER as EM_ATTRIBUTION_IMPORTER,
+)
+from api.control_plan_pricing_em_attribution import (
+    em_attribution_registry_entry,
+    validate_em_attribution_params,
+)
+from api.control_workers import (
+    _enqueue_nucc_run,
+    _request_nucc_cancel,
+    exact_worker_presence,
+)
 from db.models import ImportRun, PTG2ImportRun, PTG2Snapshot, db
 from process.control_lifecycle import (
     _SOURCE_PROFILE_IMPORTERS_BY_MODULE,
@@ -52,6 +68,15 @@ from process.live_progress import (
     read_live_progress,
 )
 from process.places_zcta_handoff import HANDOFF_FORMAT, is_protected_places_publication_enabled
+from process.plan_pricing_control import (
+    DELIVERY_FIELD,
+    PRICING_IMPORTERS,
+    enqueue_ack_values,
+    initial_delivery,
+    preserve_delivery,
+    require_pricing_replay,
+)
+from process.plan_pricing_control_transaction import pricing_admission_transaction
 from process.provider_directory_fhir_census_contract import (
     ProviderDirectoryFHIRAcquisitionStrategy,
 )
@@ -128,10 +153,15 @@ ACTIVE_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
 ALL_STATUS_IDEMPOTENCY_IMPORTERS = frozenset(
     {
+        "registry-cms-source-worker",
+        "registry-ptg-source-worker",
+        "registry-aca-source-worker",
+        "registry-source-check",
         "plan-pricing-projection",
         "plan-pricing-prewarm",
         "plan-pricing-em-distance",
         "ptg-provider-membership-projection",
+        EM_ATTRIBUTION_IMPORTER,
     }
 )
 STALE_WORKER_RECONCILIATION_IMPORTERS = ALL_STATUS_IDEMPOTENCY_IMPORTERS
@@ -185,6 +215,39 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_function": "build_provider_membership_projection",
         "job_prefix": "ptg_provider_membership_projection",
     },
+    "registry-source-check": {
+        "queue": "arq:RegistrySourceCheck",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.registry_source_check",
+        "target_function": "control_start",
+        "job_prefix": "registry_source_check",
+    },
+    "registry-ptg-source-worker": {
+        "queue": "arq:RegistryPTGSource",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.registry_ptg_source_worker",
+        "target_function": "control_start",
+        "job_prefix": "registry_ptg_source",
+    },
+    "registry-aca-source-worker": {
+        "queue": "arq:RegistryACASource",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.registry_aca_source_worker",
+        "target_function": "control_start",
+        "job_prefix": "registry_aca_source",
+    },
+    "registry-cms-source-worker": {
+        "queue": "arq:RegistryCMSSource",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.registry_cms_source_worker",
+        "target_function": "control_start",
+        "job_prefix": "registry_cms_source",
+    },
+    EM_ATTRIBUTION_IMPORTER: EM_ATTRIBUTION_ADAPTER,
     "ptg": {"queue": "arq:PTG", "function": "ptg_control_start", "payload": "ptg_control", "job_prefix": "ptg_start"},
     "ptg-candidate-audit": {
         "queue": "arq:PTGCandidateAudit",
@@ -229,6 +292,7 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "job_prefix": "npi_start",
     },
     "nucc": {
+        "job_prefix": "nucc_start",
         "queue": "arq:NUCC",
         "function": "control_single_job_start",
         "payload": "control_wrapped",
@@ -533,6 +597,10 @@ _CONTROL_HIDDEN_PARAM_NAMES_BY_IMPORTER = {
 }
 
 _CANCELABLE_IMPORTERS = {
+    "registry-ptg-source-worker",
+    "registry-aca-source-worker",
+    "registry-cms-source-worker",
+    "registry-source-check",
     "new-york-nypp-profile",
     "tennessee-tdh-profile",
     "rhode-island-doh-profile",
@@ -606,6 +674,41 @@ def _control_param_schema(
     command: click.Command,
 ) -> list[dict[str, Any]]:
     """Hide CLI-only controls from the authenticated import API catalog."""
+
+    if importer == "registry-source-check":
+        return [
+            {
+                "name": name,
+                "opts": [],
+                "required": True,
+                "multiple": False,
+                "is_flag": False,
+                "type": "integer" if name == "reporting_year" else "text",
+                "default": None,
+                "help": "Operator-allowlisted logical source scope.",
+            }
+            for name in ("source_system", "source_id", "edition_policy", "reporting_year")
+        ]
+    if importer in {"registry-cms-source-worker", "registry-ptg-source-worker", "registry-aca-source-worker"}:
+        return [
+            {
+                "name": name,
+                "opts": [],
+                "required": True,
+                "multiple": False,
+                "is_flag": False,
+                "type": "text",
+                "default": None,
+                "help": "Exact immutable source notification identity.",
+            }
+            for name in (
+                ("capture_id", "recipe_sha256", "notification_sha256")
+                if importer == "registry-aca-source-worker"
+                else ("capture_id", "approval_sha256", "hold_sha256")
+                if importer == "registry-ptg-source-worker"
+                else ("source_schema", "receipt_id", "notification_sha256")
+            )
+        ]
 
     hidden_names = _CONTROL_HIDDEN_PARAM_NAMES_BY_IMPORTER.get(
         importer,
@@ -827,6 +930,17 @@ def importer_registry() -> list[dict[str, Any]]:
                 "enqueue_adapter": "arq_single_job" if name in _SINGLE_JOB_ADAPTERS else "pending",
                 "queue": _SINGLE_JOB_ADAPTERS.get(name, {}).get("queue"),
                 "params_schema": _control_param_schema(name, command),
+                **(
+                    {"function": _SINGLE_JOB_ADAPTERS[name]["function"]}
+                    if name
+                    in {
+                        "registry-cms-source-worker",
+                        "registry-ptg-source-worker",
+                        "registry-aca-source-worker",
+                        "registry-source-check",
+                    }
+                    else {}
+                ),
                 **({"profile_source": dict(_PROFILE_SOURCES[name])} if name in _PROFILE_SOURCES else {}),
             }
         )
@@ -836,6 +950,7 @@ def importer_registry() -> list[dict[str, Any]]:
             _plan_pricing_prewarm_registry_entry(),
             _plan_pricing_em_distance_registry_entry(),
             _membership_projection_registry_entry(),
+            em_attribution_registry_entry(ENGINE_NAME),
         )
     )
     for importer in importers:
@@ -859,6 +974,7 @@ def _importer_family(importer: str) -> str:
         "plan-pricing-prewarm",
         "plan-pricing-em-distance",
         "ptg-provider-membership-projection",
+        EM_ATTRIBUTION_IMPORTER,
         "mrf",
         "mrf-source-discovery",
         "hospital-prices",
@@ -1530,7 +1646,7 @@ async def get_import_run(run_id: str) -> dict[str, Any] | None:
     if not durable_run:
         return None
     public_run = normalize_run(durable_run)
-    if public_run.get("importer") not in STALE_WORKER_RECONCILIATION_IMPORTERS:
+    if public_run.get("importer") not in STALE_WORKER_RECONCILIATION_IMPORTERS and public_run.get("importer") != "nucc":
         public_run = await _sync_terminal_worker_failure(public_run)
     blank_metrics_by_name = await _allowed_amount_blank_terminal_metrics(durable_run, public_run)
     if blank_metrics_by_name is not None:
@@ -1608,6 +1724,10 @@ async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:
     """Persist a failed worker only while its observed run still owns the attempt."""
     if run.get("status") not in {"starting", "running", "finalizing"}:
         return run
+    try:
+        cms_attempt = cms_registry_stop.failure_attempt(run)
+    except ValueError, KeyError, TypeError:
+        return run
     if (
         run.get("importer") == "places-zcta"
         and run.get("status") == "finalizing"
@@ -1623,13 +1743,7 @@ async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:
         return run
 
     now = utc_now()
-    progress_dict = {
-        "unit": "run",
-        "total": 1,
-        "done": 1,
-        "pct": 100,
-        "message": "worker job failed",
-    }
+    progress_dict = _worker_failure_progress(cms_attempt)
     metrics_map = dict(run.get("metrics") or {})
     metrics_map["terminal_worker_state"] = worker_status
     error_dict = _worker_job_failure_error(failed_item)
@@ -1661,8 +1775,16 @@ async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _worker_failure_progress(cms_attempt):
+    """Retain original CMS ownership alongside generic failed-Job progress."""
+    progress_dict = {"unit": "run", "total": 1, "done": 1, "pct": 100, "message": "worker job failed"}
+    if cms_attempt is not None:
+        progress_dict.update(attempt_id=cms_attempt.attempt_id, attempt_started_at=cms_attempt.attempt_started_at)
+    return progress_dict
+
+
 def _worker_failure_update_statement(run: dict[str, Any]):
-    """Fence a stale worker report from replacing a newer PLACES handoff."""
+    """Fence a stale worker report from replacing newer protected attempt ownership."""
     statement = _where_no_places_handoff(
         update(ImportRun).where(
             ImportRun.run_id == run["run_id"],
@@ -1670,7 +1792,7 @@ def _worker_failure_update_statement(run: dict[str, Any]):
             ImportRun.status == run["status"],
         )
     )
-    if run["importer"] == "places-zcta":
+    if run["importer"] == "places-zcta" or cms_registry_stop.failure_attempt(run) is not None:
         progress = run.get("progress") if isinstance(run.get("progress"), dict) else {}
         for key in ("attempt_id", "attempt_started_at"):
             field = ImportRun.progress[key].as_string()
@@ -2050,7 +2172,7 @@ async def _persist_stale_worker_failure(
             heartbeat_at=now,
             finished_at=now,
             progress=progress_by_field,
-            metrics=metrics_by_name,
+            metrics=preserve_delivery(ImportRun, metrics_by_name),
             error=error_by_field,
         )
     )
@@ -2140,10 +2262,21 @@ def _terminal_queue_residue_identity(
         raise StaleWorkerReconciliationConflict("run status changed during queue residue reconciliation")
     if run.get("status") not in TERMINAL_STATUSES:
         raise StaleWorkerReconciliationConflict("run is not terminal")
-    if run.get("importer") not in TERMINAL_QUEUE_RESIDUE_IMPORTERS:
+    if cms_registry_stop.is_request(expected):
+        try:
+            cms_registry_stop.terminal_proof(run, expected)
+        except (ValueError, KeyError, TypeError) as error:
+            raise StaleWorkerReconciliationConflict("CMS original terminal owner is unavailable or changed") from error
+    elif run.get("importer") not in TERMINAL_QUEUE_RESIDUE_IMPORTERS:
         raise StaleWorkerReconciliationConflict("importer does not support deterministic queue residue reconciliation")
     run_id, importer, queue, job_id = _reconciliation_arq_identity(run)
     metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    if cms_registry_stop.is_request(expected) and (
+        metrics.get("queue") != queue
+        or metrics.get("job_id") != job_id
+        or metrics.get("function") != _SINGLE_JOB_ADAPTERS[cms_registry_stop.IMPORTER]["function"]
+    ):
+        raise StaleWorkerReconciliationConflict("CMS persisted worker identity is incomplete or changed")
     persisted_queue = str(metrics.get("queue") or "").strip()
     if persisted_queue and persisted_queue != queue:
         raise StaleWorkerReconciliationConflict("persisted worker queue conflicts with importer adapter")
@@ -2294,16 +2427,34 @@ async def reconcile_terminal_queue_residue(
     normalized_run_id = str(run_id or "").strip()
     if not normalized_run_id:
         raise ValueError("run_id is required")
-    expected_by_field = _validated_terminal_queue_residue_request(request_by_field)
+    is_cms_request = cms_registry_stop.is_request(request_by_field)
+    expected_by_field = (
+        cms_registry_stop.validated_request(request_by_field, normalized_run_id)
+        if is_cms_request
+        else _validated_terminal_queue_residue_request(request_by_field)
+    )
     async with db.acquire() as connection:
         await acquire_control_run_worker_action_lock(connection, normalized_run_id)
         run_by_field = await _locked_reconciliation_run(connection, normalized_run_id)
         if run_by_field is None:
             return None
-        return await _remove_terminal_queue_residue(
+        cms_proof = worker_presence = None
+        if is_cms_request:
+            _terminal_queue_residue_identity(run_by_field, expected_by_field)
+            cms_proof = cms_registry_stop.terminal_proof(run_by_field, expected_by_field)
+            try:
+                worker_presence = cms_registry_stop.require_worker_presence(
+                    await asyncio.to_thread(exact_worker_presence, _reconciliation_worker_payload(run_by_field))
+                )
+            except Exception as error:
+                raise StaleWorkerReconciliationUnavailable("CMS exact worker stop proof is unavailable") from error
+            if worker_presence["stopped"] is not True:
+                raise StaleWorkerReconciliationConflict("CMS worker has not stopped")
+        receipt = await _remove_terminal_queue_residue(
             run_by_field,
             expected_by_field,
         )
+        return {**receipt, **cms_proof, "worker_presence": worker_presence} if cms_proof is not None else receipt
 
 
 async def finalize_import_run(run_id: str, finalize_payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -2394,11 +2545,47 @@ async def _idempotent_import_run(
         ) is not None:
             return existing
     if importer in ALL_STATUS_IDEMPOTENCY_IMPORTERS:
-        return await find_importer_run_by_idempotency_key(
-            importer,
-            idempotency_key,
-        )
+        existing = await find_importer_run_by_idempotency_key(importer, idempotency_key)
+        _validate_registry_cms_source_params(importer, params, existing)
+        return existing
     return await find_active_run_by_idempotency_key(importer, idempotency_key)
+
+
+def _validate_registry_cms_source_params(importer, params, existing=None):
+    """Reject event/configuration overrides before durable admission or queue access."""
+    if importer == "registry-source-check":
+        from process.registry_source_check import validate_registry_source_check_scope
+
+        validate_registry_source_check_scope(params)
+        if existing is not None and (existing.get("importer") != importer or existing.get("params") != params):
+            raise ValueError("registry_source_check_scope_mismatch")
+    if importer == "registry-ptg-source-worker":
+        from process.registry_ptg_source_worker import validate_registry_ptg_source_event
+
+        validate_registry_ptg_source_event(params)
+        if existing is not None:
+            previous = existing.get("params")
+            validate_registry_ptg_source_event(previous)
+            if existing.get("importer") != importer or previous != params:
+                raise ValueError("registry_ptg_source_event_identity_mismatch")
+    if importer == "registry-aca-source-worker":
+        from process.registry_aca_source_worker import validate_registry_aca_source_event
+
+        validate_registry_aca_source_event(params)
+        if existing is not None:
+            previous = existing.get("params")
+            validate_registry_aca_source_event(previous)
+            if existing.get("importer") != importer or previous != params:
+                raise ValueError("registry_aca_source_event_identity_mismatch")
+    if importer == "registry-cms-source-worker":
+        from process.registry_cms_source_worker import validate_registry_cms_source_event
+
+        validate_registry_cms_source_event(params)
+        if existing is not None:
+            previous_params = existing.get("params")
+            validate_registry_cms_source_event(previous_params)
+            if existing.get("importer") != importer or previous_params != params:
+                raise ValueError("registry_cms_source_event_identity_mismatch")
 
 
 def _validate_massachusetts_request(importer, params, existing=None):
@@ -3230,8 +3417,15 @@ async def _admit_import_row(
         return await _admit_npi_import_run(import_run_values_by_name)
     if importer == "massachusetts-borim-profile":
         return await _admit_massachusetts_import_run(import_run_values_by_name)
-    await db.execute(insert(ImportRun).values(**import_run_values_by_name))
+    async with pricing_admission_transaction(import_run_values_by_name, action="create"):
+        await db.execute(insert(ImportRun).values(**import_run_values_by_name))
     return None
+
+
+async def _has_isolated_pricing_admission(request_by_field):
+    """Bypass importer-wide serialization only with exact native admission."""
+    async with pricing_admission_transaction(request_by_field, action="create") as admission:
+        return admission is not None
 
 
 async def create_import_run(
@@ -3245,6 +3439,7 @@ async def create_import_run(
     _validate_massachusetts_request(
         importer, request_payload_map.get("params") if request_payload_map.get("params") is not None else {}
     )
+    _validate_registry_cms_source_params(importer, request_payload_map.get("params"))
     raw_params_by_name = (
         request_payload_map.get("params") if isinstance(request_payload_map.get("params"), dict) else {}
     )
@@ -3290,6 +3485,7 @@ async def create_import_run(
         from api.ptg_membership_contract import validate_params
 
         validate_params(effective_params_by_name)
+    validate_em_attribution_params(importer, effective_params_by_name)
     validated_hospital_params = await _validate_hospital_price_params(importer, effective_params_by_name)
     if validated_hospital_params is not None:
         effective_params_by_name = validated_hospital_params
@@ -3332,6 +3528,17 @@ async def create_import_run(
         }
 
     idempotency_key = str(request_payload_map.get("idempotency_key") or "").strip() or None
+    run_id = str(request_payload_map.get("run_id") or "").strip() or _new_run_id()
+    pricing_request_by_field = {
+        **request_payload_map,
+        "engine": ENGINE_NAME,
+        "node_id": os.getenv("HLTHPRT_IMPORT_NODE_ID"),
+        "importer": importer,
+        "run_id": run_id,
+        "triggered_by": _normalize_triggered_by(request_payload_map.get("triggered_by")),
+        "idempotency_key": idempotency_key,
+        "retry_of_run_id": str(request_payload_map.get("retry_of_run_id") or "").strip() or None,
+    }
     if (
         idempotency_key
         and importer not in {"provider-directory-fhir", "hospital-prices"}
@@ -3339,8 +3546,10 @@ async def create_import_run(
     ):
         replayed_run = await _idempotent_import_run(importer, idempotency_key, params=normalized_params_by_name)
         if replayed_run:
-            _validate_massachusetts_request(importer, normalized_params_by_name, replayed_run)
-            return normalize_run(replayed_run), False
+            require_pricing_replay(replayed_run, pricing_request_by_field)
+            async with pricing_admission_transaction(replayed_run, action="replay"):
+                _validate_massachusetts_request(importer, normalized_params_by_name, replayed_run)
+                return normalize_run(replayed_run), False
     if (
         importer not in {"provider-directory-fhir", "hospital-prices"}
         and not is_ptg_source_file_admission
@@ -3349,14 +3558,15 @@ async def create_import_run(
             request_payload_map,
             idempotency_key,
         )
+        and not await _has_isolated_pricing_admission(pricing_request_by_field)
     ):
         active_importer = await find_earliest_active_run_by_importer(importer)
         if active_importer:
             _validate_massachusetts_request(importer, normalized_params_by_name, active_importer)
+            _validate_registry_cms_source_params(importer, normalized_params_by_name, active_importer)
             return normalize_run(active_importer), False
 
     now = utc_now()
-    run_id = str(request_payload_map.get("run_id") or "").strip() or _new_run_id()
     retry_of_run_id = str(request_payload_map.get("retry_of_run_id") or "").strip() or None
     param_views = _import_param_views(
         importer,
@@ -3394,7 +3604,7 @@ async def create_import_run(
         "import_id": import_id,
         "retry_of_run_id": retry_of_run_id,
     }
-    if importer == "places-zcta":
+    if importer in {"places-zcta", "nucc"} or importer in PRICING_IMPORTERS:
         adapter = _SINGLE_JOB_ADAPTERS[importer]
         import_run_values_by_name["metrics"] = {
             "enqueue_adapter": "arq_single_job",
@@ -3402,6 +3612,8 @@ async def create_import_run(
             "function": adapter["function"],
             "job_id": _enqueue_job_options(adapter, import_run_values_by_name)["_job_id"],
         }
+        if importer in PRICING_IMPORTERS:
+            import_run_values_by_name["metrics"][DELIVERY_FIELD] = initial_delivery(run_id)
     try:
         blocking_run = await _admit_import_row(
             importer,
@@ -3409,6 +3621,7 @@ async def create_import_run(
             is_ptg_source_file_admission=is_ptg_source_file_admission,
         )
         if blocking_run:
+            require_pricing_replay(blocking_run, pricing_request_by_field)
             return normalize_run(blocking_run), False
     except IntegrityError:
         if idempotency_key:
@@ -3418,14 +3631,18 @@ async def create_import_run(
                 params=normalized_params_by_name,
             )
             if replayed_run:
+                require_pricing_replay(replayed_run, pricing_request_by_field)
                 _validate_massachusetts_request(importer, normalized_params_by_name, replayed_run)
                 if importer == "hospital-prices" and not _is_exact_hospital_price_replay(
                     import_run_values_by_name,
                     replayed_run,
                 ):
                     raise ValueError("hospital-price idempotency key belongs to a different import request")
-                return normalize_run(replayed_run), False
+                async with pricing_admission_transaction(replayed_run, action="replay"):
+                    return normalize_run(replayed_run), False
         raise
+    if importer == "nucc":
+        return await _enqueue_nucc_run(import_run_values_by_name, param_views.enqueue_by_name), True
     enqueue_result = await _enqueue_import_start(
         {
             **import_run_values_by_name,
@@ -3440,9 +3657,43 @@ async def create_import_run(
 
 
 async def _persist_enqueue_result(run_id: str, importer: str, run_values_by_name: dict[str, Any]) -> dict[str, Any]:
-    """Keep late PLACES enqueue acknowledgements behind the initial run state."""
+    """Preserve newer worker state when the enqueue producer acknowledges."""
+    if importer != "nucc":
+        return await _write_enqueue_result(run_id, importer, run_values_by_name)
+    from api.nucc_source_control import require_unpublished_source, source_action
+
+    async with source_action(run_id) as protected:
+        if protected is None:
+            return await _write_enqueue_result(run_id, importer, run_values_by_name)
+        current, receipt = protected
+        if receipt is None and current["status"] == "queued" and current["phase_detail"] == "created":
+            require_unpublished_source(current)
+            if all(current["progress"].get(key) is None for key in ("attempt_id", "attempt_started_at")):
+                await _write_enqueue_result(run_id, importer, run_values_by_name)
+    updated = await get_import_run(run_id)
+    if updated is None:
+        raise RuntimeError("NUCC Source run disappeared after enqueue acknowledgement")
+    return updated
+
+
+async def _write_enqueue_result(run_id, importer, run_values_by_name):
+    if importer in PRICING_IMPORTERS:
+        delivery_update = await db.execute(
+            update(ImportRun)
+            .where(
+                ImportRun.run_id == run_id,
+                ImportRun.importer == importer,
+                cast(ImportRun.metrics, JSONB)[DELIVERY_FIELD] == literal(initial_delivery(run_id), type_=JSONB),
+            )
+            .values(**enqueue_ack_values(ImportRun, run_values_by_name))
+            .returning(ImportRun)
+        )
+        acknowledged_run = delivery_update.scalar_one_or_none()
+        if acknowledged_run is None:
+            raise RuntimeError("pricing enqueue delivery identity changed")
+        return normalize_run(acknowledged_run)
     statement = update(ImportRun).where(ImportRun.run_id == run_id)
-    if importer == "places-zcta":
+    if importer in {"places-zcta", "nucc"}:
         statement = _where_no_places_handoff(
             statement.where(
                 ImportRun.importer == importer,
@@ -3452,6 +3703,14 @@ async def _persist_enqueue_result(run_id: str, importer: str, run_values_by_name
                 ImportRun.progress["attempt_id"].as_string().is_(None),
                 ImportRun.progress["attempt_started_at"].as_string().is_(None),
             )
+        )
+    if importer == "nucc":
+        statement = statement.where(
+            ImportRun.metrics["nucc_native_publication"].as_string().is_(None),
+            or_(
+                ImportRun.metrics["job_id"].as_string().is_(None),
+                ImportRun.metrics["job_id"].as_string() == f"nucc_start_{run_id}",
+            ),
         )
     updated = await db.execute(
         statement.values(
@@ -3463,10 +3722,12 @@ async def _persist_enqueue_result(run_id: str, importer: str, run_values_by_name
             error=run_values_by_name["error"],
         )
     )
-    if importer == "places-zcta" and updated.rowcount != 1:
+    if importer in {"places-zcta", "nucc"} and updated.rowcount != 1:
         latest = (await db.execute(select(ImportRun).where(ImportRun.run_id == run_id).limit(1))).scalar_one_or_none()
         if latest is None:
-            raise RuntimeError("PLACES run disappeared after enqueue acknowledgement")
+            raise RuntimeError(
+                f"{'PLACES' if importer == 'places-zcta' else 'NUCC'} run disappeared after enqueue acknowledgement"
+            )
         return normalize_run(latest)
     return normalize_run(_serialize_run_timestamps(run_values_by_name))
 
@@ -3582,6 +3843,25 @@ async def _enqueue_import_start(
 ) -> dict[str, Any]:
     """Enqueue one importer start job and return its run-state update."""
 
+    if import_run_values_by_name.get("importer") == "nucc":
+        from api.nucc_source_control import require_unpublished_source, source_action
+
+        async with source_action(import_run_values_by_name.get("run_id")) as protected:
+            if protected is not None:
+                current, receipt = protected
+                if receipt is not None or current["status"] in TERMINAL_STATUSES:
+                    return current
+                require_unpublished_source(current)
+                if current["status"] != "queued" or current["phase_detail"] != "created":
+                    return current
+                if any(current["progress"].get(key) is not None for key in ("attempt_id", "attempt_started_at")):
+                    return current
+                import_run_values_by_name = {**current, "family": _importer_family("nucc")}
+            return await _enqueue_selected_import(import_run_values_by_name)
+    return await _enqueue_selected_import(import_run_values_by_name)
+
+
+async def _enqueue_selected_import(import_run_values_by_name):
     importer = str(import_run_values_by_name.get("importer") or "")
     now = utc_now()
     raw_params = import_run_values_by_name.get("params")
@@ -3633,6 +3913,7 @@ async def _enqueue_import_start(
 def _adapter_for_import_row(row: dict[str, Any]) -> dict[str, Any] | None:
     importer = str(row.get("importer") or "")
     adapter = _SINGLE_JOB_ADAPTERS.get(importer)
+    _validate_registry_cms_source_params(importer, row.get("params"))
     if adapter is None or importer != "ptg":
         return adapter
     params = row.get("params") if isinstance(row.get("params"), dict) else {}
@@ -3691,6 +3972,10 @@ def _safe_enqueued_job_id(
     if any(name in params_by_name for name in ephemeral_param_names):
         return str(requested_job_id or "")
     explicit_job_id = getattr(job, "job_id", None)
+    if importer == "nucc" and requested_job_id:
+        if job is not None and explicit_job_id != requested_job_id:
+            raise RuntimeError("NUCC enqueue acknowledgement identity changed")
+        return str(requested_job_id)
     if explicit_job_id:
         return str(explicit_job_id)
     return str(job or "")
@@ -3774,6 +4059,13 @@ def _control_wrapped_adapter_payload(
     """Build a control-wrapped task payload with retry lineage."""
 
     task_payload_map = {"test_mode": test_mode, **params}
+    if import_run_values_by_name.get("importer") in {
+        "registry-cms-source-worker",
+        "registry-ptg-source-worker",
+        "registry-aca-source-worker",
+        "registry-source-check",
+    }:
+        task_payload_map = dict(params)
     if import_run_values_by_name.get("importer") == "openaddresses":
         task_payload_map["control_import_id"] = (
             import_run_values_by_name.get("import_id")
@@ -3848,6 +4140,8 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
     current = await get_import_run(run_id)
     if not current:
         return None
+    if current.get("importer") == "nucc":
+        return await _request_nucc_cancel(run_id)
     if (
         current.get("importer") == "places-zcta"
         and isinstance(current.get("metrics"), dict)
@@ -3918,7 +4212,7 @@ async def _mark_source_profile_cancel(session, current_by_field):
     )
 
 
-async def _request_worker_cancel(current: dict[str, Any]) -> dict[str, Any] | None:
+async def _request_worker_cancel(current: dict[str, Any], *, cancel_signal=None, publish=True) -> dict[str, Any] | None:
     """Apply the ordinary worker cancellation path to the selected run."""
     run_id = current["run_id"]
     if str(current.get("importer") or "") == "ptg":
@@ -3937,11 +4231,15 @@ async def _request_worker_cancel(current: dict[str, Any]) -> dict[str, Any] | No
     now = utc_now()
     current_progress = current.get("progress") if isinstance(current.get("progress"), dict) else {}
     is_pending_adapter = current.get("status") == "queued" and run_metrics_by_name.get("enqueue_adapter") == "pending"
-    worker_cancel_signal_map = await _cancel_signal_for_run(
-        current,
-        run_id=run_id,
-        is_pending_adapter=is_pending_adapter,
-        is_queued_arq=is_queued_arq,
+    worker_cancel_signal_map = (
+        cancel_signal
+        if cancel_signal is not None
+        else await _cancel_signal_for_run(
+            current,
+            run_id=run_id,
+            is_pending_adapter=is_pending_adapter,
+            is_queued_arq=is_queued_arq,
+        )
     )
     run_metrics_by_name["cancel_signal"] = worker_cancel_signal_map
     canceled_before_start = is_pending_adapter or (
@@ -3961,6 +4259,7 @@ async def _request_worker_cancel(current: dict[str, Any]) -> dict[str, Any] | No
         requested_at=now,
         cancel_state_by_name=cancel_state_by_name,
         run_metrics_by_name=run_metrics_by_name,
+        publish=publish,
     )
 
 
@@ -4147,6 +4446,7 @@ async def _persist_cancel_request(
     requested_at: dt.datetime,
     cancel_state_by_name: dict[str, Any],
     run_metrics_by_name: dict[str, Any],
+    publish: bool = True,
 ) -> dict[str, Any] | None:
     """Persist cancellation state and publish its live control event."""
 
@@ -4161,7 +4461,7 @@ async def _persist_cancel_request(
             heartbeat_at=requested_at,
             finished_at=(requested_at if canceled_now else current_run.get("finished_at")),
             progress=cancel_progress_by_name,
-            metrics=run_metrics_by_name,
+            metrics=preserve_delivery(ImportRun, run_metrics_by_name),
         )
     )
     attempt_pair = _cancel_attempt_pair(cancel_progress_by_name)
@@ -4181,7 +4481,7 @@ async def _persist_cancel_request(
         ):
             return await _request_source_profile_cancel(run_id)
         return updated
-    if updated:
+    if updated and publish:
         _write_run_live_progress(
             {**updated, "progress": cancel_progress_by_name},
             publish_event=False,
@@ -4202,13 +4502,15 @@ async def _cancel_signal_for_run(
     run_id: str,
     is_pending_adapter: bool,
     is_queued_arq: bool,
+    nucc_redis_timeout: float | None = None,
 ) -> dict[str, Any]:
     """Signal queued or active work through its configured control path."""
 
     if is_pending_adapter:
         return {"redis": False, "pending_adapter": True}
-    cancel_flag_by_name = await _set_cancel_flag(run_id)
-    queued_signal_by_name = await _remove_queued_job(current_run)
+    async with asyncio.timeout(nucc_redis_timeout):
+        cancel_flag_by_name = await _set_cancel_flag(run_id)
+        queued_signal_by_name = await _remove_queued_job(current_run)
     kubernetes_signal_by_name = await _delete_active_worker_jobs(current_run)
     if is_queued_arq:
         if queued_signal_by_name.get("payload_absent"):

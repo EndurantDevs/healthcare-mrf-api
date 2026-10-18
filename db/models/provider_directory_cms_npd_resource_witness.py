@@ -16,23 +16,16 @@ _SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
 class ProviderDirectoryCMSNPDResourceWitness(Base):
     """Raw source facts kept separate from the public normalized projection."""
 
+    __runtime_schema_sync__ = False
+
     __tablename__ = "provider_directory_cms_npd_resource_witness"
     __table_args__ = (
         PrimaryKeyConstraint("dataset_id", "resource_type", "resource_id"),
-        ForeignKeyConstraint(
-            ("dataset_id", "resource_type", "resource_id"),
-            (
-                f"{_SCHEMA}.provider_directory_dataset_resource.dataset_id",
-                f"{_SCHEMA}.provider_directory_dataset_resource.resource_type",
-                f"{_SCHEMA}.provider_directory_dataset_resource.resource_id",
-            ),
-            ondelete="CASCADE",
-        ),
         CheckConstraint("source_id = 'cms-npd'", name="cms_npd_witness_source_check"),
         CheckConstraint("release_id ~ '^[0-9a-f]{64}$'", name="cms_npd_witness_release_check"),
         CheckConstraint("raw_payload_sha256 ~ '^[0-9a-f]{64}$'", name="cms_npd_witness_raw_hash_check"),
         CheckConstraint("normalized_payload_hash ~ '^[0-9a-f]{64}$'", name="cms_npd_witness_normalized_hash_check"),
-        {"schema": _SCHEMA},
+        {"schema": _SCHEMA, "info": {"managed_immutable_storage": True}},
     )
 
     dataset_id = Column(String(96), nullable=False)

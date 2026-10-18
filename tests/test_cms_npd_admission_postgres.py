@@ -10,29 +10,37 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+from contextlib import aclosing, asynccontextmanager
 from contextvars import Context
-from functools import partial
 from itertools import count
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from uuid import uuid4
 
 import pytest
+import pytest_asyncio
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.provider_directory_cms_entities import read_cms_entities
+from api.provider_directory_cms_generation import accepted_cms_generation
 from api.provider_directory_entities_contract import CURSOR_KEY_ENV, DirectoryRead, DirectoryReadError
 from process import provider_directory_cms_npd as cms
 from process import provider_directory_cms_npd_recovery as recovery
 from process import provider_directory_cms_npd_relationship as relationships
 from process import provider_directory_cms_serving_coverage as coverage
+from process import provider_directory_generic_source_storage as source_storage
+from process.provider_directory_generic_candidate import GenericCandidateError
+from process.provider_directory_generic_source_adapters import completed_source_scope
+from process.provider_directory_generic_source_policy import source_transaction
+from process.provider_directory_source_failure_control import _committed_resource_count
 from process.provider_directory_source_local_publication import publish_validated_source_local_dataset
 from tests import cms_npd_admission_postgres_support as support
+from tests import cms_retained_legacy_postgres_support as retained
 from tests.cms_npd_admission_postgres_support import (
-    cms_admission_template,
     cms_artifact_root,
     fhir,
     release_probe_client,
@@ -42,7 +50,17 @@ from tests.cms_npd_admission_postgres_support import (
 pytestmark = pytest.mark.parametrize(
     "cms_admission_template", [support.LEGACY_MIGRATION_PREFIXES], indirect=True, ids=["legacy"]
 )
-admission_database = partial(support.admission_database, migration_prefixes=support.LEGACY_MIGRATION_PREFIXES)
+admission_database = support.legacy_source_admission_database
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module", autouse=True)
+async def cms_admission_template(request):
+    """Reuse closed Source baselines while retaining the raw legacy migration template."""
+    from tests.provider_directory_source_postgres_support import source_component_templates
+
+    async with source_component_templates(), aclosing(support.cms_admission_template.__wrapped__(request)) as baseline:
+        await anext(baseline)
+        yield
 
 
 async def _publish_legacy_source(fhir, candidate, identity, directory, receipt, client, ctx, task):
@@ -69,7 +87,9 @@ async def _publish_legacy_source(fhir, candidate, identity, directory, receipt, 
         )
     else:
         async with fhir.db.session() as session:
-            assert await coverage.build_cms_coverage(session) == candidate.dataset_id
+            generation = await accepted_cms_generation(session, None)
+            await coverage.require_cms_coverage(session, fhir._schema(), generation)
+            assert generation["dataset_id"] == candidate.dataset_id
     state = await fhir._endpoint_dataset_state(candidate.dataset_id)
     cms._assert_candidate_release(state, identity)
     assert state["status"] == "published" and state["is_current"] is True
@@ -91,32 +111,56 @@ async def _write_location_batch(candidate, resources):
     await cms._persist_source_batch(fhir, fhir.ProviderDirectoryLocation, parsed_rows, resources, candidate, "Location")
 
 
-async def _raw_batch_snapshot(database, dataset_id):
+async def _raw_batch_snapshot(database, dataset_id, *, candidate=None):
     """Include unmatched normalized rows so a partial rollback cannot hide."""
+    if candidate is not None:
+        async with source_transaction(fhir.db, isolation="repeatable read") as session:
+            async with session.begin_nested() as savepoint:
+                async with completed_source_scope(fhir, candidate):
+                    snapshot = await _raw_batch_snapshot(fhir.db, dataset_id)
+                await savepoint.rollback()
+        return snapshot
+    resource = fhir._qt(fhir._schema(), "provider_directory_dataset_resource")
+    witness = fhir._qt(fhir._schema(), "provider_directory_cms_npd_resource_witness")
     return await database.all(
         "SELECT r.resource_id,r.payload_hash,r.payload_json::text,w.raw_payload_sha256,"
-        "w.normalized_payload_hash,w.raw_payload_json::text FROM mrf.provider_directory_dataset_resource r "
-        "LEFT JOIN mrf.provider_directory_cms_npd_resource_witness w "
+        f"w.normalized_payload_hash,w.raw_payload_json::text FROM {resource} r "
+        f"LEFT JOIN {witness} w "
         "USING(dataset_id,resource_type,resource_id) WHERE r.dataset_id=:dataset_id ORDER BY r.resource_id",
         dataset_id=dataset_id,
     )
 
 
+async def _retained_input_count(database, dataset_id):
+    """Observe committed isolated input with the production complete-key counter."""
+    binding = await database.scalar(
+        "SELECT candidate_storage_json FROM mrf.provider_directory_endpoint_dataset WHERE dataset_id=:dataset_id",
+        dataset_id=dataset_id,
+    )
+    binding = source_storage._json(binding)
+    if binding["phase"] == "disposed":
+        assert binding["tables"] == {}
+        return 0
+    async with database.session() as session:
+        connection = (await (await session.connection()).get_raw_connection()).driver_connection
+        return await _committed_resource_count(connection, database._source_component.policy, binding)
+
+
 async def _assert_witness_copy_failure(monkeypatch, database, candidate, resource, baseline):
     """Fail after COPY has inserted a witness and require rollback of both tables."""
-    original_copy = fhir._copy_upsert_rows
+    original_copy = source_storage._copy
 
-    async def fail_after_copy(model, *args, **kwargs):
-        result = await original_copy(model, *args, **kwargs)
-        if model is cms.ProviderDirectoryCMSNPDResourceWitness:
+    async def fail_after_copy(connection, policy, table, columns, records):
+        result = await original_copy(connection, policy, table, columns, records)
+        if "raw_payload_json" in columns:
             raise RuntimeError("synthetic_after_witness_copy")
         return result
 
     with monkeypatch.context() as failed:
-        failed.setattr(fhir, "_copy_upsert_rows", fail_after_copy)
+        failed.setattr(source_storage, "_copy", fail_after_copy)
         with pytest.raises(RuntimeError, match="synthetic_after_witness_copy"):
             await _write_location_batch(candidate, [resource])
-    assert await _raw_batch_snapshot(database, candidate.dataset_id) == baseline
+    assert await _raw_batch_snapshot(database, candidate.dataset_id, candidate=candidate) == baseline
 
 
 @pytest.mark.asyncio
@@ -135,39 +179,253 @@ async def test_witness_copy_replay_and_failures_are_atomic(monkeypatch, cms_arti
             "unmapped": {"label": "Café\\u0000", "values": [None, False, 2, 1.5]},
         }
         await _write_location_batch(candidate, [resource_by_field])
-        baseline = await _raw_batch_snapshot(database, candidate.dataset_id)
+        baseline = await _raw_batch_snapshot(database, candidate.dataset_id, candidate=candidate)
         assert len(baseline) == 1 and json.loads(baseline[0][-1]) == resource_by_field
         await _write_location_batch(candidate, [resource_by_field, resource_by_field])
-        assert await _raw_batch_snapshot(database, candidate.dataset_id) == baseline
+        assert await _raw_batch_snapshot(database, candidate.dataset_id, candidate=candidate) == baseline
         new_resource_by_field = {**resource_by_field, "id": "new-site"}
         conflicting_by_field = {**resource_by_field, "unmapped": {"changed": True}}
-        with pytest.raises(RuntimeError, match="cms_npd_witness_payload_conflict"):
-            await _write_location_batch(candidate, [new_resource_by_field, conflicting_by_field])
-        assert await _raw_batch_snapshot(database, candidate.dataset_id) == baseline
+        with pytest.raises(GenericCandidateError, match="witness_replay_conflict"):
+            async with source_transaction(fhir.db, isolation="repeatable read"):
+                await _write_location_batch(candidate, [new_resource_by_field, conflicting_by_field])
+                await _raw_batch_snapshot(database, candidate.dataset_id, candidate=candidate)
+        assert await _raw_batch_snapshot(database, candidate.dataset_id, candidate=candidate) == baseline
         await _assert_witness_copy_failure(monkeypatch, database, candidate, new_resource_by_field, baseline)
         with pytest.raises(cms.source.CmsNpdSourceError, match="cms_npd_resource_invalid"):
             await _write_location_batch(candidate, [{**new_resource_by_field, "unmapped": {"bad\x00key": "value"}}])
-        assert await _raw_batch_snapshot(database, candidate.dataset_id) == baseline
+        assert await _raw_batch_snapshot(database, candidate.dataset_id, candidate=candidate) == baseline
 
 
-async def _admit_without_witnesses(monkeypatch, directory, receipt, run_id, *, before_publish=None):
-    """Model a release sealed before raw witness storage was installed."""
+async def _historical_columns(database):
+    """Read the exact legacy column order, including partitioned retained tables."""
+    columns_by_table = {}
+    async with database.session() as session:
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
+        tables = (*retained._RETAINED_TABLES, "provider_directory_cms_serving_coverage")
+        for column_row in await driver.fetch(
+            "SELECT c.relname,a.attname,t.typname FROM pg_class c "
+            "JOIN pg_attribute a ON a.attrelid=c.oid JOIN pg_type t ON t.oid=a.atttypid "
+            "WHERE c.relnamespace='mrf'::regnamespace AND c.relname=ANY($1::text[]) "
+            "AND c.relkind IN ('r','p') AND a.attnum>0 AND NOT a.attisdropped AND a.attgenerated='' "
+            "ORDER BY c.relname,a.attnum",
+            list(tables),
+        ):
+            columns_by_table.setdefault(column_row["relname"], []).append(
+                (column_row["attname"], column_row["typname"])
+            )
+        assert set(columns_by_table) == set(tables)
+    return columns_by_table
 
-    async def persist_legacy_rows(fhir_module, model, parsed_rows, _raw_resources, candidate, _resource_type):
-        await fhir_module._persist_endpoint_dataset_rows(
-            model,
-            parsed_rows,
-            candidate.dataset_id,
-            resource_hash_contract=candidate.resource_hash_contract,
-            semantic_projection_as_of=candidate.semantic_projection_as_of,
+
+async def _admit_historical_release(monkeypatch, donor, release):
+    """Produce a real terminal receipt, optionally stopping before its legacy cutover."""
+    directory, receipt, run_id, _missing, published = release
+    if published:
+        return await _admit_legacy_source(directory, receipt, run_id)
+    with monkeypatch.context() as held:
+        held.setattr(
+            f"{__name__}.publish_validated_source_local_dataset",
+            AsyncMock(side_effect=RuntimeError("synthetic_legacy_publish_hold")),
+        )
+        with pytest.raises(RuntimeError, match="synthetic_legacy_publish_hold"):
+            await _admit_legacy_source(directory, receipt, run_id)
+    candidate_row = await donor.first(
+        "SELECT dataset_id FROM mrf.provider_directory_endpoint_dataset "
+        "WHERE publication_metadata_json->'source_release'->>'vector_sha256'=:vector",
+        vector=receipt["vector_sha256"],
+    )
+    return {"dataset_id": candidate_row[0], "status": "validated"}
+
+
+async def _historical_donor_rows(monkeypatch, releases, columns_by_table, admission_by_run):
+    """Export genuine admitted rows before loading the historical custody fixture."""
+    with monkeypatch.context() as producing:
+        async with support.legacy_source_admission_database(producing) as donor:
+            for release in releases:
+                admission_by_run[release[2]] = await _admit_historical_release(producing, donor, release)
+            async with donor.session() as session:
+                driver = (await (await session.connection()).get_raw_connection()).driver_connection
+                return {
+                    table: [
+                        tuple(retained_row)
+                        for retained_row in await driver.fetch(
+                            f'SELECT {retained._projection(columns)} FROM "mrf"."{table}"'
+                        )
+                    ]
+                    for table, columns in columns_by_table.items()
+                }
+
+
+def _omit_historical_facts(releases, columns_by_table, rows_by_table, admission_by_run):
+    """Omit only facts that the selected historical release did not originally retain."""
+    for _directory, _receipt, run_id, missing, _published in releases:
+        omitted = {"provider_directory_cms_npd_relationship_receipt"} if missing in {"witness", "receipt"} else set()
+        if missing == "witness":
+            omitted |= {"provider_directory_cms_npd_resource_witness", "provider_directory_cms_npd_relationship"}
+        for table in omitted:
+            dataset_index = [name for name, _kind in columns_by_table[table]].index("dataset_id")
+            rows_by_table[table] = [
+                retained_row
+                for retained_row in rows_by_table[table]
+                if retained_row[dataset_index] != admission_by_run[run_id]["dataset_id"]
+            ]
+        if missing == "v1":
+            table = "provider_directory_insurance_network_source_binding"
+            resource_index = [name for name, _kind in columns_by_table[table]].index("resource_id")
+            rows_by_table[table] = [
+                retained_row
+                for retained_row in rows_by_table[table]
+                if retained_row[resource_index] != "unplanned-network"
+            ]
+
+
+def _apply_historical_coverage(connection, action):
+    """Use the actual version migration under the caller's transaction."""
+    from tests.test_provider_directory_cms_serving_receipt_postgres import _migration
+
+    migration = _migration("20260930080000")
+    with Operations.context(MigrationContext.configure(connection)):
+        getattr(migration, action)()
+
+
+async def _downgrade_historical_coverage(connection, columns_by_table, rows_by_table):
+    """Restore the original v1 schema while its retained coverage is still empty."""
+    await connection.run_sync(_apply_historical_coverage, "downgrade")
+    table = "provider_directory_cms_serving_coverage"
+    version_index = [name for name, _kind in columns_by_table[table]].index("proof_version")
+    columns_by_table[table].pop(version_index)
+    rows_by_table[table] = [
+        retained_row[:version_index] + retained_row[version_index + 1 :] for retained_row in rows_by_table[table]
+    ]
+
+
+async def _copy_historical_inputs(driver, columns_by_table, rows_by_table, headers):
+    """Load in native dependency order, then seal each header through its original guards."""
+    header_columns = tuple(name for name, _kind in columns_by_table[retained._HEADER])
+    for table in retained._RETAINED_TABLES:
+        columns = columns_by_table[table]
+        if table in {retained._COVERAGE, "provider_directory_cms_serving_coverage"}:
+            continue
+        copy_rows = rows_by_table[table]
+        if table == retained._HEADER:
+            copy_rows = [
+                retained.loading_header(
+                    header_columns,
+                    tuple({**header, "status": "validated", "is_current": False}[name] for name in header_columns),
+                )
+                for header in headers
+            ]
+        await driver.copy_records_to_table(
+            table, schema_name="mrf", columns=tuple(name for name, _kind in columns), records=copy_rows
+        )
+    for header in headers:
+        candidate = SimpleNamespace(dataset_id=header["dataset_id"])
+        validated_by_field = {
+            **header,
+            "status": "validated",
+            "is_current": False,
+            "published_at": None,
+            "superseded_at": None,
+        }
+        await retained._terminal_header(
+            driver,
+            candidate,
+            columns_by_table[retained._HEADER],
+            tuple(validated_by_field[name] for name in header_columns),
+        )
+        if header["status"] == "published":
+            header["published_at"] = await driver.fetchval(
+                "UPDATE mrf.provider_directory_endpoint_dataset SET status='published',is_current=true,"
+                "published_at=transaction_timestamp() WHERE dataset_id=$1 AND status='validated' AND NOT is_current "
+                "RETURNING published_at",
+                header["dataset_id"],
+            )
+            assert header["published_at"] is not None
+
+
+async def _copy_historical_coverage(driver, columns_by_table, rows_by_table, headers):
+    """Bind imported coverage to the destination publication timestamp before copying it."""
+    table = "provider_directory_cms_serving_coverage"
+    columns = [name for name, _kind in columns_by_table[table]]
+    header_by_id = {header["dataset_id"]: header for header in headers}
+    timestamp_index, dataset_index = columns.index("published_at"), columns.index("dataset_id")
+    rows_by_table[table] = [
+        tuple(
+            header_by_id[retained_row[dataset_index]]["published_at"] if index == timestamp_index else field_value
+            for index, field_value in enumerate(retained_row)
+        )
+        for retained_row in rows_by_table[table]
+    ]
+    for table in (retained._COVERAGE, "provider_directory_cms_serving_coverage"):
+        await driver.copy_records_to_table(
+            table,
+            schema_name="mrf",
+            columns=tuple(name for name, _kind in columns_by_table[table]),
+            records=rows_by_table[table],
         )
 
-    with monkeypatch.context() as legacy:
-        legacy.setattr(cms, "_persist_source_batch", persist_legacy_rows)
-        legacy.setattr(cms, "_assert_witness_counts", AsyncMock())
-        if before_publish is not None:
-            legacy.setattr(f"{__name__}.publish_validated_source_local_dataset", before_publish)
-        return await _admit_legacy_source(directory, receipt, run_id)
+
+async def _upgrade_historical_coverage(connection, driver, v1_releases, admission_by_run):
+    """Require migration refusal without pointer changes, then retire the original generation."""
+    before = await driver.fetch(
+        "SELECT dataset_id,status,is_current,published_at FROM mrf.provider_directory_endpoint_dataset ORDER BY dataset_id"
+    )
+    with pytest.raises(DBAPIError, match="cms_npd_coverage_v1_current_requires_staged_upgrade"):
+        async with connection.begin_nested():
+            await connection.run_sync(_apply_historical_coverage, "upgrade")
+    assert (
+        await driver.fetch(
+            "SELECT dataset_id,status,is_current,published_at FROM mrf.provider_directory_endpoint_dataset ORDER BY dataset_id"
+        )
+        == before
+    )
+    for run_id in v1_releases:
+        assert (
+            await driver.execute(
+                "UPDATE mrf.provider_directory_endpoint_dataset SET status='superseded',is_current=false,superseded_at=now() "
+                "WHERE dataset_id=$1 AND status='published' AND is_current",
+                admission_by_run[run_id]["dataset_id"],
+            )
+            == "UPDATE 1"
+        )
+    await connection.run_sync(_apply_historical_coverage, "upgrade")
+
+
+async def _seed_historical_admission(component, monkeypatch, releases, admission_by_run):
+    """Replay actual retained history before the target component adopts Source custody."""
+    database = support.Database(
+        engine=component.admin_engine,
+        session_factory=async_sessionmaker(component.admin_engine, expire_on_commit=False),
+    )
+    columns_by_table = await _historical_columns(database)
+    rows_by_table = await _historical_donor_rows(monkeypatch, releases, columns_by_table, admission_by_run)
+    _omit_historical_facts(releases, columns_by_table, rows_by_table, admission_by_run)
+    header_columns = tuple(name for name, _kind in columns_by_table[retained._HEADER])
+    headers = [dict(zip(header_columns, retained_row, strict=True)) for retained_row in rows_by_table[retained._HEADER]]
+    for header in headers:
+        header["candidate_storage_json"] = None
+    v1_releases = [run_id for _directory, _receipt, run_id, missing, _published in releases if missing == "v1"]
+    async with database.engine.begin() as connection:
+        driver = (await connection.get_raw_connection()).driver_connection
+        if v1_releases:
+            await _downgrade_historical_coverage(connection, columns_by_table, rows_by_table)
+        await _copy_historical_inputs(driver, columns_by_table, rows_by_table, headers)
+        await _copy_historical_coverage(driver, columns_by_table, rows_by_table, headers)
+        if v1_releases:
+            await _upgrade_historical_coverage(connection, driver, v1_releases, admission_by_run)
+
+
+@asynccontextmanager
+async def _historical_admission_database(monkeypatch, *releases):
+    """Import genuine receipts through legacy guards before adopting Source custody."""
+    admission_by_run = {}
+
+    async def before_provision(component):
+        await _seed_historical_admission(component, monkeypatch, releases, admission_by_run)
+
+    async with support.legacy_source_admission_database(monkeypatch, before_provision=before_provision) as database:
+        database._historical_results = admission_by_run
+        yield database
 
 
 async def _assert_current(database, dataset_id):
@@ -328,30 +586,43 @@ async def _assert_relationship_facts(database, dataset_id):
 
 
 async def _assert_published_payload_guard(database, dataset_id):
-    with pytest.raises(DBAPIError, match="cms_npd_published_resource_immutable"):
+    component = database._source_component
+    before = await _raw_batch_snapshot(database, dataset_id)
+    for role in component.policy.runtime_roles:
+        engine = create_async_engine(component.database.engine.url.set(username=role))
+        actor = support.Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
+        try:
+            await _assert_published_actor_payload_guard(actor, dataset_id)
+        finally:
+            await engine.dispose()
+    assert await _raw_batch_snapshot(database, dataset_id) == before
+
+
+async def _assert_published_actor_payload_guard(database, dataset_id):
+    with pytest.raises(DBAPIError, match="permission denied"):
         await database.status(
             "UPDATE mrf.provider_directory_dataset_resource SET payload_json='{}'::jsonb WHERE dataset_id=:dataset_id",
             dataset_id=dataset_id,
         )
-    with pytest.raises(DBAPIError, match="cms_npd_resource_witness_immutable"):
+    with pytest.raises(DBAPIError, match="permission denied"):
         await database.status(
             "UPDATE mrf.provider_directory_cms_npd_resource_witness "
             "SET raw_payload_json='{}'::jsonb WHERE dataset_id=:dataset_id",
             dataset_id=dataset_id,
         )
-    with pytest.raises(DBAPIError, match="cms_npd_published_relationship_immutable"):
+    with pytest.raises(DBAPIError, match="permission denied"):
         await database.status(
             "UPDATE mrf.provider_directory_cms_npd_relationship "
             "SET resolution_status='unresolved' WHERE dataset_id=:dataset_id",
             dataset_id=dataset_id,
         )
-    with pytest.raises(DBAPIError, match="cms_npd_relationship_receipt_immutable"):
+    with pytest.raises(DBAPIError, match="permission denied"):
         await database.status(
             "UPDATE mrf.provider_directory_cms_npd_relationship_receipt "
             "SET relationship_count=0 WHERE dataset_id=:dataset_id",
             dataset_id=dataset_id,
         )
-    with pytest.raises(DBAPIError, match="cms_npd_published_relationship_immutable"):
+    with pytest.raises(DBAPIError, match="permission denied"):
         await database.status(
             "INSERT INTO mrf.provider_directory_cms_npd_relationship "
             "(dataset_id, source_id, release_id, resource_type, resource_id, "
@@ -366,7 +637,7 @@ async def _assert_published_payload_guard(database, dataset_id):
             "WHERE dataset_id=:dataset_id LIMIT 1",
             dataset_id=dataset_id,
         )
-    with pytest.raises(DBAPIError, match="cms_npd_relationship_truncate_forbidden"):
+    with pytest.raises(DBAPIError, match="permission denied"):
         await database.status("TRUNCATE mrf.provider_directory_cms_npd_relationship")
 
 
@@ -517,28 +788,15 @@ async def test_coverage_only_plan_network_is_bound_and_served(monkeypatch, cms_a
 
 
 @pytest.mark.asyncio
-async def test_published_plan_only_release_replay_backfills_network_role(monkeypatch, cms_artifact_root):
-    """A v1 receipt cannot serve until exact new network roles are bound and rechecked."""
+async def test_v1_upgrade_requires_fresh_candidate(monkeypatch, cms_artifact_root):
+    """Retain the refused legacy receipt and backfill roles through a new immutable candidate."""
     directory, receipt = retained_release(cms_artifact_root, include_unplanned_network_role=True)
-    async with admission_database(monkeypatch) as database:
-        from process import provider_directory_insurance_network_batch as network_writer
-
-        current_require = coverage.require_cms_bindings
-
-        async def plan_only_require(session, schema, generation, kind):
-            if kind != "networks":
-                await current_require(session, schema, generation, kind)
-
-        with monkeypatch.context() as legacy:
-            legacy.setattr(
-                network_writer,
-                "_TARGETS_SQL",
-                network_writer._TARGETS_SQL.replace("AND (observation_json->>'network_role')::boolean", "AND FALSE"),
-            )
-            legacy.setattr(cms, "_NETWORK_ROLE_SQL", "FALSE")
-            legacy.setattr(coverage, "require_cms_bindings", plan_only_require)
-            published = await _admit_legacy_source(directory, receipt, "cms-network-role-first")
-        assert published["status"] == "published"
+    async with _historical_admission_database(
+        monkeypatch, (directory, receipt, "cms-network-role-first", "v1", True)
+    ) as database:
+        published = database._historical_results["cms-network-role-first"]
+        predecessor = await fhir._endpoint_dataset_state(published["dataset_id"])
+        assert predecessor["status"] == "superseded" and predecessor["is_current"] is False
         assert (
             await database.scalar(
                 "SELECT count(*) FROM mrf.provider_directory_insurance_network_source_binding "
@@ -546,15 +804,17 @@ async def test_published_plan_only_release_replay_backfills_network_role(monkeyp
             )
             == 0
         )
-        await _mark_legacy_coverage_receipt(database, published["dataset_id"])
         monkeypatch.setenv(CURSOR_KEY_ENV, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         async with database.session() as session:
             with pytest.raises(DirectoryReadError) as caught:
                 await read_cms_entities(session, DirectoryRead("networks", "cms-npd", "entities", None, None))
         assert caught.value.status == 503
 
+        replacement = await _admit_legacy_source(directory, receipt, "cms-network-role-replacement")
+        assert replacement["dataset_id"] != published["dataset_id"] and replacement["replayed"] is False
         replay = await _admit_legacy_source(directory, receipt, "cms-network-role-replay")
-        assert replay["dataset_id"] == published["dataset_id"] and replay["replayed"] is True
+        assert replay["dataset_id"] == replacement["dataset_id"] and replay["replayed"] is True
+        assert await fhir._endpoint_dataset_state(published["dataset_id"]) == predecessor
         assert (
             await database.scalar(
                 "SELECT count(*) FROM mrf.provider_directory_insurance_network_source_binding "
@@ -569,7 +829,14 @@ async def test_published_plan_only_release_replay_backfills_network_role(monkeyp
                 "WHERE dataset_id=:dataset_id ORDER BY proof_version",
                 dataset_id=published["dataset_id"],
             )
-        ] == [1, 2]
+        ] == [1]
+        assert (
+            await database.scalar(
+                "SELECT proof_version FROM mrf.provider_directory_cms_serving_coverage WHERE dataset_id=:dataset_id",
+                dataset_id=replacement["dataset_id"],
+            )
+            == 2
+        )
         async with database.session() as session:
             page = await read_cms_entities(session, DirectoryRead("networks", "cms-npd", "entities", None, None))
         assert len(page["items"]) == 2
@@ -646,43 +913,6 @@ async def test_coverage_version_migration_blocks_publishable_v1_receipt():
         await engine.dispose()
 
 
-async def _mark_legacy_coverage_receipt(database, dataset_id):
-    """Model a pre-version receipt in the disposable admission database."""
-    async with database.session() as session, session.begin():
-        await session.execute(
-            text(
-                "ALTER TABLE mrf.provider_directory_cms_serving_coverage "
-                "DISABLE TRIGGER cms_npd_serving_coverage_immutable"
-            )
-        )
-        await session.execute(
-            text(
-                "ALTER TABLE mrf.provider_directory_cms_serving_coverage "
-                "DROP CONSTRAINT cms_npd_coverage_new_receipt_v2_check"
-            )
-        )
-        changed = await session.execute(
-            text(
-                "UPDATE mrf.provider_directory_cms_serving_coverage SET proof_version=1 "
-                "WHERE dataset_id=:dataset_id AND proof_version=2"
-            ),
-            {"dataset_id": dataset_id},
-        )
-        assert changed.rowcount == 1
-        await session.execute(
-            text(
-                "ALTER TABLE mrf.provider_directory_cms_serving_coverage "
-                "ENABLE TRIGGER cms_npd_serving_coverage_immutable"
-            )
-        )
-        await session.execute(
-            text(
-                "ALTER TABLE mrf.provider_directory_cms_serving_coverage "
-                "ADD CONSTRAINT cms_npd_coverage_new_receipt_v2_check CHECK (proof_version=2) NOT VALID"
-            )
-        )
-
-
 async def _assert_release_replacement(
     database, artifact_root, directory, receipt, first_admission, bindings, identities
 ):
@@ -725,29 +955,48 @@ async def _assert_release_replacement(
 async def test_relationship_alias_is_ambiguous_without_merging_entities(monkeypatch, cms_artifact_root):
     """Two exact CMS resource IDs sharing one stable ID cannot silently resolve a link."""
 
+    original_rows = support._resource_rows
+
+    def aliased_rows(revision):
+        rows = original_rows(revision)
+        rows["Organization"].append({"id": "network-alias", "name": "Alias"})
+        return rows
+
+    monkeypatch.setattr(support, "_resource_rows", aliased_rows)
     directory, receipt = retained_release(cms_artifact_root)
-    identity = cms.release_identity(receipt)
-    async with admission_database(monkeypatch) as database:
-        endpoint_id = await cms._register_source(fhir)
-        candidate = await cms._admission_candidate(fhir, endpoint_id, "cms-test-ambiguous", identity, {})
-        for name, resource_type in cms.source.RESOURCE_FILES:
-            await cms._stream_file(fhir, directory / f"{name}.zst", candidate, resource_type, {}, {})
-        await cms._materialize_identity_evidence(fhir, directory, candidate, identity, {}, {})
-        alias_payload_map = {"resourceType": "Organization", "id": "network-alias", "name": "Alias"}
-        model, normalized = cms._parse_batch_row(fhir, alias_payload_map, candidate)
-        await cms._persist_source_batch(fhir, model, [normalized], [alias_payload_map], candidate, "Organization")
-        await database.status(
-            "INSERT INTO mrf.provider_directory_entity_source_binding "
-            "(source_id,resource_type,resource_id,organization_id,site_id,created_at) "
-            "SELECT source_id,resource_type,'network-alias',organization_id,NULL,now() "
-            "FROM mrf.provider_directory_entity_source_binding "
-            "WHERE source_id='cms-npd' AND resource_type='Organization' AND resource_id='network-1'"
+
+    async def before_provision(component):
+        organization_id = uuid4()
+        async with component.admin_engine.begin() as connection:
+            await connection.execute(
+                text("INSERT INTO mrf.provider_directory_organization_identity VALUES (:id,now())"),
+                {"id": organization_id},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO mrf.provider_directory_entity_source_binding "
+                    "(source_id,resource_type,resource_id,organization_id,site_id,created_at) "
+                    "SELECT 'cms-npd','Organization',resource_id,:id,NULL,now() "
+                    "FROM unnest(ARRAY['network-1','network-alias']) resource_id"
+                ),
+                {"id": organization_id},
+            )
+
+    async with support.legacy_source_admission_database(monkeypatch, before_provision=before_provision) as database:
+        with monkeypatch.context() as held:
+            held.setattr(
+                f"{__name__}.publish_validated_source_local_dataset",
+                AsyncMock(side_effect=RuntimeError("synthetic_ambiguous_source_hold")),
+            )
+            with pytest.raises(RuntimeError, match="synthetic_ambiguous_source_hold"):
+                await _admit_legacy_source(directory, receipt, "cms-test-ambiguous")
+        candidate = await database.first(
+            "SELECT dataset_id FROM mrf.provider_directory_endpoint_dataset WHERE status='validated'"
         )
-        await relationships.materialize(fhir, candidate, identity["vector_sha256"])
         statuses = await database.all(
             "SELECT target_reference,resolution_status FROM mrf.provider_directory_cms_npd_relationship "
             "WHERE dataset_id=:dataset_id AND resource_type='InsurancePlan' ORDER BY reference_field,reference_ordinal",
-            dataset_id=candidate.dataset_id,
+            dataset_id=candidate[0],
         )
         assert ("Organization/network-1", "ambiguous") in [tuple(status) for status in statuses]
         assert ("Organization/unresolved", "unresolved") in [tuple(status) for status in statuses]
@@ -827,35 +1076,46 @@ async def test_coverage_failure_keeps_prior_generation_readable(monkeypatch, cms
 
 @pytest.mark.asyncio
 async def test_first_coverage_blocks_evidence_truncate_until_sealed(monkeypatch, cms_artifact_root):
-    """A truncate racing first publication sees the new receipt and fails."""
+    """Coverage holds the evidence lock while runtime truncation stays forbidden."""
 
     directory, receipt = retained_release(cms_artifact_root)
     async with admission_database(monkeypatch) as database:
         original_validate = coverage.validate_cms_candidate_coverage
-        truncate_tasks = []
+        lock_tasks = []
+        engine = create_async_engine(
+            database._source_component.database.engine.url.set(
+                username=database._source_component.policy.runtime_roles[-1]
+            )
+        )
+        actor = support.Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
+
+        async def acquire_exclusive_lock():
+            async with database.transaction():
+                await database.status(
+                    "LOCK TABLE mrf.provider_directory_insurance_network_plan_evidence IN ACCESS EXCLUSIVE MODE"
+                )
 
         async def validate_with_truncate(*args):
             await original_validate(*args)
-            truncate_tasks.append(
-                asyncio.create_task(
-                    database.status("TRUNCATE mrf.provider_directory_insurance_network_plan_evidence"),
-                    context=Context(),
-                )
-            )
+            lock_tasks.append(asyncio.create_task(acquire_exclusive_lock(), context=Context()))
             await asyncio.sleep(0.05)
-            assert not truncate_tasks[0].done()
+            assert not lock_tasks[0].done()
+            with pytest.raises(DBAPIError, match="permission denied"):
+                await actor.status("TRUNCATE mrf.provider_directory_insurance_network_plan_evidence")
 
         monkeypatch.setattr(coverage, "validate_cms_candidate_coverage", validate_with_truncate)
         try:
             admitted = await _admit_legacy_source(directory, receipt, "cms-test-first-coverage-truncate")
             await _assert_current(database, admitted["dataset_id"])
-            assert truncate_tasks
-            with pytest.raises(DBAPIError, match="cms_npd_covered_truncate_forbidden"):
-                await asyncio.wait_for(truncate_tasks[0], 3)
+            assert lock_tasks
+            await asyncio.wait_for(lock_tasks[0], 3)
+            with pytest.raises(DBAPIError, match="permission denied"):
+                await actor.status("TRUNCATE mrf.provider_directory_insurance_network_plan_evidence")
         finally:
-            if truncate_tasks and not truncate_tasks[0].done():
-                truncate_tasks[0].cancel()
-                await asyncio.gather(truncate_tasks[0], return_exceptions=True)
+            if lock_tasks and not lock_tasks[0].done():
+                lock_tasks[0].cancel()
+                await asyncio.gather(lock_tasks[0], return_exceptions=True)
+            await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -879,8 +1139,10 @@ async def test_pre_witness_published_release_is_reacquired_without_mutating_curr
     """An exact old release stays current until its witnessed successor cuts over."""
 
     directory, receipt = retained_release(cms_artifact_root)
-    async with admission_database(monkeypatch) as database:
-        legacy = await _admit_without_witnesses(monkeypatch, directory, receipt, "cms-legacy-published")
+    async with _historical_admission_database(
+        monkeypatch, (directory, receipt, "cms-legacy-published", "witness", True)
+    ) as database:
+        legacy = database._historical_results["cms-legacy-published"]
         await _assert_current(database, legacy["dataset_id"])
         assert (
             await database.scalar(
@@ -919,8 +1181,10 @@ async def test_daily_check_upgrades_current_release_without_witnesses(monkeypatc
     directory, receipt = retained_release(cms_artifact_root)
     with release_probe_client(directory) as client:
         observed = cms.source.observe_release(client=client)
-    async with admission_database(monkeypatch) as database:
-        legacy = await _admit_without_witnesses(monkeypatch, directory, receipt, "cms-daily-legacy")
+    async with _historical_admission_database(
+        monkeypatch, (directory, receipt, "cms-daily-legacy", "witness", True)
+    ) as database:
+        legacy = database._historical_results["cms-daily-legacy"]
         await _assert_current(database, legacy["dataset_id"])
         acquired = Mock(return_value=(directory, receipt))
         verify_release = cms._verify_release
@@ -947,10 +1211,10 @@ async def test_daily_check_upgrades_witnessed_release_without_relationship_recei
     directory, receipt = retained_release(cms_artifact_root)
     with release_probe_client(directory) as client:
         observed = cms.source.observe_release(client=client)
-    async with admission_database(monkeypatch) as database:
-        with monkeypatch.context() as witness_era:
-            witness_era.setattr(cms.relationships, "materialize", AsyncMock())
-            legacy = await _admit_legacy_source(directory, receipt, "cms-witness-era")
+    async with _historical_admission_database(
+        monkeypatch, (directory, receipt, "cms-witness-era", "receipt", True)
+    ) as database:
+        legacy = database._historical_results["cms-witness-era"]
         assert (
             await cms.relationships.completed_receipt_count(fhir, legacy["dataset_id"], receipt["vector_sha256"])
             is None
@@ -994,8 +1258,10 @@ async def test_disposed_witness_upgrade_retries_without_replacing_legacy(monkeyp
     retained_file = directory / filename
     retained_bytes = retained_file.read_bytes()
     alternate_bytes = (alternate_directory / filename).read_bytes()
-    async with admission_database(monkeypatch) as database:
-        legacy = await _admit_without_witnesses(monkeypatch, directory, receipt, "cms-retry-legacy")
+    async with _historical_admission_database(
+        monkeypatch, (directory, receipt, "cms-retry-legacy", "witness", True)
+    ) as database:
+        legacy = database._historical_results["cms-retry-legacy"]
         original_verify = cms.source.verify_release
         verification_calls = count(1)
 
@@ -1029,17 +1295,13 @@ async def test_pre_witness_validated_candidate_gets_fresh_exact_release(monkeypa
     """A sealed old candidate is left intact while a new one gains witnesses."""
 
     directory, receipt = retained_release(cms_artifact_root)
-    async with admission_database(monkeypatch) as database:
-        incumbent = await _admit_legacy_source(directory, receipt, "cms-incumbent")
-        next_directory, next_receipt = retained_release(cms_artifact_root, revision="validated-legacy")
-        with pytest.raises(RuntimeError, match="synthetic_legacy_publish_hold"):
-            await _admit_without_witnesses(
-                monkeypatch,
-                next_directory,
-                next_receipt,
-                "cms-legacy-validated",
-                before_publish=AsyncMock(side_effect=RuntimeError("synthetic_legacy_publish_hold")),
-            )
+    next_directory, next_receipt = retained_release(cms_artifact_root, revision="validated-legacy")
+    async with _historical_admission_database(
+        monkeypatch,
+        (directory, receipt, "cms-incumbent", None, True),
+        (next_directory, next_receipt, "cms-legacy-validated", "witness", False),
+    ) as database:
+        incumbent = database._historical_results["cms-incumbent"]
         legacy_candidate = await database.first(
             "SELECT dataset_id FROM mrf.provider_directory_endpoint_dataset "
             "WHERE status='validated' AND publication_metadata_json::jsonb "
@@ -1048,19 +1310,26 @@ async def test_pre_witness_validated_candidate_gets_fresh_exact_release(monkeypa
         )
         assert legacy_candidate is not None
         await _assert_current(database, incumbent["dataset_id"])
-        with pytest.raises(DBAPIError, match="cms_npd_resource_witness_immutable"):
-            await database.status(
-                "INSERT INTO mrf.provider_directory_cms_npd_resource_witness "
-                "(dataset_id, source_id, release_id, resource_type, resource_id, raw_payload_sha256, "
-                "normalized_payload_hash, raw_payload_json) "
-                "SELECT dataset_id, 'cms-npd', :release_id, resource_type, resource_id, :raw_hash, "
-                "payload_hash, jsonb_build_object('resourceType', resource_type, 'id', resource_id) "
-                "FROM mrf.provider_directory_dataset_resource "
-                "WHERE dataset_id=:dataset_id AND resource_type='Location'",
-                dataset_id=legacy_candidate[0],
-                release_id=next_receipt["vector_sha256"],
-                raw_hash="a" * 64,
-            )
+        engine = create_async_engine(
+            database._source_component.database.engine.url.set(username=database._source_component.builder)
+        )
+        actor = support.Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
+        try:
+            with pytest.raises(DBAPIError, match="permission denied"):
+                await actor.status(
+                    "INSERT INTO mrf.provider_directory_cms_npd_resource_witness "
+                    "(dataset_id, source_id, release_id, resource_type, resource_id, raw_payload_sha256, "
+                    "normalized_payload_hash, raw_payload_json) "
+                    "SELECT dataset_id, 'cms-npd', :release_id, resource_type, resource_id, :raw_hash, "
+                    "payload_hash, jsonb_build_object('resourceType', resource_type, 'id', resource_id) "
+                    "FROM mrf.provider_directory_dataset_resource "
+                    "WHERE dataset_id=:dataset_id AND resource_type='Location'",
+                    dataset_id=legacy_candidate[0],
+                    release_id=next_receipt["vector_sha256"],
+                    raw_hash="a" * 64,
+                )
+        finally:
+            await engine.dispose()
         upgraded = await _admit_legacy_source(next_directory, next_receipt, "cms-upgrade-validated")
         assert upgraded["dataset_id"] != legacy_candidate[0]
         assert (await fhir._endpoint_dataset_state(legacy_candidate[0]))["status"] == "validated"
@@ -1098,7 +1367,7 @@ async def test_failed_cutover_rolls_back_incumbent_and_blocks_generic_promotion(
 
         async def fail_after_supersession(_dataset):
             assert (
-                await database.scalar("SELECT count(*) FROM mrf.provider_directory_endpoint_dataset WHERE is_current")
+                await fhir.db.scalar("SELECT count(*) FROM mrf.provider_directory_endpoint_dataset WHERE is_current")
                 == 0
             )
             raise RuntimeError("synthetic_cutover_interruption")
@@ -1183,13 +1452,7 @@ async def test_committed_batch_cancellation_keeps_incumbent_and_replays_safely(m
             "SELECT dataset_id FROM mrf.provider_directory_endpoint_dataset WHERE status='acquiring'"
         )
         assert candidate is not None
-        assert (
-            await database.scalar(
-                "SELECT count(*) FROM mrf.provider_directory_dataset_resource WHERE dataset_id=:dataset_id",
-                dataset_id=candidate[0],
-            )
-            == 3
-        )
+        assert await _retained_input_count(database, candidate[0]) == 3
         resumed = await _admit_legacy_source(next_directory, next_receipt, "cms-test-resumed")
         assert resumed["dataset_id"] == candidate[0]
         await _assert_current(database, resumed["dataset_id"])
@@ -1283,22 +1546,10 @@ async def test_interrupted_stale_cleanup_resumes_before_next_vector(monkeypatch,
             incumbent_state["endpoint_id"], tuple(sorted(cms.RESOURCE_SET)), stale_receipt["vector_sha256"]
         )
         assert (await fhir._endpoint_dataset_state(stale_id))["status"] == "failed"
-        assert (
-            await database.scalar(
-                "SELECT count(*) FROM mrf.provider_directory_dataset_resource WHERE dataset_id=:dataset_id",
-                dataset_id=stale_id,
-            )
-            == 9
-        )
+        assert await _retained_input_count(database, stale_id) == 9
         next_directory, next_receipt = retained_release(cms_artifact_root, revision="after-interruption")
         replacement = await _admit_legacy_source(next_directory, next_receipt, "cms-test-after-interruption")
-        assert (
-            await database.scalar(
-                "SELECT count(*) FROM mrf.provider_directory_dataset_resource WHERE dataset_id=:dataset_id",
-                dataset_id=stale_id,
-            )
-            == 0
-        )
+        assert await _retained_input_count(database, stale_id) == 0
         await _assert_current(database, replacement["dataset_id"])
 
 
@@ -1511,7 +1762,7 @@ async def test_migrated_clone_setup_failure_removes_owned_database(monkeypatch):
 
     monkeypatch.setattr(support.Database, "connect", fail_after_connect)
     with pytest.raises(RuntimeError, match="synthetic_connection_setup_failed"):
-        async with admission_database(monkeypatch):
+        async with support.admission_database(monkeypatch, migration_prefixes=support.LEGACY_MIGRATION_PREFIXES):
             pytest.fail("failed setup yielded a database")
     assert len(attempted_database_names) == 1
     engine = create_async_engine(support._database_url())
@@ -1529,7 +1780,9 @@ async def test_migrated_clone_setup_failure_removes_owned_database(monkeypatch):
 @pytest.mark.asyncio
 async def test_historical_template_refuses_a_different_requested_profile(monkeypatch):
     """The real historical schema cannot silently satisfy a request for current receipt guards."""
-    async with admission_database(monkeypatch) as database:
+    async with support.admission_database(
+        monkeypatch, migration_prefixes=support.LEGACY_MIGRATION_PREFIXES
+    ) as database:
         assert await database.scalar("SELECT to_regclass('mrf.provider_directory_cms_serving_receipt') IS NULL")
         assert await database.scalar("SELECT to_regclass('mrf.provider_directory_cms_candidate_coverage') IS NOT NULL")
     with pytest.raises(AssertionError, match="migration profile mismatch"):

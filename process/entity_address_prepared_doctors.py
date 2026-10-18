@@ -71,10 +71,17 @@ def _validate_doctors(database, schema, doctors, overrides_by_target):
         raise RuntimeError("entity-address Doctors family differs from its override")
 
 
-def _validate_bindings(schema, doctors, dependency_bindings):
+def _validate_bindings(schema, doctors, dependency_bindings, *, tiger_captured=None):
     """Allow only the proven Doctors address to differ from canonical geo names."""
     bindings = projection.validate_projection_dependency_bindings(schema, dependency_bindings)
+    from process.provider_directory_cms_tiger_inputs import captured_tiger_bindings
+
+    tiger_by_name = {} if tiger_captured is None else captured_tiger_bindings(tiger_captured)
     for canonical, binding in bindings.items():
+        if canonical in tiger_by_name:
+            if binding != tiger_by_name[canonical]:
+                raise RuntimeError("entity-address geo dependency is not a proven input")
+            continue
         namespace, table = canonical.split(".")
         expected_oid = None
         if doctors is not None and table == _ADDRESS:
@@ -120,7 +127,13 @@ async def capture_dependencies(
         _validate_doctors(database, schema, doctors, overrides_by_target)
     if archive is not None:
         _validate_archive(schema, archive, overrides_by_target)
-    bindings = _validate_bindings(schema, doctors, dependency_bindings)
+    tiger_captured = await _captured_tiger_dependencies(database, dependency_bindings)
+    bindings = _validate_bindings(
+        schema,
+        doctors,
+        dependency_bindings,
+        **({"tiger_captured": tiger_captured} if tiger_captured is not None else {}),
+    )
     captured = PreparedAddressDependencies(
         schema, doctors, doctors.stage_oids if doctors is not None else (), bindings, archive
     )
@@ -146,18 +159,20 @@ async def lock_prepared_relations(database, dependencies):
     schema = dependencies.schema
     relations = ", ".join(f'ONLY "{schema}"."{stage}"' for _target, stage, _oid in dependencies.stage_oids)
     await database.status(f"LOCK TABLE {relations} IN ACCESS SHARE MODE NOWAIT")
-    for _target, stage, expected_oid in dependencies.stage_oids:
-        actual_oid = await database.scalar(
-            "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass(:relation) AND relkind='r' AND relpersistence='p'",
-            relation=f'"{schema}"."{stage}"',
-        )
-        if actual_oid != expected_oid:
-            raise RuntimeError("entity-address prepared Doctors identity changed")
     binding = dependencies.dependency_bindings[f"{schema}.{_ADDRESS}"]
-    actual_filenode = await database.scalar(
-        "SELECT pg_relation_filenode(oid)::bigint FROM pg_class WHERE oid=:oid", oid=binding["relation_oid"]
+    expected_identities = [(f'"{schema}"."{stage}"', oid) for _target, stage, oid in dependencies.stage_oids]
+    observed_rows = await database.all(
+        "SELECT requested.relation,c.oid::bigint AS oid,"
+        "(SELECT pg_relation_filenode(oid)::bigint FROM pg_class WHERE oid=:binding_oid) AS address_filenode "
+        "FROM unnest(CAST(:relations AS text[])) WITH ORDINALITY AS requested(relation,ordinal) "
+        "LEFT JOIN pg_class c ON c.oid=to_regclass(requested.relation) AND c.relkind='r' AND c.relpersistence='p' "
+        "ORDER BY requested.ordinal",
+        relations=[relation for relation, _oid in expected_identities],
+        binding_oid=binding["relation_oid"],
     )
-    if actual_filenode != binding["relfilenode"]:
+    if [(row[0], row[1]) for row in observed_rows] != expected_identities:
+        raise RuntimeError("entity-address prepared Doctors identity changed")
+    if any(row[2] != binding["relfilenode"] for row in observed_rows):
         raise RuntimeError("entity-address geo dependency binding changed")
 
 
@@ -227,3 +242,23 @@ async def assert_applied_dependencies(database, dependencies):
             await doctors_preparation.assert_prepared_cms_doctors_seal(session, doctors, applied=True)
             bindings[f"{schema}.{_ADDRESS}"]["table_name"] = _ADDRESS
         await _assert_bindings(session, schema, bindings)
+
+
+async def _captured_tiger_dependencies(database, dependency_bindings):
+    """Independently observe current issued Source authority before noncanonical reads."""
+    if dependency_bindings is None:
+        return None
+    requires_capture = any(
+        dependency_bindings.get("tiger." + name, {}).get("schema_name") != "tiger" for name in ("zip_state", "zcta5")
+    )
+    if not requires_capture:
+        return None
+    binding = database._transaction_binding()
+    if binding is None:
+        raise RuntimeError("entity-address captured Tiger requires a Source transaction")
+    from process.provider_directory_cms_tiger_inputs import capture_selected_captured_tiger_input
+
+    observed = await capture_selected_captured_tiger_input(binding.session)
+    if observed is None:
+        raise RuntimeError("entity-address captured Tiger requires native Source authority")
+    return observed

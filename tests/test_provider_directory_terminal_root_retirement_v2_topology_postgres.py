@@ -17,6 +17,7 @@ from process.provider_directory_terminal_root_retirement_operator import (
 from tests.provider_directory_terminal_root_retirement_pg_support import (
     TARGET_DATASET_ID,
     RetirementPostgres,
+    historical_retirement_postgres,
     retirement_postgres,
 )
 from tests.provider_directory_terminal_root_retirement_v2_pg_support import (
@@ -59,7 +60,7 @@ async def test_function_fence_rejects_argument_name_drift(
 ) -> None:
     """Authenticate named SQL parameters as part of each frozen function."""
 
-    async with retirement_postgres(monkeypatch) as scenario:
+    async with historical_retirement_postgres(monkeypatch) as scenario:
         migration = load_v2_migration()
         function_spec = migration._legacy_function_specs(scenario.schema_name)[2]
         signature = function_signature_sql(scenario, migration, function_spec)
@@ -82,7 +83,7 @@ async def test_upgrade_and_downgrade_reject_same_name_overloads(
 ) -> None:
     """Reject overloads that could win varchar call resolution."""
 
-    async with retirement_postgres(monkeypatch) as scenario:
+    async with historical_retirement_postgres(monkeypatch) as scenario:
         migration = load_v2_migration()
         await expect_migration_rejection(
             scenario,
@@ -126,7 +127,7 @@ async def test_migration_rejects_nonretired_legacy_marker_state(
 ) -> None:
     """Keep the legacy marker equivalent to the retired parent status."""
 
-    async with retirement_postgres(monkeypatch) as scenario:
+    async with historical_retirement_postgres(monkeypatch) as scenario:
         migration = load_v2_migration()
         marker_drift_sql = _legacy_marker_drift_sql(scenario)
         await expect_migration_rejection(
@@ -155,9 +156,7 @@ async def test_dual_parent_guard_accepts_fresh_legacy_retirement(
     async with retirement_postgres(monkeypatch) as scenario:
         migration = load_v2_migration()
         await run_v2_migration(scenario, migration, "upgrade")
-        token = await preview_terminal_root_retirement(
-            request(), database=scenario.database
-        )
+        token = await preview_terminal_root_retirement(request(), database=scenario.database)
         result = await apply_terminal_root_retirement(
             request(expected_evidence_sha256=token),
             database=scenario.database,
@@ -180,7 +179,7 @@ async def test_trigger_prefix_fence_ignores_wildcard_lookalike(
 ) -> None:
     """Treat underscores in the owned trigger prefix as literal bytes."""
 
-    async with retirement_postgres(monkeypatch) as scenario:
+    async with historical_retirement_postgres(monkeypatch) as scenario:
         migration = load_v2_migration()
         transaction = scenario.connection.transaction()
         await transaction.start()
@@ -191,8 +190,6 @@ async def test_trigger_prefix_fence_ignores_wildcard_lookalike(
                 "FOR EACH ROW EXECUTE FUNCTION "
                 f'{scenario.schema}."{legacy_guards.PARENT_GUARD}"()'
             )
-            await scenario.connection.execute(
-                migration._trigger_topology_fence_sql(scenario.schema_name)
-            )
+            await scenario.connection.execute(migration._trigger_topology_fence_sql(scenario.schema_name))
         finally:
             await transaction.rollback()

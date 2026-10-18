@@ -31,6 +31,7 @@ from process.registry_ptg_office_membership import (
 )
 from process.registry_ptg_office_membership_contract import PinnedPTGOfficeMembershipSource
 from process.registry_source_recipe_store import canonical_registry_source_recipes, registry_source_recipes_sha256
+from process.uhc_flex_practitioner_async_safety import drain_operation
 
 
 class RegistrySourceCompositionError(ValueError):
@@ -83,9 +84,15 @@ async def _read_recipe_page(connection, recipe, approved, cursor, control_schema
 
 
 async def _copy_recipe_page(connection, batch, raw_table):
-    if batch.unresolved_rows or hashlib.sha256(batch.input_bytes).hexdigest() != batch.input_sha256:
+    if (
+        batch.unresolved_rows
+        or getattr(batch, "unresolved_source_rows", 0)
+        or hashlib.sha256(batch.input_bytes).hexdigest() != batch.input_sha256
+    ):
         raise RegistrySourceCompositionError("registry_source_composition_unresolved")
-    copy_bytes, row_count = await asyncio.to_thread(_encode, batch.input_bytes)
+    copy_bytes, row_count = await drain_operation(
+        asyncio.to_thread(_encode, batch.input_bytes), preserve_cancellation=True
+    )
     if row_count != batch.membership_rows:
         raise RegistrySourceCompositionError("registry_source_composition_accounting_invalid")
     if row_count:
@@ -146,8 +153,8 @@ async def _require_recipe_custody(connection, recipe, approved=None, control_sch
         try:
             await require_retained_cms_fhir_source_epoch(connection, source, source.retained_epoch)
             return
-        except FHIRSourceEpochError:
-            raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable") from None
+        except FHIRSourceEpochError as error:
+            raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable") from error
     if source.custody_owner_role is None:
         raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable")
     custody = RetainedCMSFHIRSourceCustody(
@@ -159,8 +166,8 @@ async def _require_recipe_custody(connection, recipe, approved=None, control_sch
     )
     try:
         await require_retained_cms_fhir_source_custody(connection, custody)
-    except FHIRSourceCustodyError:
-        raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable") from None
+    except FHIRSourceCustodyError as error:
+        raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable") from error
 
 
 async def stage_registry_source_recipes(

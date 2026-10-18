@@ -55,7 +55,7 @@ fn copy_rows(bytes: &[u8]) -> Vec<Vec<Option<&[u8]>>> {
         if columns == -1 {
             break;
         }
-        assert_eq!(columns, 16);
+        assert_eq!(columns, 17);
         let mut row = Vec::new();
         for _ in 0..columns {
             let length = i32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
@@ -120,7 +120,8 @@ fn binary_copy_matches_validated_rows() {
             "evidence_sha256",
             "operation",
             "expected_revision",
-            "expected_network_id"
+            "expected_network_id",
+            "office_recipe_json"
         ]
     );
     let wire = copy_rows(&result.copy_bytes);
@@ -626,4 +627,114 @@ fn published_plan_namespace_is_closed_and_keeps_cohort_compatibility() {
     reject(&[mixed], "invalid_scope");
     published["source_scope_json"]["scope_id"] = json!("00000000-0000-0000-0000-000000000000");
     reject(&[published], "invalid_scope");
+}
+
+#[test]
+fn allowed_plan_bindings_keep_selection_market_and_office_rules() {
+    let mut allowed = row();
+    allowed["source_scope_json"] = json!({
+        "review_type": "published_allowed_amount_plan",
+        "scope_id": "01234567-89ab-cdef-8123-456789abcde0",
+        "approval_sha256": "b".repeat(64), "snapshot_id": "snapshot-one",
+        "plan_id": "plan-one", "plan_market_type": "group",
+        "selection_mode": "complete_allowed_snapshot_source_set"
+    });
+    for market in ["group", ""] {
+        allowed["source_scope_json"]["plan_market_type"] = json!(market);
+        let encoded = encode(&[allowed.clone()]);
+        let wire = copy_rows(&encoded.copy_bytes);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&wire[0][8].unwrap()[1..]).unwrap(),
+            allowed["source_scope_json"]
+        );
+    }
+    for market in [" ", "Group", "group\n", &"g".repeat(33)] {
+        let mut bad = allowed.clone();
+        bad["source_scope_json"]["plan_market_type"] = json!(market);
+        reject(&[bad], "invalid_scope");
+    }
+    for (review, selection, market) in [
+        (
+            "published_allowed_amount_plan",
+            "complete_snapshot_source_set",
+            "group",
+        ),
+        (
+            "published_complete_snapshot_plan",
+            "complete_allowed_snapshot_source_set",
+            "group",
+        ),
+        (
+            "published_complete_snapshot_plan",
+            "complete_snapshot_source_set",
+            "",
+        ),
+    ] {
+        let mut bad = allowed.clone();
+        bad["source_scope_json"]["review_type"] = json!(review);
+        bad["source_scope_json"]["selection_mode"] = json!(selection);
+        bad["source_scope_json"]["plan_market_type"] = json!(market);
+        reject(&[bad], "invalid_scope");
+    }
+    allowed["office_recipe_json"] =
+        json!({"capture_id":"01234567-89ab-cdef-8123-456789abcde1","recipe_sha256":"c".repeat(64)});
+    reject(&[allowed], "invalid_office_recipe");
+}
+
+#[test]
+fn reviewed_office_selector_is_optional_closed_and_does_not_change_binding_identity() {
+    let mut input = row();
+    input["source_scope_json"] = json!({
+        "review_type":"published_complete_snapshot_plan", "scope_id":"01234567-89ab-cdef-8123-456789abcde0",
+        "approval_sha256":"b".repeat(64),"snapshot_id":"snapshot-one","plan_id":"plan-one",
+        "plan_market_type":"group","selection_mode":"complete_snapshot_source_set"
+    });
+    let original = encode(&[input.clone()]);
+    input["office_recipe_json"] =
+        json!({"capture_id":"01234567-89ab-cdef-8123-456789abcde1","recipe_sha256":"c".repeat(64)});
+    let selected = encode(&[input.clone()]);
+    assert_eq!(original.rows[0].binding_key, selected.rows[0].binding_key);
+    assert!(copy_rows(&original.copy_bytes)[0][16].is_none());
+    let field = copy_rows(&selected.copy_bytes)[0][16].unwrap();
+    assert_eq!(field[0], 1);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&field[1..]).unwrap(),
+        input["office_recipe_json"]
+    );
+    for bad in [
+        json!({}),
+        json!({"capture_id":"00000000-0000-0000-0000-000000000000","recipe_sha256":"c".repeat(64)}),
+        json!({"capture_id":"01234567-89ab-cdef-8123-456789abcde1","recipe_sha256":"C".repeat(64)}),
+    ] {
+        let mut changed = input.clone();
+        changed["office_recipe_json"] = bad;
+        assert!(bindings::encode_network_source_binding_batch(
+            &serde_json::to_vec(&vec![changed]).unwrap()
+        )
+        .is_err());
+    }
+    input["office_recipe_json"]["extra"] = json!(true);
+    reject(&[input], "invalid_row");
+    for mut legacy in [row(), aca(), fhir()] {
+        legacy["office_recipe_json"] = json!({"capture_id":"01234567-89ab-cdef-8123-456789abcde1","recipe_sha256":"c".repeat(64)});
+        reject(&[legacy], "invalid_office_recipe");
+    }
+}
+
+#[test]
+fn absent_null_and_selected_office_recipes_have_distinct_copy_values() {
+    let omitted = encode(&[row()]);
+    assert!(copy_rows(&omitted.copy_bytes)[0][16].is_none());
+    assert!(serde_json::to_value(&omitted.rows[0])
+        .unwrap()
+        .get("office_recipe_json")
+        .is_none());
+    let mut clear = row();
+    clear["office_recipe_json"] = Value::Null;
+    let cleared = encode(&[clear]);
+    assert_eq!(copy_rows(&cleared.copy_bytes)[0][16].unwrap(), b"\x01null");
+    assert_eq!(
+        serde_json::to_value(&cleared.rows[0]).unwrap()["office_recipe_json"],
+        Value::Null
+    );
 }

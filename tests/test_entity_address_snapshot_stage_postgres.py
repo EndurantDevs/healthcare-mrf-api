@@ -7,6 +7,7 @@ import importlib
 import os
 import re
 import subprocess
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -529,6 +530,9 @@ class _NativeStageArchiveAssertion:
             environment=self.tool_environment,
         )
         async with self.sessions() as observer:
+            original_indexes = await _copy_source_index_shapes(observer, self.live_schema)
+            cloned_indexes = await _copy_source_index_shapes(observer, self.stage_schema)
+            assert len(original_indexes) == 2 and original_indexes == cloned_indexes
             base_versions = tuple(
                 (
                     await observer.execute(
@@ -630,17 +634,17 @@ async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
     async_dsn, tool_environment = _native_test_connection()
     pg_dump = _native_tool(_DUMP_ENV)
     pg_restore = _native_tool(_RESTORE_ENV)
-    engine = create_async_engine(async_dsn)
     live_schema = "address_archive_live_" + uuid4().hex
+    # The legacy clone must match qualified native index DDL even for visible source tables.
+    engine = create_async_engine(
+        async_dsn, connect_args={"server_settings": {"search_path": f'"{live_schema}",pg_catalog,public'}}
+    )
     dataset_id = uuid4()
     stage_schema = source.entity_address_archive_stage_schema(dataset_id)
     relations = source.entity_address_archive_relations()
     dump_path = tmp_path / "entity-address-stage.dump"
     try:
-        await _seed_live_sentinel(engine, live_schema, relations)
-        sessions = async_sessionmaker(engine, expire_on_commit=False)
-        async with sessions() as session, session.begin():
-            await _seed_receipt_family(session, live_schema, reversed_rows=False)
+        sessions = await _indexed_archive_sessions(engine, live_schema, relations)
         queued_serving = await _capture_observed_serving(sessions, live_schema)
         archive_copy = _NativeStageArchiveAssertion(
             dataset_id=dataset_id,
@@ -655,6 +659,7 @@ async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
 
         manifest, source_receipt, source_alias_receipt = await source.export_entity_address_archive_with_receipt(
             sessions,
+            source_copy=source.native_entity_address_source_copy(max_bytes=16 * 1024**2, timeout=30),
             schema_name=live_schema,
             dataset_id=dataset_id,
             queued_serving_capture=queued_serving.as_dict(),
@@ -725,6 +730,7 @@ async def test_queued_serving_identity_rejects_source_drift(changed_identity: st
         with pytest.raises(RuntimeError, match="queued serving identity changed|geo assurance is not active"):
             await source.export_entity_address_archive_with_receipt(
                 sessions,
+                source_copy=source.native_entity_address_source_copy(max_bytes=16 * 1024**2, timeout=30),
                 schema_name=live_schema,
                 dataset_id=dataset_id,
                 queued_serving_capture=queued_serving.as_dict(),
@@ -957,6 +963,7 @@ async def test_native_owned_export_cleans_its_clone_on_failure(monkeypatch, fail
         with pytest.raises(type(failure)):
             await source.export_entity_address_archive_with_receipt(
                 sessions,
+                source_copy=source.native_entity_address_source_copy(max_bytes=16 * 1024**2, timeout=30),
                 schema_name=live_schema,
                 dataset_id=dataset_id,
                 queued_serving_capture=queued_serving,
@@ -1001,6 +1008,7 @@ async def test_native_owned_export_never_cleans_a_preexisting_collision():
         with pytest.raises(DBAPIError):
             await source.export_entity_address_archive_with_receipt(
                 sessions,
+                source_copy=source.native_entity_address_source_copy(max_bytes=16 * 1024**2, timeout=30),
                 schema_name=live_schema,
                 dataset_id=dataset_id,
                 queued_serving_capture=queued_serving,
@@ -1344,3 +1352,147 @@ async def test_native_restore_precreate_and_cleanup_retain_exact_owned_family():
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{destination_schema}" CASCADE'))
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["bytes", "deadline", "cancel"])
+async def test_native_bounded_source_copy_rolls_back_and_cleans_owned_clone(failure):
+    """Exercise real COPY overflow, timeout and backend-observed cancellation."""
+    async_dsn, _environment = _native_test_connection()
+    engine = create_async_engine(async_dsn, max_overflow=0, pool_size=2)
+    observer = create_async_engine(async_dsn, max_overflow=0, pool_size=1)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    live_schema, dataset_id = "address_copy_bounds_" + uuid4().hex, uuid4()
+    stage_schema = source.entity_address_archive_stage_schema(dataset_id)
+    marker = "address_copy_wait_" + dataset_id.hex
+    began = asyncio.Event()
+    copy = source.family_archive.native_copy_projection
+    task = None
+    copied = AsyncMock()
+
+    async def slow_copy(session, query, **options):
+        # The actual COPY OUT statement remains active in PostgreSQL until its
+        # caller-owned deadline/cancellation; this is test-only fault injection.
+        began.set()
+        return await copy(
+            session,
+            query.replace("SELECT ", f"SELECT /*{marker}*/ ", 1) + " WHERE pg_catalog.pg_sleep(30) IS NULL",
+            **options,
+        )
+
+    try:
+        await _seed_live_sentinel(engine, live_schema, source.entity_address_archive_relations())
+        queued = await _capture_observed_serving(sessions, live_schema)
+        capability = source.EntityAddressSourceCopy(
+            copy if failure == "bytes" else slow_copy,
+            1 if failure == "bytes" else 16 * 1024**2,
+            2 if failure == "deadline" else 20,
+        )
+        task = asyncio.create_task(
+            source.export_entity_address_archive_with_receipt(
+                sessions,
+                schema_name=live_schema,
+                dataset_id=dataset_id,
+                queued_serving_capture=queued,
+                archive_copy=copied,
+                source_copy=capability,
+            )
+        )
+        if failure == "cancel":
+            await _wait_source_copy_backend(observer, marker, began)
+            task.cancel()
+        expected = {"bytes": RuntimeError, "deadline": TimeoutError, "cancel": asyncio.CancelledError}[failure]
+        with pytest.raises(expected):
+            async with asyncio.timeout(15):
+                await task
+        if failure != "bytes":
+            assert began.is_set()
+        copied.assert_not_awaited()
+        await _assert_source_copy_rollback(engine, observer, stage_schema, live_schema, marker)
+    finally:
+        await _cleanup_source_copy_case(engine, observer, task, stage_schema, live_schema)
+
+
+async def _wait_source_copy_backend(observer, marker, began):
+    async with asyncio.timeout(10):
+        await began.wait()
+        while True:
+            async with observer.connect() as connection:
+                sleeping = await connection.scalar(
+                    text(
+                        "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_activity "
+                        "WHERE pid<>pg_backend_pid() AND state='active' AND query LIKE :marker)"
+                    ),
+                    {"marker": "%" + marker + "%"},
+                )
+            if sleeping:
+                break
+            await asyncio.sleep(0.02)
+
+
+async def _cleanup_source_copy_case(engine, observer, task, stage_schema, live_schema):
+    if task is not None and not task.done():
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+    async with engine.begin() as connection:
+        await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" CASCADE'))
+        await connection.execute(text(f'DROP SCHEMA IF EXISTS "{live_schema}" CASCADE'))
+    await observer.dispose()
+    await engine.dispose()
+
+
+async def _assert_source_copy_rollback(engine, observer, stage_schema, live_schema, marker):
+    async with engine.connect() as connection:
+        assert await connection.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema}) is None
+        assert await connection.scalar(text(f'SELECT count(*) FROM "{live_schema}".entity_address_unified')) == 1
+    async with observer.connect() as connection:
+        assert not await connection.scalar(
+            text(
+                "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_activity "
+                "WHERE pid<>pg_backend_pid() AND state='active' AND query LIKE :marker)"
+            ),
+            {"marker": "%" + marker + "%"},
+        )
+
+
+async def _install_copy_source_indexes(connection, schema):
+    await connection.execute(
+        text(
+            f'CREATE INDEX source_address_expression ON "{schema}".entity_address_unified '
+            "USING btree(lower(entity_id)) WITH (fillfactor=80) WHERE entity_type<>'excluded'"
+        )
+    )
+    await connection.execute(
+        text(
+            f'ALTER TABLE "{schema}".entity_address_unified ADD CONSTRAINT source_address_deferred '
+            "UNIQUE(entity_type,entity_id,location_key) DEFERRABLE INITIALLY DEFERRED"
+        )
+    )
+
+
+async def _copy_source_index_shapes(session, schema):
+    return (
+        await session.execute(
+            text(
+                "SELECT idx.relname,i.indisunique,i.indnullsnotdistinct,idx.reloptions, "
+                "pg_get_indexdef(i.indexrelid,1,false),pg_get_expr(i.indpred,i.indrelid,false), "
+                "con.contype,con.condeferrable,con.condeferred "
+                "FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid "
+                "LEFT JOIN pg_constraint con ON con.conindid=i.indexrelid AND con.conrelid=i.indrelid "
+                "WHERE i.indrelid=to_regclass(:table) AND idx.relname IN "
+                "('source_address_expression','source_address_deferred') ORDER BY idx.relname"
+            ),
+            {"table": f'"{schema}".entity_address_unified'},
+        )
+    ).all()
+
+
+async def _indexed_archive_sessions(engine, live_schema, relations):
+    await _seed_live_sentinel(engine, live_schema, relations)
+    async with engine.begin() as connection:
+        await _install_copy_source_indexes(connection, live_schema)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with sessions() as session, session.begin():
+        await _seed_receipt_family(session, live_schema, reversed_rows=False)
+    return sessions

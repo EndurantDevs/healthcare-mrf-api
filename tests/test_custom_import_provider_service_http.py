@@ -117,7 +117,7 @@ def _read_service_type(session, page_items, imported, require_match):
 
 def _install(monkeypatch, session, *, page_items=None, imported=True, require_match=True, finality_failure=False):
     """Bind signed transport, native rows, and generation finality to one session."""
-    fixtures._install_keyring(monkeypatch)
+    fixtures._install_keyring(monkeypatch, session)
 
     @asynccontextmanager
     async def bounded(same_session, *, timeout_ms):
@@ -421,33 +421,17 @@ async def test_native_price_alias_is_compacted_only_when_unrequested(monkeypatch
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("has_plan_release", [False, True])
-async def test_signed_plan_storage_precedes_read_only_snapshot(monkeypatch, has_plan_release):
-    session = SimpleNamespace()
-    events = []
-
-    async def execute(statement):
-        events.append(str(statement))
-
-    async def allocate(same_session):
-        assert same_session is session
-        events.append("allocate temporary plan tables")
-
-    session.execute = execute
-    allocation = AsyncMock(side_effect=allocate)
+async def test_signed_plan_storage_requires_prepared_reader_workspace(monkeypatch, has_plan_release):
+    session = SimpleNamespace(info={"native_plan_workspace": True})
+    allocation = AsyncMock()
     monkeypatch.setattr(plan_sql, "prepare_plan_query_tables", allocation)
-    await service_http._prepare_service_snapshot(
-        session, {"plan_release_id": "synthetic-release"} if has_plan_release else {}
-    )
+    native_args = {"plan_release_id": "synthetic-release"} if has_plan_release else {}
+    await service_http._prepare_service_snapshot(session, native_args)
+    allocation.assert_not_awaited()
     if has_plan_release:
-        assert events == [
-            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-            "allocate temporary plan tables",
-            "SET TRANSACTION READ ONLY",
-        ]
-        allocation.assert_awaited_once_with(session)
-    else:
-        assert events == ["SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"]
-        allocation.assert_not_awaited()
+        session.info.clear()
+        with pytest.raises(CustomImportReadUnavailableError, match="workspace"):
+            await service_http._prepare_service_snapshot(session, native_args)
 
 
 @pytest.mark.asyncio
@@ -555,3 +539,127 @@ def test_plan_native_entry_identity_is_bound_to_signed_release(changes, expected
     parsed_by_field = service_http._service_payload(body, plan_release_id=expected_release)
     assert [provider_item["npi"] for provider_item in parsed_by_field["items"]] == ["1104212877"] * 2
     assert parsed_by_field["custom_import_native_entry_ids"] == ["a" * 64, "b" * 64]
+
+
+def _network_service_body():
+    import hashlib
+
+    document = json.loads(_body())
+    document["network_binding"] = {
+        "version": 2,
+        "client_id": "synthetic-client",
+        "policy_revision": 3,
+        "generation_id": 7,
+        "manifest_sha256": "c" * 64,
+        "selector": {"namespace": "canonical", "values": [42, 88]},
+        "network_ids": [42, 88],
+        "query_sha256": hashlib.sha256(transport._canonical_json_bytes(document)).hexdigest(),
+    }
+    return transport._canonical_json_bytes(document)
+
+
+class _NetworkServiceSession(_Session):
+    def __init__(self):
+        super().__init__()
+        self.driver = object()
+
+    async def connection(self):
+        return SimpleNamespace(
+            get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=self.driver))
+        )
+
+    async def execute(self, statement):
+        if str(statement).startswith("LOCK TABLE"):
+            self.events.append("heap-lock")
+        else:
+            await super().execute(statement)
+
+
+def _install_network_service(monkeypatch, session, *, fail_pin=False):
+    from api import custom_import_provider_network as network
+    from api.network_address_scope import current_network_address_scope
+    from tests.test_custom_import_provider_network import _MANIFEST
+
+    _install(monkeypatch, session, page_items=[{"npi": "1104212877"}])
+    service_page = service_http._service_page
+
+    async def resolve(driver, *, generation_id):
+        assert driver is session.driver and generation_id == 7
+        assert session.events[:2] == ["begin", "snapshot"]
+        session.events.append("manifest")
+        if fail_pin:
+            raise CustomImportReadUnavailableError("synthetic retained pin unavailable")
+        return _MANIFEST
+
+    async def scoped_page(request, **arguments):
+        scope = current_network_address_scope()
+        assert scope.manifest is _MANIFEST and scope.network_ids == (42, 88)
+        return await service_page(request, **arguments)
+
+    read_service = service_http.CustomImportReadService
+    hydrate = read_service.hydrate_npi_page
+
+    async def scoped_hydrate(self, same_session, **arguments):
+        scope = current_network_address_scope()
+        assert scope.manifest is _MANIFEST and scope.network_ids == (42, 88)
+        return await hydrate(self, same_session, **arguments)
+
+    monkeypatch.setattr(network, "resolve_network_serving_manifest", resolve)
+    monkeypatch.setattr(service_http, "_service_page", scoped_page)
+    monkeypatch.setattr(read_service, "hydrate_npi_page", scoped_hydrate)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_pin", [False, True])
+async def test_signed_service_network_binding_pins_native_page_and_hydration(monkeypatch, fail_pin):
+    from api.network_address_scope import current_network_address_scope
+
+    session = _NetworkServiceSession()
+    _install_network_service(monkeypatch, session, fail_pin=fail_pin)
+    reply = await service_http.serve_custom_import_provider_service(_request(_network_service_body()), session)
+    assert reply.status == (503 if fail_pin else 200)
+    assert session.rolled_back is fail_pin and session.events[-1] == "end"
+    assert current_network_address_scope() is None
+    if fail_pin:
+        assert "page" not in session.events and "hydrate" not in session.events
+        assert "X-Network-Generation" not in reply.headers
+    else:
+        assert reply.headers["X-Network-Generation"] == "7"
+        assert session.events.index("manifest") < session.events.index("page") < session.events.index("hydrate")
+        assert json.loads(reply.body)["pagination"]["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_signed_service_network_binding_does_not_accept_tampered_query(monkeypatch):
+    session = _NetworkServiceSession()
+    _install_network_service(monkeypatch, session)
+    document = json.loads(_network_service_body())
+    document["native_query"]["limit"] = "3"
+    body = transport._canonical_json_bytes(document)
+    reply = await service_http.serve_custom_import_provider_service(_request(body), session)
+    assert reply.status == 400 and session.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 403, 404, 409, 422, 503])
+async def test_legacy_service_native_refusal_remains_unavailable(monkeypatch, status):
+    session = _Session()
+    _install(monkeypatch, session)
+    refused = AsyncMock(
+        return_value=response.json(
+            {
+                "status": 422,
+                "code": "ptg2_provider_scope_refused",
+                "message": "Bounded scope required.",
+                "fix_it": {"reason": "Choose a smaller scope.", "retry_options": []},
+            },
+            status=status,
+        )
+    )
+    monkeypatch.setattr(service_http, "_service_page", refused)
+    reply = await service_http.serve_custom_import_provider_service(_request(), session)
+    assert reply.status == 503 and set(json.loads(reply.body)) == {"error"}
+    assert reply.headers["Cache-Control"] == "private, no-store" and "X-Network-Generation" not in reply.headers
+    assert session.rolled_back and session.events[-1] == "end"
+    assert "hydrate" not in session.events and "finality" not in session.events
+    refused.assert_awaited_once()

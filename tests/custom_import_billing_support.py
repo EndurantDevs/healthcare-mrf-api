@@ -52,6 +52,8 @@ def signed_request(*, include_filter=True, require_match=True, native_changes=No
 class Session:
     """Record transaction and hydration boundaries without native data."""
 
+    snapshot_sql = str(billing_http._READ_TRANSACTION_SQL)
+
     def __init__(self):
         self.events = []
         self.hydration_pages = []
@@ -118,7 +120,7 @@ def install_pipeline(monkeypatch, session, *, provider_rows=None, imported=True,
     """Install the signed transport with a synthetic pinned read pipeline."""
 
     native_rows = [{"npi": 1000000004}] if provider_rows is None else provider_rows
-    import_fixtures._install_keyring(monkeypatch)
+    import_fixtures._install_keyring(monkeypatch, session)
     monkeypatch.setattr(billing_http, "_transport_keyring", native_fixtures._keyring)
     monkeypatch.setattr(billing_http, "_cursor_keyring", lambda: object())
     monkeypatch.setattr(transport, "_resolve_pinned_target", import_fixtures._resolved_target)

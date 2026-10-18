@@ -857,6 +857,20 @@ async def test_create_table_skips_existing_schema_ddl(table_creation_database):
 
 
 @pytest.mark.asyncio
+async def test_create_table_preserves_bound_transaction_and_never_opens_engine(table_creation_database, monkeypatch):
+    database, connection = table_creation_database
+    session = SimpleNamespace(connection=AsyncMock(return_value=connection))
+    monkeypatch.setattr(database, "_transaction_binding", lambda: SimpleNamespace(session=session))
+    monkeypatch.setattr(database.engine, "begin", lambda: pytest.fail("opened an ordinary-role transaction"))
+    table = Table("things", MetaData(), Column("id", Integer), schema="tenant")
+
+    await database.create_table(table, checkfirst=True)
+
+    session.connection.assert_awaited_once_with()
+    connection.run_sync.assert_awaited_once_with(table.create, checkfirst=True)
+
+
+@pytest.mark.asyncio
 async def test_create_table_creates_quoted_missing_schema(table_creation_database):
     database, connection = table_creation_database
     table = Table("things", MetaData(), Column("id", Integer), schema='tenant"area')
@@ -943,3 +957,15 @@ async def test_app_startup_prewarms_configured_pool(monkeypatch):
     assert engine.opened == 4
     assert engine.peak == 4
     assert engine.active == 0
+
+
+@pytest.mark.asyncio
+async def test_reader_rejects_mixed_preparation_modes_before_connection(monkeypatch):
+    """Neither trusted preparation path can silently replace the other."""
+    database = Database()
+    connect = AsyncMock()
+    monkeypatch.setattr(database, "_connect_reader", connect)
+    with pytest.raises(RuntimeError, match="separate ownership"):
+        async with database.reader_session(independent=True, temporary_setup=AsyncMock(), prepare_plan_workspace=True):
+            pytest.fail("mixed Reader preparations entered")
+    connect.assert_not_awaited()

@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
+import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-import uuid
 
 import pytest
 from sqlalchemy.exc import DBAPIError
@@ -34,29 +34,16 @@ from process.provider_directory_rooted_graph_store_contract import (
     ProviderDirectoryRootedGraphStoreError,
 )
 from process.provider_directory_rooted_graph_twin_store import (
-    admit_provider_directory_rooted_graph_twins,
     ProviderDirectoryRootedGraphTwinError,
+    admit_provider_directory_rooted_graph_twins,
 )
-from tests.formulary_fhir_twin_admission_pg_support import connect
-from tests.formulary_fhir_twin_admission_pg_support import database_url
-from tests.formulary_fhir_twin_admission_pg_support import drop_schema
-from tests.formulary_fhir_twin_admission_pg_support import load_migration
-from tests.formulary_fhir_twin_admission_pg_support import quoted
-from tests.formulary_fhir_twin_admission_pg_support import run_migration
-from tests.test_provider_directory_rooted_graph_acquisition_postgres import (
-    _complete_success,
-    _configure_database,
-    _extend_publication_foundation,
-    _identity,
-    _load_legacy_migrations,
-    _query_result_for_work,
-    _work_rows,
-    LEGACY_ACQUISITION_PATH,
-    LEGACY_COHORT_PATH,
-    LEGACY_PUBLICATION_PATH,
-    LEGACY_TWIN_PATH,
-    MIGRATION_PATH,
-    SINGLE_ROOT_MIGRATION_PATH,
+from tests.formulary_fhir_twin_admission_pg_support import (
+    connect,
+    database_url,
+    drop_schema,
+    load_migration,
+    quoted,
+    run_migration,
 )
 from tests.provider_directory_rooted_graph_pg_assertions import (
     assert_missing_terminal_witnesses,
@@ -64,9 +51,28 @@ from tests.provider_directory_rooted_graph_pg_assertions import (
 )
 from tests.provider_directory_rooted_graph_rotation_pg_support import (
     locked_exact_current as _locked_exact_current,
+)
+from tests.provider_directory_rooted_graph_rotation_pg_support import (
     prove_recursive_rooted_rotation,
     prove_stale_legacy_replacement,
+)
+from tests.provider_directory_rooted_graph_rotation_pg_support import (
     publish_legacy_root as _publish_legacy_root,
+)
+from tests.test_provider_directory_rooted_graph_acquisition_postgres import (
+    LEGACY_ACQUISITION_PATH,
+    LEGACY_COHORT_PATH,
+    LEGACY_PUBLICATION_PATH,
+    LEGACY_TWIN_PATH,
+    MIGRATION_PATH,
+    SINGLE_ROOT_MIGRATION_PATH,
+    _complete_success,
+    _configure_database,
+    _extend_publication_foundation,
+    _identity,
+    _load_legacy_migrations,
+    _query_result_for_work,
+    _work_rows,
 )
 from tests.test_provider_directory_uhc_flex_practitioner_publication_postgres import (
     _prepare_publication_schema,
@@ -89,9 +95,12 @@ async def _install_candidate_migrations(engine, set_validation, dataset_candidat
         await run_migration(engine, publication_candidates, "upgrade")
 
 
-
 @asynccontextmanager
 async def _lifecycle_scope(monkeypatch, *, request_failure_budget=True, set_validation=True, dataset_candidates=True):
+    if request_failure_budget and set_validation and dataset_candidates:
+        async with _current_lifecycle_scope(monkeypatch) as context:
+            yield context
+        return
     url = database_url()
     schema_name = f"fhir_twin_test_{uuid.uuid4().hex}"
     schema = quoted(schema_name)
@@ -107,15 +116,11 @@ async def _lifecycle_scope(monkeypatch, *, request_failure_budget=True, set_vali
     database = _configure_database(monkeypatch, url)
     connection = None
     try:
-        await _prepare_publication_schema(
-            engine, url, schema_name, schema, legacy_migrations
-        )
+        await _prepare_publication_schema(engine, url, schema_name, schema, legacy_migrations)
         connection = await connect(url)
         await _extend_publication_foundation(connection, schema_name)
         await database.connect()
-        registration = await register_provider_directory_rooted_graph_source(
-            database=database
-        )
+        registration = await register_provider_directory_rooted_graph_source(database=database)
         assert registration.endpoint_created and registration.source_created
         await run_migration(engine, migration, "upgrade")
         await run_migration(engine, single_root_migration, "upgrade")
@@ -124,18 +129,19 @@ async def _lifecycle_scope(monkeypatch, *, request_failure_budget=True, set_vali
             from tests.provider_directory_fhir_failure_pg_support import install_request_failure_budget
 
             await install_request_failure_budget(engine, schema_name)
-        replay = await register_provider_directory_rooted_graph_source(
-            database=database
-        )
+        replay = await register_provider_directory_rooted_graph_source(database=database)
         assert not replay.endpoint_created and not replay.source_created
-        yield SimpleNamespace(
-            database=database,
-            connection=connection,
-            engine=engine,
-            migration=migration,
-            schema=schema,
-            schema_name=schema_name,
-        )
+        from tests.provider_directory_historical_publication_pg_support import historical_publication_scope
+
+        with historical_publication_scope(monkeypatch):
+            yield SimpleNamespace(
+                database=database,
+                connection=connection,
+                engine=engine,
+                migration=migration,
+                schema=schema,
+                schema_name=schema_name,
+            )
     finally:
         await database.disconnect()
         if connection is not None:
@@ -144,11 +150,26 @@ async def _lifecycle_scope(monkeypatch, *, request_failure_budget=True, set_vali
         await engine.dispose()
 
 
+@asynccontextmanager
+async def _current_lifecycle_scope(monkeypatch):
+    from process.provider_directory_generic_source_policy import source_transaction
+    from process.uhc_flex_practitioner_registration import register_uhc_flex_practitioner_source
+    from tests.provider_directory_specialized_source_postgres_support import specialized_source_scope
+
+    async with specialized_source_scope(monkeypatch) as context:
+        async with source_transaction(context.database):
+            await register_uhc_flex_practitioner_source(database=context.database)
+            registration = await register_provider_directory_rooted_graph_source(database=context.database)
+            assert registration.endpoint_created and registration.source_created
+            replay = await register_provider_directory_rooted_graph_source(database=context.database)
+            assert not replay.endpoint_created and not replay.source_created
+        context.migration = load_migration(MIGRATION_PATH, "rooted_graph_lifecycle_migration")
+        yield context
+
+
 async def _complete_error_acquisition(database: Database, current) -> None:
     error_identity = _identity(current, "baseline", "6", "7")
-    await initialize_provider_directory_rooted_graph_acquisition(
-        error_identity, database=database
-    )
+    await initialize_provider_directory_rooted_graph_acquisition(error_identity, database=database)
     work_records = await _work_rows(database, error_identity.acquisition_id)
     for work_index, work_record in enumerate(work_records):
         active_claim = await claim_provider_directory_rooted_graph_work(
@@ -168,13 +189,9 @@ async def _complete_error_acquisition(database: Database, current) -> None:
                 database=database,
             )
     with pytest.raises(ProviderDirectoryRootedGraphStoreError):
-        await claim_provider_directory_rooted_graph_census(
-            error_identity, database=database
-        )
+        await claim_provider_directory_rooted_graph_census(error_identity, database=database)
     with pytest.raises(ProviderDirectoryRootedGraphStoreError):
-        await seal_provider_directory_rooted_graph_acquisition(
-            error_identity, database=database
-        )
+        await seal_provider_directory_rooted_graph_acquisition(error_identity, database=database)
 
 
 def _assert_matching_roots(baseline_summary, candidate_summary) -> None:
@@ -189,9 +206,7 @@ async def _prove_mismatch(context, current) -> None:
     mismatch_baseline = _identity(current, "baseline", "4", "6")
     mismatch_candidate = _identity(current, "candidate", "5", "6")
     await _complete_success(context.database, mismatch_baseline)
-    await _complete_success(
-        context.database, mismatch_candidate, missing_http_status=410
-    )
+    await _complete_success(context.database, mismatch_candidate, missing_http_status=410)
     with pytest.raises(ProviderDirectoryRootedGraphTwinError) as mismatch:
         await admit_provider_directory_rooted_graph_twins(
             mismatch_baseline.acquisition_id,
@@ -201,8 +216,7 @@ async def _prove_mismatch(context, current) -> None:
     assert mismatch.value.code == "mismatch"
     assert (
         await context.database.scalar(
-            f"SELECT count(*) FROM {context.schema}."
-            "provider_directory_rooted_graph_twin_attempt WHERE matched IS FALSE"
+            f"SELECT count(*) FROM {context.schema}.provider_directory_rooted_graph_twin_attempt WHERE matched IS FALSE"
         )
         == 1
     )
@@ -272,9 +286,7 @@ async def _prove_first_generation(context, current):
         "InsurancePlan": 1,
         "Endpoint": 0,
     }
-    replay = await publish_provider_directory_rooted_graph_dataset(
-        candidate.acquisition_id, database=context.database
-    )
+    replay = await publish_provider_directory_rooted_graph_dataset(candidate.acquisition_id, database=context.database)
     assert replay.replayed and replay.readiness == published.readiness
     return baseline, baseline_summary, published
 
@@ -311,9 +323,7 @@ async def test_rooted_graph_twin_publication_generations_and_fences(
 ) -> None:
     async with _lifecycle_scope(monkeypatch) as context:
         legacy_current = await _publish_legacy_root(context.database)
-        baseline, baseline_summary, first = await _prove_first_generation(
-            context, legacy_current
-        )
+        baseline, baseline_summary, first = await _prove_first_generation(context, legacy_current)
         rooted_current = await _locked_exact_current(context.database)
         assert rooted_current is not None
         _, _, _, second = await _publish_generation(context, rooted_current, "89", "4")
@@ -338,18 +348,9 @@ async def test_rooted_graph_twin_publication_generations_and_fences(
             )
             == 1
         )
-        assert (
-            await initialize_provider_directory_rooted_graph_acquisition(
-                baseline, database=context.database
-            )
-            == 0
-        )
-        replayed_summary = await seal_provider_directory_rooted_graph_acquisition(
-            baseline, database=context.database
-        )
-        assert (
-            replayed_summary.rooted_graph_sha256 == baseline_summary.rooted_graph_sha256
-        )
+        assert await initialize_provider_directory_rooted_graph_acquisition(baseline, database=context.database) == 0
+        replayed_summary = await seal_provider_directory_rooted_graph_acquisition(baseline, database=context.database)
+        assert replayed_summary.rooted_graph_sha256 == baseline_summary.rooted_graph_sha256
         with pytest.raises(DBAPIError, match="downgrade_blocked"):
             await run_migration(context.engine, context.migration, "downgrade")
 

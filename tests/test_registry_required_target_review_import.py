@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Review operator input, aggregate output and native failures without runtime success doubles."""
+"""Review operator input, CLI orchestration and native failures without database resources."""
 
 import asyncio
 import hashlib
@@ -126,7 +126,7 @@ def _aggregate(source, replayed=False):
 
 
 class _FailureDatabase:
-    """The real admission runs only into an injected failure; no retention success is fabricated."""
+    """Observe orchestration; real admission calls are restricted to injected failures."""
 
     def __init__(self, failure):
         self.failure = failure
@@ -166,7 +166,9 @@ class _FailureDatabase:
             self.events.append(f"rollback:{depth}")
             raise
         else:
-            pytest.fail("A fault-injection test must never fabricate admission success")
+            if self.failure != "operator_orchestration":
+                pytest.fail("A fault-injection test must never fabricate admission success")
+            self.events.append(f"commit:{depth}")
         finally:
             self.depth -= 1
 
@@ -265,6 +267,58 @@ def test_pure_receipt_is_closed_aggregate_and_ignores_unexpected_source_fields(r
     assert set(rendered) == _RECEIPT_FIELDS and rendered == {"status": "ok", **_aggregate(source, replayed)}
     assert len(receipt.encode()) <= 4096
     assert all(value not in receipt for value in (PRIVATE_MARKER, SOURCE_URL, "postgresql://"))
+
+
+@pytest.mark.parametrize("failure", [None, "owner", "admission", "receipt", "canceled"])
+def test_protected_owner_orchestration_uses_the_review_admission_transaction(monkeypatch, tmp_path, capsys, failure):
+    source_record = b"review\n"
+    path = tmp_path / "review.json"
+    path.write_bytes(source_record)
+    database = _FailureDatabase("operator_orchestration")
+    owner_role = "synthetic_registry_owner"
+
+    async def assume_owner(connection, role):
+        assert connection is database and role == owner_role and database.depth == 1
+        assert database.events == ["connect", "acquire", "begin:1"]
+        database.events.append("assume_owner")
+        if failure == "owner":
+            raise ValueError(PRIVATE_MARKER)
+
+    async def admit(connection, actual_source, edition, ledger_snapshot_id):
+        assert (connection, actual_source, edition, ledger_snapshot_id) == (
+            database,
+            source_record,
+            _edition(source_record),
+            LEDGER_ID,
+        )
+        assert database.depth == 1 and database.events[-1] == "assume_owner"
+        database.events.append("admission")
+        if failure == "admission":
+            raise RegistryRequiredTargetError(PRIVATE_MARKER)
+        if failure == "canceled":
+            raise asyncio.CancelledError(PRIVATE_MARKER)
+        return {**_aggregate(source_record), **({"ledger_snapshot_id": str(REVIEW_ID)} if failure == "receipt" else {})}
+
+    monkeypatch.setattr(review_import, "Database", lambda: database)
+    monkeypatch.setattr("process.registry_management_permissions.assume_registry_source_owner", assume_owner)
+    monkeypatch.setattr(review_import, "admit_registry_required_target_review", admit)
+    arguments = _arguments(path, source_record) + ["--protected-owner-role", owner_role]
+    assert review_import.run_command(arguments) == (0 if failure is None else 130 if failure == "canceled" else 1)
+    captured = capsys.readouterr()
+    expected_roles = ["connect", "acquire", "begin:1", "assume_owner"]
+    if failure != "owner":
+        expected_roles.append("admission")
+    expected_roles += ["commit:1" if failure is None else "rollback:1", "release", "disconnect"]
+    assert database.events == expected_roles and database.depth == 0 and not database.queries
+    assert PRIVATE_MARKER not in captured.out + captured.err and owner_role not in captured.out + captured.err
+    if failure is None:
+        assert json.loads(captured.out) == {"status": "ok", **_aggregate(source_record)} and captured.err == ""
+    else:
+        code = "canceled" if failure == "canceled" else "admission_failed"
+        assert (
+            captured.out == ""
+            and captured.err == json.dumps({"code": code, "status": "error"}, separators=(",", ":")) + "\n"
+        )
 
 
 @pytest.mark.parametrize(
@@ -552,3 +606,15 @@ def test_actual_cli_module_entry_has_static_argument_failure(tmp_path):
     )
     assert completed.returncode == 2 and completed.stdout == b""
     assert completed.stderr == b'{"code":"invalid_arguments","status":"error"}\n'
+
+
+def test_actual_cli_module_preflight_advertises_protected_owner_role(tmp_path):
+    completed = subprocess.run(
+        [sys.executable, "-m", "process.registry_required_target_review_import", "--help"],
+        env=os.environ | {"PYTHONPYCACHEPREFIX": str(tmp_path / "cold-cache"), "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0 and completed.stderr == b""
+    assert b"--protected-owner-role" in completed.stdout

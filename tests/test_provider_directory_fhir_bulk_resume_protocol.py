@@ -10,24 +10,17 @@ from unittest.mock import AsyncMock
 import pytest
 
 from db.models import ProviderDirectoryPractitioner
-
+from tests.provider_directory_checkpoint_unit_support import checkpoint_unit_scope as checkpoint_unit_scope
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
 def _aetna_source() -> dict:
-    return importer._source_row_from_seed(
-        importer._aetna_provider_directory_data_seed_rows(
-            source_query="Aetna"
-        )[0]
-    )
+    return importer._source_row_from_seed(importer._aetna_provider_directory_data_seed_rows(source_query="Aetna")[0])
 
 
 def _identity() -> importer.BulkExportCheckpointIdentity:
-    start_url = (
-        f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}"
-        "/$export?_type=Practitioner"
-    )
+    start_url = f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}/$export?_type=Practitioner"
     return importer.BulkExportCheckpointIdentity(
         checkpoint_id="checkpoint-protocol",
         canonical_api_base=importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE,
@@ -53,10 +46,7 @@ def _manifest() -> importer.BulkExportManifest:
             "output": [
                 {
                     "type": "Practitioner",
-                    "url": (
-                        "https://storage.googleapis.com/aetna/"
-                        "part.ndjson?X-Goog-Signature=secret"
-                    ),
+                    "url": ("https://storage.googleapis.com/aetna/part.ndjson?X-Goog-Signature=secret"),
                 }
             ],
         },
@@ -123,9 +113,7 @@ def test_bulk_output_concurrency_rejects_invalid_configuration(
     source_map = {
         "metadata_json": {
             "provider_directory_bulk_export_range_resume": True,
-            "provider_directory_bulk_export_output_concurrency": (
-                configured_concurrency
-            ),
+            "provider_directory_bulk_export_output_concurrency": (configured_concurrency),
         }
     }
 
@@ -155,8 +143,7 @@ def test_bulk_output_concurrency_rejects_invalid_configuration(
             "bulk_export_output_expiration_invalid",
         ),
         (
-            "https://storage.googleapis.com/aetna/out"
-            "?X-Goog-Date=invalid&X-Goog-Expires=3600",
+            "https://storage.googleapis.com/aetna/out?X-Goog-Date=invalid&X-Goog-Expires=3600",
             None,
             "bulk_export_output_expiration_invalid",
         ),
@@ -193,10 +180,7 @@ def test_bulk_output_validator_rejects_expired_url(monkeypatch):
     )
     with pytest.raises(ValueError, match="bulk_export_output_url_expired"):
         importer._bulk_output_validator(
-            (
-                "https://storage.googleapis.com/aetna/out"
-                "?X-Goog-Date=20260720T120000Z&X-Goog-Expires=3600"
-            ),
+            ("https://storage.googleapis.com/aetna/out?X-Goog-Date=20260720T120000Z&X-Goog-Expires=3600"),
             {
                 "accept-ranges": "bytes",
                 "content-length": "100",

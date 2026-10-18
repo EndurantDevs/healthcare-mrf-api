@@ -41,10 +41,25 @@ class DirectoryRead:
     generation_id: str | None
     limit: int = 25
     cursor: str | None = None
+    network_ids: tuple[int, ...] | None = None
+    network_generation: int | None = None
+    access_scope_sha256: str | None = None
+    excluded_network_ids: tuple[int, ...] | None = None
+    network_manifest: object | None = None
+
+    @property
+    def is_network_scoped(self):
+        """Recognize selected access and the authenticated default exclusion scope."""
+        return self.network_ids is not None or self.excluded_network_ids is not None
 
     def scope(self, generation_id):
         """Bind cursor authentication to every selector, including page size."""
-        return [self.kind, self.source_id, self.shape, self.entity_id, generation_id, self.limit]
+        scope_fields = [self.kind, self.source_id, self.shape, self.entity_id, generation_id, self.limit]
+        return (
+            scope_fields
+            if not self.is_network_scoped
+            else [*scope_fields, self.network_ids, self.network_generation, self.access_scope_sha256]
+        )
 
 
 def _query_fields(query, shape):
@@ -57,6 +72,7 @@ def _query_fields(query, shape):
     except ValueError, UnicodeError:
         raise DirectoryReadError(400) from None
     allowed = {"source_id", "generation_id"} if shape == "entity" else {"source_id", "generation_id", "limit", "cursor"}
+    allowed |= {"network_ids", "network_generation"}
     fields_by_name = dict(pairs)
     if len(fields_by_name) != len(pairs) or not set(fields_by_name) <= allowed:
         raise DirectoryReadError(400)
@@ -90,6 +106,21 @@ def parse_directory_read(kind, entity_id, shape, query):
     raw_limit = fields_by_name.get("limit", "25")
     if not re.fullmatch(r"[1-9][0-9]{0,2}", raw_limit) or int(raw_limit) > 100:
         raise DirectoryReadError(400)
+    network_ids = network_generation = None
+    if "network_generation" in fields_by_name and "network_ids" not in fields_by_name:
+        raise DirectoryReadError(400)
+    if "network_ids" in fields_by_name:
+        from process.network_serving_read import parse_canonical_network_ids
+
+        try:
+            network_ids = parse_canonical_network_ids(fields_by_name["network_ids"])
+            raw_generation = fields_by_name.get("network_generation")
+            if raw_generation is not None:
+                if not re.fullmatch(r"[1-9][0-9]{0,18}", raw_generation) or int(raw_generation) > 9223372036854775807:
+                    raise ValueError
+                network_generation = int(raw_generation)
+        except ValueError:
+            raise DirectoryReadError(400) from None
     return DirectoryRead(
         kind,
         source_id,
@@ -98,6 +129,8 @@ def parse_directory_read(kind, entity_id, shape, query):
         fields_by_name.get("generation_id"),
         int(raw_limit),
         fields_by_name.get("cursor"),
+        network_ids,
+        network_generation,
     )
 
 
@@ -121,6 +154,8 @@ def opaque_directory_key(key, prefix, *identity):
 def issue_directory_cursor(key, query, generation_id, position, now=None):
     """Encrypt one seek position with a fixed expiry and the complete query scope."""
     expires = int(time.time() if now is None else now) + _CURSOR_TTL
+    if query.excluded_network_ids is not None and query.cursor is not None:
+        _, expires = _directory_cursor_contents(key, query, generation_id, now)
     plaintext = json.dumps([position, expires], separators=(",", ":")).encode()
     nonce = os.urandom(12)
     scope = json.dumps(query.scope(generation_id), separators=(",", ":")).encode()
@@ -132,6 +167,10 @@ def read_directory_cursor(key, query, generation_id, now=None):
     """Fail stale, expired or altered cursors closed without exposing their contents."""
     if query.cursor is None:
         return None
+    return _directory_cursor_contents(key, query, generation_id, now)[0]
+
+
+def _directory_cursor_contents(key, query, generation_id, now):
     try:
         encoded = query.cursor
         decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
@@ -152,6 +191,6 @@ def read_directory_cursor(key, query, generation_id, now=None):
                 raise ValueError
         elif type(position) is not str or str(UUID(position)) != position:
             raise ValueError
-        return position
+        return position, expires
     except ValueError, TypeError, UnicodeError, InvalidTag:
         raise DirectoryReadError(409) from None

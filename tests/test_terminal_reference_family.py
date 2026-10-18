@@ -202,7 +202,9 @@ async def test_native_copy_carries_two_exact_source_slices_with_one_family_budge
     """Shared native COPY projects fixed compiled columns and debits the common byte ceiling."""
     spec = archive.reference_family_spec("claims-pricing")
     receipts = tuple(SimpleNamespace(table_name=model.__tablename__) for model in spec.model_types)
-    capture = SimpleNamespace(schema_name="mrf", manifest=SimpleNamespace(tables=receipts))
+    capture = SimpleNamespace(
+        schema_name="mrf", manifest=SimpleNamespace(tables=receipts), frozen_source_projection=None
+    )
     copy = SimpleNamespace(max_bytes=1000, copy_rows=AsyncMock(return_value=10))
     await archive._copy_source_tables("owning-session", capture, "candidate", spec, copy, 10**12)
     calls = copy.copy_rows.await_args_list

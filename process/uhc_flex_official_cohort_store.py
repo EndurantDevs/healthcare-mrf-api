@@ -4,10 +4,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 import os
 import re
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from db.models import db
@@ -18,14 +18,12 @@ from process.uhc_canonical_proof import (
     validate_uhc_canonical_content_proof,
 )
 from process.uhc_flex_official_cohort_contract import (
-    UHCFlexOfficialCohortError,
-    UHCFlexOfficialNPICohort,
     UHC_FLEX_OFFICIAL_NPI_SYSTEM,
     UHC_FLEX_OFFICIAL_RESOURCE_TYPE,
-    build_uhc_flex_official_cohort,
+    UHCFlexOfficialCohortError,
+    UHCFlexOfficialNPICohort,
 )
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
-
 
 _COHORT_TABLE = "provider_directory_uhc_flex_npi_cohort"
 _MEMBER_TABLE = "provider_directory_uhc_flex_npi_member"
@@ -102,11 +100,7 @@ def _table(table_name: str) -> str:
 def _row_fields(database_row: Any) -> dict[str, Any]:
     if database_row is None:
         return {}
-    row_mapping = (
-        database_row._mapping
-        if hasattr(database_row, "_mapping")
-        else database_row
-    )
+    row_mapping = database_row._mapping if hasattr(database_row, "_mapping") else database_row
     return dict(row_mapping)
 
 
@@ -156,9 +150,7 @@ def _validated_snapshot(source_row: Any) -> _OfficialPractitionerSnapshot:
         or re.fullmatch(r"[0-9a-f]{64}", dataset_hash) is None
     ):
         raise UHCFlexOfficialCohortError("evidence")
-    metadata_by_field = _json_object(
-        source_by_field.get("publication_metadata_json")
-    )
+    metadata_by_field = _json_object(source_by_field.get("publication_metadata_json"))
     try:
         proof_by_field = validate_uhc_canonical_content_proof(
             metadata_by_field.get(UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY),
@@ -170,15 +162,12 @@ def _validated_snapshot(source_row: Any) -> _OfficialPractitionerSnapshot:
         raise UHCFlexOfficialCohortError("evidence") from error
     resource_counts = proof_by_field.get("resource_counts")
     practitioner_count = (
-        resource_counts.get(UHC_FLEX_OFFICIAL_RESOURCE_TYPE)
-        if isinstance(resource_counts, Mapping)
-        else None
+        resource_counts.get(UHC_FLEX_OFFICIAL_RESOURCE_TYPE) if isinstance(resource_counts, Mapping) else None
     )
     if (
         proof_by_field.get("source_id") != UHC_PROVIDER_FILE_SOURCE_ID
         or proof_by_field.get("dataset_hash") != dataset_hash
-        or proof_by_field.get("resource_count")
-        != source_by_field.get("resource_count")
+        or proof_by_field.get("resource_count") != source_by_field.get("resource_count")
     ):
         raise UHCFlexOfficialCohortError("evidence")
     return _OfficialPractitionerSnapshot(
@@ -231,6 +220,8 @@ async def _current_official_snapshot(
 async def _official_practitioner_npi_count(
     database: Any,
     snapshot: _OfficialPractitionerSnapshot,
+    *,
+    resource_relation: str | None = None,
 ) -> int:
     count_row = await database.first(
         f"""
@@ -238,7 +229,7 @@ async def _official_practitioner_npi_count(
             SELECT CASE WHEN {_NPI_SHAPE_SQL}
                         THEN {_NPI_NUMBER_SQL}
                         ELSE NULL END AS npi
-              FROM {_table(_RESOURCE_TABLE)} AS resource_record
+              FROM {resource_relation or _table(_RESOURCE_TABLE)} AS resource_record
              WHERE resource_record.dataset_id = :dataset_id
                AND resource_record.resource_type = :resource_type
         )
@@ -256,8 +247,7 @@ async def _official_practitioner_npi_count(
     )
     count_by_field = _row_fields(count_row)
     if (
-        count_by_field.get("practitioner_resource_count")
-        != snapshot.practitioner_resource_count
+        count_by_field.get("practitioner_resource_count") != snapshot.practitioner_resource_count
         or count_by_field.get("invalid_npi_count") != 0
     ):
         raise UHCFlexOfficialCohortError("evidence")
@@ -271,25 +261,17 @@ def _cohort_from_row(cohort_row: Any) -> UHCFlexOfficialNPICohort:
             cohort_id=cohort_by_field.get("cohort_id"),
             official_endpoint_id=cohort_by_field.get("official_endpoint_id"),
             official_dataset_id=cohort_by_field.get("official_dataset_id"),
-            official_acquisition_root_run_id=cohort_by_field.get(
-                "official_acquisition_root_run_id"
-            ),
+            official_acquisition_root_run_id=cohort_by_field.get("official_acquisition_root_run_id"),
             official_dataset_hash=cohort_by_field.get("official_dataset_hash"),
-            official_content_proof_sha256=cohort_by_field.get(
-                "official_content_proof_sha256"
-            ),
-            practitioner_resource_count=cohort_by_field.get(
-                "practitioner_resource_count"
-            ),
+            official_content_proof_sha256=cohort_by_field.get("official_content_proof_sha256"),
+            practitioner_resource_count=cohort_by_field.get("practitioner_resource_count"),
             npi_count=cohort_by_field.get("npi_count"),
             contract_id=cohort_by_field.get("contract_id"),
             authority_id=cohort_by_field.get("authority_id"),
             official_source_id=cohort_by_field.get("official_source_id"),
             resource_type=cohort_by_field.get("resource_type"),
             cohort_complete=cohort_by_field.get("cohort_complete"),
-            endpoint_collection_complete=cohort_by_field.get(
-                "endpoint_collection_complete"
-            ),
+            endpoint_collection_complete=cohort_by_field.get("endpoint_collection_complete"),
             endpoint_complete=cohort_by_field.get("endpoint_complete"),
         )
     except (TypeError, ValueError) as error:
@@ -324,41 +306,24 @@ def _is_cohort_snapshot_match(
     return (
         cohort.official_endpoint_id == snapshot.endpoint_id
         and cohort.official_dataset_id == snapshot.dataset_id
-        and cohort.official_acquisition_root_run_id
-        == snapshot.acquisition_root_run_id
+        and cohort.official_acquisition_root_run_id == snapshot.acquisition_root_run_id
         and cohort.official_dataset_hash == snapshot.dataset_hash
-        and cohort.official_content_proof_sha256
-        == snapshot.content_proof_sha256
-        and cohort.practitioner_resource_count
-        == snapshot.practitioner_resource_count
+        and cohort.official_content_proof_sha256 == snapshot.content_proof_sha256
+        and cohort.practitioner_resource_count == snapshot.practitioner_resource_count
     )
 
 
-async def _insert_members(
-    database: Any,
-    cohort: UHCFlexOfficialNPICohort,
-) -> None:
-    inserted_count = await database.status(
-        f"""
-        INSERT INTO {_table(_MEMBER_TABLE)} (cohort_id, npi)
-        SELECT :cohort_id, candidate_npi.npi
-          FROM (
-                SELECT DISTINCT {_NPI_NUMBER_SQL} AS npi
-                  FROM {_table(_RESOURCE_TABLE)} AS resource_record
-                 WHERE resource_record.dataset_id = :dataset_id
-                   AND resource_record.resource_type = :resource_type
-                   AND {_NPI_SHAPE_SQL}
-               ) AS candidate_npi
-         WHERE {valid_npi_sql("candidate_npi.npi")}
-         ORDER BY candidate_npi.npi
-        ON CONFLICT DO NOTHING;
-        """,
-        cohort_id=cohort.cohort_id,
-        dataset_id=cohort.official_dataset_id,
-        resource_type=UHC_FLEX_OFFICIAL_RESOURCE_TYPE,
-    )
-    if inserted_count != cohort.npi_count:
-        raise UHCFlexOfficialCohortError("state")
+def _member_projection_sql(resource_relation: str) -> str:
+    """Project one complete immutable SOURCE set with the original semantic checks."""
+    return f"""
+        SELECT DISTINCT {_NPI_NUMBER_SQL} AS npi
+          FROM {resource_relation} AS resource_record
+         WHERE resource_record.dataset_id = :dataset_id
+           AND resource_record.resource_type = :resource_type
+           AND {_NPI_SHAPE_SQL}
+           AND {valid_npi_sql(_NPI_NUMBER_SQL)}
+         ORDER BY npi
+    """
 
 
 async def _insert_header(
@@ -411,51 +376,16 @@ async def _insert_header(
 async def sync_uhc_flex_official_cohort(
     *,
     database: Any = db,
+    expected_cohort: UHCFlexOfficialNPICohort | None = None,
 ) -> UHCFlexOfficialCohortSyncResult:
-    """Seal or exactly replay the current official UHC Practitioner cohort."""
+    """Prepare through genuine SOURCE custody, or exactly replay an issued cohort."""
+    from process.uhc_flex_official_cohort_snapshot import prepare_cohort, replay_cohort
 
-    async with database.transaction():
-        is_locked = await database.scalar(
-            """
-            SELECT pg_catalog.pg_try_advisory_xact_lock(
-                       pg_catalog.hashtextextended(:lock_identity, 0)
-                   );
-            """,
-            lock_identity=(
-                "provider-directory-uhc-flex-official-cohort:"
-                f"{UHC_PROVIDER_FILE_SOURCE_ID}"
-            ),
-        )
-        if is_locked is not True:
-            raise UHCFlexOfficialCohortError("busy")
-        snapshot = await _current_official_snapshot(database)
-        existing_cohort = await _stored_cohort_for_dataset(
-            database,
-            snapshot.dataset_id,
-        )
-        if existing_cohort is not None:
-            if not _is_cohort_snapshot_match(existing_cohort, snapshot):
-                raise UHCFlexOfficialCohortError("state")
-            return UHCFlexOfficialCohortSyncResult(existing_cohort, False)
-        npi_count = await _official_practitioner_npi_count(database, snapshot)
-        try:
-            cohort = build_uhc_flex_official_cohort(
-                official_endpoint_id=snapshot.endpoint_id,
-                official_dataset_id=snapshot.dataset_id,
-                official_acquisition_root_run_id=snapshot.acquisition_root_run_id,
-                official_dataset_hash=snapshot.dataset_hash,
-                official_content_proof_sha256=snapshot.content_proof_sha256,
-                practitioner_resource_count=snapshot.practitioner_resource_count,
-                npi_count=npi_count,
-            )
-        except ValueError as error:
-            raise UHCFlexOfficialCohortError("evidence") from error
-        await _insert_members(database, cohort)
-        await _insert_header(database, cohort)
-        stored_cohort = await _stored_cohort_for_dataset(database, snapshot.dataset_id)
-        if stored_cohort != cohort:
+    if expected_cohort is not None:
+        if type(expected_cohort) is not UHCFlexOfficialNPICohort:
             raise UHCFlexOfficialCohortError("state")
-        return UHCFlexOfficialCohortSyncResult(cohort, True)
+        return await replay_cohort(database, expected_cohort)
+    return await prepare_cohort(database)
 
 
 __all__ = (

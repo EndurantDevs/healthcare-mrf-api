@@ -7,6 +7,13 @@ import logging
 from sanic import Blueprint, response
 from sanic.exceptions import BadRequest, NotFound, SanicException
 
+from api.control_auth import require_control_auth as _require_control_auth
+from api.control_frozen_rate_files import (
+    ptg_import_file_payload as _ptg_import_file_payload,
+)
+from api.control_frozen_rate_files import (
+    validated_control_import_payload as _validated_control_import_payload,
+)
 from api.control_imports import (
     create_import_run,
     ensure_import_run_table,
@@ -19,29 +26,14 @@ from api.control_imports import (
     request_cancel,
     retry_import_run,
 )
-from api.control_frozen_rate_files import (
-    ptg_import_file_payload as _ptg_import_file_payload,
-    validated_control_import_payload as _validated_control_import_payload,
-)
-from api.control_workers import guarded_ensure_worker, worker_registry
-from api.control_auth import require_control_auth as _require_control_auth
-from api.control_route_registration import register_control_routes
+from api.control_ptg_membership import register_membership_projection_routes
 from api.control_ptg_source_attempt_errors import (
     register_source_attempt_error_handler,
 )
-from api.control_snapshot_rollback import register_source_snapshot_rollback_route
 from api.control_ptg_v4 import register_v4_control_routes
-from api.control_ptg_membership import register_membership_projection_routes
-from api.provider_directory_control_catalog import (
-    provider_directory_control_catalog,
-)
-from api.provider_directory_profile_selection_attestation import (
-    register_profile_selection_route,
-)
-from api.provider_directory_profile_capacity_preflight import (
-    register_profile_capacity_preflight_route,
-)
-from api.uhc_provider_file_catalog import register_uhc_provider_file_catalog_routes
+from api.control_route_registration import register_control_routes
+from api.control_snapshot_rollback import register_source_snapshot_rollback_route
+from api.control_workers import guarded_ensure_worker, worker_registry
 from api.mrf_discovery_catalog import (
     DEFAULT_FILE_PAGE_SIZE,
     DEFAULT_SOURCE_PAGE_SIZE,
@@ -51,6 +43,16 @@ from api.mrf_discovery_catalog import (
     list_discovery_sources_page,
     page_limit,
 )
+from api.provider_directory_control_catalog import (
+    provider_directory_control_catalog,
+)
+from api.provider_directory_profile_capacity_preflight import (
+    register_profile_capacity_preflight_route,
+)
+from api.provider_directory_profile_selection_attestation import (
+    register_profile_selection_route,
+)
+from api.uhc_provider_file_catalog import register_uhc_provider_file_catalog_routes
 from process.ptg_parts.ptg2_candidate_attestation import record_candidate_audit_attestation
 from process.ptg_parts.source_snapshot_control import (
     SourceSnapshotConflict,
@@ -84,7 +86,9 @@ async def control_ensure_import_run_table(_app, _loop):
 async def control_error(request, exc: SanicException):
     """Render control-plane exceptions with the stable JSON error contract."""
 
-    return response.json(_error_payload(request, exc), status=getattr(exc, "status_code", 500), headers=getattr(exc, "headers", None))
+    return response.json(
+        _error_payload(request, exc), status=getattr(exc, "status_code", 500), headers=getattr(exc, "headers", None)
+    )
 
 
 @blueprint.get("/importers")
@@ -215,15 +219,8 @@ async def control_ptg_source_snapshot_promote(request):
                 else None
             ),
             expected_audit_only_attestation_digest=(
-                str(
-                    request_payload.get(
-                        "expected_audit_only_attestation_digest"
-                    )
-                )
-                if request_payload.get(
-                    "expected_audit_only_attestation_digest"
-                )
-                is not None
+                str(request_payload.get("expected_audit_only_attestation_digest"))
+                if request_payload.get("expected_audit_only_attestation_digest") is not None
                 else None
             ),
             rollback_owner_id=(
@@ -359,6 +356,10 @@ async def control_get_import(request, run_id: str):
     """Return one import run or a not-found control response."""
 
     _require_control_auth(request)
+    if "evidence" in request.args:
+        from api.plan_pricing_no_work_http import pricing_no_work_response
+
+        return await pricing_no_work_response(request, run_id)
     run = await get_import_run(run_id)
     if not run:
         raise NotFound("import run not found")
@@ -458,7 +459,9 @@ def _ptg_source_snapshot_refresh_payload(request_payload: dict, *, source_key: s
             or request_payload.get("refresh_idempotency_key")
             or f"entity-address-unified:{source_key}:{snapshot_id}"
         ),
-        "triggered_by": refresh.get("triggered_by") or request_payload.get("triggered_by") or "ptg_source_snapshot_promote",
+        "triggered_by": refresh.get("triggered_by")
+        or request_payload.get("triggered_by")
+        or "ptg_source_snapshot_promote",
         "schedule_id": refresh.get("schedule_id") or request_payload.get("schedule_id"),
         "subscription_id": refresh.get("subscription_id") or request_payload.get("subscription_id"),
         "import_id": refresh.get("import_id") or request_payload.get("refresh_import_id"),
@@ -475,6 +478,7 @@ def _error_payload(request, exc: SanicException) -> dict:
             "request_id": _request_id(request),
         }
     }
+
 
 def _error_code(status_code: int) -> str:
     return {

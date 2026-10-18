@@ -10,18 +10,16 @@ import json
 from unittest.mock import AsyncMock
 
 import pytest
-from db.models import ProviderDirectoryPractitioner
 
+from db.models import ProviderDirectoryPractitioner
+from tests.provider_directory_fhir_bulk_test_support import _Connection
+from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
 def _aetna_source() -> dict:
-    return importer._source_row_from_seed(
-        importer._aetna_provider_directory_data_seed_rows(
-            source_query="Aetna"
-        )[0]
-    )
+    return importer._source_row_from_seed(importer._aetna_provider_directory_data_seed_rows(source_query="Aetna")[0])
 
 
 def _checkpoint_identity() -> importer.BulkExportCheckpointIdentity:
@@ -36,10 +34,7 @@ def _checkpoint_identity() -> importer.BulkExportCheckpointIdentity:
         retry_of_run_id=None,
         endpoint_id="endpoint-resume",
         dataset_id="dataset-resume",
-        start_url=(
-            f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}"
-            "/$export?_type=Practitioner"
-        ),
+        start_url=(f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}/$export?_type=Practitioner"),
         start_url_hash="a" * 64,
     )
 
@@ -48,18 +43,12 @@ def _manifest(output_count: int) -> importer.BulkExportManifest:
     return importer._bulk_export_manifest_from_payload(
         {
             "transactionTime": "2026-07-20T00:00:00Z",
-            "request": (
-                f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}"
-                "/$export?_type=Practitioner"
-            ),
+            "request": (f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}/$export?_type=Practitioner"),
             "requiresAccessToken": False,
             "output": [
                 {
                     "type": "Practitioner",
-                    "url": (
-                        "https://storage.googleapis.com/aetna/"
-                        f"part-{output_index}.ndjson?sig=secret"
-                    ),
+                    "url": (f"https://storage.googleapis.com/aetna/part-{output_index}.ndjson?sig=secret"),
                 }
                 for output_index in range(output_count)
             ],
@@ -164,10 +153,7 @@ def test_aetna_alone_enables_eight_way_range_resume(monkeypatch):
 def test_bulk_output_validator_requires_immutable_byte_identity(monkeypatch):
     observed_at = datetime.datetime(2026, 7, 20, 12, 30, tzinfo=datetime.UTC)
     monkeypatch.setattr(importer, "_bulk_export_now_utc", lambda: observed_at)
-    output_url = (
-        "https://storage.googleapis.com/aetna/export.ndjson"
-        "?X-Goog-Date=20260720T120000Z&X-Goog-Expires=3600"
-    )
+    output_url = "https://storage.googleapis.com/aetna/export.ndjson?X-Goog-Date=20260720T120000Z&X-Goog-Expires=3600"
     response_headers_by_name = {
         "accept-ranges": "bytes",
         "content-length": "1234",
@@ -181,12 +167,8 @@ def test_bulk_output_validator_requires_immutable_byte_identity(monkeypatch):
 
     assert validator.content_length_bytes == 1234
     assert validator.etag == '"strong-etag"'
-    assert validator.etag_hash == hashlib.sha256(
-        b'"strong-etag"'
-    ).hexdigest()
-    assert validator.output_expires_at == datetime.datetime(
-        2026, 7, 20, 13, tzinfo=datetime.UTC
-    )
+    assert validator.etag_hash == hashlib.sha256(b'"strong-etag"').hexdigest()
+    assert validator.output_expires_at == datetime.datetime(2026, 7, 20, 13, tzinfo=datetime.UTC)
 
     with pytest.raises(
         ValueError,
@@ -277,17 +259,20 @@ def test_bulk_range_response_contract(
     headers,
     expected_error,
 ):
-    assert importer._bulk_output_response_error(
-        status,
-        headers,
-        resume_offset=resume_offset,
-        expected_etag='"v1"',
-        expected_content_length=100,
-    ) == expected_error
+    assert (
+        importer._bulk_output_response_error(
+            status,
+            headers,
+            resume_offset=resume_offset,
+            expected_etag='"v1"',
+            expected_content_length=100,
+        )
+        == expected_error
+    )
 
 
 @pytest.mark.asyncio
-async def test_bulk_stream_resumes_at_exact_committed_ndjson_boundary():
+async def test_bulk_stream_resumes_at_exact_committed_ndjson_boundary(monkeypatch):
     first_line = b'{"resourceType":"Practitioner","id":"one"}\n'
     second_line = b'{"resourceType":"Practitioner","id":"two"}\n'
     resume_offset = len(first_line)
@@ -297,9 +282,7 @@ async def test_bulk_stream_resumes_at_exact_committed_ndjson_boundary():
         {
             "ETag": '"output-v1"',
             "Content-Length": str(len(second_line)),
-            "Content-Range": (
-                f"bytes {resume_offset}-{content_length - 1}/{content_length}"
-            ),
+            "Content-Range": (f"bytes {resume_offset}-{content_length - 1}/{content_length}"),
         },
         [second_line[:11], second_line[11:]],
     )
@@ -314,29 +297,28 @@ async def test_bulk_stream_resumes_at_exact_committed_ndjson_boundary():
     async def record_progress(rows_written, committed_bytes):
         progress.append((rows_written, committed_bytes))
 
-    stream_result = await importer._stream_bulk_export_output_rows(
-        session,
-        _aetna_source(),
-        (
-            "https://storage.googleapis.com/aetna/export.ndjson"
-            "?X-Goog-Signature=secret"
-        ),
-        model=ProviderDirectoryPractitioner,
-        resource_type="Practitioner",
-        per_resource_limit=0,
-        timeout=3,
-        run_id="run-resume",
-        row_batch_handler=write_batch,
-        row_batch_size=1,
-        retain_rows=False,
-        requires_access_token=False,
-        resume_options=importer.BulkOutputResumeOptions(
-            row_progress_handler=record_progress,
-            resume_offset=resume_offset,
-            expected_etag='"output-v1"',
-            expected_content_length=content_length,
-        ),
-    )
+    async with synthetic_source_database(monkeypatch, _Connection(1)) as database:
+        monkeypatch.setattr(importer, "db", database)
+        stream_result = await importer._stream_bulk_export_output_rows(
+            session,
+            _aetna_source(),
+            ("https://storage.googleapis.com/aetna/export.ndjson?X-Goog-Signature=secret"),
+            model=ProviderDirectoryPractitioner,
+            resource_type="Practitioner",
+            per_resource_limit=0,
+            timeout=3,
+            run_id="run-resume",
+            row_batch_handler=write_batch,
+            row_batch_size=1,
+            retain_rows=False,
+            requires_access_token=False,
+            resume_options=importer.BulkOutputResumeOptions(
+                row_progress_handler=record_progress,
+                resume_offset=resume_offset,
+                expected_etag='"output-v1"',
+                expected_content_length=content_length,
+            ),
+        )
 
     assert stream_result == ([], 1, 1, False, None)
     assert written_resource_ids == ["two"]

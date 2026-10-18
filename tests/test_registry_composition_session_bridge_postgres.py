@@ -13,7 +13,7 @@ from process.registry_company_approval_fence import _fence_key
 from tests.test_network_custom_address_source_postgres import _seed
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
-from tests.test_registry_candidate_composition_postgres import _remove_candidates, _roles
+from tests.test_registry_candidate_composition_postgres import _allow_composition_owner, _remove_candidates, _roles
 
 pytestmark = pytest.mark.asyncio
 
@@ -49,6 +49,7 @@ def _native_phases(monkeypatch, fixture, *, should_cancel):
 @pytest.mark.parametrize("should_cancel", [False, True])
 async def test_native_factory_keeps_one_driver_releases_fence_and_resumes(custom_db, monkeypatch, should_cancel):
     fixture = custom_db
+    await _allow_composition_owner(fixture)
     seed, request_id, copy_targets = await _seed(fixture), uuid4(), []
     async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
         approved = await composition.pin_approved_membership_source(

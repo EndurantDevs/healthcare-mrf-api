@@ -18,6 +18,17 @@ from process.network_membership_copy import (
     MembershipCopyTarget,
     copy_network_membership_batch,
 )
+from process.registry_source_retention import (
+    SOURCE_TABLE,
+    RegistrySourceRetentionError,
+    registry_source_retention_sha256,
+    validate_registry_source_retention_receipt,
+    verify_registry_source_retention,
+    verify_registry_source_retention_rows,
+)
+from process.registry_source_retention import (
+    SUMMARY_KEY as RETENTION_KEY,
+)
 
 
 class MembershipCandidateError(MembershipCopyError):
@@ -65,6 +76,10 @@ async def _locked_candidate(connection: Any, copy_target: MembershipCopyTarget, 
             raise MembershipCandidateError("Candidate ownership scope does not match")
     if candidate_record["schema_name"] != copy_target.schema_name:
         raise MembershipCandidateError("Candidate relation does not match its registered scope")
+    try:
+        verify_registry_source_retention(candidate_record)
+    except RegistrySourceRetentionError as error:
+        raise MembershipCandidateError(str(error)) from None
     return dict(candidate_record)
 
 
@@ -82,7 +97,7 @@ async def require_candidate_authority(connection: Any, copy_target: MembershipCo
     return copy_target
 
 
-async def _create_raw_membership(connection: Any, copy_target: MembershipCopyTarget) -> None:
+async def _create_raw_membership(connection: Any, copy_target: MembershipCopyTarget, retention=None) -> None:
     namespace = f'"{copy_target.schema_name}"'
     await connection.execute(f"CREATE SCHEMA {namespace}")
     await connection.execute(
@@ -94,6 +109,10 @@ async def _create_raw_membership(connection: Any, copy_target: MembershipCopyTar
         evidence_id TEXT NOT NULL CHECK (btrim(evidence_id) <> '' AND octet_length(evidence_id) <= 1024)
         )"""
     )
+    if retention is not None:
+        await connection.execute(
+            f"CREATE TABLE {namespace}.{SOURCE_TABLE} (LIKE {namespace}.network_membership INCLUDING CONSTRAINTS)"
+        )
 
 
 async def _insert_candidate(
@@ -102,8 +121,8 @@ async def _insert_candidate(
     return await connection.fetchval(
         f"""INSERT INTO {namespace}.network_membership_candidate
         (candidate_id,dataset_id,schema_id,producer_id,schema_name,source_generations,
-         approved_custom_revision,expected_head,expected_rows,source_recipes_json)
-        VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10::jsonb)
+         approved_custom_revision,expected_head,expected_rows,source_recipes_json,validation_json)
+        VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10::jsonb,$11::jsonb)
         ON CONFLICT(candidate_id) DO NOTHING RETURNING candidate_id""",
         UUID(copy_target.candidate_id),
         UUID(copy_target.dataset_id),
@@ -115,6 +134,7 @@ async def _insert_candidate(
         metadata["expected_head"],
         metadata["expected_rows"],
         metadata["source_recipes_json"],
+        metadata["validation_json"],
     )
 
 
@@ -140,6 +160,27 @@ def _candidate_source_metadata(source_generations, source_recipes):
         raise MembershipCandidateError("Candidate source recipes are invalid") from None
 
 
+def _retention_metadata(metadata, source_retention):
+    generations = json.loads(metadata["source_generations"])
+    if source_retention is None:
+        if RETENTION_KEY in generations:
+            raise MembershipCandidateError("Source retention receipt is missing")
+        metadata["validation_json"] = None
+    else:
+        try:
+            receipt = validate_registry_source_retention_receipt(source_retention)
+            digest = registry_source_retention_sha256(receipt)
+            if RETENTION_KEY in generations and generations[RETENTION_KEY] != digest:
+                raise RegistrySourceRetentionError("Source retention digest differs")
+            generations[RETENTION_KEY] = digest
+            metadata["source_generations"] = _source_json(generations)
+            metadata["validation_json"] = json.dumps({RETENTION_KEY: receipt}, sort_keys=True, separators=(",", ":"))
+            verify_registry_source_retention(metadata)
+        except RegistrySourceRetentionError as error:
+            raise MembershipCandidateError(str(error)) from None
+    return metadata
+
+
 def _verify_candidate_metadata(candidate, metadata):
     from process.registry_source_recipe_store import canonical_registry_source_recipes, verify_registry_source_recipes
 
@@ -149,7 +190,8 @@ def _verify_candidate_metadata(candidate, metadata):
         if type(stored_sources) is str:
             stored_sources = json.loads(stored_sources)
         if (
-            stored_recipes != metadata["source_recipes_json"]
+            verify_registry_source_retention(candidate) != verify_registry_source_retention(metadata)
+            or stored_recipes != metadata["source_recipes_json"]
             or _source_json(stored_sources) != metadata["source_generations"]
             or any(
                 candidate[field] != metadata[field]
@@ -170,9 +212,13 @@ async def create_network_candidate(
     expected_head: int,
     expected_rows: int,
     control_schema: str | None = None,
-    source_recipes: tuple = (),
+    **source_options,
 ) -> dict:
-    """Create an isolated relation, or return an exact immutable metadata replay."""
+    """Create or exactly replay a candidate; optional source recipes/retention default empty/None."""
+    if set(source_options) - {"source_recipes", "source_retention"}:
+        raise MembershipCandidateError("Candidate source options are invalid")
+    source_recipes = source_options.get("source_recipes", ())
+    source_retention = source_options.get("source_retention")
     _require_transaction(connection, copy_target)
     namespace = _control_namespace(control_schema)
     source_json, recipe_json = _candidate_source_metadata(source_generations, source_recipes)
@@ -183,16 +229,21 @@ async def create_network_candidate(
         "expected_head": _nonnegative_bigint(expected_head),
         "expected_rows": _nonnegative_bigint(expected_rows),
     }
+    metadata = _retention_metadata(metadata, source_retention)
     async with connection.transaction():
         inserted = await _insert_candidate(connection, copy_target, namespace, metadata)
         candidate_record = await _locked_candidate(connection, copy_target, namespace)
         _verify_candidate_metadata(candidate_record, metadata)
         if inserted:
-            await _create_raw_membership(connection, copy_target)
+            await _create_raw_membership(connection, copy_target, source_retention)
         elif not await connection.fetchval(
             "SELECT to_regclass($1) IS NOT NULL", f'"{copy_target.schema_name}".network_membership'
         ):
             raise MembershipCandidateError("Registered candidate relation is missing")
+        if source_retention is not None and not await connection.fetchval(
+            "SELECT to_regclass($1) IS NOT NULL", f'"{copy_target.schema_name}".{SOURCE_TABLE}'
+        ):
+            raise MembershipCandidateError("Registered source relation is missing")
     return candidate_record
 
 
@@ -258,6 +309,13 @@ async def admit_network_membership_batch(
     namespace = _control_namespace(control_schema)
     async with connection.transaction():
         candidate_record = await _locked_candidate(connection, copy_target, namespace)
+        try:
+            if verify_registry_source_retention(candidate_record) is not None:
+                raise MembershipCandidateError(
+                    "Qualified candidates require set-based composition, not batch admission"
+                )
+        except RegistrySourceRetentionError as error:
+            raise MembershipCandidateError(str(error)) from None
         batch_record = await connection.fetchrow(
             f"SELECT * FROM {namespace}.network_membership_batch WHERE candidate_id=$1 AND batch_id=$2",
             UUID(copy_target.candidate_id),
@@ -289,8 +347,39 @@ async def admit_network_membership_batch(
     return receipt
 
 
+async def _seal_membership_accounting(connection, copy_target, candidate_record, namespace):
+    """Reconcile legacy receipts or qualified zero-batch effective membership counts."""
+    try:
+        retention = verify_registry_source_retention(candidate_record)
+    except RegistrySourceRetentionError as error:
+        raise MembershipCandidateError(str(error)) from None
+    if retention is None:
+        batch_rows = await connection.fetchval(
+            f"SELECT COALESCE(SUM(row_count),0) FROM {namespace}.network_membership_batch WHERE candidate_id=$1",
+            UUID(copy_target.candidate_id),
+        )
+    else:
+        batch_counts = await connection.fetchrow(
+            f"SELECT COALESCE(SUM(row_count),0) AS batch_rows,count(*) AS batch_count "
+            f"FROM {namespace}.network_membership_batch WHERE candidate_id=$1",
+            UUID(copy_target.candidate_id),
+        )
+        if batch_counts["batch_rows"] != 0 or batch_counts["batch_count"] != 0:
+            raise MembershipCandidateError("Qualified candidate batch accounting must be empty")
+        batch_rows = candidate_record["accepted_rows"]
+    membership_rows = await connection.fetchval(f'SELECT COUNT(*) FROM "{copy_target.schema_name}".network_membership')
+    if not batch_rows == candidate_record["accepted_rows"] == candidate_record["expected_rows"] == membership_rows:
+        raise MembershipCandidateError("Candidate aggregate membership accounting does not reconcile")
+    return retention
+
+
 async def seal_network_candidate(
-    connection: Any, copy_target: MembershipCopyTarget, *, control_schema: str | None = None
+    connection: Any,
+    copy_target: MembershipCopyTarget,
+    *,
+    control_schema: str | None = None,
+    source_stage=None,
+    command_stage=None,
 ) -> dict:
     """Close new writes only after receipts, counter, expectation and raw rows agree."""
     _require_transaction(connection, copy_target)
@@ -299,15 +388,19 @@ async def seal_network_candidate(
         candidate_record = await _locked_candidate(connection, copy_target, namespace)
         if candidate_record["state"] == "rejected":
             raise MembershipCandidateError("Rejected candidates cannot be sealed")
-        batch_rows = await connection.fetchval(
-            f"SELECT COALESCE(SUM(row_count),0) FROM {namespace}.network_membership_batch WHERE candidate_id=$1",
-            UUID(copy_target.candidate_id),
-        )
-        membership_rows = await connection.fetchval(
-            f'SELECT COUNT(*) FROM "{copy_target.schema_name}".network_membership'
-        )
-        if not batch_rows == candidate_record["accepted_rows"] == candidate_record["expected_rows"] == membership_rows:
-            raise MembershipCandidateError("Candidate aggregate membership accounting does not reconcile")
+        retention = await _seal_membership_accounting(connection, copy_target, candidate_record, namespace)
+        try:
+            await verify_registry_source_retention_rows(
+                connection, copy_target, candidate_record, source_stage=source_stage
+            )
+            if retention is not None and candidate_record["state"] == "open":
+                if command_stage is None:
+                    raise MembershipCandidateError("Qualified candidate command stage is required")
+                from process.registry_membership_composition_stage import verify_registry_composition_rows
+
+                await verify_registry_composition_rows(connection, copy_target, candidate_record, command_stage)
+        except ValueError as error:
+            raise MembershipCandidateError(str(error)) from error
         if candidate_record["state"] == "open":
             await connection.execute(
                 f"UPDATE {namespace}.network_membership_candidate SET state='sealed' WHERE candidate_id=$1",

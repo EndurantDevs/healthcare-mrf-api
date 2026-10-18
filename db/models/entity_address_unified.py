@@ -153,18 +153,18 @@ class EntityAddressUnified(Base, JSONOutputMixin):
         {"index_elements": ("ptg_source_array",), "using": "gin", "name": "ptg_source_array"},
         {"index_elements": ("group_plan_array",), "using": "gin", "name": "group_plan_array"},
         {
-            "index_elements": ("canonical_network_ids gin__int_ops",),
+            "index_elements": ("canonical_network_ids public.gin__int_ops",),
             "using": "gin",
             "name": "canonical_network_ids",
         },
         {
-            "index_elements": ("taxonomy_array gin__int_ops", "plans_network_array gin__int_ops"),
+            "index_elements": ("taxonomy_array public.gin__int_ops", "plans_network_array public.gin__int_ops"),
             "using": "gin",
             "name": "taxonomy_plans_network",
             "where": "type='primary'",
         },
         {
-            "index_elements": ("plans_network_array gin__int_ops",),
+            "index_elements": ("plans_network_array public.gin__int_ops",),
             "using": "gin",
             "name": "service_plans_network_array",
             "where": "type IN ('primary', 'secondary', 'practice', 'site')",
@@ -173,20 +173,20 @@ class EntityAddressUnified(Base, JSONOutputMixin):
         {
             "index_elements": (
                 "(COALESCE(zip5, LEFT(COALESCE(postal_code, ''), 5)))",
-                "taxonomy_array gin__int_ops",
+                "taxonomy_array public.gin__int_ops",
             ),
             "using": "gin",
             "name": "serving_zip5_taxonomy",
             "where": "type IN ('practice','site','primary','secondary')",
         },
         {
-            "index_elements": ("procedures_array gin__int_ops",),
+            "index_elements": ("procedures_array public.gin__int_ops",),
             "using": "gin",
             "name": "procedures_array",
             "where": "type='primary'",
         },
         {
-            "index_elements": ("medications_array gin__int_ops",),
+            "index_elements": ("medications_array public.gin__int_ops",),
             "using": "gin",
             "name": "medications_array",
             "where": "type='primary'",
@@ -201,7 +201,9 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             # recreates this partial index (CREATE INDEX IF NOT EXISTS on a fresh
             # stage table, _create_stage_indexes), so the index lands before the
             # query that depends on it is activated.
-            "index_elements": ("Geography(ST_MakePoint((long)::double precision, (lat)::double precision))",),
+            "index_elements": (
+                "public.Geography(public.ST_MakePoint((long)::double precision, (lat)::double precision))",
+            ),
             "using": "gist",
             "name": "geo_idx",
             "where": (

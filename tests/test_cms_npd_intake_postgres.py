@@ -123,7 +123,7 @@ async def test_repaired_intake_keeps_real_owners_and_reaches_catalog(
     directory, receipt = support.retained_release(cms_artifact_root)
     monkeypatch.setattr(cms, "durable_artifact_root", lambda: cms_artifact_root)
     migration_prefixes = support.LEGACY_MIGRATION_PREFIXES if operation == "rollback" else support.MIGRATION_PREFIXES
-    async with support.admission_database(monkeypatch, migration_prefixes=migration_prefixes) as database:
+    async with support.intake_admission_database(monkeypatch, migration_prefixes=migration_prefixes) as database:
         monkeypatch.setattr(catalog, "db", database)
         if operation == "rollback":
             await _admit_legacy_source(directory, receipt, "first-publication")
@@ -253,7 +253,7 @@ async def test_selected_baseline_intake_replay_and_unpublished_rollback_rejectio
     directory, receipt = support.retained_release(cms_artifact_root)
     task = _retained_task(directory, receipt)
     monkeypatch.setattr(cms, "durable_artifact_root", lambda: cms_artifact_root)
-    async with support.admission_database(monkeypatch) as database:
+    async with support.intake_admission_database(monkeypatch) as database:
         result = await cms.run({"context": {}}, task, "retained-owner")
         await _assert_unpublished(database, result)
         assert result["cms_retained_input"] == cms.retained_input_selection(task)
@@ -283,7 +283,7 @@ async def test_selected_rollback_uses_real_publication_history_without_republish
     directory, receipt = support.retained_release(cms_artifact_root)
     next_directory, next_receipt = support.retained_release(cms_artifact_root, revision="next")
     monkeypatch.setattr(cms, "durable_artifact_root", lambda: cms_artifact_root)
-    async with support.admission_database(
+    async with support.intake_admission_database(
         monkeypatch, migration_prefixes=support.LEGACY_MIGRATION_PREFIXES
     ) as database:
         first = await _admit_legacy_source(directory, receipt, "first-owner")
@@ -322,7 +322,7 @@ async def test_single_connection_pool_rejects_before_guard_or_staging(monkeypatc
     monkeypatch.setenv("HLTHPRT_DB_POOL_MIN_SIZE", "1")
     monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "1")
     directory, receipt = support.retained_release(cms_artifact_root)
-    async with support.admission_database(monkeypatch) as database:
+    async with support.intake_admission_database(monkeypatch) as database:
         acquire = AsyncMock(wraps=fhir._acquire_provider_directory_artifact_build_lock)
         staging = AsyncMock(side_effect=AssertionError("insufficient pool reached staging"))
         monkeypatch.setattr(fhir, "_acquire_provider_directory_artifact_build_lock", acquire)
@@ -372,7 +372,7 @@ async def test_complete_source_intake_uses_bounded_distinct_native_workers(monke
             active_backends.remove(backend)
 
     monkeypatch.setattr(cms, "persist_cms_dataset_rows", persist)
-    async with support.admission_database(monkeypatch) as database:
+    async with support.intake_admission_database(monkeypatch) as database:
         assert cms._source_stage_workers(fhir) == workers
         async with asyncio.timeout(30):
             admission_result = await _admit(directory, receipt, "bounded-native-owner")
@@ -398,7 +398,7 @@ async def test_complete_source_intake_uses_bounded_distinct_native_workers(monke
 async def test_complete_intake_and_retry_preserve_owner_and_never_publish(monkeypatch, cms_artifact_root):
     """Use real migrations, admission, coverage and catalog SQL through retry and changed-vector recovery."""
     directory, receipt = support.retained_release(cms_artifact_root)
-    async with support.admission_database(monkeypatch) as database:
+    async with support.intake_admission_database(monkeypatch) as database:
         monkeypatch.setattr(catalog, "db", database)
         followup = AsyncMock(side_effect=AssertionError("intake must not request source-only follow-up"))
         monkeypatch.setattr(fhir, "_source_local_dataset_followup_if_current", followup)
@@ -428,7 +428,7 @@ async def test_complete_intake_and_retry_preserve_owner_and_never_publish(monkey
 async def test_cancellation_after_seal_replays_without_owner_or_publication_change(monkeypatch, cms_artifact_root):
     """A lost ready acknowledgement leaves immutable proof reusable and releases the intake guard."""
     directory, receipt = support.retained_release(cms_artifact_root)
-    async with support.admission_database(monkeypatch) as database:
+    async with support.intake_admission_database(monkeypatch) as database:
         with monkeypatch.context() as cancelled:
             cancelled.setattr(cms, "_serving_candidate_descriptor", AsyncMock(side_effect=asyncio.CancelledError))
             with pytest.raises(asyncio.CancelledError):
@@ -455,7 +455,7 @@ async def test_endpoint_guard_serializes_distinct_vector_intake_and_rollback(
     """Different retained directories cannot bypass the same endpoint owner, and cancellation frees it."""
     directory, receipt = support.retained_release(cms_artifact_root)
     other_directory, other_receipt = support.retained_release(cms_artifact_root, revision="other")
-    async with support.admission_database(monkeypatch) as database:
+    async with support.intake_admission_database(monkeypatch) as database:
         monkeypatch.setattr(fhir, "PROVIDER_DIRECTORY_ARTIFACT_BUILD_LOCK_ATTEMPTS", 1)
         entered, release = asyncio.Event(), asyncio.Event()
         original = cms._stage_acquired
@@ -487,7 +487,7 @@ async def test_endpoint_guard_serializes_distinct_vector_intake_and_rollback(
 async def test_disconnected_intake_owner_cannot_emit_ready(monkeypatch, cms_artifact_root, is_active):
     """Terminate only the owned guard backend and require the interrupted intake to fail closed."""
     directory, receipt = support.retained_release(cms_artifact_root)
-    async with support.admission_database(monkeypatch) as database:
+    async with support.intake_admission_database(monkeypatch) as database:
         acquired, release = asyncio.Event(), asyncio.Event()
         backend_ids = []
         original_acquire = fhir._acquire_provider_directory_artifact_build_lock

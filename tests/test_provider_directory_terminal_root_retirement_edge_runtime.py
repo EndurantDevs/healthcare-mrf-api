@@ -20,7 +20,6 @@ from tests.test_provider_directory_terminal_root_retirement_selection import (
 )
 from tests.test_provider_directory_terminal_root_retirement_store import StoreDatabase
 
-
 SelectionMutation = Callable[[SelectionDatabase], None]
 
 
@@ -108,9 +107,7 @@ async def test_selection_rejects_replay_token_drift_and_wrong_request_type() -> 
         retired_at="2026-08-10T12:00:00+00:00",
     )
     database.target["status"] = contract.RETIREMENT_STATUS
-    database.target["publication_metadata_json"][
-        contract.RETIREMENT_METADATA_KEY
-    ] = marker
+    database.target["publication_metadata_json"][contract.RETIREMENT_METADATA_KEY] = marker
 
     with pytest.raises(contract.TerminalRootRetirementError, match="evidence_changed"):
         await selected_terminal_root_retirement(
@@ -132,25 +129,28 @@ async def test_preview_rejects_apply_token() -> None:
 
 @pytest.mark.asyncio
 async def test_apply_rechecks_token_after_selection(monkeypatch) -> None:
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+
     database = StoreDatabase()
-    marker = contract.retirement_marker(
-        database.evidence,
-        minimum_terminal_age_seconds=contract.MINIMUM_TERMINAL_AGE_SECONDS,
-        retired_at="2026-08-10T12:00:00+00:00",
-    )
-
-    async def selected(_database, selected_request):
-        return contract.TerminalRootRetirementSelection(
-            request=selected_request,
-            canonical_api_base="https://synthetic.invalid/fhir",
-            prior_status="acquiring",
-            observed_metadata={"source_ids": [selected_request.source_id]},
-            marker_by_field=marker,
+    async with synthetic_source_database(monkeypatch, database) as database:
+        marker = contract.retirement_marker(
+            database.evidence,
+            minimum_terminal_age_seconds=contract.MINIMUM_TERMINAL_AGE_SECONDS,
+            retired_at="2026-08-10T12:00:00+00:00",
         )
 
-    monkeypatch.setattr(store, "selected_terminal_root_retirement", selected)
-    with pytest.raises(contract.TerminalRootRetirementError, match="evidence_changed"):
-        await store.apply_terminal_root_retirement_transaction(
-            database,
-            request(expected_evidence_sha256="f" * 64),
-        )
+        async def selected(_database, selected_request):
+            return contract.TerminalRootRetirementSelection(
+                request=selected_request,
+                canonical_api_base="https://synthetic.invalid/fhir",
+                prior_status="acquiring",
+                observed_metadata={"source_ids": [selected_request.source_id]},
+                marker_by_field=marker,
+            )
+
+        monkeypatch.setattr(store, "selected_terminal_root_retirement", selected)
+        with pytest.raises(contract.TerminalRootRetirementError, match="evidence_changed"):
+            await store.apply_terminal_root_retirement_transaction(
+                database,
+                request(expected_evidence_sha256="f" * 64),
+            )

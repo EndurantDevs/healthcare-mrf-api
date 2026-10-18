@@ -113,3 +113,28 @@ async def test_native_capture_pins_model_family_until_transaction_end(tmp_path):
         async with engine.begin() as connection:
             await connection.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
         await engine.dispose()
+
+
+@pytest.mark.parametrize("initial_mb,expected_mb", [(4, 4), (16, 16), (64, 64), (128, 64)])
+@pytest.mark.asyncio
+async def test_receipt_normalization_respects_stricter_memory_budget(initial_mb, expected_mb):
+    from process.entity_address_snapshot_receipt import _normalize_receipt_session
+
+    engine = create_async_engine(_dsn(), connect_args={"server_settings": {"work_mem": f"{initial_mb}MB"}})
+    try:
+        async with engine.connect() as connection:
+            async with connection.begin():
+                await connection.execute(text("SET TRANSACTION READ ONLY"))
+                await _normalize_receipt_session(connection, "pg_catalog")
+                assert await connection.scalar(text("SELECT pg_size_bytes(current_setting('work_mem'))")) == (
+                    expected_mb * 1024 * 1024
+                )
+                assert await connection.scalar(text("SHOW transaction_read_only")) == "on"
+                assert await connection.scalar(text("SHOW TimeZone")) == "UTC"
+                assert await connection.scalar(text("SHOW DateStyle")) == "ISO, YMD"
+                assert await connection.scalar(text("SHOW IntervalStyle")) == "iso_8601"
+            assert await connection.scalar(text("SELECT pg_size_bytes(current_setting('work_mem'))")) == (
+                initial_mb * 1024 * 1024
+            )
+    finally:
+        await engine.dispose()

@@ -111,11 +111,11 @@ async def _assert_summary_failure_revokes_source_admission(
     ensure_indexes = plan_summary._ensure_summary_indexes
     call_counts = [0]
 
-    async def fail_final_indexes():
+    async def fail_final_indexes(session, schema_name, stage_name):
         call_counts[0] += 1
-        if call_counts[0] == 2:
-            raise RuntimeError("summary failure")
-        await ensure_indexes()
+        assert call_counts[0] == 1 and stage_name.endswith("_refresh")
+        await ensure_indexes(session, schema_name, stage_name)
+        raise RuntimeError("summary failure")
 
     monkeypatch.setattr(plan_summary, "_ensure_summary_indexes", fail_final_indexes)
     with pytest.raises(RuntimeError, match="summary failure"):
@@ -342,11 +342,11 @@ async def _assert_summary_index_failure(monkeypatch, plan_summary, database, sch
     ensure_indexes = plan_summary._ensure_summary_indexes
     failure_call_counts = [0]
 
-    async def fail_final_indexes():
+    async def fail_final_indexes(session, schema_name, stage_name):
         failure_call_counts[0] += 1
-        if failure_call_counts[0] == 2:
-            raise RuntimeError("index failure")
-        await ensure_indexes()
+        assert failure_call_counts[0] == 1 and stage_name.endswith("_refresh")
+        await ensure_indexes(session, schema_name, stage_name)
+        raise RuntimeError("index failure")
 
     monkeypatch.setattr(plan_summary, "_ensure_summary_indexes", fail_final_indexes)
     with pytest.raises(RuntimeError, match="index failure"):
@@ -367,19 +367,35 @@ async def _rebuild_summary_with_input_fence(
     ensure_indexes = plan_summary._ensure_summary_indexes
     index_call_counts = [0]
 
-    async def verify_input_write_fence():
+    async def verify_input_write_fence(session, schema_name, stage_name):
         index_call_counts[0] += 1
-        if index_call_counts[0] == 2:
-            with pytest.raises(DBAPIError) as blocked:
-                async with engine.begin() as writer:
-                    await writer.execute(text("SET LOCAL lock_timeout='100ms'"))
-                    await writer.execute(text(f'UPDATE "{schema}".plan_prices SET year=year'))
-            assert blocked.value.orig.sqlstate == "55P03"
-        await ensure_indexes()
+        assert index_call_counts[0] == 1 and stage_name.endswith("_refresh")
+        with pytest.raises(DBAPIError) as blocked:
+            async with engine.begin() as writer:
+                await writer.execute(text("SET LOCAL lock_timeout='100ms'"))
+                await writer.execute(text(f'UPDATE "{schema}".plan_prices SET year=year'))
+        assert blocked.value.orig.sqlstate == "55P03"
+        await ensure_indexes(session, schema_name, stage_name)
+        assert (
+            await session.scalar(
+                text("SELECT count(*) FROM pg_index WHERE indrelid=to_regclass(:stage) AND indisvalid AND indisready"),
+                {"stage": f'"{schema_name}"."{stage_name}"'},
+            )
+            == 3
+        )
+        assert not await session.scalar(
+            text(
+                "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() AND relation=to_regclass(:live) "
+                "AND mode='AccessExclusiveLock' AND granted)"
+            ),
+            {"live": f'"{schema_name}".plan_search_summary'},
+        )
 
-    monkeypatch.setattr(plan_summary, "_ensure_summary_indexes", verify_input_write_fence)
-    assert await plan_summary.rebuild_plan_search_summary(publication=(recovery_attempt, authority, False)) == 0
-    assert index_call_counts[0] == 2
+    with monkeypatch.context() as patch:
+        patch.setattr(plan_summary, "_ensure_summary_indexes", verify_input_write_fence)
+        assert await plan_summary.rebuild_plan_search_summary(publication=(recovery_attempt, authority, False)) == 0
+    assert plan_summary._ensure_summary_indexes is ensure_indexes
+    assert index_call_counts[0] == 1
     async with engine.connect() as observer:
         completed_summary_oid = await observer.scalar(
             text(f"SELECT summary_oid FROM \"{schema}\".{receipt.TABLE} WHERE state='complete'")

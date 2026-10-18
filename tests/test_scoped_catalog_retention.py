@@ -105,6 +105,26 @@ async def test_retained_finish_refuses_oversized_or_changed_authority_before_sea
     session.execute.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_retained_finish_preserves_composite_importer_and_exact_custody_inventory(monkeypatch):
+    from process import scoped_catalog_publication as publication
+
+    receipt = _receipt()
+    prepared = SimpleNamespace(spec=publication.input_spec(receipt["importer"]), owner_oid=receipt["owner_oid"])
+    session = SimpleNamespace(scalar=AsyncMock(return_value=1), execute=AsyncMock())
+    seal, readback = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(publication, "_seal_candidate", seal)
+    monkeypatch.setattr(retention, "require_retained_catalog", readback)
+    await retention.finish_catalog_authority(session, prepared, receipt, {"local_generation": 1})
+    original, ownership, owner = seal.await_args.args
+    assert original is session and owner == receipt["owner_oid"]
+    assert ownership.importer_id == prepared.spec.importer_id == "scoped-catalog"
+    assert ownership.schema_name == receipt["schema_name"] and ownership.schema_oid == receipt["schema_oid"]
+    assert ownership.relation_oids == (("code_catalog", 13), ("code_sets_result_generation", 14))
+    assert ownership.sequence_oids == ()
+    readback.assert_awaited_once_with(session, receipt)
+
+
 @pytest.mark.parametrize("tables", [None, [None]])
 def test_retained_authority_refuses_non_table_receipts(tables):
     """Re-signing cannot turn a malformed table inventory into native retained authority."""

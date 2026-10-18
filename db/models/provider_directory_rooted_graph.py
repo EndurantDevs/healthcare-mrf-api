@@ -6,19 +6,21 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import BigInteger
-from sqlalchemy import Boolean
-from sqlalchemy import CheckConstraint
-from sqlalchemy import Column
-from sqlalchemy import ForeignKeyConstraint
-from sqlalchemy import Integer
-from sqlalchemy import PrimaryKeyConstraint
-from sqlalchemy import SmallInteger
-from sqlalchemy import String
-from sqlalchemy import Text
-from sqlalchemy import TIMESTAMP
-from sqlalchemy import UniqueConstraint
-from sqlalchemy import text
+from sqlalchemy import (
+    TIMESTAMP,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    ForeignKeyConstraint,
+    Integer,
+    PrimaryKeyConstraint,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import Base
@@ -43,15 +45,9 @@ _SOURCE = "provider_directory_source"
 _DATASET = "provider_directory_endpoint_dataset"
 _STORAGE_CONTRACT = "healthporta.provider-directory.rooted-graph-acquisition.v1"
 _CONNECTOR_ID = "pdrgc_66b9a3c04ecb2368db3a6cbc33de3e8d9203b4e0002cc80a"
-_GRAPH_CONTRACT_SHA256 = (
-    "66b9a3c04ecb2368db3a6cbc33de3e8d9203b4e0002cc80a6147a09ba2f61351"
-)
-_QUERY_CONTRACT_SHA256 = (
-    "4b93928781ea6a3d821a1ac21bd4d7f533ee5ada25184a540d31dfcbdfb2ea28"
-)
-_ROOTED_ENDPOINT_SIGNATURE = (
-    "ec925b980d5f937abd5ca144a2041dda0c2b224fbe3fa8b70ccbe088f2222140"
-)
+_GRAPH_CONTRACT_SHA256 = "66b9a3c04ecb2368db3a6cbc33de3e8d9203b4e0002cc80a6147a09ba2f61351"
+_QUERY_CONTRACT_SHA256 = "4b93928781ea6a3d821a1ac21bd4d7f533ee5ada25184a540d31dfcbdfb2ea28"
+_ROOTED_ENDPOINT_SIGNATURE = "ec925b980d5f937abd5ca144a2041dda0c2b224fbe3fa8b70ccbe088f2222140"
 _SOURCE_AUTHORITY = "unitedhealthcare"
 _FAILURE_VALID = '"' + _SCHEMA.replace('"', '""') + '"."provider_directory_fhir_request_failure_coverage_valid"'
 
@@ -108,6 +104,7 @@ def _timestamp_column():
 class ProviderDirectoryRootedGraphAcquisition(Base, JSONOutputMixin):
     """One independently resumable baseline or candidate graph census."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = _ACQUISITION
     __main_table__ = __tablename__
     __table_args__ = _table_args(
@@ -258,6 +255,7 @@ class ProviderDirectoryRootedGraphAcquisition(Base, JSONOutputMixin):
 class ProviderDirectoryRootedGraphWork(Base, JSONOutputMixin):
     """One fenced initial or witness-discovered query generation."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = _WORK
     __main_table__ = __tablename__
     __table_args__ = _table_args(
@@ -434,7 +432,6 @@ from db.models.provider_directory_rooted_graph_witness import (
     ProviderDirectoryRootedGraphEdge,
     ProviderDirectoryRootedGraphResource,
 )
-
 
 __all__ = (
     "ProviderDirectoryRootedGraphAcquisition",

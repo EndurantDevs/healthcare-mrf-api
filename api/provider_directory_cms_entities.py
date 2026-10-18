@@ -8,7 +8,9 @@ from datetime import date, timezone
 
 from sqlalchemy import text
 
+from api.provider_directory_cms_control_scope import scoped_cms_control_generation
 from api.provider_directory_cms_generation import SOURCE, accepted_cms_generation
+from api.provider_directory_cms_network_scope import pin_cms_network_scope
 from api.provider_directory_cms_payers import cms_payer_organization_rows, cms_payer_rows, payer_generation
 from api.provider_directory_cms_queries import (
     KINDS,
@@ -31,14 +33,14 @@ from process.provider_directory_cms_serving_coverage import require_cms_coverage
 
 def _evidence(key, generation, resource_type, resource_id):
     observed_at = generation["observed_at"]
-    if observed_at.tzinfo is None:
+    if observed_at is not None and observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=timezone.utc)
     return {
         "source_id": SOURCE,
         "resource_type": resource_type,
         "record_key": opaque_directory_key(key, "src_", SOURCE, resource_type, resource_id),
         "release_id": opaque_directory_key(key, "release_", SOURCE, generation["release_id"]),
-        "observed_at": observed_at.isoformat(),
+        "observed_at": observed_at.isoformat() if observed_at is not None else None,
     }
 
 
@@ -89,9 +91,11 @@ async def _relationships(session, schema, key, query, generation, parent):
         if source_status in {"unresolved", "ambiguous"}:
             target_id, status = None, "conflict" if source_status == "ambiguous" else "unresolved"
         elif relation_record["target_kind"] == "providers":
-            target_id = await cms_practitioner_npi(
-                session, schema, generation, relation_record["reference"]
-            ) if source_status == "resolved" else None
+            target_id = (
+                await cms_practitioner_npi(session, schema, generation, relation_record["reference"])
+                if source_status == "resolved"
+                else None
+            )
             status = "resolved" if target_id else "unresolved"
         else:
             target_id, status = await cms_target_identity(
@@ -139,25 +143,55 @@ def _page(key, query, generation, items, next_position):
     return {"generation_id": generation_id, "items": items, "next_cursor": cursor}
 
 
-async def _read_snapshot(session, schema, key, query):
-    generation = await accepted_cms_generation(session, key)
-    review_count = await session.scalar(
-        text(f"SELECT count(*) FROM {schema}.provider_directory_entity_redirect_decision WHERE source_id=:source_id"),
-        {"source_id": SOURCE},
+async def _scoped_generation(session, schema, key, query, generation, response_headers):
+    """Bind the source token and cursor to the exact canonical edition and access policy."""
+    scope = await pin_cms_network_scope(session, schema, query, generation)
+    query = replace(query, network_generation=scope.manifest.generation_id)
+    generation = scope.source_generation
+    pair = generation.get("retained_pair")
+    source_token = generation.get("generation_id") or opaque_directory_key(
+        key,
+        "gen_",
+        scope.source_pin.coordinates,
+        str(generation["observed_at"]),
+        pair.cms_receipt_payload if pair is not None else None,
+        pair.proof.publication_xid if pair is not None else None,
     )
-    generation_map = {
+    generation_by_field = {
         **generation,
-        "generation_id": opaque_directory_key(key, "gen_", generation["generation_id"], "entity-redirects", review_count),
+        **scope.parameters_by_name,
+        "network_scope": scope,
+        "control_schema": schema,
+        "scope_kind": query.kind,
+        "scope_shape": query.shape,
+        "generation_id": opaque_directory_key(
+            key,
+            "gen_",
+            source_token,
+            scope.manifest.generation_id,
+            scope.manifest.manifest_sha256,
+            query.network_ids,
+            query.access_scope_sha256,
+        ),
     }
-    if query.kind == "payers":
-        generation_map = await payer_generation(session, schema, key, generation_map)
+    if response_headers is not None:
+        response_headers["X-Network-Generation"] = str(scope.manifest.generation_id)
+        if generation.get("retained_pair") is not None:
+            response_headers["X-CMS-Retained-Publication"] = "committed/v1"
+    return query, generation_by_field
+
+
+async def _read_snapshot(session, schema, key, query, response_headers=None):
+    """Pin scoped source and control evidence before paging or disclosing redirects."""
+    query, schema, generation_map = await _read_generation(session, schema, key, query, response_headers)
     if query.generation_id is not None and query.generation_id != generation_map["generation_id"]:
         raise DirectoryReadError(409)
-    await require_cms_coverage(session, schema, generation_map)
+    if generation_map.get("retained_pair") is None:
+        await require_cms_coverage(session, schema, generation_map)
     if query.shape != "entities" and query.kind in {"organizations", "sites"}:
         resource_type = KINDS[query.kind]
         canonical_id = await session.scalar(
-            text(f"""SELECT canonical_entity_id FROM {schema}.provider_directory_entity_redirect
+            text(f"""SELECT canonical_entity_id FROM {generation_map.get("control_schema", schema)}.provider_directory_entity_redirect
                 WHERE source_id=:source_id AND resource_type=:resource_type
                   AND old_entity_id=CAST(:entity_id AS uuid)"""),
             {"source_id": SOURCE, "resource_type": resource_type, "entity_id": query.entity_id},
@@ -186,14 +220,16 @@ async def _read_snapshot(session, schema, key, query):
         raise DirectoryReadError(404)
     if query.shape == "relationships":
         return await _relationships(session, schema, key, query, generation_map, directory_rows[0])
-    directory_items = [_entity(key, generation_map, query.kind, directory_record) for directory_record in directory_rows[: query.limit]]
+    directory_items = [
+        _entity(key, generation_map, query.kind, directory_record) for directory_record in directory_rows[: query.limit]
+    ]
     if query.shape == "entity":
         return {"generation_id": generation_map["generation_id"], "item": directory_items[0]}
     next_position = directory_items[-1]["id"] if len(directory_rows) > query.limit else None
     return _page(key, query, generation_map, directory_items, next_position)
 
 
-async def read_cms_entities(session, query):
+async def read_cms_entities(session, query, *, response_headers=None):
     """Serve one bounded read-only snapshot; missing dependency or authority fails closed."""
     if query.source_id != SOURCE or query.kind not in {*KINDS, "payers"} or session.in_transaction():
         raise DirectoryReadError(503)
@@ -205,6 +241,43 @@ async def read_cms_entities(session, query):
             await session.execute(text("SET LOCAL statement_timeout = '2s'"))
             await session.execute(text("SET LOCAL lock_timeout = '250ms'"))
             await session.execute(text("SET LOCAL work_mem = '4MB'"))
-            return await _read_snapshot(session, schema, key, query)
+            if query.is_network_scoped:
+                await session.execute(text("SET LOCAL TIME ZONE 'UTC'"))
+            return await _read_snapshot(session, schema, key, query, response_headers)
     except TimeoutError:
         raise DirectoryReadError(503) from None
+
+
+async def read_cms_entities_snapshot(session, query, *, response_headers=None):
+    """Read inside the caller's verified Reader transaction without opening another."""
+    if query.source_id != SOURCE or query.kind not in {*KINDS, "payers"} or not session.in_transaction():
+        raise DirectoryReadError(503)
+    if query.is_network_scoped:
+        await session.execute(text("SET LOCAL TIME ZONE 'UTC'"))
+    return await _read_snapshot(session, _schema_name(), directory_cursor_key(), query, response_headers)
+
+
+async def _read_generation(session, schema, key, query, response_headers):
+    """Resolve a scoped physical source without consulting the current edition."""
+    generation = None if query.is_network_scoped else await accepted_cms_generation(session, key)
+    if query.is_network_scoped:
+        query, generation = await _scoped_generation(session, schema, key, query, generation, response_headers)
+        control_schema = schema
+        schema = generation["network_scope"].source_schema
+        generation_map = await scoped_cms_control_generation(session, control_schema, key, generation)
+    else:
+        review_count = await session.scalar(
+            text(
+                f"SELECT count(*) FROM {schema}.provider_directory_entity_redirect_decision WHERE source_id=:source_id"
+            ),
+            {"source_id": SOURCE},
+        )
+        generation_map = {
+            **generation,
+            "generation_id": opaque_directory_key(
+                key, "gen_", generation["generation_id"], "entity-redirects", review_count
+            ),
+        }
+        if query.kind == "payers":
+            generation_map = await payer_generation(session, schema, key, generation_map)
+    return query, schema, generation_map

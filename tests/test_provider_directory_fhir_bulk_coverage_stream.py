@@ -13,20 +13,22 @@ import pytest
 
 from db.models import ProviderDirectoryLocation, ProviderDirectoryPractitioner
 from tests.provider_directory_fhir_bulk_test_support import (
-    _Connection,
-    _Response,
-    _Session,
     _acquire,
     _checkpoint,
     _checkpoint_context,
     _client_session,
+    _Connection,
     _fetch_options,
     _identity,
     _manifest_payload,
+    _Response,
+    _Session,
     _source,
     _stream_options,
     importer,
 )
+from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+
 
 @pytest.mark.parametrize(
     ("line", "parse_result", "expected_error"),
@@ -55,26 +57,28 @@ async def test_bulk_stream_rejects_or_skips_malformed_rows(
             "parse_fhir_resource",
             lambda *_args, **_kwargs: parse_result,
         )
-    stream_result = await importer._stream_bulk_export_output_rows(
-        _Session(_Response(chunks=[line])),
-        _source(),
-        "https://storage.googleapis.com/aetna/part.ndjson",
-        model=ProviderDirectoryPractitioner,
-        resource_type="Practitioner",
-        per_resource_limit=0,
-        timeout=3,
-        run_id="run-coverage",
-        row_batch_handler=AsyncMock(return_value=0),
-        row_batch_size=1,
-        retain_rows=False,
-        resume_options=importer.BulkOutputResumeOptions(
-            row_progress_handler=AsyncMock(),
-            resume_offset=0,
-            expected_etag=None,
-            expected_content_length=None,
-        ),
-        requires_access_token=False,
-    )
+    async with synthetic_source_database(monkeypatch, _Connection(1)) as database:
+        monkeypatch.setattr(importer, "db", database)
+        stream_result = await importer._stream_bulk_export_output_rows(
+            _Session(_Response(chunks=[line])),
+            _source(),
+            "https://storage.googleapis.com/aetna/part.ndjson",
+            model=ProviderDirectoryPractitioner,
+            resource_type="Practitioner",
+            per_resource_limit=0,
+            timeout=3,
+            run_id="run-coverage",
+            row_batch_handler=AsyncMock(return_value=0),
+            row_batch_size=1,
+            retain_rows=False,
+            resume_options=importer.BulkOutputResumeOptions(
+                row_progress_handler=AsyncMock(),
+                resume_offset=0,
+                expected_etag=None,
+                expected_content_length=None,
+            ),
+            requires_access_token=False,
+        )
     assert stream_result[-1] == expected_error
 
 
@@ -95,26 +99,28 @@ async def test_bulk_stream_flushes_rows_and_honors_row_limit(monkeypatch):
     )
     write_batch = AsyncMock(return_value=1)
     progress = AsyncMock()
-    stream_result = await importer._stream_bulk_export_output_rows(
-        _Session(_Response(chunks=[b"\n", line])),
-        _source(),
-        "https://storage.googleapis.com/aetna/part.ndjson",
-        model=ProviderDirectoryPractitioner,
-        resource_type="Practitioner",
-        per_resource_limit=1,
-        timeout=3,
-        run_id="run-coverage",
-        row_batch_handler=write_batch,
-        row_batch_size=1,
-        retain_rows=True,
-        resume_options=importer.BulkOutputResumeOptions(
-            row_progress_handler=progress,
-            resume_offset=0,
-            expected_etag=None,
-            expected_content_length=None,
-        ),
-        requires_access_token=False,
-    )
+    async with synthetic_source_database(monkeypatch, _Connection(1)) as database:
+        monkeypatch.setattr(importer, "db", database)
+        stream_result = await importer._stream_bulk_export_output_rows(
+            _Session(_Response(chunks=[b"\n", line])),
+            _source(),
+            "https://storage.googleapis.com/aetna/part.ndjson",
+            model=ProviderDirectoryPractitioner,
+            resource_type="Practitioner",
+            per_resource_limit=1,
+            timeout=3,
+            run_id="run-coverage",
+            row_batch_handler=write_batch,
+            row_batch_size=1,
+            retain_rows=True,
+            resume_options=importer.BulkOutputResumeOptions(
+                row_progress_handler=progress,
+                resume_offset=0,
+                expected_etag=None,
+                expected_content_length=None,
+            ),
+            requires_access_token=False,
+        )
     assert stream_result == ([practitioner_row_map], 1, 1, True, None)
     write_batch.assert_awaited_once()
     progress.assert_awaited_once()
@@ -151,6 +157,7 @@ async def test_bulk_stream_sanitizes_request_failures(error, expected):
         requires_access_token=False,
     )
     assert result[-1] == expected
+
 
 @pytest.mark.asyncio
 async def test_legacy_bulk_fetch_handles_ready_outputs_and_limit(monkeypatch):
@@ -257,13 +264,16 @@ async def test_legacy_bulk_fetch_drops_zero_progress_output_error(monkeypatch):
         "_stream_bulk_export_output_rows",
         AsyncMock(return_value=([], 0, 0, False, "network")),
     )
-    assert await importer._fetch_bulk_export_resource_rows(
-        _source(),
-        "Practitioner",
-        per_resource_limit=0,
-        timeout=3,
-        run_id="run-coverage",
-    ) is None
+    assert (
+        await importer._fetch_bulk_export_resource_rows(
+            _source(),
+            "Practitioner",
+            per_resource_limit=0,
+            timeout=3,
+            run_id="run-coverage",
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

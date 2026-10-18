@@ -30,6 +30,7 @@ from process.ext import address_canon
 from process.ext.address_fast import canonicalize_batch as canonicalize_address_batch
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info, push_objects
 from process.live_progress import enqueue_live_progress
+from process.provider_directory_cms_native_inputs import prepare_local_native_input_publication
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -92,6 +93,7 @@ class OpenAddressesBackfillShard:
             parts.append(f"ZIP {self.zip_prefix}*")
         return " ".join(parts) or "all"
 
+
 @dataclass(frozen=True)
 class _RecordBatch:
     processed: int
@@ -133,9 +135,7 @@ class _LoadProgress:
         self.accepted_rows += accepted
         self.zip_recovery_rows += zip_recovery
         for reason, count in rejection_counts_by_reason.items():
-            self.rejection_counts_by_reason[reason] = (
-                self.rejection_counts_by_reason.get(reason, 0) + count
-            )
+            self.rejection_counts_by_reason[reason] = self.rejection_counts_by_reason.get(reason, 0) + count
 
     def audit(self, *, restore_shards: int, restore_concurrency: int) -> dict[str, Any]:
         """Return the stable audit payload for a completed load."""
@@ -159,14 +159,16 @@ def _env_positive_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     return _positive_int_value(raw, default)
 
+
 def _positive_int_value(raw: Any, default: int) -> int:
     if not raw:
         return default
     try:
         value = int(raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
     return value if value > 0 else default
+
 
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -174,15 +176,17 @@ def _env_float(name: str, default: float) -> float:
         return default
     try:
         value = float(raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
     return value if value > 0 else default
+
 
 def _is_env_flag_enabled(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _normalize_backfill_match_modes(value: Any = None) -> frozenset[str]:
     if value is None:
@@ -204,6 +208,7 @@ def _normalize_backfill_match_modes(value: Any = None) -> frozenset[str]:
     if invalid:
         raise ValueError(f"Invalid OpenAddresses backfill match mode(s): {', '.join(invalid)}")
     return modes
+
 
 def _validate_schema_name(schema: str) -> str:
     cleaned = (schema or "").strip()
@@ -318,7 +323,7 @@ def _valid_us_coordinate(lat: Any, lon: Any) -> tuple[float, float] | None:
     try:
         lat_value = float(lat)
         lon_value = float(lon)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     if not (-15.0 <= lat_value <= 75.0):
         return None
@@ -337,7 +342,7 @@ def _source_state(source: str | None) -> str | None:
 def _source_updated(value: Any) -> datetime.datetime | None:
     try:
         numeric = int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     # OpenAddresses timestamps are milliseconds in current API responses.
     if numeric > 10_000_000_000:
@@ -925,13 +930,9 @@ def _attach_canonical_keys(address_rows: list[dict[str, Any]]) -> list[dict[str,
         try:
             parsed_address_key = uuid.UUID(address_key)
         except ValueError as exc:
-            raise RuntimeError(
-                f"OpenAddresses canonical batch result {index} has an invalid address_key"
-            ) from exc
+            raise RuntimeError(f"OpenAddresses canonical batch result {index} has an invalid address_key") from exc
         if address_canon.key_from_identity(identity_key) != parsed_address_key:
-            raise RuntimeError(
-                f"OpenAddresses canonical batch result {index} has inconsistent keys"
-            )
+            raise RuntimeError(f"OpenAddresses canonical batch result {index} has inconsistent keys")
         canonical_keys.append((identity_key, parsed_address_key))
     return [
         {**address_row, "identity_key": identity_key, "address_key": address_key}
@@ -972,9 +973,7 @@ def _iter_record_batches(
             zip_recovery_rows.append(recovery_record)
         if not address_record:
             rejection_key = rejection_reason or "rejected"
-            rejection_counts_by_reason[rejection_key] = (
-                rejection_counts_by_reason.get(rejection_key, 0) + 1
-            )
+            rejection_counts_by_reason[rejection_key] = rejection_counts_by_reason.get(rejection_key, 0) + 1
         if len(address_rows) >= batch_size or len(zip_recovery_rows) >= batch_size:
             yield _RecordBatch(
                 processed=processed,
@@ -1127,9 +1126,7 @@ def _us_data_items(source_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if output and not output.get("output"):
             continue
         selected_source_items.append(source_item)
-    selected_source_items.sort(
-        key=lambda source_item: str(source_item.get("source") or "")
-    )
+    selected_source_items.sort(key=lambda source_item: str(source_item.get("source") or ""))
     return selected_source_items
 
 
@@ -1213,10 +1210,7 @@ def _emit_load_progress(
     total = max(int(total_files or 0), 1)
     done = max(int(processed_files or 0), 0)
     pct = min((done / total) * 100.0, 100.0)
-    message = (
-        f"{done:,}/{total_files:,} sources; "
-        f"{processed_rows:,} rows processed; {accepted_rows:,} rows accepted"
-    )
+    message = f"{done:,}/{total_files:,} sources; {processed_rows:,} rows processed; {accepted_rows:,} rows accepted"
     progress_event_by_name = dict(
         importer="openaddresses",
         status="running",
@@ -1312,9 +1306,7 @@ async def _load_file(
                 settings.recovery_cls,
             )
         for reason, count in batch.rejection_counts.items():
-            rejection_counts_by_reason[reason] = (
-                rejection_counts_by_reason.get(reason, 0) + count
-            )
+            rejection_counts_by_reason[reason] = rejection_counts_by_reason.get(reason, 0) + count
         await _maybe_raise_if_cancelled(settings.ctx, settings.task)
     return processed, accepted, zip_recovery, rejection_counts_by_reason
 
@@ -1358,7 +1350,10 @@ async def _load_source_item(
         rejection_counts,
     )
 
-async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], stage_cls, recovery_cls) -> dict[str, int]:
+
+async def _load_openaddresses_data(
+    ctx: dict[str, Any], task: dict[str, Any], stage_cls, recovery_cls
+) -> dict[str, int]:
     """Load configured OpenAddresses sources into staging tables."""
     await _maybe_raise_if_cancelled(ctx, task)
     test_mode = bool(ctx["context"].get("test_mode"))
@@ -1427,6 +1422,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
         queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
         for source_index, path in enumerate(local_files, start=1):
             queue.put_nowait((source_index, path))
+
         async def local_worker(worker_id: int) -> None:
             """Consume local source files until the queue is empty."""
             while True:
@@ -1500,11 +1496,10 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                 raise RuntimeError(f"Invalid OpenAddresses start index: {start_index_raw!r}") from exc
             if start_index > len(source_items):
                 raise RuntimeError(
-                    f"OpenAddresses start index {start_index:,} exceeds "
-                    f"source count {len(source_items):,}"
+                    f"OpenAddresses start index {start_index:,} exceeds source count {len(source_items):,}"
                 )
             first_source_index = start_index
-            source_items = source_items[start_index - 1:]
+            source_items = source_items[start_index - 1 :]
             print(
                 f"OpenAddresses resume: starting at source index {start_index:,} "
                 f"of {start_index + len(source_items) - 1:,}",
@@ -1523,8 +1518,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
             item_count = end_index - first_source_index + 1
             source_items = source_items[:item_count]
             print(
-                f"OpenAddresses shard: ending at source index {end_index:,} "
-                f"({len(source_items):,} sources in shard)",
+                f"OpenAddresses shard: ending at source index {end_index:,} ({len(source_items):,} sources in shard)",
                 flush=True,
             )
         start_source = str(task.get("start_source") or os.getenv("HLTHPRT_OPENADDRESSES_START_SOURCE") or "").strip()
@@ -1562,6 +1556,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                 start=first_source_index,
             ):
                 queue.put_nowait((source_index, source_item))
+
             async def worker(worker_id: int) -> None:
                 """Consume remote source items until the queue is empty."""
                 while True:
@@ -1636,7 +1631,7 @@ async def _create_indexes(table_name: str, schema: str) -> None:
 
 def _zip_recovery_table_name(stage_table: str) -> str:
     prefix = f"{OPENADDRESSES_TABLE}_"
-    suffix = stage_table[len(prefix):] if stage_table.startswith(prefix) else stage_table
+    suffix = stage_table[len(prefix) :] if stage_table.startswith(prefix) else stage_table
     return _bounded_identifier(f"{OpenAddressesZipRecovery.__tablename__}_{suffix}")
 
 
@@ -1815,9 +1810,7 @@ async def _complete_published_generation(
             )
         live_oid = await _relation_oid(schema, live_table)
         completion_comment = _completed_generation_marker_comment(import_id, live_oid)
-        await db.status(
-            f"COMMENT ON TABLE {_qtable(schema, live_table)} IS '{completion_comment}';"
-        )
+        await db.status(f"COMMENT ON TABLE {_qtable(schema, live_table)} IS '{completion_comment}';")
         await db.status(f"DROP TABLE {_qtable(schema, marker_table)};")
 
 
@@ -1866,7 +1859,10 @@ async def _prepare_zip_recovery_table(recovery_cls, schema: str, *, reset: bool)
         await db.status(f"DROP TABLE IF EXISTS {_qtable(schema, recovery_cls.__tablename__)};")
         await db.create_table(recovery_cls.__table__, checkfirst=True)
     elif exists:
-        print(f"OpenAddresses resume: preserving existing ZIP recovery table {schema}.{recovery_cls.__tablename__}", flush=True)
+        print(
+            f"OpenAddresses resume: preserving existing ZIP recovery table {schema}.{recovery_cls.__tablename__}",
+            flush=True,
+        )
     else:
         await db.create_table(recovery_cls.__table__, checkfirst=True)
 
@@ -1883,10 +1879,7 @@ def _emit_zip_restore_progress(
     total = max(int(total_shards or 0), 1)
     done = max(int(completed_shards or 0), 0)
     pct = min((done / total) * 100.0, 100.0)
-    message = (
-        f"{done:,}/{total_shards:,} ZIP restore shards; "
-        f"{restored:,}/{candidates:,} candidates restored"
-    )
+    message = f"{done:,}/{total_shards:,} ZIP restore shards; {restored:,}/{candidates:,} candidates restored"
     progress_event_by_name = dict(
         importer="openaddresses",
         status="running",
@@ -2058,9 +2051,7 @@ async def _zip_restore_candidate_counts(
         """
     )
     candidate_counts_by_bucket = {
-        int(_row_mapping(bucket_count_row)["restore_bucket"]): int(
-            _row_mapping(bucket_count_row)["candidates"] or 0
-        )
+        int(_row_mapping(bucket_count_row)["restore_bucket"]): int(_row_mapping(bucket_count_row)["candidates"] or 0)
         for bucket_count_row in bucket_count_rows or []
     }
     return candidate_counts_by_bucket
@@ -2173,7 +2164,9 @@ async def restore_openaddresses_zips(
 
 async def _is_table_present(schema: str, table_name: str) -> bool:
     schema = _validate_schema_name(schema)
-    return bool(await db.scalar("SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=f"{schema}.{table_name}"))
+    return bool(
+        await db.scalar("SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=f"{schema}.{table_name}")
+    )
 
 
 async def _has_table_column(schema: str, table_name: str, column_name: str) -> bool:
@@ -2480,10 +2473,13 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
 ) -> OpenAddressesBackfillStats:
     """Refresh archive geocodes through bounded concurrent shards."""
     schema = _validate_schema_name(schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
-    archive_table = os.getenv(
-        "HLTHPRT_ADDRESS_ARCHIVE_TABLE",
-        "address_archive_v2",
-    ).strip() or "address_archive_v2"
+    archive_table = (
+        os.getenv(
+            "HLTHPRT_ADDRESS_ARCHIVE_TABLE",
+            "address_archive_v2",
+        ).strip()
+        or "address_archive_v2"
+    )
     source_table = OPENADDRESSES_TABLE
     state_code = _normalize_backfill_state_code(
         state_code if state_code is not None else os.getenv("HLTHPRT_OPENADDRESSES_BACKFILL_STATE_CODE")
@@ -2550,7 +2546,12 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
             match_modes=match_modes,
         )
 
-    concurrency = max(int(concurrency or _env_positive_int("HLTHPRT_OPENADDRESSES_BACKFILL_CONCURRENCY", DEFAULT_BACKFILL_CONCURRENCY)), 1)
+    concurrency = max(
+        int(
+            concurrency or _env_positive_int("HLTHPRT_OPENADDRESSES_BACKFILL_CONCURRENCY", DEFAULT_BACKFILL_CONCURRENCY)
+        ),
+        1,
+    )
     zip_prefix_length = min(
         max(
             int(
@@ -2659,7 +2660,11 @@ async def refresh_archive_geocodes_from_openaddresses(
 ) -> OpenAddressesBackfillStats:
     """Refresh missing archive geocodes from OpenAddresses."""
     schema = _validate_schema_name(schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
-    archive_table = archive_table or os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
+    archive_table = (
+        archive_table
+        or os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip()
+        or "address_archive_v2"
+    )
     state_code = _normalize_backfill_state_code(
         state_code if state_code is not None else os.getenv("HLTHPRT_OPENADDRESSES_BACKFILL_STATE_CODE")
     )
@@ -2704,9 +2709,7 @@ async def refresh_archive_geocodes_from_openaddresses(
     if state_code:
         query_params_by_name["backfill_state_code"] = state_code
     if zip_prefix:
-        query_params_by_name["backfill_zip_lower"] = _zip_prefix_lower_bound(
-            zip_prefix
-        )
+        query_params_by_name["backfill_zip_lower"] = _zip_prefix_lower_bound(zip_prefix)
         zip_upper = _zip_prefix_upper_bound(zip_prefix)
         if zip_upper:
             query_params_by_name["backfill_zip_upper"] = zip_upper
@@ -3047,13 +3050,9 @@ async def execute_openaddresses_import_task(ctx, task=None):  # pragma: no cover
         ctx["context"]["backfill_only"] = True
         shard_labels = []
         if ctx["context"]["backfill"]["state_code"]:
-            shard_labels.append(
-                f"state={ctx['context']['backfill']['state_code']}"
-            )
+            shard_labels.append(f"state={ctx['context']['backfill']['state_code']}")
         if ctx["context"]["backfill"]["zip_prefix"]:
-            shard_labels.append(
-                f"zip_prefix={ctx['context']['backfill']['zip_prefix']}"
-            )
+            shard_labels.append(f"zip_prefix={ctx['context']['backfill']['zip_prefix']}")
         print(
             "OpenAddresses backfill complete: "
             f"exact={stats.exact_updates:,} fuzzy={stats.fuzzy_updates:,} "
@@ -3199,9 +3198,7 @@ async def publish_openaddresses_generation(ctx):  # pragma: no cover
             raise RuntimeError(f"OpenAddresses staging table {schema}.{stage_table} is missing.")
 
     if should_resume_post_publish:
-        stage_rows = int(
-            await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, live_table)};") or 0
-        )
+        stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, live_table)};") or 0)
     else:
         zip_restore_stats = await restore_openaddresses_zips(
             schema=schema,
@@ -3223,10 +3220,7 @@ async def publish_openaddresses_generation(ctx):  # pragma: no cover
             "shards": zip_restore_stats.shards,
         }
 
-        stage_rows = int(
-            await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, stage_table)};")
-            or 0
-        )
+        stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, stage_table)};") or 0)
         min_rows = int(context.get("min_rows") or _env_positive_int("HLTHPRT_OPENADDRESSES_MIN_ROWS", DEFAULT_MIN_ROWS))
         if context.get("test_mode"):
             print(f"OpenAddresses test mode: staged rows={stage_rows:,}")
@@ -3235,8 +3229,7 @@ async def publish_openaddresses_generation(ctx):  # pragma: no cover
                 f"OpenAddresses stage row count {stage_rows:,} is below minimum {min_rows:,}; aborting publish."
             )
         null_zip_rows = int(
-            await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, stage_table)} WHERE zip5 IS NULL;")
-            or 0
+            await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, stage_table)} WHERE zip5 IS NULL;") or 0
         )
         if null_zip_rows:
             raise RuntimeError(f"OpenAddresses stage contains {null_zip_rows:,} rows with null zip5; aborting publish.")
@@ -3246,18 +3239,21 @@ async def publish_openaddresses_generation(ctx):  # pragma: no cover
         stage_oid = await _relation_oid(schema, stage_table)
         marker_comment = _published_recovery_marker_comment(import_date, stage_oid)
 
-        async with db.transaction():
+        async with db.transaction() as session:
+            await prepare_local_native_input_publication(
+                session,
+                ledger_schema=schema,
+                relations=((live_table, stage_table),),
+            )
             await db.status(f"DROP TABLE IF EXISTS {_qtable(schema, archived_table)};")
-            await db.status(f"ALTER TABLE IF EXISTS {_qtable(schema, live_table)} RENAME TO {_quote_ident(archived_table)};")
+            await db.status(
+                f"ALTER TABLE IF EXISTS {_qtable(schema, live_table)} RENAME TO {_quote_ident(archived_table)};"
+            )
             await db.status(f"ALTER TABLE {_qtable(schema, stage_table)} RENAME TO {_quote_ident(live_table)};")
             await db.status(
-                f"ALTER TABLE {_qtable(schema, recovery_table)} "
-                f"RENAME TO {_quote_ident(published_recovery_table)};"
+                f"ALTER TABLE {_qtable(schema, recovery_table)} RENAME TO {_quote_ident(published_recovery_table)};"
             )
-            await db.status(
-                f"COMMENT ON TABLE {_qtable(schema, published_recovery_table)} "
-                f"IS '{marker_comment}';"
-            )
+            await db.status(f"COMMENT ON TABLE {_qtable(schema, published_recovery_table)} IS '{marker_comment}';")
         context["openaddresses_stage_published"] = True
 
     stats = await refresh_archive_geocodes_from_openaddresses_sharded(
@@ -3310,14 +3306,8 @@ async def main(
         }
     )
     requested_import_id = payload.get("import_id") or payload.get("stage_suffix")
-    requested_import_id = requested_import_id or os.getenv(
-        "HLTHPRT_IMPORT_ID_OVERRIDE"
-    )
-    payload["import_id"] = (
-        _normalize_import_id(requested_import_id)
-        if requested_import_id
-        else uuid.uuid4().hex
-    )
+    requested_import_id = requested_import_id or os.getenv("HLTHPRT_IMPORT_ID_OVERRIDE")
+    payload["import_id"] = _normalize_import_id(requested_import_id) if requested_import_id else uuid.uuid4().hex
     await redis.enqueue_job("process_data", payload, _queue_name=OPENADDRESSES_QUEUE_NAME)
 
 

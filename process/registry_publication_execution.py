@@ -38,7 +38,7 @@ from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
 )
-from process.registry_company_approval_fence import lock_registry_company_approval_writer
+from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime
 from process.registry_publication_queue import (
     _document,
     _json,
@@ -214,15 +214,50 @@ async def _source_rollback_pins(connection, command, control_schema):
 
 async def _source_rollback_difference(connection, candidate_by_name, current_pin):
     units = "network_id,provider_system,provider_id,location_id"
-    row = await connection.fetchrow(
-        f"WITH proposed AS MATERIALIZED (SELECT DISTINCT {units} FROM {_identifier(candidate_by_name['schema_name'])}.network_membership),"
-        f" current_pin AS MATERIALIZED (SELECT DISTINCT {units} FROM {_identifier(current_pin.schema_name)}.network_membership) "
-        "SELECT (SELECT count(*) FROM (TABLE proposed EXCEPT TABLE current_pin) added) AS additions,"
-        "(SELECT count(*) FROM (TABLE current_pin EXCEPT TABLE proposed) removed) AS removals,"
-        f"EXISTS(SELECT 1 FROM {_identifier(candidate_by_name['schema_name'])}.network_membership "
-        "WHERE evidence_id ~ '^[0-9a-f]{64}$') AS has_imported"
+    proposed = f"{_identifier(candidate_by_name['schema_name'])}.network_membership"
+    current = f"{_identifier(current_pin.schema_name)}.network_membership"
+    proposed_units = "p." + units.replace(",", ",p.")
+    current_units = "c." + units.replace(",", ",c.")
+    order = 'network_id,provider_system COLLATE "C",provider_id COLLATE "C",location_id'
+    sample_units = " UNION ALL ".join(
+        f"(SELECT category,{units} FROM differences WHERE category='{category}' ORDER BY {order} LIMIT 20)"
+        for category in ("additions", "removals", "changes")
     )
-    return dict(row)
+    sample = f"jsonb_agg(jsonb_build_array({units}) ORDER BY {order})"
+    aggregate_record = await connection.fetchrow(
+        f'WITH proposed AS MATERIALIZED (SELECT {units},array_agg(DISTINCT evidence_id COLLATE "C" '
+        f'ORDER BY evidence_id COLLATE "C") AS evidence FROM {proposed} GROUP BY {units}),'
+        f'current_pin AS MATERIALIZED (SELECT {units},array_agg(DISTINCT evidence_id COLLATE "C" '
+        f'ORDER BY evidence_id COLLATE "C") AS evidence FROM {current} GROUP BY {units}),'
+        "differences AS MATERIALIZED ("
+        f"SELECT 'additions' AS category,{proposed_units} FROM proposed p LEFT JOIN current_pin c "
+        f"USING ({units}) WHERE c.network_id IS NULL UNION ALL "
+        f"SELECT 'removals',{current_units} FROM current_pin c LEFT JOIN proposed p "
+        f"USING ({units}) WHERE p.network_id IS NULL UNION ALL "
+        f"SELECT 'changes',{proposed_units} FROM proposed p JOIN current_pin c USING ({units}) WHERE p.evidence<>c.evidence),"
+        f"sampled AS MATERIALIZED ({sample_units}) "
+        "SELECT count(*) FILTER (WHERE category='additions') AS additions,"
+        "count(*) FILTER (WHERE category='removals') AS removals,"
+        "count(*) FILTER (WHERE category='changes') AS changes,"
+        f"jsonb_build_object('additions',COALESCE((SELECT {sample} FROM sampled "
+        "WHERE category='additions'),'[]'::jsonb),"
+        f"'removals',COALESCE((SELECT {sample} FROM sampled "
+        "WHERE category='removals'),'[]'::jsonb),"
+        f"'changes',COALESCE((SELECT {sample} FROM sampled "
+        "WHERE category='changes'),'[]'::jsonb)) AS samples,"
+        f"EXISTS(SELECT 1 FROM {proposed} WHERE evidence_id ~ '^[0-9a-f]{{64}}$') AS has_imported "
+        "FROM differences"
+    )
+    difference_by_name = dict(aggregate_record)
+    samples_by_category = _document(difference_by_name["samples"])
+    # Leave room for preview metadata under the queue result limit, retaining stable sample prefixes.
+    while len(_json(samples_by_category).encode("utf-8")) > 60 * 1024:
+        next(
+            samples_by_category[category]
+            for category in ("changes", "removals", "additions")
+            if samples_by_category[category]
+        ).pop()
+    return {**difference_by_name, "samples": samples_by_category}
 
 
 async def _verified_source_rollback_candidate(connection, copy_target, command, writer_roles, control_schema):
@@ -235,9 +270,15 @@ async def _verified_source_rollback_candidate(connection, copy_target, command, 
         command.expected_approved_revision,
     ):
         raise RegistryApprovalConflict("registry_source_rollback_candidate_conflict")
-    await verify_network_candidate_writer_closure(
-        connection, copy_target, **writer_roles, control_schema=control_schema
+    from process.network_candidate_custody import verify_network_candidate_custody
+
+    custody = await verify_network_candidate_custody(
+        connection, copy_target, control_schema=control_schema, required=False
     )
+    if custody is None:
+        await verify_network_candidate_writer_closure(
+            connection, copy_target, **writer_roles, control_schema=control_schema
+        )
     readiness = _publication_readiness(candidate_by_name)
     await _catalog_readiness(connection, copy_target.schema_name)
     if (
@@ -250,6 +291,8 @@ async def _verified_source_rollback_candidate(connection, copy_target, command, 
         "validation": _document(candidate_by_name["validation_json"]),
         "source_recipes": _document(candidate_by_name["source_recipes_json"]),
     }
+    if custody is not None:
+        readiness_receipt_by_name["candidate_custody"] = custody
     return candidate_by_name, hashlib.sha256(_json(readiness_receipt_by_name).encode()).hexdigest()
 
 
@@ -263,6 +306,7 @@ async def _source_rollback_preview_result(
     selection = verify_registry_source_selection_receipt(candidate_by_name)
     if selection is None and (difference["has_imported"] or _document(candidate_by_name["source_recipes_json"])):
         raise ValueError("registry_source_rollback_selection_unproven")
+    report = _document(candidate_by_name["validation_json"])
     result_by_name = {
         "operation": "prepare_source_rollback",
         "candidate_id": copy_target.candidate_id,
@@ -272,6 +316,25 @@ async def _source_rollback_preview_result(
         "candidate_sha256": candidate_sha256,
         "additions": difference["additions"],
         "removals": difference["removals"],
+        "diff_version": 1,
+        "changes": difference["changes"],
+        "samples": difference["samples"],
+        "validation": {
+            "state": candidate_by_name["state"],
+            "validated": report["valid"],
+            "index_ready": report["serving_readiness"]["ready"],
+            "writer_closed": True,
+            **{
+                field: report[field]
+                for field in (
+                    "membership_rows",
+                    "distinct_memberships",
+                    "projected_locations",
+                    "orphan_bindings",
+                    "unknown_network_rows",
+                )
+            },
+        },
         "unresolved_rows": 0,
         "source_selection": {field: selection[field] if selection else 0 for field in ("mapped_rows", "omitted_rows")},
     }
@@ -284,7 +347,7 @@ async def _finish_source_rollback_preview(
 ):
     source_pin, current_pin, result_by_name = preview_context
     namespace = _namespace(control_schema)
-    async with connection.transaction():
+    async with connection.transaction(isolation="repeatable_read"):
         locked = await _request(connection, request_record["request_id"], lease_id, namespace, lock=True)
         if locked["request_sha256"] != request_record["request_sha256"]:
             raise RegistryApprovalConflict("registry_queue_request_changed")
@@ -351,7 +414,15 @@ async def _source_rollback_address_sources(connection, source_pin, control_schem
 
 
 async def complete_queued_registry_source_rollback_preview(
-    connection, request_id, lease_id, *, authorize, writer_roles, control_schema=None
+    connection,
+    request_id,
+    lease_id,
+    *,
+    authorize,
+    writer_roles,
+    control_schema=None,
+    composition_runtime=None,
+    seal_candidate=None,
 ):
     """Prepare a closed READY candidate and audit its exact diff; never publish.
 
@@ -360,10 +431,13 @@ async def complete_queued_registry_source_rollback_preview(
     final audit transaction while serving readers retain their current head.
     """
     _require_outside_transaction(connection)
+    if composition_runtime is not None and type(composition_runtime) is not RegistryPublicationPTGRuntime:
+        raise ValueError("registry_publication_ptg_runtime_invalid")
+    compose = compose_registry_membership_candidate if composition_runtime is None else composition_runtime.compose
     request_record = await _request(connection, request_id, lease_id, _namespace(control_schema))
     command = await _fresh_retained_operation_authority(authorize, request_record, "prepare_source_rollback")
     source_pin, current_pin = await _source_rollback_pins(connection, command, control_schema)
-    copy_target, addresses = await compose_registry_membership_candidate(
+    copy_target, addresses = await compose(
         connection,
         request_id=request_id,
         approved_revision=command.expected_approved_revision,
@@ -374,6 +448,9 @@ async def complete_queued_registry_source_rollback_preview(
         control_schema=control_schema,
     )
     await prepare_network_candidate(connection, copy_target, addresses, **writer_roles, control_schema=control_schema)
+    if seal_candidate is not None:
+        await _fresh_retained_operation_authority(authorize, request_record, "prepare_source_rollback")
+        await seal_candidate(copy_target)
     async with connection.transaction(isolation="repeatable_read"):
         result_by_name = await _source_rollback_preview_result(
             connection, copy_target, source_pin, current_pin, command, writer_roles, control_schema
@@ -458,7 +535,7 @@ async def complete_queued_registry_source_rollback_publication(
     command_by_name = await _fresh_retained_operation_authority(authorize, request_record, "publish_source_rollback")
     async with connection.transaction(isolation="repeatable_read"):
         await _verify_source_rollback_publication_target(connection, command_by_name, writer_roles, control_schema)
-    async with connection.transaction():
+    async with connection.transaction(isolation="repeatable_read"):
         locked = await _request(connection, request_id, lease_id, namespace, lock=True)
         if locked["request_sha256"] != request_record["request_sha256"]:
             raise RegistryApprovalConflict("registry_queue_request_changed")
@@ -501,7 +578,7 @@ async def complete_queued_registry_reactivation(connection, request_id, lease_id
     namespace = _namespace(control_schema)
     request_record = await _request(connection, request_id, lease_id, namespace)
     await _fresh_reactivation_authority(authorize, request_record)
-    async with connection.transaction():
+    async with connection.transaction(isolation="repeatable_read"):
         locked_request = await _request(connection, request_id, lease_id, namespace, lock=True)
         if locked_request["request_sha256"] != request_record["request_sha256"]:
             raise RegistryApprovalConflict("registry_queue_request_changed")
@@ -541,7 +618,9 @@ async def complete_queued_registry_reactivation(connection, request_id, lease_id
         return result_by_name
 
 
-async def approve_queued_registry_publication(connection, request_id, lease_id, *, authorize, control_schema=None):
+async def approve_queued_registry_publication(
+    connection, request_id, lease_id, *, authorize, control_schema=None, plan_metadata_client=None
+):
     """Approve only selected immutable versions after fresh current authority.
 
     Approval is retained separately from preparation; serving readers retain
@@ -557,10 +636,22 @@ async def approve_queued_registry_publication(connection, request_id, lease_id, 
         if locked_request["request_sha256"] != request_record["request_sha256"]:
             raise RegistryApprovalConflict("registry_queue_request_changed")
         await _fresh_authority(authorize, locked_request)
-        await lock_registry_company_approval_writer(connection, namespace[1:-1])
-        await connection.fetchrow(f"SELECT id FROM {namespace}.registry_revision_control WHERE id=1 FOR UPDATE")
-        await _fresh_authority(authorize, locked_request)
-        return await approve_registry_records(connection, command, actor, control_schema=control_schema)
+
+        async def final_authorize():
+            """Recheck the lease and live grant after metadata and all approval locks."""
+            current = await _request(connection, request_id, lease_id, namespace, lock=True)
+            if current["request_sha256"] != request_record["request_sha256"]:
+                raise RegistryApprovalConflict("registry_queue_request_changed")
+            await _fresh_authority(authorize, current)
+
+        return await approve_registry_records(
+            connection,
+            command,
+            actor,
+            control_schema=control_schema,
+            plan_metadata_client=plan_metadata_client,
+            final_authorize=final_authorize,
+        )
 
 
 async def _approval(connection, namespace, request_record):
@@ -580,14 +671,57 @@ async def _approval(connection, namespace, request_record):
     }
 
 
+async def _finish_approved_publication(
+    connection, request_id, lease_id, copy_target, approval_by_name, policy_revision, candidate_scope, control_schema
+):
+    """Publish and finish its exact success receipt inside the caller's already-fenced transaction."""
+    manifest_by_name = await publish_network_candidate(connection, copy_target, control_schema=control_schema)
+    receipt_by_name = {
+        **approval_by_name,
+        "serving_generation": manifest_by_name["generation_id"],
+        "policy_revision": policy_revision,
+        **_source_selection_counts(dict(candidate_scope)),
+    }
+    await finish_registry_publication_request(
+        connection, request_id, lease_id, state="completed", result=receipt_by_name, control_schema=control_schema
+    )
+    return receipt_by_name
+
+
+def _require_candidate_approval(candidate_scope, approval_by_name, command_by_name):
+    """Require the candidate's approved revision and expected head to match the fenced command."""
+    if candidate_scope is None or (
+        candidate_scope["approved_custom_revision"],
+        candidate_scope["expected_head"],
+    ) != (
+        approval_by_name["approved_revision"],
+        command_by_name["expected_serving_generation"],
+    ):
+        raise RegistryApprovalConflict("registry_queue_approved_revision_conflict")
+
+
 async def complete_queued_registry_publication(
-    connection, request_id, lease_id, copy_target, address_source, *, authorize, writer_roles, control_schema=None
+    connection,
+    request_id,
+    lease_id,
+    copy_target,
+    address_source,
+    *,
+    authorize,
+    writer_context,
+    seal_candidate=None,
 ):
     """Prepare, reauthorize, then commit the manifest and exact success receipt together.
 
     Lease expiry, revocation or a changed head preserves a closed candidate and
     the serving manifest. The controller uses a separate connection to renew.
     """
+    from process.registry_publication_consumer import RegistryPublicationConsumerConfig
+
+    if type(writer_context) is not RegistryPublicationConsumerConfig:
+        raise ValueError("registry_publication_consumer_config_invalid")
+    writer_roles = writer_context.writer_roles
+    control_schema = writer_context.control_schema
     _require_outside_transaction(connection)
     namespace = _namespace(control_schema)
     await _request(connection, request_id, lease_id, namespace)
@@ -596,7 +730,9 @@ async def complete_queued_registry_publication(
     )
     request_record = await _request(connection, request_id, lease_id, namespace)
     await _fresh_authority(authorize, request_record)
-    async with connection.transaction():
+    if seal_candidate is not None:
+        await seal_candidate(copy_target)
+    async with connection.transaction(isolation="repeatable_read"):
         locked_request = await _request(connection, request_id, lease_id, namespace, lock=True)
         if locked_request["request_sha256"] != request_record["request_sha256"]:
             raise RegistryApprovalConflict("registry_queue_request_changed")
@@ -606,30 +742,22 @@ async def complete_queued_registry_publication(
         policy_revision = await _fresh_authority(authorize, locked_request)
         approval_by_name = await _approval(connection, namespace, locked_request)
         candidate_scope = await connection.fetchrow(
-            f"SELECT approved_custom_revision,expected_head,validation_json,source_generations,source_recipes_json "
+            f"SELECT approved_custom_revision,expected_head,expected_rows,validation_json,source_generations,source_recipes_json "
             f"FROM {namespace}.network_membership_candidate WHERE candidate_id=$1",
             UUID(copy_target.candidate_id),
         )
         command_by_name = _document(locked_request["command_json"])
-        if candidate_scope is None or (
-            candidate_scope["approved_custom_revision"],
-            candidate_scope["expected_head"],
-        ) != (
-            approval_by_name["approved_revision"],
-            command_by_name["expected_serving_generation"],
-        ):
-            raise RegistryApprovalConflict("registry_queue_approved_revision_conflict")
-        manifest_by_name = await publish_network_candidate(connection, copy_target, control_schema=control_schema)
-        receipt_by_name = {
-            **approval_by_name,
-            "serving_generation": manifest_by_name["generation_id"],
-            "policy_revision": policy_revision,
-            **_source_selection_counts(dict(candidate_scope)),
-        }
-        await finish_registry_publication_request(
-            connection, request_id, lease_id, state="completed", result=receipt_by_name, control_schema=control_schema
+        _require_candidate_approval(candidate_scope, approval_by_name, command_by_name)
+        return await _finish_approved_publication(
+            connection,
+            request_id,
+            lease_id,
+            copy_target,
+            approval_by_name,
+            policy_revision,
+            candidate_scope,
+            control_schema,
         )
-        return receipt_by_name
 
 
 def _source_selection_counts(candidate):

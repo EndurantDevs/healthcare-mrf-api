@@ -468,6 +468,7 @@ async def test_registry_move_preserves_standalone_sequence_identity(monkeypatch,
 async def test_read_bridge_retirement_rolls_back_when_locked_view_identity_changes(monkeypatch):
     connection = OperatorDatabase()
     connection.fetchval = AsyncMock(return_value=True)
+    connection.fetchrow = AsyncMock(return_value=None)
     connection.execute = AsyncMock()
     for name in ("_provisioning_scope", "verify_registry_management_permissions", "_require_source_custody"):
         monkeypatch.setattr(permissions, name, AsyncMock())
@@ -487,4 +488,8 @@ async def test_read_bridge_retirement_rolls_back_when_locked_view_identity_chang
     connection.execute.assert_awaited_once_with(
         'LOCK TABLE "example_registry"."company_registry" IN ACCESS SHARE MODE NOWAIT'
     )
+    from db.registry_aca_source_notification import TABLE
+
+    connection.fetchrow.assert_awaited_once()
+    assert connection.fetchrow.await_args.args[1:] == ("example_registry", TABLE)
     assert connection.events == ["begin", "rollback"]

@@ -7,6 +7,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import asyncpg
 import pytest
 
 from process import network_cms_registry_address_equivalence as equivalence
@@ -140,3 +141,20 @@ async def test_stage_mapping_is_closed_before_native_capture(mapping_change):
         )
     session.execute.assert_not_awaited()
     session.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("database_abort", [False, True])
+async def test_failed_capture_preserves_original_error_when_restoring_search_path(monkeypatch, database_abort):
+    original = asyncpg.QueryCanceledError("catalog timeout") if database_abort else ValueError("catalog refused")
+    session = SimpleNamespace(scalar=AsyncMock(return_value="original_path"), execute=AsyncMock())
+    if database_abort:
+        session.execute.side_effect = [None, asyncpg.InFailedSQLTransactionError("transaction aborted")]
+    monkeypatch.setattr(equivalence, "_native_capture_catalog", AsyncMock(side_effect=original))
+    names = sorted(model.__tablename__ for model in equivalence.receipt._models())
+    with pytest.raises(type(original)) as caught:
+        await equivalence._native_capture(
+            session, "synthetic", tuple((name, number + 1) for number, name in enumerate(names)), verify_content=False
+        )
+    assert caught.value is original
+    assert session.execute.await_args.args[1] == {"path": "original_path"}

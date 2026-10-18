@@ -21,7 +21,13 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from db.connection import Base
 from db.registry_schema import registry_schema
 
-__all__ = ("NetworkMembershipCandidate", "NetworkMembershipBatch", "NetworkServingManifest", "NetworkServingControl")
+__all__ = (
+    "NetworkMembershipCandidate",
+    "NetworkMembershipBatch",
+    "NetworkServingManifest",
+    "NetworkServingControl",
+    "NetworkCandidateCustody",
+)
 _SCHEMA = registry_schema()
 
 
@@ -152,3 +158,25 @@ class NetworkServingControl(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=False)
     generation_id = Column(BigInteger, ForeignKey(f"{_SCHEMA}.network_serving_manifest.generation_id"))
+
+
+class NetworkCandidateCustody(Base):
+    """Independent owner-only proof; ordinary execution receives SELECT only."""
+
+    __tablename__ = "network_candidate_custody"
+    __runtime_schema_sync__ = False
+    __table_args__ = (
+        CheckConstraint("seal_sha256 ~ '^[0-9a-f]{64}$'", name="network_custody_digest"),
+        CheckConstraint(
+            "jsonb_typeof(receipt_json)='object' AND octet_length(receipt_json::text)<=2097152",
+            name="network_custody_receipt",
+        ),
+        {"schema": _SCHEMA},
+    )
+
+    candidate_id = Column(
+        UUID(as_uuid=True), ForeignKey(f"{_SCHEMA}.network_membership_candidate.candidate_id"), primary_key=True
+    )
+    seal_sha256 = Column(String(64), nullable=False)
+    receipt_json = Column(JSONB, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())

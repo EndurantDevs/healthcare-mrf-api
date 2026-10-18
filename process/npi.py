@@ -23,13 +23,21 @@ from asyncpg import DuplicateTableError
 from dateutil.parser import parse as parse_date
 from sqlalchemy import func, select
 
-from db.models import (AddressArchive, NPIAddress, NPIData,
-                       NPIDataOtherIdentifier, NPIDataTaxonomy,
-                       NPIDataTaxonomyGroup, NPIPhoneStaffing, db)
+from db.models import (
+    AddressArchive,
+    NPIAddress,
+    NPIData,
+    NPIDataOtherIdentifier,
+    NPIDataTaxonomy,
+    NPIDataTaxonomyGroup,
+    NPIPhoneStaffing,
+    db,
+)
+from process import nppes_public_evidence_catalog as nppes_catalog
+from process import provider_directory_generic_source_policy as source_policy
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import suppress_control_run_heartbeat_persistence
 from process.entity_address_cutover_contract import lock_live_serving_relations, wait_for_publication_lock
-from process.ext.archive import unzip
 from process.ext.address_canon import (
     address_key_v1,
     archive_table_name,
@@ -39,31 +47,45 @@ from process.ext.address_canon import (
 )
 from process.ext.address_fast import canonicalize_batch as canonicalize_address_batch
 from process.ext.address_format import ADDRESS_FORMAT_FUNCTION
+from process.ext.archive import unzip
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
-from process.ext.utils import (download_it, download_it_and_save,
-                               ensure_database, make_class, my_init_db,
-                               print_time_info, push_objects, return_checksum)
+from process.ext.utils import (
+    download_it,
+    download_it_and_save,
+    ensure_database,
+    make_class,
+    my_init_db,
+    print_time_info,
+    push_objects,
+    return_checksum,
+)
 from process.live_progress import enqueue_live_progress
 from process.npi_canonical_publication import (
     NPI_CANONICAL_TABLES,
     NpiCanonicalPublicationInput,
     publication_error,
+)
+from process.npi_canonical_publication import (
     receipt_metrics as npi_publication_metrics,
 )
 from process.npi_canonical_publication_store import (
     NpiCanonicalPublicationCommit,
     canonical_relation_oids,
+    has_settled_npi_publication,
     insert_npi_publication_receipt,
     load_committed_npi_publication,
     lock_npi_publication_attempt,
-    has_settled_npi_publication,
     mark_npi_publication_succeeded,
 )
 from process.npi_result_generation import (
     install_npi_result_revision_guards,
     publish_local_npi_result_generation,
 )
-from process.nppes_public_evidence_catalog import assert_nppes_admission_catalog
+from process.nppes_public_evidence_chain_rows import (
+    CHAIN_ARCHIVE_COLUMNS,
+    build_nppes_chain_storage_rows,
+    chain_archive_values,
+)
 from process.nppes_public_evidence_import import (
     NppesEvidenceRuntimeConfig,
     import_nppes_public_evidence_chain,
@@ -77,9 +99,10 @@ from process.nppes_public_evidence_scratch import (
     assert_nppes_scratch_capacity,
     resolve_nppes_scratch_root,
 )
+from process.nppes_public_evidence_storage import resolve_nppes_chain_families
 from process.openaddresses import refresh_archive_geocodes_from_openaddresses_sharded
 
-latin_pattern= re.compile(r'[^\x00-\x7f]')
+latin_pattern = re.compile(r"[^\x00-\x7f]")
 
 TEST_NPI_MAX_FILES = 1
 TEST_NPI_ROWS = 1000
@@ -102,9 +125,7 @@ _NPI_CONTROL_TERMINAL_COMMITTED_KEY = "control_run_terminal_committed"
 _NPI_CONTROL_COMMITTED_HEARTBEAT_AT_KEY = "_control_committed_heartbeat_at"
 _NPI_CONTROL_COMMITTED_FINISHED_AT_KEY = "_control_committed_finished_at"
 _NPI_CONTROL_COMMITTED_RESULT_KEY = "_control_committed_result"
-_NPI_PRIVATE_SOURCE_FIELDS = frozenset(
-    {"employer_identification_number", "parent_organization_tin"}
-)
+_NPI_PRIVATE_SOURCE_FIELDS = frozenset({"employer_identification_number", "parent_organization_tin"})
 _NPI_STAGING_CLASSES = (
     NPIData,
     NPIDataTaxonomyGroup,
@@ -164,9 +185,7 @@ def _release_lease_after_shutdown(finalize_attempt):
                 await _release_npi_import_lease(context, suppress_errors=True)
             raise
         if isinstance(context, dict):
-            is_committed = bool(
-                context.get(_NPI_CONTROL_TERMINAL_COMMITTED_KEY)
-            )
+            is_committed = bool(context.get(_NPI_CONTROL_TERMINAL_COMMITTED_KEY))
             try:
                 await _release_npi_import_lease(
                     context,
@@ -234,13 +253,9 @@ def _required_nppes_evidence_receipt(context: dict):
     """Normalize a missing or malformed required-mode receipt at the NPI boundary."""
 
     try:
-        validated = validate_nppes_public_evidence_chain_receipt(
-            context.get(_NPPES_EVIDENCE_RECEIPT_KEY)
-        )
+        validated = validate_nppes_public_evidence_chain_receipt(context.get(_NPPES_EVIDENCE_RECEIPT_KEY))
     except Exception:
-        normalized_error = NPIPrerequisiteError(
-            "NPPES public-evidence admission receipt is invalid"
-        )
+        normalized_error = NPIPrerequisiteError("NPPES public-evidence admission receipt is invalid")
     else:
         return validated
     raise normalized_error
@@ -281,15 +296,8 @@ def _required_npi_control_attempt(
     """Return the exact wrapper attempt authorized to publish live tables."""
 
     attempt_id = str(context.get(_NPI_CONTROL_ATTEMPT_ID_KEY) or "").strip()
-    attempt_started_at = str(
-        context.get(_NPI_CONTROL_ATTEMPT_STARTED_AT_KEY) or ""
-    ).strip()
-    if (
-        not run_id
-        or not attempt_id
-        or not attempt_started_at
-        or not attempt_id.startswith(run_id + ":")
-    ):
+    attempt_started_at = str(context.get(_NPI_CONTROL_ATTEMPT_STARTED_AT_KEY) or "").strip()
+    if not run_id or not attempt_id or not attempt_started_at or not attempt_id.startswith(run_id + ":"):
         raise NPIPrerequisiteError("NPI control attempt identity is missing")
     return attempt_id, attempt_started_at
 
@@ -299,7 +307,7 @@ def _canonical_publication_import_date(import_date: str) -> str:
 
     try:
         return datetime.datetime.strptime(import_date, "%Y%m%d").date().isoformat()
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise NPIPrerequisiteError("NPI import date is invalid") from None
 
 
@@ -310,7 +318,7 @@ def _canonical_publication_row_counts(
 
     try:
         counts = tuple(counts_by_table[table] for table in NPI_CANONICAL_TABLES)
-    except (KeyError, TypeError):
+    except KeyError, TypeError:
         raise NPIPrerequisiteError("NPI staging census is incomplete") from None
     if any(type(count) is not int or count < 0 for count in counts):
         raise NPIPrerequisiteError("NPI staging census is invalid")
@@ -360,13 +368,8 @@ async def _archive_npi_index(
     fixed_schema = _postgres_identifier(schema)
     fixed_index = _postgres_identifier(index_name)
     archived_name = _postgres_identifier(_archived_identifier(fixed_index))
-    await connection.execute(
-        f"DROP INDEX IF EXISTS {fixed_schema}.{archived_name};"
-    )
-    await connection.execute(
-        f"ALTER INDEX IF EXISTS {fixed_schema}.{fixed_index} "
-        f"RENAME TO {archived_name};"
-    )
+    await connection.execute(f"DROP INDEX IF EXISTS {fixed_schema}.{archived_name};")
+    await connection.execute(f"ALTER INDEX IF EXISTS {fixed_schema}.{fixed_index} RENAME TO {archived_name};")
 
 
 async def _lock_npi_publication_relations(connection, *, schema, stage_table_by_live_table):
@@ -389,7 +392,8 @@ async def _lock_npi_publication_relations(connection, *, schema, stage_table_by_
         raise NPIPrerequisiteError("NPI staging table disappeared before publication")
     private_names = tuple(name for name in installed_names if name not in stage_table_by_live_table)
     await connection.execute(
-        "LOCK TABLE " + ", ".join(f"{_postgres_identifier(schema)}.{name}" for name in private_names)
+        "LOCK TABLE "
+        + ", ".join(f"{_postgres_identifier(schema)}.{name}" for name in private_names)
         + " IN ACCESS EXCLUSIVE MODE NOWAIT"
     )
     await lock_live_serving_relations(
@@ -410,24 +414,19 @@ async def _rotate_npi_canonical_table(
     fixed_schema = _postgres_identifier(schema)
     fixed_live = _postgres_identifier(live_table)
     fixed_stage = _postgres_identifier(stage_table)
-    await connection.execute(
-        f"DROP TABLE IF EXISTS {fixed_schema}.{fixed_live}_old;"
-    )
-    await connection.execute(
-        f"ALTER TABLE IF EXISTS {fixed_schema}.{fixed_live} "
-        f"RENAME TO {fixed_live}_old;"
-    )
-    await connection.execute(
-        f"ALTER TABLE {fixed_schema}.{fixed_stage} RENAME TO {fixed_live};"
-    )
+    from process.native_publication_read_access import preserve_publication_reads
+
+    await preserve_publication_reads(connection, schema=fixed_schema, live_table=fixed_live, stage_table=fixed_stage)
+    await connection.execute(f"DROP TABLE IF EXISTS {fixed_schema}.{fixed_live}_old;")
+    await connection.execute(f"ALTER TABLE IF EXISTS {fixed_schema}.{fixed_live} RENAME TO {fixed_live}_old;")
+    await connection.execute(f"ALTER TABLE {fixed_schema}.{fixed_stage} RENAME TO {fixed_live};")
     await _archive_npi_index(
         connection,
         schema=fixed_schema,
         index_name=f"{fixed_live}_idx_primary",
     )
     await connection.execute(
-        f"ALTER INDEX IF EXISTS {fixed_schema}.{fixed_stage}_idx_primary "
-        f"RENAME TO {fixed_live}_idx_primary;"
+        f"ALTER INDEX IF EXISTS {fixed_schema}.{fixed_stage}_idx_primary RENAME TO {fixed_live}_idx_primary;"
     )
     for index_suffix in index_suffixes:
         fixed_suffix = _postgres_identifier(index_suffix)
@@ -452,38 +451,81 @@ async def _assert_nppes_canonical_stage_parity(
     fixed_receipt = validate_nppes_public_evidence_chain_receipt(receipt)
     schema = _postgres_identifier(db_schema)
     stage_table = _postgres_identifier(make_class(NPIData, import_date).__tablename__)
-    query = _nppes_canonical_parity_query(schema, stage_table)
-    async with db.acquire_driver() as connection:
-        parity = await connection.fetchrow(query, fixed_receipt.chain_ref)
-    if not _is_nppes_parity_zero(parity):
-        raise NPIPrerequisiteError(
-            "Canonical NPI staging does not match admitted NPPES evidence"
+    async with source_policy.source_transaction(db, isolation="repeatable read"):
+        publisher = source_policy.bound_publisher()
+        if publisher.policy.schema != schema:
+            raise NPIPrerequisiteError("NPPES source policy schema does not match NPI staging")
+        connection = publisher.connection
+        families = await resolve_nppes_chain_families(connection, schema, fixed_receipt.chain_ref)
+        _, expected_archives = build_nppes_chain_storage_rows(fixed_receipt)
+        stored_archives = await connection.fetch(
+            f"SELECT {', '.join(CHAIN_ARCHIVE_COLUMNS)} FROM "
+            f'"{schema}".public_evidence_nppes_registry_chain_archive '
+            "WHERE chain_ref=$1 ORDER BY archive_ordinal",
+            fixed_receipt.chain_ref,
         )
+        if (
+            type(families) is not tuple
+            or len(families) != len(expected_archives)
+            or tuple(tuple(archive_row[column] for column in CHAIN_ARCHIVE_COLUMNS) for archive_row in stored_archives)
+            != tuple(chain_archive_values(archive_row) for archive_row in expected_archives)
+        ):
+            raise NPIPrerequisiteError("NPPES source chain vector does not match admitted evidence")
+        member_tables = tuple(_postgres_identifier(family["member"]["name"]) for family in families)
+        member_oids = tuple(family["member"]["oid"] for family in families)
+        if (
+            not member_tables
+            or len(set(member_tables)) != len(member_tables)
+            or any(type(oid) is not int or oid <= 0 for oid in member_oids)
+            or len(set(member_oids)) != len(member_oids)
+        ):
+            raise NPIPrerequisiteError("NPPES member relation binding is invalid")
+        relations = tuple(f'"{schema}"."{table}"' for table in member_tables)
+        await connection.execute("LOCK TABLE " + ", ".join(relations) + " IN ACCESS SHARE MODE")
+        locked_oids = await connection.fetchval(
+            "SELECT array_agg(to_regclass(name)::oid ORDER BY ordinal) "
+            "FROM unnest($1::text[]) WITH ORDINALITY expected(name, ordinal)",
+            list(relations),
+        )
+        if locked_oids is None or tuple(locked_oids) != member_oids:
+            raise NPIPrerequisiteError("NPPES member relation binding changed")
+        query = _nppes_canonical_parity_query(schema, stage_table, member_tables)
+        parity = await connection.fetchrow(query)
+    if not _is_nppes_parity_zero(parity):
+        raise NPIPrerequisiteError("Canonical NPI staging does not match admitted NPPES evidence")
 
 
-def _nppes_canonical_parity_query(schema: str, stage_table: str) -> str:
+def _nppes_canonical_parity_query(schema: str, stage_table: str, member_tables: tuple[str, ...]) -> str:
+    schema = _postgres_identifier(schema)
+    stage_table = _postgres_identifier(stage_table)
+    if not member_tables:
+        raise NPIPrerequisiteError("NPPES member relation binding is invalid")
+    members = " UNION ALL ".join(
+        "SELECT npi, entity_type_code, provider_enumeration_date, last_update_date, "
+        f"npi_deactivation_date, npi_reactivation_date, {ordinal}::bigint AS archive_ordinal "
+        f'FROM "{schema}"."{_postgres_identifier(table)}"'
+        for ordinal, table in enumerate(member_tables)
+    )
     return f"""
-        WITH selected_members AS (
-            SELECT member.npi,
-                   member.payload_sha256,
+        WITH family_members AS ({members}), selected_members AS (
+            SELECT member.*,
                    row_number() OVER (
                        PARTITION BY member.npi
-                       ORDER BY archive.archive_ordinal DESC
+                       ORDER BY member.archive_ordinal DESC
                    ) AS newest
-              FROM {schema}.public_evidence_nppes_registry_chain_archive AS archive
-              JOIN {schema}.public_evidence_nppes_registry_member AS member
-                ON member.admission_ref = archive.admission_ref
-             WHERE archive.chain_ref = $1
+              FROM family_members AS member
         ), latest_members AS (
-            SELECT npi, payload_sha256
+            SELECT *
               FROM selected_members
              WHERE newest = 1
         ), comparison AS (
             SELECT member.npi,
                    stage.npi IS NULL AS missing_stage,
                    CASE WHEN stage.npi IS NULL THEN false ELSE
-                       member.payload_sha256 IS DISTINCT FROM
-                       {schema}.nppes_registry_payload_digest(
+                       ROW(member.npi, member.entity_type_code,
+                           member.provider_enumeration_date, member.last_update_date,
+                           member.npi_deactivation_date, member.npi_reactivation_date)
+                       IS DISTINCT FROM ROW(
                            stage.npi::text,
                            stage.entity_type_code::text,
                            stage.provider_enumeration_date,
@@ -493,19 +535,19 @@ def _nppes_canonical_parity_query(schema: str, stage_table: str) -> str:
                        )
                    END AS payload_mismatch
               FROM latest_members AS member
-              LEFT JOIN {schema}.{stage_table} AS stage
+              LEFT JOIN "{schema}"."{stage_table}" AS stage
                 ON stage.npi::text = member.npi
         )
         SELECT count(*) FILTER (WHERE missing_stage) AS missing_count,
                count(*) FILTER (WHERE payload_mismatch) AS mismatch_count,
                (SELECT count(*)
-                  FROM {schema}.{stage_table} AS stage
+                  FROM "{schema}"."{stage_table}" AS stage
                  WHERE NOT EXISTS (
                     SELECT 1 FROM latest_members AS member
                      WHERE member.npi = stage.npi::text
                  )) AS unexpected_count,
                (SELECT count(*)
-                  FROM {schema}.{stage_table}
+                  FROM "{schema}"."{stage_table}"
                  WHERE employer_identification_number IS NOT NULL
                     OR parent_organization_tin IS NOT NULL) AS private_count
           FROM comparison
@@ -616,9 +658,7 @@ async def _assert_nppes_postgres_runtime(context: dict) -> None:
         or not 180_000 <= settings[0] < 190_000
         or settings[1:] != ("on", "on", "on", "pglz")
     ):
-        raise NPIPrerequisiteError(
-            "NPPES PostgreSQL durability configuration is invalid"
-        )
+        raise NPIPrerequisiteError("NPPES PostgreSQL durability configuration is invalid")
 
 
 async def _assert_nppes_storage_catalog(context: dict, schema: str) -> None:
@@ -627,7 +667,12 @@ async def _assert_nppes_storage_catalog(context: dict, schema: str) -> None:
     lease = context.get(_NPI_IMPORT_LEASE_KEY)
     if type(lease) is not _NpiImportLease:
         raise NPIPrerequisiteError("NPI import lease is missing")
-    await assert_nppes_admission_catalog(lease.connection, schema)
+    schema = _postgres_identifier(schema)
+    async with source_policy.source_transaction(db):
+        publisher = source_policy.bound_publisher()
+        if publisher.policy.schema != schema:
+            raise NPIPrerequisiteError("NPPES source policy schema does not match NPI staging")
+        await nppes_catalog.assert_nppes_candidate_catalog(publisher.connection, schema, publisher.policy)
 
 
 async def _release_npi_import_lease(
@@ -698,7 +743,7 @@ def _env_positive_int(name: str, default: int) -> int:
     try:
         value = int(raw)
         return value if value > 0 else default
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
@@ -768,9 +813,7 @@ async def _assert_nucc_ready(schema: str) -> None:
 async def _assert_nppes_canonical_ready(schema: str) -> None:
     if not source_enabled("nppes"):
         return
-    function_exists = await db.scalar(
-        f"SELECT to_regprocedure('{schema}.addr_key_v1(text,text,text,text,text,text)');"
-    )
+    function_exists = await db.scalar(f"SELECT to_regprocedure('{schema}.addr_key_v1(text,text,text,text,text,text)');")
     if not function_exists:
         raise NPIPrerequisiteError(
             f"NPI canonical address mode requires {schema}.addr_key_v1(...). "
@@ -795,9 +838,7 @@ async def _assert_nppes_canonical_ready(schema: str) -> None:
         """
     )
     if not archive_has_key:
-        raise NPIPrerequisiteError(
-            f"NPI canonical address mode requires {schema}.{archive_table}.address_key."
-        )
+        raise NPIPrerequisiteError(f"NPI canonical address mode requires {schema}.{archive_table}.address_key.")
 
 
 async def _ensure_required_extensions() -> None:
@@ -887,7 +928,7 @@ def _taxonomy_array_from_npi_row(row: dict, taxonomy_int_code_map: dict[str, int
         return [0]
     int_codes: set[int] = set()
     for i in range(1, 16):
-        taxonomy_code = row.get(f'Healthcare Provider Taxonomy Code_{i}')
+        taxonomy_code = row.get(f"Healthcare Provider Taxonomy Code_{i}")
         if not taxonomy_code:
             break
         int_code = taxonomy_int_code_map.get(taxonomy_code)
@@ -908,22 +949,24 @@ def _npi_record_from_source_row(
         if normalized_field_name in _NPI_PRIVATE_SOURCE_FIELDS:
             npi_record_by_field[normalized_field_name] = None
             continue
-        if not normalized_field_value or str(normalized_field_value).upper() == '<UNAVAIL>':
+        if not normalized_field_value or str(normalized_field_value).upper() == "<UNAVAIL>":
             npi_record_by_field[normalized_field_name] = None
             continue
-        if normalized_field_name in ('replacement_npi', 'entity_type_code', 'npi',):
+        if normalized_field_name in (
+            "replacement_npi",
+            "entity_type_code",
+            "npi",
+        ):
             normalized_field_value = int(normalized_field_value)
-        elif normalized_field_name.endswith('_date'):
-            normalized_field_value = pytz.utc.localize(
-                parse_date(normalized_field_value, fuzzy=True)
-            )
+        elif normalized_field_name.endswith("_date"):
+            normalized_field_value = pytz.utc.localize(parse_date(normalized_field_value, fuzzy=True))
         npi_record_by_field[normalized_field_name] = normalized_field_value
     return npi_record_by_field
 
 
 async def process_npi_chunk(ctx, task):
     """Parse one NPPES CSV chunk and enqueue or persist normalized rows."""
-    redis = ctx['redis']
+    redis = ctx["redis"]
     canonical_addresses_enabled = source_enabled("nppes")
     taxonomy_int_code_map = task.get("taxonomy_int_code_map") or {}
 
@@ -933,132 +976,137 @@ async def process_npi_chunk(ctx, task):
     npi_taxonomy_group_list_dict = {}
     npi_address_list_dict = {}
 
-    npi_csv_map = task['npi_csv_map']
-    npi_csv_map_reverse = task['npi_csv_map_reverse']
-    for npi_source_row in task['row_list']:
+    npi_csv_map = task["npi_csv_map"]
+    npi_csv_map_reverse = task["npi_csv_map_reverse"]
+    for npi_source_row in task["row_list"]:
         npi_obj_list.append(_npi_record_from_source_row(npi_source_row, npi_csv_map))
         taxonomy_array = _taxonomy_array_from_npi_row(npi_source_row, taxonomy_int_code_map)
 
-        if npi_source_row['Provider First Line Business Practice Location Address']:
+        if npi_source_row["Provider First Line Business Practice Location Address"]:
             address_record_by_field = {
-                'first_line': npi_source_row['Provider First Line Business Practice Location Address'],
-                'second_line': npi_source_row['Provider Second Line Business Practice Location Address'],
-                'city_name': npi_source_row.get('Provider Business Practice Location Address City Name', '').upper(),
-                'state_name': npi_source_row.get('Provider Business Practice Location Address State Name', '').upper(),
-                'postal_code': npi_source_row['Provider Business Practice Location Address Postal Code'],
-                'country_code': npi_source_row[
-                    'Provider Business Practice Location Address Country Code (If outside U.S.)'
+                "first_line": npi_source_row["Provider First Line Business Practice Location Address"],
+                "second_line": npi_source_row["Provider Second Line Business Practice Location Address"],
+                "city_name": npi_source_row.get("Provider Business Practice Location Address City Name", "").upper(),
+                "state_name": npi_source_row.get("Provider Business Practice Location Address State Name", "").upper(),
+                "postal_code": npi_source_row["Provider Business Practice Location Address Postal Code"],
+                "country_code": npi_source_row[
+                    "Provider Business Practice Location Address Country Code (If outside U.S.)"
                 ],
             }
 
-            address_record_by_field.update({
-                'checksum': return_checksum(list(address_record_by_field.values())),  # addresses have blank symbols
-                'npi': int(npi_source_row['NPI']),
-                'type': 'primary',
-                'telephone_number': npi_source_row['Provider Business Practice Location Address Telephone Number'],
-                'fax_number': npi_source_row['Provider Business Practice Location Address Fax Number'],
-                'taxonomy_array': taxonomy_array,
-                'date_added': pytz.utc.localize(parse_date(npi_source_row['Last Update Date'], fuzzy=True))
-                if npi_source_row['Last Update Date']
-                else None,
-            })
-            address_key = '_'.join([
-                str(address_record_by_field['npi']),
-                str(address_record_by_field['checksum']),
-                address_record_by_field['type'],
-            ])
+            address_record_by_field.update(
+                {
+                    "checksum": return_checksum(list(address_record_by_field.values())),  # addresses have blank symbols
+                    "npi": int(npi_source_row["NPI"]),
+                    "type": "primary",
+                    "telephone_number": npi_source_row["Provider Business Practice Location Address Telephone Number"],
+                    "fax_number": npi_source_row["Provider Business Practice Location Address Fax Number"],
+                    "taxonomy_array": taxonomy_array,
+                    "date_added": pytz.utc.localize(parse_date(npi_source_row["Last Update Date"], fuzzy=True))
+                    if npi_source_row["Last Update Date"]
+                    else None,
+                }
+            )
+            address_key = "_".join(
+                [
+                    str(address_record_by_field["npi"]),
+                    str(address_record_by_field["checksum"]),
+                    address_record_by_field["type"],
+                ]
+            )
             npi_address_list_dict[address_key] = address_record_by_field
 
-        if npi_source_row['Provider First Line Business Mailing Address']:
+        if npi_source_row["Provider First Line Business Mailing Address"]:
             address_record_by_field = {
-                'first_line': npi_source_row['Provider First Line Business Mailing Address'],
-                'second_line': npi_source_row['Provider Second Line Business Mailing Address'],
-                'city_name': npi_source_row.get('Provider Business Mailing Address City Name', '').upper(),
-                'state_name': npi_source_row.get('Provider Business Mailing Address State Name', '').upper(),
-                'postal_code': npi_source_row['Provider Business Mailing Address Postal Code'],
-                'country_code': npi_source_row[
-                    'Provider Business Mailing Address Country Code (If outside U.S.)'
-                ],
+                "first_line": npi_source_row["Provider First Line Business Mailing Address"],
+                "second_line": npi_source_row["Provider Second Line Business Mailing Address"],
+                "city_name": npi_source_row.get("Provider Business Mailing Address City Name", "").upper(),
+                "state_name": npi_source_row.get("Provider Business Mailing Address State Name", "").upper(),
+                "postal_code": npi_source_row["Provider Business Mailing Address Postal Code"],
+                "country_code": npi_source_row["Provider Business Mailing Address Country Code (If outside U.S.)"],
             }
 
-            address_record_by_field.update({
-                'checksum': return_checksum(list(address_record_by_field.values())),  # addresses have blank symbols
-                'npi': int(npi_source_row['NPI']),
-                'type': 'mail',
-                'telephone_number': npi_source_row['Provider Business Mailing Address Telephone Number'],
-                'fax_number': npi_source_row['Provider Business Mailing Address Fax Number'],
-                'taxonomy_array': taxonomy_array,
-                'date_added': pytz.utc.localize(parse_date(npi_source_row['Last Update Date'], fuzzy=True))
-                if npi_source_row['Last Update Date']
-                else None,
-            })
-            address_key = '_'.join([
-                str(address_record_by_field['npi']),
-                str(address_record_by_field['checksum']),
-                address_record_by_field['type'],
-            ])
+            address_record_by_field.update(
+                {
+                    "checksum": return_checksum(list(address_record_by_field.values())),  # addresses have blank symbols
+                    "npi": int(npi_source_row["NPI"]),
+                    "type": "mail",
+                    "telephone_number": npi_source_row["Provider Business Mailing Address Telephone Number"],
+                    "fax_number": npi_source_row["Provider Business Mailing Address Fax Number"],
+                    "taxonomy_array": taxonomy_array,
+                    "date_added": pytz.utc.localize(parse_date(npi_source_row["Last Update Date"], fuzzy=True))
+                    if npi_source_row["Last Update Date"]
+                    else None,
+                }
+            )
+            address_key = "_".join(
+                [
+                    str(address_record_by_field["npi"]),
+                    str(address_record_by_field["checksum"]),
+                    address_record_by_field["type"],
+                ]
+            )
             npi_address_list_dict[address_key] = address_record_by_field
 
         for i in range(1, 16):
-            if npi_source_row[f'Healthcare Provider Taxonomy Code_{i}']:
+            if npi_source_row[f"Healthcare Provider Taxonomy Code_{i}"]:
                 taxonomy_record_by_field = {
-                    'npi': int(npi_source_row[npi_csv_map_reverse['npi']]),
-                    'healthcare_provider_taxonomy_code': npi_source_row[f'Healthcare Provider Taxonomy Code_{i}'],
-                    'provider_license_number': npi_source_row[f'Provider License Number_{i}'],
-                    'provider_license_number_state_code': npi_source_row[f'Provider License Number State Code_{i}'],
-                    'healthcare_provider_primary_taxonomy_switch': npi_source_row[
-                        f'Healthcare Provider Primary Taxonomy Switch_{i}']
+                    "npi": int(npi_source_row[npi_csv_map_reverse["npi"]]),
+                    "healthcare_provider_taxonomy_code": npi_source_row[f"Healthcare Provider Taxonomy Code_{i}"],
+                    "provider_license_number": npi_source_row[f"Provider License Number_{i}"],
+                    "provider_license_number_state_code": npi_source_row[f"Provider License Number State Code_{i}"],
+                    "healthcare_provider_primary_taxonomy_switch": npi_source_row[
+                        f"Healthcare Provider Primary Taxonomy Switch_{i}"
+                    ],
                 }
                 checksum = return_checksum(list(taxonomy_record_by_field.values()))
-                taxonomy_record_by_field['checksum'] = checksum
+                taxonomy_record_by_field["checksum"] = checksum
                 npi_taxonomy_list_dict[checksum] = taxonomy_record_by_field
             else:
                 break
 
         for i in range(1, 51):
-            if npi_source_row[f'Other Provider Identifier_{i}']:
+            if npi_source_row[f"Other Provider Identifier_{i}"]:
                 identifier_record_by_field = {
-                    'npi': int(npi_source_row[npi_csv_map_reverse['npi']]),
-                    'other_provider_identifier': npi_source_row[f'Other Provider Identifier_{i}'],
-                    'other_provider_identifier_type_code': npi_source_row[f'Other Provider Identifier Type Code_{i}'],
-                    'other_provider_identifier_state': npi_source_row[f'Other Provider Identifier State_{i}'],
-                    'other_provider_identifier_issuer': npi_source_row[f'Other Provider Identifier Issuer_{i}']
+                    "npi": int(npi_source_row[npi_csv_map_reverse["npi"]]),
+                    "other_provider_identifier": npi_source_row[f"Other Provider Identifier_{i}"],
+                    "other_provider_identifier_type_code": npi_source_row[f"Other Provider Identifier Type Code_{i}"],
+                    "other_provider_identifier_state": npi_source_row[f"Other Provider Identifier State_{i}"],
+                    "other_provider_identifier_issuer": npi_source_row[f"Other Provider Identifier Issuer_{i}"],
                 }
                 checksum = return_checksum(list(identifier_record_by_field.values()))
-                identifier_record_by_field['checksum'] = checksum
+                identifier_record_by_field["checksum"] = checksum
                 npi_other_id_list_dict[checksum] = identifier_record_by_field
             else:
                 break
 
         for i in range(1, 16):
-            if npi_source_row[f'Healthcare Provider Taxonomy Group_{i}']:
+            if npi_source_row[f"Healthcare Provider Taxonomy Group_{i}"]:
                 taxonomy_group_record_by_field = {
-                    'npi': int(npi_source_row[npi_csv_map_reverse['npi']]),
-                    'healthcare_provider_taxonomy_group': npi_source_row[
-                        f'Healthcare Provider Taxonomy Group_{i}'
-                    ],
+                    "npi": int(npi_source_row[npi_csv_map_reverse["npi"]]),
+                    "healthcare_provider_taxonomy_group": npi_source_row[f"Healthcare Provider Taxonomy Group_{i}"],
                 }
                 checksum = return_checksum(list(taxonomy_group_record_by_field.values()))
-                taxonomy_group_record_by_field['checksum'] = checksum
+                taxonomy_group_record_by_field["checksum"] = checksum
                 npi_taxonomy_group_list_dict[checksum] = taxonomy_group_record_by_field
             else:
                 break
 
     normalized_rows_by_kind = {
-        'npi_obj_list': npi_obj_list,
-        'npi_taxonomy_list': list(npi_taxonomy_list_dict.values()),
-        'npi_other_id_list': list(npi_other_id_list_dict.values()),
-        'npi_taxonomy_group_list': list(npi_taxonomy_group_list_dict.values()),
-        'npi_address_list': _prepare_npi_address_rows(
+        "npi_obj_list": npi_obj_list,
+        "npi_taxonomy_list": list(npi_taxonomy_list_dict.values()),
+        "npi_other_id_list": list(npi_other_id_list_dict.values()),
+        "npi_taxonomy_group_list": list(npi_taxonomy_group_list_dict.values()),
+        "npi_address_list": _prepare_npi_address_rows(
             npi_address_list_dict.values(),
             canonical_enabled=canonical_addresses_enabled,
         ),
     }
-    if task.get('direct'):
+    if task.get("direct"):
         await save_npi_data(ctx, normalized_rows_by_kind)
-        print(f'Processing.. {len(npi_obj_list)} rows directly')
+        print(f"Processing.. {len(npi_obj_list)} rows directly")
     else:
-        await redis.enqueue_job('save_npi_data', normalized_rows_by_kind, _queue_name=NPI_QUEUE_NAME)
+        await redis.enqueue_job("save_npi_data", normalized_rows_by_kind, _queue_name=NPI_QUEUE_NAME)
 
 
 async def _prepare_npi_staging(import_date: str, db_schema: str) -> None:
@@ -1066,9 +1114,7 @@ async def _prepare_npi_staging(import_date: str, db_schema: str) -> None:
 
     for model_class in _NPI_STAGING_CLASSES:
         staged_model = make_class(model_class, import_date)
-        await db.status(
-            f"DROP TABLE IF EXISTS {db_schema}.{staged_model.__main_table__}_{import_date};"
-        )
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{staged_model.__main_table__}_{import_date};")
         await db.create_table(staged_model.__table__, checkfirst=True)
         if hasattr(staged_model, "__my_index_elements__"):
             await db.status(
@@ -1089,38 +1135,29 @@ async def _prepare_npi_staging(import_date: str, db_schema: str) -> None:
             )
 
 
-
 @_release_lease_after_process_failure
 async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
     """Download and process the configured NPPES dissemination files."""
     # Track whether any work actually ran so shutdown can distinguish "no jobs" from a bad import
     task = task or {}
-    ctx.setdefault('context', {})
-    context = ctx['context']
+    ctx.setdefault("context", {})
+    context = ctx["context"]
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
-    context['run'] = 0
+    context["run"] = 0
     context.pop(_NPPES_EVIDENCE_RECEIPT_KEY, None)
     context.pop(_NPPES_EVIDENCE_METRICS_KEY, None)
     await raise_if_cancelled(ctx, task)
-    if 'test_mode' in task:
-        context['test_mode'] = bool(task.get('test_mode'))
-    test_mode = bool(context.get('test_mode', False))
+    if "test_mode" in task:
+        context["test_mode"] = bool(task.get("test_mode"))
+    test_mode = bool(context.get("test_mode", False))
     if test_mode and run_id:
-        raise NPIPrerequisiteError(
-            "Controlled NPI test mode is unavailable without isolated publication"
-        )
+        raise NPIPrerequisiteError("Controlled NPI test mode is unavailable without isolated publication")
     evidence_config = _nppes_evidence_runtime_config(context)
     if test_mode and evidence_config.required:
-        raise NPIPrerequisiteError(
-            "NPI test mode cannot admit immutable public evidence"
-        )
+        raise NPIPrerequisiteError("NPI test mode cannot admit immutable public evidence")
     if run_id and not evidence_config.required:
-        raise NPIPrerequisiteError(
-            "Controlled NPI publication requires NPPES public evidence"
-        )
-    scratch_root = (
-        resolve_nppes_scratch_root() if evidence_config.required else None
-    )
+        raise NPIPrerequisiteError("Controlled NPI publication requires NPPES public evidence")
+    scratch_root = resolve_nppes_scratch_root() if evidence_config.required else None
     canonical_addresses_enabled = source_enabled("nppes")
     await ensure_database(test_mode)
     await _acquire_npi_import_lease(context)
@@ -1129,7 +1166,7 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
         await _assert_nppes_postgres_runtime(context)
     await _ensure_required_extensions()
 
-    import_date = ctx['import_date']
+    import_date = ctx["import_date"]
     db_schema = _runtime_db_schema()
     if evidence_config.required:
         await _assert_nppes_storage_catalog(context, db_schema)
@@ -1170,15 +1207,10 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
         assert_nppes_scratch_capacity(prepared_chain, scratch_root)
         selected_sources = prepared_chain.archives
     else:
-        listing_url = (
-            os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR']
-            + os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_FILE']
-        )
+        listing_url = os.environ["HLTHPRT_NPPES_DOWNLOAD_URL_DIR"] + os.environ["HLTHPRT_NPPES_DOWNLOAD_URL_FILE"]
         print(listing_url)
         html_source = await download_it(listing_url)
-        source_files = re.findall(
-            r'(NPPES_Data_Dissemination.*_V2.zip)', html_source
-        )
+        source_files = re.findall(r"(NPPES_Data_Dissemination.*_V2.zip)", html_source)
         file_limit = TEST_NPI_MAX_FILES if test_mode else None
         selected_sources = source_files[:file_limit] if file_limit else source_files
     if not selected_sources:
@@ -1200,11 +1232,7 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
     for file_idx, source_item in enumerate(selected_sources):
         await raise_if_cancelled(ctx, task)
         prepared_archive = source_item if evidence_config.required else None
-        archive_filename = (
-            prepared_archive.archive_name
-            if prepared_archive is not None
-            else source_item
-        )
+        archive_filename = prepared_archive.archive_name if prepared_archive is not None else source_item
         count_files = count_files + 1
         current_sql_chunk_size = sql_chunk_size
         if test_mode:
@@ -1237,17 +1265,14 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                 legacy_layout = None
                 tmp_filename = str(PurePath(str(tmpdirname), archive_filename))
                 await download_it_and_save(
-                    os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR'] + archive_filename,
+                    os.environ["HLTHPRT_NPPES_DOWNLOAD_URL_DIR"] + archive_filename,
                     tmp_filename,
                     chunk_size=10 * 1024 * 1024,
-                    cache_dir='/tmp',
+                    cache_dir="/tmp",
                 )
                 print(f"Downloaded: {archive_filename}")
                 if os.environ.get("DEBUG"):
-                    print(
-                        f"DEBUG: Downloaded file {tmp_filename}, "
-                        f"size: {os.path.getsize(tmp_filename)} bytes"
-                    )
+                    print(f"DEBUG: Downloaded file {tmp_filename}, size: {os.path.getsize(tmp_filename)} bytes")
                     if os.path.getsize(tmp_filename) > 100 * 1024 * 1024:
                         print(f"File {tmp_filename} is too big, skipping")
                         continue
@@ -1257,89 +1282,83 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                     await unzip(tmp_filename, tmpdirname, buffer_size=10 * 1024 * 1024)
                 except Exception:
                     print(f"Failed to unzip {tmp_filename}, trying with zipfile")
-                    with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+                    with zipfile.ZipFile(tmp_filename, "r") as zip_ref:
                         zip_ref.extractall(tmpdirname)
                 npi_file = [
                     filename
                     for filename in glob.glob(f"{tmpdirname}/npi*.csv")
-                    if not os.path.basename(filename).endswith('_fileheader.csv')
+                    if not os.path.basename(filename).endswith("_fileheader.csv")
                 ][0]
                 pl_file = [
                     filename
                     for filename in glob.glob(f"{tmpdirname}/pl_pfile*.csv")
-                    if not os.path.basename(filename).endswith('_fileheader.csv')
+                    if not os.path.basename(filename).endswith("_fileheader.csv")
                 ][0]
                 other_file = [
                     filename
                     for filename in glob.glob(f"{tmpdirname}/other*.csv")
-                    if not os.path.basename(filename).endswith('_fileheader.csv')
+                    if not os.path.basename(filename).endswith("_fileheader.csv")
                 ][0]
                 endpoint_file = [
                     filename
                     for filename in glob.glob(f"{tmpdirname}/endpoint*.csv")
-                    if not os.path.basename(filename).endswith('_fileheader.csv')
+                    if not os.path.basename(filename).endswith("_fileheader.csv")
                 ][0]
             if count_files > 1:
                 # Collect all NPIs from npi_file and pl_file
                 current_sql_chunk_size = sql_chunk_size // 26
                 npi_set: set[int] = set()
-                async with _open_nppes_source(
-                    legacy_layout, "primary", npi_file
-                ) as afp:
+                async with _open_nppes_source(legacy_layout, "primary", npi_file) as afp:
                     async for source_csv_row in AsyncDictReader(afp, delimiter=","):
-                        if source_csv_row.get('NPI'):
-                            npi_set.add(int(source_csv_row['NPI']))
+                        if source_csv_row.get("NPI"):
+                            npi_set.add(int(source_csv_row["NPI"]))
 
                 for cls in (NPIData, NPIDataTaxonomyGroup, NPIDataTaxonomy, NPIAddress):
                     table = make_class(cls, import_date)
                     npi_list = list(npi_set)
                     chunk_size = 1000
-                    npi_column = getattr(table, 'npi')
+                    npi_column = getattr(table, "npi")
                     for index in range(0, len(npi_list), chunk_size):
                         await raise_if_cancelled(ctx, task)
-                        chunk = npi_list[index:index + chunk_size]
+                        chunk = npi_list[index : index + chunk_size]
                         delete_stmt = db.delete(table.__table__).where(npi_column.in_(chunk))
                         if cls is NPIAddress:
-                            delete_stmt = delete_stmt.where((table.type == 'primary') | (table.type == 'mail'))
+                            delete_stmt = delete_stmt.where((table.type == "primary") | (table.type == "mail"))
                         await delete_stmt.status()
                 print(f"Cleaned up models for {len(npi_set)} NPIs due to multiple files.")
 
                 npi_set.clear()
 
-                async with _open_nppes_source(
-                    legacy_layout, "practice_location", pl_file
-                ) as afp:
+                async with _open_nppes_source(legacy_layout, "practice_location", pl_file) as afp:
                     async for source_csv_row in AsyncDictReader(afp, delimiter=","):
-                        if source_csv_row.get('NPI'):
-                            npi_set.add(int(source_csv_row['NPI']))
+                        if source_csv_row.get("NPI"):
+                            npi_set.add(int(source_csv_row["NPI"]))
 
                 table = make_class(NPIAddress, import_date)
                 npi_list = list(npi_set)
                 chunk_size = 10000
-                npi_column = getattr(table, 'npi')
+                npi_column = getattr(table, "npi")
                 for index in range(0, len(npi_list), chunk_size):
                     await raise_if_cancelled(ctx, task)
-                    chunk = npi_list[index:index + chunk_size]
+                    chunk = npi_list[index : index + chunk_size]
                     delete_stmt = db.delete(table.__table__).where(npi_column.in_(chunk))
-                    delete_stmt = delete_stmt.where(table.type == 'secondary')
+                    delete_stmt = delete_stmt.where(table.type == "secondary")
                     await delete_stmt.status()
 
                 npi_set.clear()
 
-                async with _open_nppes_source(
-                    legacy_layout, "other_name", other_file
-                ) as afp:
+                async with _open_nppes_source(legacy_layout, "other_name", other_file) as afp:
                     async for source_csv_row in AsyncDictReader(afp, delimiter=","):
-                        if source_csv_row.get('NPI'):
-                            npi_set.add(int(source_csv_row['NPI']))
+                        if source_csv_row.get("NPI"):
+                            npi_set.add(int(source_csv_row["NPI"]))
 
                 table = make_class(NPIDataOtherIdentifier, import_date)
                 npi_list = list(npi_set)
                 chunk_size = 10000
-                npi_column = getattr(table, 'npi')
+                npi_column = getattr(table, "npi")
                 for index in range(0, len(npi_list), chunk_size):
                     await raise_if_cancelled(ctx, task)
-                    chunk = npi_list[index:index + chunk_size]
+                    chunk = npi_list[index : index + chunk_size]
                     delete_stmt = db.delete(table.__table__).where(npi_column.in_(chunk))
                     await delete_stmt.status()
 
@@ -1348,34 +1367,28 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
             for source_file_path in (endpoint_file, other_file, pl_file, npi_file):
                 print(f"Files: {source_file_path}")
 
-
             npi_csv_map = {}
             npi_csv_map_reverse = {}
 
-            int_key_re = re.compile(r'.*_\d+$')
+            int_key_re = re.compile(r".*_\d+$")
 
-            async with _open_nppes_source(
-                legacy_layout, "primary", npi_file
-            ) as afp:
+            async with _open_nppes_source(legacy_layout, "primary", npi_file) as afp:
                 async for source_csv_row in AsyncDictReader(afp, delimiter=","):
                     for key in source_csv_row:
-                        if int_key_re.match(key) or ' Address' in key:
+                        if int_key_re.match(key) or " Address" in key:
                             continue
-                        normalized_column_name = re.sub(r"\(.*\)", r"", key.lower()).strip().replace(' ', '_')
+                        normalized_column_name = re.sub(r"\(.*\)", r"", key.lower()).strip().replace(" ", "_")
                         npi_csv_map[key] = normalized_column_name
                         npi_csv_map_reverse[normalized_column_name] = key
                     break
             count = 0
 
-
             row_list = []
             coros = pending_save_tasks
             processed_rows = 0
-            async with _open_nppes_source(
-                legacy_layout, "primary", npi_file
-            ) as afp:
+            async with _open_nppes_source(legacy_layout, "primary", npi_file) as afp:
                 async for source_csv_row in AsyncDictReader(afp, delimiter=","):
-                    if not source_csv_row['NPI']:
+                    if not source_csv_row["NPI"]:
                         continue
                     if not count % current_sql_chunk_size:
                         print(f"Processed: {count}")
@@ -1397,11 +1410,11 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                         print(f"Sending to DB: {count}")
                         await raise_if_cancelled(ctx, task)
                         npi_chunk_by_field = {
-                            'row_list': row_list.copy(),
-                            'npi_csv_map': npi_csv_map,
-                            'npi_csv_map_reverse': npi_csv_map_reverse,
-                            'taxonomy_int_code_map': taxonomy_int_code_map,
-                            'direct': True,
+                            "row_list": row_list.copy(),
+                            "npi_csv_map": npi_csv_map,
+                            "npi_csv_map_reverse": npi_csv_map_reverse,
+                            "taxonomy_int_code_map": taxonomy_int_code_map,
+                            "direct": True,
                         }
                         await enqueue_or_flush(coros, process_npi_chunk(ctx, npi_chunk_by_field))
                         row_list.clear()
@@ -1412,11 +1425,11 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                         break
 
             npi_chunk_by_field = {
-                'row_list': row_list.copy(),
-                'npi_csv_map': npi_csv_map,
-                'npi_csv_map_reverse': npi_csv_map_reverse,
-                'taxonomy_int_code_map': taxonomy_int_code_map,
-                'direct': True,
+                "row_list": row_list.copy(),
+                "npi_csv_map": npi_csv_map,
+                "npi_csv_map_reverse": npi_csv_map_reverse,
+                "taxonomy_int_code_map": taxonomy_int_code_map,
+                "direct": True,
             }
             await raise_if_cancelled(ctx, task)
             await enqueue_or_flush(coros, process_npi_chunk(ctx, npi_chunk_by_field))
@@ -1424,33 +1437,31 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
 
             npi_other_org_list_dict = {}
 
-            async with _open_nppes_source(
-                legacy_layout, "other_name", other_file
-            ) as afp:
+            async with _open_nppes_source(legacy_layout, "other_name", other_file) as afp:
                 processed_other = 0
                 async for source_csv_row in AsyncDictReader(afp, delimiter=","):
-                    if not source_csv_row['NPI']:
+                    if not source_csv_row["NPI"]:
                         continue
                     if not count % current_sql_chunk_size:
                         print(f"Other Names Processed: {count}")
                     other_identifier_by_field = {
-                        'npi': int(source_csv_row['NPI']),
-                        'other_provider_identifier': source_csv_row['Provider Other Organization Name'],
-                        'other_provider_identifier_type_code': source_csv_row[
-                            'Provider Other Organization Name Type Code'
+                        "npi": int(source_csv_row["NPI"]),
+                        "other_provider_identifier": source_csv_row["Provider Other Organization Name"],
+                        "other_provider_identifier_type_code": source_csv_row[
+                            "Provider Other Organization Name Type Code"
                         ],
-                        'other_provider_identifier_state': None,
-                        'other_provider_identifier_issuer': None,
+                        "other_provider_identifier_state": None,
+                        "other_provider_identifier_issuer": None,
                     }
                     checksum = return_checksum(list(other_identifier_by_field.values()))
-                    other_identifier_by_field['checksum'] = checksum
+                    other_identifier_by_field["checksum"] = checksum
                     npi_other_org_list_dict[checksum] = other_identifier_by_field
 
                     if count > current_sql_chunk_size:
                         print(f"Sending to DB: {count}")
                         await raise_if_cancelled(ctx, task)
                         other_identifier_rows_by_key = {
-                            'npi_other_id_list': list(npi_other_org_list_dict.copy().values())
+                            "npi_other_id_list": list(npi_other_org_list_dict.copy().values())
                         }
                         await enqueue_or_flush(coros, save_npi_data(ctx, other_identifier_rows_by_key))
                         npi_other_org_list_dict.clear()
@@ -1473,66 +1484,59 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                     if test_mode and processed_other >= TEST_NPI_OTHER_ROWS:
                         break
 
-            other_identifier_rows_by_key = {
-                'npi_other_id_list': list(npi_other_org_list_dict.copy().values())
-            }
+            other_identifier_rows_by_key = {"npi_other_id_list": list(npi_other_org_list_dict.copy().values())}
             await enqueue_or_flush(coros, save_npi_data(ctx, other_identifier_rows_by_key))
             npi_other_org_list_dict.clear()
 
-
             npi_address_list_dict = {}
-            async with _open_nppes_source(
-                legacy_layout, "practice_location", pl_file
-            ) as afp:
+            async with _open_nppes_source(legacy_layout, "practice_location", pl_file) as afp:
                 processed_secondary = 0
                 async for source_csv_row in AsyncDictReader(afp, delimiter=","):
                     if (
-                        not source_csv_row['NPI']
-                        and not source_csv_row['Provider Secondary Practice Location Address- Address Line 1']
+                        not source_csv_row["NPI"]
+                        and not source_csv_row["Provider Secondary Practice Location Address- Address Line 1"]
                     ):
                         continue
                     if not count % current_sql_chunk_size:
                         print(f"Secondary Addresses Processed: {count}")
                     secondary_address_by_field = {
-                        'first_line': source_csv_row[
-                            'Provider Secondary Practice Location Address- Address Line 1'
-                        ],
-                        'second_line': source_csv_row[
-                            'Provider Secondary Practice Location Address-  Address Line 2'
-                        ],
-                        'city_name': source_csv_row.get(
-                            'Provider Secondary Practice Location Address - City Name',
-                            '',
+                        "first_line": source_csv_row["Provider Secondary Practice Location Address- Address Line 1"],
+                        "second_line": source_csv_row["Provider Secondary Practice Location Address-  Address Line 2"],
+                        "city_name": source_csv_row.get(
+                            "Provider Secondary Practice Location Address - City Name",
+                            "",
                         ).upper(),
-                        'state_name': source_csv_row.get(
-                            'Provider Secondary Practice Location Address - State Name',
-                            '',
+                        "state_name": source_csv_row.get(
+                            "Provider Secondary Practice Location Address - State Name",
+                            "",
                         ).upper(),
-                        'postal_code': source_csv_row[
-                            'Provider Secondary Practice Location Address - Postal Code'
-                        ],
-                        'country_code': source_csv_row[
-                            'Provider Secondary Practice Location Address - Country Code (If outside U.S.)'
+                        "postal_code": source_csv_row["Provider Secondary Practice Location Address - Postal Code"],
+                        "country_code": source_csv_row[
+                            "Provider Secondary Practice Location Address - Country Code (If outside U.S.)"
                         ],
                     }
 
-                    secondary_address_by_field.update({
-                        'checksum': return_checksum(
-                            list(secondary_address_by_field.values())
-                        ),  # addresses have blank symbols
-                        'npi': int(source_csv_row['NPI']),
-                        'type': 'secondary',
-                        'telephone_number': source_csv_row[
-                            'Provider Secondary Practice Location Address - Telephone Number'
-                        ],
-                        'fax_number': source_csv_row['Provider Practice Location Address - Fax Number'],
-                        'date_added': pytz.utc.localize(datetime.datetime.now())
-                    })
-                    address_key = '_'.join([
-                        str(secondary_address_by_field['npi']),
-                        str(secondary_address_by_field['checksum']),
-                        secondary_address_by_field['type'],
-                    ])
+                    secondary_address_by_field.update(
+                        {
+                            "checksum": return_checksum(
+                                list(secondary_address_by_field.values())
+                            ),  # addresses have blank symbols
+                            "npi": int(source_csv_row["NPI"]),
+                            "type": "secondary",
+                            "telephone_number": source_csv_row[
+                                "Provider Secondary Practice Location Address - Telephone Number"
+                            ],
+                            "fax_number": source_csv_row["Provider Practice Location Address - Fax Number"],
+                            "date_added": pytz.utc.localize(datetime.datetime.now()),
+                        }
+                    )
+                    address_key = "_".join(
+                        [
+                            str(secondary_address_by_field["npi"]),
+                            str(secondary_address_by_field["checksum"]),
+                            secondary_address_by_field["type"],
+                        ]
+                    )
                     npi_address_list_dict[address_key] = secondary_address_by_field
 
                     if count > current_sql_chunk_size:
@@ -1543,7 +1547,7 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                             save_npi_data(
                                 ctx,
                                 {
-                                    'npi_address_list': _prepare_npi_address_rows(
+                                    "npi_address_list": _prepare_npi_address_rows(
                                         npi_address_list_dict.copy().values(),
                                         canonical_enabled=canonical_addresses_enabled,
                                     )
@@ -1581,7 +1585,7 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                 save_npi_data(
                     ctx,
                     {
-                        'npi_address_list': _prepare_npi_address_rows(
+                        "npi_address_list": _prepare_npi_address_rows(
                             npi_address_list_dict.copy().values(),
                             canonical_enabled=canonical_addresses_enabled,
                         )
@@ -1594,12 +1598,8 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
 
             if evidence_config.required:
                 if processed_rows <= 0:
-                    raise NPIPrerequisiteError(
-                        "NPPES primary member did not contain source rows"
-                    )
-                staged_source_record_counts.append(
-                    (archive_filename, processed_rows)
-                )
+                    raise NPIPrerequisiteError("NPPES primary member did not contain source rows")
+                staged_source_record_counts.append((archive_filename, processed_rows))
 
             print(f"Processed: {count}")
             if run_id:
@@ -1623,24 +1623,20 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
             schema=db_schema,
             cancel_check=evidence_cancel_check,
         )
-        validated_receipt = validate_nppes_public_evidence_chain_receipt(
-            chain_receipt
-        )
+        validated_receipt = validate_nppes_public_evidence_chain_receipt(chain_receipt)
         await _assert_nppes_canonical_stage_parity(
             validated_receipt,
             import_date,
             db_schema,
         )
         context[_NPPES_EVIDENCE_RECEIPT_KEY] = validated_receipt
-        context[_NPPES_EVIDENCE_METRICS_KEY] = _nppes_evidence_metrics(
-            validated_receipt
-        )
+        context[_NPPES_EVIDENCE_METRICS_KEY] = _nppes_evidence_metrics(validated_receipt)
 
     # Mark this job as successfully completed; shutdown finalization depends on this.
     if pending_save_tasks:
         raise NPIPrerequisiteError("NPI staged writes did not drain")
     context.pop(_NPI_PENDING_SAVE_TASKS_KEY, None)
-    context['run'] = context.get('run', 0) + 1
+    context["run"] = context.get("run", 0) + 1
 
 
 process_data = execute_npi_import_attempt
@@ -1652,18 +1648,18 @@ async def startup(ctx):  # pragma: no cover
 
     evidence_config = resolve_nppes_evidence_runtime_config()
     await my_init_db(db)
-    ctx['context'] = {}
-    ctx['context']['start'] = datetime.datetime.utcnow()
-    ctx['context']['run'] = 0
-    ctx['context']['test_mode'] = False
-    ctx['context'][_NPPES_EVIDENCE_CONFIG_KEY] = evidence_config
+    ctx["context"] = {}
+    ctx["context"]["start"] = datetime.datetime.utcnow()
+    ctx["context"]["run"] = 0
+    ctx["context"]["test_mode"] = False
+    ctx["context"][_NPPES_EVIDENCE_CONFIG_KEY] = evidence_config
     await ensure_database(False)
     override_import_id = os.getenv("HLTHPRT_IMPORT_ID_OVERRIDE")
     if override_import_id:
-        ctx['import_date'] = override_import_id
+        ctx["import_date"] = override_import_id
     else:
-        ctx['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
-    import_date = ctx['import_date']
+        ctx["import_date"] = datetime.datetime.now().strftime("%Y%m%d")
+    import_date = ctx["import_date"]
     db_schema = _runtime_db_schema()
 
     await _ensure_required_extensions()
@@ -1679,6 +1675,7 @@ async def startup(ctx):  # pragma: no cover
     except DuplicateTableError:
         print(f"Address archive table {db_schema}.{archive_model.__tablename__} already exists.")
     print("Preparing done")
+
 
 def _do_business_as_update_sql(
     db_schema: str,
@@ -1753,13 +1750,8 @@ async def refresh_do_business_as(
     db_schema = _runtime_db_schema()
     target_table_name = target_table or NPIData.__tablename__
     source_table_name = source_table or NPIDataOtherIdentifier.__tablename__
-    if not await db.scalar(
-        f"SELECT to_regclass('{db_schema}.{source_table_name}');"
-    ):
-        print(
-            "Skipping do_business_as refresh: source table "
-            f"{db_schema}.{source_table_name} does not exist."
-        )
+    if not await db.scalar(f"SELECT to_regclass('{db_schema}.{source_table_name}');"):
+        print(f"Skipping do_business_as refresh: source table {db_schema}.{source_table_name} does not exist.")
         return
 
     updated = int(
@@ -1883,11 +1875,7 @@ async def validate_npi_search_taxonomy_projection(
              LIMIT 1
         );
         """
-    mismatch = (
-        await connection.fetchval(validation_sql)
-        if connection is not None
-        else await db.scalar(validation_sql)
-    )
+    mismatch = await connection.fetchval(validation_sql) if connection is not None else await db.scalar(validation_sql)
     if mismatch:
         raise NPIPrerequisiteError("NPI search taxonomy projection is invalid")
 
@@ -1918,10 +1906,7 @@ async def resolve_npi_address_archive(
 ):
     """Stamp and resolve NPI staging addresses into the canonical archive."""
     missing_key_rows = int(
-        await db.scalar(
-            f"SELECT count(*) FROM {schema}.{staging_table} WHERE address_key IS NULL;"
-        )
-        or 0
+        await db.scalar(f"SELECT count(*) FROM {schema}.{staging_table} WHERE address_key IS NULL;") or 0
     )
     if missing_key_rows:
         configured_shards = int(os.getenv("HLTHPRT_ADDRESS_CANON_NPI_SHARDS", "16"))
@@ -1978,10 +1963,7 @@ async def _is_phone_staffing_ready(
 ) -> bool:
     """Validate the tables required by phone staffing materialization."""
     if not await db.scalar(f"SELECT to_regclass('{schema}.{target_table}');"):
-        print(
-            f"Skipping phone staffing materialization for {schema}.{target_table}: "
-            "target staging table is missing."
-        )
+        print(f"Skipping phone staffing materialization for {schema}.{target_table}: target staging table is missing.")
         return False
     if not await db.scalar(f"SELECT to_regclass('{schema}.{address_table}');"):
         print(
@@ -2054,8 +2036,6 @@ async def rebuild_phone_staffing_table(
         GROUP BY a.state_name, REGEXP_REPLACE(a.telephone_number, '[^0-9]', '', 'g');
         """
     )
-
-
 
 
 def _npi_shutdown_timing(
@@ -2173,12 +2153,8 @@ def _install_npi_committed_control_state(
     ):
         raise NPIPrerequisiteError("NPI publication commit is invalid")
     context["preserve_control_run_finished_at"] = True
-    context[_NPI_CONTROL_COMMITTED_HEARTBEAT_AT_KEY] = (
-        publication_commit.heartbeat_at
-    )
-    context[_NPI_CONTROL_COMMITTED_FINISHED_AT_KEY] = (
-        publication_commit.finished_at
-    )
+    context[_NPI_CONTROL_COMMITTED_HEARTBEAT_AT_KEY] = publication_commit.heartbeat_at
+    context[_NPI_CONTROL_COMMITTED_FINISHED_AT_KEY] = publication_commit.finished_at
     context[_NPI_CONTROL_COMMITTED_RESULT_KEY] = {
         **terminal_metrics_by_name,
         "terminal_progress": terminal_progress_by_name,
@@ -2203,11 +2179,7 @@ async def _npi_publication_transaction(
         commit = publication_state_by_name.get("commit")
         progress = publication_state_by_name.get("progress")
         metrics = publication_state_by_name.get("metrics")
-        if (
-            type(commit) is not NpiCanonicalPublicationCommit
-            or type(progress) is not dict
-            or type(metrics) is not dict
-        ):
+        if type(commit) is not NpiCanonicalPublicationCommit or type(progress) is not dict or type(metrics) is not dict:
             raise
         reconciled = await _reconcile_npi_commit_after_error(
             schema=schema,
@@ -2238,8 +2210,8 @@ def _print_time_info_best_effort(started_at: object) -> None:
 @_release_lease_after_shutdown
 async def finalize_npi_import_attempt(ctx):  # pragma: no cover
     """Finalize, index, validate, and atomically publish an NPI import."""
-    import_date = ctx['import_date']
-    context = ctx.get('context') or {}
+    import_date = ctx["import_date"]
+    context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
     shutdown_phase_timings: list[dict[str, object]] = []
 
@@ -2273,7 +2245,7 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
         _emit_npi_shutdown_progress(run_id, phase, "running", 1)
         return phase_result
 
-    if not context.get('run'):
+    if not context.get("run"):
         print("No NPI jobs ran in this worker session; skipping shutdown validation.")
         return
     attempt_id, attempt_started_at = _required_npi_control_attempt(context, run_id)
@@ -2282,9 +2254,7 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
         raise NPIPrerequisiteError("NPI test mode cannot publish live tables")
     evidence_config = _nppes_evidence_runtime_config(context)
     if not evidence_config.required:
-        raise NPIPrerequisiteError(
-            "Controlled NPI publication requires NPPES public evidence"
-        )
+        raise NPIPrerequisiteError("Controlled NPI publication requires NPPES public evidence")
     evidence_receipt = _required_nppes_evidence_receipt(context)
     evidence_metrics = _nppes_evidence_metrics(evidence_receipt)
     await ensure_database(bool(context.get("test_mode")))
@@ -2298,9 +2268,7 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
     has_missing_stage = False
     for model_class in _NPI_STAGING_CLASSES:
         staged_model = make_class(model_class, import_date)
-        stage_exists = await db.scalar(
-            f"SELECT to_regclass('{db_schema}.{staged_model.__tablename__}');"
-        )
+        stage_exists = await db.scalar(f"SELECT to_regclass('{db_schema}.{staged_model.__tablename__}');")
         has_missing_stage = has_missing_stage or not bool(stage_exists)
     if has_missing_stage:
         raise NPIPrerequisiteError("NPI staging table set is incomplete")
@@ -2322,8 +2290,9 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
 
     async def has_table_column(table_name: str, column_name: str) -> bool:
         """Check whether an import table exposes a named column."""
-        return bool(await db.scalar(
-            f"""
+        return bool(
+            await db.scalar(
+                f"""
             SELECT EXISTS (
                 SELECT 1
                   FROM information_schema.columns
@@ -2332,7 +2301,8 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
                    AND column_name = '{column_name}'
             );
             """
-        ))
+            )
+        )
 
     postgis_availability_by_key: dict[str, bool | None] = {"available": None}
 
@@ -2340,7 +2310,9 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
         """Cache whether PostGIS types and constructors are available."""
         if postgis_availability_by_key["available"] is None:
             geography_type = await db.scalar("SELECT to_regtype('geography');")
-            st_makepoint = await db.scalar("SELECT to_regprocedure('st_makepoint(double precision, double precision)');")
+            st_makepoint = await db.scalar(
+                "SELECT to_regprocedure('st_makepoint(double precision, double precision)');"
+            )
             postgis_availability_by_key["available"] = bool(geography_type and st_makepoint)
             if not postgis_availability_by_key["available"]:
                 print("PostGIS is unavailable; geo GIST index creation will be skipped.")
@@ -2348,6 +2320,7 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
 
     address_stats = None
     if source_enabled("nppes"):
+
         async def _cancel_check():
             await raise_if_cancelled(ctx, {"run_id": run_id})
 
@@ -2430,10 +2403,10 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
 
     async def create_additional_indexes(cls, staged_model) -> None:
         """Create model-declared secondary indexes on a staged table."""
-        if not hasattr(cls, '__my_additional_indexes__') or not cls.__my_additional_indexes__:
+        if not hasattr(cls, "__my_additional_indexes__") or not cls.__my_additional_indexes__:
             return
         for index in cls.__my_additional_indexes__:
-            index_name = index.get('name', '_'.join(index.get('index_elements')))
+            index_name = index.get("name", "_".join(index.get("index_elements")))
             if _index_requires_postgis(index) and not await has_postgis():
                 print(
                     f"Skipping index {staged_model.__tablename__}_idx_{index_name}: "
@@ -2441,16 +2414,16 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
                 )
                 continue
             using = ""
-            if index_method := index.get('using'):
+            if index_method := index.get("using"):
                 using = f"USING {index_method} "
             where_clause = ""
-            if where := index.get('where'):
+            if where := index.get("where"):
                 where_clause = f" WHERE {where}"
             index_elements = [
                 str(element)
                 .replace("Geography(ST_MakePoint", "public.Geography(public.ST_MakePoint")
                 .replace("geography(st_makepoint", "public.geography(public.st_makepoint")
-                for element in index.get('index_elements')
+                for element in index.get("index_elements")
             ]
             create_index_sql = (
                 f"CREATE INDEX IF NOT EXISTS {staged_model.__tablename__}_idx_{index_name} "
@@ -2472,7 +2445,7 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
             if cls is NPIData:
                 deferred_npi_indexes_obj = staged_model
             if cls is NPIDataOtherIdentifier:
-                print('Updating NPI do_business_as arrays from other identifiers...')
+                print("Updating NPI do_business_as arrays from other identifiers...")
                 target_npi_cls = staged_models_by_table.get(NPIData.__main_table__)
                 target_table_name = target_npi_cls.__tablename__ if target_npi_cls else NPIData.__tablename__
                 source_table_name = staged_model.__tablename__
@@ -2498,9 +2471,7 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
                     deferred_npi_indexes_obj = None
             if cls is NPIAddress:
                 npi_taxonomy_table = f"npi_taxonomy_{import_date}"
-                if await has_table(npi_taxonomy_table) and await has_table(
-                    "nucc_taxonomy"
-                ):
+                if await has_table(npi_taxonomy_table) and await has_table("nucc_taxonomy"):
                     print("Updating NUCC Taxonomy for NPI Addresses...")
                     await timed_shutdown_phase(
                         "taxonomy_array_enrichment",
@@ -2534,7 +2505,7 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
                     await timed_shutdown_phase(
                         "plan_network_array_enrichment",
                         db.status(
-                        f"""UPDATE {db_schema}.{staged_model.__tablename__} as a
+                            f"""UPDATE {db_schema}.{staged_model.__tablename__} as a
 SET
     plans_network_array = n_list
 FROM (
@@ -2556,7 +2527,7 @@ WHERE
                     await timed_shutdown_phase(
                         "procedures_array_enrichment",
                         db.status(
-                        f"""UPDATE {db_schema}.{staged_model.__tablename__} AS a
+                            f"""UPDATE {db_schema}.{staged_model.__tablename__} AS a
 SET
     procedures_array = b.codes
 FROM (
@@ -2581,7 +2552,7 @@ WHERE
                     await timed_shutdown_phase(
                         "medications_array_enrichment",
                         db.status(
-                        f"""UPDATE {db_schema}.{staged_model.__tablename__} AS a
+                            f"""UPDATE {db_schema}.{staged_model.__tablename__} AS a
 SET
     medications_array = b.codes
 FROM (
@@ -2635,9 +2606,7 @@ WHERE
         )
 
     vacuum_tasks = [
-        asyncio.create_task(
-            vacuum_table(staged_models_by_table[cls.__main_table__])
-        )
+        asyncio.create_task(vacuum_table(staged_models_by_table[cls.__main_table__]))
         for cls in processing_classes_array
     ]
     await _drain_npi_save_tasks(vacuum_tasks)
@@ -2645,9 +2614,7 @@ WHERE
     terminal_metrics_by_name = {
         "npi_shutdown_phase_timings": shutdown_phase_timings,
         **({"address_resolve": address_stats.__dict__} if address_stats else {}),
-        "openaddresses_backfill_enabled": _is_environment_enabled(
-            "HLTHPRT_NPI_OPENADDRESSES_BACKFILL", False
-        ),
+        "openaddresses_backfill_enabled": _is_environment_enabled("HLTHPRT_NPI_OPENADDRESSES_BACKFILL", False),
         _NPPES_EVIDENCE_METRICS_KEY: evidence_metrics,
     }
     await raise_if_cancelled(ctx, {"run_id": run_id})
@@ -2687,10 +2654,7 @@ WHERE
                 }
                 await lease.connection.execute(
                     "LOCK TABLE "
-                    + ", ".join(
-                        f"{schema}.{stage_table}"
-                        for stage_table in stage_table_by_live_table.values()
-                    )
+                    + ", ".join(f"{schema}.{stage_table}" for stage_table in stage_table_by_live_table.values())
                     + " IN ACCESS EXCLUSIVE MODE NOWAIT"
                 )
                 await _install_npi_postseal_guards(
@@ -2714,13 +2678,9 @@ WHERE
                 )
                 stage_row_counts_by_table: dict[str, int] = {}
                 for table, stage_table in stage_table_by_live_table.items():
-                    row_count = await lease.connection.fetchval(
-                        f"SELECT count(*)::bigint FROM {schema}.{stage_table}"
-                    )
+                    row_count = await lease.connection.fetchval(f"SELECT count(*)::bigint FROM {schema}.{stage_table}")
                     stage_row_counts_by_table[table] = row_count
-                publication_row_counts = _canonical_publication_row_counts(
-                    stage_row_counts_by_table
-                )
+                publication_row_counts = _canonical_publication_row_counts(stage_row_counts_by_table)
                 published_address_count = stage_row_counts_by_table["npi_address"]
                 terminal_progress_by_name = {
                     "unit": "rows",
@@ -2746,9 +2706,9 @@ WHERE
                     staged_model = staged_models_by_table[cls.__main_table__]
                     table = _postgres_identifier(staged_model.__main_table__)
                     stage_table = _postgres_identifier(staged_model.__tablename__)
-                    index_definitions = tuple(
-                        getattr(cls, "__my_initial_indexes__", ()) or ()
-                    ) + tuple(getattr(cls, "__my_additional_indexes__", ()) or ())
+                    index_definitions = tuple(getattr(cls, "__my_initial_indexes__", ()) or ()) + tuple(
+                        getattr(cls, "__my_additional_indexes__", ()) or ()
+                    )
                     index_suffixes = tuple(
                         index_definition.get(
                             "name",
@@ -2789,9 +2749,7 @@ WHERE
                     schema_name=schema,
                     receipt=publication_receipt,
                 )
-                terminal_metrics_by_name["npi_canonical_publication"] = (
-                    npi_publication_metrics(publication_receipt)
-                )
+                terminal_metrics_by_name["npi_canonical_publication"] = npi_publication_metrics(publication_receipt)
                 publication_state_by_name["progress"] = terminal_progress_by_name
                 publication_state_by_name["metrics"] = terminal_metrics_by_name
                 publication_state_by_name["commit"] = await mark_npi_publication_succeeded(
@@ -2809,7 +2767,7 @@ WHERE
     committed_result_by_name = context.get(_NPI_CONTROL_COMMITTED_RESULT_KEY)
     if type(committed_result_by_name) is not dict:
         raise NPIPrerequisiteError("NPI publication result is invalid")
-    _print_time_info_best_effort(ctx['context']['start'])
+    _print_time_info_best_effort(ctx["context"]["start"])
     return committed_result_by_name
 
 
@@ -2819,30 +2777,30 @@ shutdown.__name__ = "shutdown"
 
 async def save_npi_data(ctx, task):
     """Persist one normalized NPI payload into its staging models."""
-    import_date = ctx['import_date']
+    import_date = ctx["import_date"]
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     await ensure_database(test_mode)
     write_tasks = []
     for key in task:
         match key:
-            case 'npi_obj_list':
+            case "npi_obj_list":
                 mynpidata = make_class(NPIData, import_date)
-                write_tasks.append(push_objects(task['npi_obj_list'], mynpidata, rewrite=True))
-            case 'npi_taxonomy_list':
+                write_tasks.append(push_objects(task["npi_obj_list"], mynpidata, rewrite=True))
+            case "npi_taxonomy_list":
                 mynpidatataxonomy = make_class(NPIDataTaxonomy, import_date)
-                write_tasks.append(push_objects(task['npi_taxonomy_list'], mynpidatataxonomy, rewrite=True))
-            case 'npi_other_id_list':
+                write_tasks.append(push_objects(task["npi_taxonomy_list"], mynpidatataxonomy, rewrite=True))
+            case "npi_other_id_list":
                 mynpidataotheridentifier = make_class(NPIDataOtherIdentifier, import_date)
-                unique_rows = list({item['checksum']: item for item in task['npi_other_id_list']}.values())
+                unique_rows = list({item["checksum"]: item for item in task["npi_other_id_list"]}.values())
                 write_tasks.append(push_objects(unique_rows, mynpidataotheridentifier))
-            case 'npi_taxonomy_group_list':
+            case "npi_taxonomy_group_list":
                 mynpidatataxonomygroup = make_class(NPIDataTaxonomyGroup, import_date)
-                write_tasks.append(push_objects(task['npi_taxonomy_group_list'], mynpidatataxonomygroup, rewrite=True))
-            case 'npi_address_list':
+                write_tasks.append(push_objects(task["npi_taxonomy_group_list"], mynpidatataxonomygroup, rewrite=True))
+            case "npi_address_list":
                 mynpiaddress = make_class(NPIAddress, import_date)
-                write_tasks.append(push_objects(task['npi_address_list'], mynpiaddress, rewrite=True))
+                write_tasks.append(push_objects(task["npi_address_list"], mynpiaddress, rewrite=True))
             case _:
-                print('Some wrong key passed')
+                print("Some wrong key passed")
     for coro in write_tasks:
         await coro
 
@@ -2850,14 +2808,14 @@ async def save_npi_data(ctx, task):
 async def main(test_mode: bool = False):  # pragma: no cover
     """Create and enqueue one controlled NPI import run."""
     if test_mode:
-        raise ValueError(
-            "NPI test mode requires an isolated database and cannot use the live queue"
-        )
+        raise ValueError("NPI test mode requires an isolated database and cannot use the live queue")
     from api.control_imports import create_import_run
 
-    run, _ = await create_import_run({
-        "importer": "npi",
-        "params": {},
-        "triggered_by": "manual",
-    })
+    run, _ = await create_import_run(
+        {
+            "importer": "npi",
+            "params": {},
+            "triggered_by": "manual",
+        }
+    )
     return run

@@ -53,6 +53,7 @@ MRF_TABLE_TEMPLATES = (
     )
     """,
     "CREATE TABLE {schema}.ptg2_snapshot_pin (snapshot_id text PRIMARY KEY)",
+    "CREATE TABLE {schema}.plan_release_snapshot_pin (serving_revision_id text, snapshot_id text)",
     """
     CREATE TABLE {schema}.plan_release_snapshot_binding (
         snapshot_id text PRIMARY KEY
@@ -129,5 +130,3 @@ MRF_TABLE_TEMPLATES = (
     )
     """,
 )
-
-

@@ -211,7 +211,12 @@ async def test_inconsistent_main_input_census_cannot_produce_receipt(monkeypatch
     monkeypatch.setattr(receipt, "_schema_identity", AsyncMock(return_value="a" * 64))
     monkeypatch.setattr(receipt, "_row_identity", AsyncMock(return_value=(1, "b" * 64)))
     monkeypatch.setattr(receipt, "_main_input_identity", AsyncMock(return_value=(2, "c" * 64)))
-    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
+
+    async def scalar(statement):
+        assert str(statement) in {"SHOW transaction_read_only", "SHOW transaction_isolation"}
+        return "off" if str(statement) == "SHOW transaction_read_only" else "repeatable read"
+
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(), scalar=scalar)
     with pytest.raises(receipt.EntityAddressArchiveReceiptError, match="main input receipt is invalid"):
         if stage:
             await receipt.capture_entity_address_stage_integrity_receipt(

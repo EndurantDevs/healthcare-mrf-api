@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from process.provider_directory_source_checkpoint_control import source_checkpoint_transaction
 from process.provider_directory_terminal_root_retirement_contract import (
     RETIREMENT_STATUS,
     TerminalRootRetirementError,
@@ -15,6 +16,7 @@ from process.provider_directory_terminal_root_retirement_contract import (
     TerminalRootRetirementSelection,
     canonical_json_sha256,
     quoted_relation,
+    schema_name,
 )
 from process.provider_directory_terminal_root_retirement_selection import (
     selected_terminal_root_retirement,
@@ -22,9 +24,7 @@ from process.provider_directory_terminal_root_retirement_selection import (
 
 
 async def _require_read_committed(database: Any) -> None:
-    isolation = await database.scalar(
-        "SELECT pg_catalog.current_setting('transaction_isolation');"
-    )
+    isolation = await database.scalar("SELECT pg_catalog.current_setting('transaction_isolation');")
     if isolation != "read committed":
         raise TerminalRootRetirementError("state_invalid")
 
@@ -53,7 +53,7 @@ async def preview_terminal_root_retirement_transaction(
 
     if request.expected_evidence_sha256 is not None:
         raise TerminalRootRetirementError("request_invalid")
-    async with database.transaction():
+    async with source_checkpoint_transaction(database, schema=schema_name()):
         await _require_read_committed(database)
         selection = await selected_terminal_root_retirement(database, request)
         if selection.prior_status == RETIREMENT_STATUS:
@@ -78,7 +78,7 @@ async def _apply_parent_cas(
     )
     updated_count = await database.status(
         f"""
-        UPDATE {quoted_relation('provider_directory_endpoint_dataset')}
+        UPDATE {quoted_relation("provider_directory_endpoint_dataset")}
            SET status = :retirement_status,
                publication_metadata_json =
                    publication_metadata_json::jsonb
@@ -126,7 +126,7 @@ async def apply_terminal_root_retirement_transaction(
 
     if request.expected_evidence_sha256 is None:
         raise TerminalRootRetirementError("request_invalid")
-    async with database.transaction():
+    async with source_checkpoint_transaction(database, schema=schema_name()):
         await _require_read_committed(database)
         selection = await selected_terminal_root_retirement(database, request)
         marker_sha256 = canonical_json_sha256(selection.marker_by_field)

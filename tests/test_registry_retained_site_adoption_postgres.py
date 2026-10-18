@@ -4,12 +4,14 @@
 import asyncio
 import hashlib
 import json
+from contextlib import AsyncExitStack
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 
+from process.network_approved_site_source import copy_approved_site_rows
 from process.network_membership_candidate_lifecycle import (
     admit_network_membership_batch,
     create_network_candidate,
@@ -19,6 +21,8 @@ from process.network_membership_copy import MAX_INPUT_BYTES, MembershipCopyTarge
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_retained_site_adoption import RetainedSiteAdoptionError, resolve_retained_site_adoptions
+from tests import registry_candidate_custody_postgres_support as custody
+from tests.registry_candidate_custody_postgres_support import install_candidate_custody
 from tests.test_network_custom_address_source_postgres import _draft, custom_db
 from tests.test_network_serving_schema_postgres import serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _create
@@ -150,6 +154,97 @@ async def _resolve(fixture, rows=None, *, source=None, isolation="repeatable_rea
         )
 
 
+@pytest.fixture
+async def copy_target(retained_db):
+    """Keep a full native address target whose checksum has moved physically."""
+    fixture = retained_db
+    schema = "site_copy_test_" + uuid4().hex
+    source = f'"{fixture.source.schema_name}".entity_address_unified'
+    target = f'"{schema}".entity_address_unified'
+    connection = fixture.connection
+    try:
+        await connection.execute(f'CREATE SCHEMA "{schema}"')
+        await connection.execute(f"CREATE TABLE {target} (LIKE {source} INCLUDING DEFAULTS)")
+        await connection.execute(f"ALTER TABLE {target} ADD PRIMARY KEY(location_key)")
+        await connection.execute(f"ALTER TABLE {target} DROP COLUMN checksum, ADD COLUMN checksum bigint NOT NULL")
+        await connection.execute(
+            f'CREATE TABLE "{schema}".provider_location_binding '
+            f'(LIKE "{fixture.source.schema_name}".provider_location_binding INCLUDING ALL)'
+        )
+        order = await connection.fetch(
+            "SELECT attrelid,array_agg(attname ORDER BY attnum) AS names FROM pg_attribute "
+            "WHERE attrelid IN(to_regclass($1),to_regclass($2)) AND attnum>0 AND NOT attisdropped GROUP BY attrelid",
+            source,
+            target,
+        )
+        assert len(order) == 2 and order[0]["names"] != order[1]["names"]
+        yield SimpleNamespace(
+            fixture=fixture, schema=schema, target=target, source=source, receipt=await _resolve(fixture)
+        )
+    finally:
+        await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        assert await connection.fetchval("SELECT to_regnamespace($1)", schema) is None
+
+
+@pytest.mark.parametrize("exact_rows", [False, True])
+async def test_copy_reordered_native_columns_preserves_every_field_and_hash(copy_target, exact_rows):
+    target = copy_target
+    connection = target.fixture.connection
+    async with connection.transaction(isolation="repeatable_read"):
+        await copy_approved_site_rows(
+            connection, (target.receipt,), target.schema, exact_rows=exact_rows, reproject_network_ids=exact_rows
+        )
+    actual = await connection.fetchrow(
+        f"SELECT to_jsonb(copied)=to_jsonb(retained) AS same, "
+        "encode(sha256(convert_to(to_jsonb(copied)::text,'UTF8')),'hex') AS hash,"
+        "pg_typeof(copied.canonical_network_ids)::text AS array_type, copied.canonical_network_ids "
+        f"FROM {target.target} copied JOIN {target.source} retained USING(location_key)"
+    )
+    assert actual["same"] and actual["hash"] == target.receipt.records[0].address_row_sha256
+    assert actual["array_type"] == "integer[]" and all(type(value) is int for value in actual["canonical_network_ids"])
+    assert await connection.fetchval(f'SELECT count(*) FROM "{target.schema}".provider_location_binding') == 1
+
+
+@pytest.mark.parametrize("damage", ["missing", "extra", "type", "array"])
+async def test_copy_shape_mismatch_refuses_all_dml_and_caller_rollback_restores(copy_target, damage):
+    target = copy_target
+    connection = target.fixture.connection
+    changes_by_damage = {
+        "missing": "DROP COLUMN second_line",
+        "extra": "ADD COLUMN unrecognized text",
+        "type": "ALTER COLUMN checksum TYPE numeric",
+        "array": "ALTER COLUMN canonical_network_ids TYPE bigint[]",
+    }
+    transaction = connection.transaction(isolation="repeatable_read")
+    await transaction.start()
+    try:
+        await connection.execute(f"ALTER TABLE {target.target} {changes_by_damage[damage]}")
+        with pytest.raises(RetainedSiteAdoptionError, match="columns or types differ"):
+            await copy_approved_site_rows(connection, (target.receipt,), target.schema)
+        assert await connection.fetchval(f"SELECT count(*) FROM {target.target}") == 0
+        assert await connection.fetchval(f'SELECT count(*) FROM "{target.schema}".provider_location_binding') == 0
+    finally:
+        await transaction.rollback()
+    async with connection.transaction(isolation="repeatable_read"):
+        await copy_approved_site_rows(connection, (target.receipt,), target.schema)
+    assert await connection.fetchval(f"SELECT count(*) FROM {target.target}") == 1
+
+
+async def test_later_binding_failure_rolls_back_the_reordered_address_copy(copy_target):
+    import asyncpg
+
+    target = copy_target
+    connection = target.fixture.connection
+    with pytest.raises(asyncpg.CheckViolationError):
+        async with connection.transaction(isolation="repeatable_read"):
+            await connection.execute(
+                f'ALTER TABLE "{target.schema}".provider_location_binding ADD CONSTRAINT refuse_copy CHECK(false)'
+            )
+            await copy_approved_site_rows(connection, (target.receipt,), target.schema)
+    assert await connection.fetchval(f"SELECT count(*) FROM {target.target}") == 0
+    assert await connection.fetchval(f'SELECT count(*) FROM "{target.schema}".provider_location_binding') == 0
+
+
 @pytest.mark.parametrize("retained_db", [(2, "npi"), (2, "provider_directory")], indirect=True)
 async def test_selected_office_only_and_deterministic_immutable_receipt(retained_db):
     fixture = retained_db
@@ -228,7 +323,11 @@ async def test_native_tampering_fails_closed_and_caller_rollback_restores(retain
     assert len((await _resolve(fixture)).records) == 1
 
 
-@pytest.mark.parametrize("payload", [b"[]", b"{}", b"null", b"[NaN]", b"[{}]", b"[", b" " * (MAX_INPUT_BYTES + 1)])
+@pytest.mark.parametrize(
+    "payload",
+    [b"[]", b"{}", b"null", b"[NaN]", b"[{}]", b"[", b" " * (MAX_INPUT_BYTES + 1)],
+    ids=["empty-array", "object", "null", "nonfinite", "missing-fields", "truncated", "oversized-whitespace"],
+)
 async def test_strict_input_is_rejected_before_database(retained_db, payload):
     with pytest.raises(RetainedSiteAdoptionError):
         await resolve_retained_site_adoptions(None, retained_db.source, payload)
@@ -278,14 +377,15 @@ async def test_transaction_contract_and_readonly_query_count(retained_db):
                 control_schema=fixture.control_schema,
             )
             await asyncio.sleep(0)
-            assert len(queries) == 3
+            assert len(queries) == 5
+            assert sum("network_candidate_custody" in query.query for query in queries) == 1
             assert all(query.query.lstrip().split()[0] in ("SELECT", "WITH") for query in queries)
     finally:
         fixture.connection.remove_query_logger(queries.append)
 
 
 @pytest.mark.parametrize("retained_db", [(5000, "npi")], indirect=True)
-async def test_maximum_batch_has_the_same_three_native_queries(retained_db):
+async def test_maximum_batch_has_the_same_five_native_queries(retained_db):
     fixture = retained_db
     queries = []
     fixture.connection.add_query_logger(queries.append)
@@ -300,6 +400,43 @@ async def test_maximum_batch_has_the_same_three_native_queries(retained_db):
                 control_schema=fixture.control_schema,
             )
             await asyncio.sleep(0)
-            assert len(receipt.records) == 5000 and len(queries) == 3
+            assert len(receipt.records) == 5000 and len(queries) == 5
+            assert sum("network_candidate_custody" in query.query for query in queries) == 1
     finally:
         fixture.connection.remove_query_logger(queries.append)
+
+
+@pytest.mark.asyncio
+async def test_candidate_custody_restores_schema_owner_without_dropping_notification(custom_db):
+    """A protected table owned by the original role survives custody and role cleanup."""
+    fixture = custom_db
+    original = await fixture.connection.fetchrow(
+        "SELECT n.oid,n.nspowner,c.oid AS table_oid,c.relowner FROM pg_namespace n "
+        "JOIN pg_class c ON c.relnamespace=n.oid "
+        "WHERE n.nspname=$1 AND c.relname='registry_aca_source_notification'",
+        fixture.control_schema,
+    )
+    assert original is not None and original["nspowner"] == original["relowner"]
+    async with AsyncExitStack() as stack:
+        await install_candidate_custody(fixture, stack)
+        assert (
+            await fixture.connection.fetchval(
+                "SELECT r.rolname FROM pg_namespace n JOIN pg_roles r ON r.oid=n.nspowner WHERE n.oid=$1",
+                original["oid"],
+            )
+            == fixture.roles["owner"]
+        )
+        inbox = await custody._aca_controls(fixture.connection, fixture.control_schema)
+        assert len(inbox) == 1 and inbox[0]["oid"] == original["table_oid"]
+        assert inbox[0]["relowner"] == inbox[0]["head_owner"]
+        assert inbox[0]["relowner"] != original["relowner"]
+    retained = await fixture.connection.fetchrow(
+        "SELECT n.oid,n.nspowner,c.oid AS table_oid,c.relowner FROM pg_namespace n "
+        "JOIN pg_class c ON c.relnamespace=n.oid "
+        "WHERE n.nspname=$1 AND c.relname='registry_aca_source_notification'",
+        fixture.control_schema,
+    )
+    assert retained == original
+    assert not await fixture.connection.fetchval(
+        "SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=ANY($1::text[]))", list(fixture.custody_roles.values())
+    )

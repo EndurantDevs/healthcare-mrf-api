@@ -9,11 +9,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy.exc import DBAPIError
 
+from process import provider_directory_dataset_candidate as candidate_storage
 from process import provider_directory_rooted_graph_publication_materialization as rooted_materialization
 from process import uhc_flex_practitioner_materialization as normalizer
 from process import uhc_flex_practitioner_publication_materialization as materialization
+from process.provider_directory_generic_candidate import GenericCandidateError
 from process.uhc_flex_practitioner_store_contract import UHCFlexPractitionerResourceRow
 from tests.test_provider_directory_rooted_graph_publication_postgres import (
     _complete_success,
@@ -65,13 +66,10 @@ def test_admitted_normalization_preserves_external_canonical_encoding(number):
     assert normalizer._canonical_json(admitted) == normalizer._canonical_json(external.dataset_resource)
 
 
-def _tampered_copy(copier, field_name, value, candidate_names):
+def _tampered_copy(copier, field_name, value, candidate_names, target_table):
     async def copy_rows(database, table, columns, records):
         candidate_names.add(publication._table(table))
-        is_targeted = table == (
-            publication._PROVENANCE if field_name == "requested_npi" else publication._DATASET_RESOURCE
-        )
-        if is_targeted:
+        if table == target_table:
             records = [
                 tuple(value if name == field_name else item for name, item in zip(columns, record, strict=True))
                 for record in records
@@ -81,20 +79,23 @@ def _tampered_copy(copier, field_name, value, candidate_names):
     return copy_rows
 
 
-async def _assert_invalid_candidate(database, admission, monkeypatch, field_name, value):
+async def _assert_invalid_candidate(database, admission, monkeypatch, field_name, value, target_table):
     copier = materialization.copy_dataset_candidate_rows
     candidate_names = set()
     with monkeypatch.context() as patch:
         patch.setattr(
-            materialization, "copy_dataset_candidate_rows", _tampered_copy(copier, field_name, value, candidate_names)
+            materialization,
+            "copy_dataset_candidate_rows",
+            _tampered_copy(copier, field_name, value, candidate_names, target_table),
         )
-        with pytest.raises(DBAPIError) as failure:
+        with pytest.raises(
+            GenericCandidateError, match="^provider_directory_generic_source_candidate_content_changed$"
+        ):
             await publication.publish_uhc_flex_practitioner_dataset(
                 admission.candidate_acquisition_id,
                 database=database,
                 batch_size=1,
             )
-        assert failure.value.orig.sqlstate == "23514"
     for candidate_name in candidate_names:
         assert await database.scalar("SELECT to_regclass(:relation)", relation=candidate_name) is None
 
@@ -117,7 +118,11 @@ async def test_candidate_shape_identity_and_npi_are_checked_as_a_set(monkeypatch
             ("requested_npi", 1000000001),
         )
         for field_name, value in invalid_fields:
-            await _assert_invalid_candidate(database, admission, monkeypatch, field_name, value)
+            target_table = publication._PROVENANCE if field_name == "requested_npi" else publication._DATASET_RESOURCE
+            await _assert_invalid_candidate(database, admission, monkeypatch, field_name, value, target_table)
+        await _assert_invalid_candidate(
+            database, admission, monkeypatch, "acquired_resource_sha256", "bad", publication._PROVENANCE
+        )
         published = await publication.publish_uhc_flex_practitioner_dataset(
             admission.candidate_acquisition_id,
             database=database,
@@ -173,9 +178,41 @@ async def _admitted_rooted_candidate(database, current):
 async def _candidate_relations(context):
     """Capture physical publication candidates, including the incumbent snapshot."""
     return await context.connection.fetch(
-        "SELECT oid FROM pg_class WHERE relnamespace=$1::regnamespace AND relname LIKE 'pd_ds_%' ORDER BY oid",
+        "SELECT oid FROM pg_class WHERE relnamespace=$1::regnamespace "
+        "AND (relname LIKE 'pd_ds_%' OR relname LIKE 'pdgs_%') ORDER BY oid",
         context.schema_name,
     )
+
+
+@pytest.mark.asyncio
+async def test_rooted_provenance_checks_are_retained_before_publication(monkeypatch):
+    async with _lifecycle_scope(monkeypatch) as context:
+        current = await _publish_legacy_root(context.database)
+        admission = await _admitted_rooted_candidate(context.database, current)
+        original_relations = await _candidate_relations(context)
+        assert original_relations
+        copier = candidate_storage.copy_dataset_candidate_rows
+        for field_name, value in (("origin_kind", "invalid"), ("attempt", 0)):
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    candidate_storage,
+                    "copy_dataset_candidate_rows",
+                    _tampered_copy(
+                        copier, field_name, value, set(), "provider_directory_rooted_graph_dataset_resource"
+                    ),
+                )
+                with pytest.raises(
+                    GenericCandidateError, match="^provider_directory_generic_source_candidate_content_changed$"
+                ):
+                    await publish_provider_directory_rooted_graph_dataset(
+                        admission.publication_acquisition_id, database=context.database, batch_size=4
+                    )
+            assert await _candidate_relations(context) == original_relations
+            assert await _locked_exact_current(context.database) == current
+        published = await publish_provider_directory_rooted_graph_dataset(
+            admission.publication_acquisition_id, database=context.database, batch_size=4
+        )
+        assert published.readiness.previous_dataset_id == current.dataset_id
 
 
 @pytest.mark.asyncio
@@ -184,6 +221,7 @@ async def test_rooted_normalizer_identity_drift_fails_set_proof_and_rolls_back(m
         current = await _publish_legacy_root(context.database)
         admission = await _admitted_rooted_candidate(context.database, current)
         original_relations = await _candidate_relations(context)
+        assert original_relations
         normalize = rooted_materialization.materialize_provider_directory_dataset_fhir_resource
 
         def drift_identity(**keywords):
@@ -196,11 +234,12 @@ async def test_rooted_normalizer_identity_drift_fails_set_proof_and_rolls_back(m
             patch.setattr(
                 rooted_materialization, "materialize_provider_directory_dataset_fhir_resource", drift_identity
             )
-            with pytest.raises(DBAPIError, match="provider_directory_dataset_candidate_content") as failure:
+            with pytest.raises(
+                GenericCandidateError, match="^provider_directory_generic_source_candidate_content_changed$"
+            ):
                 await publish_provider_directory_rooted_graph_dataset(
                     admission.publication_acquisition_id, database=context.database, batch_size=4
                 )
-            assert failure.value.orig.sqlstate == "23514"
         assert await _candidate_relations(context) == original_relations
         assert await _locked_exact_current(context.database) == current
         assert (

@@ -36,6 +36,7 @@ async def test_release_query_requires_exact_logical_snapshot_scope():
                     "CREATE TEMP TABLE plan_release_snapshot_binding (serving_revision_id text, binding_ordinal integer, snapshot_id text, source_key text, plan_id text, plan_market_type text, role text, required boolean)",
                     "CREATE TEMP TABLE ptg2_snapshot (snapshot_id text, status text)",
                     "CREATE TEMP TABLE ptg2_snapshot_pin (owner_type text, owner_id text, snapshot_id text)",
+                    "CREATE TEMP TABLE plan_release_snapshot_pin (serving_revision_id text, snapshot_id text)",
                     "CREATE TEMP TABLE ptg2_v3_snapshot_plan_scope (snapshot_id text, plan_id text, plan_market_type text)",
                     "INSERT INTO plan_release_serving_revision VALUES ('revision', now(), 'release', 'plan', NULL, '2026-09', 'published', 1, 'digest', 'published', true)",
                     "INSERT INTO plan_release_snapshot_binding VALUES ('revision', 0, 'snapshot', 'synthetic-source', 'logical-plan', 'group', 'in_network', true)",

@@ -430,13 +430,24 @@ async def _verify_or_dispose(
     try:
         await _verify_release(directory, receipt_by_field, client, task)
     except source.CmsNpdSourceError as error:
-        if not candidate.already_published and str(error) in {
-            "cms_npd_retained_file_missing",
-            "cms_npd_source_vector_changed",
-            "cms_npd_retained_receipt_changed",
-        }:
-            await recovery.dispose_changed_vector(fhir, candidate, identity)
+        await _dispose_changed_release(fhir, candidate, identity, error)
         raise
+
+
+async def _dispose_changed_release(fhir, candidate, identity, error):
+    """Dispose only after the failed completion transaction has rolled back."""
+    from process.provider_directory_generic_source_policy import (
+        is_source_storage_required,
+        source_transaction_available,
+    )
+
+    if (
+        not candidate.already_published
+        and str(error)
+        in {"cms_npd_retained_file_missing", "cms_npd_source_vector_changed", "cms_npd_retained_receipt_changed"}
+        and (not is_source_storage_required() or source_transaction_available() is None)
+    ):
+        await recovery.dispose_changed_vector(fhir, candidate, identity)
 
 
 def _rollback_selection(task, run_id):
@@ -609,53 +620,22 @@ def _source_witnesses_by_id(
 
 
 async def _insert_verified_witnesses(session: Any, witness_by_id: dict[str, dict[str, Any]]) -> None:
-    """Insert new witnesses and check replay using fixed-size bindings and hashes."""
+    """Append exact raw facts; replay equality is checked over the complete key."""
+    from process.provider_directory_generic_source_policy import bound_publisher
+    from process.provider_directory_generic_source_storage import (
+        append_generic_source_batch,
+        resolve_existing_source_candidate,
+    )
 
+    bound_publisher()
     fhir = importlib.import_module("process.provider_directory_fhir")
-    table = ProviderDirectoryCMSNPDResourceWitness.__table__
-    # The shared normalized COPY serializer strips NULs; raw witnesses must never change.
-    if any(
-        fhir._strip_postgres_nuls(witness["raw_payload_json"]) != witness["raw_payload_json"]
-        for witness in witness_by_id.values()
-    ):
+    if not witness_by_id or fhir._bound_upsert_session() is not session:
+        raise RuntimeError("cms_npd_resource_batch_transaction_missing")
+    witnesses = list(witness_by_id.values())
+    if any(fhir._strip_postgres_nuls(row["raw_payload_json"]) != row["raw_payload_json"] for row in witnesses):
         raise source.CmsNpdSourceError("cms_npd_resource_invalid")
-    replay_fields = (
-        "dataset_id",
-        "source_id",
-        "release_id",
-        "resource_type",
-        "resource_id",
-        "raw_payload_sha256",
-        "normalized_payload_hash",
-    )
-    first_witness = next(iter(witness_by_id.values()))
-    await fhir._copy_upsert_rows(
-        ProviderDirectoryCMSNPDResourceWitness,
-        list(witness_by_id.values()),
-        [column.name for column in table.columns],
-        ["dataset_id", "resource_type", "resource_id"],
-        skip_unchanged=False,
-        transaction_session=session,
-        ignore_conflicts=True,
-    )
-    stored_witnesses = (
-        (
-            await session.execute(
-                select(*(table.c[field] for field in replay_fields)).where(
-                    table.c.dataset_id == first_witness["dataset_id"],
-                    table.c.resource_type == first_witness["resource_type"],
-                    table.c.resource_id.in_(witness_by_id),
-                )
-            )
-        )
-        .mappings()
-        .all()
-    )
-    if len(stored_witnesses) != len(witness_by_id) or any(
-        any(stored_witness[field] != witness_by_id[stored_witness["resource_id"]][field] for field in replay_fields)
-        for stored_witness in stored_witnesses
-    ):
-        raise RuntimeError("cms_npd_witness_payload_conflict")
+    candidate = await resolve_existing_source_candidate(fhir.db, fhir, witnesses[0]["dataset_id"])
+    await append_generic_source_batch(fhir.db, fhir, candidate, (), witnesses)
 
 
 async def _persist_source_batch(
@@ -667,21 +647,23 @@ async def _persist_source_batch(
     resource_type: str,
 ) -> None:
     """Commit normalized rows and their complete CMS witnesses together."""
+    from process.provider_directory_generic_source_policy import source_transaction
 
-    if len(resource_rows) != len(raw_resources):
-        raise RuntimeError("cms_npd_witness_batch_invalid")
-    witness_by_id = _source_witnesses_by_id(raw_resources, candidate, resource_type)
-    async with fhir.db.transaction() as session:
-        normalized_rows = await persist_cms_dataset_rows(fhir, session, model, resource_rows, candidate)
-        normalized_by_id = {normalized_row["resource_id"]: normalized_row for normalized_row in normalized_rows}
-        if set(normalized_by_id) != set(witness_by_id) or any(
-            normalized_row["resource_type"] != resource_type or normalized_row["dataset_id"] != candidate.dataset_id
-            for normalized_row in normalized_rows
-        ):
-            raise RuntimeError("cms_npd_witness_projection_mismatch")
-        for resource_id, witness in witness_by_id.items():
-            witness["normalized_payload_hash"] = normalized_by_id[resource_id]["payload_hash"]
-        await _insert_verified_witnesses(session, witness_by_id)
+    async with source_transaction(fhir.db):
+        if len(resource_rows) != len(raw_resources):
+            raise RuntimeError("cms_npd_witness_batch_invalid")
+        witness_by_id = _source_witnesses_by_id(raw_resources, candidate, resource_type)
+        async with fhir.db.transaction() as session:
+            normalized_rows = await persist_cms_dataset_rows(fhir, session, model, resource_rows, candidate)
+            normalized_by_id = {normalized_row["resource_id"]: normalized_row for normalized_row in normalized_rows}
+            if set(normalized_by_id) != set(witness_by_id) or any(
+                normalized_row["resource_type"] != resource_type or normalized_row["dataset_id"] != candidate.dataset_id
+                for normalized_row in normalized_rows
+            ):
+                raise RuntimeError("cms_npd_witness_projection_mismatch")
+            for resource_id, witness in witness_by_id.items():
+                witness["normalized_payload_hash"] = normalized_by_id[resource_id]["payload_hash"]
+            await _insert_verified_witnesses(session, witness_by_id)
 
 
 def _resource_from_line(line: bytes, resource_type: str) -> dict[str, Any]:
@@ -733,6 +715,16 @@ async def _stream_file(fhir: Any, path: Path, candidate: Any, resource_type: str
     return row_count
 
 
+async def _seal_identity_evidence(fhir, candidate, identity, ctx, task):
+    """Seal and verify complete staged identity evidence before publication."""
+    from process.provider_directory_generic_source_auxiliary import seal_identity_candidate
+
+    await seal_identity_candidate(fhir.db, fhir, candidate)
+    await _refresh_identity_statistics(fhir, ctx, task)
+    _observe_intake(ctx, phase="identity_validation")
+    await _assert_identity_evidence(fhir, candidate, identity)
+
+
 async def _materialize_identity_evidence(
     fhir: Any,
     directory: Path,
@@ -744,7 +736,6 @@ async def _materialize_identity_evidence(
     """Replay exact entity and network facts in bounded, committed transactions."""
 
     if candidate.already_validated or candidate.already_published:
-        await _backfill_network_roles(fhir, identity, ctx, task)
         _observe_intake(ctx, phase="identity_validation")
         await _assert_identity_evidence(fhir, candidate, identity)
         return
@@ -789,9 +780,7 @@ async def _materialize_identity_evidence(
         _observe_intake(ctx, phase="identity", family=resource_type, completed_rows=row_count, force=True)
         if row_count != identity["files"][name]["row_count"]:
             raise RuntimeError("cms_npd_identity_file_row_count_changed")
-    await _refresh_identity_statistics(fhir, ctx, task)
-    _observe_intake(ctx, phase="identity_validation")
-    await _assert_identity_evidence(fhir, candidate, identity)
+    await _seal_identity_evidence(fhir, candidate, identity, ctx, task)
 
 
 async def _refresh_identity_statistics(fhir: Any, ctx: dict, task: dict) -> None:
@@ -840,7 +829,7 @@ async def _backfill_network_roles(fhir: Any, identity: dict[str, Any], ctx: dict
         )
         if not missing:
             return
-        async with fhir.db.session() as session, session.begin():
+        async with fhir.db.session() as session:
             await network_writer.record_insurance_network_batch(
                 session,
                 source_id=SOURCE_ID,
@@ -890,7 +879,7 @@ async def _write_identity_batch(
     if resource_type == "PractitionerRole":
         return
 
-    async with fhir.db.session() as session, session.begin():
+    async with fhir.db.session() as session:
         await network_writer.record_insurance_network_batch(
             session,
             source_id=SOURCE_ID,
@@ -1034,8 +1023,96 @@ async def _assert_witness_counts(fhir: Any, candidate: Any, identity: dict[str, 
         raise RuntimeError("cms_npd_witness_counts_incomplete")
 
 
+def _source_registry_replay_sql(fhir):
+    """Read only the bounded, authenticated receipt; never compile a legacy payload hash."""
+    from process.provider_directory_admission_seal import ADMISSION_METADATA_SUMMARY_MAX_BYTES
+
+    header = fhir._qt(fhir._schema(), "provider_directory_endpoint_dataset")
+    return f"""SELECT endpoint_id,acquisition_root_run_id,dataset_hash,resource_count,status,
+        publication_metadata_summary_json,publication_metadata_sha256,content_proof_admission_version,
+        content_proof_admission_kind,content_proof_admission_sha256,content_proof_resource_types,
+        (({fhir._artifact_admission_seal_valid_sql("dataset")})
+          AND ({fhir._artifact_seal_receipt_consistent_sql("dataset")})) AS seal_valid
+        FROM {header} dataset WHERE dataset_id=$1
+          AND octet_length(publication_metadata_summary_json::text)<={ADMISSION_METADATA_SUMMARY_MAX_BYTES}
+        FOR UPDATE"""
+
+
+def _source_registry_replay_seal(candidate, dataset_row):
+    """Decode the already-admitted fixed receipt without revisiting payload records."""
+    from process.provider_directory_admission_seal import (
+        ADMISSION_GENERIC_PROOF_SUMMARY_KEY,
+        ProviderDirectoryAdmissionSeal,
+    )
+    from process.provider_directory_generic_source_storage import _json, _require
+
+    _require(
+        dataset_row is not None
+        and dataset_row["seal_valid"] is True
+        and dataset_row["endpoint_id"] == candidate.endpoint_id
+        and dataset_row["acquisition_root_run_id"] == candidate.acquisition_root_run_id
+        and dataset_row["status"] in {"validated", "published", "superseded"}
+        and tuple(dataset_row["content_proof_resource_types"]) == tuple(sorted(candidate.selected_resources)),
+        "admission_replay_changed",
+    )
+    summary_by_field = _json(dataset_row["publication_metadata_summary_json"])
+    proof_by_field = (
+        summary_by_field.get(ADMISSION_GENERIC_PROOF_SUMMARY_KEY) if type(summary_by_field) is dict else None
+    )
+    _require(
+        type(proof_by_field) is dict
+        and proof_by_field.get("dataset_hash") == dataset_row["dataset_hash"]
+        and proof_by_field.get("resource_count") == dataset_row["resource_count"],
+        "admission_replay_changed",
+    )
+    return ProviderDirectoryAdmissionSeal(
+        summary_by_field,
+        dataset_row["publication_metadata_sha256"],
+        dataset_row["content_proof_admission_version"],
+        dataset_row["content_proof_admission_kind"],
+        dataset_row["content_proof_admission_sha256"],
+        tuple(dataset_row["content_proof_resource_types"]),
+    )
+
+
+async def _replayed_source_registry_admission(fhir, candidate):
+    """Reuse sealed SOURCE admission only inside the genuine original native snapshot."""
+    from db.plan_release_storage import storage_relation
+    from process.network_fhir_source_custody import _generic_partitioned_custody
+    from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
+    from process.provider_directory_generic_source_storage import _require, candidate_identity
+
+    async with source_transaction(fhir.db, isolation="repeatable read"):
+        publisher = bound_publisher()
+        _require(publisher.policy.schema == fhir._schema(), "admission_replay_changed")
+        driver = publisher.connection
+        dataset_row = await driver.fetchrow(_source_registry_replay_sql(fhir), candidate.dataset_id)
+        seal = _source_registry_replay_seal(candidate, dataset_row)
+        resource_oid = await driver.fetchval(
+            "SELECT to_regclass($1)::oid::bigint",
+            storage_relation(publisher.policy.schema, "provider_directory_dataset_resource"),
+        )
+        pin = SimpleNamespace(
+            schema_name=publisher.policy.schema,
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            dataset_sha256=dataset_row["dataset_hash"],
+            resource_table_oid=resource_oid,
+            release_id=candidate.source_release["vector_sha256"],
+        )
+        custody = await _generic_partitioned_custody(
+            driver, pin, publisher.policy.owner_role, publisher.policy.runtime_roles, source_policy=publisher.policy
+        )
+        _require(custody["binding"]["identity"] == candidate_identity(fhir, candidate), "admission_replay_changed")
+        return {"dataset_hash": dataset_row["dataset_hash"], **fhir._endpoint_dataset_admission_handoff(seal)}
+
+
 async def _replayed_registry_admission(fhir, candidate):
     """Reconstruct completed metadata and verify actual payloads before a replay handoff."""
+    from process.provider_directory_generic_source_policy import is_source_storage_required
+
+    if is_source_storage_required():
+        return await _replayed_source_registry_admission(fhir, candidate)
     from process.provider_directory_admission_backfill import _locked_dataset_row, _validated_row_seal
     from process.provider_directory_admission_seal import ADMISSION_GENERIC_PROOF_SUMMARY_KEY
 
@@ -1293,20 +1370,20 @@ async def _stage_and_validate_candidate(fhir, directory, candidate, identity, re
             await fhir._gather_provider_directory_profile_tasks(
                 [asyncio.create_task(stage_files()) for _ in range(workers)]
             )
-    _observe_intake(ctx, phase="count_validation")
-    counts_by_type = await _assert_counts(fhir, candidate, identity)
-    _observe_intake(ctx, phase="release_validation")
-    await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None, task)
-    _observe_intake(ctx, phase="witness_validation")
-    await _assert_witness_counts(fhir, candidate, identity)
-    _observe_intake(ctx, phase="identity")
-    await _materialize_identity_evidence(fhir, directory, candidate, identity, ctx, task)
-    _observe_intake(ctx, phase="relationships")
-    await relationships.materialize(fhir, candidate, identity["vector_sha256"], ctx, task)
-    _observe_intake(ctx, phase="release_validation")
-    await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None, task)
-    _observe_intake(ctx, phase="candidate_validation")
-    return await _validate_candidate(fhir, candidate, identity, counts_by_type)
+    from process.provider_directory_generic_source_adapters import completed_source_scope
+    from process.provider_directory_generic_source_policy import source_transaction
+
+    if candidate.already_validated or candidate.already_published:
+        return await _validate_staged_source_snapshot(fhir, directory, candidate, identity, receipt_by_field, ctx, task)
+    try:
+        async with source_transaction(fhir.db, isolation="repeatable read"):
+            async with completed_source_scope(fhir, candidate):
+                return await _validate_staged_source_snapshot(
+                    fhir, directory, candidate, identity, receipt_by_field, ctx, task
+                )
+    except source.CmsNpdSourceError as error:
+        await _dispose_changed_release(fhir, candidate, identity, error)
+        raise
 
 
 async def _stage_acquired(
@@ -1443,14 +1520,19 @@ async def _current_registry_source_admission(fhir, state):
     if not isinstance(metadata, dict) or "network_bindings" not in metadata:
         return None
     contract = fhir._dataset_resource_hash_contract(state)
-    candidate = SimpleNamespace(
+    candidate = fhir.EndpointDatasetCandidate(
         dataset_id=state["dataset_id"],
         endpoint_id=state["endpoint_id"],
         acquisition_root_run_id=state["acquisition_root_run_id"],
+        source_ids=(SOURCE_ID,),
         selected_resources=tuple(sorted(RESOURCE_SET)),
+        expected_resources=tuple(sorted(RESOURCE_SET)),
+        import_run_id=state["acquisition_root_run_id"],
+        previous_dataset_id=state.get("previous_dataset_id"),
         resource_hash_contract=contract,
         source_release=metadata["source_release"],
         semantic_projection_as_of=fhir._dataset_semantic_projection_as_of(state, contract),
+        registry_network_binding_metadata=metadata["network_bindings"],
     )
     finalization = await _replayed_registry_admission(fhir, candidate)
     return await _registry_source_admission(fhir, candidate, finalization)
@@ -1597,3 +1679,21 @@ async def _execute_intake(ctx: dict[str, Any], task: dict[str, Any], run_id: str
 async def run(ctx: dict[str, Any], task: dict[str, Any], run_id: str | None) -> dict[str, Any]:
     """Acquire, batch-stage, validate, and request composite CMS serving publication."""
     return await _execute_intake(ctx, task, run_id)
+
+
+async def _validate_staged_source_snapshot(fhir, directory, candidate, identity, receipt_by_field, ctx, task):
+    """Run the existing aggregate release/relationship proofs on one exact snapshot."""
+    _observe_intake(ctx, phase="count_validation")
+    counts_by_type = await _assert_counts(fhir, candidate, identity)
+    _observe_intake(ctx, phase="release_validation")
+    await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None, task)
+    _observe_intake(ctx, phase="witness_validation")
+    await _assert_witness_counts(fhir, candidate, identity)
+    _observe_intake(ctx, phase="identity")
+    await _materialize_identity_evidence(fhir, directory, candidate, identity, ctx, task)
+    _observe_intake(ctx, phase="relationships")
+    await relationships.materialize(fhir, candidate, identity["vector_sha256"], ctx, task)
+    _observe_intake(ctx, phase="release_validation")
+    await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None, task)
+    _observe_intake(ctx, phase="candidate_validation")
+    return await _validate_candidate(fhir, candidate, identity, counts_by_type)

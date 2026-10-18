@@ -4,7 +4,6 @@ import csv
 import hashlib
 import importlib
 import os
-import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -14,12 +13,10 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from db.connection import Database
 from process import cms_doctors_education as education
 from process.entity_address_cutover_contract import postgres_sqlstate
-from tests.reference_family_generation_fixture import generation_shape_check, install_source_generation_guards_from_dsn
+from tests.test_cms_doctors_organizations import _unit_source_transaction
 
 NPI = "1000000004"
 SOURCE_URL = "https://example.test/cms-national.csv"
@@ -41,6 +38,10 @@ def staged_rows(monkeypatch):
     async def retain_batch(batch, _stage):
         rows.extend(dict(row) for row in batch)
 
+    async def create_stage(database, model, import_date, schema):
+        return await database.create_table(education.make_class(model, import_date).__table__, checkfirst=False)
+
+    monkeypatch.setattr(education, "create_doctors_stage", create_stage)
     monkeypatch.setattr(education.db, "create_table", AsyncMock())
     monkeypatch.setattr(education.db, "status", AsyncMock())
     monkeypatch.setattr(education, "_copy_sidecar_rows", retain_batch)
@@ -275,6 +276,10 @@ async def test_address_failure_discards_completed_education_stage(tmp_path, stag
     import aiohttp
 
     cms_doctors = importlib.import_module("process.cms_doctors")
+    monkeypatch.setattr(cms_doctors, "source_transaction", _unit_source_transaction)
+    monkeypatch.setattr(cms_doctors, "_create_stage_indexes", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "bound_publisher", lambda: SimpleNamespace(connection=object(), policy=object()))
+    monkeypatch.setattr(cms_doctors.source_storage, "_close_grants", AsyncMock())
 
     async def download_source(_client, _url, source_path):
         with open(source_path, "w") as source_file:
@@ -307,6 +312,10 @@ async def test_address_failure_discards_completed_education_stage(tmp_path, stag
 
 async def test_publication_validation_failure_discards_owned_stage(tmp_path, staged_rows, monkeypatch):
     cms_doctors = importlib.import_module("process.cms_doctors")
+    monkeypatch.setattr(cms_doctors, "source_transaction", _unit_source_transaction)
+    monkeypatch.setattr(cms_doctors, "_create_stage_indexes", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "bound_publisher", lambda: SimpleNamespace(connection=object(), policy=object()))
+    monkeypatch.setattr(cms_doctors.source_storage, "_close_grants", AsyncMock())
     source_path = tmp_path / "national.csv"
     source_path.write_text(f"NPI,Med_sch,Grd_yr\n{NPI},Example School,2001\n")
     worker_context_by_key = {"import_date": "educationtests", "context": {"run": 1}}
@@ -381,147 +390,135 @@ async def test_validation_accepts_first_and_safe_refresh_but_blocks_volume_drop(
         await validation
 
 
-async def _create_publication_fixture(connection, schema):
-    marker_by_table = {
-        "doctor_clinician_address": "live_address",
-        "doctor_clinician_address_old": "old_address",
-        "doctor_stage": "new_address",
-        "cms_doctor_education": "live_education",
-        "cms_doctor_education_old": "old_education",
-        "cms_doctor_group_site": "live_group",
-        "cms_doctor_group_site_old": "old_group",
-    }
-    for table, marker in marker_by_table.items():
-        await connection.execute(f"CREATE TABLE {schema}.{table} (marker text)")
-        await connection.execute(f"INSERT INTO {schema}.{table} VALUES ($1)", marker)
-    return marker_by_table
+async def _assert_native_family_rollback(fixture):
+    from process import cms_doctors_preparation as preparation
+    from tests.cms_doctors_preparation_postgres_support import authority, native, stage_family, stage_oids
 
-
-async def _assert_publication_markers(connection, schema, marker_by_table):
-    for table, marker in marker_by_table.items():
-        assert await connection.fetchval(f"SELECT marker FROM {schema}.{table}") == marker
-
-
-def _publisher_database(dsn):
-    engine = create_async_engine(make_url(dsn).set(drivername="postgresql+asyncpg"))
-    return Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
-
-
-async def _create_generation_fixture(connection, schema, dsn):
-    await connection.execute(
-        f"CREATE TABLE {schema}.reference_family_result_generation ("
-        "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, local_generation bigint NOT NULL, "
-        "origin_lineage_id uuid, origin_generation bigint, published_at timestamptz, relation_oids bigint[], "
-        f"CONSTRAINT reference_family_result_generation_shape_check CHECK ({generation_shape_check()}))"
-    )
-    await connection.execute(
-        f"INSERT INTO {schema}.reference_family_result_generation "
-        "(importer_id, local_lineage_id, local_generation) VALUES ('cms-doctors', $1, 0)",
-        uuid.uuid4(),
-    )
-    await install_source_generation_guards_from_dsn(dsn, schema)
-    return await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation")
-
-
-async def _assert_published_generation(connection, database, schema, generation_before):
-    generation = importlib.import_module("process.reference_family_result_generation")
-    authority = await generation.read_reference_family_result_generation_authority(
-        database,
-        importer_id="cms-doctors",
-        schema_name=schema,
-    )
-    assert authority.local_generation == 1
-    assert authority.serving_generation.origin_lineage_id == str(generation_before["local_lineage_id"])
-    assert authority.serving_generation.origin_generation == 1
-    assert authority.relation_oids == tuple(
-        [
-            await connection.fetchval("SELECT $1::regclass::oid::bigint", f"{schema}.{name}")
-            for name in ("doctor_clinician_address", "cms_doctor_education", "cms_doctor_group_site")
-        ]
-    )
-    assert (
-        await generation.capture_reference_family_serving_generation(
-            database,
-            importer_id="cms-doctors",
-            schema_name=schema,
+    incumbent = await authority(fixture)
+    first = await stage_family(fixture.database, fixture.schema)
+    stages = await stage_oids(fixture, first)
+    async with fixture.database.transaction() as session:
+        await session.execute(education.text(f'DROP TABLE "{fixture.schema}"."{stages[1][1]}"'))
+    with pytest.raises(DBAPIError) as missing_stage:
+        await native._publish_cms_doctors_stage(
+            native.make_class(native.DoctorClinicianAddress, first["import_date"]), fixture.schema, first["import_date"]
         )
-        == authority.serving_generation
-    )
-
-
-async def _assert_swapped_doctors_markers(connection, schema):
-    """Check all current and retained markers after the genuine atomic swap."""
-    await _assert_publication_markers(
-        connection,
-        schema,
-        {
-            "doctor_clinician_address": "new_address",
-            "cms_doctor_education": "new_education",
-            "cms_doctor_group_site": "new_group",
-            "doctor_clinician_address_old": "live_address",
-            "cms_doctor_education_old": "live_education",
-            "cms_doctor_group_site_old": "live_group",
-        },
-    )
+    assert postgres_sqlstate(missing_stage.value) == "42P01"
+    assert await authority(fixture) == incumbent
+    await preparation._drop_owned_stages(fixture.schema, stages)
+    ctx = await stage_family(fixture.database, fixture.schema)
+    async with preparation.prepare_cms_doctors_generation(ctx) as prepared:
+        async with fixture.engine.begin() as admin:
+            await admin.execute(
+                education.text(
+                    f'ALTER TABLE "{fixture.schema}".reference_family_result_generation ADD CONSTRAINT reject_advance '
+                    f"CHECK (importer_id<>'cms-doctors' OR local_generation={incumbent.local_generation})"
+                )
+            )
+        try:
+            with pytest.raises(DBAPIError) as rejected_generation:
+                async with fixture.database.transaction():
+                    await preparation.apply_prepared_cms_doctors_generation(prepared)
+            assert postgres_sqlstate(rejected_generation.value) == "23514"
+            assert await authority(fixture) == incumbent
+            assert await stage_oids(fixture, ctx) == prepared.stage_oids
+        finally:
+            async with fixture.engine.begin() as admin:
+                await admin.execute(
+                    education.text(
+                        f'ALTER TABLE "{fixture.schema}".reference_family_result_generation DROP CONSTRAINT reject_advance'
+                    )
+                )
+        async with fixture.database.transaction():
+            result_authority = await preparation.apply_prepared_cms_doctors_generation(prepared)
+        assert result_authority == await authority(fixture)
+        assert result_authority.local_generation == incumbent.local_generation + 1
+        for table, column in (
+            ("doctor_clinician_address", "city"),
+            ("cms_doctor_education", "medical_school"),
+            ("cms_doctor_group_site", "org_pac_id"),
+        ):
+            assert await fixture.database.scalar(f'SELECT {column} FROM "{fixture.schema}"."{table}"') == "prepared"
+            assert (
+                await fixture.database.scalar(f'SELECT {column} FROM "{fixture.schema}"."{table}_old"') == "incumbent"
+            )
 
 
 async def test_native_postgres_publication_rolls_back_both_tables_on_education_failure(monkeypatch):
-    """All table swaps and exact generation authority commit or roll back together."""
+    """The native-role component rolls back all three heaps and the real ledger CAS."""
+    from tests.cms_doctors_preparation_postgres_support import doctors_database
+    from tests.cms_npd_admission_postgres_support import _owned_database
+
     dsn = os.getenv("HLTHPRT_CMS_EDUCATION_POSTGRES_DSN")
     if not dsn:
         pytest.skip("set HLTHPRT_CMS_EDUCATION_POSTGRES_DSN for the PostgreSQL proof")
-    import asyncpg
+    url = make_url(dsn)
+    if url.host not in {"127.0.0.1", "localhost", "postgres"} or "test" not in (url.database or "").lower():
+        pytest.fail("CMS education proof requires an explicit local test database")
+    async with _owned_database(url.set(drivername="postgresql+asyncpg")) as (owned_url, _admin):
+        monkeypatch.setenv("HLTHPRT_CMS_NPD_ADMISSION_TEST_DSN", owned_url.render_as_string(hide_password=False))
+        async with doctors_database(monkeypatch, cms_active=False) as fixture:
+            await _assert_native_family_rollback(fixture)
 
-    cms_doctors = importlib.import_module("process.cms_doctors")
-    groups = importlib.import_module("process.cms_doctors_groups")
 
-    connection = await asyncpg.connect(dsn, timeout=5)
-    database = _publisher_database(dsn)
-    schema = f"cms_education_test_{uuid.uuid4().hex[:12]}"
-    is_schema_created = False
-    try:
-        if "test" not in str(await connection.fetchval("SELECT current_database()")).lower():
-            pytest.fail("CMS education publication proof requires an explicit test database")
-        await connection.execute(f"CREATE SCHEMA {schema}")
-        is_schema_created = True
-        marker_by_table = await _create_publication_fixture(connection, schema)
-        generation_before = await _create_generation_fixture(connection, schema, dsn)
-        monkeypatch.setattr(cms_doctors, "db", database)
-        monkeypatch.setattr(education, "db", database)
-        monkeypatch.setattr(groups, "db", database)
-        stage = SimpleNamespace(__tablename__="doctor_stage")
-        with pytest.raises(DBAPIError) as missing_stage:
-            await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
-        assert postgres_sqlstate(missing_stage.value) == "42P01"
-        await _assert_publication_markers(connection, schema, marker_by_table)
-        assert (
-            await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation") == generation_before
-        )
-        await connection.execute(f"CREATE TABLE {schema}.cms_doctor_education_educationtests (marker text)")
-        await connection.execute(f"INSERT INTO {schema}.cms_doctor_education_educationtests VALUES ('new_education')")
-        await connection.execute(f"CREATE TABLE {schema}.cms_doctor_group_site_educationtests (marker text)")
-        await connection.execute(f"INSERT INTO {schema}.cms_doctor_group_site_educationtests VALUES ('new_group')")
-        # Reject the authority write after all three swaps; PostgreSQL must undo them too.
-        await connection.execute(
-            f"ALTER TABLE {schema}.reference_family_result_generation ADD CONSTRAINT reject_advance "
-            "CHECK (local_generation = 0)"
-        )
-        with pytest.raises(DBAPIError) as rejected_generation:
-            await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
-        assert postgres_sqlstate(rejected_generation.value) == "23514"
-        await _assert_publication_markers(connection, schema, marker_by_table)
-        assert (
-            await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation") == generation_before
-        )
-        await connection.execute(
-            f"ALTER TABLE {schema}.reference_family_result_generation DROP CONSTRAINT reject_advance"
-        )
-        await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
-        await _assert_swapped_doctors_markers(connection, schema)
-        await _assert_published_generation(connection, database, schema, generation_before)
-    finally:
-        await database.disconnect()
-        if is_schema_created:
-            await connection.execute(f"DROP SCHEMA {schema} CASCADE")
-            assert await connection.fetchval("SELECT to_regnamespace($1)", schema) is None
-        await connection.close()
+@pytest.mark.asyncio
+async def test_clinical_copy_keeps_nullable_columns_and_never_uses_insert_fallback(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from db.models import DoctorClinicianAddress
+
+    clinical = importlib.import_module("process.cms_doctors")
+    from process import reference_family_archive as native
+
+    session = SimpleNamespace(execute=AsyncMock())
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(education.db, "transaction", transaction)
+    copy = AsyncMock(return_value=1)
+    monkeypatch.setattr(native, "native_copy_record_batch", copy)
+    stage = clinical.make_class(DoctorClinicianAddress, "copyunit")
+    clinical_row = clinical.doctor_address_row(
+        {"NPI": NPI, "adr_ln_1": "1 Example Street", "zip_code": "10001"},
+        datetime(2026, 1, 1),
+    )
+    await clinical._copy_clinical_rows([clinical_row], stage)
+    columns = tuple(stage.__table__.columns.keys())
+    assert copy.await_args.kwargs["columns"] == columns
+    actual_by_column = dict(zip(columns, copy.await_args.kwargs["records"][0], strict=True))
+    assert actual_by_column == {**clinical_row, "latitude": None, "longitude": None, "address_key": None}
+    copy.side_effect = TypeError("native COPY failed")
+    with pytest.raises(TypeError, match="native COPY failed"):
+        await clinical._copy_clinical_rows([clinical_row], stage)
+    assert copy.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_sidecar_copy_splits_native_bytes_and_refuses_an_oversized_single_row(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from process import reference_family_archive as native
+
+    session = SimpleNamespace(execute=AsyncMock())
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(education.db, "transaction", transaction)
+    copy = AsyncMock(return_value=1)
+    monkeypatch.setattr(native, "native_copy_record_batch", copy)
+    stage = SimpleNamespace(
+        __table__=SimpleNamespace(columns={"source_json": None}, schema="mrf"),
+        __tablename__="cms_doctor_education_copyunit",
+    )
+    wide_row_by_column = {"source_json": {"value": "x" * (8 * 1024 * 1024)}}
+    await education._copy_sidecar_rows([wide_row_by_column, wide_row_by_column], stage)
+    assert copy.await_count == 2
+    assert all(len(call.kwargs["records"]) == 1 for call in copy.await_args_list)
+    copy.reset_mock()
+    with pytest.raises(ValueError, match="copy_row_bytes_invalid"):
+        await education._copy_sidecar_rows([{"source_json": {"value": "x" * (16 * 1024 * 1024)}}], stage)
+    copy.assert_not_awaited()

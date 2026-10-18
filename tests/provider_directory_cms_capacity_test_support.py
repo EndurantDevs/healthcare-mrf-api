@@ -159,7 +159,10 @@ def cms_plan():
     fence = SimpleNamespace(
         datasets=tuple(
             SimpleNamespace(
-                **pair, evidence_run_id=pair["acquisition_root_run_id"], artifact_resources=("Practitioner",)
+                **pair,
+                evidence_run_id=pair["acquisition_root_run_id"],
+                artifact_resources=("Practitioner",),
+                semantic_projection_as_of="2026-07-30" if pair["source_id"] == "cms-npd" else None,
             )
             for pair in execution.attestation.pairs
         )

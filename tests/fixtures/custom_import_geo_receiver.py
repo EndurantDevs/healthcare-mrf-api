@@ -28,6 +28,7 @@ def _guard(event, args):
 sys.addaudithook(_guard)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from pytest import MonkeyPatch
 from sqlalchemy.dialects import postgresql
 
 from api import custom_import_provider_geo as geo
@@ -35,6 +36,7 @@ from api import custom_import_read_http as transport
 from db.models.custom_import import CustomImportGeneration, CustomImportGenerationSeal
 from process.custom_import import publication, read_core
 from process.custom_import.definition import CustomImportDefinition, canonical_json, canonical_sha256
+from tests.signed_request_reader_support import cold_caller, install_reader_factory
 from tests.test_custom_import_provider_geo_sql import _geo_row
 from tests.test_custom_import_provider_http import _Session
 
@@ -405,6 +407,7 @@ class CustomImportGeoFixtureHandler(BaseHTTPRequestHandler):
             "hydration": False,
         }
         session = SyntheticSession(json.loads(body)["target"])
+        caller = cold_caller()
         request = SimpleNamespace(
             body=body,
             headers=dict(self.headers),
@@ -412,9 +415,11 @@ class CustomImportGeoFixtureHandler(BaseHTTPRequestHandler):
             path=self.path,
             query_string="",
             args={},
-            ctx=SimpleNamespace(sa_session=session),
+            ctx=SimpleNamespace(sa_session=caller),
         )
-        reply = asyncio.run(geo.serve_custom_import_provider_geo(request, session))
+        with MonkeyPatch.context() as settings:
+            install_reader_factory(settings, session)
+            reply = asyncio.run(geo.serve_custom_import_provider_geo(request, caller))
         _FIXTURE_STATE.request_event_by_name["status"] = reply.status
         _EVENTS.append(_FIXTURE_STATE.request_event_by_name)
         self._reply(reply.status, reply.body)

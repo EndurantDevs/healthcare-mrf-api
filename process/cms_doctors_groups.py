@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from db.models import CMSDoctorGroupSite, db
 from process.cms_doctors_education import _copy_sidecar_rows, open_doctors_csv
+from process.cms_doctors_immutable import create_doctors_stage
 from process.cms_doctors_rows import doctor_address_row
 from process.control_cancel import raise_if_cancelled
 from process.ext.utils import make_class
@@ -73,7 +74,7 @@ async def discard_group_site_stage(ctx) -> None:
 async def import_group_site_rows(source_path, ctx, task, manifest: dict) -> dict:
     """Stage every physical source row independently of address deduplication."""
     stage = make_class(CMSDoctorGroupSite, ctx["import_date"])
-    await db.create_table(stage.__table__, checkfirst=False)
+    await create_doctors_stage(db, CMSDoctorGroupSite, ctx["import_date"], str(stage.__table__.schema))
     ctx.setdefault("context", {})["group_site_stage_owned"] = True
     batch_rows = []
     source_rows = 0

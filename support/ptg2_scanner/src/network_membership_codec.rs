@@ -5,6 +5,7 @@ use serde::de::{self, DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -70,6 +71,52 @@ struct MembershipRow<'a> {
     location_id: Cow<'a, str>,
     #[serde(borrow)]
     evidence_id: Cow<'a, str>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MembershipOperation {
+    #[default]
+    #[serde(skip)]
+    Legacy,
+    Add,
+    Remove,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipCommand<'a> {
+    network_id: i32,
+    #[serde(borrow)]
+    provider_system: Cow<'a, str>,
+    #[serde(borrow)]
+    provider_id: Cow<'a, str>,
+    #[serde(borrow)]
+    location_id: Cow<'a, str>,
+    #[serde(borrow)]
+    evidence_id: Cow<'a, str>,
+    #[serde(default)]
+    operation: MembershipOperation,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct PartitionedMembershipCommands {
+    pub additions: EncodedMembershipBatch,
+    pub removals: EncodedMembershipBatch,
+}
+
+pub fn partition_network_membership_commands(
+    input: &[u8],
+) -> Result<PartitionedMembershipCommands, MembershipBatchError> {
+    partition_commands(input, None)
+}
+
+/// Cancellation discards both privately encoded streams.
+pub fn partition_network_membership_commands_cancellable(
+    input: &[u8],
+    cancelled: &AtomicBool,
+) -> Result<PartitionedMembershipCommands, MembershipBatchError> {
+    partition_commands(input, Some(cancelled))
 }
 
 pub fn encode_network_membership_batch(
@@ -162,6 +209,16 @@ impl BatchEncoder<'_> {
                 "Membership row has missing, unknown or invalid fields",
             )
         })?;
+        self.encode_membership_row(&row, index)?;
+        Ok(())
+    }
+
+    fn encode_membership_row(
+        &mut self,
+        row: &MembershipRow<'_>,
+        index: Option<usize>,
+    ) -> Result<[u8; 16], MembershipBatchError> {
+        self.check_cancelled(index)?;
         if row.network_id <= 0 {
             return Err(error(
                 "invalid_network_id",
@@ -221,7 +278,7 @@ impl BatchEncoder<'_> {
         write_field(&location, &mut self.output);
         write_field(row.evidence_id.as_bytes(), &mut self.output);
         self.row_count += 1;
-        Ok(())
+        Ok(location)
     }
 }
 
@@ -253,6 +310,185 @@ impl<'de> Visitor<'de> for &mut BatchEncoder<'_> {
                 self.encode_row(raw)
             };
             if let Err(failure) = result {
+                self.failure = Some(failure);
+                return Err(de::Error::custom("membership batch rejected"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn command_encoder(cancelled: Option<&AtomicBool>) -> BatchEncoder<'_> {
+    BatchEncoder {
+        output: COPY_HEADER.to_vec(),
+        row_count: 0,
+        failure: None,
+        cancelled,
+    }
+}
+
+fn partition_commands(
+    input: &[u8],
+    cancelled: Option<&AtomicBool>,
+) -> Result<PartitionedMembershipCommands, MembershipBatchError> {
+    if input.len() > MAX_INPUT_BYTES {
+        return Err(error(
+            "input_limit",
+            None,
+            None,
+            "Membership input exceeds byte limit",
+        ));
+    }
+    let mut state = CommandPartitioner {
+        additions: command_encoder(cancelled),
+        removals: command_encoder(cancelled),
+        seen: HashSet::new(),
+        command_mode: false,
+        first_duplicate: None,
+        row_count: 0,
+        failure: None,
+    };
+    state.additions.check_cancelled(None)?;
+    let mut decoder = serde_json::Deserializer::from_slice(input);
+    if (&mut state).deserialize(&mut decoder).is_err() {
+        return Err(state.failure.unwrap_or_else(|| {
+            error(
+                "invalid_json",
+                Some(state.row_count),
+                None,
+                "Expected a complete JSON membership array",
+            )
+        }));
+    }
+    if decoder.end().is_err() {
+        return Err(error(
+            "invalid_json",
+            None,
+            None,
+            "Unexpected data after membership array",
+        ));
+    }
+    state.additions.check_cancelled(None)?;
+    state
+        .additions
+        .output
+        .extend_from_slice(&(-1i16).to_be_bytes());
+    state
+        .removals
+        .output
+        .extend_from_slice(&(-1i16).to_be_bytes());
+    Ok(PartitionedMembershipCommands {
+        additions: EncodedMembershipBatch {
+            copy_bytes: state.additions.output,
+            row_count: state.additions.row_count,
+        },
+        removals: EncodedMembershipBatch {
+            copy_bytes: state.removals.output,
+            row_count: state.removals.row_count,
+        },
+    })
+}
+
+struct CommandPartitioner<'a> {
+    additions: BatchEncoder<'a>,
+    removals: BatchEncoder<'a>,
+    seen: HashSet<(i32, String, String, [u8; 16])>,
+    command_mode: bool,
+    first_duplicate: Option<usize>,
+    row_count: usize,
+    failure: Option<MembershipBatchError>,
+}
+
+impl CommandPartitioner<'_> {
+    fn check_duplicate(&self) -> Result<(), MembershipBatchError> {
+        if self.command_mode
+            && let Some(index) = self.first_duplicate
+        {
+            return Err(error(
+                "duplicate_command",
+                Some(index),
+                None,
+                "Membership identity is repeated or conflicting",
+            ));
+        }
+        Ok(())
+    }
+
+    fn encode_command(&mut self, raw: &RawValue) -> Result<(), MembershipBatchError> {
+        let index = Some(self.row_count);
+        self.additions.check_cancelled(index)?;
+        if self.row_count >= MAX_ROWS {
+            return Err(error(
+                "row_limit",
+                index,
+                None,
+                "Membership batch exceeds row limit",
+            ));
+        }
+        let command: MembershipCommand<'_> = serde_json::from_str(raw.get()).map_err(|_| {
+            error(
+                "invalid_row",
+                index,
+                None,
+                "Membership row has missing, unknown or invalid fields",
+            )
+        })?;
+        self.command_mode |= !matches!(command.operation, MembershipOperation::Legacy);
+        self.check_duplicate()?;
+        let row = MembershipRow {
+            network_id: command.network_id,
+            provider_system: command.provider_system,
+            provider_id: command.provider_id,
+            location_id: command.location_id,
+            evidence_id: command.evidence_id,
+        };
+        let destination = match command.operation {
+            MembershipOperation::Legacy | MembershipOperation::Add => &mut self.additions,
+            MembershipOperation::Remove => &mut self.removals,
+        };
+        let location = destination.encode_membership_row(&row, index)?;
+        if !self.seen.insert((
+            row.network_id,
+            row.provider_system.into_owned(),
+            row.provider_id.into_owned(),
+            location,
+        )) && self.first_duplicate.is_none()
+        {
+            // A later explicit operation switches the entire document to command mode.
+            self.first_duplicate = Some(self.row_count);
+        }
+        self.check_duplicate()?;
+        if self.additions.output.len() + self.removals.output.len() + 4 > MAX_COPY_BYTES {
+            return Err(error(
+                "output_limit",
+                index,
+                None,
+                "Membership COPY output exceeds byte limit",
+            ));
+        }
+        self.row_count += 1;
+        Ok(())
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for &mut CommandPartitioner<'_> {
+    type Value = ();
+
+    fn deserialize<D: de::Deserializer<'de>>(self, decoder: D) -> Result<(), D::Error> {
+        decoder.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for &mut CommandPartitioner<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an array of exact network membership commands")
+    }
+
+    fn visit_seq<S: SeqAccess<'de>>(self, mut sequence: S) -> Result<(), S::Error> {
+        while let Some(raw) = sequence.next_element::<&RawValue>()? {
+            if let Err(failure) = self.encode_command(raw) {
                 self.failure = Some(failure);
                 return Err(de::Error::custom("membership batch rejected"));
             }

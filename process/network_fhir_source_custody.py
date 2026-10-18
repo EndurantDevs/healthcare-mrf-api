@@ -579,15 +579,22 @@ async def _catalog(connection, source_pin, owner_role, runtime_roles):
         source_pin.schema_name,
         list(_TABLES),
     )
-    _require_relations(source_pin, owner, relations)
+    is_partitioned = _is_partitioned_source_shape(relations)
+    _require_relations(source_pin, owner, relations, partitioned=is_partitioned)
+    generic = (
+        await _generic_partitioned_custody(connection, source_pin, owner_role, runtime_roles)
+        if is_partitioned
+        else None
+    )
     await _roles(
         connection,
         relations[0]["schema_oid"],
         owner["oid"],
         runtime_roles,
         [relation_record["oid"] for relation_record in relations],
+        namespace_owner_oid=relations[0]["nspowner"] if is_partitioned else owner["oid"],
     )
-    guards = await _guards(connection, source_pin.schema_name, owner["oid"], relations)
+    guards = await _guards(connection, source_pin.schema_name, owner["oid"], relations, partitioned=is_partitioned)
     await _require_routine_capabilities(connection, runtime_roles, source_pin.schema_name, owner["oid"])
     routines = await _routines(connection, source_pin.schema_name, relations[0]["schema_oid"], owner["oid"])
     return _digest(
@@ -596,6 +603,7 @@ async def _catalog(connection, source_pin, owner_role, runtime_roles):
             "guards": guards,
             "routines": [dict(relation_record) for relation_record in routines],
             "owner_oid": owner["oid"],
+            **({"generic_source": generic} if is_partitioned else {}),
         }
     )
 
@@ -640,16 +648,17 @@ async def _require_routine_capabilities(connection, runtime_roles, schema, owner
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
 
 
-def _require_relations(source_pin, owner, relations):
+def _require_relations(source_pin, owner, relations, *, partitioned=False):
     """Require the exact persistent, protected input relation family."""
     if len(relations) != len(_TABLES) or any(
         relation_record["relowner"] != owner["oid"]
-        or relation_record["nspowner"] != owner["oid"]
-        or relation_record["relkind"] != b"r"
+        or (not partitioned and relation_record["nspowner"] != owner["oid"])
+        or relation_record["relkind"]
+        != (b"p" if partitioned and relation_record["relname"] in _PARTITIONED_SOURCE else b"r")
         or relation_record["relpersistence"] != b"p"
         or relation_record["relrowsecurity"]
         or relation_record["relforcerowsecurity"]
-        or relation_record["inherited"]
+        or (relation_record["inherited"] and not (partitioned and relation_record["relname"] in _PARTITIONED_SOURCE))
         for relation_record in relations
     ):
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
@@ -664,7 +673,7 @@ def _require_relations(source_pin, owner, relations):
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
 
 
-async def _roles(connection, schema_oid, owner_oid, names, oids):
+async def _roles(connection, schema_oid, owner_oid, names, oids, *, namespace_owner_oid=None):
     """Permit guarded row DML, while excluding native DDL and trigger bypass."""
     unsafe = await connection.fetchval(
         """WITH configured AS (
@@ -678,10 +687,11 @@ async def _roles(connection, schema_oid, owner_oid, names, oids):
         WHERE att.attrelid=ANY($4::oid[]) AND att.attnum>0 AND NOT att.attisdropped
     ) SELECT EXISTS(SELECT 1 FROM configured r WHERE r.oid IS NULL OR r.rolsuper OR r.rolcreaterole
       OR r.rolreplication OR r.rolbypassrls OR pg_has_role(r.oid,$3::oid,'MEMBER')
-      OR pg_has_role(r.oid,$3::oid,'SET') OR has_parameter_privilege(r.oid,'session_replication_role','SET')
+      OR pg_has_role(r.oid,$3::oid,'SET') OR pg_has_role(r.oid,$5::oid,'MEMBER')
+      OR pg_has_role(r.oid,$5::oid,'SET') OR has_parameter_privilege(r.oid,'session_replication_role','SET')
       OR EXISTS(SELECT 1 FROM pg_roles elevated WHERE (elevated.rolsuper OR elevated.rolcreaterole)
         AND pg_has_role(r.oid,elevated.oid,'MEMBER')))
-      OR EXISTS(SELECT 1 FROM acl a WHERE a.grantee<>$3::oid AND
+      OR EXISTS(SELECT 1 FROM acl a WHERE a.grantee<>$3::oid AND (a.relation OR a.grantee<>$5::oid) AND
         (a.is_grantable OR a.grantee NOT IN (SELECT oid FROM configured)
          OR (NOT a.relation AND a.privilege_type<>'USAGE')
          OR (a.relation AND a.privilege_type NOT IN ('SELECT','INSERT','UPDATE','DELETE'))))
@@ -690,12 +700,13 @@ async def _roles(connection, schema_oid, owner_oid, names, oids):
         schema_oid,
         owner_oid,
         oids,
+        owner_oid if namespace_owner_oid is None else namespace_owner_oid,
     )
     if unsafe:
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
 
 
-async def _guards(connection, schema, owner_oid, relations):
+async def _guards(connection, schema, owner_oid, relations, *, partitioned=False):
     """Recognize required existing guard bodies and retain every observed trigger identity."""
     guard_records = await connection.fetch(
         """SELECT c.relname,t.tgname,t.tgtype,t.tgenabled::text,t.tgnargs,
@@ -722,6 +733,8 @@ async def _guards(connection, schema, owner_oid, relations):
     for guard_record in guard_records:
         _require_function(guard_record, schema, owner_oid)
     for table, required in _GUARDS.items():
+        if partitioned and table in _MANAGED_SOURCE:
+            continue
         for name, event_mask in required.items():
             _require_guard(guard_by_identity.get((table, name)), schema, owner_oid, name, event_mask)
     return [
@@ -856,7 +869,9 @@ async def capture_retained_cms_fhir_source_custody(connection, source_pin, *, ow
             catalog = await _catalog(connection, source_pin, owner_role, runtime_roles)
             proof = await _proof(connection, source_pin)
         return RetainedCMSFHIRSourceCustody(source_pin, owner_role, runtime_roles, proof, catalog)
-    except ValueError, TypeError, asyncpg.PostgresError, OSError, TimeoutError:
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError, ConnectionError) as error:
+        raise FHIRSourceCustodyError("fhir_source_custody_unavailable") from error
+    except ValueError, TypeError, OSError, TimeoutError:
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable") from None
 
 
@@ -870,3 +885,102 @@ async def require_retained_cms_fhir_source_custody(connection, custody):
     if current != custody:
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
     return current
+
+
+_PARTITIONED_SOURCE = {
+    "provider_directory_dataset_resource",
+    "provider_directory_cms_npd_resource_witness",
+    "provider_directory_cms_npd_relationship",
+}
+_MANAGED_SOURCE = _PARTITIONED_SOURCE | {
+    "provider_directory_entity_source_binding",
+    "provider_directory_entity_release_evidence",
+    "provider_directory_insurance_network_source_binding",
+    "provider_directory_insurance_network_plan_evidence",
+    "provider_directory_cms_doctors_group_binding",
+    "provider_directory_cms_doctors_site_binding",
+}
+
+
+def _is_partitioned_source_shape(relations):
+    """Keep historical all-heap custody; reject partial native cutovers."""
+    kind_by_name = {row["relname"]: row["relkind"] for row in relations if row["relname"] in _PARTITIONED_SOURCE}
+    if kind_by_name == {name: b"r" for name in _PARTITIONED_SOURCE}:
+        return False
+    if kind_by_name == {name: b"p" for name in _PARTITIONED_SOURCE}:
+        return True
+    raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
+
+
+async def _generic_custody_family(connection, source_pin, owner_role, runtime_roles, source_policy):
+    """Verify the Reader or exact bound publisher before checking child custody."""
+    from process.provider_directory_generic_source_provision import verify_generic_source_read_family
+
+    if source_policy is None:
+        family_rows = await verify_generic_source_read_family(
+            connection, source_pin.schema_name, owner_role, runtime_roles
+        )
+    else:
+        from process.provider_directory_generic_source_policy import bound_publisher
+        from process.provider_directory_generic_source_provision import verify_generic_source_family
+
+        publisher = bound_publisher()
+        if (
+            publisher.connection is not connection
+            or publisher.policy is not source_policy
+            or (source_policy.schema, source_policy.owner_role, source_policy.runtime_roles)
+            != (source_pin.schema_name, owner_role, runtime_roles)
+        ):
+            raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
+        family_rows = await verify_generic_source_family(connection, source_policy)
+    return family_rows
+
+
+async def _generic_partitioned_custody(connection, source_pin, owner_role, runtime_roles, *, source_policy=None):
+    """Authenticate every child and the exact published acquisition binding."""
+    from db.plan_release_storage import storage_relation
+    from process.provider_directory_generic_source_storage import (
+        HEADER,
+        RELATIONS,
+        RESOURCE,
+        _json,
+        _table_proof,
+        _validate_binding,
+    )
+
+    family_rows = await _generic_custody_family(connection, source_pin, owner_role, runtime_roles, source_policy)
+    header = await connection.fetchrow(
+        f"SELECT endpoint_id,acquisition_root_run_id,candidate_storage_json FROM "
+        f"{storage_relation(source_pin.schema_name, HEADER)} WHERE dataset_id=$1 AND endpoint_id=$2 AND dataset_hash=$3",
+        source_pin.dataset_id,
+        source_pin.endpoint_id,
+        source_pin.dataset_sha256,
+    )
+    if header is None:
+        raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
+    binding = _json(header["candidate_storage_json"])
+    if type(binding) is not dict or type(binding.get("identity")) is not dict:
+        raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
+    identity = binding["identity"]
+    _validate_binding(binding, identity, phases=("published",))
+    if (
+        identity["dataset_id"] != source_pin.dataset_id
+        or identity["endpoint_id"] != source_pin.endpoint_id
+        or identity["acquisition_root_run_id"] != header["acquisition_root_run_id"]
+        or identity["metadata"].get("source_ids") != ["cms-npd"]
+        or identity["metadata"].get("source_release", {}).get("vector_sha256") != source_pin.release_id
+    ):
+        raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
+    by_name = {relation_by_field["relname"]: relation_by_field for relation_by_field in family_rows}
+    if by_name[RESOURCE]["oid"] != source_pin.resource_table_oid:
+        raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
+    for root in RELATIONS:
+        proof = binding["tables"][root]
+        relation_by_field = by_name.get(proof["name"])
+        if (
+            relation_by_field is None
+            or list(relation_by_field["parents"]) != [by_name[root]["oid"]]
+            or _table_proof(relation_by_field, private=False) != proof
+        ):
+            raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
+    return {"binding": binding, "family": [dict(relation_by_field) for relation_by_field in family_rows]}

@@ -72,8 +72,8 @@ def _is_owned_native_test_database(database_url) -> bool:
     host = str(database_url.host or "")
     if not database_url.drivername.startswith("postgresql") or not database_url.username:
         return False
-    if database_url.port == 5440:
-        return host in _LOCAL_HOSTS and _LOCAL_DATABASE.fullmatch(database_name) is not None
+    if host in _LOCAL_HOSTS and _LOCAL_DATABASE.fullmatch(database_name) is not None:
+        return database_url.port is not None and 1 <= database_url.port <= 65535
     return host in _CI_HOSTS and database_url.port in (None, 5432) and database_name == _CI_DATABASE
 
 
@@ -194,6 +194,9 @@ def _restore_npi_table_data(dump_path: Path, restore_list_path: Path, stage_sche
             "postgresql://postgres@127.0.0.1:5440/hc_npi_archive_0123456789abcdef0123456789abcdef",
             True,
         ),
+        ("postgresql://postgres@127.0.0.1:16432/hc_npi_archive_0123456789abcdef0123456789abcdef", True),
+        ("postgresql://postgres@example.invalid:16432/hc_npi_archive_0123456789abcdef0123456789abcdef", False),
+        ("postgresql://postgres@127.0.0.1/hc_npi_archive_0123456789abcdef0123456789abcdef", False),
         (
             "postgresql://postgres@localhost:5432/ptg2_v3_lifecycle_test_ci_runner",
             True,
@@ -474,6 +477,9 @@ async def _activate(
     owner_oid: int,
     validation: archive.NpiValidationReceipt,
 ) -> archive.NpiActivationReceipt:
+    owner = await session.scalar(text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:oid"), {"oid": owner_oid})
+    await session.execute(text(f"SET LOCAL ROLE {owner}"))
+
     async def record_activation(active_session, _receipt) -> None:
         """Persist a synthetic controller record in the caller transaction."""
 
@@ -854,8 +860,9 @@ async def test_npi_snapshot_generation_activation_and_rollback(native_runtime) -
     cleanup_schemas: set[str] = {source_schema, destination_schema}
     try:
         await create_native_npi_family(native_runtime, source_schema)
-        await create_native_npi_family(native_runtime, destination_schema)
+        await create_native_npi_family(native_runtime, destination_schema, publication_owner=True)
         async with native_runtime.engine.begin() as connection:
+            await connection.execute(text(f'SET LOCAL ROLE "{native_runtime.owner}"'))
             await connection.execute(text(f'CREATE TABLE "{destination_schema}".activation_log (id integer)'))
         async with sessions() as session, session.begin():
             legacy_capture = await archive.capture_npi_source(
@@ -1481,6 +1488,10 @@ async def _activate_and_assert_restored_sequence(
         await active_session.execute(text(f'INSERT INTO "{incumbent.schema_name}".activation_log VALUES (1)'))
 
     async with sessions() as session, session.begin():
+        owner = await session.scalar(
+            text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:oid"), {"oid": owner_oid}
+        )
+        await session.execute(text(f"SET LOCAL ROLE {owner}"))
         receipt = await archive.activate_validated_npi_stage(
             session,
             ownership=ownership,
@@ -1516,8 +1527,9 @@ async def test_data_only_restore_advances_owned_sequence_before_activation(tmp_p
         destination_schema,
     }
     try:
-        await create_native_npi_family(native_runtime, destination_schema, populated=False)
+        await create_native_npi_family(native_runtime, destination_schema, populated=False, publication_owner=True)
         async with sessions() as session, session.begin():
+            await session.execute(text(f'SET LOCAL ROLE "{native_runtime.owner}"'))
             await session.execute(text(f'CREATE TABLE "{destination_schema}".activation_log (id integer)'))
         native_runtime.schemas.add(archive.npi_predecessor_schema(restore_dataset_id))
         manifest = await _build_dumped_npi_archive(

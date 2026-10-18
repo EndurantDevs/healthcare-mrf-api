@@ -151,17 +151,7 @@ async def native_npi_runtime(database_url):
             await connection.run_sync(
                 lambda sync: AddressArchiveV2.__table__.c.geo_source.type.create(sync, checkfirst=True)
             )
-            database = await connection.scalar(text("SELECT current_database()"))
-            driver = (await connection.get_raw_connection()).driver_connection
-            for role in roles:
-                login = "NOLOGIN" if role == owner else f"LOGIN PASSWORD '{password}'"
-                try:
-                    await driver.execute(f'CREATE ROLE "{role}" {login} NOSUPERUSER NOCREATEDB NOCREATEROLE')
-                except Exception:
-                    raise RuntimeError("native principal bootstrap failed") from None
-            await connection.execute(text(f'GRANT "{owner}" TO "{publisher}"'))
-            await connection.execute(text(f'GRANT CREATE ON DATABASE "{database}" TO "{owner}","{publisher}"'))
-            await connection.execute(text(f'GRANT USAGE ON SCHEMA mrf TO "{publisher}","{builder}","{reader}"'))
+            await _create_npi_principals(connection, roles, password)
         publisher_url = make_url(database_url).set(username=publisher, password=password)
         builder_url = publisher_url.set(username=builder)
         reader_url = publisher_url.set(username=reader)
@@ -190,6 +180,22 @@ async def native_npi_runtime(database_url):
         )
 
 
+async def _create_npi_principals(connection, roles, password):
+    """Create the registered principals inside the original administrator transaction."""
+    owner, publisher, builder, reader = roles
+    database = await connection.scalar(text("SELECT current_database()"))
+    driver = (await connection.get_raw_connection()).driver_connection
+    for role in roles:
+        login = "NOLOGIN" if role == owner else f"LOGIN PASSWORD '{password}'"
+        try:
+            await driver.execute(f'CREATE ROLE "{role}" {login} NOSUPERUSER NOCREATEDB NOCREATEROLE')
+        except Exception:
+            raise RuntimeError("native principal bootstrap failed") from None
+    await connection.execute(text(f'GRANT "{owner}" TO "{publisher}"'))
+    await connection.execute(text(f'GRANT CREATE ON DATABASE "{database}" TO "{owner}","{publisher}"'))
+    await connection.execute(text(f'GRANT USAGE ON SCHEMA mrf TO "{owner}","{publisher}","{builder}","{reader}"'))
+
+
 def _model_actor_engine(database_url, search_path):
     """Keep the discovered extension path on each independently authenticated fixture connection."""
     return create_async_engine(
@@ -200,7 +206,7 @@ def _model_actor_engine(database_url, search_path):
     )
 
 
-async def create_native_npi_family(runtime, schema, *, populated=True):
+async def create_native_npi_family(runtime, schema, *, populated=True, publication_owner=False):
     """Keep genuine historical source controls around the exact compiled payload model."""
     import importlib.util
     from pathlib import Path
@@ -211,6 +217,8 @@ async def create_native_npi_family(runtime, schema, *, populated=True):
     source_dataset = uuid4()
     runtime.schemas.update((schema, archive.npi_stage_schema(source_dataset)))
     async with runtime.sessions() as session, session.begin():
+        if publication_owner:
+            await session.execute(text(f'SET LOCAL ROLE "{runtime.owner}"'))
         await _create_source(session, schema, source_dataset)
         if not populated:
             for model in archive.npi_archive_models():

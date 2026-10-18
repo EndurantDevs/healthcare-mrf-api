@@ -7,7 +7,11 @@ import asyncpg
 
 from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
-from process.network_membership_publication import _lock_publication_controls
+from process.network_membership_publication import (
+    _lock_publication_controls,
+    _publication_readiness,
+    _verify_provider_custody,
+)
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
 
 
@@ -39,7 +43,7 @@ async def _reactivate(connection, namespace, generation_id, expected_head, expec
         raise NetworkServingReactivationError("network_reactivation_approved_conflict")
     # Only low-volume retained metadata is locked; active serving heaps stay readable.
     retained = await connection.fetchrow(
-        f"SELECT manifest.generation_id FROM {namespace}.network_serving_manifest manifest "
+        f"SELECT candidate.* FROM {namespace}.network_serving_manifest manifest "
         f"JOIN {namespace}.network_membership_candidate candidate USING(candidate_id) "
         "WHERE manifest.generation_id=$1 AND manifest.eligible AND candidate.state='published' "
         "FOR SHARE OF candidate",
@@ -52,6 +56,8 @@ async def _reactivate(connection, namespace, generation_id, expected_head, expec
     )
     if manifest.approved_custom_revision != approved_revision:
         raise NetworkServingReactivationError("network_reactivation_target_approval_conflict")
+    readiness = _publication_readiness(dict(retained))
+    await _verify_provider_custody(connection, dict(retained), readiness[3])
     has_changed = current_head != generation_id
     if has_changed:
         status = await connection.execute(
@@ -85,11 +91,11 @@ async def reactivate_network_serving_generation(
         namespace = _identifier(control_schema if control_schema is not None else registry_schema())
         async with connection.transaction():
             return await _reactivate(connection, namespace, generation_id, expected_head, expected_approved_revision)
-    except NetworkServingReadUnavailable:
-        raise NetworkServingReactivationError("network_reactivation_target_unavailable") from None
-    except asyncpg.PostgresError:
-        raise NetworkServingReactivationError("network_reactivation_storage_unavailable") from None
+    except NetworkServingReadUnavailable as error:
+        raise NetworkServingReactivationError("network_reactivation_target_unavailable") from error
+    except asyncpg.PostgresError as error:
+        raise NetworkServingReactivationError("network_reactivation_storage_unavailable") from error
     except (ValueError, TypeError) as error:
         if isinstance(error, NetworkServingReactivationError):
             raise
-        raise NetworkServingReactivationError("network_reactivation_controls_unavailable") from None
+        raise NetworkServingReactivationError("network_reactivation_controls_unavailable") from error

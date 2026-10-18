@@ -43,10 +43,8 @@ async def test_cancellation_fixture_stops_after_third_acknowledged_commit(monkey
     original_persist = cms._persist_source_batch
     probe = AsyncMock()
     monkeypatch.setattr(fhir, "_raise_if_resource_import_cancelled", probe)
-    database = SimpleNamespace(
-        first=AsyncMock(return_value=(fixture.candidate.dataset_id,)),
-        scalar=AsyncMock(side_effect=lambda *_args, **_kwargs: len(fixture.committed_rows)),
-    )
+    database = SimpleNamespace(first=AsyncMock(return_value=(fixture.candidate.dataset_id,)))
+    retained_count = AsyncMock(side_effect=lambda _database, _dataset_id: len(fixture.committed_rows))
 
     @asynccontextmanager
     async def database_context(_monkeypatch):
@@ -66,7 +64,9 @@ async def test_cancellation_fixture_stops_after_third_acknowledged_commit(monkey
     monkeypatch.setattr(native_case, "retained_release", lambda *_args, **_kwargs: (fixture.directory, fixture.receipt))
     monkeypatch.setattr(native_case, "_admit_legacy_source", admit)
     monkeypatch.setattr(native_case, "_assert_current", current)
+    monkeypatch.setattr(native_case, "_retained_input_count", retained_count)
     await native_case.test_committed_batch_cancellation_keeps_incumbent_and_replays_safely(monkeypatch, tmp_path)
+    retained_count.assert_awaited_once_with(database, fixture.candidate.dataset_id)
     assert cms._persist_source_batch is original_persist
     assert len(fixture.committed_rows) == 3
     assert len(fixture.worker_tasks) == 2 and all(task.done() for task in fixture.worker_tasks)

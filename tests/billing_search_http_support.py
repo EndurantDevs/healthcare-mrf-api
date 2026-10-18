@@ -51,6 +51,7 @@ class RecordingTransaction:
 class RecordingSession:
     def __init__(self) -> None:
         self.active = False
+        self.info = {}
         self.begin_count = 0
         self.events: list[object] = []
 

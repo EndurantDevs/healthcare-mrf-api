@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """One request's exact canonical network and immutable address relation."""
 
+import hashlib
+import json
 import re
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -11,13 +13,14 @@ from uuid import UUID
 
 import asyncpg
 from sanic.exceptions import InvalidUsage, SanicException, ServiceUnavailable
-from sqlalchemy import MetaData, bindparam, func, or_, select, text
+from sqlalchemy import MetaData, String, all_, bindparam, cast, func, or_, select, text
 from sqlalchemy.dialects.postgresql import ARRAY, INTEGER
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import visitors
 from sqlalchemy.sql.elements import TextClause
 
 from db.models import EntityAddressUnified
+from process.registry_catalog_policy import RegistryOrganizationVisibility
 
 _SCOPE = ContextVar("canonical_network_address_scope", default=None)
 
@@ -25,9 +28,12 @@ _SCOPE = ContextVar("canonical_network_address_scope", default=None)
 @dataclass(frozen=True)
 class NetworkAddressReadScope:
     manifest: object
-    network_ids: tuple[int, ...]
+    network_ids: tuple[int, ...] | None
     address_relation: object
     access_scope_sha256: str | None = None
+    excluded_network_ids: tuple[int, ...] | None = None
+    address_predicate_sql: str | None = None
+    organization_policy: RegistryOrganizationVisibility | None = None
 
 
 def current_network_address_scope():
@@ -35,16 +41,171 @@ def current_network_address_scope():
     return _SCOPE.get()
 
 
-@contextmanager
-def network_address_read_scope(manifest, network_ids, *, access_scope_sha256=None):
-    """Keep SQL and hydration on the same filtered physical address heap."""
+def _approved_network_clause(network_id, scope):
+    """Use active approved identity at the exact pinned revision, without listing IDs."""
+    from db.models.registry_approval import RegistryApprovedRecord
+    from db.registry_schema import registry_schema
+
+    network = RegistryApprovedRecord.__table__.to_metadata(MetaData(), schema=registry_schema()).alias("policy_network")
+    identity = cast(network_id, String)
+    return (
+        select(1)
+        .select_from(network)
+        .where(
+            network.c.approved_revision == scope.manifest.approved_custom_revision,
+            network.c.record_kind == "network",
+            network.c.record_key == identity,
+            network.c.record_json["archived"].as_boolean().is_(False),
+            func.jsonb_typeof(network.c.record_json["network_id"]) == "number",
+            network.c.record_json["network_id"].astext == identity,
+            network_id
+            != all_(bindparam("_network_excluded_ids", list(scope.excluded_network_ids), type_=ARRAY(INTEGER))),
+        )
+        .exists()
+    )
+
+
+def _visible_membership_predicate():
+    """Require an active approved canonical membership permitted by this policy."""
+    from db.registry_schema import registry_schema
+
+    return f"""EXISTS (
+      SELECT 1 FROM unnest(canonical_network_ids) AS policy_ids(network_id)
+      JOIN "{registry_schema()}".registry_approved_record policy_network
+        ON policy_network.record_key=policy_ids.network_id::text
+      WHERE policy_network.approved_revision=:_network_approved_revision
+        AND policy_network.record_kind='network'
+        AND policy_network.record_json->'archived'='false'::jsonb
+        AND jsonb_typeof(policy_network.record_json->'network_id')='number'
+        AND policy_network.record_json->>'network_id'=policy_ids.network_id::text
+        AND NOT policy_ids.network_id=ANY(CAST(:_network_excluded_ids AS integer[])))"""
+
+
+def _default_address_predicate():
+    """Keep public imported offices; custom offices need permitted approved membership."""
+    # Publisher masks do not restrict ordinary public contact facts.
+    return "row_origin IN ('base','ptg_overlay') OR " + _visible_membership_predicate()
+
+
+def scoped_address_insurance_predicate():
+    """Use visible canonical membership for managed reads and legacy semantics otherwise."""
+    scope = current_network_address_scope()
+    if scope is None:
+        return "NOT (plans_network_array @@ '0'::query_int)"
+    if scope.network_ids is not None:
+        # The trusted scope already authorizes this exact approved selection.
+        return "canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[])"
+    return _visible_membership_predicate()
+
+
+def scoped_address_aca_insurance_predicate():
+    """Require the same visible office membership and an active approved ACA binding."""
+    scope = current_network_address_scope()
+    if scope is None:
+        return "NOT (plans_network_array @@ '0'::query_int)"
+    from db.registry_schema import registry_schema
+
+    permitted = (
+        "policy_ids.network_id=ANY(CAST(:_canonical_network_ids AS INTEGER[]))"
+        if scope.network_ids is not None
+        else "NOT policy_ids.network_id=ANY(CAST(:_network_excluded_ids AS INTEGER[]))"
+    )
+    revision = scope.manifest.approved_custom_revision
+    return f"""EXISTS (
+      SELECT 1 FROM unnest(canonical_network_ids) AS policy_ids(network_id)
+      JOIN "{registry_schema()}".registry_approved_record policy_network
+        ON policy_network.record_key=policy_ids.network_id::text
+      JOIN "{registry_schema()}".registry_approved_record aca_binding
+        ON aca_binding.record_json->>'network_id'=policy_ids.network_id::text
+      WHERE policy_network.approved_revision={revision}
+        AND policy_network.record_kind='network'
+        AND policy_network.record_json->'archived'='false'::jsonb
+        AND jsonb_typeof(policy_network.record_json->'network_id')='number'
+        AND policy_network.record_json->>'network_id'=policy_ids.network_id::text
+        AND aca_binding.approved_revision={revision} AND aca_binding.record_kind='network_binding'
+        AND aca_binding.record_json->'archived'='false'::jsonb
+        AND aca_binding.record_json->>'source_system'='aca'
+        AND jsonb_typeof(aca_binding.record_json->'network_id')='number'
+        AND jsonb_typeof(aca_binding.record_json->'source_scope_json'->'plan_id')='string'
+        AND aca_binding.record_json->'source_scope_json'->>'plan_id'<>''
+        AND jsonb_typeof(aca_binding.record_json->'source_scope_json'->'plan_year')='number'
+        AND jsonb_typeof(aca_binding.record_json->'source_scope_json'->'issuer_id')='number'
+        AND jsonb_typeof(aca_binding.record_json->'source_scope_json'->'state')='string'
+        AND aca_binding.record_json->'source_scope_json'->>'state'<>''
+        AND jsonb_typeof(aca_binding.record_json->'source_scope_json'->'checksum_network')='number'
+        AND {permitted})"""
+
+
+def scoped_aca_plan_clause(*, plan_id, year, issuer_id, state, checksum_network):
+    """Match complete approved ACA plan coordinates in the pinned revision."""
+    from db.models.registry_approval import RegistryApprovedRecord
+    from db.registry_schema import registry_schema
+
+    scope = current_network_address_scope()
+    if scope is None:
+        raise ValueError("network_address_scope_required")
+    binding = RegistryApprovedRecord.__table__.to_metadata(MetaData(), schema=registry_schema()).alias(
+        "approved_aca_binding"
+    )
+    binding_record_json = binding.c.record_json
+    source_scope = binding_record_json["source_scope_json"]
+    network_id = binding_record_json["network_id"].astext.cast(INTEGER)
+    network_clause = (
+        network_id.in_(scope.network_ids)
+        if scope.network_ids is not None
+        else _approved_network_clause(network_id, scope)
+    )
+    return (
+        select(1)
+        .select_from(binding)
+        .where(
+            binding.c.approved_revision == scope.manifest.approved_custom_revision,
+            binding.c.record_kind == "network_binding",
+            binding_record_json["archived"].as_boolean().is_(False),
+            binding_record_json["source_system"].astext == "aca",
+            network_clause,
+            source_scope["plan_id"].astext == plan_id,
+            source_scope["plan_year"].astext.cast(INTEGER) == year,
+            source_scope["issuer_id"].astext.cast(INTEGER) == issuer_id,
+            source_scope["state"].astext == state,
+            source_scope["checksum_network"].astext.cast(INTEGER) == checksum_network,
+        )
+        .exists()
+    )
+
+
+def _validate_network_scope_inputs(
+    manifest, network_ids, access_scope_sha256, excluded_network_ids, organization_policy
+):
+    """Validate selectors and independent visibility before installing address scope."""
     from process.network_serving_read import PinnedNetworkServingManifest
 
-    if type(manifest) is not PinnedNetworkServingManifest or type(network_ids) is not tuple or not network_ids:
+    if type(manifest) is not PinnedNetworkServingManifest:
         raise ValueError("network_address_scope_invalid")
-    if len(network_ids) > 100 or any(type(value) is not int or not 1 <= value <= 2147483647 for value in network_ids):
+    if organization_policy is not None and type(organization_policy) is not RegistryOrganizationVisibility:
         raise ValueError("network_address_scope_invalid")
-    if network_ids != tuple(sorted(set(network_ids))):
+    if network_ids is None:
+        from process.registry_network_catalog_read import _exclusions
+
+        try:
+            _exclusions(excluded_network_ids)
+        except ValueError as error:
+            raise ValueError("network_address_scope_invalid") from error
+        if (
+            type(manifest.approved_custom_revision) is not int
+            or not 0 <= manifest.approved_custom_revision <= 9223372036854775807
+        ):
+            raise ValueError("network_address_scope_invalid")
+        if access_scope_sha256 is None:
+            raise ValueError("network_access_scope_invalid")
+    elif (
+        type(network_ids) is not tuple
+        or not network_ids
+        or len(network_ids) > 100
+        or any(type(network_id) is not int or not 1 <= network_id <= 2147483647 for network_id in network_ids)
+        or network_ids != tuple(sorted(set(network_ids)))
+        or excluded_network_ids is not None
+    ):
         raise ValueError("network_address_scope_invalid")
     if access_scope_sha256 is not None and (
         type(access_scope_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", access_scope_sha256) is None
@@ -52,13 +213,35 @@ def network_address_read_scope(manifest, network_ids, *, access_scope_sha256=Non
         raise ValueError("network_access_scope_invalid")
     if manifest.schema_name != "network_candidate_" + UUID(manifest.candidate_id).hex:
         raise ValueError("network_address_scope_invalid")
-    physical = EntityAddressUnified.__table__.to_metadata(MetaData(), schema=manifest.schema_name)
-    relation = (
-        select(physical)
-        .where(physical.c.canonical_network_ids.op("&&")(bindparam("_canonical_network_ids", type_=ARRAY(INTEGER))))
-        .subquery("entity_address_unified")
+
+
+@contextmanager
+def network_address_read_scope(
+    manifest, network_ids, *, access_scope_sha256=None, excluded_network_ids=None, organization_policy=None
+):
+    """Keep SQL and hydration on the same filtered physical address heap."""
+    _validate_network_scope_inputs(
+        manifest, network_ids, access_scope_sha256, excluded_network_ids, organization_policy
     )
-    token = _SCOPE.set(NetworkAddressReadScope(manifest, network_ids, relation, access_scope_sha256))
+    physical = EntityAddressUnified.__table__.to_metadata(MetaData(), schema=manifest.schema_name)
+    predicate_sql = _default_address_predicate() if network_ids is None else None
+    predicate = (
+        text(predicate_sql)
+        if predicate_sql is not None
+        else physical.c.canonical_network_ids.op("&&")(bindparam("_canonical_network_ids", type_=ARRAY(INTEGER)))
+    )
+    relation = select(physical).where(predicate).subquery("entity_address_unified")
+    token = _SCOPE.set(
+        NetworkAddressReadScope(
+            manifest,
+            network_ids,
+            relation,
+            access_scope_sha256,
+            excluded_network_ids,
+            predicate_sql,
+            organization_policy,
+        )
+    )
     try:
         yield _SCOPE.get()
     finally:
@@ -70,6 +253,10 @@ def scoped_address_relation_sql(table_ref):
     scope = _SCOPE.get()
     if scope is None or not table_ref.endswith(".entity_address_unified"):
         return table_ref
+    if scope.network_ids is None:
+        return (
+            f'(SELECT * FROM "{scope.manifest.schema_name}".entity_address_unified WHERE {scope.address_predicate_sql})'
+        )
     return (
         f'(SELECT * FROM "{scope.manifest.schema_name}".entity_address_unified '
         "WHERE canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[]))"
@@ -82,11 +269,32 @@ def is_scoped_address_relation(table_ref):
     return scope is not None and table_ref == scoped_address_relation_sql("mrf.entity_address_unified")
 
 
+def _is_reserved_parameter_equal(provided, expected):
+    return (
+        type(provided) is type(expected)
+        and provided == expected
+        and (type(expected) is not list or all(type(network_id) is int for network_id in provided))
+    )
+
+
 def scoped_address_parameters(parameters_by_name):
     """Supply the same typed selector to every count, page and raw hydration."""
     scope = _SCOPE.get()
     if scope is None:
         return dict(parameters_by_name)
+    if scope.network_ids is None:
+        reserved_by_name = {
+            "_network_excluded_ids": list(scope.excluded_network_ids),
+            "_network_approved_revision": scope.manifest.approved_custom_revision,
+        }
+        if "_canonical_network_ids" in parameters_by_name or any(
+            key in parameters_by_name and not _is_reserved_parameter_equal(parameters_by_name[key], expected)
+            for key, expected in reserved_by_name.items()
+        ):
+            raise ValueError("network_address_reserved_parameter")
+        return {**parameters_by_name, **reserved_by_name}
+    if any(key in parameters_by_name for key in ("_network_excluded_ids", "_network_approved_revision")):
+        raise ValueError("network_address_reserved_parameter")
     if "_canonical_network_ids" in parameters_by_name and parameters_by_name["_canonical_network_ids"] != list(
         scope.network_ids
     ):
@@ -119,6 +327,14 @@ def scoped_address_cache_key(cache_key):
     scope = _SCOPE.get()
     if scope is None:
         return cache_key
+    if scope.network_ids is None:
+        excluded_digest = hashlib.sha256(
+            json.dumps(scope.excluded_network_ids, separators=(",", ":")).encode()
+        ).hexdigest()
+        return (
+            f"{cache_key}|network:{scope.manifest.manifest_sha256}:default:"
+            f"{scope.manifest.approved_custom_revision}:{excluded_digest}:{scope.access_scope_sha256}"
+        )
     return (
         f"{cache_key}|network:{scope.manifest.manifest_sha256}:{','.join(map(str, scope.network_ids))}"
         f":{scope.access_scope_sha256 or ''}"

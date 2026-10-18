@@ -7,6 +7,7 @@ import datetime
 import importlib
 import io
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -14,7 +15,7 @@ from process.ptg_parts import artifacts as ptg_artifacts
 from process.ptg_parts import input_artifact_retention as retention
 from process.ptg_parts import json_streams
 from process.ptg_parts.domain import PTG2HeadMetadata
-
+from tests.test_provider_directory_generic_source_policy import synthetic_source_factory
 
 fhir = importlib.import_module("process.provider_directory_fhir")
 
@@ -38,35 +39,41 @@ def test_uhc_reference_helpers_cover_multi_value_and_state_only_rows():
             "coverage": [{"network": [{"reference": "Organization/n4"}]}],
         }
     ) == ["Organization/n1", "Organization/n2", "Organization/n3", "Organization/n4"]
-    assert fhir._uhc_location_partition_predicate_error(
-        _source(),
-        "Location",
-        f"{fhir.UHC_PROVIDER_DIRECTORY_BASE}/Location?address-state=CA",
-        {
-            "resourceType": "Bundle",
-            "entry": [
-                {
-                    "resource": {
-                        "resourceType": "Location",
-                        "address": {"state": "CA"},
+    assert (
+        fhir._uhc_location_partition_predicate_error(
+            _source(),
+            "Location",
+            f"{fhir.UHC_PROVIDER_DIRECTORY_BASE}/Location?address-state=CA",
+            {
+                "resourceType": "Bundle",
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "Location",
+                            "address": {"state": "CA"},
+                        }
                     }
-                }
-            ],
-        },
-    ) is None
+                ],
+            },
+        )
+        is None
+    )
 
 
 def test_uhc_plan_graph_merge_accepts_empty_network_page():
-    assert fhir._merge_uhc_plan_graph_bundle_rows(
-        _source(),
-        "PractitionerRole",
-        {"resourceType": "Bundle", "total": 0, "entry": []},
-        fetch_url="https://example.test/PractitionerRole",
-        network_reference="Organization/n1",
-        run_id="run",
-        rows_by_id={},
-        fingerprints_by_id={},
-    ) is None
+    assert (
+        fhir._merge_uhc_plan_graph_bundle_rows(
+            _source(),
+            "PractitionerRole",
+            {"resourceType": "Bundle", "total": 0, "entry": []},
+            fetch_url="https://example.test/PractitionerRole",
+            network_reference="Organization/n1",
+            run_id="run",
+            rows_by_id={},
+            fingerprints_by_id={},
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -106,9 +113,7 @@ async def test_uhc_linked_rows_cover_empty_and_successful_collections(monkeypatc
 @pytest.mark.asyncio
 async def test_uhc_snapshot_reports_network_failure_and_merges_linked_rows(monkeypatch):
     async def insurance_plans(*_args, **_kwargs):
-        return [
-            {"resource_id": "plan", "network_refs": ["Organization/n1"]}
-        ], 1, None, False
+        return [{"resource_id": "plan", "network_refs": ["Organization/n1"]}], 1, None, False
 
     async def failed_network(*_args, **_kwargs):
         return {}, {}, "network-failed", False
@@ -142,6 +147,7 @@ async def test_uhc_snapshot_reports_network_failure_and_merges_linked_rows(monke
 
 @pytest.mark.asyncio
 async def test_provider_directory_persistence_helpers_cover_empty_edges(monkeypatch):
+    """Empty dataset batches cannot fall back to legacy output writes."""
     await fhir._update_source_resource_import_metadata(
         [],
         run_id=None,
@@ -152,27 +158,42 @@ async def test_provider_directory_persistence_helpers_cover_empty_edges(monkeypa
     monkeypatch.setattr(fhir, "_canonical_resource_rows", lambda *_a, **_k: [])
     monkeypatch.setattr(fhir, "_source_resource_edge_rows", lambda *_a, **_k: [])
 
-    async def upsert(_model, rows, **_kwargs):
-        return len(rows)
-
+    upsert = AsyncMock()
     monkeypatch.setattr(fhir, "_upsert_rows", upsert)
-    written = await fhir._upsert_resource_rows(
-        fhir.RESOURCE_MODELS_BY_TYPE["Organization"],
-        [{"resource_id": "o1"}],
-        options=fhir.ProviderDirectoryResourceWriteOptions(
-            run_id="run",
-            track_seen=False,
-            canonical_api_base=fhir.UHC_PROVIDER_DIRECTORY_BASE,
-            source_ids=["uhc"],
-        ),
+    options = fhir.ProviderDirectoryResourceWriteOptions(
+        run_id="run",
+        track_seen=False,
+        canonical_api_base=fhir.UHC_PROVIDER_DIRECTORY_BASE,
+        source_ids=["uhc"],
+        dataset_scope=fhir.EndpointDatasetWriteScope("dataset", fhir.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT),
     )
-    assert written == 1
+    async with synthetic_source_factory(monkeypatch, fhir.db, schema=fhir._schema()):
+        assert (
+            await fhir._upsert_resource_rows(
+                fhir.RESOURCE_MODELS_BY_TYPE["Organization"], [{"resource_id": "o1"}], options=options
+            )
+            == 0
+        )
+    with pytest.raises(RuntimeError, match="output_snapshot_dataset_scope_required"):
+        await fhir._upsert_resource_rows(
+            fhir.RESOURCE_MODELS_BY_TYPE["Organization"],
+            [{"resource_id": "o1"}],
+            options=fhir.ProviderDirectoryResourceWriteOptions(run_id="run", track_seen=False),
+        )
+    upsert.assert_not_awaited()
 
-    assert await fhir._delete_stale_resource_rows(
-        fhir.RESOURCE_MODELS_BY_TYPE["Organization"],
-        "uhc",
-        None,
-    ) == 0
+
+@pytest.mark.asyncio
+async def test_stale_resource_deletes_cover_empty_edges(monkeypatch):
+    """Missing run identity and unknown resource families leave storage untouched."""
+    assert (
+        await fhir._delete_stale_resource_rows(
+            fhir.RESOURCE_MODELS_BY_TYPE["Organization"],
+            "uhc",
+            None,
+        )
+        == 0
+    )
 
     class UnknownResource:
         __tablename__ = "unknown_resource"
@@ -181,17 +202,23 @@ async def test_provider_directory_persistence_helpers_cover_empty_edges(monkeypa
         return 0
 
     monkeypatch.setattr(fhir.db, "status", status)
-    assert await fhir._delete_stale_resource_rows(
-        UnknownResource,
-        "uhc",
-        "run",
-        use_seen_table=True,
-    ) == 0
-    assert await fhir._delete_stale_resource_rows(
-        UnknownResource,
-        "uhc",
-        "run",
-    ) == 0
+    assert (
+        await fhir._delete_stale_resource_rows(
+            UnknownResource,
+            "uhc",
+            "run",
+            use_seen_table=True,
+        )
+        == 0
+    )
+    assert (
+        await fhir._delete_stale_resource_rows(
+            UnknownResource,
+            "uhc",
+            "run",
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio
@@ -255,9 +282,7 @@ def test_ptg_lock_and_manifest_loop_edges(tmp_path, monkeypatch):
 def test_ptg_reuse_policy_loop_edges(tmp_path):
     candidate_metadata_by_field = {"raw_sha256": "a" * 64, "content_length": 1}
     head = PTG2HeadMetadata(url="https://example.test", content_length=1)
-    assert ptg_artifacts.choose_reusable_raw_artifact(
-        [candidate_metadata_by_field], None
-    ) == (None, None)
+    assert ptg_artifacts.choose_reusable_raw_artifact([candidate_metadata_by_field], None) == (None, None)
     assert ptg_artifacts.choose_reusable_raw_artifact(
         [candidate_metadata_by_field],
         head,
@@ -307,16 +332,19 @@ def test_ptg_retention_loops_over_released_paths_and_prefixes(tmp_path):
         now=now,
     )
     assert marked == {"raw/one", "raw/two"}
-    assert retention._mark_released_paths_unleased_locked(
-        store,
-        {
-            "paths": [path.relative_to(store.root).as_posix() for path in retained_paths],
-            "prefixes": [],
-        },
-        active_exact_paths=set(),
-        active_prefixes=set(),
-        now=now,
-    ) == set()
+    assert (
+        retention._mark_released_paths_unleased_locked(
+            store,
+            {
+                "paths": [path.relative_to(store.root).as_posix() for path in retained_paths],
+                "prefixes": [],
+            },
+            active_exact_paths=set(),
+            active_prefixes=set(),
+            now=now,
+        )
+        == set()
+    )
 
     (store.root / "raw" / "aaa-directory").mkdir()
     lease = retention.PTG2ArtifactLease(

@@ -311,10 +311,11 @@ async def _canonical_enum_oid(session):
     return enum["oid"]
 
 
-async def require_native_read_catalog(session, oids, *, allowed_type_oids=()):
+async def require_native_read_catalog(session, oids, *, allowed_type_oids=(), executable_roles=None):
     """Reuse the common native execution boundary before privileged SOURCE payload reads."""
     from process import entity_address_native_publication as native
 
+    _native_execution_subjects(executable_roles)
     if not oids or any(type(oid) is not int or oid <= 0 for oid in oids):
         raise RuntimeError("native SOURCE catalog is incomplete")
     safe = await session.scalar(
@@ -336,40 +337,59 @@ async def require_native_read_catalog(session, oids, *, allowed_type_oids=()):
         allowed_extensions=("postgis", "intarray", "btree_gin", "btree_gist", "pg_trgm"),
     )
     for oid in oids:
-        await _require_native_expression_owners(session, oid)
+        await _require_native_expression_owners(session, oid, executable_roles=executable_roles)
 
 
-async def _require_native_expression_owners(session, oid):
+def _native_execution_subjects(executable_roles):
+    if executable_roles is None:
+        return (None,)
+    from db.plan_release_storage import storage_identifier
+
+    if (
+        type(executable_roles) is not tuple
+        or len(executable_roles) != 2
+        or any(type(role) is not str for role in executable_roles)
+        or len(set(executable_roles)) != 2
+    ):
+        raise RuntimeError("native SOURCE executable roles are invalid")
+    for role in executable_roles:
+        storage_identifier(role)
+    return executable_roles
+
+
+async def _require_native_expression_owners(session, oid, *, executable_roles=None):
     """Source membership must not permit replacement of any invoked native code."""
-    unsafe = await session.scalar(
-        text(
-            "WITH objects(classid,objid) AS (SELECT 'pg_class'::regclass,indexrelid "
-            "FROM pg_catalog.pg_index WHERE indrelid=CAST(:oid AS oid) UNION ALL "
-            "SELECT 'pg_attrdef'::regclass,oid FROM pg_catalog.pg_attrdef WHERE adrelid=CAST(:oid AS oid) UNION ALL "
-            "SELECT 'pg_constraint'::regclass,oid FROM pg_catalog.pg_constraint WHERE conrelid=CAST(:oid AS oid)), "
-            "referenced AS (SELECT d.refclassid,d.refobjid FROM objects x JOIN pg_catalog.pg_depend d "
-            "ON (d.classid,d.objid)=(x.classid,x.objid)) "
-            "SELECT EXISTS(SELECT 1 FROM referenced d LEFT JOIN pg_catalog.pg_proc p "
-            "ON d.refclassid='pg_proc'::regclass AND p.oid=d.refobjid LEFT JOIN pg_catalog.pg_operator o "
-            "ON d.refclassid='pg_operator'::regclass AND o.oid=d.refobjid LEFT JOIN pg_catalog.pg_proc impl "
-            "ON impl.oid=o.oprcode WHERE pg_catalog.pg_has_role(current_user,p.proowner,'MEMBER') "
-            "OR pg_catalog.pg_has_role(current_user,o.oprowner,'MEMBER') "
-            "OR pg_catalog.pg_has_role(current_user,impl.proowner,'MEMBER')) "
-            "OR EXISTS(SELECT 1 FROM pg_catalog.pg_index i,LATERAL unnest(i.indclass) cls(oid) "
-            "JOIN pg_catalog.pg_opclass c ON c.oid=cls.oid JOIN pg_catalog.pg_opfamily f ON f.oid=c.opcfamily "
-            "WHERE i.indrelid=CAST(:oid AS oid) AND (pg_catalog.pg_has_role(current_user,c.opcowner,'MEMBER') "
-            "OR pg_catalog.pg_has_role(current_user,f.opfowner,'MEMBER') "
-            "OR EXISTS(SELECT 1 FROM pg_catalog.pg_amproc a JOIN pg_catalog.pg_proc p ON p.oid=a.amproc "
-            "WHERE a.amprocfamily=f.oid AND pg_catalog.pg_has_role(current_user,p.proowner,'MEMBER')) "
-            "OR EXISTS(SELECT 1 FROM pg_catalog.pg_amop a JOIN pg_catalog.pg_operator o ON o.oid=a.amopopr "
-            "JOIN pg_catalog.pg_proc p ON p.oid=o.oprcode WHERE a.amopfamily=f.oid "
-            "AND (pg_catalog.pg_has_role(current_user,o.oprowner,'MEMBER') "
-            "OR pg_catalog.pg_has_role(current_user,p.proowner,'MEMBER')))))"
-        ),
-        {"oid": oid},
+    statement = text(
+        "WITH objects(classid,objid) AS (SELECT 'pg_class'::regclass,indexrelid "
+        "FROM pg_catalog.pg_index WHERE indrelid=CAST(:oid AS oid) UNION ALL "
+        "SELECT 'pg_attrdef'::regclass,oid FROM pg_catalog.pg_attrdef WHERE adrelid=CAST(:oid AS oid) UNION ALL "
+        "SELECT 'pg_constraint'::regclass,oid FROM pg_catalog.pg_constraint WHERE conrelid=CAST(:oid AS oid)), "
+        "referenced AS (SELECT d.refclassid,d.refobjid FROM objects x JOIN pg_catalog.pg_depend d "
+        "ON (d.classid,d.objid)=(x.classid,x.objid)) "
+        "SELECT EXISTS(SELECT 1 FROM referenced d LEFT JOIN pg_catalog.pg_proc p "
+        "ON d.refclassid='pg_proc'::regclass AND p.oid=d.refobjid LEFT JOIN pg_catalog.pg_operator o "
+        "ON d.refclassid='pg_operator'::regclass AND o.oid=d.refobjid LEFT JOIN pg_catalog.pg_proc impl "
+        "ON impl.oid=o.oprcode WHERE pg_catalog.pg_has_role(current_user,p.proowner,'MEMBER') "
+        "OR pg_catalog.pg_has_role(current_user,o.oprowner,'MEMBER') "
+        "OR pg_catalog.pg_has_role(current_user,impl.proowner,'MEMBER')) "
+        "OR EXISTS(SELECT 1 FROM pg_catalog.pg_index i,LATERAL unnest(i.indclass) cls(oid) "
+        "JOIN pg_catalog.pg_opclass c ON c.oid=cls.oid JOIN pg_catalog.pg_opfamily f ON f.oid=c.opcfamily "
+        "WHERE i.indrelid=CAST(:oid AS oid) AND (pg_catalog.pg_has_role(current_user,c.opcowner,'MEMBER') "
+        "OR pg_catalog.pg_has_role(current_user,f.opfowner,'MEMBER') "
+        "OR EXISTS(SELECT 1 FROM pg_catalog.pg_amproc a JOIN pg_catalog.pg_proc p ON p.oid=a.amproc "
+        "WHERE a.amprocfamily=f.oid AND pg_catalog.pg_has_role(current_user,p.proowner,'MEMBER')) "
+        "OR EXISTS(SELECT 1 FROM pg_catalog.pg_amop a JOIN pg_catalog.pg_operator o ON o.oid=a.amopopr "
+        "JOIN pg_catalog.pg_proc p ON p.oid=o.oprcode WHERE a.amopfamily=f.oid "
+        "AND (pg_catalog.pg_has_role(current_user,o.oprowner,'MEMBER') "
+        "OR pg_catalog.pg_has_role(current_user,p.proowner,'MEMBER')))))"
     )
-    if unsafe is not False:
-        raise RuntimeError("canonical source executable ownership is unsupported")
+    for role in _native_execution_subjects(executable_roles):
+        selected = (
+            statement if role is None else text(str(statement).replace("current_user", "CAST(:execution_role AS name)"))
+        )
+        unsafe = await session.scalar(selected, {"oid": oid, **({"execution_role": role} if role is not None else {})})
+        if unsafe is not False:
+            raise RuntimeError("canonical source executable ownership is unsupported")
 
 
 def canonical_reference_filter(importer_id, schema, qualified, *, key="canonical.address_key", canonical_name=None):

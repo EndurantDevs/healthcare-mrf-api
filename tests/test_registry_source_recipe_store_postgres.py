@@ -273,6 +273,16 @@ async def test_closed_wire_rejects_malformed_batch(mutation):
         "[" * 2000 + "]" * 2000,
         "[]" + " " * MAX_SOURCE_RECIPE_INPUT_BYTES,
     ],
+    ids=[
+        "null",
+        "object",
+        "boolean-element",
+        "nan",
+        "infinity",
+        "duplicate-key",
+        "deep-nesting",
+        "oversized-whitespace",
+    ],
 )
 async def test_json_limits_and_duplicate_fields_are_whole_batch_errors(wire):
     with pytest.raises(RegistrySourceRecipeError, match="^registry_source_recipes_invalid$"):

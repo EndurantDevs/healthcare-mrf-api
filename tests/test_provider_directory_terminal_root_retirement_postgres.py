@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from process.provider_directory_generic_source_policy import source_transaction
 from process.provider_directory_terminal_root_retirement_contract import (
     REQUIRED_CHILD_RELATIONS,
     RETIREMENT_EVIDENCE_FUNCTION,
@@ -133,14 +134,12 @@ async def preview_in_timezone(
 ) -> tuple[str, dict[str, Any]]:
     """Return one preview token and SQL evidence under a session timezone."""
 
-    async with scenario.database.transaction():
+    async with source_transaction(scenario.database, isolation="read committed"):
         await scenario.database.scalar(
             "SELECT pg_catalog.set_config('TimeZone', :timezone_name, true)",
             timezone_name=timezone_name,
         )
-        evidence_sha256 = await preview_terminal_root_retirement(
-            request(), database=scenario.database
-        )
+        evidence_sha256 = await preview_terminal_root_retirement(request(), database=scenario.database)
         evidence_by_field = await scenario.database.scalar(
             f"SELECT {scenario.schema}.{RETIREMENT_EVIDENCE_FUNCTION}(:dataset_id)",
             dataset_id=TARGET_DATASET_ID,
@@ -155,7 +154,7 @@ async def apply_in_timezone(
 ):
     """Apply or replay while returning the truthful UTC transaction instant."""
 
-    async with scenario.database.transaction():
+    async with source_transaction(scenario.database, isolation="read committed"):
         await scenario.database.scalar(
             "SELECT pg_catalog.set_config('TimeZone', :timezone_name, true)",
             timezone_name=timezone_name,
@@ -179,14 +178,9 @@ async def test_exact_retirement_preview_apply_and_drifted_replay(monkeypatch) ->
 
     async with retirement_postgres(monkeypatch) as scenario:
         seeded = await scenario.snapshot()
-        token = await preview_terminal_root_retirement(
-            request(), database=scenario.database
-        )
+        token = await preview_terminal_root_retirement(request(), database=scenario.database)
         assert len(token) == 64
-        assert (
-            "resource_hash_contract"
-            not in (await target_json(scenario))["publication_metadata_json"]
-        )
+        assert "resource_hash_contract" not in (await target_json(scenario))["publication_metadata_json"]
         assert await scenario.snapshot() == seeded
         await require_runtime_error_without_writes(
             scenario,
@@ -210,20 +204,10 @@ async def test_exact_retirement_preview_apply_and_drifted_replay(monkeypatch) ->
         assert evidence["proof_row_count"] == 4
         assert evidence["terminal_run_count"] == 4
         assert set(evidence["child_relations"]) == REQUIRED_CHILD_RELATIONS
-        assert (
-            evidence["child_relations"][
-                "provider_directory_endpoint_dataset_previous_reference"
-            ]["row_count"]
-            == 0
-        )
+        assert evidence["child_relations"]["provider_directory_endpoint_dataset_previous_reference"]["row_count"] == 0
         await drift_replay_inputs(scenario)
         replay_input = await scenario.snapshot()
-        assert (
-            await preview_terminal_root_retirement(
-                request(), database=scenario.database
-            )
-            == token
-        )
+        assert await preview_terminal_root_retirement(request(), database=scenario.database) == token
         replay = await apply_terminal_root_retirement(
             request(expected_evidence_sha256=token),
             database=scenario.database,
@@ -245,22 +229,14 @@ async def test_timezone_invariant_evidence_apply_and_replay(monkeypatch) -> None
         ny_token, ny_evidence = await preview_in_timezone(scenario, "America/New_York")
         assert ny_token == utc_token
         assert ny_evidence == utc_evidence
-        apply_result, expected_retired_at = await apply_in_timezone(
-            scenario, "America/New_York", utc_token
-        )
+        apply_result, expected_retired_at = await apply_in_timezone(scenario, "America/New_York", utc_token)
         assert apply_result.retired is True
-        marker = (await target_json(scenario))["publication_metadata_json"][
-            RETIREMENT_METADATA_KEY
-        ]
+        marker = (await target_json(scenario))["publication_metadata_json"][RETIREMENT_METADATA_KEY]
         assert marker["retired_at"] == expected_retired_at
         assert marker["retired_at"].endswith("Z")
         for timezone_name in ("UTC", "America/New_York"):
-            replay_token, replay_evidence = await preview_in_timezone(
-                scenario, timezone_name
-            )
-            replay_result, _ = await apply_in_timezone(
-                scenario, timezone_name, utc_token
-            )
+            replay_token, replay_evidence = await preview_in_timezone(scenario, timezone_name)
+            replay_result, _ = await apply_in_timezone(scenario, timezone_name, utc_token)
             assert replay_token == utc_token
             assert replay_evidence == utc_evidence
             assert replay_result.retired is False
@@ -273,9 +249,7 @@ async def test_retired_parent_children_lineage_and_reference_are_guarded(
     """Prove frozen evidence surfaces and unrelated-row mutability."""
 
     async with retirement_postgres(monkeypatch) as scenario:
-        token = await preview_terminal_root_retirement(
-            request(), database=scenario.database
-        )
+        token = await preview_terminal_root_retirement(request(), database=scenario.database)
         await apply_terminal_root_retirement(
             request(expected_evidence_sha256=token),
             database=scenario.database,
@@ -285,9 +259,7 @@ async def test_retired_parent_children_lineage_and_reference_are_guarded(
             await require_database_guard(scenario, statement, expected_text)
         await mutate_unrelated_rows(scenario)
         assert (
-            await scenario.connection.fetchval(
-                f"SELECT status FROM {schema}.import_run WHERE run_id = 'run-unrelated'"
-            )
+            await scenario.connection.fetchval(f"SELECT status FROM {schema}.import_run WHERE run_id = 'run-unrelated'")
             == "running"
         )
 
@@ -312,8 +284,7 @@ def retired_mutation_cases(schema: str) -> tuple[tuple[str, str], ...]:
             "child_immutable",
         ),
         (
-            f"UPDATE {schema}.import_run SET summary_json = '{{\"drift\":true}}' "
-            f"WHERE run_id = '{ROOT_RUN_ID}'",
+            f"UPDATE {schema}.import_run SET summary_json = '{{\"drift\":true}}' WHERE run_id = '{ROOT_RUN_ID}'",
             "run_immutable",
         ),
         (
@@ -357,9 +328,7 @@ async def direct_transition_marker_json(scenario: RetirementPostgres) -> str:
     """Build the valid pre-drift marker used to exercise the SQL trigger."""
 
     async with scenario.database.transaction():
-        selection = await selected_terminal_root_retirement(
-            scenario.database, request()
-        )
+        selection = await selected_terminal_root_retirement(scenario.database, request())
     return json.dumps(selection.marker_by_field, sort_keys=True, separators=(",", ":"))
 
 
@@ -414,9 +383,7 @@ async def test_non_linear_or_foreign_descendant_blocks_python_and_sql(
             await require_runtime_error_without_writes(
                 scenario,
                 "evidence_invalid",
-                lambda: preview_terminal_root_retirement(
-                    request(), database=scenario.database
-                ),
+                lambda: preview_terminal_root_retirement(request(), database=scenario.database),
             )
             await require_database_guard(
                 scenario,
@@ -424,9 +391,7 @@ async def test_non_linear_or_foreign_descendant_blocks_python_and_sql(
                 "transition_invalid",
             )
             assert await scenario.snapshot() == drifted_snapshot
-            await scenario.connection.execute(
-                f"DELETE FROM {scenario.schema}.import_run WHERE run_id = $1", run_id
-            )
+            await scenario.connection.execute(f"DELETE FROM {scenario.schema}.import_run WHERE run_id = $1", run_id)
 
 
 @pytest.mark.asyncio
@@ -459,9 +424,5 @@ async def test_too_young_nonterminal_v4_and_predecessorless_roots_fail_closed(
             "expected_current_dataset_id": CURRENT_DATASET_ID,
         }
         with pytest.raises(TerminalRootRetirementError, match="evidence_invalid"):
-            await preview_terminal_root_retirement(
-                request(values=orphan_selector_by_field), database=scenario.database
-            )
-        assert (
-            await scenario.rows("provider_directory_endpoint_dataset") == orphan_before
-        )
+            await preview_terminal_root_retirement(request(values=orphan_selector_by_field), database=scenario.database)
+        assert await scenario.rows("provider_directory_endpoint_dataset") == orphan_before

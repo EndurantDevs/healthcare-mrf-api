@@ -14,6 +14,7 @@ from process import registry_ptg_cohort_authority as source
 from process import registry_ptg_graph_reader as graph
 from process import registry_ptg_office_capture as capture
 from process.network_address_projection import _identifier
+from process.uhc_flex_practitioner_async_safety import drain_operation
 
 _PAGE_ROWS = 1024
 
@@ -153,7 +154,28 @@ async def _sources(session, context, scope):
     return identity
 
 
-async def _prepared(session, driver, context, request, manifest):
+def _is_retained_review_command_match(expected, original, current_revision):
+    if current_revision is None:
+        return expected == original
+    if type(current_revision) is not int or not 0 < current_revision < 2**63:
+        return False
+    if type(expected) is not dict or type(original) is not dict:
+        return False
+    if type(expected.get("source")) is not dict or type(original.get("source")) is not dict:
+        return False
+    historical_revision = original["source"].get("approved_revision")
+    if (
+        type(historical_revision) is not int
+        or not 0 < historical_revision <= current_revision
+        or type(expected["source"].get("approved_revision")) is not int
+        or expected["source"]["approved_revision"] != current_revision
+    ):
+        return False
+    comparison_by_name = {**expected, "source": {**expected["source"], "approved_revision": historical_revision}}
+    return comparison_by_name == original
+
+
+async def _prepared(session, driver, context, request, manifest, retained_approved_revision=None):
     scope = await capture._scope(session, context)
     if scope["scope_id"] != str(context.scope_id) or scope["client_id"] != context.client_id:
         raise RegistryPTGOfficeWitnessError("registry_ptg_office_context_changed")
@@ -162,7 +184,7 @@ async def _prepared(session, driver, context, request, manifest):
     )
     expected = capture.office_review_command(request, scope, serving, manifest["accounting"])
     if (
-        expected != manifest["command"]
+        not _is_retained_review_command_match(expected, manifest["command"], retained_approved_revision)
         or expected["canonical_input_sha256"] != request.canonical_input_sha256
         or expected["input_row_count"] != request.input_row_count
     ):
@@ -173,12 +195,15 @@ async def _prepared(session, driver, context, request, manifest):
 async def _verified_page(session, driver, context, request, prepared, page, office_rows, limits):
     read_budget, guard = limits
     scope, serving = prepared[1:3]
-    _, canonical, _, _, encoded_rows = await asyncio.to_thread(
-        capture._batch,
-        capture._encoder(),
-        capture._canonical(office_rows),
-        capture._codec_context(scope, request),
-        page["after_ordinal"],
+    _, canonical, _, _, encoded_rows = await drain_operation(
+        asyncio.to_thread(
+            capture._batch,
+            capture._encoder(),
+            capture._canonical(office_rows),
+            capture._codec_context(scope, request),
+            page["after_ordinal"],
+        ),
+        preserve_cancellation=True,
     )
     guard()
     receipt = await capture._adopt_batch(driver, serving, encoded_rows, context.control_schema)
@@ -234,7 +259,13 @@ async def _scan(session, driver, context, request, prepared, read_budget, guard)
     }
 
 
-async def verify_registry_ptg_office_witness(session, context, request, descriptor, *, read_budget):
+def _graph_budget_usage(read_budget):
+    return {name: getattr(read_budget, name) for name in ("read_bytes", "read_pages", "coordinates")}
+
+
+async def verify_registry_ptg_office_witness(
+    session, context, request, descriptor, *, read_budget, retained_approved_revision=None
+):
     """Rebuild every prepared office and exhaust source witnesses in one transaction.
 
     The budget belongs to the caller and remains charged on failure. Fresh office
@@ -248,7 +279,7 @@ async def verify_registry_ptg_office_witness(session, context, request, descript
     guard()
     custody = await _family(driver, schema_name, descriptor, context)
     guard()
-    scope, serving, identity = await _prepared(session, driver, context, request, manifest)
+    scope, serving, identity = await _prepared(session, driver, context, request, manifest, retained_approved_revision)
     await capture._validate_rows(driver, schema_name, scope, request.input_row_count)
     guard()
     accounting_by_field, census = await _scan(
@@ -262,7 +293,7 @@ async def verify_registry_ptg_office_witness(session, context, request, descript
     )
     if accounting_by_field != manifest["accounting"]:
         raise RegistryPTGOfficeWitnessError("registry_ptg_office_accounting_invalid")
-    if await _prepared(session, driver, context, request, manifest) != (
+    if await _prepared(session, driver, context, request, manifest, retained_approved_revision) != (
         scope,
         serving,
         identity,
@@ -288,9 +319,7 @@ async def verify_registry_ptg_office_witness(session, context, request, descript
                 "retained_serving": manifest["command"]["retained_serving"],
                 "source_witness_census": census,
                 "custody": custody,
-                "graph_budget": {
-                    name: getattr(read_budget, name) for name in ("read_bytes", "read_pages", "coordinates")
-                },
+                "graph_budget": _graph_budget_usage(read_budget),
             }
         )
     )

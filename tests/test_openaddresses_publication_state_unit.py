@@ -2,7 +2,6 @@ import importlib
 
 import pytest
 
-
 openaddresses = importlib.import_module("process.openaddresses")
 
 
@@ -45,9 +44,7 @@ def _completed_state_fixture(state):
         relation_names.add(stage_table)
     elif state == "pending_and_completed":
         relation_names.add(marker_table)
-        generation_records.append(
-            {"table_name": marker_table, "import_id": import_id, "live_oid": 41}
-        )
+        generation_records.append({"table_name": marker_table, "import_id": import_id, "live_oid": 41})
     return import_id, stage_table, recovery_table, marker_table, relation_names, marker_oid, generation_records
 
 
@@ -281,9 +278,7 @@ async def test_openaddresses_default_direct_enqueues_use_distinct_import_ids(mon
     generated_ids = iter(("a" * 32, "b" * 32))
     monkeypatch.setattr(openaddresses, "create_pool", create_pool)
     monkeypatch.setattr(openaddresses.datetime, "datetime", FixedDatetime)
-    monkeypatch.setattr(
-        openaddresses.uuid, "uuid4", lambda: GeneratedId(next(generated_ids))
-    )
+    monkeypatch.setattr(openaddresses.uuid, "uuid4", lambda: GeneratedId(next(generated_ids)))
     monkeypatch.delenv("HLTHPRT_IMPORT_ID_OVERRIDE", raising=False)
 
     await openaddresses.main()
@@ -327,9 +322,7 @@ async def test_openaddresses_direct_enqueue_preserves_environment_import_identit
     ],
 )
 @pytest.mark.asyncio
-async def test_openaddresses_postpublish_marker_state_fails_closed(
-    monkeypatch, state, error
-):
+async def test_openaddresses_postpublish_marker_state_fails_closed(monkeypatch, state, error):
     fixture = _pending_marker_fixture(state)
     import_id, stage_table, recovery_table, marker_table, relation_names, generation_records = fixture
 
@@ -348,8 +341,11 @@ async def test_openaddresses_postpublish_marker_state_fails_closed(
 
     with pytest.raises(RuntimeError, match=error):
         await openaddresses._is_owned_postpublish_generation_ready(
-            schema="mrf", import_id=import_id, stage_table=stage_table,
-            recovery_table=recovery_table, marker_table=marker_table,
+            schema="mrf",
+            import_id=import_id,
+            stage_table=stage_table,
+            recovery_table=recovery_table,
+            marker_table=marker_table,
             live_table=openaddresses.OPENADDRESSES_TABLE,
         )
 
@@ -363,9 +359,7 @@ async def test_openaddresses_postpublish_marker_state_fails_closed(
     ],
 )
 @pytest.mark.asyncio
-async def test_openaddresses_completed_generation_state_fails_closed(
-    monkeypatch, state, error
-):
+async def test_openaddresses_completed_generation_state_fails_closed(monkeypatch, state, error):
     fixture = _completed_state_fixture(state)
     import_id, stage_table, recovery_table, marker_table, relation_names, marker_oid, generation_records = fixture
 
@@ -388,8 +382,11 @@ async def test_openaddresses_completed_generation_state_fails_closed(
 
     with pytest.raises(RuntimeError, match=error):
         await openaddresses._publication_retry_state(
-            schema="mrf", import_id=import_id, stage_table=stage_table,
-            recovery_table=recovery_table, marker_table=marker_table,
+            schema="mrf",
+            import_id=import_id,
+            stage_table=stage_table,
+            recovery_table=recovery_table,
+            marker_table=marker_table,
             live_table=openaddresses.OPENADDRESSES_TABLE,
         )
 
@@ -474,10 +471,74 @@ async def test_openaddresses_completion_preserves_foreign_relation_comment(monke
 
     with pytest.raises(RuntimeError, match="preserving it instead of overwriting"):
         await openaddresses._complete_published_generation(
-            schema="mrf", import_id=import_id, stage_table=stage_table,
-            recovery_table=recovery_table, marker_table=marker_table,
+            schema="mrf",
+            import_id=import_id,
+            stage_table=stage_table,
+            recovery_table=recovery_table,
+            marker_table=marker_table,
             live_table=openaddresses.OPENADDRESSES_TABLE,
         )
 
     assert len(status_calls) == 1
     assert status_calls[0].startswith("LOCK TABLE")
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_enrollment_follows_indexes_and_precedes_rotation(monkeypatch):
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    events = []
+    original_session = object()
+
+    @asynccontextmanager
+    async def transaction():
+        events.append("begin")
+        yield original_session
+        events.append("commit")
+
+    async def status(sql):
+        assert "enroll" in events
+        events.append(str(sql))
+
+    async def indexed(*args):
+        events.append("indexes")
+
+    async def analyzed(*args):
+        events.append("analyze")
+
+    async def prepare(session, **scope):
+        assert session is original_session and events[-3:] == ["indexes", "analyze", "begin"]
+        assert scope == dict(ledger_schema="mrf", relations=(("openaddresses_geocode", "openaddresses_geocode_test"),))
+        events.append("enroll")
+
+    database = SimpleNamespace(
+        transaction=transaction, scalar=AsyncMock(side_effect=[3, 0]), status=status, execute_ddl=analyzed
+    )
+    monkeypatch.setattr(openaddresses, "db", database)
+    monkeypatch.setattr(openaddresses, "ensure_database", AsyncMock())
+    monkeypatch.setattr(openaddresses, "_publication_retry_state", AsyncMock(return_value=None))
+    monkeypatch.setattr(openaddresses, "_is_table_present", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        openaddresses,
+        "restore_openaddresses_zips",
+        AsyncMock(return_value=SimpleNamespace(candidates=3, restored=3, discarded=0, shards=1)),
+    )
+    monkeypatch.setattr(openaddresses, "_create_indexes", indexed)
+    monkeypatch.setattr(openaddresses, "_relation_oid", AsyncMock(return_value=41))
+    monkeypatch.setattr(openaddresses, "prepare_local_native_input_publication", prepare)
+    monkeypatch.setattr(
+        openaddresses,
+        "refresh_archive_geocodes_from_openaddresses_sharded",
+        AsyncMock(return_value=SimpleNamespace(exact_updates=3, fuzzy_updates=0, relaxed_updates=0)),
+    )
+    completed = AsyncMock()
+    monkeypatch.setattr(openaddresses, "_complete_published_generation", completed)
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
+    await openaddresses.publish_openaddresses_generation(
+        {"import_date": "test", "context": {"run": 1, "test_mode": True}}
+    )
+    assert events.index("enroll") < next(i for i, event in enumerate(events) if "ALTER TABLE" in event)
+    assert "commit" in events
+    completed.assert_awaited_once()

@@ -345,6 +345,12 @@ async def test_read_only_reader_without_owner_uses_nine_set_queries(coverage_db)
         def is_in_transaction(self):
             return fixture.connection.is_in_transaction()
 
+        async def fetchval(self, statement, *arguments):
+            assert statement.lstrip().startswith(("SELECT", "WITH"))
+            assert "FOR SHARE" not in statement.upper() and "FOR UPDATE" not in statement.upper()
+            statements.append(statement)
+            return await fixture.connection.fetchval(statement, *arguments)
+
         async def fetchrow(self, statement, *arguments):
             assert statement.lstrip().startswith(("SELECT", "WITH"))
             assert "FOR SHARE" not in statement.upper() and "FOR UPDATE" not in statement.upper()
@@ -368,8 +374,13 @@ async def test_read_only_reader_without_owner_uses_nine_set_queries(coverage_db)
             )
     finally:
         await fixture.connection.execute("RESET ROLE")
-    assert len(statements) == 9
     namespace = f'"{fixture.control_schema}"'
+    assert statements[2:4] == [
+        "SELECT to_regclass($1)::oid",
+        f"SELECT seal_sha256,receipt_json::text AS receipt_json FROM {namespace}.network_candidate_custody "
+        "WHERE candidate_id=$1",
+    ]
+    assert len(statements) == 9 + 2
     assert statements[-2] == membership_source._SCOPE_SQL.format(
         namespace=namespace, control_source="(SELECT $1::bigint AS approved_revision,1 AS id)"
     )

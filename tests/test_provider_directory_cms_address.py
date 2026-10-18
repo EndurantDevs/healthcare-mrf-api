@@ -59,6 +59,7 @@ def address_build_case(monkeypatch):
             dataset_id=source_id + "-dataset",
             dataset_hash="a" * 64,
             evidence_run_id="run_" + "1" * 32,
+            semantic_projection_as_of="2026-01-01",
             artifact_resources=("Location",),
         )
         for source_id in ("cms-npd", "retained")
@@ -136,7 +137,7 @@ def _retention_policy(address_build_case):
             "release-1",
             123,
             "cms-npd",
-            execution.attestation.desired_profile_as_of,
+            cms.semantic_projection_as_of,
         ),
         RegistryNetworkSourceCoordinates("fhir", cms.source_id, "fixture", cms.dataset_id, "producer", "edition"),
         execution.attestation.proof_id,
@@ -156,6 +157,8 @@ def test_retention_policy_survives_current_input_recheck_and_binds_hash(address_
     assert factory.input_hash != original.input_hash
     assert factory._current_input(address_build_case[2], expected) == factory.input_json
     assert factory._assert_inputs(address_build_case[2], _admission(factory)) == expected
+    assert expected["profile_as_of"] == "2026-01-02"
+    assert policy["source_pin"]["as_of"] == "2026-01-01"
     policy["runtime_roles"].append("z_reader")
     assert json.loads(factory.input_json)["registry_source_retention"]["runtime_roles"] == ["reader", "writer"]
     assert original.with_registry_source_retention(policy).input_hash != factory.input_hash
@@ -185,13 +188,15 @@ def test_retention_policy_requires_exact_fence_and_selection(address_build_case,
         _factory(address_build_case).with_registry_source_retention(policy)
 
 
-@pytest.mark.parametrize("change", ["date", "hash", "selection"])
+@pytest.mark.parametrize("change", ["date", "source-date", "hash", "selection"])
 def test_retention_current_input_refuses_successor_scope(address_build_case, change):
     policy = _retention_policy(address_build_case)
     factory = _factory(address_build_case).with_registry_source_retention(policy)
     execution, fence = address_build_case[1:3]
     if change == "date":
         execution.attestation.desired_profile_as_of = "2026-01-03"
+    elif change == "source-date":
+        fence.datasets[0].semantic_projection_as_of = "2026-01-03"
     elif change == "hash":
         fence.datasets[0].dataset_hash = "f" * 64
     else:
@@ -611,3 +616,43 @@ async def test_unproved_doctors_override_is_rejected_with_incumbent_source(addre
     with pytest.raises(RuntimeError, match="override_unproved"):
         async with factory(address_build_case[2], {"cms_doctor_group_site": "unproved"}, None, _admission(factory)):
             pytest.fail("unproved input must not yield")
+
+
+@pytest.mark.parametrize("raw_date", ["2026-01-01", None, "not-a-date"])
+def test_cms_fence_date_requires_immutable_semantic_metadata(raw_date):
+    fhir = address.importlib.import_module("process.provider_directory_fhir")
+    metadata_by_field = {
+        "source_id": "cms-npd",
+        "dataset_scoped_projection_as_of": "2026-01-02",
+        "publication_metadata_json": {
+            "resource_hash_contract": "semantic_content_v4",
+            "semantic_projection_as_of": raw_date,
+        },
+    }
+    if raw_date == "2026-01-01":
+        assert fhir._artifact_dataset_scoped_state_from_row(metadata_by_field)["semantic_projection_as_of"] == raw_date
+    else:
+        with pytest.raises(RuntimeError, match="semantic_projection_as_of_(missing|invalid)"):
+            fhir._artifact_dataset_scoped_state_from_row(metadata_by_field)
+
+
+def test_captured_tiger_desired_geo_keeps_exact_native_heaps_and_separate_doctors(
+    address_build_case, prepared_doctors_case
+):
+    from process import provider_directory_cms_tiger_inputs as tiger
+    from tests.test_cms_tiger_native_inputs import _captured_proof
+
+    _fhir, _execution, _fence, _native, native_fence = address_build_case
+    proof = _captured_proof()
+    native_fence["tiger_captured"] = proof
+    native_fence["geo_bindings"].update(tiger.captured_tiger_bindings(proof))
+    doctors, bindings = prepared_doctors_case
+    bindings.update(tiger.captured_tiger_bindings(proof))
+    expected = address._desired_geo_bindings("fixture", native_fence, doctors, bindings)
+    assert {name: expected[name] for name in ("tiger.zcta5", "tiger.zip_state")} == tiger.captured_tiger_bindings(proof)
+    assert expected["fixture.doctor_clinician_address"]["table_name"] == doctors.stage_oids[0][1]
+    assert native_fence["geo_bindings"]["fixture.doctor_clinician_address"]["table_name"] == "doctor_clinician_address"
+    changed_by_name = {name: dict(binding) for name, binding in bindings.items()}
+    changed_by_name["tiger.zcta5"]["relfilenode"] += 1
+    with pytest.raises(RuntimeError, match="desired_geo_bindings_changed"):
+        address._desired_geo_bindings("fixture", native_fence, doctors, changed_by_name)

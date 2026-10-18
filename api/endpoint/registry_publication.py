@@ -19,9 +19,17 @@ from process.registry_approval_store import (
     _validated_command,
 )
 from process.registry_approved_company_read import MAX_APPROVED_COMPANY_PAGE_SIZE, read_registry_approved_companies
+from process.registry_company_approval_fence import (
+    _source_engine,
+    registry_company_approval_transaction,
+    require_registry_company_approval_fence,
+)
 from process.registry_imported_selection_preview import (
     RegistryImportedSelectionUnavailable,
 )
+from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
+from process.registry_ptg_scope_engine import RegistryPTGScopeEngineService
+from process.registry_publication_ptg_runtime import _IDENTITY_SQL
 from process.registry_publication_queue import (
     RegistryReactivationCommand,
     _reactivation_actor,
@@ -291,6 +299,45 @@ async def publication_state(request):
         return _error(503)
 
 
+async def _checked_preview(driver, command, actor, expected_head, office_authority=None):
+    current_head = await driver.fetchval(
+        f"SELECT coalesce(generation_id,0) FROM {_namespace(None)}.network_serving_control WHERE id=1"
+    )
+    if current_head is None or current_head != expected_head:
+        raise RegistryApprovalConflict("registry_queue_revision_conflict")
+    if office_authority is None:
+        return await preview_registry_approval(driver, command, actor)
+    return await preview_registry_approval(driver, command, actor, office_authority=office_authority)
+
+
+async def _configured_preview(request, service, command, actor, expected_head):
+    """Own one genuine fenced source session; never accept a request-supplied authority."""
+    control_schema = _namespace(None)[1:-1]
+    if (
+        type(service) is not RegistryPTGScopeEngineService
+        or (service.store.control_schema or control_schema) != control_schema
+    ):
+        raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
+    async with request.ctx.sa_session.begin():
+        driver = await _driver(request.ctx.sa_session)
+        expected_by_name = dict(await driver.fetchrow(_IDENTITY_SQL.replace(":schema", "$1"), control_schema))
+    engine = _source_engine(service.reader_sessions)
+    async with registry_company_approval_transaction(service.reader_sessions, control_schema=control_schema) as session:
+        await require_registry_company_approval_fence(session, control_schema)
+        driver = await _driver(session)
+        actual_by_name = dict(await driver.fetchrow(_IDENTITY_SQL.replace(":schema", "$1"), control_schema))
+        if actual_by_name["current_role"] != engine.url.username:
+            raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
+        original_roles = [
+            identity.pop("session_role") == identity.pop("current_role")
+            for identity in (expected_by_name, actual_by_name)
+        ]
+        if expected_by_name != actual_by_name or actual_by_name["control_oid"] is None or not all(original_roles):
+            raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
+        authority = (session, service.store, RegistryPTGGraphReadBudget(16 * 1024 * 1024))
+        return await _checked_preview(driver, command, actor, expected_head, authority)
+
+
 @blueprint.post("/<operation>")
 async def request_publication(request, operation):
     """Preview or queue one selection; HTTP never enters the publisher role."""
@@ -299,25 +346,29 @@ async def request_publication(request, operation):
         if operation not in {"preview", "queue"}:
             raise ValueError("registry_publication_operation_invalid")
         command, actor, expected_head, session_hash = _command(request)
-        async with request.ctx.sa_session.begin():
-            if operation == "preview":
-                await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-            driver = await _driver(request.ctx.sa_session)
-            if operation == "queue":
-                publication_receipt = await enqueue_registry_publication(
-                    driver,
-                    command,
-                    actor,
-                    session_token_sha256=session_hash,
-                    expected_serving_generation=expected_head,
-                )
-            else:
-                current_head = await driver.fetchval(
-                    f"SELECT coalesce(generation_id,0) FROM {_namespace(None)}.network_serving_control WHERE id=1"
-                )
-                if current_head is None or current_head != expected_head:
-                    raise RegistryApprovalConflict("registry_queue_revision_conflict")
-                publication_receipt = await preview_registry_approval(driver, command, actor)
+        service = getattr(request.app.ctx, "registry_ptg_scope_engine", None) if operation == "preview" else None
+        if service is not None:
+            try:
+                publication_receipt = await _configured_preview(request, service, command, actor, expected_head)
+            except RegistryRecordConflict:
+                raise
+            except ValueError, TypeError, TimeoutError:
+                raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable") from None
+        else:
+            async with request.ctx.sa_session.begin():
+                if operation == "preview":
+                    await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+                driver = await _driver(request.ctx.sa_session)
+                if operation == "queue":
+                    publication_receipt = await enqueue_registry_publication(
+                        driver,
+                        command,
+                        actor,
+                        session_token_sha256=session_hash,
+                        expected_serving_generation=expected_head,
+                    )
+                else:
+                    publication_receipt = await _checked_preview(driver, command, actor, expected_head)
         return response.json(publication_receipt, headers=_HEADERS)
     except RegistryRecordConflict:
         return _error(409)

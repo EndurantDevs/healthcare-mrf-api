@@ -135,8 +135,16 @@ def _observe_backfill_calls(monkeypatch, database, observed):
 
 
 async def _run_backfill(monkeypatch, schema, relation, worker):
+    if worker == "location_key":
+        with pytest.raises(RuntimeError, match="address_scratch_custody_required"):
+            await importer.publish_provider_directory_location_address_keys(schema)
+        return None
     if worker == "resource_npi":
-        return await importer.backfill_provider_directory_resource_id_npis(schema)
+        # Ordinary four-column fixtures cannot authorize protected output maintenance.
+        monkeypatch.setattr(importer, "_schema", lambda: schema)
+        with pytest.raises(RuntimeError, match="npi_unbound_operation_required"):
+            await importer.backfill_provider_directory_resource_id_npis(schema)
+        return None
     update = f"UPDATE {schema}.{relation} SET value=value+1"
     batch = f"WITH changed AS ({update} RETURNING 1) SELECT 0 AS candidate_rows,count(*) AS updated_rows,NULL AS last_source_id,NULL AS last_resource_id FROM changed"
     monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
@@ -149,14 +157,12 @@ async def _run_backfill(monkeypatch, schema, relation, worker):
             importer, "provider_directory_location_coordinate_batch_sql", lambda *_args, **_kwargs: batch
         )
         return await importer.backfill_provider_directory_location_coordinates(schema)
-    monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
-    monkeypatch.setattr(importer.address_fast, "_fast_module", lambda: object())
-    monkeypatch.setattr(importer, "provider_directory_location_address_key_batch_sql", lambda *_args, **_kwargs: batch)
-    fast = AsyncMock(side_effect=AssertionError("admitted Location must retain its captured OID"))
-    monkeypatch.setattr(importer, "_publish_location_keys_fast", fast)
-    result = await importer.publish_provider_directory_location_address_keys(schema)
-    fast.assert_not_awaited()
-    return result
+
+
+async def _assert_legacy_npi_unchanged(database, schema):
+    """The unsupported ordinary component must retain both original row sets."""
+    for table in ("provider_directory_practitioner", "provider_directory_organization"):
+        assert await database.scalar(f"SELECT count(*) FROM {schema}.{table} WHERE npi IS NULL") == 2
 
 
 @pytest.mark.asyncio
@@ -194,15 +200,20 @@ async def test_early_backfills_bound_actual_statements_and_preserve_owned_locati
                 for variable, token in reversed(tokens):
                     variable.reset(token)
             assert tuple(await database.first(_SETTINGS)) == previous_setting_values
-            assert len(observed_rows) == (2 if worker == "resource_npi" else 1)
-            assert len({observation_row["pid"] for observation_row in observed_rows}) == 1
+            assert len(observed_rows) == (0 if worker in {"resource_npi", "location_key"} else 1)
+            assert len({observation_row["pid"] for observation_row in observed_rows}) == (
+                0 if worker in {"resource_npi", "location_key"} else 1
+            )
             if relation is not None:
                 assert (
                     await database.scalar("SELECT to_regclass(:relation)::oid", relation=f"{schema}.{relation}") == oid
                 )
-                assert await database.scalar(f"SELECT value FROM {schema}.{relation}") == 1
+                assert await database.scalar(f"SELECT value FROM {schema}.{relation}") == (
+                    0 if worker == "location_key" else 1
+                )
             else:
-                assert backfill_result == {"Practitioner": 1, "Organization": 1}
+                assert backfill_result is None
+                await _assert_legacy_npi_unchanged(database, schema)
                 assert (
                     await database.scalar(
                         f"SELECT npi IS NULL FROM {schema}.provider_directory_practitioner WHERE source_id='cms-npd'"

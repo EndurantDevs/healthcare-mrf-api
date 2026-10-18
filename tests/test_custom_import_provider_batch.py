@@ -60,7 +60,7 @@ def _request(body):
 
 
 def _install(monkeypatch, session, *, finality_failure=False):
-    fixtures._install_keyring(monkeypatch)
+    fixtures._install_keyring(monkeypatch, session)
     prepared_reads = []
     hydrated_chunks = []
 

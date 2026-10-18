@@ -3,8 +3,9 @@
 
 import json
 from dataclasses import FrozenInstanceError
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+import asyncpg
 import pytest
 
 from process.network_address_projection import _identifier
@@ -24,6 +25,7 @@ from tests.test_network_membership_publication_postgres import (
     _snapshot,
     _write_report,
     publication_db,
+    qualified_publication_db,
 )
 from tests.test_network_membership_serving_indexes_postgres import _prepare, serving_indexes_db
 from tests.test_network_membership_validation_postgres import validation_db
@@ -68,23 +70,46 @@ async def test_current_and_retained_pin_after_concurrent_head_advance(read_compo
 
 
 @pytest.mark.asyncio
-async def test_resolver_is_one_select_with_no_state_or_sequence_writes(read_component_db):
+async def test_resolver_uses_bounded_metadata_reads_with_no_state_or_sequence_writes(read_component_db):
     fixture = read_component_db
     before = await _snapshot(fixture)
     sequence = f'"{fixture.control_schema}".network_serving_manifest_generation_id_seq'
     sequence_before = await fixture.connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}")
 
+    custody_relation = f'"{fixture.control_schema}".network_candidate_custody'
+    custody_table_oid = await fixture.connection.fetchval("SELECT to_regclass($1)::oid", custody_relation)
+    seal_sql = f"SELECT seal_sha256,receipt_json::text AS receipt_json FROM {custody_relation} WHERE candidate_id=$1"
+
     class ReadOnlyConnection:
-        statements = 0
+        def __init__(self):
+            self.requests = []
 
         def is_in_transaction(self):
             return fixture.connection.is_in_transaction()
 
         async def fetchrow(self, statement, *parameters):
-            self.statements += 1
             assert statement.lstrip().startswith("SELECT")
             assert "FOR UPDATE" not in statement and "FOR SHARE" not in statement
+            if statement == seal_sql:
+                assert parameters == (UUID(fixture.copy_target.candidate_id),)
+                self.requests.append("seal_row")
+                row = await fixture.connection.fetchrow(statement, *parameters)
+                assert row is None, "This component fixture must remain an unsealed legacy candidate"
+                return row
+            assert statement.lstrip().startswith("SELECT to_jsonb(candidate)::text AS candidate_json")
+            assert f'FROM "{fixture.control_schema}".network_serving_manifest manifest' in statement
+            assert f'JOIN "{fixture.control_schema}".network_membership_candidate candidate' in statement
+            assert statement.count("LIMIT 129") == 1
+            assert "octet_length(candidate.validation_json::text)<=1048576" in statement
+            assert f'"{fixture.copy_target.schema_name}".' not in statement
+            self.requests.append("manifest")
             return await fixture.connection.fetchrow(statement, *parameters)
+
+        async def fetchval(self, statement, *parameters):
+            assert statement == "SELECT to_regclass($1)::oid"
+            assert parameters == (custody_relation,)
+            self.requests.append("seal_table")
+            return await fixture.connection.fetchval(statement, *parameters)
 
     connection = ReadOnlyConnection()
     async with fixture.connection.transaction(readonly=True):
@@ -92,7 +117,8 @@ async def test_resolver_is_one_select_with_no_state_or_sequence_writes(read_comp
         second = await resolve_network_serving_manifest(
             connection, generation_id=first.generation_id, control_schema=fixture.control_schema
         )
-    assert first == second and connection.statements == 2
+    expected_requests = ["manifest", "seal_table"] + (["seal_row"] if custody_table_oid is not None else [])
+    assert first == second and connection.requests == expected_requests * 2
     assert await _snapshot(fixture) == before
     assert await fixture.connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}") == sequence_before
 
@@ -319,3 +345,60 @@ async def test_positive_legacy_42_does_not_expand_canonical_selector(read_compon
     )
     assert [row["location_key"] for row in canonical] == ["a" * 64]
     assert [row["location_key"] for row in legacy] == ["a" * 64, "c" * 64]
+
+
+@pytest.fixture
+async def qualified_read_db(qualified_publication_db):
+    fixture = qualified_publication_db
+    async with fixture.connection.transaction():
+        fixture.read_manifest = await _publish(fixture)
+    yield fixture
+
+
+async def test_qualified_current_and_retained_reader_pins_include_fixed_source_heap(qualified_read_db):
+    fixture = qualified_read_db
+    first = await _resolve(fixture)
+    assert await _resolve(fixture, first.generation_id) == first
+    assert "registry_source_retention" in first.source_generations
+    await fixture.observer.execute(f'SET ROLE "{fixture.writer_roles["reader"]}"')
+    try:
+        assert not await fixture.observer.fetchval(
+            "SELECT pg_has_role(current_user,$1::name,'SET')", fixture.writer_roles["owner"]
+        )
+        assert await _resolve(fixture, connection=fixture.observer) == first
+        assert await _resolve(fixture, first.generation_id, fixture.observer) == first
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await fixture.observer.execute(
+                f'UPDATE "{fixture.copy_target.schema_name}".network_membership_source SET evidence_id=evidence_id'
+            )
+    finally:
+        await fixture.observer.execute("RESET ROLE")
+
+
+@pytest.mark.parametrize(
+    "tamper", ["source_write", "owner_set", "extra_heap", "missing_heap", "source_oid", "orphan_hash"]
+)
+async def test_qualified_current_and_retained_resolvers_refuse_source_tampering(qualified_read_db, tamper):
+    fixture = qualified_read_db
+    namespace = _identifier(fixture.copy_target.schema_name)
+    source_table = namespace + ".network_membership_source"
+    commands_by_tamper = {
+        "source_write": [f'GRANT UPDATE ON {source_table} TO "{fixture.writer_roles["loader"]}"'],
+        "owner_set": [
+            f'GRANT "{fixture.writer_roles["owner"]}" TO "{fixture.writer_roles["reader"]}" WITH INHERIT FALSE, SET TRUE'
+        ],
+        "extra_heap": [f"CREATE TABLE {namespace}.unregistered_source(id integer)"],
+        "missing_heap": [f"DROP TABLE {source_table}"],
+        "source_oid": [
+            f"DROP TABLE {source_table}",
+            f"CREATE TABLE {source_table} (LIKE {namespace}.network_membership INCLUDING CONSTRAINTS)",
+        ],
+        "orphan_hash": [
+            f"UPDATE \"{fixture.control_schema}\".network_membership_candidate SET validation_json=validation_json-'registry_source_retention'"
+        ],
+    }
+    for statement in commands_by_tamper[tamper]:
+        await fixture.connection.execute(statement)
+    for generation in (None, fixture.read_manifest["generation_id"]):
+        with pytest.raises(NetworkServingReadUnavailable):
+            await _resolve(fixture, generation)

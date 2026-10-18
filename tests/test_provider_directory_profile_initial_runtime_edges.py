@@ -480,17 +480,12 @@ async def test_initial_composite_refuses_expired_witness_before_live_locks(initi
         initial_case.db, "_transaction_binding", lambda: SimpleNamespace(session=object()), raising=False
     )
     monkeypatch.setattr(publication.coverage, "assert_sealed_cms_candidate_coverage", AsyncMock())
-    lock_live = AsyncMock()
-    monkeypatch.setattr(publication, "_lock_live_swap_relations", lock_live)
-
-    async def prepared_bundle(*args, **options):
-        await options["before_swaps"]()
-
+    prepared_bundle = AsyncMock()
     monkeypatch.setattr(publication, "apply_prepared_artifact_bundle", prepared_bundle)
     with pytest.raises(RuntimeError, match="synthetic_witness_expired"):
         await publication._apply_prepared_results(fhir, None, prepared, None, {}, None, None)
     prepared.assert_ready.assert_awaited_once_with(cutover=True, archive_applied=False)
-    lock_live.assert_not_awaited()
+    prepared_bundle.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

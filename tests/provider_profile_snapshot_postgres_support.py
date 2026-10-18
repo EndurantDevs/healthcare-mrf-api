@@ -2,16 +2,20 @@
 
 """Small serving families in the existing UUID-owned native database lifecycle."""
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
+from contextvars import Context
 from uuid import uuid4
 
-from sqlalchemy import text
+from sqlalchemy import Index, MetaData, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api import provider_profile, provider_profile_cms, provider_profile_states
 from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi
 from db.connection import Database
+from process import cms_doctors_immutable as doctors
+from process.provider_directory_generic_source_policy import bind_generic_source_transaction_factory, source_transaction
 from tests.provider_directory_entities_postgres_support import _database_url
 from tests.reference_family_generation_fixture import generation_shape_check, install_source_generation_guards
 
@@ -37,7 +41,6 @@ READ_TABLES = tuple(
             "provider_directory_cms_candidate_coverage",
             "provider_directory_cms_serving_coverage",
             "provider_directory_cms_npd_relationship_receipt",
-            "cms_native_input_revision",
         )
     )
 )
@@ -122,6 +125,27 @@ async def profile_reader(database, schema, monkeypatch):
             await _cleanup_profile_reader(database, schema, role)
 
 
+async def _enroll_snapshot_doctors(engine, database, schema, monkeypatch, custody):
+    """Keep the real Doctors publisher and its exact fixture custody inside the caller's stack."""
+    await grant_profile_reader(database, schema, (name + "_next" for name in TABLES))
+    from tests.cms_doctors_component_postgres_support import doctors_component_source
+    from tests.cms_native_inputs_postgres_support import source_header_models
+
+    component = await custody.enter_async_context(
+        doctors_component_source(engine, schema, monkeypatch, reader=database._reader_database._reader_login[0])
+    )
+    database._snapshot_doctors_component = component
+    async with source_transaction(component.database) as session:
+        connection = await session.connection()
+        for table in source_header_models(schema):
+            await connection.run_sync(lambda sync, table=table: table.create(sync, checkfirst=False))
+    await grant_profile_reader(database, schema, ("provider_directory_endpoint_dataset",))
+    async with engine.begin() as connection:
+        for name in TABLES:
+            for suffix in ("", "_next"):
+                await connection.execute(text(f'ALTER TABLE "{schema}"."{name}{suffix}" OWNER TO "{component.owner}"'))
+
+
 @asynccontextmanager
 async def snapshot_database(monkeypatch, *, populated=True):
     """Create and remove only one task-owned schema on an explicitly owned database."""
@@ -144,9 +168,9 @@ async def snapshot_database(monkeypatch, *, populated=True):
         await database.status(f'CREATE SCHEMA "{schema}"')
         if populated:
             await create_families(database, schema)
-        async with profile_reader(database, schema, monkeypatch):
+        async with profile_reader(database, schema, monkeypatch), AsyncExitStack() as custody:
             if populated:
-                await grant_profile_reader(database, schema, (name + "_next" for name in TABLES))
+                await _enroll_snapshot_doctors(engine, database, schema, monkeypatch, custody)
             yield database, schema
     finally:
         async with engine.begin() as connection:
@@ -157,10 +181,13 @@ async def snapshot_database(monkeypatch, *, populated=True):
 
 async def create_families(database, schema):
     """Stage old and new marker rows before a reader takes its snapshot."""
-    for table in TABLES:
+    for name in TABLES:
+        if name in snapshot._DOCTORS_TABLES:
+            continue
         for suffix, marker in (("", "old"), ("_next", "new")):
-            await database.status(f'CREATE TABLE "{schema}".{table}{suffix} (marker text)')
-            await database.status(f'INSERT INTO "{schema}".{table}{suffix} VALUES (:marker)', marker=marker)
+            await database.status(f'CREATE TABLE "{schema}".{name}{suffix} (marker text)')
+            await database.status(f'INSERT INTO "{schema}".{name}{suffix} VALUES (:marker)', marker=marker)
+    await _create_doctors_families(database, schema)
     await database.status(f'''CREATE TABLE "{schema}".reference_family_result_generation (
         importer_id text PRIMARY KEY, local_lineage_id uuid, local_generation bigint,
         origin_lineage_id uuid, origin_generation bigint, published_at timestamptz, relation_oids bigint[],
@@ -172,11 +199,6 @@ async def create_families(database, schema):
     )
     async with database.transaction() as session:
         await install_source_generation_guards(await session.connection(), schema)
-        await snapshot.reference_generation.publish_local_reference_family_generation(
-            session,
-            importer_id="cms-doctors",
-            schema_name=schema,
-        )
     await database.status(f'''CREATE TABLE "{schema}".entity_address_result_generation (
         singleton boolean PRIMARY KEY, local_lineage_id uuid, local_generation bigint,
         origin_lineage_id uuid, origin_generation bigint, published_at timestamptz, relation_oids bigint[])''')
@@ -185,6 +207,36 @@ async def create_families(database, schema):
         VALUES (true,:lineage,1,:lineage,1,now(),{address_oids_sql(schema)})''',
         lineage=uuid4(),
     )
+
+
+async def _create_doctors_families(database, schema):
+    """Use the fixed native model shapes for both genuine publication generations."""
+    from types import SimpleNamespace
+
+    from tests.cms_doctors_preparation_postgres_support import _insert_marker
+
+    async with database.transaction() as session:
+        connection = await session.connection()
+        for model in doctors._models():
+            for suffix, marker in (("", "old"), ("_next", "new")):
+                table = model.__table__.to_metadata(MetaData(), schema=schema, name=model.__tablename__ + suffix)
+                for column in table.columns:
+                    column.autoincrement = False
+                await connection.run_sync(lambda sync, table=table: table.create(sync, checkfirst=False))
+                for index, spec in enumerate(getattr(model, "__my_additional_indexes__", ())):
+                    native_index = Index(
+                        table.name + "_snapshot_" + str(index), *(table.c[name] for name in spec["index_elements"])
+                    )
+                    await connection.run_sync(lambda sync, native_index=native_index: native_index.create(sync))
+                await _insert_marker(
+                    session, SimpleNamespace(__table__=table, __main_table__=model.__main_table__), marker
+                )
+        await session.execute(
+            text(
+                f'CREATE TABLE "{schema}".provider_directory_cms_serving_receipt '
+                "(receipt_id text,payload jsonb,publication_xid xid8)"
+            )
+        )
 
 
 async def create_composite_families(database, schema, *, install_receipt=True):
@@ -211,20 +263,28 @@ def address_oids_sql(schema):
     )
 
 
-async def publish_family(session, schema, started=None):
+async def publish_family(database, schema, started=None):
+    """Run the independent native publisher without inheriting a Reader request session."""
+    component = database._snapshot_doctors_component
+
+    async def publish():
+        async with bind_generic_source_transaction_factory(component.factory):
+            await _publish_family(component, schema, started)
+
+    await asyncio.create_task(publish(), context=Context())
+
+
+async def _publish_family(component, schema, started):
     """Rename every serving family and advance its native receipt in one commit."""
-    async with session.begin():
+    async with source_transaction(component.database) as session:
+        previous = await doctors.capture_doctors_predecessor(session, schema)
         await session.execute(text("SET LOCAL statement_timeout = '5s'"))
         if started is not None:
             started.set()
         for table in TABLES:
             await session.execute(text(f'ALTER TABLE "{schema}".{table} RENAME TO {table}_old'))
             await session.execute(text(f'ALTER TABLE "{schema}".{table}_next RENAME TO {table}'))
-        await snapshot.reference_generation.publish_local_reference_family_generation(
-            session,
-            importer_id="cms-doctors",
-            schema_name=schema,
-        )
+        await doctors.publish_doctors_generation(session, schema_name=schema, expected_authority=previous)
         await session.execute(
             text(f'''UPDATE "{schema}".entity_address_result_generation
             SET local_generation=2,origin_generation=2,published_at=clock_timestamp(),

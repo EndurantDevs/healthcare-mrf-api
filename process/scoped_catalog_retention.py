@@ -164,6 +164,7 @@ async def finish_catalog_authority(session, prepared, receipt, current):
         raise native.ReferenceFamilyArchiveError("retained catalog authority changed")
     await session.execute(text(f"ALTER TABLE {qualified} ALTER COLUMN retained_family SET NOT NULL"))
     ownership = SimpleNamespace(
+        importer_id=prepared.spec.importer_id,
         schema_name=schema,
         schema_oid=receipt["schema_oid"],
         sequence_oids=(),

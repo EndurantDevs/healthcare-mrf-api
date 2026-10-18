@@ -36,6 +36,12 @@ from db.connection import Base, db
 from db.json_mixin import JSONOutputMixin
 from db.models.address_archive import AddressArchiveV2 as AddressArchiveV2
 from db.models.entity_address_unified import EntityAddressUnified
+from db.models.plan_release_storage import (
+    PlanReleaseSnapshotBinding as PlanReleaseSnapshotBinding,
+)
+from db.models.plan_release_storage import (
+    PlanReleaseSnapshotPin as PlanReleaseSnapshotPin,
+)
 from db.ptg2_v4_attempt_schema import (
     ATTEMPT_FENCE_TABLE,
     ATTEMPT_STAGE_RUN_INDEX,
@@ -716,10 +722,15 @@ class PlanRatingAreas(Base, JSONOutputMixin):
 
 class GeoZipLookup(Base, JSONOutputMixin):
     __tablename__ = "geo_zip_lookup"
+    __runtime_schema_sync__ = False
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("zip_code"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["zip_code"]
     __my_additional_indexes__ = [
@@ -1259,6 +1270,7 @@ class AddressAliasStateV1(Base, JSONOutputMixin):
 
 
 class AddressAliasArtifactStateV1(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "address_alias_artifact_state_v1"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -1998,6 +2010,7 @@ class PlanReleaseServingRevision(Base, JSONOutputMixin):
 
     __tablename__ = "plan_release_serving_revision"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("serving_revision_id"),
         CheckConstraint(
@@ -2044,48 +2057,6 @@ class PlanReleaseServingRevision(Base, JSONOutputMixin):
     created_at = Column(DateTime(timezone=True))
     published_at = Column(DateTime(timezone=True))
     retired_at = Column(DateTime(timezone=True))
-
-
-class PlanReleaseSnapshotBinding(Base, JSONOutputMixin):
-    """One ordinal member of a frozen physical plan-release binding set."""
-
-    __tablename__ = "plan_release_snapshot_binding"
-    __main_table__ = __tablename__
-    __table_args__ = (
-        PrimaryKeyConstraint(
-            "serving_revision_id",
-            "role",
-            "binding_ordinal",
-        ),
-        ForeignKeyConstraint(
-            ["serving_revision_id"],
-            [f"{_PTG2_DATABASE_SCHEMA}.plan_release_serving_revision.serving_revision_id"],
-            ondelete="CASCADE",
-        ),
-        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
-    )
-    __my_index_elements__ = [
-        "serving_revision_id",
-        "role",
-        "binding_ordinal",
-    ]
-    __my_additional_indexes__ = [
-        {
-            "index_elements": ("snapshot_id",),
-            "name": "plan_release_snapshot_binding_snapshot_idx",
-        },
-    ]
-
-    serving_revision_id = Column(String(64), nullable=False)
-    binding_ordinal = Column(Integer, nullable=False)
-    snapshot_id = Column(String(128), nullable=False)
-    source_key = Column(String(128), nullable=False)
-    plan_id = Column(String(128), nullable=False)
-    plan_market_type = Column(String(64))
-    role = Column(String(32), nullable=False)
-    required = Column(Boolean, nullable=False, default=True)
-    metadata_json = Column(JSON, nullable=False)
-    created_at = Column(DateTime(timezone=True))
 
 
 class PTG2SnapshotPin(Base, JSONOutputMixin):
@@ -6395,11 +6366,16 @@ class MedicareEnrollmentStats(Base, JSONOutputMixin):
 
 
 class DoctorClinicianAddress(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "doctor_clinician_address"
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("npi", "address_checksum"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["npi", "address_checksum"]
     __my_additional_indexes__ = [

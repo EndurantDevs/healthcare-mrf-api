@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import text
 
 from process import provider_directory_cms_desired_fence as dependencies
+from process.provider_directory_generic_source_policy import source_copy_session
 from tests import cms_npd_admission_postgres_support as support
 from tests.cms_npd_admission_postgres_support import cms_artifact_root, fhir
 from tests.test_cms_npd_intake_postgres import _admit
@@ -43,7 +44,9 @@ async def _state(database):
 async def _prepare(database, result):
     """Use the production desired resolver and proof readers in a real read-only snapshot."""
     metrics_map = {}
-    async with database.transaction() as session:
+    assert fhir.db is database._source_component.database
+    async with fhir.db.transaction() as session:
+        assert session is source_copy_session()
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         fence = await dependencies.prepare_desired_fence(
             fhir,
@@ -61,7 +64,7 @@ async def _prepare(database, result):
 async def test_real_intake_relations_reuse_without_mutation(monkeypatch, cms_artifact_root, empty_type):
     """Complete zero-edge families and unresolved references retain their existing proof semantics."""
     directory, receipt = support.retained_release(cms_artifact_root, empty_resource_type=empty_type)
-    async with support.admission_database(monkeypatch) as database:
+    async with support.intake_admission_database(monkeypatch) as database:
         result = await _admit(directory, receipt, "owner")
         before = await _state(database)
         metrics = await _prepare(database, result)
@@ -82,7 +85,7 @@ async def test_real_intake_relations_reuse_without_mutation(monkeypatch, cms_art
 async def test_dependency_rows_cannot_drift_behind_complete_metadata(monkeypatch, cms_artifact_root, corruption):
     """Deleting an edge or substituting same-count keys fails without modifying retained metadata."""
     directory, receipt = support.retained_release(cms_artifact_root)
-    async with support.admission_database(monkeypatch) as database:
+    async with support.intake_admission_database(monkeypatch) as database:
         result = await _admit(directory, receipt, "owner")
         metadata_before = (await _state(database))[0]
         statements_by_corruption_map = {

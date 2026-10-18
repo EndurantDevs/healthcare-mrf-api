@@ -244,7 +244,8 @@ async def test_repeatable_snapshot_contract_and_fixed_read_count(binding_db):
                 fixture.connection, _wire_fields(fixture), control_schema=fixture.control_schema
             )
             await asyncio.sleep(0)
-            assert len(queries) == 4
+            assert len(queries) == 8
+            assert sum("network_candidate_custody" in query.query for query in queries) == 2
             assert all(query.query.lstrip().split()[0] in ("SELECT", "WITH") for query in queries)
     finally:
         fixture.connection.remove_query_logger(queries.append)

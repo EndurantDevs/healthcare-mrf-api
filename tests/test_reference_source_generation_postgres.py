@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Native source revision guards on synthetic reference and address families."""
+"""Native legacy census/address guards; immutable Geo qualifies through its Source fixture."""
 
 from contextlib import asynccontextmanager
 from io import StringIO
@@ -19,7 +19,10 @@ from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
 from process import reference_source_generation as source_generation
 from tests.test_reference_family_result_generation_postgres import (
+    _CENSUS_MIGRATION_PATH,
     _GEO_MIGRATION_PATH,
+    _PHARMACY_MIGRATION_PATH,
+    _TERMINOLOGY_MIGRATION_PATH,
     _database_url,
     _migration_module,
     _run_migration,
@@ -40,11 +43,17 @@ async def _source_family(monkeypatch, *, migrate=True):
     try:
         async with engine.begin() as connection:
             await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-            for name in (*generation.RELATION_NAMES_BY_IMPORTER["mrf"], "geo_zip_lookup"):
+            for name in (*generation.RELATION_NAMES_BY_IMPORTER["mrf"], "geo_zip_census_profile"):
                 await connection.execute(text(f'CREATE TABLE "{schema}"."{name}" (id bigint, marker text)'))
                 await connection.execute(text(f'INSERT INTO "{schema}"."{name}" VALUES (1, \'initial\')'))
             await _upgrade_reference_generation_chain(connection)
-            await _run_migration(connection, _GEO_MIGRATION_PATH, "upgrade")
+            for path in (
+                _GEO_MIGRATION_PATH,
+                _PHARMACY_MIGRATION_PATH,
+                _TERMINOLOGY_MIGRATION_PATH,
+                _CENSUS_MIGRATION_PATH,
+            ):
+                await _run_migration(connection, path, "upgrade")
             if migrate:
                 await _run_migration(connection, _MIGRATION, "upgrade")
         yield engine, schema, async_sessionmaker(engine, expire_on_commit=False)
@@ -54,7 +63,7 @@ async def _source_family(monkeypatch, *, migrate=True):
         await engine.dispose()
 
 
-async def _observe(session, schema, importer="geo", *, bootstrap=False):
+async def _observe(session, schema, importer="geo-census", *, bootstrap=False):
     oids = await generation.current_reference_family_relation_oids(session, importer_id=importer, schema_name=schema)
     if importer == "mrf-address":
         observer = (
@@ -71,7 +80,7 @@ async def _observe(session, schema, importer="geo", *, bootstrap=False):
     return await observer(session, importer_id=importer, schema_name=schema, expected_relation_oids=oids)
 
 
-async def _read_authority(connection, schema, importer="geo"):
+async def _read_authority(connection, schema, importer="geo-census"):
     return await generation.read_reference_family_result_generation_authority(
         connection, importer_id=importer, schema_name=schema
     )
@@ -84,7 +93,7 @@ async def test_legacy_bootstrap_preserves_migration_evidence(monkeypatch):
                 text(
                     f'UPDATE "{schema}".reference_family_result_generation SET local_generation=4, '
                     "origin_lineage_id=local_lineage_id, origin_generation=4, published_at=transaction_timestamp(), "
-                    f"relation_oids=ARRAY['\"{schema}\".geo_zip_lookup'::regclass::oid::bigint] WHERE importer_id='geo'"
+                    f"relation_oids=ARRAY['\"{schema}\".geo_zip_census_profile'::regclass::oid::bigint] WHERE importer_id='geo-census'"
                 )
             )
             before = await _read_authority(connection, schema)
@@ -118,7 +127,7 @@ async def test_shared_address_writes_advance_both_families(monkeypatch, statemen
         async with sessions.begin() as session:
             before_by_importer = {
                 importer: await _observe(session, schema, importer, bootstrap=True)
-                for importer in ("mrf", "mrf-address", "geo")
+                for importer in ("mrf", "mrf-address", "geo-census")
             }
         async with engine.begin() as connection:
             await connection.execute(text(statement.format(table=f'"{schema}".mrf_address')))
@@ -126,7 +135,7 @@ async def test_shared_address_writes_advance_both_families(monkeypatch, statemen
             for importer, before in before_by_importer.items():
                 after = await _observe(session, schema, importer)
                 assert after.relation_oids == before.relation_oids
-                assert after.local_generation == before.local_generation + (importer != "geo")
+                assert after.local_generation == before.local_generation + (importer != "geo-census")
         with pytest.raises(RuntimeError, match="rollback"):
             async with engine.begin() as connection:
                 await connection.execute(text(f"UPDATE \"{schema}\".mrf_address SET marker='rollback'"))
@@ -142,10 +151,10 @@ async def test_publish_and_adopt_install_new_oid_guards(monkeypatch):
         async with sessions.begin() as session:
             first = await _observe(session, schema, bootstrap=True)
         async with sessions.begin() as session:
-            await session.execute(text(f'ALTER TABLE "{schema}".geo_zip_lookup RENAME TO retained_geo'))
-            await session.execute(text(f'CREATE TABLE "{schema}".geo_zip_lookup (id bigint, marker text)'))
+            await session.execute(text(f'ALTER TABLE "{schema}".geo_zip_census_profile RENAME TO retained_geo'))
+            await session.execute(text(f'CREATE TABLE "{schema}".geo_zip_census_profile (id bigint, marker text)'))
             published = await generation.publish_local_reference_family_generation(
-                session, importer_id="geo", schema_name=schema
+                session, importer_id="geo-census", schema_name=schema
             )
             assert published.relation_oids != first.relation_oids
             assert await _observe(session, schema) == published
@@ -158,24 +167,24 @@ async def test_publish_and_adopt_install_new_oid_guards(monkeypatch):
             "published_at": "2026-09-01T00:00:00Z",
         }
         async with sessions.begin() as session:
-            await session.execute(text(f'ALTER TABLE "{schema}".geo_zip_lookup RENAME TO retained_second_geo'))
-            await session.execute(text(f'CREATE TABLE "{schema}".geo_zip_lookup (id bigint, marker text)'))
+            await session.execute(text(f'ALTER TABLE "{schema}".geo_zip_census_profile RENAME TO retained_second_geo'))
+            await session.execute(text(f'CREATE TABLE "{schema}".geo_zip_census_profile (id bigint, marker text)'))
             adopted = await generation.publish_adopted_reference_family_generation(
                 session,
-                importer_id="geo",
+                importer_id="geo-census",
                 schema_name=schema,
                 source_generation=incoming_by_field,
                 source_revision_tracked=True,
             )
             assert (await _observe(session, schema)).serving_generation == adopted.serving_generation
         async with engine.begin() as connection:
-            await connection.execute(text(f"INSERT INTO \"{schema}\".geo_zip_lookup VALUES (1, 'local')"))
+            await connection.execute(text(f"INSERT INTO \"{schema}\".geo_zip_census_profile VALUES (1, 'local')"))
         async with sessions.begin() as session:
             changed = await _observe(session, schema)
             assert changed.serving_generation.origin_lineage_id == adopted.local_lineage_id
             assert changed.local_generation == adopted.local_generation + 1
             await generation.publish_adopted_reference_family_generation(
-                session, importer_id="geo", schema_name=schema, source_generation=None
+                session, importer_id="geo-census", schema_name=schema, source_generation=None
             )
         with pytest.raises(RuntimeError, match="tracking is unavailable"):
             async with sessions.begin() as session:
@@ -189,9 +198,9 @@ async def test_observation_holds_writer_fences(monkeypatch):
         async with sessions.begin() as session:
             await _observe(session, schema)
             for statement in (
-                f"UPDATE \"{schema}\".geo_zip_lookup SET marker='blocked'",
-                f'TRUNCATE "{schema}".geo_zip_lookup',
-                f'ALTER TABLE "{schema}".geo_zip_lookup RENAME TO moved',
+                f"UPDATE \"{schema}\".geo_zip_census_profile SET marker='blocked'",
+                f'TRUNCATE "{schema}".geo_zip_census_profile',
+                f'ALTER TABLE "{schema}".geo_zip_census_profile RENAME TO moved',
                 f'UPDATE "{schema}".reference_family_result_generation SET local_generation=local_generation+1',
             ):
                 await _assert_writer_blocked(engine, statement)
@@ -200,7 +209,7 @@ async def test_observation_holds_writer_fences(monkeypatch):
                 await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
                 await _observe(session, schema)
         async with engine.begin() as writer:
-            await writer.execute(text(f'LOCK TABLE "{schema}".geo_zip_lookup IN ROW EXCLUSIVE MODE'))
+            await writer.execute(text(f'LOCK TABLE "{schema}".geo_zip_census_profile IN ROW EXCLUSIVE MODE'))
             with pytest.raises(DBAPIError) as blocked:
                 async with sessions.begin() as session:
                     await _observe(session, schema)
@@ -215,7 +224,7 @@ async def _assert_writer_blocked(engine, statement):
     assert blocked.value.orig.sqlstate == "55P03"
 
 
-@pytest.mark.parametrize("observed,other", [("geo", "mrf"), ("mrf", "geo")])
+@pytest.mark.parametrize("observed,other", [("geo-census", "mrf"), ("mrf", "geo-census")])
 async def test_source_observation_does_not_block_unrelated_family(monkeypatch, observed, other):
     async with _source_family(monkeypatch) as (engine, schema, sessions):
         async with sessions.begin() as session:
@@ -241,7 +250,7 @@ async def test_source_observation_rejects_absent_authority(monkeypatch, bootstra
     async with _source_family(monkeypatch) as (engine, schema, sessions):
         async with engine.begin() as connection:
             await connection.execute(
-                text(f"DELETE FROM \"{schema}\".reference_family_result_generation WHERE importer_id='geo'")
+                text(f"DELETE FROM \"{schema}\".reference_family_result_generation WHERE importer_id='geo-census'")
             )
         with pytest.raises(RuntimeError, match="generation authority is unavailable"):
             async with sessions.begin() as session:
@@ -279,7 +288,7 @@ async def test_offline_source_guard_upgrade_handles_absent_optional_tables(monke
         async with sessions.begin() as session:
             initial = await _observe(session, schema, bootstrap=True)
         async with engine.begin() as writer:
-            await writer.execute(text(f"UPDATE \"{schema}\".geo_zip_lookup SET marker='offline-guarded'"))
+            await writer.execute(text(f"UPDATE \"{schema}\".geo_zip_census_profile SET marker='offline-guarded'"))
         async with sessions.begin() as session:
             assert (await _observe(session, schema)).local_generation == initial.local_generation + 1
 
@@ -289,7 +298,7 @@ async def test_observer_rejects_missing_or_weak_guards(monkeypatch, mutation):
     async with _source_family(monkeypatch) as (engine, schema, sessions):
         async with sessions.begin() as session:
             await _observe(session, schema, bootstrap=True)
-        relation = f'"{schema}".geo_zip_lookup'
+        relation = f'"{schema}".geo_zip_census_profile'
         trigger = source_generation.REVISION_TRIGGER
         statement = (
             f'DROP TRIGGER "{trigger}" ON {relation}'
@@ -313,7 +322,11 @@ async def _tiger_publisher(engine, schema, *, can_publish=False):
             await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
             await connection.execute(text(f'CREATE ROLE "{owner}" NOLOGIN'))
             await connection.execute(text(f'ALTER SCHEMA "{schema}" OWNER TO "{role}"'))
-            for name in (*generation.RELATION_NAMES_BY_IMPORTER["mrf"], "geo_zip_lookup", generation.TABLE_NAME):
+            for name in (
+                *generation.RELATION_NAMES_BY_IMPORTER["mrf"],
+                "geo_zip_census_profile",
+                generation.TABLE_NAME,
+            ):
                 await connection.execute(text(f'ALTER TABLE "{schema}"."{name}" OWNER TO "{role}"'))
             await connection.execute(text(f'CREATE SCHEMA tiger AUTHORIZATION "{owner}"'))
             for name in ("zip_state", "zcta5"):
@@ -570,7 +583,7 @@ async def test_inherited_writes_cannot_bypass_revision(monkeypatch):
             await _observe(session, schema, bootstrap=True)
         async with engine.begin() as connection:
             await connection.execute(text(f'CREATE TABLE "{schema}".parent (id bigint, marker text)'))
-            await connection.execute(text(f'ALTER TABLE "{schema}".geo_zip_lookup INHERIT "{schema}".parent'))
+            await connection.execute(text(f'ALTER TABLE "{schema}".geo_zip_census_profile INHERIT "{schema}".parent'))
         with pytest.raises(RuntimeError, match="guards are unavailable"):
             async with sessions.begin() as session:
                 await _observe(session, schema)
@@ -582,9 +595,9 @@ async def test_untracked_incumbent_blocks_automatic_cutover(monkeypatch):
             authority = await _observe(session, schema, bootstrap=True)
             incoming_by_field = {**authority.serving_generation.as_dict(), "origin_generation": 100}
             expected = SimpleNamespace(
-                schema_name=schema, relation_oids=(("geo_zip_lookup", authority.relation_oids[0]),)
+                schema_name=schema, relation_oids=(("geo_zip_census_profile", authority.relation_oids[0]),)
             )
-            spec = archive.reference_family_spec("geo")
+            spec = archive.reference_family_spec("geo-census")
             await archive._require_automatic_cutover_generation(session, spec, expected, incoming_by_field)
             await session.execute(
                 text(f'UPDATE "{schema}".reference_family_result_generation SET source_revision_tracked=FALSE')

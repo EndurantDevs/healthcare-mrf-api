@@ -107,24 +107,97 @@ async def verify_approved_site_sources(connection, *, approved_revision, control
     return tuple(receipts)
 
 
-async def copy_approved_site_rows(connection, receipts, target_schema):
-    """Reuse a pinned address with the same entity/site key, or copy its retained row."""
+def _address_overlap_sql(source_namespace, target_namespace, reproject_network_ids):
+    """Keep source rows exact while a PTG artifact awaits mandatory array projection."""
+    address_rows_sql = f"JOIN {target_namespace}.entity_address_unified address USING(location_key)"
+    address_conflict_sql = """(address.entity_type,address.entity_id) IS DISTINCT FROM (site.entity_type,site.entity_id)
+      OR encode(sha256(convert_to(to_jsonb(address)::text,'UTF8')),'hex') IS DISTINCT FROM site.address_row_sha256"""
+    if reproject_network_ids:
+        # This PTG path retains the original complete row proof. The pipeline
+        # rebuilds canonical_network_ids and validates its exact membership set.
+        address_rows_sql = f"""LEFT JOIN {source_namespace}.entity_address_unified retained USING(location_key)
+          LEFT JOIN {target_namespace}.entity_address_unified address USING(location_key)"""
+        address_conflict_sql = """retained.location_key IS NULL
+          OR (retained.entity_type,retained.entity_id) IS DISTINCT FROM (site.entity_type,site.entity_id)
+          OR encode(sha256(convert_to(to_jsonb(retained)::text,'UTF8')),'hex') IS DISTINCT FROM site.address_row_sha256
+          OR (address.location_key IS NOT NULL AND
+            (to_jsonb(address)-'canonical_network_ids') IS DISTINCT FROM
+            (to_jsonb(retained)-'canonical_network_ids'))"""
+    return address_rows_sql, address_conflict_sql
+
+
+async def _address_copy_columns(connection, source_namespace, target_namespace):
+    """Match every logical field once; native column positions may differ."""
     from process.network_address_projection import _identifier
 
-    target = _identifier(target_schema)
+    columns = await connection.fetch(
+        """SELECT relation.position,attribute.attname,attribute.atttypid,attribute.atttypmod,
+          attribute.attcollation,attribute.attnotnull,
+          attribute.attgenerated::text AS attgenerated,attribute.attidentity::text AS attidentity
+        FROM unnest(ARRAY[to_regclass($1),to_regclass($2)]) WITH ORDINALITY relation(oid,position)
+        JOIN pg_attribute attribute ON attribute.attrelid=relation.oid
+        WHERE attribute.attnum>0 AND NOT attribute.attisdropped ORDER BY relation.position,attribute.attnum""",
+        source_namespace + ".entity_address_unified",
+        target_namespace + ".entity_address_unified",
+    )
+    # LIKE omits advisory array dimensions; native array types and typmods must match.
+    shapes = [{}, {}]
+    for column in columns:
+        shapes[column["position"] - 1][column["attname"]] = tuple(
+            column[field]
+            for field in ("atttypid", "atttypmod", "attcollation", "attnotnull", "attgenerated", "attidentity")
+        )
+        if column["attgenerated"] or column["attidentity"]:
+            raise RetainedSiteAdoptionError("Retained address copy requires ordinary columns")
+    if not shapes[0] or shapes[0] != shapes[1]:
+        raise RetainedSiteAdoptionError("Retained address copy columns or types differ")
+    return tuple(_identifier(name) for name in shapes[1])
+
+
+async def copy_approved_site_rows(
+    connection, receipts, target_schema, *, exact_rows=False, reproject_network_ids=False
+):
+    """Reuse or copy a pinned address; PTG may reproject only its derived network array."""
+    if reproject_network_ids and not exact_rows:
+        raise RetainedSiteAdoptionError("Network array reprojection requires exact retained rows")
+    from process.network_address_projection import _identifier
+
+    target_namespace = _identifier(target_schema)
     for receipt in receipts:
-        source = _identifier(receipt.schema_name)
-        records = json.dumps(receipt.as_dict()["records"], separators=(",", ":"))
+        source_namespace = _identifier(receipt.schema_name)
+        selection_json = json.dumps(receipt.as_dict()["records"], separators=(",", ":"))
         selected = """SELECT * FROM jsonb_to_recordset($1::jsonb) AS site(
           provider_system text,provider_id text,location_id uuid,location_key text,
           entity_type text,entity_id text,address_row_sha256 text)"""
+        if exact_rows:
+            address_rows_sql, address_conflict_sql = _address_overlap_sql(
+                source_namespace, target_namespace, reproject_network_ids
+            )
+            invalid = await connection.fetchval(
+                f"""WITH selected AS MATERIALIZED ({selected}) SELECT
+                EXISTS(SELECT 1 FROM selected site {address_rows_sql} WHERE {address_conflict_sql})
+                OR EXISTS(SELECT 1 FROM selected site JOIN {target_namespace}.provider_location_binding binding
+                  ON (binding.provider_system,binding.provider_id,binding.location_id)=
+                     (site.provider_system,site.provider_id,site.location_id) OR binding.location_key=site.location_key
+                  WHERE (binding.provider_system,binding.provider_id,binding.location_id,binding.location_key,binding.entity_type,binding.entity_id)
+                    IS DISTINCT FROM (site.provider_system,site.provider_id,site.location_id,site.location_key,site.entity_type,site.entity_id))""",
+                selection_json,
+            )
+            if invalid is not False:
+                raise RetainedSiteAdoptionError("PTG retained address or binding conflicts with replacement")
+        columns = await _address_copy_columns(connection, source_namespace, target_namespace)
+        target_columns = ",".join(columns)
+        source_columns = ",".join("address." + name for name in columns)
         await connection.execute(
-            f"INSERT INTO {target}.entity_address_unified SELECT address.* FROM {source}.entity_address_unified address "
+            f"INSERT INTO {target_namespace}.entity_address_unified ({target_columns}) "
+            f"SELECT {source_columns} FROM {source_namespace}.entity_address_unified address "
             f"JOIN ({selected}) site USING(location_key,entity_type,entity_id) ON CONFLICT(location_key) DO NOTHING",
-            records,
+            selection_json,
         )
         await connection.execute(
-            f"INSERT INTO {target}.provider_location_binding "
-            f"SELECT provider_system,provider_id,location_id,location_key,entity_type,entity_id FROM ({selected}) site",
-            records,
+            f"INSERT INTO {target_namespace}.provider_location_binding "
+            "(provider_system,provider_id,location_id,location_key,entity_type,entity_id) "
+            f"SELECT provider_system,provider_id,location_id,location_key,entity_type,entity_id FROM ({selected}) site"
+            + (" ON CONFLICT DO NOTHING" if exact_rows else ""),
+            selection_json,
         )

@@ -60,14 +60,13 @@ async def test_source_observation_rejects_a_drifted_serving_ledger(monkeypatch):
     monkeypatch.setattr(
         source_generation.generation, "current_reference_family_relation_oids", AsyncMock(return_value=(17,))
     )
-    monkeypatch.setattr(
-        source_generation.generation, "_first", AsyncMock(return_value={"source_revision_tracked": True})
-    )
-    monkeypatch.setattr(source_generation, "_guarded_oids", AsyncMock(return_value=(17,)))
+    from process import geo_source_storage
+
+    monkeypatch.setattr(geo_source_storage, "require_geo_storage", AsyncMock(return_value=17))
     authority = SimpleNamespace(serving_generation=object(), relation_oids=(18,))
     reader = AsyncMock(return_value=authority)
     monkeypatch.setattr(source_generation.generation, "read_reference_family_result_generation_authority", reader)
-    with pytest.raises(RuntimeError, match="serving generation is unavailable or drifted"):
+    with pytest.raises(RuntimeError, match="geo_source_generation_unavailable"):
         await source_generation.require_reference_source_generation(
             session, importer_id="geo", schema_name="mrf", expected_relation_oids=(17,)
         )
@@ -99,10 +98,10 @@ async def test_guard_installation_requires_a_matching_post_install_catalog(monke
     guarded = AsyncMock(side_effect=[(), (18,)])
     monkeypatch.setattr(source_generation, "_guarded_oids", guarded)
     with pytest.raises(RuntimeError, match="revision guards are unavailable"):
-        await source_generation.install_reference_revision_guards(database, importer_id="geo", schema_name="mrf")
+        await source_generation.install_reference_revision_guards(database, importer_id="geo-census", schema_name="mrf")
     assert guarded.await_count == 2
     statements = [call.args[0] for call in database.status.await_args_list]
     assert len(statements) == 5
     assert statements[-1] == (
-        'ALTER TABLE "mrf"."geo_zip_lookup" ENABLE ALWAYS TRIGGER "reference_source_generation_revision_guard"'
+        'ALTER TABLE "mrf"."geo_zip_census_profile" ENABLE ALWAYS TRIGGER "reference_source_generation_revision_guard"'
     )

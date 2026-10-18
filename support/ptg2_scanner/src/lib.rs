@@ -140,6 +140,28 @@ mod python_api {
     }
 
     #[pyfunction]
+    fn partition_network_membership_commands(
+        py: Python<'_>,
+        input: &[u8],
+    ) -> PyResult<(Py<PyBytes>, usize, Py<PyBytes>, usize)> {
+        let batch = py
+            .detach(|| {
+                crate::network_membership_codec::partition_network_membership_commands(input)
+            })
+            .map_err(|error| {
+                PyValueError::new_err(
+                    serde_json::to_string(&error).unwrap_or_else(|_| error.code.to_string()),
+                )
+            })?;
+        Ok((
+            PyBytes::new(py, &batch.additions.copy_bytes).unbind(),
+            batch.additions.row_count,
+            PyBytes::new(py, &batch.removals.copy_bytes).unbind(),
+            batch.removals.row_count,
+        ))
+    }
+
+    #[pyfunction]
     fn encode_cms_mlr_observations(
         py: Python<'_>,
         input: &[u8],
@@ -594,6 +616,7 @@ mod python_api {
             m
         )?)?;
         m.add_function(wrap_pyfunction!(encode_network_membership_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(partition_network_membership_commands, m)?)?;
         m.add_function(wrap_pyfunction!(encode_cms_mlr_observations, m)?)?;
         m.add_function(wrap_pyfunction!(encode_cms_planfinder_observations, m)?)?;
         m.add_function(wrap_pyfunction!(parse_naic_company_registry_member, m)?)?;

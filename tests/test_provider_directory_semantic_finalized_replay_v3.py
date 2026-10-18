@@ -31,7 +31,6 @@ from tests.test_provider_directory_twin_root_replay import (
     _terminal_dataset_map,
 )
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 PROJECTION_AS_OF = "2026-08-10"
 PROOF_RESOURCE_SCOPE = ("Organization", "Practitioner")
@@ -79,9 +78,7 @@ def _select_finalized_row(candidate, dataset_map, status):
     selection_options_by_name = {
         "requires_twin_root_verification": True,
         "verification_campaign_id": candidate.verification_campaign_id,
-        "verification_source_scope_hash": (
-            candidate.verification_source_scope_hash
-        ),
+        "verification_source_scope_hash": (candidate.verification_source_scope_hash),
     }
     if status in {
         importer.ENDPOINT_DATASET_VERIFICATION_BASELINE,
@@ -124,9 +121,7 @@ def test_v3_finalized_replay_rejects_malformed_sealed_proof(
     """Reject every finalized state when its mandatory seal is malformed."""
 
     candidate, dataset_map = _build_finalized_row(monkeypatch, status)
-    dataset_map["publication_metadata_json"][
-        PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
-    ] = {"malformed": True}
+    dataset_map["publication_metadata_json"][PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY] = {"malformed": True}
 
     with pytest.raises(RuntimeError, match="verification_.*_invalid"):
         _select_finalized_row(candidate, dataset_map, status)
@@ -139,9 +134,9 @@ def test_v3_finalized_replay_binds_twin_and_outcome_proofs(monkeypatch):
     candidate, dataset_map = _build_finalized_row(monkeypatch, status)
     content_proof = _content_proof()
     metadata = dataset_map["publication_metadata_json"]
-    metadata[
-        importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY
-    ] = importer._outcome_resource_count_proof(candidate, content_proof)
+    metadata[importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY] = importer._outcome_resource_count_proof(
+        candidate, content_proof
+    )
     stored_proof_by_field = {
         "dataset_hash": content_proof.dataset_hash,
         "resource_count": content_proof.resource_count,
@@ -155,9 +150,7 @@ def test_v3_finalized_replay_binds_twin_and_outcome_proofs(monkeypatch):
     )
 
     assert _select_finalized_row(candidate, dataset_map, status) is not None
-    outcome_proof = metadata[
-        importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY
-    ]
+    outcome_proof = metadata[importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY]
     outcome_proof["version"] = True
     with pytest.raises(RuntimeError, match="verification_proof_invalid"):
         importer._validate_finalized_content_proof(dataset_map, metadata)
@@ -217,9 +210,7 @@ def _artifact_row_with_sealed_proof(stored_proof_by_field):
             "endpoint_id": ENDPOINT_ID,
             "metadata_json": {
                 "provider_directory_supported_resources": ["Practitioner"],
-                "provider_directory_fully_enumerable_resources": [
-                    "Practitioner"
-                ],
+                "provider_directory_fully_enumerable_resources": ["Practitioner"],
             },
         },
         "dataset_id": DATASET_ID,
@@ -230,29 +221,21 @@ def _artifact_row_with_sealed_proof(stored_proof_by_field):
         "is_current": True,
         "dataset_hash": stored_proof_by_field["dataset_hash"],
         "resource_count": stored_proof_by_field["resource_count"],
-        "publication_metadata_json": _artifact_metadata_with_sealed_proof(
-            stored_proof_by_field
-        ),
+        "publication_metadata_json": _artifact_metadata_with_sealed_proof(stored_proof_by_field),
     }
 
 
 @pytest.mark.asyncio
-async def test_v3_artifact_selection_binds_sealed_proof_to_row():
+async def test_v3_artifact_selection_binds_sealed_proof_to_row(monkeypatch):
     """Reject a coherent row and outcome mutation outside the sealed proof."""
 
-    stored_proof_by_field = await _sealed_semantic_proof_metadata()
-    artifact_row_by_field = _artifact_row_with_sealed_proof(
-        stored_proof_by_field
-    )
-    assert importer._provider_directory_artifact_dataset_from_row(
-        artifact_row_by_field
-    ) is not None
+    stored_proof_by_field = await _sealed_semantic_proof_metadata(monkeypatch)
+    artifact_row_by_field = _artifact_row_with_sealed_proof(stored_proof_by_field)
+    assert importer._provider_directory_artifact_dataset_from_row(artifact_row_by_field) is not None
 
     artifact_row_by_field["dataset_hash"] = "f" * 64
     artifact_row_by_field["publication_metadata_json"][
         importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY
     ]["dataset_hash"] = "f" * 64
     with pytest.raises(importer.ProviderDirectoryArtifactBuildStale):
-        importer._provider_directory_artifact_dataset_from_row(
-            artifact_row_by_field
-        )
+        importer._provider_directory_artifact_dataset_from_row(artifact_row_by_field)

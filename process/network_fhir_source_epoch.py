@@ -14,11 +14,14 @@ import hashlib
 import json
 import struct
 import tempfile
+from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
+
+import asyncpg
 
 from process.network_address_projection import _identifier
 from process.network_bootstrap_sources import _copy_native_batch, _CopyBatchTooLarge
@@ -41,35 +44,77 @@ _TABLES = (
 )
 _PRIMARY_KEYS = (
     ("provider_directory_endpoint_dataset", ("dataset_id",)),
-    ("provider_directory_dataset_resource", ("dataset_id", "resource_type", "resource_id")),
-    ("provider_directory_entity_source_binding", ("source_id", "resource_type", "resource_id")),
-    ("provider_directory_entity_release_evidence", ("source_id", "resource_type", "resource_id", "release_id")),
-    ("provider_directory_insurance_network_source_binding", ("source_id", "resource_id")),
+    (
+        "provider_directory_dataset_resource",
+        ("dataset_id", "resource_type", "resource_id"),
+    ),
+    (
+        "provider_directory_entity_source_binding",
+        ("source_id", "resource_type", "resource_id"),
+    ),
+    (
+        "provider_directory_entity_release_evidence",
+        ("source_id", "resource_type", "resource_id", "release_id"),
+    ),
+    (
+        "provider_directory_insurance_network_source_binding",
+        ("source_id", "resource_id"),
+    ),
     (
         "provider_directory_insurance_network_plan_evidence",
-        ("source_id", "release_id", "network_resource_id", "insurance_plan_resource_id"),
+        (
+            "source_id",
+            "release_id",
+            "network_resource_id",
+            "insurance_plan_resource_id",
+        ),
     ),
-    ("provider_directory_cms_npd_resource_witness", ("dataset_id", "resource_type", "resource_id")),
+    (
+        "provider_directory_cms_npd_resource_witness",
+        ("dataset_id", "resource_type", "resource_id"),
+    ),
     (
         "provider_directory_cms_npd_relationship",
-        ("dataset_id", "resource_type", "resource_id", "reference_field", "parent_ordinal", "reference_ordinal"),
+        (
+            "dataset_id",
+            "resource_type",
+            "resource_id",
+            "reference_field",
+            "parent_ordinal",
+            "reference_ordinal",
+        ),
     ),
     ("provider_directory_cms_npd_relationship_receipt", ("dataset_id",)),
-    ("provider_directory_cms_candidate_coverage", ("dataset_id", "release_id", "proof_version")),
+    (
+        "provider_directory_cms_candidate_coverage",
+        ("dataset_id", "release_id", "proof_version"),
+    ),
     ("provider_directory_cms_serving_coverage", ("dataset_id", "release_id")),
 )
 # Source coverage keys include proof version; retained index identities stay unchanged.
 _COPY_KEYS = dict(_PRIMARY_KEYS)
-_COPY_KEYS["provider_directory_cms_serving_coverage"] = ("dataset_id", "release_id", "proof_version")
+_COPY_KEYS["provider_directory_cms_serving_coverage"] = (
+    "dataset_id",
+    "release_id",
+    "proof_version",
+)
 _LOOKUP_INDEXES = (
     ("cms_epoch_entity_site", "provider_directory_entity_source_binding", ("site_id",)),
-    ("cms_epoch_entity_organization", "provider_directory_entity_source_binding", ("organization_id",)),
+    (
+        "cms_epoch_entity_organization",
+        "provider_directory_entity_source_binding",
+        ("organization_id",),
+    ),
     (
         "cms_epoch_plan_release",
         "provider_directory_insurance_network_plan_evidence",
         ("source_id", "release_id", "insurance_plan_resource_id"),
     ),
-    ("cms_epoch_network_identity", "provider_directory_insurance_network_source_binding", ("network_id",)),
+    (
+        "cms_epoch_network_identity",
+        "provider_directory_insurance_network_source_binding",
+        ("network_id",),
+    ),
     (
         "cms_epoch_relationship_target",
         "provider_directory_cms_npd_relationship",
@@ -304,11 +349,22 @@ def _verify_resource_copy(path, source_pin, metadata, evidence_run_id):
     return count
 
 
-async def _require_admitted_candidate(connection, source_pin):
+def _source_query(query, namespace, relations):
+    """Only an admitted input may replace fixed parent references with pinned leaves."""
+    if relations is None:
+        return query
+    if set(relations) != set(_TABLES):
+        _fail()
+    for root in sorted(_TABLES, key=len, reverse=True):
+        query = query.replace(namespace + "." + _identifier(root), relations[root])
+        query = query.replace(namespace + "." + root, relations[root])
+    return query
+
+
+async def _require_admitted_candidate(connection, source_pin, *, relations=None):
     """Read immutable admission scalars and validate complete source-scoped witnesses as sets."""
     namespace = _identifier(source_pin.schema_name)
-    proof_record = await connection.fetchrow(
-        f"""SELECT d.content_proof_admission_sha256 AS admission_sha256,
+    proof_query = f"""SELECT d.content_proof_admission_sha256 AS admission_sha256,
       d.publication_metadata_sha256 AS metadata_sha256,d.resource_count,c.relationship_count,
       d.publication_metadata_summary_json->'network_bindings' AS network_bindings
       FROM {namespace}.provider_directory_endpoint_dataset d
@@ -325,7 +381,9 @@ async def _require_admitted_candidate(connection, source_pin):
         AND d.publication_metadata_summary_json->'source_release'->>'vector_sha256'=$4
         AND d.content_proof_admission_version=1 AND d.content_proof_admission_kind='generic'
         AND d.content_proof_resource_types=ARRAY['Endpoint','HealthcareService','InsurancePlan','Location',
-          'Organization','OrganizationAffiliation','Practitioner','PractitionerRole']::varchar[]""",
+          'Organization','OrganizationAffiliation','Practitioner','PractitionerRole']::varchar[]"""
+    proof_record = await connection.fetchrow(
+        _source_query(proof_query, namespace, relations),
         source_pin.dataset_id,
         source_pin.endpoint_id,
         source_pin.dataset_sha256,
@@ -334,8 +392,7 @@ async def _require_admitted_candidate(connection, source_pin):
     )
     if proof_record is None:
         _fail()
-    valid = await connection.fetchval(
-        f"""SELECT
+    validation_query = f"""SELECT
       (SELECT count(*) FROM {namespace}.provider_directory_dataset_resource WHERE dataset_id=$1)=$3
       AND (SELECT count(*) FROM {namespace}.provider_directory_cms_npd_relationship WHERE dataset_id=$1)=$4
       AND NOT EXISTS(SELECT 1 FROM {namespace}.provider_directory_dataset_resource r
@@ -351,7 +408,11 @@ async def _require_admitted_candidate(connection, source_pin):
         LEFT JOIN {namespace}.provider_directory_entity_source_binding b ON b.source_id='cms-npd'
           AND b.resource_type=r.resource_type AND b.resource_id=r.resource_id
         WHERE r.dataset_id=$1 AND r.resource_type IN ('Organization','Location')
-          AND (e.payload_sha256 IS DISTINCT FROM w.raw_payload_sha256 OR b.resource_id IS NULL))""",
+          AND (e.payload_sha256 IS DISTINCT FROM w.raw_payload_sha256 OR b.resource_id IS NULL))"""
+    if relations is not None:
+        validation_query += f" AND (SELECT count(*) FROM {namespace}.provider_directory_cms_npd_resource_witness WHERE dataset_id=$1)=$3"
+    valid = await connection.fetchval(
+        _source_query(validation_query, namespace, relations),
         source_pin.dataset_id,
         source_pin.release_id,
         proof_record["resource_count"],
@@ -419,16 +480,104 @@ def _scope(table, namespace):
     return f"source_id='cms-npd' AND release_id=$2 AND EXISTS(SELECT 1 FROM {namespace}.provider_directory_dataset_resource r WHERE r.dataset_id=$1 AND r.resource_type='InsurancePlan' AND r.resource_id=head.insurance_plan_resource_id)"
 
 
-async def _content(connection, schema):
+_CONTENT_SETTINGS = (
+    ("TimeZone", "UTC"),
+    ("DateStyle", "ISO, YMD"),
+    ("IntervalStyle", "iso_8601"),
+    ("extra_float_digits", "3"),
+    ("bytea_output", "hex"),
+)
+
+
+async def _start_epoch_savepoint(transaction, state):
+    """Record a completed start even when its caller is concurrently cancelled."""
+    await transaction.start()
+    state.started = True
+
+
+async def _rollback_epoch_savepoint(transaction, state):
+    """Record successful restoration before a drained caller cancellation propagates."""
+    await transaction.rollback()
+    state.started = False
+
+
+async def _set_content_settings(connection, names, values):
+    """Apply the fixed serialization profile as one bounded native operation."""
+    await connection.fetch(
+        "SELECT pg_catalog.set_config(name,value,true) FROM unnest($1::text[],$2::text[]) AS settings(name,value)",
+        names,
+        values,
+    )
+
+
+@asynccontextmanager
+async def _borrowed_epoch_settings(connection):
+    """Rollback read-only setting changes without releasing the caller's prior locks."""
+    transaction, state = connection.transaction(), SimpleNamespace(started=False)
+    try:
+        await drain_operation(_start_epoch_savepoint(transaction, state), preserve_cancellation=True)
+        yield
+    except BaseException:
+        if state.started:
+            try:
+                await drain_operation(_rollback_epoch_savepoint(transaction, state), preserve_cancellation=False)
+            except BaseException:
+                # An unusable connection cannot return borrowed settings to a pool.
+                with suppress(BaseException):
+                    connection.terminate()
+        raise
+    else:
+        try:
+            await drain_operation(_rollback_epoch_savepoint(transaction, state), preserve_cancellation=True)
+        except BaseException:
+            if state.started:
+                with suppress(BaseException):
+                    connection.terminate()
+            raise
+
+
+@asynccontextmanager
+async def _canonical_content_settings(connection):
+    """Canonicalize row serialization without lending settings to the caller."""
+    names, canonical = zip(*_CONTENT_SETTINGS)
+    previous = await connection.fetchval(
+        "SELECT array_agg(pg_catalog.current_setting(name) ORDER BY ordinal) "
+        "FROM unnest($1::text[]) WITH ORDINALITY AS settings(name,ordinal)",
+        names,
+    )
+    if tuple(previous) == canonical:
+        yield
+        return
+    async with _borrowed_epoch_settings(connection):
+        await _set_content_settings(connection, names, canonical)
+        yield
+
+
+async def _content(connection, schema, source_input=None):
+    """Fold the unchanged epoch chunks under canonical native serialization."""
+    async with _canonical_content_settings(connection):
+        return await _content_chunks(connection, schema, source_input)
+
+
+async def _content_chunks(connection, schema, source_input=None):
     """Fold native bounded row-hash chunks for the fixed eleven-relation epoch."""
     receipts = []
     namespace = _identifier(schema)
     for table in sorted(_TABLES):
-        chunks = await connection.fetch(f"""WITH hashed AS (
-          SELECT encode(sha256(convert_to(to_jsonb(row_value)::text,'UTF8')),'hex') AS sha FROM {namespace}.{_identifier(table)} row_value
+        row_source, parameters = f"{namespace}.{_identifier(table)}", ()
+        if source_input is not None:
+            source_input.require_active()
+            predicate, parameters = _epoch_copy_range(source_input.source_pin, table, None)
+            row_source = "(SELECT head.* FROM " + source_input.relation(table) + " head WHERE " + predicate + ")"
+            row_source = source_input.query(row_source)
+        chunks = await connection.fetch(
+            f"""WITH hashed AS (
+          SELECT encode(sha256(convert_to(to_jsonb(row_value)::text,'UTF8')),'hex') AS sha FROM {row_source} row_value
         ), ordered AS (SELECT sha,row_number() OVER(ORDER BY sha COLLATE "C")-1 AS ordinal FROM hashed)
         SELECT ordinal/8192 AS ordinal,count(*) AS count,encode(sha256(convert_to(string_agg(sha,'' ORDER BY ordinal),'UTF8')),'hex') AS sha
-        FROM ordered GROUP BY ordinal/8192 ORDER BY ordinal/8192""")
+        FROM ordered GROUP BY ordinal/8192 ORDER BY ordinal/8192""",
+            *parameters,
+        )
         digest, count = hashlib.sha256(b"cms-epoch-row-chunks-v1\0"), 0
         for index, chunk in enumerate(chunks):
             if chunk["ordinal"] != index or not 0 < chunk["count"] <= 8192:
@@ -442,9 +591,8 @@ async def _content(connection, schema):
 
 async def _catalog_relations(connection, schema):
     """Read native layout, keys and exact index identities as one bounded catalog set."""
-    original_search_path = await connection.fetchval("SELECT current_setting('search_path')")
     # Deparsed expressions and operator classes must not depend on the reader's path.
-    async with connection.transaction():
+    async with _borrowed_epoch_settings(connection):
         await connection.execute("SET LOCAL search_path TO pg_catalog")
         relations = await connection.fetch(
             """SELECT c.oid::bigint,c.relname,c.relkind,c.relpersistence,c.relowner::bigint,c.relhastriggers,
@@ -467,7 +615,6 @@ async def _catalog_relations(connection, schema):
       FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid WHERE n.nspname=$1 AND c.relkind IN ('r','p','v','m','f','S') ORDER BY c.relname""",
             schema,
         )
-        await connection.execute("SELECT pg_catalog.set_config('search_path',$1,true)", original_search_path)
         return relations
 
 
@@ -619,10 +766,10 @@ def _epoch_copy_limits(copy_admission):
     return rows, byte_limit
 
 
-async def _require_epoch_copy_key(connection, source_pin, table):
+async def _require_epoch_copy_key(connection, source_pin, table, *, relation=None):
     """Require exact existing native primary keys; never index or rewrite parents."""
     keys = _COPY_KEYS[table]
-    relation = _identifier(source_pin.schema_name) + "." + _identifier(table)
+    relation = relation or _identifier(source_pin.schema_name) + "." + _identifier(table)
     has_native_key = await connection.fetchval(
         """SELECT EXISTS(SELECT 1 FROM pg_index i
         JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am am ON am.oid=c.relam
@@ -662,7 +809,7 @@ def _epoch_copy_range(source_pin, table, last_keys, upper_keys=None):
     return predicate, parameters
 
 
-async def _epoch_batch_bounds(connection, source_pin, table, last_keys, row_limit):
+async def _epoch_batch_bounds(connection, source_pin, table, last_keys, row_limit, source_input=None):
     """Read only bounded aggregate and key metadata, never individual source rows."""
     namespace = _identifier(source_pin.schema_name)
     keys = _COPY_KEYS[table]
@@ -670,18 +817,22 @@ async def _epoch_batch_bounds(connection, source_pin, table, last_keys, row_limi
     last_columns = ",".join(_identifier(key) + " AS copy_key_" + str(index) for index, key in enumerate(keys))
     descending = ",".join(_identifier(key) + " DESC" for key in keys)
     predicate, parameters = _epoch_copy_range(source_pin, table, last_keys)
-    return await connection.fetchrow(
-        f"""WITH batch AS MATERIALIZED (SELECT head.* FROM {namespace}.{_identifier(table)} head
+    query = f"""WITH batch AS MATERIALIZED (SELECT head.* FROM {namespace}.{_identifier(table)} head
         WHERE {predicate} ORDER BY {columns} LIMIT {row_limit}),
         totals AS (SELECT count(*)::bigint AS row_count,
           COALESCE(sum(octet_length(record_send(batch))::bigint),0)::bigint AS native_bytes FROM batch),
         last_row AS (SELECT {last_columns} FROM batch ORDER BY {descending} LIMIT 1)
-        SELECT totals.*,last_row.* FROM totals LEFT JOIN last_row ON TRUE""",
+        SELECT totals.*,last_row.* FROM totals LEFT JOIN last_row ON TRUE"""
+    if source_input is not None:
+        query = source_input.query(query)
+        connection = source_input.connection
+    return await connection.fetchrow(
+        query,
         *parameters,
     )
 
 
-async def _copy_epoch_batch(connection, source_pin, schema, table, boundaries, copy_admission, oid):
+async def _copy_epoch_batch(connection, source_pin, schema, table, boundaries, copy_admission, oid, source_input=None):
     """Recheck admission after export and bracket exactly one native binary import."""
     last_keys, upper_keys, count, byte_limit = boundaries
     predicate, parameters = _epoch_copy_range(source_pin, table, last_keys, upper_keys)
@@ -693,9 +844,13 @@ async def _copy_epoch_batch(connection, source_pin, schema, table, boundaries, c
         phase = {"before_import": "before_copy_batch", "after_import": "after_copy_batch"}[phase]
         await _admit_epoch_copy(copy_admission, phase, schema, table, oid)
 
+    query = f"SELECT head.* FROM {namespace}.{_identifier(table)} head WHERE {predicate} ORDER BY {columns}"
+    if source_input is not None:
+        connection = source_input.copy_connections(connection)
+        query = source_input.query(query)
     await _copy_native_batch(
         connection,
-        f"SELECT head.* FROM {namespace}.{_identifier(table)} head WHERE {predicate} ORDER BY {columns}",
+        query,
         parameters,
         schema,
         table,
@@ -705,12 +860,18 @@ async def _copy_epoch_batch(connection, source_pin, schema, table, boundaries, c
     )
 
 
-async def _copy_epoch_rows(connection, source_pin, schema, table, oid, copy_admission):
+async def _copy_epoch_rows(connection, source_pin, schema, table, oid, copy_admission, source_input=None):
     """Copy complete compound-key ranges with bounded binary input and no row callbacks."""
     row_limit, byte_limit = _epoch_copy_limits(copy_admission)
     last_keys = None
     while True:
-        bounds = await _epoch_batch_bounds(connection, source_pin, table, last_keys, row_limit)
+        bounds = (
+            await _epoch_batch_bounds(connection, source_pin, table, last_keys, row_limit)
+            if source_input is None
+            else await _epoch_batch_bounds(connection, source_pin, table, last_keys, row_limit, source_input)
+        )
+        if source_input is not None:
+            source_input.require_active()
         count = bounds["row_count"]
         if type(count) is not int or not 0 <= count <= row_limit:
             _fail()
@@ -727,9 +888,16 @@ async def _copy_epoch_rows(connection, source_pin, schema, table, oid, copy_admi
             row_limit = max(1, count // 2)
             continue
         try:
-            await _copy_epoch_batch(
-                connection, source_pin, schema, table, (last_keys, upper_keys, count, byte_limit), copy_admission, oid
+            arguments = (
+                connection,
+                source_pin,
+                schema,
+                table,
+                (last_keys, upper_keys, count, byte_limit),
+                copy_admission,
+                oid,
             )
+            await _copy_epoch_batch(*arguments, *(() if source_input is None else (source_input,)))
         except _CopyBatchTooLarge:
             if count == 1:
                 _fail()
@@ -738,15 +906,23 @@ async def _copy_epoch_rows(connection, source_pin, schema, table, oid, copy_admi
         last_keys = upper_keys
 
 
-async def _copy_epoch(connection, source_pin, schema, owner_role, runtime_roles, copy_admission=None):
+async def _copy_epoch(
+    connection, source_pin, schema, owner_role, runtime_roles, copy_admission=None, source_input=None
+):
     """Create only task-owned native tables, without original functions or row hooks."""
     namespace = _identifier(source_pin.schema_name)
     await connection.execute(f"CREATE SCHEMA {_identifier(schema)}")
     oid_by_table = {}
     for table in _TABLES:
-        await _require_epoch_copy_key(connection, source_pin, table)
+        if source_input is None:
+            await _require_epoch_copy_key(connection, source_pin, table)
         table_ref = _identifier(schema) + "." + _identifier(table)
-        await connection.execute(f"CREATE TABLE {table_ref} (LIKE {namespace}.{_identifier(table)} INCLUDING STORAGE)")
+        definition = (
+            f"LIKE {namespace}.{_identifier(table)} INCLUDING STORAGE"
+            if source_input is None
+            else source_input.columns(table)
+        )
+        await connection.execute(f"CREATE TABLE {table_ref} ({definition})")
         oid = None
         if copy_admission is not None:
             oid = await connection.fetchval(
@@ -758,7 +934,7 @@ async def _copy_epoch(connection, source_pin, schema, owner_role, runtime_roles,
             oid_by_table[table] = oid
         await _admit_epoch_copy(copy_admission, "created", schema, table, oid)
         await _admit_epoch_copy(copy_admission, "before_insert", schema, table, oid)
-        await _copy_epoch_rows(connection, source_pin, schema, table, oid, copy_admission)
+        await _copy_epoch_rows(connection, source_pin, schema, table, oid, copy_admission, source_input)
         await _admit_epoch_copy(copy_admission, "after_insert", schema, table, oid)
     await _create_epoch_indexes(connection, schema, copy_admission, oid_by_table)
     await connection.execute(f"ALTER SCHEMA {_identifier(schema)} OWNER TO {_identifier(owner_role)}")
@@ -800,7 +976,30 @@ async def capture_retained_cms_fhir_source_epoch(
     expected_metadata_sha256,
     copy_admission=None,
 ):
-    """Admit one exact edition and atomically freeze its task-owned native copy."""
+    """Admit the historical capture only outside genuine SOURCE orchestration."""
+    from process.provider_directory_generic_source_policy import is_source_storage_required
+
+    if is_source_storage_required():
+        _fail()
+    options = (epoch_id, owner_role, runtime_roles, expected_admission_sha256, expected_metadata_sha256)
+    return await _freeze_epoch(connection, source_pin, options, copy_admission)
+
+
+async def capture_source_cms_fhir_source_epoch(
+    connection, source_input, *, epoch_id, owner_role, runtime_roles, copy_admission=None
+):
+    """Copy an issued original Reader, never open a SourceOwner under RetPub."""
+    from process.network_fhir_source_epoch_pin import PinnedCMSFHIRSourceEpochInput
+
+    if type(source_input) is not PinnedCMSFHIRSourceEpochInput:
+        _fail()
+    await source_input.require_target(connection, owner_role)
+    options = (epoch_id, owner_role, runtime_roles, source_input.admission_sha256, source_input.metadata_sha256)
+    return await _freeze_epoch(connection, source_input.source_pin, options, copy_admission, source_input)
+
+
+async def _freeze_epoch(connection, source_pin, options, copy_admission, source_input=None):
+    epoch_id, owner_role, runtime_roles, expected_admission_sha256, expected_metadata_sha256 = options
     origin = _origin(source_pin)
     _validate_capture_options(
         epoch_id, owner_role, runtime_roles, expected_admission_sha256, expected_metadata_sha256, copy_admission
@@ -811,16 +1010,23 @@ async def capture_retained_cms_fhir_source_epoch(
         async with connection.transaction():
             if await connection.fetchval("SELECT to_regnamespace($1)", schema) is not None:
                 _fail()
-            namespace = _identifier(source_pin.schema_name)
-            await connection.execute(
-                "LOCK TABLE "
-                + ",".join(namespace + "." + _identifier(name) for name in _TABLES)
-                + " IN ACCESS SHARE MODE NOWAIT"
-            )
-            await _admit_origin(connection, source_pin, expected_admission_sha256, expected_metadata_sha256)
-            await _copy_epoch(connection, source_pin, schema, owner_role, runtime_roles, copy_admission)
+            if source_input is None:
+                namespace = _identifier(source_pin.schema_name)
+                await connection.execute(
+                    "LOCK TABLE "
+                    + ",".join(namespace + "." + _identifier(name) for name in _TABLES)
+                    + " IN ACCESS SHARE MODE NOWAIT"
+                )
+                await _admit_origin(connection, source_pin, expected_admission_sha256, expected_metadata_sha256)
+            else:
+                source_input.require_active()
+            await _copy_epoch(connection, source_pin, schema, owner_role, runtime_roles, copy_admission, source_input)
             schema_oid, oids, catalog = await _catalog(connection, schema, owner_role, runtime_roles)
             content = await _content(connection, schema)
+            if source_input is not None and content != await _content(
+                source_input.connection, source_pin.schema_name, source_input
+            ):
+                _fail()
             epoch = validate_retained_cms_fhir_source_epoch(
                 RetainedCMSFHIRSourceEpoch(
                     origin,
@@ -841,6 +1047,8 @@ async def capture_retained_cms_fhir_source_epoch(
             return epoch
     except FHIRSourceEpochError:
         raise
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError, ConnectionError) as error:
+        raise FHIRSourceEpochError("fhir_source_epoch_unavailable") from error
     except Exception:
         raise FHIRSourceEpochError("fhir_source_epoch_unavailable") from None
 
@@ -857,7 +1065,11 @@ async def require_retained_cms_fhir_source_epoch(connection, source_pin, epoch, 
     epoch = validate_retained_cms_fhir_source_epoch(epoch)
     if epoch.origin_coordinates != _origin(source_pin):
         _fail()
-    await _require_transaction(connection)
+    from process.provider_directory_cms_source_runtime import (
+        require_registry_epoch_transaction,
+    )
+
+    await require_registry_epoch_transaction(connection, source_pin, epoch)
     try:
         observed = await _catalog(connection, epoch.schema_name, epoch.owner_role, epoch.runtime_roles)
         if (
@@ -870,5 +1082,7 @@ async def require_retained_cms_fhir_source_epoch(connection, source_pin, epoch, 
         return epoch
     except FHIRSourceEpochError:
         raise
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError, ConnectionError) as error:
+        raise FHIRSourceEpochError("fhir_source_epoch_unavailable") from error
     except Exception:
         raise FHIRSourceEpochError("fhir_source_epoch_unavailable") from None

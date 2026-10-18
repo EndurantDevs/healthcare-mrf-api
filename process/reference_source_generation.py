@@ -53,6 +53,10 @@ async def install_reference_revision_guards(database, *, importer_id, schema_nam
     owners require explicit function privilege provisioning before installation.
     """
     importer, schema, authority_schema = _family(importer_id, schema_name)
+    if importer == "cms-doctors":
+        raise RuntimeError("cms_doctors_native_publication_required")
+    if importer == "geo":
+        raise RuntimeError("geo_source_native_publication_required")
     names = generation.RELATION_NAMES_BY_IMPORTER[importer]
     relations = ", ".join(f"{generation._quoted(schema)}.{generation._quoted(name)}" for name in names)
     await _execute_guard_statement(database, f"LOCK TABLE {relations} IN SHARE MODE NOWAIT")
@@ -142,7 +146,16 @@ async def require_reference_source_generation(session, *, importer_id, schema_na
     importer, schema = await _lock_source(
         session, importer_id=importer_id, schema_name=schema_name, expected_relation_oids=expected_relation_oids
     )
-    await require_reference_revision_tracking(session, importer_id=importer, schema_name=schema)
+    if importer == "geo":
+        from process.geo_source_storage import capture_geo_generation
+
+        await capture_geo_generation(session, schema)
+    elif importer == "cms-doctors":
+        from process.cms_doctors_immutable import require_doctors_storage
+
+        await require_doctors_storage(session, schema_name=schema, legacy=True)
+    else:
+        await require_reference_revision_tracking(session, importer_id=importer, schema_name=schema)
     authority = await generation.read_reference_family_result_generation_authority(
         session, importer_id=importer, schema_name=schema
     )
@@ -160,6 +173,24 @@ async def bootstrap_reference_source_generation(session, *, importer_id, schema_
         expected_relation_oids=expected_relation_oids,
         bootstrap=True,
     )
+    if importer == "geo":
+        from process.geo_source_storage import capture_geo_generation
+
+        await capture_geo_generation(session, schema)
+        return await generation.read_reference_family_result_generation_authority(
+            session,
+            importer_id="geo",
+            schema_name=schema,
+        )
+    if importer == "cms-doctors":
+        from process.cms_doctors_immutable import capture_doctors_predecessor, publish_doctors_generation
+
+        authority = await capture_doctors_predecessor(session, schema)
+        if authority.serving_generation is not None:
+            return await require_reference_source_generation(
+                session, importer_id=importer, schema_name=schema, expected_relation_oids=expected_relation_oids
+            )
+        return await publish_doctors_generation(session, schema_name=schema, expected_authority=authority)
     authority_schema = generation._authority_schema(importer, schema)
     tracked = await session.scalar(
         text(

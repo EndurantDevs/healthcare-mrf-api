@@ -10,8 +10,14 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from process import provider_directory_cms_native_inputs as inputs
+from tests.cms_native_inputs_postgres_support import (
+    create_fixed_input_models,
+    enroll_native_input_custody,
+    native_input_actor,
+    source_input_custody,
+)
 from tests.provider_directory_profile_delta_test_support import _delta_database
-from tests.test_provider_directory_cms_serving_receipt_postgres import _apply
+from tests.test_provider_directory_cms_serving_receipt_postgres import _apply, _migration
 
 _DATASET_INPUTS = {
     "provider_directory_dataset_network_plan": (
@@ -36,9 +42,11 @@ async def _seed_authorities(database, schema):
     async with database.engine.begin() as connection:
         await connection.run_sync(lambda sync: _apply(sync, "20260914120000_npi_result_generation"))
         await connection.run_sync(lambda sync: _apply(sync, "20260930120000"))
+        await connection.execute(text(_migration("20261019130000")._counter_sql(schema)))
     await database.status(f'''CREATE TABLE "{schema}".reference_family_result_generation (
         importer_id text PRIMARY KEY,local_lineage_id uuid,local_generation bigint,
-        origin_lineage_id uuid,origin_generation bigint,published_at timestamptz,relation_oids bigint[])''')
+        origin_lineage_id uuid,origin_generation bigint,published_at timestamptz,relation_oids bigint[],
+        source_revision_tracked boolean NOT NULL DEFAULT false)''')
     for family in inputs._FAMILIES:
         if family == "mrf":
             continue
@@ -52,6 +60,7 @@ async def _seed_authorities(database, schema):
         ]
         await database.status(
             f'''INSERT INTO "{schema}".reference_family_result_generation
+            (importer_id,local_lineage_id,local_generation,origin_lineage_id,origin_generation,published_at,relation_oids)
             VALUES (:family,:lineage,1,:lineage,1,now(),:oids)''',
             family=family,
             lineage=uuid4(),
@@ -73,25 +82,30 @@ async def _fixture(monkeypatch):
         monkeypatch.setenv("DB_SCHEMA", schema)
         await database.status("CREATE SCHEMA tiger")
         try:
+            await create_fixed_input_models(database, schema)
+            fixed_names = {"doctor_clinician_address", "geo_zip_lookup"}
             for namespace, name in inputs._relations(schema):
+                if namespace == schema and name in fixed_names:
+                    continue
                 columns = _DATASET_INPUTS[name][0] if name in _DATASET_INPUTS else "value int"
                 await database.status(f'CREATE TABLE "{namespace}"."{name}" ({columns})')
             await _seed_authorities(database, schema)
-            async with database.engine.begin() as connection:
-                await inputs.register_native_address_inputs(connection, schema)
-            yield database, schema
+            async with source_input_custody(database, schema, monkeypatch, fixed_inputs=True) as component:
+                await enroll_native_input_custody(database, schema, component)
+                async with native_input_actor(database) as connection:
+                    await inputs.register_native_address_inputs(connection, schema)
+                yield database, schema
         finally:
             await database.status("DROP SCHEMA tiger CASCADE")
 
 
 async def _capture(database, schema):
-    async with database.engine.begin() as connection:
-        await connection.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
+    async with native_input_actor(database, readonly=True) as connection:
         return await inputs.capture_native_address_input_fence(connection, schema)
 
 
 async def _assert(database, schema, fence):
-    async with database.engine.begin() as connection:
+    async with native_input_actor(database) as connection:
         await inputs.assert_native_address_input_fence(connection, schema, fence)
 
 
@@ -129,9 +143,12 @@ async def test_swapped_in_input_requires_additive_registration(monkeypatch):
         fence = await _capture(database, schema)
         await database.status(f'ALTER TABLE "{schema}".nucc_taxonomy RENAME TO old_nucc')
         await database.status(f'CREATE TABLE "{schema}".nucc_taxonomy (value int)')
+        await enroll_native_input_custody(
+            database, schema, database._native_input_component, replacement_name="nucc_taxonomy"
+        )
         with pytest.raises(RuntimeError, match="revision_guard_unavailable"):
             await _capture(database, schema)
-        async with database.engine.begin() as connection:
+        async with native_input_actor(database) as connection:
             await inputs.register_native_address_inputs(connection, schema)
         changed = await _capture(database, schema)
         assert changed["relations"] != fence["relations"]
@@ -149,7 +166,7 @@ async def test_registration_never_repairs_tampered_existing_trigger(monkeypatch,
     async with _fixture(monkeypatch) as (database, schema):
         await database.status(f'ALTER TABLE "{schema}".nucc_taxonomy {mutation}')
         with pytest.raises(RuntimeError, match="revision_guard_unavailable"):
-            async with database.engine.begin() as connection:
+            async with native_input_actor(database) as connection:
                 await inputs.register_native_address_inputs(connection, schema)
 
 
@@ -247,7 +264,10 @@ async def test_registration_rollback_and_history_retention(monkeypatch):
         await database.status(f'ALTER TABLE "{schema}".nucc_taxonomy RENAME TO prior_nucc')
         await database.status(f'CREATE TABLE "{schema}".nucc_taxonomy (value int)')
         with pytest.raises(asyncio.CancelledError):
-            async with database.engine.begin() as connection:
+            await enroll_native_input_custody(
+                database, schema, database._native_input_component, replacement_name="nucc_taxonomy"
+            )
+            async with native_input_actor(database) as connection:
                 await inputs.register_native_address_inputs(connection, schema)
                 raise asyncio.CancelledError
         with pytest.raises(RuntimeError, match="revision_guard_unavailable"):
@@ -350,9 +370,12 @@ async def test_dataset_input_drop_or_replacement_cannot_reuse_captured_fence(mon
         else:
             await database.status(f'ALTER TABLE {relation} RENAME TO "{table}_prior"')
             await database.status(f"CREATE TABLE {relation} ({_DATASET_INPUTS[table][0]})")
+            await enroll_native_input_custody(
+                database, schema, database._native_input_component, replacement_name=table
+            )
             with pytest.raises(RuntimeError, match="revision_guard_unavailable"):
                 await _assert(database, schema, fence)
-            async with database.engine.begin() as connection:
+            async with native_input_actor(database) as connection:
                 await inputs.register_native_address_inputs(connection, schema)
             changed = await _capture(database, schema)
             assert changed["relations"][relation]["relation_oid"] != fence["relations"][relation]["relation_oid"]
@@ -387,5 +410,85 @@ async def test_dataset_guard_tampering_cannot_be_repaired_by_registration(monkey
         with pytest.raises(RuntimeError, match="revision_guard_unavailable"):
             await _assert(database, schema, fence)
         with pytest.raises(RuntimeError, match="revision_guard_unavailable"):
-            async with database.engine.begin() as connection:
+            async with native_input_actor(database) as connection:
                 await inputs.register_native_address_inputs(connection, schema)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError])
+async def test_native_input_actor_restores_read_mode_on_every_exit(monkeypatch, failure):
+    """Actor proof uses the fixture Factory without leaking capture mode on failure."""
+    from types import SimpleNamespace
+
+    from process import provider_directory_generic_source_policy as source
+
+    factory = SimpleNamespace()
+    actual_database = object()
+    events = []
+
+    class Session:
+        async def scalar(self, statement, parameters=None):
+            events.append(str(statement))
+            if parameters is not None:
+                assert parameters == {"owner": "synthetic_owner", "publisher": "synthetic_publisher"}
+                return True
+            return "on" if factory.readonly else "off"
+
+    @asynccontextmanager
+    async def transaction(database, *, isolation):
+        assert database is actual_database and isolation == "repeatable read"
+        assert factory.readonly is True
+        yield Session()
+
+    database = SimpleNamespace(
+        _native_input_component=SimpleNamespace(
+            database=actual_database,
+            factory=factory,
+            owner="synthetic_owner",
+            publisher="synthetic_publisher",
+        )
+    )
+    monkeypatch.setattr(source, "source_transaction", transaction)
+    try:
+        async with native_input_actor(database, readonly=True):
+            if failure is not None:
+                raise failure()
+    except BaseException as error:
+        assert failure is not None and type(error) is failure
+    assert not hasattr(factory, "readonly")
+    assert "session_user=:publisher" in events[0] and "rolsuper" in events[0]
+    assert events[1] == "SHOW transaction_read_only"
+
+
+@pytest.mark.asyncio
+async def test_native_input_replacement_enrollment_changes_only_the_exact_oid():
+    """Explicit new-root setup grants no functions and never adopts during a read."""
+    from types import SimpleNamespace
+
+    statements = []
+
+    class Connection:
+        async def scalar(self, statement, parameters):
+            statements.append((str(statement), parameters))
+            return 42 if str(statement).startswith("SELECT to_regclass") else True
+
+        async def execute(self, statement):
+            statements.append((str(statement), None))
+
+    @asynccontextmanager
+    async def begin():
+        yield Connection()
+
+    database = SimpleNamespace(engine=SimpleNamespace(begin=begin))
+    component = SimpleNamespace(owner="synthetic_owner")
+    await enroll_native_input_custody(
+        database,
+        "synthetic_schema",
+        component,
+        replacement_name="nucc_taxonomy",
+    )
+    assert len(statements) == 3
+    assert statements[0][1] == {"name": '"synthetic_schema"."nucc_taxonomy"'}
+    assert statements[1] == ('ALTER TABLE "synthetic_schema"."nucc_taxonomy" OWNER TO "synthetic_owner"', None)
+    assert statements[2][1] == {"oid": 42, "owner": "synthetic_owner", "name": '"synthetic_schema"."nucc_taxonomy"'}
+    assert database._native_input_component is component

@@ -17,6 +17,7 @@ from db.models.manual_directory_registry import (
 from db.models.network_membership_draft import NetworkMembershipDraft
 from db.models.network_registry import NetworkRegistryAlias, NetworkRegistryIdentity, NetworkRegistryRecord
 from db.models.network_serving import (
+    NetworkCandidateCustody,
     NetworkMembershipBatch,
     NetworkMembershipCandidate,
     NetworkServingControl,
@@ -61,6 +62,7 @@ _MODELS = _HEAD_MODELS + (
     RegistryRevisionControl,
     RegistryRecordHistory,
     NetworkMembershipCandidate,
+    NetworkCandidateCustody,
     NetworkMembershipBatch,
     NetworkServingManifest,
     NetworkServingControl,
@@ -152,7 +154,14 @@ _UPDATE_COLUMNS = {
     for model in _HEAD_MODELS
 }
 _UPDATE_COLUMNS["registry_revision_control"] = ("draft_revision",)
-_UPDATE_COLUMNS["registry_network_binding"] = ("network_id", "evidence_id", "evidence_sha256", "archived", "revision")
+_UPDATE_COLUMNS["registry_network_binding"] = (
+    "network_id",
+    "evidence_id",
+    "evidence_sha256",
+    "office_recipe_json",
+    "archived",
+    "revision",
+)
 _SEQUENCES = {"network_registry_identity_network_id_seq", "network_serving_manifest_generation_id_seq"}
 
 
@@ -310,6 +319,66 @@ async def _verify_table_privileges(connection, tables, api_role):
             raise RegistryManagementPermissionError("Effective registry table privileges exceed the draft policy")
 
 
+async def _aca_controls(connection, namespace):
+    """Keep the accepted inbox in custody without granting draft metadata access."""
+    from db.registry_aca_source_notification import INSERT_COLUMNS, TABLE
+
+    relation = await connection.fetchrow(
+        "SELECT c.oid::bigint,c.relname,c.relowner,c.relkind::text,c.relpersistence::text,"
+        "h.relowner AS head_owner,o.rolcanlogin,o.rolsuper,o.rolcreatedb,o.rolcreaterole,"
+        "o.rolreplication,o.rolbypassrls,c.relhastriggers,c.relhasrules,c.relrowsecurity,c.relforcerowsecurity,"
+        "ARRAY(SELECT a.attname::text FROM pg_attribute a "
+        "WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum) AS columns "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "JOIN pg_roles o ON o.oid=c.relowner LEFT JOIN pg_class h ON h.relnamespace=n.oid "
+        "AND h.relname='network_serving_control' WHERE n.nspname=$1 AND c.relname=$2",
+        namespace,
+        TABLE,
+    )
+    if relation is None:
+        return []
+    if (
+        relation["relkind"] != "r"
+        or relation["relpersistence"] != "p"
+        or relation["relowner"] != relation["head_owner"]
+        or any(relation[name] for name in ("relhastriggers", "relhasrules", "relrowsecurity", "relforcerowsecurity"))
+        or tuple(relation["columns"]) != (*INSERT_COLUMNS, "created_at")
+    ):
+        raise RegistryManagementPermissionError("Accepted ACA inbox custody differs")
+    return [dict(relation)]
+
+
+async def _aca_readers(connection, namespace, controls):
+    """Preserve only safe existing native inbox grantees during a namespace move."""
+    if not controls:
+        return []
+    rows = await connection.fetch(
+        f"""WITH scope AS (SELECT $2::oid AS owner_oid), acl AS (
+        SELECT a.grantee,a.privilege_type,a.is_grantable,NULL::text AS column_name
+        FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE c.oid=$1::oid
+        UNION ALL SELECT a.grantee,a.privilege_type,a.is_grantable,att.attname
+        FROM pg_attribute att CROSS JOIN LATERAL aclexplode(att.attacl) a
+        WHERE att.attrelid=$1::oid AND att.attnum>0 AND NOT att.attisdropped
+        ), roles AS (SELECT DISTINCT grantee FROM acl WHERE grantee<>$2::oid)
+        SELECT configured.grantee,r.rolname,
+        NOT ({_NATIVE_RUNTIME_ROLE_UNSAFE_SQL}) AND NOT r.rolcreatedb AND NOT r.rolreplication
+        AND NOT r.rolbypassrls AND NOT has_parameter_privilege(r.oid,'session_replication_role','SET')
+        AND has_schema_privilege(r.oid,$3,'USAGE') AND NOT has_schema_privilege(r.oid,$3,'CREATE')
+        AND (SELECT count(DISTINCT grantee) FROM acl WHERE privilege_type='INSERT' AND grantee<>s.owner_oid)<=1
+        AND NOT EXISTS(SELECT 1 FROM acl a WHERE a.grantee=configured.grantee AND
+          (a.is_grantable OR NOT (a.privilege_type='SELECT' OR
+           (a.privilege_type='INSERT' AND a.column_name=ANY($4::text[]))))) AS safe
+        FROM roles configured LEFT JOIN pg_roles r ON r.oid=configured.grantee CROSS JOIN scope s""",
+        controls[0]["oid"],
+        controls[0]["relowner"],
+        namespace,
+        list(controls[0]["columns"][:-1]),
+    )
+    if len(rows) > 128 or any(row["safe"] is not True for row in rows):
+        raise RegistryManagementPermissionError("Accepted ACA inbox grantees are unsafe")
+    return [dict(row) for row in rows]
+
+
 async def _verify(connection, namespace, api_role, owner_role):
     """Compare native ownership and effective privileges to the explicit draft policy."""
     schema = await _roles(connection, namespace, api_role, owner_role)
@@ -323,9 +392,10 @@ async def _verify(connection, namespace, api_role, owner_role):
         api_role,
     ):
         raise RegistryManagementPermissionError("Draft schema privileges must not carry grant options")
+    controls = await _aca_controls(connection, namespace)
     tables, sequences = await _catalog(connection, schema["oid"])
     owner_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", owner_role)
-    if any(relation["relowner"] != owner_oid for relation in tables + sequences):
+    if any(relation["relowner"] != owner_oid for relation in tables + sequences + controls):
         raise RegistryManagementPermissionError("Registry object ownership is not protected")
     await _check_direct_grants(connection, schema["oid"], api_role)
     await _reject_inherited_grants(connection, schema["oid"], api_role)
@@ -365,6 +435,7 @@ async def install_registry_management_permissions(connection, *, api_role, owner
         if not await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", owner_role):
             raise RegistryManagementPermissionError("Installer must be able to assume the protected owner")
         tables, sequences = await _catalog(connection, schema["oid"])
+        controls = await _aca_controls(connection, namespace)
         await _reject_inherited_grants(connection, schema["oid"], api_role)
         try:
             existing = await _verify(connection, namespace, api_role, owner_role)
@@ -372,13 +443,16 @@ async def install_registry_management_permissions(connection, *, api_role, owner
             existing = None
         if existing is not None:
             return existing
-        for table in tables:
+        for table in tables + controls:
             await connection.execute(
                 f"LOCK TABLE {_identifier(namespace)}.{_identifier(table['relname'])} IN ACCESS EXCLUSIVE MODE NOWAIT"
             )
-        if await _catalog(connection, schema["oid"]) != (tables, sequences):
+        if (
+            await _catalog(connection, schema["oid"]) != (tables, sequences)
+            or await _aca_controls(connection, namespace) != controls
+        ):
             raise RegistryManagementPermissionError("Native registry objects changed while locking")
-        for table in tables:
+        for table in tables + controls:
             await connection.execute(
                 f"ALTER TABLE {_identifier(namespace)}.{_identifier(table['relname'])} OWNER TO {_identifier(owner_role)}"
             )
@@ -478,15 +552,17 @@ async def _require_provisioning_operator(connection, namespace, owner, tables, s
         raise RegistryManagementPermissionError("Existing API cannot read the old registry namespace")
 
 
-async def _lock_empty_registry(connection, source_schema, tables, sequences):
+async def _lock_empty_registry(connection, source_schema, tables, sequences, controls=()):
     """Lock and reject retained business rows without modifying receipt identities."""
     namespace = _identifier(source_schema)
-    for table in tables:
+    for table in [*tables, *controls]:
         await connection.execute(
             f"LOCK TABLE {namespace}.{_identifier(table['relname'])} IN ACCESS EXCLUSIVE MODE NOWAIT"
         )
     schema_oid = await connection.fetchval("SELECT oid FROM pg_namespace WHERE nspname=$1", source_schema)
-    if await _catalog(connection, schema_oid) != (tables, sequences):
+    if await _catalog(connection, schema_oid) != (tables, sequences) or await _aca_controls(
+        connection, source_schema
+    ) != list(controls):
         raise RegistryManagementPermissionError("Registry objects changed while locking")
     for table in tables:
         name = table["relname"]
@@ -502,11 +578,11 @@ async def _lock_empty_registry(connection, source_schema, tables, sequences):
             )
 
 
-async def _move_registry_objects(connection, source_schema, target_schema, owner_role, tables, sequences):
+async def _move_registry_objects(connection, source_schema, target_schema, owner_role, tables, sequences, controls=()):
     """Move only native enumerated empty objects and preserve their catalog identities."""
     old_namespace, new_namespace = _identifier(source_schema), _identifier(target_schema)
     await connection.execute(f"CREATE SCHEMA {new_namespace} AUTHORIZATION {_identifier(owner_role)}")
-    for table in tables:
+    for table in [*tables, *controls]:
         await connection.execute(
             f"ALTER TABLE {old_namespace}.{_identifier(table['relname'])} SET SCHEMA {new_namespace}"
         )
@@ -633,6 +709,8 @@ async def provision_empty_registry_namespace(connection, *, source_schema, targe
     """Move only a complete zero-row registry, with atomic read bridges for old processes."""
     owner, namespace = await _provisioning_scope(connection, source_schema, target_schema, api_role, owner_role)
     if await connection.fetchval("SELECT oid FROM pg_namespace WHERE nspname=$1", target_schema) is not None:
+        if await _aca_controls(connection, source_schema):
+            raise RegistryManagementPermissionError("Accepted ACA inbox conflicts with the existing target namespace")
         receipt = await verify_registry_management_permissions(
             connection, api_role=api_role, owner_role=owner_role, control_schema=target_schema
         )
@@ -640,16 +718,18 @@ async def provision_empty_registry_namespace(connection, *, source_schema, targe
         if await _read_view_catalog(connection, source_schema):
             await _verify_registry_read_views(connection, source_schema, target_schema, api_role, owner_role)
         return receipt
+    controls = await _aca_controls(connection, source_schema)
     tables, sequences = await _catalog(connection, namespace["oid"])
-    await _require_provisioning_operator(connection, namespace, owner, tables, sequences, api_role)
-    await _lock_empty_registry(connection, source_schema, tables, sequences)
+    await _require_provisioning_operator(connection, namespace, owner, tables + controls, sequences, api_role)
+    await _lock_empty_registry(connection, source_schema, tables, sequences, controls)
     ptg_readers = await _ptg_readers(connection, namespace["oid"], owner_role, api_role)
+    aca_readers = await _aca_readers(connection, source_schema, controls)
     async with connection.transaction():
-        await _move_registry_objects(connection, source_schema, target_schema, owner_role, tables, sequences)
+        await _move_registry_objects(connection, source_schema, target_schema, owner_role, tables, sequences, controls)
         receipt = await install_registry_management_permissions(
             connection, api_role=api_role, owner_role=owner_role, control_schema=target_schema
         )
-        for role in ptg_readers:
+        for role in ptg_readers + aca_readers:
             await connection.execute(
                 f"GRANT USAGE ON SCHEMA {_identifier(target_schema)} TO {_identifier(role['rolname'])}"
             )
@@ -661,6 +741,8 @@ async def provision_empty_registry_namespace(connection, *, source_schema, targe
 async def retire_registry_read_views(connection, *, source_schema, target_schema, api_role, owner_role):
     """Remove only exact bridges after the operator verifies all old registry processes are gone."""
     await _provisioning_scope(connection, source_schema, target_schema, api_role, owner_role)
+    if await _aca_controls(connection, source_schema):
+        raise RegistryManagementPermissionError("Accepted ACA inbox must move before compatibility retirement")
     if not await connection.fetchval(
         "SELECT pg_has_role(current_user,$1::name,'SET') AND pg_has_role(current_user,$1::name,'USAGE')", owner_role
     ):

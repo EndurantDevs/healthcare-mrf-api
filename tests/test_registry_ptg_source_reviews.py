@@ -488,3 +488,11 @@ def test_closed_stored_document_and_exact_source_binding_refuse_substitution(mut
         reviews._verified_review(
             approval_record_by_field, schema_name, envelope_by_field["ownership"], inventory_by_field
         )
+
+
+@pytest.fixture(autouse=True)
+def legacy_source_discriminator(monkeypatch):
+    """Keep existing negotiated/frozen fixture focus; allowed discovery has separate coverage."""
+    from process import registry_ptg_allowed_plan_source
+
+    monkeypatch.setattr(registry_ptg_allowed_plan_source, "is_allowed_snapshot", AsyncMock(return_value=False))

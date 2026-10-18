@@ -5,8 +5,8 @@
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import importlib
+import importlib.util
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -15,10 +15,27 @@ import pytest
 directory = importlib.import_module("process.provider_directory_fhir")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [(), ("lat",), ("formatted_address_source",), ("premise_key",)])
+async def test_overlay_ensure_emits_only_missing_column_groups(monkeypatch, missing):
+    """A complete serving table needs no DDL; older columns retain their compatibility updates."""
+    columns = set(directory._provider_directory_address_overlay_columns()) - set(missing)
+    indexes = [
+        directory._address_overlay_index_name(directory.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, suffix)
+        for suffix in directory.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES
+        if suffix not in {"npi_premise_key_idx", "source_run_resource_idx"}
+    ]
+    monkeypatch.setattr(directory.db, "first", AsyncMock(return_value=(columns, indexes)))
+    status = AsyncMock()
+    monkeypatch.setattr(directory.db, "status", status)
+    await directory._ensure_provider_directory_address_overlay_table("mrf")
+    assert status.await_count == bool(missing)
+    if missing:
+        assert f"ADD COLUMN IF NOT EXISTS {missing[0]} " in status.await_args.args[0]
+
+
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = (
-    ROOT / "alembic/versions/20260811140000_address_premise_grouping.py"
-)
+MIGRATION_PATH = ROOT / "alembic/versions/20260811140000_address_premise_grouping.py"
 
 
 def _load_migration():
@@ -57,9 +74,7 @@ def test_premise_migration_is_the_repository_head_successor(monkeypatch):
     migration.upgrade()
 
     assert migration.revision == "20260811140000_address_premise_grouping"
-    assert migration.down_revision == (
-        "20260811130000_provider_directory_exact_practitioner_resource_order_repair"
-    )
+    assert migration.down_revision == ("20260811130000_provider_directory_exact_practitioner_resource_order_repair")
     assert len(recorder.statements) == 2
     upgrade_sql = "\n".join(recorder.statements)
     assert recorder.statements[0] == "SET LOCAL lock_timeout = '5s';"
@@ -113,9 +128,7 @@ async def test_overlay_stage_indexes_include_partial_npi_premise_lookup(monkeypa
     await directory._create_address_overlay_stage_indexes("mrf", stage_table)
 
     joined_sql = "\n".join(call.args[0] for call in status.await_args_list)
-    premise_index = directory._address_overlay_index_name(
-        stage_table, "npi_premise_key_idx"
-    )
+    premise_index = directory._address_overlay_index_name(stage_table, "npi_premise_key_idx")
     assert premise_index in joined_sql
     assert "(npi, premise_key)" in joined_sql
     assert "WHERE premise_key IS NOT NULL" in joined_sql

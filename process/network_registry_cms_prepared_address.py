@@ -11,10 +11,17 @@ from process.entity_address_snapshot_receipt import (
     capture_entity_address_stage_integrity_receipt as capture_entity_address_stage_integrity_receipt,
 )
 from process.entity_address_snapshot_source import (
+    _SOURCE_INDEX_PREDICATES as _SOURCE_INDEX_PREDICATES,
+)
+from process.entity_address_snapshot_source import (
     _clone_entity_address_evidence_sequence,
+    _source_index_statements,
     entity_address_archive_relations,
     entity_address_archive_stage_schema,
     entity_address_unified,
+)
+from process.entity_address_snapshot_source import (
+    _legacy_index_statements as _legacy_index_statements,
 )
 from process.network_address_projection import _identifier
 from process.network_bootstrap_sources import (
@@ -107,9 +114,11 @@ async def _prepared_copy_bounds(connection, source_relation, keys, last_keys, ro
     return bounds_by_field["row_count"], bounds_by_field["native_bytes"], upper_keys
 
 
-def _prepared_import_admission(connection, prepared, schema, source_relation, oid):
+def _prepared_import_admission(connection, prepared, schema, source_relation, oid, source_input=None):
     async def admit_import(_phase):
         """Recheck source identity and the complete signed admission at each COPY boundary."""
+        if source_input is not None:
+            await source_input.verify_transaction()
         actual = await connection.fetchval(
             "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass($1) AND relkind='r' AND relpersistence='p'",
             source_relation,
@@ -121,7 +130,7 @@ def _prepared_import_admission(connection, prepared, schema, source_relation, oi
     return admit_import
 
 
-async def _copy_prepared_rows(connection, prepared, schema, stage_entry, expected_count, limits):
+async def _copy_prepared_rows(connection, prepared, schema, stage_entry, expected_count, limits, source_input=None):
     """Copy bounded compound-key ranges, retaining the original source and admission."""
     logical, stage, oid = stage_entry
     source_relation = _identifier(prepared.address.db_schema) + "." + _identifier(stage)
@@ -129,10 +138,11 @@ async def _copy_prepared_rows(connection, prepared, schema, stage_entry, expecte
     columns = ",".join(_identifier(key) for key in keys)
     row_limit, byte_limit = limits
     copied_rows, last_keys = 0, None
-    admit_import = _prepared_import_admission(connection, prepared, schema, source_relation, oid)
+    reader = connection if source_input is None else source_input.connection
+    admit_import = _prepared_import_admission(reader, prepared, schema, source_relation, oid, source_input)
     while copied_rows < expected_count:
         count, native_bytes, upper_keys = await _prepared_copy_bounds(
-            connection, source_relation, keys, last_keys, row_limit
+            reader, source_relation, keys, last_keys, row_limit
         )
         if (
             type(count) is not int
@@ -152,7 +162,7 @@ async def _copy_prepared_rows(connection, prepared, schema, stage_entry, expecte
         predicate, parameters = _prepared_copy_range(keys, last_keys, upper_keys)
         try:
             await _copy_native_batch(
-                connection,
+                connection if source_input is None else source_input.copy_connections(connection),
                 f"SELECT * FROM {source_relation} WHERE {predicate} ORDER BY {columns}",
                 parameters,
                 schema,
@@ -239,9 +249,24 @@ async def _prepared_native_sources(prepared, stages):
     return source_layout_by_logical, policy_json
 
 
-async def prepare_retained_registry_address(session, prepared, *, capture_id, owner_role, runtime_roles):
+async def prepare_retained_registry_address(
+    session, prepared, *, capture_id, owner_role, runtime_roles, source_input=None
+):
     """Copy and close the exact admitted stage family outside serving locks."""
     limits = _prepared_copy_limits(prepared)
+    if source_input is not None:
+        from process.network_registry_cms_prepared_address_pin import PinnedRegistryCMSAddressInput
+
+        if type(source_input) is not PinnedRegistryCMSAddressInput or source_input.prepared is not prepared:
+            raise ValueError("registry_cms_prepared_address_pin_invalid")
+        connection = await native_driver(session)
+        await source_input.require_target(connection, owner_role)
+        async with connection.transaction():
+            return await _prepare_source_address(session, prepared, source_input, capture_id, owner_role, runtime_roles)
+    from process.provider_directory_generic_source_policy import is_source_storage_required
+
+    if is_source_storage_required():
+        raise ValueError("registry_cms_prepared_address_pin_required")
     stages = await lock_prepared_address(session, prepared.address)
     connection = await native_driver(session)
     for logical, stage, oid in stages:
@@ -280,6 +305,88 @@ async def prepare_retained_registry_address(session, prepared, *, capture_id, ow
     return ownership, receipt, catalog, stages
 
 
+def _source_heap_sql(schema, logical, columns):
+    """Use only the authenticated native model columns; keep indexes out of intake."""
+    definitions = []
+    for column in columns:
+        if column["attgenerated"] or column["attidentity"]:
+            raise ValueError("registry_cms_prepared_address_columns_invalid")
+        definition = _identifier(column["attname"]) + " " + column["type"]
+        if column["collation_name"] is not None:
+            definition += (
+                " COLLATE " + _identifier(column["collation_schema"]) + "." + _identifier(column["collation_name"])
+            )
+        if column["attnotnull"]:
+            definition += " NOT NULL"
+        if column["default_expression"] is not None and (logical, column["attname"]) != (
+            "entity_address_evidence",
+            "evidence_id",
+        ):
+            definition += " DEFAULT " + column["default_expression"]
+        definitions.append(definition)
+    return f"CREATE TABLE {_identifier(schema)}.{_identifier(logical)} (" + ",".join(definitions) + ")"
+
+
+def _source_column_options(schema, logical, columns):
+    """Keep authenticated native column storage_by_code/compression_by_code without consulting SOURCE on Ret."""
+    storage_by_code = {"p": "PLAIN", "e": "EXTERNAL", "m": "MAIN", "x": "EXTENDED"}
+    compression_by_code = {"p": "pglz", "l": "lz4"}
+    for column in columns:
+        prefix = (
+            f"ALTER TABLE {_identifier(schema)}.{_identifier(logical)} ALTER COLUMN {_identifier(column['attname'])}"
+        )
+        yield prefix + " SET STORAGE " + storage_by_code[column["storage"]]
+        if column["compression"]:
+            yield prefix + " SET COMPRESSION " + compression_by_code[column["compression"]]
+
+
+async def _prepare_source_address(session, prepared, source_input, capture_id, owner_role, runtime_roles):
+    """Copy on the original Ret transaction; every SOURCE read uses its issued Reader."""
+    from process.network_cms_registry_address_capture import NativeReceiptSession
+
+    connection = await native_driver(session)
+    reader_session = NativeReceiptSession(source_input.connection)
+    schema = entity_address_archive_stage_schema(capture_id)
+    await session.execute(text(f"CREATE SCHEMA {_identifier(schema)}"))
+    layouts, columns_by_logical = dict(source_input.layouts), json.loads(source_input.columns_json)
+    for logical, _stage, oid in source_input.stages:
+        await session.execute(text(_source_heap_sql(schema, logical, columns_by_logical[logical])))
+        for statement in _source_column_options(schema, logical, columns_by_logical[logical]):
+            await session.execute(text(statement))
+        await _preserve_prepared_storage_options(session, schema, logical, oid, source_session=reader_session)
+        if logical == "entity_address_evidence":
+            await _clone_entity_address_evidence_sequence(session, stage_schema=schema)
+        await _register_retained_relation(
+            session, prepared, schema, logical, layouts[logical], source_input.policy_json, source_input
+        )
+    counts_by_logical = {
+        entry.table_name: entry.row_count for entry in source_input.source_capture.semantic_receipt.tables
+    }
+    for entry in source_input.stages:
+        await _copy_prepared_rows(
+            connection,
+            prepared,
+            schema,
+            entry,
+            counts_by_logical[entry[0]],
+            _prepared_copy_limits(prepared),
+            source_input,
+        )
+    indexes = json.loads(source_input.indexes_json)
+    admission = prepared.nonprofile_admission
+    for logical, source_stage, _ in source_input.stages:
+        await admission.advance_retained_native_relation(prepared.fhir, schema, logical, "indexing")
+        for index in indexes[logical]:
+            for statement in _source_index_statements(index, schema=schema, table=logical, source_stage=source_stage):
+                await session.execute(text(statement))
+                await admission.assert_ready(prepared.fhir, schema)
+        await admission.advance_retained_native_relation(prepared.fhir, schema, logical, "finished")
+    ownership = await capture_created_entity_address_archive_stage(session, dataset_id=capture_id)
+    receipt, catalog = await freeze_address_clone(session, ownership, owner_role, runtime_roles)
+    await source_input.finish_copy(session, ownership, receipt)
+    return ownership, receipt, catalog, source_input.stages
+
+
 async def _validate_prepared_address_copy(session, source_capture, ownership, receipt):
     """Require native content/catalog equivalence and the exact closed clone receipt."""
     try:
@@ -292,9 +399,9 @@ async def _validate_prepared_address_copy(session, source_capture, ownership, re
         raise ValueError("registry_cms_prepared_address_copy_changed")
 
 
-async def _preserve_prepared_storage_options(session, schema, logical, source_oid):
+async def _preserve_prepared_storage_options(session, schema, logical, source_oid, *, source_session=None):
     """LIKE omits heap and TOAST options; preserve the locked source's exact settings."""
-    statement = await session.scalar(
+    statement = await (source_session or session).scalar(
         text(
             """SELECT CASE WHEN count(*)>0 THEN format('ALTER TABLE %I.%I SET (%s)',
               CAST(:schema AS text), CAST(:logical AS text),
@@ -312,13 +419,23 @@ async def _preserve_prepared_storage_options(session, schema, logical, source_oi
         await session.execute(text(statement))
 
 
-async def _register_retained_relation(session, prepared, schema, logical, source_layout, policy_json):
+async def _register_retained_relation(
+    session, prepared, schema, logical, source_layout, policy_json, source_input=None
+):
     """Enroll each empty native heap before its bulk COPY and index growth."""
     connection = await native_driver(session)
     oid = await connection.fetchval(
         "SELECT to_regclass($1)::oid::bigint", _identifier(schema) + "." + _identifier(logical)
     )
-    annotation = RetainedNativeRelation(schema, logical, oid, policy_json, source_layout)
+    annotation = RetainedNativeRelation(
+        schema,
+        logical,
+        oid,
+        policy_json,
+        source_layout,
+        phase="loading" if source_input is not None else "finished",
+        source_input=source_input,
+    )
     await prepared.nonprofile_admission.register_external_relation(
         prepared.fhir, schema, logical, oid, native_relation=annotation
     )

@@ -13,9 +13,10 @@ from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
-from sqlalchemy import Column, MetaData, String, Table
 
 from api import provider_directory_cms_candidate_catalog as candidate_catalog
+from process import cms_doctors_identity_candidate as doctors_identities
+from process import cms_doctors_immutable
 from process import cms_doctors_preparation as preparation
 from process import cms_doctors_sites as sites
 from process import cms_npd_tax_candidate_followup as followup
@@ -28,8 +29,10 @@ from process import provider_directory_profile_capacity_preflight_contract as pr
 from process import provider_directory_profile_selection_contract as selection
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
+from process.cms_doctors_identity_candidate import _complete as complete_doctors_candidate
 from process.control_cancel import ImportCancelledError
 from process.tin_npi_connector import TinNpiConnectorError
+from tests import test_cms_doctors_identity_candidate as doctors_identity_tests
 from tests.provider_directory_cms_capacity_test_support import (
     cms_execution,
     cms_guard,
@@ -37,6 +40,7 @@ from tests.provider_directory_cms_capacity_test_support import (
     cms_request,
     sign_guard,
 )
+from tests.test_cms_doctors_organizations import _unit_source_transaction
 from tests.test_cms_npd_tax_candidate_followup import _Fhir
 from tests.test_cms_npd_tax_candidate_lookup import _organization, _report_for_organizations, _Result, _Session
 from tests.test_cms_npd_tax_candidate_runner import _admitted_release, _run_candidate_report
@@ -59,6 +63,12 @@ from tests.test_provider_directory_cms_candidate_catalog import (
 )
 from tests.test_provider_directory_cms_capacity_contract import _cms_task
 from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME, _signed_envelope
+
+
+@pytest.fixture(name="identity_runtime")
+def _doctors_identity_runtime(monkeypatch):
+    """Reuse only the application transport fake, without native custody claims."""
+    return doctors_identity_tests.runtime.__wrapped__(monkeypatch)
 
 
 @pytest.fixture(autouse=True)
@@ -603,82 +613,63 @@ def test_valid_cms_geometry_and_request_retain_exact_plan_and_independent_pair()
 @pytest.mark.asyncio
 @pytest.mark.parametrize("owned", [False, True])
 async def test_doctors_site_binding_refuses_unowned_or_other_schema_stage_before_writes(monkeypatch, owned):
-    context_by_name = {"context": {"group_site_stage_owned": owned}}
-    database = SimpleNamespace(transaction=Mock(side_effect=AssertionError("must not start a transaction")))
-    monkeypatch.setattr(sites, "db", database)
+    context_by_name = {
+        "import_date": "20260730",
+        "context": {"group_site_stage_owned": owned, "artifact": {"content_sha256": "a" * 64}},
+    }
+    transaction = Mock(side_effect=AssertionError("must not start a transaction"))
+    monkeypatch.setattr(doctors_identities, "source_transaction", transaction)
     monkeypatch.setattr(sites, "raise_if_cancelled", AsyncMock())
     monkeypatch.setattr(
-        sites, "make_class", Mock(return_value=SimpleNamespace(__table__=SimpleNamespace(schema="other")))
+        doctors_identities, "make_class", Mock(return_value=SimpleNamespace(__table__=SimpleNamespace(schema="other")))
     )
-    bind = AsyncMock()
-    monkeypatch.setattr(sites, "bind_cms_doctors_site_batch", bind)
-    error = "schema_mismatch" if owned else "stage_not_owned"
-    with pytest.raises(RuntimeError, match=f"^cms_group_site_binding_{error}$"):
-        await sites.bind_cms_doctors_sites(context_by_name, "20260730", "mrf", {})
-    database.transaction.assert_not_called()
-    bind.assert_not_awaited()
+    error = "cms_doctors_identity_schema_changed" if owned else "cms_group_site_binding_stage_not_owned"
+    with pytest.raises(RuntimeError, match=f"^{error}$"):
+        await sites.bind_cms_doctors_sites(
+            context_by_name, "20260730", "mrf", {"source_rows": 1, "generation_id": "b" * 64}
+        )
+    transaction.assert_not_called()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cancel_second_batch", [False, True])
-async def test_doctors_site_batches_commit_prior_work_and_roll_back_cancelled_batch(monkeypatch, cancel_second_batch):
-    events = []
-    bound_batches = []
+@pytest.mark.parametrize("cancel_second_page", [False, True])
+async def test_doctors_site_pages_finish_one_private_cohort_or_roll_back(identity_runtime, cancel_second_page):
+    runtime = identity_runtime
+    runtime.connection.keys = [f"site-{index:06}" for index in range(513)]
 
-    @asynccontextmanager
-    async def transaction():
-        yield object()
-
-    @asynccontextmanager
-    async def session():
-        try:
-            yield object()
-        except ImportCancelledError:
-            events.append("rollback")
-            raise
-        else:
-            events.append("commit")
-
-    async def bind(_session, *, adrs_ids):
-        bound_batches.append(tuple(adrs_ids))
-        events.append(tuple(adrs_ids))
-
-    async def cancelled(_ctx, _task):
-        if cancel_second_batch and len(bound_batches) == 2:
+    async def _cancel_check():
+        if cancel_second_page and sum(event == "copy" for event, _ in runtime.events) == 2:
             raise ImportCancelledError("synthetic cancellation")
 
-    table = SimpleNamespace(schema="mrf")
-    monkeypatch.setattr(sites, "db", SimpleNamespace(transaction=transaction, session=session))
-    monkeypatch.setattr(sites, "make_class", lambda *_args: SimpleNamespace(__table__=table))
-    monkeypatch.setattr(sites, "_lock_group_stage", AsyncMock(return_value=41))
-    monkeypatch.setattr(sites, "validate_group_site_stage", AsyncMock())
-    pages = AsyncMock(side_effect=[["site-a", "site-b"], ["site-c"], []])
-    complete = AsyncMock()
-    monkeypatch.setattr(sites, "_read_site_page", pages)
-    monkeypatch.setattr(sites, "_require_complete_site_bindings", complete)
-    monkeypatch.setattr(sites, "bind_cms_doctors_site_batch", bind)
-    monkeypatch.setattr(sites, "raise_if_cancelled", cancelled)
-    context_by_name = {"context": {"group_site_stage_owned": True, "control_run_id": "run_" + "a" * 32}}
-    if cancel_second_batch:
+    prepare = doctors_identities.prepare_doctors_identity_kind(
+        runtime.database,
+        runtime.context,
+        "identitytest",
+        "mrf",
+        runtime.receipt,
+        kind="site",
+        cancel_check=_cancel_check,
+    )
+    if cancel_second_page:
         with pytest.raises(ImportCancelledError, match="^synthetic cancellation$"):
-            await sites.bind_cms_doctors_sites(context_by_name, "20260730", "mrf", {})
-        assert events == [("site-a", "site-b"), "commit", ("site-c",), "rollback"]
-        complete.assert_not_awaited()
-        assert pages.await_count == 2
+            await prepare
+        assert runtime.events[-1][0] == "rollback"
+        assert doctors_identities._CONTEXT_KEY not in runtime.context["context"]
     else:
-        assert await sites.bind_cms_doctors_sites(context_by_name, "20260730", "mrf", {}) == 3
-        assert events == [("site-a", "site-b"), "commit", ("site-c",), "commit"]
-        complete.assert_awaited_once_with(table, 41, "20260730", "mrf", {})
-    assert pages.await_args_list[0].args == (table, 41, None)
-    assert pages.await_args_list[1].args == (table, 41, "site-b")
-    if not cancel_second_batch:
-        assert pages.await_args_list[2].args == (table, 41, "site-c")
+        assert await prepare == 513
+        assert runtime.events[-1][0] == "commit"
+        assert runtime.context["context"][doctors_identities._CONTEXT_KEY]["site"].count == 513
+    assert sum(event == "copy" for event, _ in runtime.events) == 2
+    assert sum(event == "commit" for event, _ in runtime.events) == (not cancel_second_page)
+    assert not any("INSERT INTO" in payload for event, payload in runtime.events if event == "statement")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("active,committed", [(True, False), (False, True), (False, False)])
 async def test_doctors_cleanup_respects_publication_transaction_and_committed_ownership(monkeypatch, active, committed):
-    prepared = SimpleNamespace(schema="mrf", stage_oids=(("target", "stage", 41),), committed=committed)
+    prepared = SimpleNamespace(
+        schema="mrf", import_date="20260730", context={}, stage_oids=(("target", "stage", 41),), committed=committed
+    )
     database = SimpleNamespace(_transaction_binding=lambda: object() if active else None)
     monkeypatch.setattr(preparation, "_native", lambda: SimpleNamespace(db=database))
     drop = AsyncMock()
@@ -700,7 +691,9 @@ async def test_doctors_cleanup_finishes_owned_drop_before_propagating_cancellati
     entered = asyncio.Event()
     release = asyncio.Event()
     finished = asyncio.Event()
-    prepared = SimpleNamespace(schema="mrf", stage_oids=(("target", "stage", 41),), committed=False)
+    prepared = SimpleNamespace(
+        schema="mrf", import_date="20260730", context={}, stage_oids=(("target", "stage", 41),), committed=False
+    )
     monkeypatch.setattr(
         preparation, "_native", lambda: SimpleNamespace(db=SimpleNamespace(_transaction_binding=lambda: None))
     )
@@ -744,6 +737,7 @@ async def test_doctors_preparation_refuses_nested_transaction_before_database_se
 @pytest.mark.asyncio
 @pytest.mark.parametrize("committed", [False, True])
 async def test_doctors_apply_refuses_stale_authority_or_already_consumed_preparation(monkeypatch, committed):
+    monkeypatch.setattr(preparation, "source_owner_transaction", _unit_source_transaction)
     authority = generation.ReferenceFamilyResultGenerationAuthority(
         "cms-doctors", "00000000-0000-0000-0000-000000000001", 1, None, None
     )
@@ -1002,68 +996,54 @@ async def test_followup_retains_verifiable_empty_completion_instead_of_retrying(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("after", [None, "site-a"])
-async def test_doctors_site_page_keeps_exact_locked_bounded_sql_cursor(monkeypatch, after):
-    table = Table("group_stage", MetaData(), Column("adrs_id", String), schema="mrf")
-    events = []
-
-    async def read(_statement):
-        events.append("read")
-        return SimpleNamespace(all=lambda: ["site-b", "site-c"])
-
-    session = SimpleNamespace(scalars=AsyncMock(side_effect=read))
-
-    @asynccontextmanager
-    async def transaction():
-        yield session
-
-    lock = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("lock"))
-    monkeypatch.setattr(sites, "db", SimpleNamespace(transaction=transaction))
-    monkeypatch.setattr(sites, "_lock_group_stage", lock)
-    assert await sites._read_site_page(table, 41, after) == ["site-b", "site-c"]
-    assert events == ["lock", "read"]
-    lock.assert_awaited_once_with(session, table, 41, identifier_column="adrs_id")
-    statement = session.scalars.await_args.args[0]
-    sql = str(statement)
-    assert "SELECT DISTINCT" in sql and "adrs_id IS NOT NULL" in sql and "adrs_id !=" in sql
-    assert "ORDER BY" in sql and "LIMIT" in sql
-    assert ("adrs_id >" in sql) is (after is not None)
-    assert statement.compile().params["param_1"] == sites.GROUP_BINDING_BATCH_SIZE
-    if after is not None:
-        assert after in statement.compile().params.values()
+async def test_doctors_site_page_keeps_exact_bounded_copy_cursor(identity_runtime):
+    runtime = identity_runtime
+    runtime.connection.keys = ["site-a", "site-b", "site-c"]
+    await doctors_identities.prepare_doctors_identity_kind(
+        runtime.database,
+        runtime.context,
+        "identitytest",
+        "mrf",
+        runtime.receipt,
+        kind="site",
+        cancel_check=AsyncMock(),
+    )
+    queries = [payload for event, payload in runtime.events if event == "read"]
+    assert len(queries) == 2
+    assert all(
+        "SELECT DISTINCT" in query
+        and '"adrs_id" IS NOT NULL' in query
+        and "\"adrs_id\"<>''" in query
+        and "ORDER BY" in query
+        and "LIMIT 512" in query
+        and '"adrs_id">$1' in query
+        for query in queries
+    )
+    args, kwargs = next(payload for event, payload in runtime.events if event == "copy")
+    assert args[0] is runtime.session and args[2:4] == ("", "site-c")
+    assert '"adrs_id">$1 AND "adrs_id"<=$2' in args[1]
+    assert kwargs["columns"] == ("adrs_id", "site_id", "created_at")
+    assert kwargs["max_bytes"] == 16 * 1024 * 1024
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing", [None, "site-unbound"])
-async def test_doctors_site_completeness_rechecks_owned_source_and_exact_bindings(monkeypatch, missing):
-    table = Table("group_stage", MetaData(), Column("adrs_id", String), schema="mrf")
-    events = []
-
-    async def read(_statement):
-        events.append("read")
-        return missing
-
-    session = SimpleNamespace(scalar=AsyncMock(side_effect=read))
-
-    @asynccontextmanager
-    async def transaction():
-        yield session
-
-    lock = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("lock"))
-    validate = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("validate"))
-    monkeypatch.setattr(sites, "db", SimpleNamespace(transaction=transaction))
-    monkeypatch.setattr(sites, "_lock_group_stage", lock)
-    monkeypatch.setattr(sites, "validate_group_site_stage", validate)
+@pytest.mark.parametrize("missing", [False, True])
+async def test_doctors_site_completeness_checks_full_source_and_immutable_coordinates(identity_runtime, missing):
+    runtime = identity_runtime
+    runtime.connection.changed = missing
+    proof_by_field = {"name": "private_site"}
+    call = complete_doctors_candidate(
+        runtime.connection, "mrf", runtime.stage.name, proof_by_field, doctors_identities._SPECS["site"]
+    )
     if missing:
-        with pytest.raises(RuntimeError, match="^cms_group_site_site_binding_incomplete$"):
-            await sites._require_complete_site_bindings(table, 41, "20260730", "mrf", {})
+        with pytest.raises(doctors_identities.CMSIdentityReprepareRequired):
+            await call
     else:
-        await sites._require_complete_site_bindings(table, 41, "20260730", "mrf", {})
-    assert events == ["lock", "validate", "read"]
-    lock.assert_awaited_once_with(session, table, 41, identifier_column="adrs_id")
-    validate.assert_awaited_once_with("20260730", "mrf", {})
-    sql = str(session.scalar.await_args.args[0])
-    assert "NOT (EXISTS" in sql and 'COLLATE "C"' in sql and "LIMIT" in sql
+        assert await call == 0
+    query = runtime.events[0][1]
+    assert 'source."adrs_id" IS NOT NULL' in query and "NOT EXISTS" in query
+    assert "IS DISTINCT FROM" in query and 'canonical."site_id" IS NULL' in query
+    assert "LIMIT" not in query and "pg_advisory" not in query
 
 
 @pytest.mark.asyncio
@@ -1094,44 +1074,37 @@ async def test_doctors_site_identity_rejects_invalid_batches_before_any_database
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("existing", [(), ("site-a",), ("site-a", "site-b")])
-async def test_doctors_site_identity_reuses_exact_ids_and_inserts_missing_sites(existing):
-    prior_ids_by_site = {"site-a": UUID(int=1), "site-b": UUID(int=2)}
-    writes = []
-
-    async def execute(statement, params=None):
-        if getattr(statement, "is_select", False):
-            return SimpleNamespace(all=lambda: [(key, prior_ids_by_site[key]) for key in existing])
-        if getattr(statement, "is_insert", False):
-            writes.append(statement)
-        return SimpleNamespace()
-
-    session = SimpleNamespace(execute=AsyncMock(side_effect=execute))
-    ids = await entity_identity.bind_cms_doctors_site_batch(session, adrs_ids=["site-a", "site-b", "site-a"])
-    assert len(ids) == 3 and ids[0] == ids[2] and ids[0] != ids[1]
-    assert all(isinstance(site_id, UUID) for site_id in ids)
-    for key in existing:
-        assert ids[0 if key == "site-a" else 1] == prior_ids_by_site[key]
-    if len(existing) == 2:
-        assert writes == []
-    else:
-        assert len(writes) == 2
-        binding = next(
-            statement for statement in writes if statement.table.name == "provider_directory_cms_doctors_site_binding"
+async def test_doctors_site_identity_requires_exact_prepared_ids_without_global_mint(
+    identity_runtime, monkeypatch, existing
+):
+    runtime = identity_runtime
+    for kind in ("group", "site"):
+        await doctors_identities.prepare_doctors_identity_kind(
+            runtime.database,
+            runtime.context,
+            "identitytest",
+            "mrf",
+            runtime.receipt,
+            kind=kind,
+            cancel_check=AsyncMock(),
         )
-        binding_params_by_name = binding.compile().params
-        inserted_ids_by_site = {
-            adrs_id: binding_params_by_name["site_id" + key.removeprefix("adrs_id")]
-            for key, adrs_id in binding_params_by_name.items()
-            if key.startswith("adrs_id")
-        }
-        returned_ids_by_site = {"site-a": ids[0], "site-b": ids[1]}
-        assert inserted_ids_by_site == {
-            key: site_id for key, site_id in returned_ids_by_site.items() if key not in existing
-        }
-        assert len(set(inserted_ids_by_site.values())) == len(inserted_ids_by_site)
-        identity = next(statement for statement in writes if statement.table.name == "provider_directory_site_identity")
-        identity_ids = {site_id for key, site_id in identity.compile().params.items() if key.startswith("site_id")}
-        assert identity_ids == set(inserted_ids_by_site.values())
+    monkeypatch.setattr(doctors_identities, "_verify_candidate", AsyncMock())
+    prior_ids_by_site = {"site-a": UUID(int=1), "site-b": UUID(int=2)}
+    runtime.connection.bindings = [(key, prior_ids_by_site[key]) for key in existing]
+    runtime.events.clear()
+    async with doctors_identities.doctors_identity_read_scope(runtime.database, runtime.context):
+        if len(existing) == 2:
+            ids = await entity_identity.bind_cms_doctors_site_batch(
+                runtime.session, adrs_ids=["site-a", "site-b", "site-a"]
+            )
+            assert ids == [prior_ids_by_site["site-a"], prior_ids_by_site["site-b"], prior_ids_by_site["site-a"]]
+        else:
+            with pytest.raises(RuntimeError, match="prepared_keys_missing"):
+                await entity_identity.bind_cms_doctors_site_batch(
+                    runtime.session, adrs_ids=["site-a", "site-b", "site-a"]
+                )
+    assert sum(event == "read" for event, _ in runtime.events) == 1
+    assert not any(event == "statement" for event, _ in runtime.events)
 
 
 @pytest.mark.asyncio
@@ -1223,6 +1196,7 @@ def _doctors_family():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["indexes", "result"])
 async def test_doctors_apply_rejects_catalog_or_result_drift_without_consuming_preparation(monkeypatch, failure):
+    monkeypatch.setattr(preparation, "source_owner_transaction", _unit_source_transaction)
     original_native, prepared = _doctors_family()
     relation_oids_by_name = {f"mrf.{stage}": oid for _target, stage, oid in prepared.stage_oids}
 
@@ -1241,6 +1215,8 @@ async def test_doctors_apply_rejects_catalog_or_result_drift_without_consuming_p
         return True
 
     session = SimpleNamespace(execute=AsyncMock(side_effect=execute), scalar=AsyncMock(side_effect=scalar))
+    storage = AsyncMock()
+    monkeypatch.setattr(cms_doctors_immutable, "require_doctors_storage", storage)
     expected_oids = tuple(oid for _target, _stage, oid in prepared.stage_oids)
     returned = replace(
         prepared.incumbent_authority,
@@ -1270,9 +1246,12 @@ async def test_doctors_apply_rejects_catalog_or_result_drift_without_consuming_p
     assert not prepared.committed and prepared.context == {} and prepared.metrics == {}
     if failure == "result":
         apply.assert_awaited_once()
-        assert prepared.native_receipt == returned
+        expected_pairs = tuple((stage, oid) for _target, stage, oid in prepared.stage_oids)
+        storage.assert_awaited_once_with(session, schema_name=prepared.schema, relation_pairs=expected_pairs)
+        assert prepared.native_receipt is None
     else:
         apply.assert_not_awaited()
+        storage.assert_not_awaited()
         assert prepared.native_receipt is None
     assert all(str(call.args[0]).lstrip().startswith("SELECT") for call in session.execute.await_args_list)
 
@@ -1281,6 +1260,7 @@ async def test_doctors_apply_rejects_catalog_or_result_drift_without_consuming_p
 @pytest.mark.parametrize("failure", ["capture-authority", "active-cleanup"])
 async def test_doctors_preparation_fences_authority_and_defers_active_cleanup(monkeypatch, failure):
     """Changed authority stops preparation; owned cleanup waits for the outer transaction."""
+    monkeypatch.setattr(preparation, "source_transaction", _unit_source_transaction)
     original_native, expected = _doctors_family()
     transaction_bindings = [None]
     session = object()

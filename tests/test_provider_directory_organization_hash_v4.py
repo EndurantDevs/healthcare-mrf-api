@@ -36,14 +36,22 @@ from process.provider_directory_resource_hash import (
     is_resource_payload_hash_match,
     resource_payload_sha256_for_contract,
 )
+from tests.provider_directory_proof_memory_support import proof_memory_authority as proof_memory_authority
 from tests.test_provider_directory_proof_store import (
     DATASET_ID as PROOF_DATASET_ID,
+)
+from tests.test_provider_directory_proof_store import (
     ENDPOINT_ID as PROOF_ENDPOINT_ID,
+)
+from tests.test_provider_directory_proof_store import (
     ROOT_RUN_ID as PROOF_ROOT_RUN_ID,
+)
+from tests.test_provider_directory_proof_store import (
     SOURCE_IDS as PROOF_SOURCE_IDS,
+)
+from tests.test_provider_directory_proof_store import (
     _MemoryProofConnection,
 )
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -172,9 +180,7 @@ def test_v4_union_is_lossless_associative_and_order_independent() -> None:
     ]
     assert forward["resource_url"].startswith("https://z.example.test/")
     assert merge_organization_semantic_payloads(forward, first) == forward
-    assert organization_semantic_payload_sha256(forward) == (
-        organization_semantic_payload_sha256(reverse)
-    )
+    assert organization_semantic_payload_sha256(forward) == (organization_semantic_payload_sha256(reverse))
 
 
 def test_v4_primary_alias_overlap_has_proof_parity() -> None:
@@ -190,10 +196,7 @@ def test_v4_primary_alias_overlap_has_proof_parity() -> None:
     )
     merged = merge_organization_semantic_payloads(primary, alias)
     merged_components = organization_label_hashes(merged)
-    observed_components = sorted(
-        set(organization_label_hashes(primary))
-        | set(organization_label_hashes(alias))
-    )
+    observed_components = sorted(set(organization_label_hashes(primary)) | set(organization_label_hashes(alias)))
     assert list(merged_components) == observed_components
     assert merged["name_variants"] == [
         "Community Health Center",
@@ -239,9 +242,7 @@ def test_v4_hash_is_typed_and_v3_stays_immutable() -> None:
         SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
         resource_type="Organization",
     )
-    assert DEFAULT_RESOURCE_HASH_CONTRACT == (
-        SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-    )
+    assert DEFAULT_RESOURCE_HASH_CONTRACT == (SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT)
     assert v4_hash == organization_semantic_payload_sha256(canonical_payload)
     assert v4_hash != v3_hash
     assert not is_resource_payload_hash_match(
@@ -300,12 +301,8 @@ def test_v4_batch_unions_while_v3_record_shape_remains_readable() -> None:
     assert v4_record[7] == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
     assert v4_record[8] == organization_semantic_base_sha256(merged_payload)
     assert v4_record[9] == list(organization_label_hashes(merged_payload))
-    assert v4_record[10] == list(
-        organization_primary_name_hashes(merged_payload)
-    )
-    _merged_record, diagnostics_by_name = (
-        proof_store._finalized_proof_record_group([v4_record])
-    )
+    assert v4_record[10] == list(organization_primary_name_hashes(merged_payload))
+    _merged_record, diagnostics_by_name = proof_store._finalized_proof_record_group([v4_record])
     assert diagnostics_by_name == {
         "added_name_count": 1,
         "collision_identities": 1,
@@ -319,12 +316,8 @@ def test_v4_batch_unions_while_v3_record_shape_remains_readable() -> None:
 def test_v4_proof_composes_labels_and_rejects_mixed_contracts() -> None:
     """Compose same-base v4 observations but reject v3/v4 shard mixing."""
 
-    first = canonical_organization_payload(
-        _organization_payload("Community Health Center")
-    )
-    second = canonical_organization_payload(
-        _organization_payload("Community Health Group")
-    )
+    first = canonical_organization_payload(_organization_payload("Community Health Center"))
+    second = canonical_organization_payload(_organization_payload("Community Health Group"))
     first_record = proof_store._proof_record(
         _dataset_row(first, SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT),
         SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
@@ -333,15 +326,9 @@ def test_v4_proof_composes_labels_and_rejects_mixed_contracts() -> None:
         _dataset_row(second, SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT),
         SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
     )
-    merged_record, diagnostics = proof_store._finalized_proof_record_group(
-        [second_record, first_record]
-    )
-    assert merged_record[9] == sorted(
-        set(first_record[9]) | set(second_record[9])
-    )
-    assert merged_record[10] == sorted(
-        set(first_record[10]) | set(second_record[10])
-    )
+    merged_record, diagnostics = proof_store._finalized_proof_record_group([second_record, first_record])
+    assert merged_record[9] == sorted(set(first_record[9]) | set(second_record[9]))
+    assert merged_record[10] == sorted(set(first_record[10]) | set(second_record[10]))
     assert diagnostics["collision_identities"] == 1
     v3_record = proof_store._proof_record(
         _dataset_row(
@@ -384,9 +371,7 @@ async def _stored_v4_union_proof():
                 }
             ],
             dataset_id=PROOF_DATASET_ID,
-            expected_resource_hash_contract=(
-                SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-            ),
+            expected_resource_hash_contract=(SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT),
         )
     stored_proof = await proof_store.build_stored_dataset_proof(
         connection,
@@ -398,9 +383,7 @@ async def _stored_v4_union_proof():
         selected_resources=["Organization"],
         options=ProviderDirectoryStoredProofOptions(
             proof_resource_scope=["Organization"],
-            expected_resource_hash_contract=(
-                SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-            ),
+            expected_resource_hash_contract=(SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT),
             expected_semantic_projection_as_of="2026-08-10",
         ),
     )
@@ -413,19 +396,11 @@ async def test_v4_sealed_proof_binds_union_and_contract() -> None:
     """Seal the reduced Organization union only under the v4 envelope."""
 
     stored_proof, merged_hash = await _stored_v4_union_proof()
-    expected_identity = proof_store._stable_json(
-        ["Organization", "organization-a", merged_hash]
-    ).encode()
+    expected_identity = proof_store._stable_json(["Organization", "organization-a", merged_hash]).encode()
 
-    assert stored_proof.dataset_hash == hashlib.sha256(
-        expected_identity
-    ).hexdigest()
-    assert stored_proof.metadata["contract_id"] == (
-        PROVIDER_DIRECTORY_SEMANTIC_CONTENT_V4_PROOF_CONTRACT_ID
-    )
-    assert stored_proof.metadata["resource_hash_contract"] == (
-        SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-    )
+    assert stored_proof.dataset_hash == hashlib.sha256(expected_identity).hexdigest()
+    assert stored_proof.metadata["contract_id"] == (PROVIDER_DIRECTORY_SEMANTIC_CONTENT_V4_PROOF_CONTRACT_ID)
+    assert stored_proof.metadata["resource_hash_contract"] == (SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT)
     assert stored_proof.metadata["semantic_union"] == {
         "added_name_count": 1,
         "collision_identities": 1,
@@ -445,9 +420,7 @@ async def test_v4_sealed_proof_binds_union_and_contract() -> None:
             selected_resources=["Organization"],
             options=ProviderDirectoryStoredProofOptions(
                 proof_resource_scope=["Organization"],
-                expected_resource_hash_contract=(
-                    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-                ),
+                expected_resource_hash_contract=(SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
                 expected_semantic_projection_as_of="2026-08-10",
             ),
         )
@@ -462,9 +435,7 @@ async def test_v4_union_proof_admits_deduplicated_shards() -> None:
 
     assert sum(shard["resource_count"] for shard in proof["shards"]) == 2
     assert proof["resource_count"] == 1
-    receipt = admission_seal_from_validated_metadata(
-        {PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: proof}
-    )
+    receipt = admission_seal_from_validated_metadata({PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: proof})
     assert receipt is not None
     assert receipt.proof_sha256 == proof["proof_sha256"]
 

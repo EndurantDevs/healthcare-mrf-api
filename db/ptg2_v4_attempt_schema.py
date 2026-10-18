@@ -6,7 +6,6 @@ from __future__ import annotations
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-
 ATTEMPT_FENCE_TABLE = "ptg2_v4_attempt_fence"
 ATTEMPT_IMPORT_JOB_TABLE = "ptg2_import_job"
 ATTEMPT_IMPORT_JOB_PRIMARY_KEY = "ptg2_import_job_pkey"
@@ -17,6 +16,7 @@ ATTEMPT_IMPORT_JOB_INDEXES = (
 )
 ATTEMPT_STAGE_TABLE = "ptg2_v4_attempt_stage"
 ATTEMPT_STAGE_RUN_INDEX = "ptg2_v4_attempt_stage_run_idx"
+# Frozen historical migration policy; current runtime follows its attachment registry.
 LIFECYCLE_GUARDED_TABLES = (
     "ptg2_v3_snapshot_binding",
     "ptg2_v3_snapshot_scope",
@@ -100,9 +100,7 @@ ATTEMPT_IMPORT_JOB_COLUMNS = frozenset(
     }
 )
 FENCE_FINAL_COLUMNS = FENCE_LEGACY_COLUMNS | {"fence_nonce"}
-STAGE_FINAL_COLUMNS = frozenset(
-    {"snapshot_id", "internal_run_id", "table_name", "created_at"}
-)
+STAGE_FINAL_COLUMNS = frozenset({"snapshot_id", "internal_run_id", "table_name", "created_at"})
 
 FENCE_BASE_CONSTRAINTS = frozenset(
     {
@@ -114,9 +112,7 @@ FENCE_BASE_CONSTRAINTS = frozenset(
         "ptg2_v4_attempt_fence_state_check",
     }
 )
-FENCE_LEGACY_AUDIT_CONSTRAINT = (
-    "ptg2_v4_attempt_fence_reconciled_check"
-)
+FENCE_LEGACY_AUDIT_CONSTRAINT = "ptg2_v4_attempt_fence_reconciled_check"
 FENCE_AUDIT_CONSTRAINT = "ptg2_v4_attempt_fence_audit_shape_check"
 FENCE_NONCE_CONSTRAINT = "ptg2_v4_attempt_fence_nonce_key"
 FENCE_FINAL_CONSTRAINTS = FENCE_BASE_CONSTRAINTS | {
@@ -181,47 +177,39 @@ def _fence_constraints(
     """Return fresh named constraints for one supported fence shape."""
 
     elements: list = [
-            sa.PrimaryKeyConstraint(
-                "snapshot_id",
-                name="ptg2_v4_attempt_fence_pkey",
-            ),
-            sa.UniqueConstraint(
-                "internal_run_id",
-                name="ptg2_v4_attempt_fence_internal_run_id_key",
-            ),
-            sa.UniqueConstraint(
-                "snapshot_id",
-                "internal_run_id",
-                name="ptg2_v4_attempt_fence_pair_key",
-            ),
-            sa.ForeignKeyConstraint(
-                ["snapshot_id"],
-                [f"{schema_name}.ptg2_snapshot.snapshot_id"],
-                name="ptg2_v4_attempt_fence_snapshot_fkey",
-                ondelete="CASCADE",
-            ),
-            sa.ForeignKeyConstraint(
-                ["internal_run_id"],
-                [f"{schema_name}.ptg2_import_run.import_run_id"],
-                name="ptg2_v4_attempt_fence_run_fkey",
-                ondelete="CASCADE",
-            ),
-            sa.CheckConstraint(
-                FENCE_STATE_CHECK_SQL,
-                name="ptg2_v4_attempt_fence_state_check",
-            ),
-            sa.CheckConstraint(
-                (
-                    FENCE_LEGACY_AUDIT_SHAPE_CHECK_SQL
-                    if legacy_audit_constraint
-                    else FENCE_AUDIT_SHAPE_CHECK_SQL
-                ),
-                name=(
-                    FENCE_LEGACY_AUDIT_CONSTRAINT
-                    if legacy_audit_constraint
-                    else FENCE_AUDIT_CONSTRAINT
-                ),
-            ),
+        sa.PrimaryKeyConstraint(
+            "snapshot_id",
+            name="ptg2_v4_attempt_fence_pkey",
+        ),
+        sa.UniqueConstraint(
+            "internal_run_id",
+            name="ptg2_v4_attempt_fence_internal_run_id_key",
+        ),
+        sa.UniqueConstraint(
+            "snapshot_id",
+            "internal_run_id",
+            name="ptg2_v4_attempt_fence_pair_key",
+        ),
+        sa.ForeignKeyConstraint(
+            ["snapshot_id"],
+            [f"{schema_name}.ptg2_snapshot.snapshot_id"],
+            name="ptg2_v4_attempt_fence_snapshot_fkey",
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["internal_run_id"],
+            [f"{schema_name}.ptg2_import_run.import_run_id"],
+            name="ptg2_v4_attempt_fence_run_fkey",
+            ondelete="CASCADE",
+        ),
+        sa.CheckConstraint(
+            FENCE_STATE_CHECK_SQL,
+            name="ptg2_v4_attempt_fence_state_check",
+        ),
+        sa.CheckConstraint(
+            (FENCE_LEGACY_AUDIT_SHAPE_CHECK_SQL if legacy_audit_constraint else FENCE_AUDIT_SHAPE_CHECK_SQL),
+            name=(FENCE_LEGACY_AUDIT_CONSTRAINT if legacy_audit_constraint else FENCE_AUDIT_CONSTRAINT),
+        ),
     ]
     if include_nonce and include_nonce_constraint:
         elements.append(

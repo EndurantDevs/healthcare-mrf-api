@@ -10,6 +10,7 @@ from pathlib import Path
 _SIGNED_GEO_READER_SCRIPT = """
 import asyncio
 import dataclasses
+import io
 import json
 from types import SimpleNamespace
 
@@ -21,6 +22,7 @@ from process.custom_import.read_contracts import PinnedReadTarget
 from process.custom_import.read_identity import resolve_generation_snapshot
 from tests import test_custom_import_read_http as headers
 from tests.fixtures import custom_import_geo_receiver as fixture
+from tests.signed_request_reader_support import cold_caller, install_reader_factory
 
 async def verify_transaction_protocol():
     session = fixture.SyntheticSession({})
@@ -61,15 +63,18 @@ def read_page(cursor, scope="a" * 64):
     event = {"transport_verified": False, "native_page": False, "hydration": False}
     fixture._FIXTURE_STATE.request_event_by_name = event
     session = fixture.SyntheticSession(target)
+    caller = cold_caller()
     request = SimpleNamespace(
         body=body, method="POST", path=fixture.geo.CUSTOM_IMPORT_PROVIDER_GEO_PATH,
-        query_string="", args={}, ctx=SimpleNamespace(sa_session=session),
+        query_string="", args={}, ctx=SimpleNamespace(sa_session=caller),
         headers=headers._resigned_provider_headers(
             body=body, path=fixture.geo.CUSTOM_IMPORT_PROVIDER_GEO_PATH, target=target,
             authorization_scope_sha256=scope,
         ),
     )
-    return asyncio.run(fixture.geo.serve_custom_import_provider_geo(request, session)), event
+    with pytest.MonkeyPatch.context() as settings:
+        install_reader_factory(settings, session)
+        return asyncio.run(fixture.geo.serve_custom_import_provider_geo(request, caller)), event
 
 for include in (False, True):
     document["include_filter"] = include
@@ -93,6 +98,22 @@ for include in (False, True):
     rejected, event = read_page(first_cursor, scope="b" * 64)
     assert rejected.status == 400 and event["transport_verified"] and event["cursor_attempt"]
     assert not event["native_page"] and not event["hydration"]
+
+document["native_query"].pop("cursor", None)
+body = transport._canonical_json_bytes(document)
+handler = object.__new__(fixture.CustomImportGeoFixtureHandler)
+handler.path = fixture.geo.CUSTOM_IMPORT_PROVIDER_GEO_PATH
+handler.rfile = io.BytesIO(body)
+handler.headers = {
+    "Content-Length": str(len(body)),
+    **headers._resigned_provider_headers(body=body, path=handler.path, target=target),
+}
+replies = []
+handler._reply = lambda status, encoded: replies.append((status, json.loads(encoded)))
+handler.do_POST()
+assert replies[0][0] == 200 and len(replies[0][1]["items"]) == 1
+assert fixture._EVENTS[-1]["transport_verified"] and fixture._EVENTS[-1]["native_page"]
+assert fixture._EVENTS[-1]["hydration"] and fixture._EVENTS[-1]["legacy_projection"]
 
 session = fixture.SyntheticSession(target)
 pinned = PinnedReadTarget(11, 12, 11, 13, "default")

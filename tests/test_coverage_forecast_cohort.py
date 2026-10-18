@@ -101,11 +101,11 @@ def _rewrite_sidecar(fixture: tuple[Path, Path, dict], changed: dict) -> None:
 
 
 def test_complete_cohort_retains_all_sidecars_and_accepts_only_the_union(cohort_input, cohort_template: Path) -> None:
-    """All sixty producer identities survive without transporting sixty repeated databases."""
+    """Every producer identity survives while transporting one combined database."""
 
     _, directory, _ = cohort_input
     bytes_by_name = {path.name: path.read_bytes() for path in directory.iterdir()}
-    assert len(bytes_by_name) == 62
+    assert len(bytes_by_name) == 63
     assert _verify(cohort_input) == [directory / artifacts.POSTGRES_COVERAGE_NAME]
     assert bytes_by_name == {path.name: path.read_bytes() for path in directory.iterdir()}
     for path in (cohort_template / "originals").glob("*.json"):

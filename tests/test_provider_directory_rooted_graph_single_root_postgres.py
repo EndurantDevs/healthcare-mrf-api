@@ -5,108 +5,24 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from pathlib import Path
-from types import SimpleNamespace
-import uuid
 
 import pytest
-from sqlalchemy.ext.asyncio import create_async_engine
 
-from process.provider_directory_rooted_graph_registration import (
-    register_provider_directory_rooted_graph_source,
-)
-from process.provider_directory_rooted_graph_single_root_contract import (
-    derive_single_root_identity,
-)
+from process.provider_directory_rooted_graph_single_root_contract import derive_single_root_identity
 from process.provider_directory_rooted_graph_twin_store import (
-    admit_rooted_graph_single_root,
     ProviderDirectoryRootedGraphTwinError,
+    admit_rooted_graph_single_root,
 )
-from tests.formulary_fhir_twin_admission_pg_support import (
-    connect,
-    database_url,
-    drop_schema,
-    load_migration,
-    quoted,
-    run_migration,
-)
-from tests.provider_directory_rooted_graph_rotation_pg_support import (
-    publish_legacy_root,
-)
-from tests.test_provider_directory_rooted_graph_acquisition_postgres import (
-    _complete_success,
-    _configure_database,
-    _extend_publication_foundation,
-    _load_legacy_migrations,
-    MIGRATION_PATH,
-)
-from tests.test_provider_directory_uhc_flex_practitioner_publication_postgres import (
-    _prepare_publication_schema,
-)
-
-
-VERSIONS = Path(__file__).resolve().parents[1] / "alembic" / "versions"
-SINGLE_ROOT_PATH = VERSIONS / (
-    "20260812030000_provider_directory_specialized_single_root_admission.py"
-)
-CANONICAL_JSON_PATH = VERSIONS / "20260810110000_ptg_wave_receipt_authority.py"
-
-
-async def _install_single_root_schema(context: SimpleNamespace) -> None:
-    connection = await connect(context.url)
-    try:
-        await _extend_publication_foundation(connection, context.schema_name)
-    finally:
-        await connection.close()
-    await context.database.connect()
-    await register_provider_directory_rooted_graph_source(database=context.database)
-    await run_migration(context.engine, context.base_migration, "upgrade")
-    await run_migration(context.engine, context.single_root_migration, "upgrade")
-    for filename in (
-        "20261005100000_rooted_graph_set_validation.py",
-        "20261005130000_provider_dataset_candidates.py",
-    ):
-        migration = load_migration(VERSIONS / filename, filename.removesuffix(".py"))
-        await run_migration(context.engine, migration, "upgrade")
-    from tests.provider_directory_fhir_failure_pg_support import install_request_failure_budget
-
-    await install_request_failure_budget(context.engine, context.schema_name)
+from tests.provider_directory_rooted_graph_rotation_pg_support import publish_legacy_root
+from tests.test_provider_directory_rooted_graph_acquisition_postgres import _complete_success
 
 
 @asynccontextmanager
 async def _single_root_scope(monkeypatch):
-    url = database_url()
-    schema_name = f"fhir_twin_test_{uuid.uuid4().hex}"
-    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
-    monkeypatch.setenv("DB_SCHEMA", schema_name)
-    context = SimpleNamespace(
-        url=url,
-        schema_name=schema_name,
-        engine=create_async_engine(url.set(drivername="postgresql+asyncpg")),
-        database=_configure_database(monkeypatch, url),
-        base_migration=load_migration(MIGRATION_PATH, "rooted_single_root_base"),
-        single_root_migration=load_migration(SINGLE_ROOT_PATH, "rooted_single_root"),
-        canonical_migration=load_migration(CANONICAL_JSON_PATH, "rooted_json"),
-    )
-    context.canonical_migration.install = lambda: (
-        context.canonical_migration._install_receipt_verification_functions(
-            schema_name
-        )
-    )
-    try:
-        await _prepare_publication_schema(
-            context.engine,
-            url,
-            schema_name,
-            quoted(schema_name),
-            _load_legacy_migrations("rooted_single_root_legacy"),
-        )
-        await _install_single_root_schema(context)
+    from tests.test_provider_directory_rooted_graph_publication_postgres import _lifecycle_scope
+
+    async with _lifecycle_scope(monkeypatch) as context:
         yield context.database
-    finally:
-        await context.database.disconnect()
-        await drop_schema(context.engine, schema_name)
-        await context.engine.dispose()
 
 
 async def _prove_authority(database) -> None:

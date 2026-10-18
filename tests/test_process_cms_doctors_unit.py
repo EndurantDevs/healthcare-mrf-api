@@ -22,39 +22,6 @@ def _zip_bytes_with_csv(csv_name: str, csv_payload: str) -> bytes:
     return buffer.getvalue()
 
 
-class _FakeContent:
-    def __init__(self, payload: bytes):
-        self._payload = payload
-
-    async def iter_chunked(self, _chunk_size):
-        yield self._payload
-
-
-class _FakeResponse:
-    def __init__(self, payload: bytes):
-        self.content = _FakeContent(payload)
-
-    def raise_for_status(self):
-        return None
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-
-class _FakeClient:
-    def __init__(self, payload: bytes):
-        self._payload = payload
-
-    def get(self, _url, timeout=0):
-        return _FakeResponse(self._payload)
-
-    async def close(self):
-        return None
-
-
 class _CatalogResponse:
     def __init__(self, *, payload=None, status=200, enter_error=None):
         self._payload = payload
@@ -173,24 +140,24 @@ async def test_cms_doctor_stage_indexes_allow_an_index_free_stage(
 
 
 @pytest.mark.asyncio
-async def test_cms_doctor_schema_creation_tolerates_only_a_proven_existing_schema(
-    monkeypatch,
-    cms_doctors_module,
-):
-    """A failed CREATE is recoverable only when PostgreSQL proves the schema exists."""
+@pytest.mark.parametrize("reason", ["unprovisioned", "schema_changed"])
+async def test_cms_doctor_startup_refuses_missing_source_custody(monkeypatch, cms_doctors_module, reason):
+    """Missing preprovisioned authority propagates before private DDL or schema fallback."""
+    from tests.test_cms_doctors_startup_preprovisioned import _startup_boundaries
 
-    status = AsyncMock(side_effect=[None, RuntimeError("race"), RuntimeError("denied")])
-    scalar = AsyncMock(side_effect=[True, False])
-    monkeypatch.setattr(cms_doctors_module.db, "status", status)
-    monkeypatch.setattr(cms_doctors_module.db, "scalar", scalar)
-
-    await cms_doctors_module._ensure_schema_exists("mrf")
-    await cms_doctors_module._ensure_schema_exists("mrf")
-    with pytest.raises(RuntimeError, match="denied"):
-        await cms_doctors_module._ensure_schema_exists("mrf")
-
-    assert status.await_count == 3
-    assert scalar.await_count == 2
+    database, events = _startup_boundaries(monkeypatch)
+    failure = RuntimeError(reason)
+    require_roots = AsyncMock(side_effect=failure)
+    create_stage = AsyncMock()
+    monkeypatch.setattr(cms_doctors_module, "require_doctors_identity_roots", require_roots)
+    monkeypatch.setattr(cms_doctors_module, "create_doctors_stage", create_stage)
+    with pytest.raises(RuntimeError, match=reason) as raised:
+        await cms_doctors_module.startup({})
+    assert raised.value is failure and events == []
+    require_roots.assert_awaited_once_with(database)
+    create_stage.assert_not_awaited()
+    database.status.assert_not_awaited()
+    cms_doctors_module.source_storage._close_grants.assert_not_awaited()
 
 
 def test_cms_doctor_distribution_urls_keep_only_supported_downloads(
@@ -348,7 +315,7 @@ async def test_custom_cms_dataset_never_falls_back_to_default_title(
 
 
 @pytest.mark.asyncio
-async def test_process_data_keeps_multiple_addresses_per_npi(monkeypatch, cms_doctors_module):
+async def test_consume_doctors_keeps_multiple_addresses_per_npi(monkeypatch, tmp_path, cms_doctors_module):
     csv_payload = (
         "NPI,Line 1 Street Address,Line 2 Street Address,City,State,Zip Code,Primary specialty\n"
         "1111111111,123 Main St,,Chicago,IL,60654,Internal Medicine\n"
@@ -362,23 +329,20 @@ async def test_process_data_keeps_multiple_addresses_per_npi(monkeypatch, cms_do
     async def _fake_push(rows, _cls):
         pushed_rows.extend(rows)
 
-    monkeypatch.setattr(
-        cms_doctors_module,
-        "_fetch_doctors_download_url",
-        AsyncMock(return_value="https://x/y.zip"),
-    )
-    monkeypatch.setattr(cms_doctors_module, "ensure_database", AsyncMock())
-    monkeypatch.setattr(cms_doctors_module, "push_objects", _fake_push)
-    monkeypatch.setattr(cms_doctors_module, "import_doctor_education", AsyncMock())
-    monkeypatch.setattr(cms_doctors_module, "_stage_doctors_sidecars", AsyncMock())
-    monkeypatch.setitem(
-        __import__("sys").modules,
-        "aiohttp",
-        SimpleNamespace(ClientSession=lambda: _FakeClient(zip_payload)),
-    )
-
-    import_context_map = {"import_date": "20260321", "context": {}}
-    await cms_doctors_module.process_data(import_context_map, {"test_mode": True})
+    monkeypatch.setattr(cms_doctors_module, "_copy_clinical_rows", _fake_push)
+    source_path = tmp_path / "doctors.zip"
+    source_path.write_bytes(zip_payload)
+    with cms_doctors_module.open_doctors_csv(source_path) as reader:
+        accepted = await cms_doctors_module._consume_doctors_reader(
+            reader,
+            ctx={"context": {}},
+            task={"test_mode": True},
+            stage_cls=object(),
+            batch_size=5000,
+            test_mode=True,
+            test_row_limit=5000,
+        )
+    assert accepted == len(pushed_rows)
 
     assert len(pushed_rows) == 2
     assert len({pushed_doctor_row["address_checksum"] for pushed_doctor_row in pushed_rows}) == 2
@@ -386,7 +350,7 @@ async def test_process_data_keeps_multiple_addresses_per_npi(monkeypatch, cms_do
 
 
 @pytest.mark.asyncio
-async def test_process_data_accepts_current_cms_lowercase_schema(monkeypatch, cms_doctors_module):
+async def test_consume_doctors_accepts_current_cms_lowercase_schema(monkeypatch, tmp_path, cms_doctors_module):
     csv_payload = (
         "npi,adr_ln_1,adr_ln_2,citytown,state,zip_code,pri_spec\n"
         "2222222222,456 Oak Ave,Ste 7,Austin,TX,78701,Family Practice\n"
@@ -398,23 +362,20 @@ async def test_process_data_accepts_current_cms_lowercase_schema(monkeypatch, cm
     async def _fake_push(rows, _cls):
         pushed_rows.extend(rows)
 
-    monkeypatch.setattr(
-        cms_doctors_module,
-        "_fetch_doctors_download_url",
-        AsyncMock(return_value="https://x/y.zip"),
-    )
-    monkeypatch.setattr(cms_doctors_module, "ensure_database", AsyncMock())
-    monkeypatch.setattr(cms_doctors_module, "push_objects", _fake_push)
-    monkeypatch.setattr(cms_doctors_module, "import_doctor_education", AsyncMock())
-    monkeypatch.setattr(cms_doctors_module, "_stage_doctors_sidecars", AsyncMock())
-    monkeypatch.setitem(
-        __import__("sys").modules,
-        "aiohttp",
-        SimpleNamespace(ClientSession=lambda: _FakeClient(zip_payload)),
-    )
-
-    import_context_map = {"import_date": "20260321", "context": {}}
-    await cms_doctors_module.process_data(import_context_map, {"test_mode": True})
+    monkeypatch.setattr(cms_doctors_module, "_copy_clinical_rows", _fake_push)
+    source_path = tmp_path / "doctors.zip"
+    source_path.write_bytes(zip_payload)
+    with cms_doctors_module.open_doctors_csv(source_path) as reader:
+        accepted = await cms_doctors_module._consume_doctors_reader(
+            reader,
+            ctx={"context": {}},
+            task={"test_mode": True},
+            stage_cls=object(),
+            batch_size=5000,
+            test_mode=True,
+            test_row_limit=5000,
+        )
+    assert accepted == len(pushed_rows)
 
     assert pushed_rows == [
         {

@@ -25,6 +25,7 @@ from process.registry_required_target_review_references import (
     require_required_target_review_references,
 )
 from process.registry_source_observation_store import _namespace
+from process.uhc_flex_practitioner_async_safety import drain_operation
 
 _MAX_INPUT_BYTES = 8 * 1024 * 1024
 _MAX_COPY_BYTES = 16 * 1024 * 1024
@@ -48,6 +49,7 @@ COPY_COLUMNS = (
     "operation",
     "expected_revision",
     "expected_network_id",
+    "office_recipe_json",
 )
 
 
@@ -126,7 +128,7 @@ async def _stage(connection, copy_bytes, row_count):
       edition_id text NOT NULL,source_key text NOT NULL,source_scope_json jsonb NOT NULL,
       binding_key text NOT NULL UNIQUE,network_id integer NOT NULL,evidence_id text NOT NULL,
       evidence_sha256 text NOT NULL,operation text NOT NULL,expected_revision bigint NOT NULL,
-      expected_network_id integer) ON COMMIT DROP""")
+      expected_network_id integer,office_recipe_json jsonb) ON COMMIT DROP""")
     with io.BytesIO(copy_bytes) as source:
         status = await connection.copy_to_table(
             table,
@@ -151,7 +153,10 @@ _VALIDATION_SQL = """SELECT
       AND head.producer_id=target.producer_id AND head.edition_id=target.edition_id
       AND head.source_key=target.source_key AND head.source_scope_json=target.source_scope_json
       AND head.binding_key=target.binding_key END),false) AS revisions_valid,
-  COALESCE(bool_or(starts_with(target.evidence_id,'required-target-review:')),false) AS required_reviews
+  COALESCE(bool_or(starts_with(target.evidence_id,'required-target-review:')),false) AS required_reviews,
+  COALESCE(bool_or(CASE WHEN target.office_recipe_json IS NULL AND target.operation IN ('rebind','close')
+    THEN head.office_recipe_json IS NOT NULL
+    ELSE target.office_recipe_json IS NOT NULL AND target.office_recipe_json<>'null'::jsonb END),false) AS office_selections
 FROM {staging} target LEFT JOIN {namespace}.network_registry_identity identity USING(network_id)
 LEFT JOIN {namespace}.network_registry_record network USING(network_id)
 LEFT JOIN {namespace}.registry_network_binding head USING(binding_id)
@@ -159,13 +164,13 @@ LEFT JOIN {namespace}.registry_network_binding keyed ON keyed.binding_key=target
 
 _WRITE_SQL = """WITH created AS (
   INSERT INTO {namespace}.registry_network_binding AS head(binding_id,source_system,source_id,dataset_schema,
-    dataset_id,producer_id,edition_id,source_key,source_scope_json,binding_key,network_id,evidence_id,evidence_sha256)
+    dataset_id,producer_id,edition_id,source_key,source_scope_json,binding_key,network_id,evidence_id,evidence_sha256,office_recipe_json)
   SELECT binding_id,source_system,source_id,dataset_schema,dataset_id,producer_id,edition_id,source_key,
-    source_scope_json,binding_key,network_id,evidence_id,evidence_sha256 FROM {staging} WHERE operation='bind'
+    source_scope_json,binding_key,network_id,evidence_id,evidence_sha256,NULLIF(office_recipe_json,'null'::jsonb) FROM {staging} WHERE operation='bind'
   RETURNING head.*
 ), changed AS (
   UPDATE {namespace}.registry_network_binding head SET network_id=target.network_id,evidence_id=target.evidence_id,
-    evidence_sha256=target.evidence_sha256,archived=(target.operation='close'),revision=target.expected_revision+1
+    evidence_sha256=target.evidence_sha256,office_recipe_json=NULLIF(target.office_recipe_json,'null'::jsonb),archived=(target.operation='close'),revision=target.expected_revision+1
   FROM {staging} target WHERE target.operation IN ('rebind','close') AND head.binding_id=target.binding_id
     AND head.revision=target.expected_revision AND head.network_id=target.expected_network_id RETURNING head.*
 ), written AS (SELECT * FROM created UNION ALL SELECT * FROM changed), history AS (
@@ -239,13 +244,19 @@ async def _apply(connection, command, metadata, namespace, published_plan_store)
         return json.loads(replay["receipt_json"])
     if control["draft_revision"] > _MAX_REVISION:
         raise RegistryRecordConflict("registry_source_binding_control_unavailable")
-    copy_bytes, row_count = await asyncio.to_thread(_encode, command.input_bytes)
+    copy_bytes, row_count = await drain_operation(
+        asyncio.to_thread(_encode, command.input_bytes), preserve_cancellation=True
+    )
     staging = await _stage(connection, copy_bytes, row_count)
     status = await connection.fetchrow(_VALIDATION_SQL.format(namespace=namespace, staging=staging))
     if not status["targets_valid"]:
         raise ValueError("registry_source_binding_target_invalid")
     if not status["revisions_valid"]:
         raise RegistryRecordConflict("registry_source_binding_revision_conflict")
+    from process.registry_ptg_office_selection import require_staged_binding_office_references
+
+    if status["office_selections"]:
+        await require_staged_binding_office_references(connection, namespace, staging, published_plan_store)
     if status["required_reviews"]:
         await require_required_target_review_references(connection, namespace, staging)
     return await _save(

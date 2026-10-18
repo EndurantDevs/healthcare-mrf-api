@@ -30,6 +30,7 @@ MAX_FACTOR_BATCH_MEMBERS = 1_000_000
 
 
 def canonical_code(code_system, code):
+    """Reject aliases and return the exact canonical procedure selector."""
     system = normalize_code_system(code_system)
     normalized = canonical_catalog_code(system, code)
     if not system or not normalized or system != code_system or normalized != code:
@@ -38,6 +39,7 @@ def canonical_code(code_system, code):
 
 
 def validate_params(params):
+    """Accept only the four nonempty canonical physical-source selectors."""
     names = {"source_key", "snapshot_id", "code_system", "code"}
     if (
         type(params) is not dict
@@ -49,14 +51,17 @@ def validate_params(params):
 
 
 def encoded(value):
+    """Serialize identity and accounting data deterministically without NaN."""
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
 
 
 def digest(value):
+    """Hash the canonical serialization of an immutable identity."""
     return hashlib.sha256(encoded(value).encode()).hexdigest()
 
 
 def physical_identity(tables):
+    """Preserve the complete physical binding, or genuine legacy absence."""
     binding = getattr(tables, "physical_binding", None)
     if binding is None:
         return None
@@ -66,6 +71,7 @@ def physical_identity(tables):
 
 
 def identity(tables, root, finalizer, code_system, code):
+    """Bind source custody, graph and finalizer roots to one canonical code."""
     system, normalized = canonical_code(code_system, code)
     return {
         "contract": CONTRACT,

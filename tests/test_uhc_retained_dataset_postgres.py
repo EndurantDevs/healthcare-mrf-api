@@ -16,21 +16,9 @@ import pytest
 
 from api.endpoint import npi as npi_endpoint
 from process import provider_directory_profile as profile
-from process.provider_directory_admission_seal import (
-    admission_seal_from_validated_metadata,
-)
-from process.provider_directory_proof_store import (
-    ensure_dataset_proof_shard_table,
-)
+from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_source_summary import (
-    SOURCE_SUMMARY_CONTRACT_ID,
-    SOURCE_SUMMARY_CONTRACT_VERSION,
     SOURCE_SUMMARY_UHC_OUTCOME_COUNT_FIELDS,
-    SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID,
-)
-from process.uhc_canonical_proof import (
-    UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY,
-    bind_uhc_canonical_content_proof,
 )
 from process.uhc_provider_quarantine_contract import (
     UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
@@ -40,10 +28,8 @@ from process.uhc_provider_quarantine_contract import (
     quarantine_identity_set_sha256,
 )
 from process.uhc_retained_dataset import (
-    UHC_RETAINED_PUBLICATION_CONTRACT_ID,
     UHC_RETAINED_PUBLICATION_METADATA_KEY,
     UHC_RETAINED_SOURCE_ID,
-    UHC_RETAINED_SUMMARY_INPUT_CONTRACT_ID,
     UHC_RETAINED_SUMMARY_INPUT_METADATA_KEY,
     UhcAdmittedFile,
     UhcRetainedDatasetError,
@@ -55,9 +41,9 @@ from process.uhc_retained_dataset import (
 )
 from process.uhc_retained_native import retain_source_native
 from process.uhc_semantic_build_store import (
-    UHC_SEMANTIC_CONTRACT_ID,
     UhcSemanticBuildIdentity,
 )
+from tests.cms_npd_admission_postgres_support import legacy_source_admission_database
 from tests.provider_profile_snapshot_postgres_support import profile_reader
 from tests.test_provider_directory_dataset_serving_relations_db import (
     _dataset_database,
@@ -775,109 +761,6 @@ async def _install_native_admitted_catalog(
         await _install_native_admitted_file(connection, schema, admitted)
 
 
-def _publication_outcome(
-    dataset_id: str,
-    endpoint_id: str,
-    root_id: str,
-    dataset_hash: str,
-    resource_counts: dict[str, int],
-) -> dict[str, object]:
-    """Build the final resource-count outcome fixture."""
-    selected_resources = sorted(importer.UHC_SUPPORTED_RESOURCES)
-    return {
-        "complete": True,
-        "version": 1,
-        "dataset_id": dataset_id,
-        "endpoint_id": endpoint_id,
-        "acquisition_root_run_id": root_id,
-        "dataset_hash": dataset_hash,
-        "resource_count": sum(resource_counts.values()),
-        "resource_counts": resource_counts,
-        "source_ids": [UHC_RETAINED_SOURCE_ID],
-        "selected_resources": selected_resources,
-    }
-
-
-def _publication_source_summary(
-    outcome: dict[str, object],
-    canonical_proof: dict[str, object],
-) -> dict[str, object]:
-    """Build the source summary fixture bound to the publication outcome."""
-    resource_counts = outcome["resource_counts"]
-    return {
-        "contract_id": SOURCE_SUMMARY_CONTRACT_ID,
-        "contract_version": SOURCE_SUMMARY_CONTRACT_VERSION,
-        "complete": True,
-        "dataset_id": outcome["dataset_id"],
-        "endpoint_id": outcome["endpoint_id"],
-        "acquisition_root_run_id": outcome["acquisition_root_run_id"],
-        "dataset_hash": outcome["dataset_hash"],
-        "total_resources": outcome["resource_count"],
-        "resource_counts": resource_counts,
-        "resource_hashes": {
-            resource_type: canonical_proof["resource_hashes"][resource_type] for resource_type in resource_counts
-        },
-        "source_ids": outcome["source_ids"],
-        "selected_resources": outcome["selected_resources"],
-        "semantic_contract_id": SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID,
-    }
-
-
-def _publication_metadata(
-    dataset_id: str,
-    endpoint_id: str,
-    root_id: str,
-    dataset_hash: str,
-    resource_counts: dict[str, int],
-    canonical_proof: dict[str, object],
-) -> dict[str, object]:
-    """Build immutable UHC publication metadata for one fixture dataset."""
-
-    selected_resources = sorted(importer.UHC_SUPPORTED_RESOURCES)
-    input_sha256 = "1" * 64
-    outcome = _publication_outcome(
-        dataset_id,
-        endpoint_id,
-        root_id,
-        dataset_hash,
-        resource_counts,
-    )
-    return {
-        "source_ids": [UHC_RETAINED_SOURCE_ID],
-        "selected_resources": selected_resources,
-        "expected_resources": selected_resources,
-        UHC_RETAINED_PUBLICATION_METADATA_KEY: {
-            "contract_id": UHC_RETAINED_PUBLICATION_CONTRACT_ID,
-            "complete": True,
-            "source_id": UHC_RETAINED_SOURCE_ID,
-            "dataset_id": dataset_id,
-            "acquisition_root_run_id": root_id,
-            "semantic_contract_id": UHC_SEMANTIC_CONTRACT_ID,
-            "summary_input_sha256": input_sha256,
-        },
-        UHC_RETAINED_SUMMARY_INPUT_METADATA_KEY: {
-            "contract_id": UHC_RETAINED_SUMMARY_INPUT_CONTRACT_ID,
-            "complete": True,
-            "source_id": UHC_RETAINED_SOURCE_ID,
-            "semantic_contract_id": UHC_SEMANTIC_CONTRACT_ID,
-            "input_sha256": input_sha256,
-        },
-        UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY: (
-            bind_uhc_canonical_content_proof(
-                canonical_proof,
-                dataset_id=dataset_id,
-                endpoint_id=endpoint_id,
-                acquisition_root_run_id=root_id,
-            )
-        ),
-        importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY: outcome,
-        importer.SOURCE_SUMMARY_METADATA_KEY: _publication_source_summary(
-            outcome,
-            canonical_proof,
-        ),
-    }
-
-
 async def _build_canonical_fixture(
     database,
     schema: str,
@@ -1062,18 +945,26 @@ async def _native_profile_row(database, stage):
 
 
 async def _prepare_candidate_fixture_tables(database, schema: str) -> None:
-    """Add candidate timestamps, endpoint identity, and proof shards."""
+    """Seed the source identity beside the genuinely provisioned candidate roots."""
     await database.status(
-        f"ALTER TABLE {schema}.provider_directory_endpoint_dataset "
-        "ADD COLUMN created_at timestamptz NOT NULL DEFAULT now(), "
-        "ADD COLUMN validated_at timestamptz, "
-        "ADD COLUMN published_at timestamptz;"
+        f"INSERT INTO {schema}.provider_directory_api_endpoint "
+        "(endpoint_id,canonical_api_base,credential_descriptor_hash,endpoint_signature_hash) "
+        "VALUES ('endpoint-a',:api_base,repeat('0',64),repeat('1',64))",
+        api_base=importer.UHC_PROVIDER_DIRECTORY_BASE,
     )
     await database.status(
-        f"CREATE TABLE {schema}.provider_directory_api_endpoint (endpoint_id varchar(64) PRIMARY KEY);"
+        f"INSERT INTO {schema}.provider_directory_source "
+        "(source_id,org_name,endpoint_id,canonical_api_base,metadata_json,requires_registration,requires_api_key) "
+        "VALUES (:source,'Example source','endpoint-a',:api_base,CAST(:metadata AS jsonb),false,false)",
+        source=UHC_RETAINED_SOURCE_ID,
+        api_base=importer.UHC_PROVIDER_DIRECTORY_BASE,
+        metadata=json.dumps(
+            {
+                "provider_directory_supported_resources": sorted(importer.UHC_SUPPORTED_RESOURCES),
+                "provider_directory_fully_enumerable_resources": sorted(importer.UHC_SUPPORTED_RESOURCES),
+            }
+        ),
     )
-    await database.status(f"INSERT INTO {schema}.provider_directory_api_endpoint VALUES ('endpoint-a');")
-    await ensure_dataset_proof_shard_table(database, schema)
 
 
 async def _assert_canonical_facility_evidence(database, stage) -> None:
@@ -1179,7 +1070,7 @@ async def _assert_quarantined_provider_is_private(database, stage) -> None:
     assert _provider_npi(2) not in public_summary
 
 
-async def _assert_candidate_retry_and_validation(database, stage):
+async def _assert_candidate_retry_and_validation(database, stage, *, run_id="uhc-root"):
     """Assert candidate replacement is replayable and then immutable."""
     source_by_field = {
         "endpoint_id": "endpoint-a",
@@ -1187,14 +1078,14 @@ async def _assert_candidate_retry_and_validation(database, stage):
     }
     candidate = await importer._prepare_uhc_retained_candidate(
         source_by_field,
-        run_id="uhc-root",
+        run_id=run_id,
         summary_input=stage.summary_input,
     )
     first_count = await importer._replace_uhc_candidate_resources(candidate, stage)
     first_proof = await importer._assert_uhc_candidate_content(candidate, stage)
     replay_candidate = await importer._prepare_uhc_retained_candidate(
         source_by_field,
-        run_id="uhc-root",
+        run_id=run_id,
         summary_input=stage.summary_input,
     )
     assert replay_candidate.dataset_id == candidate.dataset_id
@@ -1223,208 +1114,6 @@ async def _assert_candidate_retry_and_validation(database, stage):
         == "healthporta.uhc.semantic-facts.v3"
     )
     return candidate, first_proof
-
-
-async def _prepare_uhc_source_for_publish_gate(
-    database,
-    schema: str,
-    candidate,
-    stage,
-) -> list[str]:
-    """Finalize the replay candidate and bind the corporate source."""
-    await database.status(
-        f"UPDATE {schema}.provider_directory_endpoint_dataset SET status='validated' WHERE dataset_id=:dataset_id;",
-        dataset_id=candidate.dataset_id,
-    )
-    with pytest.raises(RuntimeError, match="parent_immutable"):
-        await importer._replace_uhc_candidate_resources(candidate, stage)
-    selected_resources = sorted(importer.UHC_SUPPORTED_RESOURCES)
-    await database.status(
-        f"UPDATE {schema}.provider_directory_source "
-        "SET source_id=:source_id, org_name='UHC', "
-        "canonical_api_base=:api_base, metadata_json=CAST(:metadata AS jsonb) "
-        "WHERE source_id='source-a';",
-        source_id=UHC_RETAINED_SOURCE_ID,
-        api_base=importer.UHC_PROVIDER_DIRECTORY_BASE,
-        metadata=json.dumps(
-            {
-                "provider_directory_supported_resources": selected_resources,
-                "provider_directory_fully_enumerable_resources": (selected_resources),
-            },
-            sort_keys=True,
-        ),
-    )
-    await database.status(
-        f"UPDATE {schema}.provider_directory_endpoint_dataset SET status='failed' WHERE dataset_id=:dataset_id;",
-        dataset_id=candidate.dataset_id,
-    )
-    return selected_resources
-
-
-async def _insert_publish_gate_candidate(
-    database,
-    schema: str,
-    dataset_id: str,
-    previous_dataset_id: str,
-    dataset_hash: str,
-    metadata: dict[str, object],
-) -> None:
-    """Insert one validated dataset fixture for the publication gate."""
-    receipt = admission_seal_from_validated_metadata(metadata)
-    assert receipt is not None
-    await database.status(
-        f"""
-        INSERT INTO {schema}.provider_directory_endpoint_dataset (
-            dataset_id, endpoint_id, acquisition_root_run_id,
-            import_run_id, previous_dataset_id, dataset_hash,
-            resource_count, status, is_current, validated_at,
-            publication_metadata_json, publication_metadata_summary_json,
-            publication_metadata_sha256, content_proof_admission_version,
-            content_proof_admission_kind, content_proof_admission_sha256,
-            content_proof_resource_types
-        ) VALUES (
-            :dataset_id, 'endpoint-a', 'gate-root', 'gate-root',
-            :previous_dataset_id, :dataset_hash, 10, 'validated', false,
-            now(), CAST(:metadata AS jsonb), CAST(:summary AS jsonb),
-            :metadata_sha256, :admission_version, :admission_kind,
-            :proof_sha256, CAST(:resource_types AS varchar[])
-        )
-        """,
-        dataset_id=dataset_id,
-        previous_dataset_id=previous_dataset_id,
-        dataset_hash=dataset_hash,
-        metadata=json.dumps(metadata, sort_keys=True),
-        summary=json.dumps(receipt.metadata_summary, sort_keys=True),
-        metadata_sha256=receipt.metadata_sha256,
-        admission_version=receipt.admission_version,
-        admission_kind=receipt.admission_kind,
-        proof_sha256=receipt.proof_sha256,
-        resource_types=list(receipt.resource_types),
-    )
-
-
-def _good_gate_artifact_dataset(
-    dataset_hash: str,
-    selected_resources: list[str],
-):
-    """Build the artifact dataset expected by the successful gate."""
-    return importer.ProviderDirectoryArtifactDataset(
-        source_id=UHC_RETAINED_SOURCE_ID,
-        endpoint_id="endpoint-a",
-        dataset_id="uhc-gate-good",
-        evidence_run_id="gate-root",
-        selected_resources=tuple(selected_resources),
-        expected_resources=tuple(selected_resources),
-        recorded_expected_resources=tuple(selected_resources),
-        previous_dataset_id="dataset-a",
-        expected_incumbent_dataset_id="dataset-a",
-        status="validated",
-        is_current=False,
-        promote_on_cutover=True,
-        dataset_hash=dataset_hash,
-        resource_count=10,
-    )
-
-
-async def _publish_good_gate_candidate(
-    database,
-    schema: str,
-    first_proof,
-    stage,
-    selected_resources: list[str],
-):
-    """Publish the fully bound candidate and return its artifact identity."""
-    metadata = _publication_metadata(
-        "uhc-gate-good",
-        "endpoint-a",
-        "gate-root",
-        first_proof.dataset_hash,
-        stage.resource_counts,
-        stage.content_proof,
-    )
-    await _insert_publish_gate_candidate(
-        database,
-        schema,
-        "uhc-gate-good",
-        "dataset-a",
-        first_proof.dataset_hash,
-        metadata,
-    )
-    good = _good_gate_artifact_dataset(
-        first_proof.dataset_hash,
-        selected_resources,
-    )
-    await importer._publish_validated_uhc_dataset(
-        importer.EndpointDatasetCandidate(
-            endpoint_id="endpoint-a",
-            dataset_id="uhc-gate-good",
-            acquisition_root_run_id="gate-root",
-            source_ids=(UHC_RETAINED_SOURCE_ID,),
-            selected_resources=tuple(selected_resources),
-            import_run_id="gate-root",
-            previous_dataset_id="dataset-a",
-            expected_resources=tuple(selected_resources),
-            already_validated=True,
-        )
-    )
-    assert (
-        await database.scalar(
-            f"SELECT is_current FROM {schema}.provider_directory_endpoint_dataset WHERE dataset_id='uhc-gate-good';"
-        )
-        is True
-    )
-    assert (
-        await database.scalar(
-            f"SELECT status FROM {schema}.provider_directory_endpoint_dataset WHERE dataset_id='dataset-a';"
-        )
-        == "superseded"
-    )
-    return good
-
-
-async def _assert_bad_gate_candidate_rejected(
-    database,
-    schema: str,
-    first_proof,
-    stage,
-    good,
-) -> None:
-    """Reject a candidate whose source summary contradicts its proof."""
-    bad_metadata = _publication_metadata(
-        "uhc-gate-bad",
-        "endpoint-a",
-        "gate-root",
-        first_proof.dataset_hash,
-        stage.resource_counts,
-        stage.content_proof,
-    )
-    bad_metadata[importer.SOURCE_SUMMARY_METADATA_KEY]["resource_counts"] = {"InsurancePlan": 999}
-    await _insert_publish_gate_candidate(
-        database,
-        schema,
-        "uhc-gate-bad",
-        "uhc-gate-good",
-        first_proof.dataset_hash,
-        bad_metadata,
-    )
-    with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="candidate_changed",
-    ):
-        await importer._publish_validated_artifact_dataset(
-            importer.replace(
-                good,
-                dataset_id="uhc-gate-bad",
-                previous_dataset_id="uhc-gate-good",
-                expected_incumbent_dataset_id="uhc-gate-good",
-            )
-        )
-    assert (
-        await database.scalar(
-            f"SELECT status FROM {schema}.provider_directory_endpoint_dataset WHERE dataset_id='uhc-gate-bad';"
-        )
-        == "validated"
-    )
 
 
 async def _assert_native_quarantine_stage(database, stage) -> None:
@@ -1536,39 +1225,76 @@ async def test_postgres_canonical_stage_retry_idempotency_and_publish_gate(
 ):
     """Prove canonical rows, crash replay, immutable fencing, and final gate."""
 
-    async with _dataset_database(monkeypatch) as (database, schema):
-        monkeypatch.setattr(importer, "db", database)
+    async with legacy_source_admission_database(monkeypatch) as database:
+        schema = database._source_component.policy.schema
+        await _prepare_candidate_fixture_tables(database, schema)
         stage = await _build_canonical_fixture(database, schema, tmp_path)
         try:
+            await database.status(f'GRANT SELECT ON {stage.resource_ref} TO "{database._source_component.owner}"')
             assert stage.resource_counts["InsurancePlan"] == 1
             assert stage.summary_input["count_by_field"]["raw_provider_records"] == 4
             await _assert_canonical_facility_evidence(database, stage)
             await _assert_quarantined_provider_is_private(database, stage)
-            await _prepare_candidate_fixture_tables(database, schema)
             candidate, first_proof = await _assert_candidate_retry_and_validation(database, stage)
-            selected_resources = await _prepare_uhc_source_for_publish_gate(
-                database,
-                schema,
-                candidate,
-                stage,
+            await _validate_native_uhc_candidate(candidate, first_proof, stage)
+            await importer._publish_validated_uhc_dataset(candidate)
+            next_candidate, next_proof = await _assert_candidate_retry_and_validation(
+                database, stage, run_id="uhc-root-next"
             )
-            good = await _publish_good_gate_candidate(
-                database,
-                schema,
-                first_proof,
-                stage,
-                selected_resources,
-            )
-            await _assert_bad_gate_candidate_rejected(
-                database,
-                schema,
-                first_proof,
-                stage,
-                good,
-            )
+            assert next_proof.dataset_hash == first_proof.dataset_hash
+            await _assert_inconsistent_uhc_summary_rejected(next_candidate, next_proof)
+            assert (await importer._endpoint_dataset_state(candidate.dataset_id))["is_current"] is True
+            artifact = await _validate_native_uhc_candidate(next_candidate, next_proof, stage)
+            assert artifact.previous_dataset_id == candidate.dataset_id
+            with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="candidate_changed"):
+                await importer._publish_validated_artifact_dataset(replace(artifact, dataset_hash="0" * 64))
+            assert (await importer._endpoint_dataset_state(candidate.dataset_id))["is_current"] is True
+            assert (await importer._endpoint_dataset_state(next_candidate.dataset_id))["status"] == "validated"
+            await importer._publish_validated_uhc_dataset(next_candidate)
+            assert (await importer._endpoint_dataset_state(candidate.dataset_id))["status"] == "superseded"
+            assert (await importer._endpoint_dataset_state(next_candidate.dataset_id))["is_current"] is True
         finally:
             async with database.acquire_driver() as connection:
                 await cleanup_uhc_canonical_stage(connection, stage)
+
+
+async def _assert_inconsistent_uhc_summary_rejected(candidate, proof):
+    """Reject contradictory counts before sealing while preserving the candidate."""
+    inconsistent_proof = replace(proof, resource_counts={**proof.resource_counts, "InsurancePlan": 999})
+    async with importer.db.acquire() as connection:
+        with pytest.raises(RuntimeError, match="provider_directory_uhc_canonical_relationship_counts_inconsistent"):
+            await importer._endpoint_dataset_source_summary_metadata(
+                connection, candidate, inconsistent_proof, {}, importer.ENDPOINT_DATASET_VALIDATED
+            )
+    assert (await importer._endpoint_dataset_state(candidate.dataset_id))[
+        "status"
+    ] == importer.ENDPOINT_DATASET_ACQUIRING
+
+
+async def _validate_native_uhc_candidate(candidate, proof, stage):
+    """Close the actual candidate before probing its immutable publication gate."""
+    finalization = await importer._finalize_endpoint_dataset_candidate(
+        candidate, importer._uhc_resource_diagnostics(stage.resource_counts)
+    )
+    assert finalization["validated"] is True
+    with pytest.raises(GenericCandidateError, match="header_sealed"):
+        await importer._replace_uhc_candidate_resources(candidate, stage)
+    return importer.ProviderDirectoryArtifactDataset(
+        source_id=UHC_RETAINED_SOURCE_ID,
+        endpoint_id=candidate.endpoint_id,
+        dataset_id=candidate.dataset_id,
+        evidence_run_id=candidate.acquisition_root_run_id,
+        selected_resources=tuple(candidate.selected_resources),
+        expected_resources=tuple(candidate.expected_resources),
+        recorded_expected_resources=tuple(candidate.expected_resources),
+        previous_dataset_id=candidate.previous_dataset_id,
+        expected_incumbent_dataset_id=candidate.previous_dataset_id,
+        status="validated",
+        is_current=False,
+        promote_on_cutover=True,
+        dataset_hash=proof.dataset_hash,
+        resource_count=proof.resource_count,
+    )
 
 
 @pytest.mark.asyncio

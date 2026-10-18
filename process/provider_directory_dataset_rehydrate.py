@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 from typing import Any
 
 from process.provider_directory_dataset_rehydrate_payload import _validate_payload
@@ -27,7 +28,6 @@ from process.provider_directory_dataset_rehydrate_store import (
 )
 from process.provider_directory_dataset_rehydrate_types import (
     DATASET_RESOURCE_TABLE,
-    DEFAULT_BATCH_SIZE,
     MAX_BATCH_SIZE,
     DatasetRehydrationError,
     DatasetScope,
@@ -41,6 +41,9 @@ from process.provider_directory_dataset_rehydrate_types import (
     _run_cancel_check,
     _table_ref,
 )
+from process.provider_directory_dataset_rehydrate_types import (
+    DEFAULT_BATCH_SIZE as DEFAULT_BATCH_SIZE,
+)
 
 
 async def rehydrate_current_dataset(
@@ -51,9 +54,7 @@ async def rehydrate_current_dataset(
     _validate_request(request)
     async with _dataset_guard(runtime, request):
         dataset_scope = await _load_dataset_scope(runtime, request)
-        selected_resource_types = _selected_resource_types(
-            runtime, request, dataset_scope
-        )
+        selected_resource_types = _selected_resource_types(runtime, request, dataset_scope)
         digest_before = await _verify_dataset_digest(runtime, dataset_scope)
         summary_by_resource = await _rehydrate_selected_resources(
             runtime, request, dataset_scope, selected_resource_types
@@ -86,9 +87,7 @@ async def _rehydrate_selected_resources(
     """Process selected resource types serially under the dataset guard."""
     summary_by_resource: dict[str, dict[str, Any]] = {}
     for resource_type in selected_resource_types:
-        resource_context = await _resource_context(
-            runtime, request, scope, resource_type
-        )
+        resource_context = await _resource_context(runtime, request, scope, resource_type)
         summary_by_resource[resource_type] = await _rehydrate_resource(resource_context)
     return summary_by_resource
 
@@ -144,9 +143,7 @@ async def _prepare_checkpoint(
         and stored_checkpoint.state == "complete"
         and _is_proof_complete(stored_checkpoint, resource_proof)
     ):
-        return stored_checkpoint, _resource_summary(
-            stored_checkpoint, resource_proof, reused=True
-        )
+        return stored_checkpoint, _resource_summary(stored_checkpoint, resource_proof, reused=True)
     resumable_checkpoint = await _resumable_checkpoint(context, stored_checkpoint)
     await _save_checkpoint(context, resumable_checkpoint)
     return resumable_checkpoint, None
@@ -204,9 +201,7 @@ async def _process_resource_batches(
         current_checkpoint = await _process_one_batch(context, current_checkpoint)
         await _report_progress(context, current_checkpoint)
         if current_checkpoint.state == "rejected":
-            raise DatasetRehydrationError(
-                "provider_directory_dataset_rehydrate_payload_rejected"
-            )
+            raise DatasetRehydrationError("provider_directory_dataset_rehydrate_payload_rejected")
     return current_checkpoint
 
 
@@ -216,9 +211,7 @@ async def _process_one_batch(
 ) -> RehydrationCheckpoint:
     """Write rows and checkpoint progress in one database transaction."""
     async with context.runtime.database.transaction():
-        await _assert_scope_unchanged(
-            context.runtime, context.request, context.scope, lock=True
-        )
+        await _assert_scope_unchanged(context.runtime, context.request, context.scope, lock=True)
         retained_records = await _read_retained_batch(context, checkpoint)
         retained_batch = _map_retained_batch(
             context.model,
@@ -226,9 +219,7 @@ async def _process_one_batch(
             context.scope,
             context.resource_type,
         )
-        next_checkpoint = _advance_checkpoint(
-            checkpoint, retained_batch, mapped_count=0
-        )
+        next_checkpoint = _advance_checkpoint(checkpoint, retained_batch, mapped_count=0)
         if retained_batch.rejection_reasons:
             await _save_checkpoint(context, next_checkpoint)
             return next_checkpoint
@@ -238,16 +229,12 @@ async def _process_one_batch(
             context.scope,
         )
         if mapped_count != len(retained_batch.typed_rows):
-            raise DatasetRehydrationError(
-                "provider_directory_dataset_rehydrate_upsert_count_mismatch"
-            )
+            raise DatasetRehydrationError("provider_directory_dataset_rehydrate_upsert_count_mismatch")
         await _sync_canonical_payload_hashes(
             context,
             retained_batch.typed_rows,
         )
-        next_checkpoint = _advance_checkpoint(
-            checkpoint, retained_batch, mapped_count=mapped_count
-        )
+        next_checkpoint = _advance_checkpoint(checkpoint, retained_batch, mapped_count=mapped_count)
         await _save_checkpoint(context, next_checkpoint)
     return next_checkpoint
 
@@ -276,9 +263,7 @@ async def _read_retained_batch(
         **query_params_by_name,
     )
     if not retained_records:
-        raise DatasetRehydrationError(
-            "provider_directory_dataset_rehydrate_input_ended_early"
-        )
+        raise DatasetRehydrationError("provider_directory_dataset_rehydrate_input_ended_early")
     return retained_records
 
 
@@ -303,9 +288,7 @@ def _map_retained_batch(
             mapped_payload,
             resource_hash_contract=scope.resource_hash_contract,
             resource_type=resource_type,
-            acquired_resource_sha256=retained_fields.get(
-                "acquired_resource_sha256"
-            ),
+            acquired_resource_sha256=retained_fields.get("acquired_resource_sha256"),
         )
         if rejection_reason:
             rejection_reasons.append(rejection_reason)
@@ -319,9 +302,7 @@ def _map_retained_batch(
                 "updated_at": scope.published_at,
             }
         )
-    last_resource_id = _clean_text(
-        _record_fields(retained_records[-1]).get("resource_id")
-    )
+    last_resource_id = _clean_text(_record_fields(retained_records[-1]).get("resource_id"))
     return RetainedBatch(
         typed_rows=typed_rows,
         rejection_reasons=tuple(rejection_reasons),
@@ -338,14 +319,17 @@ def _advance_checkpoint(
 ) -> RehydrationCheckpoint:
     """Return progress advanced through one retained batch."""
     rejection_count = len(retained_batch.rejection_reasons)
-    evidence_by_name = (
-        {
-            "rejection_reasons": sorted(set(retained_batch.rejection_reasons)),
-            "rejected_in_batch": rejection_count,
-        }
-        if rejection_count
-        else {}
-    )
+    evidence_by_name = {
+        **checkpoint.evidence_by_name,
+        **(
+            {
+                "rejection_reasons": sorted(set(retained_batch.rejection_reasons)),
+                "rejected_in_batch": rejection_count,
+            }
+            if rejection_count
+            else {}
+        ),
+    }
     return RehydrationCheckpoint(
         state="rejected" if rejection_count else "running",
         last_resource_id=retained_batch.last_resource_id,
@@ -363,25 +347,17 @@ async def _finalize_resource(
 ) -> dict[str, Any]:
     """Persist complete state only after independent exact-membership proof."""
     async with context.runtime.database.transaction():
-        await _assert_scope_unchanged(
-            context.runtime, context.request, context.scope, lock=True
-        )
+        await _assert_scope_unchanged(context.runtime, context.request, context.scope, lock=True)
         resource_proof = await _load_resource_proof(context)
-        final_state = (
-            "complete"
-            if _is_proof_complete(checkpoint, resource_proof)
-            else "proof_failed"
-        )
+        final_state = "complete" if _is_proof_complete(checkpoint, resource_proof) else "proof_failed"
         final_checkpoint = dataclasses.replace(
             checkpoint,
             state=final_state,
-            evidence_by_name={"proof": resource_proof.as_dict()},
+            evidence_by_name={**checkpoint.evidence_by_name, "proof": resource_proof.as_dict()},
         )
         await _save_checkpoint(context, final_checkpoint)
     if final_state != "complete":
-        raise DatasetRehydrationError(
-            "provider_directory_dataset_rehydrate_proof_failed"
-        )
+        raise DatasetRehydrationError("provider_directory_dataset_rehydrate_proof_failed")
     return _resource_summary(final_checkpoint, resource_proof, reused=False)
 
 
@@ -414,9 +390,7 @@ async def _assert_scope_unchanged(
     """Reject changes to any immutable dataset fence value."""
     current_scope = await _load_dataset_scope(runtime, request, lock=lock)
     if current_scope.fence_identity != expected_scope.fence_identity:
-        raise DatasetRehydrationError(
-            "provider_directory_dataset_rehydrate_scope_changed"
-        )
+        raise DatasetRehydrationError("provider_directory_dataset_rehydrate_scope_changed")
 
 
 async def _report_progress(
@@ -432,8 +406,230 @@ async def _report_progress(
             "unit": "rows",
             "done": checkpoint.input_count,
             "total": context.expected_count,
-            "pct": round(
-                100 * checkpoint.input_count / max(context.expected_count, 1), 2
-            ),
+            "pct": round(100 * checkpoint.input_count / max(context.expected_count, 1), 2),
         }
     )
+
+
+async def _verify_pinned_rehydration_digest(directory, runtime, pinned):
+    """Hash only the issued immutable child, without mutable parent routing."""
+    from process.provider_directory_dataset_rehydrate_scope import _append_digest_rows
+    from process.provider_directory_dataset_rehydrate_types import _run_cancel_check
+
+    digest = hashlib.sha256()
+    cursor, processed = None, 0
+    while True:
+        await _run_cancel_check(runtime)
+        digest_rows = await pinned.reader.all(
+            f"SELECT resource_type, resource_id, payload_hash FROM {pinned.source_relation(directory)} "
+            "WHERE dataset_id=:dataset_id AND resource_type NOT LIKE 'LU:%:pass:%' "
+            "AND (CAST(:after_type AS varchar) IS NULL OR (resource_type,resource_id)>(:after_type,:after_id)) "
+            "ORDER BY resource_type,resource_id LIMIT 10000",
+            dataset_id=pinned.scope.dataset_id,
+            after_type=cursor[0] if cursor else None,
+            after_id=cursor[1] if cursor else None,
+        )
+        if not digest_rows:
+            break
+        processed, cursor = _append_digest_rows(digest, digest_rows, processed)
+        if len(digest_rows) < 10000:
+            break
+    if processed != pinned.scope.resource_count or digest.hexdigest() != pinned.scope.dataset_hash:
+        raise RuntimeError("provider_directory_dataset_rehydrate_dataset_hash_mismatch")
+    return digest.hexdigest()
+
+
+async def _validate_rehydration_input(directory, runtime, request, pinned, resources):
+    """Verify the original digest and selected payloads on the pinned Reader."""
+    from process.provider_directory_dataset_rehydrate_types import _run_cancel_check
+
+    digest = await directory._verify_pinned_rehydration_digest(runtime, pinned)
+    resource_counts = []
+    for resource in resources:
+        cursor, count = None, 0
+        while True:
+            await _run_cancel_check(runtime)
+            retained_rows = await pinned.reader.all(
+                f"SELECT resource_id,payload_hash,payload_json,acquired_resource_sha256 "
+                f"FROM {pinned.source_relation(directory)} "
+                "WHERE dataset_id=:dataset_id AND resource_type=:resource_type "
+                "AND (CAST(:cursor AS varchar) IS NULL OR resource_id>:cursor) ORDER BY resource_id LIMIT :batch_size",
+                dataset_id=request.dataset_id,
+                resource_type=resource,
+                cursor=cursor,
+                batch_size=min(request.batch_size, 5000),
+            )
+            if not retained_rows:
+                break
+            batch = _map_retained_batch(runtime.models_by_type[resource], retained_rows, pinned.scope, resource)
+            if batch.rejection_reasons:
+                raise RuntimeError("provider_directory_dataset_rehydrate_payload_rejected")
+            count += batch.input_count
+            cursor = batch.last_resource_id
+        resource_counts.append((resource, count))
+    return digest, tuple(resource_counts)
+
+
+async def _rehydration_completed_generation(directory, journal, pinned):
+    """Read complete, agreeing checkpoint evidence without writing checkpoint rows."""
+    from process import provider_directory_dataset_rehydrate_journal as protocol
+    from process import provider_directory_dataset_rehydrate_store as store
+    from process.provider_directory_dataset_rehydrate_types import ResourceContext
+    from process.provider_directory_generic_source_policy import source_transaction
+
+    histories = []
+    async with source_transaction(directory.db):
+        for resource, expected in journal.expected_by_resource:
+            context = ResourceContext(
+                journal.runtime,
+                journal.request,
+                pinned.scope,
+                resource,
+                directory.RESOURCE_MODELS_BY_TYPE[resource],
+                expected,
+            )
+            checkpoint = await store._load_checkpoint(context)
+            if checkpoint is None or checkpoint.state != "complete":
+                return None
+            proof = await store._load_pinned_resource_proof(context, pinned, directory)
+            if checkpoint.expected_count != expected or not store._is_proof_complete(checkpoint, proof):
+                return None
+            observed = protocol.output_journal(checkpoint.evidence_by_name)
+            histories.append(observed)
+    return protocol.merge_completed_histories(histories) if histories else None
+
+
+async def _is_rehydration_output_replay_valid(directory, journal, pinned, operation):
+    """Reuse a complete installed cut with one bounded native catalog transaction."""
+    from db.plan_release_storage import storage_relation
+    from process import provider_directory_dataset_rehydrate_prepare as preparation
+    from process import provider_directory_output_snapshot_custody as custody
+    from process.provider_directory_output_snapshot_retention import RetainedOutputReceipt
+
+    history = await directory._rehydration_completed_generation(journal, pinned)
+    if history is None or history["active"] is not None:
+        return False
+    output_targets = preparation._targets(directory, journal.members)
+    desired_operation_by_field = {**operation, "run_id": None}
+    async with custody.output_snapshot_transaction(directory, operation=operation, targets=output_targets) as cap:
+        installed = await custody._capture(cap, {target_name: target_name for target_name in output_targets})
+        for generation in history["generations"].values():
+            intent = generation["operation"]
+            if (
+                generation["published"] is None
+                or intent["kind"] != "rehydrate"
+                or {**intent, "run_id": None} != desired_operation_by_field
+                or generation["members"] != list(journal.members)
+            ):
+                continue
+            receipts = tuple(
+                RetainedOutputReceipt.from_payload(receipt_payload) for receipt_payload in generation["published"]
+            )
+            if tuple(receipt.target for receipt in receipts) != output_targets:
+                raise RuntimeError("provider_directory_dataset_rehydrate_output_set_changed")
+            if any(installed[receipt.target].oid != receipt.new_oid for receipt in receipts):
+                continue
+            target_by_relation = {
+                proof.relation: proof.target for receipt in receipts for proof in (receipt.incumbent, receipt.successor)
+            }
+            await cap.connection.execute(
+                "LOCK TABLE "
+                + ",".join(storage_relation(journal.runtime.schema, name) for name in sorted(target_by_relation))
+                + " IN ACCESS SHARE MODE NOWAIT"
+            )
+            actual = await custody._capture(cap, target_by_relation)
+            if any(
+                actual[proof.relation] != proof
+                for receipt in receipts
+                for proof in (receipt.incumbent, receipt.successor)
+            ):
+                raise RuntimeError("provider_directory_dataset_rehydrate_native_receipt_changed")
+            return True
+    return False
+
+
+async def _rehydrate_prepared_dataset(directory, runtime, request):
+    """Prepare isolated outputs and atomically publish their proofs and checkpoints."""
+    from process import provider_directory_dataset_rehydrate_prepare as preparation
+    from process import provider_directory_dataset_rehydrate_scope as scope_store
+    from process.provider_directory_cms_preparation import desired_fence_hash
+    from process.provider_directory_dataset_rehydrate_journal_store import (
+        CheckpointOutputJournal,
+        preparation_operation,
+        verify_retry_predecessor,
+    )
+    from process.provider_directory_dataset_rehydrate_pin import pinned_current_source
+    from process.provider_directory_dataset_rehydrate_publish import publish_prepared_rehydration
+    from process.provider_directory_dataset_rehydrate_report import _execution_summary
+
+    _validate_request(request)
+    predecessor = await verify_retry_predecessor(runtime, request)
+    async with scope_store._dataset_guard(runtime, request):
+        async with pinned_current_source(runtime, request, directory=directory) as pinned:
+            resources = tuple(sorted(scope_store._selected_resource_types(runtime, request, pinned.scope)))
+            digest, expected = await directory._validate_rehydration_input(runtime, request, pinned, resources)
+            journal = CheckpointOutputJournal(runtime, request, pinned.scope, expected, predecessor)
+            fence = await directory._resolve_provider_directory_artifact_datasets([request.source_id])
+            operation_by_field = dict(
+                kind="rehydrate",
+                run_id=request.owner_run_id,
+                producer="provider-directory-fhir",
+                source_pins=[preparation._source_pin(pinned.scope)],
+                resource_types=list(resources),
+                source_fence_digest=desired_fence_hash(fence),
+            )
+            reused = await directory._is_rehydration_output_replay_valid(journal, pinned, operation_by_field)
+            if not reused:
+                operation_by_field = await preparation_operation(
+                    journal, operation_by_field, preparation._targets(directory, resources)
+                )
+                async with preparation.prepared_compatibility_outputs(
+                    directory, pinned, operation_by_field, checkpoint_journal=journal
+                ) as prepared:
+                    await publish_prepared_rehydration(
+                        directory,
+                        pinned,
+                        operation_by_field,
+                        prepared,
+                        checkpoint_journal=journal,
+                        fence=fence,
+                        artifact_bundle=directory.ProviderDirectoryArtifactBundle(),
+                    )
+            digest_after = await directory._verify_pinned_rehydration_digest(runtime, pinned)
+            summaries = await directory._rehydration_output_summaries(journal, pinned, reused)
+            return _execution_summary(request, pinned.scope, summaries, digest, digest_after)
+
+
+async def _rehydration_output_summaries(directory, journal, pinned, reused):
+    """Recheck completed output proofs before emitting the existing result contract."""
+    from process import provider_directory_dataset_rehydrate_pin as source_pin
+    from process import provider_directory_dataset_rehydrate_store as store
+    from process.provider_directory_dataset_rehydrate_report import _resource_summary
+    from process.provider_directory_dataset_rehydrate_types import ResourceContext
+    from process.provider_directory_generic_source_policy import source_transaction
+
+    summary_by_resource = {}
+    async with source_transaction(directory.db):
+        fresh, _, binding = await source_pin._capture_source(journal.runtime, journal.request)
+        if fresh != pinned.scope or binding != pinned.binding(directory):
+            raise RuntimeError("provider_directory_dataset_rehydrate_source_binding_changed")
+        for resource, expected in journal.expected_by_resource:
+            context = ResourceContext(
+                journal.runtime,
+                journal.request,
+                pinned.scope,
+                resource,
+                directory.RESOURCE_MODELS_BY_TYPE[resource],
+                expected,
+            )
+            checkpoint = await store._load_checkpoint(context)
+            proof = await store._load_pinned_resource_proof(context, pinned, directory)
+            if (
+                checkpoint is None
+                or checkpoint.state != "complete"
+                or checkpoint.expected_count != expected
+                or not store._is_proof_complete(checkpoint, proof)
+            ):
+                raise RuntimeError("provider_directory_dataset_rehydrate_proof_incomplete")
+            summary_by_resource[resource] = _resource_summary(checkpoint, proof, reused=reused)
+    return summary_by_resource

@@ -26,9 +26,11 @@ from db.connection import Database
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
 from process.entity_address_cutover_contract import _ServingRelationLockTimeout, wait_for_publication_lock
+from tests.cms_doctors_component_postgres_support import doctors_component_source
 from tests.cms_doctors_preparation_postgres_support import doctors_snapshot, pending_publisher_locks
-from tests.provider_profile_snapshot_postgres_support import profile_reader
+from tests.cms_native_inputs_postgres_support import source_header_models
 from tests.reference_family_generation_fixture import install_source_generation_guards, native_reference_source
+from tests.test_cms_doctors_retained_export_postgres import _retained_sessions
 
 _CMS_REVISION = "20260920100000_cms_doctors_result_generation"
 _GROUP_REVISION = "20260929000000_cms_doctor_group_site"
@@ -139,9 +141,49 @@ async def _create_source(session, schema, *, has_adrs_index=True):
             "VALUES (1,1000000004,'0012345678','site-1','source-digest','{}',CURRENT_TIMESTAMP)"
         )
     )
-    return await generation.publish_local_reference_family_generation(
-        session, importer_id="cms-doctors", schema_name=schema
+    await _create_archive_receipt_control(session, schema)
+    return await generation.read_reference_family_result_generation_authority(
+        session,
+        importer_id="cms-doctors",
+        schema_name=schema,
     )
+
+
+async def _create_archive_receipt_control(session, schema):
+    path = next((Path(__file__).resolve().parents[1] / "alembic/versions").glob("20260930100000*.py"))
+    spec = importlib.util.spec_from_file_location("archive_component_receipt", path)
+    receipt = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(receipt)
+
+    def create(connection):
+        with Operations.context(MigrationContext.configure(connection)):
+            receipt._create_table('"' + schema + '"')
+
+    await (await session.connection()).run_sync(create)
+
+
+@asynccontextmanager
+async def _archive_source(engine, schema, monkeypatch, *, has_adrs_index=True):
+    """Qualify native source3 component custody before the first real publication."""
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with sessions() as session, session.begin():
+        cold = await _create_source(session, schema, has_adrs_index=has_adrs_index)
+        assert cold.local_generation == 0 and cold.serving_generation is None
+        if not has_adrs_index:
+            # Finish the known importer index before initial publication; no reader
+            # or portable historical origin is invented for these cold test heaps.
+            await archive._require_legacy_cms_group_schema(session, schema)
+            await session.execute(
+                text(f'CREATE INDEX cms_doctor_group_site_idx_adrs ON "{schema}".cms_doctor_group_site (adrs_id)')
+            )
+    async with doctors_component_source(engine, schema, monkeypatch) as component:
+        async with component.database.transaction() as session:
+            connection = await session.connection()
+            for table in source_header_models(schema):
+                await connection.run_sync(lambda sync: table.create(sync, checkfirst=False))
+        async with _retained_sessions(component) as sessions:
+            component.retained_sessions = sessions
+            yield component
 
 
 async def _command(*args):
@@ -174,8 +216,9 @@ async def _restore_native_dump(url, path):
     )
 
 
-async def _roundtrip(sessions, prepared, url, path, custody):
-    """Export and restore the complete current family, then verify its rows."""
+async def _restore_retained_archive(sessions, prepared, path, custody, component):
+    """Dump the retained Owner's exact snapshot, then restore a fresh SOURCE-owned stage."""
+    url = sessions.kw["bind"].url
 
     async def dump(capture):
         await _command(
@@ -193,32 +236,35 @@ async def _roundtrip(sessions, prepared, url, path, custody):
             str(path),
         )
 
-    original_manifest = archive._canonical_json(prepared.manifest.as_dict())
     await archive.export_prepared_reference_family_archive(
         sessions, prepared=prepared, archive_copy=dump, verify_custody=custody.verify
     )
+    async with sessions() as session, session.begin():
+        await custody.retire(session, prepared.ownership)
+    async with component.database.transaction() as session:
+        restored = await archive.precreate_reference_family_restore(
+            session, importer_id="cms-doctors", dataset_id=prepared.ownership.dataset_id
+        )
+    await _restore_native_dump(component.database.engine.url, path)
+    async with component.database.transaction() as session:
+        await archive.complete_reference_family_restore(session, restored)
+        await archive.validate_reference_family_stage(session, ownership=restored, manifest=prepared.manifest.as_dict())
+        owner_oid = await archive.model_family_publisher_owner(session, "cms-doctors")
+        await _seal_restored_family(session, restored, owner_oid)
+    return restored
+
+
+async def _roundtrip(sessions, prepared, path, custody, component):
+    """Export and restore the complete current family, then verify its rows."""
+    original_manifest = archive._canonical_json(prepared.manifest.as_dict())
+    restored = await _restore_retained_archive(sessions, prepared, path, custody, component)
     original_dump = path.read_bytes()
     listing = await _command("pg_restore", "--list", str(path))
     assert all(
-        name in listing
-        for name in (
-            "doctor_clinician_address",
-            "cms_doctor_education",
-            "cms_doctor_group_site",
-        )
+        name in listing for name in ("doctor_clinician_address", "cms_doctor_education", "cms_doctor_group_site")
     )
     assert "address_archive" not in listing
-    async with sessions() as session, session.begin():
-        await custody.retire(session, prepared.ownership)
-        restored = await archive.precreate_reference_family_restore(
-            session,
-            importer_id="cms-doctors",
-            dataset_id=prepared.ownership.dataset_id,
-        )
-    await _restore_native_dump(url, path)
-    async with sessions() as session, session.begin():
-        await archive.complete_reference_family_restore(session, restored)
-        await archive.validate_reference_family_stage(session, ownership=restored, manifest=prepared.manifest.as_dict())
+    async with component.database.transaction() as session:
         await _assert_clinician_restored_rows(session, restored)
         await _assert_group_index_tampering(session, restored, prepared.manifest)
         await _assert_restored_activation(session, restored, prepared.manifest)
@@ -278,8 +324,9 @@ async def _assert_restored_activation(session, ownership, manifest):
     """Exercise both cutover paths without retaining their disposable predecessors."""
     schema = os.environ["HLTHPRT_DB_SCHEMA"]
     incumbent = await archive.capture_reference_family_incumbent(session, importer_id="cms-doctors", schema_name=schema)
-    owner_oid = await session.scalar(text("SELECT oid FROM pg_roles WHERE rolname=current_user"))
+    owner_oid = await archive.model_family_publisher_owner(session, "cms-doctors")
     package_id = hashlib.sha256(archive._canonical_json(manifest.as_dict())).hexdigest()
+    await _seal_restored_family(session, ownership, owner_oid)
     validation = await archive.prepare_reference_family_activation(
         session,
         ownership=ownership,
@@ -328,6 +375,12 @@ async def _assert_restored_activation(session, ownership, manifest):
             await savepoint.rollback()
 
 
+async def _seal_restored_family(session, ownership, owner_oid):
+    owner = await session.scalar(text("SELECT pg_get_userbyid(:oid)"), {"oid": owner_oid})
+    await session.execute(text(f'ALTER SCHEMA "{ownership.schema_name}" OWNER TO ' + archive._quoted(owner)))
+    await archive.seal_model_family_storage(session, ownership, owner_oid)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("has_adrs_index", [False, True])
 async def test_clinician_migration_and_native_archive_are_one_closed_generation(monkeypatch, tmp_path, has_adrs_index):
@@ -342,11 +395,14 @@ async def test_clinician_migration_and_native_archive_are_one_closed_generation(
     cleanup = AsyncExitStack()
     cleanup.push_async_callback(engine.dispose)
     try:
-        custody = await cleanup.enter_async_context(native_reference_source(sessions))
         cleanup.push_async_callback(_drop_test_schemas, engine, (stage_schema, schema))
-        async with sessions() as session, session.begin():
-            authority = await _create_source(session, schema, has_adrs_index=has_adrs_index)
-        async with sessions() as session, session.begin():
+        component = await cleanup.enter_async_context(
+            _archive_source(engine, schema, monkeypatch, has_adrs_index=has_adrs_index)
+        )
+        sessions = component.retained_sessions
+        custody = await cleanup.enter_async_context(native_reference_source(sessions, owner=component.retention_owner))
+        authority = component.authority
+        async with async_sessionmaker(component.admin_engine)() as session, session.begin():
             with pytest.raises(RuntimeError, match="evidence prevents downgrade"):
                 await _migration(session, _CMS_REVISION, "downgrade")
 
@@ -376,7 +432,7 @@ async def test_clinician_migration_and_native_archive_are_one_closed_generation(
             "cms_doctor_group_site",
             "doctor_clinician_address",
         )
-        await _roundtrip(sessions, prepared, url, tmp_path / "clinician.dump", custody)
+        await _roundtrip(sessions, prepared, tmp_path / "clinician.dump", custody, component)
     finally:
         await cleanup.aclose()
 
@@ -435,12 +491,11 @@ async def test_group_migration_advances_existing_two_relation_generation(monkeyp
         await engine.dispose()
 
 
-async def _export_legacy_package(sessions, schema, dataset_id, url, tmp_path):
+async def _export_legacy_package(sessions, schema, dataset_id, url, tmp_path, authority):
     """Build a synthetic historical package and retain its exact received bytes."""
     stage_schema = archive.reference_family_stage_schema(dataset_id)
     legacy_spec = archive.ReferenceFamilySpec("cms-doctors", (models.DoctorClinicianAddress, models.CMSDoctorEducation))
     async with sessions() as session, session.begin():
-        authority = await _create_source(session, schema)
         await archive._create_model_family(session, legacy_spec, stage_schema)
         for table_name in legacy_spec.table_names:
             await session.execute(
@@ -476,18 +531,19 @@ async def _export_legacy_package(sessions, schema, dataset_id, url, tmp_path):
     return manifest, authority, original_bytes_by_path
 
 
-async def _restore_legacy_stage(sessions, dataset_id, url, dump_path, *, has_adrs_index=True):
+async def _restore_legacy_stage(sessions, component, dataset_id, dump_path, *, has_adrs_index=True):
     """Replace the synthetic exported stage with the current three-table restore stage."""
     stage_schema = archive.reference_family_stage_schema(dataset_id)
     async with sessions() as session, session.begin():
         await session.execute(text(f'DROP SCHEMA "{stage_schema}" CASCADE'))
+    async with component.database.transaction() as session:
         ownership = await archive.precreate_reference_family_restore(
             session,
             importer_id="cms-doctors",
             dataset_id=dataset_id,
         )
-    await _restore_native_dump(url, dump_path)
-    async with sessions() as session, session.begin():
+    await _restore_native_dump(component.database.engine.url, dump_path)
+    async with component.database.transaction() as session:
         await archive.complete_reference_family_restore(session, ownership)
         if not has_adrs_index:
             await session.execute(text(f"DROP INDEX {_group_address_index(stage_schema)}"))
@@ -521,8 +577,9 @@ async def _assert_legacy_tampering(session, ownership, manifest, schema):
 
 async def _prepare_legacy_cutover(session, ownership, manifest, schema, authority):
     """Bind all three stage receipts to the original manifest and reject automatic activation."""
-    owner_oid = await session.scalar(text("SELECT oid FROM pg_roles WHERE rolname=current_user"))
+    owner_oid = await archive.model_family_publisher_owner(session, "cms-doctors")
     package_id = hashlib.sha256(json.dumps(manifest.as_dict(), indent=2).encode()).hexdigest()
+    await _seal_restored_family(session, ownership, owner_oid)
     validation = await archive.prepare_reference_family_activation(
         session,
         ownership=ownership,
@@ -605,6 +662,16 @@ async def _exercise_legacy_activation(session, ownership, manifest, schema, auth
     """Exercise schema guards, frozen-stage proof, rollback and the selected manual cutover path."""
     await archive.validate_reference_family_stage(session, ownership=ownership, manifest=manifest)
     await _assert_legacy_tampering(session, ownership, manifest, schema)
+    if not await session.scalar(
+        text("SELECT to_regclass(:index)"), {"index": _group_address_index(ownership.schema_name)}
+    ):
+        await archive._require_legacy_cms_group_schema(session, ownership.schema_name)
+        await session.execute(
+            text(
+                f"CREATE INDEX {_group_address_index(ownership.schema_name).partition('.')[2]} "
+                f'ON "{ownership.schema_name}".cms_doctor_group_site (adrs_id)'
+            )
+        )
     validation, incumbent, cutover = await _prepare_legacy_cutover(session, ownership, manifest, schema, authority)
 
     async def activate():
@@ -657,18 +724,21 @@ async def test_legacy_two_table_package_restores_manually_as_three_tables(
     monkeypatch.delenv("DB_SCHEMA", raising=False)
     engine = create_async_engine(url)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
+    cleanup = AsyncExitStack()
     try:
+        component = await cleanup.enter_async_context(_archive_source(engine, schema, monkeypatch))
         manifest, authority, original_bytes_by_path = await _export_legacy_package(
             sessions,
             schema,
             dataset_id,
             url,
             tmp_path,
+            component.authority,
         )
         ownership = await _restore_legacy_stage(
-            sessions, dataset_id, url, tmp_path / "legacy.dump", has_adrs_index=has_adrs_index
+            sessions, component, dataset_id, tmp_path / "legacy.dump", has_adrs_index=has_adrs_index
         )
-        async with sessions() as session, session.begin():
+        async with component.database.transaction() as session:
             predecessor = await _exercise_legacy_activation(
                 session,
                 ownership,
@@ -681,13 +751,14 @@ async def test_legacy_two_table_package_restores_manually_as_three_tables(
         for archive_path, original_bytes in original_bytes_by_path.items():
             assert archive_path.read_bytes() == original_bytes
     finally:
+        await cleanup.aclose()
         await _drop_test_schemas(engine, (stage_schema, schema, predecessor))
         await engine.dispose()
 
 
-async def _prepare_readable_archive(fixture, dataset_id, custody):
+async def _prepare_readable_archive(fixture, dataset_id, custody, tmp_path):
     """Clone and validate a complete real family before any reader starts."""
-    sessions = fixture.database.session_factory
+    sessions = fixture.component.retained_sessions
 
     async def retain(session, prepared):
         assert prepared.ownership.dataset_id == dataset_id
@@ -710,25 +781,27 @@ async def _prepare_readable_archive(fixture, dataset_id, custody):
         source_copy=custody.source_copy,
         on_precreated=custody.precreate,
     )
-    async with sessions() as session, session.begin():
-        await custody.verify(session, prepared)
+    restored = await _restore_retained_archive(
+        sessions, prepared, tmp_path / "readable.dump", custody, fixture.component
+    )
+    async with fixture.database.transaction() as session:
         incumbent = await archive.capture_reference_family_incumbent(
             session,
             importer_id="cms-doctors",
             schema_name=fixture.schema,
         )
-        owner_oid = await session.scalar(text("SELECT CAST(:owner AS regrole)::oid"), {"owner": custody.owner})
+        owner_oid = await archive.model_family_publisher_owner(session, "cms-doctors")
         package_id = hashlib.sha256(archive._canonical_json(prepared.manifest.as_dict())).hexdigest()
         validation = await archive.prepare_reference_family_activation(
             session,
-            ownership=prepared.ownership,
+            ownership=restored,
             manifest=prepared.manifest,
             package_id=package_id,
             profile_contract=archive.CONTRACT,
             sealed_owner_oid=owner_oid,
         )
     return {
-        "ownership": prepared.ownership,
+        "ownership": restored,
         "manifest": prepared.manifest,
         "expected_incumbent": incumbent,
         "validation_receipt": validation,
@@ -744,16 +817,31 @@ async def _prepare_readable_archive(fixture, dataset_id, custody):
 
 
 @asynccontextmanager
-async def _readable_archive(fixture, dataset_id, monkeypatch):
-    """Create the source before Reader admission, then retire every Reader-granted heap first."""
+async def _readable_archive(fixture, dataset_id, monkeypatch, tmp_path):
+    """Use the genuine component Publisher and pinned read-only login for archive cuts."""
     async with AsyncExitStack() as cleanup:
         cleanup.push_async_callback(_drop_test_schemas, fixture.engine, (fixture.schema,))
-        async with fixture.database.session_factory() as session, session.begin():
-            await _create_source(session, fixture.schema)
-        await cleanup.enter_async_context(profile_reader(fixture.database, fixture.schema, monkeypatch))
-        reader_role = fixture.database._reader_database._reader_login[0]
+        component = await cleanup.enter_async_context(_archive_source(fixture.engine, fixture.schema, monkeypatch))
+        fixture.database = component.database
+        fixture.component = component
+        url = fixture.engine.url
+        for name, setting_value in {
+            "HOST": url.host,
+            "PORT": url.port,
+            "DATABASE": url.database,
+            "USER": component.publisher,
+            "PASSWORD": url.password or "",
+            "READER_USER": component.reader,
+            "READER_PASSWORD": url.password or "",
+        }.items():
+            monkeypatch.setenv("HLTHPRT_DB_" + name, str(setting_value))
+        await fixture.database._connect_reader()
         custody = await cleanup.enter_async_context(
-            native_reference_source(fixture.database.session_factory, readers=(reader_role,))
+            native_reference_source(
+                component.retained_sessions,
+                readers=(component.reader,),
+                owner=component.retention_owner,
+            )
         )
         cleanup.push_async_callback(_drop_readable_serving_tables, fixture.engine, fixture.schema)
         cleanup.push_async_callback(
@@ -764,7 +852,7 @@ async def _readable_archive(fixture, dataset_id, monkeypatch):
                 archive.reference_family_predecessor_schema(dataset_id),
             ),
         )
-        yield await _prepare_readable_archive(fixture, dataset_id, custody)
+        yield await _prepare_readable_archive(fixture, dataset_id, custody, tmp_path)
 
 
 async def _drop_readable_serving_tables(engine, schema):
@@ -786,7 +874,7 @@ async def _activate_readable_archive(fixture, activation_by_field, is_validated)
         )
 
 
-async def test_validated_archive_completes_with_continuous_snapshot_readers(monkeypatch):
+async def test_validated_archive_completes_with_continuous_snapshot_readers(monkeypatch, tmp_path):
     """Prepared metadata-only adoption drains real readers without changing caller ownership."""
     schema, dataset_id = "cms_reader_" + uuid4().hex, uuid4()
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
@@ -811,7 +899,9 @@ async def test_validated_archive_completes_with_continuous_snapshot_readers(monk
             entered.set()
 
     try:
-        activation_by_field = await cleanup.enter_async_context(_readable_archive(fixture, dataset_id, monkeypatch))
+        activation_by_field = await cleanup.enter_async_context(
+            _readable_archive(fixture, dataset_id, monkeypatch, tmp_path)
+        )
         incumbent = await doctors_snapshot(fixture)
         tasks = [asyncio.create_task(read()) for _ in range(3)]
         await entered.wait()
@@ -840,7 +930,7 @@ async def test_validated_archive_completes_with_continuous_snapshot_readers(monk
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_validated", [False, True])
-async def test_archive_activation_preserves_late_readers(monkeypatch, is_validated):
+async def test_archive_activation_preserves_late_readers(monkeypatch, is_validated, tmp_path):
     """Both entry points bound contention and preserve the caller's rollback and retry."""
     schema, dataset_id = "cms_reader_" + uuid4().hex, uuid4()
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
@@ -856,7 +946,9 @@ async def test_archive_activation_preserves_late_readers(monkeypatch, is_validat
     cleanup = AsyncExitStack()
     cleanup.push_async_callback(engine.dispose)
     try:
-        activation_by_field = await cleanup.enter_async_context(_readable_archive(fixture, dataset_id, monkeypatch))
+        activation_by_field = await cleanup.enter_async_context(
+            _readable_archive(fixture, dataset_id, monkeypatch, tmp_path)
+        )
         incumbent = await doctors_snapshot(fixture)
         reader = asyncio.create_task(doctors_snapshot(fixture, entered=entered, release=release))
         await asyncio.wait_for(entered.wait(), 3)

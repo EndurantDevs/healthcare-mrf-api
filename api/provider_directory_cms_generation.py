@@ -104,6 +104,7 @@ async def accepted_cms_generation(session, key):
         )
     )
     return {
+        "endpoint_id": dataset["endpoint_id"],
         "dataset_id": dataset["dataset_id"],
         "dataset_hash": dataset["dataset_hash"],
         "release_id": release_id,

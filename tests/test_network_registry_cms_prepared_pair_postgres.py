@@ -1,21 +1,22 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Native prepared retention and atomic receipt binding with component controls.
-
-Capacity signatures are genuine synthetic fixture signatures; phase checks use
-actual PostgreSQL relation bytes and WAL. This is component evidence, not the
-complete signed producer/storage-continuation pipeline.
-"""
+"""Native retained pairs through the original signed Source publication pipeline."""
 
 import asyncio
 import contextvars
 import json
-from contextlib import asynccontextmanager
+import os
+import re
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import MetaData, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
+from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.schema import CreateIndex, CreateTable
 
 from process import network_cms_registry_address_capture as address_capture
@@ -29,7 +30,11 @@ from process import provider_directory_cms_serving_receipt as serving
 from process.entity_address_candidate_preparation import PreparedEntityAddressGeneration
 from process.entity_address_result_generation import ENTITY_ADDRESS_RESULT_MODELS, RELATION_NAMES
 from process.entity_address_snapshot_source import entity_address_unified
-from process.network_cms_registry_source_pair import require_registry_cms_source_pair
+from process.network_cms_registry_source_pair import (
+    capture_registry_cms_source_pair,
+    require_registry_cms_source_pair,
+    resolve_committed_registry_cms_source_pair,
+)
 from process.network_registry_cms_prepared_pair import RegistryCMSRetentionRequest
 from process.provider_directory_cms_address import CMSAddressPreparation
 from process.provider_directory_cms_preparation import (
@@ -41,12 +46,64 @@ from process.provider_directory_cms_preparation import (
 from tests import cms_npd_admission_postgres_support as support
 from tests import test_provider_directory_cms_serving_receipt_postgres as native
 from tests.provider_directory_cms_capacity_test_support import cms_execution, paired_profile_envelope, signed_cms_plan
-from tests.retained_wal_diagnostics import RetainedWalDiagnostic, retained_bound_operands
-from tests.test_network_cms_registry_source_pair_postgres import _publish_pair
+from tests.retained_wal_diagnostics import RetainedWalDiagnostic, retained_bound_operands, retained_wal_attribution
+from tests.test_network_cms_registry_source_pair_postgres import (
+    _bounded_source_copy,
+    _publish_pair,
+    _read_transaction,
+    _retained_office_resources,
+    _verify_read_pair,
+    _verify_retained_entity_read,
+)
 from tests.test_network_custom_address_source_postgres import BootstrapCopyConnection
 from tests.test_provider_directory_cms_preparation import VALIDATION_TIME
-from tests.test_provider_directory_cms_resource_batch_postgres import cms_resource_template as cms_resource_template
+from tests.test_provider_directory_cms_resource_batch_postgres import cms_source_template as cms_source_template
 from tests.test_provider_directory_profile_capacity_attestation import _trust, _verify
+
+pytestmark = pytest.mark.usefixtures(cms_source_template.__name__)
+
+
+def _retention_catalog_url(configured):
+    """Whole-database maintenance is restricted to the runner-owned UUID database."""
+    try:
+        url = make_url(configured)
+    except ArgumentError:
+        raise ValueError("retention_catalog_database_not_disposable") from None
+    allowed_hosts = {"127.0.0.1", "localhost"}
+    if os.getenv("CI") == "true":
+        allowed_hosts.add("postgres")
+    if (
+        url.drivername not in {"postgresql", "postgresql+asyncpg"}
+        or url.query
+        or url.host not in allowed_hosts
+        or url.port is None
+        or not 1 <= url.port <= 65535
+        or not re.fullmatch(r"hc_network_registry_[0-9a-f]{32}", url.database or "")
+    ):
+        raise ValueError("retention_catalog_database_not_disposable")
+    return url.set(drivername="postgresql+asyncpg")
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def cms_resource_template(request, cms_source_template):
+    """Keep the ordinary admission baseline explicit for the tests that use it."""
+    async with aclosing(support.cms_admission_template.__wrapped__(request)) as baseline:
+        await anext(baseline)
+        yield
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def retained_catalog_baseline(cms_resource_template):
+    """Finish earlier fixture catalog cleanup before measuring cluster-wide WAL."""
+    url = _retention_catalog_url(os.environ["NETWORK_REGISTRY_TEST_DSN"])
+    engine = create_async_engine(url)
+    try:
+        async with engine.connect() as connection:
+            connection = await connection.execution_options(isolation_level="AUTOCOMMIT")
+            await connection.exec_driver_sql("VACUUM")
+        yield
+    finally:
+        await engine.dispose()
 
 
 class NativePreparationDB:
@@ -122,6 +179,12 @@ async def _staged_address(database, monkeypatch):
                     is True
                 )
             await connection.execute(text(entity_address_unified._disable_autovacuum_sql("mrf", stage)))
+            assert await _native_storage_options(
+                (await connection.get_raw_connection()).driver_connection, f'"mrf"."{stage}"'
+            ) == {
+                "heap_options": ["autovacuum_enabled=false"],
+                "toast_options": ["autovacuum_enabled=false"],
+            }
             columns = ",".join(column.name for column in model.__table__.columns)
             await connection.execute(text(f"INSERT INTO mrf.{stage} ({columns}) SELECT {columns} FROM mrf.{logical}"))
             oid = await connection.scalar(
@@ -136,6 +199,67 @@ async def _staged_address(database, monkeypatch):
     return PreparedEntityAddressGeneration(
         "mrf", [], [], [], [], tuple(stages), {"publication_state": "prepared"}, {}, None, None
     )
+
+
+async def _transfer_address_publication_custody(database, address):
+    """Transfer only exact fixture live/stage OIDs and their owned native sequences."""
+    owner = database._source_component.owner
+    expected_by_name = {stage: oid for _logical, stage, oid in address.stage_oids}
+    async with database.engine.begin() as connection:
+        for logical, _stage, _oid in address.stage_oids:
+            expected_by_name[logical] = await connection.scalar(
+                text("SELECT to_regclass(:relation)::oid::bigint"), {"relation": "mrf." + logical}
+            )
+        assert all(type(oid) is int and oid > 0 for oid in expected_by_name.values())
+        heaps = (
+            (
+                await connection.execute(
+                    text(
+                        "SELECT c.relname,c.oid::bigint,c.relkind::text AS relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                        "WHERE n.nspname='mrf' AND c.oid=ANY(CAST(:oids AS oid[])) ORDER BY c.relname"
+                    ),
+                    {"oids": list(expected_by_name.values())},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        assert {entry["relname"]: entry["oid"] for entry in heaps} == expected_by_name
+        assert all(entry["relkind"] == "r" for entry in heaps)
+        sequences = (
+            (
+                await connection.execute(
+                    text(
+                        "SELECT s.relname,s.oid::bigint,n.nspname AS schema_name FROM pg_depend d JOIN pg_class s ON s.oid=d.objid JOIN pg_namespace n ON n.oid=s.relnamespace "
+                        "WHERE d.classid='pg_class'::regclass AND d.refclassid='pg_class'::regclass "
+                        "AND d.refobjid=ANY(CAST(:oids AS oid[])) AND d.deptype IN ('a','i') AND s.relkind='S'"
+                    ),
+                    {"oids": list(expected_by_name.values())},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        assert all(entry["schema_name"] == "mrf" for entry in sequences)
+        for name in expected_by_name:
+            await connection.execute(text(f'ALTER TABLE mrf."{name}" OWNER TO "{owner}"'))
+        for sequence in sequences:
+            await connection.execute(text(f'ALTER SEQUENCE mrf."{sequence["relname"]}" OWNER TO "{owner}"'))
+        owned_oids = [*expected_by_name.values(), *(entry["oid"] for entry in sequences)]
+        assert await connection.scalar(
+            text(
+                "SELECT count(*) FROM pg_class WHERE oid=ANY(CAST(:oids AS oid[])) "
+                "AND relowner=(SELECT oid FROM pg_roles WHERE rolname=:owner)"
+            ),
+            {"oids": owned_oids, "owner": owner},
+        ) == len(owned_oids)
+        assert not await connection.scalar(
+            text(
+                "SELECT EXISTS(SELECT FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
+                "WHERE i.indrelid=ANY(CAST(:oids AS oid[])) AND c.relowner<>(SELECT oid FROM pg_roles WHERE rolname=:owner))"
+            ),
+            {"oids": list(expected_by_name.values()), "owner": owner},
+        )
 
 
 async def _seed_support_stages(connection, stages_by_logical):
@@ -177,6 +301,7 @@ async def _seed_support_stages(connection, stages_by_logical):
 async def _prepared_input(database, proof, capture_id, roles, monkeypatch, batch_rows=32):
     """Bind a genuine synthetic signature to the explicit retained-copy policy."""
     address = await _staged_address(database, monkeypatch)
+    await _transfer_address_publication_custody(database, address)
 
     async def signed_fixture_clock():
         return VALIDATION_TIME
@@ -205,7 +330,7 @@ async def _prepared_input(database, proof, capture_id, roles, monkeypatch, batch
         fhir,
         execution,
         "retention-component",
-        json.dumps({"registry_source_retention": request.policy(capture_id, roles[0], (roles[1],))}),
+        json.dumps({"registry_source_retention": request.policy(capture_id, roles[0], tuple(sorted(roles[1:])))}),
     )
     plan = NonprofileAdmissionPlan(
         proof.selection_proof_id,
@@ -226,7 +351,9 @@ async def _prepared_input(database, proof, capture_id, roles, monkeypatch, batch
         1024**2,
         profile_lease.lease_digest,
     )
-    admission = await _native_admission(fhir, plan, request.policy(capture_id, roles[0], (roles[1],)), execution)
+    admission = await _native_admission(
+        fhir, plan, request.policy(capture_id, roles[0], tuple(sorted(roles[1:]))), execution
+    )
     prepared = PreparedServingArtifacts(fhir, None, execution, admission, None, None, {}, {}, None, address)
     await _admit_address_stages(prepared)
     return prepared, factory, request
@@ -285,18 +412,19 @@ async def _native_admission(fhir, plan, policy, execution):
 
 async def _native_database_identity(fhir):
     """Sign the genuine fixture lease for its exact current ephemeral database."""
-    return dict(
-        await fhir.db.first(
-            """SELECT database_row.oid::bigint AS database_oid,database_row.datname AS database_name,
+    database_identity = await fhir.db.first(
+        """SELECT database_row.oid::bigint AS database_oid,database_row.datname AS database_name,
         control.system_identifier::text AS database_system_identifier
         FROM pg_database database_row CROSS JOIN pg_control_system() control
         WHERE database_row.datname=current_database()"""
-        )
     )
+    assert database_identity is not None
+    return dict(support.fhir._pagination_checkpoint_row_mapping(database_identity))
 
 
 async def _publish_stages(session, prepared_pair, predecessor):
     """Apply an actual native OID swap and append its guarded common receipt."""
+    await _publish_retained_candidate(session, prepared_pair)
     for logical, stage, _oid in prepared_pair.address_stages:
         await session.execute(text(f"ALTER TABLE mrf.{logical} RENAME TO retained_old_{logical}"))
         await session.execute(text(f"ALTER TABLE mrf.{stage} RENAME TO {logical}"))
@@ -307,17 +435,75 @@ async def _publish_stages(session, prepared_pair, predecessor):
         ),
         {"generation": "pdprofile_" + uuid4().hex},
     )
-    payload = await native._payload(session, "mrf", predecessor)
-    payload["selection"]["proof_id"] = predecessor["payload"]["selection"]["proof_id"]
-    payload["cms"]["release_id"] = predecessor["payload"]["cms"]["release_id"]
-    receipt_id = await serving.append_serving_receipt(session, "mrf", payload)
-    return receipt_id, payload
+    publication_payload = await native._payload(session, "mrf", predecessor)
+    publication_payload["selection"]["proof_id"] = predecessor["payload"]["selection"]["proof_id"]
+    publication_payload["cms"]["release_id"] = prepared_pair.request.source_pin.release_id
+    publication_payload["expected_incumbent"] = {field: predecessor["payload"]["cms"][field] for field in native._PIN}
+    receipt_id = await serving.append_serving_receipt(
+        session, "mrf", publication_payload, registry_source_pair=prepared_pair
+    )
+    slot = (
+        (
+            await session.execute(
+                text(
+                    "SELECT registry_source_pair_json,publication_xid::text FROM mrf.provider_directory_cms_serving_receipt "
+                    "WHERE receipt_id=:receipt"
+                ),
+                {"receipt": receipt_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    assert serving.decode_registry_source_pair_document(slot["registry_source_pair_json"]) == prepared_pair
+    assert slot["publication_xid"] == await session.scalar(text("SELECT pg_current_xact_id()::text"))
+    assert (
+        await serving.read_registry_source_pair_receipt(
+            session, "mrf", prepared_pair.recipe.source_pin.retained_epoch.epoch_id
+        )
+        is None
+    )
+    return receipt_id, publication_payload
+
+
+async def _publish_retained_candidate(session, prepared_pair):
+    """Advance the genuine validated successor through the existing guarded transition."""
+    pin = prepared_pair.request.source_pin
+    parameters_by_field = {
+        "dataset": pin.dataset_id,
+        "release": pin.release_id,
+        "hash": pin.dataset_sha256,
+        "vector": json.dumps([{"source_id": pin.source_id, "dataset_id": pin.dataset_id}]),
+    }
+    await session.execute(
+        text(
+            "UPDATE mrf.provider_directory_endpoint_dataset SET status='superseded',is_current=false,superseded_at=now() WHERE status='published' AND endpoint_id=:endpoint AND dataset_id<>:dataset"
+        ),
+        {**parameters_by_field, "endpoint": pin.endpoint_id},
+    )
+    await session.execute(
+        text(
+            "UPDATE mrf.provider_directory_endpoint_dataset SET status='published',is_current=true,published_at=now() WHERE dataset_id=:dataset AND status='validated'"
+        ),
+        parameters_by_field,
+    )
+    await session.execute(
+        text(
+            "INSERT INTO mrf.provider_directory_cms_serving_coverage(dataset_id,release_id,dataset_hash,proof_version,published_at,created_at) VALUES(:dataset,:release,:hash,2,now(),now()) ON CONFLICT DO NOTHING"
+        ),
+        parameters_by_field,
+    )
+    await session.execute(
+        text("UPDATE mrf.provider_directory_profile_serving_generation SET source_vector_json=:vector"),
+        parameters_by_field,
+    )
+    await native._advance_native(session, "mrf", doctors=True)
 
 
 async def _reject_preparation(database, prepared, factory, request, roles, capture_id, monkeypatch):
     """Missing signed policy and cancellation leave no retained copy namespaces."""
     unsigned_id = uuid4()
-    options_by_field = dict(capture_id=unsigned_id, owner_role=roles[0], runtime_roles=(roles[1],))
+    options_by_field = dict(capture_id=unsigned_id, owner_role=roles[0], runtime_roles=tuple(sorted(roles[1:])))
     with pytest.raises(ValueError, match="retention_admission_required"):
         await retention.prepare_registry_cms_source_pair(prepared, factory, request, **options_by_field)
     with monkeypatch.context() as patch:
@@ -333,7 +519,7 @@ async def _reject_preparation(database, prepared, factory, request, roles, captu
                 request,
                 capture_id=capture_id,
                 owner_role=roles[0],
-                runtime_roles=(roles[1],),
+                runtime_roles=tuple(sorted(roles[1:])),
             )
     async with database.session_factory() as session:
         for identity in (unsigned_id, capture_id):
@@ -344,67 +530,292 @@ async def _reject_preparation(database, prepared, factory, request, roles, captu
                 )
 
 
+async def _verify_current_office_successor(database, original_pair, pair):
+    async with database.session_factory() as session:
+        current_dataset = await session.scalar(
+            text(
+                "SELECT dataset_id FROM mrf.provider_directory_endpoint_dataset WHERE status='published' AND is_current"
+            )
+        )
+        assert current_dataset == pair.recipe.source_pin.dataset_id
+        assert current_dataset != original_pair.recipe.source_pin.dataset_id
+        assert (
+            await session.scalar(
+                text(
+                    "SELECT payload_json->>'name' FROM mrf.provider_directory_dataset_resource WHERE dataset_id=:dataset AND resource_type='Location' AND resource_id='site-1'"
+                ),
+                {"dataset": current_dataset},
+            )
+            == "Office A second"
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("copy_bounds", [(1, 64 * 1024**2), (32, 64 * 1024)])
 async def test_prepared_retention_native_binding(monkeypatch, tmp_path, copy_bounds):
-    """Close before publication, roll binding back, then retain through a successor."""
-    directory, acquired = support.retained_release(tmp_path)
-    monkeypatch.setattr(
-        retention.RegistryCMSRawEpochAdmission, "copy_batch_bytes", property(lambda _self: copy_bounds[1])
+    """Publish the signed successor with full retention enrollment, parity and binder checks."""
+    from tests.cms_registry_native_producer_postgres_support import genuine_prepared_publication
+
+    async with genuine_prepared_publication(monkeypatch, tmp_path, copy_bounds, observe_preparation=True) as state:
+        await _verify_genuine_retained_state(state, monkeypatch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("copy_bounds", [(1, 64 * 1024**2), (32, 64 * 1024)])
+async def test_native_retained_pair_survives_receipt_head_refresh(monkeypatch, tmp_path, copy_bounds):
+    """Keep retained readers pinned before and after an independent guarded receipt refresh."""
+    from tests.cms_registry_native_producer_postgres_support import (
+        genuine_prepared_publication,
+        refresh_native_receipt_head,
     )
-    roles = tuple("retention_" + uuid4().hex for _ in range(2))
-    capture_id = uuid4()
+
+    async with genuine_prepared_publication(monkeypatch, tmp_path, copy_bounds) as state:
+        await _verify_genuine_retained_state(state, monkeypatch)
+        await refresh_native_receipt_head(state, monkeypatch)
+        await _verify_genuine_retained_state(state, monkeypatch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("copy_bounds", [(1, 64 * 1024**2), (32, 64 * 1024)])
+async def test_native_retention_preparation_failures_preserve_source(monkeypatch, tmp_path, copy_bounds):
+    """Isolate raw preparation failures from successful publication and late rollback."""
+    from tests.cms_registry_native_producer_postgres_support import verify_native_preparation_failures
+
+    await verify_native_preparation_failures(monkeypatch, tmp_path, copy_bounds)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("copy_bounds", [(1, 64 * 1024**2), (32, 64 * 1024)])
+async def test_native_retention_address_copy_interruptions_preserve_source(monkeypatch, tmp_path, copy_bounds):
+    """Retain genuine address COPY refusal and cancellation with fresh signed preparation."""
+    from tests.cms_registry_native_producer_postgres_support import verify_native_preparation_failures
+
+    await verify_native_preparation_failures(monkeypatch, tmp_path, copy_bounds, address_copy=True)
+
+
+async def _verify_genuine_retained_state(state, monkeypatch):
+    database, pair = state.database, state.pair
+    await _verify_read_pair(database, pair, monkeypatch, published=False)
+    async with database.session_factory() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        assert await require_registry_cms_source_pair(session, pair) == pair
+    await _verify_current_office_successor(database, state.original_pair, pair)
+    await _verify_retained_entity_read(database, state.original_pair, monkeypatch)
+    await _verify_retained_entity_read(database, pair, monkeypatch, revision="second", unknown=True)
+
+
+async def _reject_historical_capture_during_source(database, proof, roles):
+    """A completed real SOURCE input does not waive the historical actor boundary."""
+    from process.provider_directory_generic_source_policy import bind_generic_source_transaction_factory
+
+    async with bind_generic_source_transaction_factory(database._source_component.factory):
+        async with database.session_factory() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+            driver = await address_capture.native_driver(session)
+            with pytest.raises(epoch_capture.FHIRSourceEpochError, match="fhir_source_epoch_unavailable"):
+                await epoch_capture.capture_retained_cms_fhir_source_epoch(
+                    driver,
+                    proof.source_pin,
+                    epoch_id=uuid4(),
+                    owner_role=roles[0],
+                    runtime_roles=tuple(sorted(roles[1:])),
+                    expected_admission_sha256=proof.expected_admission_sha256,
+                    expected_metadata_sha256=proof.expected_metadata_sha256,
+                )
+
+
+async def _can_install_wal_inspector(database):
+    """Optional fixture setup cannot replace an original admission outcome."""
+    try:
+        async with database.engine.begin() as connection:
+            if not await connection.scalar(
+                text("SELECT EXISTS(SELECT 1 FROM pg_available_extensions WHERE name='pg_walinspect')")
+            ):
+                return False
+            await connection.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS pg_walinspect WITH SCHEMA public")
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("retained_catalog_baseline")
+async def test_native_wal_attribution_preserves_original_refusal(monkeypatch, record_property):
+    """Classify real foreign WAL and FPI without changing the original 32MiB guard."""
+    from tests import retained_wal_diagnostics as diagnostics
+
+    original_inspection = diagnostics._inspect_original_interval
+
+    async def flushed_inspection(connection, start_lsn, end_lsn):
+        """Flush this disposable cluster only after the failed interval is frozen."""
+        await connection.fetchval("SELECT pg_catalog.pg_switch_wal()")
+        return await original_inspection(connection, start_lsn, end_lsn)
+
+    monkeypatch.setattr(diagnostics, "_inspect_original_interval", flushed_inspection)
     async with support.admission_database(monkeypatch) as database:
-        with support.release_probe_client(directory) as client:
-            initial = await cms._run_acquired({"context": {}}, {}, "retention-component", directory, acquired, client)
-        execution = cms_execution(day=initial["registry_source_admission"]["semantic_projection_as_of"])
-        proof = await _publish_pair(database, initial, monkeypatch, selection_proof_id=execution.attestation.proof_id)
-        try:
-            async with database.engine.begin() as connection:
-                for role in roles:
-                    await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
-            prepared, factory, request = await _prepared_input(
-                database, proof, capture_id, roles, monkeypatch, copy_bounds[0]
-            )
-            await _reject_preparation(database, prepared, factory, request, roles, capture_id, monkeypatch)
-            await _reject_copy_budget(prepared, factory, request, capture_id, roles, monkeypatch)
-            await _reject_raw_oid(database, prepared, factory, request, roles, capture_id, monkeypatch)
-            retained = await _prepare_observed(prepared, factory, request, roles, capture_id, monkeypatch)
-            await _assert_retained_raw_parity(database, retained)
-            await _assert_retained_address_parity(database, retained, prepared)
-            async with database.session_factory() as session:
-                predecessor = await serving.read_current_receipt(session, "mrf")
-            await _bind_rollback(database, retained, predecessor)
+        await _seed_wal_attribution(database)
+        original_errors = []
+        with pytest.raises(ValueError, match="registry_cms_retention_reservation_exceeded") as captured:
             async with database.session_factory() as session, session.begin():
                 await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-                with pytest.raises(ValueError, match="prepared_receipt_invalid"):
-                    await retention.bind_prepared_registry_cms_source_pair(
-                        session, retained, receipt_id=predecessor["receipt_id"], receipt_payload=predecessor["payload"]
-                    )
-                receipt_id, publication_document = await _publish_stages(session, retained, predecessor)
-                await _reject_open_custody(session, retained, roles, receipt_id, publication_document)
-                with monkeypatch.context() as patch:
+                driver = await address_capture.native_driver(session)
+                before = await driver.fetchval("SELECT pg_total_relation_size('public.admitted_wal_fixture')")
+                start = await driver.fetchval("SELECT pg_current_wal_insert_lsn()::text")
+                await driver.execute("UPDATE public.admitted_wal_fixture SET counter=counter+1 WHERE id=1")
+                async with database.engine.begin() as foreign_writer:
+                    await foreign_writer.exec_driver_sql("""INSERT INTO public.foreign_wal_fixture
+                        SELECT unit,repeat(md5(unit::text),256) FROM generate_series(1,5000) unit""")
+                state = _retained_diagnostic_observers()
+                state.diagnostic.begin(start)
+                state.diagnostic.enter("readiness")
+                prepared = await _wal_attribution_prepared(driver)
+                request = SimpleNamespace(
+                    extra_data_upper_bound_bytes=32 * 1024**2, extra_wal_upper_bound_bytes=32 * 1024**2
+                )
+                physical_ids = await driver.fetchval("""SELECT ARRAY[pg_relation_filenode(oid),
+                    pg_relation_filenode(reltoastrelid)] FROM pg_class
+                    WHERE oid='public.foreign_wal_fixture'::regclass""")
+                settings_before = await _wal_attribution_settings(driver)
+                try:
+                    await state.observers["_assert_retained_bounds"](driver, prepared, request, before, start)
+                except ValueError as error:
+                    original_errors.append(error)
+                    assert await _wal_attribution_settings(driver) == settings_before
+                    assert await driver.fetchval("SELECT 1") == 1
+                    _assert_native_attribution(error, record_property, physical_ids)
+                    await _reject_native_diagnostic_failure(driver, start, error, settings_before, monkeypatch)
+                    raise
+        assert captured.value is original_errors[0]
+        assert captured.value.__cause__ is None and captured.value.__context__ is None
+        async with database.engine.connect() as connection:
+            assert await connection.scalar(text("SELECT count(*) FROM public.foreign_wal_fixture")) == 5000
+            assert await connection.scalar(text("SELECT counter FROM public.admitted_wal_fixture WHERE id=1")) == 0
 
-                    async def forbidden_scan(*_args, **_kwargs):
-                        raise AssertionError("full content scan in atomic binder")
 
-                    patch.setattr(epoch_capture, "_content", forbidden_scan)
-                    patch.setattr(address_capture, "capture_entity_address_archive_receipt", forbidden_scan)
-                    pair = await retention.bind_prepared_registry_cms_source_pair(
-                        session, retained, receipt_id=receipt_id, receipt_payload=publication_document
-                    )
-            async with database.session_factory() as session, session.begin():
-                await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-                assert await require_registry_cms_source_pair(session, pair) == pair
-            await _successor_retention(database, pair)
-        finally:
-            async with database.engine.begin() as connection:
-                for role in roles:
-                    await connection.execute(text(f'DROP OWNED BY "{role}" CASCADE'))
-                    await connection.execute(text(f'DROP ROLE "{role}"'))
-                    assert not await connection.scalar(
-                        text("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=:role)"), {"role": role}
-                    )
+async def _reject_native_diagnostic_failure(driver, start, original_error, settings_before, monkeypatch):
+    """A genuine diagnostic SQL error rolls its savepoint back without poisoning the refusal."""
+    from tests import retained_wal_diagnostics as diagnostics
+
+    async def failed_inspection(connection, *_args):
+        await connection.execute("SET LOCAL work_mem='8MB'")
+        await connection.execute("SELECT 1/0")
+
+    operands = json.loads(original_error.__notes__[0].split(" ", 1)[1])
+    before_notes = tuple(original_error.__notes__)
+    with monkeypatch.context() as patch:
+        patch.setattr(diagnostics, "_inspect_original_interval", failed_inspection)
+        assert await retained_wal_attribution(driver, start, operands["wal_bytes"]) is None
+    assert await _wal_attribution_settings(driver) == settings_before
+    assert await driver.fetchval("SELECT 1") == 1
+    assert tuple(original_error.__notes__) == before_notes
+
+
+async def _seed_wal_attribution(database):
+    """Install native inspection and seed logged fixtures before the measured interval."""
+    assert await _can_install_wal_inspector(database), "native attribution proof requires pg_walinspect"
+    async with database.engine.begin() as connection:
+        await connection.exec_driver_sql("CREATE TABLE public.admitted_wal_fixture(id bigint PRIMARY KEY,counter int)")
+        await connection.exec_driver_sql("INSERT INTO public.admitted_wal_fixture VALUES(1,0)")
+        await connection.exec_driver_sql("CREATE TABLE public.foreign_wal_fixture(id bigint PRIMARY KEY,payload text)")
+        await connection.exec_driver_sql(
+            "ALTER TABLE public.foreign_wal_fixture ALTER COLUMN payload SET STORAGE EXTERNAL"
+        )
+    async with database.engine.connect() as connection:
+        connection = await connection.execution_options(isolation_level="AUTOCOMMIT")
+        await connection.exec_driver_sql("CHECKPOINT")
+
+
+async def _wal_attribution_prepared(driver):
+    async def measure(_fhir, _schema):
+        size = await driver.fetchval("SELECT pg_total_relation_size('public.admitted_wal_fixture')")
+        return (SimpleNamespace(total_bytes=size),)
+
+    return SimpleNamespace(
+        nonprofile_admission=SimpleNamespace(measure=measure), fhir=None, address=SimpleNamespace(db_schema="public")
+    )
+
+
+async def _wal_attribution_settings(driver):
+    return tuple(
+        await driver.fetchrow("""SELECT current_setting('work_mem'),current_setting('statement_timeout'),
+        current_setting('temp_file_limit'),current_setting('search_path')""")
+    )
+
+
+def _assert_native_attribution(error, record_property, physical_ids):
+    notes = error.__notes__
+    operands = json.loads(notes[0].split(" ", 1)[1])
+    attribution = json.loads(notes[2].split(" ", 1)[1])
+    assert operands["wal_limit_bytes"] == 32 * 1024**2 < operands["wal_bytes"]
+    assert operands["data_delta_bytes"] < operands["data_limit_bytes"] == 32 * 1024**2
+    assert attribution["lsn_span_bytes"] == operands["wal_bytes"]
+    assert attribution["status"] == "complete" and attribution["accounting_authority"] is False
+    assert sum(entry["fpi_bytes"] for entry in attribution["record_types"]) > 0
+    assert sum(entry["record_bytes"] for entry in attribution["record_types"]) > 32 * 1024**2
+    assert 0 < len(attribution["top_physical_relations"]) <= 16
+    attributed_ids = {entry["relfilenode"] for entry in attribution["top_physical_relations"]}
+    assert set(physical_ids).issubset(attributed_ids)
+    record_property("fixture_physical_ids", json.dumps(physical_ids))
+    record_property("original_bound_operands", json.dumps(operands, sort_keys=True))
+    record_property("wal_attribution", json.dumps(attribution, sort_keys=True))
+
+
+async def _prepare_successor_pair(database, tmp_path, execution, roles, capture_id, monkeypatch, copy_bounds):
+    """Seal a genuine successor while its dataset is still validated and unpublished."""
+    (tmp_path / "successor").mkdir()
+    directory, acquired = support.retained_release(tmp_path / "successor", revision="second")
+    with support.release_probe_client(directory) as client:
+        successor = await support.run_protected_admission(
+            database, monkeypatch, "retention-successor", directory, acquired, client
+        )
+    proof = _prepublication_inputs(successor, execution.attestation.proof_id)
+    monkeypatch.setattr(
+        native,
+        "_PIN",
+        {field: successor["cms_serving_candidate"]["desired_cms_dataset"][field] for field in native._PIN},
+    )
+    prepared, factory, request = await _prepared_input(database, proof, capture_id, roles, monkeypatch, copy_bounds[0])
+    await _reject_preparation(database, prepared, factory, request, roles, capture_id, monkeypatch)
+    await _reject_copy_budget(prepared, factory, request, capture_id, roles, monkeypatch)
+    await _reject_raw_oid(database, prepared, factory, request, roles, capture_id, monkeypatch)
+    retained = await _prepare_observed(prepared, factory, request, roles, capture_id, monkeypatch)
+    await _assert_retained_raw_parity(database, retained)
+    await _assert_retained_address_parity(database, retained, prepared)
+    async with database.session_factory() as session, session.begin():
+        await _read_transaction(session)
+        with pytest.raises(ValueError, match="registry_cms_source_pair_unavailable"):
+            await resolve_committed_registry_cms_source_pair(session, retained.recipe)
+    return retained
+
+
+def _prepublication_inputs(initial, selection_proof_id):
+    """Use genuine sealed candidate coordinates before any publication receipt exists."""
+    from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+    from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+
+    handoff = initial["registry_source_admission"]
+    return SimpleNamespace(
+        source_pin=PinnedFHIRMembershipSource(
+            "mrf",
+            "cms-npd",
+            handoff["endpoint_id"],
+            handoff["network_bindings"]["dataset_id"],
+            handoff["dataset_sha256"],
+            handoff["release_id"],
+            handoff["resource_table_oid"],
+            "cms-npd",
+            handoff["semantic_projection_as_of"],
+        ),
+        binding_coordinates=RegistryNetworkSourceCoordinates(
+            **{
+                field: handoff["network_bindings"][field]
+                for field in RegistryNetworkSourceCoordinates.__dataclass_fields__
+            }
+        ),
+        selection_proof_id=selection_proof_id,
+        expected_admission_sha256=handoff["expected_admission_sha256"],
+        expected_metadata_sha256=handoff["expected_metadata_sha256"],
+    )
 
 
 async def _reject_copy_budget(prepared, factory, request, capture_id, roles, monkeypatch):
@@ -412,13 +823,18 @@ async def _reject_copy_budget(prepared, factory, request, capture_id, roles, mon
     bounded_request = replace(request, extra_data_upper_bound_bytes=1)
     bounded_factory = replace(
         factory,
-        input_json=json.dumps({"registry_source_retention": bounded_request.policy(capture_id, roles[0], (roles[1],))}),
+        input_json=json.dumps(
+            {"registry_source_retention": bounded_request.policy(capture_id, roles[0], tuple(sorted(roles[1:])))}
+        ),
     )
     bounded_plan = replace(prepared.nonprofile_admission.plan, native_address_input_hash=bounded_factory.input_hash)
     bounded_prepared = replace(
         prepared,
         nonprofile_admission=await _native_admission(
-            prepared.fhir, bounded_plan, bounded_request.policy(capture_id, roles[0], (roles[1],)), prepared.execution
+            prepared.fhir,
+            bounded_plan,
+            bounded_request.policy(capture_id, roles[0], tuple(sorted(roles[1:]))),
+            prepared.execution,
         ),
     )
     await _admit_address_stages(bounded_prepared)
@@ -438,7 +854,7 @@ async def _reject_copy_budget(prepared, factory, request, capture_id, roles, mon
                 bounded_request,
                 capture_id=capture_id,
                 owner_role=roles[0],
-                runtime_roles=(roles[1],),
+                runtime_roles=tuple(sorted(roles[1:])),
             )
     assert budget_events == [("created", 0)]
     assert (
@@ -460,7 +876,12 @@ async def _reject_raw_oid(database, prepared, factory, request, roles, capture_i
         patch.setattr(retention.RegistryCMSRawEpochAdmission, "__call__", substitute)
         with pytest.raises(epoch_capture.FHIRSourceEpochError, match="copy_admission_refused"):
             await retention.prepare_registry_cms_source_pair(
-                prepared, factory, request, capture_id=capture_id, owner_role=roles[0], runtime_roles=(roles[1],)
+                prepared,
+                factory,
+                request,
+                capture_id=capture_id,
+                owner_role=roles[0],
+                runtime_roles=tuple(sorted(roles[1:])),
             )
     assert prepared.nonprofile_admission._relations == before_oid_by_relation
     async with database.session_factory() as session:
@@ -470,6 +891,13 @@ async def _reject_raw_oid(database, prepared, factory, request, roles, capture_i
             )
             is None
         )
+
+
+def _copy_import_connection(connection):
+    """Observe imported rows on the retained writer, never its pinned export Reader."""
+    from process.network_fhir_source_epoch_pin import _CopyConnections
+
+    return connection.target if isinstance(connection, _CopyConnections) else connection
 
 
 def _address_copy_observer(prepared, created_relations, address_inputs, address_phases):
@@ -490,7 +918,7 @@ def _address_copy_observer(prepared, created_relations, address_inputs, address_
 
         async def observe_admission(phase):
             await admit(phase)
-            count = await connection.fetchval(f'SELECT count(*) FROM "{schema}"."{table}"')
+            count = await _copy_import_connection(connection).fetchval(f'SELECT count(*) FROM "{schema}"."{table}"')
             address_phases.append((table, phase, count))
 
         options["import_admission"] = observe_admission
@@ -559,6 +987,12 @@ def _retained_diagnostic_observers():
                 operands = json.loads(note.split(" ", 1)[1])
                 diagnostic.record(diagnostic.start_lsn, operands["wal_bytes"])
                 failure_notes.extend(value for value in (note, diagnostic.note(operands)) if value is not None)
+                try:
+                    attribution = await retained_wal_attribution(args[0], diagnostic.start_lsn, operands["wal_bytes"])
+                except Exception, asyncio.CancelledError:
+                    attribution = None
+                if attribution is not None:
+                    failure_notes.append(attribution)
                 for value in failure_notes:
                     error.add_note(value)
             raise
@@ -596,7 +1030,12 @@ async def _prepare_with_retained_notes(prepared, factory, request, capture_id, r
     """Keep closed original-bound notes when admission hides its exception context."""
     try:
         return await retention.prepare_registry_cms_source_pair(
-            prepared, factory, request, capture_id=capture_id, owner_role=roles[0], runtime_roles=(roles[1],)
+            prepared,
+            factory,
+            request,
+            capture_id=capture_id,
+            owner_role=roles[0],
+            runtime_roles=tuple(sorted(roles[1:])),
         )
     except (ValueError, epoch_capture.FHIRSourceEpochError) as error:
         for note in failure_notes:
@@ -608,10 +1047,9 @@ async def _prepare_with_retained_notes(prepared, factory, request, capture_id, r
 async def _prepare_observed(prepared, factory, request, roles, capture_id, monkeypatch):
     """Observe real callbacks and registration while preserving actual admission checks."""
     source_sequence_state = await _source_evidence_sequence_state(prepared)
+    previous_oid_by_relation = dict(prepared.nonprofile_admission._relations)
     growth_events, created_relations, binary_inputs = [], [], []
     address_inputs, address_phases = [], []
-    await _reject_copy_batch_interruptions(prepared, factory, request, roles, capture_id, monkeypatch)
-    await _reject_address_copy_interruptions(prepared, factory, request, roles, capture_id, monkeypatch)
     original_growth = retention.RegistryCMSRawEpochAdmission.__call__
     original_copy = epoch_capture._copy_native_batch
     diagnostic_state = _retained_diagnostic_observers()
@@ -651,9 +1089,9 @@ async def _prepare_observed(prepared, factory, request, roles, capture_id, monke
         retained = await _prepare_with_retained_notes(
             prepared, factory, request, capture_id, roles, diagnostic_state.failure_notes
         )
-    _assert_original_heap_growth(growth_events, created_relations, retained, prepared)
+    _assert_original_heap_growth(growth_events, created_relations, retained, prepared, previous_oid_by_relation)
     assert binary_inputs
-    assert {table for table, _count, _bytes in address_inputs} == set(prepared_address._COPY_KEYS)
+    _assert_address_copy_counts(address_inputs, retained.address_receipt)
     assert len(address_phases) == 2 * len(address_inputs)
     for index, (table, count, _bytes) in enumerate(address_inputs):
         before, after = address_phases[index * 2 : index * 2 + 2]
@@ -661,6 +1099,20 @@ async def _prepare_observed(prepared, factory, request, roles, capture_id, monke
         assert after[2] - before[2] == count
     assert await _source_evidence_sequence_state(prepared) == source_sequence_state
     return retained
+
+
+def _assert_address_copy_counts(address_inputs, receipt):
+    """Match exact batch totals to the receipt checked against the complete source family."""
+    expected_by_table = {entry.table_name: entry.row_count for entry in receipt.tables}
+    assert set(expected_by_table) == set(prepared_address._COPY_KEYS)
+    copied_by_table = dict.fromkeys(expected_by_table, 0)
+    for table, count, _bytes in address_inputs:
+        assert table in copied_by_table and count > 0
+        copied_by_table[table] += count
+    assert copied_by_table == expected_by_table
+    assert {table for table, _count, _bytes in address_inputs} == {
+        table for table, count in expected_by_table.items() if count > 0
+    }
 
 
 async def _source_evidence_sequence_state(prepared):
@@ -675,11 +1127,13 @@ async def _source_evidence_sequence_state(prepared):
         relation=prepared.address.db_schema + "." + stage,
     )
     assert default is not None
+    default = support.fhir._pagination_checkpoint_row_mapping(default)
     state = await prepared.fhir.db.first("SELECT last_value,is_called FROM " + default["sequence"])
-    return dict(default), dict(state)
+    assert state is not None
+    return dict(default), dict(support.fhir._pagination_checkpoint_row_mapping(state))
 
 
-def _assert_original_heap_growth(growth_events, created_relations, retained, prepared):
+def _assert_original_heap_growth(growth_events, created_relations, retained, prepared, previous_oid_by_relation):
     """All eighteen retained heaps enroll once; each native index growth is bracketed."""
     assert len(created_relations) == len(set(created_relations)) == 18
     assert len({oid for _schema, _logical, oid in created_relations}) == 18
@@ -710,12 +1164,16 @@ def _assert_original_heap_growth(growth_events, created_relations, retained, pre
     native_relations = prepared.nonprofile_admission._relations
     for schema, logical, oid in created_relations:
         assert native_relations[(schema, logical)] == oid
-    assert len(native_relations) == 7 + 18
+    assert native_relations == {
+        **previous_oid_by_relation,
+        **{(schema, logical): oid for schema, logical, oid in created_relations},
+    }
 
 
 async def _reject_copy_batch_interruptions(prepared, factory, request, roles, capture_id, monkeypatch):
     """Actual completed COPY failures retire heaps and preserve an exact retry."""
     original = retention.RegistryCMSRawEpochAdmission.__call__
+    previous_oid_by_relation = dict(prepared.nonprofile_admission._relations)
     for interruption in (RuntimeError, asyncio.CancelledError):
         completed_batches = []
 
@@ -731,12 +1189,17 @@ async def _reject_copy_batch_interruptions(prepared, factory, request, roles, ca
             patch.setattr(retention.RegistryCMSRawEpochAdmission, "__call__", refuse_after_import)
             with pytest.raises(expected):
                 await retention.prepare_registry_cms_source_pair(
-                    prepared, factory, request, capture_id=capture_id, owner_role=roles[0], runtime_roles=(roles[1],)
+                    prepared,
+                    factory,
+                    request,
+                    capture_id=capture_id,
+                    owner_role=roles[0],
+                    runtime_roles=tuple(sorted(roles[1:])),
                 )
         assert len(completed_batches) == 1
         for schema in ("registry_cms_epoch_" + capture_id.hex, "entity_address_archive_" + capture_id.hex):
             assert await prepared.fhir.db.scalar("SELECT to_regnamespace(:schema)", schema=schema) is None
-        assert len(prepared.nonprofile_admission._relations) == 7
+        assert prepared.nonprofile_admission._relations == previous_oid_by_relation
 
 
 async def _reject_address_copy_interruptions(prepared, factory, request, roles, capture_id, monkeypatch):
@@ -753,7 +1216,10 @@ async def _reject_address_copy_interruptions(prepared, factory, request, roles, 
             async def refuse_after(phase):
                 await admit(phase)
                 if phase == "after_import":
-                    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}"."{table}"') == count
+                    assert (
+                        await _copy_import_connection(connection).fetchval(f'SELECT count(*) FROM "{schema}"."{table}"')
+                        == count
+                    )
                     completed_copies.append((schema, table))
                     raise interruption("synthetic completed address COPY interruption")
 
@@ -764,7 +1230,12 @@ async def _reject_address_copy_interruptions(prepared, factory, request, roles, 
             patch.setattr(prepared_address, "_copy_native_batch", refuse_copy)
             with pytest.raises(interruption):
                 await retention.prepare_registry_cms_source_pair(
-                    prepared, factory, request, capture_id=capture_id, owner_role=roles[0], runtime_roles=(roles[1],)
+                    prepared,
+                    factory,
+                    request,
+                    capture_id=capture_id,
+                    owner_role=roles[0],
+                    runtime_roles=tuple(sorted(roles[1:])),
                 )
         assert len(completed_copies) == 1
         for prefix in ("registry_cms_epoch_", "entity_address_archive_"):
@@ -799,14 +1270,16 @@ async def _assert_retained_address_parity(database, retained, prepared):
         witness = await address_equivalence.validate_registry_cms_address_copy(
             session, source_capture=source_capture, clone_ownership=retained.address_ownership
         )
+        assert witness.source == source_capture
         assert witness.clone_receipt == retained.address_receipt
-        assert source_capture.semantic_receipt.schema_sha256 != retained.address_receipt.schema_sha256
+        assert set(dict(source_capture.relation_oids).values()).isdisjoint(
+            dict(retained.address_ownership.relation_oids).values()
+        )
+        assert source_capture.schema_name != retained.address_ownership.schema_name
         assert source_capture.semantic_receipt.main_input_sha256 == retained.address_receipt.main_input_sha256
-        for logical in RELATION_NAMES:
-            assert dict(source_capture.ordinals)[logical][0][1:] == (2, 1)
-            assert dict(witness.clone_ordinals)[logical][0][1:] == (1, 1)
         driver = await address_capture.native_driver(session)
         schema = retained.address_ownership.schema_name
+        await _assert_live_retained_ordinals(driver, prepared.address, source_capture, witness)
         await _assert_prepared_native_copy_key(driver, prepared.address)
         for logical, stage, oid in prepared.address.stage_oids:
             source_ref = f'"{prepared.address.db_schema}"."{stage}"'
@@ -815,8 +1288,6 @@ async def _assert_retained_address_parity(database, retained, prepared):
                 driver, source_ref, oid, prepared_address._COPY_KEYS[logical]
             )
             source_options = await _native_storage_options(driver, source_ref)
-            assert source_options["heap_options"] == ["autovacuum_enabled=false"]
-            assert source_options["toast_options"] == ["autovacuum_enabled=false"]
             assert await _native_storage_options(driver, target_ref) == source_options
             assert await driver.fetchval(
                 f"""SELECT NOT EXISTS((SELECT to_jsonb(head) FROM {source_ref} head
@@ -829,6 +1300,22 @@ async def _assert_retained_address_parity(database, retained, prepared):
         )
         assert sequence == schema + ".entity_address_evidence_evidence_id_seq"
         assert tuple(await driver.fetchrow(f"SELECT last_value,is_called FROM {sequence}")) == (1, False)
+
+
+async def _assert_live_retained_ordinals(driver, address, source_capture, witness):
+    """Compare physical source holes and packed clone columns with original live OIDs."""
+    for logical, _stage, oid in address.stage_oids:
+        columns = await driver.fetch(
+            "SELECT attname,attnum FROM pg_attribute WHERE attrelid=$1 AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+            oid,
+        )
+        actual_ordinals = tuple(
+            (column["attname"], column["attnum"], ordinal) for ordinal, column in enumerate(columns, 1)
+        )
+        assert dict(source_capture.ordinals)[logical] == actual_ordinals
+        assert dict(witness.clone_ordinals)[logical] == tuple(
+            (name, ordinal, ordinal) for name, _physical, ordinal in actual_ordinals
+        )
 
 
 async def _native_storage_options(driver, relation):
@@ -910,22 +1397,46 @@ async def _assert_native_source_copy_keys(driver, pin):
     await epoch_capture._require_epoch_copy_key(driver, temporary_pin, table)
 
 
-async def _reject_open_custody(session, retained, roles, receipt_id, payload):
-    """Actual opened clone ACLs fail before the common commit."""
-    schema = retained.address_ownership.schema_name
-    await session.execute(text(f'GRANT UPDATE ON {schema}.entity_address_unified TO "{roles[1]}"'))
-    with pytest.raises(ValueError):
-        await retention.bind_prepared_registry_cms_source_pair(
-            session, retained, receipt_id=receipt_id, receipt_payload=payload
+async def _reject_nonoriginal_receipt_sessions(database, retained):
+    """Neither fixture administrator nor a foreign session is the original publisher."""
+    from process.provider_directory_generic_candidate import GenericCandidateError
+
+    async with database.session_factory() as session, session.begin():
+        with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
+            await serving.require_registry_receipt_owner(session, "mrf")
+        assert (
+            await serving.read_registry_source_pair_receipt(
+                session, "mrf", retained.recipe.source_pin.retained_epoch.epoch_id
+            )
+            is None
         )
-    await session.execute(text(f'REVOKE UPDATE ON {schema}.entity_address_unified FROM "{roles[1]}"'))
+    async with support.original_source_transaction(database, isolation="repeatable read"):
+        async with database.session_factory() as foreign, foreign.begin():
+            with pytest.raises(ValueError, match="original_session_required"):
+                await serving.require_registry_receipt_owner(foreign, "mrf")
+
+
+async def _reject_open_custody(database, retained, roles, predecessor):
+    """Admin ACL corruption is visible to a fresh original Source publication snapshot."""
+    schema = retained.address_ownership.schema_name
+    async with database.engine.begin() as connection:
+        await connection.execute(text(f'GRANT UPDATE ON {schema}.entity_address_unified TO "{roles[1]}"'))
+    try:
+        with pytest.raises(ValueError, match="privileges are not closed"):
+            async with support.original_source_transaction(database, isolation="repeatable read") as session:
+                receipt_id, payload = await _publish_stages(session, retained, predecessor)
+                await retention.bind_prepared_registry_cms_source_pair(
+                    session, retained, receipt_id=receipt_id, receipt_payload=payload
+                )
+    finally:
+        async with database.engine.begin() as connection:
+            await connection.execute(text(f'REVOKE UPDATE ON {schema}.entity_address_unified FROM "{roles[1]}"'))
 
 
 async def _bind_rollback(database, retained, predecessor):
     """Native receipt append and pair binding remain one rollback boundary."""
     with pytest.raises(RuntimeError, match="synthetic bind rollback"):
-        async with database.session_factory() as session, session.begin():
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        async with support.original_source_transaction(database, isolation="repeatable read") as session:
             receipt_id, payload = await _publish_stages(session, retained, predecessor)
             with pytest.raises(ValueError):
                 await retention.bind_prepared_registry_cms_source_pair(
@@ -944,7 +1455,7 @@ async def _bind_rollback(database, retained, predecessor):
 
 async def _successor_retention(database, pair):
     """A later real native address swap cannot change the closed retained family."""
-    async with database.session_factory() as session, session.begin():
+    async with support.original_source_transaction(database, isolation="repeatable read") as session:
         predecessor = await serving.read_current_receipt(session, "mrf")
         for logical in RELATION_NAMES:
             await session.execute(text(f"DROP TABLE mrf.retained_old_{logical} CASCADE"))
@@ -965,3 +1476,288 @@ async def _successor_retention(database, pair):
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
         assert await require_registry_cms_source_pair(session, pair) == pair
         assert pair.address_receipt.tables[0].row_count == 2
+
+
+async def _bind_native_retained_pair(database, retained, roles, predecessor, monkeypatch):
+    """Keep receipt append and committed pair binding in the same real transaction."""
+    await _reject_open_custody(database, retained, roles, predecessor)
+    async with support.original_source_transaction(database, isolation="repeatable read") as session:
+        with pytest.raises(ValueError, match="prepared_receipt_invalid"):
+            await retention.bind_prepared_registry_cms_source_pair(
+                session, retained, receipt_id=predecessor["receipt_id"], receipt_payload=predecessor["payload"]
+            )
+        receipt_id, publication_document = await _publish_stages(session, retained, predecessor)
+        with monkeypatch.context() as patch:
+
+            async def forbidden_scan(*_args, **_kwargs):
+                raise AssertionError("full content scan in atomic binder")
+
+            patch.setattr(epoch_capture, "_content", forbidden_scan)
+            patch.setattr(address_capture, "capture_entity_address_archive_receipt", forbidden_scan)
+            pair = await retention.bind_prepared_registry_cms_source_pair(
+                session, retained, receipt_id=receipt_id, receipt_payload=publication_document
+            )
+    return pair
+
+
+async def _notification_migration(connection, operation, *, schema):
+    """Execute the actual frozen migration using Alembic's real operations context."""
+    import importlib.util
+    from pathlib import Path
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    path = Path(__file__).parents[1] / "alembic/versions/20261017010000_registry_cms_source_notifications.py"
+    specification = importlib.util.spec_from_file_location("notification_migration", path)
+    migration = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(migration)
+    migration._schema = lambda: schema
+
+    def apply(sync_connection):
+        with Operations.context(MigrationContext.configure(sync_connection)):
+            getattr(migration, operation)()
+
+    await connection.run_sync(apply)
+
+
+async def _install_notification_inbox(database, retained, attempt, publisher_roles):
+    """Run the actual migration and explicit operator plan before publication."""
+    from process import registry_cms_source_notifications as notifications
+    from process.network_cms_registry_address_capture import native_driver
+
+    publisher = database._source_component.publisher
+    schema = "cms_notify_control_" + uuid4().hex
+    owner = "cms_notify_owner_" + uuid4().hex
+    foreign = "cms_notify_foreign_" + uuid4().hex
+    publisher_roles.extend((owner, foreign))
+    store = notifications.RegistryCMSSourceNotificationStore(schema, owner, publisher, attempt)
+    async with database.engine.begin() as connection:
+        await connection.execute(text(f'CREATE ROLE "{owner}" NOLOGIN'))
+        await connection.execute(text(f'CREATE ROLE "{foreign}" NOLOGIN'))
+        await connection.execute(text(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{owner}"'))
+        await connection.execute(text(f'REVOKE ALL ON SCHEMA "{schema}" FROM PUBLIC'))
+        for operation in ("upgrade", "downgrade", "upgrade"):
+            await _notification_migration(connection, operation, schema=schema)
+        assert not await connection.scalar(
+            text("SELECT has_schema_privilege(CAST(:role AS name),:schema,'CREATE')"),
+            {"role": publisher, "schema": schema},
+        )
+    async with database.session_factory() as session, session.begin():
+        await session.execute(text("SET LOCAL lock_timeout='1s'"))
+        await _verify_notification_operator_refusals(session, store, foreign)
+        driver = await native_driver(session)
+        statements = await notifications.plan_registry_cms_source_notification_grants(
+            driver, control_schema=schema, owner_role=owner, publisher_role=publisher
+        )
+        for statement in statements:
+            await session.execute(text(statement))
+    return store
+
+
+async def _verify_notification_operator_refusals(session, store, foreign_role):
+    """Refuse unknown ACLs and created-at insertion without clearing either grant."""
+    from process.network_cms_registry_address_capture import native_driver
+    from process.registry_cms_source_notifications import plan_registry_cms_source_notification_grants
+
+    driver = await native_driver(session)
+
+    async def grant_plan():
+        return await plan_registry_cms_source_notification_grants(
+            driver,
+            control_schema=store.control_schema,
+            owner_role=store.owner_role,
+            publisher_role=store.publisher_role,
+        )
+
+    await session.execute(
+        text(f'GRANT SELECT ON {store.control_schema}.registry_cms_source_notification TO "{foreign_role}"')
+    )
+    with pytest.raises(ValueError, match="source_notification_invalid"):
+        await grant_plan()
+    assert await session.scalar(
+        text(
+            f"SELECT has_table_privilege(CAST(:role AS name),'{store.control_schema}.registry_cms_source_notification','SELECT')"
+        ),
+        {"role": foreign_role},
+    )
+    await session.execute(
+        text(f'REVOKE SELECT ON {store.control_schema}.registry_cms_source_notification FROM "{foreign_role}"')
+    )
+    await session.execute(
+        text(
+            f'GRANT INSERT(created_at) ON {store.control_schema}.registry_cms_source_notification TO "{store.publisher_role}"'
+        )
+    )
+    with pytest.raises(ValueError, match="source_notification_invalid"):
+        await grant_plan()
+    assert await session.scalar(
+        text(
+            f"SELECT has_column_privilege(CAST(:role AS name),'{store.control_schema}.registry_cms_source_notification','created_at','INSERT')"
+        ),
+        {"role": store.publisher_role},
+    )
+    await session.execute(
+        text(
+            f'REVOKE INSERT(created_at) ON {store.control_schema}.registry_cms_source_notification FROM "{store.publisher_role}"'
+        )
+    )
+
+
+async def _refuse_elevated_notification_role(database, retained, predecessor, store):
+    """Grant the forbidden parameter as admin before opening the genuine Source snapshot."""
+    async with database.engine.begin() as connection:
+        await connection.execute(text(f'GRANT SET ON PARAMETER session_replication_role TO "{store.publisher_role}"'))
+    try:
+        with pytest.raises(ValueError, match="source_notification_invalid"):
+            async with support.original_source_transaction(database, isolation="repeatable read") as session:
+                receipt_id, payload = await _publish_stages(session, retained, predecessor)
+                await retention.bind_prepared_registry_cms_source_pair(
+                    session, retained, receipt_id=receipt_id, receipt_payload=payload
+                )
+    finally:
+        async with database.engine.begin() as connection:
+            await connection.execute(
+                text(f'REVOKE SET ON PARAMETER session_replication_role FROM "{store.publisher_role}"')
+            )
+
+
+def _notification_callback(original_bind, stores, recorded_notifications):
+    async def notify_bound(session, prepared, *, receipt_id, receipt_payload):
+        from process import registry_cms_source_notifications as notifications
+        from process.provider_directory_generic_source_policy import source_publisher_body
+
+        pair = await original_bind(session, prepared, receipt_id=receipt_id, receipt_payload=receipt_payload)
+        store = stores[-1]
+        assert store.owner_role != pair.owner_role
+        before_actor = (await session.execute(text("SELECT pg_backend_pid(),pg_current_xact_id()::text"))).one()
+        with pytest.raises(ValueError, match="source_notification_invalid"):
+            await store.notify_receipt(session, receipt_id=receipt_id, pair=pair)
+        async with source_publisher_body(session):
+            assert await session.scalar(text("SELECT current_user")) == store.publisher_role
+            assert (
+                await session.execute(text("SELECT pg_backend_pid(),pg_current_xact_id()::text"))
+            ).one() == before_actor
+            notice = await store.notify_receipt(session, receipt_id=receipt_id, pair=pair)
+            assert await store.notify_receipt(session, receipt_id=receipt_id, pair=pair) == notice
+            assert notifications.decode_registry_cms_source_notification(notice.canonical_json, notice.sha256) == notice
+            with pytest.raises(ValueError, match="source_notification_invalid"):
+                await store.notify_receipt(session, receipt_id="0" * 64, pair=pair)
+            foreign = replace(
+                store, source_attempt=replace(store.source_attempt, attempt_id="source-run:" + uuid4().hex)
+            )
+            with pytest.raises(ValueError, match="source_notification_invalid"):
+                await foreign.notify_receipt(session, receipt_id=receipt_id, pair=pair)
+            assert (
+                await session.scalar(
+                    text(f"SELECT count(*) FROM {store.control_schema}.registry_cms_source_notification")
+                )
+                == 1
+            )
+        recorded_notifications.append(notice)
+        return pair
+
+    return notify_bound
+
+
+async def _verify_committed_notification(database, pair, store, notice):
+    async with database.session_factory() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        await session.execute(text(f'SET LOCAL ROLE "{store.publisher_role}"'))
+        loaded = await store.read(session, source_schema="mrf", receipt_id=pair.proof.serving_receipt_id)
+        assert loaded == notice and loaded.as_dict()["capture_id"] == str(
+            pair.recipe.source_pin.retained_epoch.epoch_id
+        )
+    async with database.session_factory() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        await session.execute(text(f'SET LOCAL ROLE "{store.publisher_role}"'))
+        with pytest.raises(ValueError, match="source_notification_invalid"):
+            await store.notify_receipt(session, receipt_id=pair.proof.serving_receipt_id, pair=pair)
+
+
+async def _verify_notification_rc_refusal(database, retained, predecessor, store):
+    from process.network_custom_address_source import NetworkCustomAddressSourceError
+
+    with pytest.raises(RuntimeError, match="synthetic RC rollback"):
+        async with support.original_source_transaction(database, isolation="read committed") as session:
+            receipt_id, payload = await _publish_stages(session, retained, predecessor)
+            with pytest.raises(NetworkCustomAddressSourceError, match="repeatable-read transaction"):
+                await retention.bind_prepared_registry_cms_source_pair(
+                    session, retained, receipt_id=receipt_id, receipt_payload=payload
+                )
+            raise RuntimeError("synthetic RC rollback")
+    async with database.session_factory() as session:
+        assert (await serving.read_current_receipt(session, "mrf"))["receipt_id"] == predecessor["receipt_id"]
+        assert (
+            await session.scalar(text(f"SELECT count(*) FROM {store.control_schema}.registry_cms_source_notification"))
+            == 0
+        )
+
+
+async def _verify_notification_populated_downgrade(database, store):
+    async with database.engine.connect() as connection:
+        before = (
+            await connection.execute(
+                text(
+                    f"SELECT notification_json,notification_sha256 FROM {store.control_schema}.registry_cms_source_notification"
+                )
+            )
+        ).all()
+    with pytest.raises(RuntimeError, match="retained-data migration"):
+        async with database.engine.begin() as connection:
+            await _notification_migration(connection, "downgrade", schema=store.control_schema)
+    async with database.engine.connect() as connection:
+        assert (
+            await connection.execute(
+                text(
+                    f"SELECT notification_json,notification_sha256 FROM {store.control_schema}.registry_cms_source_notification"
+                )
+            )
+        ).all() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("copy_bounds", [(1, 64 * 1024**2), (32, 64 * 1024)])
+async def test_native_signed_retention_budget_refuses_before_copy(monkeypatch, tmp_path, copy_bounds):
+    """Keep both original COPY profiles' actual signed refusal and predecessor rollback."""
+    from tests.cms_registry_native_producer_postgres_support import verify_native_budget_refusal
+
+    await verify_native_budget_refusal(monkeypatch, tmp_path, copy_bounds)
+
+
+async def _verify_native_notification_publication(state, monkeypatch):
+    from tests.cms_registry_native_producer_postgres_support import (
+        reject_elevated_notification_role,
+        reject_unscoped_notification,
+    )
+
+    await _verify_notification_populated_downgrade(state.database, state.store)
+    await reject_elevated_notification_role(state)
+    await reject_unscoped_notification(state)
+    await _verify_genuine_retained_state(state, monkeypatch)
+    await _verify_committed_notification(state.database, state.pair, state.store, state.notices[-1])
+
+
+async def verify_committed_source_publication(monkeypatch, tmp_path):
+    """Exercise genuine publication and retained replay across a guarded receipt refresh."""
+    from tests.cms_registry_native_producer_postgres_support import (
+        genuine_prepared_publication,
+        refresh_native_receipt_head,
+    )
+
+    monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", "mrf")
+    async with genuine_prepared_publication(monkeypatch, tmp_path, (32, 64 * 1024)) as state:
+        assert len(state.notices) == 1
+        await _verify_native_notification_publication(state, monkeypatch)
+        await refresh_native_receipt_head(state, monkeypatch)
+        await _verify_genuine_retained_state(state, monkeypatch)
+        await _verify_committed_notification(state.database, state.pair, state.store, state.notices[-1])
+
+
+@pytest.mark.asyncio
+async def test_native_source_notification_rollback_preserves_incumbent(monkeypatch, tmp_path):
+    """Keep the predecessor and charged capacity after the real late notification rollback."""
+    from tests.cms_registry_native_producer_postgres_support import verify_native_notification_rollback
+
+    monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", "mrf")
+    await verify_native_notification_rollback(monkeypatch, tmp_path, (32, 64 * 1024))

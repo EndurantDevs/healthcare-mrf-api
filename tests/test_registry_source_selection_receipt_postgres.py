@@ -456,3 +456,114 @@ async def test_missing_native_stage_fails_without_persisting_receipt(selection_d
     with pytest.raises(RegistrySourceSelectionError, match="^registry_source_selection_unavailable$"):
         await _record(fixture)
     assert (await _candidate(fixture))["validation_json"] is None
+
+
+async def _approved_removal(fixture):
+    """Retain an active manual target outside the genuine CMS source office."""
+    connection, schema = fixture.connection, fixture.schema
+    member = json.loads(
+        await connection.fetchval(
+            f'SELECT input_json FROM pg_temp."{fixture.stage.table_name}" ORDER BY ordinal LIMIT 1'
+        )
+    )
+    provider_id, location_id = str(uuid4()), str(uuid4())
+    member.update(
+        provider_system="manual",
+        provider_id=provider_id,
+        location_id=location_id,
+        evidence_id="approved-target-removal",
+        operation="remove",
+    )
+    documents = (
+        ("provider", provider_id, {"provider_id": provider_id, "archived": False}),
+        ("location", location_id, {"location_id": location_id, "archived": False}),
+        (
+            "membership",
+            str(member["network_id"]),
+            {"network_id": member["network_id"], "archived": False, "memberships_json": [member]},
+        ),
+    )
+    for kind, key, document_by_field in documents:
+        await connection.execute(
+            f'INSERT INTO "{schema}".registry_approved_record (approved_revision,record_kind,record_key,record_revision,custom_revision,record_json) VALUES($1,$2,$3,1,1,$4::jsonb)',
+            fixture.approved.approved_revision,
+            kind,
+            key,
+            json.dumps(document_by_field),
+        )
+    fixture.approved = await _approved_pin(connection, schema)
+    assert fixture.approved.total_rows == 1
+
+
+async def _qualified_selection(fixture, damage):
+    """Replace the fixture's candidate using an exact approved command count."""
+    from tests.test_registry_source_retention import retention_receipt
+
+    connection, schema = fixture.connection, fixture.schema
+    await _approved_removal(fixture)
+    await connection.execute(f'DROP TABLE pg_temp."{fixture.stage.table_name}"')
+    await connection.execute(f'DROP SCHEMA "{fixture.copy_target.schema_name}" CASCADE')
+    await connection.execute(
+        f'DELETE FROM "{schema}".network_membership_candidate WHERE candidate_id=$1',
+        UUID(fixture.copy_target.candidate_id),
+    )
+    async with connection.transaction(isolation="repeatable_read"):
+        fixture.stage = await stage_registry_source_recipes(
+            connection, fixture.recipes, fixture.approved, request_id=uuid4(), control_schema=schema
+        )
+        receipt = retention_receipt(
+            source_generation_sha256=fixture.stage.generation_sha256,
+            source_rows=1,
+            add_rows=0,
+            remove_rows=1,
+            suppressed_source_rows=0,
+            effective_rows=1,
+        )
+        if damage == "mapped_rows":
+            receipt.update(source_rows=2, suppressed_source_rows=1)
+        elif damage == "command_rows":
+            receipt["remove_rows"] = 2
+        await create_network_candidate(
+            connection,
+            fixture.copy_target,
+            source_generations={
+                "custom_membership": fixture.approved.generation_id,
+                "registry_source_membership": fixture.stage.generation_sha256,
+            },
+            approved_custom_revision=fixture.approved.approved_revision,
+            expected_head=0,
+            expected_rows=1,
+            source_recipes=fixture.recipes,
+            source_retention=receipt,
+            control_schema=schema,
+        )
+    if damage == "expected_rows":
+        await connection.execute(
+            f'UPDATE "{schema}".network_membership_candidate SET expected_rows=2 WHERE candidate_id=$1',
+            UUID(fixture.copy_target.candidate_id),
+        )
+    return receipt
+
+
+@pytest.mark.parametrize("damage", ["none", "mapped_rows", "command_rows", "expected_rows"])
+async def test_qualified_selection_uses_raw_and_command_counts_not_positive_sum(selection_db, damage):
+    fixture = selection_db
+    retained = await _qualified_selection(fixture, damage)
+    if damage == "none":
+        receipt = await _record(fixture)
+        assert receipt["mapped_rows"] == retained["source_rows"] == 1
+        assert fixture.approved.total_rows == retained["add_rows"] + retained["remove_rows"] == 1
+        assert (await _candidate(fixture))["expected_rows"] == retained["effective_rows"] == 1
+        assert verify_registry_source_selection_receipt(await _candidate(fixture)) == receipt
+        before = await _candidate(fixture)
+        assert await _record(fixture) == receipt
+        assert await _candidate(fixture) == before
+    else:
+        before = await _candidate(fixture)
+        error = RegistrySourceSelectionError if damage == "expected_rows" else RegistrySourceSelectionConflict
+        code = (
+            "registry_source_selection_invalid" if damage == "expected_rows" else "registry_source_selection_conflict"
+        )
+        with pytest.raises(error, match="^" + code + "$"):
+            await _record(fixture)
+        assert await _candidate(fixture) == before

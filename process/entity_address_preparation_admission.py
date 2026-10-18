@@ -13,6 +13,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from process import entity_address_source_preparation as source_preparation
 from process.provider_directory_profile_temp_limit import apply_temp_file_limit
 
 if TYPE_CHECKING:
@@ -41,6 +42,7 @@ class _AdmittedPreparation:
     stage_oids: tuple[tuple[str, str, int], ...] = ()
     owned_oids: dict[str, int] = field(default_factory=dict)
     retired_oids: list[tuple[str, str, int]] = field(default_factory=list)
+    source_preparation: object = None
 
     @property
     def cleanup_oids(self) -> tuple[tuple[str, str, int], ...]:
@@ -68,7 +70,9 @@ def _admitted_preparation(admission, native_input_hash):
     if type(limit) is not int or limit <= 0 or limit % 1024 or type(worker_count) is not int or worker_count < 1:
         raise ValueError("entity-address preparation temp bound is invalid")
     admission._assert_lease()
-    return _AdmittedPreparation(admission, native_input_hash, asyncio.Semaphore(worker_count))
+    scope = _AdmittedPreparation(admission, native_input_hash, asyncio.Semaphore(worker_count))
+    scope.source_preparation = source_preparation.issue_source_preparation(admission, native_input_hash)
+    return scope
 
 
 def assert_full_recipe(ctx, task) -> None:
@@ -112,17 +116,23 @@ async def lock_owned_relations(database) -> None:
     """Prevent a checked scratch name from being replaced on the executing backend."""
     await _native().candidate_preparation.lock_prepared_doctors(database)
     scope = _ADMISSION.get()
+    source_preparation.require_building(scope)
     if scope is None or not scope.owned_oids:
         return
     names = sorted(scope.owned_oids)
+    expected_identities = [(f"{scope.db_schema}.{name}", scope.owned_oids[name]) for name in names]
+    for name in names:
+        source_preparation.require_owned_relation(scope, name, scope.owned_oids[name])
     relations = ", ".join(f"{scope.db_schema}.{name}" for name in names)
     await database.status(f"LOCK TABLE {relations} IN ACCESS SHARE MODE NOWAIT")
-    for name in names:
-        actual_oid = await database.scalar(
-            "SELECT to_regclass(:relation)::oid::bigint", relation=f"{scope.db_schema}.{name}"
-        )
-        if actual_oid != scope.owned_oids[name]:
-            raise RuntimeError("entity-address owned stage changed")
+    observed_rows = await database.all(
+        "SELECT requested.relation,c.oid::bigint AS oid "
+        "FROM unnest(CAST(:relations AS text[])) WITH ORDINALITY AS requested(relation,ordinal) "
+        "LEFT JOIN pg_class c ON c.oid=to_regclass(requested.relation) ORDER BY requested.ordinal",
+        relations=[relation for relation, _oid in expected_identities],
+    )
+    if [(row[0], row[1]) for row in observed_rows] != expected_identities:
+        raise RuntimeError("entity-address owned stage changed")
 
 
 async def _finish_owned_operation(operation):
@@ -193,13 +203,14 @@ async def _create_owned_relation(db_schema, name, create):
     async with _worker_slot():
         await check_owned_storage()
         is_transaction_owner = native.db._transaction_binding() is None
-        async with native.db.transaction() as session:
+        async with source_preparation.preparation_transaction(native.db, scope) as session:
             await _apply_owned_temp_entry(native.db, is_transaction_owner)
             await native._apply_entity_address_transaction_settings()
             await create(session)
             oid = await native.db.scalar("SELECT to_regclass(:relation)::oid::bigint", relation=f"{db_schema}.{name}")
             if oid is None:
                 raise RuntimeError("entity-address created stage is missing")
+            await source_preparation.register_source_relation(scope, name, int(oid))
             scope.owned_oids[name] = int(oid)
         await scope.admission.register_external_relation(_fhir(), db_schema, name, int(oid))
 
@@ -210,6 +221,7 @@ async def _lock_owned_stage(db_schema, name):
     expected_oid = scope.owned_oids.get(name)
     if scope.db_schema != db_schema or expected_oid is None:
         raise RuntimeError("entity-address stage was not created by this build")
+    source_preparation.require_owned_relation(scope, name, expected_oid)
     await native.db.status("SET LOCAL lock_timeout='500ms'")
     await native.db.status("SET LOCAL statement_timeout='5s'")
     await native.db.status(f"LOCK TABLE {db_schema}.{_identifier(name)} IN ACCESS EXCLUSIVE MODE NOWAIT")
@@ -230,7 +242,7 @@ async def drop_stage(db_schema, name):
 async def _drop_owned_relation(db_schema, name):
     """Commit removal before forgetting the owned OID or its storage registration."""
     scope, native = _ADMISSION.get(), _native()
-    async with native.db.transaction():
+    async with source_preparation.preparation_transaction(native.db, scope):
         oid = await _lock_owned_stage(db_schema, name)
         await native.db.status(f"DROP TABLE {db_schema}.{name} RESTRICT")
     await scope.admission.retire_external_relation(_fhir(), db_schema, name, oid)
@@ -252,7 +264,7 @@ async def replace_compacted_stage(db_schema, stage, compact, context):
 async def _replace_owned_relation(db_schema, stage, compact):
     """Keep both possible names through commit acknowledgement for failure cleanup."""
     scope, native = _ADMISSION.get(), _native()
-    async with native.db.transaction():
+    async with source_preparation.preparation_transaction(native.db, scope):
         for name in sorted((stage, compact)):
             await _lock_owned_stage(db_schema, name)
         old_oid, new_oid = scope.owned_oids[stage], scope.owned_oids[compact]
@@ -260,6 +272,7 @@ async def _replace_owned_relation(db_schema, stage, compact):
         await native.db.status(f"DROP TABLE {db_schema}.{stage} RESTRICT")
         await scope.admission.retire_external_relation(_fhir(), db_schema, stage, old_oid)
         await native.db.status(f"ALTER TABLE {db_schema}.{compact} RENAME TO {stage}")
+        source_preparation.record_source_rename(scope, compact, stage, new_oid)
         await scope.admission.rename_external_relation(_fhir(), db_schema, compact, stage, new_oid)
         scope.owned_oids[stage] = scope.owned_oids.pop(compact)
 
@@ -268,6 +281,7 @@ async def _replace_owned_relation(db_schema, stage, compact):
 async def _worker_slot():
     """Share one signed worker bound across nested source, shard, and index producers."""
     scope = _ADMISSION.get()
+    source_preparation.require_building(scope)
     if scope is None:
         yield
         return
@@ -318,7 +332,7 @@ async def native_transaction():
         await check_owned_storage()
         database = _native().db
         is_transaction_owner = database._transaction_binding() is None
-        async with database.transaction() as session:
+        async with source_preparation.preparation_transaction(database, _ADMISSION.get()) as session:
             await _apply_owned_temp_entry(database, is_transaction_owner)
             await lock_owned_relations(_native().db)
             yield session
@@ -411,6 +425,20 @@ async def tuned_status(statement: str, **params) -> int | None:
 async def _execute_tuned_status(statement, **params):
     """Preserve legacy savepoint tuning and verify admitted settings before executing SQL."""
     native, database = _native(), _native().db
+    scope = _ADMISSION.get()
+    if scope is not None and scope.source_preparation is not None:
+        async with source_preparation.preparation_transaction(database, scope):
+            await _apply_owned_temp_entry(database, True)
+            async with native.entity_address_tuned_transaction(
+                database,
+                native._entity_address_sql_settings(),
+                native._sql_literal,
+                native.logger,
+                **_admitted_temp_options(),
+            ):
+                await verify_sql_settings(database)
+                await lock_owned_relations(database)
+                return native._coerce_rowcount(await database.status(statement, **params))
     settings = native._entity_address_sql_settings()
     transaction_binding = getattr(database, "_transaction_binding", None)
     if callable(transaction_binding) and transaction_binding() is not None:
@@ -464,7 +492,7 @@ async def _bounded_read(database, operation):
     native = _native()
     async with _worker_slot():
         is_transaction_owner = database._transaction_binding() is None
-        async with database.transaction():
+        async with source_preparation.preparation_transaction(database, _ADMISSION.get()):
             scope = _ADMISSION.get()
             if scope is not None and is_transaction_owner:
                 await apply_temp_file_limit(database, scope.admission.plan.temp_file_limit_bytes_per_backend)

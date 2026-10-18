@@ -9,6 +9,7 @@ import time
 from functools import lru_cache
 from typing import Any, Mapping
 
+from sanic.exceptions import InvalidUsage
 from sqlalchemy import text
 
 from api.billing_search_cursor import (
@@ -22,6 +23,8 @@ from api.billing_search_cursor_keys import (
     BILLING_SEARCH_CURSOR_KEYRING_ENV,
     load_billing_search_cursor_keyring,
 )
+from api.billing_search_transport_contract import BILLING_SEARCH_TRANSPORT_PATH
+from api.network_address_scope import current_network_address_scope
 from api.plan_pricing_projection_contract import (
     PROJECTION_CONTRACT,
     PlanPricingProjectionUnavailable,
@@ -36,25 +39,53 @@ from api.plan_pricing_state_scan_contract import (
     STATE_SCAN_RESPONSE_BYTE_LIMIT,
     PlanPricingStateScanBudgetExceeded,
     is_plan_pricing_state_scan,
-    pagination_metadata as _pagination_metadata,
-    query_metadata as _query_metadata,
-    response_document as _response_document,
     validate_plan_pricing_state_scan,
+)
+from api.plan_pricing_state_scan_contract import (
+    pagination_metadata as _pagination_metadata,
+)
+from api.plan_pricing_state_scan_contract import (
+    query_metadata as _query_metadata,
+)
+from api.plan_pricing_state_scan_contract import (
+    response_document as _response_document,
 )
 from api.plan_pricing_state_scan_hydration import (
     eligible_provider_npis as _eligible_provider_npis,
+)
+from api.plan_pricing_state_scan_hydration import (
     hydrate_selected_groups as _hydrate_selected_groups,
 )
 from api.plan_pricing_state_scan_sql import (
     state_scan_page_sql as _page_sql,
+)
+from api.plan_pricing_state_scan_sql import (
     state_scan_provider_page_sql as _provider_page_sql,
 )
-from api.plan_release_serving import PlanReleaseServingSelection
+from api.plan_release_serving import PlanReleaseServingSelection, prepare_plan_release_bindings
+from api.provider_service_source_policy import admitted_plan_release_bindings
 from api.ptg2_response import _is_request_flag_enabled
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
-
 _AUTHORIZATION_SCOPE_SHA256 = hashlib.sha256(b"HEALTHPORTA_PLAN_PRICING_STATE_SCAN_PUBLIC_V1").hexdigest()
+
+
+def validate_state_scan_transport(request, native_args):
+    """Keep public scans canonical and admit only the installed protected default scope."""
+    if getattr(request, "path", BILLING_SEARCH_TRANSPORT_PATH) == BILLING_SEARCH_TRANSPORT_PATH:
+        return
+    scope = current_network_address_scope()
+    if (
+        getattr(request, "path", None) == "/api/v1/registry/serving/providers/collection"
+        and getattr(request, "method", None) == "POST"
+        and native_args is not None
+        and scope is not None
+        and scope.network_ids is None
+    ):
+        return
+    raise InvalidUsage(
+        "Release-bound state scans require the canonical /api/v1/pricing/providers/search-by-procedure path"
+    )
 
 
 @lru_cache(maxsize=1)
@@ -131,17 +162,32 @@ def _cursor_scope(
             "plan_release_id": selection.plan_release_id,
         }
     )
-    generation_bundle = _digest(
-        {
-            "pricing_projection_contract": selection.pricing_projection_contract,
-            "pricing_projection_id": selection.pricing_projection_id,
-            "serving_revision_id": selection.serving_revision_id,
-            "snapshot_set_sha256": snapshot_set,
+    generation_by_field = {
+        "pricing_projection_contract": selection.pricing_projection_contract,
+        "pricing_projection_id": selection.pricing_projection_id,
+        "serving_revision_id": selection.serving_revision_id,
+        "snapshot_set_sha256": snapshot_set,
+    }
+    authorization_scope = _AUTHORIZATION_SCOPE_SHA256
+    managed_scope = current_network_address_scope()
+    if managed_scope is not None:
+        if managed_scope.network_ids is not None:
+            raise PlanPricingProjectionUnavailable("selected networks do not admit state scans")
+        authorization_scope = managed_scope.access_scope_sha256
+        generation_by_field["network_catalog"] = {
+            "generation": managed_scope.manifest.generation_id,
+            "approved_custom_revision": managed_scope.manifest.approved_custom_revision,
+            "manifest_sha256": managed_scope.manifest.manifest_sha256,
         }
-    )
+    from api.provider_service_legacy_selection import service_legacy_selection_sha256
+
+    legacy_selection_sha256 = service_legacy_selection_sha256()
+    if legacy_selection_sha256 is not None:
+        generation_by_field["legacy_selection_sha256"] = legacy_selection_sha256
+    generation_bundle = _digest(generation_by_field)
     return (
         request_fingerprint,
-        _AUTHORIZATION_SCOPE_SHA256,
+        authorization_scope,
         generation_bundle,
         snapshot_set,
     )
@@ -203,15 +249,20 @@ async def _read_state_npis(
     state: str,
     after_npi: int,
     limit: int,
+    *,
+    binding_ordinals=None,
 ) -> tuple[tuple[int, ...], dict[int, Any], bool]:
+    parameters_by_name = {
+        "after_npi": after_npi,
+        "npi_sentinel_limit": limit + 1,
+        "projection_id": projection_id,
+        "state": state,
+    }
+    if binding_ordinals is not None:
+        parameters_by_name["admitted_binding_ordinals"] = list(binding_ordinals)
     state_result = await session.execute(
-        text(_provider_page_sql()),
-        {
-            "after_npi": after_npi,
-            "npi_sentinel_limit": limit + 1,
-            "projection_id": projection_id,
-            "state": state,
-        },
+        text(_provider_page_sql(binding_ordinals)),
+        parameters_by_name,
     )
     state_rows = [row_mapping(state_row) for state_row in state_result.mappings().all()]
     has_more = len(state_rows) > limit
@@ -219,10 +270,7 @@ async def _read_state_npis(
     selected_npis = tuple(int(state_row["npi"]) for state_row in selected_rows)
     return (
         selected_npis,
-        {
-            int(state_row["npi"]): state_row.get("provider_fragment")
-            for state_row in selected_rows
-        },
+        {int(state_row["npi"]): state_row.get("provider_fragment") for state_row in selected_rows},
         has_more,
     )
 
@@ -234,22 +282,24 @@ async def _read_projected_occurrences(
     code: str,
     selected_npis: tuple[int, ...],
     limit: int,
+    *,
+    binding_ordinals=None,
 ) -> list[dict[str, Any]]:
-    page_result = await session.execute(
-        text(_page_sql()),
-        {
-            "code": code,
-            "code_system": code_system,
-            "membership_limit": STATE_SCAN_PROVIDER_MEMBERSHIP_LIMIT,
-            "membership_probe_limit": STATE_SCAN_PROVIDER_MEMBERSHIP_LIMIT + 1,
-            "membership_sentinel_limit": (STATE_SCAN_PROVIDER_MEMBERSHIP_LIMIT + 1),
-            "occurrence_probe_limit": STATE_SCAN_RATE_OCCURRENCE_LIMIT + 1,
-            "occurrence_sentinel_limit": STATE_SCAN_RATE_OCCURRENCE_LIMIT + 1,
-            "page_row_limit": STATE_SCAN_RATE_OCCURRENCE_LIMIT + limit + 1,
-            "projection_id": projection_id,
-            "selected_npis": list(selected_npis),
-        },
-    )
+    parameters_by_name = {
+        "code": code,
+        "code_system": code_system,
+        "membership_limit": STATE_SCAN_PROVIDER_MEMBERSHIP_LIMIT,
+        "membership_probe_limit": STATE_SCAN_PROVIDER_MEMBERSHIP_LIMIT + 1,
+        "membership_sentinel_limit": (STATE_SCAN_PROVIDER_MEMBERSHIP_LIMIT + 1),
+        "occurrence_probe_limit": STATE_SCAN_RATE_OCCURRENCE_LIMIT + 1,
+        "occurrence_sentinel_limit": STATE_SCAN_RATE_OCCURRENCE_LIMIT + 1,
+        "page_row_limit": STATE_SCAN_RATE_OCCURRENCE_LIMIT + limit + 1,
+        "projection_id": projection_id,
+        "selected_npis": list(selected_npis),
+    }
+    if binding_ordinals is not None:
+        parameters_by_name["admitted_binding_ordinals"] = list(binding_ordinals)
+    page_result = await session.execute(text(_page_sql(binding_ordinals)), parameters_by_name)
     return [row_mapping(database_row) for database_row in page_result.mappings().all()]
 
 
@@ -347,8 +397,48 @@ def _search_cursor_context(
         scope=scope,
     )
     return (
-        trusted_now, keyring, scope, after_npi,
-        scanned_before, emitted_before, completed_page_count,
+        trusted_now,
+        keyring,
+        scope,
+        after_npi,
+        scanned_before,
+        emitted_before,
+        completed_page_count,
+    )
+
+
+async def _prefix_pricing_items(
+    session, selection, args, code_identity, provider_fragments, eligible_npis, contributing_bindings
+):
+    """Read only admitted occurrences before hydrating one complete provider prefix."""
+    occurrence_rows = []
+    if eligible_npis:
+        options_by_name = (
+            {}
+            if contributing_bindings is None
+            else {"binding_ordinals": tuple(binding.binding_ordinal for binding in contributing_bindings)}
+        )
+        occurrence_rows = _validated_occurrences(
+            await _read_projected_occurrences(
+                session,
+                selection.pricing_projection_id,
+                code_identity[0],
+                code_identity[1],
+                eligible_npis,
+                len(eligible_npis),
+                **options_by_name,
+            )
+        )
+    return (
+        await _hydrate_selected_groups(
+            session,
+            selection,
+            args,
+            occurrence_rows,
+            {npi: provider_fragments[npi] for npi in eligible_npis},
+        )
+        if occurrence_rows
+        else []
     )
 
 
@@ -357,50 +447,49 @@ async def _prefix_response(
     selection: PlanReleaseServingSelection,
     args: Mapping[str, Any],
     code_identity: tuple[str, str, str],
-    provider_page: tuple[tuple[int, ...], dict[int, Any], bool, frozenset[int]],
+    provider_page: tuple[Any, ...],
     cursor_context: tuple[Any, ...],
     requested_limit: int,
     selected_npis: tuple[int, ...],
 ) -> dict[str, Any]:
     """Build one complete bounded prefix response."""
 
-    candidate_npis, provider_fragments, state_has_more, eligible_candidates = provider_page
+    candidate_npis, provider_fragments, state_has_more, eligible_candidates = provider_page[:4]
+    contributing_bindings = provider_page[4] if len(provider_page) > 4 else None
     eligible_npis = tuple(npi for npi in selected_npis if npi in eligible_candidates)
-    occurrence_rows = []
-    if eligible_npis:
-        occurrence_rows = _validated_occurrences(
-            await _read_projected_occurrences(
-                session, selection.pricing_projection_id,
-                code_identity[0], code_identity[1], eligible_npis, len(eligible_npis),
-            )
-        )
-    response_items = (
-        await _hydrate_selected_groups(
-            session, selection, args, occurrence_rows,
-            {npi: provider_fragments[npi] for npi in eligible_npis},
-        )
-        if occurrence_rows
-        else []
+    response_items = await _prefix_pricing_items(
+        session, selection, args, code_identity, provider_fragments, eligible_npis, contributing_bindings
     )
     scanned_after = cursor_context[4] + len(selected_npis)
     emitted_after = cursor_context[5] + len(response_items)
     page_number = cursor_context[6] + 1
     has_more = state_has_more or len(selected_npis) < len(candidate_npis)
     next_cursor = _next_page_cursor(
-        selected_npis, scanned_after, emitted_after, page_number,
+        selected_npis,
+        scanned_after,
+        emitted_after,
+        page_number,
         has_more=has_more,
-        keyring=cursor_context[1], trusted_now=cursor_context[0], scope=cursor_context[2],
+        keyring=cursor_context[1],
+        trusted_now=cursor_context[0],
+        scope=cursor_context[2],
     )
     return _response_document(
         selection,
         response_items,
         _pagination_metadata(
-            requested_limit, cursor_context[5], scanned_after,
-            emitted_after, page_number, has_more, next_cursor,
+            requested_limit,
+            cursor_context[5],
+            scanned_after,
+            emitted_after,
+            page_number,
+            has_more,
+            next_cursor,
         ),
         _query_metadata(*code_identity),
         args,
         byte_limit=STATE_SCAN_RESPONSE_BYTE_LIMIT,
+        contributing_bindings=contributing_bindings,
     )
 
 
@@ -412,6 +501,8 @@ async def _adaptive_page_response(
     provider_page: tuple[tuple[int, ...], dict[int, Any], bool],
     cursor_context: tuple[Any, ...],
     requested_limit: int,
+    *,
+    contributing_bindings=None,
 ) -> dict[str, Any]:
     """Return the largest attempted complete NPI prefix or refuse one NPI."""
 
@@ -421,6 +512,7 @@ async def _adaptive_page_response(
         provider_fragments,
         state_has_more,
         frozenset(_eligible_provider_npis(provider_fragments, args)),
+        contributing_bindings,
     )
     selected_npis = candidate_npis
     while True:
@@ -452,15 +544,41 @@ async def search_plan_pricing_state_scan(
     code_system, code, state, cursor = _validate_search_request(selection, args, pagination)
     requested_limit = int(pagination.limit)
     cursor_context = _search_cursor_context(
-        selection, args, code_system, code, state, requested_limit, cursor,
+        selection,
+        args,
+        code_system,
+        code,
+        state,
+        requested_limit,
+        cursor,
     )
-    provider_page = await _read_state_npis(
-        session, selection.pricing_projection_id, state,
-        cursor_context[3], requested_limit,
+    contributing_bindings = None
+    options_by_name = {}
+    if current_network_address_scope() is not None:
+        contributing_bindings = await admitted_plan_release_bindings(session, selection)
+        selection = await prepare_plan_release_bindings(session, selection, contributing_bindings)
+        options_by_name["binding_ordinals"] = tuple(binding.binding_ordinal for binding in contributing_bindings)
+    provider_page = (
+        await _read_state_npis(
+            session,
+            selection.pricing_projection_id,
+            state,
+            cursor_context[3],
+            requested_limit,
+            **options_by_name,
+        )
+        if contributing_bindings != ()
+        else ((), {}, False)
     )
     return await _adaptive_page_response(
-        session, selection, args, (code_system, code, state),
-        provider_page, cursor_context, requested_limit,
+        session,
+        selection,
+        args,
+        (code_system, code, state),
+        provider_page,
+        cursor_context,
+        requested_limit,
+        contributing_bindings=contributing_bindings,
     )
 
 

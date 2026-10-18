@@ -261,3 +261,55 @@ async def test_native_preparation_threads_archive_and_restores_scope_after_inter
     assert preparation.current() is None
     assert preparation._NATIVE_DEPENDENCIES.get() is None
     assert preparation.admitted._ADMISSION.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [None, "no_factory", "wrong_oid", "wrong_file", "one_canonical", "other_source"])
+async def test_captured_tiger_dependencies_require_fresh_factory_native_proof(monkeypatch, fault):
+    from process import provider_directory_cms_tiger_inputs as tiger
+    from process import provider_directory_generic_source_policy as policy
+    from tests.test_cms_tiger_native_inputs import CapturedSourceSession, IssuedFactory, _captured_proof
+
+    bindings = _example_bindings()
+    bindings.update(tiger.captured_tiger_bindings(_captured_proof()))
+    if fault == "wrong_oid":
+        bindings["tiger.zcta5"]["relation_oid"] += 100
+    elif fault == "wrong_file":
+        bindings["tiger.zcta5"]["relfilenode"] += 1
+    elif fault == "one_canonical":
+        bindings["tiger.zip_state"]["schema_name"] = "tiger"
+    elif fault == "other_source":
+        bindings["mrf.npi_address"]["schema_name"] = "unproved"
+    session = CapturedSourceSession()
+    database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session))
+    check = AsyncMock()
+    monkeypatch.setattr(dependencies, "assert_prepared_dependencies", check)
+    if fault == "no_factory":
+        with pytest.raises(RuntimeError, match="native Source authority"):
+            await dependencies.capture_dependencies(database, "mrf", (), dependency_bindings=bindings)
+        check.assert_not_awaited()
+        assert session.calls == []
+        return
+    callback = AsyncMock(return_value=_captured_proof())
+    async with policy.bind_generic_source_transaction_factory(IssuedFactory(callback)):
+        if fault is None:
+            observed = await dependencies.capture_dependencies(database, "mrf", (), dependency_bindings=bindings)
+            assert observed.dependency_bindings == bindings and observed.doctors is None and observed.archive is None
+            check.assert_awaited_once_with(database, observed)
+        else:
+            with pytest.raises(RuntimeError, match="not a proven input"):
+                await dependencies.capture_dependencies(database, "mrf", (), dependency_bindings=bindings)
+            check.assert_not_awaited()
+    callback.assert_awaited_once_with(session)
+    assert any(sql == tiger.CAPTURED_CATALOG_SQL for sql, _ in session.calls)
+
+
+def test_captured_tiger_linkage_does_not_allow_foreign_bindings_without_native_metadata():
+    from process import provider_directory_cms_tiger_inputs as tiger
+    from tests.test_cms_tiger_native_inputs import _captured_proof
+
+    bindings = _example_bindings()
+    bindings.update(tiger.captured_tiger_bindings(_captured_proof()))
+    with pytest.raises(RuntimeError, match="not a proven input"):
+        dependencies._validate_bindings("mrf", None, bindings)
+    assert dependencies._validate_bindings("mrf", None, bindings, tiger_captured=_captured_proof()) == bindings

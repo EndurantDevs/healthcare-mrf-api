@@ -12,6 +12,7 @@ import asyncpg
 
 from process.registry_approved_company_groups import approved_company_group_diagnostics
 from process.registry_approved_membership import approved_membership_diagnostics
+from process.registry_benefit_plan_metadata import validate_benefit_plan_ids
 from process.registry_company_approval_fence import lock_registry_company_approval_writer
 from process.registry_record_store import (
     RegistryActor,
@@ -250,19 +251,70 @@ async def _validate_company_groups(connection, namespace, staging, previous_revi
         raise RegistryApprovalConflict("registry_approval_company_group_unresolved")
 
 
-async def approve_registry_records(connection, command, actor: RegistryActor, *, control_schema=None):
+async def _approval_replay(connection, namespace, command, metadata):
+    replay = await connection.fetchrow(
+        f"SELECT approved_revision,previous_approved_revision,jsonb_array_length(selection_json) AS selected_count,request_sha256 "
+        f"FROM {namespace}.registry_approval_history WHERE actor_key=$1 AND idempotency_key=$2",
+        metadata["actor_key"],
+        command.idempotency_key,
+    )
+    if replay is None:
+        return None
+    if replay["request_sha256"] != metadata["request_sha256"]:
+        raise RegistryApprovalConflict("registry_approval_idempotency_conflict")
+    return {key: replay[key] for key in ("approved_revision", "previous_approved_revision", "selected_count")} | {
+        "replayed": True
+    }
+
+
+async def _approval_benefit_ids(connection, namespace, selection_json):
+    return tuple(
+        json.loads(
+            await connection.fetchval(
+                f"""WITH selected AS (SELECT * FROM jsonb_to_recordset($1::jsonb)
+          AS selection(record_kind text,record_id text,revision bigint)), identities AS (
+          SELECT DISTINCT plan_id #>> '{{}}' AS plan_id FROM selected
+          JOIN {namespace}.registry_record_history history ON history.record_kind='company_links'
+            AND selected.record_kind='company_links' AND history.record_key=selected.record_id
+            AND history.revision=selected.revision
+          CROSS JOIN LATERAL jsonb_array_elements(coalesce(history.record_json->'network_assertions','[]'::jsonb)) assertion
+          CROSS JOIN LATERAL jsonb_array_elements(coalesce(assertion->'benefit_plan_ids','[]'::jsonb)) plan_id
+          WHERE history.record_json->'archived'='false'::jsonb LIMIT 5001)
+          SELECT coalesce(jsonb_agg(plan_id ORDER BY plan_id),'[]'::jsonb)::text FROM identities""",
+                selection_json,
+            )
+        )
+    )
+
+
+async def approve_registry_records(
+    connection, command, actor: RegistryActor, *, control_schema=None, plan_metadata_client=None, final_authorize=None
+):
     """Retain an explicit approved map; the caller authenticates live grants first.
 
     Actor identity and a replay key do not grant approval permission. The caller
     must recheck live authorization on every invocation, including exact retries.
     A savepoint preserves earlier caller work and never commits the transaction.
+    A trusted final_authorize callback runs after metadata and approval locks;
+    exact retries still recheck authority without another metadata request.
     """
+    if final_authorize is not None and not callable(final_authorize):
+        raise ValueError("registry_approval_authority_invalid")
     reason, selection_json = _validated_command(command)
     actor_document = _validated_actor(actor)
     namespace = _namespace(control_schema)
     if not connection.is_in_transaction():
         raise ValueError("registry_approval_requires_caller_transaction")
     async with connection.transaction():
+        if any(
+            type(entry) is dict and entry.get("record_kind") == "company_links" for entry in json.loads(selection_json)
+        ):
+            selection_json = await _canonical_selection(connection, selection_json)
+            approval_metadata = _approval_metadata(command, actor_document, selection_json, reason)
+            if await _approval_replay(connection, namespace, command, approval_metadata) is None:
+                await validate_benefit_plan_ids(
+                    await _approval_benefit_ids(connection, namespace, selection_json), plan_metadata_client, actor
+                )
         await lock_registry_company_approval_writer(connection, namespace[1:-1])
         selection_json = await _canonical_selection(connection, selection_json)
         approval_metadata = _approval_metadata(command, actor_document, selection_json, reason)
@@ -270,20 +322,13 @@ async def approve_registry_records(connection, command, actor: RegistryActor, *,
         control = await connection.fetchrow(
             f"SELECT draft_revision,approved_revision FROM {namespace}.registry_revision_control WHERE id=1 FOR UPDATE"
         )
+        if final_authorize is not None:
+            await final_authorize()
         if control is None:
             raise RegistryApprovalConflict("registry_control_unavailable")
-        replay = await connection.fetchrow(
-            f"""SELECT approved_revision,previous_approved_revision,jsonb_array_length(selection_json) AS selected_count,
-            request_sha256 FROM {namespace}.registry_approval_history WHERE actor_key=$1 AND idempotency_key=$2""",
-            approval_metadata["actor_key"],
-            command.idempotency_key,
-        )
+        replay = await _approval_replay(connection, namespace, command, approval_metadata)
         if replay is not None:
-            if replay["request_sha256"] != approval_metadata["request_sha256"]:
-                raise RegistryApprovalConflict("registry_approval_idempotency_conflict")
-            return {
-                key: replay[key] for key in ("approved_revision", "previous_approved_revision", "selected_count")
-            } | {"replayed": True}
+            return replay
         if (control["draft_revision"], control["approved_revision"]) != (
             command.expected_draft_revision,
             command.expected_approved_revision,

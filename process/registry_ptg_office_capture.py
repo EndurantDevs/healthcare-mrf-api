@@ -300,8 +300,8 @@ async def _copy_office_batches(driver, schema_name, batches, encoder, scope, req
     expected_context = _codec_context(scope, request)
     async for raw in batches:
         guard()
-        encoded, canonical, count, last, office_rows = await asyncio.to_thread(
-            _batch, encoder, raw, expected_context, ordinal
+        encoded, canonical, count, last, office_rows = await drain_operation(
+            asyncio.to_thread(_batch, encoder, raw, expected_context, ordinal), preserve_cancellation=True
         )
         guard()
         if last > request.input_row_count:

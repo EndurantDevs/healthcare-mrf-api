@@ -11,10 +11,6 @@ from unittest.mock import AsyncMock
 
 from db.connection import Database
 from db.models import ProviderDirectoryOrganization
-from process.provider_directory_proof_store import (
-    ProviderDirectoryStoredProofOptions,
-    build_stored_dataset_proof,
-)
 from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
 )
@@ -22,9 +18,11 @@ from tests.provider_directory_semantic_proof_v3_postgres_support import (
     CANONICAL_BASE,
     PROJECTION_AS_OF,
     SOURCE_ID,
+    _candidate_stored_proof,
+    _completed_semantic_scope,
+    _materialize_semantic_dataset,
     importer,
 )
-
 
 RESOURCE_ID = "organization-semantic-union"
 V4_DATASET_FORWARD = "dataset-organization-union-forward"
@@ -49,9 +47,7 @@ def organization_observation(
         "name": name,
         "aliases": aliases or [],
         "active": True,
-        "identifiers": [
-            {"system": "urn:example", "value": RESOURCE_ID}
-        ],
+        "identifiers": [{"system": "urn:example", "value": RESOURCE_ID}],
         "resource_url": f"https://{transport_host}/{RESOURCE_ID}",
         "fhir_self_url": f"https://{transport_host}/self/{RESOURCE_ID}",
         "fhir_fetch_url": f"https://{transport_host}/page/{page_number}",
@@ -117,9 +113,7 @@ async def write_partition_page(
     retained_row = dataset_row(dataset_id, row_by_field)
     stage = importer.LastUpdatedPartitionStage(
         rows=(retained_row,),
-        candidate_hashes_by_id={
-            str(retained_row["resource_id"]): str(retained_row["payload_hash"])
-        },
+        candidate_hashes_by_id={str(retained_row["resource_id"]): str(retained_row["payload_hash"])},
         resource_hash_contract=SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
         semantic_projection_as_of=PROJECTION_AS_OF,
     )
@@ -154,17 +148,18 @@ async def stored_dataset_row(
 ) -> tuple[str, dict[str, object]]:
     """Return the retained v4 hash and decoded payload."""
 
-    record = await database.first(
-        f'SELECT payload_hash, payload_json FROM "{schema}".'
-        "provider_directory_dataset_resource WHERE dataset_id=:dataset_id "
-        "AND resource_type='Organization' AND resource_id=:resource_id;",
-        dataset_id=dataset_id,
-        resource_id=RESOURCE_ID,
-    )
-    payload_by_field = record[1]
-    if isinstance(payload_by_field, str):
-        payload_by_field = json.loads(payload_by_field)
-    return str(record[0]), payload_by_field
+    async with _completed_semantic_scope(database, dataset_id):
+        record = await database.first(
+            f"SELECT payload_hash, payload_json FROM {importer._qt(schema, 'provider_directory_dataset_resource')} "
+            "WHERE dataset_id=:dataset_id "
+            "AND resource_type='Organization' AND resource_id=:resource_id;",
+            dataset_id=dataset_id,
+            resource_id=RESOURCE_ID,
+        )
+        payload_by_field = record[1]
+        if isinstance(payload_by_field, str):
+            payload_by_field = json.loads(payload_by_field)
+        return str(record[0]), payload_by_field
 
 
 async def stored_proof(
@@ -174,48 +169,36 @@ async def stored_proof(
 ):
     """Build one sealed v4 Organization proof from durable shards."""
 
-    return await build_stored_dataset_proof(
-        database,
-        schema,
-        dataset_id=dataset_id,
-        endpoint_id=f"endpoint-{dataset_id}"[:64],
-        acquisition_root_run_id=f"root-{dataset_id}"[:64],
-        source_ids=[SOURCE_ID],
-        selected_resources=["Organization"],
-        options=ProviderDirectoryStoredProofOptions(
-            proof_resource_scope=["Organization"],
-            expected_resource_hash_contract=(
-                SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-            ),
-            expected_semantic_projection_as_of=PROJECTION_AS_OF,
-        ),
-    )
+    return await _candidate_stored_proof(database, database.semantic_candidates[dataset_id])
 
 
 async def materialized_organization(
     database: Database,
     schema: str,
+    dataset_id: str,
 ) -> tuple[dict[str, object], str]:
     """Return typed name state and canonical hash."""
 
-    typed_record = await database.first(
-        f'SELECT name, name_variants, aliases, resource_url FROM "{schema}".'
-        "provider_directory_organization WHERE source_id=:source_id "
-        "AND resource_id=:resource_id;",
-        source_id=SOURCE_ID,
-        resource_id=RESOURCE_ID,
-    )
-    canonical_hash = await database.scalar(
-        f'SELECT payload_hash FROM "{schema}".'
-        "provider_directory_canonical_resource "
-        "WHERE canonical_api_base=:canonical_base "
-        "AND resource_type='Organization' AND resource_id=:resource_id;",
-        canonical_base=CANONICAL_BASE,
-        resource_id=RESOURCE_ID,
-    )
-    return {
-        "name": typed_record[0],
-        "name_variants": list(typed_record[1]),
-        "aliases": list(typed_record[2]),
-        "resource_url": typed_record[3],
-    }, str(canonical_hash)
+    await _materialize_semantic_dataset(database, dataset_id)
+    async with _completed_semantic_scope(database, dataset_id):
+        typed_record = await database.first(
+            f'SELECT name, name_variants, aliases, resource_url FROM "{schema}".'
+            "provider_directory_organization WHERE source_id=:source_id "
+            "AND resource_id=:resource_id;",
+            source_id=SOURCE_ID,
+            resource_id=RESOURCE_ID,
+        )
+        canonical_hash = await database.scalar(
+            f'SELECT payload_hash FROM "{schema}".'
+            "provider_directory_canonical_resource "
+            "WHERE canonical_api_base=:canonical_base "
+            "AND resource_type='Organization' AND resource_id=:resource_id;",
+            canonical_base=CANONICAL_BASE,
+            resource_id=RESOURCE_ID,
+        )
+        return {
+            "name": typed_record[0],
+            "name_variants": list(typed_record[1]),
+            "aliases": list(typed_record[2]),
+            "resource_url": typed_record[3],
+        }, str(canonical_hash)

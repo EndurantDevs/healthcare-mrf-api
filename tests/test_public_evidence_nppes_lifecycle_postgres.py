@@ -8,11 +8,12 @@ from pathlib import Path
 import asyncpg
 import pytest
 
-from public_evidence import nppes_registry_row_projection as row_projection
 from process.nppes_public_evidence_catalog import assert_nppes_admission_catalog
 from process.nppes_public_evidence_writer_contract import (
     NppesPublicEvidenceWriterError,
 )
+from public_evidence import nppes_registry_row_projection as row_projection
+from tests.nppes_candidate_postgres_support import nppes_candidate_schema, resolved_family
 from tests.public_evidence_npi_enumeration_postgres_support import (
     npi_enumeration_schema,
 )
@@ -20,7 +21,6 @@ from tests.public_evidence_nppes_admission_postgres_support import (
     admit_replay,
     load_admission_migration,
     load_lifecycle_migration,
-    nppes_admission_schema,
     prepared_replay,
 )
 from tests.public_evidence_nppes_registry_support import (
@@ -34,16 +34,13 @@ from tests.public_evidence_storage_postgres_support import (
     run_migration_action,
 )
 
-
 ADMISSION_TABLE = "public_evidence_nppes_registry_admission"
 MEMBER_TABLE = "public_evidence_nppes_registry_member"
 COMMON_TABLE = "public_evidence_record"
 TYPED_TABLE = "public_evidence_npi_enumeration"
 ADMISSION_TRIGGER = "public_evidence_nppes_registry_admission_integrity_guard"
 OLD_VALIDATOR = "validate_public_evidence_nppes_registry_admission"
-NEW_VALIDATOR = (
-    "validate_public_evidence_nppes_registry_admission_lifecycle_v2"
-)
+NEW_VALIDATOR = "validate_public_evidence_nppes_registry_admission_lifecycle_v2"
 OBSERVED_LIFECYCLE_ROWS = (
     equal_day_reactivated_type_1_row(),
     orphan_reactivated_type_2_row(),
@@ -101,9 +98,7 @@ def test_lifecycle_migration_schema_resolution_is_exact(
             monkeypatch.setenv(variable_name, schema_value)
     migration = load_lifecycle_migration()
     assert migration.revision == "20260809020000_nppes_lifecycle_date_tolerance"
-    assert migration.down_revision == (
-        "20260809010000_provider_directory_effective_endpoint_identity"
-    )
+    assert migration.down_revision == ("20260809010000_provider_directory_effective_endpoint_identity")
     assert migration._schema() == expected_schema
 
 
@@ -206,7 +201,7 @@ async def test_lifecycle_v2_rejects_future_enumeration_before_seal(
         "06/15/2026",
     )
     replay = await prepared_replay(tmp_path, (future_enumeration_row,))
-    async with nppes_admission_schema() as (_engine, url, schema, _migration):
+    async with nppes_candidate_schema() as (_engine, url, schema, _migration):
         connection = await connect(url)
         try:
             with pytest.raises(NppesPublicEvidenceWriterError):
@@ -216,9 +211,7 @@ async def test_lifecycle_v2_rejects_future_enumeration_before_seal(
                 "public_evidence_nppes_registry_admission_seal",
                 MEMBER_TABLE,
             ):
-                assert await connection.fetchval(
-                    f'SELECT count(*) FROM "{schema}"."{table_name}"'
-                ) == 0
+                assert await connection.fetchval(f'SELECT count(*) FROM "{schema}"."{table_name}"') == 0
         finally:
             await connection.close()
 
@@ -228,15 +221,21 @@ async def test_lifecycle_v2_admits_and_seals_observed_as_of_shapes(
     tmp_path: Path,
 ) -> None:
     replay = await prepared_replay(tmp_path, OBSERVED_LIFECYCLE_ROWS)
-    async with nppes_admission_schema() as (_engine, url, schema, _migration):
+    async with nppes_candidate_schema() as (_engine, url, schema, _migration):
         connection = await connect(url)
         try:
             admission_receipt = await admit_replay(connection, schema, replay)
             assert admission_receipt.write_state == "inserted"
-            assert await connection.fetchval(
-                f'SELECT count(*) FROM "{schema}".'
-                '"public_evidence_nppes_registry_admission_seal"'
-            ) == 1
+            assert (
+                await connection.fetchval(
+                    f'SELECT count(*) FROM "{schema}"."public_evidence_nppes_registry_admission_seal"'
+                )
+                == 1
+            )
+            family = await resolved_family(schema, replay.admission_row.admission_ref)
+            member = family["member"]["name"]
+            common = family["common"]["name"]
+            typed = family["typed"]["name"]
             lifecycle_rows = await connection.fetch(
                 "SELECT member.source_row_ordinal, "
                 "to_char(member.last_update_date, 'YYYY-MM-DD') AS last_update, "
@@ -245,18 +244,15 @@ async def test_lifecycle_v2_admits_and_seals_observed_as_of_shapes(
                 "typed.enumeration_state, "
                 "to_char(common.effective_start_at AT TIME ZONE 'UTC', "
                 "'YYYY-MM-DD') AS effective_start "
-                f'FROM "{schema}"."{MEMBER_TABLE}" AS member '
-                f'JOIN "{schema}"."{COMMON_TABLE}" AS common '
+                f'FROM "{schema}"."{member}" AS member '
+                f'JOIN "{schema}"."{common}" AS common '
                 "ON common.evidence_ref=member.evidence_ref "
                 "AND common.nppes_admission_ref=member.admission_ref "
-                f'JOIN "{schema}"."{TYPED_TABLE}" AS typed '
+                f'JOIN "{schema}"."{typed}" AS typed '
                 "ON typed.evidence_ref=member.evidence_ref "
                 "AND typed.nppes_admission_ref=member.admission_ref "
                 "ORDER BY member.source_row_ordinal"
             )
-            assert tuple(
-                tuple(lifecycle_row.values())
-                for lifecycle_row in lifecycle_rows
-            ) == EXPECTED_LIFECYCLE_ROWS
+            assert tuple(tuple(lifecycle_row.values()) for lifecycle_row in lifecycle_rows) == EXPECTED_LIFECYCLE_ROWS
         finally:
             await connection.close()

@@ -22,7 +22,6 @@ from db.models import (
     ProviderDirectorySource,
 )
 
-
 fhir = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -49,18 +48,11 @@ def test_reverse_lookup_and_start_url_empty_boundaries():
         "metadata_json": {"provider_directory_resource_page_count_cap": {}},
     }
 
-    assert (
-        fhir._metadata_resource_page_count_cap(source_by_field, "Practitioner") is None
-    )
-    assert (
-        fhir._resource_start_url(source_by_field, "Practitioner", page_count=10) is None
-    )
+    assert fhir._metadata_resource_page_count_cap(source_by_field, "Practitioner") is None
+    assert fhir._resource_start_url(source_by_field, "Practitioner", page_count=10) is None
     assert fhir._practitioner_role_reverse_lookup_params({}) == {}
     assert (
-        fhir._scan_practitioner_role_reverse_lookup_url(
-            {}, "practitioner", "Practitioner", "p1", page_count=10
-        )
-        is None
+        fhir._scan_practitioner_role_reverse_lookup_url({}, "practitioner", "Practitioner", "p1", page_count=10) is None
     )
 
 
@@ -85,18 +77,14 @@ async def test_reverse_lookup_checkpoint_short_circuits(monkeypatch):
 @pytest.mark.asyncio
 async def test_scan_seed_iterators_cover_empty_and_skipped_rows(monkeypatch):
     options = _scan_options(source={})
-    assert [
-        seed async for seed in fhir._iter_scan_practitioner_role_seed_rows({}, options)
-    ] == []
+    assert [seed async for seed in fhir._iter_scan_practitioner_role_seed_rows({}, options)] == []
 
     monkeypatch.setattr(
         fhir,
         "_practitioner_role_reverse_lookup_resources",
         lambda _source: ("Unknown",),
     )
-    skipped = _scan_options(
-        source={}, seed_stage_table="stage", seed_source_ids=("source",)
-    )
+    skipped = _scan_options(source={}, seed_stage_table="stage", seed_source_ids=("source",))
     assert [seed async for seed in fhir._scan_role_stage_seeds(skipped)] == []
 
     monkeypatch.setattr(
@@ -125,9 +113,7 @@ def test_reference_and_metadata_reader_boundaries(monkeypatch):
     assert fhir._insurance_plan_network_references({"plan": [None]}) == []
     assert fhir._json_object("{") == {}
     assert fhir._source_hosts({}) == set()
-    assert not fhir._is_url_within_api_base(
-        "https://example.test:bad/fhir", "https://example.test/fhir"
-    )
+    assert not fhir._is_url_within_api_base("https://example.test:bad/fhir", "https://example.test/fhir")
     assert fhir._references([{}]) == []
     assert fhir._organization_reference_identity("Organization/bad$id") is None
 
@@ -156,9 +142,7 @@ def test_alohr_scalar_boundaries(monkeypatch):
     monkeypatch.setattr(fhir, "int", fail_int, raising=False)
     assert fhir._alohr_npi("123") is None
     assert fhir._alohr_telecom([{}], "") == []
-    assert fhir._alohr_specialty_codings(None, "Specialty") == [
-        {"display": "Specialty"}
-    ]
+    assert fhir._alohr_specialty_codings(None, "Specialty") == [{"display": "Specialty"}]
 
 
 @pytest.mark.asyncio
@@ -166,9 +150,7 @@ async def test_artifact_lock_release_and_simple_publishers(monkeypatch):
     monkeypatch.setattr(fhir.db, "status", AsyncMock(return_value=1))
     await fhir.publish_provider_directory_address_corroboration_view("mrf")
 
-    monkeypatch.setattr(
-        fhir, "provider_directory_address_corroboration_sql", lambda _s: "bad"
-    )
+    monkeypatch.setattr(fhir, "provider_directory_address_corroboration_sql", lambda _s: "bad")
     with pytest.raises(ValueError, match="view AS marker"):
         fhir.provider_directory_address_corroboration_select_sql("mrf")
 
@@ -196,9 +178,7 @@ async def test_address_artifact_small_helpers(monkeypatch):
         is metrics_by_field
     )
     ensure = AsyncMock(return_value={"rows": 3})
-    monkeypatch.setattr(
-        fhir, "_ensure_provider_directory_network_catalog_populated", ensure
-    )
+    monkeypatch.setattr(fhir, "_ensure_provider_directory_network_catalog_populated", ensure)
     assert await fhir._address_corroboration_network_metrics(
         "mrf", [], refresh_network_catalog=False, metrics_override=None
     ) == {"rows": 3}
@@ -215,32 +195,12 @@ async def test_address_artifact_small_helpers(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_location_address_key_stuck_cursor_stops(monkeypatch):
-    monkeypatch.setattr(
-        fhir, "_has_address_canon_functions", AsyncMock(return_value=True)
-    )
-    monkeypatch.setattr(fhir, "_is_table_present", AsyncMock(return_value=False))
-    monkeypatch.setattr(
-        fhir.db,
-        "first",
-        AsyncMock(
-            side_effect=[
-                {
-                    "candidate_rows": 1,
-                    "updated_rows": 1,
-                    "last_source_id": "s",
-                    "last_resource_id": "r",
-                },
-                {
-                    "candidate_rows": 1,
-                    "updated_rows": 0,
-                    "last_source_id": "s",
-                    "last_resource_id": "r",
-                },
-            ]
-        ),
-    )
+    from process import provider_directory_output_address_key_backfill as repair
 
+    publish = AsyncMock(return_value=1)
+    monkeypatch.setattr(repair, "publish_location_address_keys", publish)
     assert await fhir.publish_provider_directory_location_address_keys("mrf") == 1
+    publish.assert_awaited_once_with(fhir, "mrf", run_id=None, source_ids=None, seen_table=None, batch_size=None)
 
 
 def test_update_expression_edge_columns():
@@ -251,30 +211,16 @@ def test_update_expression_edge_columns():
     source = ProviderDirectorySource.__table__
     source_stmt = pg_insert(source)
 
-    assert (
-        fhir._effective_update_expression(
-            canonical, canonical_stmt, "first_seen_run_id"
-        )
-        is not None
-    )
-    assert (
-        fhir._effective_update_expression(endpoint, endpoint_stmt, "created_at")
-        is not None
-    )
-    assert (
-        fhir._effective_update_expression(source, source_stmt, "last_probe_status_code")
-        is not None
-    )
+    assert fhir._effective_update_expression(canonical, canonical_stmt, "first_seen_run_id") is not None
+    assert fhir._effective_update_expression(endpoint, endpoint_stmt, "created_at") is not None
+    assert fhir._effective_update_expression(source, source_stmt, "last_probe_status_code") is not None
     assert "COALESCE" in fhir._effective_update_sql(
         endpoint, "created_at", target_prefix="target", incoming_prefix="incoming"
     )
 
 
 def test_canonical_row_builder_empty_boundaries():
-    assert (
-        fhir._canonical_resource_rows(object, [], canonical_api_base=None, run_id=None)
-        == []
-    )
+    assert fhir._canonical_resource_rows(object, [], canonical_api_base=None, run_id=None) == []
     assert (
         fhir._canonical_resource_rows(
             ProviderDirectoryPractitioner,
@@ -293,12 +239,7 @@ def test_canonical_row_builder_empty_boundaries():
         )
         == []
     )
-    assert (
-        fhir._source_resource_edge_rows(
-            object, [], canonical_api_base=None, source_ids=[], run_id=None
-        )
-        == []
-    )
+    assert fhir._source_resource_edge_rows(object, [], canonical_api_base=None, source_ids=[], run_id=None) == []
 
 
 @pytest.mark.asyncio
@@ -313,10 +254,7 @@ async def test_upsert_value_and_copy_boundaries(monkeypatch):
     model = SimpleNamespace(__table__=table)
     statement = pg_insert(table)
     assert fhir._upsert_changed_row_predicate(table, statement, ["id"], ["id"]) is None
-    assert (
-        await fhir._upsert_rows_values(model, [], ["id"], ["id"], skip_unchanged=False)
-        == 0
-    )
+    assert await fhir._upsert_rows_values(model, [], ["id"], ["id"], skip_unchanged=False) == 0
 
     session = SimpleNamespace(execute=AsyncMock())
     monkeypatch.setattr(fhir.db, "session", lambda: _async_context(session))
@@ -337,9 +275,7 @@ async def test_upsert_value_and_copy_boundaries(monkeypatch):
     )
     monkeypatch.setattr(fhir.db, "acquire", lambda: _async_context(connection))
     with pytest.raises(NotImplementedError, match="copy_records_to_table"):
-        await fhir._copy_upsert_rows(
-            model, [{"id": "1"}], ["id"], ["id"], skip_unchanged=False
-        )
+        await fhir._copy_upsert_rows(model, [{"id": "1"}], ["id"], ["id"], skip_unchanged=False)
 
 
 @pytest.mark.asyncio
@@ -354,13 +290,11 @@ async def test_seen_copy_and_contact_backfill_boundaries(monkeypatch):
 
     monkeypatch.setattr(fhir.db, "status", AsyncMock(return_value=2))
     assert await fhir._clear_resource_rows_seen("run") == 2
-    monkeypatch.setattr(fhir, "_ensure_provider_directory_tables", AsyncMock())
-    monkeypatch.setattr(
-        fhir, "provider_directory_location_contact_backfill_sql", lambda _s: "SQL"
-    )
-    assert await fhir.backfill_provider_directory_location_contacts() == {
-        "location_contact_rows_updated": 2
-    }
+    contact = importlib.import_module("process.provider_directory_output_contact_backfill")
+    staged = AsyncMock(return_value={"location_contact_rows_updated": 2})
+    monkeypatch.setattr(contact, "backfill_location_contacts", staged)
+    assert await fhir.backfill_provider_directory_location_contacts() == {"location_contact_rows_updated": 2}
+    staged.assert_awaited_once_with(fhir, run_id=None)
 
 
 def _cms_reader_csv() -> str:
@@ -393,25 +327,13 @@ def test_catalog_parser_skip_boundaries(monkeypatch):
     parser.feed("<a>missing href</a>")
     assert parser.links == []
     assert (
-        fhir._cms_sma_selected_api_base(
-            "https://one.test/fhir", ["https://two.test/fhir"]
-        )
-        == "https://one.test/fhir"
+        fhir._cms_sma_selected_api_base("https://one.test/fhir", ["https://two.test/fhir"]) == "https://one.test/fhir"
     )
 
-    monkeypatch.setattr(
-        fhir, "_provider_directory_base_from_metadata_url", lambda _url: None
-    )
-    monkeypatch.setattr(
-        fhir, "_provider_directory_base_from_catalog_url", lambda _url: None
-    )
+    monkeypatch.setattr(fhir, "_provider_directory_base_from_metadata_url", lambda _url: None)
+    monkeypatch.setattr(fhir, "_provider_directory_base_from_catalog_url", lambda _url: None)
     assert fhir._cms_sma_seed_rows_from_csv(_cms_reader_csv()) == []
-    assert (
-        fhir._amerihealth_seed_rows_from_catalog_html(
-            "<table><tr><td>code</td><td>Plan</td></tr></table>"
-        )
-        == []
-    )
+    assert fhir._amerihealth_seed_rows_from_catalog_html("<table><tr><td>code</td><td>Plan</td></tr></table>") == []
 
 
 @pytest.mark.asyncio
@@ -431,9 +353,7 @@ async def test_fetch_loop_and_cooldown_boundaries(monkeypatch):
 
     monkeypatch.setattr(fhir, "_source_fetch_candidate_urls", lambda _url: [])
     monkeypatch.setattr(fhir, "_record_terminal_source_fetch_diagnostic", Mock())
-    assert (await fhir._fetch_source_json({}, "https://x.test", timeout=1))[
-        2
-    ] == "request_not_attempted"
+    assert (await fhir._fetch_source_json({}, "https://x.test", timeout=1))[2] == "request_not_attempted"
 
     monkeypatch.setattr(fhir.asyncio, "sleep", AsyncMock())
     monkeypatch.setattr(
@@ -451,9 +371,10 @@ async def test_fetch_loop_and_cooldown_boundaries(monkeypatch):
 async def test_cooldown_deadline_boundaries(monkeypatch):
     monkeypatch.setattr(fhir.time, "monotonic", lambda: 10.0)
     prior = (423, None, None, 0)
-    assert await fhir._fetch_cooldown_checkpoint_page(
-        {}, "https://x.test", prior, timeout=1, deadline_at=9.0
-    ) == (prior, True)
+    assert await fhir._fetch_cooldown_checkpoint_page({}, "https://x.test", prior, timeout=1, deadline_at=9.0) == (
+        prior,
+        True,
+    )
 
     monkeypatch.setattr(fhir.time, "monotonic", lambda: 0.0)
 
@@ -472,9 +393,7 @@ async def test_cooldown_deadline_boundaries(monkeypatch):
 async def test_empty_probe_batch_skips_all_flushes(monkeypatch):
     monkeypatch.setattr(fhir, "_mark_provider_directory_progress", AsyncMock())
     monkeypatch.setattr(fhir, "_upsert_rows", AsyncMock())
-    assert await fhir._run_source_probe_batch(
-        [], timeout=1, concurrency=1, run_id=None
-    ) == (
+    assert await fhir._run_source_probe_batch([], timeout=1, concurrency=1, run_id=None) == (
         0,
         0,
         set(),
@@ -487,14 +406,14 @@ def test_bundle_and_pagination_reader_boundaries():
     assert fhir._next_link(None) is None
     assert fhir._pagination_host_key("https://example.test:bad") is None
     assert fhir._pagination_allowed_hosts(
-        {
-            "metadata_json": {
-                "provider_directory_pagination_allowed_hosts": ["http://bad"]
-            }
-        },
+        {"metadata_json": {"provider_directory_pagination_allowed_hosts": ["http://bad"]}},
         "https://good.test/fhir",
     ) == {"good.test:443"}
 
-    assert not fhir._is_idaho_medicaid_query_valid(urllib.parse.urlsplit("https://idaho.test/fhir?_count=10"), "Practitioner")
-    assert not fhir._is_idaho_medicaid_query_valid(urllib.parse.urlsplit("https://idaho.test/fhir?ct=x&_count=bad"), "Practitioner")
+    assert not fhir._is_idaho_medicaid_query_valid(
+        urllib.parse.urlsplit("https://idaho.test/fhir?_count=10"), "Practitioner"
+    )
+    assert not fhir._is_idaho_medicaid_query_valid(
+        urllib.parse.urlsplit("https://idaho.test/fhir?ct=x&_count=bad"), "Practitioner"
+    )
     assert fhir._url_https_port(urllib.parse.urlsplit("https://example.test:bad")) == 0

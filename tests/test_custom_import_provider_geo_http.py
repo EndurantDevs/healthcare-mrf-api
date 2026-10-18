@@ -97,7 +97,7 @@ def _geo_reply(items, *, has_more=False, anchor=None, total_count=None):
 
 
 def _install_snapshot(monkeypatch, session):
-    fixtures._install_keyring(monkeypatch)
+    fixtures._install_keyring(monkeypatch, session)
 
     @asynccontextmanager
     async def bounded(same_session, *, timeout_ms):

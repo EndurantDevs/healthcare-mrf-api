@@ -4,7 +4,7 @@
 import asyncio
 import contextvars
 import copy
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 
 _STATEMENT = contextvars.ContextVar("provider_directory_artifact_statement_custody", default=None)
 _CONTROL_STATEMENTS = contextvars.ContextVar("provider_directory_artifact_control_statements", default=None)
@@ -56,6 +56,31 @@ async def execute_insert(fhir, statement, params):
     ):
         raise RuntimeError("provider_directory_artifact_statement_custody_invalid")
     return await fhir.profile_payload_custody.execute(fhir, custody)
+
+
+@asynccontextmanager
+async def copy_payload_transaction(fhir, request, outcome):
+    """Attach the frozen COPY to the already authenticated original Source owner."""
+    if not _is_bounded(fhir) or fhir.profile_owned_wal.current_owned_wal_transaction(fhir.db) is not outcome:
+        raise RuntimeError("provider_directory_artifact_statement_custody_invalid")
+    custody = fhir.profile_payload_custody.statement(request, dict(request.projection_params))
+    identity = ("artifact_scope_payload", "native_copy", request.relation, request.batch, request.table_projection)
+    token = _STATEMENT.set((asyncio.current_task(), custody))
+    try:
+        async with fhir.profile_control_custody.transaction(
+            fhir, nullcontext(), identity=identity, statement_custody=custody, enabled=True
+        ):
+            yield
+    finally:
+        _STATEMENT.reset(token)
+
+
+async def execute_copy(fhir, request, pages, outcome):
+    """Require the original COPY context; missing custody never falls back to DML."""
+    capture = _STATEMENT.get()
+    if capture is None or capture[0] is not asyncio.current_task() or capture[1]["statement"] is not request:
+        raise RuntimeError("provider_directory_artifact_statement_custody_invalid")
+    return await fhir.profile_payload_custody.execute_copy(fhir, capture[1], request, pages, outcome)
 
 
 async def status(fhir, operation, relation_ref, statement, **params):

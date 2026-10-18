@@ -14,6 +14,8 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api import provider_directory_sources
+from process import provider_directory_generic_source_adapters as source_adapters
+from process import provider_directory_generic_source_policy as source_policy
 from process import provider_directory_profile as profile
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -213,7 +215,7 @@ def test_artifact_stage_normalization_and_collection_reject_invalid_shapes():
 
 
 @contextlib.asynccontextmanager
-async def _transaction():
+async def _transaction(*_args, **_coordinates):
     yield
 
 
@@ -231,7 +233,8 @@ async def test_retry_state_cleanup_only_clears_all_finalized_datasets(
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "all", all_rows)
     monkeypatch.setattr(importer.db, "status", status)
-    monkeypatch.setattr(importer.db, "transaction", _transaction)
+    monkeypatch.setattr(source_policy, "source_transaction", _transaction)
+    monkeypatch.setattr(source_adapters, "require_source_transaction", Mock())
 
     cleared = await importer._clear_promoted_endpoint_dataset_retry_state([" dataset_b ", "dataset_a", "", None])
 
@@ -241,7 +244,7 @@ async def test_retry_state_cleanup_only_clears_all_finalized_datasets(
         "dataset_b",
     ]
     delete_sql = "\n".join(call.args[0] for call in status.await_args_list)
-    assert "provider_directory_dataset_resource" in delete_sql
+    assert "provider_directory_dataset_resource" not in delete_sql
     assert "provider_directory_pagination_checkpoint" in delete_sql
 
 
@@ -254,7 +257,8 @@ async def test_retry_state_cleanup_keeps_partial_or_empty_selections(
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "all", all_rows)
     monkeypatch.setattr(importer.db, "status", status)
-    monkeypatch.setattr(importer.db, "transaction", _transaction)
+    monkeypatch.setattr(source_policy, "source_transaction", _transaction)
+    monkeypatch.setattr(source_adapters, "require_source_transaction", Mock())
 
     assert await importer._clear_promoted_endpoint_dataset_retry_state([]) == []
     assert await importer._clear_promoted_endpoint_dataset_retry_state(["dataset_a", "dataset_b"]) == []
@@ -266,11 +270,11 @@ async def test_retry_state_cleanup_is_best_effort_on_lock_failure(monkeypatch):
     """Leave checkpoints intact when the cutover cleanup lock cannot be acquired."""
 
     @contextlib.asynccontextmanager
-    async def failed_transaction():
+    async def failed_transaction(*_args, **_coordinates):
         raise RuntimeError("lock unavailable")
         yield
 
-    monkeypatch.setattr(importer.db, "transaction", failed_transaction)
+    monkeypatch.setattr(source_policy, "source_transaction", failed_transaction)
 
     assert await importer._clear_promoted_endpoint_dataset_retry_state(["dataset_a"]) == []
 
@@ -2533,39 +2537,27 @@ def test_artifact_incumbent_supersession_contract():
 
 
 @pytest.mark.asyncio
-async def test_resource_id_npi_backfill_honors_seen_and_run_scopes(
-    monkeypatch,
-):
-    """Update only selected ten-digit resource IDs under the active fence."""
-    status = AsyncMock(side_effect=["UPDATE 2", "UPDATE 3"])
+async def test_resource_id_npi_backfill_honors_seen_and_run_scopes(monkeypatch):
+    """Unprotected seen heaps refuse before IO; native run/source value filters remain."""
+    from process import provider_directory_output_npi_backfill as repair
+
+    status = AsyncMock(side_effect=AssertionError("unprotected mutation"))
     monkeypatch.setattr(importer.db, "status", status)
-    counts = await importer.backfill_provider_directory_resource_id_npis(
-        "mrf",
-        run_id="run-a",
-        source_ids=["source-a", "source-a", ""],
-        seen_table="seen_stage",
-    )
-    assert counts == {"Practitioner": 2, "Organization": 3}
-    for call in status.await_args_list:
-        assert "seen.run_id" in call.args[0]
-        assert call.kwargs["run_id"] == "run-a"
-        assert call.kwargs["source_ids"] == ["source-a"]
-
-    status.side_effect = [1, 1]
-    status.reset_mock()
-    await importer.backfill_provider_directory_resource_id_npis(
-        "mrf",
-        seen_table="seen_stage",
-    )
-    assert all("seen.run_id" not in call.args[0] for call in status.await_args_list)
-
-    status.side_effect = [1, 1]
-    status.reset_mock()
-    await importer.backfill_provider_directory_resource_id_npis(
-        "mrf",
-        run_id="run-b",
-    )
-    assert all("resource.last_seen_run_id" in call.args[0] for call in status.await_args_list)
+    for run_id in ("run-a", None):
+        with pytest.raises(RuntimeError, match="npi_seen_custody_required"):
+            await importer.backfill_provider_directory_resource_id_npis(
+                "mrf",
+                run_id=run_id,
+                source_ids=["source-a", "source-a", ""],
+                seen_table="seen_stage",
+            )
+    status.assert_not_awaited()
+    selector = repair._selector(importer, "mrf", "run-b", ["source-a", "source-a", ""], None)
+    for target in repair.TARGETS:
+        inputs, _expected, _count, params_by_name = repair.npi_projection(importer, target, selector)
+        assert "r.last_seen_run_id=CAST(:run_id AS varchar)" in inputs
+        assert "r.source_id=ANY(CAST(:source_ids AS varchar[]))" in inputs
+        assert params_by_name["source_ids"] == ["source-a"] and params_by_name["run_id"] == "run-b"
 
 
 async def _assert_dataset_fence_lock_contract(dataset, status):
@@ -3300,7 +3292,7 @@ async def test_artifact_bundle_transaction_runs_all_fenced_steps(monkeypatch):
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(importer.db, "status", AsyncMock())
     monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=1))
-    monkeypatch.setattr(importer.db, "_transaction_binding", lambda: SimpleNamespace())
+    monkeypatch.setattr(importer.db, "_transaction_binding", lambda: SimpleNamespace(borrowed=False))
     monkeypatch.setattr(importer, "_provider_directory_relation_attribute", AsyncMock(return_value="r"))
     helper_names = (
         "_acquire_provider_directory_artifact_cutover_lock",

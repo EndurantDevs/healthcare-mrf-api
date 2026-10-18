@@ -30,7 +30,6 @@ from process.ptg_parts.snapshot_cleanup import (
     is_shared_snapshot_control_manifest,
 )
 
-
 _GC_CANDIDATE_STATUSES = frozenset({"published", "failed"})
 _AGE_GC_PROTECTED_STATUSES = frozenset({"validated"})
 _PTG2_SOURCE_GC_SHARED_GENERATIONS = (
@@ -55,6 +54,8 @@ SELECT DISTINCT snapshot_id
         SELECT previous_snapshot_id AS snapshot_id FROM __SCHEMA__.ptg2_current_plan_source WHERE previous_snapshot_id IS NOT NULL
         UNION ALL
         SELECT snapshot_id FROM __SCHEMA__.ptg2_snapshot_pin WHERE snapshot_id IS NOT NULL
+        UNION ALL
+        SELECT snapshot_id FROM __SCHEMA__.plan_release_snapshot_pin
         UNION ALL
         SELECT snapshot_id FROM __SCHEMA__.plan_release_snapshot_binding
          WHERE snapshot_id IS NOT NULL
@@ -202,10 +203,7 @@ class PTG2SourceSnapshotGCPlan:
     def has_actions(self) -> bool:
         """Return whether the garbage-collection plan selects snapshots or tables."""
         return bool(
-            self.candidate_snapshot_ids
-            or self.tables
-            or self.shared_layout_count
-            or self.shared_candidate_hash_count
+            self.candidate_snapshot_ids or self.tables or self.shared_layout_count or self.shared_candidate_hash_count
         )
 
 
@@ -218,14 +216,10 @@ def _row_mapping(row: Any) -> dict[str, Any]:
 
 
 def _stale_build_seconds(value: int | None) -> int:
-    raw_value: Any = (
-        value
-        if value is not None
-        else os.getenv(_STALE_BUILD_SECONDS_ENV, _STALE_BUILD_SECONDS_DEFAULT)
-    )
+    raw_value: Any = value if value is not None else os.getenv(_STALE_BUILD_SECONDS_ENV, _STALE_BUILD_SECONDS_DEFAULT)
     try:
         return max(int(raw_value), 0)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return _STALE_BUILD_SECONDS_DEFAULT
 
 
@@ -263,10 +257,8 @@ def _is_allowed_amount_snapshot(row: dict[str, Any]) -> bool:
     allowed_amount_index = manifest.get("allowed_amount_index")
     return bool(
         isinstance(allowed_amount_index, dict)
-        and allowed_amount_index.get("contract")
-        == PTG2_ALLOWED_AMOUNT_CONTRACT
-        and allowed_amount_index.get("arch_version")
-        == "postgres_binary_v3"
+        and allowed_amount_index.get("contract") == PTG2_ALLOWED_AMOUNT_CONTRACT
+        and allowed_amount_index.get("arch_version") == "postgres_binary_v3"
         and allowed_amount_index.get("storage") == "postgresql"
         and allowed_amount_index.get("snapshot_scoped") is True
     )
@@ -303,13 +295,8 @@ async def _load_current_snapshot_ids(
     executor: Any,
     schema_name: str,
 ) -> tuple[str, ...]:
-    pointer_records = await executor.all(
-        _schema_sql(_CURRENT_SNAPSHOT_IDS_SQL, schema_name)
-    )
-    return tuple(
-        str(_row_mapping(pointer_record).get("snapshot_id"))
-        for pointer_record in pointer_records
-    )
+    pointer_records = await executor.all(_schema_sql(_CURRENT_SNAPSHOT_IDS_SQL, schema_name))
+    return tuple(str(_row_mapping(pointer_record).get("snapshot_id")) for pointer_record in pointer_records)
 
 
 async def _load_snapshot_gc_rows(
@@ -340,9 +327,7 @@ def _classify_snapshot_gc_candidates(
         snapshot_id = str(snapshot_by_field.get("snapshot_id") or "")
         snapshot_status = str(snapshot_by_field.get("status") or "")
         serving_index = _serving_index(snapshot_by_field)
-        is_shared_strict = _is_gc_shared_manifest(
-            serving_index
-        )
+        is_shared_strict = _is_gc_shared_manifest(serving_index)
         is_allowed_strict_v3 = _is_allowed_amount_snapshot(snapshot_by_field)
         is_strict_v3 = is_shared_strict or is_allowed_strict_v3
         table_names: tuple[str, ...] = ()
@@ -364,11 +349,7 @@ def _classify_snapshot_gc_candidates(
         if not (is_terminal_candidate or is_stale_building_candidate):
             retained_table_refs.update(table_names)
             continue
-        source_key = str(
-            snapshot_by_field.get("source_key")
-            or serving_index.get("source_key")
-            or ""
-        )
+        source_key = str(snapshot_by_field.get("source_key") or serving_index.get("source_key") or "")
         candidates.append(
             _PTG2SnapshotGCCandidate(
                 snapshot_id=snapshot_id,
@@ -399,8 +380,7 @@ async def _build_snapshot_gc_context(
             table_name
             for candidate in candidates[:snapshot_limit]
             for table_name in candidate.table_names
-            if table_name not in retained_table_refs
-            and last_candidate_index_by_table[table_name] < snapshot_limit
+            if table_name not in retained_table_refs and last_candidate_index_by_table[table_name] < snapshot_limit
         }
     )
     size_by_table: dict[str, int] = {}
@@ -420,9 +400,7 @@ async def _build_snapshot_gc_context(
             table_names=candidate_table_names,
         )
         size_by_table = {
-            str(_row_mapping(size_record).get("table_name")): int(
-                _row_mapping(size_record).get("bytes") or 0
-            )
+            str(_row_mapping(size_record).get("table_name")): int(_row_mapping(size_record).get("bytes") or 0)
             for size_record in size_records
         }
     return _SnapshotGCPlanContext(
@@ -448,8 +426,7 @@ def _selected_gc_tables(
                 table_name in selected_table_names
                 or table_name not in plan_context.size_by_table
                 or table_name in plan_context.retained_table_refs
-                or plan_context.last_candidate_index_by_table[table_name]
-                >= candidate_count
+                or plan_context.last_candidate_index_by_table[table_name] >= candidate_count
             ):
                 continue
             selected_table_names.add(table_name)
@@ -469,9 +446,7 @@ async def _shared_gc_metrics(
     candidate_count: int,
 ) -> tuple[tuple[str, ...], int, int, int]:
     shared_snapshot_ids = tuple(
-        candidate.snapshot_id
-        for candidate in plan_context.candidates[:candidate_count]
-        if candidate.is_shared
+        candidate.snapshot_id for candidate in plan_context.candidates[:candidate_count] if candidate.is_shared
     )
     if not shared_snapshot_ids:
         return shared_snapshot_ids, 0, 0, 0
@@ -503,14 +478,9 @@ async def _gc_plan_for_candidate_count(
     ) = await _shared_gc_metrics(plan_context, candidate_count)
     return PTG2SourceSnapshotGCPlan(
         current_snapshot_ids=plan_context.current_snapshot_ids,
-        candidate_snapshot_ids=tuple(
-            candidate.snapshot_id for candidate in selected_candidates
-        ),
+        candidate_snapshot_ids=tuple(candidate.snapshot_id for candidate in selected_candidates),
         tables=_selected_gc_tables(plan_context, candidate_count),
-        candidate_reasons=tuple(
-            (candidate.snapshot_id, candidate.reason)
-            for candidate in selected_candidates
-        ),
+        candidate_reasons=tuple((candidate.snapshot_id, candidate.reason) for candidate in selected_candidates),
         shared_snapshot_ids=shared_snapshot_ids,
         shared_layout_count=shared_layout_count,
         shared_candidate_hash_count=shared_candidate_hash_count,
@@ -539,12 +509,8 @@ async def _select_bounded_gc_plan(
             plan_context,
             candidate_count,
         )
-        is_within_table_limit = (
-            table_limit is None or candidate_plan.table_count <= table_limit
-        )
-        is_within_byte_limit = (
-            byte_limit is None or candidate_plan.total_bytes <= byte_limit
-        )
+        is_within_table_limit = table_limit is None or candidate_plan.table_count <= table_limit
+        is_within_byte_limit = byte_limit is None or candidate_plan.total_bytes <= byte_limit
         if is_within_table_limit and is_within_byte_limit:
             selected_plan = candidate_plan
             lower_bound = candidate_count + 1
@@ -581,11 +547,7 @@ async def build_source_gc_plan(
         current_snapshot_ids,
         retain_current_lineage,
     )
-    snapshot_limit = (
-        len(candidates)
-        if max_snapshots is None
-        else min(max(int(max_snapshots), 0), len(candidates))
-    )
+    snapshot_limit = len(candidates) if max_snapshots is None else min(max(int(max_snapshots), 0), len(candidates))
     table_limit = None if max_tables is None else max(int(max_tables), 0)
     byte_limit = None if max_bytes is None else max(int(max_bytes), 0)
     plan_context = await _build_snapshot_gc_context(
@@ -625,9 +587,7 @@ def validate_source_gc_plan(
             f"Refusing cleanup: candidate table count {plan.table_count} exceeds safety bound {max_tables}"
         )
     if plan.total_bytes > max_bytes:
-        raise RuntimeError(
-            f"Refusing cleanup: candidate bytes {plan.total_bytes} exceeds safety bound {max_bytes}"
-        )
+        raise RuntimeError(f"Refusing cleanup: candidate bytes {plan.total_bytes} exceeds safety bound {max_bytes}")
 
 
 validate_ptg2_source_snapshot_gc_plan = validate_source_gc_plan
@@ -713,9 +673,7 @@ async def _execute_snapshot_gc_actions(
     plan: PTG2SourceSnapshotGCPlan,
 ) -> None:
     for table_name in sorted({table.table_name for table in plan.tables}):
-        await connection.status(
-            f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)}"
-        )
+        await connection.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)}")
     if not plan.candidate_snapshot_ids:
         return
     candidate_snapshot_ids = list(plan.candidate_snapshot_ids)

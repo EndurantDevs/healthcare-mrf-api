@@ -71,6 +71,7 @@ async def test_prescription_copy_selects_all_referenced_endpoints_with_one_uncha
     capture = SimpleNamespace(
         schema_name="synthetic_source",
         manifest=SimpleNamespace(tables=tuple(SimpleNamespace(table_name=name) for name in spec.table_names)),
+        frozen_source_projection=None,
     )
     copy = SimpleNamespace(max_bytes=1000, copy_rows=AsyncMock(return_value=10))
     await archive._copy_source_tables("session", capture, "candidate", spec, copy, 10**12)

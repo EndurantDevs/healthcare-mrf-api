@@ -3,23 +3,11 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
-from datetime import datetime, timezone
 from typing import Any, Mapping
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from db.models import (
-    ProviderDirectoryEntityReleaseEvidence,
-    ProviderDirectoryEntitySourceBinding,
-    ProviderDirectoryInsuranceNetworkIdentity,
-    ProviderDirectoryInsuranceNetworkPlanEvidence,
-    ProviderDirectoryInsuranceNetworkSourceBinding,
-)
 
 _FHIR_ID = re.compile(r"[A-Za-z0-9.-]{1,64}\Z")
 
@@ -64,91 +52,6 @@ def has_source_declared_network_role(organization: Mapping[str, Any]) -> bool:
     )
 
 
-async def _lock_source(session: AsyncSession, source_id: str) -> None:
-    """Coordinate compatibility writes with the bounded source-wide batch writer."""
-    await session.execute(
-        text("SELECT pg_catalog.pg_advisory_xact_lock(hashtextextended(:identity_key, 0))"),
-        {"identity_key": f"provider-directory-insurance-network-batch:{source_id}"},
-    )
-
-
-async def _bind_network(session: AsyncSession, source_id: str, network_resource_id: str, observed_at: datetime) -> UUID:
-    """Create one identity while the caller holds the source-wide control lock."""
-    binding = ProviderDirectoryInsuranceNetworkSourceBinding.__table__
-    identity = ProviderDirectoryInsuranceNetworkIdentity.__table__
-    network_id = (
-        await session.execute(
-            select(binding.c.network_id).where(
-                binding.c.source_id == source_id,
-                binding.c.resource_id == network_resource_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if network_id is None:
-        # The foreign key is the final guard; this check fails before making an ID.
-        entity_binding = ProviderDirectoryEntitySourceBinding.__table__
-        organization_exists = (
-            await session.execute(
-                select(entity_binding.c.organization_id)
-                .where(
-                    entity_binding.c.source_id == source_id,
-                    entity_binding.c.resource_type == "Organization",
-                    entity_binding.c.resource_id == network_resource_id,
-                )
-                .with_for_update(read=True, key_share=True),
-            )
-        ).scalar_one_or_none()
-        if organization_exists is None:
-            raise ValueError("provider_directory_insurance_network_organization_binding_missing")
-        network_id = uuid4()
-        await session.execute(identity.insert().values(network_id=network_id, created_at=observed_at))
-        await session.execute(
-            binding.insert().values(
-                source_id=source_id,
-                resource_type="Organization",
-                resource_id=network_resource_id,
-                network_id=network_id,
-                created_at=observed_at,
-            )
-        )
-    return network_id
-
-
-async def _existing_plan_networks(session: AsyncSession, evidence_values: dict[str, Any]) -> set[str]:
-    """Reject conflicting plan facts before a network identity can be inserted."""
-    evidence = ProviderDirectoryInsuranceNetworkPlanEvidence.__table__
-    existing_network_hashes = (
-        await session.execute(
-            select(evidence.c.network_resource_id, evidence.c.plan_payload_sha256).where(
-                evidence.c.source_id == evidence_values["source_id"],
-                evidence.c.release_id == evidence_values["release_id"],
-                evidence.c.insurance_plan_resource_id == evidence_values["insurance_plan_resource_id"],
-            )
-        )
-    ).all()
-    if any(plan_hash != evidence_values["plan_payload_sha256"] for _, plan_hash in existing_network_hashes):
-        raise ValueError("provider_directory_insurance_network_release_plan_conflict")
-    return {network_id for network_id, _ in existing_network_hashes}
-
-
-async def _require_release_evidence(
-    session: AsyncSession, source_id: str, network_resource_id: str, release_id: str, payload_sha256: str | None = None
-) -> None:
-    evidence = ProviderDirectoryEntityReleaseEvidence.__table__
-    observed_hash = await session.scalar(
-        select(evidence.c.payload_sha256)
-        .where(
-            evidence.c.source_id == source_id,
-            evidence.c.resource_type == "Organization",
-            evidence.c.resource_id == network_resource_id,
-            evidence.c.release_id == release_id,
-        )
-        .with_for_update(read=True, key_share=True)
-    )
-    if observed_hash is None or payload_sha256 is not None and observed_hash != payload_sha256:
-        raise ValueError("provider_directory_insurance_network_release_evidence_missing")
-
-
 async def record_insurance_network_organization(
     session: AsyncSession, *, source_id: str, release_id: str, organization: Mapping[str, Any]
 ) -> UUID:
@@ -160,12 +63,12 @@ async def record_insurance_network_organization(
     network_resource_id = _identity(organization.get("id"), 256)
     if not _FHIR_ID.fullmatch(network_resource_id) or not has_source_declared_network_role(organization):
         raise ValueError("provider_directory_insurance_network_role_missing")
-    payload_text = json.dumps(organization, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-    await _lock_source(session, source_id)
-    await _require_release_evidence(
-        session, source_id, network_resource_id, release_id, hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    from process.provider_directory_insurance_network_batch import record_insurance_network_batch
+
+    await record_insurance_network_batch(
+        session, source_id=source_id, release_id=release_id, resource_type="Organization", resources=[organization]
     )
-    return await _bind_network(session, source_id, network_resource_id, datetime.now(timezone.utc))
+    return await _staged_network_id(session, source_id, network_resource_id)
 
 
 async def record_insurance_network_plan(
@@ -185,32 +88,35 @@ async def record_insurance_network_plan(
     network_resource_id = _identity(network_resource_id, 256)
     if not isinstance(plan, Mapping) or plan.get("resourceType") != "InsurancePlan":
         raise ValueError("provider_directory_insurance_network_plan_invalid")
-    plan_id = _identity(plan.get("id"), 256)
+    _identity(plan.get("id"), 256)
     if not _FHIR_ID.fullmatch(network_resource_id):
         raise ValueError("provider_directory_insurance_network_resource_id_invalid")
     network_refs = _plan_network_refs(plan)
     # An absolute URL cannot establish source equivalence without an endpoint binding.
     if f"Organization/{network_resource_id}" not in network_refs:
         raise ValueError("provider_directory_insurance_network_ref_missing")
-    plan_payload_text = json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-    observed_at = datetime.now(timezone.utc)
-    await _lock_source(session, source_id)
-    evidence_dict = {
-        "source_id": source_id,
-        "release_id": release_id,
-        "network_resource_type": "Organization",
-        "network_resource_id": network_resource_id,
-        "insurance_plan_resource_id": plan_id,
-        "network_refs": network_refs,
-        "owned_by_ref": _payer_ref(plan, "ownedBy"),
-        "administered_by_ref": _payer_ref(plan, "administeredBy"),
-        "plan_payload_sha256": hashlib.sha256(plan_payload_text.encode("utf-8")).hexdigest(),
-        "plan_payload_json": json.loads(plan_payload_text),
-        "observed_at": observed_at,
-    }
-    existing_networks = await _existing_plan_networks(session, evidence_dict)
-    await _require_release_evidence(session, source_id, network_resource_id, release_id)
-    network_id = await _bind_network(session, source_id, network_resource_id, observed_at)
-    if network_resource_id not in existing_networks:
-        await session.execute(ProviderDirectoryInsuranceNetworkPlanEvidence.__table__.insert().values(**evidence_dict))
-    return network_id
+    from process.provider_directory_insurance_network_batch import _record_network_batch
+
+    await _record_network_batch(
+        session,
+        source_id=source_id,
+        release_id=release_id,
+        resource_type="InsurancePlan",
+        resources=[plan],
+        network_resource_id=network_resource_id,
+    )
+    return await _staged_network_id(session, source_id, network_resource_id)
+
+
+async def _staged_network_id(session, source_id, resource_id):
+    from db.plan_release_storage import storage_relation
+    from process.provider_directory_cms_identity_candidate import CMS_IDENTITY_TABLES, identity_candidate
+
+    publisher, _, receipts = await identity_candidate(session)
+    relation = storage_relation(publisher.policy.schema, receipts[CMS_IDENTITY_TABLES[2]]["name"])
+    value = await publisher.connection.fetchval(
+        f"SELECT network_id FROM {relation} WHERE source_id=$1 AND resource_id=$2", source_id, resource_id
+    )
+    if value is None:
+        raise ValueError("provider_directory_insurance_network_release_evidence_missing")
+    return value

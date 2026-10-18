@@ -114,6 +114,9 @@ async def _database(monkeypatch, *, install_receipt=True, install_source_guard=T
                 await install_source_generation_guards(connection, schema)
             if install_receipt:
                 await connection.run_sync(lambda sync: _apply(sync, "20260930100000"))
+                await connection.run_sync(
+                    lambda sync: sync.exec_driver_sql(_migration("20261019130000")._repair_sql(schema))
+                )
         yield engine, schema
     finally:
         async with engine.begin() as connection:
@@ -342,6 +345,7 @@ async def _install_archive(engine, schema):
         )
         oid = await connection.scalar(text(f"SELECT to_regclass('{schema}.address_archive_v2')::oid::bigint"))
         await native_inputs._register_relation(connection, schema, schema, "address_archive_v2", oid)
+        await _upgrade_archive_counter(connection, schema)
     return {
         "target_oid": oid,
         "from_revision": 0,
@@ -350,6 +354,42 @@ async def _install_archive(engine, schema):
         "delta_rows": 1,
         "delta_sha256": "b" * 64,
     }
+
+
+async def _counter_migration_snapshot(connection, schema):
+    return (
+        (
+            await connection.execute(
+                text(f"""
+        SELECT to_regclass('"{schema}".cms_native_input_revision')::oid::bigint AS oid,
+        (SELECT jsonb_agg(to_jsonb(p)-'prosrc' ORDER BY p.oid) FROM pg_proc p
+          WHERE p.pronamespace=to_regnamespace(:schema)
+          AND p.proname IN ('cms_native_input_advance','cms_native_input_revision_guard')) AS functions,
+        (SELECT jsonb_agg(to_jsonb(t) ORDER BY t.oid) FROM pg_trigger t
+          WHERE t.tgrelid=to_regclass('"{schema}".cms_native_input_revision')) AS triggers,
+        (SELECT jsonb_agg(to_jsonb(i) ORDER BY i.indexrelid) FROM pg_index i
+          WHERE i.indrelid=to_regclass('"{schema}".cms_native_input_revision')) AS indexes,
+        (SELECT jsonb_agg(jsonb_build_array(relation_oid,schema_name,table_name,revision,xmin::text)
+          ORDER BY relation_oid) FROM "{schema}".cms_native_input_revision) AS rows
+    """),
+                {"schema": schema},
+            )
+        )
+        .mappings()
+        .one()
+    )
+
+
+async def _upgrade_archive_counter(connection, schema):
+    before_by_field = dict(await _counter_migration_snapshot(connection, schema))
+    sql = _migration("20261019130000")._counter_sql(schema)
+    await connection.exec_driver_sql(sql)
+    assert dict(await _counter_migration_snapshot(connection, schema)) == before_by_field
+    assert await connection.scalar(
+        text(f'SELECT bool_and(mutation_xid IS NULL) FROM "{schema}".cms_native_input_revision')
+    )
+    await connection.exec_driver_sql(sql)
+    assert dict(await _counter_migration_snapshot(connection, schema)) == before_by_field
 
 
 async def _merge_archive(connection, schema):

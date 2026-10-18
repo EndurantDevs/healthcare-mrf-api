@@ -153,7 +153,7 @@ async def test_original_cancellation_restores_scope(canonical_pin):
     assert scope_module.current_network_address_scope() is None
 
 
-def test_custom_import_is_explicitly_unsupported_inside_canonical_scope():
+def test_unverified_import_context_refuses_inside_canonical_scope():
     with (
         scope_module.network_address_read_scope(MANIFEST, (42,)),
         pytest.raises(InvalidUsage, match="claims lane only"),
@@ -369,3 +369,48 @@ async def test_canonical_exact_zip_does_not_resolve_an_anchor(canonical_pin, mon
     reply = await pricing_module.list_providers_by_procedure(request_for(zip5="10001", zip_radius_miles="0"))
     assert json.loads(reply.body)["pagination"]["total"] == 0
     anchor.assert_not_awaited()
+
+
+def test_validated_ordinary_import_context_preserves_canonical_office_predicate():
+    from sqlalchemy import literal, select
+
+    from api.custom_import_provider_service_sql import ProviderServiceImportQuery
+    from process.custom_import.read_core import PreparedNpiEntityRelation
+
+    imported = ProviderServiceImportQuery(
+        PreparedNpiEntityRelation(select(literal("1000000012").label("entity_value")), (), "a" * 64, "b" * 64),
+        True,
+    )
+    with scope_module.network_address_read_scope(MANIFEST, (42,)):
+        clause = pricing_module._canonical_network_procedure_clause(
+            {}, imported, pricing_module.provider_procedure_table.c.npi
+        )
+        compiled = clause.compile(dialect=postgresql.dialect())
+        assert "EXISTS" in str(compiled) and "entity_address_unified" in str(compiled)
+        assert compiled.params["_canonical_network_ids"] == [42]
+        with pytest.raises(InvalidUsage, match="claims lane only"):
+            pricing_module._canonical_network_procedure_clause(
+                {"plan_release_id": ""}, imported, pricing_module.provider_procedure_table.c.npi
+            )
+
+
+@pytest.mark.parametrize("selector", ["plan_id", "plan_external_id", "plan_release_id", "source_key", "snapshot_id"])
+def test_managed_native_plan_lane_uses_its_source_and_office_readers(selector):
+    with scope_module.network_address_read_scope(MANIFEST, (42,)):
+        assert (
+            pricing_module._canonical_network_procedure_clause(
+                {selector: "selected"}, None, pricing_module.provider_procedure_table.c.npi, managed_native=True
+            )
+            is None
+        )
+        with pytest.raises(InvalidUsage, match="claims lane only"):
+            pricing_module._canonical_network_procedure_clause(
+                {selector: "selected"}, None, pricing_module.provider_procedure_table.c.npi
+            )
+        with pytest.raises(InvalidUsage, match="claims lane only"):
+            pricing_module._canonical_network_procedure_clause(
+                {selector: "selected", "billing_entity_ref": ""},
+                None,
+                pricing_module.provider_procedure_table.c.npi,
+                managed_native=True,
+            )

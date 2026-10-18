@@ -128,7 +128,7 @@ def _relationship(key, row, kind):
         "target_kind": "sites" if kind == "medical-groups" else "medical-groups",
         "target_id": str(target_id),
         "provider_npi": str(row["npi"]),
-        "provider_profile_path": f'/api/v1/providers/{row["npi"]}/profile',
+        "provider_profile_path": f"/api/v1/providers/{row['npi']}/profile",
         "status": "resolved",
         "effective_start": None,
         "effective_end": None,
@@ -285,7 +285,12 @@ async def _read_page(session, schema, key, query, generation_id):
 
 async def read_medical_groups(session, query):
     """Serve one bounded read snapshot, failing closed for unsupported or unaccepted sources."""
-    if query.kind not in {"medical-groups", "sites"} or query.source_id != _SOURCE or session.in_transaction():
+    if (
+        query.network_ids is not None
+        or query.kind not in {"medical-groups", "sites"}
+        or query.source_id != _SOURCE
+        or session.in_transaction()
+    ):
         raise DirectoryReadError(503)
     key = directory_cursor_key()
     schema = _schema_name()
@@ -299,6 +304,38 @@ async def read_medical_groups(session, query):
             raise DirectoryReadError(409)
         await _require_complete_bindings(session, schema)
         return await _read_page(session, schema, key, query, generation_id)
+
+
+async def read_medical_groups_snapshot(session, query):
+    """Keep public Doctors facts inside the caller's existing Reader snapshot."""
+    if (
+        query.network_ids is not None
+        or query.kind not in {"medical-groups", "sites"}
+        or query.source_id != _SOURCE
+        or not session.in_transaction()
+    ):
+        raise DirectoryReadError(503)
+    key, schema = directory_cursor_key(), _schema_name()
+    generation_id = await _accepted_generation(session, schema, key)
+    if query.excluded_network_ids is not None:
+        from api.network_address_scope import current_network_address_scope
+
+        scope = current_network_address_scope()
+        if scope is None or scope.manifest is not query.network_manifest:
+            raise DirectoryReadError(503)
+        generation_id = opaque_directory_key(
+            key,
+            "gen_",
+            generation_id,
+            scope.manifest.generation_id,
+            scope.manifest.approved_custom_revision,
+            scope.manifest.manifest_sha256,
+            query.access_scope_sha256,
+        )
+    if query.generation_id is not None and query.generation_id != generation_id:
+        raise DirectoryReadError(409)
+    await _require_complete_bindings(session, schema)
+    return await _read_page(session, schema, key, query, generation_id)
 
 
 async def _require_complete_bindings(session, schema):

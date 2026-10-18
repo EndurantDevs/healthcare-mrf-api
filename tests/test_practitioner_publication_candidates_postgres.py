@@ -11,6 +11,7 @@ import pytest
 from process import uhc_flex_practitioner_publication_materialization as materialization
 from process import uhc_flex_practitioner_publication_store as store
 from tests.formulary_fhir_twin_admission_pg_support import assert_sqlstate
+from tests.nppes_candidate_postgres_support import candidate_component
 from tests.test_provider_directory_uhc_flex_practitioner_publication_postgres import (
     ENDPOINT_ID,
     _publication_test_scope,
@@ -67,28 +68,30 @@ async def _publish_with_failure_probes(monkeypatch, database, admission, reader,
     )
 
 
-async def _assert_published_resource_immutable(reader, schema, dataset_id):
-    resources = f"{schema}.provider_directory_dataset_resource"
-    original_rows = await reader.fetch(f"SELECT * FROM {resources} WHERE dataset_id=$1", dataset_id)
-    statements = (
-        ({"55000"}, f"UPDATE {resources} SET payload_hash=repeat('0',64) WHERE dataset_id=$1"),
-        ({"55000", "23503"}, f"DELETE FROM {resources} WHERE dataset_id=$1"),
-        (
-            {"55000"},
+async def _assert_published_resource_immutable(url, schema, dataset_id):
+    builder = candidate_component(publication._schema_name()).builder
+    restricted = await connect(url.set(username=builder))
+    try:
+        assert tuple(await restricted.fetchrow("SELECT session_user::text,current_user::text")) == (builder, builder)
+        resources = f"{schema}.provider_directory_dataset_resource"
+        original_rows = await restricted.fetch(f"SELECT * FROM {resources} WHERE dataset_id=$1", dataset_id)
+        statements = (
+            f"UPDATE {resources} SET payload_hash=repeat('0',64) WHERE dataset_id=$1",
+            f"DELETE FROM {resources} WHERE dataset_id=$1",
             f"INSERT INTO {resources}(dataset_id,resource_type,resource_id,payload_hash,payload_json) "
             f"SELECT dataset_id,resource_type,resource_id||'-tamper',payload_hash,payload_json FROM {resources} WHERE dataset_id=$1",
-        ),
-    )
-    for allowed_states, statement in statements:
-        with pytest.raises(asyncpg.PostgresError) as failure:
-            async with reader.transaction():
-                await reader.execute(statement, dataset_id)
-        assert failure.value.sqlstate in allowed_states
-    candidate = await reader.fetchval(
-        f"SELECT tableoid::regclass::text FROM {resources} WHERE dataset_id=$1", dataset_id
-    )
-    await assert_sqlstate(reader, "55000", f"DELETE FROM {candidate}")
-    assert await reader.fetch(f"SELECT * FROM {resources} WHERE dataset_id=$1", dataset_id) == original_rows
+        )
+        for statement in statements:
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                async with restricted.transaction():
+                    await restricted.execute(statement, dataset_id)
+        candidate = await restricted.fetchval(
+            f"SELECT tableoid::regclass::text FROM {resources} WHERE dataset_id=$1", dataset_id
+        )
+        await assert_sqlstate(restricted, "42501", f"DELETE FROM {candidate}")
+        assert await restricted.fetch(f"SELECT * FROM {resources} WHERE dataset_id=$1", dataset_id) == original_rows
+    finally:
+        await restricted.close()
 
 
 async def _assert_unpublished_snapshot(reader, schema, pinned_id, pinned_rows, candidate_id):
@@ -149,6 +152,6 @@ async def test_practitioner_candidate_failure_retry_and_pinned_read(monkeypatch)
                 )
                 == 1
             )
-            await _assert_published_resource_immutable(reader, schema, current.readiness.dataset_id)
+            await _assert_published_resource_immutable(url, schema, current.readiness.dataset_id)
         finally:
             await reader.close()

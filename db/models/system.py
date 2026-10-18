@@ -91,6 +91,7 @@ __all__ = (
 class EntityAddressResultGeneration(Base, JSONOutputMixin):
     """Singleton authority for local builds and the currently served origin."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "entity_address_result_generation"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -191,13 +192,24 @@ class ImportRun(Base, JSONOutputMixin):
             "unique": True,
             "where": (
                 "importer IN ('plan-pricing-projection', "
-                "'plan-pricing-prewarm', 'plan-pricing-em-distance') "
+                "'plan-pricing-prewarm', 'plan-pricing-em-distance', 'plan-pricing-em-attribution') "
                 "AND idempotency_key IS NOT NULL"
             ),
+        },
+        {
+            "index_elements": ("importer", "idempotency_key"),
+            "name": "import_run_registry_source_check_idempotency_idx",
+            "unique": True,
+            "where": "importer = 'registry-source-check' AND idempotency_key IS NOT NULL",
         },
         {"index_elements": ("schedule_id",), "name": "import_run_schedule_idx"},
         {"index_elements": ("subscription_id",), "name": "import_run_subscription_idx"},
         {"index_elements": ("source_file_import_id",), "name": "import_run_source_file_import_idx"},
+        {
+            "index_elements": ("retry_of_run_id", "run_id"),
+            "name": "import_run_plan_pricing_retry_census_idx",
+            "where": "importer = 'plan-pricing-projection' AND retry_of_run_id IS NOT NULL",
+        },
         {
             "index_elements": ("retry_of_run_id",),
             "name": "import_run_provider_directory_retry_child_idx",
@@ -1271,6 +1283,7 @@ class MRFUrlObservation(Base, JSONOutputMixin):
 
 
 class ProviderDirectoryAPIEndpoint(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_api_endpoint"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -1299,11 +1312,16 @@ class ProviderDirectoryAPIEndpoint(Base, JSONOutputMixin):
 
 
 class ProviderDirectoryEndpointDataset(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_endpoint_dataset"
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("dataset_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["dataset_id"]
     __my_additional_indexes__ = [
@@ -1358,9 +1376,11 @@ class ProviderDirectoryEndpointDataset(Base, JSONOutputMixin):
     completion_proof_required_version = Column(Integer)
     completion_proof_json = Column(JSONB)
     completion_proof_sha256 = Column(String(64))
+    candidate_storage_json = Column(JSONB)
 
 
 class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_dataset_resource"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -1371,7 +1391,11 @@ class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
             text('resource_type COLLATE "C"'),
             text('resource_id COLLATE "C"'),
         ),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["dataset_id", "resource_type", "resource_id"]
     __my_additional_indexes__ = [
@@ -1389,10 +1413,6 @@ class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
 
     dataset_id = Column(
         String(96),
-        ForeignKey(
-            ProviderDirectoryEndpointDataset.dataset_id,
-            name="provider_directory_dataset_resource_dataset_id_fkey",
-        ),
         nullable=False,
     )
     resource_type = Column(String(64), nullable=False)
@@ -1403,11 +1423,16 @@ class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
 
 
 class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_dataset_insurance_plan"
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("dataset_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["dataset_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1424,11 +1449,6 @@ class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):
 
     dataset_id = Column(
         String(96),
-        ForeignKey(
-            ProviderDirectoryEndpointDataset.dataset_id,
-            name="provider_directory_dataset_insurance_plan_dataset_id_fkey",
-            ondelete="CASCADE",
-        ),
         nullable=False,
     )
     resource_id = Column(String(256), nullable=False)
@@ -1451,6 +1471,7 @@ class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):
 
 
 class ProviderDirectoryDatasetNetworkPlan(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_dataset_network_plan"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -1459,7 +1480,11 @@ class ProviderDirectoryDatasetNetworkPlan(Base, JSONOutputMixin):
             "network_resource_id",
             "insurance_plan_resource_id",
         ),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = [
         "dataset_id",
@@ -1475,11 +1500,6 @@ class ProviderDirectoryDatasetNetworkPlan(Base, JSONOutputMixin):
     ]
     dataset_id = Column(
         String(96),
-        ForeignKey(
-            ProviderDirectoryEndpointDataset.dataset_id,
-            name="provider_directory_dataset_network_plan_dataset_id_fkey",
-            ondelete="CASCADE",
-        ),
         nullable=False,
     )
     network_resource_id = Column(String(256), nullable=False)
@@ -1487,6 +1507,7 @@ class ProviderDirectoryDatasetNetworkPlan(Base, JSONOutputMixin):
 
 
 class ProviderDirectoryDatasetAffiliationOrganization(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_dataset_affiliation_organization"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -1495,7 +1516,11 @@ class ProviderDirectoryDatasetAffiliationOrganization(Base, JSONOutputMixin):
             "participating_organization_resource_id",
             "affiliation_resource_id",
         ),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = [
         "dataset_id",
@@ -1504,11 +1529,6 @@ class ProviderDirectoryDatasetAffiliationOrganization(Base, JSONOutputMixin):
     ]
     dataset_id = Column(
         String(96),
-        ForeignKey(
-            ProviderDirectoryEndpointDataset.dataset_id,
-            name="pd_dataset_affiliation_org_dataset_id_fkey",
-            ondelete="CASCADE",
-        ),
         nullable=False,
     )
     participating_organization_resource_id = Column(
@@ -1519,6 +1539,7 @@ class ProviderDirectoryDatasetAffiliationOrganization(Base, JSONOutputMixin):
 
 
 class ProviderDirectorySource(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_source"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -1631,9 +1652,14 @@ class ProviderDirectoryCapability(Base, JSONOutputMixin):
 class ProviderDirectoryInsurancePlan(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_insurance_plan"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1671,9 +1697,14 @@ class ProviderDirectoryInsurancePlan(Base, JSONOutputMixin):
 class ProviderDirectoryPractitioner(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_practitioner"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1717,9 +1748,14 @@ class ProviderDirectoryPractitioner(Base, JSONOutputMixin):
 class ProviderDirectoryOrganization(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_organization"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1762,9 +1798,14 @@ class ProviderDirectoryOrganization(Base, JSONOutputMixin):
 class ProviderDirectoryLocation(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_location"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1825,9 +1866,14 @@ class ProviderDirectoryLocation(Base, JSONOutputMixin):
 class ProviderDirectoryPractitionerRole(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_practitioner_role"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1892,9 +1938,14 @@ class ProviderDirectoryPractitionerRole(Base, JSONOutputMixin):
 class ProviderDirectoryHealthcareService(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_healthcare_service"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
 
@@ -1939,9 +1990,14 @@ class ProviderDirectoryHealthcareService(Base, JSONOutputMixin):
 class ProviderDirectoryOrganizationAffiliation(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_organization_affiliation"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1994,9 +2050,14 @@ class ProviderDirectoryOrganizationAffiliation(Base, JSONOutputMixin):
 class ProviderDirectoryEndpoint(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_endpoint"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -2039,9 +2100,14 @@ class ProviderDirectoryEndpoint(Base, JSONOutputMixin):
 class ProviderDirectoryCanonicalResource(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_canonical_resource"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("canonical_api_base", "resource_type", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["canonical_api_base", "resource_type", "resource_id"]
     __my_additional_indexes__ = [
@@ -2072,9 +2138,14 @@ class ProviderDirectoryCanonicalResource(Base, JSONOutputMixin):
 class ProviderDirectorySourceResource(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_source_resource"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_type", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_type", "resource_id"]
     __my_additional_indexes__ = [
@@ -2099,9 +2170,14 @@ class ProviderDirectoryDatasetRehydrationCheckpoint(Base, JSONOutputMixin):
 
     __tablename__ = "provider_directory_dataset_rehydration_checkpoint"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "dataset_id", "acquisition_root_run_id", "resource_type"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "dataset_id", "acquisition_root_run_id", "resource_type"]
     __my_additional_indexes__ = [
@@ -2136,6 +2212,7 @@ class ProviderDirectoryBulkAcquisitionCheckpoint(Base, JSONOutputMixin):
 
     __tablename__ = "provider_directory_bulk_acquisition_checkpoint"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("checkpoint_id"),
         UniqueConstraint(
@@ -2147,7 +2224,11 @@ class ProviderDirectoryBulkAcquisitionCheckpoint(Base, JSONOutputMixin):
             "dataset_id",
             name="provider_directory_bulk_acquisition_identity_key",
         ),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["checkpoint_id"]
     __my_additional_indexes__ = [
@@ -2218,6 +2299,7 @@ class ProviderDirectoryBulkOutputCheckpoint(Base, JSONOutputMixin):
 
     __tablename__ = "provider_directory_bulk_output_checkpoint"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("checkpoint_id", "output_id"),
         UniqueConstraint(
@@ -2225,7 +2307,11 @@ class ProviderDirectoryBulkOutputCheckpoint(Base, JSONOutputMixin):
             "output_index",
             name="provider_directory_bulk_output_index_key",
         ),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["checkpoint_id", "output_id"]
     __my_additional_indexes__ = [
@@ -2277,6 +2363,7 @@ class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
 
     __tablename__ = "provider_directory_pagination_checkpoint"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint(
             "canonical_api_base",
@@ -2284,7 +2371,11 @@ class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
             "source_scope_hash",
             "acquisition_root_run_id",
         ),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = [
         "canonical_api_base",
@@ -2340,6 +2431,7 @@ class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
 class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
     """Durable, lineage-fenced progress for one staged Profile build."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_profile_build_checkpoint"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -2528,6 +2620,7 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
 class ProviderDirectoryProfileServingGeneration(Base, JSONOutputMixin):
     """One exact global generation over incrementally materialized profiles."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_profile_serving_generation"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -2599,6 +2692,7 @@ class ProviderDirectoryProfileServingGeneration(Base, JSONOutputMixin):
 class ProviderDirectoryProfileDeltaReceipt(Base, JSONOutputMixin):
     """Replay-safe receipt for one committed source-vector delta."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_profile_delta_receipt"
     __main_table__ = __tablename__
     __table_args__ = (

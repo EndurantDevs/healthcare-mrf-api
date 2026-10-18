@@ -417,3 +417,85 @@ async def test_received_parent_reader_rechecks_identity_without_sequence_state_g
     assert not any(
         "last_value" in str(call.args[0]) or "nextval" in str(call.args[0]) for call in session.scalar.await_args_list
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["captured-source", "captured-epoch", "installed", "absent"])
+async def test_tiger_source_observation_preserves_captured_priority_and_installed_fallback(monkeypatch, kind):
+    generation_by_field = dict(
+        node_id="synthetic-node",
+        generation_id=UUID(_EPOCH_ID),
+        selected_package_id="a" * 64,
+        registration_sha256="b" * 64,
+    )
+    is_generic = kind == "captured-source"
+    reader = AsyncMock(return_value=({"owner_oid": _OWNER}, [generation_by_field] if is_generic else []))
+    monkeypatch.setattr(held, "_selected_captured_generations", reader)
+    model = AsyncMock(return_value=_inventory())
+    monkeypatch.setattr(held, "_require_model_capture", model)
+    fallback = None if kind == "absent" else dict(selection_kind="installed", inventory=_inventory())
+    if kind == "captured-epoch":
+        fallback = held._captured_tiger_proof(kind, "synthetic-node", _EPOCH_ID, "a" * 64, "b" * 64, _inventory())
+    observer = AsyncMock(return_value=fallback)
+    monkeypatch.setattr(held, "_selected_tiger_observation", observer)
+    native_owner = AsyncMock(return_value={"owner_oid": _OWNER})
+    monkeypatch.setattr(held, "_protected_relation", native_owner)
+    session = _session()
+    observed = await held.selected_tiger_source_observation(session, node_id="synthetic-node", owner_oid=_OWNER)
+    assert reader.await_args.kwargs == dict(node_id="synthetic-node", families=("tiger",))
+    if kind in {"captured-source", "captured-epoch"}:
+        assert observed["selection_kind"] == kind and observed["source_id"] == _EPOCH_ID
+        assert observed["selection_sha256"] == held._digest(
+            {key: field_value for key, field_value in observed.items() if key != "selection_sha256"}
+        )
+    else:
+        assert observed is None
+    if is_generic:
+        model.assert_awaited_once_with(session, generation_by_field, _OWNER)
+        observer.assert_not_awaited()
+    else:
+        model.assert_not_awaited()
+        assert observer.await_args.kwargs == dict(node_id="synthetic-node", observe=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["owner", "node", "ambiguous"])
+async def test_tiger_source_observation_refuses_scope_before_native_model_reads(monkeypatch, fault):
+    generation_by_field = dict(node_id="other" if fault == "node" else "synthetic-node")
+    monkeypatch.setattr(
+        held,
+        "_selected_captured_generations",
+        AsyncMock(
+            return_value=(
+                {"owner_oid": _OWNER + int(fault == "owner")},
+                [generation_by_field] * (2 if fault == "ambiguous" else 1),
+            )
+        ),
+    )
+    check = AsyncMock()
+    monkeypatch.setattr(held, "_require_model_capture", check)
+    with pytest.raises(RuntimeError, match="protected TIGER"):
+        await held.selected_tiger_source_observation(_session(), node_id="synthetic-node", owner_oid=_OWNER)
+    check.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_new_epoch_observation_preserves_full_registration_and_package_guards(monkeypatch):
+    epoch, selected, family = _captured_selection()
+    selected.update(manifest={"adapter_metadata": {"family": family}}, selected_package_id="a" * 64)
+    selected["selected_package_id"] = held._digest(selected["manifest"])
+    session = _session(epoch, scalars=(True, True))
+    monkeypatch.setattr(held, "_protected_relation", AsyncMock(return_value={"owner_oid": _OWNER}))
+    monkeypatch.setattr(held, "_require_inventory", AsyncMock(return_value=epoch["inventory"]))
+    proof = await held._require_captured_selection(session, selected, family, observe=True)
+    assert proof == held._captured_tiger_proof(
+        "captured-epoch",
+        selected["node_id"],
+        _EPOCH_ID,
+        selected["selected_package_id"],
+        epoch["registration_sha256"],
+        epoch["inventory"],
+    )
+    selected["selected_package_id"] = "f" * 64
+    with pytest.raises(RuntimeError, match="protected TIGER"):
+        await held._require_captured_selection(session, selected, family, observe=True)

@@ -1279,3 +1279,40 @@ async def test_shielded_cleanup_finishes_once_before_forwarding_cancellation(mon
         await task
     assert cleaned.is_set()
     assert cleaned_ownerships == [ownership]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_access_fails", [False, True])
+async def test_received_npi_replays_six_reads_before_any_activation_mutation(monkeypatch, read_access_fails):
+    from process import native_publication_read_access
+
+    ownership = _ownership()
+    incumbent = archive.NpiIncumbent(
+        "canonical", tuple((name, index) for index, name in enumerate(generation.RELATION_NAMES, 1))
+    )
+    driver = object()
+    session = SimpleNamespace(
+        connection=AsyncMock(
+            return_value=SimpleNamespace(
+                get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver))
+            )
+        )
+    )
+    preserved = AsyncMock(side_effect=RuntimeError("read ACL denied") if read_access_fails else None)
+    mutation = AsyncMock(side_effect=RuntimeError("stop before mutation"))
+    monkeypatch.setattr(native_publication_read_access, "preserve_publication_reads", preserved)
+    monkeypatch.setattr(archive, "_remove_npi_clone_freeze", mutation)
+    with pytest.raises(RuntimeError, match="read ACL denied" if read_access_fails else "stop before mutation"):
+        await archive._activate_npi_relations(
+            session, ownership=ownership, incumbent=incumbent, manifest=_manifest(), validation=None
+        )
+    expected = generation.RELATION_NAMES[:1] if read_access_fails else generation.RELATION_NAMES
+    assert [call.args[0] for call in preserved.await_args_list] == [driver] * len(expected)
+    assert [call.kwargs for call in preserved.await_args_list] == [
+        dict(schema="canonical", live_table=name, stage_schema=ownership.schema_name, stage_table=name)
+        for name in expected
+    ]
+    if read_access_fails:
+        mutation.assert_not_awaited()
+    else:
+        mutation.assert_awaited_once_with(session, ownership)

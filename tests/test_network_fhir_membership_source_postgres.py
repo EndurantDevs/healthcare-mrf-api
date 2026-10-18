@@ -35,10 +35,42 @@ from process.network_membership_copy import MembershipCopyTarget
 from process.network_source_binding_store import NetworkSourceBindingBatchCommand, apply_network_source_binding_batch
 from process.registry_source_recipe_composition import _read_recipe_page
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+from tests import network_fhir_source_epoch_content_postgres_support as epoch_content
+from tests.network_fhir_source_epoch_content_postgres_support import content_database as content_database
 from tests.test_network_serving_schema_postgres import serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _approve, _command, _CountedConnection, _create, _draft
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_epoch_content_matches_canonical_hash_and_restores_profiles(content_database, record_property):
+    """Native alternate sessions retain canonical bytes and detect changed rows."""
+    record_property(
+        "canonical_content_sha256", await epoch_content.verify_canonical_hash_and_profiles(content_database)
+    )
+
+
+async def test_epoch_content_sql_error_restores_settings(content_database, monkeypatch):
+    """Native scan failures preserve the caller's settings and exception."""
+    await epoch_content.verify_sql_error_restoration(content_database, monkeypatch)
+
+
+@pytest.mark.parametrize("boundary", ("start", "rollback", "success_rollback"))
+async def test_epoch_content_repeated_cancellation_restores_savepoint(content_database, monkeypatch, boundary):
+    """Repeated cancellation cannot strand native startup or rollback."""
+    await epoch_content.verify_repeated_cancellation(content_database, monkeypatch, boundary)
+
+
+@pytest.mark.parametrize("fail", (False, True))
+async def test_epoch_catalog_restores_settings_and_retains_caller_locks(content_database, fail):
+    """Read-only catalog savepoint rollback preserves caller custody on success and failure."""
+    await epoch_content.verify_catalog_restoration(content_database, fail=fail)
+
+
+@pytest.mark.parametrize("boundary", ("start", "rollback", "success_rollback"))
+async def test_epoch_catalog_repeated_cancellation_retains_caller_locks(content_database, monkeypatch, boundary):
+    """Repeated cancellation drains the existing catalog savepoint and keeps outer locks."""
+    await epoch_content.verify_repeated_cancellation(content_database, monkeypatch, boundary, catalog=True)
 
 
 async def _source_tables(engine, schema):
@@ -472,6 +504,7 @@ async def test_inactive_and_period_scopes_are_explicit(fhir_source):
         await _resource(connection, schema, "PractitionerRole", resource_id, _role(**change))
     batch = await _read(fhir_source)
     assert batch.source_rows == 4 and batch.membership_rows == 1 and batch.unresolved_rows == 0
+    assert (batch.accepted_source_rows, batch.unresolved_source_rows, batch.omitted_source_rows) == (1, 0, 3)
 
 
 async def test_ambiguous_site_binding_and_alias_scope_never_guess(fhir_source):
@@ -1105,3 +1138,78 @@ async def test_reviewed_copy_requires_actual_candidate_recipe_and_rolls_back(
         if connection.is_in_transaction():
             await connection.execute("ROLLBACK")
         await connection.execute(f'DROP SCHEMA IF EXISTS "{copy_target.schema_name}" CASCADE')
+
+
+@pytest.mark.parametrize(
+    "payload,outcome,reason",
+    [
+        ({"active": False}, "omitted", "inactive"),
+        ({"active": False, "period_start": "not-a-date"}, "unresolved", "malformed_resource"),
+        ({"active": False, "location_refs": [1]}, "unresolved", "malformed_resource"),
+        (
+            {"active": False, "period_start": "2027-01-01", "period_end": "2025-01-01"},
+            "unresolved",
+            "malformed_resource",
+        ),
+    ],
+)
+async def test_resource_eligibility_preserves_structural_refusals(fhir_source, payload, outcome, reason):
+    connection, schema, _, _ = fhir_source
+    await _resource(connection, schema, "PractitionerRole", "minimal", payload)
+    batch = await _read(fhir_source)
+    assert batch.source_rows == 1 and batch.membership_rows == 0
+    assert len(batch.source_outcomes) == 1
+    disposition = batch.source_outcomes[0]
+    assert (disposition.outcome, disposition.reason) == (outcome, reason)
+    assert disposition.generation_id == batch.generation_id and disposition.payload_sha256 == "a" * 64
+    assert (disposition.resource_type, disposition.resource_id) == ("PractitionerRole", "minimal")
+    assert batch.accepted_source_rows == 0
+    assert (batch.unresolved_source_rows, batch.omitted_source_rows) == ((1, 0) if outcome == "unresolved" else (0, 1))
+    if outcome == "unresolved":
+        counted = _CountedConnection(connection)
+        with pytest.raises(FHIRMembershipSourceError, match="unresolved"):
+            await copy_fhir_membership_batch(counted, batch, None, require_candidate_authority=None)
+        assert counted.statements == 0
+
+
+async def test_partial_location_failure_is_one_unresolved_resource(fhir_source):
+    connection, schema, _, _ = fhir_source
+    await _resource(
+        connection,
+        schema,
+        "PractitionerRole",
+        "partial",
+        _role(location_refs=["Location/office-one", "Location/missing"]),
+    )
+    batch = await _read(fhir_source)
+    assert (batch.source_rows, batch.membership_rows, batch.unresolved_rows) == (1, 1, 1)
+    assert (batch.accepted_source_rows, batch.unresolved_source_rows, batch.omitted_source_rows) == (0, 1, 0)
+    assert [(row.resource_id, row.reason) for row in batch.source_outcomes] == [("partial", "location_unresolved")]
+    counted = _CountedConnection(connection)
+    with pytest.raises(FHIRMembershipSourceError, match="unresolved"):
+        await copy_fhir_membership_batch(counted, batch, None, require_candidate_authority=None)
+    assert counted.statements == 0
+
+
+async def test_resource_dispositions_do_not_expand_and_retry_with_cursor(reviewed_fhir_source):
+    fixture, _, _, _, _, _ = reviewed_fhir_source
+    connection, schema, _, _ = fixture
+    await _resource(
+        connection,
+        schema,
+        "PractitionerRole",
+        "zz-fanout",
+        _role(location_refs=["Location/office-one", "Location/office-two"]),
+    )
+    whole = await _reviewed_read(reviewed_fhir_source, approved_only=True)
+    assert (whole.source_rows, whole.membership_rows, whole.accepted_source_rows) == (2, 3, 2)
+    first = await _reviewed_read(reviewed_fhir_source, approved_only=True, limit=1)
+    assert await _reviewed_read(reviewed_fhir_source, approved_only=True, limit=1) == first
+    second = await _reviewed_read(reviewed_fhir_source, approved_only=True, limit=1, after_resource=first.next_resource)
+    terminal = await _reviewed_read(
+        reviewed_fhir_source, approved_only=True, limit=1, after_resource=second.next_resource
+    )
+    assert first.source_outcomes + second.source_outcomes == whole.source_outcomes
+    assert terminal.source_rows == 0 and terminal.source_outcomes == () and terminal.next_resource is None
+    assert sum(page.accepted_source_rows for page in (first, second)) == 2
+    assert all(row.generation_id == whole.generation_id for row in whole.source_outcomes)

@@ -10,11 +10,9 @@ from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts.ptg2_v4_finalizer_maps import has_complete_v4_finalizer_map
 
 
-async def source_identity(session, source_key, snapshot_id, code_system, code, *, tables=None):
+def _require_source_custody(tables, expected, source_key, snapshot_id):
     from api import ptg2_serving as serving
 
-    expected = tables
-    tables = await snapshot_serving_tables(session, snapshot_id)
     serving._require_strict_shared_v3(tables)
     if tables.source_key != source_key or tables.snapshot_id != snapshot_id or not tables.uses_v4_graph:
         raise ValueError("membership index source snapshot is not an audited V4 serving source")
@@ -25,16 +23,19 @@ async def source_identity(session, source_key, snapshot_id, code_system, code, *
         or serving._payload_schema(expected) != schema
     ):
         raise PTG2ManifestArtifactError("membership source physical custody changed")
-    root = await load_v4_graph_root(session, key, schema_name=schema, refresh=True)
+    return key, schema
+
+
+async def _finalizer_identity(session, schema, key):
     packed = await has_complete_v4_finalizer_map(session, schema_name=schema, snapshot_key=key)
-    finalizer = {
+    finalizer_by_field = {
         "state": "legacy_relational",
         "map_digest": None,
         "canonical_mapping_digest": None,
         "target_identity_digest": None,
     }
     if packed:
-        row = (
+        finalizer_row = (
             (
                 await session.execute(
                     text(
@@ -46,9 +47,14 @@ async def source_identity(session, source_key, snapshot_id, code_system, code, *
             .mappings()
             .one()
         )
-        finalizer = {"state": "packed", **{name: bytes(value).hex() for name, value in row.items()}}
-    document = identity(tables, root, finalizer, code_system, code)
-    required = {
+        finalizer_by_field = {"state": "packed", **{name: bytes(value).hex() for name, value in finalizer_row.items()}}
+    return finalizer_by_field
+
+
+async def _source_storage(session, schema, snapshot_id):
+    from api import ptg2_serving as serving
+
+    required_relations = {
         "ptg2_v4_snapshot_map_root",
         "ptg2_v4_relation_manifest",
         "ptg2_v4_snapshot_map_pack",
@@ -59,8 +65,8 @@ async def source_identity(session, source_key, snapshot_id, code_system, code, *
         "ptg2_v3_provider_set",
         "ptg2_v3_provider_group",
     }
-    optional = {"ptg2_v4_finalizer_map_root", "ptg2_v4_finalizer_map_pack", "ptg2_v4_finalizer_map_target"}
-    rows = (
+    optional_relations = {"ptg2_v4_finalizer_map_root", "ptg2_v4_finalizer_map_pack", "ptg2_v4_finalizer_map_target"}
+    storage_rows = (
         (
             await session.execute(
                 text(
@@ -69,13 +75,13 @@ async def source_identity(session, source_key, snapshot_id, code_system, code, *
                     "CROSS JOIN pg_database d WHERE n.nspname=:schema AND d.datname=current_database() "
                     "AND c.relkind IN ('r','p') AND c.relname=ANY(CAST(:names AS text[])) ORDER BY c.relname"
                 ),
-                {"schema": schema, "names": sorted(required | optional)},
+                {"schema": schema, "names": sorted(required_relations | optional_relations)},
             )
         )
         .mappings()
         .all()
     )
-    if not rows or not required.issubset({row["relname"] for row in rows}):
+    if not storage_rows or not required_relations.issubset({storage_row["relname"] for storage_row in storage_rows}):
         raise PTG2ManifestArtifactError("membership source relation inventory is incomplete")
     attestation_digest = await session.scalar(
         text(
@@ -86,10 +92,21 @@ async def source_identity(session, source_key, snapshot_id, code_system, code, *
     )
     if not isinstance(attestation_digest, str) or len(attestation_digest) != 64:
         raise PTG2ManifestArtifactError("membership source audit attestation is unavailable")
-    document["source_storage"] = {
-        "database_oid": int(rows[0]["database_oid"]),
-        "schema_oid": int(rows[0]["schema_oid"]),
-        "relation_oids": [[row["relname"], int(row["relation_oid"])] for row in rows],
+    return {
+        "database_oid": int(storage_rows[0]["database_oid"]),
+        "schema_oid": int(storage_rows[0]["schema_oid"]),
+        "relation_oids": [[storage_row["relname"], int(storage_row["relation_oid"])] for storage_row in storage_rows],
         "attestation_digest": attestation_digest,
     }
+
+
+async def source_identity(session, source_key, snapshot_id, code_system, code, *, tables=None):
+    """Resolve fresh audited source custody and its immutable physical/code identity."""
+    expected = tables
+    tables = await snapshot_serving_tables(session, snapshot_id)
+    key, schema = _require_source_custody(tables, expected, source_key, snapshot_id)
+    root = await load_v4_graph_root(session, key, schema_name=schema, refresh=True)
+    finalizer_by_field = await _finalizer_identity(session, schema, key)
+    document = identity(tables, root, finalizer_by_field, code_system, code)
+    document["source_storage"] = await _source_storage(session, schema, snapshot_id)
     return tables, root, document

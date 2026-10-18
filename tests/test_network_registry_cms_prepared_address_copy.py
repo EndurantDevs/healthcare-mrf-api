@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import network_registry_cms_prepared_address as clone
+from tests.test_network_registry_cms_prepared_pair_postgres import _retention_catalog_url
 
 
 def _prepared(rows=4):
@@ -175,3 +176,108 @@ async def test_native_row_accounting_must_reach_exact_receipt(monkeypatch):
             connection, _prepared(), "retained", ("entity_address_unified", "stage", 42), 2, (1, 130)
         )
     assert copy.await_count == 1
+
+
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+asyncpg"])
+@pytest.mark.parametrize("host,is_ci", [("127.0.0.1", False), ("localhost", False), ("postgres", True)])
+def test_retention_catalog_accepts_only_owned_database(driver, host, is_ci, monkeypatch):
+    monkeypatch.setenv("CI", "true" if is_ci else "false")
+    url = _retention_catalog_url(f"{driver}://fixture@{host}:5440/hc_network_registry_{'a' * 32}")
+    assert url.drivername == "postgresql+asyncpg"
+    assert url.host == host and url.database == "hc_network_registry_" + "a" * 32
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "invalid",
+        "sqlite:///hc_network_registry_" + "a" * 32,
+        "postgresql://fixture@127.0.0.1:5440/postgres",
+        "postgresql://fixture@127.0.0.1:5440/hc_network_registry_short",
+        "postgresql://fixture@127.0.0.1:5440/hc_network_registry_" + "A" * 32,
+        "postgresql://fixture@remote.example:5440/hc_network_registry_" + "a" * 32,
+        "postgresql://fixture@postgres:5440/hc_network_registry_" + "a" * 32,
+        "postgresql://fixture@127.0.0.1/hc_network_registry_" + "a" * 32,
+        "postgresql://fixture@127.0.0.1:0/hc_network_registry_" + "a" * 32,
+        "postgresql://fixture@127.0.0.1:5440/hc_network_registry_" + "a" * 32 + "?options=unsafe",
+    ],
+)
+def test_retention_catalog_refuses_unowned_database(configured, monkeypatch):
+    monkeypatch.setenv("CI", "false")
+    with pytest.raises(ValueError, match="^retention_catalog_database_not_disposable$"):
+        _retention_catalog_url(configured)
+
+
+def _index_recipe(name, predicate):
+    source_stage = "entity_address_unified_cms_synthetic"
+    index_name = clone.entity_address_unified._stage_index_name(source_stage, name)
+    prefix = f'CREATE INDEX "{index_name}" ON "source"."{source_stage}"'
+    return source_stage, {
+        "index_name": index_name,
+        "indisunique": False,
+        "constraint_name": None,
+        "source_prefix": prefix,
+        "definition": prefix + " USING btree (npi) WHERE " + predicate,
+    }
+
+
+@pytest.mark.parametrize(
+    "name,predicate",
+    [(name, predicate) for names, predicate in clone._SOURCE_INDEX_PREDICATES.items() for name in names],
+)
+def test_declared_cms_index_restores_only_exact_native_array_coercion(name, predicate):
+    source_stage, recipe = _index_recipe(name, predicate)
+    before = recipe.copy()
+    statements = clone._source_index_statements(
+        recipe, schema="retained", table="entity_address_unified", source_stage=source_stage
+    )
+    legacy = clone._legacy_index_statements(recipe, schema="retained", table="entity_address_unified")
+    assert statements == [legacy[0].removesuffix(predicate) + predicate.replace("])::text[]", "])")]
+    assert recipe == before
+    assert statements[0].partition(" WHERE ")[0] == legacy[0].partition(" WHERE ")[0]
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["label", "and", "predicate", "element", "literal", "identifier", "name", "stage", "table", "unique", "constraint"],
+)
+def test_unrecognized_cms_index_recipe_is_not_rewritten(change):
+    predicate = clone._SOURCE_INDEX_PREDICATES[("serving_zip5_npi", "serving_zip5_taxonomy")]
+    source_stage, recipe = _index_recipe("serving_zip5_npi", predicate)
+    table = "entity_address_unified"
+    if change in {"label", "and", "predicate", "element", "literal", "identifier"}:
+        replacement = {
+            "label": predicate.replace("'practice'", "'other'"),
+            "and": predicate + " AND npi IS NOT NULL",
+            "predicate": "npi IS NOT NULL",
+            "element": predicate.replace("'practice'::character varying", "'practice'::character varying::text"),
+            "literal": "npi::text = '" + predicate.replace("'", "''") + "'",
+            "identifier": '"' + predicate + '" IS NOT NULL',
+        }[change]
+        recipe["definition"] = recipe["definition"].removesuffix(predicate) + replacement
+    if change == "name":
+        recipe["index_name"] = "unknown_declared_index"
+    if change == "stage":
+        source_stage += "_foreign"
+    if change == "table":
+        table = "entity_address_evidence"
+    if change == "unique":
+        recipe["indisunique"] = True
+    if change == "constraint":
+        recipe.update(constraint_name="unique_key", constraint_type="u", condeferrable=False, condeferred=False)
+    assert clone._source_index_statements(recipe, schema="retained", table=table, source_stage=source_stage) == (
+        clone._legacy_index_statements(recipe, schema="retained", table=table)
+    )
+
+
+@pytest.mark.parametrize("expression", ["'])::text[]'", "E'])::text[]'", "$known$])::text[]$known$", '"])::text[]"'])
+def test_native_predicate_restoration_preserves_quoted_keys(expression):
+    predicate = clone._SOURCE_INDEX_PREDICATES[("serving_zip5_npi", "serving_zip5_taxonomy")]
+    source_stage, recipe = _index_recipe("serving_zip5_npi", predicate)
+    recipe["definition"] = recipe["definition"].replace("btree (npi)", "btree ((" + expression + "))")
+    legacy = clone._legacy_index_statements(recipe, schema="retained", table="entity_address_unified")
+    actual = clone._source_index_statements(
+        recipe, schema="retained", table="entity_address_unified", source_stage=source_stage
+    )
+    assert actual[0].partition(" WHERE ")[0] == legacy[0].partition(" WHERE ")[0]
+    assert actual[0].endswith(predicate.replace("])::text[]", "])"))

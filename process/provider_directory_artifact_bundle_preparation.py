@@ -57,12 +57,15 @@ async def apply_prepared_artifact_bundle(
     cutover_timeout: Any = None,
     settings_configured: bool = False,
     before_swaps: Any = None,
+    extra_live_relations: tuple[str, ...] = (),
 ) -> Any:
     """Apply prepared relations without committing the owner's publication."""
     if fhir.db._transaction_binding() is None:
         raise RuntimeError("provider_directory_artifact_bundle_requires_transaction")
     ordered_stages = fhir._ordered_provider_directory_artifact_bundle(stages)
     if not ordered_stages and profile_delta is None:
+        if extra_live_relations:
+            await fhir._lock_provider_directory_artifact_live_tables(fhir._schema(), extra_live_relations)
         if before_swaps is not None:
             await before_swaps()
         return
@@ -89,7 +92,61 @@ async def apply_prepared_artifact_bundle(
         active_fence,
         cutover_timeout,
         before_swaps=before_swaps,
+        extra_live_relations=extra_live_relations,
     )
+
+
+async def apply_prepared_output_bundle(
+    fhir,
+    capability,
+    prepared_receipts,
+    *,
+    artifact_stages=(),
+    profile_delta=None,
+    before_swaps=None,
+    after_output_publish,
+):
+    """Keep every family's publication and its final journal in one original savepoint."""
+    from process import provider_directory_output_snapshot_custody as custody
+    from process.provider_directory_artifact_read_access import preserve_artifact_read_access
+    from process.provider_directory_generic_source_policy import _savepoint
+    from process.provider_directory_output_snapshot_retention import retain_prepared_outputs
+
+    await custody._require_capability(capability)
+    binding = fhir.db._transaction_binding()
+    if binding is None or binding.session is not capability.session or not callable(after_output_publish):
+        raise RuntimeError("provider_directory_output_bundle_original_session_required")
+    preparations = tuple(prepared_receipts)
+    artifact_stages = tuple(artifact_stages)
+    await custody.recheck_output_cut(capability, preparations)
+    output_targets = {receipt.incumbent.target for receipt in preparations}
+    if output_targets.intersection(stage.target_relation for stage in artifact_stages):
+        raise ValueError("provider_directory_output_bundle_duplicate_target")
+    retained_results = []
+
+    async def publish_outputs():
+        """Publish outputs after the common helper locks every live family."""
+        await preserve_artifact_read_access(capability, artifact_stages)
+        if before_swaps is not None:
+            await before_swaps()
+        retained_results.extend(await retain_prepared_outputs(capability, preparations))
+
+    async with _savepoint(capability.connection):
+        await fhir._lock_provider_directory_artifact_tables(
+            capability.policy.schema, tuple(receipt.successor.relation for receipt in preparations)
+        )
+        forecast = await apply_prepared_artifact_bundle(
+            fhir,
+            artifact_stages,
+            profile_delta=profile_delta,
+            before_swaps=publish_outputs,
+            extra_live_relations=tuple(sorted(output_targets)),
+        )
+        await custody._require_capability(capability)
+        if len(retained_results) != len(preparations):
+            raise RuntimeError("provider_directory_output_bundle_publication_incomplete")
+        await after_output_publish(capability, tuple(retained_results))
+    return forecast, tuple(retained_results)
 
 
 async def validate_profile_delta_total_wal(fhir, capacity_admission, capacity_forecast) -> None:

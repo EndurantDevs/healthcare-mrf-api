@@ -3,21 +3,23 @@
 
 from sqlalchemy import text
 
+from api.provider_directory_cms_network_scope import cms_network_predicate
 from api.provider_directory_entities_contract import opaque_directory_key
 
 
-def _reviewed_rows(schema):
+def _reviewed_rows(schema, generation):
+    controls = generation.get("control_schema", schema)
     return f"""
         SELECT b.payer_id, r.resource_id, e.organization_id,
           left(r.payload_json->>'name',2049) AS name,
           CASE WHEN jsonb_typeof(r.payload_json::jsonb->'active')='boolean'
                THEN r.payload_json->>'active' END AS active
-        FROM {schema}.provider_directory_mrf_payer_binding b
-        JOIN {schema}.provider_directory_mrf_payer_review_decision d
+        FROM {controls}.provider_directory_mrf_payer_binding b
+        JOIN {controls}.provider_directory_mrf_payer_review_decision d
           ON d.decision_id=b.binding_decision_id AND d.action='bind'
           AND d.source_id=b.source_id AND d.resource_type=b.resource_type
           AND d.resource_id=b.resource_id AND d.payer_id=b.payer_id
-        JOIN {schema}.mrf_payer p ON p.payer_id=b.payer_id
+        JOIN {controls}.mrf_payer p ON p.payer_id=b.payer_id
         JOIN {schema}.provider_directory_dataset_resource r
           ON r.dataset_id=:dataset_id AND r.resource_type='Organization' AND r.resource_id=b.resource_id
           AND (r.acquired_resource_sha256 IS NULL OR r.acquired_resource_sha256=d.source_payload_sha256)
@@ -28,8 +30,9 @@ def _reviewed_rows(schema):
           AND facts.resource_id=b.resource_id AND facts.release_id=:release_id
           AND facts.payload_sha256=d.source_payload_sha256
         WHERE b.source_id='cms-npd' AND b.resource_type='Organization'
+          {cms_network_predicate(generation, "payers", "r.resource_id")}
           AND b.payer_id ~ '^[A-Za-z0-9_-]{{1,64}}$'
-          AND NOT EXISTS (SELECT 1 FROM {schema}.provider_directory_mrf_payer_review_decision closure
+          AND NOT EXISTS (SELECT 1 FROM {controls}.provider_directory_mrf_payer_review_decision closure
               WHERE closure.prior_decision_id=d.decision_id AND closure.action='close')
     """
 
@@ -61,7 +64,7 @@ async def cms_payer_rows(session, schema, query, generation, position=None):
         (
             await session.execute(
                 text(f"""
-        WITH reviewed AS NOT MATERIALIZED ({_reviewed_rows(schema)}), page AS (
+        WITH reviewed AS NOT MATERIALIZED ({_reviewed_rows(schema, generation)}), page AS (
             SELECT DISTINCT payer_id COLLATE "C" AS payer_id FROM reviewed
             WHERE (CAST(:entity_id AS text) IS NULL OR payer_id=:entity_id)
               AND (CAST(:position AS text) IS NULL OR payer_id COLLATE "C">CAST(:position AS text) COLLATE "C")
@@ -96,7 +99,7 @@ async def cms_payer_organization_rows(session, schema, query, generation, resour
         SELECT r.organization_id AS position, 'payer-source-organization'::text AS relationship_type,
           'organizations'::text AS target_kind, 'Organization/' || r.resource_id AS reference,
           r.resource_id AS evidence_id
-        FROM ({_reviewed_rows(schema)}) r WHERE r.payer_id=:entity_id
+        FROM ({_reviewed_rows(schema, generation)}) r WHERE r.payer_id=:entity_id
           AND (CAST(:position AS uuid) IS NULL OR r.organization_id>CAST(:position AS uuid))
         ORDER BY r.organization_id LIMIT :page_size
     """),

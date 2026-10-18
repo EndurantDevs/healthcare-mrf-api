@@ -363,6 +363,8 @@ def _clone_case(monkeypatch, importer="mrf"):
         events.append(str(statement.compile(dialect=archive.postgresql.dialect())))
 
     async def is_clone_equal(statement, _parameters=None):
+        if importer in {"cms-doctors", "geo"} and "quote_ident(rolname)" in str(statement):
+            return '"retained_owner"'
         return "FULL OUTER JOIN" in str(statement)
 
     session = SimpleNamespace(execute=execute, scalar=is_clone_equal, in_transaction=lambda: True)
@@ -370,9 +372,13 @@ def _clone_case(monkeypatch, importer="mrf"):
     monkeypatch.setattr(archive, "_capture_model_family_ownership", AsyncMock(return_value=ownership))
     monkeypatch.setattr(archive, "_rebase_owned_sequences", AsyncMock())
     monkeypatch.setattr(archive, "_is_model_table_equal", AsyncMock(return_value=True))
+    if importer in {"cms-doctors", "geo"}:
+        monkeypatch.setattr(archive, "protected_publisher_owner", AsyncMock(return_value=41))
+        monkeypatch.setattr(archive, "seal_model_family_storage", AsyncMock())
     capture = archive.ReferenceFamilySourceCapture(
         SimpleNamespace(
             importer_id=importer,
+            source_capture_contract=None,  # Ordinary COPY retains the real manifest's non-finite default.
             tables=[SimpleNamespace(table_name=name) for name in spec.table_names],
             as_dict=lambda: {
                 "importer_id": importer,
@@ -454,9 +460,19 @@ async def test_direct_clone_requires_complete_native_capability_before_sql(monke
     archive.capture_reference_family_stage_ownership.assert_not_awaited()
 
 
+def _clone_index_positions(events):
+    return [
+        position
+        for position, statement in enumerate(events)
+        if statement.startswith(("CREATE INDEX", "CREATE UNIQUE INDEX"))
+        or (statement.startswith("ALTER TABLE") and " ADD " in statement)
+    ]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("importer", [importer for importer in archive._SPECS if importer != "nucc"])
 async def test_native_source_seals_all_heaps_then_copies_then_builds_indexes(monkeypatch, importer):
+    """Unit COPY/index ordering preserves the explicit retained-owner seam."""
     session, capture, ownership, events = _clone_case(monkeypatch, importer)
     copy_options = []
     deadline = asyncio.get_running_loop().time() + 100
@@ -500,19 +516,88 @@ async def test_native_source_seals_all_heaps_then_copies_then_builds_indexes(mon
         )
         assert "payload" not in copy_options[-1]["columns"]
     copy_positions = [position for position, statement in enumerate(events) if statement.startswith("copy:")]
-    index_positions = [
-        position
-        for position, statement in enumerate(events)
-        if statement.startswith(("CREATE INDEX", "CREATE UNIQUE INDEX"))
-        or statement.startswith("ALTER TABLE")
-        and " ADD " in statement
-    ]
+    index_positions = _clone_index_positions(events)
     assert events.index("seal") < min(copy_positions) <= max(copy_positions) < min(index_positions)
     assert not any(statement.startswith("INSERT") for statement in events)
     assert not any("INCLUDING ALL" in statement for statement in events)
     assert archive._is_model_table_equal.await_count == len(
         archive.reference_family_spec(importer, canonical=importer == "mrf").model_types
     )
+    if importer in {"cms-doctors", "geo"}:
+        assert next(sql for sql in events if sql.startswith("CREATE SCHEMA")).endswith('AUTHORIZATION "retained_owner"')
+        archive.seal_model_family_storage.assert_awaited_once_with(session, ownership, 41, require_empty=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("postgis_available", [False, True])
+async def test_mrf_clone_spatial_index_follows_copy(monkeypatch, postgis_available):
+    """Exercise the real optional index helper through complete clone preparation."""
+    session, capture, ownership, events = _clone_case(monkeypatch)
+
+    async def scalar(statement, _parameters=None):
+        if "to_regtype('public.geography')" in str(statement):
+            events.append("postgis-probe")
+            return postgis_available
+        return "FULL OUTER JOIN" in str(statement)
+
+    async def copy_rows(_session, _query, **options):
+        events.append("copy:" + options["table_name"])
+        return 0
+
+    session.scalar = scalar
+    await archive._clone_source(
+        session,
+        capture,
+        archive.reference_family_stage_schema(ownership.dataset_id),
+        source_copy=archive.ReferenceFamilySourceCopy(copy_rows, 4096, 30),
+        deadline=asyncio.get_running_loop().time() + 30,
+        on_precreated=AsyncMock(),
+    )
+    spatial_statements = [sql for sql in events if "USING gist" in sql]
+    assert len(spatial_statements) == int(postgis_available)
+    assert max(i for i, event in enumerate(events) if event.startswith("copy:")) < events.index("postgis-probe")
+    if postgis_available:
+        assert (
+            f'ON "{archive.reference_family_stage_schema(ownership.dataset_id)}"."mrf_canonical_address"'
+            in spatial_statements[0]
+        )
+        assert (
+            "public.Geography(public.ST_MakePoint((long)::double precision,(lat)::double precision))"
+            in spatial_statements[0]
+        )
+        assert "WHERE lat IS NOT NULL AND long IS NOT NULL" in spatial_statements[0]
+
+
+@pytest.mark.asyncio
+async def test_mrf_spatial_index_failure_stops_completion(monkeypatch):
+    """An index failure cannot advance sequence rebasing or complete set validation."""
+    session, capture, ownership, events = _clone_case(monkeypatch)
+    original_execute = session.execute
+
+    async def execute(statement, parameters=None):
+        if "USING gist" in str(statement):
+            raise RuntimeError("spatial index refused")
+        await original_execute(statement, parameters)
+
+    async def copy_rows(_session, _query, **options):
+        events.append("copy:" + options["table_name"])
+        return 0
+
+    session.execute, session.scalar = execute, AsyncMock(return_value=True)
+    validate = AsyncMock()
+    monkeypatch.setattr(archive, "_validate_source_clone_sets", validate)
+    with pytest.raises(RuntimeError, match="spatial index refused"):
+        await archive._clone_source(
+            session,
+            capture,
+            archive.reference_family_stage_schema(ownership.dataset_id),
+            source_copy=archive.ReferenceFamilySourceCopy(copy_rows, 4096, 30),
+            deadline=asyncio.get_running_loop().time() + 30,
+            on_precreated=AsyncMock(),
+        )
+    assert sum(event.startswith("copy:") for event in events) == len(capture.manifest.tables)
+    archive._rebase_owned_sequences.assert_not_awaited()
+    validate.assert_not_awaited()
 
 
 @pytest.mark.asyncio

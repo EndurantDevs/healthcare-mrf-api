@@ -33,6 +33,13 @@ from tests.test_cms_npd_source import _client, _source
 fhir = importlib.import_module("process.provider_directory_fhir")
 
 
+@pytest.fixture
+def source_workflow():
+    from tests.test_provider_directory_generic_source_policy import SyntheticSourceWorkflow
+
+    return SyntheticSourceWorkflow
+
+
 def _dispatch_retained_release(tmp_path):
     """Acquire the same synthetic thousand-row release for all eight families."""
     resource_bytes_by_name = {
@@ -127,7 +134,7 @@ def _source_dispatch_fixture(monkeypatch, tmp_path, *, configured=5, size=2, ove
     "configured,size,overflow,expected", [(5, 2, 1, 2), (2, 1, 1, 1), (5, 1, 1, 1), (2, 5, 0, 1), (9, 7, 0, 2)]
 )
 async def test_source_dispatch_overlaps_only_connected_admitted_file_slots(
-    monkeypatch, tmp_path, configured, size, overflow, expected
+    monkeypatch, tmp_path, configured, size, overflow, expected, source_workflow
 ):
     fixture = _source_dispatch_fixture(monkeypatch, tmp_path, configured=configured, size=size, overflow=overflow)
     started = asyncio.Event()
@@ -148,27 +155,35 @@ async def test_source_dispatch_overlaps_only_connected_admitted_file_slots(
             fixture.writing.remove(kind)
 
     monkeypatch.setattr(cms, "_persist_source_batch", persist)
-    staging = asyncio.create_task(
-        cms._stage_and_validate_candidate(
-            fixture.fhir, fixture.directory, fixture.candidate, fixture.identity, fixture.receipt, {}, {}
+
+    def drained():
+        assert not fixture.opened and not fixture.writing
+
+    workflow = source_workflow(fixture.fhir, fixture.candidate, fixture.identity, drained=drained)
+    async with workflow.bind(monkeypatch):
+        staging = asyncio.create_task(
+            cms._stage_and_validate_candidate(
+                fixture.fhir, fixture.directory, fixture.candidate, fixture.identity, fixture.receipt, {}, {}
+            )
         )
-    )
-    try:
-        async with asyncio.timeout(2):
-            await started.wait()
-        assert len(fixture.opened) == expected
-        assert fixture.events == []
-        release.set()
-        assert await staging == {"validated": True}
-    finally:
-        release.set()
-        if not staging.done():
-            staging.cancel()
-        await asyncio.gather(staging, return_exceptions=True)
+        try:
+            async with asyncio.timeout(2):
+                await started.wait()
+            assert len(fixture.opened) == expected
+            assert fixture.events == []
+            release.set()
+            assert await staging == {"validated": True}
+        finally:
+            release.set()
+            if not staging.done():
+                staging.cancel()
+            await asyncio.gather(staging, return_exceptions=True)
     assert sorted(staged_types) == sorted(cms.RESOURCE_TYPES)
     assert fixture.peaks == {"opened": expected, "writing": expected}
     assert fixture.events == ["counts", "witnesses", "identity", "relationships", "validate"]
     fixture.publisher.assert_not_awaited()
+
+    workflow.assert_outcome("commit")
 
 
 def _dispatch_failure_writer(fixture, failure_mode, both_started, drain, failure):
@@ -293,7 +308,7 @@ def test_source_dispatch_uses_serial_unknown_pools_and_rejects_no_writer_capacit
 
 
 @pytest.mark.asyncio
-async def test_cms_pre_cutover_deadline_rolls_back_and_releases_transaction() -> None:
+async def test_cms_pre_cutover_deadline_rolls_back_and_releases_transaction(monkeypatch) -> None:
     candidate = SimpleNamespace(
         dataset_id="dataset-synthetic",
         endpoint_id="endpoint-synthetic",
@@ -332,14 +347,17 @@ async def test_cms_pre_cutover_deadline_rolls_back_and_releases_transaction() ->
         db=SimpleNamespace(transaction=transaction, status=AsyncMock()),
         LOGGER=Mock(),
     )
-    with pytest.raises(TimeoutError):
-        await publish_validated_source_local_dataset(
-            fake_fhir,
-            candidate,
-            "cms-npd",
-            before_cutover=stall,
-            before_cutover_timeout_seconds=0.1,
-        )
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_publisher
+
+    async with synthetic_source_publisher(monkeypatch, fake_fhir.db, isolation="read committed"):
+        with pytest.raises(TimeoutError):
+            await publish_validated_source_local_dataset(
+                fake_fhir,
+                candidate,
+                "cms-npd",
+                before_cutover=stall,
+                before_cutover_timeout_seconds=0.1,
+            )
     assert transaction_state.has_rolled_back and not transaction_state.is_held
     promote.assert_not_awaited()
     fake_fhir._is_provider_directory_dataset_cutover_committed.assert_awaited_once_with(fence)
@@ -706,49 +724,85 @@ async def test_empty_witness_group_is_zero_but_unknown_group_is_rejected():
 
 @pytest.mark.asyncio
 async def test_witness_replay_reads_hashes_without_raw_payload(monkeypatch):
-    """A changed raw payload fails replay without fetching large source JSON."""
+    """Intake copies exact raw_by_field facts; complete replay refuses changed_by_field hashes."""
+    import json
 
-    witness_by_field = {
-        "dataset_id": "dataset-synthetic",
-        "source_id": "cms-npd",
-        "release_id": "a" * 64,
-        "resource_type": "Location",
-        "resource_id": "site-1",
-        "raw_payload_sha256": "b" * 64,
-        "normalized_payload_hash": "c" * 64,
-        "raw_payload_json": {"resourceType": "Location", "id": "site-1", "text": "x" * 100_000},
-    }
-    stored_by_field = {
-        field: field_value for field, field_value in witness_by_field.items() if field != "raw_payload_json"
-    }
-    query_response = SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: [stored_by_field]))
+    from process import provider_directory_generic_source_storage as storage
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_publisher
+
+    raw_by_field = {"resourceType": "Location", "id": "site-1", "text": "x" * 100_000}
+    witness_by_field = dict(
+        dataset_id="dataset-synthetic",
+        source_id="cms-npd",
+        release_id="a" * 64,
+        resource_type="Location",
+        resource_id="site-1",
+        normalized_payload_hash="c" * 64,
+        raw_payload_json=raw_by_field,
+        raw_payload_sha256=hashlib.sha256(
+            json.dumps(raw_by_field, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    )
+    candidate = object()
+    resolve = AsyncMock(return_value=candidate)
+    append = AsyncMock()
+    monkeypatch.setattr(storage, "resolve_existing_source_candidate", resolve)
+    monkeypatch.setattr(storage, "append_generic_source_batch", append)
     copy_rows = AsyncMock()
     monkeypatch.setattr(fhir, "_copy_upsert_rows", copy_rows)
-    session = SimpleNamespace(execute=AsyncMock(return_value=query_response))
-    await cms._insert_verified_witnesses(session, {witness_by_field["resource_id"]: witness_by_field})
-    assert copy_rows.call_args.kwargs == {
-        "skip_unchanged": False,
-        "transaction_session": session,
-        "ignore_conflicts": True,
+    async with synthetic_source_publisher(monkeypatch, fhir.db) as (session, _):
+        await cms._insert_verified_witnesses(session, {"site-1": witness_by_field})
+        resolve.assert_awaited_once_with(fhir.db, fhir, "dataset-synthetic")
+        append.assert_awaited_once_with(fhir.db, fhir, candidate, (), [witness_by_field])
+        with pytest.raises(RuntimeError, match="transaction_missing"):
+            await cms._insert_verified_witnesses(object(), {"site-1": witness_by_field})
+    copy_rows.assert_not_awaited()
+
+    assert await _reduced_witness_rows([witness_by_field, witness_by_field]) == [witness_by_field]
+    changed_by_field = {**witness_by_field, "raw_payload_sha256": "d" * 64}
+    with pytest.raises(storage.GenericCandidateError, match="raw_hash_changed"):
+        await _reduced_witness_rows([changed_by_field])
+    changed_raw_by_field = {**raw_by_field, "text": "changed"}
+    changed_by_field = {
+        **witness_by_field,
+        "raw_payload_json": changed_raw_by_field,
+        "raw_payload_sha256": hashlib.sha256(storage._encoded(changed_raw_by_field).encode()).hexdigest(),
     }
-    selected_columns = set(session.execute.call_args_list[0].args[0].selected_columns.keys())
-    assert selected_columns == set(stored_by_field)
-    witness_by_field["raw_payload_sha256"] = "d" * 64
-    with pytest.raises(RuntimeError, match="cms_npd_witness_payload_conflict"):
-        await cms._insert_verified_witnesses(session, {witness_by_field["resource_id"]: witness_by_field})
+    with pytest.raises(storage.GenericCandidateError, match="witness_replay_conflict"):
+        await _reduced_witness_rows([witness_by_field, changed_by_field])
+
+
+async def _reduced_witness_rows(witness_rows):
+    """Run the complete raw/replay reducer for the exact synthetic dataset/vector."""
+    from process import provider_directory_generic_source_completion as completion
+
+    async def observations():
+        for witness_row in witness_rows:
+            yield witness_row
+
+    return [
+        witness_row
+        async for witness_row in completion._reduced_witnesses(observations(), "dataset-synthetic", "a" * 64)
+    ]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("raw_payload", [{"value": "bad\x00value"}, {"bad\x00key": "value"}])
 async def test_raw_witness_copy_rejects_lossy_normalization(monkeypatch, raw_payload):
     """Never store sanitized JSON under the original source hash."""
-    copy_rows = AsyncMock()
+    from process import provider_directory_generic_source_storage as storage
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_publisher
+
+    copy_rows, resolve, append = AsyncMock(), AsyncMock(), AsyncMock()
     monkeypatch.setattr(fhir, "_copy_upsert_rows", copy_rows)
-    session = SimpleNamespace(execute=AsyncMock())
-    with pytest.raises(CmsNpdSourceError, match="cms_npd_resource_invalid"):
-        await cms._insert_verified_witnesses(session, {"site-1": {"raw_payload_json": raw_payload}})
+    monkeypatch.setattr(storage, "resolve_existing_source_candidate", resolve)
+    monkeypatch.setattr(storage, "append_generic_source_batch", append)
+    async with synthetic_source_publisher(monkeypatch, fhir.db) as (session, _):
+        with pytest.raises(CmsNpdSourceError, match="cms_npd_resource_invalid"):
+            await cms._insert_verified_witnesses(session, {"site-1": {"raw_payload_json": raw_payload}})
     copy_rows.assert_not_awaited()
-    session.execute.assert_not_awaited()
+    resolve.assert_not_awaited()
+    append.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -768,8 +822,22 @@ async def test_copy_conflict_policy_is_explicit_and_transaction_bound(monkeypatc
 
     monkeypatch.setattr(fhir, "_copy_upsert_connection", bound_connection)
     options = {"ignore_conflicts": True} if ignore_conflicts else {}
-    await fhir._copy_upsert_rows(
+    arguments = (
         cms.ProviderDirectoryCMSNPDResourceWitness,
+        [{"dataset_id": "synthetic", "resource_id": "site-1", "resource_type": "Location", "raw_payload_json": {}}],
+        ["dataset_id", "resource_type", "resource_id", "raw_payload_json"],
+        ["dataset_id", "resource_type", "resource_id"],
+    )
+    with pytest.raises(RuntimeError, match="isolated_copy_required"):
+        await fhir._copy_upsert_rows(*arguments, skip_unchanged=False, transaction_session=session, **options)
+    connection.status.assert_not_awaited()
+    connection.raw_connection.driver_connection.copy_records_to_table.assert_not_awaited()
+    from sqlalchemy import MetaData
+
+    table = cms.ProviderDirectoryCMSNPDResourceWitness.__table__.to_metadata(MetaData())
+    table.info = {}
+    await fhir._copy_upsert_rows(
+        SimpleNamespace(__table__=table),
         [{"dataset_id": "synthetic", "resource_id": "site-1", "resource_type": "Location", "raw_payload_json": {}}],
         ["dataset_id", "resource_type", "resource_id", "raw_payload_json"],
         ["dataset_id", "resource_type", "resource_id"],
@@ -888,7 +956,7 @@ async def test_identity_batches_delegate_complete_source_facts_to_bulk_writer():
 
     @asynccontextmanager
     async def session():
-        async with AsyncSession() as writer_session:
+        async with AsyncSession() as writer_session, writer_session.begin():
             yield writer_session
 
     async def capture(kind, _session, **kwargs):
@@ -1020,7 +1088,7 @@ async def test_finalized_replay_checks_identity_without_rewriting_entire_release
     fake_fhir = object()
     ctx_by_field = {}
     await cms._materialize_identity_evidence(fake_fhir, tmp_path, candidate, identity, ctx_by_field, {})
-    backfill.assert_awaited_once_with(fake_fhir, identity, ctx_by_field, {})
+    backfill.assert_not_awaited()
     check.assert_awaited_once_with(fake_fhir, candidate, identity)
     refresh.assert_not_awaited()
     assert ctx_by_field["context"]["audit"]["cms_intake"]["phase"] == "identity_validation"
@@ -1049,8 +1117,13 @@ def _identity_statistics_fixture(monkeypatch, directory: Path, failure=None):
         _qt=lambda schema, table: f'"{schema}"."{table}"',
         _raise_if_resource_import_cancelled=AsyncMock(side_effect=lambda *_args: events.append(("cancel", None))),
     )
+
+    def before_seal():
+        assert events == [("write", kind) for kind in ("Organization", "Location", "InsurancePlan", "PractitionerRole")]
+
     return SimpleNamespace(
         fhir=fake_fhir,
+        before_seal=before_seal,
         candidate=SimpleNamespace(dataset_id="synthetic", already_validated=False, already_published=False),
         identity=cms.release_identity(_receipt()),
         check=check,
@@ -1059,9 +1132,11 @@ def _identity_statistics_fixture(monkeypatch, directory: Path, failure=None):
 
 
 @pytest.mark.asyncio
-async def test_fresh_identity_refreshes_before_validation(monkeypatch, tmp_path: Path):
+async def test_fresh_identity_refreshes_before_validation(monkeypatch, tmp_path: Path, source_workflow):
     fixture = _identity_statistics_fixture(monkeypatch, tmp_path)
-    await cms._materialize_identity_evidence(fixture.fhir, tmp_path, fixture.candidate, fixture.identity, {}, {})
+    workflow = source_workflow(fixture.fhir, fixture.candidate, fixture.identity, before_seal=fixture.before_seal)
+    async with workflow.bind(monkeypatch, completed=True):
+        await cms._materialize_identity_evidence(fixture.fhir, tmp_path, fixture.candidate, fixture.identity, {}, {})
     assert fixture.events == [
         ("write", "Organization"),
         ("write", "Location"),
@@ -1078,14 +1153,22 @@ async def test_fresh_identity_refreshes_before_validation(monkeypatch, tmp_path:
     ]
     fixture.check.assert_awaited_once_with(fixture.fhir, fixture.candidate, fixture.identity)
 
+    workflow.assert_outcome("commit", sealed=True)
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_cancelled", (False, True))
-async def test_identity_refresh_failure_preserves_writes(monkeypatch, tmp_path: Path, is_cancelled: bool):
+async def test_identity_refresh_failure_preserves_writes(
+    monkeypatch, tmp_path: Path, is_cancelled: bool, source_workflow
+):
     failure = asyncio.CancelledError() if is_cancelled else RuntimeError("synthetic_refresh_failure")
     fixture = _identity_statistics_fixture(monkeypatch, tmp_path, failure)
+    workflow = source_workflow(fixture.fhir, fixture.candidate, fixture.identity, before_seal=fixture.before_seal)
     with pytest.raises(type(failure)) as caught:
-        await cms._materialize_identity_evidence(fixture.fhir, tmp_path, fixture.candidate, fixture.identity, {}, {})
+        async with workflow.bind(monkeypatch, completed=True):
+            await cms._materialize_identity_evidence(
+                fixture.fhir, tmp_path, fixture.candidate, fixture.identity, {}, {}
+            )
     assert caught.value is failure
     assert fixture.events == [
         ("write", "Organization"),
@@ -1100,9 +1183,13 @@ async def test_identity_refresh_failure_preserves_writes(monkeypatch, tmp_path: 
     assert fixture.fhir.db.status.await_count == 2
     fixture.check.assert_not_awaited()
 
+    workflow.assert_outcome("rollback", sealed=True)
+
 
 @pytest.mark.asyncio
-async def test_missing_identity_evidence_blocks_validation_and_publication(monkeypatch, tmp_path: Path):
+async def test_missing_identity_evidence_blocks_validation_and_publication(
+    monkeypatch, tmp_path: Path, source_workflow
+):
     candidate = SimpleNamespace(
         dataset_id="dataset-synthetic",
         already_validated=False,
@@ -1131,17 +1218,21 @@ async def test_missing_identity_evidence_blocks_validation_and_publication(monke
         "publish_validated_source_local_dataset",
         publisher,
     )
-    with pytest.raises(RuntimeError, match="identity_evidence_incomplete"):
-        await cms._run_acquired(
-            {"context": {}},
-            {},
-            "run-synthetic",
-            tmp_path,
-            _receipt(),
-            object(),
-        )
+    workflow = source_workflow(fhir, candidate, cms.release_identity(_receipt()))
+    async with workflow.bind(monkeypatch):
+        with pytest.raises(RuntimeError, match="identity_evidence_incomplete"):
+            await cms._run_acquired(
+                {"context": {}},
+                {},
+                "run-synthetic",
+                tmp_path,
+                _receipt(),
+                object(),
+            )
     finalizer.assert_not_awaited()
     publisher.assert_not_awaited()
+
+    workflow.assert_outcome("rollback")
 
 
 @pytest.mark.asyncio
@@ -1284,7 +1375,7 @@ async def test_stream_flushes_on_decoded_byte_bound(monkeypatch, tmp_path: Path)
 @pytest.mark.parametrize("error_code", ["cms_npd_source_vector_changed", "cms_npd_retained_file_missing"])
 @pytest.mark.parametrize("failed_check_index", [1, 2])
 async def test_retained_verification_failure_never_reaches_validation(
-    monkeypatch, tmp_path: Path, error_code: str, failed_check_index: int
+    monkeypatch, tmp_path: Path, error_code: str, failed_check_index: int, source_workflow
 ):
     identity = cms.release_identity(_receipt())
     candidate = SimpleNamespace(
@@ -1317,21 +1408,30 @@ async def test_retained_verification_failure_never_reaches_validation(
             raise CmsNpdSourceError(error_code)
 
     monkeypatch.setattr(cms.source, "verify_retained_release", reject_local_release)
-    dispose = AsyncMock()
+    workflow = source_workflow(fhir, candidate, identity)
+
+    async def dispose_after_rollback(*_args):
+        assert workflow.active == 0 and workflow.snapshot.get() is None
+        assert workflow.events[-1] == "transaction.rollback"
+
+    dispose = AsyncMock(side_effect=dispose_after_rollback)
     monkeypatch.setattr(cms.recovery, "dispose_changed_vector", dispose)
-    with pytest.raises(CmsNpdSourceError, match=error_code):
-        await cms._run_acquired(
-            {"context": {}},
-            {},
-            "run-synthetic",
-            tmp_path,
-            _receipt(),
-            object(),
-        )
+    async with workflow.bind(monkeypatch):
+        with pytest.raises(CmsNpdSourceError, match=error_code):
+            await cms._run_acquired(
+                {"context": {}},
+                {},
+                "run-synthetic",
+                tmp_path,
+                _receipt(),
+                object(),
+            )
     assert cms.release_identity(_receipt()) == identity
     finalizer.assert_not_awaited()
     publisher.assert_not_awaited()
     dispose.assert_awaited_once()
+
+    workflow.assert_outcome("rollback")
 
 
 @pytest.mark.asyncio
@@ -1349,7 +1449,7 @@ async def test_retained_failure_preserves_published_candidate(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_replaced_release_after_validation_never_reaches_cutover(monkeypatch, tmp_path: Path):
+async def test_replaced_release_after_validation_never_reaches_cutover(monkeypatch, tmp_path: Path, source_workflow):
     candidate = SimpleNamespace(
         dataset_id="dataset-synthetic",
         already_validated=False,
@@ -1390,19 +1490,23 @@ async def test_replaced_release_after_validation_never_reaches_cutover(monkeypat
     monkeypatch.setattr(cms.source, "verify_retained_release", lambda *_args: verification_phases.append("local"))
     dispose = AsyncMock()
     monkeypatch.setattr(cms.recovery, "dispose_changed_vector", dispose)
-    with pytest.raises(CmsNpdSourceError, match="source_vector_changed"):
-        await cms._run_acquired(
-            {"context": {}},
-            {},
-            "run-synthetic",
-            tmp_path,
-            _receipt(),
-            object(),
-        )
+    workflow = source_workflow(fhir, candidate, identity)
+    async with workflow.bind(monkeypatch):
+        with pytest.raises(CmsNpdSourceError, match="source_vector_changed"):
+            await cms._run_acquired(
+                {"context": {}},
+                {},
+                "run-synthetic",
+                tmp_path,
+                _receipt(),
+                object(),
+            )
     assert verification_phases == ["full", "local", "local", "full"]
     finalizer.assert_awaited_once()
     publisher.assert_not_awaited()
     dispose.assert_awaited_once()
+
+    workflow.assert_outcome("commit")
 
 
 def _stub_rollback_publication(monkeypatch, identity):
@@ -1476,10 +1580,10 @@ def _stub_validated_rollback_state(monkeypatch, identity):
 
 
 @pytest.mark.asyncio
-async def test_new_publication_defers_optional_tax_until_same_byte_replay(monkeypatch, tmp_path: Path):
+async def test_new_publication_defers_optional_tax_until_same_byte_replay(monkeypatch, tmp_path: Path, source_workflow):
     receipt_by_field = _receipt()
     identity = cms.release_identity(receipt_by_field)
-    _, _, _, tax_followup = _stub_rollback_publication(monkeypatch, identity)
+    candidate_factory, _, _, tax_followup = _stub_rollback_publication(monkeypatch, identity)
 
     async def run_preflight(*_args, **kwargs):
         await kwargs["before_cutover"](object())
@@ -1489,23 +1593,31 @@ async def test_new_publication_defers_optional_tax_until_same_byte_replay(monkey
         "publish_validated_source_local_dataset",
         AsyncMock(side_effect=run_preflight),
     )
-    result = await cms._run_acquired(
-        {"context": {}},
-        {"import_resources": True, "full_refresh": True},
-        "run-synthetic",
-        tmp_path,
-        receipt_by_field,
-        None,
-    )
-    assert "dataset_followup" not in result
-    assert result["status"] == "validated"
-    assert result["cms_serving_candidate"]["desired_cms_dataset"]["is_current"] is False
-    assert result["tax_candidates"] == {"status": "pending", "retryable": True, "retry_via": "same_byte_import"}
+    workflow = source_workflow(fhir, candidate_factory.return_value, identity)
+    async with workflow.bind(monkeypatch):
+        admission_result = await cms._run_acquired(
+            {"context": {}},
+            {"import_resources": True, "full_refresh": True},
+            "run-synthetic",
+            tmp_path,
+            receipt_by_field,
+            None,
+        )
+    assert "dataset_followup" not in admission_result
+    assert admission_result["status"] == "validated"
+    assert admission_result["cms_serving_candidate"]["desired_cms_dataset"]["is_current"] is False
+    assert admission_result["tax_candidates"] == {
+        "status": "pending",
+        "retryable": True,
+        "retry_via": "same_byte_import",
+    }
     tax_followup.assert_not_awaited()
+
+    workflow.assert_outcome("commit")
 
 
 @pytest.mark.asyncio
-async def test_rollback_replays_fresh_candidate_without_upstream_recheck(monkeypatch, tmp_path: Path):
+async def test_rollback_replays_fresh_candidate_without_upstream_recheck(monkeypatch, tmp_path: Path, source_workflow):
     """Reopen retained bytes without consulting the upstream CMS endpoint."""
     receipt_by_field = _receipt()
     identity = cms.release_identity(receipt_by_field)
@@ -1521,14 +1633,16 @@ async def test_rollback_replays_fresh_candidate_without_upstream_recheck(monkeyp
         publisher,
     )
     task_by_field = {"cms_npd_rollback_vector_sha256": identity["vector_sha256"]}
-    admission_summary = await cms._run_acquired(
-        {"context": {}},
-        task_by_field,
-        "run-synthetic",
-        tmp_path,
-        receipt_by_field,
-        None,
-    )
+    workflow = source_workflow(fhir, candidate_factory.return_value, identity)
+    async with workflow.bind(monkeypatch):
+        admission_summary = await cms._run_acquired(
+            {"context": {}},
+            task_by_field,
+            "run-synthetic",
+            tmp_path,
+            receipt_by_field,
+            None,
+        )
     candidate_key = candidate_factory.await_args.kwargs["candidate_key"]
     assert candidate_key != identity["vector_sha256"]
     assert candidate_key.startswith("cms-npd-rollback:")
@@ -1543,6 +1657,8 @@ async def test_rollback_replays_fresh_candidate_without_upstream_recheck(monkeyp
     publisher.assert_not_awaited()
     cms.recovery.dispose_prior_vectors.assert_awaited_once_with(fhir, "endpoint-synthetic", identity["vector_sha256"])
     upstream_verify.assert_not_called()
+
+    workflow.assert_outcome("commit")
 
 
 @pytest.mark.asyncio

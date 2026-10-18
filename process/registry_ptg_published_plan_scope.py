@@ -38,7 +38,12 @@ async def resolve_published_plan(session, schema_name, intent_by_field, ownershi
     """Resolve an exact real plan and complete files without company/cohort relabeling."""
     intent_by_field = validated_intent(intent_by_field)
     await require_published_lock_privileges(session, schema_name, pin_writer=pin_writer)
-    inventory = await published_plan_inventory(
+    inventory_loader = published_plan_inventory
+    if intent_by_field["review_type"] == "published_allowed_amount_plan":
+        from process.registry_ptg_allowed_plan_source import allowed_plan_inventory
+
+        inventory_loader = allowed_plan_inventory
+    inventory = await inventory_loader(
         session,
         schema_name,
         ownership,
@@ -56,6 +61,14 @@ def resolved_published_plan_inventory(schema_name, intent_by_field, ownership, i
     } not in inventory["plan_scopes"] or intent_by_field["file_versions"] != inventory["file_versions"]:
         raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")
     identity = inventory["identity"]
+    authority_contract, selection_mode = AUTHORITY_CONTRACT, SELECTION_MODE
+    if intent_by_field["review_type"] == "published_allowed_amount_plan":
+        from process.registry_ptg_allowed_plan_contract import AUTHORITY_CONTRACT as allowed_contract
+        from process.registry_ptg_allowed_plan_contract import SELECTION_MODE as allowed_selection
+
+        authority_contract, selection_mode = allowed_contract, allowed_selection
+    if inventory["authority"].get("contract") != authority_contract:
+        raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")
     full = validated_command(
         {
             **intent_by_field,
@@ -67,7 +80,7 @@ def resolved_published_plan_inventory(schema_name, intent_by_field, ownership, i
                 "source_id": identity["source_key"],
                 "dataset_schema": schema_name,
                 "dataset_id": identity["snapshot_id"],
-                "producer_id": AUTHORITY_CONTRACT,
+                "producer_id": authority_contract,
                 "edition_id": identity["snapshot_manifest_sha256"],
             },
             "source": {
@@ -80,7 +93,7 @@ def resolved_published_plan_inventory(schema_name, intent_by_field, ownership, i
     evidence_by_field = {
         "source_authority": inventory["authority"],
         "selected_source_keys": inventory["source_keys"],
-        "selection_mode": SELECTION_MODE,
+        "selection_mode": selection_mode,
     }
     return full, inventory["authority"], evidence_by_field
 
@@ -219,7 +232,12 @@ async def approve_published_plan(service, envelope, deadline, state):
         _remaining(deadline)
         await service.authority.authorize(envelope, deadline=deadline)
         _remaining(deadline)
-        await commit_ptg_result_archive_source_authority(session, schema_name=service.schema_name, authority=authority)
+        commit_source = commit_ptg_result_archive_source_authority
+        if full["review_type"] == "published_allowed_amount_plan":
+            from process.ptg_parts.result_archive_allowed_authority import commit_allowed_source_authority
+
+            commit_source = commit_allowed_source_authority
+        await commit_source(session, schema_name=service.schema_name, authority=authority)
         await session.execute(
             text(f"""
             INSERT INTO {table}(scope_id,scope_key,actor_key,idempotency_key,approval_sha256,approval_json)
@@ -252,7 +270,7 @@ async def read_registry_ptg_published_plan_scope(session, *, scope_id, client_id
     return await _read_protected_published_scope(session, table, scope_id, client_id, approval_sha256)
 
 
-async def _read_protected_published_scope(session, table, scope_id, client_id, approval_sha256):
+async def _read_protected_published_scope(session, table, scope_id, client_id, approval_sha256, *, pin_writer=False):
     """Reconstruct the original proof after a caller verified the exact store role."""
     from process.ptg_parts.result_archive_published_authority import (
         lock_ptg_published_result_for_clone,
@@ -286,12 +304,16 @@ async def _read_protected_published_scope(session, table, scope_id, client_id, a
         {name: full[name] for name in INTENT_FIELDS},
         full["ownership"],
         document["actor"],
+        pin_writer=pin_writer,
     )
     if current != full or _document(full, document["actor"], evidence) != document:
         raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")
-    retained = await lock_ptg_published_result_for_clone(
-        session, schema_name=full["source"]["ptg_schema_name"], authority=authority
-    )
+    lock_source = lock_ptg_published_result_for_clone
+    if full["review_type"] == "published_allowed_amount_plan":
+        from process.ptg_parts.result_archive_allowed_authority import lock_allowed_source_authority
+
+        lock_source = lock_allowed_source_authority
+    retained = await lock_source(session, schema_name=full["source"]["ptg_schema_name"], authority=authority)
     if retained.as_dict() != authority:
         raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")
     return {**document, "approval_sha256": approval_sha256}

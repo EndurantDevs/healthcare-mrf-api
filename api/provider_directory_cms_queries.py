@@ -5,6 +5,7 @@ import re
 
 from sqlalchemy import text
 
+from api.provider_directory_cms_network_scope import cms_network_predicate, cms_network_target_predicate
 from api.provider_directory_entities_contract import DirectoryReadError
 from process.provider_directory_identifier_policy import explicit_npi
 
@@ -63,13 +64,14 @@ def _release_join(schema, kind):
 async def require_cms_bindings(session, schema, generation, kind):
     """Reject missing identities rather than returning a deceptively partial source page."""
     binding, id_column = _binding(kind)
+    identity_schema = generation.get("control_schema", schema) if binding == _IDENTITY else schema
     scope = f"AND EXISTS ({_network_witness(schema)})" if kind == "networks" else ""
     missing = (
         await session.execute(
             text(f"""
         SELECT EXISTS (SELECT 1 FROM {schema}.{_RESOURCE} r
         WHERE r.dataset_id=:dataset_id AND r.resource_type=:resource_type {scope}
-          AND NOT EXISTS (SELECT 1 FROM {schema}.{binding} b {_release_join(schema, kind)}
+          AND NOT EXISTS (SELECT 1 FROM {identity_schema}.{binding} b {_release_join(schema, kind)}
             WHERE b.source_id='cms-npd' AND b.resource_type=r.resource_type
               AND b.resource_id=r.resource_id AND b.{id_column} IS NOT NULL))
     """),
@@ -81,7 +83,7 @@ async def require_cms_bindings(session, schema, generation, kind):
     ambiguous = (
         await session.execute(
             text(f"""
-        SELECT EXISTS (SELECT 1 FROM {schema}.{binding} b
+        SELECT EXISTS (SELECT 1 FROM {identity_schema}.{binding} b
         JOIN {schema}.{_RESOURCE} r ON r.dataset_id=:dataset_id
           AND r.resource_type=b.resource_type AND r.resource_id=b.resource_id
         WHERE b.source_id='cms-npd' AND b.resource_type=:resource_type {scope}
@@ -124,6 +126,7 @@ async def _require_network_witnesses(session, schema, generation):
 async def cms_entity_rows(session, schema, query, generation, position=None):
     """Seek indexed stable identities, opening only the selected resource projections."""
     binding, id_column = _binding(query.kind)
+    identity_schema = generation.get("control_schema", schema) if binding == _IDENTITY else schema
     network_join = f"JOIN LATERAL ({_network_witness(schema)}) witness ON true" if query.kind == "networks" else ""
     plan_evidence = "witness.insurance_plan_resource_id" if query.kind == "networks" else "NULL::text"
     alias_scope = f"AND EXISTS ({_network_witness(schema, 'selected')})" if query.kind == "networks" else ""
@@ -132,16 +135,18 @@ async def cms_entity_rows(session, schema, query, generation, position=None):
           left(r.payload_json->>'name', 2049) AS name, CASE WHEN jsonb_typeof(r.payload_json::jsonb->'active')='boolean' THEN r.payload_json->>'active' END AS active,
           left(r.payload_json->>'status', 32) AS status, left(r.payload_json->>'period_start', 40) AS period_start,
           left(r.payload_json->>'period_end', 40) AS period_end, {plan_evidence} AS plan_evidence,
-          (SELECT count(*) FROM {schema}.{binding} aliases
+          (SELECT count(*) FROM {identity_schema}.{binding} aliases
             JOIN {schema}.{_RESOURCE} selected ON selected.dataset_id=:dataset_id
               AND selected.resource_type=aliases.resource_type AND selected.resource_id=aliases.resource_id
             WHERE aliases.source_id='cms-npd' AND aliases.resource_type=b.resource_type
-              AND aliases.{id_column}=b.{id_column} {alias_scope}) AS identity_count
-        FROM {schema}.{binding} b
+              AND aliases.{id_column}=b.{id_column} {alias_scope}
+              {cms_network_predicate(generation, query.kind, "selected.resource_id")}) AS identity_count
+        FROM {identity_schema}.{binding} b
         JOIN {schema}.{_RESOURCE} r ON r.dataset_id=:dataset_id AND r.resource_type=b.resource_type
           AND r.resource_id=b.resource_id
         {_release_join(schema, query.kind)} {network_join}
         WHERE b.source_id='cms-npd' AND b.resource_type=:resource_type
+          {cms_network_predicate(generation, query.kind, "r.resource_id")}
           AND (CAST(:entity_id AS uuid) IS NULL OR b.{id_column}=CAST(:entity_id AS uuid))
           AND (CAST(:position AS uuid) IS NULL OR b.{id_column}>CAST(:position AS uuid))
         ORDER BY b.{id_column} LIMIT :page_size
@@ -217,6 +222,8 @@ async def cms_relationship_rows(session, schema, query, generation, resource_id,
           WHERE link.dataset_id=:dataset_id AND link.source_id='cms-npd'
             AND link.release_id=:release_id AND link.resource_type=:resource_type
             AND link.resource_id=:resource_id
+            {cms_network_predicate(generation, query.kind, "r.resource_id")}
+            {cms_network_target_predicate(generation, "fields.target_kind", "link.target_reference", {entry[2] for entry in RELATION_FIELDS[query.kind]})}
         ) SELECT * FROM numbered WHERE position>:position
         ORDER BY position LIMIT :page_size"""
     return (
@@ -250,10 +257,12 @@ async def cms_network_plan_rows(session, schema, query, generation, resource_id,
         JOIN {schema}.{_RESOURCE} p ON p.dataset_id=:dataset_id AND p.resource_type='InsurancePlan'
           AND p.resource_id=n.insurance_plan_resource_id
           AND (p.acquired_resource_sha256 IS NULL OR p.acquired_resource_sha256=n.plan_payload_sha256)
-        JOIN {schema}.{_IDENTITY} b ON b.source_id='cms-npd' AND b.resource_type='InsurancePlan'
+        JOIN {generation.get("control_schema", schema)}.{_IDENTITY} b ON b.source_id='cms-npd' AND b.resource_type='InsurancePlan'
           AND b.resource_id=p.resource_id
         WHERE n.source_id='cms-npd' AND n.release_id=:release_id AND n.network_resource_id=:resource_id
           AND p.payload_json::jsonb->'network_refs' @> jsonb_build_array('Organization/' || n.network_resource_id)
+          {cms_network_predicate(generation, "networks", "n.network_resource_id")}
+          {cms_network_predicate(generation, "plans", "p.resource_id")}
           AND (CAST(:position AS uuid) IS NULL OR b.entity_id>CAST(:position AS uuid))
         ORDER BY b.entity_id LIMIT :page_size
     """),
@@ -272,27 +281,29 @@ async def cms_target_identity(session, schema, generation, kind, reference):
     if not reference.startswith(prefix) or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", reference[len(prefix) :]) is None:
         return None, "unresolved"
     binding, id_column = _binding(kind)
+    identity_schema = generation.get("control_schema", schema) if binding == _IDENTITY else schema
     scope = f"AND EXISTS ({_network_witness(schema)})" if kind == "networks" else ""
-    rows = (
+    identity_rows = (
         await session.execute(
             text(f"""
         SELECT b.{id_column} AS entity_id FROM {schema}.{_RESOURCE} r
-        LEFT JOIN {schema}.{binding} b ON b.source_id='cms-npd' AND b.resource_type=r.resource_type
+        LEFT JOIN {identity_schema}.{binding} b ON b.source_id='cms-npd' AND b.resource_type=r.resource_type
           AND b.resource_id=r.resource_id
         {_release_join(schema, kind)}
         WHERE r.dataset_id=:dataset_id AND r.resource_type=:resource_type AND r.resource_id=:resource_id {scope}
+        {cms_network_predicate(generation, kind, "r.resource_id")}
         LIMIT 2
     """),
             {**generation, "resource_type": resource_type, "resource_id": reference[len(prefix) :]},
         )
     ).all()
-    if len(rows) > 1:
+    if len(identity_rows) > 1:
         return None, "conflict"
-    if not rows:
+    if not identity_rows:
         return None, "unresolved"
-    if rows[0][0] is None:
+    if identity_rows[0][0] is None:
         raise DirectoryReadError(503)
-    return str(rows[0][0]), "resolved"
+    return str(identity_rows[0][0]), "resolved"
 
 
 async def cms_practitioner_npi(session, schema, generation, reference):
@@ -300,8 +311,9 @@ async def cms_practitioner_npi(session, schema, generation, reference):
     if not isinstance(reference, str) or re.fullmatch(r"Practitioner/[A-Za-z0-9.-]{1,64}", reference) is None:
         return None
     practitioner_row = (
-        await session.execute(
-            text(f"""SELECT r.payload_json->>'npi' AS npi, w.raw_payload_json AS raw
+        (
+            await session.execute(
+                text(f"""SELECT r.payload_json->>'npi' AS npi, w.raw_payload_json AS raw
                 FROM {schema}.{_RESOURCE} r
                 JOIN {schema}.{_WITNESS} w ON w.dataset_id=r.dataset_id
                   AND w.resource_type=r.resource_type AND w.resource_id=r.resource_id
@@ -311,9 +323,12 @@ async def cms_practitioner_npi(session, schema, generation, reference):
                   AND r.resource_id=:resource_id
                   AND w.raw_payload_json->>'resourceType'='Practitioner'
                   AND w.raw_payload_json->>'id'=r.resource_id"""),
-            {**generation, "resource_id": reference.removeprefix("Practitioner/")},
+                {**generation, "resource_id": reference.removeprefix("Practitioner/")},
+            )
         )
-    ).mappings().one_or_none()
+        .mappings()
+        .one_or_none()
+    )
     if practitioner_row is None or not isinstance(practitioner_row["raw"], dict):
         return None
     identifiers = practitioner_row["raw"].get("identifier")

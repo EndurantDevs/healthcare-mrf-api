@@ -1650,14 +1650,26 @@ def provider_enrichment(test: bool):
 )
 @click.option("--concurrency", type=int, help="Concurrent source metadata probes.")
 @click.option("--timeout", type=int, help="Per-request timeout in seconds.")
-def provider_directory_fhir(**options):
-    """Run a configured Provider Directory FHIR refresh."""
+@click.pass_context
+def provider_directory_fhir(command_context, **options):
+    """Run a configured Provider Directory FHIR refresh under its issued launcher."""
     options["test_mode"] = options.pop("test")
     source_ids = options.pop("source_id")
     options["source_ids"] = list(source_ids) if source_ids else None
     options["probe"] = not options.pop("no_probe")
     options["rehydrate_resources"] = list(options.pop("rehydrate_resource"))
-    _run(initiate_provider_directory_fhir(**options))
+    operation_runner = (
+        command_context.obj.get("provider_directory_operation_runner")
+        if isinstance(command_context.obj, dict)
+        else None
+    )
+    if operation_runner is None:
+        operation = initiate_provider_directory_fhir(**options)
+    else:
+        if not callable(operation_runner):
+            raise click.ClickException("provider_directory_operation_runner must be callable")
+        operation = operation_runner(initiate_provider_directory_fhir, options)
+    _run(operation)
 
 
 @click.command(help="Backfill one fixed-size Provider Directory dataset receipt")
@@ -2220,3 +2232,83 @@ process_group.add_command(code_sets, name="code-sets")
 process_group.add_command(ms_drg, name="ms-drg")
 process_group.add_command(clinical_reference, name="clinical-reference")
 process_group.add_command(terminology_synonyms, name="terminology-synonyms")
+
+from process.registry_publication_worker import registry_publication_worker_command
+
+process_group.add_command(registry_publication_worker_command, name="registry-publication-worker")
+
+
+from process.registry_ptg_source_worker import registry_ptg_source_worker_command
+
+process_group.add_command(registry_ptg_source_worker_command, name="registry-ptg-source-worker")
+
+
+class RegistryPTGSource:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:RegistryPTGSource"
+    job_timeout = 4200
+    max_tries = 1
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+from process.registry_cms_source_worker import registry_cms_source_worker_command
+
+process_group.add_command(registry_cms_source_worker_command, name="registry-cms-source-worker")
+
+
+class RegistryCMSSource:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:RegistryCMSSource"
+    job_timeout = 4200
+    max_tries = 1
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+from process.registry_source_check import registry_source_check_command
+
+process_group.add_command(registry_source_check_command, name="registry-source-check")
+
+
+class RegistrySourceCheck:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:RegistrySourceCheck"
+    job_timeout = 600
+    max_tries = 1
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+from process.registry_aca_source_worker import registry_aca_source_worker_command
+
+process_group.add_command(registry_aca_source_worker_command, name="registry-aca-source-worker")
+
+
+class RegistryACASource:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:RegistryACASource"
+    job_timeout = 4200
+    max_tries = 1
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job

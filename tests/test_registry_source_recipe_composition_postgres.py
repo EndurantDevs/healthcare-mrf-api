@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+from contextlib import aclosing
 from uuid import UUID, uuid4, uuid5
 
 import asyncpg
@@ -418,3 +419,92 @@ async def test_complete_aca_recipe_reports_retained_fact_totals(reviewed_aca_sou
     stage, members = await _stage(connection, schema, (RegistrySourceMembershipRecipe(source, coordinates),))
     assert (stage.raw_source_rows, stage.accepted_raw_source_rows, stage.omitted_raw_source_rows) == (2, 2, 0)
     assert len(members) == 2
+
+
+@pytest.fixture
+async def disposition_cms_source(request, cms_recipe_database, serving_schema, monkeypatch, tmp_path):
+    """Admit the declared input variation before hashes, publication and real custody."""
+    from tests import cms_registry_recipe_postgres_support as support
+
+    original = support._membership_resource_rows
+
+    def resources(revision_source, revision):
+        documents = original(revision_source, revision)
+        if request.param == "omitted":
+            documents["PractitionerRole"].extend(
+                [
+                    {"id": "zz-expired", "period": {"end": "2025-01-01"}},
+                    {"id": "zz-future", "period": {"start": "2027-01-01"}},
+                ]
+            )
+        else:
+            documents["PractitionerRole"].append(
+                {
+                    **documents["PractitionerRole"][0],
+                    "id": "zz-partial",
+                    "location": [{"reference": "Location/site-1"}, {"reference": "Location/missing"}],
+                }
+            )
+        return documents
+
+    monkeypatch.setattr(support, "_membership_resource_rows", resources)
+    async with aclosing(
+        support.reviewed_cms_source.__wrapped__(cms_recipe_database, serving_schema, monkeypatch, tmp_path)
+    ) as fixture:
+        yield await anext(fixture)
+
+
+@pytest.mark.parametrize("disposition_cms_source", ["omitted"], indirect=True)
+async def test_fhir_recipe_census_counts_omitted_tail_once(disposition_cms_source, monkeypatch):
+    import process.registry_source_recipe_composition as composition
+
+    fixture, _, _, _, coordinates, _ = disposition_cms_source
+    connection, schema, source_pin, _ = fixture
+    original = composition._read_recipe_page
+    dispositions = []
+
+    async def one_resource(connection, recipe, approved, cursor, control_schema, limit, office_source=None):
+        batch, next_cursor, _ = await original(connection, recipe, approved, cursor, control_schema, 1, office_source)
+        dispositions.extend(batch.source_outcomes)
+        return batch, next_cursor, 1
+
+    monkeypatch.setattr(composition, "_read_recipe_page", one_resource)
+    recipe = RegistrySourceMembershipRecipe(source_pin, coordinates)
+    first, members = await _stage(connection, schema, (recipe,))
+    assert (first.raw_source_rows, first.accepted_raw_source_rows, first.omitted_raw_source_rows) == (4, 1, 3)
+    assert first.membership_rows == len(members) == 1
+    assert len({(disposition.resource_type, disposition.resource_id) for disposition in dispositions}) == 4
+    assert len(dispositions) == 4
+    second, retried = await _stage(connection, schema, (recipe,))
+    assert second.generation_sha256 == first.generation_sha256 and retried == members
+
+
+@pytest.mark.parametrize("disposition_cms_source", ["partial"], indirect=True)
+async def test_late_fhir_partial_resource_refuses_complete_recipe(disposition_cms_source, monkeypatch):
+    import process.registry_source_recipe_composition as composition
+
+    fixture, _, _, _, coordinates, _ = disposition_cms_source
+    connection, schema, source_pin, _ = fixture
+    original, encode = composition._read_recipe_page, composition._encode
+    dispositions, encoded_pages = [], []
+
+    async def one_resource(connection, recipe, approved, cursor, control_schema, limit, office_source=None):
+        batch, next_cursor, _ = await original(connection, recipe, approved, cursor, control_schema, 1, office_source)
+        dispositions.extend(batch.source_outcomes)
+        return batch, next_cursor, 1
+
+    def observed_encode(input_bytes):
+        encoded_pages.append(input_bytes)
+        return encode(input_bytes)
+
+    monkeypatch.setattr(composition, "_read_recipe_page", one_resource)
+    monkeypatch.setattr(composition, "_encode", observed_encode)
+    with pytest.raises(RegistrySourceCompositionError, match="unresolved"):
+        await _stage(connection, schema, (RegistrySourceMembershipRecipe(source_pin, coordinates),))
+    assert [disposition.outcome for disposition in dispositions] == ["omitted", "accepted", "unresolved"]
+    assert dispositions[-1].resource_id == "zz-partial" and len(encoded_pages) == 2
+    assert not await connection.fetchval(
+        "SELECT EXISTS(SELECT FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
+        "AND (relname LIKE 'registry_recipe_raw_%' OR relname LIKE 'registry_source_page_%'))"
+    )
+    assert await connection.fetchval(f'SELECT generation_id FROM "{schema}".network_serving_control') is None

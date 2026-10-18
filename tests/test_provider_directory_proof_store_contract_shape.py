@@ -8,10 +8,14 @@ import copy
 import hashlib
 import json
 import zlib
+from contextlib import asynccontextmanager
 
 import pytest
 
+from process import provider_directory_generic_source_policy as source_policy
 from process import provider_directory_proof_store as proof_store
+from process import provider_directory_source_proof_control as proof_control
+from process.plan_release_storage_catalog import CATALOG_SQL
 from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID,
     PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID,
@@ -24,19 +28,20 @@ from process.provider_directory_resource_hash import (
     TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     resource_payload_sha256_for_contract,
 )
+from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+from tests.test_provider_directory_generic_source_storage import _case as source_case
 from tests.test_provider_directory_proof_store import (
     DATASET_ID,
     ENDPOINT_ID,
     ROOT_RUN_ID,
     SELECTED_RESOURCES,
     SOURCE_IDS,
-    _MemoryProofConnection,
     _dataset_resource,
+    _MemoryProofConnection,
     _persist_rows_by_resource,
     _sample_dataset_resources,
     _stored_proof,
 )
-
 
 SEMANTIC_PROJECTION_AS_OF = "2026-08-09"
 SEMANTIC_PROOF_SCOPE = ["Practitioner"]
@@ -55,11 +60,9 @@ def _semantic_practitioner_row() -> dict[str, object]:
         "practitioner-1",
         payload_by_field,
     )
-    resource_row_by_field["payload_hash"] = (
-        resource_payload_sha256_for_contract(
-            payload_by_field,
-            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-        )
+    resource_row_by_field["payload_hash"] = resource_payload_sha256_for_contract(
+        payload_by_field,
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
     )
     return resource_row_by_field
 
@@ -76,35 +79,135 @@ def _semantic_proof_connection() -> _MemoryProofConnection:
     return connection
 
 
-async def _sealed_semantic_proof_metadata() -> dict[str, object]:
+def _proof_control_catalog():
+    root = proof_control.PROOF_ROOT
+    constraints = [
+        dict(name=root + "_pkey", type="p", columns=[1, 2], valid=True),
+        dict(name=root + "_dataset_fkey", type="f", columns=[1], valid=True),
+    ]
+    constraints.extend(
+        dict(name=name, type="c", definition=definition, valid=True)
+        for name, definition in proof_control._CHECKS.items()
+    )
+    catalog_by_field = dict(
+        oid=31,
+        relname=root,
+        nspname="mrf",
+        relowner=1,
+        relkind="r",
+        relpersistence="p",
+        parents=[],
+        relrowsecurity=False,
+        relforcerowsecurity=False,
+        native_checks=True,
+        direct_acl_closed=True,
+        readers_closed=True,
+        columns=[
+            [name, kind, True, "now()" if name == "created_at" else None] for name, kind in proof_control._COLUMNS
+        ],
+        constraints=constraints,
+        indexes=[
+            dict(valid=True, native=True, method="btree", predicate=None, expression=None, keys=keys)
+            for keys in (["dataset_id", "shard_id"], ["dataset_id", "acquisition_root_run_id", "shard_id"])
+        ],
+    )
+    hooks = [
+        dict(
+            tgtype=event,
+            proname=function,
+            tgisinternal=True,
+            tgenabled="O",
+            function_schema="pg_catalog",
+            conname=root + "_dataset_fkey",
+            contype="f",
+            convalidated=True,
+            condeferrable=False,
+            confupdtype="a",
+            confdeltype="c",
+            confmatchtype="s",
+            conkey=[1],
+            exact_parent=True,
+            target_columns=["dataset_id"],
+            has_rules=False,
+        )
+        for event, function in ((5, "RI_FKey_check_ins"), (17, "RI_FKey_check_upd"))
+    ]
+    return catalog_by_field, hooks
+
+
+def _source_proof_parent(connection):
+    _, _, parent_by_field = source_case()
+    parent_by_field.update(connection.parent)
+    parent_by_field["dataset_id"] = DATASET_ID
+    identity_by_field = parent_by_field["candidate_storage_json"]["identity"]
+    identity_by_field.update(
+        dataset_id=DATASET_ID,
+        endpoint_id=parent_by_field["endpoint_id"],
+        acquisition_root_run_id=parent_by_field["acquisition_root_run_id"],
+        metadata=copy.deepcopy(parent_by_field["publication_metadata_json"]),
+    )
+    for table in parent_by_field["candidate_storage_json"]["tables"].values():
+        table["owner"] = 1
+    connection.parent = parent_by_field
+
+
+@asynccontextmanager
+async def _source_proof_memory(monkeypatch, connection):
+    """Declare unit catalog/parent facts while retaining every real Source and proof guard."""
+    _source_proof_parent(connection)
+    async with (
+        synthetic_source_database(monkeypatch, connection) as database,
+        source_policy.source_transaction(database),
+    ):
+        native = source_policy.bound_publisher().connection
+        catalog_by_field, hooks = _proof_control_catalog()
+        role_fetch = native.fetch
+
+        async def fetch(query, *arguments):
+            if query == CATALOG_SQL:
+                assert arguments == (['"mrf"."' + proof_control.PROOF_ROOT + '"'], 1, [3])
+                return [catalog_by_field]
+            if query.startswith("SELECT t.tgtype"):
+                assert arguments == (31, '"mrf"."provider_directory_endpoint_dataset"')
+                return hooks
+            return await role_fetch(query, *arguments)
+
+        async def parent(query, *arguments):
+            if "candidate_storage_json FROM" in query:
+                assert arguments == (DATASET_ID,)
+                return copy.deepcopy(connection.parent)
+            assert query == "SELECT session_user::text AS session,current_user::text AS current"
+            return native.fetchrow.return_value
+
+        monkeypatch.setattr(native, "fetch", fetch)
+        native.fetchrow.side_effect = parent
+        yield database
+
+
+async def _sealed_semantic_proof_metadata(monkeypatch) -> dict[str, object]:
     connection = _semantic_proof_connection()
-    await proof_store.persist_dataset_proof_shard(
-        connection,
-        "mrf",
-        [_semantic_practitioner_row()],
-        dataset_id=DATASET_ID,
-        expected_resource_hash_contract=(
-            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-        ),
-    )
-    stored_proof = await proof_store.build_stored_dataset_proof(
-        connection,
-        "mrf",
-        dataset_id=DATASET_ID,
-        endpoint_id=ENDPOINT_ID,
-        acquisition_root_run_id=ROOT_RUN_ID,
-        source_ids=SOURCE_IDS,
-        selected_resources=["Practitioner"],
-        options=ProviderDirectoryStoredProofOptions(
-            proof_resource_scope=SEMANTIC_PROOF_SCOPE,
-            expected_resource_hash_contract=(
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    async with _source_proof_memory(monkeypatch, connection) as database:
+        await proof_store.persist_dataset_proof_shard(
+            database,
+            "mrf",
+            [_semantic_practitioner_row()],
+            dataset_id=DATASET_ID,
+            expected_resource_hash_contract=(SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
+        )
+        stored_proof = await proof_store.build_stored_dataset_proof(
+            database,
+            "mrf",
+            dataset_id=DATASET_ID,
+            endpoint_id=ENDPOINT_ID,
+            acquisition_root_run_id=ROOT_RUN_ID,
+            source_ids=SOURCE_IDS,
+            selected_resources=["Practitioner"],
+            options=ProviderDirectoryStoredProofOptions(
+                proof_resource_scope=SEMANTIC_PROOF_SCOPE,
+                expected_resource_hash_contract=(SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
+                expected_semantic_projection_as_of=(SEMANTIC_PROJECTION_AS_OF),
             ),
-            expected_semantic_projection_as_of=(
-                SEMANTIC_PROJECTION_AS_OF
-            ),
-        ),
-    )
+        )
     return stored_proof.metadata
 
 
@@ -112,9 +215,7 @@ def _resign_proof_metadata(metadata_by_field: dict[str, object]) -> None:
     """Recompute the public seal after an intentional test mutation."""
 
     metadata_by_field.pop("proof_sha256", None)
-    metadata_by_field["proof_sha256"] = proof_store._json_hash(
-        metadata_by_field
-    )
+    metadata_by_field["proof_sha256"] = proof_store._json_hash(metadata_by_field)
 
 
 @pytest.mark.asyncio
@@ -147,12 +248,11 @@ async def test_semantic_proof_rejects_recomputed_seal_tampering(
     field_name,
     replacement_value,
     error_pattern,
+    monkeypatch,
 ):
     """Reject contract, scope, or date drift even under a recomputed seal."""
 
-    metadata_by_field = copy.deepcopy(
-        await _sealed_semantic_proof_metadata()
-    )
+    metadata_by_field = copy.deepcopy(await _sealed_semantic_proof_metadata(monkeypatch))
     metadata_by_field[field_name] = replacement_value
     _resign_proof_metadata(metadata_by_field)
 
@@ -169,23 +269,20 @@ async def test_semantic_proof_rejects_recomputed_seal_tampering(
             selected_resources=["Practitioner"],
             options=ProviderDirectoryStoredProofOptions(
                 proof_resource_scope=SEMANTIC_PROOF_SCOPE,
-                expected_resource_hash_contract=(
-                    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-                ),
-                expected_semantic_projection_as_of=(
-                    SEMANTIC_PROJECTION_AS_OF
-                ),
+                expected_resource_hash_contract=(SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
+                expected_semantic_projection_as_of=(SEMANTIC_PROJECTION_AS_OF),
             ),
         )
 
 
 @pytest.mark.asyncio
-async def test_legacy_proof_rejects_resigned_semantic_fields():
+async def test_legacy_proof_rejects_resigned_semantic_fields(monkeypatch):
     """Keep v3-only identity fields out of historical proof shapes."""
 
     connection = _MemoryProofConnection()
-    await _persist_rows_by_resource(connection, _sample_dataset_resources())
-    metadata_by_field = copy.deepcopy((await _stored_proof(connection)).metadata)
+    async with _source_proof_memory(monkeypatch, connection) as database:
+        await _persist_rows_by_resource(database, _sample_dataset_resources())
+        metadata_by_field = copy.deepcopy((await _stored_proof(database)).metadata)
     metadata_by_field.update(
         resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
         semantic_projection_as_of=SEMANTIC_PROJECTION_AS_OF,
@@ -210,36 +307,33 @@ async def test_legacy_proof_rejects_resigned_semantic_fields():
             source_ids=SOURCE_IDS,
             selected_resources=SELECTED_RESOURCES,
             options=ProviderDirectoryStoredProofOptions(
-                expected_resource_hash_contract=(
-                    LEGACY_RESOURCE_HASH_CONTRACT
-                ),
+                expected_resource_hash_contract=(LEGACY_RESOURCE_HASH_CONTRACT),
             ),
         )
 
 
 @pytest.mark.asyncio
-async def test_semantic_proof_accepts_one_shot_scope_iterable():
+async def test_semantic_proof_accepts_one_shot_scope_iterable(monkeypatch):
     """Normalize a one-shot scope once before every identity comparison."""
 
-    metadata_by_field = await _sealed_semantic_proof_metadata()
-    proof_resource_types = (
-        resource_type for resource_type in SEMANTIC_PROOF_SCOPE
-    )
-    assert proof_store.validate_stored_dataset_proof_metadata(
-        metadata_by_field,
-        dataset_id=DATASET_ID,
-        endpoint_id=ENDPOINT_ID,
-        acquisition_root_run_id=ROOT_RUN_ID,
-        source_ids=SOURCE_IDS,
-        selected_resources=["Practitioner"],
-        options=ProviderDirectoryStoredProofOptions(
-            proof_resource_scope=proof_resource_types,
-            expected_resource_hash_contract=(
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    metadata_by_field = await _sealed_semantic_proof_metadata(monkeypatch)
+    proof_resource_types = (resource_type for resource_type in SEMANTIC_PROOF_SCOPE)
+    assert (
+        proof_store.validate_stored_dataset_proof_metadata(
+            metadata_by_field,
+            dataset_id=DATASET_ID,
+            endpoint_id=ENDPOINT_ID,
+            acquisition_root_run_id=ROOT_RUN_ID,
+            source_ids=SOURCE_IDS,
+            selected_resources=["Practitioner"],
+            options=ProviderDirectoryStoredProofOptions(
+                proof_resource_scope=proof_resource_types,
+                expected_resource_hash_contract=(SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
+                expected_semantic_projection_as_of=SEMANTIC_PROJECTION_AS_OF,
             ),
-            expected_semantic_projection_as_of=SEMANTIC_PROJECTION_AS_OF,
-        ),
-    ) == metadata_by_field
+        )
+        == metadata_by_field
+    )
 
 
 def _semantic_expectation_proof() -> dict[str, object]:
@@ -327,9 +421,7 @@ def test_semantic_shard_rejects_recomputed_outer_hash_tampering():
     tampered_base_hash = hashlib.sha256(b"tampered-base").hexdigest()
     assert tampered_base_hash != proof_record_fields[8]
     proof_record_fields[8] = tampered_base_hash
-    tampered_input = (
-        proof_store._stable_json(proof_record_fields).encode() + b"\n"
-    )
+    tampered_input = proof_store._stable_json(proof_record_fields).encode() + b"\n"
     tampered_compressed = zlib.compress(tampered_input, level=1)
     shard_fields_by_name.update(
         input_sha256=hashlib.sha256(tampered_input).hexdigest(),
@@ -347,3 +439,23 @@ def test_semantic_shard_rejects_recomputed_outer_hash_tampering():
             shard_fields_by_name,
             tampered_compressed,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["sealed", "root"])
+async def test_semantic_proof_refuses_parent_drift_before_shard_write(monkeypatch, change):
+    connection = _semantic_proof_connection()
+    async with _source_proof_memory(monkeypatch, connection) as database:
+        if change == "sealed":
+            connection.parent["status"] = "published"
+        else:
+            connection.parent["candidate_storage_json"]["identity"]["acquisition_root_run_id"] = "other-root"
+        with pytest.raises(ValueError, match="proof_parent_sealed|proof_identity_changed|binding_changed"):
+            await proof_store.persist_dataset_proof_shard(
+                database,
+                "mrf",
+                [_semantic_practitioner_row()],
+                dataset_id=DATASET_ID,
+                expected_resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+            )
+    assert connection.shards == {}

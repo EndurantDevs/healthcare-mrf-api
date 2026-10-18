@@ -691,13 +691,16 @@ async def _create_profile_bucket_probe_scopes(
         row_count=row_count,
         include_affiliation_edges=include_affiliation_edges,
     )
-    for _model, scope_table in (
+    for model, scope_table in (
         (importer.ProviderDirectoryPractitionerRole, role_scope),
         (
             importer.ProviderDirectoryOrganizationAffiliation,
             affiliation_scope,
         ),
     ):
+        await importer._build_artifact_scope_pk(model, schema, scope_table, status_executor=database.status)
+        _index_name, index_sql = importer._provider_directory_profile_bucket_index_sql(schema, scope_table)
+        await database.status(index_sql)
         await database.status(f"ANALYZE {profile.qualified_table(schema, scope_table)};")
     return role_scope, affiliation_scope
 

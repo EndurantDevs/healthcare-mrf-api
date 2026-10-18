@@ -20,6 +20,7 @@ from db.registry_schema import registry_schema
 
 __all__ = ("RegistryNetworkBinding", "RegistryNetworkBindingBatch")
 _SCHEMA = registry_schema()
+OFFICE_RECIPE_CHECK_SQL = "office_recipe_json IS NULL OR COALESCE((source_system='ptg'\n AND source_scope_json->>'review_type'='published_complete_snapshot_plan'\n AND jsonb_typeof(office_recipe_json)='object' AND octet_length(office_recipe_json::text)<=256\n AND office_recipe_json ?& ARRAY['capture_id','recipe_sha256']\n AND office_recipe_json - ARRAY['capture_id','recipe_sha256']='{}'::jsonb\n AND jsonb_typeof(office_recipe_json->'capture_id')='string'\n AND jsonb_typeof(office_recipe_json->'recipe_sha256')='string'\n AND office_recipe_json->>'capture_id' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'\n AND office_recipe_json->>'capture_id'<>'00000000-0000-0000-0000-000000000000'\n AND office_recipe_json->>'recipe_sha256' ~ '^[0-9a-f]{64}$'),false)"
 
 
 class RegistryNetworkBinding(Base):
@@ -28,6 +29,7 @@ class RegistryNetworkBinding(Base):
     __tablename__ = "registry_network_binding"
     __runtime_schema_sync__ = False
     __table_args__ = (
+        CheckConstraint(OFFICE_RECIPE_CHECK_SQL, name="registry_network_binding_office_recipe"),
         CheckConstraint(
             "binding_id<>'00000000-0000-0000-0000-000000000000'::uuid", name="registry_network_binding_identity"
         ),
@@ -67,6 +69,7 @@ class RegistryNetworkBinding(Base):
     archived = Column(Boolean, nullable=False, server_default="false")
     revision = Column(BigInteger, nullable=False, server_default="1")
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    office_recipe_json = Column(JSONB, nullable=True)
 
 
 class RegistryNetworkBindingBatch(Base):

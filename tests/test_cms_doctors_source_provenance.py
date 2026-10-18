@@ -15,6 +15,7 @@ from process import cms_doctors_artifact as artifact
 from process import cms_doctors_education as education
 from process import cms_doctors_groups as groups
 from process import cms_doctors_source_provenance as provenance
+from tests.test_cms_doctors_organizations import _unit_source_transaction
 
 
 def source_metrics(tmp_path, monkeypatch):
@@ -183,11 +184,21 @@ def _mock_replay_staging(native, monkeypatch):
         staged_by_family[family].extend(dict(row) for row in batch)
 
     monkeypatch.setattr(native, "ensure_database", AsyncMock())
+    monkeypatch.setattr(native, "source_transaction", _unit_source_transaction)
+    monkeypatch.setattr(native, "bound_publisher", lambda: SimpleNamespace(connection=object(), policy=object()))
+    monkeypatch.setattr(native.source_storage, "_close_grants", AsyncMock())
     monkeypatch.setattr(native, "_create_stage_indexes", AsyncMock())
     monkeypatch.setattr(native.db, "create_table", AsyncMock())
     monkeypatch.setattr(native.db, "status", AsyncMock())
+
+    async def create_stage(database, model, import_date, schema):
+        stage = native.make_class(model, import_date)
+        await database.create_table(stage.__table__, checkfirst=False)
+        return stage
+
     for module in (native, education, groups):
-        monkeypatch.setattr(module, "push_objects" if module is native else "_copy_sidecar_rows", collect)
+        monkeypatch.setattr(module, "create_doctors_stage", create_stage)
+        monkeypatch.setattr(module, "_copy_clinical_rows" if module is native else "_copy_sidecar_rows", collect)
         monkeypatch.setattr(module, "raise_if_cancelled", AsyncMock())
     return staged_by_family
 
@@ -346,6 +357,8 @@ async def test_retained_manifest_is_validated_before_queue_creation(tmp_path, mo
 @pytest.mark.parametrize("changed_count", [None, "organization_groups", "sites"])
 async def test_retained_manifest_fences_group_site_preparation_before_publication(tmp_path, monkeypatch, changed_count):
     native = importlib.import_module("process.cms_doctors")
+    monkeypatch.setattr(native, "source_transaction", _unit_source_transaction)
+    monkeypatch.setattr(native, "_create_stage_indexes", AsyncMock())
     original = provenance.read_doctors_source_provenance(
         provenance.mint_doctors_source_provenance(source_metrics(tmp_path, monkeypatch))
     )

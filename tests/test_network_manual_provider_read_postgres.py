@@ -79,7 +79,12 @@ async def _reader_grants(fixture):
     reader = '"' + fixture.roles["reader"] + '"'
     namespace = '"' + fixture.control_schema + '"'
     await fixture.connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO {reader}")
-    for table in ("network_serving_manifest", "network_membership_candidate", "network_serving_control"):
+    for table in (
+        "network_serving_manifest",
+        "network_membership_candidate",
+        "network_serving_control",
+        "network_candidate_custody",
+    ):
         await fixture.connection.execute(f"GRANT SELECT ON {namespace}.{table} TO {reader}")
 
 
@@ -293,7 +298,8 @@ async def test_office_bound_and_fixed_bulk_query_count(catalog_db):
                 queries.clear()
                 await _bounded_office_page(fixture, scope, count)
                 await asyncio.sleep(0)
-                assert len(queries) == 3
+                assert len(queries) == 5
+                assert sum("network_candidate_custody" in query.query for query in queries) == 1
     finally:
         fixture.connection.remove_query_logger(queries.append)
 
@@ -332,7 +338,7 @@ async def test_draft_edits_and_new_head_preserve_retained_approved_identity(manu
     assert current["providers"] == before["providers"] and newer.approved_custom_revision == fixture.seed.revision
 
 
-async def test_three_native_reads_and_reader_cannot_modify_candidate(manual_read_db):
+async def test_five_native_reads_and_reader_cannot_modify_candidate(manual_read_db):
     fixture = manual_read_db
     await _reader_grants(fixture)
     statements = []
@@ -348,9 +354,10 @@ async def test_three_native_reads_and_reader_cannot_modify_candidate(manual_read
                 )
                 assert result["total_count"] == 1
                 await asyncio.sleep(0)
-                assert len(statements) == 3 and all(
+                assert len(statements) == 5 and all(
                     query.query.lstrip().startswith(("SELECT", "WITH")) for query in statements
                 )
+                assert sum("network_candidate_custody" in query.query for query in statements) == 1
     finally:
         fixture.connection.remove_query_logger(statements.append)
     async with fixture.connection.transaction():

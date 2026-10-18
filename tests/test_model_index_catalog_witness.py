@@ -89,3 +89,78 @@ def test_witness_opclasses_are_qualified_without_moving_ordering_or_function_loo
     assert any('lower(COALESCE(rx_name, \'\')) "public"."gin_trgm_ops"' in sql for sql in sql_statements)
     assert any('total_drug_cost "public"."text_ops" DESC' in sql for sql in sql_statements)
     assert not any('DESC "public"' in sql for sql in sql_statements)
+
+
+def test_index_renderer_alias_keeps_archive_helper_lookups(monkeypatch):
+    from process import reference_family_model_indexes as indexes
+
+    assert archive._additional_index_sql is indexes._additional_index_sql
+    helpers = (
+        "_is_reviewed_index_element",
+        "_index_name_for_table",
+        "_reviewed_index_where",
+        "_witness_index_element",
+        "_quoted",
+    )
+    calls = []
+
+    def tracked(name, original):
+        def call(*args, **kwargs):
+            calls.append(name)
+            return original(*args, **kwargs)
+
+        return call
+
+    for name in helpers:
+        monkeypatch.setattr(archive, name, tracked(name, getattr(archive, name)))
+    sql = archive._additional_index_sql(
+        "candidate", SimpleNamespace(__tablename__="entry"), {"index_elements": ("code",), "unique": True}
+    )
+    assert sql == 'CREATE UNIQUE INDEX "candidate_entry_idx_code" ON "candidate"."entry" (code)'
+    assert set(calls) == set(helpers)
+
+
+def test_index_renderer_keeps_archive_identifier_and_exception_authority(monkeypatch):
+    class RefusedIndex(RuntimeError):
+        pass
+
+    class RefusedIdentifier:
+        @staticmethod
+        def fullmatch(value):
+            return None
+
+    monkeypatch.setattr(archive, "ReferenceFamilyArchiveError", RefusedIndex)
+    monkeypatch.setattr(archive, "_IDENTIFIER", RefusedIdentifier)
+    with pytest.raises(RefusedIndex, match="model index is invalid"):
+        archive._additional_index_sql(
+            "candidate", SimpleNamespace(__tablename__="entry"), {"index_elements": ("code",)}
+        )
+
+
+def test_catalog_witness_keeps_archive_declaration_and_input_lookups(monkeypatch):
+    model = archive.reference_family_spec("drug-claims").model_types[1]
+    declaration_calls = []
+    input_calls = []
+    compile_declarations = archive._declared_index_statements
+    read_input = archive._model_index_input
+
+    def declarations(*args, **kwargs):
+        declaration_calls.append((args[2], kwargs["index_schema_name"]))
+        return compile_declarations(*args, **kwargs)
+
+    def index_input(*args):
+        input_calls.append(args[1:])
+        return read_input(*args)
+
+    monkeypatch.setattr(archive, "_declared_index_statements", declarations)
+    monkeypatch.setattr(archive, "_model_index_input", index_input)
+    inputs = archive._model_index_catalog_inputs(model)
+    assert ("gin", "gin_trgm_ops", None) in inputs
+    assert input_calls
+    input_calls.clear()
+    opclasses_by_input = {key: ("public", key[1] or "text_ops") for key in inputs}
+    _, statements = archive._model_index_catalog_plan(model, "source_catalog", resolved_opclasses=opclasses_by_input)
+    assert declaration_calls == [("pg_temp", "source_catalog")]
+    assert input_calls
+    sql_statements = [str(statement.compile(dialect=dialect())) for statement in statements]
+    assert any('total_drug_cost "public"."text_ops" DESC' in sql for sql in sql_statements)

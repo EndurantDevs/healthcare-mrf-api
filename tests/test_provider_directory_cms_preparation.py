@@ -132,6 +132,13 @@ def _database():
     async def first(query, *, relation_ref):
         return relation_by_ref.get(relation_ref)
 
+    async def all_rows(query, *, relation_refs):
+        return [
+            {"relation_ref": relation_ref, **relation_by_ref[relation_ref]}
+            for relation_ref in relation_refs
+            if relation_ref in relation_by_ref
+        ]
+
     async def scalar(query, *, relation_ref):
         return relation_by_ref.get(relation_ref, {}).get("oid")
 
@@ -145,6 +152,7 @@ def _database():
 
     database = SimpleNamespace(
         first=first,
+        all=all_rows,
         scalar=scalar,
         status=status,
         transaction=transaction,
@@ -153,6 +161,50 @@ def _database():
     )
     database._transaction_binding = lambda: object() if database.transaction_active else None
     return database
+
+
+async def test_measure_uses_one_fresh_query_for_complete_sorted_inventory():
+    admission = _admission()
+    admission._started = True
+    fake, *_ = _fake_fhir([])
+    admission._relations = {("test_schema", f"stage_{index:03d}"): index + 1 for index in reversed(range(128))}
+    for (schema, name), oid in admission._relations.items():
+        fake.db.relations[f"{schema}.{name}"] = {"oid": oid, "total_bytes": oid * 10, "persistence": "p"}
+    fake.db.relations["other_schema.new_stage"] = {"oid": 200, "total_bytes": 50, "persistence": "u"}
+    all_rows = fake.db.all
+
+    async def reversed_rows(query, **parameters):
+        return list(reversed(await all_rows(query, **parameters)))
+
+    fake.db.all = AsyncMock(side_effect=reversed_rows)
+    fake.db.first = AsyncMock(side_effect=AssertionError("per-relation query"))
+    measured = await admission.measure(fake, "other_schema", ("new_stage",))
+    assert [(row.schema, row.relation) for row in measured] == sorted(admission._relations)
+    assert len(measured) == 129 and measured[0].oid == 200 and measured[0].persistence == "u"
+    assert sum(row.total_bytes for row in measured) == sum(range(1, 129)) * 10 + 50
+    assert fake.db.all.await_count == 1
+    assert len(fake.db.all.await_args.kwargs["relation_refs"]) == 129
+    fake.db.relations["other_schema.new_stage"]["total_bytes"] = 75
+    assert (await admission.measure(fake, "test_schema"))[0].total_bytes == 75
+    assert fake.db.all.await_count == 2
+    fake.db.first.assert_not_awaited()
+
+
+@pytest.mark.parametrize("fault", ["missing", "duplicate", "extra"])
+async def test_measure_rejects_incomplete_or_ambiguous_bulk_catalog(fault):
+    admission = _admission()
+    admission._started = True
+    fake, *_ = _fake_fhir([])
+    catalog_record_by_field = {"relation_ref": "test_schema.stage", "oid": 42, "total_bytes": 100, "persistence": "p"}
+    catalog_records = {
+        "missing": [],
+        "duplicate": [catalog_record_by_field, catalog_record_by_field],
+        "extra": [catalog_record_by_field, {**catalog_record_by_field, "relation_ref": "test_schema.foreign"}],
+    }[fault]
+    fake.db.all = AsyncMock(return_value=catalog_records)
+    with pytest.raises(RuntimeError, match="nonprofile_relation_changed"):
+        await admission.measure(fake, "test_schema", ("stage",))
+    assert admission._relations == {("test_schema", "stage"): 0}
 
 
 @pytest.mark.parametrize("persistence", ["u", "p"])
@@ -728,12 +780,16 @@ async def _load_native_scope_heaps(database, schema, duplicate, *arguments):
 
 
 async def _assert_native_scope_layouts(database, schema, overrides):
-    """Compare post-load indexes with the untouched Profile layout on all nine real models."""
+    """Compare both completed index phases on all nine real model layouts."""
     for index, model in enumerate((importer.ProviderDirectorySource, *importer.RESOURCE_MODELS)):
         reference = "reference_scope_" + str(index)
         await importer._create_provider_directory_artifact_scope_layout(
             model, schema, reference, status_executor=database.status
         )
+        await importer._build_artifact_scope_pk(model, schema, reference, status_executor=database.status)
+        if model in {importer.ProviderDirectoryPractitionerRole, importer.ProviderDirectoryOrganizationAffiliation}:
+            _index_name, index_sql = importer._provider_directory_profile_bucket_index_sql(schema, reference)
+            await database.status(index_sql)
         name = overrides[model.__tablename__]
         assert await _native_scope_index_shape(database, schema, name) == await _native_scope_index_shape(
             database, schema, reference

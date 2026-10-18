@@ -55,7 +55,7 @@ def _request(body=None, **changes):
 
 
 def _install(monkeypatch, session, imported=None, *, failure=None, finality_failure=False):
-    fixtures._install_keyring(monkeypatch)
+    fixtures._install_keyring(monkeypatch, session)
 
     @asynccontextmanager
     async def bounded(same_session, *, timeout_ms):
@@ -289,6 +289,7 @@ async def test_ordinary_batch_projects_complete_roots_without_expanding_query_pa
     selected_rows = ((winner, family, SimpleNamespace(root_revision_id=4), None, _VALUES[0]),)
     session = _Session()
     session.execute = AsyncMock(return_value=SimpleNamespace(all=lambda: selected_rows, first=lambda: None))
+    fixtures._install_keyring(monkeypatch, session)
 
     @asynccontextmanager
     async def bounded(_session, *, timeout_ms):

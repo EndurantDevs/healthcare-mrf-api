@@ -237,27 +237,102 @@ async def test_adoption_target_oid_drift_fails_before_insert(monkeypatch):
             )
 
 
-def _current_migration_heads():
-    """Check the current head without weakening the historical predecessor chain."""
+@pytest.mark.asyncio
+async def test_runtime_observation_reads_migrated_postgres_snapshot(monkeypatch):
+    """A freshly migrated disposable schema must witness the sole current head."""
+
+    dsn = os.getenv(_POSTGRES_DSN_ENV)
+    if not dsn:
+        pytest.skip(f"{_POSTGRES_DSN_ENV} is required")
+    _configure_database(monkeypatch, dsn)
+    monkeypatch.setattr(runtime, "build_baked_healthcare_source_commit", lambda: "d" * 40)
+    expected_heads = _assert_registry_migration_lineage()
+    async with _delta_database(monkeypatch) as (database, schema):
+        monkeypatch.setenv("DB_SCHEMA", schema)
+        await _upgrade_disposable_schema_to_head(dsn, schema)
+        async with database.transaction():
+            await database.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;")
+            observation = await runtime.observe_profile_runtime(database)
+            _assert_runtime_bound_lease_replay(observation)
+            transaction_read_only = await database.scalar("SELECT current_setting('transaction_read_only')::boolean;")
+    assert transaction_read_only is True
+    assert observation == {
+        "contract_id": runtime.PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID,
+        "healthcare_source_commit": "d" * 40,
+        "profile_migration_revision": next(iter(expected_heads)),
+        "profile_schema_version": profile_artifact.PROFILE_SCHEMA_VERSION,
+        "profile_strategy_version": profile_artifact.PROFILE_BUILD_STRATEGY_VERSION,
+        "postgres_server_version_num": observation["postgres_server_version_num"],
+    }
+    assert observation["postgres_server_version_num"] >= 180000
+
+
+def _assert_custom_import_manual_acceptance_lineage(script):
+    """Preserve the joined custom-import verification and acceptance ancestry."""
+    assert script.get_revision("20261020210000_registry_manual_acceptance_join").down_revision == (
+        "20261020160000_registry_staged_verification_join",
+        "20261021110000_ptg_membership_import_idempotency",
+    )
+    assert script.get_revision("20261021110000_ptg_membership_import_idempotency").down_revision == (
+        "20261020200000_custom_import_manual_acceptance"
+    )
+    assert script.get_revision("20261020200000_custom_import_manual_acceptance").down_revision == (
+        "20261020190000_custom_import_verification_root_ranges"
+    )
+    assert script.get_revision("20261020190000_custom_import_verification_root_ranges").down_revision == (
+        "20261020180000_custom_import_verification_arms"
+    )
+    assert script.get_revision("20261020180000_custom_import_verification_arms").down_revision == (
+        "20261020150000_custom_import_staged_verification"
+    )
+    assert script.get_revision("20261020150000_custom_import_staged_verification").down_revision == (
+        "20261019010000_custom_import_build_continuation"
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261017010000_custom_import_raw_objects").down_revision == (
+        "20261017210000_provider_directory_readiness_indexes"
+    )
+    assert script.get_revision("20261017210000_provider_directory_readiness_indexes").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+
+
+def _assert_registry_migration_lineage():
+    """Require the current joined head and every protected registry parent edge."""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     expected_heads = set(script.get_heads())
-    assert expected_heads == {"20261020200000_custom_import_manual_acceptance"}
+    assert expected_heads == {"20261020210000_registry_manual_acceptance_join"}
+    _assert_custom_import_manual_acceptance_lineage(script)
+    assert (
+        script.get_revision("20261019030000_provider_directory_role_schema").down_revision
+        == "20261019020000_registry_continuation_join"
+    )
+    assert script.get_revision("20261019020000_registry_continuation_join").down_revision == (
+        "20261019010000_registry_raw_object_join",
+        "20261019010000_custom_import_build_continuation",
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )
-    readiness = script.get_revision("20261017210000_provider_directory_readiness_indexes")
-    raw_objects = script.get_revision("20261017010000_custom_import_raw_objects")
-    continuation = script.get_revision("20261019010000_custom_import_build_continuation")
-    staged_verification = script.get_revision("20261020150000_custom_import_staged_verification")
-    verification_arms = script.get_revision("20261020180000_custom_import_verification_arms")
-    root_ranges = script.get_revision("20261020190000_custom_import_verification_root_ranges")
-    assert script.get_revision(next(iter(expected_heads))).down_revision == root_ranges.revision
-    assert root_ranges.down_revision == verification_arms.revision
-    assert verification_arms.down_revision == staged_verification.revision
-    assert staged_verification.down_revision == continuation.revision
-    assert continuation.down_revision == raw_objects.revision
-    assert raw_objects.down_revision == readiness.revision
-    assert readiness.down_revision == "20261015020000_custom_import_query_projections"
+    assert script.get_revision("20261019010000_registry_raw_object_join").down_revision == (
+        "20261018040000_registry_aca_source_notifications",
+        "20261017010000_custom_import_raw_objects",
+    )
+    assert script.get_revision("20261017010000_custom_import_raw_objects").down_revision == (
+        "20261017210000_provider_directory_readiness_indexes"
+    )
+    assert script.get_revision("20261018011000_network_candidate_custody").down_revision == (
+        "20261017040000_nppes_evidence_candidates",
+        "20261017210000_provider_directory_readiness_indexes",
+    )
+    assert script.get_revision("20261017210000_provider_directory_readiness_indexes").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
     assert script.get_revision("20261015020000_custom_import_query_projections").down_revision == (
         "20261013010000_registry_custom_history_events"
     )
@@ -283,33 +358,3 @@ def _current_migration_heads():
         "20261007000000_custom_import_rejection_anti_joins"
     )
     return expected_heads
-
-
-@pytest.mark.asyncio
-async def test_runtime_observation_reads_migrated_postgres_snapshot(monkeypatch):
-    """A freshly migrated disposable schema must witness the sole current head."""
-
-    dsn = os.getenv(_POSTGRES_DSN_ENV)
-    if not dsn:
-        pytest.skip(f"{_POSTGRES_DSN_ENV} is required")
-    _configure_database(monkeypatch, dsn)
-    monkeypatch.setattr(runtime, "build_baked_healthcare_source_commit", lambda: "d" * 40)
-    expected_heads = _current_migration_heads()
-    async with _delta_database(monkeypatch) as (database, schema):
-        monkeypatch.setenv("DB_SCHEMA", schema)
-        await _upgrade_disposable_schema_to_head(dsn, schema)
-        async with database.transaction():
-            await database.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;")
-            observation = await runtime.observe_profile_runtime(database)
-            _assert_runtime_bound_lease_replay(observation)
-            transaction_read_only = await database.scalar("SELECT current_setting('transaction_read_only')::boolean;")
-    assert transaction_read_only is True
-    assert observation == {
-        "contract_id": runtime.PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID,
-        "healthcare_source_commit": "d" * 40,
-        "profile_migration_revision": next(iter(expected_heads)),
-        "profile_schema_version": profile_artifact.PROFILE_SCHEMA_VERSION,
-        "profile_strategy_version": profile_artifact.PROFILE_BUILD_STRATEGY_VERSION,
-        "postgres_server_version_num": observation["postgres_server_version_num"],
-    }
-    assert observation["postgres_server_version_num"] >= 180000

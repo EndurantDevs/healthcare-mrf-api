@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Genuine geocoder inheritance, source fences and protected flattened captures."""
 
+import asyncio
 import os
 from contextlib import AsyncExitStack, asynccontextmanager
 from secrets import token_hex
@@ -48,8 +49,8 @@ async def owned_tiger_capture_database():
     url = _capture_admin_url(raw)
     suffix = uuid4().hex[:20]
     name = "tiger_capture_test_" + suffix
-    role_by_kind = {kind: "capture_" + kind + "_" + suffix for kind in ("owner", "publisher", "reader")}
-    password_by_kind = {"source": url.password, **{kind: token_hex(32) for kind in ("publisher", "reader")}}
+    role_by_kind = {kind: "capture_" + kind + "_" + suffix for kind in ("owner", "publisher", "reader", "snapshot")}
+    password_by_kind = {"source": url.password, **{kind: token_hex(32) for kind in ("publisher", "reader", "snapshot")}}
     async with AsyncExitStack() as cleanup:
         admin = await asyncpg.connect(url.set(drivername="postgresql").render_as_string(hide_password=False))
         cleanup.push_async_callback(admin.close, timeout=5)
@@ -80,6 +81,7 @@ async def owned_tiger_capture_database():
             ("source", url.username),
             ("publisher", role_by_kind["publisher"]),
             ("reader", role_by_kind["reader"]),
+            ("snapshot", role_by_kind["snapshot"]),
         ):
             engine = create_async_engine(database_url.set(username=username, password=password_by_kind[kind]))
             cleanup.push_async_callback(engine.dispose)
@@ -272,3 +274,164 @@ async def test_capture_refuses_different_publisher_database_before_clone():
                 "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)",
                 archive.reference_family_stage_schema(epoch_id),
             )
+
+
+async def _seed_readonly_finite_graph(database):
+    """Exercise the finite59-heap shape with a genuinely SELECT-only source actor."""
+    for number in range(55):
+        parent = "zip_state_synthetic" if number % 2 == 0 else "zcta5_synthetic"
+        await database.admin.execute(f'CREATE TABLE tiger_data."finite_{number}" () INHERITS(tiger_data."{parent}")')
+    source_relations = [
+        ("tiger", "zip_state"),
+        ("tiger", "zcta5"),
+        ("tiger_data", "zip_state_synthetic"),
+        ("tiger_data", "zcta5_synthetic"),
+    ]
+    source_relations.extend(("tiger_data", "finite_" + str(number)) for number in range(55))
+    names = [f'"{schema}"."{table}"' for schema, table in source_relations]
+    assert len(names) == len(set(names)) == 59
+    for actor in ("snapshot", "publisher"):
+        role = database.roles[actor]
+        await database.admin.execute(f'GRANT USAGE ON SCHEMA tiger,tiger_data TO "{role}"')
+        await database.admin.execute("GRANT SELECT ON TABLE " + ", ".join(names) + f' TO "{role}"')
+        assert (
+            await database.admin.fetchval(
+                """SELECT count(*)=59 AND bool_and(
+            has_schema_privilege($1,n.oid,'USAGE') AND has_table_privilege($1,c.oid,'SELECT')
+            AND NOT has_table_privilege($1,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE')
+            AND NOT has_any_column_privilege($1,c.oid,'INSERT,UPDATE')
+            AND NOT has_table_privilege($1,c.oid,'MAINTAIN') AND NOT pg_has_role($1,c.relowner,'USAGE'))
+            FROM unnest($2::text[]) requested(name) JOIN pg_class c ON c.oid=to_regclass(requested.name)
+            JOIN pg_namespace n ON n.oid=c.relnamespace""",
+                role,
+                names,
+            )
+            is True
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["attach", "write", "detach", "rename", "drop", "truncate"])
+async def test_readonly_finite_capture_keeps_concurrent_changes_outside_snapshot(mutation):
+    async with owned_tiger_capture_database() as database:
+        await _seed_readonly_finite_graph(database)
+        if mutation == "attach":
+            await database.admin.execute("CREATE TABLE tiger_data.later_zip (LIKE tiger.zip_state)")
+            await database.admin.execute("INSERT INTO tiger_data.later_zip VALUES('99999','ZZ','99')")
+        custody = ReferenceSourceCustody(database.roles["owner"], (database.roles["reader"],))
+        captured_graphs = []
+
+        async def authorize(_session):
+            await _mutate_finite_snapshot(database, mutation)
+
+        async def protect(session, prepared, graph):
+            assert len(graph["relations"]) == 59
+            assert sum(len(oids) for oids in graph["projection_oids"].values()) == 59
+            captured_graphs.append(graph)
+            await custody.retain(session, prepared)
+
+        prepared = await captured.prepare_snapshot_tiger_epoch(
+            database.sessions["snapshot"],
+            database.sessions["publisher"],
+            epoch_id=uuid4(),
+            on_prepared=protect,
+            source_copy=custody.source_copy,
+            on_precreated=custody.precreate,
+            authorize_creation=authorize,
+        )
+        schema = prepared.ownership.schema_name
+        assert await database.admin.fetchval(f'SELECT zip FROM "{schema}".zip_state') == "12345"
+        assert await database.admin.fetchval(f'SELECT count(*) FROM "{schema}".zip_state') == 1
+        assert prepared.manifest.source_capture_contract == archive.CAPTURED_TIGER_SNAPSHOT_CONTRACT
+        assert len(captured_graphs) == 1
+        await _assert_reader_cannot_mutate(database, schema)
+        copies = []
+
+        async def exported(capture):
+            copies.append(capture)
+
+        await archive.export_prepared_reference_family_archive(
+            database.sessions["reader"], prepared=prepared, archive_copy=exported, verify_custody=custody.verify
+        )
+        assert len(copies) == 1 and copies[0].manifest == prepared.manifest
+
+
+@pytest.mark.asyncio
+async def test_readonly_finite_capture_refuses_truncate_between_discovery_and_locks(monkeypatch):
+    async with owned_tiger_capture_database() as database:
+        await _seed_readonly_finite_graph(database)
+        original = captured._pin_snapshot_graph
+
+        async def changed(session, discovered):
+            await database.admin.execute("TRUNCATE ONLY tiger_data.zip_state_synthetic")
+            return await original(session, discovered)
+
+        monkeypatch.setattr(captured, "_pin_snapshot_graph", changed)
+        custody = ReferenceSourceCustody(database.roles["owner"], ())
+        epoch = uuid4()
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="changed before read locks"):
+            await captured.prepare_snapshot_tiger_epoch(
+                database.sessions["snapshot"],
+                database.sessions["publisher"],
+                epoch_id=epoch,
+                on_prepared=custody.retain,
+                source_copy=custody.source_copy,
+                on_precreated=custody.precreate,
+            )
+        assert (
+            await database.admin.fetchval("SELECT to_regnamespace($1)", archive.reference_family_stage_schema(epoch))
+            is None
+        )
+
+
+async def _mutate_finite_snapshot(database, mutation):
+    async with database.admin.transaction():
+        await database.admin.execute("SET LOCAL lock_timeout='100ms'")
+        if mutation == "attach":
+            await database.admin.execute("ALTER TABLE tiger_data.later_zip INHERIT tiger.zip_state")
+            return
+        if mutation == "write":
+            await database.admin.execute("UPDATE tiger_data.zip_state_synthetic SET zip='54321'")
+            return
+        statements_by_mutation = dict(
+            detach="ALTER TABLE tiger_data.zip_state_synthetic NO INHERIT tiger.zip_state",
+            rename="ALTER TABLE tiger_data.zip_state_synthetic RENAME TO renamed_zip",
+            drop="DROP TABLE tiger_data.zip_state_synthetic CASCADE",
+            truncate="TRUNCATE ONLY tiger_data.zip_state_synthetic",
+        )
+        with pytest.raises(asyncpg.LockNotAvailableError):
+            async with database.admin.transaction():
+                await database.admin.execute(statements_by_mutation[mutation])
+
+
+@pytest.mark.asyncio
+async def test_readonly_finite_capture_cancellation_rolls_back_and_releases_source_locks():
+    async with owned_tiger_capture_database() as database:
+        await _seed_readonly_finite_graph(database)
+        custody = ReferenceSourceCustody(database.roles["owner"], ())
+        epoch = uuid4()
+
+        async def cancelled(_session):
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await captured.prepare_snapshot_tiger_epoch(
+                database.sessions["snapshot"],
+                database.sessions["publisher"],
+                epoch_id=epoch,
+                on_prepared=custody.retain,
+                source_copy=custody.source_copy,
+                on_precreated=custody.precreate,
+                authorize_creation=cancelled,
+            )
+        assert (
+            await database.admin.fetchval("SELECT to_regnamespace($1)", archive.reference_family_stage_schema(epoch))
+            is None
+        )
+        assert (
+            await database.admin.fetchval(
+                "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.usename=$1 AND l.locktype='relation'",
+                database.roles["snapshot"],
+            )
+            == 0
+        )

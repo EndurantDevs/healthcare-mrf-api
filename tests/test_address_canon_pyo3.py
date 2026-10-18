@@ -675,13 +675,17 @@ def test_compiled_catalog_and_company_links_keep_typed_identity():
     }
     validated_by_field = json.loads(validate(_wire([assertion_by_field])))
     assert validated_by_field["assertions"] == [assertion_by_field] and validated_by_field["conflicts"] == []
+    selected_by_field = assertion_by_field | {"benefit_plan_ids": ["hpplan_" + "0" * 26]}
+    assert json.loads(validate(_wire([selected_by_field])))["assertions"] == [selected_by_field]
+    for invalid in (None, ["hpversion_" + "0" * 26], ["hpplan_" + "0" * 26] * 2):
+        with pytest.raises(ValueError):
+            validate(_wire([assertion_by_field | {"benefit_plan_ids": invalid}]))
     with pytest.raises(ValueError, match="invalid_row"):
         validate(_wire([{**assertion_by_field, "network_id": "42"}]))
 
 
-def test_compiled_source_binding_copy_keeps_exact_scope_and_revision():
-    encode = _compiled_export("encode_network_source_binding_batch")
-    binding_by_field = {
+def _source_binding():
+    return {
         "binding_id": _identity(3),
         "source_system": "ptg",
         "source_id": "source-one",
@@ -698,13 +702,75 @@ def test_compiled_source_binding_copy_keeps_exact_scope_and_revision():
         "expected_revision": 0,
         "expected_network_id": None,
     }
+
+
+def test_compiled_source_binding_copy_keeps_exact_scope_and_revision():
+    from process.network_source_binding_store import COPY_COLUMNS
+
+    assert COPY_COLUMNS == (
+        "binding_id",
+        "source_system",
+        "source_id",
+        "dataset_schema",
+        "dataset_id",
+        "producer_id",
+        "edition_id",
+        "source_key",
+        "source_scope_json",
+        "binding_key",
+        "network_id",
+        "evidence_id",
+        "evidence_sha256",
+        "operation",
+        "expected_revision",
+        "expected_network_id",
+        "office_recipe_json",
+    )
+    encode = _compiled_export("encode_network_source_binding_batch")
+    binding_by_field = _source_binding()
     wire, count = encode(_wire([binding_by_field]))
-    fields = _copy_fields(wire, 16)[0]
-    assert count == 1 and fields[0] == UUID(binding_by_field["binding_id"]).bytes
-    assert fields[7] == b"opaque-key" and json.loads(fields[8][1:]) == binding_by_field["source_scope_json"]
-    assert fields[10] == struct.pack(">i", 42) and fields[-1] is None
+    decoded_rows = _copy_fields(wire, len(COPY_COLUMNS))
+    assert count == len(decoded_rows) == 1
+    fields = decoded_rows[0]
+    assert fields[0] == UUID(binding_by_field["binding_id"]).bytes
+    assert fields[1:8] == [binding_by_field[name].encode() for name in COPY_COLUMNS[1:8]]
+    assert fields[8][0] == 1 and json.loads(fields[8][1:]) == binding_by_field["source_scope_json"]
+    coordinates_by_field = {name: binding_by_field[name] for name in COPY_COLUMNS[1:9]}
+    coordinates = json.dumps(coordinates_by_field, sort_keys=True, separators=(",", ":")).encode()
+    assert fields[9] == hashlib.sha256(b"registry_network_source_binding:v1:" + coordinates).hexdigest().encode()
+    assert fields[10:] == [struct.pack(">i", 42), b"review-one", b"a" * 64, b"bind", struct.pack(">q", 0), None, None]
     with pytest.raises(ValueError, match="invalid_row"):
         encode(_wire([{**binding_by_field, "expected_revision": True}]))
+
+
+def test_compiled_binding_office_states():
+    from process.network_source_binding_store import COPY_COLUMNS
+
+    encode = _compiled_export("encode_network_source_binding_batch")
+    binding_by_field = _source_binding()
+    binding_by_field["source_scope_json"] = {
+        "review_type": "published_complete_snapshot_plan",
+        "scope_id": _identity(4),
+        "approval_sha256": "b" * 64,
+        "snapshot_id": "snapshot-one",
+        "plan_id": "plan-one",
+        "plan_market_type": "group",
+        "selection_mode": "complete_snapshot_source_set",
+    }
+    wire, count = encode(_wire([binding_by_field]))
+    omitted = _copy_fields(wire, len(COPY_COLUMNS))[0]
+    assert count == 1 and omitted[16] is None
+    pin_by_field = {"capture_id": _identity(5), "recipe_sha256": "c" * 64}
+    for selection in (None, pin_by_field):
+        selected_by_field = binding_by_field | {"office_recipe_json": selection}
+        wire, count = encode(_wire([selected_by_field]))
+        fields = _copy_fields(wire, len(COPY_COLUMNS))[0]
+        assert count == 1 and fields[:16] == omitted[:16]
+        assert fields[16] == b"\x01" + json.dumps(selection, sort_keys=True, separators=(",", ":")).encode()
+    with pytest.raises(ValueError, match="invalid_office_recipe"):
+        encode(_wire([_source_binding() | {"office_recipe_json": pin_by_field}]))
+    with pytest.raises(ValueError, match="invalid_row"):
+        encode(_wire([binding_by_field | {"office_recipe_json": pin_by_field | {"extra": True}}]))
 
 
 def test_compiled_network_evidence_and_coverage_preserve_unknown_pricing():
@@ -1097,3 +1163,161 @@ def test_compiled_assertions_reject_invalid_input():
         classify(duplicate_key, "group_inclusive")
     with pytest.raises(TypeError):
         classify(_wire([]))
+
+
+def test_compiled_membership_command_partition_matches_facade_and_legacy():
+    from process.network_membership_copy import partition_network_membership_commands
+
+    partition = _compiled_export("partition_network_membership_commands")
+    encode = _compiled_export("encode_network_membership_batch")
+    addition_by_field = {
+        "network_id": 42,
+        "provider_system": "manual",
+        "provider_id": "000123",
+        "location_id": _identity(1),
+        "evidence_id": "review-1",
+    }
+    removal_by_field = {**addition_by_field, "location_id": _identity(2), "operation": "remove"}
+    payload = _wire([addition_by_field, removal_by_field])
+    adds, add_count, removes, remove_count = partition(payload)
+    assert add_count == remove_count == 1
+    assert (adds, add_count) == encode(_wire([addition_by_field]))
+    assert _copy_fields(removes, 5)[0][3] == UUID(_identity(2)).bytes
+    receipt = partition_network_membership_commands(payload)
+    assert (receipt.additions_copy_bytes, receipt.additions_count) == (adds, add_count)
+    assert (receipt.removals_copy_bytes, receipt.removals_count) == (removes, remove_count)
+    with pytest.raises(ValueError, match="invalid_row"):
+        encode(payload)
+    with pytest.raises(ValueError, match="duplicate_command"):
+        partition_network_membership_commands(_wire([addition_by_field, {**addition_by_field, "operation": "remove"}]))
+    empty = partition_network_membership_commands(b"[]")
+    assert empty.additions_count == empty.removals_count == 0
+    assert len(empty.additions_copy_bytes) == len(empty.removals_copy_bytes) == 21
+
+
+@pytest.mark.parametrize(
+    "native_result",
+    [None, (), (b"bad", 1, b"bad", 0), (b"", True, b"", 0), (b"", -1, b"", 0)],
+)
+def test_membership_command_facade_rejects_invalid_native_shape(monkeypatch, native_result):
+    from process.network_membership_copy import MembershipCopyError, partition_network_membership_commands
+
+    monkeypatch.setattr(ptg2_address_canon, "partition_network_membership_commands", lambda _input: native_result)
+    with pytest.raises(MembershipCopyError, match="shape|framing"):
+        partition_network_membership_commands(b"[]")
+
+
+def test_membership_command_facade_checks_bounds_before_native_call(monkeypatch):
+    from process.network_membership_copy import (
+        MAX_INPUT_BYTES,
+        MembershipCopyError,
+        partition_network_membership_commands,
+    )
+
+    def unexpected(_input):
+        pytest.fail("invalid input must not reach native partitioner")
+
+    monkeypatch.setattr(ptg2_address_canon, "partition_network_membership_commands", unexpected)
+    for invalid in ["[]", bytearray(b"[]"), b" " * (MAX_INPUT_BYTES + 1)]:
+        with pytest.raises(MembershipCopyError, match="bounded bytes"):
+            partition_network_membership_commands(invalid)
+
+
+def test_membership_command_facade_checks_combined_native_totals(monkeypatch):
+    from process.network_membership_copy import (
+        MAX_COPY_BYTES,
+        MembershipCopyError,
+        partition_network_membership_commands,
+    )
+
+    encode = _compiled_export("encode_network_membership_batch")
+    command_by_field = {
+        "network_id": 42,
+        "provider_system": "manual",
+        "provider_id": "p-1",
+        "location_id": _identity(1),
+        "evidence_id": "review-1",
+    }
+    wire, _ = encode(_wire([command_by_field]))
+    oversized = wire[:-2] + b"x" * (MAX_COPY_BYTES - len(wire)) + wire[-2:]
+    for native_result in [(wire, 2500, wire, 2501), (oversized, 1, wire, 1)]:
+        monkeypatch.setattr(ptg2_address_canon, "partition_network_membership_commands", lambda _input: native_result)
+        with pytest.raises(MembershipCopyError, match="total bounds"):
+            partition_network_membership_commands(b"[]")
+
+
+def test_compiled_membership_partition_keeps_legacy_duplicate_bytes_and_late_operation_fence():
+    from process.network_membership_copy import partition_network_membership_commands
+
+    partition = _compiled_export("partition_network_membership_commands")
+    encode = _compiled_export("encode_network_membership_batch")
+    legacy_by_field = {
+        "network_id": 42,
+        "provider_system": "manual",
+        "provider_id": "000123",
+        "location_id": _identity(1),
+        "evidence_id": "review-1",
+    }
+    rows = [legacy_by_field, legacy_by_field, {**legacy_by_field, "evidence_id": "review-2"}]
+    payload = _wire(rows)
+    adds, add_count, removes, remove_count = partition(payload)
+    assert (adds, add_count) == encode(payload)
+    assert (add_count, remove_count, len(removes)) == (3, 0, 21)
+    receipt = partition_network_membership_commands(payload)
+    assert receipt.additions_copy_bytes == adds and receipt.additions_count == 3
+    for operation in ("add", "remove"):
+        command_by_field = {**legacy_by_field, "network_id": 43, "operation": operation}
+        with pytest.raises(ValueError) as failure:
+            partition_network_membership_commands(_wire([*rows, command_by_field]))
+        assert json.loads(str(failure.value))["code"] == "duplicate_command"
+        assert json.loads(str(failure.value))["row_index"] == 1
+    for operation in (None, "legacy", "replace"):
+        with pytest.raises(ValueError, match="invalid_row"):
+            partition_network_membership_commands(_wire([{**legacy_by_field, "operation": operation}]))
+
+
+@pytest.mark.asyncio
+async def test_actual_native_aca_batch_runs_once_during_loading(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from process import registry_aca_address_carry as carry
+    from process.registry_aca_source_recipe import _recipe
+    from tests.test_registry_aca_address_carry import _batch
+    from tests.test_registry_aca_source_recipe import _ROLES, _prepared
+
+    prepared, validation = await _prepared(monkeypatch)
+    recipe = _recipe(prepared, validation, _ROLES)
+    native = ptg2_address_canon
+
+    raw_address = ["123 Example Street", "Suite 2", "Sample City", "CA", "90210", "US"]
+    office_records = [
+        {
+            "provider_id": "1000000491",
+            "location_id": str(UUID(int=8)),
+            "location_key": "c" * 64,
+            "evidence_address": raw_address,
+            "address": raw_address,
+        }
+    ]
+    binding = ("npi", "1000000491", str(UUID(int=8)), "c" * 64, "npi", "1000000491")
+    encoded = json.dumps([dict(zip(carry._BINDING_COLUMNS, binding, strict=True))])
+    connection = SimpleNamespace(
+        execute=AsyncMock(),
+        fetchval=AsyncMock(return_value=False),
+        fetchrow=AsyncMock(return_value={"valid": True, "bindings_json": encoded}),
+    )
+    monkeypatch.setattr(carry, "_source_documents", AsyncMock(return_value=[]))
+    monkeypatch.setattr(carry, "_office_records", AsyncMock(return_value=office_records))
+    canonicalize = Mock(wraps=native.canonicalize_batch)
+    monkeypatch.setattr(native, "canonicalize_batch", canonicalize)
+    written = await carry._page(connection, _batch(recipe), "target_fixture", writing=True)
+    canonicalize.assert_called_once_with([tuple(raw_address), tuple(raw_address)])
+    assert connection.fetchrow.await_count == 2
+    canonicalize.reset_mock()
+    connection.fetchrow.reset_mock()
+    connection.execute.reset_mock()
+    assert await carry._page(connection, _batch(recipe), "target_fixture", writing=False) == written
+    canonicalize.assert_not_called()
+    connection.execute.assert_not_awaited()
+    assert connection.fetchrow.await_count == 1

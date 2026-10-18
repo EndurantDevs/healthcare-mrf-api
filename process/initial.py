@@ -27,12 +27,27 @@ from dateutil.parser import parse as parse_date
 from sqlalchemy import func, literal, or_, select, text
 from sqlalchemy.exc import IntegrityError, ProgrammingError
 
-from db.models import (ImportHistory, ImportLog, Issuer, NPIAddress,
-                       NPIDataOtherIdentifier, NPIDataTaxonomyGroup, MRFAddress,
-                       MRFAddressEvidence, Plan, PlanBenefitsMarketplace,
-                       PlanDrugRaw, PlanDrugStats, PlanDrugTierStats,
-                       PlanFormulary, PlanNetworkTierRaw, PlanNPIRaw,
-                       PlanTransparency, db)
+from db.models import (
+    ImportHistory,
+    ImportLog,
+    Issuer,
+    MRFAddress,
+    MRFAddressEvidence,
+    NPIAddress,
+    NPIDataOtherIdentifier,
+    NPIDataTaxonomyGroup,
+    Plan,
+    PlanBenefitsMarketplace,
+    PlanDrugRaw,
+    PlanDrugStats,
+    PlanDrugTierStats,
+    PlanFormulary,
+    PlanNetworkTierRaw,
+    PlanNPIRaw,
+    PlanTransparency,
+    db,
+)
+from process.control_lifecycle import mark_control_run
 from process.ext.address_canon import (
     address_key_v1,
     propagate_child_address_keys,
@@ -42,18 +57,26 @@ from process.ext.address_canon import (
 )
 from process.ext.archive import unzip
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
-from process.ext.utils import (download_it_and_save, ensure_database,
-                               flush_error_log, get_import_schema, log_error,
-                               make_class, my_init_db, print_time_info,
-                               push_objects, return_checksum)
-from process.openaddresses import refresh_archive_geocodes_from_openaddresses
-from process.control_lifecycle import mark_control_run
+from process.ext.utils import (
+    download_it_and_save,
+    ensure_database,
+    flush_error_log,
+    get_import_schema,
+    log_error,
+    make_class,
+    my_init_db,
+    print_time_info,
+    push_objects,
+    return_checksum,
+)
 from process.live_progress import enqueue_live_progress
-from process.plan_summary import rebuild_plan_search_summary
 from process.mrf_publication_receipt import begin_publication
-from process.reference_family_result_generation import publish_local_reference_family_generation
+from process.openaddresses import refresh_archive_geocodes_from_openaddresses
+from process.plan_summary import rebuild_plan_search_summary
+from process.provider_directory_cms_native_inputs import prepare_local_native_input_publication
 from process.ptg_parts.copy_load import _copy_ignore_objects
 from process.redis_config import build_redis_settings
+from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.serialization import deserialize_job, serialize_job
 
 TEST_PLAN_TRANSPARENCY_ROWS = 25
@@ -86,9 +109,7 @@ PLAN_ID_MAX_LENGTH = getattr(Plan.__table__.c.plan_id.type, "length", 14)
 logger = logging.getLogger(__name__)
 MRF_QUEUE_NAME = "arq:MRF"
 MRF_FINISH_QUEUE_NAME = "arq:MRF_finish"
-MRF_RECOVERABLE_FUNCTIONS = frozenset(
-    {"process_json_index", "process_plan", "process_provider", "process_formulary"}
-)
+MRF_RECOVERABLE_FUNCTIONS = frozenset({"process_json_index", "process_plan", "process_provider", "process_formulary"})
 _POSTGRES_SETTING_RE = re.compile(r"^\d+(?:\.\d+)?\s*[A-Za-z]*$")
 _MRF_ADDRESS_SUMMARY_DEFERRED_INDEX_NAMES = {
     "address_sources",
@@ -147,7 +168,7 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
         return default
     try:
         value = int(str(raw_value).strip())
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         logger.warning("Ignoring invalid integer env %s=%r; using %s", name, raw_value, default)
         return default
     return max(value, minimum)
@@ -177,7 +198,7 @@ def _safe_int(raw, default: int = 0) -> int:
         raw = raw.decode("utf-8")
     try:
         return int(raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
@@ -579,7 +600,9 @@ def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: st
     return chunks
 
 
-async def _has_enqueued_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: str, kind: str, function_name: str) -> bool:
+async def _has_enqueued_mrf_file_chunks(
+    ctx: dict, task: dict, tmp_filename: str, kind: str, function_name: str
+) -> bool:
     if task.get("input_url") or not _is_mrf_file_chunking_enabled(kind, ctx):
         return False
     file_size = os.path.getsize(tmp_filename)
@@ -614,9 +637,7 @@ async def _has_enqueued_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: str
             task=chunk_task_dict,
         ):
             continue
-        await redis.enqueue_job(
-            function_name, chunk_task_dict, _queue_name=MRF_QUEUE_NAME, _job_id=work_id
-        )
+        await redis.enqueue_job(function_name, chunk_task_dict, _queue_name=MRF_QUEUE_NAME, _job_id=work_id)
     logger.info(
         "Enqueued %s %s chunk job(s) for %s (%s bytes)",
         len(chunks),
@@ -629,7 +650,9 @@ async def _has_enqueued_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: str
 
 def _cleanup_mrf_chunk_file(task: dict) -> None:
     input_url = str(task.get("input_url") or "")
-    if not input_url.startswith("file://") or _is_truthy(os.environ.get("HLTHPRT_MRF_KEEP_CHUNKS"), ("1", "true", "yes", "on")):
+    if not input_url.startswith("file://") or _is_truthy(
+        os.environ.get("HLTHPRT_MRF_KEEP_CHUNKS"), ("1", "true", "yes", "on")
+    ):
         return
     parsed = urlparse(input_url)
     try:
@@ -696,7 +719,7 @@ def _coerce_plan_year(candidate) -> int | None:
             if year_text.endswith(".0"):
                 year_text = year_text[:-2]
             year_value = int(year_text)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return year_value if 1900 <= year_value <= 2200 else None
 
@@ -794,12 +817,9 @@ async def _ensure_staging_primary_index(stage_cls, db_schema: str) -> None:
         return
     primary_columns = [column.name for column in stage_cls.__table__.primary_key.columns]
     if index_columns != primary_columns:
-        raise RuntimeError(
-            f"{stage_cls.__tablename__} conflict columns must match its primary key"
-        )
+        raise RuntimeError(f"{stage_cls.__tablename__} conflict columns must match its primary key")
     await db.status(
-        f"ALTER INDEX {db_schema}.{stage_cls.__tablename__}_pkey "
-        f"RENAME TO {stage_cls.__tablename__}_idx_primary;"
+        f"ALTER INDEX {db_schema}.{stage_cls.__tablename__}_pkey RENAME TO {stage_cls.__tablename__}_idx_primary;"
     )
 
 
@@ -811,7 +831,7 @@ def _benefit_label_from_key(key):
 def _serialize_jsonable(value):
     try:
         return json.loads(json.dumps(value))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return {"value": str(value)}
 
 
@@ -848,7 +868,8 @@ def _iter_marketplace_benefit_entries(benefit_item, position):
         )
         has_value_field = "value" in benefit_item
         extra_keys = {
-            key for key in benefit_item.keys()
+            key
+            for key in benefit_item.keys()
             if key not in {"benefit_name", "name", "key", "label", "display_name", "value"}
         }
         if named_key and has_value_field and not extra_keys:
@@ -948,9 +969,7 @@ def _normalize_marketplace_address_entry_base(address):
     if not first_line or not city_name or not state_name or not postal_code:
         return None
 
-    second_line = _coerce_text(
-        address.get("address_2") or address.get("address2") or address.get("line2")
-    )
+    second_line = _coerce_text(address.get("address_2") or address.get("address2") or address.get("line2"))
     country_code = _normalize_upper(address.get("country") or address.get("country_code"))
     telephone_number = _coerce_text(address.get("phone") or address.get("telephone"))
     fax_number = _coerce_text(address.get("fax") or address.get("fax_number"))
@@ -995,9 +1014,7 @@ def _normalize_marketplace_address_entry(address):
     return _apply_marketplace_contact_fields(normalized, canonical_contact)
 
 
-def _mrf_address_evidence_row(
-    evidence_value_by_field, normalized_address, network_tier_row
-):
+def _mrf_address_evidence_row(evidence_value_by_field, normalized_address, network_tier_row):
     """Build one address-evidence row and its checksum."""
     npi = evidence_value_by_field["npi"]
     address_type = evidence_value_by_field["address_type"]
@@ -1029,8 +1046,7 @@ def _mrf_address_evidence_row(
         "type": address_type,
         "checksum": normalized_address["checksum"],
         "issuer_id": issuer_id,
-        "issuer_name": evidence_value_by_field["issuer_lookup"].get(issuer_id)
-        or str(issuer_id),
+        "issuer_name": evidence_value_by_field["issuer_lookup"].get(issuer_id) or str(issuer_id),
         "year": network_tier_row["year"],
         "checksum_network": network_tier_row["checksum_network"],
         "network_tier": network_tier_row["network_tier"],
@@ -1056,9 +1072,7 @@ def _mrf_address_evidence_row(
     }
 
 
-def _mrf_aggregate_address_row(
-    npi, address_type, normalized_address, last_updated_on, computed_address_key
-):
+def _mrf_aggregate_address_row(npi, address_type, normalized_address, last_updated_on, computed_address_key):
     """Build one compatibility aggregate address row."""
     return (npi, address_type, normalized_address["checksum"]), {
         "npi": npi,
@@ -1090,9 +1104,7 @@ def _mrf_rows_for_normalized_address(
     include_address_rows,
 ):
     """Build aggregate and evidence rows for one normalized address."""
-    normalized_address = _apply_marketplace_contact_fields(
-        normalized_address, canonical_contact
-    )
+    normalized_address = _apply_marketplace_contact_fields(normalized_address, canonical_contact)
     computed_address_key = address_key_v1(
         normalized_address["first_line"],
         normalized_address["second_line"],
@@ -1147,17 +1159,14 @@ def _build_mrf_address_rows(
     evidence_by_checksum = {}
     try:
         import_date_value = datetime.datetime.strptime(str(import_id)[:8], "%Y%m%d").date()
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         import_date_value = None
 
     normalized_addresses = [
-        normalized
-        for address in addresses
-        if (normalized := _normalize_marketplace_address_entry_base(address))
+        normalized for address in addresses if (normalized := _normalize_marketplace_address_entry_base(address))
     ]
     canonical_contacts = canonicalize_contact_batch(
-        _marketplace_contact_row(normalized)
-        for normalized in normalized_addresses
+        _marketplace_contact_row(normalized) for normalized in normalized_addresses
     )
 
     shared_evidence_value_by_field = {
@@ -1170,14 +1179,12 @@ def _build_mrf_address_rows(
         "issuer_lookup": issuer_lookup,
     }
     for normalized_address, canonical_contact in zip(normalized_addresses, canonical_contacts):
-        address_row_entry, address_evidence_rows_by_checksum = (
-            _mrf_rows_for_normalized_address(
-                normalized_address,
-                canonical_contact,
-                network_tiers,
-                shared_evidence_value_by_field,
-                include_address_rows,
-            )
+        address_row_entry, address_evidence_rows_by_checksum = _mrf_rows_for_normalized_address(
+            normalized_address,
+            canonical_contact,
+            network_tiers,
+            shared_evidence_value_by_field,
+            include_address_rows,
         )
         evidence_by_checksum.update(address_evidence_rows_by_checksum)
         if address_row_entry:
@@ -1215,10 +1222,7 @@ async def _push_mrf_address_rows(rows, cls) -> None:
     # Address provenance arrays are rebuilt from mrf_address_evidence during
     # finalization, so duplicate aggregate address rows and early provenance
     # arrays do not need writes or GIN index maintenance during ingestion.
-    insert_rows = [
-        {column: row[column] for column in _MRF_ADDRESS_INSERT_COLUMNS if column in row}
-        for row in rows
-    ]
+    insert_rows = [{column: row[column] for column in _MRF_ADDRESS_INSERT_COLUMNS if column in row} for row in rows]
     await push_objects(insert_rows, cls, rewrite=False, use_copy=False)
 
 
@@ -1440,7 +1444,7 @@ async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
             logger.debug("Import staging table could not be dropped: %s", staging_cls.__tablename__)
         try:
             await db.create_table(staging_cls.__table__, checkfirst=True)
-        except (ProgrammingError, DuplicateTableError, IntegrityError):
+        except ProgrammingError, DuplicateTableError, IntegrityError:
             logger.debug("Import staging table already exists: %s", staging_cls.__tablename__)
         await _ensure_staging_primary_index(staging_cls, db_schema)
         if cls is PlanBenefitsMarketplace:
@@ -1629,10 +1633,7 @@ async def process_plan(ctx, task):
                             if plan_limit and processed_plans >= plan_limit:
                                 should_stop_processing = True
                                 break
-                            if (
-                                len(plan_rows) >= plan_flush_rows
-                                or len(marketplace_benefit_rows) >= plan_flush_rows
-                            ):
+                            if len(plan_rows) >= plan_flush_rows or len(marketplace_benefit_rows) >= plan_flush_rows:
                                 await asyncio.gather(
                                     _push_mrf_duplicate_tolerant_rows(plan_rows, myplan),
                                     _push_mrf_duplicate_tolerant_rows(
@@ -2008,9 +2009,7 @@ async def process_provider(ctx, task):
                                 cleaned = _clean_name_part(provider_name_dict.get(k))
                                 if cleaned:
                                     provider_row_dict["name_or_facility_name"] += f"{cleaned} "
-                        provider_row_dict["name_or_facility_name"] = provider_row_dict[
-                            "name_or_facility_name"
-                        ].strip()
+                        provider_row_dict["name_or_facility_name"] = provider_row_dict["name_or_facility_name"].strip()
                         provider_row_dict["specialty_or_facility_type"] = [
                             str(x) for x in provider_record.get("specialty", [])
                         ]
@@ -2020,9 +2019,9 @@ async def process_provider(ctx, task):
                         provider_row_dict["checksum_network"] = x["checksum_network"]
                         provider_row_dict["issuer_id"] = x["issuer_id"]
                         provider_row_dict["year"] = x["year"]
-                        plan_npi_obj_dict[
-                            "_".join([str(provider_row_dict["npi"]), str(x["checksum_network"])])
-                        ] = provider_row_dict.copy()
+                        plan_npi_obj_dict["_".join([str(provider_row_dict["npi"]), str(x["checksum_network"])])] = (
+                            provider_row_dict.copy()
+                        )
 
                         # if count > 10 * int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 50)):
                         #     await push_objects(list(plan_npi_obj_dict.values()), myplan_npi)
@@ -2080,9 +2079,7 @@ async def process_provider(ctx, task):
 
                 await asyncio.gather(
                     _push_mrf_duplicate_tolerant_rows(list(plan_npi_obj_dict.values()), myplan_npi),
-                    _push_mrf_duplicate_tolerant_rows(
-                        list(plan_networks_by_checksum.values()), myplan_networktier
-                    ),
+                    _push_mrf_duplicate_tolerant_rows(list(plan_networks_by_checksum.values()), myplan_networktier),
                     _push_mrf_address_rows(list(mrf_address_obj_dict.values()), mymrfaddress),
                     _push_mrf_duplicate_tolerant_rows(
                         list(mrf_address_evidence_dict.values()),
@@ -2146,7 +2143,7 @@ def _parse_optional_bool(value):
 def _chunked(values, chunk_size=500):
     items = [value for value in set(values) if value]
     for idx in range(0, len(items), chunk_size):
-        yield items[idx: idx + chunk_size]
+        yield items[idx : idx + chunk_size]
 
 
 _PLAN_DRUG_STATS_COLUMNS = (
@@ -2208,10 +2205,7 @@ def _plan_drug_stats_upsert(stats_table, stats_select):
     )
     return stats_insert.on_conflict_do_update(
         index_elements=[stats_table.c.plan_id],
-        set_={
-            column_name: getattr(stats_insert.excluded, column_name)
-            for column_name in _PLAN_DRUG_STATS_COLUMNS
-        },
+        set_={column_name: getattr(stats_insert.excluded, column_name) for column_name in _PLAN_DRUG_STATS_COLUMNS},
     )
 
 
@@ -2316,7 +2310,7 @@ def _formulary_plan_row(
                 parse_date(formulary_record["last_updated_on"], fuzzy=True),
                 datetime.datetime.min.time(),
             )
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             last_updated_on = None
     return {
         "plan_id": plan_id,
@@ -2524,12 +2518,8 @@ async def save_mrf_data(ctx, task):
                 myplan_drugs = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
                 await push_objects(task["plan_drugs"], myplan_drugs, rewrite=True)
             case "plan_benefits_marketplace":
-                myplanbenefitsmarketplace = make_class(
-                    PlanBenefitsMarketplace, import_date, schema_override=db_schema
-                )
-                pending_writes.append(
-                    push_objects(task["plan_benefits_marketplace"], myplanbenefitsmarketplace)
-                )
+                myplanbenefitsmarketplace = make_class(PlanBenefitsMarketplace, import_date, schema_override=db_schema)
+                pending_writes.append(push_objects(task["plan_benefits_marketplace"], myplanbenefitsmarketplace))
             case "mrf_address":
                 mymrfaddress = make_class(MRFAddress, import_date, schema_override=db_schema)
                 pending_writes.append(_push_mrf_address_rows(task["mrf_address"], mymrfaddress))
@@ -2537,16 +2527,10 @@ async def save_mrf_data(ctx, task):
                 mymrfaddressevidence = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
                 pending_writes.append(push_objects(task["mrf_address_evidence"], mymrfaddressevidence))
             case "npi_other_id_list":
-                mynpidataotheridentifier = make_class(
-                    NPIDataOtherIdentifier, import_date, schema_override=db_schema
-                )
-                pending_writes.append(
-                    push_objects(task["npi_other_id_list"], mynpidataotheridentifier, rewrite=True)
-                )
+                mynpidataotheridentifier = make_class(NPIDataOtherIdentifier, import_date, schema_override=db_schema)
+                pending_writes.append(push_objects(task["npi_other_id_list"], mynpidataotheridentifier, rewrite=True))
             case "npi_taxonomy_group_list":
-                mynpidatataxonomygroup = make_class(
-                    NPIDataTaxonomyGroup, import_date, schema_override=db_schema
-                )
+                mynpidatataxonomygroup = make_class(NPIDataTaxonomyGroup, import_date, schema_override=db_schema)
                 pending_writes.append(
                     push_objects(task["npi_taxonomy_group_list"], mynpidatataxonomygroup, rewrite=True)
                 )
@@ -2591,20 +2575,14 @@ _MRF_INDEX_STREAM_SPECS = (
 )
 
 
-async def _enqueue_mrf_index_stream_items(
-    ctx, task, stream, stream_spec_map, limit
-):
+async def _enqueue_mrf_index_stream_items(ctx, task, stream, stream_spec_map, limit):
     """Register and enqueue one class of URLs from an MRF index stream."""
     redis = ctx["redis"]
-    job_scope = str(
-        ctx["context"].get("control_run_id") or ctx["context"]["import_date"]
-    )
+    job_scope = str(ctx["context"].get("control_run_id") or ctx["context"]["import_date"])
     enqueued_count = 0
     seen_urls = set()
     should_deduplicate = stream_spec_map["deduplicate"]
-    async for raw_url in ijson.items(
-        stream, stream_spec_map["item_path"], use_float=True
-    ):
+    async for raw_url in ijson.items(stream, stream_spec_map["item_path"], use_float=True):
         url = str(raw_url).strip() if should_deduplicate else raw_url
         if should_deduplicate and (not url or url in seen_urls):
             continue
@@ -2637,9 +2615,7 @@ async def _enqueue_mrf_index_stream_items(
             break
 
 
-async def _has_enqueued_mrf_index_file(
-    ctx, task, tmp_filename, import_log, stream_spec_map, limit
-):
+async def _has_enqueued_mrf_index_file(ctx, task, tmp_filename, import_log, stream_spec_map, limit):
     """Enqueue one index array and terminalize malformed input."""
     async with async_open(tmp_filename, "rb") as stream:
         try:
@@ -2699,9 +2675,7 @@ async def process_json_index(ctx, task):
             await _mark_mrf_task_terminal(ctx, task, "index")
             return
         for stream_spec_map in _MRF_INDEX_STREAM_SPECS:
-            limit = (
-                stream_spec_map["test_limit"] if is_test_mode_enabled else None
-            )
+            limit = stream_spec_map["test_limit"] if is_test_mode_enabled else None
             if not await _has_enqueued_mrf_index_file(
                 ctx,
                 task,
@@ -2769,9 +2743,7 @@ async def _read_unknown_federal_attribute_file(source_url, plans_by_key, issuers
             async for attribute_row in AsyncDictReader(stream, delimiter=","):
                 if not attribute_row["StandardComponentId"] or not attribute_row["PlanId"]:
                     continue
-                plan_key = (
-                    f"{attribute_row['StandardComponentId']}_{attribute_row['BusinessYear']}"
-                )
+                plan_key = f"{attribute_row['StandardComponentId']}_{attribute_row['BusinessYear']}"
                 if plan_key in plans_by_key:
                     continue
                 plans_by_key[plan_key] = _unknown_federal_plan_row(attribute_row)
@@ -2802,10 +2774,7 @@ async def _state_attribute_field_name_map(csv_path):
         async for attribute_row in AsyncDictReader(stream, delimiter=","):
             if attribute_row.get("STANDARD COMPONENT ID") and attribute_row.get("PLAN ID"):
                 continue
-            return {
-                label: "".join(word.capitalize() for word in label.split())
-                for label in field_name_map
-            }
+            return {label: "".join(word.capitalize() for word in label.split()) for label in field_name_map}
     return field_name_map
 
 
@@ -2819,9 +2788,7 @@ def _unknown_state_plan_row(attribute_row, field_name_map, plan_id, business_yea
         "issuer_id": int(issuer_id),
         "state": str(attribute_row.get(field_name_map["STATE CODE"])).upper(),
         "marketing_name": attribute_row.get(field_name_map["PLAN MARKETING NAME"]),
-        "summary_url": attribute_row.get(
-            field_name_map["URL FOR SUMMARY OF BENEFITS COVERAGE"]
-        ),
+        "summary_url": attribute_row.get(field_name_map["URL FOR SUMMARY OF BENEFITS COVERAGE"]),
         "marketing_url": attribute_row.get(field_name_map["PLAN BROCHURE"]),
         "formulary_url": attribute_row.get(field_name_map["FORMULARY URL"]),
         "plan_contact": "",
@@ -2849,9 +2816,7 @@ def _unknown_state_issuer_row(attribute_row, field_name_map):
     }
 
 
-async def _read_unknown_state_attribute_file(
-    source_url, plans_by_key, issuers_by_id, processed_rows, row_limit
-):
+async def _read_unknown_state_attribute_file(source_url, plans_by_key, issuers_by_id, processed_rows, row_limit):
     """Merge one state plan-attributes archive and return its bounded row count."""
     with tempfile.TemporaryDirectory() as tmpdirname:
         archive_path = str(PurePath(str(tmpdirname), "attr.csv.zip"))
@@ -2877,12 +2842,8 @@ async def _read_unknown_state_attribute_file(
                 plan_key = f"{plan_id.upper()}_{business_year}"
                 if plan_key in plans_by_key:
                     continue
-                plans_by_key[plan_key] = _unknown_state_plan_row(
-                    attribute_row, field_name_map, plan_id, business_year
-                )
-                issuer_id, issuer_row = _unknown_state_issuer_row(
-                    attribute_row, field_name_map
-                )
+                plans_by_key[plan_key] = _unknown_state_plan_row(attribute_row, field_name_map, plan_id, business_year)
+                issuer_id, issuer_row = _unknown_state_issuer_row(attribute_row, field_name_map)
                 issuers_by_id[issuer_id] = issuer_row
                 processed_rows += 1
                 if row_limit and processed_rows >= row_limit:
@@ -2896,15 +2857,11 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
     issuers_by_id = {}
     attribute_files = json.loads(os.environ["HLTHPRT_CMSGOV_PLAN_ATTRIBUTES_URL_PUF"])
     for source in attribute_files:
-        await _read_unknown_federal_attribute_file(
-            source["url"], plans_by_key, issuers_by_id
-        )
+        await _read_unknown_federal_attribute_file(source["url"], plans_by_key, issuers_by_id)
 
     processed_rows = 0
     row_limit = TEST_UNKNOWN_STATE_ROWS if test_mode else None
-    state_attribute_files = json.loads(
-        os.environ["HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF"]
-    )
+    state_attribute_files = json.loads(os.environ["HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF"])
     for source in state_attribute_files:
         processed_rows = await _read_unknown_state_attribute_file(
             source["url"],
@@ -2931,9 +2888,7 @@ async def _read_rate_review_issuer_names(csv_files: list[str], row_limit: int | 
                     "data_contact_email": "",
                     "issuer_marketing_name": "",
                     "issuer_name": (
-                        rate_row["COMPANY"].strip()
-                        if rate_row["COMPANY"].strip()
-                        else rate_row["ISSUER_ID"]
+                        rate_row["COMPANY"].strip() if rate_row["COMPANY"].strip() else rate_row["ISSUER_ID"]
                     ),
                 }
                 processed_rows += 1
@@ -3071,40 +3026,26 @@ async def init_file(ctx, task=None):
                 for worksheet_row in xls_file.ws(ws=ws_name).rows:
                     if count > 2:
                         transparency_row_dict = {}
-                        transparency_row_dict["state"] = str(
-                            worksheet_row[column_index_by_name["state"]].upper()
-                        )
-                        transparency_row_dict["issuer_name"] = str(
-                            worksheet_row[column_index_by_name["issuer_name"]]
-                        )
-                        transparency_row_dict["issuer_id"] = int(
-                            worksheet_row[column_index_by_name["issuer_id"]]
-                        )
+                        transparency_row_dict["state"] = str(worksheet_row[column_index_by_name["state"]].upper())
+                        transparency_row_dict["issuer_name"] = str(worksheet_row[column_index_by_name["issuer_name"]])
+                        transparency_row_dict["issuer_id"] = int(worksheet_row[column_index_by_name["issuer_id"]])
                         transparency_row_dict["new_issuer_to_exchange"] = _is_truthy(
                             worksheet_row[column_index_by_name["new_issuer_to_exchange"]], ("yes", "y")
                         )
                         transparency_row_dict["sadp_only"] = _is_truthy(
                             worksheet_row[column_index_by_name["sadp_only"]], ("yes", "y")
                         )
-                        transparency_row_dict["plan_id"] = str(
-                            worksheet_row[column_index_by_name["plan_id"]]
-                        )
+                        transparency_row_dict["plan_id"] = str(worksheet_row[column_index_by_name["plan_id"]])
                         transparency_row_dict["year"] = int(file["year"])
-                        transparency_row_dict["qhp_sadp"] = str(
-                            worksheet_row[column_index_by_name["qhp_sadp"]]
-                        )
-                        transparency_row_dict["plan_type"] = str(
-                            worksheet_row[column_index_by_name["plan_type"]]
-                        )
-                        transparency_row_dict["metal"] = str(
-                            worksheet_row[column_index_by_name["metal"]]
-                        )
+                        transparency_row_dict["qhp_sadp"] = str(worksheet_row[column_index_by_name["qhp_sadp"]])
+                        transparency_row_dict["plan_type"] = str(worksheet_row[column_index_by_name["plan_type"]])
+                        transparency_row_dict["metal"] = str(worksheet_row[column_index_by_name["metal"]])
                         transparency_row_dict["claims_payment_policies_url"] = str(
                             worksheet_row[column_index_by_name["claims_payment_policies_url"]]
                         )
-                        transparency_issuer_name_by_id[transparency_row_dict["issuer_id"]] = (
-                            transparency_row_dict["issuer_name"]
-                        )
+                        transparency_issuer_name_by_id[transparency_row_dict["issuer_id"]] = transparency_row_dict[
+                            "issuer_name"
+                        ]
 
                         obj_list.append(transparency_row_dict)
                         if count > int(os.environ.get("HLTHPRT_SAVE_PER_PACK", 50)):
@@ -3125,9 +3066,7 @@ async def init_file(ctx, task=None):
                 if is_test_mode_enabled and len(obj_list) >= TEST_PLAN_TRANSPARENCY_ROWS:
                     break
 
-        (issuers_by_id, plans_by_key) = await import_unknown_state_issuers_data(
-            test_mode=is_test_mode_enabled
-        )
+        (issuers_by_id, plans_by_key) = await import_unknown_state_issuers_data(test_mode=is_test_mode_enabled)
         issuers_by_id.update(await update_issuer_names_data(test_mode=is_test_mode_enabled))
         if is_test_mode_enabled:
             issuers_by_id = dict(list(issuers_by_id.items())[:TEST_UNKNOWN_STATE_ROWS])
@@ -3181,13 +3120,9 @@ async def init_file(ctx, task=None):
                             "state": worksheet_row[0].upper(),
                             "issuer_id": int(worksheet_row[1]),
                             "issuer_marketing_name": "",
-                            "data_contact_email": (
-                                (worksheet_row[3] or "").strip() if worksheet_row[3] else ""
-                            ),
+                            "data_contact_email": ((worksheet_row[3] or "").strip() if worksheet_row[3] else ""),
                         }
-                        issuer_name = transparency_issuer_name_by_id.get(
-                            issuer_row_dict["issuer_id"]
-                        )
+                        issuer_name = transparency_issuer_name_by_id.get(issuer_row_dict["issuer_id"])
                         issuer_row_dict["issuer_name"] = issuer_name if issuer_name else "N/A"
                         for single_url in row_urls:
                             issuer_row_dict["mrf_url"] = single_url
@@ -3201,17 +3136,13 @@ async def init_file(ctx, task=None):
                                 if issuer_row_dict["data_contact_email"] and not existing_issuer.get(
                                     "data_contact_email"
                                 ):
-                                    existing_issuer["data_contact_email"] = issuer_row_dict[
-                                        "data_contact_email"
-                                    ]
+                                    existing_issuer["data_contact_email"] = issuer_row_dict["data_contact_email"]
                                 if issuer_row_dict["issuer_name"] and not existing_issuer.get("issuer_name"):
                                     existing_issuer["issuer_name"] = issuer_row_dict["issuer_name"]
                                 if issuer_row_dict["issuer_marketing_name"] and not existing_issuer.get(
                                     "issuer_marketing_name"
                                 ):
-                                    existing_issuer["issuer_marketing_name"] = issuer_row_dict[
-                                        "issuer_marketing_name"
-                                    ]
+                                    existing_issuer["issuer_marketing_name"] = issuer_row_dict["issuer_marketing_name"]
                             else:
                                 issuers_by_id[issuer_row_dict["issuer_id"]] = issuer_row_dict.copy()
                     count += 1
@@ -3325,24 +3256,23 @@ async def startup(ctx):
 async def _publish_mrf_table_generation(import_date: str, db_schema: str):
     """Rotate the closed MRF family and record its generation atomically."""
 
-    staging_tables_by_main_name = {}
-    async with db.transaction():
+    staging_tables_by_main_name = {
+        cls.__main_table__: make_class(cls, import_date, schema_override=db_schema) for cls in _MRF_PUBLICATION_MODELS
+    }
+    async with db.transaction() as session:
+        await prepare_local_native_input_publication(
+            session,
+            ledger_schema=db_schema,
+            relations=tuple((name, stage.__tablename__) for name, stage in staging_tables_by_main_name.items()),
+        )
         for cls in _MRF_PUBLICATION_MODELS:
-            staging_tables_by_main_name[cls.__main_table__] = make_class(
-                cls, import_date, schema_override=db_schema
-            )
             staging_cls = staging_tables_by_main_name[cls.__main_table__]
             table = staging_cls.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-            await db.status(
-                f"ALTER TABLE IF EXISTS {db_schema}.{staging_cls.__tablename__} RENAME TO {table};"
-            )
+            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{staging_cls.__tablename__} RENAME TO {table};")
 
-            await db.status(
-                f"ALTER INDEX IF EXISTS "
-                f"{db_schema}.{table}_idx_primary RENAME TO {table}_idx_primary_old;"
-            )
+            await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {table}_idx_primary_old;")
             await db.status(
                 f"ALTER INDEX IF EXISTS "
                 f"{db_schema}.{staging_cls.__tablename__}_idx_primary RENAME TO "
@@ -3442,9 +3372,7 @@ async def publish_initial_generation(ctx, task):
                         "recovery": recovery,
                     },
                 )
-                raise RuntimeError(
-                    f"MRF parser recovery failed: done={done_work} total={total_work}"
-                )
+                raise RuntimeError(f"MRF parser recovery failed: done={done_work} total={total_work}")
             if wait_count >= max_waits:
                 error_dict = {
                     "code": "mrf_parser_jobs_incomplete",
@@ -3545,9 +3473,7 @@ async def publish_initial_generation(ctx, task):
     def record_finalize_phase(phase: str, started: float) -> None:
         """Append one successful MRF finalization timing."""
         elapsed = round(time.monotonic() - started, 3)
-        finalize_phase_timings.append(
-            {"phase": phase, "status": "succeeded", "elapsed_seconds": elapsed}
-        )
+        finalize_phase_timings.append({"phase": phase, "status": "succeeded", "elapsed_seconds": elapsed})
         logger.info("MRF finalization phase complete: phase=%s elapsed_seconds=%s", phase, elapsed)
 
     async def timed_finalize_phase(phase: str, awaitable):
@@ -3707,7 +3633,14 @@ async def publish_initial_generation(ctx, task):
             "mrf_finalize_phase_timings": finalize_phase_timings,
             **({"address_resolve": address_stats.__dict__} if address_stats else {}),
         },
-        progress={"unit": "phase", "total": 4, "done": 4, "pct": 100, "message": "succeeded", "phase": "mrf import published"},
+        progress={
+            "unit": "phase",
+            "total": 4,
+            "done": 4,
+            "pct": 100,
+            "message": "succeeded",
+            "phase": "mrf import published",
+        },
     )
     if redis:
         await _cleanup_mrf_finalize_jobs(redis, import_date)
@@ -3730,8 +3663,8 @@ async def main(test_mode: bool = False):
 async def finish_main(test_mode: bool = False, import_id: str | None = None):
     """Queue finalization for one MRF import run."""
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
-    resolved_import_id = import_id or os.environ.get("HLTHPRT_IMPORT_ID_OVERRIDE") or datetime.datetime.utcnow().strftime(
-        "%Y%m%d"
+    resolved_import_id = (
+        import_id or os.environ.get("HLTHPRT_IMPORT_ID_OVERRIDE") or datetime.datetime.utcnow().strftime("%Y%m%d")
     )
     finish_context_dict = {
         "import_date": resolved_import_id,

@@ -103,19 +103,21 @@ async def _copy_relation(session, tables, root, relation, ownership, model, hash
         )
         if set(members) != set(owners):
             raise PTG2ManifestArtifactError("membership factor owner coverage is incomplete")
-        rows = []
+        edge_rows = []
         for owner in owners:
-            values = members[owner]
-            if tuple(values) != tuple(sorted(set(values))) or any(not 0 <= value <= 0xFFFFFFFF for value in values):
+            members_for_owner = members[owner]
+            if tuple(members_for_owner) != tuple(sorted(set(members_for_owner))) or any(
+                not 0 <= member_key <= 0xFFFFFFFF for member_key in members_for_owner
+            ):
                 raise PTG2ManifestArtifactError("membership factor vector is noncanonical")
-            for member in values:
-                rows.append((owner, member))
+            for member in members_for_owner:
+                edge_rows.append((owner, member))
                 hasher.update(struct.pack(">II", owner, member))
-                if len(rows) == 5000:
-                    await _copy(session, ownership, model, rows)
-                    rows = []
-            count += len(values)
-        await _copy(session, ownership, model, rows)
+                if len(edge_rows) == 5000:
+                    await _copy(session, ownership, model, edge_rows)
+                    edge_rows = []
+            count += len(members_for_owner)
+        await _copy(session, ownership, model, edge_rows)
         if count - reported >= 250_000 or count == manifest.logical_member_count:
             enqueue_live_progress(
                 phase=f"membership {relation}", done=count, total=manifest.logical_member_count, unit="edges"
@@ -136,36 +138,39 @@ async def _physical_code_rows(session, tables, code_system, code):
     from api import ptg2_serving as serving
 
     predicates = ["code_metadata.snapshot_key=:snapshot_key"]
-    params = {"snapshot_key": serving._required_shared_snapshot_key(tables)}
+    params_by_name = {"snapshot_key": serving._required_shared_snapshot_key(tables)}
     serving._append_reported_code_system_filter(
         predicates,
-        params,
+        params_by_name,
         column="code_metadata.reported_code_system",
         code_system=code_system,
     )
     serving._append_reported_code_value_filter(
         predicates,
-        params,
+        params_by_name,
         column="code_metadata.reported_code",
         param_name="reported_code",
         values=serving._ptg2_reported_code_lookup_values(code_system, code),
     )
-    rows = (
+    code_rows = (
         (
             await session.execute(
                 text(
                     f"SELECT code_metadata.code_key,code_metadata.rate_count FROM {serving._shared_v3_code_table(tables)} code_metadata "
                     f"WHERE {' AND '.join(predicates)} ORDER BY code_metadata.code_key LIMIT :row_limit"
                 ),
-                params | {"row_limit": MAX_CODE_OCCURRENCES + 1},
+                params_by_name | {"row_limit": MAX_CODE_OCCURRENCES + 1},
             )
         )
         .mappings()
         .all()
     )
-    if len(rows) > MAX_CODE_OCCURRENCES or sum(int(row["rate_count"]) for row in rows) > MAX_CODE_OCCURRENCES:
+    if (
+        len(code_rows) > MAX_CODE_OCCURRENCES
+        or sum(int(code_row["rate_count"]) for code_row in code_rows) > MAX_CODE_OCCURRENCES
+    ):
         raise ValueError("membership requested code exceeds the bounded build contract")
-    return rows
+    return code_rows
 
 
 async def _copy_code(session, tables, identity, ownership, hasher, *, byte_allowance):
@@ -177,24 +182,24 @@ async def _copy_code(session, tables, identity, ownership, hasher, *, byte_allow
         maximum_raw_payload_bytes=byte_allowance,
         maximum_row_capacity=MAX_CODE_OCCURRENCES + 1,
     )
-    coverage = []
+    coverage_rows = []
     for row in rows:
         entries = await serving._shared_forward_entries_for_code_rows(session, tables, [row], scan_budget=budget)
         if len(entries) != int(row["rate_count"]):
             raise PTG2ManifestArtifactError("membership requested code occurrence coverage is incomplete")
         sets = sorted({int(entry.provider_set_key) for entry in entries})
         set_digest = hashlib.sha256(b"".join(struct.pack(">I", key) for key in sets)).hexdigest()
-        covered = {
+        coverage_by_field = {
             "code_key": int(row["code_key"]),
             "occurrence_count": len(entries),
             "set_count": len(sets),
             "set_digest": set_digest,
         }
-        coverage.append(covered)
-        hasher.update(encoded(covered).encode("ascii"))
-        await _copy(session, ownership, PTGMembershipCode, [(covered["code_key"], key) for key in sets])
-        await _copy(session, ownership, PTGMembershipCodeCoverage, [tuple(covered.values())])
-    return coverage
+        coverage_rows.append(coverage_by_field)
+        hasher.update(encoded(coverage_by_field).encode("ascii"))
+        await _copy(session, ownership, PTGMembershipCode, [(coverage_by_field["code_key"], key) for key in sets])
+        await _copy(session, ownership, PTGMembershipCodeCoverage, [tuple(coverage_by_field.values())])
+    return coverage_rows
 
 
 async def _validate_candidate(session, ownership, factors, coverage):
@@ -257,10 +262,11 @@ async def _reader_principals(session, tables):
 
 
 async def build_in_session(session, *, source_key, snapshot_id, code_system, code):
-    params = dict(source_key=source_key, snapshot_id=snapshot_id, code_system=code_system, code=code)
-    validate_params(params)
+    """Build or adopt one complete source/code family within the caller transaction."""
+    params_by_name = dict(source_key=source_key, snapshot_id=snapshot_id, code_system=code_system, code=code)
+    validate_params(params_by_name)
     await native.protected_publisher_owner(session)
-    tables, root, identity = await source_identity(session, **params)
+    tables, root, identity = await source_identity(session, **params_by_name)
     await lock_identity(session, identity)
     found = await locate(session, identity)
     if found is not None:
@@ -298,9 +304,9 @@ async def build_in_session(session, *, source_key, snapshot_id, code_system, cod
     coverage = await _copy_code(
         session, tables, identity, ownership, hasher, byte_allowance=MAX_BUILD_BYTES - edges * 8
     )
-    counts = {"factors": factors, "code_coverage": coverage}
+    counts_by_name = {"factors": factors, "code_coverage": coverage}
     await _copy(
-        session, ownership, PTGMembershipManifest, [(1, encoded(identity), hasher.hexdigest(), encoded(counts))]
+        session, ownership, PTGMembershipManifest, [(1, encoded(identity), hasher.hexdigest(), encoded(counts_by_name))]
     )
     enqueue_live_progress(
         phase="membership indexes and validation", message="Completing isolated native indexes and set validation"
@@ -309,7 +315,7 @@ async def build_in_session(session, *, source_key, snapshot_id, code_system, cod
     await _validate_candidate(session, ownership, factors, coverage)
     for table in SPEC.table_names:
         await session.execute(text(f"ANALYZE {native._quoted(ownership.schema_name)}.{native._quoted(table)}"))
-    _, _, after = await source_identity(session, **params, tables=tables)
+    _, _, after = await source_identity(session, **params_by_name, tables=tables)
     if after != identity:
         raise PTG2ManifestArtifactError("membership source changed during candidate build")
     await seal(session, ownership, identity, reader_principals=await _reader_principals(session, tables))

@@ -7,13 +7,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass, field
 import os
-from pathlib import Path
 import signal
 import sys
-from typing import Any, Sequence
-
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Sequence
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -21,9 +20,7 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("HLTHPRT_LOG_CFG", str(ROOT / "logging.yaml"))
 
 SIGNALS = (signal.SIGTERM, signal.SIGINT)
-_RETIREMENT_ENABLED_ENV = (
-    "HLTHPRT_PROVIDER_DIRECTORY_TERMINAL_ROOT_RETIREMENT_ENABLED"
-)
+_RETIREMENT_ENABLED_ENV = "HLTHPRT_PROVIDER_DIRECTORY_TERMINAL_ROOT_RETIREMENT_ENABLED"
 SAFE_ERROR_CODES = frozenset(
     {
         "busy",
@@ -66,9 +63,7 @@ def _add_selectors(parser: argparse.ArgumentParser) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = RedactedArgumentParser(
         allow_abbrev=False,
-        description=(
-            "Preview a closed evidence token or apply its exact parent-only CAS."
-        ),
+        description=("Preview a closed evidence token or apply its exact parent-only CAS."),
     )
     commands = parser.add_subparsers(dest="command", required=True)
     preview_parser = commands.add_parser("preview", allow_abbrev=False)
@@ -82,9 +77,7 @@ def _parser() -> argparse.ArgumentParser:
 @dataclass(slots=True)
 class _SignalRegistration:
     operation_loop: Any
-    previous_handler_by_signal: dict[signal.Signals, Any] = field(
-        default_factory=dict
-    )
+    previous_handler_by_signal: dict[signal.Signals, Any] = field(default_factory=dict)
     is_restored: bool = False
 
     def restore(self) -> None:
@@ -107,11 +100,9 @@ def _install_signal_handlers(active_task: asyncio.Task[Any]) -> _SignalRegistrat
     try:
         for signal_number in SIGNALS:
             previous_handler = signal.getsignal(signal_number)
-            operation_loop.add_signal_handler(
-                signal_number, active_task.cancel, signal_number
-            )
+            operation_loop.add_signal_handler(signal_number, active_task.cancel, signal_number)
             registration.previous_handler_by_signal[signal_number] = previous_handler
-    except (NotImplementedError, RuntimeError, ValueError):
+    except NotImplementedError, RuntimeError, ValueError:
         registration.restore()
         raise RuntimeError("terminal retirement signal setup failed") from None
     return registration
@@ -151,9 +142,7 @@ def _request(arguments: argparse.Namespace) -> Any:
         acquisition_root_run_id=arguments.acquisition_root_run_id,
         owner_run_id=arguments.owner_run_id,
         expected_current_dataset_id=arguments.expected_current_dataset_id,
-        expected_evidence_sha256=getattr(
-            arguments, "expected_evidence_sha256", None
-        ),
+        expected_evidence_sha256=getattr(arguments, "expected_evidence_sha256", None),
     )
 
 
@@ -230,7 +219,11 @@ def _print_error(code: str) -> None:
     print(_error_json(code), file=sys.stderr)
 
 
-def run_command(arguments: Sequence[str] | None = None) -> int:
+def run_command(
+    arguments: Sequence[str] | None = None,
+    *,
+    operation_runner: Callable[[argparse.Namespace], Awaitable[str]] | None = None,
+) -> int:
     """Run a gated operation with selector-free JSON output."""
 
     if not _is_gate_enabled():
@@ -238,7 +231,8 @@ def run_command(arguments: Sequence[str] | None = None) -> int:
         return 1
     parsed_arguments = _parser().parse_args(arguments)
     try:
-        rendered_result = asyncio.run(_run_operator(parsed_arguments))
+        runner = _run_operator if operation_runner is None else operation_runner
+        rendered_result = asyncio.run(runner(parsed_arguments))
     except asyncio.CancelledError as error:
         _print_error("canceled")
         return _cancellation_exit_code(error)

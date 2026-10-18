@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -12,15 +13,28 @@ from sqlalchemy import text
 from process import provider_directory_cms_serving_coverage as coverage
 from process import provider_directory_cms_serving_receipt as receipts
 from process.cms_doctors_preparation import apply_prepared_cms_doctors_generation
-from process.entity_address_candidate_preparation import publish_prepared_entity_address_generation
-from process.entity_address_cutover_contract import lock_live_serving_relations
-from process.provider_directory_artifact_bundle_preparation import apply_prepared_artifact_bundle
+from process.entity_address_candidate_preparation import (
+    publish_prepared_entity_address_generation,
+)
+from process.native_publication_read_access import preserve_publication_reads
+from process.provider_directory_artifact_bundle_preparation import (
+    apply_prepared_artifact_bundle,
+)
 from process.provider_directory_cms_address import admitted_native_input_fence
-from process.provider_directory_cms_native_inputs import assert_native_address_input_fence
+from process.provider_directory_cms_native_inputs import (
+    assert_native_address_input_fence,
+)
 from process.provider_directory_cms_preparation import remaining_build_seconds
+from process.provider_directory_projection_stage import _copy_driver
 from process.reference_family_result_generation import RELATION_NAMES_BY_IMPORTER
 
-_PIN_FIELDS = ("source_id", "endpoint_id", "dataset_id", "dataset_hash", "acquisition_root_run_id")
+_PIN_FIELDS = (
+    "source_id",
+    "endpoint_id",
+    "dataset_id",
+    "dataset_hash",
+    "acquisition_root_run_id",
+)
 
 
 def _pin(pair):
@@ -87,12 +101,13 @@ async def _published_coverage_matches(fhir, session, proof):
 
 
 async def _seal_published_coverage(fhir, session, proof):
-    if not await _published_coverage_matches(fhir, session, proof):
-        await coverage.seal_cms_candidate_coverage(
-            fhir, SimpleNamespace(**proof), proof["release_id"], proof["dataset_hash"]
-        )
-    if not await _published_coverage_matches(fhir, session, proof):
-        raise RuntimeError("cms_npd_coverage_cutover_changed")
+    async with coverage._source_publication_body(fhir, session):
+        if not await _published_coverage_matches(fhir, session, proof):
+            await coverage.seal_cms_candidate_coverage(
+                fhir, SimpleNamespace(**proof), proof["release_id"], proof["dataset_hash"]
+            )
+        if not await _published_coverage_matches(fhir, session, proof):
+            raise RuntimeError("cms_npd_coverage_cutover_changed")
 
 
 async def _verify_commit(fhir, receipt_id, receipt_payload):
@@ -120,7 +135,13 @@ async def _consume_preparations(prepared, address, doctors, receipt_id, receipt_
 async def _finalize_committed_publication(fhir, prepared, address, doctors, receipt_id, receipt_payload, is_recovered):
     """Bound recovery and ownership finalization independently of caller cancellation."""
     async with asyncio.timeout(10):
-        if not await _verify_commit(fhir, receipt_id, receipt_payload):
+        registry_preparation = _registry_preparation(prepared)
+        verified = (
+            await _has_registry_commit(fhir, prepared, receipt_id, receipt_payload)
+            if registry_preparation is not None
+            else await _verify_commit(fhir, receipt_id, receipt_payload)
+        )
+        if not verified:
             return None
         prepared.metrics["cms_serving"] = {
             "receipt_id": receipt_id,
@@ -132,6 +153,44 @@ async def _finalize_committed_publication(fhir, prepared, address, doctors, rece
         }
         await _consume_preparations(prepared, address, doctors, receipt_id, receipt_payload)
         return receipt_id
+
+
+async def _has_registry_commit(fhir, prepared, receipt_id, receipt_payload):
+    """Read all committed evidence in one fresh authenticated Publisher snapshot."""
+    from process.network_registry_cms_prepared_pair import (
+        read_committed_registry_cms_pair,
+    )
+    from process.registry_cms_source_notifications import RegistryCMSSourceNotification
+
+    prepared_pair = _registry_preparation(prepared)
+    job = prepared.nonprofile_admission.registry_source_job
+    async with job.source_session_factory() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        await session.execute(text("SET LOCAL statement_timeout='5s'"))
+        await session.execute(text("SET LOCAL lock_timeout='1s'"))
+        notice = await job.read_receipt(
+            session,
+            source_schema=prepared_pair.request.source_pin.schema_name,
+            receipt_id=receipt_id,
+        )
+        if type(notice) is not RegistryCMSSourceNotification or notice.source_attempt != job.source_attempt:
+            return False
+        if not await receipts.verify_historical_receipt(session, fhir._schema(), receipt_id, receipt_payload):
+            return False
+        pair = await read_committed_registry_cms_pair(session, prepared_pair)
+        is_matching = (
+            pair is not None
+            and pair == notice.pair
+            and pair.proof.serving_receipt_id == receipt_id
+            and json.loads(pair.cms_receipt_payload) == receipt_payload
+        )
+    if is_matching:
+        prepared.metrics["registry_source_notification"] = {
+            "source_schema": notice.pair.proof.source_pin.schema_name,
+            "receipt_id": notice.pair.proof.serving_receipt_id,
+            "notification_sha256": notice.sha256,
+        }
+    return is_matching
 
 
 def _assert_address_prepared(execution, prepared, address, candidate_proof, predecessor):
@@ -165,35 +224,63 @@ async def _cutover_authorization(prepared):
 async def _publication_session(fhir, source_session_factory, *, capture_id=None):
     """Choose the source pool before opening the final owner's transaction."""
     from process import provider_directory_cms_publication_custody as wal_custody
+    from process.provider_directory_generic_source_policy import is_source_storage_required, source_publication_sessions
 
+    is_source_publication = is_source_storage_required()
     if source_session_factory is None:
-        async with wal_custody.database_session(fhir) as session:
-            yield session
-        return
+        if is_source_publication:
+            source_session_factory = await source_publication_sessions()
+        else:
+            async with wal_custody.database_session(fhir) as session:
+                yield session
+            return
     if not callable(source_session_factory) or fhir.db._transaction_binding() is not None:
         raise RuntimeError("cms_serving_publication_requires_own_transaction")
     if capture_id is not None:
         from process.network_registry_cms_capture_lock import registry_cms_capture_transaction
 
         options = {"fhir": fhir} if wal_custody.is_bounded(fhir) else {}
+        if is_source_publication:
+            options["isolation"] = "read committed"
         async with registry_cms_capture_transaction(
             source_session_factory, capture_id=capture_id, **options
         ) as session:
-            async with fhir.db.bind_existing_session(session):
-                async with wal_custody.source_body(fhir, source_session_factory, capture_id, session):
-                    yield session
+            async with (
+                fhir.db.bind_existing_session(session),
+                wal_custody.source_body(fhir, source_session_factory, capture_id, session),
+                _original_source_publication(fhir, session),
+            ):
+                yield session
         return
     group = None
     try:
         async with source_session_factory() as session, session.begin():
-            async with fhir.db.bind_existing_session(session):
-                async with wal_custody.source_body(fhir, source_session_factory, capture_id, session) as group:
+            if is_source_publication:
+                await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            async with (
+                fhir.db.bind_existing_session(session),
+                wal_custody.source_body(fhir, source_session_factory, capture_id, session) as group,
+            ):
+                if not is_source_publication:
                     await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+                async with _original_source_publication(fhir, session):
                     yield session
     except BaseException as failure:
         if group is not None and group["failure"] is None:
             group["failure"] = failure
         raise
+
+
+@asynccontextmanager
+async def _original_source_publication(fhir, session):
+    """Bind after the existing original transaction/WAL/database owners have started."""
+    from process.provider_directory_generic_source_policy import is_source_storage_required, original_source_publication
+
+    if is_source_storage_required():
+        async with original_source_publication(fhir.db, session):
+            yield
+    else:
+        yield
 
 
 @asynccontextmanager
@@ -254,29 +341,21 @@ def _source_capture_id(prepared):
 async def _lock_retained_relations(fhir, session, fence):
     """Take endpoint locks before the captured native revision fence locks its inputs."""
     if fence.datasets:
+        from process.provider_directory_generic_source_policy import is_source_storage_required
+
+        if is_source_storage_required():
+            await fhir._lock_source_publication_controls()
         await fhir._lock_and_verify_artifact_dataset_fence(fence)
 
 
-async def _lock_live_swap_relations(fhir, session, prepared, address, doctors):
-    """Acquire the complete composite live set before any family starts its swaps."""
+def _live_swap_relations(prepared, address, doctors):
+    """Let the common cut lock the complete composite set in one ordered call."""
     relation_names = {stage.target_relation for stage in prepared.stages}
     if address is not None:
         relation_names.update(swap.live_cls.__main_table__ for swap in address.swaps)
     if doctors is not None:
         relation_names.update(RELATION_NAMES_BY_IMPORTER["cms-doctors"])
-    installed_names = [
-        name
-        for name in sorted(relation_names)
-        if await session.scalar(
-            text(
-                "SELECT c.relkind::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-                "WHERE n.nspname=:schema AND c.relname=:name"
-            ),
-            {"schema": fhir._schema(), "name": name},
-        )
-        in {"r", "p"}
-    ]
-    await lock_live_serving_relations(lambda sql: session.execute(text(sql)), fhir._schema(), installed_names)
+    return tuple(sorted(relation_names))
 
 
 async def _apply_prepared_results(
@@ -287,12 +366,19 @@ async def _apply_prepared_results(
     await coverage.assert_sealed_cms_candidate_coverage(session, fhir._schema(), proof)
     archive = getattr(prepared, "archive_delta", None)
     archive_result = await archive.apply(fhir, session) if archive is not None else None
+    if fhir.profile_initial.build_from_stages(fhir, prepared.stages, prepared.profile_delta) is not None:
+        await prepared.assert_ready(cutover=True, archive_applied=archive_result is not None)
 
     async def before_swaps():
         """Keep every prepared swap behind the complete live lock phase."""
         if fhir.profile_initial.build_from_stages(fhir, prepared.stages, prepared.profile_delta) is not None:
             await prepared.assert_ready(cutover=True, archive_applied=archive_result is not None)
-        await _lock_live_swap_relations(fhir, session, prepared, address, doctors)
+        if prepared.stages:
+            driver = await _copy_driver(session)
+            for stage in prepared.stages:
+                await preserve_publication_reads(
+                    driver, schema=stage.schema, live_table=stage.target_relation, stage_table=stage.stage_table
+                )
         if doctors is not None:
             await apply_prepared_cms_doctors_generation(doctors)
 
@@ -303,13 +389,20 @@ async def _apply_prepared_results(
         cutover_timeout=None if prepared.profile_delta is not None else cutover_timeout,
         settings_configured=True,
         before_swaps=before_swaps,
+        extra_live_relations=_live_swap_relations(prepared, address, doctors),
     )
     await _seal_published_coverage(fhir, session, proof)
     if address is not None:
         await publish_prepared_entity_address_generation(address)
     snapshot = await receipts.capture_native_dependencies(session, fhir._schema())
     receipt_payload = _receipt_payload(execution, proof, predecessor, snapshot, archive_result)
-    receipt_id = await receipts.append_serving_receipt(session, fhir._schema(), receipt_payload)
+    registry_preparation = _registry_preparation(prepared)
+    if registry_preparation is None:
+        receipt_id = await receipts.append_serving_receipt(session, fhir._schema(), receipt_payload)
+    else:
+        receipt_id = await receipts.append_serving_receipt(
+            session, fhir._schema(), receipt_payload, registry_source_pair=registry_preparation
+        )
     await _bind_registry_source_receipt(session, prepared, receipt_id, receipt_payload)
     await session.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
     if capacity_forecast is not None:
@@ -323,18 +416,72 @@ async def _apply_prepared_results(
 
 async def _bind_registry_source_receipt(session, prepared, receipt_id, receipt_payload):
     """Bind retention and enqueue its notification in the source publication TX."""
-    from process.network_registry_cms_prepared_pair import bind_prepared_registry_cms_source_pair
+    from process.network_registry_cms_prepared_pair import (
+        bind_prepared_registry_cms_source_pair,
+    )
+    from process.provider_directory_cms_source_runtime import (
+        registry_source_publication,
+    )
+    from process.provider_directory_generic_source_policy import source_publisher_body
+
+    admission = getattr(prepared, "nonprofile_admission", None)
+    job = getattr(admission, "registry_source_job", None)
+    registry_preparation = _registry_preparation(prepared)
+    if registry_preparation is None:
+        return
+    async with registry_source_publication(session, prepared, receipt_id, receipt_payload) as expected_pair:
+        pair = await bind_prepared_registry_cms_source_pair(
+            session,
+            registry_preparation,
+            receipt_id=receipt_id,
+            receipt_payload=receipt_payload,
+        )
+        if pair != expected_pair:
+            raise RuntimeError("cms_registry_source_runtime_invalid")
+        async with source_publisher_body(session):
+            await job.notify_receipt(session, receipt_id=receipt_id, pair=pair)
+
+
+def _registry_preparation(prepared):
+    """Require the captured prepared pair to match the actual authenticated job."""
+    from process.network_registry_cms_prepared_pair import PreparedRegistryCMSSourcePair
     from process.provider_directory_cms_source_runtime import BoundCMSRegistrySourceJob
 
-    job = getattr(prepared.nonprofile_admission, "registry_source_job", None)
+    admission = getattr(prepared, "nonprofile_admission", None)
+    job = getattr(admission, "registry_source_job", None)
     if job is None:
-        return
-    if type(job) is not BoundCMSRegistrySourceJob or prepared.registry_source_pair is None:
+        return None
+    pair = getattr(prepared, "registry_source_pair", None)
+    if (
+        type(job) is not BoundCMSRegistrySourceJob
+        or type(pair) is not PreparedRegistryCMSSourcePair
+        or not callable(job.read_receipt)
+    ):
         raise RuntimeError("cms_registry_source_runtime_invalid")
-    pair = await bind_prepared_registry_cms_source_pair(
-        session, prepared.registry_source_pair, receipt_id=receipt_id, receipt_payload=receipt_payload
+    plan, lease = getattr(admission, "plan", None), getattr(admission, "lease", None)
+    expected = (
+        job.retention_request,
+        job.capture_id,
+        job.owner_role,
+        job.runtime_roles,
+        job.source_attempt,
+        getattr(plan, "capacity_geometry_hash", None),
+        getattr(lease, "lease_digest", None),
+        getattr(plan, "native_address_input_hash", None),
     )
-    await job.notify_receipt(session, receipt_id=receipt_id, pair=pair)
+    actual = (
+        pair.request,
+        pair.recipe.source_pin.retained_epoch.epoch_id,
+        pair.owner_role,
+        pair.runtime_roles,
+        pair.source_attempt,
+        pair.capacity_geometry_hash,
+        pair.lease_digest,
+        pair.native_address_input_hash,
+    )
+    if actual != expected:
+        raise RuntimeError("cms_registry_source_runtime_invalid")
+    return pair
 
 
 async def commit_prepared_serving_generation(

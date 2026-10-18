@@ -376,3 +376,40 @@ async def test_native_fixture_refuses_preexisting_names_before_registering_clean
     assert attempted_roles == []
     await fixture._remove_catalog_actors(engine, attempted_roles, ["synthetic_live"])
     connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer", ["code-sets", "ms-drg"])
+async def test_native_fixture_supplies_exact_importer_to_real_custody_guard(monkeypatch, importer):
+    from process import ms_drg_result_generation as drg
+    from tests import scoped_catalog_native_fixture as fixture
+
+    generation = codes.TABLE if importer == "code-sets" else drg.TABLE
+    connection = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(side_effect=[True, False, True, False]))
+
+    @asynccontextmanager
+    async def begin():
+        yield connection
+
+    actors = SimpleNamespace(
+        roles=dict(owner="synthetic_owner", builder="synthetic_builder", publisher="synthetic_publisher"),
+        engine=SimpleNamespace(begin=begin),
+        publisher=SimpleNamespace(begin=begin),
+        builder=SimpleNamespace(begin=begin),
+    )
+    monkeypatch.setattr(native, "_schema_oid", AsyncMock(return_value=9))
+    monkeypatch.setattr(native, "_relation_oid", AsyncMock(side_effect=[10, 11]))
+    owner = AsyncMock(return_value=77)
+    monkeypatch.setattr(native, "model_family_publisher_owner", owner)
+    monkeypatch.setattr(native, "protected_publisher_owner", AsyncMock(return_value=77))
+    with pytest.raises(native.ReferenceFamilyArchiveError, match="schema identity differs"):
+        await fixture.seal_catalog(actors, "synthetic_live", (CodeCatalog,), generation)
+    owner.assert_awaited_once_with(connection, importer)
+
+
+@pytest.mark.asyncio
+async def test_native_fixture_refuses_unknown_importer_before_custody_mutation():
+    from tests import scoped_catalog_native_fixture as fixture
+
+    with pytest.raises(ValueError, match="unsupported scoped catalog generation table"):
+        await fixture.seal_catalog(object(), "synthetic_live", (CodeCatalog,), "unknown_generation")

@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import importlib.util
+from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -32,10 +34,10 @@ from process.provider_directory_fhir_subset_abandonment_store import (
     sync_reviewed_subset_abandonment_transaction,
 )
 from tests.provider_directory_fhir_subset_abandonment_support import (
-    AbandonmentDatabase,
     RESOURCE_TYPES,
     SOURCE_SCOPE_SHA256,
     VERIFICATION_SCOPE_SHA256,
+    AbandonmentDatabase,
     abandonment_inputs,
 )
 
@@ -62,16 +64,12 @@ def test_marker_and_terminal_diagnostics_are_closed():
     source_row, _candidate_row, checkpoint_rows = abandonment_inputs()
     diagnostics = source_row["metadata_json"]["last_resource_import"]["resources"]
     validated = validated_terminal_diagnostics(diagnostics, RESOURCE_TYPES)
-    resource_count = sum(
-        checkpoint_row["rows_processed"] for checkpoint_row in checkpoint_rows
-    )
+    resource_count = sum(checkpoint_row["rows_processed"] for checkpoint_row in checkpoint_rows)
     marker = abandonment_marker(
         source_scope_sha256=SOURCE_SCOPE_SHA256,
         resource_types=RESOURCE_TYPES,
         checkpoint_count=len(checkpoint_rows),
-        pages_processed=sum(
-            checkpoint_row["pages_processed"] for checkpoint_row in checkpoint_rows
-        ),
+        pages_processed=sum(checkpoint_row["pages_processed"] for checkpoint_row in checkpoint_rows),
         rows_processed=resource_count,
         resource_count=resource_count,
         proof_shard_count=2,
@@ -120,16 +118,12 @@ def test_terminal_error_code_admits_only_exact_gone_status(error_text):
 
 def test_marker_rejects_open_fields_and_noninteger_counts():
     _source_row, _candidate_row, checkpoint_rows = abandonment_inputs()
-    resource_count = sum(
-        checkpoint_row["rows_processed"] for checkpoint_row in checkpoint_rows
-    )
+    resource_count = sum(checkpoint_row["rows_processed"] for checkpoint_row in checkpoint_rows)
     marker = abandonment_marker(
         source_scope_sha256=SOURCE_SCOPE_SHA256,
         resource_types=RESOURCE_TYPES,
         checkpoint_count=len(checkpoint_rows),
-        pages_processed=sum(
-            checkpoint_row["pages_processed"] for checkpoint_row in checkpoint_rows
-        ),
+        pages_processed=sum(checkpoint_row["pages_processed"] for checkpoint_row in checkpoint_rows),
         rows_processed=resource_count,
         resource_count=resource_count,
         proof_shard_count=2,
@@ -172,24 +166,16 @@ def test_source_state_accepts_legacy_and_policy_lifecycles_exactly():
         "required_root_count": 1,
     }
     legacy_pending_by_field = {
-        "provider_directory_candidate_status": (
-            "pending_two_matching_reviewed_subset_acquisitions"
-        )
+        "provider_directory_candidate_status": ("pending_two_matching_reviewed_subset_acquisitions")
     }
     policy_pending_by_field = {
-        "provider_directory_candidate_status": (
-            "pending_reviewed_subset_acquisition"
-        ),
+        "provider_directory_candidate_status": ("pending_reviewed_subset_acquisition"),
         "provider_directory_reviewed_root_policy_v1": root_policy_by_field,
     }
     policy_active_by_field = {
         **policy_pending_by_field,
-        "provider_directory_candidate_status": (
-            "verified_reviewed_subset_acquisition"
-        ),
-        "provider_directory_reviewed_subset_activation_v2": {
-            "root_policy": root_policy_by_field
-        },
+        "provider_directory_candidate_status": ("verified_reviewed_subset_acquisition"),
+        "provider_directory_reviewed_subset_activation_v2": {"root_policy": root_policy_by_field},
     }
 
     assert _reviewed_source_state(legacy_pending_by_field) == "pending"
@@ -212,17 +198,11 @@ def test_abandonment_policy_binding_rejects_presence_or_value_drift():
         "policy_version": "provider-directory-reviewed-root-policy-v1",
         "required_root_count": 1,
     }
-    source_metadata_by_field = {
-        "provider_directory_reviewed_root_policy_v1": root_policy_by_field
-    }
+    source_metadata_by_field = {"provider_directory_reviewed_root_policy_v1": root_policy_by_field}
 
     assert _has_matching_reviewed_root_policy(
         source_metadata_by_field,
-        {
-            "provider_directory_reviewed_root_policy_v1": deepcopy(
-                root_policy_by_field
-            )
-        },
+        {"provider_directory_reviewed_root_policy_v1": deepcopy(root_policy_by_field)},
     )
     assert not _has_matching_reviewed_root_policy(source_metadata_by_field, {})
     assert not _has_matching_reviewed_root_policy(
@@ -250,30 +230,25 @@ async def test_selector_locks_exact_evidence_and_builds_private_selection():
     assert selection.endpoint_id == "endpoint-a"
     assert selection.source_scope_sha256 == SOURCE_SCOPE_SHA256
     assert (
-        database.candidate_row["publication_metadata_json"]
-        ["verification_source_scope_hash"]
+        database.candidate_row["publication_metadata_json"]["verification_source_scope_hash"]
         == VERIFICATION_SCOPE_SHA256
     )
     assert selection.source_scope_sha256 != VERIFICATION_SCOPE_SHA256
     assert selection.resource_types == RESOURCE_TYPES
-    expected_resource_count = sum(
-        checkpoint_row["rows_processed"] for checkpoint_row in checkpoint_rows
-    )
+    expected_resource_count = sum(checkpoint_row["rows_processed"] for checkpoint_row in checkpoint_rows)
     assert selection.marker_by_field["resource_count"] == expected_resource_count
     assert len(checkpoint_rows) == len(RESOURCE_TYPES)
     call_text = " ".join(call[1] for call in database.calls)
     endpoint_lock_calls = [
         parameters
         for method, statement, parameters in database.calls
-        if method == "scalar" and "hashtextextended" in statement
-        and "endpoint_id" in parameters
+        if method == "scalar" and "hashtextextended" in statement and "endpoint_id" in parameters
     ]
     assert endpoint_lock_calls == [{"endpoint_id": "endpoint-a"}]
     source_lock_parameters = next(
         parameters
         for method, statement, parameters in database.calls
-        if method == "all" and "SELECT source.*" in statement
-        and "FOR UPDATE OF source" in statement
+        if method == "all" and "SELECT source.*" in statement and "FOR UPDATE OF source" in statement
     )
     assert source_lock_parameters["endpoint_id"] == "endpoint-a"
     assert "provider-directory-pagination:" in str(database.calls)
@@ -287,15 +262,11 @@ async def test_selector_rejects_collapsed_or_malformed_scope_domains():
     malformed_databases = []
 
     invalid_verification_scope = AbandonmentDatabase()
-    invalid_verification_scope.candidate_row["publication_metadata_json"][
-        "verification_source_scope_hash"
-    ] = "invalid"
+    invalid_verification_scope.candidate_row["publication_metadata_json"]["verification_source_scope_hash"] = "invalid"
     malformed_databases.append(invalid_verification_scope)
 
     mismatched_campaign = AbandonmentDatabase()
-    mismatched_campaign.candidate_row["publication_metadata_json"][
-        "verification_campaign_id"
-    ] = "campaign-b"
+    mismatched_campaign.candidate_row["publication_metadata_json"]["verification_campaign_id"] = "campaign-b"
     malformed_databases.append(mismatched_campaign)
 
     mixed_checkpoint_scopes = AbandonmentDatabase()
@@ -303,9 +274,9 @@ async def test_selector_rejects_collapsed_or_malformed_scope_domains():
     malformed_databases.append(mixed_checkpoint_scopes)
 
     collapsed_scope_domains = AbandonmentDatabase()
-    collapsed_scope_domains.candidate_row["publication_metadata_json"][
-        "verification_source_scope_hash"
-    ] = SOURCE_SCOPE_SHA256
+    collapsed_scope_domains.candidate_row["publication_metadata_json"]["verification_source_scope_hash"] = (
+        SOURCE_SCOPE_SHA256
+    )
     malformed_databases.append(collapsed_scope_domains)
 
     for database in malformed_databases:
@@ -319,73 +290,74 @@ async def test_selector_rejects_collapsed_or_malformed_scope_domains():
 
 
 @pytest.mark.asyncio
-async def test_store_seals_children_before_parent_and_forces_both_guards():
+async def test_store_seals_children_before_parent_and_forces_both_guards(monkeypatch):
     database = AbandonmentDatabase()
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
-    result = await sync_reviewed_subset_abandonment_transaction(
-        database,
-        "source-a",
-        RESOURCE_TYPES,
-    )
+    async with synthetic_source_database(monkeypatch, database) as database:
+        result = await sync_reviewed_subset_abandonment_transaction(
+            database,
+            "source-a",
+            RESOURCE_TYPES,
+        )
 
-    assert result == ReviewedSubsetAbandonmentResult(abandoned=True)
-    update_statements = [
-        statement
-        for method, statement, _parameters in database.calls
-        if method == "status" and "UPDATE" in statement
-    ]
-    assert len(update_statements) == len(RESOURCE_TYPES) + 1
-    assert all("pagination_checkpoint" in sql for sql in update_statements[:-1])
-    assert "endpoint_dataset" in update_statements[-1]
-    constraint_call = next(
-        statement
-        for method, statement, _parameters in database.calls
-        if method == "status" and "SET CONSTRAINTS" in statement
-    )
-    assert "checkpoint_guard" in constraint_call
-    assert "dataset_consistency_guard" in constraint_call
-
-
-@pytest.mark.asyncio
-async def test_store_exact_retry_is_validated_without_rewriting_evidence():
-    database = AbandonmentDatabase(already_applied=True)
-
-    result = await sync_reviewed_subset_abandonment_transaction(
-        database,
-        "source-a",
-        RESOURCE_TYPES,
-    )
-
-    assert result == ReviewedSubsetAbandonmentResult(abandoned=False)
-    assert not any(
-        method == "status" and "UPDATE" in statement
-        for method, statement, _parameters in database.calls
-    )
+        assert result == ReviewedSubsetAbandonmentResult(abandoned=True)
+        update_statements = [
+            statement
+            for method, statement, _parameters in database.calls
+            if method == "status" and "UPDATE" in statement
+        ]
+        assert len(update_statements) == len(RESOURCE_TYPES) + 1
+        assert all("pagination_checkpoint" in sql for sql in update_statements[:-1])
+        assert "endpoint_dataset" in update_statements[-1]
+        constraint_call = next(
+            statement
+            for method, statement, _parameters in database.calls
+            if method == "status" and "SET CONSTRAINTS" in statement
+        )
+        assert "checkpoint_guard" in constraint_call
+        assert "dataset_consistency_guard" in constraint_call
 
 
 @pytest.mark.asyncio
-async def test_store_retry_remains_idempotent_after_source_activation():
+async def test_store_exact_retry_is_validated_without_rewriting_evidence(monkeypatch):
     database = AbandonmentDatabase(already_applied=True)
-    database.source_row["metadata_json"].update(
-        provider_directory_candidate_status=(
-            "verified_two_matching_reviewed_subset_acquisitions"
-        ),
-        provider_directory_reviewed_subset_activation_v1={
-            "contract_version": "synthetic-activation"
-        },
-    )
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
-    result = await sync_reviewed_subset_abandonment_transaction(
-        database,
-        "source-a",
-        RESOURCE_TYPES,
-    )
+    async with synthetic_source_database(monkeypatch, database) as database:
+        result = await sync_reviewed_subset_abandonment_transaction(
+            database,
+            "source-a",
+            RESOURCE_TYPES,
+        )
 
-    assert result == ReviewedSubsetAbandonmentResult(abandoned=False)
-    assert not any(
-        method == "status" and "UPDATE" in statement
-        for method, statement, _parameters in database.calls
-    )
+        assert result == ReviewedSubsetAbandonmentResult(abandoned=False)
+        assert not any(
+            method == "status" and "UPDATE" in statement for method, statement, _parameters in database.calls
+        )
+
+
+@pytest.mark.asyncio
+async def test_store_retry_remains_idempotent_after_source_activation(monkeypatch):
+    database = AbandonmentDatabase(already_applied=True)
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+
+    async with synthetic_source_database(monkeypatch, database) as database:
+        database.source_row["metadata_json"].update(
+            provider_directory_candidate_status=("verified_two_matching_reviewed_subset_acquisitions"),
+            provider_directory_reviewed_subset_activation_v1={"contract_version": "synthetic-activation"},
+        )
+
+        result = await sync_reviewed_subset_abandonment_transaction(
+            database,
+            "source-a",
+            RESOURCE_TYPES,
+        )
+
+        assert result == ReviewedSubsetAbandonmentResult(abandoned=False)
+        assert not any(
+            method == "status" and "UPDATE" in statement for method, statement, _parameters in database.calls
+        )
 
 
 @pytest.mark.parametrize(
@@ -398,59 +370,59 @@ async def test_store_fails_closed_at_each_transactional_boundary(
     failure_boundary,
 ):
     """Reject isolation, CAS, and relational-validation drift without success."""
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
     database = AbandonmentDatabase(already_applied=failure_boundary == "replay_guard")
-    if failure_boundary == "isolation":
-        original_scalar = database.scalar
+    async with synthetic_source_database(monkeypatch, database) as database:
+        if failure_boundary == "isolation":
+            original_scalar = database.scalar
 
-        async def scalar(statement, **parameters):
-            if "transaction_isolation" in statement:
-                database.calls.append(("scalar", statement, parameters))
-                return "repeatable read"
-            return await original_scalar(statement, **parameters)
+            async def scalar(statement, **parameters):
+                if "transaction_isolation" in statement:
+                    database.calls.append(("scalar", statement, parameters))
+                    return "repeatable read"
+                return await original_scalar(statement, **parameters)
 
-        monkeypatch.setattr(database, "scalar", scalar)
-    elif failure_boundary in {"guard", "replay_guard"}:
-        database.valid = False
-    else:
-        original_status = database.status
-        failed_relation = (
-            "pagination_checkpoint"
-            if failure_boundary == "checkpoint_cas"
-            else "endpoint_dataset"
-        )
+            monkeypatch.setattr(database, "scalar", scalar)
+        elif failure_boundary in {"guard", "replay_guard"}:
+            database.valid = False
+        else:
+            original_status = database.status
+            failed_relation = "pagination_checkpoint" if failure_boundary == "checkpoint_cas" else "endpoint_dataset"
 
-        async def status(statement, **parameters):
-            if "UPDATE" in statement and failed_relation in statement:
-                database.calls.append(("status", statement, parameters))
-                return 0
-            return await original_status(statement, **parameters)
+            async def status(statement, **parameters):
+                if "UPDATE" in statement and failed_relation in statement:
+                    database.calls.append(("status", statement, parameters))
+                    return 0
+                return await original_status(statement, **parameters)
 
-        monkeypatch.setattr(database, "status", status)
+            monkeypatch.setattr(database, "status", status)
 
-    with pytest.raises(ReviewedSubsetAbandonmentError) as error:
-        await sync_reviewed_subset_abandonment_transaction(
-            database,
-            "source-a",
-            RESOURCE_TYPES,
-        )
-    assert error.value.code == "state"
+        with pytest.raises(ReviewedSubsetAbandonmentError) as error:
+            await sync_reviewed_subset_abandonment_transaction(
+                database,
+                "source-a",
+                RESOURCE_TYPES,
+            )
+        assert error.value.code == "state"
 
 
 @pytest.mark.asyncio
 async def test_operator_is_selector_free_and_gate_bound(monkeypatch):
     database = AbandonmentDatabase()
-    monkeypatch.setenv(ABANDONMENT_ENABLED_ENV, "true")
-    monkeypatch.setattr(
-        "process.provider_directory_fhir_manual_catalog."
-        "reviewed_manual_census_source_id",
-        lambda: "source-a",
-    )
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
-    result = await abandonment.abandon_reviewed_subset_expired_root(database=database)
+    async with synthetic_source_database(monkeypatch, database) as database:
+        monkeypatch.setenv(ABANDONMENT_ENABLED_ENV, "true")
+        monkeypatch.setattr(
+            "process.provider_directory_fhir_manual_catalog.reviewed_manual_census_source_id",
+            lambda: "source-a",
+        )
 
-    assert result.abandoned is True
-    assert all("source-a" not in field_name for field_name in vars(result))
+        result = await abandonment.abandon_reviewed_subset_expired_root(database=database)
+
+        assert result.abandoned is True
+        assert all("source-a" not in field_name for field_name in vars(result))
 
 
 def test_abandoned_status_does_not_expand_completion_terminal_contract():
@@ -472,3 +444,33 @@ def test_abandoned_status_does_not_expand_completion_terminal_contract():
 
     assert ABANDONED_STATUS in importer_source.IMMUTABLE_ENDPOINT_DATASET_STATUSES
     assert ABANDONED_STATUS not in migration._TERMINAL_STATUSES_SQL
+
+
+@pytest.mark.asyncio
+async def test_admission_query_surface_preserves_exact_predecessor_execute_custody(monkeypatch):
+    """The reduced fixture closes the same exact overload as the real policy migration."""
+    from tests.provider_directory_fhir_subset_abandonment_pg_support import install_admission_query_surface
+    from tests.provider_directory_reviewed_root_policy_pg import _load_policy_migration
+    from tests.provider_directory_subset_completion_pg_setup import MigrationSqlCapture, load_migration
+    from tests.tin_npi_connector_postgres_support import load_admission_seal_migration
+
+    scenario = SimpleNamespace(schema="subset_admission_test", connection=SimpleNamespace(execute=AsyncMock()))
+    policy = _load_policy_migration()
+    capture = MigrationSqlCapture()
+    monkeypatch.setattr(policy, "op", capture)
+    policy._revoke_execute(scenario.schema)
+    expected_revoke = capture.statements[0]
+    assert expected_revoke == (
+        'REVOKE ALL ON FUNCTION "subset_admission_test"."provider_directory_subset_content_proof_valid"'
+        "(jsonb,text,text,text,jsonb,jsonb,text,bigint,jsonb,jsonb) FROM PUBLIC;"
+    )
+    await install_admission_query_surface(scenario)
+    statements = [call.args[0] for call in scenario.connection.execute.await_args_list]
+    subset, admission = load_migration(), load_admission_seal_migration()
+    assert statements == [
+        subset._content_proof_valid_function_sql(scenario.schema),
+        expected_revoke,
+        admission._add_columns_sql(scenario.schema),
+        admission._digest_function_sql(scenario.schema),
+    ]
+    assert "SECURITY DEFINER" in statements[0] and "SET search_path = pg_catalog" in statements[0]

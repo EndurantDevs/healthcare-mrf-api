@@ -114,19 +114,25 @@ async def test_mrf_unfinalized_fixture_provisions_the_real_summary_model_and_ind
 async def test_mrf_fixture_publisher_gets_exact_guard_execute_without_code_membership():
     """Table ownership and the existing statement guard are independently enrolled."""
     session = SimpleNamespace(
-        scalars=AsyncMock(return_value=["issuer"]), execute=AsyncMock(), scalar=AsyncMock(return_value=False)
+        scalars=AsyncMock(return_value=["issuer", "log", "cms_native_input_revision"]),
+        execute=AsyncMock(),
+        scalar=AsyncMock(return_value=False),
     )
     await _transfer_destination_owner(session, "synthetic_destination", "synthetic_owner", "synthetic_publisher")
     statements = [str(call.args[0]) for call in session.execute.await_args_list]
     assert statements == [
         'ALTER SCHEMA "synthetic_destination" OWNER TO "synthetic_owner"',
         'ALTER TABLE "synthetic_destination"."issuer" OWNER TO "synthetic_owner"',
+        'ALTER TABLE "synthetic_destination"."log" OWNER TO "synthetic_publisher"',
+        'GRANT SELECT ON TABLE "synthetic_destination".cms_native_input_revision TO "synthetic_publisher"',
+        'GRANT INSERT(relation_oid,schema_name,table_name) ON TABLE "synthetic_destination".cms_native_input_revision TO "synthetic_publisher"',
         'GRANT EXECUTE ON FUNCTION "synthetic_destination".advance_reference_source_generation() TO "synthetic_publisher"',
+        'GRANT EXECUTE ON FUNCTION "synthetic_destination".cms_native_input_advance() TO "synthetic_publisher"',
     ]
-    assert session.scalar.call_args.args[1] == {
-        "role": "synthetic_publisher",
-        "function": '"synthetic_destination".advance_reference_source_generation()',
-    }
+    assert [call.args[1] for call in session.scalar.await_args_list] == [
+        {"role": "synthetic_publisher", "function": f'"synthetic_destination".{function}()'}
+        for function in ("advance_reference_source_generation", "cms_native_input_advance")
+    ]
 
 
 async def _provision_canonical_type(sessions):
@@ -204,15 +210,25 @@ async def _transfer_destination_owner(session, schema, owner, publisher_role):
     names = await session.scalars(
         text("SELECT tablename FROM pg_tables WHERE schemaname=:schema ORDER BY tablename"), {"schema": schema}
     )
+    functions = ["advance_reference_source_generation"]
     for name in names:
-        await session.execute(text(f'ALTER TABLE "{schema}"."{name}" OWNER TO "{owner}"'))
-    await session.execute(
-        text(f'GRANT EXECUTE ON FUNCTION "{schema}".advance_reference_source_generation() TO "{publisher_role}"')
-    )
-    assert not await session.scalar(
-        text("SELECT pg_has_role(:role,proowner,'MEMBER') FROM pg_proc WHERE oid=CAST(:function AS regprocedure)"),
-        {"role": publisher_role, "function": f'"{schema}".advance_reference_source_generation()'},
-    )
+        if name == "cms_native_input_revision":
+            await session.execute(text(f'GRANT SELECT ON TABLE "{schema}".{name} TO "{publisher_role}"'))
+            await session.execute(
+                text(
+                    f'GRANT INSERT(relation_oid,schema_name,table_name) ON TABLE "{schema}".{name} TO "{publisher_role}"'
+                )
+            )
+            functions.append("cms_native_input_advance")
+        else:
+            table_owner = publisher_role if name == initial.ImportLog.__tablename__ else owner
+            await session.execute(text(f'ALTER TABLE "{schema}"."{name}" OWNER TO "{table_owner}"'))
+    for function in functions:
+        await session.execute(text(f'GRANT EXECUTE ON FUNCTION "{schema}".{function}() TO "{publisher_role}"'))
+        assert not await session.scalar(
+            text("SELECT pg_has_role(:role,proowner,'MEMBER') FROM pg_proc WHERE oid=CAST(:function AS regprocedure)"),
+            {"role": publisher_role, "function": f'"{schema}".{function}()'},
+        )
 
 
 @asynccontextmanager
@@ -287,8 +303,10 @@ class _PublisherDatabase:
         self.session = session
         self.schema_name = schema_name
 
-    def transaction(self):
-        return self.session.begin()
+    @asynccontextmanager
+    async def transaction(self):
+        async with self.session.begin():
+            yield self.session
 
     def in_transaction(self):
         return self.session.in_transaction()
@@ -680,7 +698,18 @@ async def _assert_rolled_back_activation(
         )
 
 
+async def _assert_retained_activation_owner(session, activation_by_field):
+    """Retained activation keeps every heap and attached sequence with its sealed owner."""
+    retained_oids = [oid for _, oid in activation_by_field["ownership"].relation_oids]
+    retained_oids += [oid for _, oid, _, _ in activation_by_field["ownership"].sequence_oids]
+    assert await session.scalar(
+        text("SELECT bool_and(relowner=:owner) FROM pg_class WHERE oid=ANY(CAST(:oids AS oid[]))"),
+        {"owner": activation_by_field["owner_oid"], "oids": retained_oids},
+    )
+
+
 async def _assert_committed_activation(native, destination_schema, unrelated_schema, activation_by_field) -> None:
+    """Verify committed custody, predecessor data, and unrelated state survive the retained cut."""
     sessions = native.publisher
     async with sessions() as session, session.begin():
         receipt = await _activate(session, **activation_by_field)
@@ -691,6 +720,7 @@ async def _assert_committed_activation(native, destination_schema, unrelated_sch
         )
         assert adopted.serving_generation == activation_by_field["source_generation"]
         assert len(adopted.relation_oids) == 12
+        await _assert_retained_activation_owner(session, activation_by_field)
         assert await session.scalar(text(f'SELECT text FROM "{destination_schema}".log')) == "destination-v1"
         assert await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "source-v2"
         assert (
@@ -980,7 +1010,16 @@ async def _initialize_published_mrf_schema(session, schema_name):
         {"mrf_lineage_id": uuid4(), "address_lineage_id": uuid4()},
     )
     await install_source_generation_guards(await session.connection(), schema_name)
+    await _install_native_input_ledger(await session.connection(), schema_name)
     await session.commit()
+
+
+async def _install_native_input_ledger(connection, schema_name):
+    """Install the same revision authority required by ordinary native publication."""
+    directory = _MIGRATION_PATH.parent
+    await _run_migration(connection, schema_name, "upgrade", directory / "20260930120000_cms_native_input_revision.py")
+    counter = _migration_module(directory / "20261019130000_cms_archive_transaction_guard.py")
+    await connection.execute(text(counter._counter_sql(schema_name)))
 
 
 async def _stage_normal_mrf_family(session, schema_name, import_date, address_key):
@@ -1033,6 +1072,82 @@ async def _activate_manual_archive(sessions, destination_schema, manifest, owner
         )
 
 
+async def _assert_retained_mrf_publication_rejected(session, destination_schema):
+    """Inherited owner membership cannot bypass the ordinary writer's exact-owner boundary."""
+    before = await generation.read_reference_family_result_generation_authority(
+        session, importer_id="mrf", schema_name=destination_schema
+    )
+    before_oids = await generation.current_reference_family_relation_oids(
+        session, importer_id="mrf", schema_name=destination_schema
+    )
+    await session.commit()
+    with pytest.raises(RuntimeError, match="publication_read_access_custody_changed"):
+        await initial._publish_mrf_table_generation("20260921", destination_schema)
+    assert (
+        await generation.read_reference_family_result_generation_authority(
+            session, importer_id="mrf", schema_name=destination_schema
+        )
+        == before
+    )
+    assert (
+        await generation.current_reference_family_relation_oids(
+            session, importer_id="mrf", schema_name=destination_schema
+        )
+        == before_oids
+    )
+    assert await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "destination-v1"
+
+
+async def _assert_manual_mrf_publication_owner(sessions, ownership):
+    """The committed manual cut returns exactly its activated heaps and serials."""
+    activated_oids = [oid for _, oid in ownership.relation_oids]
+    activated_oids += [oid for _, oid, _, _ in ownership.sequence_oids]
+    async with sessions.begin() as session:
+        assert await session.scalar(
+            text(
+                "SELECT count(*)=:count AND bool_and(relowner=current_user::regrole::oid) "
+                "FROM pg_class WHERE oid=ANY(CAST(:oids AS oid[]))"
+            ),
+            {"count": len(activated_oids), "oids": activated_oids},
+        )
+
+
+async def _assert_manual_mrf_activation_rollback(sessions, destination_schema, manifest, ownership):
+    """A rolled-back manual cut also returns heap and sequence ownership to custody."""
+    async with sessions() as session, session.begin():
+        incumbent = await archive.capture_reference_family_incumbent(
+            session, importer_id="mrf", schema_name=destination_schema, canonical=True
+        )
+        before = await generation.read_reference_family_result_generation_authority(
+            session, importer_id="mrf", schema_name=destination_schema
+        )
+        await archive.activate_reference_family_stage(
+            session, ownership=ownership, manifest=manifest, expected_incumbent=incumbent, authority="manual"
+        )
+        await session.rollback()
+    async with sessions.begin() as session:
+        await archive.verify_reference_family_stage_ownership(session, ownership)
+        assert (
+            await archive.capture_reference_family_incumbent(
+                session, importer_id="mrf", schema_name=destination_schema, canonical=True
+            )
+            == incumbent
+        )
+        assert (
+            await generation.read_reference_family_result_generation_authority(
+                session, importer_id="mrf", schema_name=destination_schema
+            )
+            == before
+        )
+        oids = [oid for _, oid in ownership.relation_oids] + [oid for _, oid, _, _ in ownership.sequence_oids]
+        assert await session.scalar(
+            text(
+                "SELECT bool_and(relowner<>current_user::regrole::oid) FROM pg_class WHERE oid=ANY(CAST(:oids AS oid[]))"
+            ),
+            {"oids": oids},
+        )
+
+
 async def _run_interleaved_archive_cycle(
     engine,
     native,
@@ -1048,12 +1163,17 @@ async def _run_interleaved_archive_cycle(
         first_prepared,
         first_restored,
     )
-    await _activate_manual_archive(native.publisher, destination_schema, manifest, ownership)
-
     async with native.publisher() as session:
         monkeypatch.setattr(initial, "db", _PublisherDatabase(session, destination_schema))
         monkeypatch.setattr(initial, "get_import_schema", lambda *_args: destination_schema)
-        await _publish_normal_mrf_stage(session, destination_schema, "20260921", uuid4())
+        await _stage_normal_mrf_family(session, destination_schema, "20260921", uuid4())
+        await _assert_retained_mrf_publication_rejected(session, destination_schema)
+    await _assert_manual_mrf_activation_rollback(native.publisher, destination_schema, manifest, ownership)
+    await _activate_manual_archive(native.publisher, destination_schema, manifest, ownership)
+    await _assert_manual_mrf_publication_owner(native.publisher, ownership)
+    async with native.publisher() as session:
+        monkeypatch.setattr(initial, "db", _PublisherDatabase(session, destination_schema))
+        await initial._publish_mrf_table_generation("20260921", destination_schema)
     async with native.admin.begin() as session:
         await session.execute(text(f"UPDATE \"{source_schema}\".issuer SET issuer_name = 'source-v3'"))
 
@@ -1067,6 +1187,7 @@ async def _run_interleaved_archive_cycle(
         second_restored,
     )
     await _activate_manual_archive(native.publisher, destination_schema, manifest, ownership)
+    await _assert_manual_mrf_publication_owner(native.publisher, ownership)
 
 
 async def _initialize_interleaved_archive_source(monkeypatch, engine, sessions, source_schema, destination_schema):
@@ -1086,6 +1207,7 @@ async def _initialize_interleaved_archive_source(monkeypatch, engine, sessions, 
     await _complete_synthetic_publication(monkeypatch, engine, sessions, source_schema)
     async with sessions() as session, session.begin():
         await _create_canonical_address_source(await session.connection(), archive, destination_schema)
+        await _install_native_input_ledger(await session.connection(), destination_schema)
 
 
 async def _command(*args):

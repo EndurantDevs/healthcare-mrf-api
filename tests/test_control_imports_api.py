@@ -42,6 +42,7 @@ CONTROL_HEADERS = {"Authorization": "Bearer secret"}
 
 def authed_request(**kwargs):
     kwargs.setdefault("headers", CONTROL_HEADERS)
+    kwargs.setdefault("args", {})
     return types.SimpleNamespace(**kwargs)
 
 
@@ -1314,10 +1315,17 @@ async def test_enqueue_import_start_rejects_invalid_ptg_lane():
 
 @pytest.mark.asyncio
 async def test_enqueue_import_start_wraps_single_job_lifecycle(monkeypatch):
+    from api import nucc_source_control
+
+    @asynccontextmanager
+    async def legacy_source_action(_run_id):
+        yield None
+
+    monkeypatch.setattr(nucc_source_control, "source_action", legacy_source_action)
     calls = []
 
     class FakeJob:
-        job_id = "job_nucc"
+        job_id = "nucc_start_run_nucc"
 
     class FakeRedis:
         async def enqueue_job(self, *args, **kwargs):
@@ -1343,7 +1351,7 @@ async def test_enqueue_import_start_wraps_single_job_lifecycle(monkeypatch):
     assert args[1]["target_module"] == "process.nucc"
     assert args[1]["target_function"] == "process_data"
     assert args[1]["task"] == {"test_mode": True}
-    assert kwargs == {"_queue_name": "arq:NUCC"}
+    assert kwargs == {"_queue_name": "arq:NUCC", "_job_id": "nucc_start_run_nucc"}
 
 
 @pytest.mark.asyncio
@@ -1725,7 +1733,7 @@ async def test_remove_queued_job_refuses_unresolvable_identity(monkeypatch):
     create_pool = AsyncMock()
     monkeypatch.setattr(control_imports, "create_pool", create_pool)
 
-    outcome_by_field = await _remove_queued_job({"run_id": "run_exact", "importer": "nucc", "metrics": {}})
+    outcome_by_field = await _remove_queued_job({"run_id": "run_exact", "importer": "code-sets", "metrics": {}})
 
     assert outcome_by_field["identity_unavailable"] is True
     assert outcome_by_field["removed"] is False
@@ -1791,6 +1799,9 @@ def test_import_run_migration_mirrors_model(monkeypatch):
             "import_run_provider_directory_retry_child_idx",
             "import_run_mrf_discovery_retry_child_idx",
             "import_run_plan_pricing_idempotency_idx",
+            "import_run_registry_source_check_idempotency_idx",
+            "import_run_plan_pricing_retry_census_idx",
+            "import_run_ptg_membership_idempotency_idx",
         }
     }
     assert {name for name in recorder.indexes} == expected_model_indexes | {"import_run_active_idempotency_idx"}
@@ -1801,6 +1812,73 @@ def test_import_run_migration_mirrors_model(monkeypatch):
     assert str(idempotency_idx["postgresql_where"]) == (
         "status IN ('queued', 'starting', 'running', 'finalizing', 'canceling')"
     )
+
+
+def _load_membership_idempotency_migration():
+    path = Path(__file__).parents[1] / "alembic" / "versions" / "20261021110000_ptg_membership_import_idempotency.py"
+    spec = importlib.util.spec_from_file_location("migration_ptg_membership_idempotency", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    return migration
+
+
+def test_membership_idempotency_migration_mirrors_model(monkeypatch):
+    migration = _load_membership_idempotency_migration()
+    recorder = _OpRecorder()
+    drops = []
+    recorder.drop_index = lambda name, **options: drops.append((name, options))
+    monkeypatch.setattr(migration, "op", recorder)
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
+    index = next(
+        spec
+        for spec in ImportRun.__my_additional_indexes__
+        if spec["name"] == "import_run_ptg_membership_idempotency_idx"
+    )
+    assert index["unique"] is True
+    migration.upgrade()
+    created = recorder.indexes[index["name"]]
+    assert created["table"] == "import_run"
+    assert created["schema"] == "mrf"
+    assert created["unique"] is True
+    assert created["columns"] == list(index["index_elements"])
+    assert str(created["postgresql_where"]) == index["where"]
+    migration.downgrade()
+    assert drops == [(index["name"], {"table_name": "import_run", "schema": "mrf"})]
+
+
+@pytest.mark.parametrize("mismatch", [None, "columns", "predicate", "unique"])
+def test_membership_idempotency_migration_adopts_only_exact_index(monkeypatch, mismatch):
+    from dataclasses import replace
+
+    from db import migration_index_adoption
+
+    migration = _load_membership_idempotency_migration()
+    recorder = _OpRecorder()
+    monkeypatch.setattr(migration, "op", recorder)
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "membership_schema")
+    monkeypatch.setenv("DB_SCHEMA", "membership_schema")
+    shape = migration_index_adoption._fallback_expected_index_shape(
+        migration_index_adoption.IndexDefinition(
+            ("importer", "idempotency_key"),
+            predicate="importer = 'ptg-provider-membership-projection' AND idempotency_key IS NOT NULL",
+            unique=True,
+        ),
+        {},
+    )
+    if mismatch == "columns":
+        shape = replace(shape, key_columns=("idempotency_key", "importer"))
+    elif mismatch == "predicate":
+        shape = replace(shape, predicate="idempotency_key IS NOT NULL")
+    elif mismatch == "unique":
+        shape = replace(shape, unique=False)
+    monkeypatch.setattr(migration_index_adoption, "_existing_index_shape", lambda *_args: shape)
+    if mismatch:
+        with pytest.raises(RuntimeError, match="existing_schema_index_mismatch:membership_schema"):
+            migration.upgrade()
+    else:
+        migration.upgrade()
+    assert recorder.indexes == {}
 
 
 class _MigrationRows:
@@ -3473,7 +3551,12 @@ class _CancelDbUpdateRecorder:
         self.lookup_attempts = 0
 
     async def execute(self, statement):
-        self.update_parameters.append(statement.compile().params)
+        parameters = statement.compile().params
+        if "metrics" not in parameters:
+            metrics_expression = statement._values[ImportRun.__table__.c.metrics]
+            assert isinstance(metrics_expression, sa.sql.elements.Case)
+            parameters["metrics"] = metrics_expression.else_.clause.value
+        self.update_parameters.append(parameters)
         return _CancelUpdateResult()
 
     async def scalar(self, *_args, **_kwargs):
@@ -3481,6 +3564,8 @@ class _CancelDbUpdateRecorder:
         return None
 
     def merged_run(self, source_run: dict[str, object]) -> dict[str, object]:
+        # These fixtures exercise the non-pricing CASE branch; pricing has native coverage.
+        assert source_run.get("importer") not in control_imports.PRICING_IMPORTERS
         latest_update = self.update_parameters[-1]
         return {
             **source_run,

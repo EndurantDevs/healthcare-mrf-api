@@ -1079,6 +1079,61 @@ async def test_model_index_completion_preserves_expressions_predicates_and_legac
     assert table.schema == "source_schema"
 
 
+def _attribute_index_signature(statement, import_date):
+    """Compare real producer/clone definitions independently of staging names."""
+    normalized = " ".join(str(statement).replace('"', "").strip().removesuffix(";").split())
+    prefix, target = normalized.split(" ON ", 1)
+    relation, definition = target.split(" ", 1)
+    table_name = relation.rsplit(".", 1)[-1].removesuffix("_" + import_date)
+    return table_name, prefix.startswith("CREATE UNIQUE INDEX"), definition
+
+
+@pytest.mark.asyncio
+async def test_attribute_archive_keeps_the_ordinary_index_set(monkeypatch):
+    """All four producer indexes supplement retained PKs and the six additional indexes."""
+    from process import attributes as producer
+
+    schema, import_date = "synthetic_attributes", "20261018"
+    spec = archive.reference_family_spec("plan-attributes")
+    ordinary, created = [], []
+    monkeypatch.setitem(producer._TABLE_STATE_BY_KEY, "is_prepared", False)
+    monkeypatch.setattr(producer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(producer, "get_import_schema", lambda *_args: schema)
+    monkeypatch.setattr(producer.db, "status", AsyncMock(side_effect=ordinary.append))
+    monkeypatch.setattr(
+        producer.db, "create_table", AsyncMock(side_effect=lambda table, **_options: created.append(table))
+    )
+    await producer._prepare_attribute_tables({"import_date": import_date, "context": {}})
+    for model in spec.model_types:
+        stage = producer.make_class(model, import_date, schema_override=schema)
+        await producer._create_additional_indexes(model, stage, schema)
+    producer_indexes = [
+        statement for statement in ordinary if statement.startswith(("CREATE INDEX", "CREATE UNIQUE INDEX"))
+    ]
+    assert len(created) == len(spec.model_types) == 4
+    assert [tuple(table.primary_key.columns.keys()) for table in created] == [
+        tuple(model.__table__.primary_key.columns.keys()) for model in spec.model_types
+    ]
+    assert all(table.primary_key.columns for table in created)
+    assert len([statement for statement in producer_indexes if "_idx_primary ON " in statement]) == 4
+    assert len(producer_indexes) == 10
+    original_statements = [
+        str(archive.CreateTable(model.__table__).compile(dialect=archive.postgresql.dialect()))
+        for model in spec.model_types
+    ]
+    session = SimpleNamespace(execute=AsyncMock())
+    await archive._create_model_indexes(session, spec, schema)
+    clone_indexes = _model_ddl(session)
+    assert len(clone_indexes) == 10
+    assert sorted(_attribute_index_signature(statement, import_date) for statement in clone_indexes) == sorted(
+        _attribute_index_signature(statement, import_date) for statement in producer_indexes
+    )
+    assert [
+        str(archive.CreateTable(model.__table__).compile(dialect=archive.postgresql.dialect()))
+        for model in spec.model_types
+    ] == original_statements
+
+
 @pytest.mark.asyncio
 async def test_restore_defers_constraints_preserving_model_column_semantics():
     table = Table(

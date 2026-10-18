@@ -2,7 +2,7 @@
 """Preparation guards retain signed scope and creation-time storage ownership."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -18,6 +18,7 @@ from process import provider_directory_cms_desired_fence as desired
 from process import provider_directory_cms_native_inputs as native_inputs
 from process import provider_directory_cms_native_layout as layout
 from process import provider_directory_cms_preparation as preparation
+from process import provider_directory_generic_source_policy as source_policy
 from tests.test_entity_address_candidate_preparation_postgres import _inputs as _address_inputs
 from tests.test_provider_directory_cms_address import (
     _admission as _address_admission,
@@ -25,9 +26,7 @@ from tests.test_provider_directory_cms_address import (
 from tests.test_provider_directory_cms_address import (
     _factory as _address_factory,
 )
-from tests.test_provider_directory_cms_address import (
-    address_build_case,
-)
+from tests.test_provider_directory_cms_address import address_build_case as address_build_case
 from tests.test_provider_directory_cms_desired_fence import _fixture as _desired_fixture
 from tests.test_provider_directory_cms_native_projection import _query_inputs
 from tests.test_provider_directory_cms_preparation import (
@@ -36,8 +35,64 @@ from tests.test_provider_directory_cms_preparation import (
     _inputs,
     _prepare,
     _signed_lease,
-    emulate_only_in_memory_sql_backend,
 )
+from tests.test_provider_directory_cms_preparation import (
+    emulate_only_in_memory_sql_backend as emulate_only_in_memory_sql_backend,
+)
+
+
+@asynccontextmanager
+async def _archive_factory_scope(monkeypatch, database, events=None):
+    """Use real Source context guards over the existing explicit unit role catalog."""
+    from tests.provider_directory_source_postgres_support import NativeSourceFactory
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_publisher
+
+    events = events if events is not None else []
+    configured = source_policy.GenericSourcePolicy(
+        "test_schema", "source_owner", "source_publisher", ("source_reader",)
+    )
+    factory = NativeSourceFactory(database, configured)
+
+    @asynccontextmanager
+    async def transaction(requested_database, *, isolation):
+        assert requested_database is database and source_policy._FACTORY.get() is factory
+        assert source_policy._PUBLISHER.get() is None and database._transaction_binding() is None
+        events.append(("source-enter", asyncio.current_task()))
+        try:
+            with monkeypatch.context() as settings:
+                async with synthetic_source_publisher(
+                    settings, database, isolation=isolation, schema="test_schema"
+                ) as pair:
+                    pair[0].in_transaction = pair[0].is_in_transaction
+                    original_fetchval = pair[0].fetchval.side_effect
+
+                    def fetchval(query, *arguments):
+                        if query == (
+                            "SELECT relation.relowner=current_user::regrole AND current_user::text=$2 AND session_user::text=$3 "
+                            "FROM pg_class relation WHERE relation.oid=to_regclass($1)"
+                        ):
+                            return arguments == (
+                                '"test_schema"."address_archive_v2"',
+                                "source_owner",
+                                "source_publisher",
+                            ) and pair[0].fetchrow.return_value == dict(
+                                session="source_publisher", current="source_owner"
+                            )
+                        return original_fetchval(query, *arguments)
+
+                    pair[0].fetchval.side_effect = fetchval
+                    yield pair[0]
+        except BaseException:
+            events.append(("source-rollback", asyncio.current_task()))
+            raise
+        else:
+            events.append(("source-commit", asyncio.current_task()))
+        finally:
+            assert source_policy._PUBLISHER.get() is None and database._transaction_binding() is None
+
+    monkeypatch.setattr(factory, "transaction", transaction)
+    async with source_policy.bind_generic_source_transaction_factory(factory):
+        yield factory
 
 
 @asynccontextmanager
@@ -821,9 +876,15 @@ async def test_native_layout_rejects_catalog_drift_before_returning_fingerprint(
     else:
         indexes = [{"index_oid": 51}]
     backend = SimpleNamespace(
-        db=SimpleNamespace(all=AsyncMock(return_value=[])),
+        db=SimpleNamespace(
+            all=AsyncMock(return_value=[]),
+            first=AsyncMock(
+                return_value=dict(
+                    attributes=attributes, indexes=indexes, constraints=constraints, triggers=triggers, database_oid=9
+                )
+            ),
+        ),
         _profile_capacity_relation_row=AsyncMock(return_value=(relation_by_field, None)),
-        _profile_capacity_relation_catalog=AsyncMock(return_value=(attributes, indexes, constraints, triggers)),
         _pagination_checkpoint_row_mapping=lambda value: value,
     )
     with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
@@ -874,6 +935,20 @@ async def test_archive_read_seal_requires_exact_function_and_trigger(failure):
     assert backend.scalar.await_count == (1 if failure == "seal-function" else 2)
 
 
+async def test_archive_seal_reuses_the_exact_legacy_body_contract():
+    backend = SimpleNamespace(scalar=AsyncMock(side_effect=[51, True]))
+    await archive._assert_backend_seal(backend, "test_schema", 41)
+    owner_call, custody_call = backend.scalar.await_args_list
+    assert owner_call.kwargs == {"schema": "test_schema"}
+    assert "provider_directory_endpoint_dataset" in owner_call.args[0]
+    assert "NOT r.rolcanlogin" in owner_call.args[0] and "NOT r.rolsuper" in owner_call.args[0]
+    assert custody_call.kwargs == {"oid": 41, "schema": "test_schema", "owner_oid": 51}
+    assert "c.relowner=:owner_oid" in custody_call.args[0]
+    assert "pg_trigger" in custody_call.args[0] and "NOT tgisinternal" in custody_call.args[0]
+    assert "pg_rewrite" in custody_call.args[0] and "pg_inherits" in custody_call.args[0]
+    assert "has_table_privilege" in custody_call.args[0] and "has_any_column_privilege" in custody_call.args[0]
+
+
 @pytest.mark.parametrize("failure", ["name", "input-trigger", "identity", "constraint"])
 async def test_archive_layout_rejects_unowned_or_unsupported_catalog(failure):
     name = "cms_archive_" + "a" * 32 + ("_input" if failure == "input-trigger" else "_delta")
@@ -903,8 +978,9 @@ async def test_archive_cleanup_detects_replacement_after_lock_and_never_drops_it
     fake.db.status = AsyncMock()
     monkeypatch.setattr(archive, "_oid", AsyncMock(side_effect=[41, 42]))
     admission.retire_external_relation = AsyncMock()
-    with pytest.raises(RuntimeError, match="cleanup_identity_changed"):
-        await archive._cleanup(fake, admission, "test_schema", [("delta_stage", 41, "TABLE")])
+    async with _archive_factory_scope(monkeypatch, fake.db):
+        with pytest.raises(RuntimeError, match="cleanup_identity_changed"):
+            await archive._cleanup(fake, admission, "test_schema", [("delta_stage", 41, "TABLE")])
     assert not any("DROP" in call.args[0] for call in fake.db.status.await_args_list)
     admission.retire_external_relation.assert_not_awaited()
 
@@ -1080,7 +1156,7 @@ def test_query_only_source_vector_cannot_be_mutable():
 
 @pytest.mark.parametrize("failure", ["schema", "missing", "foreign-oid"])
 async def test_native_registration_requires_all_stages_created_by_its_scope(monkeypatch, failure):
-    native = candidate._native()
+    candidate._native()
     admission = _admission()
     scope = admitted._admitted_preparation(admission, admission.plan.native_address_input_hash)
     scope.db_schema = None if failure == "schema" else "test_schema"
@@ -1188,7 +1264,7 @@ async def test_owned_backend_lock_rechecks_each_creation_time_oid(monkeypatch):
     admission = _admission()
     scope = admitted._admitted_preparation(admission, admission.plan.native_address_input_hash)
     scope.db_schema, scope.owned_oids = "test_schema", {"stage_a": 41}
-    database = SimpleNamespace(status=AsyncMock(), scalar=AsyncMock(return_value=42))
+    database = SimpleNamespace(status=AsyncMock(), all=AsyncMock(return_value=[("test_schema.stage_a", 42)]))
     token = admitted._ADMISSION.set(scope)
     try:
         with pytest.raises(RuntimeError, match="owned stage changed"):
@@ -1303,12 +1379,17 @@ async def test_native_revision_guard_cannot_substitute_for_registration(monkeypa
     }
     monkeypatch.setattr(native_inputs, "_require_ledger_guards", AsyncMock())
     results = [
+        SimpleNamespace(),  # Empty SELECT pins the native ledger before catalog reads.
         SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: [guard_by_field])),
         SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: [])),
     ]
     session = SimpleNamespace(execute=AsyncMock(side_effect=results))
     with pytest.raises(RuntimeError, match="native_input_not_registered"):
         await native_inputs._revision_guards(session, "test_schema", {"input": {"relation_oid": 41}})
+
+    assert str(session.execute.await_args_list[0].args[0]) == (
+        'SELECT relation_oid FROM "test_schema"."cms_native_input_revision" WHERE FALSE'
+    )
 
 
 def test_native_evidence_heap_declarations_include_exact_shard_and_location_keys():
@@ -1449,7 +1530,7 @@ async def test_archive_apply_requires_write_intent_and_exact_revision_increment(
         _q=lambda name: '"' + name + '"',
     )
     prepared.assert_ready = AsyncMock()
-    monkeypatch.setattr(archive, "_revision", AsyncMock(return_value=1))
+    prepared._applied_backend_identity = AsyncMock(return_value=(None, None, None, (1,)))
     with pytest.raises(RuntimeError, match="write_lock_required|publication_revision_changed"):
         await prepared.apply(backend, session)
     if failure == "write-lock":
@@ -1465,6 +1546,115 @@ async def test_archive_unknown_read_transport_cannot_claim_transaction_ownership
         archive._require_backend(SimpleNamespace(_transaction_binding=lambda: object()))
 
 
+@asynccontextmanager
+async def _archive_applied_owner_case(monkeypatch):
+    from db.connection import Database
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_publisher
+
+    prepared, database = _archive_delta(_admission()), Database()
+    case = SimpleNamespace(
+        prepared=prepared,
+        database=database,
+        row=["source_publisher", "source_owner", 17, "23", 71, "(0,1)", "21", 0],
+        after_insert=None,
+    )
+    async with synthetic_source_publisher(monkeypatch, database, schema="test_schema") as (connection, _events):
+        case.session = case.connection = connection
+        case.fhir = SimpleNamespace(
+            db=database, _unscoped_qt=lambda schema, name: schema + "." + name, _q=lambda name: '"' + name + '"'
+        )
+        original_execute = connection.execute
+
+        async def execute(statement, *_args):
+            if str(statement).lstrip().startswith("INSERT INTO"):
+                case.row[5:] = ["(0,2)", "31", 2]
+                if case.after_insert is not None:
+                    case.after_insert()
+                return
+            await original_execute(statement)
+
+        async def fetchrow(query, *_args):
+            if "tableoid::bigint,ctid::text,xmin::text,revision" in query:
+                return tuple(case.row)
+            return connection.fetchrow.return_value
+
+        connection.execute = AsyncMock(side_effect=execute)
+        connection.fetchrow.side_effect = fetchrow
+        connection.in_transaction = lambda: True
+        connection.scalar = AsyncMock(return_value=True)
+        database.scalar = AsyncMock(side_effect=lambda *_args, **_kwargs: case.row[6] == case.row[3])
+        prepared.assert_ready = AsyncMock()
+        prepared._assert_backend_identity = AsyncMock()
+        yield case
+
+
+@contextmanager
+def _changed_archive_origin(monkeypatch, case, change):
+    tokens = []
+    if change in {"backend", "transaction", "row", "row_xmin", "table", "publisher_role", "owner_role"}:
+        column, replacement = {
+            "backend": (2, 18),
+            "transaction": (3, "24"),
+            "row": (5, "(0,3)"),
+            "row_xmin": (6, "32"),
+            "table": (4, 72),
+            "publisher_role": (0, "another_publisher"),
+            "owner_role": (1, "another_owner"),
+        }[change]
+        case.row[column] = replacement
+    elif change == "publisher":
+        publisher = replace(source_policy.bound_publisher())
+        tokens = [
+            (source_policy._PUBLISHER, source_policy._PUBLISHER.set(publisher)),
+            (source_policy._OWNER, source_policy._OWNER.set((publisher, case.session))),
+        ]
+    elif change == "session":
+        tokens = [(source_policy._OWNER, source_policy._OWNER.set((source_policy.bound_publisher(), object())))]
+    elif change == "connection":
+        monkeypatch.setattr(archive, "_copy_driver", AsyncMock(return_value=object()))
+    try:
+        yield
+    finally:
+        for variable, token in reversed(tokens):
+            variable.reset(token)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        "backend",
+        "transaction",
+        "row",
+        "row_xmin",
+        "table",
+        "publisher_role",
+        "owner_role",
+        "publisher",
+        "session",
+        "connection",
+    ],
+)
+async def test_archive_applied_owner_keeps_subtransaction_row_and_exact_origin(monkeypatch, change):
+    async with _archive_applied_owner_case(monkeypatch) as case:
+        await case.prepared.apply(case.fhir, case.session)
+        assert case.row[6] != case.row[3]
+        with _changed_archive_origin(monkeypatch, case, change):
+            if change is None:
+                await case.prepared.assert_applied_backend(case.database)
+            else:
+                with pytest.raises(RuntimeError, match="applied_owner_changed"):
+                    await case.prepared.assert_applied_backend(case.database)
+
+
+@pytest.mark.parametrize("changed_column", [2, 3])
+async def test_archive_apply_cannot_record_a_replacement_backend_or_transaction(monkeypatch, changed_column):
+    async with _archive_applied_owner_case(monkeypatch) as case:
+        case.after_insert = lambda: case.row.__setitem__(changed_column, 18 if changed_column == 2 else "24")
+        with pytest.raises(RuntimeError, match="applied_owner_changed"):
+            await case.prepared.apply(case.fhir, case.session)
+
+
 async def test_archive_missing_owned_heap_retires_registration_without_drop(monkeypatch):
     fake, *_ = _fake_fhir([])
     admission = await _started_admission()
@@ -1472,7 +1662,8 @@ async def test_archive_missing_owned_heap_retires_registration_without_drop(monk
     admission._external_relations.add(("test_schema", "delta_stage"))
     fake.db.status = AsyncMock()
     monkeypatch.setattr(archive, "_oid", AsyncMock(return_value=None))
-    await archive._cleanup(fake, admission, "test_schema", [("delta_stage", 41, "TABLE")])
+    async with _archive_factory_scope(monkeypatch, fake.db):
+        await archive._cleanup(fake, admission, "test_schema", [("delta_stage", 41, "TABLE")])
     assert not admission._relations and not admission._external_relations
     fake.db.status.assert_not_awaited()
 
@@ -1659,6 +1850,13 @@ async def test_native_registration_preserves_absent_inputs_and_requires_revision
 
     async def execute(statement, parameters=None):
         sql = str(statement)
+        if "unnest(CAST(:relation_names AS text[])) WITH ORDINALITY" in sql:
+            assert parameters == {
+                "schema_name": "test_schema",
+                "relation_names": ["doctor_clinician_address", "cms_doctor_education", "cms_doctor_group_site"],
+            }
+            assert "ORDER BY ordinal" in sql
+            return SimpleNamespace(all=lambda: [(name, None) for name in parameters["relation_names"]])
         if "unnest(CAST(:names AS text[]))" in sql:
             return SimpleNamespace(mappings=lambda: relations)
         if "SELECT to_regclass(:name)" in sql:
@@ -1668,8 +1866,10 @@ async def test_native_registration_preserves_absent_inputs_and_requires_revision
         raise AssertionError("unexpected registration statement: " + sql)
 
     session = SimpleNamespace(execute=AsyncMock(side_effect=execute))
-    with pytest.raises(RuntimeError, match="native_revision_ledger_unavailable"):
+    with pytest.raises(RuntimeError, match="reference family serving relations are unavailable"):
         await native_inputs.register_native_address_inputs(session, "test_schema")
+    with pytest.raises(RuntimeError, match="native_revision_ledger_unavailable"):
+        await native_inputs._require_ledger_guards(session, "test_schema")
     assert all(
         not str(call.args[0]).lstrip().startswith(("LOCK TABLE", "INSERT", "CREATE", "ALTER"))
         for call in session.execute.await_args_list
@@ -1683,13 +1883,18 @@ async def test_index_free_native_heap_preserves_catalog_fingerprint():
         "relation_oid": 41,
         "schema_name": "test_schema",
         "relation_name": name,
+        "relpersistence": "u",
         "effective_tablespace_oid": 42,
     }
     fhir = admitted._fhir()
     backend = SimpleNamespace(
-        db=SimpleNamespace(all=AsyncMock(), scalar=AsyncMock(return_value=9)),
+        db=SimpleNamespace(
+            all=AsyncMock(),
+            scalar=AsyncMock(return_value=9),
+            first=AsyncMock(return_value=dict(attributes=[], indexes=[], constraints=[], triggers=[], database_oid=9)),
+        ),
         _profile_capacity_relation_row=AsyncMock(return_value=(relation_by_field, None)),
-        _profile_capacity_relation_catalog=AsyncMock(return_value=([], [], [], [])),
+        _pagination_checkpoint_row_mapping=lambda value: value,
         _profile_capacity_tablespaces=fhir._profile_capacity_tablespaces,
         _identity_hash=fhir._identity_hash,
     )
@@ -1709,7 +1914,7 @@ async def test_index_free_native_heap_preserves_catalog_fingerprint():
 
 
 @pytest.mark.parametrize("failure", [None, "table-replaced", "view-replaced", "view-absent"])
-async def test_archive_cleanup_drops_owned_relations_and_records_replacements_once(failure):
+async def test_archive_cleanup_drops_owned_relations_and_records_replacements_once(failure, monkeypatch):
     fake, *_ = _fake_fhir([])
     admission = await _started_admission()
     admission._relations[("test_schema", "delta_stage")] = 41
@@ -1731,8 +1936,9 @@ async def test_archive_cleanup_drops_owned_relations_and_records_replacements_on
 
     fake.db.scalar, fake.db.status = AsyncMock(side_effect=scalar), AsyncMock(side_effect=status)
     identities = [("delta_stage", 41, "TABLE"), ("effective_view", 42, "VIEW")]
-    await archive._cleanup(fake, admission, "test_schema", identities)
-    await archive._cleanup(fake, admission, "test_schema", identities)
+    async with _archive_factory_scope(monkeypatch, fake.db):
+        await archive._cleanup(fake, admission, "test_schema", identities)
+        await archive._cleanup(fake, admission, "test_schema", identities)
     if failure == "table-replaced":
         assert relation_oids_by_name == {"test_schema.delta_stage": 51}
         assert admission.cleanup_preserved == [("test_schema", "delta_stage")]
@@ -1746,7 +1952,7 @@ async def test_archive_cleanup_drops_owned_relations_and_records_replacements_on
     assert not any("CASCADE" in call.args[0] for call in fake.db.status.await_args_list)
 
 
-async def test_cancelled_archive_cleanup_finishes_owned_drop_and_retirement_before_propagating():
+async def test_cancelled_archive_cleanup_finishes_owned_drop_and_retirement_before_propagating(monkeypatch):
     fake, *_ = _fake_fhir([])
     admission = await _started_admission()
     admission._relations[("test_schema", "delta_stage")] = 41
@@ -1762,20 +1968,21 @@ async def test_cancelled_archive_cleanup_finishes_owned_drop_and_retirement_befo
             heap_presence_flags[0] = False
 
     fake.db.status = AsyncMock(side_effect=status)
-    owner = asyncio.create_task(archive._cleanup(fake, admission, "test_schema", [("delta_stage", 41, "TABLE")]))
-    try:
-        await asyncio.wait_for(entered.wait(), timeout=2)
-        owner.cancel()
-        await asyncio.sleep(0)
-        assert not owner.done() and heap_presence_flags[0]
-    finally:
-        release.set()
-        if not owner.done() and not owner.cancelling():
-            owner.cancel()
+    async with _archive_factory_scope(monkeypatch, fake.db):
+        owner = asyncio.create_task(archive._cleanup(fake, admission, "test_schema", [("delta_stage", 41, "TABLE")]))
         try:
-            await asyncio.wait_for(owner, timeout=2)
-        except asyncio.CancelledError:
-            assert owner.done()
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            owner.cancel()
+            await asyncio.sleep(0)
+            assert not owner.done() and heap_presence_flags[0]
+        finally:
+            release.set()
+            if not owner.done() and not owner.cancelling():
+                owner.cancel()
+            try:
+                await asyncio.wait_for(owner, timeout=2)
+            except asyncio.CancelledError:
+                assert owner.done()
     assert owner.cancelled()
     assert not heap_presence_flags[0] and not admission._relations and not admission._external_relations
 
@@ -1804,8 +2011,8 @@ async def _archive_catalog_response(statement, parameters):
         "pg_relation_filenode": 51,
         "pg_get_viewdef": "SELECT archive",
         "SELECT revision": 0,
-        "FROM pg_proc p JOIN pg_language": 61,
-        "SELECT count(*)=1": True,
+        "SELECT r.oid::bigint FROM pg_class": 61,
+        "SELECT c.relowner=:owner_oid": True,
     }
     scalar_response = next((scalar for query, scalar in scalars_by_query.items() if query in sql), None)
     if "to_regclass(:name)" in sql:
@@ -1819,7 +2026,7 @@ async def _archive_catalog_response(statement, parameters):
 
 
 @pytest.mark.parametrize("phase", ["build", "changed-build", "cutover", "profile"])
-async def test_archive_build_verifies_rows_and_handoff_verifies_catalog(phase):
+async def test_archive_build_verifies_rows_and_handoff_verifies_catalog(phase, monkeypatch):
     """Reject changed build rows, retain catalog checks at handoff, and close every row stream."""
     fake, *_ = _fake_fhir([])
     admission = _admission()
@@ -1833,7 +2040,7 @@ async def test_archive_build_verifies_rows_and_handoff_verifies_catalog(phase):
 
     connection = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(side_effect=_archive_catalog_response))
     database = archive.ConnectionProxy(None, connection, None)
-    database._transaction_binding = lambda: SimpleNamespace(session=database)
+    database._transaction_binding = lambda: None
     database.in_transaction = lambda: True
     database.stream = AsyncMock(side_effect=stream)
     fake.db = database
@@ -1843,18 +2050,207 @@ async def test_archive_build_verifies_rows_and_handoff_verifies_catalog(phase):
     active_token = preparation._ACTIVE.set(admission)
     capacity_token = fake._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(object() if phase == "profile" else None)
     try:
-        if phase == "changed-build":
-            with pytest.raises(RuntimeError, match="archive_preparation_changed"):
-                await prepared.assert_ready(fake)
-        else:
-            await prepared.assert_ready(fake, cutover=phase == "cutover")
-        assert len(streams) == (2 if phase in {"build", "changed-build"} else 1)
-        assert all(stream_result.closed for stream_result in streams)
-        assert not prepared.committed
-        assert not any(
-            str(call.args[0]).lstrip().startswith(("INSERT", "UPDATE", "DELETE", "DROP"))
-            for call in connection.execute.await_args_list
-        )
+        async with _archive_factory_scope(monkeypatch, database):
+            if phase == "changed-build":
+                with pytest.raises(RuntimeError, match="archive_preparation_changed"):
+                    await prepared.assert_ready(fake)
+            else:
+                await prepared.assert_ready(fake, cutover=phase == "cutover")
+            assert len(streams) == (2 if phase in {"build", "changed-build"} else 1)
+            assert all(stream_result.closed for stream_result in streams)
+            assert not prepared.committed
+            assert not any(
+                str(call.args[0]).lstrip().startswith(("INSERT", "UPDATE", "DELETE", "DROP"))
+                for call in connection.execute.await_args_list
+            )
     finally:
         fake._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(capacity_token)
         preparation._ACTIVE.reset(active_token)
+
+
+async def _assert_archive_source_context(case):
+    publisher = source_policy.bound_publisher()
+    assert publisher.task is asyncio.current_task()
+    assert source_policy.source_copy_session() is case.db._transaction_binding().session
+    assert await publisher.connection.fetchrow() == {"session": "source_publisher", "current": "source_owner"}
+    assert preparation._ACTIVE.get() is case.admission and case.budget.get() == "bounded"
+
+
+async def _archive_unit_scalar(case, _statement, **parameters):
+    await _assert_archive_source_context(case)
+    name = parameters.get("name") or parameters["relation_ref"]
+    return case.relations.get(name.split(".")[-1])
+
+
+async def _archive_unit_oid(case, database, schema, name):
+    assert database is case.db and schema == "test_schema"
+    await _assert_archive_source_context(case)
+    return case.relations.get(name)
+
+
+async def _archive_unit_status(case, statement):
+    await _assert_archive_source_context(case)
+    case.events.append((statement, asyncio.current_task()))
+    if statement.startswith("DROP "):
+        del case.relations[statement.split(" ", 2)[2].split(".")[-1]]
+
+
+async def _archive_unit_seed(case, fhir, admission, schema, input_name, delta_name, identities, options):
+    await _assert_archive_source_context(case)
+    assert fhir is case.fhir and admission is case.admission and options["source_ids"] == ["synthetic"]
+    for name, oid in ((input_name, 40), (delta_name, 41)):
+        case.relations[name] = oid
+        identities.append((name, oid, "TABLE"))
+        admission._relations[(schema, name)] = oid
+        admission._external_relations.add((schema, name))
+    return 41
+
+
+async def _archive_unit_enrich(case, *_args):
+    await _assert_archive_source_context(case)
+    case.events.append(("enrich-enter", asyncio.current_task()))
+    if case.failure == "enrich":
+        raise RuntimeError("synthetic enrichment")
+    if case.failure == "cancel":
+        raise asyncio.CancelledError
+    return {"rows": 0}
+
+
+async def _archive_unit_seal(case, fhir, admission, schema, delta_name, effective_name, identities):
+    await _assert_archive_source_context(case)
+    assert fhir is case.fhir and admission is case.admission and schema == "test_schema"
+    assert case.relations[delta_name] == 41
+    case.relations[effective_name] = 42
+    identities.append((effective_name, 42, "VIEW"))
+    return 51, 42, "SELECT archive"
+
+
+async def _archive_unit_ready(_prepared, fhir, **_options):
+    await _assert_archive_source_context(fhir.archive_case)
+
+
+@asynccontextmanager
+async def _archive_unit_limits(fhir):
+    await _assert_archive_source_context(fhir.archive_case)
+    fhir.archive_case.events.append(("limits-enter", asyncio.current_task()))
+    yield
+    fhir.archive_case.events.append(("limits-exit", asyncio.current_task()))
+
+
+def _ordinary_archive_case(monkeypatch, failure=None):
+    from contextvars import ContextVar
+    from functools import partial
+
+    from db.connection import Database
+
+    case = SimpleNamespace(
+        db=Database(),
+        admission=_admission(),
+        events=[],
+        relations={"address_archive_v2": 43},
+        failure=failure,
+        budget=ContextVar("archive_unit_budget"),
+    )
+    case.fhir = SimpleNamespace(db=case.db, archive_case=case, _unscoped_qt=lambda schema, name: schema + "." + name)
+    case.admission._started = True
+    case.admission.assert_ready = AsyncMock()
+    case.db.status = AsyncMock(side_effect=partial(_archive_unit_status, case))
+    case.db.scalar = AsyncMock(side_effect=partial(_archive_unit_scalar, case))
+    for name, callback in (
+        ("_oid", partial(_archive_unit_oid, case)),
+        ("_columns", AsyncMock(return_value=("address_key",))),
+        ("_revision", AsyncMock(return_value=0)),
+        ("_digest", AsyncMock(return_value=(0, "d" * 64))),
+        ("_seed_delta", partial(_archive_unit_seed, case)),
+        ("_enrich_delta", partial(_archive_unit_enrich, case)),
+        ("_seal_delta", partial(_archive_unit_seal, case)),
+    ):
+        monkeypatch.setattr(archive, name, callback)
+    monkeypatch.setattr(archive.PreparedArchiveDelta, "assert_ready", _archive_unit_ready)
+    monkeypatch.setattr(preparation, "active_nonprofile_sql_transaction", _archive_unit_limits)
+    return case
+
+
+@pytest.mark.parametrize("failure", [None, "enrich", "cancel"])
+async def test_archive_ordinary_database_uses_issued_source_lifecycle(monkeypatch, failure):
+    """Factory-only entry owns preparation; cleanup gets a fresh child and retains budgets."""
+    from db.connection import Database
+
+    case = _ordinary_archive_case(monkeypatch, failure)
+    assert type(case.db) is Database and case.db.transaction.__func__ is Database.transaction
+    active = preparation._ACTIVE.set(case.admission)
+    budget = case.budget.set("bounded")
+    parent = asyncio.current_task()
+    try:
+        async with _archive_factory_scope(monkeypatch, case.db, case.events):
+            if failure:
+                expected = asyncio.CancelledError if failure == "cancel" else RuntimeError
+                with pytest.raises(expected, match="synthetic enrichment" if failure == "enrich" else None):
+                    await archive.prepare_archive_delta(case.fhir, "test_schema", source_ids=["synthetic"])
+            else:
+                prepared, metrics = await archive.prepare_archive_delta(
+                    case.fhir, "test_schema", source_ids=["synthetic"]
+                )
+                assert metrics == {"rows": 0}
+                await prepared.cleanup(case.fhir)
+        transitions = [(kind, task) for kind, task in case.events if kind.startswith("source-")]
+        assert [(kind, task) for kind, task in case.events if kind == "enrich-enter"] == [("enrich-enter", parent)]
+        assert transitions[0] == ("source-enter", parent)
+        assert transitions[1] == ("source-rollback" if failure else "source-commit", parent)
+        assert all(task is not parent for _kind, task in transitions[2:])
+        assert case.relations == {"address_archive_v2": 43}
+        assert not case.admission._relations and not case.admission._external_relations
+        assert case.db._transaction_binding() is None and source_policy._PUBLISHER.get() is None
+        assert case.db.transaction.__func__ is Database.transaction
+    finally:
+        case.budget.reset(budget)
+        preparation._ACTIVE.reset(active)
+
+
+@pytest.mark.parametrize("operation", ["prepare", "cleanup"])
+@pytest.mark.parametrize("authority", ["missing", "active"])
+async def test_archive_source_refusal_precedes_io(monkeypatch, operation, authority):
+    """An absent factory or still-active original owner cannot enter archive SQL."""
+    case = _ordinary_archive_case(monkeypatch)
+
+    async def refuse():
+        token = preparation._ACTIVE.set(case.admission)
+        try:
+            with pytest.raises(RuntimeError, match="source_factory_required|source_transaction_active"):
+                if operation == "prepare":
+                    await archive.prepare_archive_delta(case.fhir, "test_schema")
+                else:
+                    await archive._cleanup(case.fhir, case.admission, "test_schema", [("delta", 41, "TABLE")])
+        finally:
+            preparation._ACTIVE.reset(token)
+
+    if authority == "active":
+        async with _archive_factory_scope(monkeypatch, case.db):
+            async with source_policy.source_transaction(case.db):
+                await refuse()
+    else:
+        await refuse()
+    case.db.scalar.assert_not_awaited()
+    case.db.status.assert_not_awaited()
+
+
+async def test_archive_cleanup_rechecks_factory_before_child_io(monkeypatch):
+    """A policy changed after parent preflight cannot open the cleanup Source actor."""
+    case = _ordinary_archive_case(monkeypatch)
+    async with _archive_factory_scope(monkeypatch, case.db, case.events) as factory:
+        original = factory._require_current_policy
+        enrolled = factory.policy
+
+        def invalidate_after_first_check():
+            original()
+            factory.policy = replace(enrolled)
+
+        monkeypatch.setattr(factory, "_require_current_policy", invalidate_after_first_check)
+        try:
+            with pytest.raises(AssertionError):
+                await archive._cleanup(case.fhir, case.admission, "test_schema", [("delta", 41, "TABLE")])
+        finally:
+            factory.policy = enrolled
+    assert case.events == []
+    case.db.scalar.assert_not_awaited()
+    case.db.status.assert_not_awaited()

@@ -268,7 +268,6 @@ async def test_actual_prepared_results_consumes_actual_bundle_helper_inside_sour
     prepared = SimpleNamespace(stages=(stage,), profile_delta=None, nonprofile_admission=None)
     monkeypatch.setattr(publication.coverage, "assert_sealed_cms_candidate_coverage", AsyncMock())
     monkeypatch.setattr(publication, "_seal_published_coverage", AsyncMock())
-    monkeypatch.setattr(publication, "_lock_live_swap_relations", AsyncMock())
     monkeypatch.setattr(publication, "_receipt_payload", Mock(return_value={"synthetic": True}))
     monkeypatch.setattr(
         publication.receipts, "capture_native_dependencies", AsyncMock(return_value={"synthetic": True})
@@ -283,10 +282,22 @@ async def test_actual_prepared_results_consumes_actual_bundle_helper_inside_sour
     monkeypatch.setattr(fhir.profile_initial, "lock_metadata", AsyncMock())
     monkeypatch.setattr(fhir, "_lock_provider_directory_artifact_bundle_targets", AsyncMock())
     monkeypatch.setattr(fhir, "_reserve_provider_directory_artifact_cutover_budget", AsyncMock(return_value=None))
+    copy_driver = AsyncMock(side_effect=lambda session: session.bind.driver)
+    preserve_reads = AsyncMock()
+    monkeypatch.setattr(publication, "_copy_driver", copy_driver)
+    monkeypatch.setattr(publication, "preserve_publication_reads", preserve_reads)
 
-    async def apply(stages, schema, relations, profile_delta, active_fence, timeout, *, before_swaps):
+    async def apply(
+        stages, schema, relations, profile_delta, active_fence, timeout, *, before_swaps, extra_live_relations
+    ):
         assert custody.current_owned_wal_transaction(database) is not None
+        assert extra_live_relations == ("target",)
         await before_swaps()
+        session = database._transaction_binding().session
+        copy_driver.assert_awaited_once_with(session)
+        preserve_reads.assert_awaited_once_with(
+            session.bind.driver, schema="synthetic", live_table="target", stage_table="scratch"
+        )
         await database.status("UPDATE synthetic_target SET generation_id='new';")
 
     monkeypatch.setattr(fhir, "_apply_locked_provider_directory_artifact_bundle", apply)
@@ -462,3 +473,68 @@ async def test_commit_cancellation_recovers_receipt_despite_retirement_error(sou
         monkeypatch.setattr(custody, "_terminate_owned_driver", original_terminate)
         connection = state.connections[0]
         await custody._retire_owned_connection(connection, connection.driver, custody.OwnedWalTransaction())
+
+
+@pytest.mark.parametrize("capture_id", [None, CAPTURE_ID])
+async def test_source_final_selects_rc_before_original_body_and_retains_factory(source_wave, monkeypatch, capture_id):
+    from process import provider_directory_cms_publication_custody as wal
+    from process import provider_directory_generic_source_policy as policy
+
+    state, _, _, factory, _ = source_wave
+    events = []
+    original_execute, original_body = SourceSession.execute, wal.source_body
+
+    async def execute(session, statement, parameters=None):
+        events.append(str(statement))
+        return await original_execute(session, statement, parameters)
+
+    @asynccontextmanager
+    async def body(*args):
+        events.append("original-body")
+        async with original_body(*args) as group:
+            yield group
+
+    @asynccontextmanager
+    async def bind(database, session, *, isolation):
+        assert isolation == "read committed" and session is database._transaction_binding().session
+        events.append("authenticated-rc")
+        yield session
+
+    @asynccontextmanager
+    async def publication_body(database):
+        yield database._transaction_binding().session
+
+    monkeypatch.setattr(policy, "source_publication_body", publication_body)
+    trusted_factory = SimpleNamespace(
+        transaction=lambda: None, bind_existing_transaction=bind, publication_session_factory=lambda: None
+    )
+    monkeypatch.setattr(SourceSession, "execute", execute)
+    monkeypatch.setattr(wal, "source_body", body)
+    async with policy.bind_generic_source_transaction_factory(trusted_factory):
+        await write_publication(source_wave, capture_id=capture_id)
+    assert events.index("original-body") < events.index("authenticated-rc")
+    if capture_id is None:
+        assert events[0] == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    else:
+        assert state.connections[0].events.index("isolation:READ COMMITTED") < state.connections[0].events.index(
+            "begin"
+        )
+    assert not any("REPEATABLE READ" in event for event in events)
+    assert source_group(source_wave)["identity"][1] is factory
+
+
+async def test_retention_capture_keeps_rr_before_native_begin(source_wave):
+    state, _, _, factory, _ = source_wave
+    async with capture.registry_cms_capture_transaction(factory, capture_id=CAPTURE_ID) as session:
+        assert session is not None
+    events = state.connections[0].events
+    assert events.index("isolation:REPEATABLE READ") < events.index("begin")
+    assert "isolation:READ COMMITTED" not in events
+
+
+async def test_capture_refuses_unknown_isolation_before_opening(source_wave):
+    state, _, _, factory, _ = source_wave
+    with pytest.raises(ValueError, match="capture_isolation_invalid"):
+        async with capture.registry_cms_capture_transaction(factory, capture_id=CAPTURE_ID, isolation="serializable"):
+            pytest.fail("unsupported capture mode admitted")
+    assert state.connections == []

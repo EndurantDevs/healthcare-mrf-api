@@ -42,9 +42,7 @@ async def test_combined_page_preserves_conservative_total_exactness(monkeypatch,
     }
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("page_sizes", [(12,), (25,), (50,), (50, 12, 25)])
-async def test_combined_distance_pages_preserve_ties_sources_rates_and_scores(monkeypatch, page_sizes):
+def _network_rows():
     network_rows = [
         [
             {
@@ -61,54 +59,68 @@ async def test_combined_distance_pages_preserve_ties_sources_rates_and_scores(mo
         for network in range(4)
     ]
 
+    return network_rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_sizes", [(12,), (25,), (50,), (50, 12, 25)])
+async def test_combined_distance_pages_preserve_ties_sources_rates_and_scores(monkeypatch, page_sizes):
+    network_rows = _network_rows()
+
     async def read_networks(_session, networks, _args, pagination, _selection):
         return [
             (
                 source,
                 snapshot,
                 {
-                    "items": rows[: pagination.limit],
-                    "pagination": {"total": len(rows), "total_is_exact": True},
+                    "items": provider_rows[: pagination.limit],
+                    "pagination": {"total": len(provider_rows), "total_is_exact": True},
                     "query": {"code": "99213"},
                 },
             )
-            for (source, snapshot), rows in zip(networks, network_rows)
+            for (source, snapshot), provider_rows in zip(networks, network_rows)
         ]
 
     monkeypatch.setattr(serving, "_read_multi_ptg2_snapshots", read_networks)
     networks = [(f"source-{index}", f"snapshot-{index}") for index in range(4)]
-    args = {"lat": 40, "long": -80, "order_by": "distance", "order": "asc"}
-    collected = []
+    args_by_name = {"lat": 40, "long": -80, "order_by": "distance", "order": "asc"}
+    collected_rows = []
     page_index = 0
     while True:
         page_size = page_sizes[page_index % len(page_sizes)]
         page_index += 1
         response = await serving._search_multi_ptg2_snapshots(
-            object(), networks, args, SimpleNamespace(offset=len(collected), limit=page_size)
+            object(), networks, args_by_name, SimpleNamespace(offset=len(collected_rows), limit=page_size)
         )
-        collected.extend(response["items"])
+        collected_rows.extend(response["items"])
         assert response["pagination"]["total_is_exact"] is True
         if not response["pagination"]["has_more"]:
             break
     # Independent ordering includes every attributable source row and both prices.
     expected = sorted(
-        (dict(row, network=row["source_key"]) for rows in network_rows for row in rows),
-        key=lambda row: (row["distance_miles"], row["npi"], int(row["prices"][0]["negotiated_rate"])),
+        (
+            dict(provider_row, network=provider_row["source_key"])
+            for provider_rows in network_rows
+            for provider_row in provider_rows
+        ),
+        key=lambda provider_row: (
+            provider_row["distance_miles"],
+            provider_row["npi"],
+            int(provider_row["prices"][0]["negotiated_rate"]),
+        ),
     )
-    assert collected == expected
-    assert len({(row["npi"], row["source_key"]) for row in collected}) == 244
+    assert collected_rows == expected
+    assert len({(provider_row["npi"], provider_row["source_key"]) for provider_row in collected_rows}) == 244
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("page_sizes", [(50,), (25,), (12,), (50, 12, 25)])
-async def test_complete_network_pages_keep_equal_distance_address_source_and_code_variant_ties(monkeypatch, page_sizes):
+def _tied_network_rows():
     network_rows = []
     for network in range(4):
-        rows = []
+        provider_rows = []
         for provider in range(3):
             for address in range(5):
                 for variant, arrangement in enumerate(("ffs", "capitation")):
-                    rows.append(
+                    provider_rows.append(
                         {
                             "npi": 1000000000 + provider,
                             "provider_name": f"Provider {provider}",
@@ -126,60 +138,91 @@ async def test_complete_network_pages_keep_equal_distance_address_source_and_cod
                             "_ptg_price_key": network * 1000 + provider * 10 + address * 2 + variant,
                         }
                     )
-        network_rows.append(rows)
-    args = {"lat": 40, "long": -80, "order_by": "distance", "order": "asc"}
-    networks = [(f"source-{network}", f"snapshot-{network}") for network in range(4)]
+        network_rows.append(provider_rows)
+    return network_rows
 
-    async def read_networks(_session, selected, _args, pagination, _selection):
-        responses = []
-        for (source, snapshot), rows in zip(selected, network_rows):
-            local = serving._sort_ptg2_manifest_provider_items(
-                list(reversed(rows)), args, location_filter_requested=True
-            )
-            # The strict source response strips its private price/rank coordinates before union.
-            public = [
-                {key: value for key, value in row.items() if key != "_ptg_price_key"}
-                for row in local[: pagination.limit]
-            ]
-            responses.append(
-                (
-                    source,
-                    snapshot,
-                    {
-                        "items": public,
-                        "pagination": {"total": len(rows), "total_is_exact": True},
-                        "query": {"code": "99213"},
-                    },
-                )
-            )
-        return responses
 
-    monkeypatch.setattr(serving, "_read_multi_ptg2_snapshots", read_networks)
-    collected = []
-    page = 0
-    while True:
-        result = await serving._search_multi_ptg2_snapshots(
-            object(), networks, args, SimpleNamespace(offset=len(collected), limit=page_sizes[page % len(page_sizes)])
+def _tied_network_responses(network_rows, args_by_name, selected, pagination):
+    responses = []
+    for (source, snapshot), provider_rows in zip(selected, network_rows):
+        local = serving._sort_ptg2_manifest_provider_items(
+            list(reversed(provider_rows)), args_by_name, location_filter_requested=True
         )
-        page += 1
-        collected.extend(result["items"])
-        if not result["pagination"]["has_more"]:
-            break
+        # The strict source response strips its private price/rank coordinates before union.
+        public_rows = [
+            {key: field_value for key, field_value in provider_row.items() if key != "_ptg_price_key"}
+            for provider_row in local[: pagination.limit]
+        ]
+        responses.append(
+            (
+                source,
+                snapshot,
+                {
+                    "items": public_rows,
+                    "pagination": {"total": len(provider_rows), "total_is_exact": True},
+                    "query": {"code": "99213"},
+                },
+            )
+        )
+    return responses
+
+
+def _assert_tied_rows(network_rows, collected_rows):
     expected = sorted(
         (
-            {**{key: value for key, value in row.items() if key != "_ptg_price_key"}, "network": row["source_key"]}
-            for rows in network_rows
-            for row in rows
+            {
+                **{key: field_value for key, field_value in provider_row.items() if key != "_ptg_price_key"},
+                "network": provider_row["source_key"],
+            }
+            for provider_rows in network_rows
+            for provider_row in provider_rows
         ),
-        key=lambda row: (row["npi"], row["address"]["address_key"], row["negotiation_arrangement"], row["source_key"]),
+        key=lambda provider_row: (
+            provider_row["npi"],
+            provider_row["address"]["address_key"],
+            provider_row["negotiation_arrangement"],
+            provider_row["source_key"],
+        ),
     )
-    assert collected == expected
+    assert collected_rows == expected
     assert (
         len(
             {
-                (row["npi"], row["address"]["address_key"], row["source_key"], row["negotiation_arrangement"])
-                for row in collected
+                (
+                    provider_row["npi"],
+                    provider_row["address"]["address_key"],
+                    provider_row["source_key"],
+                    provider_row["negotiation_arrangement"],
+                )
+                for provider_row in collected_rows
             }
         )
         == 120
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_sizes", [(50,), (25,), (12,), (50, 12, 25)])
+async def test_distance_pages_preserve_address_source_and_code_ties(monkeypatch, page_sizes):
+    network_rows = _tied_network_rows()
+    args_by_name = {"lat": 40, "long": -80, "order_by": "distance", "order": "asc"}
+    networks = [(f"source-{network}", f"snapshot-{network}") for network in range(4)]
+
+    async def read_networks(_session, selected, _args, pagination, _selection):
+        return _tied_network_responses(network_rows, args_by_name, selected, pagination)
+
+    monkeypatch.setattr(serving, "_read_multi_ptg2_snapshots", read_networks)
+    collected_rows = []
+    page = 0
+    while True:
+        response = await serving._search_multi_ptg2_snapshots(
+            object(),
+            networks,
+            args_by_name,
+            SimpleNamespace(offset=len(collected_rows), limit=page_sizes[page % len(page_sizes)]),
+        )
+        page += 1
+        collected_rows.extend(response["items"])
+        if not response["pagination"]["has_more"]:
+            break
+    _assert_tied_rows(network_rows, collected_rows)

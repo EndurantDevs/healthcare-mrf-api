@@ -62,7 +62,7 @@ def test_migration_matches_serving_model_contract():
 
     assert runtime_indexes == [
         {
-            "index_elements": migration.INDEX_EXPRESSIONS,
+            "index_elements": ("plans_network_array public.gin__int_ops",),
             "using": "gin",
             "name": "service_plans_network_array",
             "where": migration.INDEX_PREDICATE,

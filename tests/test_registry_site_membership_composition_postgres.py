@@ -372,6 +372,7 @@ async def _source_read_count(fixture, revision):
             )
             await asyncio.sleep(0)
             assert all(query.query.lstrip().split()[0] in ("SELECT", "WITH", "SHOW") for query in queries)
+            assert sum("network_candidate_custody" in query.query for query in queries) == 2
             return len(queries), sum(len(receipt.records) for receipt in receipts)
     finally:
         fixture.connection.remove_query_logger(queries.append)
@@ -399,7 +400,7 @@ async def test_same_generation_bulk_revalidation_uses_fixed_queries(site_db):
     )
     approval = await _approval(fixture, seed.actor, second, corrected)
     two = await _source_read_count(fixture, approval["approved_revision"])
-    assert one == (7, 1) and two == (7, 2)
+    assert one == (11, 1) and two == (11, 2)
 
 
 async def test_approval_is_caller_atomic_and_only_seals_explicit_records(site_db):

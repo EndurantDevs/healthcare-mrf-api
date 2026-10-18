@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 SCRIPTS_DIRECTORY = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIRECTORY) not in sys.path:
@@ -26,6 +27,24 @@ CoverageRatchetError = reports.CoverageRatchetError
 
 BASE_SHA = "a" * 40
 HEAD_SHA = "b" * 40
+
+
+def test_workflow_postgres_producers_match_forecast_contract() -> None:
+    """Every database worker must write a receipt accepted by aggregation."""
+    workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    producers = workflow["jobs"]["address-canonical-db-tests"]["strategy"]["matrix"]["include"]
+    assert tuple(producer["shard"] for producer in producers) == artifacts.SHARD_SPEC_BY_KIND["postgres"]["shards"]
+    for shard in (
+        "registry-48",
+        "registry--1",
+        "registry-08",
+        "registry-any",
+        "directory-source-1",
+        "directory-source-3",
+    ):
+        with pytest.raises(CoverageRatchetError, match="unsupported coverage shard"):
+            artifacts.shard_file_names("postgres", shard)
 
 
 def _report_config(report_path: Path, report_format: str) -> dict:
@@ -486,8 +505,9 @@ def test_python_forecast_combines_only_the_bound_coverage_files(tmp_path: Path) 
             ".coverage.postgres.core-snapshots",
             ".coverage.postgres.core-snapshots-2",
             ".coverage.postgres.core-ptg",
-            *[f".coverage.postgres.registry-{index}" for index in range(48)],
+            *(f".coverage.postgres.registry-{index}" for index in range(48)),
             ".coverage.postgres.directory-source",
+            ".coverage.postgres.directory-source-2",
             ".coverage.postgres.directory-storage",
             ".coverage.postgres.directory-address",
             ".coverage.postgres.profile-storage",

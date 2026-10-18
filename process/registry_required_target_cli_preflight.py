@@ -23,6 +23,7 @@ def review_parser(description):
     parser.add_argument("--source-url", required=True)
     parser.add_argument("--input-sha256", required=True)
     parser.add_argument("--ledger-snapshot-id", type=UUID, required=True)
+    parser.add_argument("--protected-owner-role", help="explicit trusted operator role for a closed registry")
     return parser
 
 

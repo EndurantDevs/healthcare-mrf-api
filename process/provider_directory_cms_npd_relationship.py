@@ -118,28 +118,20 @@ def _page_sql(resource, witness):
     """Look up at most one qualifying witness for each full source key."""
     return f"""SELECT source.resource_type, source.resource_id, source.payload_hash,
         witness.raw_payload_sha256, witness.raw_payload_json FROM {resource} source
-      JOIN LATERAL (
-        SELECT witness.raw_payload_sha256, witness.raw_payload_json
-        FROM {witness} witness
-        WHERE witness.dataset_id=source.dataset_id
-          AND witness.resource_type=source.resource_type AND witness.resource_id=source.resource_id
-          AND witness.source_id='cms-npd' AND witness.release_id=:release_id
-          AND (witness.resource_type, witness.resource_id) > (:after_type, :after_id)
-          AND (witness.resource_type, witness.resource_id) <= (:last_type, :last_id)
-          AND witness.normalized_payload_hash=source.payload_hash
-        LIMIT 1
-      ) witness ON TRUE
+      JOIN {witness} witness ON witness.dataset_id=source.dataset_id
+        AND witness.resource_type=source.resource_type AND witness.resource_id=source.resource_id
+        AND witness.source_id='cms-npd' AND witness.release_id=:release_id
+        AND witness.normalized_payload_hash=source.payload_hash
       WHERE source.dataset_id=:dataset_id
         AND (source.resource_type, source.resource_id) > (:after_type, :after_id)
         AND (source.resource_type, source.resource_id) <= (:last_type, :last_id)"""
 
 
-def _insert_sql(fhir):
+def _projection_sql(fhir):
     schema = fhir._schema()
     resource = fhir._qt(schema, _RESOURCE)
     witness = fhir._qt(schema, _WITNESS)
     binding = fhir._qt(schema, _BINDING)
-    relationship = fhir._qt(schema, _TABLE)
     page = _page_sql(resource, witness)
     return (
         _references(page)
@@ -147,11 +139,23 @@ def _insert_sql(fhir):
       local_refs AS (
         SELECT refs.*, CASE WHEN target_reference ~ ('^' || target_type || '/[A-Za-z0-9.-]{{1,64}}$')
           THEN split_part(target_reference, '/', 2) END AS target_resource_id FROM refs
-      )
-      INSERT INTO {relationship} (
-        dataset_id, source_id, release_id, resource_type, resource_id, source_payload_hash, raw_payload_sha256,
-        reference_field, parent_ordinal, reference_ordinal, target_type, target_reference, target_resource_id,
-        resolution_status, period_start, period_end
+      ),
+      selected_bindings AS MATERIALIZED (
+        SELECT DISTINCT b.resource_type,b.resource_id,b.organization_id,b.site_id
+        FROM local_refs r JOIN {binding} b ON b.source_id='cms-npd'
+          AND b.resource_type=r.target_type AND b.resource_id=r.target_resource_id
+        WHERE r.target_type IN ('Organization','Location')
+      ),
+      ambiguous_bindings AS MATERIALIZED (
+        SELECT selected.resource_type,selected.resource_id
+        FROM selected_bindings selected JOIN {binding} alias
+          ON alias.source_id='cms-npd' AND alias.resource_type=selected.resource_type
+          AND alias.resource_id<>selected.resource_id
+          AND ((selected.resource_type='Organization' AND alias.organization_id=selected.organization_id)
+            OR (selected.resource_type='Location' AND alias.site_id=selected.site_id))
+        JOIN {resource} other ON other.dataset_id=:dataset_id
+          AND other.resource_type=alias.resource_type AND other.resource_id=alias.resource_id
+        GROUP BY selected.resource_type,selected.resource_id
       )
       SELECT :dataset_id, 'cms-npd', :release_id, r.resource_type, r.resource_id,
         r.payload_hash, r.raw_payload_sha256,
@@ -160,15 +164,7 @@ def _insert_sql(fhir):
         CASE
           WHEN target.resource_id IS NULL THEN 'unresolved'
           WHEN r.target_type IN ('Organization','Location') AND b.resource_id IS NULL THEN 'unresolved'
-          WHEN r.target_type IN ('Organization','Location') AND EXISTS (
-            SELECT 1 FROM {binding} alias
-            JOIN {resource} other ON other.dataset_id=:dataset_id
-              AND other.resource_type=alias.resource_type AND other.resource_id=alias.resource_id
-            WHERE alias.source_id='cms-npd' AND alias.resource_type=r.target_type
-              AND alias.resource_id<>r.target_resource_id
-              AND ((r.target_type='Organization' AND alias.organization_id=b.organization_id)
-                OR (r.target_type='Location' AND alias.site_id=b.site_id))
-          ) THEN 'ambiguous'
+          WHEN ambiguous.resource_id IS NOT NULL THEN 'ambiguous'
           ELSE 'resolved' END,
         r.payload->'period'->>'start', r.payload->'period'->>'end'
       FROM local_refs r
@@ -176,18 +172,15 @@ def _insert_sql(fhir):
         AND target.resource_type=r.target_type AND target.resource_id=r.target_resource_id
       LEFT JOIN {binding} b ON b.source_id='cms-npd' AND b.resource_type=r.target_type
         AND b.resource_id=r.target_resource_id AND r.target_type IN ('Organization','Location')
-      ON CONFLICT (dataset_id, resource_type, resource_id, reference_field, parent_ordinal, reference_ordinal)
-      DO NOTHING"""
+      LEFT JOIN ambiguous_bindings ambiguous ON ambiguous.resource_type=r.target_type
+        AND ambiguous.resource_id=r.target_resource_id
+"""
     )
 
 
 async def _page_complete(fhir, session, dataset_id, release_id, after_type, after_id, last_type, last_id):
-    """Check one bounded source page against its exact retained references."""
-    schema = fhir._schema()
-    resource = fhir._qt(schema, _RESOURCE)
-    witness = fhir._qt(schema, _WITNESS)
-    relationship = fhir._qt(schema, _TABLE)
-    page = _page_sql(resource, witness)
+    """Compare the complete indexed projection, including resolved target identity."""
+    relationship = fhir._qt(fhir._schema(), _TABLE)
     params_by_field = {
         "dataset_id": dataset_id,
         "release_id": release_id,
@@ -196,24 +189,17 @@ async def _page_complete(fhir, session, dataset_id, release_id, after_type, afte
         "last_type": last_type,
         "last_id": last_id,
     }
+    fields = ",".join(_COLUMNS)
+    different = " OR ".join(f"link.{column} IS DISTINCT FROM expected.{column}" for column in _COLUMNS)
     expected, missing = (
         await session.execute(
             text(
-                _references(page)
-                + f""" SELECT count(*), coalesce(bool_or(
-            link.resource_type IS NULL OR link.source_id<>'cms-npd' OR link.release_id<>:release_id
-            OR link.source_payload_hash<>refs.payload_hash
-            OR link.raw_payload_sha256<>refs.raw_payload_sha256
-            OR link.target_type<>refs.target_type
-            OR link.target_reference IS DISTINCT FROM refs.target_reference
-            OR link.period_start IS DISTINCT FROM refs.payload->'period'->>'start'
-            OR link.period_end IS DISTINCT FROM refs.payload->'period'->>'end'
-          ), false)
-          FROM refs LEFT JOIN {relationship} link ON link.dataset_id=:dataset_id
-            AND link.resource_type=refs.resource_type AND link.resource_id=refs.resource_id
-            AND link.reference_field=refs.reference_field
-            AND link.parent_ordinal=refs.parent_ordinal
-            AND link.reference_ordinal=refs.reference_ordinal"""
+                f"WITH expected({fields}) AS MATERIALIZED ({_projection_sql(fhir)}) "
+                f"SELECT count(*),coalesce(bool_or(link.resource_type IS NULL OR {different}),false) "
+                f"FROM expected LEFT JOIN {relationship} link ON link.dataset_id=expected.dataset_id "
+                "AND link.resource_type=expected.resource_type AND link.resource_id=expected.resource_id "
+                "AND link.reference_field=expected.reference_field AND link.parent_ordinal=expected.parent_ordinal "
+                "AND link.reference_ordinal=expected.reference_ordinal"
             ),
             params_by_field,
         )
@@ -265,6 +251,66 @@ async def _page_keys(session, resource, witness, dataset_id, after_type, after_i
     return last_type, last_id
 
 
+_COLUMNS = (
+    "dataset_id",
+    "source_id",
+    "release_id",
+    "resource_type",
+    "resource_id",
+    "source_payload_hash",
+    "raw_payload_sha256",
+    "reference_field",
+    "parent_ordinal",
+    "reference_ordinal",
+    "target_type",
+    "target_reference",
+    "target_resource_id",
+    "resolution_status",
+    "period_start",
+    "period_end",
+)
+
+
+async def _copy_page(fhir, session, parameters):
+    """COPY one bounded reference page only into its protected private heap."""
+    from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
+
+    from db.plan_release_storage import storage_relation
+    from process.provider_directory_cms_identity_candidate import identity_candidate
+    from process.reference_family_archive import native_copy_projection
+
+    publisher, identity, _ = await identity_candidate(session, phases=("sealed",))
+    raw = await publisher.connection.fetchval(
+        f"SELECT candidate_storage_json FROM {storage_relation(publisher.policy.schema, 'provider_directory_endpoint_dataset')} "
+        "WHERE dataset_id=$1",
+        identity["dataset_id"],
+    )
+    import json
+
+    binding = json.loads(raw) if isinstance(raw, str) else raw
+    table = binding["tables"][_TABLE]["name"]
+    if (
+        parameters["dataset_id"] != identity["dataset_id"]
+        or table == _TABLE
+        or fhir._qt(fhir._schema(), _TABLE) != storage_relation(publisher.policy.schema, table)
+    ):
+        raise RuntimeError("cms_npd_relationship_private_candidate_required")
+    compiled = text("SELECT * FROM (" + _projection_sql(fhir) + ") AS cms_relationship_rows").compile(
+        dialect=PGDialect_asyncpg()
+    )
+    arguments = tuple(parameters[name] for name in compiled.positiontup)
+    await native_copy_projection(
+        session,
+        str(compiled),
+        *arguments,
+        schema_name=publisher.policy.schema,
+        table_name=table,
+        columns=_COLUMNS,
+        max_bytes=32 * 1024 * 1024,
+        timeout=300,
+    )
+
+
 async def _scan_pages(fhir, dataset_id, release_id, *, write, ctx=None, task=None):
     """Project and verify key pages without materializing the full raw release."""
     schema = fhir._schema()
@@ -287,19 +333,20 @@ async def _scan_pages(fhir, dataset_id, release_id, *, write, ctx=None, task=Non
                 "last_id": last_id,
             }
             if write:
-                await session.execute(text(_insert_sql(fhir)), params_by_field)
-            verified_count += await _page_complete(
-                fhir, session, dataset_id, release_id, after_type, after_id, last_type, last_id
-            )
+                await _copy_page(fhir, session, params_by_field)
+            if not write:
+                verified_count += await _page_complete(
+                    fhir, session, dataset_id, release_id, after_type, after_id, last_type, last_id
+                )
         after_type, after_id = last_type, last_id
         if ctx is not None and task is not None:
             await fhir._raise_if_resource_import_cancelled(ctx, task)
     actual = await fhir.db.scalar(
         f"SELECT count(*) FROM {relationship} WHERE dataset_id=:dataset_id", dataset_id=dataset_id
     )
-    if int(actual or 0) != verified_count:
+    if not write and int(actual or 0) != verified_count:
         raise RuntimeError("cms_npd_relationship_projection_incomplete")
-    return verified_count
+    return int(actual or 0) if write else verified_count
 
 
 async def assert_complete(fhir, dataset_id, release_id):
@@ -320,6 +367,60 @@ async def completed_receipt_count(fhir, dataset_id, release_id):
     return int(row[0]) if row is not None else None
 
 
+async def _assert_relationship_sealed(fhir, candidate, release_id):
+    """Recheck the exact finished private group in the original receipt transaction."""
+    from db.plan_release_storage import storage_relation
+    from process import provider_directory_generic_source_auxiliary as auxiliary
+    from process import provider_directory_generic_source_storage as storage
+    from process.provider_directory_generic_source_policy import bound_publisher
+
+    publisher = bound_publisher()
+    identity = storage.candidate_identity(fhir, candidate)
+    storage._require(
+        publisher.policy.schema == fhir._schema()
+        and identity["metadata"]["source_release"].get("vector_sha256") == release_id,
+        "relationship_identity_changed",
+    )
+    binding = await storage._locked(publisher.connection, publisher.policy, identity, phases=("prepared",))
+    storage._require(binding is not None, "relationship_seal_required")
+    await storage._verify_tables(publisher.connection, publisher.policy, binding)
+    proof = binding["tables"][storage.RELATIONSHIP]
+    identity_stages = binding["auxiliary"]
+    storage._require(
+        binding["relationship_sha256"] == auxiliary.relationship_seal(identity, proof)
+        and identity_stages is not None
+        and identity_stages["phase"] == "sealed"
+        and identity_stages["sealed_sha256"] == auxiliary._seal_digest(identity, identity_stages["tables"])
+        and fhir._qt(fhir._schema(), _TABLE) == storage_relation(publisher.policy.schema, proof["name"]),
+        "relationship_seal_changed",
+    )
+
+
+async def _insert_relationship_receipt(fhir, candidate, release_id, count):
+    """Append only after native custody and same-transaction indexed seal checks."""
+    from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
+    from process.provider_directory_source_cms_epoch_control import capture_source_cms_epoch_controls
+
+    async with source_transaction(fhir.db, isolation="repeatable read"):
+        publisher = bound_publisher()
+        await capture_source_cms_epoch_controls(publisher.connection, publisher.policy)
+        await _assert_relationship_sealed(fhir, candidate, release_id)
+        if await assert_complete(fhir, candidate.dataset_id, release_id) != count:
+            raise RuntimeError("cms_npd_relationship_projection_incomplete")
+        receipt = fhir._qt(fhir._schema(), _RECEIPT)
+        await fhir.db.status(
+            f"INSERT INTO {receipt} (dataset_id, release_id, projection_contract, relationship_count) "
+            "VALUES (:dataset_id, :release_id, :contract, :count) ON CONFLICT (dataset_id) DO NOTHING",
+            dataset_id=candidate.dataset_id,
+            release_id=release_id,
+            contract=CONTRACT,
+            count=count,
+        )
+        await _assert_relationship_sealed(fhir, candidate, release_id)
+        if await completed_receipt_count(fhir, candidate.dataset_id, release_id) != count:
+            raise RuntimeError("cms_npd_relationship_receipt_changed")
+
+
 async def materialize(fhir, candidate, release_id, ctx=None, task=None):
     """Write bounded, restartable batches before source-local publication."""
     sealed_count = await completed_receipt_count(fhir, candidate.dataset_id, release_id)
@@ -329,15 +430,16 @@ async def materialize(fhir, candidate, release_id, ctx=None, task=None):
         if await assert_complete(fhir, candidate.dataset_id, release_id) != sealed_count:
             raise RuntimeError("cms_npd_relationship_receipt_changed")
         return
+    from process.provider_directory_generic_source_auxiliary import seal_identity_candidate
+
+    await seal_identity_candidate(fhir.db, fhir, candidate)
+    relationship = fhir._qt(fhir._schema(), _TABLE)
+    if await fhir.db.scalar(
+        f"SELECT EXISTS(SELECT FROM {relationship} WHERE dataset_id=:dataset_id)", dataset_id=candidate.dataset_id
+    ):
+        raise RuntimeError("cms_npd_relationship_unsealed_candidate_reprepare_required")
     count = await _scan_pages(fhir, candidate.dataset_id, release_id, write=True, ctx=ctx, task=task)
-    receipt = fhir._qt(fhir._schema(), _RECEIPT)
-    await fhir.db.status(
-        f"INSERT INTO {receipt} (dataset_id, release_id, projection_contract, relationship_count) "
-        "VALUES (:dataset_id, :release_id, :contract, :count) ON CONFLICT (dataset_id) DO NOTHING",
-        dataset_id=candidate.dataset_id,
-        release_id=release_id,
-        contract=CONTRACT,
-        count=count,
-    )
-    if await completed_receipt_count(fhir, candidate.dataset_id, release_id) != count:
-        raise RuntimeError("cms_npd_relationship_receipt_changed")
+    from process.provider_directory_generic_source_auxiliary import seal_relationship_candidate
+
+    await seal_relationship_candidate(fhir.db, fhir, candidate)
+    await _insert_relationship_receipt(fhir, candidate, release_id, count)

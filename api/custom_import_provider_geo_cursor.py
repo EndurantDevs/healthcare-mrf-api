@@ -38,6 +38,7 @@ class GeoCursorState:
     anchor_address_key: str
     issued_at: int
     expires_at: int
+    network_generation: int | None = None
 
 
 def issue_geo_cursor(state: GeoCursorState, *, secret: bytes) -> str:
@@ -60,6 +61,7 @@ def open_geo_cursor(
     query_fingerprint: str,
     authorization_scope_sha256: str,
     trusted_now: int,
+    network_generation: int | None = None,
 ) -> GeoCursorState:
     """Authenticate before parsing and require fresh exact result-set identity."""
 
@@ -72,6 +74,10 @@ def open_geo_cursor(
         or not _is_sha256_hex(authorization_scope_sha256)
         or type(trusted_now) is not int
         or not 0 <= trusted_now < 2**63
+        or (
+            network_generation is not None
+            and (type(network_generation) is not int or not 1 <= network_generation < 2**63)
+        )
     ):
         raise _invalid_cursor()
     decoded = _base64url_decode(token)
@@ -83,6 +89,7 @@ def open_geo_cursor(
     state = _state_from_payload(cursor_payload)
     if (
         state.target != pinned_target
+        or state.network_generation != network_generation
         or not hmac.compare_digest(state.query_fingerprint, query_fingerprint)
         or not hmac.compare_digest(state.authorization_scope_sha256, authorization_scope_sha256)
         or not state.issued_at <= trusted_now < state.expires_at
@@ -106,6 +113,10 @@ def _state_document(state: GeoCursorState) -> dict[str, object]:
         or type(state.expires_at) is not int
         or not 0 <= state.issued_at < state.expires_at < 2**63
         or state.expires_at - state.issued_at > MAX_CURSOR_TTL_SECONDS
+        or (
+            state.network_generation is not None
+            and (type(state.network_generation) is not int or not 1 <= state.network_generation < 2**63)
+        )
     ):
         raise _invalid_cursor()
     try:
@@ -113,7 +124,11 @@ def _state_document(state: GeoCursorState) -> dict[str, object]:
             raise _invalid_cursor()
     except ValueError:
         raise _invalid_cursor() from None
-    return {"version": 1, **asdict(state)}
+    document = asdict(state)
+    if state.network_generation is None:
+        document.pop("network_generation")
+        return {"version": 1, **document}
+    return {"version": 2, **document}
 
 
 def _state_from_payload(payload: bytes) -> GeoCursorState:
@@ -122,10 +137,13 @@ def _state_from_payload(payload: bytes) -> GeoCursorState:
         if (
             type(document) is not dict
             or type(document.get("version")) is not int
-            or document.pop("version", None) != 1
+            or document["version"] not in {1, 2}
+            or (document["version"] == 1 and "network_generation" in document)
+            or (document["version"] == 2 and document.get("network_generation") is None)
             or type(document.get("target")) is not dict
         ):
             raise _invalid_cursor()
+        document.pop("version")
         document["target"] = PinnedReadTarget(**document["target"])
         state = GeoCursorState(**document)
         if canonical_read_document(_state_document(state)) != payload:

@@ -66,6 +66,13 @@ SELECT revision.serving_revision_id,
             WHERE pin.owner_type = {pin_owner_parameter}
               AND pin.owner_id = revision.serving_revision_id
               AND pin.snapshot_id = binding.snapshot_id
+       ) OR (
+           {pin_owner_parameter} = 'plan_release_serving_revision'
+           AND EXISTS (
+               SELECT 1 FROM {schema}.plan_release_snapshot_pin pin
+                WHERE pin.serving_revision_id = revision.serving_revision_id
+                  AND pin.snapshot_id = binding.snapshot_id
+           )
        ) AS is_pinned
   FROM {schema}.plan_release_serving_revision revision
   JOIN {schema}.plan_release_snapshot_binding binding

@@ -111,23 +111,49 @@ async def _assert_bulk_precedes_live_locks(fixture, session):
         )
 
 
+def _observe_publication_phases(fixture, monkeypatch):
+    """Observe real bulk and lock phases without replacing their native work."""
+    observations = []
+    apply_rows = importer._apply_provider_directory_profile_delta_rows
+
+    async def observe_bulk(*args, **kwargs):
+        applied = await apply_rows(*args, **kwargs)
+        session = fixture.database._transaction_binding().session
+        await _assert_bulk_precedes_live_locks(fixture, session)
+        observations.append("bulk-before-live-locks")
+        return applied
+
+    async def before_swaps():
+        assert (
+            await fixture.database.scalar(
+                "SELECT count(*) FROM pg_locks WHERE pid=pg_backend_pid() "
+                "AND mode='AccessExclusiveLock' AND granted AND relation=ANY("
+                "ARRAY(SELECT oid FROM pg_class WHERE relname IN "
+                "('entity_address_unified','provider_directory_address_overlay')))"
+            )
+            == 2
+        )
+        observations.append("complete-live-locks")
+
+    monkeypatch.setattr(importer, "_apply_provider_directory_profile_delta_rows", observe_bulk)
+    return observations, before_swaps
+
+
 @pytest.mark.parametrize("abort", [False, True])
 async def test_real_delta_bulk_precedes_composite_locks_and_preserves_owner_rollback(monkeypatch, abort):
+    """Keep bulk work before the common lock set and roll back a late owner failure."""
     async with _prepared_delta(monkeypatch) as fixture:
         stages, address = await _companion_relations(fixture)
         prepared = SimpleNamespace(stages=stages)
-        observations = []
-
-        async def before_swaps():
-            session = fixture.database._transaction_binding().session
-            await _assert_bulk_precedes_live_locks(fixture, session)
-            await publication._lock_live_swap_relations(importer, session, prepared, address, None)
-            observations.append("bulk-before-live-locks")
-
+        observations, before_swaps = _observe_publication_phases(fixture, monkeypatch)
         try:
             async with fixture.database.transaction():
                 forecast = await apply_prepared_artifact_bundle(
-                    importer, stages, profile_delta=fixture.delta, before_swaps=before_swaps
+                    importer,
+                    stages,
+                    profile_delta=fixture.delta,
+                    before_swaps=before_swaps,
+                    extra_live_relations=publication._live_swap_relations(prepared, address, None),
                 )
                 assert (
                     await fixture.database.scalar(
@@ -140,7 +166,7 @@ async def test_real_delta_bulk_precedes_composite_locks_and_preserves_owner_roll
                     raise RuntimeError("synthetic late owner failure")
         except RuntimeError as error:
             assert abort and str(error) == "synthetic late owner failure"
-        assert observations == ["bulk-before-live-locks"]
+        assert observations == ["bulk-before-live-locks", "complete-live-locks"]
         if abort:
             assert (
                 await fixture.database.scalar(f"SELECT generation_id FROM {fixture.scenario.profile_target_ref}")
@@ -178,8 +204,8 @@ async def test_combined_live_lock_order_prevents_cross_family_reader_cycle(monke
             async with database.transaction() as session:
                 writer_pids.append(await session.scalar(text("SELECT pg_backend_pid()")))
                 ready.set()
-                await publication._lock_live_swap_relations(
-                    importer, session, SimpleNamespace(stages=stages), address, None
+                await importer._lock_provider_directory_artifact_live_tables(
+                    schema, publication._live_swap_relations(SimpleNamespace(stages=stages), address, None)
                 )
                 for name in ("entity_address_unified", "provider_directory_address_overlay"):
                     await session.execute(text(f'ALTER TABLE "{schema}".{name} RENAME TO {name}_old'))
@@ -240,8 +266,7 @@ async def test_live_prelocks_preserve_legacy_view_conversion(monkeypatch, kind, 
         stage = await _prepared_bundle_stage(schema, "replacement", target_name, _keep_stage_indexes)
 
         async def before_swaps():
-            session = database._transaction_binding().session
-            await publication._lock_live_swap_relations(importer, session, SimpleNamespace(stages=(stage,)), None, None)
+            assert await importer._provider_directory_relation_attribute(schema, target_name, "relkind") in {"v", "m"}
 
         async with database.transaction():
             await apply_prepared_artifact_bundle(importer, (stage,), before_swaps=before_swaps if composite else None)

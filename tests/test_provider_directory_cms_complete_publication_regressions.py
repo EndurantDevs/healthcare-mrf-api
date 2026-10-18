@@ -7,15 +7,21 @@ import json
 from uuid import uuid4
 
 import pytest
+import pytest_asyncio
 
 from process import provider_directory_cms_native_layout as layout
 from process import provider_directory_cms_nonprofile_capacity as nonprofile
 from process.entity_address_snapshot_source import entity_address_unified as addresses
 from process.provider_directory_cms_preparation import OwnedRelation
 from tests import cms_npd_admission_postgres_support as source
+from tests import test_provider_directory_cms_resource_batch_postgres as resource_batch
 from tests import test_provider_directory_import_run_guards as run_guards
 from tests import test_provider_directory_profile_capacity_preflight_postgres as receipt_support
-from tests.test_provider_directory_cms_resource_batch_postgres import cms_resource_template as cms_resource_template
+
+# Host regressions do not require the native database template.
+cms_resource_template = pytest_asyncio.fixture(scope="module", loop_scope="module")(
+    resource_batch.cms_resource_template.__wrapped__
+)
 
 
 def test_small_address_minimum_still_rejects_empty_candidate():
@@ -45,6 +51,7 @@ def test_original_profile_scope_restores_full_inputs_after_failure():
         assert fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get() == prepared_by_name
 
 
+@pytest.mark.usefixtures("cms_resource_template")
 async def test_native_metadata_first_toast_write_and_larger_growth(monkeypatch):
     """Budget the real first TOAST leaf and preserve larger native page observations."""
     fhir = source.fhir
@@ -138,6 +145,7 @@ def test_metadata_timestamp_size_keeps_byte_cap():
         )
 
 
+@pytest.mark.usefixtures("cms_resource_template")
 async def test_native_receipt_first_write_and_growth(monkeypatch):
     """Preserve the native replay fence while budgeting the first B-tree leaf."""
     async with source.admission_database(monkeypatch) as database:
@@ -170,6 +178,7 @@ async def test_native_receipt_first_write_and_growth(monkeypatch):
             await source.fhir._assert_profile_capacity_receipt_storage("mrf", {"preflight_receipt_storage": empty})
 
 
+@pytest.mark.usefixtures("cms_resource_template")
 async def test_native_scope_declared_gin_and_catalog_drift(monkeypatch):
     """Accept actual CMS GIN declarations and reject index, expression and OID drift."""
     fhir = source.fhir

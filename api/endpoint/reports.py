@@ -16,12 +16,55 @@ from sanic.exceptions import InvalidUsage, NotFound
 from sqlalchemy import text
 
 from api.endpoint.pagination import parse_pagination
-from db.models import (EntityAddressUnified, NPIDataOtherIdentifier,
-                       NPIPhoneStaffing, PartDPharmacyActivity,
-                       PharmacyLicenseRecord)
+from api.network_address_scope import (
+    _request_selector,
+    current_network_address_scope,
+    is_scoped_address_relation,
+    scoped_address_aca_insurance_predicate,
+    scoped_address_insurance_predicate,
+    scoped_address_parameters,
+    scoped_address_relation_sql,
+)
+from db.models import (
+    EntityAddressUnified,
+    NPIDataOtherIdentifier,
+    NPIPhoneStaffing,
+    PartDPharmacyActivity,
+    PharmacyLicenseRecord,
+)
 
 blueprint = Blueprint("reports", url_prefix="/reports", version=1)
 logger = logging.getLogger(__name__)
+
+MANAGED_REPORT_FIELDS = {
+    "pharmacy-markets": frozenset(
+        "scope sort order state city county zip chain as_of include_staffing page page_size limit offset start".split()
+    ),
+    "pharmacy-market": frozenset("market_id as_of include_staffing".split()),
+    "pharmacy-rankings": frozenset(
+        "scope state city county zip chain as_of include_staffing page page_size limit offset start".split()
+    ),
+    "pharmacy-chain-summary": frozenset("name_like include_states".split()),
+    "pharmacy-state-stats": frozenset(),
+    "pharmacy-context": frozenset("npi as_of include_staffing".split()),
+}
+
+
+def _report_args(request, native_args):
+    if native_args is not None:
+        if current_network_address_scope() is None:
+            raise InvalidUsage("Managed report scope is required.")
+        return native_args
+    if current_network_address_scope() is None and _request_selector(request, None) is not None:
+        raise InvalidUsage("Canonical report selectors require the managed read endpoint.")
+    return request.args
+
+
+def _report_address_type_clause(alias):
+    if current_network_address_scope() is None:
+        return f"{alias}.type = 'primary'"
+    return f"{alias}.type IN ('primary','secondary','practice','site')"
+
 
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 200
@@ -195,9 +238,7 @@ def _qualified_table_name(table) -> str:
 
 
 def _address_serving_source() -> str:
-    return str(
-        os.getenv("HLTHPRT_ADDRESS_SERVING_SOURCE") or ADDRESS_SERVING_SOURCE_UNIFIED
-    ).strip().lower()
+    return str(os.getenv("HLTHPRT_ADDRESS_SERVING_SOURCE") or ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower()
 
 
 def _pharmacy_address_table_sql(source: str | None = None) -> str:
@@ -207,7 +248,7 @@ def _pharmacy_address_table_sql(source: str | None = None) -> str:
 
 
 def _is_pharmacy_address_unified(address_table_sql: str) -> bool:
-    return address_table_sql.endswith(".entity_address_unified")
+    return address_table_sql.endswith(".entity_address_unified") or is_scoped_address_relation(address_table_sql)
 
 
 def _pharmacy_address_zip5_expr(alias: str, address_table_sql: str) -> str:
@@ -222,6 +263,7 @@ def _pharmacy_address_order_expr(alias: str, address_table_sql: str) -> str:
             f"{alias}.npi, ({alias}.telephone_number IS NOT NULL) DESC, "
             f"({alias}.address_precision = 'street') DESC, {alias}.source_count DESC NULLS LAST, "
             f"{alias}.checksum ASC"
+            + (f", {alias}.location_key ASC" if is_scoped_address_relation(address_table_sql) else "")
         )
     return f"{alias}.npi, ({alias}.telephone_number IS NOT NULL) DESC, {alias}.checksum ASC"
 
@@ -242,6 +284,8 @@ async def _is_table_available(session, table) -> bool:
 
 
 async def _resolve_pharmacy_address_table_sql(session) -> str:
+    if current_network_address_scope() is not None:
+        return scoped_address_relation_sql("mrf.entity_address_unified")
     source = _address_serving_source()
     if source != ADDRESS_SERVING_SOURCE_UNIFIED:
         return _pharmacy_address_table_sql(ADDRESS_SERVING_SOURCE_LEGACY)
@@ -459,14 +503,14 @@ def _sort_expression(sort: str) -> str:
 def _coerce_int(value: Any) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
 
 def _coerce_float(value: Any) -> float:
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0.0
 
 
@@ -610,7 +654,7 @@ staffing_by_phone AS (
         COUNT(DISTINCT a.npi)::int AS pharmacist_count
     FROM {address_table_sql} AS a
     CROSS JOIN pharmacist_taxonomy AS pt
-    WHERE a.type = 'primary'
+    WHERE {_report_address_type_clause("a")}
       AND a.state_name IS NOT NULL
       AND a.state_name <> ''
       AND a.telephone_number IS NOT NULL
@@ -636,11 +680,7 @@ chain_pharmacies AS (
         a.npi::bigint AS npi,
         COALESCE(NULLIF(a.state_name, ''), 'NA') AS state_name,
         REGEXP_REPLACE(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g') AS telephone_number,
-        CASE
-            WHEN a.plans_network_array IS NULL THEN FALSE
-            WHEN a.plans_network_array @@ '0'::query_int THEN FALSE
-            ELSE TRUE
-        END AS has_insurance,
+        {scoped_address_insurance_predicate() if current_network_address_scope() is not None else "CASE WHEN a.plans_network_array IS NULL THEN FALSE WHEN a.plans_network_array @@ '0'::query_int THEN FALSE ELSE TRUE END"} AS has_insurance,
         COALESCE(s.pharmacist_count, 0)::int AS pharmacist_count
     FROM {address_table_sql} AS a
     CROSS JOIN pharmacy_taxonomy AS pt
@@ -648,7 +688,7 @@ chain_pharmacies AS (
     LEFT JOIN staffing_by_phone AS s
       ON s.state_name = a.state_name
      AND s.telephone_number = REGEXP_REPLACE(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g')
-    WHERE a.type = 'primary'
+    WHERE {_report_address_type_clause("a")}
       AND a.taxonomy_array && pt.codes
       {("AND " + name_clause) if not should_match_all_names else ""}
     ORDER BY {address_order_expr}
@@ -754,7 +794,9 @@ async def _query_chain_summary(
     names: list[str],
     include_states: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], bool]:
-    has_staffing_helper = await _is_table_available(session, NPIPhoneStaffing.__table__)
+    has_staffing_helper = current_network_address_scope() is None and await _is_table_available(
+        session, NPIPhoneStaffing.__table__
+    )
     address_table_sql = await _resolve_pharmacy_address_table_sql(session)
     sql, params = _build_chain_summary_sql(
         names=names,
@@ -762,12 +804,10 @@ async def _query_chain_summary(
         include_states=include_states,
         address_table_sql=address_table_sql,
     )
-    result = await session.execute(text(sql), params)
+    result = await session.execute(text(sql), scoped_address_parameters(params))
     row = result.mappings().first() or {}
     summary = _ensure_json_dict(row.get("summary"))
-    histogram_entries = [
-        item for item in _ensure_json_list(row.get("histogram")) if isinstance(item, dict)
-    ]
+    histogram_entries = [item for item in _ensure_json_list(row.get("histogram")) if isinstance(item, dict)]
     states = [item for item in _ensure_json_list(row.get("states")) if isinstance(item, dict)]
     return summary, histogram_entries, states, has_staffing_helper
 
@@ -805,15 +845,31 @@ def _pharmacy_chain_summary_methodology(*, staffing_helper_available: bool) -> d
     return {
         "version": "v1",
         "sources": [
-            "NPPES/NPI provider names and primary addresses",
+            (
+                "NPPES/NPI provider names and eligible retained offices"
+                if current_network_address_scope() is not None
+                else "NPPES/NPI provider names and primary addresses"
+            ),
             "NUCC taxonomy classification mapping",
-            "HealthPorta NPI staffing helper derived from pharmacist primary addresses",
+            (
+                "Live pharmacist matches restricted to eligible retained offices"
+                if current_network_address_scope() is not None
+                else "HealthPorta NPI staffing helper derived from pharmacist primary addresses"
+            ),
         ],
         "notes": [
             "Chain matching uses organization and DBA name-like filters supplied by the caller.",
-            "Pharmacy counts are based on primary-address pharmacy NPIs matched to the chain filters.",
+            (
+                "Pharmacy counts use eligible retained offices before selecting one office per NPI and matching chain filters."
+                if current_network_address_scope() is not None
+                else "Pharmacy counts are based on primary-address pharmacy NPIs matched to the chain filters."
+            ),
             "Active pharmacy count means at least one pharmacist matched on the same state and phone number.",
-            "Insured pharmacy count means the primary NPI address carries a non-zero plans_network_array.",
+            (
+                "Insured pharmacy count requires permitted approved canonical membership at the selected office."
+                if current_network_address_scope() is not None
+                else "Insured pharmacy count means the primary NPI address carries a non-zero plans_network_array."
+            ),
         ],
         "staffing_helper_available": staffing_helper_available,
         "staffing_mode": "helper_table" if staffing_helper_available else "live_fallback_query",
@@ -875,7 +931,7 @@ staffing_by_phone AS (
         COUNT(DISTINCT a.npi)::int AS pharmacist_count
     FROM {address_table_sql} AS a
     CROSS JOIN pharmacist_taxonomy AS pt
-    WHERE a.type = 'primary'
+    WHERE {_report_address_type_clause("a")}
       AND (a.country_code IS NULL OR UPPER(a.country_code) IN ('US', 'USA'))
       AND a.state_name IS NOT NULL
       AND a.state_name <> ''
@@ -898,7 +954,7 @@ pharmacist_base AS (
         REGEXP_REPLACE(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g') AS telephone_number
     FROM {address_table_sql} AS a
     CROSS JOIN pharmacist_taxonomy AS pt
-    WHERE a.type = 'primary'
+    WHERE {_report_address_type_clause("a")}
       AND (a.country_code IS NULL OR UPPER(a.country_code) IN ('US', 'USA'))
       AND a.taxonomy_array && pt.codes
     ORDER BY {address_order_expr}
@@ -937,14 +993,10 @@ pharmacy_base AS (
         a.npi::bigint AS npi,
         COALESCE(NULLIF(a.state_name, ''), 'NA') AS state_name,
         REGEXP_REPLACE(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g') AS telephone_number,
-        CASE
-            WHEN a.plans_network_array IS NULL THEN FALSE
-            WHEN a.plans_network_array @@ '0'::query_int THEN FALSE
-            ELSE TRUE
-        END AS has_insurance
+        {scoped_address_aca_insurance_predicate() if current_network_address_scope() is not None else "CASE WHEN a.plans_network_array IS NULL THEN FALSE WHEN a.plans_network_array @@ '0'::query_int THEN FALSE ELSE TRUE END"} AS has_insurance
     FROM {address_table_sql} AS a
     CROSS JOIN pharmacy_taxonomy AS pt
-    WHERE a.type = 'primary'
+    WHERE {_report_address_type_clause("a")}
       AND (a.country_code IS NULL OR UPPER(a.country_code) IN ('US', 'USA'))
       AND a.taxonomy_array && pt.codes
     ORDER BY {address_order_expr}
@@ -988,29 +1040,56 @@ def _pharmacy_state_stats_methodology(*, staffing_helper_available: bool) -> dic
     return {
         "version": "v1",
         "sources": [
-            "NPPES/NPI primary provider addresses",
+            (
+                "NPPES/NPI eligible retained offices"
+                if current_network_address_scope() is not None
+                else "NPPES/NPI primary provider addresses"
+            ),
             "NUCC taxonomy classification mapping",
-            "HealthPorta NPI staffing helper derived from pharmacist primary addresses",
+            (
+                "Live pharmacist matches restricted to eligible retained offices"
+                if current_network_address_scope() is not None
+                else "HealthPorta NPI staffing helper derived from pharmacist primary addresses"
+            ),
         ],
         "notes": [
-            "Rows are grouped by primary-address state across pharmacy and pharmacist NPIs.",
-            "Active pharmacists require a state-and-phone match to at least one pharmacy primary address.",
+            (
+                "Rows use eligible retained offices before selecting one office per NPI and grouping by state."
+                if current_network_address_scope() is not None
+                else "Rows are grouped by primary-address state across pharmacy and pharmacist NPIs."
+            ),
+            (
+                "Active pharmacists require a state-and-phone match within eligible retained offices."
+                if current_network_address_scope() is not None
+                else "Active pharmacists require a state-and-phone match to at least one pharmacy primary address."
+            ),
             "Active pharmacies require at least one matched pharmacist on the same state and phone number.",
-            "ACA pharmacy count means the primary NPI address carries a non-zero plans_network_array.",
+            (
+                "ACA pharmacy count means an eligible office belongs to an active approved ACA-bound canonical network."
+                if current_network_address_scope() is not None
+                else "ACA pharmacy count means the primary NPI address carries a non-zero plans_network_array."
+            ),
             "Output is normalized to US states plus District of Columbia (51 rows); unknown labels are excluded.",
         ],
         "staffing_helper_available": staffing_helper_available,
         "staffing_mode": "helper_table" if staffing_helper_available else "live_fallback_query",
     }
 
+
 async def _query_pharmacy_state_stats(session) -> tuple[list[dict[str, Any]], bool]:
-    has_staffing_helper = await _is_table_available(session, NPIPhoneStaffing.__table__)
+    has_staffing_helper = current_network_address_scope() is None and await _is_table_available(
+        session, NPIPhoneStaffing.__table__
+    )
     address_table_sql = await _resolve_pharmacy_address_table_sql(session)
     sql = _build_pharmacy_state_stats_sql(
         has_staffing_helper=has_staffing_helper,
         address_table_sql=address_table_sql,
     )
-    result = await session.execute(text(sql))
+    result = (
+        await session.execute(text(sql), scoped_address_parameters({}))
+        if current_network_address_scope() is not None
+        else await session.execute(text(sql))
+    )
     rows = []
     for row in result.mappings().all():
         rows.append(
@@ -1033,9 +1112,7 @@ def _build_pharmacy_state_stats_payload(
 ) -> dict[str, Any]:
     return {
         "states": states,
-        "methodology": _pharmacy_state_stats_methodology(
-            staffing_helper_available=staffing_helper_available
-        ),
+        "methodology": _pharmacy_state_stats_methodology(staffing_helper_available=staffing_helper_available),
     }
 
 
@@ -1061,7 +1138,7 @@ def _build_market_sql(
     address_zip5_expr = _pharmacy_address_zip5_expr("a", address_table_sql)
     parameter_map: dict[str, Any] = {}
     base_filters: list[str] = [
-        "a.type = 'primary'",
+        _report_address_type_clause("a"),
         "a.taxonomy_array && pc.codes",
     ]
     if state:
@@ -1251,7 +1328,7 @@ identifier_by_npi AS (
     staffing_join = ""
     staffing_select = "NULL::int AS estimated_pharmacist_count_proxy"
     if include_staffing:
-        staffing_cte = """
+        staffing_cte = f"""
 , pharmacist_codes AS (
     SELECT COALESCE(ARRAY_AGG(int_code), ARRAY[]::integer[]) AS codes
     FROM mrf.nucc_taxonomy
@@ -1264,7 +1341,7 @@ identifier_by_npi AS (
         REGEXP_REPLACE(COALESCE(p.telephone_number, ''), '[^0-9]', '', 'g') AS phone_digits
     FROM {address_table_sql} p
     CROSS JOIN pharmacist_codes pc
-    WHERE p.type = 'primary'
+    WHERE {_report_address_type_clause("p")}
       AND p.taxonomy_array && pc.codes
       AND REGEXP_REPLACE(COALESCE(p.telephone_number, ''), '[^0-9]', '', 'g') <> ''
 )
@@ -1581,7 +1658,7 @@ async def _build_market_summary_query_sql(session, query: _MarketSummaryQuery):
             "offset": query.offset,
         }
     )
-    return count_sql, data_sql, parameter_map
+    return count_sql, data_sql, scoped_address_parameters(parameter_map)
 
 
 async def _load_market_summary_rows(session, query: _MarketSummaryQuery):
@@ -1605,9 +1682,7 @@ def _normalize_market_summary_metrics(market_row_dict, *, include_staffing: bool
         }
     )
     metric_by_name["estimated_pharmacist_count_proxy"] = (
-        _coerce_int(market_row_dict.get("estimated_pharmacist_count_proxy"))
-        if include_staffing
-        else None
+        _coerce_int(market_row_dict.get("estimated_pharmacist_count_proxy")) if include_staffing else None
     )
     metric_by_name["top_chains"] = _hydrate_top_chains(market_row_dict.get("top_chains"))
     score = _score_components(metric_by_name)
@@ -1801,21 +1876,21 @@ LEFT JOIN mrf.geo_zip_lookup g ON g.zip_code = {address_zip5_expr}
 {license_join}
 {other_id_join}
 CROSS JOIN pharmacy_codes pc
-WHERE a.type = 'primary'
+WHERE {_report_address_type_clause("a")}
   AND a.npi = :npi
   AND a.taxonomy_array && pc.codes
+{("ORDER BY " + _pharmacy_address_order_expr("a", address_table)) if current_network_address_scope() is not None else ""}
 LIMIT 1;
 """
     pharmacy_row = (
-        await session.execute(text(sql), {"npi": npi, "as_of": as_of})
-    ).mappings().first()
+        (await session.execute(text(sql), scoped_address_parameters({"npi": npi, "as_of": as_of}))).mappings().first()
+    )
     if not pharmacy_row:
         return None
     pharmacy_row_dict = dict(pharmacy_row)
     return {
         "npi": _coerce_int(pharmacy_row_dict.get("npi")),
-        "name": pharmacy_row_dict.get("provider_organization_name")
-        or pharmacy_row_dict.get("do_business_as_text"),
+        "name": pharmacy_row_dict.get("provider_organization_name") or pharmacy_row_dict.get("do_business_as_text"),
         "chain_name": pharmacy_row_dict.get("chain_name"),
         "state": pharmacy_row_dict.get("state_name"),
         "city": pharmacy_row_dict.get("city_name"),
@@ -1824,25 +1899,15 @@ LIMIT 1;
         "medicare_active": bool(pharmacy_row_dict.get("medicare_active")),
         "mail_order": bool(pharmacy_row_dict.get("mail_order")),
         "pharmacy_type": pharmacy_row_dict.get("pharmacy_type"),
-        "has_active_state_license": bool(
-            pharmacy_row_dict.get("has_active_state_license")
-        ),
+        "has_active_state_license": bool(pharmacy_row_dict.get("has_active_state_license")),
         "disciplinary_flag_any": bool(pharmacy_row_dict.get("disciplinary_flag_any")),
         "has_ncpdp_identifier": bool(pharmacy_row_dict.get("has_ncpdp_identifier")),
-        "has_medicaid_identifier": bool(
-            pharmacy_row_dict.get("has_medicaid_identifier")
-        ),
-        "has_railroad_medicare_identifier": bool(
-            pharmacy_row_dict.get("has_railroad_medicare_identifier")
-        ),
+        "has_medicaid_identifier": bool(pharmacy_row_dict.get("has_medicaid_identifier")),
+        "has_railroad_medicare_identifier": bool(pharmacy_row_dict.get("has_railroad_medicare_identifier")),
         "has_ptan_identifier": bool(pharmacy_row_dict.get("has_ptan_identifier")),
         "has_clia_identifier": bool(pharmacy_row_dict.get("has_clia_identifier")),
-        "has_medicare_identifier": bool(
-            pharmacy_row_dict.get("has_medicare_identifier")
-        ),
-        "other_identifier_count": _coerce_int(
-            pharmacy_row_dict.get("other_identifier_count")
-        ),
+        "has_medicare_identifier": bool(pharmacy_row_dict.get("has_medicare_identifier")),
+        "other_identifier_count": _coerce_int(pharmacy_row_dict.get("other_identifier_count")),
     }
 
 
@@ -1905,10 +1970,11 @@ def _market_list_request(args):
 
 
 @blueprint.get("/pharmacies/markets")
-async def list_pharmacy_markets(request):
+async def list_pharmacy_markets(request, *, native_args=None):
     """List pharmacy market summaries under the requested filters."""
+    args = _report_args(request, native_args)
     session = _get_session(request)
-    pagination, query, response_filter_by_field = _market_list_request(request.args)
+    pagination, query, response_filter_by_field = _market_list_request(args)
     total, market_items = await _query_market_summaries(session, query)
     return response.json(
         {
@@ -1932,8 +1998,9 @@ async def list_pharmacy_markets(request):
 
 
 @blueprint.get("/pharmacies/markets/<market_id>")
-async def get_pharmacy_market_by_id(request, market_id):
+async def get_pharmacy_market_by_id(request, market_id, *, native_args=None):
     """Return one pharmacy market summary by stable market identifier."""
+    args = _report_args(request, native_args)
     session = _get_session(request)
     market_id = str(market_id or "").strip()
     if not _MARKET_ID_PATTERN.fullmatch(market_id):
@@ -1941,8 +2008,8 @@ async def get_pharmacy_market_by_id(request, market_id):
     scope = market_id.split(":", 1)[0].lower()
     if scope not in _ALLOWED_SCOPES:
         raise InvalidUsage("Unsupported market_id scope")
-    as_of = _parse_date_param(request.args.get("as_of"), "as_of") or datetime.date.today()
-    include_staffing = _is_boolean_parameter_enabled(request.args.get("include_staffing"), default=False)
+    as_of = _parse_date_param(args.get("as_of"), "as_of") or datetime.date.today()
+    include_staffing = _is_boolean_parameter_enabled(args.get("include_staffing"), default=False)
     total, market_items = await _query_market_summaries(
         session,
         _MarketSummaryQuery(
@@ -1989,10 +2056,10 @@ def _rank_pharmacy_access_markets(market_items, offset: int) -> list[dict]:
 
 
 @blueprint.get("/pharmacies/rankings/access")
-async def list_pharmacy_access_rankings(request):
+async def list_pharmacy_access_rankings(request, *, native_args=None):
     """Rank pharmacy markets by the selected access metric."""
+    args = _report_args(request, native_args)
     session = _get_session(request)
-    args = request.args
     args.get("page")
     args.get("page_size")
     args.get("limit")
@@ -2013,9 +2080,7 @@ async def list_pharmacy_access_rankings(request):
 
     scope = _parse_scope(args.get("scope"), default=default_scope)
     as_of = _parse_date_param(args.get("as_of"), "as_of") or datetime.date.today()
-    include_staffing = _is_boolean_parameter_enabled(
-        args.get("include_staffing"), default=False
-    )
+    include_staffing = _is_boolean_parameter_enabled(args.get("include_staffing"), default=False)
     chain = _canonical_chain(args.get("chain"))
     query = _MarketSummaryQuery(
         scope=scope,
@@ -2050,9 +2115,7 @@ def _access_ranking_response(
     total: int,
     market_items,
 ):
-    ranked_markets = _rank_pharmacy_access_markets(
-        market_items, pagination.offset
-    )
+    ranked_markets = _rank_pharmacy_access_markets(market_items, pagination.offset)
     return response.json(
         {
             "as_of": as_of.isoformat(),
@@ -2069,14 +2132,15 @@ def _access_ranking_response(
 
 
 @blueprint.get("/pharmacies/chains/summary")
-async def get_pharmacy_chain_summary(request):
+async def get_pharmacy_chain_summary(request, *, native_args=None):
     """Return pharmacy-chain coverage and access summary metrics."""
+    args = _report_args(request, native_args)
     session = _get_session(request)
-    request.args.get("name_like")
-    names = _extract_name_like_filters(request.args)
+    args.get("name_like")
+    names = _extract_name_like_filters(args)
     if not names:
         raise InvalidUsage("At least one name_like value is required")
-    include_states = _is_boolean_parameter_enabled(request.args.get("include_states"), default=True)
+    include_states = _is_boolean_parameter_enabled(args.get("include_states"), default=True)
     summary, histogram_entries, states, staffing_helper_available = await _query_chain_summary(
         session,
         names=names,
@@ -2105,32 +2169,23 @@ async def get_pharmacy_chain_summary(request):
             "states": [
                 {
                     "state": str(state_entry.get("state") or "").upper(),
-                    "active_pharmacy_count": _coerce_int(
-                        state_entry.get("active_pharmacy_count")
-                    ),
-                    "pharmacy_npi_count": _coerce_int(
-                        state_entry.get("pharmacy_npi_count")
-                    ),
-                    "insured_pharmacy_npi_count": _coerce_int(
-                        state_entry.get("insured_pharmacy_npi_count")
-                    ),
-                    "pharmacist_count": _coerce_int(
-                        state_entry.get("pharmacist_count")
-                    ),
+                    "active_pharmacy_count": _coerce_int(state_entry.get("active_pharmacy_count")),
+                    "pharmacy_npi_count": _coerce_int(state_entry.get("pharmacy_npi_count")),
+                    "insured_pharmacy_npi_count": _coerce_int(state_entry.get("insured_pharmacy_npi_count")),
+                    "pharmacist_count": _coerce_int(state_entry.get("pharmacist_count")),
                 }
                 for state_entry in states
                 if state_entry.get("state")
             ],
-            "methodology": _pharmacy_chain_summary_methodology(
-                staffing_helper_available=staffing_helper_available
-            ),
+            "methodology": _pharmacy_chain_summary_methodology(staffing_helper_available=staffing_helper_available),
         }
     )
 
 
 @blueprint.get("/pharmacies/state-stats", name="pharmacy_state_stats")
-async def get_pharmacy_state_stats(request):
+async def get_pharmacy_state_stats(request, *, native_args=None):
     """Return state-level pharmacy access summary metrics."""
+    _report_args(request, native_args)
     session = _get_session(request)
     states, staffing_helper_available = await _query_pharmacy_state_stats(session)
     return response.json(
@@ -2142,12 +2197,13 @@ async def get_pharmacy_state_stats(request):
 
 
 @blueprint.get("/pharmacies/<npi>/market-context")
-async def get_pharmacy_market_context(request, npi):
+async def get_pharmacy_market_context(request, npi, *, native_args=None):
     """Return market context for one pharmacy NPI."""
+    args = _report_args(request, native_args)
     session = _get_session(request)
     parsed_npi = _parse_npi(npi)
-    as_of = _parse_date_param(request.args.get("as_of"), "as_of") or datetime.date.today()
-    include_staffing = _is_boolean_parameter_enabled(request.args.get("include_staffing"), default=False)
+    as_of = _parse_date_param(args.get("as_of"), "as_of") or datetime.date.today()
+    include_staffing = _is_boolean_parameter_enabled(args.get("include_staffing"), default=False)
 
     pharmacy = await _fetch_pharmacy_context(session, npi=parsed_npi, as_of=as_of)
     if not pharmacy:
@@ -2190,3 +2246,27 @@ async def get_pharmacy_market_context(request, npi):
             "methodology": _pharmacy_market_methodology(as_of, include_staffing),
         }
     )
+
+
+async def read_managed_pharmacy_report(request, kind, native_args):
+    """Dispatch only the fixed reports inside the already-authorized Reader scope."""
+    if current_network_address_scope() is None or kind not in MANAGED_REPORT_FIELDS:
+        raise InvalidUsage("Managed report scope is required.")
+    handlers_by_kind = {
+        "pharmacy-markets": list_pharmacy_markets,
+        "pharmacy-market": get_pharmacy_market_by_id,
+        "pharmacy-rankings": list_pharmacy_access_rankings,
+        "pharmacy-chain-summary": get_pharmacy_chain_summary,
+        "pharmacy-state-stats": get_pharmacy_state_stats,
+        "pharmacy-context": get_pharmacy_market_context,
+    }
+    path_args = (
+        (native_args.get("market_id"),)
+        if kind == "pharmacy-market"
+        else (native_args.get("npi"),)
+        if kind == "pharmacy-context"
+        else ()
+    )
+    if path_args and (type(path_args[0]) is not str or not path_args[0]):
+        raise InvalidUsage("Report identity is required.")
+    return await handlers_by_kind[kind](request, *path_args, native_args=native_args)

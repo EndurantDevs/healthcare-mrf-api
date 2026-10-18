@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-
 ReferenceRowLoader = Callable[..., Awaitable[list[Any]]]
 
 
@@ -50,6 +49,15 @@ async def load_snapshot_reference_rows(
             selected_fields=selected_fields,
             reference_field=reference_field,
         )
+    reference_rows_by_kind["pin"].extend(
+        await loader(
+            schema,
+            snapshot_id,
+            table="plan_release_snapshot_pin",
+            selected_fields="'plan_release_serving_revision'::text AS owner_type, serving_revision_id AS owner_id",
+            order_fields="serving_revision_id",
+        )
+    )
     return reference_rows_by_kind
 
 
@@ -60,7 +68,4 @@ def reference_string_values(
 ) -> list[str]:
     """Return one stable string value from every loaded reference row."""
 
-    return [
-        str(row_mapping(reference_row).get(field))
-        for reference_row in reference_rows
-    ]
+    return [str(row_mapping(reference_row).get(field)) for reference_row in reference_rows]

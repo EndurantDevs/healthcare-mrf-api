@@ -6,20 +6,21 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import BigInteger
-from sqlalchemy import Boolean
-from sqlalchemy import CheckConstraint
-from sqlalchemy import Column
-from sqlalchemy import ForeignKeyConstraint
-from sqlalchemy import PrimaryKeyConstraint
-from sqlalchemy import String
-from sqlalchemy import TIMESTAMP
-from sqlalchemy import UniqueConstraint
-from sqlalchemy import text
+from sqlalchemy import (
+    TIMESTAMP,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    ForeignKeyConstraint,
+    PrimaryKeyConstraint,
+    String,
+    UniqueConstraint,
+    text,
+)
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
-
 
 __all__ = (
     "ProviderDirectoryUHCFlexNPICohort",
@@ -28,10 +29,7 @@ __all__ = (
 
 
 _SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-_CONTRACT = (
-    "healthporta.provider-directory.uhc-flex-official-practitioner-"
-    "npi-cohort.v1"
-)
+_CONTRACT = "healthporta.provider-directory.uhc-flex-official-practitioner-npi-cohort.v1"
 _SOURCE_ID = "pdfhir_2754e999dd691175821ec26e"
 
 
@@ -46,6 +44,7 @@ def _table_args(*constraints):
 class ProviderDirectoryUHCFlexNPICohort(Base, JSONOutputMixin):
     """One sealed NPI set derived from a current official UHC dataset."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_uhc_flex_npi_cohort"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
@@ -113,6 +112,7 @@ class ProviderDirectoryUHCFlexNPICohort(Base, JSONOutputMixin):
 class ProviderDirectoryUHCFlexNPIMember(Base, JSONOutputMixin):
     """One validated NPI in a child-first, header-sealed cohort."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_uhc_flex_npi_member"
     __main_table__ = __tablename__
     __table_args__ = _table_args(

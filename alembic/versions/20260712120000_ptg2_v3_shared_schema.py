@@ -8,8 +8,14 @@ from __future__ import annotations
 
 import os
 
-from alembic import op
+import sqlalchemy as sa
 
+from alembic import op
+from db.migration_adoption import (
+    _schema_inspector,
+    add_column_if_missing,
+    create_table_or_validate,
+)
 
 revision = "20260712120000_ptg2_v3_shared_schema"
 down_revision = "20260713237000_provider_directory_plan_scalars"
@@ -24,9 +30,7 @@ def _schema() -> str:
     runtime_schema = os.getenv("HLTHPRT_DB_SCHEMA")
     legacy_schema = os.getenv("DB_SCHEMA")
     if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
-        raise RuntimeError(
-            "DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema"
-        )
+        raise RuntimeError("DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema")
     return runtime_schema or legacy_schema or "mrf"
 
 
@@ -56,6 +60,54 @@ def _create_hash_partitions(schema: str, parent: str) -> None:
 def _execute_ddl(*statements: str) -> None:
     for statement in statements:
         op.execute(statement)
+
+
+def _adopt_code_catalog(schema: str) -> None:
+    """Retain older catalog rows without guessing classification or provenance."""
+    inspector = _schema_inspector(op)
+    if inspector is None:
+        return
+    column_by_name = {column["name"]: column for column in inspector.get_columns("code_catalog", schema=schema)}
+    for name, nullable in (("code", False), ("source", True)):
+        column = column_by_name.get(name)
+        if (
+            column is None
+            or not isinstance(column["type"], sa.String)
+            or column["type"].length not in (64, 128)
+            or bool(column["nullable"]) != nullable
+        ):
+            raise RuntimeError(f"existing_schema_column_mismatch:{schema}.code_catalog.{name}")
+        if column["type"].length == 64:
+            op.alter_column(
+                "code_catalog",
+                name,
+                existing_type=column["type"],
+                type_=sa.String(128),
+                schema=schema,
+            )
+    for column in (
+        sa.Column("code_type", sa.String(32), nullable=True),
+        sa.Column("source_release", sa.String(64), nullable=True),
+        sa.Column("source_attribution", sa.Text(), nullable=True),
+    ):
+        add_column_if_missing(op, "code_catalog", column, schema=schema)
+    create_table_or_validate(
+        op,
+        "code_catalog",
+        sa.Column("code_system", sa.String(32), nullable=False),
+        sa.Column("code", sa.String(128), nullable=False),
+        sa.Column("code_type", sa.String(32), nullable=True),
+        sa.Column("display_name", sa.String(), nullable=True),
+        sa.Column("short_description", sa.String(), nullable=True),
+        sa.Column("long_description", sa.Text(), nullable=True),
+        sa.Column("is_active", sa.Boolean(), nullable=True),
+        sa.Column("source", sa.String(128), nullable=True),
+        sa.Column("source_release", sa.String(64), nullable=True),
+        sa.Column("source_attribution", sa.Text(), nullable=True),
+        sa.Column("updated_at", sa.DateTime(), nullable=True),
+        sa.PrimaryKeyConstraint("code_system", "code"),
+        schema=schema,
+    )
 
 
 def _create_runtime_control_prerequisites(schema: str) -> None:
@@ -158,6 +210,9 @@ def _create_runtime_control_prerequisites(schema: str) -> None:
             CONSTRAINT {_q("code_catalog_pkey")} PRIMARY KEY (code_system, code)
         )
         """,
+    )
+    _adopt_code_catalog(schema)
+    _execute_ddl(
         f"""
         CREATE INDEX IF NOT EXISTS {_q("code_catalog_code_system_idx")}
             ON {_qt(schema, "code_catalog")} (code, code_system)
@@ -914,12 +969,8 @@ def upgrade():
 def downgrade():
     schema = _schema()
     op.execute(f"DROP TABLE IF EXISTS {_qt(schema, 'ptg2_v3_gc_candidate')};")
-    op.execute(
-        f"DROP TABLE IF EXISTS {_qt(schema, 'ptg2_v3_candidate_audit_attestation')};"
-    )
-    op.execute(
-        f"DROP TABLE IF EXISTS {_qt(schema, 'ptg2_v3_audit_occurrence')} CASCADE;"
-    )
+    op.execute(f"DROP TABLE IF EXISTS {_qt(schema, 'ptg2_v3_candidate_audit_attestation')};")
+    op.execute(f"DROP TABLE IF EXISTS {_qt(schema, 'ptg2_v3_audit_occurrence')} CASCADE;")
     op.execute(f"DROP TABLE IF EXISTS {_qt(schema, 'ptg2_v3_npi_scope')} CASCADE;")
     op.execute(f"DROP TABLE IF EXISTS {_qt(schema, 'ptg2_v3_price_attr')};")
     op.execute(f"DROP TABLE IF EXISTS {_qt(schema, 'ptg2_v3_provider_set')};")

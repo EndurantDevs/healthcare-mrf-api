@@ -165,6 +165,18 @@ def _validate_epoch_coordinates(source):
 
 
 @dataclass(frozen=True)
+class FHIRResourceDisposition:
+    """One retained resource position, independently of its membership fanout."""
+
+    generation_id: str
+    resource_type: str
+    resource_id: str
+    payload_sha256: str
+    outcome: str
+    reason: str | None
+
+
+@dataclass(frozen=True)
 class FHIRMembershipBatch:
     """Bounded exact rows and the immutable source recipe used to extract them."""
 
@@ -179,21 +191,32 @@ class FHIRMembershipBatch:
     binding_coordinates: RegistryNetworkSourceCoordinates | None = None
     approved_only: bool = False
     omitted_rows: int = 0
+    accepted_source_rows: int = 0
+    unresolved_source_rows: int = 0
+    omitted_source_rows: int = 0
+    source_outcomes: tuple[FHIRResourceDisposition, ...] = ()
+
+    complete_raw_facts: bool = True
 
     @property
     def generation_id(self):
         """Bind reviewed mappings without changing the legacy source generation."""
-        _reviewed_descriptor(self.source, self.approved_source, self.binding_coordinates, self.approved_only)
-        if self.approved_source is None and self.binding_coordinates is None:
-            return self.source.generation_id
-        recipe_dict = {
-            "source": self.source.coordinates,
-            "approved_source": asdict(self.approved_source),
-            "binding_coordinates": asdict(self.binding_coordinates),
-        }
-        if self.approved_only:
-            recipe_dict["selection_policy"] = "approved-bindings-only"
-        return hashlib.sha256(json.dumps(recipe_dict, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return _generation_id(self.source, self.approved_source, self.binding_coordinates, self.approved_only)
+
+
+def _generation_id(source, approved_source, coordinates, approved_only):
+    """Preserve the existing source/approved-map generation for positions and retries."""
+    _reviewed_descriptor(source, approved_source, coordinates, approved_only)
+    if approved_source is None and coordinates is None:
+        return source.generation_id
+    recipe_dict = {
+        "source": source.coordinates,
+        "approved_source": asdict(approved_source),
+        "binding_coordinates": asdict(coordinates),
+    }
+    if approved_only:
+        recipe_dict["selection_policy"] = "approved-bindings-only"
+    return hashlib.sha256(json.dumps(recipe_dict, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _reviewed_descriptor(source, approved_source, coordinates, approved_only=False):
@@ -222,8 +245,8 @@ async def _require_pinned_source(connection, source_pin, descriptor=None):
             await require_retained_cms_fhir_source_epoch(
                 connection, source_pin, source_pin.retained_epoch, verify_content=False
             )
-        except FHIRSourceEpochError:
-            raise FHIRMembershipSourceError("Pinned FHIR source is unavailable") from None
+        except FHIRSourceEpochError as error:
+            raise FHIRMembershipSourceError("Pinned FHIR source is unavailable") from error
     namespace = _identifier(source_pin.read_schema_name)
     admission = (
         "dataset.status IN ('validated','published','superseded')"
@@ -262,8 +285,8 @@ async def _require_source_recipe(connection, source_pin, descriptor, approved_so
         await require_approved_network_source_bindings(
             connection, approved_source, coordinates, control_schema=registry_schema
         )
-    except ApprovedNetworkSourceBindingError:
-        raise FHIRMembershipSourceError("Reviewed FHIR bindings are unavailable") from None
+    except ApprovedNetworkSourceBindingError as error:
+        raise FHIRMembershipSourceError("Reviewed FHIR bindings are unavailable") from error
     return (approved_source.approved_revision, *coordinates.sql_parameters)
 
 
@@ -299,7 +322,27 @@ _BATCH_SQL = """WITH {approved_cte}page AS MATERIALIZED (
         SELECT page.*, {provider_system} AS provider_system,{provider_id} AS provider_id,
           provider.resource_type AS provider_resource_type,provider.resource_id AS provider_resource_id,
           {provider_payload_sha256} AS provider_payload_sha256,
-          page.resource_id IS DISTINCT FROM page.payload->>'resource_id'
+          CASE WHEN payload->'active'='false'::jsonb THEN 'inactive'
+            WHEN pg_input_is_valid(left(payload->>'period_end',10),'date')
+              AND left(payload->>'period_end',10)<$8 THEN 'expired'
+            WHEN pg_input_is_valid(left(payload->>'period_start',10),'date')
+              AND left(payload->>'period_start',10)>$8 THEN 'future' END AS omission_reason,
+          page.resource_id !~ '^[A-Za-z0-9.-]{{1,64}}$' OR page.payload_hash !~ '^[0-9a-f]{{64}}$'
+          OR (payload->'active' IS NOT NULL AND payload->'active'<>'null'::jsonb
+            AND jsonb_typeof(payload->'active')<>'boolean')
+          OR coalesce((pg_input_is_valid(left(payload->>'period_start',10),'date')
+            AND pg_input_is_valid(left(payload->>'period_end',10),'date')
+            AND left(payload->>'period_start',10)>left(payload->>'period_end',10)),false)
+          OR EXISTS(SELECT 1 FROM jsonb_array_elements(CASE
+            WHEN jsonb_typeof(payload->'location_refs')='array' THEN payload->'location_refs' ELSE '[]'::jsonb END) item
+            WHERE jsonb_typeof(item)<>'string')
+          OR EXISTS(SELECT 1 FROM jsonb_array_elements(CASE
+            WHEN jsonb_typeof(payload->'network_refs')='array' THEN payload->'network_refs' ELSE '[]'::jsonb END) item
+            WHERE jsonb_typeof(item)<>'string')
+          OR EXISTS(SELECT 1 FROM jsonb_array_elements(CASE
+            WHEN jsonb_typeof(payload->'insurance_plan_refs')='array' THEN payload->'insurance_plan_refs' ELSE '[]'::jsonb END) item
+            WHERE jsonb_typeof(item)<>'string')
+          OR page.resource_id IS DISTINCT FROM page.payload->>'resource_id'
           OR (page.payload->>'source_id' IS NOT NULL AND page.payload->>'source_id'<>$5)
           OR (page.payload->>'npi' IS NOT NULL AND provider.payload_json::jsonb->>'npi' IS NOT NULL
             AND page.payload->>'npi'<>provider.payload_json::jsonb->>'npi')
@@ -336,11 +379,7 @@ _BATCH_SQL = """WITH {approved_cte}page AS MATERIALIZED (
               THEN payload->'insurance_plan_refs' ELSE '[]'::jsonb END) refs(reference)
           LEFT JOIN plan_networks ON plan_networks.insurance_plan_reference COLLATE "C"=refs.reference COLLATE "C"
         ) networks ON true
-        WHERE payload->'active' IS DISTINCT FROM 'false'::jsonb
-          AND (payload->>'period_start' IS NULL OR NOT pg_input_is_valid(left(payload->>'period_start',10),'date')
-            OR left(payload->>'period_start',10)<=$8)
-          AND (payload->>'period_end' IS NULL OR NOT pg_input_is_valid(left(payload->>'period_end',10),'date')
-            OR left(payload->>'period_end',10)>=$8)
+        WHERE omission_reason IS NULL OR malformed
         LIMIT 5001
       ), selected_sites AS (
         SELECT DISTINCT binding.site_id FROM expanded
@@ -359,7 +398,12 @@ _BATCH_SQL = """WITH {approved_cte}page AS MATERIALIZED (
         SELECT expanded.*,binding.site_id,{network_id} AS network_id,
           {omission_columns}
           malformed OR provider_id IS NULL OR (provider_system='npi' AND provider_id !~ '^[12][0-9]{{9}}$')
-            OR binding.site_id IS NULL OR {network_unresolved} OR ambiguous_sites.site_id IS NOT NULL AS unresolved
+            OR binding.site_id IS NULL OR {network_unresolved} OR ambiguous_sites.site_id IS NOT NULL AS unresolved,
+          CASE WHEN malformed THEN 'malformed_resource'
+            WHEN provider_id IS NULL OR (provider_system='npi' AND provider_id !~ '^[12][0-9]{{9}}$')
+              THEN 'provider_unresolved'
+            WHEN binding.site_id IS NULL OR ambiguous_sites.site_id IS NOT NULL THEN 'location_unresolved'
+            WHEN {network_unresolved} THEN 'network_unresolved' END AS unresolved_reason
         FROM expanded
         LEFT JOIN {source_namespace}.provider_directory_dataset_resource location
           ON location.dataset_id=$1 AND location.resource_type='Location'
@@ -387,23 +431,56 @@ _BATCH_SQL = """WITH {approved_cte}page AS MATERIALIZED (
             AND alias.alias_value=legacy.network_id::text AND alias.scope_key=$7
         LEFT JOIN {registry_namespace}.network_registry_identity identity ON identity.network_id=alias.network_id
         {reviewed_join}
+      ), resource_edges AS (
+        SELECT resource_type,resource_id,count(*) AS edge_count,bool_or(unresolved) AS unresolved,
+          bool_or(NOT unresolved AND NOT omitted) AS accepted,
+          min(unresolved_reason COLLATE "C") AS unresolved_reason
+        FROM resolved GROUP BY resource_type,resource_id
+      ), resource_status AS (
+        SELECT providers.resource_type,providers.resource_id,providers.payload_hash,
+          CASE WHEN malformed OR coalesce(edges.unresolved,false)
+              OR (omission_reason IS NULL AND edge_count IS NULL) THEN 'unresolved'
+            WHEN omission_reason IS NOT NULL THEN 'omitted'
+            WHEN edges.accepted THEN 'accepted' ELSE 'omitted' END AS outcome,
+          CASE WHEN malformed THEN 'malformed_resource'
+            WHEN edges.unresolved THEN edges.unresolved_reason
+            WHEN omission_reason IS NOT NULL THEN omission_reason
+            WHEN edge_count IS NULL THEN 'location_unresolved'
+            WHEN NOT edges.accepted THEN 'unmapped_network' END AS reason
+        FROM providers LEFT JOIN resource_edges edges USING(resource_type,resource_id)
+      ), resource_documents AS (
+        SELECT outcome,jsonb_build_object('generation_id',$9::text,'resource_type',resource_type,
+          'resource_id',resource_id,'payload_sha256',payload_hash,'outcome',outcome,'reason',reason) AS document
+        FROM resource_status
+      ), resource_accounting AS (
+        SELECT count(*) FILTER(WHERE outcome='accepted') AS accepted_source_rows,
+          count(*) FILTER(WHERE outcome='unresolved') AS unresolved_source_rows,
+          count(*) FILTER(WHERE outcome='omitted') AS omitted_source_rows,
+          coalesce(jsonb_agg(document ORDER BY document->>'resource_type' COLLATE "C",
+            document->>'resource_id' COLLATE "C"),'[]'::jsonb)::text AS source_outcomes
+        FROM resource_documents
       ), encoded AS (
         SELECT jsonb_build_object('network_id',network_id,'provider_system',provider_system,'provider_id',provider_id,
           'location_id',site_id,'evidence_id',encode(sha256(convert_to(
             ({provider_evidence})::text,'UTF8')),'hex')) AS membership
-        FROM resolved WHERE NOT unresolved {encoded_filter}
+        FROM resolved WHERE NOT unresolved AND omission_reason IS NULL {encoded_filter}
+      ), transfer AS (
+        SELECT (SELECT count(*) FROM resolved)<=5000
+          AND (SELECT coalesce(sum(octet_length(membership::text)),0)+2*count(*)+2 FROM encoded)
+            +octet_length(source_outcomes)<=8388608 AS bounded FROM resource_accounting
       )
-      SELECT (SELECT count(*) FROM page) AS source_rows,
+      SELECT resource_accounting.accepted_source_rows,resource_accounting.unresolved_source_rows,
+        resource_accounting.omitted_source_rows,CASE WHEN transfer.bounded THEN source_outcomes END AS source_outcomes,
+        (SELECT count(*) FROM page) AS source_rows,
         (SELECT resource_type FROM page ORDER BY resource_type DESC,resource_id DESC LIMIT 1) AS last_type,
         (SELECT resource_id FROM page ORDER BY resource_type DESC,resource_id DESC LIMIT 1) AS last_id,
         (SELECT count(*) FROM resolved) AS expanded_rows,
         (SELECT count(*) FROM resolved WHERE unresolved {unresolved_filter}) AS unresolved_rows,
         {omitted_summary}
         (SELECT count(*) FROM encoded) AS membership_rows,
-        CASE WHEN (SELECT count(*) FROM resolved)<=5000
-          AND (SELECT coalesce(sum(octet_length(membership::text)),0)+2*count(*)+2 FROM encoded)<=8388608
+        CASE WHEN transfer.bounded
           THEN (SELECT coalesce(jsonb_agg(membership ORDER BY membership::text),'[]'::jsonb)::text FROM encoded)
-          END AS input_json"""
+          END AS input_json FROM resource_accounting CROSS JOIN transfer"""
 
 
 def _extraction_sql(source_pin, registry_namespace, reviewed, approved_only=False):
@@ -430,10 +507,14 @@ def _extraction_sql(source_pin, registry_namespace, reviewed, approved_only=Fals
             if reviewed
             else "identity.network_id IS NULL"
         ),
-        omission_columns=f"approved.record_key IS NULL AND ({complete_key}) AS omitted," if approved_only else "",
+        omission_columns=f"approved.record_key IS NULL AND ({complete_key}) AS omitted,"
+        if approved_only
+        else "false AS omitted,",
         encoded_filter="AND NOT omitted" if approved_only else "",
-        unresolved_filter="AND NOT omitted" if approved_only else "",
-        omitted_summary="(SELECT count(*) FROM resolved WHERE omitted) AS omitted_rows," if approved_only else "",
+        unresolved_filter="",
+        omitted_summary="(SELECT count(*) FROM resolved WHERE omitted AND NOT unresolved AND omission_reason IS NULL) AS omitted_rows,"
+        if approved_only
+        else "",
         reviewed_join=(
             "LEFT JOIN approved_network_bindings approved ON approved.record_json->>'source_key'=network.resource_id "
             "AND approved.record_json->'source_scope_json'=jsonb_build_object('organization_id',network.resource_id,"
@@ -541,13 +622,22 @@ async def read_fhir_membership_batch(
         source_pin.release_id,
         source_pin.alias_scope,
         source_pin.as_of,
+        _generation_id(source_pin, approved_source, binding_coordinates, approved_only),
     )
+    return _fhir_batch(source_pin, batch, approved_source, binding_coordinates, approved_only)
+
+
+def _fhir_batch(source_pin, batch, approved_source, binding_coordinates, approved_only):
+    """Bound and validate one complete SQL page before exposing its dispositions."""
     if batch["input_json"] is None:
         raise FHIRMembershipBatchBoundsError("FHIR membership batch exceeds bounds")
     input_bytes = batch["input_json"].encode()
     if len(input_bytes) > MAX_INPUT_BYTES:
         raise FHIRMembershipBatchBoundsError("FHIR membership batch exceeds bounds")
     next_resource = (batch["last_type"], batch["last_id"]) if batch["source_rows"] else None
+    outcomes = _resource_outcomes(
+        batch, _generation_id(source_pin, approved_source, binding_coordinates, approved_only)
+    )
     return FHIRMembershipBatch(
         source_pin,
         batch["source_rows"],
@@ -560,7 +650,34 @@ async def read_fhir_membership_batch(
         binding_coordinates,
         approved_only,
         batch["omitted_rows"] if approved_only else 0,
+        batch["accepted_source_rows"],
+        batch["unresolved_source_rows"],
+        batch["omitted_source_rows"],
+        outcomes,
     )
+
+
+def _resource_outcomes(batch, generation_id):
+    """Validate the closed resource census before a caller may admit any edge."""
+    outcomes = tuple(FHIRResourceDisposition(**document) for document in json.loads(batch["source_outcomes"]))
+    reasons_by_outcome = {
+        "accepted": {None},
+        "unresolved": {"malformed_resource", "provider_unresolved", "location_unresolved", "network_unresolved"},
+        "omitted": {"inactive", "expired", "future", "unmapped_network"},
+    }
+    if (
+        batch["source_rows"]
+        != sum(batch[name] for name in ("accepted_source_rows", "unresolved_source_rows", "omitted_source_rows"))
+        or len(outcomes) != batch["source_rows"]
+        or len({(outcome.resource_type, outcome.resource_id) for outcome in outcomes}) != len(outcomes)
+        or any(
+            outcome.generation_id != generation_id
+            or outcome.reason not in reasons_by_outcome.get(outcome.outcome, set())
+            for outcome in outcomes
+        )
+    ):
+        raise FHIRMembershipSourceError("FHIR resource accounting is incomplete")
+    return outcomes
 
 
 async def _require_reviewed_candidate(connection, batch, copy_target, control_schema):
@@ -591,7 +708,7 @@ async def copy_fhir_membership_batch(
     source map and, for reviewed batches, its exact approved revision. Batch
     registration and whole-source accounting belong to the candidate lifecycle.
     """
-    if type(batch) is not FHIRMembershipBatch or batch.unresolved_rows:
+    if type(batch) is not FHIRMembershipBatch or batch.unresolved_rows or batch.unresolved_source_rows:
         raise FHIRMembershipSourceError("FHIR source memberships are unresolved")
     _reviewed_descriptor(batch.source, batch.approved_source, batch.binding_coordinates, batch.approved_only)
     if not connection.is_in_transaction():

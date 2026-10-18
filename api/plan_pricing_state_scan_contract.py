@@ -16,7 +16,6 @@ from api.plan_pricing_projection_contract import (
 from api.plan_release_serving import annotate_plan_release_response
 from api.ptg2_response import _is_request_flag_enabled, _shape_ptg2_response
 
-
 STATE_SCAN_MAX_LIMIT = 200
 STATE_SCAN_RATE_OCCURRENCE_LIMIT = 256
 STATE_SCAN_PRICE_ATOM_LIMIT = 256
@@ -108,9 +107,7 @@ def _validate_scan_options(args: Mapping[str, Any], state: str) -> None:
     if view != "full" or not _is_request_flag_enabled(args.get("include_providers"), default=True):
         raise PlanPricingProjectionUnsupported("state scan requires view=full and include_providers=true")
     if not _is_explicit_false(args.get("include_allowed_amounts")):
-        raise PlanPricingProjectionUnsupported(
-            "state scan requires include_allowed_amounts=false"
-        )
+        raise PlanPricingProjectionUnsupported("state scan requires include_allowed_amounts=false")
     if order_by != "npi" or order != "asc":
         raise PlanPricingProjectionUnsupported("state scan requires order_by=npi and order=asc")
 
@@ -179,6 +176,7 @@ def response_document(
     args: Mapping[str, Any],
     *,
     byte_limit: int,
+    contributing_bindings=None,
 ) -> dict[str, Any]:
     """Shape one public response before enforcing its byte budget."""
 
@@ -187,12 +185,12 @@ def response_document(
         "pagination": pagination_by_field,
         "query": query_by_field,
     }
-    annotated = annotate_plan_release_response(response_by_field, selection)
+    annotated = annotate_plan_release_response(
+        response_by_field, selection, contributing_bindings=contributing_bindings
+    )
     public_response = _shape_ptg2_response(annotated or response_by_field, dict(args))
     if len(orjson.dumps(public_response, default=str)) > byte_limit:
-        raise PlanPricingStateScanBudgetExceeded(
-            "state scan page exceeds its serialized response budget"
-        )
+        raise PlanPricingStateScanBudgetExceeded("state scan page exceeds its serialized response budget")
     return public_response
 
 

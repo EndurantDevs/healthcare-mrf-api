@@ -34,45 +34,26 @@ def _bounded_copy_batches(records):
 
 @asynccontextmanager
 async def prepare_dataset_candidate(database, dataset_id, *, kind):
-    """Route materialization to private heaps, then attach the completed group."""
-    directory = import_module("process.provider_directory_fhir")
+    """Use the explicit native publisher; no custom database prepare/finish functions."""
+    from process.provider_directory_generic_source_kind_candidate import native_kind_candidate
 
-    if kind not in {"rooted", "practitioner"}:
-        raise ValueError("provider_directory_candidate_kind_invalid")
-    if database._transaction_binding() is None:
-        raise RuntimeError("provider_directory_candidate_transaction_required")
-    relations = await database.scalar(
-        f"SELECT {directory._qt(directory._schema(), f'prepare_pd_{kind}_dataset_candidate')}(:dataset_id);",
-        dataset_id=dataset_id,
-    )
-    if isinstance(relations, str):
-        relations = json.loads(relations)
-    if not isinstance(relations, dict) or not relations:
-        raise RuntimeError("provider_directory_candidate_invalid")
-    with directory._provider_directory_artifact_relation_scope(relations):
+    directory = import_module("process.provider_directory_fhir")
+    async with native_kind_candidate(database, directory, dataset_id, kind=kind) as relations:
         yield relations
-    await database.scalar(
-        f"SELECT {directory._qt(directory._schema(), f'finish_pd_{kind}_dataset_candidate')}(:dataset_id);",
-        dataset_id=dataset_id,
-    )
 
 
 async def copy_dataset_candidate_rows(database, table_name, columns, records):
-    """Native COPY of one bounded materialization page into its isolated heap."""
-    directory = import_module("process.provider_directory_fhir")
+    """COPY one complete bounded page using the original native publisher owner."""
+    from process.provider_directory_generic_source_policy import bound_publisher
+    from process.provider_directory_generic_source_storage import _copy
 
+    directory = import_module("process.provider_directory_fhir")
+    publisher = bound_publisher()
     binding = database._transaction_binding()
     relation = directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(table_name)
     if binding is None or not relation or not 1 <= len(records) <= 4096:
         raise RuntimeError("provider_directory_candidate_copy_invalid")
     driver = await _copy_driver(binding.session)
-    for batch in _bounded_copy_batches(records):
-        status = await driver.copy_records_to_table(
-            relation,
-            schema_name=directory._schema(),
-            columns=columns,
-            records=batch,
-        )
-        if status != f"COPY {len(batch)}":
-            raise RuntimeError("provider_directory_candidate_copy_incomplete")
-    return len(records)
+    if driver is not publisher.connection or publisher.policy.schema != directory._schema():
+        raise RuntimeError("provider_directory_generic_source_physical_transaction_changed")
+    return await _copy(driver, publisher.policy, relation, columns, records)

@@ -55,6 +55,7 @@ MATRIX_ROWS_BY_JOB = {
             ("core-ptg", "PTG"),
             *((f"registry-{index}", f"registry {index + 1}") for index in range(48)),
             ("directory-source", "directory source"),
+            ("directory-source-2", "directory source 2"),
             ("directory-storage", "directory storage"),
             ("directory-address", "directory address"),
             ("profile-storage", "profile storage"),
@@ -435,7 +436,7 @@ def test_publisher_requires_every_matrix_result_and_all_immutable_artifacts():
         for matrix_row in MATRIX_ROWS_BY_JOB["address-canonical-db-tests"]
     )
     assert identities == expected_ids
-    assert len(set(identities)) == 68
+    assert len(set(identities)) == 69
     assert download["with"]["digest-mismatch"] == "error"
     assert download["with"]["merge-multiple"] is False
     assert jobs["source-validation"]["needs"] == ["measurement"]

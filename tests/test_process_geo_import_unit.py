@@ -2,12 +2,11 @@ import asyncio
 import csv
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from process import geo_import
-
 
 CSV_FIELDNAMES = (
     "Zip Code",
@@ -48,80 +47,24 @@ def _write_geo_csv(
         writer.writerows(source_rows)
 
 
-class _TransactionSpy:
-    def __init__(self):
-        self.active = False
-        self.enter_count = 0
-        self.exit_count = 0
-        self.exit_exception_type = None
-
-    async def __aenter__(self):
-        assert not self.active
-        self.active = True
-        self.enter_count += 1
-        return self
-
-    async def __aexit__(self, exc_type, _exc, _traceback):
-        assert self.active
-        self.active = False
-        self.exit_count += 1
-        self.exit_exception_type = exc_type
-        return False
-
-
 @pytest.fixture
 def database_mocks(monkeypatch):
-    ensure_database_mock = AsyncMock()
-    create_table_mock = AsyncMock()
-    status_mock = AsyncMock()
-    generation_mock = AsyncMock()
-    transaction_spy = _TransactionSpy()
-    monkeypatch.setattr(geo_import, "ensure_database", ensure_database_mock)
-    monkeypatch.setattr(geo_import.db, "create_table", create_table_mock)
-    monkeypatch.setattr(geo_import.db, "status", status_mock)
-    monkeypatch.setattr(geo_import, "publish_local_reference_family_generation", generation_mock)
-    monkeypatch.setattr(
-        geo_import.db,
-        "transaction",
-        lambda: transaction_spy,
-    )
-    return SimpleNamespace(
-        ensure_database=ensure_database_mock,
-        create_table=create_table_mock,
-        status=status_mock,
-        generation=generation_mock,
-        transaction=transaction_spy,
-    )
+    captured_rows = []
+
+    async def publish(database, rows, expected_count, *, deadline, test_mode):
+        assert database is geo_import.db and deadline > 0
+        captured_rows.extend(rows)
+        geo_import._validate_stable_source_row_count(len(captured_rows), expected_count)
+
+    boundary = SimpleNamespace(authority=Mock(), producer=AsyncMock(side_effect=publish), rows=captured_rows)
+    monkeypatch.setattr(geo_import, "source_transaction_available", boundary.authority)
+    monkeypatch.setattr(geo_import, "publish_geo_rows", boundary.producer)
+    return boundary
 
 
-def _assert_database_not_reached(database_mocks) -> None:
-    database_mocks.ensure_database.assert_not_awaited()
-    database_mocks.create_table.assert_not_awaited()
-    database_mocks.status.assert_not_awaited()
-    assert database_mocks.transaction.enter_count == 0
-
-
-class _InsertStatementSpy:
-    def __init__(self, table, *, should_fail: bool = False):
-        self.table = table
-        self.should_fail = should_fail
-        self.excluded = SimpleNamespace(**{column.name: f"excluded_{column.name}" for column in table.c})
-        self.submitted_geo_rows = None
-        self.index_elements = None
-        self.updates_by_column = None
-
-    def values(self, pending_geo_rows):
-        self.submitted_geo_rows = list(pending_geo_rows)
-        return self
-
-    def on_conflict_do_update(self, *, index_elements, set_):
-        self.index_elements = index_elements
-        self.updates_by_column = set_
-        return self
-
-    async def status(self):
-        if self.should_fail:
-            raise RuntimeError("database write failed")
+def _assert_database_not_reached(database_mocks):
+    database_mocks.authority.assert_not_called()
+    database_mocks.producer.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -183,47 +126,40 @@ def test_normalize_county_code_keeps_last_five_digits(raw_value, expected):
 
 
 @pytest.mark.asyncio
-async def test_flush_skips_database_for_empty_buffer(monkeypatch):
-    monkeypatch.setattr(
-        geo_import.db,
-        "insert",
-        lambda _table: pytest.fail("empty buffers must not reach the database"),
-    )
+async def test_empty_stream_does_not_copy(monkeypatch):
+    from process import geo_source_snapshot as snapshot
 
-    await geo_import._flush_rows([])
-
-
-@pytest.mark.asyncio
-async def test_flush_upserts_every_mutable_column_and_clears_buffer(monkeypatch):
-    table = geo_import.GeoZipLookup.__table__
-    insert_spy = _InsertStatementSpy(table)
-    pending_geo_rows = [{"zip_code": "60654", "city": "Chicago"}]
-    monkeypatch.setattr(geo_import.db, "insert", lambda _table: insert_spy)
-
-    await geo_import._flush_rows(pending_geo_rows)
-
-    expected_updates_by_column = {
-        column.name: f"excluded_{column.name}" for column in table.c if not column.primary_key
-    }
-    assert insert_spy.submitted_geo_rows == [{"zip_code": "60654", "city": "Chicago"}]
-    assert insert_spy.index_elements == geo_import.GeoZipLookup.__my_index_elements__
-    assert insert_spy.updates_by_column == expected_updates_by_column
-    assert "zip_code" not in insert_spy.updates_by_column
-    assert pending_geo_rows == []
+    copy = AsyncMock()
+    monkeypatch.setattr(snapshot, "_copy", copy)
+    candidate = SimpleNamespace(deadline=float("inf"), raw="private")
+    assert await snapshot._load(object(), candidate, []) == 0
+    copy.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_flush_preserves_buffer_when_database_write_fails(monkeypatch):
-    table = geo_import.GeoZipLookup.__table__
-    insert_spy = _InsertStatementSpy(table, should_fail=True)
-    pending_geo_rows = [{"zip_code": "60654", "city": "Chicago"}]
-    expected_pending_geo_rows = list(pending_geo_rows)
-    monkeypatch.setattr(geo_import.db, "insert", lambda _table: insert_spy)
+async def test_native_copy_preserves_every_model_column(monkeypatch):
+    from process import geo_source_snapshot as snapshot
 
+    copy = AsyncMock()
+    monkeypatch.setattr(snapshot, "_copy", copy)
+    row = geo_import._geo_zip_values_from_csv_fields(_csv_fields_by_name())
+    candidate = SimpleNamespace(deadline=float("inf"), raw="private")
+    assert await snapshot._load(object(), candidate, [row]) == 1
+    assert copy.await_args.args[3] == [tuple(row[name] for name in snapshot.COLUMNS) + (0, 0)]
+    assert tuple(row) == snapshot.COLUMNS
+
+
+@pytest.mark.asyncio
+async def test_native_copy_failure_preserves_source_values(monkeypatch):
+    from process import geo_source_snapshot as snapshot
+
+    row = geo_import._geo_zip_values_from_csv_fields(_csv_fields_by_name())
+    saved_by_column = dict(row)
+    monkeypatch.setattr(snapshot, "_copy", AsyncMock(side_effect=RuntimeError("database write failed")))
+    candidate = SimpleNamespace(deadline=float("inf"), raw="private")
     with pytest.raises(RuntimeError, match="database write failed"):
-        await geo_import._flush_rows(pending_geo_rows)
-
-    assert pending_geo_rows == expected_pending_geo_rows
+        await snapshot._load(object(), candidate, [row])
+    assert row == saved_by_column
 
 
 @pytest.mark.asyncio
@@ -252,13 +188,7 @@ async def test_load_parses_bom_semicolon_and_skips_missing_keys(
             _csv_fields_by_name(**{"Official USPS city name": ""}),
         ],
     )
-    captured_geo_rows = []
-
-    async def capture_flush(pending_geo_rows, *, target_table):
-        captured_geo_rows.extend(pending_geo_rows)
-        pending_geo_rows.clear()
-
-    monkeypatch.setattr(geo_import, "_flush_rows", capture_flush)
+    captured_geo_rows = database_mocks.rows
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "geo_test")
 
     await geo_import.load_geo_lookup(csv_path)
@@ -282,72 +212,30 @@ async def test_load_parses_bom_semicolon_and_skips_missing_keys(
 
 
 def _assert_load_database_calls(database_mocks):
-    database_mocks.ensure_database.assert_awaited_once_with(False)
-    database_mocks.create_table.assert_awaited_once_with(
-        geo_import.GeoZipLookup.__table__,
-        checkfirst=True,
-    )
-    database_mocks.status.assert_awaited_once_with(
-        f"TRUNCATE TABLE {geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};"
-    )
-    database_mocks.generation.assert_awaited_once_with(
-        geo_import.db,
-        importer_id="geo",
-        schema_name=geo_import.GeoZipLookup.__table__.schema,
-    )
+    database_mocks.authority.assert_called_once_with()
+    database_mocks.producer.assert_awaited_once()
+    assert database_mocks.producer.await_args.args[0] is geo_import.db
 
 
 @pytest.mark.asyncio
-async def test_load_flushes_two_thousand_rows_then_remainder(
-    tmp_path,
-    monkeypatch,
-    database_mocks,
-):
+async def test_load_preserves_complete_multi_batch_input(tmp_path, database_mocks):
     csv_path = tmp_path / "large-geo.csv"
-    source_rows = [_csv_fields_by_name(**{"Zip Code": str(zip_number)}) for zip_number in range(1, 2002)]
-    _write_geo_csv(csv_path, source_rows)
-    batch_sizes = []
-
-    async def capture_batch_size(pending_geo_rows, *, target_table):
-        assert target_table is geo_import.GeoZipLookup.__table__
-        assert database_mocks.transaction.active
-        batch_sizes.append(len(pending_geo_rows))
-        pending_geo_rows.clear()
-
-    monkeypatch.setattr(geo_import, "_flush_rows", capture_batch_size)
-
+    rows = [_csv_fields_by_name(**{"Zip Code": str(number)}) for number in range(1, 2002)]
+    _write_geo_csv(csv_path, rows)
     await geo_import.load_geo_lookup(csv_path)
-
-    assert batch_sizes == [geo_import.IMPORT_BATCH_SIZE, 1]
-    database_mocks.status.assert_awaited_once_with(
-        f"TRUNCATE TABLE {geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};"
-    )
+    assert len(database_mocks.rows) == 2001
+    assert database_mocks.producer.await_args.args[2] == 2001
+    _assert_load_database_calls(database_mocks)
 
 
 @pytest.mark.asyncio
-async def test_load_uses_default_source_and_model_schema(
-    tmp_path,
-    monkeypatch,
-    database_mocks,
-):
+async def test_load_uses_default_source_and_model_schema(tmp_path, monkeypatch, database_mocks):
     csv_path = tmp_path / "default-geo.csv"
     _write_geo_csv(csv_path, [_csv_fields_by_name()])
-    flushed_geo_rows = []
-
-    async def capture_flush(pending_geo_rows, *, target_table):
-        assert target_table is geo_import.GeoZipLookup.__table__
-        flushed_geo_rows.extend(pending_geo_rows)
-        pending_geo_rows.clear()
-
     monkeypatch.setattr(geo_import, "DEFAULT_SOURCE", csv_path)
-    monkeypatch.setattr(geo_import, "_flush_rows", capture_flush)
-
     await geo_import.load_geo_lookup()
-
-    assert [geo_values["zip_code"] for geo_values in flushed_geo_rows] == ["60654"]
-    database_mocks.status.assert_awaited_once_with(
-        f"TRUNCATE TABLE {geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};"
-    )
+    assert database_mocks.rows == [geo_import._geo_zip_values_from_csv_fields(_csv_fields_by_name())]
+    _assert_load_database_calls(database_mocks)
 
 
 @pytest.mark.asyncio

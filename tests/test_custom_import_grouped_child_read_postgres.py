@@ -43,6 +43,7 @@ from tests.custom_import_postgres_support import (
     _quoted_publication_schema,
     isolated_publication_case,
 )
+from tests.signed_request_reader_postgres_support import native_reader_witness
 
 _PANEL = ReadFilter("segment", "eq", "segment_a")
 _KEY = ReadFilter("service_code", "eq", "chosen")
@@ -576,10 +577,10 @@ async def test_present_null_precedes_missing_child_and_import(is_geo, direction)
 
 @pytest.mark.asyncio
 async def test_signed_detail_verifies_child_capability_and_full_family(monkeypatch):
-    http_fixture._install_keyring(monkeypatch)
-    async with native._case(children=_children()) as (case, target):
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
+    async with native._case(children=_children(), monkeypatch=monkeypatch) as (case, pinned_target):
         document_map = {
-            "target": transport._target_document(native._external_target(target)),
+            "target": transport._target_document(native._external_target(pinned_target)),
             "entity": {"adapter_id": "npi", "value": native._A},
             "family_entitlement": "full_family",
             "context": [{"field_id": "service_code", "operator": "eq", "value": "chosen"}],
@@ -601,6 +602,7 @@ async def test_signed_detail_verifies_child_capability_and_full_family(monkeypat
             request = http_fixture._Request(body, headers, path=transport.CUSTOM_IMPORT_DETAIL_PATH)
             async with case.sessions() as session:
                 reply = await transport.serve_custom_import_detail(request, session)
+                assert not session.in_transaction()
             assert reply.status == status, (mode, reply.body)
             if mode == "valid":
                 assert len(json.loads(reply.body)["families"]) == 2
@@ -608,8 +610,11 @@ async def test_signed_detail_verifies_child_capability_and_full_family(monkeypat
 
 @pytest.mark.asyncio
 async def test_child_descriptor_cannot_be_added_after_transport_signing(monkeypatch):
-    http_fixture._install_keyring(monkeypatch)
-    async with native._case(children=_children()) as (case, target), case.sessions() as session:
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
+    async with (
+        native._case(children=_children(), monkeypatch=monkeypatch) as (case, target),
+        case.sessions() as session,
+    ):
         path = provider_http.CUSTOM_IMPORT_PROVIDERS_PATH
         request = native._page_request(target, path, full_family=True)
         changed_map = {**json.loads(request.body), "grouped_child_query": fixture.child_descriptor()}
@@ -657,17 +662,22 @@ async def _signed_page_reply(session, prepared, *, is_geo):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_geo", [False, True])
 async def test_signed_child_order_keeps_optional_rows(monkeypatch, is_geo):
-    http_fixture._install_keyring(monkeypatch)
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
     module = geo_http if is_geo else provider_http
     path = geo_http.CUSTOM_IMPORT_PROVIDER_GEO_PATH if is_geo else provider_http.CUSTOM_IMPORT_PROVIDERS_PATH
     endpoint = geo_http.serve_custom_import_provider_geo if is_geo else provider_http.serve_custom_import_providers
-    async with native._case(children=_children()) as (case, pinned_target), case.sessions() as session:
+    async with (
+        native._case(children=_children(), monkeypatch=monkeypatch) as (case, pinned_target),
+        case.sessions() as session,
+    ):
 
         async def native_page(request, *, native_args, import_context, prepare_cursor=None, native_scope_preparer=None):
+            reader_session = request.ctx.sa_session
+            await native_reader_witness(reader_session, case.reader)
             assert callable(native_scope_preparer)
             if prepare_cursor is not None:
-                await prepare_cursor(session=session, coordinates=[40, -73])
-            return await _signed_page_reply(session, import_context.prepared, is_geo=is_geo)
+                await prepare_cursor(session=reader_session, coordinates=[40, -73])
+            return await _signed_page_reply(reader_session, import_context.prepared, is_geo=is_geo)
 
         monkeypatch.setattr(module, "_geo_page" if is_geo else "_provider_page", native_page)
         baseline = native._page_request(pinned_target, path, full_family=True)
@@ -678,6 +688,7 @@ async def test_signed_child_order_keeps_optional_rows(monkeypatch, is_geo):
         body = transport._canonical_json_bytes(body_map)
         headers = http_fixture._resigned_provider_headers(body=body, path=path, target=body_map["target"])
         reply = await endpoint(http_fixture._Request(body, headers, path=path), session)
+        assert not session.in_transaction()
         assert reply.status == 200, reply.body
         result_map = json.loads(reply.body)
         assert result_map["total_count" if is_geo else "total"] == (5 if is_geo else 4)

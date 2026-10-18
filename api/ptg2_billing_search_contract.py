@@ -229,6 +229,7 @@ class BillingSearchServiceResult:
     cursor_binding: BillingSearchCursorBinding | None = None
     import_scope: BillingSearchImportCursorScope | None = None
     composed_order: BillingSearchComposedOrder | None = None
+    admitted_bindings: tuple | None = None
 
     def __post_init__(self) -> None:
         is_match = self.state == BILLING_SEARCH_RESULT_MATCHED
@@ -265,6 +266,8 @@ class BillingSearchServiceResult:
                 raise serving_unavailable() from None
             if self.cursor_binding.import_scope != self.import_scope:
                 raise serving_unavailable()
+        if self.admitted_bindings is not None:
+            _validate_admitted_bindings(self.selection, self.admitted_bindings)
         if self.import_scope is not None:
             if type(self.import_scope) is not BillingSearchImportCursorScope:
                 raise serving_unavailable()
@@ -290,6 +293,15 @@ class BillingSearchServiceResult:
 
     def __repr__(self) -> str:
         return f"<billing-search-service-result state={self.state} provider_count={len(self.providers)}>"
+
+
+def _validate_admitted_bindings(selection, bindings):
+    from api.billing_search_network_policy import admitted_coordinates
+    from api.network_address_scope import current_network_address_scope
+
+    if current_network_address_scope() is None or type(selection) is not PlanReleaseServingSelection:
+        raise serving_unavailable()
+    admitted_coordinates(selection, bindings)
 
 
 def validate_service_result(result: Any) -> BillingSearchServiceResult:

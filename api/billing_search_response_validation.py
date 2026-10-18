@@ -207,7 +207,14 @@ def _validated_expected_cursor_coordinates(
         trusted_now=trusted_now,
         import_scope=import_scope,
     )
-    snapshot_set_sha256 = billing_search_snapshot_set_sha256(selection)
+    snapshot_set_sha256 = billing_search_snapshot_set_sha256(
+        selection,
+        **(
+            {"contributing_bindings": service_result.admitted_bindings}
+            if service_result.admitted_bindings is not None
+            else {}
+        ),
+    )
     if (
         cursor_binding.trusted_now != trusted_timestamp
         or cursor_binding.import_scope != import_scope

@@ -2,7 +2,7 @@
 """Unused archive acknowledgement faults cannot replace a precommit failure."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -23,6 +23,11 @@ def _archive_fixture_io(monkeypatch, engine, failure, events, outcome):
     async def transaction(_database):
         yield object()
         events.append("cleanup_commit")
+
+    @asynccontextmanager
+    async def publication_database(_monkeypatch, actual_engine, _schema):
+        assert actual_engine is engine
+        yield archive_case._CommitAcknowledgementDatabase(engine)
 
     async def prepare(_monkeypatch, database, _schema, _outcome, phase_checks):
         async def ready():
@@ -46,6 +51,7 @@ def _archive_fixture_io(monkeypatch, engine, failure, events, outcome):
         }
     }
     monkeypatch.setattr(archive_case.native, "_database", database_context)
+    monkeypatch.setattr(archive_case, "_publication_database", publication_database)
     monkeypatch.setattr(archive_case.native, "_publish_initial", AsyncMock(return_value=predecessor_by_field))
     monkeypatch.setattr(archive_case.common, "_enable_candidate_checks", AsyncMock())
     monkeypatch.setattr(archive_case.common, "_serving_state", AsyncMock(return_value=({}, {})))
@@ -82,5 +88,52 @@ async def test_original_archive_fixture_disarms_fault_before_cleanup(monkeypatch
         assert archive_case.publication.commit_prepared_serving_generation.await_count == 1
         assert archive_case.fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get() is previous_profile
         assert archive_case.preparation._ACTIVE.get() is previous_preparation
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", [None, "acknowledgement", "rollback"])
+async def test_source_transaction_remains_the_acknowledgement_boundary(monkeypatch, failure_kind):
+    """The real fixture wrapper keeps one owner and faults only after Source commit."""
+    engine = create_async_engine("postgresql+asyncpg://synthetic@127.0.0.1/synthetic")
+    events = []
+    actual_databases = []
+
+    @asynccontextmanager
+    async def custody(administrator, schema, settings):
+        assert administrator.engine is engine and schema == "synthetic"
+        assert archive_case.source_support.Database is archive_case._CommitAcknowledgementDatabase
+        actual_database = archive_case.source_support.Database(engine)
+        actual_databases.append(actual_database)
+
+        @asynccontextmanager
+        async def source_transaction():
+            events.append("source_enter")
+            yield object()
+            events.append("source_commit")
+
+        settings.setattr(actual_database, "transaction", source_transaction)
+        yield SimpleNamespace(database=actual_database)
+
+    async def source_body(database):
+        async with database.transaction():
+            events.append("body")
+            if failure_kind == "rollback":
+                raise OSError("synthetic rollback")
+
+    monkeypatch.setattr(archive_case, "source_input_custody", custody)
+    monkeypatch.setattr(archive_case, "_install_epoch_controls", AsyncMock())
+    try:
+        async with archive_case._publication_database(monkeypatch, engine, "synthetic") as database:
+            assert database is actual_databases[0]
+            database.acknowledgement_failure = (
+                OSError("synthetic acknowledgement") if failure_kind == "acknowledgement" else None
+            )
+            error_context = pytest.raises(OSError, match="synthetic") if failure_kind else nullcontext()
+            with error_context:
+                await source_body(database)
+            assert events == ["source_enter", "body"] + ([] if failure_kind == "rollback" else ["source_commit"])
+            assert database.acknowledgement_failure is None
     finally:
         await engine.dispose()

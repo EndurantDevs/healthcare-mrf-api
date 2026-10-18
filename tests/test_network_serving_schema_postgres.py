@@ -27,6 +27,7 @@ _SERVING_MIGRATIONS = (
     "20261007110000_registry_site_bindings.py",
     "20261007120000_company_network_assertions.py",
     "20261007130000_registry_network_bindings.py",
+    "20261017030000_registry_ptg_office_recipe_selection.py",
     "20261009010000_registry_ptg_producer_scope.py",
     "20261009020000_company_registry_assertions.py",
     "20261009030000_network_catalog_evidence.py",
@@ -38,6 +39,8 @@ _SERVING_MIGRATIONS = (
     "20261011010000_company_registry_group_assertions.py",
     "20261012010000_company_registry_name_origin.py",
     "20261013010000_registry_custom_history_events.py",
+    "20261018011000_network_candidate_custody.py",
+    "20261018040000_registry_aca_source_notifications.py",
 )
 
 

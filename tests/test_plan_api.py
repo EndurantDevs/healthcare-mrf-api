@@ -1,21 +1,15 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
-
 import datetime
-
 import json
-
 import types
 
 import pytest
-
 import sanic.exceptions
-
 from sqlalchemy.exc import ProgrammingError
 
 import api.endpoint.plan as plan_module
-
 from api.endpoint.plan import (
     _fetch_network_entry,
     _get_session,
@@ -26,8 +20,8 @@ from api.endpoint.plan import (
     all_plans_variants,
     find_a_plan,
     get_autocomplete_list,
-    get_network_by_checksum,
     get_network_batch_by_checksums,
+    get_network_by_checksum,
     get_plan,
     get_price_plan,
     get_price_plans_bulk,
@@ -38,6 +32,7 @@ try:
     asyncio.get_event_loop()
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
+
 
 class FakeResult:
     def __init__(self, rows=None, scalar=None):
@@ -56,6 +51,7 @@ class FakeResult:
     def __iter__(self):
         return iter(self._rows)
 
+
 class FakeSession:
     def __init__(self, results=None):
         self._results = list(results or [])
@@ -65,16 +61,16 @@ class FakeSession:
             return self._results.pop(0)
         return FakeResult()
 
+
 def make_request(results, args=None, json_data=None, app_config=None):
     session = FakeSession(results)
     return types.SimpleNamespace(
         ctx=types.SimpleNamespace(sa_session=session),
         args=args or {},
         json=json_data,
-        app=types.SimpleNamespace(
-            config=app_config or {"RELEASE": "dev", "ENVIRONMENT": "test"}
-        ),
+        app=types.SimpleNamespace(config=app_config or {"RELEASE": "dev", "ENVIRONMENT": "test"}),
     )
+
 
 def make_facet_results(
     plan_types=None,
@@ -89,6 +85,7 @@ def make_facet_results(
         FakeResult(rows=[boolean_counts or {}]),
     ]
 
+
 @pytest.mark.asyncio
 async def test_get_network_by_checksum(monkeypatch):
     async def fake_fetch(_session, checksum):
@@ -101,37 +98,39 @@ async def test_get_network_by_checksum(monkeypatch):
     response_payload = json.loads(response.body)
     assert response_payload["checksum"] == 123
 
+
 @pytest.mark.asyncio
 async def test_get_network_batch_by_checksums(monkeypatch):
-    async def fake_fetch(_session, checksum):
-        return {"checksum": checksum, "plans": []}
+    async def fake_fetch(_session, checksums):
+        return {checksum: {"checksum": checksum, "plans": []} for checksum in checksums}
 
-    monkeypatch.setattr("api.endpoint.plan._fetch_network_entry", fake_fetch)
+    monkeypatch.setattr("api.endpoint.plan._fetch_networks_by_checksum", fake_fetch)
 
     request = make_request([])
     response = await get_network_batch_by_checksums(request, "1,2,1")
     response_payload = json.loads(response.body)
     assert [entry["checksum"] for entry in response_payload] == [1, 2]
 
+
 @pytest.mark.asyncio
 async def test_get_network_batch_by_checksums_not_found(monkeypatch):
-    async def fake_fetch(_session, _checksum):
-        return None
+    async def fake_fetch(_session, _checksums):
+        return {}
 
-    monkeypatch.setattr("api.endpoint.plan._fetch_network_entry", fake_fetch)
+    monkeypatch.setattr("api.endpoint.plan._fetch_networks_by_checksum", fake_fetch)
 
     request = make_request([])
     with pytest.raises(sanic.exceptions.NotFound):
         await get_network_batch_by_checksums(request, "1,2")
 
+
 def test_network_batch_route_keeps_legacy_reverse_name():
     route = next(
-        route
-        for route in plan_module.blueprint._future_routes
-        if route.uri == "/network/multiple/<checksums>"
+        route for route in plan_module.blueprint._future_routes if route.uri == "/network/multiple/<checksums>"
     )
 
     assert route.name == "plan.get_networks_by_checksums"
+
 
 @pytest.mark.asyncio
 async def test_plan_index_status():
@@ -148,12 +147,14 @@ async def test_plan_index_status():
     assert response_payload["import_log_errors"] == 3
     assert response_payload["plans_network_count"] == 2
 
+
 @pytest.mark.asyncio
 async def test_plan_all_plans():
     request = make_request([FakeResult(rows=[{"plan_id": "123"}])])
     response = await all_plans(request)
     response_payload = json.loads(response.body)
     assert response_payload == [{"plan_id": "123"}]
+
 
 @pytest.mark.asyncio
 async def test_plan_all_plans_variants():
@@ -174,9 +175,8 @@ async def test_plan_all_plans_variants():
     )
     response = await all_plans_variants(request)
     response_payload = json.loads(response.body)
-    assert response_payload == [
-        {"marketing_name": "Plan", "plan_id": "123", "full_plan_id": "123-00", "year": 2024}
-    ]
+    assert response_payload == [{"marketing_name": "Plan", "plan_id": "123", "full_plan_id": "123-00", "year": 2024}]
+
 
 @pytest.mark.asyncio
 async def test_plan_get_autocomplete_empty():
@@ -184,6 +184,7 @@ async def test_plan_get_autocomplete_empty():
     response = await get_autocomplete_list(request)
     response_payload = json.loads(response.body)
     assert response_payload == {"plans": []}
+
 
 @pytest.mark.asyncio
 async def test_plan_get_autocomplete_success():
@@ -205,11 +206,13 @@ async def test_plan_get_autocomplete_success():
     assert lookup_by_key["P123"]["network_checksum"] == {"111": "GOLD"}
     assert lookup_by_key["P456"]["network_checksum"] == {"222": "SILVER"}
 
+
 @pytest.mark.asyncio
 async def test_plan_find_plan_bad_year():
     request = make_request([], args={"year": "bad"})
     with pytest.raises(sanic.exceptions.BadRequest):
         await find_a_plan(request)
+
 
 @pytest.mark.asyncio
 async def test_plan_get_price_plan_bad_age():
@@ -217,11 +220,13 @@ async def test_plan_get_price_plan_bad_age():
     with pytest.raises(sanic.exceptions.BadRequest):
         await get_price_plan(request, "123")
 
+
 @pytest.mark.asyncio
 async def test_plan_get_plan_not_found():
     request = make_request([FakeResult(rows=[])])
     with pytest.raises(sanic.exceptions.NotFound):
         await get_plan(request, "123")
+
 
 @pytest.mark.asyncio
 async def test_plan_get_price_plan_success():
@@ -255,6 +260,7 @@ async def test_plan_get_price_plan_success():
         }
     ]
 
+
 @pytest.mark.asyncio
 async def test_plan_get_plan_success():
     plan_row_by_field = {
@@ -283,6 +289,7 @@ async def test_plan_get_plan_success():
     assert response_payload["formulary_drug_count"] == 1
     assert response_payload["formulary_has_drug_data"] is True
     assert response_payload["formulary_uri"] == "P123/2024"
+
 
 def _find_plan_success_request():
     plan_entry_by_field = {
@@ -338,6 +345,7 @@ def _find_plan_success_request():
         args={"year": "2024", "age": "30", "rating_area": "A", "limit": "1", "page": "1"},
     )
 
+
 @pytest.mark.asyncio
 async def test_plan_find_plan_success():
     """Verify plan find plan success."""
@@ -352,9 +360,11 @@ async def test_plan_find_plan_success():
     assert matched_plan["plan_benefits"]["Primary Care Visit"]["benefit_name"] == "Primary Care Visit"
     assert matched_plan["rate_expiration_date"] == "2025-06-04 00:00:00"
 
+
 def test_get_session_missing():
     with pytest.raises(RuntimeError):
         _get_session(types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=None)))
+
 
 def test_row_to_dict_variants():
     class MappingRow:
@@ -363,15 +373,19 @@ def test_row_to_dict_variants():
 
     assert _row_to_dict(MappingRow()) == {"a": 1}
     assert _row_to_dict({"b": 2}) == {"b": 2}
+
     class BadRow:
         def __iter__(self):
             raise TypeError
+
     assert _row_to_dict(BadRow()) == {}
+
 
 def test_result_rows_and_scalar_helpers():
     class NoAll:
         def __iter__(self):
             return iter([(1,), (2,)])
+
     assert _result_rows(NoAll()) == [(1,), (2,)]
 
     class BareResult:
@@ -386,13 +400,16 @@ def test_result_rows_and_scalar_helpers():
     dict_result = BareResult([{"k": "v"}])
     assert _result_scalar(dict_result) == "v"
 
+
 def test_parse_bool_invalid():
     with pytest.raises(sanic.exceptions.InvalidUsage):
         plan_module._parse_bool("maybe", "flag")
 
+
 def test_parse_float_invalid():
     with pytest.raises(sanic.exceptions.InvalidUsage):
         plan_module._parse_float("bad", "number")
+
 
 def test_append_filter_skips_empty():
     applied_filter_map = {"existing": 1}
@@ -400,6 +417,7 @@ def test_append_filter_skips_empty():
     assert applied_filter_map == {"existing": 1}
     plan_module._append_filter(applied_filter_map, "filled", 2)
     assert applied_filter_map["filled"] == 2
+
 
 def test_summary_attributes_and_benefits_conversion():
     attr_payload = json.dumps([{"attr_name": "Foo", "attr_value": "bar"}])
@@ -409,6 +427,7 @@ def test_summary_attributes_and_benefits_conversion():
     benefit_payload = json.dumps([{"benefit_name": "Primary", "copay_inn_tier1": "10"}])
     benefits = plan_module._summary_benefits_to_dict(benefit_payload)
     assert benefits["Primary"]["copay_inn_tier1"] == "10"
+
 
 class SequenceSession:
     def __init__(self, responses):
@@ -422,6 +441,7 @@ class SequenceSession:
             raise response
         return response
 
+
 class SimpleResult:
     def __init__(self, rows):
         self._rows = rows
@@ -429,52 +449,48 @@ class SimpleResult:
     def all(self):
         return self._rows
 
+
 def _variant_identifier_results() -> list[FakeResult]:
     """Return plan-query results containing tuple-shaped variant IDs."""
     return [
-            FakeResult(rows=[{"plan_id": "P1", "year": 2024, "issuer_id": 7}]),
-            FakeResult(rows=[("checksum", "TIER1")]),
-            FakeResult(rows=[], scalar="Issuer"),
-            FakeResult(rows=[]),
-            FakeResult(rows=[], scalar=0),
-            FakeResult(
-                rows=[("P1-01",), ("('P1-02',)",)]
-            ),
-            FakeResult(
-                rows=[
-                    {"full_plan_id": ("P1-03",), "attr_name": "SomeAttr", "attr_value": "value"}
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "full_plan_id": ("P1-04",), "benefit_name": "GeneralBenefit",
-                        "copay_inn_tier1": "$5", "coins_inn_tier1": "25%",
-                        "copay_inn_tier2": "Not Applicable", "coins_inn_tier2": None,
-                        "copay_outof_net": "$15", "coins_outof_net": "20%", "year": 2024,
-                        "plan_id": "P1",
-                    }
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {"full_plan_id": "P1-01", "attr_name": "VariantAttr", "attr_value": "X"}
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "full_plan_id": "P1-01",
-                        "benefit_name": "VariantBenefit",
-                        "copay_inn_tier1": "$10",
-                        "coins_inn_tier1": "50%",
-                        "copay_inn_tier2": "Not Applicable",
-                        "coins_inn_tier2": None,
-                        "copay_outof_net": "Not Applicable",
-                        "coins_outof_net": None,
-                        "year": 2024,
-                        "plan_id": "P1",
-                    }
-                ]
-            ),
-        ]
+        FakeResult(rows=[{"plan_id": "P1", "year": 2024, "issuer_id": 7}]),
+        FakeResult(rows=[("checksum", "TIER1")]),
+        FakeResult(rows=[], scalar="Issuer"),
+        FakeResult(rows=[]),
+        FakeResult(rows=[], scalar=0),
+        FakeResult(rows=[("P1-01",), ("('P1-02',)",)]),
+        FakeResult(rows=[{"full_plan_id": ("P1-03",), "attr_name": "SomeAttr", "attr_value": "value"}]),
+        FakeResult(
+            rows=[
+                {
+                    "full_plan_id": ("P1-04",),
+                    "benefit_name": "GeneralBenefit",
+                    "copay_inn_tier1": "$5",
+                    "coins_inn_tier1": "25%",
+                    "copay_inn_tier2": "Not Applicable",
+                    "coins_inn_tier2": None,
+                    "copay_outof_net": "$15",
+                    "coins_outof_net": "20%",
+                    "year": 2024,
+                    "plan_id": "P1",
+                }
+            ]
+        ),
+        FakeResult(rows=[{"full_plan_id": "P1-01", "attr_name": "VariantAttr", "attr_value": "X"}]),
+        FakeResult(
+            rows=[
+                {
+                    "full_plan_id": "P1-01",
+                    "benefit_name": "VariantBenefit",
+                    "copay_inn_tier1": "$10",
+                    "coins_inn_tier1": "50%",
+                    "copay_inn_tier2": "Not Applicable",
+                    "coins_inn_tier2": None,
+                    "copay_outof_net": "Not Applicable",
+                    "coins_outof_net": None,
+                    "year": 2024,
+                    "plan_id": "P1",
+                }
+            ]
+        ),
+    ]

@@ -4,13 +4,13 @@ import asyncio
 import threading
 import urllib.parse
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from api import control_workers
+from api import control_workers, plan_pricing_worker_policy
 from process.control_lifecycle import acquire_control_run_worker_action_lock
-
 
 RUN_ID = "run_missing_worker"
 
@@ -44,15 +44,17 @@ def test_exact_worker_presence_queries_job_and_pod_for_same_run(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_plan_pricing_ensure_holds_exact_run_lock_through_launch(
+@pytest.mark.parametrize("importer", ["plan-pricing-projection", "provider-directory-fhir"])
+async def test_worker_ensure_holds_exact_run_lock_through_launch(
     monkeypatch,
+    importer,
 ):
     event_list: list[str] = []
 
     @asynccontextmanager
     async def acquire():
         event_list.append("transaction-enter")
-        yield object()
+        yield SimpleNamespace(raw_connection=SimpleNamespace(driver_connection=object()))
         event_list.append("transaction-exit")
 
     async def lock(_connection, _run_id):
@@ -62,6 +64,7 @@ async def test_plan_pricing_ensure_holds_exact_run_lock_through_launch(
         event_list.append("admit")
         return None
 
+    monkeypatch.setattr(plan_pricing_worker_policy, "admit_pricing_worker", AsyncMock(return_value=None))
     monkeypatch.setattr(control_workers.db, "acquire", acquire)
     monkeypatch.setattr(control_workers, "acquire_ptg_admission_lock", AsyncMock())
     monkeypatch.setattr(
@@ -78,9 +81,7 @@ async def test_plan_pricing_ensure_holds_exact_run_lock_through_launch(
         lambda _payload: event_list.append("launch") or {"status": "started"},
     )
 
-    result_by_field = await control_workers.guarded_ensure_worker(
-        {"run_id": RUN_ID, "importer": "plan-pricing-projection"}
-    )
+    result_by_field = await control_workers.guarded_ensure_worker({"run_id": RUN_ID, "importer": importer})
 
     assert result_by_field == {"status": "started"}
     assert event_list == [
@@ -93,8 +94,10 @@ async def test_plan_pricing_ensure_holds_exact_run_lock_through_launch(
 
 
 @pytest.mark.asyncio
-async def test_plan_pricing_ensure_keeps_lock_until_canceled_launch_settles(
+@pytest.mark.parametrize("importer", ["plan-pricing-projection", "provider-directory-fhir"])
+async def test_worker_ensure_keeps_lock_until_canceled_launch_settles(
     monkeypatch,
+    importer,
 ):
     events: list[str] = []
     launch_started = threading.Event()
@@ -104,7 +107,7 @@ async def test_plan_pricing_ensure_keeps_lock_until_canceled_launch_settles(
     async def acquire():
         events.append("transaction-enter")
         try:
-            yield object()
+            yield SimpleNamespace(raw_connection=SimpleNamespace(driver_connection=object()))
         finally:
             events.append("transaction-exit")
 
@@ -114,6 +117,7 @@ async def test_plan_pricing_ensure_keeps_lock_until_canceled_launch_settles(
         events.append("launch-finished")
         return {"status": "started"}
 
+    monkeypatch.setattr(plan_pricing_worker_policy, "admit_pricing_worker", AsyncMock(return_value=None))
     monkeypatch.setattr(control_workers.db, "acquire", acquire)
     monkeypatch.setattr(control_workers, "acquire_ptg_admission_lock", AsyncMock())
     monkeypatch.setattr(
@@ -130,11 +134,7 @@ async def test_plan_pricing_ensure_keeps_lock_until_canceled_launch_settles(
     )
     monkeypatch.setattr(control_workers, "ensure_worker", launch)
 
-    ensure_task = asyncio.create_task(
-        control_workers.guarded_ensure_worker(
-            {"run_id": RUN_ID, "importer": "plan-pricing-projection"}
-        )
-    )
+    ensure_task = asyncio.create_task(control_workers.guarded_ensure_worker({"run_id": RUN_ID, "importer": importer}))
     assert await asyncio.to_thread(launch_started.wait, 1)
     ensure_task.cancel()
     await asyncio.sleep(0)
@@ -158,9 +158,7 @@ async def test_worker_action_lock_uses_exact_run_key():
     await acquire_control_run_worker_action_lock(_Executor(), RUN_ID)
 
     assert "pg_advisory_xact_lock" in calls[0][0]
-    assert calls[0][1] == {
-        "lock_name": f"control-run-worker-action:v1:{RUN_ID}"
-    }
+    assert calls[0][1] == {"lock_name": f"control-run-worker-action:v1:{RUN_ID}"}
 
 
 @pytest.mark.asyncio

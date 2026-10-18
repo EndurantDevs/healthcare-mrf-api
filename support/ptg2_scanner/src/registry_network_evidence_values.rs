@@ -162,7 +162,7 @@ fn bounded_text(text: &str) -> bool {
         && !text.contains('\0')
 }
 
-fn registry_id(text: &str, prefix: &str) -> bool {
+pub(crate) fn registry_id(text: &str, prefix: &str) -> bool {
     bounded_text(text)
         && text.strip_prefix(prefix).is_some_and(|suffix| {
             suffix.len() == 26

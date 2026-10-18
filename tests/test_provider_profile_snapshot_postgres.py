@@ -28,7 +28,7 @@ async def test_profile_route_keeps_both_loaders_before_family_rename(monkeypatch
 
         async def state_loader(_npi):
             loader_tasks.append(asyncio.current_task())
-            marker = await database.scalar(f'SELECT marker FROM "{schema}".cms_doctor_education')
+            marker = await database.scalar(f'SELECT medical_school FROM "{schema}".cms_doctor_education')
             reached_first_read.set()
             await writer_started.wait()
             return {"marker": marker}
@@ -44,17 +44,16 @@ async def test_profile_route_keeps_both_loaders_before_family_rename(monkeypatch
         monkeypatch.setattr(npi, "fetch_provider_profile_projection", state_loader)
         monkeypatch.setattr(npi, "_fetch_provider_directory_profile_map", profile_loader)
         monkeypatch.setattr(npi, "_compose_requested_provider_profile", compose)
-        async with database.session_factory() as writer:
-            reader = asyncio.create_task(npi.get_provider_profile(SimpleNamespace(args={}), str(NPI)))
-            await asyncio.wait_for(reached_first_read.wait(), 3)
-            publication = asyncio.create_task(publish_family(writer, schema, writer_started))
-            try:
-                operation_result = await asyncio.wait_for(reader, 3)
-                await asyncio.wait_for(publication, 3)
-            finally:
-                for task in (reader, publication):
-                    task.cancel()
-                await asyncio.gather(reader, publication, return_exceptions=True)
+        reader = asyncio.create_task(npi.get_provider_profile(SimpleNamespace(args={}), str(NPI)))
+        await asyncio.wait_for(reached_first_read.wait(), 3)
+        publication = asyncio.create_task(publish_family(database, schema, writer_started))
+        try:
+            operation_result = await asyncio.wait_for(reader, 3)
+            await asyncio.wait_for(publication, 3)
+        finally:
+            for task in (reader, publication):
+                task.cancel()
+            await asyncio.gather(reader, publication, return_exceptions=True)
         profile = json.loads(operation_result.body)["provider_profile"]
         assert profile["cms"] == profile["directory"] == "old"
         assert len(set(loader_tasks)) == 1
@@ -74,7 +73,7 @@ async def test_snapshot_pins_rows_when_independent_updates_commit(monkeypatch):
             assert await session.scalar(text("SHOW transaction_isolation")) == "repeatable read"
             authority = session.info["provider_profile_native_authorities"]
             assert set(authority) == {"cms-doctors", "entity-address"}
-            first = await database.scalar(f'SELECT marker FROM "{schema}".cms_doctor_education')
+            first = await database.scalar(f'SELECT medical_school FROM "{schema}".cms_doctor_education')
             async with database.session_factory() as writer, writer.begin():
                 await writer.execute(text(f"UPDATE \"{schema}\".provider_directory_profile SET marker='changed'"))
             second = await database.scalar(f'SELECT marker FROM "{schema}".provider_directory_profile')
@@ -99,8 +98,7 @@ async def test_cancelled_read_releases_all_relation_locks(monkeypatch):
         with pytest.raises(asyncio.CancelledError):
             await reader
         assert not sessions[0].in_transaction()
-        async with database.session_factory() as writer:
-            await asyncio.wait_for(publish_family(writer, schema), 3)
+        await asyncio.wait_for(publish_family(database, schema), 3)
 
 
 async def test_cutover_lock_timeout_releases_snapshot(monkeypatch):
@@ -139,7 +137,7 @@ async def test_lock_conflict_retries_a_fresh_snapshot_after_real_publication(mon
                     await writer.execute(text(f'LOCK TABLE "{schema}".cms_doctor_education IN ACCESS EXCLUSIVE MODE'))
                     entered.set()
                     await release.wait()
-                await publish_family(writer, schema)
+                await publish_family(database, schema)
 
         publication = asyncio.create_task(publish())
 
@@ -157,7 +155,7 @@ async def test_lock_conflict_retries_a_fresh_snapshot_after_real_publication(mon
         try:
             await asyncio.wait_for(entered.wait(), 3)
             async with snapshot.provider_profile_read_snapshot(database, schema):
-                assert await database.scalar(f'SELECT marker FROM "{schema}".cms_doctor_education') == "new"
+                assert await database.scalar(f'SELECT medical_school FROM "{schema}".cms_doctor_education') == "new"
                 assert await database.scalar(f'SELECT marker FROM "{schema}".provider_directory_profile') == "new"
             assert len(sessions) == 2 and sessions[0] is not sessions[1]
             assert all(not session.in_transaction() for session in sessions)
@@ -179,13 +177,12 @@ async def test_rename_setup_retries_only_a_fresh_owned_snapshot(monkeypatch):
             observed_snapshots.append(relation_oids)
             sessions.append(session)
             if len(observed_snapshots) == 1:
-                async with database.session_factory() as writer:
-                    await publish_family(writer, schema)
+                await publish_family(database, schema)
             return relation_oids
 
         monkeypatch.setattr(snapshot, "_snapshot_relation_oids", rotate_after_inventory)
         async with snapshot.provider_profile_read_snapshot(database, schema):
-            assert await database.scalar(f'SELECT marker FROM "{schema}".cms_doctor_education') == "new"
+            assert await database.scalar(f'SELECT medical_school FROM "{schema}".cms_doctor_education') == "new"
         assert len(sessions) == 2 and sessions[0] is not sessions[1]
         assert observed_snapshots[0] != observed_snapshots[1]
         assert database._transaction_binding() is None and snapshot._SNAPSHOT.get() is None
@@ -263,7 +260,8 @@ def _detail_loaders(database, schema):
 
     async def read_marker(table, session):
         assert database.has_reader_session() and current_session() is session
-        value = await session.scalar(text(f'SELECT marker FROM "{schema}".{table}'))
+        column = {"doctor_clinician_address": "city", "cms_doctor_group_site": "org_pac_id"}.get(table, "marker")
+        value = await session.scalar(text(f'SELECT {column} FROM "{schema}".{table}'))
         marker_reads.append(value)
         return value
 
@@ -321,8 +319,7 @@ async def test_detail_reads_finish_before_geocoding(monkeypatch):
             geocode_reader_scopes.append(database.has_reader_session())
             assert not database.has_reader_session() and database._transaction_binding() is None
             assert snapshot._SNAPSHOT.get() is None
-            async with database.session_factory() as writer:
-                await asyncio.wait_for(publish_family(writer, schema), 3)
+            await asyncio.wait_for(publish_family(database, schema), 3)
             return json.dumps({"features": [{"geometry": {"coordinates": [-87, 41]}}]})
 
         monkeypatch.setattr(npi, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 0)

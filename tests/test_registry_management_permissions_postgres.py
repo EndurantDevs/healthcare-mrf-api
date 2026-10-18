@@ -144,7 +144,7 @@ async def _draft(fixture, command, actor):
 async def test_full_draft_services_and_protected_publisher_approval(permissions_db):
     fixture, actor = permissions_db, _actor()
     receipt = await _install(fixture)
-    assert len(receipt["table_oids"]) == 38 and len(receipt["sequence_oids"]) == 2
+    assert len(receipt["table_oids"]) == 39 and len(receipt["sequence_oids"]) == 2
     assert set(receipt["table_oids"]) == set(_TABLES)
     commands = [create_record(kind) for kind in ("group", "company", "network")]
     created_records = [await _draft(fixture, command, actor) for command in commands]
@@ -643,7 +643,7 @@ async def _assert_read_bridge_denies_writes(fixture):
 async def _retire_read_bridge(fixture, namespace):
     async with fixture.connection.transaction():
         retired = await retire_registry_read_views(fixture.connection, **_provision_arguments(fixture, namespace))
-    assert retired["retired_views"] == len(_TABLES) == 38
+    assert retired["retired_views"] == len(_TABLES) == 39
     assert set(retired["view_oids"]) == set(_TABLES)
     assert (
         await fixture.connection.fetchval(
@@ -880,7 +880,7 @@ async def test_ptg_protected_lookup_preserves_approver_grants_after_cutover(perm
     engine = create_async_engine(fixture.sessions.kw["bind"].url, pool_size=1, max_overflow=0)
     try:
         receipt = await _provision_registry(fixture, namespace)
-        assert set(_PTG_TABLES) <= set(receipt["table_oids"]) and len(receipt["table_oids"]) == 38
+        assert set(_PTG_TABLES) <= set(receipt["table_oids"]) and len(receipt["table_oids"]) == 39
         assert await _ptg_grants(fixture, namespace) == original_grants
         await _assert_ptg_protected_stores(fixture, namespace)
         await _assert_dormant_ptg_reader(fixture, namespace, dormant)
@@ -1009,7 +1009,7 @@ async def test_retained_ptg_receipts_refuse_empty_cutover_without_rewriting(perm
         )
         == original_oids
     )
-    assert len(original_oids) == 38
+    assert len(original_oids) == 39
     for name, rows in originals_by_table.items():
         assert await fixture.connection.fetch(f'SELECT * FROM "{fixture.schema}"."{name}" ORDER BY 1') == rows
 
@@ -1115,10 +1115,277 @@ async def test_read_bridge_retirement_refuses_dependents_and_api(permissions_db)
                 fixture.schema,
                 sorted(_TABLES),
             )
-            == 38
+            == 39
         )
         await connection.execute(f"DROP VIEW {dependency} RESTRICT")
         await _retire_read_bridge(fixture, namespace)
         assert await _provision_registry(fixture, namespace)
+    finally:
+        await connection.execute(f'DROP SCHEMA IF EXISTS "{namespace}" CASCADE')
+
+
+async def test_installed_management_api_role_reads_exact_group_source_evidence(permissions_db):
+    from tests.test_registry_record_store_postgres import _retain_group_evidence
+
+    fixture = permissions_db
+    command = create_record()
+    await apply_record(fixture.sessions, fixture.schema, command, registry_actor())
+    reference = await _retain_group_evidence(fixture.connection, fixture.schema, command.record_id)
+    await _install(fixture)
+    assert await fixture.connection.fetchval(
+        "SELECT NOT rolsuper AND NOT rolcreaterole AND NOT rolbypassrls FROM pg_roles WHERE rolname=$1",
+        fixture.roles_by_kind["api"],
+    )
+    async with fixture.sessions() as session, session.begin():
+        await session.execute(text(f'SET LOCAL ROLE "{fixture.roles_by_kind["api"]}"'))
+        assert await session.scalar(text("SELECT current_user")) == fixture.roles_by_kind["api"]
+        record = await get_registry_record(session, "group", command.record_id, schema=fixture.schema)
+        assert record["source_evidence"] == [reference]
+        assert (await list_registry_records(session, "group", schema=fixture.schema)) == [record]
+    assert await verify_registry_management_permissions(fixture.connection, **_arguments(fixture))
+
+
+async def _aca_inbox_storage(fixture, monkeypatch):
+    """Use the shared Alembic fixture before inserting a storage-only retention row."""
+    import hashlib
+
+    await _install(fixture)
+    await _prepare_old_registry_reads(fixture)
+    monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", fixture.schema)
+    capture_id = uuid4()
+    encoded = '{"storage_retention_fixture":true}'
+    # This row proves control storage retention, not typed producer acceptance.
+    notification_values = (
+        capture_id,
+        "reference_family_archive_" + capture_id.hex,
+        1,
+        "a" * 64,
+        hashlib.sha256(encoded.encode()).hexdigest(),
+        encoded,
+    )
+    await fixture.connection.execute(
+        f'INSERT INTO "{fixture.schema}".registry_aca_source_notification '
+        "(capture_id,source_schema,source_schema_oid,recipe_sha256,notification_sha256,notification_json) "
+        "VALUES($1,$2,$3,$4,$5,$6)",
+        *notification_values,
+    )
+    publisher = fixture.roles_by_kind["publisher"]
+    await fixture.connection.execute(
+        f'GRANT SELECT ON "{fixture.schema}".registry_aca_source_notification TO "{publisher}"'
+    )
+    columns = "capture_id,source_schema,source_schema_oid,recipe_sha256,notification_sha256,notification_json"
+    await fixture.connection.execute(
+        f'GRANT INSERT ({columns}) ON "{fixture.schema}".registry_aca_source_notification TO "{publisher}"'
+    )
+    return notification_values
+
+
+async def test_fresh_login_owned_migration_precedes_protected_operator_enrollment(permissions_db):
+    from process.registry_aca_source_notification_permissions import (
+        install_registry_aca_source_notification_permissions,
+    )
+
+    fixture, connection = permissions_db, permissions_db.connection
+    name = f'"{fixture.schema}".registry_aca_source_notification'
+    owner_sql = """SELECT h.relowner AS head_owner,t.relowner AS inbox_owner,r.rolcanlogin
+      FROM pg_namespace n JOIN pg_class h ON h.relnamespace=n.oid AND h.relname='network_serving_control'
+      JOIN pg_roles r ON r.oid=h.relowner JOIN pg_class t ON t.relnamespace=n.oid
+        AND t.relname='registry_aca_source_notification' WHERE n.nspname=$1"""
+    before = await connection.fetchrow(owner_sql, fixture.schema)
+    assert before["head_owner"] == before["inbox_owner"] and before["rolcanlogin"] is True
+    arguments_by_name = dict(
+        control_schema=fixture.schema,
+        publisher_role=fixture.roles_by_kind["publisher"],
+        reader_roles=(fixture.roles_by_kind["api"],),
+        runtime_roles=tuple(sorted(fixture.roles_by_kind.values())),
+    )
+    async with connection.transaction():
+        with pytest.raises(ValueError, match="grants_invalid"):
+            await install_registry_aca_source_notification_permissions(connection, **arguments_by_name)
+    assert not await connection.fetchval(
+        "SELECT has_any_column_privilege($1,$2,'INSERT')", arguments_by_name["publisher_role"], name
+    )
+    await _install(fixture)
+    async with connection.transaction():
+        receipt = await install_registry_aca_source_notification_permissions(connection, **arguments_by_name)
+    after = await connection.fetchrow(owner_sql, fixture.schema)
+    assert after["head_owner"] == after["inbox_owner"] and after["rolcanlogin"] is False
+    assert receipt["table_oid"] == await connection.fetchval("SELECT to_regclass($1)::oid", name)
+    assert await connection.fetchval("SELECT count(*) FROM " + name) == 0
+
+
+@pytest.mark.parametrize(
+    "membership_options",
+    (
+        pytest.param("WITH ADMIN FALSE, INHERIT TRUE, SET FALSE", id="inherited-insert"),
+        pytest.param("WITH ADMIN FALSE, INHERIT FALSE, SET TRUE", id="set-only"),
+        pytest.param("WITH ADMIN FALSE, INHERIT FALSE, SET FALSE", id="member-only"),
+    ),
+)
+async def test_aca_original_reader_rejects_publisher_role_drift_after_enrollment(permissions_db, membership_options):
+    from process.registry_aca_source_notification_permissions import (
+        install_registry_aca_source_notification_permissions,
+    )
+    from process.registry_aca_source_notifications import RegistryACASourceNotificationStore
+
+    fixture, connection = permissions_db, permissions_db.connection
+    await _install(fixture)
+    publisher, reader_role = fixture.roles_by_kind["publisher"], fixture.roles_by_kind["api"]
+    password, reader = uuid4().hex, None
+    store = RegistryACASourceNotificationStore(fixture.schema, publisher, (reader_role,))
+    try:
+        await connection.execute(f"ALTER ROLE \"{reader_role}\" LOGIN PASSWORD '{password}'")
+        async with connection.transaction():
+            await install_registry_aca_source_notification_permissions(
+                connection,
+                control_schema=fixture.schema,
+                publisher_role=publisher,
+                reader_roles=(reader_role,),
+                runtime_roles=tuple(sorted(fixture.roles_by_kind.values())),
+            )
+        url = fixture.sessions.kw["bind"].url.set(drivername="postgresql", username=reader_role, password=password)
+        reader = await asyncpg.connect(url.render_as_string(hide_password=False))
+        assert tuple(await reader.fetchrow("SELECT current_user,session_user,current_setting('role')")) == (
+            reader_role,
+            reader_role,
+            "none",
+        )
+        async with reader.transaction(isolation="repeatable_read", readonly=True):
+            identity = await store.qualify(reader, writing=False)
+        await connection.execute(f'GRANT "{publisher}" TO "{reader_role}" {membership_options}')
+        assert await reader.fetchval("SELECT pg_has_role(current_user,$1,'MEMBER')", publisher)
+        relation = f'"{fixture.schema}".registry_aca_source_notification'
+        assert not await reader.fetchval("SELECT has_table_privilege(current_user,$1,'INSERT')", relation)
+        assert await reader.fetchval("SELECT has_any_column_privilege(current_user,$1,'INSERT')", relation) is (
+            "INHERIT TRUE" in membership_options
+        )
+        async with reader.transaction(isolation="repeatable_read", readonly=True):
+            with pytest.raises(ValueError, match="registry_aca_source_notification_invalid"):
+                await store.qualify(reader, writing=False)
+        await connection.execute(f'REVOKE "{publisher}" FROM "{reader_role}"')
+        async with reader.transaction(isolation="repeatable_read", readonly=True):
+            assert await store.qualify(reader, writing=False) == identity
+        assert await connection.fetchval(f"SELECT count(*) FROM {relation}") == 0
+    finally:
+        if reader is not None:
+            await reader.close()
+        await connection.execute(f'REVOKE "{publisher}" FROM "{reader_role}"')
+        await connection.execute(f'ALTER ROLE "{reader_role}" NOLOGIN PASSWORD NULL')
+
+
+@pytest.mark.parametrize(
+    ("global_role", "membership_options"),
+    (
+        pytest.param("pg_write_all_data", "", id="pg_write_all_data"),
+        pytest.param("pg_read_all_data", "", id="pg_read_all_data"),
+        pytest.param("pg_write_all_data", " WITH INHERIT FALSE, SET TRUE", id="pg_write_all_data-set-only"),
+        pytest.param("pg_read_all_data", " WITH INHERIT FALSE, SET TRUE", id="pg_read_all_data-set-only"),
+    ),
+)
+async def test_aca_enrollment_rejects_effective_global_authority_outside_reader_subset(
+    permissions_db, global_role, membership_options
+):
+    from process.registry_aca_source_notification_permissions import (
+        install_registry_aca_source_notification_permissions,
+    )
+
+    fixture, connection = permissions_db, permissions_db.connection
+    await _install(fixture)
+    extra = fixture.roles_by_kind["api"]
+    await connection.execute(f'GRANT "{global_role}" TO "{extra}"' + membership_options)
+    try:
+        if membership_options:
+            assert await connection.fetchval("SELECT pg_has_role($1,$2,'SET')", extra, global_role)
+            assert not await connection.fetchval("SELECT pg_has_role($1,$2,'USAGE')", extra, global_role)
+            privilege = "INSERT" if global_role == "pg_write_all_data" else "SELECT"
+            assert not await connection.fetchval(
+                "SELECT has_any_column_privilege($1,$2,$3)",
+                extra,
+                f'"{fixture.schema}".registry_aca_source_notification',
+                privilege,
+            )
+        async with connection.transaction():
+            with pytest.raises(ValueError, match="grants_invalid"):
+                await install_registry_aca_source_notification_permissions(
+                    connection,
+                    control_schema=fixture.schema,
+                    publisher_role=fixture.roles_by_kind["publisher"],
+                    reader_roles=(fixture.roles_by_kind["ancestor"],),
+                    runtime_roles=tuple(sorted(fixture.roles_by_kind.values())),
+                )
+        assert not await connection.fetchval(
+            "SELECT has_any_column_privilege($1,$2,'INSERT')",
+            fixture.roles_by_kind["publisher"],
+            f'"{fixture.schema}".registry_aca_source_notification',
+        )
+    finally:
+        await connection.execute(f'REVOKE "{global_role}" FROM "{extra}"')
+
+
+async def test_aca_control_namespace_move_preserves_native_oid_acl_indexes_and_rows(permissions_db, monkeypatch):
+    fixture, connection = permissions_db, permissions_db.connection
+    notification_values = await _aca_inbox_storage(fixture, monkeypatch)
+    name = "registry_aca_source_notification"
+    original = await connection.fetchrow(
+        "SELECT c.oid,c.relowner,c.relacl::text,ARRAY(SELECT indexrelid FROM pg_index "
+        "WHERE indrelid=c.oid ORDER BY indexrelid) AS indexes FROM pg_class c "
+        "WHERE c.oid=to_regclass($1)",
+        f'"{fixture.schema}".{name}',
+    )
+    namespace = "aca_registry_move_" + uuid4().hex
+    try:
+        await _provision_registry(fixture, namespace)
+        moved = await connection.fetchrow(
+            "SELECT c.oid,c.relowner,c.relacl::text,ARRAY(SELECT indexrelid FROM pg_index "
+            "WHERE indrelid=c.oid ORDER BY indexrelid) AS indexes FROM pg_class c "
+            "WHERE c.oid=to_regclass($1)",
+            f'"{namespace}".{name}',
+        )
+        assert moved == original
+        assert await connection.fetchval("SELECT to_regclass($1)", f'"{fixture.schema}".{name}') is None
+        retained = await connection.fetchrow(
+            f"SELECT capture_id,source_schema,source_schema_oid,recipe_sha256,notification_sha256,notification_json "
+            f'FROM "{namespace}".{name}'
+        )
+        assert tuple(retained.values()) == notification_values
+        assert await connection.fetchval(
+            "SELECT has_table_privilege($1,$2,'SELECT')", fixture.roles_by_kind["api"], f'"{namespace}".{name}'
+        )
+        assert not await connection.fetchval(
+            "SELECT has_table_privilege($1,$2,'INSERT,UPDATE,DELETE,TRUNCATE')",
+            fixture.roles_by_kind["api"],
+            f'"{namespace}".{name}',
+        )
+        assert await connection.fetchval(
+            "SELECT has_schema_privilege($1,$2,'USAGE')", fixture.roles_by_kind["publisher"], namespace
+        )
+    finally:
+        await connection.execute(f'DROP SCHEMA IF EXISTS "{namespace}" CASCADE')
+
+
+@pytest.mark.parametrize("damage", ("owner", "target"))
+async def test_aca_control_namespace_move_refuses_owner_drift_or_conflicting_target(
+    permissions_db, monkeypatch, damage
+):
+    fixture, connection = permissions_db, permissions_db.connection
+    notification_values = await _aca_inbox_storage(fixture, monkeypatch)
+    namespace = "aca_registry_refusal_" + uuid4().hex
+    if damage == "owner":
+        await connection.execute(
+            f'ALTER TABLE "{fixture.schema}".registry_aca_source_notification '
+            f'OWNER TO "{fixture.roles_by_kind["ancestor"]}"'
+        )
+    else:
+        await connection.execute(f'CREATE SCHEMA "{namespace}" AUTHORIZATION "{fixture.roles_by_kind["owner"]}"')
+    try:
+        with pytest.raises(RegistryManagementPermissionError, match="ACA inbox"):
+            await _provision_registry(fixture, namespace)
+        assert (
+            await connection.fetchval(
+                f'SELECT notification_json FROM "{fixture.schema}".registry_aca_source_notification WHERE capture_id=$1',
+                notification_values[0],
+            )
+            == notification_values[-1]
+        )
     finally:
         await connection.execute(f'DROP SCHEMA IF EXISTS "{namespace}" CASCADE')

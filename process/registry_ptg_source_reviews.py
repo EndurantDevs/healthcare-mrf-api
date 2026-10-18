@@ -108,7 +108,14 @@ def _verified_review(approval_record, schema_name, ownership, inventory):
     full = validated_command(document["command"])
     if full["scope_id"] != str(approval_record["scope_id"]) or full["ownership"] != ownership:
         raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")
-    authority = _authority_from_identity(
+    authority_factory = _authority_from_identity
+    if full["review_type"] == "published_allowed_amount_plan":
+        from process.ptg_parts.result_archive_allowed_authority import AllowedSourceAuthority
+        from process.registry_ptg_allowed_plan_contract import validated_identity
+
+        validated_identity(inventory["identity"])
+        authority_factory = AllowedSourceAuthority
+    authority = authority_factory(
         "registry_ptg_published_review_" + full["scope_id"].replace("-", ""), inventory["identity"]
     )
     current, _, evidence = resolved_published_plan_inventory(
@@ -192,7 +199,12 @@ async def read_registry_ptg_source_reviews(session, schema_name, ownership, sele
     """Read one source-bound page; caller must authorize the whole returned batch."""
     table = await _protected_store(session, store, write=False, table_name=TABLE)
     await require_published_lock_privileges(session, schema_name, pin_writer=False)
-    inventory = await published_plan_inventory(
+    from process.registry_ptg_allowed_plan_source import allowed_plan_inventory, is_allowed_snapshot
+
+    inventory_loader = published_plan_inventory
+    if await is_allowed_snapshot(session, schema_name, ownership["snapshot_id"]):
+        inventory_loader = allowed_plan_inventory
+    inventory = await inventory_loader(
         session, schema_name, ownership, operation_id="registry_ptg_inventory_" + _digest(ownership)
     )
     approval_records = await _review_rows(session, table, ownership, selection)

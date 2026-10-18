@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from sqlalchemy import text
 
+from db.cms_registry_source_pair_slot import COLUMN, INDEX_NAME, NATIVE_CHECK_SQL
 from process import provider_directory_cms_serving_receipt as receipts
 from process import provider_directory_profile_capacity_physical as physical
 from process import provider_directory_profile_capacity_types as capacity
@@ -14,6 +15,41 @@ from process.entity_address_serving_receipt import _publication_session
 from process.provider_directory_cms_publication import _receipt_payload
 from process.provider_directory_cms_receipt_guard import assert_common_receipt_guards
 from process.provider_directory_profile_selection_contract import ProviderDirectoryProfileExecution
+
+
+def _without_registry_slot(attributes, indexes, checks):
+    """Accept only the exact forward nullable slot and native partial capture uniqueness."""
+    slots = [entry for entry in attributes if entry["attname"] == COLUMN]
+    if not slots:
+        return attributes, indexes, checks
+    slot = slots[0]
+    slot_indexes = [entry for entry in indexes if entry["index_name"] == INDEX_NAME]
+    if (
+        len(slots) != 1
+        or slot is not attributes[-1]
+        or (slot["atttypid"], slot["atttypmod"], slot["default_expression"]) != (3802, -1, "")
+        or slot["attnotnull"]
+        or slot["attgenerated"]
+        or len(slot_indexes) != 1
+        or checks.count(NATIVE_CHECK_SQL) != 1
+    ):
+        raise RuntimeError("profile_common_receipt_storage_shape_unsupported")
+    index = slot_indexes[0]
+    if (
+        index["indkey"] != "0"
+        or index["index_expressions"] != "registry_source_pair_json ->> 'capture_id'::text"
+        or index["index_predicate"] != "registry_source_pair_json IS NOT NULL"
+        or not index["indisunique"]
+        or index["indisprimary"]
+        or index["indisexclusion"]
+        or not index["indimmediate"]
+    ):
+        raise RuntimeError("profile_common_receipt_storage_shape_unsupported")
+    return (
+        attributes[:-1],
+        [entry for entry in indexes if entry is not index],
+        [check for check in checks if check != NATIVE_CHECK_SQL],
+    )
 
 
 def _assert_receipt_catalog(oid, schema, attributes, indexes, constraints):
@@ -33,6 +69,7 @@ def _assert_receipt_catalog(oid, schema, attributes, indexes, constraints):
     main_indexes = [entry for entry in indexes if entry["relation_oid"] == oid]
     expected_keys = {"1", "3", "4", "5 6 7", "0", "7 8 1"}
     checks = [entry["constraint_definition"] for entry in constraints if entry["constraint_type"] == "c"]
+    main_attributes, main_indexes, checks = _without_registry_slot(main_attributes, main_indexes, checks)
     foreign_keys = [entry["constraint_definition"] for entry in constraints if entry["constraint_type"] == "f"]
     if (
         {entry["attname"]: entry["default_expression"] for entry in main_attributes} != defaults_by_name
