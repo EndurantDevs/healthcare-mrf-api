@@ -1340,8 +1340,7 @@ async def _close_cursor_result(part_rows, primary=None):
         except asyncio.CancelledError as exc:
             if primary is None:
                 primary = exc
-            else:
-                primary._custom_import_retry_blocked = True
+            primary._custom_import_retry_blocked = True
         except BaseException:
             break
     try:
@@ -1349,8 +1348,8 @@ async def _close_cursor_result(part_rows, primary=None):
     except BaseException as exc:
         if primary is None:
             primary = exc
-        elif primary is not exc:
-            primary._custom_import_retry_blocked = True
+        primary._custom_import_retry_blocked = True
+        if primary is not exc:
             primary.add_note(f"cursor reader cleanup also failed: {type(exc).__name__}")
             primary.__cause__ = exc
     if primary is not None:

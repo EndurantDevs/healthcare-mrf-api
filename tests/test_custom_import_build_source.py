@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.dialects.postgresql import dialect
+from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 import process.custom_import.build_source as staging
@@ -246,8 +247,70 @@ async def test_cleanup_drains_repeated_cancellation_without_losing_primary(prima
     assert not task.done()
     release.set()
     assert await task is primary
+    assert primary._custom_import_retry_blocked is True
     assert isinstance(primary.__cause__, RuntimeError)
     assert any("cleanup also failed" in note for note in primary.__notes__)
+
+
+@pytest.mark.parametrize("kind", [InterfaceError, OperationalError])
+@pytest.mark.parametrize("preserve_primary", [False, True])
+async def test_cleanup_connection_failure_blocks_retry_even_when_it_is_the_primary(kind, preserve_primary):
+    failure = kind(None, None, OSError("synthetic-disconnect"), connection_invalidated=True)
+
+    async def close():
+        raise failure
+
+    primary = await staging._drain_cleanup(close(), failure if preserve_primary else None)
+
+    assert primary is failure and failure._custom_import_retry_blocked is True
+    assert failure.__cause__ is None and not getattr(failure, "__notes__", ())
+
+
+async def test_first_cleanup_cancellation_is_retained_and_blocks_retry():
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def close():
+        entered.set()
+        await release.wait()
+
+    task = asyncio.create_task(staging._drain_cleanup(close(), None))
+    await entered.wait()
+    task.cancel("synthetic-cancellation")
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    primary = await task
+
+    assert isinstance(primary, asyncio.CancelledError)
+    assert primary._custom_import_retry_blocked is True
+    assert primary.__cause__ is None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("primary_kind", ["none", "generator_exit", "same", "error"])
+async def test_decoder_cleanup_blocks_retry_and_preserves_the_first_error(asynchronous, primary_kind):
+    failure = OperationalError(None, None, OSError("synthetic-close"), connection_invalidated=True)
+    primary = {
+        "none": None,
+        "generator_exit": GeneratorExit(),
+        "same": failure,
+        "error": InterfaceError(None, None, OSError("synthetic-read"), connection_invalidated=True),
+    }[primary_kind]
+    close = AsyncMock(side_effect=failure) if asynchronous else Mock(side_effect=failure)
+    pages = SimpleNamespace(**({"aclose": close} if asynchronous else {"close": close}))
+
+    result = await staging._close_source_pages(pages, primary)
+
+    assert result._custom_import_retry_blocked is True
+    if primary_kind == "error":
+        assert result is primary and primary.__cause__ is failure
+        assert primary.__notes__ == ["source decoder cleanup also failed: OperationalError"]
+    else:
+        assert result is failure and failure.__cause__ is None
+        assert not getattr(failure, "__notes__", ())
+    close.assert_called_once_with()
+    if asynchronous:
+        close.assert_awaited_once_with()
 
 
 @pytest.mark.parametrize("late_error", ["iterator", "close"])
@@ -298,6 +361,7 @@ async def test_first_cleanup_failure_survives_later_session_failure():
     session = SimpleNamespace(__aexit__=AsyncMock(side_effect=last))
     primary = await staging._close_contexts([session, transaction], None)
     assert primary is first and primary.__cause__ is last
+    assert primary._custom_import_retry_blocked is True
     transaction.__aexit__.assert_awaited_once_with(None, None, None)
     assert session.__aexit__.await_args.args[0] is ConnectionError
     assert session.__aexit__.await_args.args[1] is first
