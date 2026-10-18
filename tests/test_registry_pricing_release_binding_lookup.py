@@ -273,7 +273,7 @@ def test_native_set_query_preserves_all_original_singleton_predicates():
         bulk_sql = projection.plan_release_binding_set_sql("synthetic", include_pricing_projection=has_projection)
         restored_sql = bulk_sql.replace(
             "revision.plan_release_id = ANY($1::text[])", "revision.plan_release_id = :plan_release_id"
-        ).replace("pin.owner_type = $2", "pin.owner_type = :pin_owner_type")
+        ).replace("$2", ":pin_owner_type")
         assert restored_sql == projection.plan_release_serving_sql(
             "synthetic", include_pricing_projection=has_projection
         )

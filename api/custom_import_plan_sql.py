@@ -50,7 +50,7 @@ OCCURRENCE_COPY_COLUMNS = (
 SELECTED_COPY_COLUMNS = ("page_ordinal", "binding_ordinal", "npi", "location_key", *GROUP_COLUMNS)
 
 
-async def prepare_plan_query_tables(session):
+async def prepare_plan_query_tables(session, *, preserve_rows=False):
     """Allocate only TEMP tables before the request becomes read-only."""
 
     statements = (
@@ -89,6 +89,8 @@ async def prepare_plan_query_tables(session):
         ) ON COMMIT DROP""",
     )
     for statement in statements:
+        if preserve_rows:
+            statement = statement.replace("ON COMMIT DROP", "ON COMMIT PRESERVE ROWS")
         await session.execute(text(statement))
 
 

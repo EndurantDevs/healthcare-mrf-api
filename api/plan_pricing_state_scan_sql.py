@@ -6,22 +6,38 @@ from __future__ import annotations
 from api.plan_pricing_projection_contract import table
 
 
-def state_scan_provider_page_sql() -> str:
+def state_scan_provider_page_sql(binding_ordinals=None) -> str:
     """Return the bounded provider-state witness keyset query."""
 
+    admission = ""
+    relation = table("plan_pricing_provider_state")
+    if binding_ordinals is not None:
+        relation += " provider_state"
+        admission = f"""AND EXISTS (
+            SELECT 1 FROM {table("plan_pricing_provider_membership")} permitted
+             WHERE permitted.projection_id = :projection_id
+               AND permitted.npi = provider_state.npi
+               AND permitted.binding_ordinal = ANY(CAST(:admitted_binding_ordinals AS integer[]))
+        )"""
     return f"""
         SELECT npi, provider_fragment
-          FROM {table('plan_pricing_provider_state')}
+          FROM {relation}
          WHERE projection_id = :projection_id
            AND state = :state AND npi > :after_npi
+           {admission}
          ORDER BY npi
          LIMIT :npi_sentinel_limit
     """
 
 
-def _membership_candidates_sql() -> str:
+def _membership_candidates_sql(binding_ordinals=None) -> str:
     """Return the bounded provider-membership candidate CTEs."""
 
+    admission = (
+        "AND candidate.binding_ordinal = ANY(CAST(:admitted_binding_ordinals AS integer[]))"
+        if binding_ordinals is not None
+        else ""
+    )
     return f"""
         selected AS MATERIALIZED (
             SELECT npi, npi_ordinal
@@ -35,9 +51,10 @@ def _membership_candidates_sql() -> str:
               CROSS JOIN LATERAL (
                   SELECT candidate.binding_ordinal,
                          candidate.provider_set_key
-                    FROM {table('plan_pricing_provider_membership')} candidate
+                    FROM {table("plan_pricing_provider_membership")} candidate
                    WHERE candidate.projection_id = :projection_id
                      AND candidate.npi = selected.npi
+                     {admission}
                    LIMIT :membership_probe_limit
               ) membership
              LIMIT :membership_sentinel_limit
@@ -78,7 +95,7 @@ def _occurrence_candidates_sql() -> str:
                          candidate.provider_count,
                          candidate.group_fragment,
                          candidate.occurrence_multiplicity
-                    FROM {table('plan_pricing_rate_occurrence')} candidate
+                    FROM {table("plan_pricing_rate_occurrence")} candidate
                    WHERE candidate.projection_id = :projection_id
                      AND candidate.binding_ordinal = membership.binding_ordinal
                      AND candidate.provider_set_key = membership.provider_set_key
@@ -138,11 +155,11 @@ def _page_result_sql() -> str:
     """
 
 
-def state_scan_page_sql() -> str:
+def state_scan_page_sql(binding_ordinals=None) -> str:
     """Probe indexed children before applying any canonical ordering."""
 
     return f"""
-        WITH {_membership_candidates_sql()},
+        WITH {_membership_candidates_sql(binding_ordinals)},
              {_occurrence_candidates_sql()},
              {_page_result_sql()}
     """

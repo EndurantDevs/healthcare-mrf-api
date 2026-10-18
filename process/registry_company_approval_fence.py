@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 from sqlalchemy import text
@@ -16,6 +17,7 @@ from process.network_address_projection import _identifier
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 _FENCE_INFO = "registry_company_approval_fence"
+_ISSUED_FENCE = ContextVar("registry_company_approval_issued_fence", default=None)
 
 
 def _fence_key(control_schema):
@@ -25,12 +27,13 @@ def _fence_key(control_schema):
     )
 
 
-@dataclass
+@dataclass(frozen=True)
 class _ScopeFence:
     session: object
     transaction: object
     control_schema: str
     key: int
+    owner_task: object
 
 
 def _source_engine(sessions):
@@ -66,10 +69,13 @@ async def require_registry_company_approval_fence(session, control_schema, *, is
     fence = session.info.get(_FENCE_INFO)
     if (
         type(fence) is not _ScopeFence
+        or fence is not _ISSUED_FENCE.get()
         or fence.session is not session
         or fence.transaction is not session.get_transaction()
         or not session.in_transaction()
         or fence.control_schema != control_schema
+        or fence.owner_task is not asyncio.current_task()
+        or fence.key != _fence_key(control_schema)
     ):
         raise ValueError("registry_ptg_scope_company_fence_unavailable")
     mode = "ExclusiveLock" if is_exclusive else "ShareLock"
@@ -153,11 +159,15 @@ async def _company_approval_snapshot(sessions, connection, *, control_schema, is
         raise ValueError("registry_ptg_scope_company_busy")
     await connection.execution_options(isolation_level="REPEATABLE READ")
     async with sessions(bind=connection) as session, session.begin():
-        session.info[_FENCE_INFO] = _ScopeFence(session, session.get_transaction(), control_schema, key)
+        session.info[_FENCE_INFO] = _ScopeFence(
+            session, session.get_transaction(), control_schema, key, asyncio.current_task()
+        )
+        issued = _ISSUED_FENCE.set(session.info[_FENCE_INFO])
         try:
             yield session
         finally:
             session.info.pop(_FENCE_INFO, None)
+            _ISSUED_FENCE.reset(issued)
     await _release_connection_fence(connection, key, is_exclusive=is_exclusive)
 
 

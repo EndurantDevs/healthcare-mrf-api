@@ -28,6 +28,7 @@ from process.custom_import.read_core import (
     SearchPage,
     WinnerLocator,
 )
+from tests.signed_request_reader_support import cold_caller, install_reader_factory
 
 _KEY = bytes(range(32))
 _CURSOR_KEY = bytes(reversed(range(32)))
@@ -248,7 +249,10 @@ class _Service:
         )
 
 
-def _install_keyring(monkeypatch) -> None:
+def _install_keyring(monkeypatch, session=None, *, install_fake_reader=True) -> None:
+    # Managed-only transport fakes own their Reader separately and carry no SQL session.
+    if install_fake_reader and (session is None or callable(getattr(session, "execute", None))):
+        install_reader_factory(monkeypatch, session)
     http._keyring_for_document.cache_clear()
     http._cursor_secret_for_document.cache_clear()
     monkeypatch.setenv(http.CUSTOM_IMPORT_READ_TRANSPORT_KEYRING_ENV, _keyring_document())
@@ -661,7 +665,7 @@ async def test_signed_search_authorizes_before_service_and_returns_typed_payload
     monkeypatch.setattr(http, "CustomImportReadService", _Service)
     monkeypatch.setattr(http, "_resolve_pinned_target", _resolved_target)
 
-    http_response = await http.serve_custom_import_search(_Request(_BODY, _headers()), object())
+    http_response = await http.serve_custom_import_search(_Request(_BODY, _headers()), cold_caller())
 
     assert http_response.status == 200
     assert http_response.headers["Cache-Control"] == "private, no-store"
@@ -704,7 +708,7 @@ async def test_signed_detail_returns_one_full_family_with_multiple_collections(m
         path=http.CUSTOM_IMPORT_DETAIL_PATH,
     )
 
-    http_response = await http.serve_custom_import_detail(request, object())
+    http_response = await http.serve_custom_import_detail(request, cold_caller())
 
     assert http_response.status == 200
     assert orjson.loads(http_response.body) == {
@@ -973,7 +977,7 @@ async def test_wrong_path_stops_before_keyring_and_service(monkeypatch) -> None:
     monkeypatch.setattr(http, "CustomImportReadService", forbidden)
 
     result = await http.serve_custom_import_search(
-        _Request(_BODY, _headers(), path="/api/v1/extensions/custom-import/detail"), object()
+        _Request(_BODY, _headers(), path="/api/v1/extensions/custom-import/detail"), cold_caller()
     )
 
     assert result.status == 404
@@ -985,8 +989,8 @@ async def test_wrong_method_and_invalid_body_use_bounded_errors(monkeypatch) -> 
         raise AssertionError("invalid request crossed the route gate")
 
     monkeypatch.setattr(http, "_keyring", forbidden)
-    wrong_method = await http.serve_custom_import_search(_Request(_BODY, _headers(), method="GET"), object())
-    invalid_body = await http.serve_custom_import_search(_Request(b"", _headers()), object())
+    wrong_method = await http.serve_custom_import_search(_Request(_BODY, _headers(), method="GET"), cold_caller())
+    invalid_body = await http.serve_custom_import_search(_Request(b"", _headers()), cold_caller())
 
     assert wrong_method.status == 404
     assert invalid_body.status == 404
@@ -999,7 +1003,7 @@ async def test_oversized_response_fails_closed(monkeypatch) -> None:
     monkeypatch.setattr(http, "_resolve_pinned_target", _resolved_target)
     monkeypatch.setattr(http, "_MAX_RESPONSE_BYTES", 1)
 
-    result = await http.serve_custom_import_search(_Request(_BODY, _headers()), object())
+    result = await http.serve_custom_import_search(_Request(_BODY, _headers()), cold_caller())
 
     assert result.status == 503
 
@@ -1049,7 +1053,7 @@ async def test_detail_root_maps_absence_distinct_from_unavailable(
             _headers(body=_DETAIL_BODY, path=http.CUSTOM_IMPORT_DETAIL_PATH),
             path=http.CUSTOM_IMPORT_DETAIL_PATH,
         ),
-        object(),
+        cold_caller(),
     )
 
     assert result.status == expected_status
@@ -1071,7 +1075,7 @@ async def test_detail_absence_before_transport_authorization_fails_closed(monkey
             _headers(body=_DETAIL_BODY, path=http.CUSTOM_IMPORT_DETAIL_PATH),
             path=http.CUSTOM_IMPORT_DETAIL_PATH,
         ),
-        object(),
+        cold_caller(),
     )
 
     assert result.status == 503
@@ -1158,11 +1162,17 @@ async def test_missing_dataset_returns_closed_not_found(monkeypatch) -> None:
         def scalar_one_or_none(self):
             return None
 
-    class Session:
-        async def execute(self, _statement):
+    from tests.test_api_reader_sessions import ReaderSession
+
+    class Session(ReaderSession):
+        async def execute(self, statement, params=None):
+            if str(statement) == "SELECT session_user, current_user":
+                return await super().execute(statement, params)
             return Result()
 
-    result = await http.serve_custom_import_search(_Request(_BODY, _headers()), Session())
+    reader = Session()
+    _install_keyring(monkeypatch, reader)
+    result = await http.serve_custom_import_search(_Request(_BODY, _headers()), cold_caller())
 
     assert result.status == 404
     assert result.headers["Cache-Control"] == "private, no-store"
@@ -1230,3 +1240,29 @@ def test_transport_requires_canonical_uuid4_request_id() -> None:
             trusted_now=_NOW,
             keyring=http._load_keyring(_keyring_document()),
         )
+
+
+@pytest.mark.parametrize("install_fake_reader", [False, True])
+def test_keyring_reader_fixture_has_explicit_native_opt_out(monkeypatch, install_fake_reader):
+    """Key setup can preserve a native Reader; default unit ownership is unchanged."""
+    calls = []
+    monkeypatch.setitem(
+        globals(),
+        "install_reader_factory",
+        lambda *args: calls.append(args),
+    )
+    if install_fake_reader:
+        _install_keyring(monkeypatch)
+    else:
+        _install_keyring(monkeypatch, install_fake_reader=False)
+    assert len(calls) == int(install_fake_reader)
+    assert http._keyring_for_document(_keyring_document()) is not None
+
+
+@pytest.mark.asyncio
+async def test_native_reader_context_leaves_direct_fixture_unchanged():
+    from tests.custom_import_signed_reader_postgres_support import signed_publication_reader
+
+    direct_case = object()
+    async with signed_publication_reader(direct_case) as observed:
+        assert observed is direct_case

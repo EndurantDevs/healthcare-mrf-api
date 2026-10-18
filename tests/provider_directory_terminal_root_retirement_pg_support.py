@@ -4,33 +4,39 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
 import importlib.util
 import json
 import os
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, AsyncIterator
-import uuid
 
 import pytest
 from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from db.connection import Database
+from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
+from process.provider_directory_source_checkpoint_catalog import (
+    _GUARDS,
+    CHECKPOINT_LAYOUTS,
+    RETIRED_BULK_HOOKS,
+    capture_checkpoint_controls,
+)
+from tests.provider_directory_dataset_rehydrate_checkpoint_support import _checkpoint_function, _guard, _layout
+from tests.provider_directory_source_postgres_support import native_source_component
 from tests.tin_npi_connector_postgres_support import (
     POSTGRES_DSN_ENV,
     open_test_connection,
 )
 
-
 asyncpg = pytest.importorskip("asyncpg")
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = (
-    ROOT
-    / "alembic/versions"
-    / ("20260810090000_provider_directory_terminal_root_retirement.py")
-)
+MIGRATION_PATH = ROOT / "alembic/versions" / ("20260810090000_provider_directory_terminal_root_retirement.py")
 SOURCE_ID = "source-terminal"
 ENDPOINT_ID = "endpoint-terminal"
 CURRENT_DATASET_ID = "dataset-current"
@@ -49,22 +55,16 @@ RELATION_ORDERS = {
         "dataset_id, participating_organization_resource_id, affiliation_resource_id"
     ),
     "provider_directory_dataset_insurance_plan": "dataset_id, resource_id",
-    "provider_directory_dataset_network_plan": (
-        "dataset_id, network_resource_id, insurance_plan_resource_id"
-    ),
+    "provider_directory_dataset_network_plan": ("dataset_id, network_resource_id, insurance_plan_resource_id"),
     "provider_directory_dataset_proof_shard": "dataset_id, shard_id",
     "provider_directory_dataset_rehydration_checkpoint": (
         "dataset_id, source_id, acquisition_root_run_id, resource_type"
     ),
     "provider_directory_dataset_resource": "dataset_id, resource_type, resource_id",
-    "provider_directory_pagination_checkpoint": (
-        "dataset_id, canonical_api_base, resource_type, source_scope_hash"
-    ),
+    "provider_directory_pagination_checkpoint": ("dataset_id, canonical_api_base, resource_type, source_scope_hash"),
     "provider_directory_uhc_flex_npi_cohort": "cohort_id",
     "provider_directory_uhc_flex_practitioner_dataset": "dataset_id",
-    "provider_directory_uhc_flex_practitioner_dataset_resource": (
-        "dataset_id, resource_id"
-    ),
+    "provider_directory_uhc_flex_practitioner_dataset_resource": ("dataset_id, resource_id"),
 }
 
 
@@ -83,7 +83,7 @@ class RetirementPostgres:
     """One isolated schema with setup and runtime database handles."""
 
     connection: Any
-    database: Database
+    database: Database | None
     schema_name: str
     migration: Any
 
@@ -152,6 +152,8 @@ async def _create_foundation(connection: Any, schema_name: str) -> None:
         _foundation_projection_sql(schema),
     ):
         await connection.execute(statement)
+    for root, layout in CHECKPOINT_LAYOUTS.items():
+        await _layout(connection, schema_name, root, layout)
 
 
 def _foundation_catalog_sql(schema: str) -> str:
@@ -193,19 +195,6 @@ def _foundation_evidence_sql(schema: str) -> str:
     CREATE TABLE {schema}.provider_directory_dataset_proof_shard (
         dataset_id varchar(96), shard_id integer, payload_bytes bytea,
         resource_count bigint, PRIMARY KEY (dataset_id, shard_id));
-    CREATE TABLE {schema}.provider_directory_pagination_checkpoint (
-        dataset_id varchar(96), canonical_api_base text, resource_type varchar(64),
-        source_scope_hash varchar(64), state varchar(32),
-        PRIMARY KEY (dataset_id, canonical_api_base, resource_type, source_scope_hash));
-    CREATE TABLE {schema}.provider_directory_bulk_acquisition_checkpoint (
-        checkpoint_id varchar(64) PRIMARY KEY, dataset_id varchar(96), state varchar(32));
-    CREATE TABLE {schema}.provider_directory_bulk_output_checkpoint (
-        checkpoint_id varchar(64), output_id varchar(64), state varchar(32),
-        PRIMARY KEY (checkpoint_id, output_id));
-    CREATE TABLE {schema}.provider_directory_dataset_rehydration_checkpoint (
-        dataset_id varchar(96), source_id varchar(64), acquisition_root_run_id varchar(64),
-        resource_type varchar(64), state varchar(32),
-        PRIMARY KEY (dataset_id, source_id, acquisition_root_run_id, resource_type));
     """
 
 
@@ -329,15 +318,53 @@ async def _seed_target_evidence(scenario: RetirementPostgres) -> None:
         CURRENT_DATASET_ID,
     )
     await scenario.connection.execute(
-        f"""INSERT INTO {schema}.provider_directory_dataset_proof_shard
-            VALUES ('{TARGET_DATASET_ID}', 0, decode('abcd', 'hex'), 4);
-        INSERT INTO {schema}.provider_directory_pagination_checkpoint
-            VALUES ('{TARGET_DATASET_ID}', 'https://terminal.example.invalid/fhir',
-                    'Practitioner', '{'d' * 64}', 'complete');
-        INSERT INTO {schema}.provider_directory_bulk_acquisition_checkpoint
-            VALUES ('bulk-1', '{TARGET_DATASET_ID}', 'complete');
-        INSERT INTO {schema}.provider_directory_bulk_output_checkpoint
-            VALUES ('bulk-1', 'output-1', 'committed');"""
+        f"INSERT INTO {schema}.provider_directory_dataset_proof_shard VALUES ($1, 0, decode('abcd', 'hex'), 4)",
+        TARGET_DATASET_ID,
+    )
+    await _seed_checkpoint_witnesses(scenario)
+
+
+async def _seed_checkpoint_witnesses(scenario: RetirementPostgres) -> None:
+    """Bind complete checkpoints to the seeded endpoint, sources, URL and lineage."""
+    api_base = "https://terminal.example.invalid/fhir"
+    source_ids = json.dumps([SOURCE_ID], separators=(",", ":"))
+    scope_hash = sha256(source_ids.encode()).hexdigest()
+    start_hash = sha256((api_base + "/Practitioner").encode()).hexdigest()
+    await scenario.connection.execute(
+        f"""INSERT INTO {scenario.schema}.provider_directory_pagination_checkpoint
+        (dataset_id, canonical_api_base, resource_type, source_scope_hash,
+         source_ids, owner_run_id, retry_of_run_id, start_url_hash, state,
+         acquisition_root_run_id) VALUES
+        ($1, $2, 'Practitioner', $3, $4::jsonb, $5, 'run-terminal-2', $6,
+         'complete', $7)""",
+        TARGET_DATASET_ID,
+        api_base,
+        scope_hash,
+        source_ids,
+        OWNER_RUN_ID,
+        start_hash,
+        ROOT_RUN_ID,
+    )
+    await scenario.connection.execute(
+        f"""INSERT INTO {scenario.schema}.provider_directory_bulk_acquisition_checkpoint
+        (checkpoint_id, dataset_id, canonical_api_base, resource_type,
+         source_scope_hash, strategy_version, acquisition_root_run_id,
+         owner_run_id, retry_of_run_id, endpoint_id, start_url_hash, state)
+        VALUES ('bulk-1', $1, $2, 'Practitioner', $3, 'terminal-fixture-v1',
+         $4, $5, 'run-terminal-2', $6, $7, 'complete')""",
+        TARGET_DATASET_ID,
+        api_base,
+        scope_hash,
+        ROOT_RUN_ID,
+        OWNER_RUN_ID,
+        ENDPOINT_ID,
+        start_hash,
+    )
+    await scenario.connection.execute(
+        f"""INSERT INTO {scenario.schema}.provider_directory_bulk_output_checkpoint
+        (checkpoint_id, output_id, output_index, resource_type, output_url_hash, state)
+        VALUES ('bulk-1', 'output-1', 0, 'Practitioner', $1, 'committed')""",
+        sha256((api_base + "/bulk/output-1.ndjson").encode()).hexdigest(),
     )
 
 
@@ -357,17 +384,11 @@ async def seed_ineligible(
         "NULL"
         if failure_kind == "nonterminal"
         else (
-            "transaction_timestamp()"
-            if failure_kind == "young"
-            else "transaction_timestamp() - interval '20 minutes'"
+            "transaction_timestamp()" if failure_kind == "young" else "transaction_timestamp() - interval '20 minutes'"
         )
     )
-    await _seed_ineligible_catalog(
-        scenario, endpoint, source_id, root, run_status, finished, slug
-    )
-    await _seed_ineligible_datasets(
-        scenario, endpoint, source_id, root, current, target_dataset_id, contract
-    )
+    await _seed_ineligible_catalog(scenario, endpoint, source_id, root, run_status, finished, slug)
+    await _seed_ineligible_datasets(scenario, endpoint, source_id, root, current, target_dataset_id, contract)
     return {
         "source_id": source_id,
         "endpoint_id": endpoint,
@@ -388,14 +409,12 @@ async def _seed_ineligible_catalog(
     slug: str,
 ) -> None:
     await scenario.connection.execute(
-        f"INSERT INTO {scenario.schema}.provider_directory_api_endpoint "
-        "VALUES ($1, $2, '{}')",
+        f"INSERT INTO {scenario.schema}.provider_directory_api_endpoint VALUES ($1, $2, '{{}}')",
         endpoint,
         f"https://{slug}.example.invalid/fhir",
     )
     await scenario.connection.execute(
-        f"INSERT INTO {scenario.schema}.provider_directory_source "
-        "VALUES ($1, $2, $3, '{}')",
+        f"INSERT INTO {scenario.schema}.provider_directory_source VALUES ($1, $2, $3, '{{}}')",
         source_id,
         endpoint,
         f"https://{slug}.example.invalid/fhir",
@@ -449,33 +468,92 @@ async def _seed_ineligible_datasets(
         "e" * 64,
     )
     await scenario.connection.execute(
-        f"INSERT INTO {scenario.schema}.provider_directory_dataset_proof_shard "
-        "VALUES ($1, 0, decode('01', 'hex'), 1)",
+        f"INSERT INTO {scenario.schema}.provider_directory_dataset_proof_shard VALUES ($1, 0, decode('01', 'hex'), 1)",
         target_dataset_id,
     )
+
+
+async def _install_checkpoint_guards(scenario: RetirementPostgres) -> None:
+    """Add only missing current guards around the unchanged v1 retirement corpus."""
+    await scenario.connection.execute(_checkpoint_function(scenario.schema_name))
+    for root, guards in _GUARDS.items():
+        for name, guard in guards.items():
+            if name in RETIRED_BULK_HOOKS:
+                continue
+            present = await scenario.connection.fetchval(
+                "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=to_regclass($1) AND tgname=$2)",
+                scenario.schema_name + "." + root,
+                name,
+            )
+            if not present:
+                await _guard(scenario.connection, scenario.schema_name, root, name, guard)
+
+
+async def _adopt_checkpoint_fixture(scenario: RetirementPostgres, component: Any) -> None:
+    """Give the issued Source owner the declared fixture corpus, then attest it."""
+    owner = quote(component.owner)
+    async with scenario.connection.transaction():
+        for root in RELATION_ORDERS:
+            await scenario.connection.execute(f"ALTER TABLE {scenario.schema}.{quote(root)} OWNER TO {owner}")
+        signatures = (
+            *scenario.migration._function_signatures(scenario.schema_name),
+            f'{scenario.schema}."guard_provider_directory_subset_abandonment_checkpoint"()',
+        )
+        for signature in signatures:
+            await scenario.connection.execute(f"ALTER FUNCTION {signature} OWNER TO {owner}")
+            await scenario.connection.execute(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC")
+        closed_roles = ",".join(quote(role) for role in (component.publisher, *component.policy.runtime_roles))
+        for root in CHECKPOINT_LAYOUTS:
+            relation = f"{scenario.schema}.{quote(root)}"
+            await scenario.connection.execute(f"REVOKE ALL ON TABLE {relation} FROM PUBLIC, {closed_roles}")
+            await scenario.connection.execute(f"GRANT SELECT ON TABLE {relation} TO {quote(component.reader)}")
+    async with source_transaction(component.database, isolation="read committed"):
+        publisher = bound_publisher()
+        assert publisher.policy is component.policy
+        await capture_checkpoint_controls(publisher.connection, publisher.policy)
 
 
 @asynccontextmanager
 async def retirement_postgres(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    current_runtime: bool = True,
 ) -> AsyncIterator[RetirementPostgres]:
     connection = await open_test_connection()
     schema_name = f"provider_terminal_retirement_{uuid.uuid4().hex}"
-    _configure_runtime(monkeypatch, schema_name)
-    database = Database()
-    scenario = RetirementPostgres(
-        connection=connection,
-        database=database,
-        schema_name=schema_name,
-        migration=load_migration(),
-    )
+    engine = None
     try:
+        _configure_runtime(monkeypatch, schema_name)
+        scenario = RetirementPostgres(connection, None, schema_name, load_migration())
         await _create_foundation(connection, schema_name)
         await seed_exact_fixture(scenario)
         await scenario.migrate("upgrade")
-        await database.connect()
-        yield scenario
+        if not current_runtime:
+            yield scenario
+            return
+        await _install_checkpoint_guards(scenario)
+        url = make_url(os.environ[POSTGRES_DSN_ENV]).set(drivername="postgresql+asyncpg")
+        engine = create_async_engine(url)
+        async with native_source_component(engine, schema_name, monkeypatch) as component:
+            scenario.database = component.database
+            await _adopt_checkpoint_fixture(scenario, component)
+            yield scenario
     finally:
-        await database.disconnect()
-        await connection.execute(f"DROP SCHEMA IF EXISTS {quote(schema_name)} CASCADE")
-        await connection.close()
+        try:
+            if engine is not None:
+                await engine.dispose()
+        finally:
+            try:
+                await connection.execute(f"DROP SCHEMA IF EXISTS {quote(schema_name)} CASCADE")
+            finally:
+                await connection.close()
+
+
+@asynccontextmanager
+async def historical_retirement_postgres(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[RetirementPostgres]:
+    """Keep catalog-only historical migration proofs on their original administrator."""
+    async with retirement_postgres(monkeypatch, current_runtime=False) as scenario:
+        assert scenario.database is None
+        yield scenario

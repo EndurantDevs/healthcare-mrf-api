@@ -13,19 +13,22 @@ from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 
 def register_membership_projection_routes(blueprint):
+    """Register authenticated, read-only readiness for the fixed importer."""
+
     @blueprint.get("/ptg/provider-membership-projection")
     async def membership_projection_readiness(request):
+        """Report absent or protected ready state for an exact audited source/code."""
         require_control_auth(request)
-        params = dict(request.args)
+        params_by_name = dict(request.args)
         try:
-            if any(len(request.args.getlist(name)) != 1 for name in params):
+            if any(len(request.args.getlist(name)) != 1 for name in params_by_name):
                 raise ValueError("membership readiness requires one value per parameter")
-            params = {name: request.args.get(name) for name in params}
-            validate_params(params)
+            params_by_name = {name: request.args.get(name) for name in params_by_name}
+            validate_params(params_by_name)
             async with db.transaction() as session:
-                _, _, identity = await source_identity(session, **params)
+                _, _, identity = await source_identity(session, **params_by_name)
                 found = await locate(session, identity)
-                result = dict(params, contract=CONTRACT, state="absent") if found is None else receipt(found)
+                result = dict(params_by_name, contract=CONTRACT, state="absent") if found is None else receipt(found)
         except PTG2ManifestArtifactError:
             raise
         except ValueError as error:

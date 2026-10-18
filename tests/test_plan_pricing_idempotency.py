@@ -27,6 +27,13 @@ def _durable_import_request(importer: str, run_id: str) -> dict:
             "plan_release_id": "hprelease_" + "2" * 26,
             "serving_revision_id": "hpserve_" + "3" * 26,
         }
+    elif importer == "plan-pricing-em-attribution":
+        params_by_name = {
+            "plan_release_id": "hprelease_" + "2" * 26,
+            "serving_revision_id": "hpserve_" + "3" * 26,
+            "owner_role": "attribution_owner",
+            "runtime_roles": ["attribution_reader"],
+        }
     else:
         params_by_name = {
             "binding_manifest_digest": "b" * 64,
@@ -45,7 +52,7 @@ def _projection_migration():
         Path(__file__).resolve().parents[1]
         / "alembic"
         / "versions"
-        / "20260901103000_plan_pricing_em_distance.py"
+        / "20261019140000_plan_pricing_attribution_idempotency.py"
     )
     module_spec = importlib.util.spec_from_file_location(
         "plan_pricing_idempotency_migration",
@@ -65,8 +72,7 @@ def test_plan_pricing_all_status_index_matches_model_and_migration(
     index_spec = next(
         index_by_field
         for index_by_field in ImportRun.__my_additional_indexes__
-        if index_by_field["name"]
-        == "import_run_plan_pricing_idempotency_idx"
+        if index_by_field["name"] == "import_run_plan_pricing_idempotency_idx"
     )
     assert index_spec == {
         "index_elements": ("importer", "idempotency_key"),
@@ -74,7 +80,7 @@ def test_plan_pricing_all_status_index_matches_model_and_migration(
         "unique": True,
         "where": (
             "importer IN ('plan-pricing-projection', "
-            "'plan-pricing-prewarm', 'plan-pricing-em-distance') "
+            "'plan-pricing-prewarm', 'plan-pricing-em-distance', 'plan-pricing-em-attribution') "
             "AND idempotency_key IS NOT NULL"
         ),
     }
@@ -88,12 +94,16 @@ def test_plan_pricing_all_status_index_matches_model_and_migration(
     statement = " ".join(" ".join(statements).split())
     assert "CREATE UNIQUE INDEX" in statement
     assert "import_run_plan_pricing_idempotency_idx" in statement
-    assert (
-        'ON "projection_test"."import_run" (importer, idempotency_key)'
-        in statement
-    )
-    assert "'plan-pricing-em-distance'" in statement
-    assert "AND idempotency_key IS NOT NULL" in statement
+    assert statements == [
+        'DROP INDEX IF EXISTS "projection_test"."import_run_plan_pricing_idempotency_idx"',
+        'CREATE UNIQUE INDEX "import_run_plan_pricing_idempotency_idx" '
+        'ON "projection_test"."import_run" (importer, idempotency_key) WHERE ' + index_spec["where"],
+    ]
+    statements.clear()
+    migration.downgrade()
+    assert len(statements) == 2
+    assert "'plan-pricing-em-attribution'" not in statements[1]
+    assert "'plan-pricing-em-distance') AND idempotency_key IS NOT NULL" in statements[1]
 
 
 @pytest.mark.asyncio
@@ -103,6 +113,7 @@ def test_plan_pricing_all_status_index_matches_model_and_migration(
         "plan-pricing-projection",
         "plan-pricing-prewarm",
         "plan-pricing-em-distance",
+        "plan-pricing-em-attribution",
     ),
 )
 async def test_terminal_plan_pricing_idempotency_replays_succeeded_run(
@@ -112,7 +123,10 @@ async def test_terminal_plan_pricing_idempotency_replays_succeeded_run(
     """Return an exact succeeded owner without active-only lookup."""
 
     terminal_run_by_field = {
+        **_durable_import_request(importer, "run_succeeded"),
         "run_id": "run_succeeded",
+        "engine": control_imports.ENGINE_NAME,
+        "node_id": control_imports.os.getenv("HLTHPRT_IMPORT_NODE_ID"),
         "importer": importer,
         "status": "succeeded",
     }
@@ -128,9 +142,7 @@ async def test_terminal_plan_pricing_idempotency_replays_succeeded_run(
         AsyncMock(side_effect=AssertionError("active-only lookup is unsafe")),
     )
 
-    replayed_run, created = await control_imports.create_import_run(
-        _durable_import_request(importer, "run_replay")
-    )
+    replayed_run, created = await control_imports.create_import_run(_durable_import_request(importer, "run_replay"))
 
     assert created is False
     assert replayed_run == terminal_run_by_field
@@ -147,6 +159,7 @@ async def test_terminal_plan_pricing_idempotency_replays_succeeded_run(
         "plan-pricing-projection",
         "plan-pricing-prewarm",
         "plan-pricing-em-distance",
+        "plan-pricing-em-attribution",
     ),
 )
 async def test_plan_pricing_integrity_race_replays_terminal_owner(
@@ -156,17 +169,16 @@ async def test_plan_pricing_integrity_race_replays_terminal_owner(
     """Resolve a unique-index loser to the terminal durable owner."""
 
     terminal_run_by_field = {
+        **_durable_import_request(importer, "run_race_winner"),
         "run_id": "run_race_winner",
+        "engine": control_imports.ENGINE_NAME,
+        "node_id": control_imports.os.getenv("HLTHPRT_IMPORT_NODE_ID"),
         "importer": importer,
         "status": "succeeded",
     }
-    terminal_lookup = AsyncMock(
-        side_effect=(None, terminal_run_by_field)
-    )
+    terminal_lookup = AsyncMock(side_effect=(None, terminal_run_by_field))
     failing_database = SimpleNamespace(
-        execute=AsyncMock(
-            side_effect=IntegrityError("insert", {}, Exception("duplicate"))
-        )
+        execute=AsyncMock(side_effect=IntegrityError("insert", {}, Exception("duplicate")))
     )
     monkeypatch.setattr(control_imports, "db", failing_database)
     monkeypatch.setattr(
@@ -180,9 +192,7 @@ async def test_plan_pricing_integrity_race_replays_terminal_owner(
         AsyncMock(return_value=None),
     )
 
-    replayed_run, created = await control_imports.create_import_run(
-        _durable_import_request(importer, "run_race_loser")
-    )
+    replayed_run, created = await control_imports.create_import_run(_durable_import_request(importer, "run_race_loser"))
 
     assert created is False
     assert replayed_run == terminal_run_by_field

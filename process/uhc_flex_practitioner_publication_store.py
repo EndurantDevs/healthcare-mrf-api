@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 """Transactional store operations for admitted Flex dataset publication."""
+
 from __future__ import annotations
 
 from datetime import date
@@ -10,9 +11,9 @@ from db.connection import db
 from process.provider_directory_dataset_candidate import prepare_dataset_candidate
 from process.provider_directory_dataset_scoped_publication import (
     ExactCurrentDataset,
+    ProviderDirectoryDatasetScopedPublicationError,
     exact_uhc_dataset_pair,
     lock_exact_current_dataset,
-    ProviderDirectoryDatasetScopedPublicationError,
     supersede_exact_current_dataset,
 )
 from process.provider_directory_resource_hash import SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
@@ -24,34 +25,34 @@ from process.uhc_flex_practitioner_contract import (
     UHC_FLEX_PRACTITIONER_SOURCE_ID,
 )
 from process.uhc_flex_practitioner_publication import (
-    build_uhc_flex_practitioner_dataset_identity,
-    _canonical_json,
     _DATASET_RESOURCE,
     _ENDPOINT_DATASET,
-    _function,
     _HEADER,
     _PROVENANCE,
     _READY_FUNCTION,
-    _row_fields,
     _SOURCE,
-    _table,
-    uhc_flex_practitioner_publication_metadata,
     UHCFlexPractitionerDatasetIdentity,
     UHCFlexPractitionerDatasetReadiness,
     UHCFlexPractitionerPublicationError,
     UHCFlexPractitionerPublicationResult,
+    _canonical_json,
+    _function,
+    _row_fields,
+    _table,
+    build_uhc_flex_practitioner_dataset_identity,
+    uhc_flex_practitioner_publication_metadata,
 )
 from process.uhc_flex_practitioner_publication_materialization import _materialize_candidate, _validate_candidate
 from process.uhc_flex_practitioner_single_root_contract import (
+    UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
     UHCFlexPractitionerAdmission,
     UHCFlexPractitionerSingleRootAdmission,
-    UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
 )
 from process.uhc_flex_practitioner_store_support import ACQUISITION_TABLE
-from process.uhc_flex_practitioner_twin_store import require_uhc_flex_practitioner_admission
+from process.uhc_flex_practitioner_twin_store import _read_admission, require_uhc_flex_practitioner_admission
 from process.uhc_flex_practitioner_twin_store_contract import (
-    UHCFlexPractitionerTwinAdmission,
     UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID,
+    UHCFlexPractitionerTwinAdmission,
 )
 
 
@@ -59,9 +60,7 @@ def _readiness_from_row(database_row: Any) -> UHCFlexPractitionerDatasetReadines
     database_fields = _row_fields(database_row)
     try:
         projection = database_fields.get("semantic_projection_as_of")
-        projection_text = (
-            projection.isoformat() if hasattr(projection, "isoformat") else projection
-        )
+        projection_text = projection.isoformat() if hasattr(projection, "isoformat") else projection
         return UHCFlexPractitionerDatasetReadiness(
             dataset_id=database_fields.get("dataset_id"),
             previous_dataset_id=database_fields.get("previous_dataset_id"),
@@ -78,13 +77,11 @@ def _readiness_from_row(database_row: Any) -> UHCFlexPractitionerDatasetReadines
             source_id=database_fields.get("source_id"),
             source_authority_id=database_fields.get("source_authority_id"),
             cohort_complete=database_fields.get("cohort_complete"),
-            endpoint_collection_complete=database_fields.get(
-                "endpoint_collection_complete"
-            ),
+            endpoint_collection_complete=database_fields.get("endpoint_collection_complete"),
             endpoint_complete=database_fields.get("endpoint_complete"),
             retry_exhausted_count=database_fields.get("retry_exhausted_count"),
         )
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise UHCFlexPractitionerPublicationError("state") from None
 
 
@@ -157,8 +154,7 @@ async def _assert_no_orphan_parent(
     identity: UHCFlexPractitionerDatasetIdentity,
 ) -> None:
     parent_count = await database.scalar(
-        f"SELECT count(*) FROM {_table(_ENDPOINT_DATASET)} "
-        "WHERE dataset_id = :dataset_id;",
+        f"SELECT count(*) FROM {_table(_ENDPOINT_DATASET)} WHERE dataset_id = :dataset_id;",
         dataset_id=identity.dataset_id,
     )
     if parent_count not in {0, 1}:
@@ -178,9 +174,7 @@ async def _locked_current_dataset(
             require_ready=False,
         )
     except ProviderDirectoryDatasetScopedPublicationError as error:
-        code = (
-            error.code if error.code in {"foreign_current", "source_drift"} else "state"
-        )
+        code = error.code if error.code in {"foreign_current", "source_drift"} else "state"
         raise UHCFlexPractitionerPublicationError(code) from error
 
 
@@ -258,9 +252,7 @@ async def _insert_dedicated_header(
         cohort_id=admission.cohort_id,
         dataset_intent_id=admission.dataset_intent_id,
         acquisition_root_run_id=identity.acquisition_root_run_id,
-        semantic_projection_as_of=date.fromisoformat(
-            admission.semantic_projection_as_of
-        ),
+        semantic_projection_as_of=date.fromisoformat(admission.semantic_projection_as_of),
         operation_key=admission.operation_key,
         source_authority_id=UHC_FLEX_OFFICIAL_AUTHORITY_ID,
         terminal_set_sha256=admission.terminal_set_sha256,
@@ -311,9 +303,7 @@ async def _supersede_previous(
     try:
         await supersede_exact_current_dataset(database, previous_dataset)
     except ProviderDirectoryDatasetScopedPublicationError as error:
-        code = (
-            error.code if error.code in {"foreign_current", "source_drift"} else "state"
-        )
+        code = error.code if error.code in {"foreign_current", "source_drift"} else "state"
         raise UHCFlexPractitionerPublicationError(code) from error
 
 
@@ -348,12 +338,10 @@ def _is_expected_admission(
 ) -> bool:
     has_expected_contract = (
         type(admission) is UHCFlexPractitionerTwinAdmission
-        and admission.admission_contract_id
-        == UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID
+        and admission.admission_contract_id == UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID
     ) or (
         type(admission) is UHCFlexPractitionerSingleRootAdmission
-        and admission.admission_contract_id
-        == UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+        and admission.admission_contract_id == UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID
     )
     return bool(
         has_expected_contract
@@ -371,15 +359,14 @@ async def _lock_admission(
     endpoint_id: str,
 ) -> tuple[UHCFlexPractitionerAdmission, int]:
     await database.scalar(
-        "SELECT pg_catalog.pg_advisory_xact_lock("
-        "pg_catalog.hashtextextended(:lock_identity, 0));",
+        "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:lock_identity, 0));",
         lock_identity=UHC_FLEX_PRACTITIONER_PUBLICATION_LOCK_IDENTITY,
     )
     locked_source = await database.first(
         f"""
         SELECT source.source_id
           FROM {_table(_SOURCE)} AS source
-          JOIN {_table('provider_directory_api_endpoint')} AS endpoint
+          JOIN {_table("provider_directory_api_endpoint")} AS endpoint
             ON endpoint.endpoint_id = source.endpoint_id
          WHERE source.source_id = :source_id
            AND source.endpoint_id = :endpoint_id
@@ -416,10 +403,7 @@ async def _lock_admission(
         or candidate.get("cohort_complete") is not (retry_exhausted_count == 0)
         or candidate.get("terminal_set_sha256") != admission.terminal_set_sha256
         or candidate.get("resource_count") != admission.resource_count
-        or (
-            retry_exhausted_count > 0
-            and type(admission) is not UHCFlexPractitionerSingleRootAdmission
-        )
+        or (retry_exhausted_count > 0 and type(admission) is not UHCFlexPractitionerSingleRootAdmission)
     ):
         raise UHCFlexPractitionerPublicationError("admission")
     return admission, retry_exhausted_count
@@ -446,9 +430,7 @@ async def _publish_admitted_dataset(
         return UHCFlexPractitionerPublicationResult(readiness, replayed=True)
     await _assert_no_orphan_parent(database, identity)
     previous_dataset = await _locked_current_dataset(database, identity)
-    previous_dataset_id = (
-        previous_dataset.dataset_id if previous_dataset is not None else None
-    )
+    previous_dataset_id = previous_dataset.dataset_id if previous_dataset is not None else None
     await _insert_building_headers(
         database,
         identity,
@@ -478,20 +460,30 @@ async def publish_registered_uhc_flex_dataset(
     database: Any = db,
 ) -> UHCFlexPractitionerPublicationResult:
     """Publish within one lock-protected transaction after registration."""
+    from process.provider_directory_generic_source_adapters import require_source_transaction
+    from process.provider_directory_generic_source_policy import source_owner_transaction, source_transaction
+    from process.uhc_flex_official_cohort_store import sync_uhc_flex_official_cohort
 
-    async with database.transaction():
-        admission, retry_exhausted_count = await _lock_admission(
-            database,
-            candidate_acquisition_id,
-            endpoint_id,
-        )
-        return await _publish_admitted_dataset(
-            database,
-            admission,
-            endpoint_id,
-            batch_size,
-            retry_exhausted_count,
-        )
+    if require_source_transaction(repeatable_read=True) is None:
+        async with database.transaction():
+            admission = await _read_admission(database, candidate_acquisition_id)
+        if type(admission) is UHCFlexPractitionerSingleRootAdmission:
+            await sync_uhc_flex_official_cohort(database=database)
+
+    async with source_transaction(database, isolation="repeatable read"):
+        async with source_owner_transaction(database):
+            admission, retry_exhausted_count = await _lock_admission(
+                database,
+                candidate_acquisition_id,
+                endpoint_id,
+            )
+            return await _publish_admitted_dataset(
+                database,
+                admission,
+                endpoint_id,
+                batch_size,
+                retry_exhausted_count,
+            )
 
 
 __all__ = (

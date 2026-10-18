@@ -9,17 +9,15 @@ from process.ptg_parts.ptg2_legacy_orphan_models import (
     LEGACY_SWEEP_MAX_OWNERSHIP_ROWS,
 )
 from process.ptg_parts.ptg2_legacy_orphan_store_common import (
-    _OwnershipAccumulator,
     _bare_control_suffix,
     _internal_run_suffix,
+    _OwnershipAccumulator,
     _row_mapping,
     _schema_table,
     _snapshot_manifest_suffixes,
 )
 
-_TERMINAL_JOB_STATUSES = frozenset(
-    {"canceled", "cancelled", "dead_letter", "failed", "succeeded"}
-)
+_TERMINAL_JOB_STATUSES = frozenset({"canceled", "cancelled", "dead_letter", "failed", "succeeded"})
 
 
 async def _bounded_owner_rows(
@@ -37,9 +35,7 @@ async def _bounded_owner_rows(
         **parameters,
     )
     if len(rows) > LEGACY_SWEEP_MAX_OWNERSHIP_ROWS:
-        raise RuntimeError(
-            f"legacy_sweep_{evidence_kind}_scan_limit_exceeded"
-        )
+        raise RuntimeError(f"legacy_sweep_{evidence_kind}_scan_limit_exceeded")
     return rows
 
 
@@ -47,9 +43,7 @@ def _new_accumulators(
     suffixes: Iterable[str],
     ambiguity_by_suffix: Mapping[str, tuple[str, ...]],
 ) -> dict[str, _OwnershipAccumulator]:
-    accumulator_by_suffix = {
-        suffix: _OwnershipAccumulator() for suffix in sorted(set(suffixes))
-    }
+    accumulator_by_suffix = {suffix: _OwnershipAccumulator() for suffix in sorted(set(suffixes))}
     for suffix, reasons in ambiguity_by_suffix.items():
         if suffix in accumulator_by_suffix:
             accumulator_by_suffix[suffix].ambiguity_reasons.update(reasons)
@@ -64,18 +58,14 @@ async def _candidate_snapshot_rows(
     candidate_suffixes = sorted(accumulators)
     candidate_run_ids = [f"ptg2:{suffix}" for suffix in candidate_suffixes]
     declared_snapshot_ids = sorted(
-        {
-            snapshot_id
-            for accumulator in accumulators.values()
-            for snapshot_id in accumulator.declared_snapshot_ids
-        }
+        {snapshot_id for accumulator in accumulators.values() for snapshot_id in accumulator.declared_snapshot_ids}
     )
     manifest_patterns = [f"%{suffix}%" for suffix in candidate_suffixes]
     return await _bounded_owner_rows(
         executor,
         f"""
         SELECT snapshot_id, import_run_id, status, manifest
-          FROM {_schema_table(schema_name, 'ptg2_snapshot')}
+          FROM {_schema_table(schema_name, "ptg2_snapshot")}
          WHERE import_run_id = ANY(CAST(:candidate_run_ids AS text[]))
             OR snapshot_id = ANY(CAST(:declared_snapshot_ids AS text[]))
             OR manifest::text LIKE ANY(CAST(:manifest_patterns AS text[]))
@@ -115,21 +105,15 @@ async def _snapshot_ownership(
             raw_suffixes.add(import_suffix)
         elif raw_import_run_id:
             for suffix in raw_suffixes.intersection(accumulators):
-                accumulators[suffix].ambiguity_reasons.add(
-                    "snapshot_import_run_identity_malformed"
-                )
+                accumulators[suffix].ambiguity_reasons.add("snapshot_import_run_identity_malformed")
         raw_suffixes_by_snapshot[snapshot_id] = raw_suffixes
         candidate_owners = raw_suffixes.intersection(accumulators)
         if len(raw_suffixes) != 1:
             for suffix in candidate_owners:
-                accumulators[suffix].ambiguity_reasons.add(
-                    "snapshot_owner_suffix_conflict"
-                )
+                accumulators[suffix].ambiguity_reasons.add("snapshot_owner_suffix_conflict")
         for suffix in candidate_owners:
             accumulator = accumulators[suffix]
-            accumulator.snapshot_statuses.add(
-                (snapshot_id, str(mapping.get("status") or ""))
-            )
+            accumulator.snapshot_statuses.add((snapshot_id, str(mapping.get("status") or "")))
             accumulator.declared_snapshot_ids.add(snapshot_id)
             accumulator.evidence_kinds.add("snapshot")
     return raw_suffixes_by_snapshot
@@ -145,7 +129,7 @@ async def _internal_run_ownership(
         executor,
         f"""
         SELECT import_run_id, status
-          FROM {_schema_table(schema_name, 'ptg2_import_run')}
+          FROM {_schema_table(schema_name, "ptg2_import_run")}
          WHERE import_run_id = ANY(CAST(:candidate_run_ids AS text[]))
          ORDER BY import_run_id
         """,
@@ -168,7 +152,7 @@ async def _internal_run_ownership(
         executor,
         f"""
         SELECT import_job_id, import_run_id, status
-          FROM {_schema_table(schema_name, 'ptg2_import_job')}
+          FROM {_schema_table(schema_name, "ptg2_import_job")}
          WHERE import_run_id = ANY(CAST(:candidate_run_ids AS text[]))
          ORDER BY import_run_id, import_job_id
         """,
@@ -182,9 +166,7 @@ async def _internal_run_ownership(
             continue
         status = str(mapping.get("status") or "").strip().lower()
         if status not in _TERMINAL_JOB_STATUSES:
-            accumulators[suffix].ambiguity_reasons.add(
-                f"active_import_job_{status or 'missing'}"
-            )
+            accumulators[suffix].ambiguity_reasons.add(f"active_import_job_{status or 'missing'}")
 
 
 async def _mirror_run_ownership(
@@ -197,7 +179,7 @@ async def _mirror_run_ownership(
         executor,
         f"""
         SELECT run_id, source_file_import_id, status, snapshot_id
-          FROM {_schema_table(schema_name, 'import_run')}
+          FROM {_schema_table(schema_name, "import_run")}
          WHERE source_file_import_id = ANY(CAST(:suffixes AS text[]))
          ORDER BY source_file_import_id, run_id
         """,
@@ -210,9 +192,7 @@ async def _mirror_run_ownership(
         if suffix not in accumulators:
             continue
         accumulator = accumulators[suffix]
-        accumulator.mirror_run_statuses.add(
-            (str(mapping["run_id"]), str(mapping.get("status") or ""))
-        )
+        accumulator.mirror_run_statuses.add((str(mapping["run_id"]), str(mapping.get("status") or "")))
         snapshot_id = str(mapping.get("snapshot_id") or "").strip()
         if snapshot_id:
             accumulator.declared_snapshot_ids.add(snapshot_id)
@@ -229,7 +209,7 @@ async def _control_ownership(
         executor,
         f"""
         SELECT source_file_import_id, status, snapshot_id
-          FROM {_schema_table(control_schema_name, 'source_file_import')}
+          FROM {_schema_table(control_schema_name, "source_file_import")}
          WHERE source_file_import_id = ANY(CAST(:suffixes AS text[]))
          ORDER BY source_file_import_id
         """,
@@ -242,9 +222,7 @@ async def _control_ownership(
         if suffix not in accumulators:
             continue
         accumulator = accumulators[suffix]
-        accumulator.control_import_statuses.add(
-            (suffix, str(mapping.get("status") or ""))
-        )
+        accumulator.control_import_statuses.add((suffix, str(mapping.get("status") or "")))
         snapshot_id = str(mapping.get("snapshot_id") or "").strip()
         if snapshot_id:
             accumulator.declared_snapshot_ids.add(snapshot_id)
@@ -253,7 +231,7 @@ async def _control_ownership(
         executor,
         f"""
         SELECT placement_id, source_file_import_id, status, snapshot_id
-          FROM {_schema_table(control_schema_name, 'ptg_file_placement')}
+          FROM {_schema_table(control_schema_name, "ptg_file_placement")}
          WHERE source_file_import_id = ANY(CAST(:suffixes AS text[]))
          ORDER BY source_file_import_id, placement_id
         """,
@@ -290,6 +268,7 @@ def _snapshot_reference_statement(
         ("snapshot_id", "plan_source_current", "ptg2_current_plan_source"),
         ("previous_snapshot_id", "plan_source_previous", "ptg2_current_plan_source"),
         ("snapshot_id", "snapshot_pin", "ptg2_snapshot_pin"),
+        ("snapshot_id", "plan_release_pin", "plan_release_snapshot_pin"),
         ("snapshot_id", "release_binding", "plan_release_snapshot_binding"),
         ("snapshot_id", "shared_snapshot_binding", "ptg2_v3_snapshot_binding"),
     )
@@ -312,8 +291,7 @@ def _snapshot_reference_statement(
             "SELECT snapshot_id, "
             f"'{reference_kind}'::text AS reference_kind "
             f"FROM {_schema_table(control_schema_name, table_name)} "
-            "WHERE snapshot_id = ANY(CAST(:snapshot_ids AS text[]))"
-            + qualifier
+            "WHERE snapshot_id = ANY(CAST(:snapshot_ids AS text[]))" + qualifier
         )
         for table_name, reference_kind, qualifier in control_refs
     )
@@ -337,7 +315,4 @@ async def _reference_rows(
         statement,
         snapshot_ids=snapshot_ids,
     )
-    return [
-        dict(_row_mapping(reference_row))
-        for reference_row in reference_rows
-    ]
+    return [dict(_row_mapping(reference_row)) for reference_row in reference_rows]

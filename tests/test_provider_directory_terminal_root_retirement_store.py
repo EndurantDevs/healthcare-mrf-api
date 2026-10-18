@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import AbstractAsyncContextManager
 from copy import deepcopy
-import json
 from typing import Any
 
 import pytest
@@ -73,196 +73,181 @@ class StoreDatabase(SelectionDatabase):
 
 
 @pytest.mark.asyncio
-async def test_preview_returns_closed_token_without_parent_write() -> None:
+async def test_preview_returns_closed_token_without_parent_write(monkeypatch) -> None:
     database = StoreDatabase()
-    before = deepcopy(database.target)
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
-    evidence_sha256 = await preview_terminal_root_retirement_transaction(
-        database, request()
-    )
+    async with synthetic_source_database(monkeypatch, database) as database:
+        before = deepcopy(database.target)
 
-    assert evidence_sha256 == contract.canonical_json_sha256(database.evidence)
-    assert database.target == before
-    assert database.transaction_entries == 1
-    assert not any(
-        call[0] == "status" and call[1].lstrip().startswith("UPDATE")
-        for call in database.calls
-    )
+        evidence_sha256 = await preview_terminal_root_retirement_transaction(database, request())
+
+        assert evidence_sha256 == contract.canonical_json_sha256(database.evidence)
+        assert database.target == before
+        assert database.transaction_entries == 1
+        assert not any(call[0] == "status" and call[1].lstrip().startswith("UPDATE") for call in database.calls)
 
 
 @pytest.mark.asyncio
-async def test_apply_mutates_only_status_and_marker_with_exact_cas() -> None:
+async def test_apply_mutates_only_status_and_marker_with_exact_cas(monkeypatch) -> None:
     database = StoreDatabase()
-    before = deepcopy(database.target)
-    evidence_sha256 = contract.canonical_json_sha256(database.evidence)
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
-    retirement_result = await apply_terminal_root_retirement_transaction(
-        database,
-        request(expected_evidence_sha256=evidence_sha256),
-    )
+    async with synthetic_source_database(monkeypatch, database) as database:
+        before = deepcopy(database.target)
+        evidence_sha256 = contract.canonical_json_sha256(database.evidence)
 
-    assert retirement_result.retired is True
-    assert database.target["status"] == contract.RETIREMENT_STATUS
-    marker = database.target["publication_metadata_json"].pop(
-        contract.RETIREMENT_METADATA_KEY
-    )
-    before_metadata = before.pop("publication_metadata_json")
-    after_metadata = database.target.pop("publication_metadata_json")
-    before["status"] = contract.RETIREMENT_STATUS
-    assert database.target == before
-    assert after_metadata == before_metadata
-    assert marker["evidence"] == database.evidence
-    update = next(
-        call
-        for call in database.calls
-        if call[0] == "status" and call[1].lstrip().startswith("UPDATE")
-    )
-    assert "resource_count =" not in update[1]
-    assert "completion_proof_required_version IS NULL" in update[1]
-    assert update[2]["metadata_json"] == json.dumps(
-        before_metadata, sort_keys=True, separators=(",", ":")
-    )
-
-
-@pytest.mark.asyncio
-async def test_semantic_v4_apply_uses_versioned_marker_and_validator() -> None:
-    database = StoreDatabase()
-    profile = contract.SEMANTIC_V4_RETIREMENT_PROFILE
-    database.target["resource_count"] = 0
-    database.target["publication_metadata_json"][
-        "resource_hash_contract"
-    ] = "semantic_content_v4"
-    database.evidence["parent_resource_count"] = 0
-    evidence_sha256 = contract.canonical_json_sha256(database.evidence)
-
-    retirement_result = await apply_terminal_root_retirement_transaction(
-        database,
-        request(expected_evidence_sha256=evidence_sha256),
-    )
-
-    assert retirement_result.retired is True
-    marker = database.target["publication_metadata_json"][profile.metadata_key]
-    assert marker["contract_version"] == profile.contract_version
-    assert marker["evidence"]["parent_resource_count"] == 0
-    assert marker["evidence"]["actual_resource_count"] == 7
-    update_call = next(
-        call
-        for call in database.calls
-        if call[0] == "status" and call[1].lstrip().startswith("UPDATE")
-    )
-    assert update_call[2]["marker_key"] == profile.metadata_key
-    assert any(
-        profile.valid_function in call[1]
-        for call in database.calls
-        if call[0] == "scalar"
-    )
-
-
-@pytest.mark.asyncio
-async def test_replay_is_write_free_and_ignores_mutable_source_state() -> None:
-    database = StoreDatabase()
-    marker = contract.retirement_marker(
-        database.evidence,
-        minimum_terminal_age_seconds=900,
-        retired_at="2026-08-10T12:00:00+00:00",
-    )
-    database.target["status"] = contract.RETIREMENT_STATUS
-    database.target["publication_metadata_json"][
-        contract.RETIREMENT_METADATA_KEY
-    ] = marker
-    database.source = None
-    database.predecessor = None
-    token = contract.canonical_json_sha256(database.evidence)
-
-    retirement_result = await apply_terminal_root_retirement_transaction(
-        database, request(expected_evidence_sha256=token)
-    )
-
-    assert retirement_result.retired is False
-    assert retirement_result.marker_sha256 == contract.canonical_json_sha256(marker)
-    assert not any(
-        call[0] == "status" and call[1].lstrip().startswith("UPDATE")
-        for call in database.calls
-    )
-    assert any(contract.RETIREMENT_VALID_FUNCTION in call[1] for call in database.calls)
-
-
-@pytest.mark.asyncio
-async def test_semantic_v4_replay_uses_versioned_validator_without_write() -> None:
-    database = StoreDatabase()
-    profile = contract.SEMANTIC_V4_RETIREMENT_PROFILE
-    marker = contract.retirement_marker(
-        database.evidence,
-        minimum_terminal_age_seconds=900,
-        retired_at="2026-08-10T12:00:00+00:00",
-        profile=profile,
-    )
-    database.target["status"] = contract.RETIREMENT_STATUS
-    database.target["publication_metadata_json"].update(
-        {
-            "resource_hash_contract": "semantic_content_v4",
-            profile.metadata_key: marker,
-        }
-    )
-    database.source = None
-    database.predecessor = None
-    token = contract.canonical_json_sha256(database.evidence)
-
-    assert (
-        await preview_terminal_root_retirement_transaction(
+        retirement_result = await apply_terminal_root_retirement_transaction(
             database,
-            request(),
+            request(expected_evidence_sha256=evidence_sha256),
         )
-        == token
-    )
-    database.lock_results = [True, True]
-    retirement_result = await apply_terminal_root_retirement_transaction(
-        database,
-        request(expected_evidence_sha256=token),
-    )
 
-    assert retirement_result.retired is False
-    assert not any(
-        call[0] == "status" and call[1].lstrip().startswith("UPDATE")
-        for call in database.calls
-    )
-    assert any(profile.valid_function in call[1] for call in database.calls)
+        assert retirement_result.retired is True
+        assert database.target["status"] == contract.RETIREMENT_STATUS
+        marker = database.target["publication_metadata_json"].pop(contract.RETIREMENT_METADATA_KEY)
+        before_metadata = before.pop("publication_metadata_json")
+        after_metadata = database.target.pop("publication_metadata_json")
+        before["status"] = contract.RETIREMENT_STATUS
+        assert database.target == before
+        assert after_metadata == before_metadata
+        assert marker["evidence"] == database.evidence
+        update = next(call for call in database.calls if call[0] == "status" and call[1].lstrip().startswith("UPDATE"))
+        assert "resource_count =" not in update[1]
+        assert "completion_proof_required_version IS NULL" in update[1]
+        assert update[2]["metadata_json"] == json.dumps(before_metadata, sort_keys=True, separators=(",", ":"))
 
 
 @pytest.mark.asyncio
-async def test_apply_rejects_missing_or_changed_evidence_before_write() -> None:
+async def test_semantic_v4_apply_uses_versioned_marker_and_validator(monkeypatch) -> None:
+    database = StoreDatabase()
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+
+    async with synthetic_source_database(monkeypatch, database) as database:
+        profile = contract.SEMANTIC_V4_RETIREMENT_PROFILE
+        database.target["resource_count"] = 0
+        database.target["publication_metadata_json"]["resource_hash_contract"] = "semantic_content_v4"
+        database.evidence["parent_resource_count"] = 0
+        evidence_sha256 = contract.canonical_json_sha256(database.evidence)
+
+        retirement_result = await apply_terminal_root_retirement_transaction(
+            database,
+            request(expected_evidence_sha256=evidence_sha256),
+        )
+
+        assert retirement_result.retired is True
+        marker = database.target["publication_metadata_json"][profile.metadata_key]
+        assert marker["contract_version"] == profile.contract_version
+        assert marker["evidence"]["parent_resource_count"] == 0
+        assert marker["evidence"]["actual_resource_count"] == 7
+        update_call = next(
+            call for call in database.calls if call[0] == "status" and call[1].lstrip().startswith("UPDATE")
+        )
+        assert update_call[2]["marker_key"] == profile.metadata_key
+        assert any(profile.valid_function in call[1] for call in database.calls if call[0] == "scalar")
+
+
+@pytest.mark.asyncio
+async def test_replay_is_write_free_and_ignores_mutable_source_state(monkeypatch) -> None:
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+
+    database = StoreDatabase()
+    async with synthetic_source_database(monkeypatch, database) as database:
+        marker = contract.retirement_marker(
+            database.evidence,
+            minimum_terminal_age_seconds=900,
+            retired_at="2026-08-10T12:00:00+00:00",
+        )
+        database.target["status"] = contract.RETIREMENT_STATUS
+        database.target["publication_metadata_json"][contract.RETIREMENT_METADATA_KEY] = marker
+        database.source = None
+        database.predecessor = None
+        token = contract.canonical_json_sha256(database.evidence)
+
+        retirement_result = await apply_terminal_root_retirement_transaction(
+            database, request(expected_evidence_sha256=token)
+        )
+
+        assert retirement_result.retired is False
+        assert retirement_result.marker_sha256 == contract.canonical_json_sha256(marker)
+        assert not any(call[0] == "status" and call[1].lstrip().startswith("UPDATE") for call in database.calls)
+        assert any(contract.RETIREMENT_VALID_FUNCTION in call[1] for call in database.calls)
+
+
+@pytest.mark.asyncio
+async def test_semantic_v4_replay_uses_versioned_validator_without_write(monkeypatch) -> None:
+    database = StoreDatabase()
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+
+    async with synthetic_source_database(monkeypatch, database) as database:
+        profile = contract.SEMANTIC_V4_RETIREMENT_PROFILE
+        marker = contract.retirement_marker(
+            database.evidence,
+            minimum_terminal_age_seconds=900,
+            retired_at="2026-08-10T12:00:00+00:00",
+            profile=profile,
+        )
+        database.target["status"] = contract.RETIREMENT_STATUS
+        database.target["publication_metadata_json"].update(
+            {
+                "resource_hash_contract": "semantic_content_v4",
+                profile.metadata_key: marker,
+            }
+        )
+        database.source = None
+        database.predecessor = None
+        token = contract.canonical_json_sha256(database.evidence)
+
+        assert (
+            await preview_terminal_root_retirement_transaction(
+                database,
+                request(),
+            )
+            == token
+        )
+        database.lock_results = [True, True]
+        retirement_result = await apply_terminal_root_retirement_transaction(
+            database,
+            request(expected_evidence_sha256=token),
+        )
+
+        assert retirement_result.retired is False
+        assert not any(call[0] == "status" and call[1].lstrip().startswith("UPDATE") for call in database.calls)
+        assert any(profile.valid_function in call[1] for call in database.calls)
+
+
+@pytest.mark.asyncio
+async def test_apply_rejects_missing_or_changed_evidence_before_write(monkeypatch) -> None:
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+
     with pytest.raises(contract.TerminalRootRetirementError, match="request_invalid"):
         await apply_terminal_root_retirement_transaction(StoreDatabase(), request())
 
     database = StoreDatabase()
-    with pytest.raises(contract.TerminalRootRetirementError, match="evidence_changed"):
-        await apply_terminal_root_retirement_transaction(
-            database, request(expected_evidence_sha256="f" * 64)
-        )
-    assert not any(
-        call[0] == "status" and call[1].lstrip().startswith("UPDATE")
-        for call in database.calls
-    )
+    async with synthetic_source_database(monkeypatch, database) as database:
+        with pytest.raises(contract.TerminalRootRetirementError, match="evidence_changed"):
+            await apply_terminal_root_retirement_transaction(database, request(expected_evidence_sha256="f" * 64))
+        assert not any(call[0] == "status" and call[1].lstrip().startswith("UPDATE") for call in database.calls)
 
 
 @pytest.mark.asyncio
-async def test_store_fails_closed_on_isolation_cas_or_guard_drift() -> None:
-    database = StoreDatabase()
-    database.isolation = "repeatable read"
-    with pytest.raises(contract.TerminalRootRetirementError, match="state_invalid"):
-        await preview_terminal_root_retirement_transaction(database, request())
-
-    token = contract.canonical_json_sha256(StoreDatabase().evidence)
-    database = StoreDatabase()
-    database.update_result = 0
-    with pytest.raises(contract.TerminalRootRetirementError, match="state_invalid"):
-        await apply_terminal_root_retirement_transaction(
-            database, request(expected_evidence_sha256=token)
-        )
+async def test_store_fails_closed_on_isolation_cas_or_guard_drift(monkeypatch) -> None:
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
     database = StoreDatabase()
-    database.valid_retirement = False
-    with pytest.raises(contract.TerminalRootRetirementError, match="state_invalid"):
-        await apply_terminal_root_retirement_transaction(
-            database, request(expected_evidence_sha256=token)
-        )
+    async with synthetic_source_database(monkeypatch, database) as database:
+        database.isolation = "repeatable read"
+        with pytest.raises(contract.TerminalRootRetirementError, match="state_invalid"):
+            await preview_terminal_root_retirement_transaction(database, request())
+
+        token = contract.canonical_json_sha256(StoreDatabase().evidence)
+    database = StoreDatabase()
+    async with synthetic_source_database(monkeypatch, database) as database:
+        database.update_result = 0
+        with pytest.raises(contract.TerminalRootRetirementError, match="state_invalid"):
+            await apply_terminal_root_retirement_transaction(database, request(expected_evidence_sha256=token))
+
+    database = StoreDatabase()
+    async with synthetic_source_database(monkeypatch, database) as database:
+        database.valid_retirement = False
+        with pytest.raises(contract.TerminalRootRetirementError, match="state_invalid"):
+            await apply_terminal_root_retirement_transaction(database, request(expected_evidence_sha256=token))

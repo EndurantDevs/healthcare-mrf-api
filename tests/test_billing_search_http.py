@@ -139,10 +139,11 @@ async def test_success_uses_one_read_only_snapshot_and_encodes_inside_it(
         service_result,
     )
 
-    http_response = await billing_http.serve_billing_search_get(
-        make_request(),
-        session,
-    )
+    async with bound_reader(session):
+        http_response = await billing_http.serve_billing_search_get(
+            make_request(),
+            session,
+        )
 
     assert http_response.status == 200
     assert http_response.headers.get("Cache-Control") == "private, no-store"
@@ -271,10 +272,11 @@ async def test_noncanonical_selector_requests_stop_before_keys_auth_and_sql(
     )
     monkeypatch.setattr(billing_http, "authorize_billing_search_endpoint", forbidden)
 
-    http_response = await billing_http.serve_billing_search_get(
-        make_request(method=method, path=path),
-        session,
-    )
+    async with bound_reader(session):
+        http_response = await billing_http.serve_billing_search_get(
+            make_request(method=method, path=path),
+            session,
+        )
 
     assert_private_response(
         http_response,
@@ -307,10 +309,11 @@ async def test_key_configuration_fails_closed_before_sql(
         unavailable_keyring,
     )
     with caplog.at_level(logging.WARNING, logger=billing_http.__name__):
-        unavailable_response = await billing_http.serve_billing_search_get(
-            make_request(),
-            session,
-        )
+        async with bound_reader(session):
+            unavailable_response = await billing_http.serve_billing_search_get(
+                make_request(),
+                session,
+            )
 
     assert_private_response(
         unavailable_response,
@@ -334,10 +337,11 @@ async def test_access_denial_fails_closed_before_sql(monkeypatch, caplog) -> Non
 
     monkeypatch.setattr(billing_http, "authorize_billing_search_endpoint", denied)
     with caplog.at_level(logging.WARNING, logger=billing_http.__name__):
-        denied_response = await billing_http.serve_billing_search_get(
-            make_request(),
-            session,
-        )
+        async with bound_reader(session):
+            denied_response = await billing_http.serve_billing_search_get(
+                make_request(),
+                session,
+            )
 
     assert_private_response(
         denied_response,
@@ -385,10 +389,11 @@ async def test_unexpected_boundary_failures_are_sanitized_503s(
         private_value = "private-unexpected-authorization-context"
 
     with caplog.at_level(logging.WARNING, logger=billing_http.__name__):
-        http_response = await billing_http.serve_billing_search_get(
-            make_request(),
-            session,
-        )
+        async with bound_reader(session):
+            http_response = await billing_http.serve_billing_search_get(
+                make_request(),
+                session,
+            )
 
     assert_private_response(
         http_response,
@@ -450,10 +455,11 @@ async def test_service_failures_have_closed_status_and_rollback(
         failed_service,
     )
     with caplog.at_level(logging.WARNING, logger=billing_http.__name__):
-        http_response = await billing_http.serve_billing_search_get(
-            make_request(),
-            session,
-        )
+        async with bound_reader(session):
+            http_response = await billing_http.serve_billing_search_get(
+                make_request(),
+                session,
+            )
 
     assert_private_response(http_response, status=status, code=code)
     assert str(failure) not in http_response.body.decode("utf-8")
@@ -481,10 +487,11 @@ async def test_outgoing_cursor_or_shape_failure_is_503_not_client_cursor_error(
     monkeypatch.setattr(billing_http, "search_exact_billing_provider_page", search)
     monkeypatch.setattr(billing_http, "shape_billing_search_response", failed_shape)
     with caplog.at_level(logging.WARNING, logger=billing_http.__name__):
-        http_response = await billing_http.serve_billing_search_get(
-            make_request(),
-            session,
-        )
+        async with bound_reader(session):
+            http_response = await billing_http.serve_billing_search_get(
+                make_request(),
+                session,
+            )
 
     assert_private_response(
         http_response,
@@ -517,10 +524,11 @@ async def test_oversized_success_body_is_rejected_inside_the_transaction(
     monkeypatch.setattr(billing_http, "search_exact_billing_provider_page", search)
     monkeypatch.setattr(billing_http, "shape_billing_search_response", shape)
     with caplog.at_level(logging.WARNING, logger=billing_http.__name__):
-        http_response = await billing_http.serve_billing_search_get(
-            make_request(),
-            session,
-        )
+        async with bound_reader(session):
+            http_response = await billing_http.serve_billing_search_get(
+                make_request(),
+                session,
+            )
 
     assert_private_response(
         http_response,

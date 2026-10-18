@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
 import inspect
+from dataclasses import fields
 
 import pytest
 
@@ -31,41 +31,39 @@ from tests.provider_directory_fhir_subset_terminal_disposition_support import (
 
 
 @pytest.mark.asyncio
-async def test_store_cas_order_and_exact_retry_are_idempotent():
+async def test_store_cas_order_and_exact_retry_are_idempotent(monkeypatch):
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+
     database = TerminalDispositionDatabase()
+    async with synthetic_source_database(monkeypatch, database) as database:
+        first = await sync_reviewed_subset_terminal_disposition_transaction(
+            database,
+            "source-a",
+        )
+        second = await sync_reviewed_subset_terminal_disposition_transaction(
+            database,
+            "source-a",
+        )
 
-    first = await sync_reviewed_subset_terminal_disposition_transaction(
-        database,
-        "source-a",
-    )
-    second = await sync_reviewed_subset_terminal_disposition_transaction(
-        database,
-        "source-a",
-    )
-
-    assert first == ReviewedSubsetTerminalDispositionResult(disposed=True)
-    assert second == ReviewedSubsetTerminalDispositionResult(disposed=False)
-    updates = [
-        statement
-        for method, statement, _parameters in database.calls
-        if method == "status" and "UPDATE" in statement
-    ]
-    assert len(updates) == len(EXPECTED_RESOURCE_TYPES) + 1
-    assert all("pagination_checkpoint" in sql for sql in updates[:-1])
-    assert "endpoint_dataset" in updates[-1]
-    marker = database.candidate_row["publication_metadata_json"][
-        TERMINAL_DISPOSITION_METADATA_KEY
-    ]
-    assert validated_terminal_disposition_marker(marker) == marker
+        assert first == ReviewedSubsetTerminalDispositionResult(disposed=True)
+        assert second == ReviewedSubsetTerminalDispositionResult(disposed=False)
+        updates = [
+            statement
+            for method, statement, _parameters in database.calls
+            if method == "status" and "UPDATE" in statement
+        ]
+        assert len(updates) == len(EXPECTED_RESOURCE_TYPES) + 1
+        assert all("pagination_checkpoint" in sql for sql in updates[:-1])
+        assert "endpoint_dataset" in updates[-1]
+        marker = database.candidate_row["publication_metadata_json"][TERMINAL_DISPOSITION_METADATA_KEY]
+        assert validated_terminal_disposition_marker(marker) == marker
 
 
 @pytest.mark.asyncio
 async def test_marker_rejects_zero_retained_progress():
-    selection, _checkpoint_rows = (
-        await selected_reviewed_subset_terminal_disposition(
-            TerminalDispositionDatabase(),
-            "source-a",
-        )
+    selection, _checkpoint_rows = await selected_reviewed_subset_terminal_disposition(
+        TerminalDispositionDatabase(),
+        "source-a",
     )
     marker = selection.marker_by_field
     for resource in marker["resource_dispositions"].values():
@@ -83,73 +81,74 @@ async def test_marker_rejects_zero_retained_progress():
 
 
 @pytest.mark.asyncio
-async def test_replay_does_not_depend_on_mutable_source_import_snapshot():
+async def test_replay_does_not_depend_on_mutable_source_import_snapshot(monkeypatch):
     """Keep sealed evidence valid after a later campaign updates the source."""
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
     database = TerminalDispositionDatabase()
-    first = await sync_reviewed_subset_terminal_disposition_transaction(
-        database,
-        "source-a",
-    )
-    database.source_row["metadata_json"]["last_resource_import"] = {
-        "run_id": "owner-fresh",
-        "observed_at": "2026-08-10T00:00:00Z",
-        "resources": {"Synthetic": {"complete": True}},
-    }
-    database.source_row["metadata_json"][
-        "provider_directory_configured_endpoint_id"
-    ] = "endpoint-fresh"
+    async with synthetic_source_database(monkeypatch, database) as database:
+        first = await sync_reviewed_subset_terminal_disposition_transaction(
+            database,
+            "source-a",
+        )
+        database.source_row["metadata_json"]["last_resource_import"] = {
+            "run_id": "owner-fresh",
+            "observed_at": "2026-08-10T00:00:00Z",
+            "resources": {"Synthetic": {"complete": True}},
+        }
+        database.source_row["metadata_json"]["provider_directory_configured_endpoint_id"] = "endpoint-fresh"
 
-    replay = await sync_reviewed_subset_terminal_disposition_transaction(
-        database,
-        "source-a",
-    )
+        replay = await sync_reviewed_subset_terminal_disposition_transaction(
+            database,
+            "source-a",
+        )
 
-    assert first.disposed is True
-    assert replay.is_already_applied is True
+        assert first.disposed is True
+        assert replay.is_already_applied is True
 
 
 @pytest.mark.asyncio
 async def test_store_rejects_cas_or_guard_failure(monkeypatch):
     database = TerminalDispositionDatabase()
-    original_status = database.status
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
-    async def failed_candidate_cas(statement, **parameters):
-        if "provider_directory_endpoint_dataset" in statement:
-            database.calls.append(("status", statement, parameters))
-            return 0
-        return await original_status(statement, **parameters)
+    async with synthetic_source_database(monkeypatch, database) as database:
+        original_status = database.status
 
-    monkeypatch.setattr(database, "status", failed_candidate_cas)
-    with pytest.raises(ReviewedSubsetTerminalDispositionError) as error:
-        await sync_reviewed_subset_terminal_disposition_transaction(
-            database,
-            "source-a",
-        )
-    assert error.value.code == "state"
+        async def failed_candidate_cas(statement, **parameters):
+            if "provider_directory_endpoint_dataset" in statement:
+                database.calls.append(("status", statement, parameters))
+                return 0
+            return await original_status(statement, **parameters)
+
+        monkeypatch.setattr(database, "status", failed_candidate_cas)
+        with pytest.raises(ReviewedSubsetTerminalDispositionError) as error:
+            await sync_reviewed_subset_terminal_disposition_transaction(
+                database,
+                "source-a",
+            )
+        assert error.value.code == "state"
 
 
 @pytest.mark.asyncio
 async def test_operator_facade_is_selector_free(monkeypatch):
     database = TerminalDispositionDatabase()
-    monkeypatch.setenv(TERMINAL_DISPOSITION_ENABLED_ENV, "true")
-    monkeypatch.setattr(
-        "process.provider_directory_fhir_manual_catalog."
-        "reviewed_manual_census_source_id",
-        lambda: "source-a",
-    )
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
-    result = await facade.dispose_reviewed_subset_census_drift_root(
-        database=database
-    )
+    async with synthetic_source_database(monkeypatch, database) as database:
+        monkeypatch.setenv(TERMINAL_DISPOSITION_ENABLED_ENV, "true")
+        monkeypatch.setattr(
+            "process.provider_directory_fhir_manual_catalog.reviewed_manual_census_source_id",
+            lambda: "source-a",
+        )
 
-    assert result.disposed is True
-    assert [field.name for field in fields(result)] == ["disposed"]
+        result = await facade.dispose_reviewed_subset_census_drift_root(database=database)
+
+        assert result.disposed is True
+        assert [field.name for field in fields(result)] == ["disposed"]
 
 
 def test_new_and_expired_cursor_markers_are_mutually_exclusive_in_store_sql():
-    source = inspect.getsource(
-        provider_directory_fhir_subset_terminal_disposition_store._seal_candidate
-    )
+    source = inspect.getsource(provider_directory_fhir_subset_terminal_disposition_store._seal_candidate)
     assert "abandonment_key" in source
     assert "disposition_key" in source

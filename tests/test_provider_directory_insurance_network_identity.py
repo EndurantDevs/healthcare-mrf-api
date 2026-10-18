@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
-import hashlib
 import importlib.util
 import json
 import os
@@ -20,9 +19,19 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from db.models import ProviderDirectoryInsuranceNetworkPlanEvidence
 from process.provider_directory_insurance_network_identity import (
     _plan_network_refs,
+    has_source_declared_network_role,
     record_insurance_network_organization,
     record_insurance_network_plan,
-    has_source_declared_network_role,
+)
+from tests.insurance_network_identity_postgres_support import (
+    candidate_evidence_rows,
+    seed_historical_network_plan,
+)
+from tests.insurance_network_identity_postgres_support import (
+    network_candidate_db as network_candidate_db,
+)
+from tests.insurance_network_identity_postgres_support import (
+    network_candidate_template as network_candidate_template,
 )
 
 
@@ -41,9 +50,7 @@ def test_network_refs_include_nested_plan_networks_without_guessing():
     plan = _plan()
     plan["plan"] = [{"network": [{"reference": "Organization/network-2"}]}]
     plan["coverage"] = [{"network": [{"reference": "Organization/network-3"}]}]
-    assert _plan_network_refs(plan) == [
-        "Organization/network-1", "Organization/network-2", "Organization/network-3"
-    ]
+    assert _plan_network_refs(plan) == ["Organization/network-1", "Organization/network-2", "Organization/network-3"]
 
 
 def test_only_explicit_organization_type_declares_network_role():
@@ -158,49 +165,46 @@ async def _network_test_engine():
 
 
 @pytest.mark.asyncio
-async def test_network_identity_is_source_scoped_and_release_evidence_is_immutable():
-    """Replays retain IDs and facts; source and release boundaries are enforced."""
-    async with _network_test_engine() as engine:
-        async with AsyncSession(engine) as session:
-            async with session.begin():
-                first_id = await record_insurance_network_plan(
-                    session,
-                    source_id="source-a",
-                    release_id="release-1",
-                    network_resource_id="network-1",
-                    plan=_plan(),
-                )
-                assert first_id == await record_insurance_network_plan(
-                    session,
-                    source_id="source-a",
-                    release_id="release-1",
-                    network_resource_id="network-1",
-                    plan=_plan(),
-                )
-                second_id = await record_insurance_network_plan(
-                    session,
-                    source_id="source-b",
-                    release_id="release-1",
-                    network_resource_id="network-1",
-                    plan=_plan(),
-                )
-                assert first_id != second_id
-        async with AsyncSession(engine) as session:
-            evidence_rows = (
-                (await session.execute(select(ProviderDirectoryInsuranceNetworkPlanEvidence))).scalars().all()
-            )
-            assert len(evidence_rows) == 2
-            assert all(entry.owned_by_ref == "Organization/insurer-1" for entry in evidence_rows)
-            assert all(entry.administered_by_ref == "Organization/administrator-1" for entry in evidence_rows)
-            assert all(entry.network_refs == ["Organization/network-1"] for entry in evidence_rows)
-        await _assert_network_failures(engine)
+async def test_network_identity_is_source_scoped_and_release_evidence_is_immutable(network_candidate_db):
+    """Replays retain private IDs and facts while the exact source/release cut is enforced."""
+    db = network_candidate_db
+    async with db.session() as session:
+        first_id = await record_insurance_network_plan(
+            session, source_id="cms-npd", release_id="a" * 64, network_resource_id="network-1", plan=_plan()
+        )
+        assert first_id == await record_insurance_network_plan(
+            session, source_id="cms-npd", release_id="a" * 64, network_resource_id="network-1", plan=_plan()
+        )
+        second_id = await record_insurance_network_plan(
+            session,
+            source_id="cms-npd",
+            release_id="a" * 64,
+            network_resource_id="network-2",
+            plan={**_plan(network="Organization/network-2"), "id": "plan-2"},
+        )
+        assert first_id != second_id
+    evidence_rows = await candidate_evidence_rows(db)
+    assert len(evidence_rows) == 2
+    assert all(entry["owned_by_ref"] == "Organization/insurer-1" for entry in evidence_rows)
+    assert all(entry["administered_by_ref"] == "Organization/administrator-1" for entry in evidence_rows)
+    assert [entry["network_refs"] for entry in evidence_rows] == [
+        '["Organization/network-1"]',
+        '["Organization/network-2"]',
+    ]
+    assert await db.connection.fetchval("SELECT count(*) FROM mrf.provider_directory_insurance_network_identity") == 0
+    await _assert_network_failures(db)
+    assert await candidate_evidence_rows(db) == evidence_rows
 
 
 @pytest.mark.asyncio
-async def test_source_declared_network_reuses_id_when_plan_arrives():
+async def test_source_declared_network_reuses_id_when_plan_arrives(network_candidate_db):
     """Share one network across plans without merging a same-name network."""
+    db = network_candidate_db
     organization_map = {
-        "resourceType": "Organization", "id": "network-2", "name": "Example Network", "type": [{"text": "ntwk"}]
+        "resourceType": "Organization",
+        "id": "network-2",
+        "name": "Example Network",
+        "type": [{"text": "ntwk"}],
     }
     plan_maps = [
         _plan(network="Organization/network-2"),
@@ -211,194 +215,149 @@ async def test_source_declared_network_reuses_id_when_plan_arrives():
             "administeredBy": {"reference": "Organization/administrator-2"},
         },
     ]
-    async with _network_test_engine() as engine:
-        async with AsyncSession(engine) as session, session.begin():
-            network_ids = []
-            for organization in (organization_map, {**organization_map, "id": "network-1"}):
-                payload_json = json.dumps(organization, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                await session.execute(
-                    text(
-                        "UPDATE mrf.provider_directory_entity_release_evidence "
-                        "SET payload_json=CAST(:payload AS jsonb), payload_sha256=:sha "
-                        "WHERE source_id='source-a' AND release_id='release-1' AND resource_id=:resource_id"
-                    ),
-                    {"payload": payload_json, "sha": hashlib.sha256(payload_json.encode()).hexdigest(),
-                     "resource_id": organization["id"]},
+    async with db.session() as session:
+        network_ids = []
+        for organization in (organization_map, {**organization_map, "id": "network-1"}):
+            network_ids.append(
+                await record_insurance_network_organization(
+                    session, source_id="cms-npd", release_id="a" * 64, organization=organization
                 )
-                network_ids.append(await record_insurance_network_organization(
-                    session, source_id="source-a", release_id="release-1", organization=organization
-                ))
-            network_id = network_ids[0]
-            assert network_id != network_ids[1]
-            assert network_id == await record_insurance_network_organization(
-                session, source_id="source-a", release_id="release-1", organization=organization_map
             )
-            for plan in plan_maps:
-                assert network_id == await record_insurance_network_plan(
-                    session, source_id="source-a", release_id="release-1", network_resource_id="network-2", plan=plan
-                )
-        async with AsyncSession(engine) as session:
-            evidence_rows = (await session.scalars(select(ProviderDirectoryInsuranceNetworkPlanEvidence))).all()
-            evidence_by_plan = {evidence_row.insurance_plan_resource_id: evidence_row for evidence_row in evidence_rows}
-            assert len(evidence_rows) == 2 and set(evidence_by_plan) == {"plan-1", "plan-2"}
-            for plan in plan_maps:
-                evidence = evidence_by_plan[plan["id"]]
-                assert evidence.owned_by_ref == plan["ownedBy"]["reference"]
-                assert evidence.administered_by_ref == plan["administeredBy"]["reference"]
-                assert evidence.network_refs == ["Organization/network-2"]
-                assert evidence.plan_payload_json == plan
-            assert await session.scalar(
-                text("SELECT count(*) FROM mrf.provider_directory_insurance_network_identity")
-            ) == 2
+        network_id = network_ids[0]
+        assert network_id != network_ids[1]
+        assert network_id == await record_insurance_network_organization(
+            session, source_id="cms-npd", release_id="a" * 64, organization=organization_map
+        )
+        for plan in plan_maps:
+            assert network_id == await record_insurance_network_plan(
+                session, source_id="cms-npd", release_id="a" * 64, network_resource_id="network-2", plan=plan
+            )
+    evidence_rows = await candidate_evidence_rows(db)
+    evidence_by_plan = {evidence_row["insurance_plan_resource_id"]: evidence_row for evidence_row in evidence_rows}
+    assert len(evidence_rows) == 2 and set(evidence_by_plan) == {"plan-1", "plan-2"}
+    for plan in plan_maps:
+        evidence = evidence_by_plan[plan["id"]]
+        assert evidence["owned_by_ref"] == plan["ownedBy"]["reference"]
+        assert evidence["administered_by_ref"] == plan["administeredBy"]["reference"]
+        assert json.loads(evidence["network_refs"]) == ["Organization/network-2"]
+        assert json.loads(evidence["plan_payload_json"]) == plan
+    assert (
+        await db.connection.fetchval(
+            f"SELECT count(*) FROM {db.relation('provider_directory_insurance_network_source_binding')}"
+        )
+        == 2
+    )
 
 
-async def _assert_network_failures(engine):
-    """Reject changed facts, unsupported releases, and destructive downgrade."""
-    async with AsyncSession(engine) as session:
+async def _assert_network_failures(db):
+    """Reject changed facts, unsupported references, source and release before allocation."""
+    async with db.session() as session:
         with pytest.raises(ValueError, match="release_plan_conflict"):
             await record_insurance_network_plan(
                 session,
-                source_id="source-a",
-                release_id="release-1",
+                source_id="cms-npd",
+                release_id="a" * 64,
                 network_resource_id="network-1",
                 plan=_plan(name="Changed"),
             )
         with pytest.raises(ValueError, match="network_ref_missing"):
             await record_insurance_network_plan(
                 session,
-                source_id="source-a",
-                release_id="release-2",
+                source_id="cms-npd",
+                release_id="a" * 64,
                 network_resource_id="network-1",
                 plan=_plan(network="Organization/other"),
             )
-    async with AsyncSession(engine) as session:
-        async with session.begin():
-            with pytest.raises(ValueError, match="release_evidence_missing"):
+        for source_id, release_id in (("source-b", "a" * 64), ("cms-npd", "b" * 64)):
+            with pytest.raises(ValueError, match="scope_changed"):
                 await record_insurance_network_plan(
-                    session,
-                    source_id="source-a",
-                    release_id="release-2",
-                    network_resource_id="network-1",
-                    plan=_plan(),
+                    session, source_id=source_id, release_id=release_id, network_resource_id="network-1", plan=_plan()
                 )
-    async with engine.begin() as connection:
-        with pytest.raises(RuntimeError, match="downgrade_requires_empty_tables"):
-            await _migrate(connection, False)
 
 
 @pytest.mark.asyncio
-async def test_plan_payload_conflict_across_networks_is_rejected_sequentially():
+async def test_plan_payload_conflict_across_networks_is_rejected_sequentially(network_candidate_db):
     """One source, release and plan cannot acquire conflicting network facts."""
-    async with _network_test_engine() as engine:
-        async with AsyncSession(engine) as session:
-            async with session.begin():
-                await record_insurance_network_plan(
-                    session,
-                    source_id="source-a",
-                    release_id="release-1",
-                    network_resource_id="network-1",
-                    plan=_plan(),
-                )
-        async with AsyncSession(engine) as session:
-            async with session.begin():
-                with pytest.raises(ValueError, match="release_plan_conflict"):
-                    await record_insurance_network_plan(
-                        session,
-                        source_id="source-a",
-                        release_id="release-1",
-                        network_resource_id="network-2",
-                        plan=_plan(name="Conflicting", network="Organization/network-2"),
-                    )
-        async with AsyncSession(engine) as session:
-            evidence_rows = (
-                (await session.execute(select(ProviderDirectoryInsuranceNetworkPlanEvidence))).scalars().all()
+    db = network_candidate_db
+    async with db.session() as session:
+        await record_insurance_network_plan(
+            session, source_id="cms-npd", release_id="a" * 64, network_resource_id="network-1", plan=_plan()
+        )
+    async with db.session() as session:
+        with pytest.raises(ValueError, match="release_plan_conflict"):
+            await record_insurance_network_plan(
+                session,
+                source_id="cms-npd",
+                release_id="a" * 64,
+                network_resource_id="network-2",
+                plan=_plan(name="Conflicting", network="Organization/network-2"),
             )
-            assert len(evidence_rows) == 1
-            assert evidence_rows[0].network_resource_id == "network-1"
-            assert (
-                await session.scalar(
-                    text(
-                        "SELECT count(*) FROM mrf.provider_directory_insurance_network_source_binding WHERE resource_id='network-2'"
-                    )
-                )
-                == 0
-            )
+    evidence_rows = await candidate_evidence_rows(db)
+    assert len(evidence_rows) == 1
+    assert evidence_rows[0]["network_resource_id"] == "network-1"
+    assert (
+        await db.connection.fetchval(
+            f"SELECT count(*) FROM {db.relation('provider_directory_insurance_network_source_binding')} "
+            "WHERE resource_id='network-2'"
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio
-async def test_network_identity_requires_exact_source_release_evidence():
-    """No ID is made for an Organization absent from this source release."""
-    async with _network_test_engine() as engine:
+async def test_network_identity_requires_exact_source_release_evidence(network_candidate_db):
+    """No ID is made for an Organization absent from this exact candidate release."""
+    db = network_candidate_db
+    async with db.session() as session:
         with pytest.raises(ValueError, match="release_evidence_missing"):
-            async with AsyncSession(engine) as session:
-                async with session.begin():
-                    await record_insurance_network_plan(
-                        session,
-                        source_id="source-b",
-                        release_id="release-1",
-                        network_resource_id="network-2",
-                        plan=_plan(network="Organization/network-2"),
-                    )
-        async with AsyncSession(engine) as session:
-            assert (
-                await session.scalar(text("SELECT count(*) FROM mrf.provider_directory_insurance_network_identity"))
-                == 0
+            await record_insurance_network_plan(
+                session,
+                source_id="cms-npd",
+                release_id="a" * 64,
+                network_resource_id="absent-network",
+                plan=_plan(network="Organization/absent-network"),
             )
-            assert (
-                await session.scalar(
-                    text("SELECT count(*) FROM mrf.provider_directory_insurance_network_source_binding")
-                )
-                == 0
-            )
+    for table in (
+        "provider_directory_insurance_network_source_binding",
+        "provider_directory_insurance_network_plan_evidence",
+    ):
+        assert await db.connection.fetchval(f"SELECT count(*) FROM {db.relation(table)}") == 0
+    assert await db.connection.fetchval("SELECT count(*) FROM mrf.provider_directory_insurance_network_identity") == 0
 
 
 @pytest.mark.asyncio
-async def test_concurrent_conflicting_network_plan_payloads_serialize():
-    """A plan lock permits one payload even when network IDs differ."""
-    async with _network_test_engine() as engine:
-        start = asyncio.Event()
+async def test_concurrent_conflicting_network_plan_payloads_serialize(network_candidate_db):
+    """The real protected header permits one payload even when network IDs differ."""
+    db = network_candidate_db
+    start = asyncio.Event()
 
-        async def record(network_id, plan_name):
-            async with AsyncSession(engine) as session:
-                async with session.begin():
-                    await start.wait()
-                    return await record_insurance_network_plan(
-                        session,
-                        source_id="source-a",
-                        release_id="release-1",
-                        network_resource_id=network_id,
-                        plan=_plan(name=plan_name, network=f"Organization/{network_id}"),
-                    )
-
-        tasks = [
-            asyncio.create_task(record("network-1", "First")),
-            asyncio.create_task(record("network-2", "Second")),
-        ]
-        start.set()
-        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-        assert sum(isinstance(outcome, UUID) for outcome in outcomes) == 1
-        assert sum(isinstance(outcome, ValueError) for outcome in outcomes) == 1
-        assert any("release_plan_conflict" in str(outcome) for outcome in outcomes if isinstance(outcome, ValueError))
-        async with AsyncSession(engine) as session:
-            evidence_rows = (
-                (await session.execute(select(ProviderDirectoryInsuranceNetworkPlanEvidence))).scalars().all()
+    async def record(network_id, plan_name):
+        async with db.session() as session:
+            await start.wait()
+            return await record_insurance_network_plan(
+                session,
+                source_id="cms-npd",
+                release_id="a" * 64,
+                network_resource_id=network_id,
+                plan=_plan(name=plan_name, network=f"Organization/{network_id}"),
             )
-            assert len(evidence_rows) == 1
+
+    tasks = [asyncio.create_task(record("network-1", "First")), asyncio.create_task(record("network-2", "Second"))]
+    start.set()
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    assert sum(isinstance(outcome, UUID) for outcome in outcomes) == 1
+    assert sum(isinstance(outcome, ValueError) for outcome in outcomes) == 1
+    assert any("release_plan_conflict" in str(outcome) for outcome in outcomes if isinstance(outcome, ValueError))
+    assert len(await candidate_evidence_rows(db)) == 1
 
 
 @pytest.mark.asyncio
 async def test_downgrade_waits_for_importer_and_preserves_committed_evidence():
-    """A concurrent importer commit is visible before downgrade emptiness checks."""
+    """A historical writer commit is visible before downgrade emptiness checks."""
     async with _network_test_engine() as engine:
         async with AsyncSession(engine) as writer:
             async with writer.begin():
-                await record_insurance_network_plan(
-                    writer,
-                    source_id="source-a",
-                    release_id="release-1",
-                    network_resource_id="network-1",
-                    plan=_plan(),
-                )
+                await seed_historical_network_plan(writer, _plan())
 
                 async def downgrade():
                     async with engine.begin() as connection:

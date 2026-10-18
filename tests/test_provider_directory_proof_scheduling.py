@@ -27,6 +27,7 @@ from process.provider_directory_resource_hash import (
     composed_practitioner_semantic_sha256,
     resource_payload_sha256_for_contract,
 )
+from tests.provider_directory_proof_memory_support import proof_memory_authority as proof_memory_authority
 from tests.test_provider_directory_organization_hash_v4 import _organization_payload
 from tests.test_provider_directory_proof_store import DATASET_ID, _dataset_resource, _MemoryProofConnection
 

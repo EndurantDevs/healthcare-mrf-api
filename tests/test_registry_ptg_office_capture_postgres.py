@@ -651,7 +651,7 @@ async def test_explicit_site_uuid_keeps_canonical_address_witness_and_other_offi
         )
         assert key is not None and str(key) != office.location_id
         address = PinnedAddressSource(
-            fixture.serving.schema_name, "entity_address_unified", "retained-office-addresses"
+            fixture.serving.schema_name, "entity_address_unified", fixture.serving.manifest_sha256
         )
         copy_target = await _office_candidate(fixture, driver, batch, address)
         pin = await pin_ptg_office_address_source(
@@ -685,7 +685,7 @@ async def test_explicit_site_copy_refuses_changed_or_unmatched_exact_witness(off
         driver, batch = await _binding_batch(fixture, session, descriptor, request)
         office = batch.office_records[0]
         address = PinnedAddressSource(
-            fixture.serving.schema_name, "entity_address_unified", "retained-office-addresses"
+            fixture.serving.schema_name, "entity_address_unified", fixture.serving.manifest_sha256
         )
         retained = f'"{fixture.serving.schema_name}".entity_address_unified'
         assertions = f'"{descriptor.schema_name}".office_assertion'

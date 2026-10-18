@@ -12,7 +12,7 @@ from urllib.parse import unquote, urlsplit
 
 from db.connection import db
 from process.ptg_parts.artifacts import resolve_ptg2_artifact_dir
-from process.ptg_parts.db_tables import _quote_ident, _is_table_available
+from process.ptg_parts.db_tables import _is_table_available, _quote_ident
 from process.ptg_parts.domain import (
     PTG2_STATUS_BUILDING,
     PTG2_STATUS_PENDING,
@@ -20,6 +20,7 @@ from process.ptg_parts.domain import (
     PTG2_STATUS_VALIDATED,
 )
 from process.ptg_parts.ptg2_artifact_blobs import ptg2_artifact_id_from_db_uri
+from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg2_shared_audit import (
     PTG2_V3_AUDIT_CONTRACT,
     PTG2_V3_AUDIT_MAX_SAMPLE_ROWS,
@@ -33,11 +34,9 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SHARED_GENERATION,
     PTG2_V4_SHARED_GENERATION,
 )
-from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     drop_attempt_stage_tables,
 )
-
 
 PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE_ENV = "HLTHPRT_PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE"
 PTG2_V3_ARCH_VERSION = "postgres_binary_v3"
@@ -112,6 +111,11 @@ SELECT DISTINCT snapshot_id
             ON snapshot.snapshot_id = pin.snapshot_id
          WHERE snapshot.manifest->'serving_index'->>'source_key' = :source_key
         UNION ALL
+        SELECT pin.snapshot_id
+          FROM __SCHEMA__.plan_release_snapshot_pin AS pin
+          JOIN __SCHEMA__.ptg2_snapshot AS snapshot ON snapshot.snapshot_id = pin.snapshot_id
+         WHERE snapshot.manifest->'serving_index'->>'source_key' = :source_key
+        UNION ALL
         SELECT binding.snapshot_id
           FROM __SCHEMA__.plan_release_snapshot_binding AS binding
          WHERE binding.source_key = :source_key
@@ -168,9 +172,7 @@ SELECT layout.state,
 
 
 def _is_ptg2_snapshot_in_flight(snapshot_status: Any) -> bool:
-    return (
-        str(snapshot_status or "").strip().lower() in PTG2_IN_FLIGHT_SNAPSHOT_STATUSES
-    )
+    return str(snapshot_status or "").strip().lower() in PTG2_IN_FLIGHT_SNAPSHOT_STATUSES
 
 
 def _is_strict_shared_manifest(
@@ -181,10 +183,8 @@ def _is_strict_shared_manifest(
     if not isinstance(serving_index, dict):
         return False
     return (
-        str(serving_index.get("arch_version") or "").strip().lower()
-        == PTG2_V3_ARCH_VERSION
-        and str(serving_index.get("storage_generation") or "").strip().lower()
-        == PTG2_V3_SHARED_GENERATION
+        str(serving_index.get("arch_version") or "").strip().lower() == PTG2_V3_ARCH_VERSION
+        and str(serving_index.get("storage_generation") or "").strip().lower() == PTG2_V3_SHARED_GENERATION
     )
 
 
@@ -198,12 +198,9 @@ def is_shared_snapshot_control_manifest(
 
     if not isinstance(serving_index, dict):
         return False
-    return (
-        str(serving_index.get("arch_version") or "").strip().lower()
-        == PTG2_V3_ARCH_VERSION
-        and str(serving_index.get("storage_generation") or "").strip().lower()
-        in {PTG2_V3_SHARED_GENERATION, PTG2_V4_SHARED_GENERATION}
-    )
+    return str(serving_index.get("arch_version") or "").strip().lower() == PTG2_V3_ARCH_VERSION and str(
+        serving_index.get("storage_generation") or ""
+    ).strip().lower() in {PTG2_V3_SHARED_GENERATION, PTG2_V4_SHARED_GENERATION}
 
 
 def _dedupe_preserve_table_names(seq: list[str]) -> list[str]:
@@ -220,11 +217,7 @@ def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list
     if not serving_index:
         return []
     materialized_tables = serving_index.get("materialized_tables")
-    materialized_table_values = (
-        list(materialized_tables.values())
-        if isinstance(materialized_tables, dict)
-        else []
-    )
+    materialized_table_values = list(materialized_tables.values()) if isinstance(materialized_tables, dict) else []
     table_values = [
         serving_index.get("table"),
         serving_index.get("serving_binary_table"),
@@ -270,9 +263,7 @@ def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list
             continue
         table_text = str(table_value)
         table_name = table_text.split(".", 1)[1] if "." in table_text else table_text
-        if table_name.startswith(allowed_prefixes) and re.fullmatch(
-            r"[a-z0-9_]{1,63}", table_name
-        ):
+        if table_name.startswith(allowed_prefixes) and re.fullmatch(r"[a-z0-9_]{1,63}", table_name):
             manifest_table_names.append(table_name)
     return _dedupe_preserve_table_names(manifest_table_names)
 
@@ -280,20 +271,12 @@ def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list
 def _required_snapshot_table_names(serving_index: dict[str, Any]) -> list[str]:
     materialized_tables = serving_index.get("materialized_tables")
     if isinstance(materialized_tables, dict) and materialized_tables:
-        return _snapshot_manifest_table_names(
-            {"materialized_tables": materialized_tables}
-        )
+        return _snapshot_manifest_table_names({"materialized_tables": materialized_tables})
     table_names = _snapshot_manifest_table_names(serving_index)
     if serving_index.get("serving_table_retained") is not False:
         return table_names
-    transient_table_names = set(
-        _snapshot_manifest_table_names({"table": serving_index.get("table")})
-    )
-    return [
-        table_name
-        for table_name in table_names
-        if table_name not in transient_table_names
-    ]
+    transient_table_names = set(_snapshot_manifest_table_names({"table": serving_index.get("table")}))
+    return [table_name for table_name in table_names if table_name not in transient_table_names]
 
 
 def _snapshot_artifact_entries(serving_index: dict[str, Any]) -> list[dict[str, Any]]:
@@ -303,9 +286,7 @@ def _snapshot_artifact_entries(serving_index: dict[str, Any]) -> list[dict[str, 
     artifact_entries: list[dict[str, Any]] = []
     for artifact_name, artifact_value in artifacts.items():
         if artifact_name == "sidecars" and isinstance(artifact_value, list):
-            artifact_entries.extend(
-                entry for entry in artifact_value if isinstance(entry, dict)
-            )
+            artifact_entries.extend(entry for entry in artifact_value if isinstance(entry, dict))
         elif isinstance(artifact_value, dict):
             artifact_entries.append(artifact_value)
     return artifact_entries
@@ -395,13 +376,7 @@ async def _available_snapshot_db_artifact_ids(
         artifact_ids=sorted(artifact_ids),
     )
     return {
-        str(
-            (
-                artifact_row
-                if isinstance(artifact_row, dict)
-                else artifact_row._mapping
-            ).get("artifact_id")
-        )
+        str((artifact_row if isinstance(artifact_row, dict) else artifact_row._mapping).get("artifact_id"))
         for artifact_row in artifact_rows
     }
 
@@ -415,14 +390,13 @@ def _audit_sample_context(
         sample_count = int(audit_sample.get("sample_count"))
         format_version = int(audit_sample.get("format_version"))
         maximum_rows = int(audit_sample.get("maximum_rows"))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return -1, "", False
     sample_digest = str(audit_sample.get("sample_digest") or "").strip().lower()
     valid = (
         audit_sample.get("contract") == PTG2_V3_AUDIT_CONTRACT
         and audit_sample.get("method") == PTG2_V3_AUDIT_METHOD
-        and audit_sample.get("serving_multiplicity_semantics")
-        == PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS
+        and audit_sample.get("serving_multiplicity_semantics") == PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS
         and audit_sample.get("complete_population") is False
         and format_version == 2
         and maximum_rows == PTG2_V3_AUDIT_MAX_SAMPLE_ROWS
@@ -449,22 +423,18 @@ def _serving_contract_context(
             errors.append(field_name)
     try:
         snapshot_key = int(serving_index.get("shared_snapshot_key"))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         snapshot_key = 0
     if snapshot_key <= 0:
         errors.append("shared_snapshot_key")
     raw_coverage_scope_id = serving_index.get("coverage_scope_id")
-    if isinstance(raw_coverage_scope_id, str) and _COVERAGE_SCOPE_ID_RE.fullmatch(
-        raw_coverage_scope_id
-    ):
+    if isinstance(raw_coverage_scope_id, str) and _COVERAGE_SCOPE_ID_RE.fullmatch(raw_coverage_scope_id):
         coverage_scope_id = bytes.fromhex(raw_coverage_scope_id)
     else:
         coverage_scope_id = b""
     if len(coverage_scope_id) != 32:
         errors.append("coverage_scope_id")
-    sample_count, sample_digest, audit_valid = _audit_sample_context(
-        serving_index.get("audit_sample")
-    )
+    sample_count, sample_digest, audit_valid = _audit_sample_context(serving_index.get("audit_sample"))
     if not audit_valid:
         errors.append("audit_sample")
     return {
@@ -498,10 +468,7 @@ def _validate_resource_identity(resource_record: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if str(resource_record.get("state") or "").strip().lower() != "sealed":
         errors.append("layout_state")
-    if (
-        str(resource_record.get("generation") or "").strip().lower()
-        != PTG2_V3_SHARED_GENERATION
-    ):
+    if str(resource_record.get("generation") or "").strip().lower() != PTG2_V3_SHARED_GENERATION:
         errors.append("layout_generation")
     if len(bytes(resource_record.get("mapping_digest") or b"")) != 32:
         errors.append("mapping_digest")
@@ -524,9 +491,7 @@ def _validate_resource_identity(resource_record: dict[str, Any]) -> list[str]:
 def _validate_code_scope(resource_record: dict[str, Any]) -> tuple[int, list[str]]:
     code_count = int(resource_record.get("code_count") or 0)
     code_scope_count = int(resource_record.get("code_scope_count") or 0)
-    matching_code_scope_count = int(
-        resource_record.get("matching_code_scope_count") or 0
-    )
+    matching_code_scope_count = int(resource_record.get("matching_code_scope_count") or 0)
     if code_count == 0:
         if code_scope_count != 0 or matching_code_scope_count != 0:
             return code_count, ["coverage_scope_code"]
@@ -545,11 +510,7 @@ def _validate_layout_manifest(
             layout_manifest = json.loads(layout_manifest)
         except json.JSONDecodeError:
             layout_manifest = None
-    layout_serving_index = (
-        layout_manifest.get("serving_index")
-        if isinstance(layout_manifest, dict)
-        else None
-    )
+    layout_serving_index = layout_manifest.get("serving_index") if isinstance(layout_manifest, dict) else None
     if not isinstance(layout_serving_index, dict):
         return ["layout_manifest"]
     fields = (
@@ -589,15 +550,11 @@ async def _validate_persisted_audit(
         row_limit=PTG2_V3_AUDIT_MAX_SAMPLE_ROWS + 1,
     )
     audit_row_mappings = [
-        audit_row if isinstance(audit_row, dict) else dict(audit_row._mapping)
-        for audit_row in audit_rows
+        audit_row if isinstance(audit_row, dict) else dict(audit_row._mapping) for audit_row in audit_rows
     ]
     if len(audit_row_mappings) != context["audit_sample_count"]:
         return ["audit_sample:row_count"]
-    if (
-        persisted_audit_sample_digest(audit_row_mappings)
-        != context["audit_sample_digest"]
-    ):
+    if persisted_audit_sample_digest(audit_row_mappings) != context["audit_sample_digest"]:
         return ["audit_sample:digest"]
     return []
 
@@ -619,13 +576,9 @@ def _validate_dense_resources(
         "npi_scope": int(provider_graph.get("npi_count") or 0),
     }
     for dense_name, expected_count in required_dense_count_by_name.items():
-        if expected_count > 0 and not bool(
-            resource_record.get(f"has_{dense_name}")
-        ):
+        if expected_count > 0 and not bool(resource_record.get(f"has_{dense_name}")):
             errors.append(f"dense:{dense_name}")
-    if serving_rate_count > 0 and (
-        code_count <= 0 or not bool(resource_record.get("has_code"))
-    ):
+    if serving_rate_count > 0 and (code_count <= 0 or not bool(resource_record.get("has_code"))):
         errors.append("dense:code")
     return errors
 
@@ -655,15 +608,9 @@ async def _missing_snapshot_serving_resources(
     contract_errors.extend(_validate_resource_identity(resource_record))
     code_count, code_errors = _validate_code_scope(resource_record)
     contract_errors.extend(code_errors)
-    contract_errors.extend(
-        _validate_layout_manifest(resource_record, serving_index)
-    )
-    contract_errors.extend(
-        await _validate_persisted_audit(schema_name, context)
-    )
-    contract_errors.extend(
-        _validate_dense_resources(resource_record, serving_index, code_count)
-    )
+    contract_errors.extend(_validate_layout_manifest(resource_record, serving_index))
+    contract_errors.extend(await _validate_persisted_audit(schema_name, context))
+    contract_errors.extend(_validate_dense_resources(resource_record, serving_index, code_count))
     return missing_table_names, contract_errors
 
 
@@ -681,9 +628,7 @@ async def _drop_ptg2_snapshot_table_names(
     executor = executor or db
     if snapshot_id or internal_run_id:
         if not snapshot_id or not internal_run_id:
-            raise ValueError(
-                "attempt stage cleanup requires snapshot and run identifiers"
-            )
+            raise ValueError("attempt stage cleanup requires snapshot and run identifiers")
         await drop_attempt_stage_tables(
             executor,
             schema_name=schema_name,
@@ -694,9 +639,7 @@ async def _drop_ptg2_snapshot_table_names(
         )
         return
     for table_name in table_names:
-        await executor.status(
-            f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)};"
-        )
+        await executor.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)};")
 
 
 async def _drop_snapshot_tables_for_manifest(
@@ -716,23 +659,17 @@ def _source_snapshot_lineage_limit() -> int:
     raw_value = os.getenv(PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE_ENV, "4")
     try:
         return max(1, min(int(raw_value), 50))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 4
 
 
-def _source_snapshot_keep_ids(
-    rows: list[Any], current_snapshot_ids: set[str]
-) -> set[str]:
+def _source_snapshot_keep_ids(rows: list[Any], current_snapshot_ids: set[str]) -> set[str]:
     previous_snapshot_by_id = {}
     for row in rows:
         data = row if isinstance(row, dict) else row._mapping
         snapshot_id = str(data.get("snapshot_id") or "")
-        previous_snapshot_by_id[snapshot_id] = str(
-            data.get("previous_snapshot_id") or ""
-        )
-    keep_snapshot_ids = {
-        str(snapshot_id) for snapshot_id in current_snapshot_ids if snapshot_id
-    }
+        previous_snapshot_by_id[snapshot_id] = str(data.get("previous_snapshot_id") or "")
+    keep_snapshot_ids = {str(snapshot_id) for snapshot_id in current_snapshot_ids if snapshot_id}
     for current_snapshot_id in tuple(keep_snapshot_ids):
         lineage_snapshot_id = current_snapshot_id
         for _lineage_depth in range(1, _source_snapshot_lineage_limit()):
@@ -757,22 +694,14 @@ async def _current_source_pointer_snapshot_ids(
         source_key=source_key,
     )
     return {
-        str(
-            (
-                pointer_row if isinstance(pointer_row, dict) else pointer_row._mapping
-            ).get("snapshot_id")
-        )
+        str((pointer_row if isinstance(pointer_row, dict) else pointer_row._mapping).get("snapshot_id"))
         for pointer_row in pointer_rows
-        if (pointer_row if isinstance(pointer_row, dict) else pointer_row._mapping).get(
-            "snapshot_id"
-        )
+        if (pointer_row if isinstance(pointer_row, dict) else pointer_row._mapping).get("snapshot_id")
     }
 
 
 def _snapshot_serving_index_dict(snapshot_row: Any) -> dict[str, Any]:
-    snapshot_fields = (
-        snapshot_row if isinstance(snapshot_row, dict) else snapshot_row._mapping
-    )
+    snapshot_fields = snapshot_row if isinstance(snapshot_row, dict) else snapshot_row._mapping
     manifest_dict = snapshot_fields.get("manifest") or {}
     if isinstance(manifest_dict, str):
         try:
@@ -787,15 +716,11 @@ def _snapshot_serving_index_dict(snapshot_row: Any) -> dict[str, Any]:
 def _snapshot_table_owners(snapshot_rows: list[Any]) -> dict[str, set[str]]:
     snapshot_ids_by_table_name: dict[str, set[str]] = {}
     for snapshot_row in snapshot_rows:
-        snapshot_fields = (
-            snapshot_row if isinstance(snapshot_row, dict) else snapshot_row._mapping
-        )
+        snapshot_fields = snapshot_row if isinstance(snapshot_row, dict) else snapshot_row._mapping
         snapshot_id = str(snapshot_fields.get("snapshot_id") or "")
         if not snapshot_id:
             continue
-        for table_name in _snapshot_manifest_table_names(
-            _snapshot_serving_index_dict(snapshot_row)
-        ):
+        for table_name in _snapshot_manifest_table_names(_snapshot_serving_index_dict(snapshot_row)):
             snapshot_ids_by_table_name.setdefault(table_name, set()).add(snapshot_id)
     return snapshot_ids_by_table_name
 

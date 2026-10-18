@@ -1,71 +1,27 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Real immutable SOURCE and atomic retained-output repair, including interrupted resume."""
 
-from __future__ import annotations
-
-from contextlib import asynccontextmanager
 import hashlib
-import importlib
 import json
-import uuid
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy.exc import OperationalError
 
-from db.connection import Database
-from db.models import (
-    ProviderDirectoryAPIEndpoint,
-    ProviderDirectoryCanonicalResource,
-    ProviderDirectoryDatasetRehydrationCheckpoint,
-    ProviderDirectoryDatasetResource,
-    ProviderDirectoryEndpointDataset,
-    ProviderDirectoryLocation,
-    ProviderDirectoryOrganization,
-    ProviderDirectoryPractitioner,
-    ProviderDirectorySource,
-    ProviderDirectorySourceResource,
+from db.models import ProviderDirectoryLocation
+from process import provider_directory_dataset_rehydrate_prepare as preparation
+from process.provider_directory_dataset_rehydrate_types import DatasetRehydrationError
+from process.provider_directory_generic_source_policy import source_transaction
+from process.provider_directory_resource_hash import resource_payload_sha256
+from tests.provider_directory_dataset_rehydrate_postgres_support import (
+    CANONICAL_BASE,
+    DATASET_ID,
+    ROOT_RUN_ID,
+    SOURCE_ID,
+    fhir,
+    rehydration_case,
+    source_rows,
 )
-from process.provider_directory_dataset_rehydrate import (
-    DatasetRehydrationError,
-    DatasetScope,
-    RehydrationRequest,
-    RehydrationRuntime,
-    rehydrate_current_dataset,
-)
-from process.provider_directory_proof_store import ensure_dataset_proof_shard_table
-from process.provider_directory_resource_hash import (
-    LEGACY_RESOURCE_HASH_CONTRACT,
-    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-    resource_payload_sha256,
-    resource_payload_sha256_for_contract,
-)
-from tests.test_provider_directory_dataset_rehydrate_unit import (
-    _replace_fixture_with_semantic_practitioner,
-)
-
-
-importer = importlib.import_module("process.provider_directory_fhir")
-rehydration = importlib.import_module(
-    "process.provider_directory_dataset_rehydrate"
-)
-
-SOURCE_ID = "pdfhir_directory_fixture"
-ENDPOINT_ID = "endpoint_directory_fixture"
-DATASET_ID = "pdds_directory_fixture"
-ROOT_RUN_ID = "run_directory_fixture_root"
-CANONICAL_BASE = "https://directory.fixture.test/fhir"
-
-
-async def _require_disposable_postgres(database: Database) -> None:
-    """Skip unless the configured PostgreSQL database is explicitly a test DB."""
-    try:
-        database_name = str(
-            await database.scalar("SELECT current_database();") or ""
-        )
-    except (OSError, OperationalError):
-        pytest.skip("dataset rehydration DB test needs disposable PostgreSQL")
-    if "test" not in database_name.lower():
-        pytest.skip("dataset rehydration DB test refuses a non-test database")
+from tests.test_provider_directory_dataset_rehydrate_unit import _semantic_retained_resources
 
 
 def _fixture_payloads() -> tuple[dict[str, object], ...]:
@@ -96,400 +52,180 @@ def _payload_hash(mapped_payload: dict[str, object]) -> str:
     return hashlib.sha256(encoded_payload.encode()).hexdigest()
 
 
-def _dataset_hash(mapped_payloads: tuple[dict[str, object], ...]) -> str:
-    """Build the ordered dataset identity digest."""
-    dataset_digest = hashlib.sha256()
-    for payload_index, mapped_payload in enumerate(mapped_payloads):
-        if payload_index:
-            dataset_digest.update(b"\n")
-        identity_parts = (
-            "Location",
-            str(mapped_payload["resource_id"]),
-            _payload_hash(mapped_payload),
-        )
-        dataset_digest.update(
-            json.dumps(identity_parts, separators=(",", ":")).encode()
-        )
-    return dataset_digest.hexdigest()
-
-
-def _rehydration_models() -> tuple[type, ...]:
-    """Return fixture tables in dependency order."""
-    return (
-        ProviderDirectoryAPIEndpoint,
-        ProviderDirectorySource,
-        ProviderDirectoryEndpointDataset,
-        ProviderDirectoryDatasetResource,
-        ProviderDirectoryCanonicalResource,
-        ProviderDirectorySourceResource,
-        ProviderDirectoryDatasetRehydrationCheckpoint,
-        ProviderDirectoryLocation,
-        ProviderDirectoryOrganization,
-        ProviderDirectoryPractitioner,
-    )
-
-
-async def _create_fixture_tables(database: Database, schema: str) -> None:
-    """Create only the relations exercised by rehydration."""
-    for model in _rehydration_models():
-        table_sql = importer._provider_directory_artifact_scope_table_sql(
-            model, schema, model.__tablename__
-        )
-        assert table_sql.startswith("CREATE UNLOGGED TABLE ")
-        await database.status(
-            table_sql.replace("CREATE UNLOGGED TABLE", "CREATE TABLE", 1)
-        )
-        for primary_key_statement in importer._artifact_scope_pk_sql(
-            model, schema, model.__tablename__
-        ):
-            await database.status(primary_key_statement)
-    await ensure_dataset_proof_shard_table(database, schema)
-
-
-async def _insert_fixture(database: Database, schema: str) -> None:
-    """Insert one current published dataset with three retained resources."""
-    mapped_payloads = _fixture_payloads()
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_api_endpoint ("
-        "endpoint_id, canonical_api_base, credential_descriptor_hash, "
-        "endpoint_signature_hash) VALUES ("
-        ":endpoint_id, :canonical_base, repeat('c', 64), repeat('s', 64));",
-        endpoint_id=ENDPOINT_ID,
-        canonical_base=CANONICAL_BASE,
-    )
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_source ("
-        "source_id, org_name, api_base, canonical_api_base, endpoint_id, "
-        "requires_registration, requires_api_key) VALUES ("
-        ":source_id, 'Example Directory', :canonical_base, :canonical_base, "
-        ":endpoint_id, false, false);",
-        source_id=SOURCE_ID,
-        canonical_base=CANONICAL_BASE,
-        endpoint_id=ENDPOINT_ID,
-    )
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_endpoint_dataset ("
-        "dataset_id, endpoint_id, import_run_id, acquisition_root_run_id, "
-        "dataset_hash, status, is_current, resource_count, created_at, "
-        "validated_at, published_at, publication_metadata_json) VALUES ("
-        ":dataset_id, :endpoint_id, 'run_fixture_terminal', :root_run_id, "
-        ":dataset_hash, 'published', true, :resource_count, now(), now(), "
-        "now(), CAST(:metadata_json AS json));",
-        dataset_id=DATASET_ID,
-        endpoint_id=ENDPOINT_ID,
-        root_run_id=ROOT_RUN_ID,
-        dataset_hash=_dataset_hash(mapped_payloads),
-        resource_count=len(mapped_payloads),
-        metadata_json=json.dumps(
-            {"selected_resources": ["Location"], "source_ids": [SOURCE_ID]}
-        ),
-    )
-    for mapped_payload in mapped_payloads:
-        await _insert_retained_payload(database, schema, mapped_payload)
-
-
-async def _insert_retained_payload(
-    database: Database,
-    schema: str,
-    mapped_payload: dict[str, object],
-) -> None:
-    """Insert one retained mapped resource with its canonical hash."""
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_dataset_resource ("
-        "dataset_id, resource_type, resource_id, payload_hash, payload_json) "
-        "VALUES (:dataset_id, 'Location', :resource_id, :payload_hash, "
-        "CAST(:payload_json AS json));",
-        dataset_id=DATASET_ID,
-        resource_id=mapped_payload["resource_id"],
-        payload_hash=_payload_hash(mapped_payload),
-        payload_json=json.dumps(mapped_payload, sort_keys=True),
-    )
-
-
-@asynccontextmanager
-async def _fixture_database(monkeypatch):
-    """Yield an isolated schema in the configured disposable PostgreSQL."""
-    monkeypatch.setenv("HLTHPRT_DB_POOL_MIN_SIZE", "1")
-    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "4")
-    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS", "1")
-    schema = f"provider_directory_rehydrate_{uuid.uuid4().hex[:12]}"
-    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
-    database = Database()
-    is_schema_created = False
-    try:
-        await database.connect()
-        await _require_disposable_postgres(database)
-        await database.status(f"CREATE SCHEMA {schema};")
-        is_schema_created = True
-        await _create_fixture_tables(database, schema)
-        await _insert_fixture(database, schema)
-        for model in _rehydration_models():
-            monkeypatch.setattr(model.__table__, "schema", schema)
-        monkeypatch.setattr(importer, "db", database)
-        yield database, schema
-    finally:
-        if is_schema_created:
-            await database.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
-        await database.disconnect()
-
-
-async def _normal_upsert(
-    model: type,
-    typed_rows: list[dict[str, object]],
-    scope: DatasetScope,
-) -> int:
-    """Write typed rows through the production provenance path."""
-    return await importer._upsert_resource_rows(
-        model,
-        typed_rows,
-        options=importer.ProviderDirectoryResourceWriteOptions(
-            run_id=scope.acquisition_root_run_id,
-            track_seen=False,
-            canonical_api_base=scope.canonical_api_base,
-            source_ids=[scope.source_id],
-            resource_hash_contract=scope.resource_hash_contract,
-            semantic_projection_as_of=scope.semantic_projection_as_of,
-            derive_location_contacts=False,
-        ),
-    )
-
-
-def _runtime(database: Database, schema: str) -> RehydrationRuntime:
-    """Build a runtime using production Location upserts."""
-    return RehydrationRuntime(
-        database=database,
-        schema=schema,
-        models_by_type={
-            "Location": ProviderDirectoryLocation,
-            "Organization": ProviderDirectoryOrganization,
-            "Practitioner": ProviderDirectoryPractitioner,
-        },
-        upsert_batch=_normal_upsert,
-    )
-
-
-def _request(owner_run_id: str) -> RehydrationRequest:
-    """Build one exact fixture request with single-row transactions."""
-    return RehydrationRequest(
-        source_id=SOURCE_ID,
-        dataset_id=DATASET_ID,
-        acquisition_root_run_id=ROOT_RUN_ID,
-        owner_run_id=owner_run_id,
-        batch_size=1,
-    )
-
-
-async def _persistence_counts(database: Database, schema: str) -> tuple[int, ...]:
-    """Count typed, canonical, and source-edge rows for the fixture root."""
-    count_record = await database.first(
-        f"SELECT "
-        f"(SELECT count(*) FROM {schema}.provider_directory_location "
-        "WHERE source_id=:source_id AND last_seen_run_id=:root_run_id), "
-        f"(SELECT count(*) FROM {schema}.provider_directory_canonical_resource "
-        "WHERE canonical_api_base=:canonical_base "
-        "AND last_seen_run_id=:root_run_id), "
-        f"(SELECT count(*) FROM {schema}.provider_directory_source_resource "
-        "WHERE source_id=:source_id AND last_seen_run_id=:root_run_id);",
-        source_id=SOURCE_ID,
-        root_run_id=ROOT_RUN_ID,
-        canonical_base=CANONICAL_BASE,
-    )
-    return tuple(int(count_value) for count_value in count_record)
-
-
-async def _checkpoint_state(database: Database, schema: str) -> tuple[object, ...]:
-    """Read the durable Location checkpoint state and counts."""
-    checkpoint_record = await database.first(
-        f"SELECT state, input_count, mapped_count, last_resource_id "
-        f"FROM {schema}.provider_directory_dataset_rehydration_checkpoint "
-        "WHERE resource_type='Location';"
-    )
-    return tuple(checkpoint_record)
-
-
-async def _assert_exact_canonical_payload(
-    database: Database,
-    schema: str,
-) -> None:
-    """Prove rehydration does not augment immutable retained payload JSON."""
-
-    canonical_record = await database.first(
-        f"SELECT payload_hash, payload_json FROM {schema}."
-        "provider_directory_canonical_resource "
-        "WHERE canonical_api_base=:canonical_base "
-        "AND resource_type='Location' AND resource_id='location-1';",
-        canonical_base=CANONICAL_BASE,
-    )
-    canonical_payload = canonical_record[1]
-    if isinstance(canonical_payload, str):
-        canonical_payload = json.loads(canonical_payload)
-    expected_payload = _fixture_payloads()[0]
-    assert canonical_payload == expected_payload
-    assert canonical_record[0] == _payload_hash(expected_payload)
-    assert all(
-        field_name not in canonical_payload
-        for field_name in (
-            "phone_number",
-            "phone_extension",
-            "fax_number_digits",
-            "fax_extension",
-        )
-    )
-
-
-async def _insert_extra_membership(database: Database) -> None:
-    """Add one same-root typed/canonical/source-edge identity outside dataset."""
-    extra_typed_rows = [
-        {
-            "source_id": SOURCE_ID,
-            "resource_id": "location-outside-dataset",
-            "status": "active",
-            "name": "Outside Dataset",
-            "last_seen_run_id": ROOT_RUN_ID,
-        }
-    ]
-    await _normal_upsert(
-        ProviderDirectoryLocation,
-        extra_typed_rows,
-        DatasetScope(
-            source_id=SOURCE_ID,
+def _retained_locations():
+    return tuple(
+        dict(
             dataset_id=DATASET_ID,
-            acquisition_root_run_id=ROOT_RUN_ID,
-            endpoint_id=ENDPOINT_ID,
-            canonical_api_base=CANONICAL_BASE,
-            dataset_hash="unused",
-            resource_count=3,
-            resource_types=("Location",),
-            resource_hash_contract=(
-                LEGACY_RESOURCE_HASH_CONTRACT
-            ),
-            semantic_projection_as_of=None,
-            publication_metadata_hash="unused",
-            published_at=None,
-        ),
+            resource_type="Location",
+            resource_id=payload["resource_id"],
+            payload_hash=_payload_hash(payload),
+            payload_json=payload,
+            acquired_resource_sha256=None,
+        )
+        for payload in _fixture_payloads()
     )
+
+
+async def _output_state(case):
+    """Capture exact serving identities and row counts before and after private preparation."""
+    tables = (
+        "provider_directory_location",
+        "provider_directory_canonical_resource",
+        "provider_directory_source_resource",
+    )
+    async with source_transaction(case.database):
+        return tuple(
+            [
+                (
+                    await case.database.scalar("SELECT to_regclass(:name)::oid", name=f"{case.schema}.{name}"),
+                    await case.database.scalar(f'SELECT count(*) FROM "{case.schema}"."{name}"'),
+                )
+                for name in tables
+            ]
+        )
+
+
+async def _private_progress(case):
+    """Read the actual durable stage cursor and its exact original private heap."""
+    async with source_transaction(case.database):
+        evidence = await case.database.scalar(
+            f'SELECT evidence_json FROM "{case.schema}".provider_directory_dataset_rehydration_checkpoint '
+            "WHERE resource_type='Location'"
+        )
+        entry = evidence["output_snapshots"]["active"]["stages"]["provider_directory_location"]
+        count = await case.database.scalar(f'SELECT count(*) FROM "{case.schema}"."{entry["stage"]["relation"]}"')
+        return entry, count
+
+
+async def _assert_source_payload(case):
+    """Preserve the original payload/hash without adding derived contact fields to SOURCE."""
+    assert await source_rows(case.database) == case.original_source
+    for _, _, digest, payload in case.original_source:
+        assert digest == _payload_hash(payload)
+        assert all(
+            name not in payload for name in ("phone_number", "phone_extension", "fax_number_digits", "fax_extension")
+        )
 
 
 def test_fixture_payloads_use_historical_transport_hashes():
     """Keep the PostgreSQL fixture on the legacy read-compatibility path."""
 
     assert all(
-        _payload_hash(mapped_payload)
-        != resource_payload_sha256(mapped_payload)
+        _payload_hash(mapped_payload) != resource_payload_sha256(mapped_payload)
         for mapped_payload in _fixture_payloads()
     )
 
 
+async def _complete_and_replay(case, entry):
+    """Complete the same original stages, then reuse exactly the committed physical cut."""
+    completed = await fhir._rehydrate_prepared_dataset(case.runtime, case.request)
+    assert tuple(count for _, count in await _output_state(case)) == (3, 3, 3)
+    assert completed["resources"]["Location"] == {
+        "state": "complete",
+        "input": 3,
+        "mapped": 3,
+        "rejected": 0,
+        "typed": 3,
+        "typed_extra": 0,
+        "canonical_hash_matched": 3,
+        "canonical_extra": 0,
+        "source_edges": 3,
+        "source_edge_extra": 0,
+        "reused_complete_checkpoint": False,
+    }
+    published = await _output_state(case)
+    assert published[0][0] == entry["stage"]["oid"]
+    replay = await fhir._rehydrate_prepared_dataset(case.runtime, case.request)
+    assert replay["resources"]["Location"]["reused_complete_checkpoint"] is True
+    assert await _output_state(case) == published
+    await _assert_source_payload(case)
+
+
+async def _assert_extra_membership_refused(case):
+    """An extraneous same-root identity cannot reuse the completed exact-membership proof."""
+    async with source_transaction(case.database):
+        for statement in (
+            "INSERT INTO mrf.provider_directory_location (source_id,resource_id,last_seen_run_id) "
+            "VALUES (:source,'outside-dataset',:root)",
+            "INSERT INTO mrf.provider_directory_canonical_resource "
+            "(canonical_api_base,resource_type,resource_id,payload_hash,first_seen_run_id,last_seen_run_id) "
+            "VALUES (:base,'Location','outside-dataset',repeat('e',64),:root,:root)",
+            "INSERT INTO mrf.provider_directory_source_resource "
+            "(source_id,canonical_api_base,resource_type,resource_id,last_seen_run_id) "
+            "VALUES (:source,:base,'Location','outside-dataset',:root)",
+        ):
+            await case.database.status(statement, source=SOURCE_ID, base=CANONICAL_BASE, root=ROOT_RUN_ID)
+    changed = await _output_state(case)
+    assert tuple(count for _, count in changed) == (4, 4, 4)
+    with pytest.raises(DatasetRehydrationError, match="generation_exists"):
+        await fhir._rehydrate_prepared_dataset(case.runtime, case.request)
+    assert await _output_state(case) == changed
+    await _assert_source_payload(case)
+
+
 @pytest.mark.asyncio
-async def test_postgres_rolls_back_resumes_and_proves_exact_membership(
-    monkeypatch,
-):
-    async with _fixture_database(monkeypatch) as (database, schema):
-        values_upsert = AsyncMock(
-            side_effect=AssertionError("COPY upsert unexpectedly fell back")
-        )
-        monkeypatch.setattr(importer, "_upsert_rows_values", values_upsert)
-        original_save = rehydration._save_checkpoint
+async def test_postgres_rolls_back_resumes_and_proves_exact_membership(monkeypatch):
+    """Retain one committed private page, resume it, and publish exactly one complete output group."""
+    async with rehydration_case(monkeypatch, _retained_locations()) as case:
+        values_upsert = AsyncMock(side_effect=AssertionError("COPY upsert unexpectedly fell back"))
+        monkeypatch.setattr(fhir, "_upsert_rows_values", values_upsert)
+        incumbent = await _output_state(case)
+        original_pages = preparation.projected_pages
 
-        async def fail_second_checkpoint(context, checkpoint_record):
-            """Fail after second-batch writes but before checkpoint commit."""
-            if (
-                checkpoint_record.state == "running"
-                and checkpoint_record.input_count == 2
-            ):
-                raise RuntimeError("simulated checkpoint failure")
-            await original_save(context, checkpoint_record)
+        async def interrupted_pages(reader, statement, params, model, *, after):
+            seen = 0
+            async for rows in original_pages(reader, statement, params, model, after=after):
+                for row in rows:
+                    seen += 1
+                    if model is ProviderDirectoryLocation and seen == 2:
+                        raise RuntimeError("simulated checkpoint failure")
+                    yield [row]
 
-        monkeypatch.setattr(rehydration, "_save_checkpoint", fail_second_checkpoint)
+        monkeypatch.setattr(preparation, "projected_pages", interrupted_pages)
         with pytest.raises(RuntimeError, match="simulated checkpoint failure"):
-            await rehydrate_current_dataset(
-                _runtime(database, schema), _request("run_fixture_first")
-            )
-        assert await _persistence_counts(database, schema) == (1, 1, 1)
-        assert await _checkpoint_state(database, schema) == (
-            "interrupted", 1, 1, "location-1"
-        )
+            await fhir._rehydrate_prepared_dataset(case.runtime, case.request)
+        assert await _output_state(case) == incumbent
+        entry, private_count = await _private_progress(case)
+        assert private_count == entry["rows"] == 1
+        assert entry["cursor"][-1] == "location-1" and entry["receipt"] is None
+        await _assert_source_payload(case)
 
-        monkeypatch.setattr(rehydration, "_save_checkpoint", original_save)
-        completed_summary = await rehydrate_current_dataset(
-            _runtime(database, schema), _request("run_fixture_resume")
-        )
-        assert await _persistence_counts(database, schema) == (3, 3, 3)
-        assert completed_summary["resources"]["Location"] == {
-            "state": "complete",
-            "input": 3,
-            "mapped": 3,
-            "rejected": 0,
-            "typed": 3,
-            "typed_extra": 0,
-            "canonical_hash_matched": 3,
-            "canonical_extra": 0,
-            "source_edges": 3,
-            "source_edge_extra": 0,
-            "reused_complete_checkpoint": False,
-        }
-        await _assert_exact_canonical_payload(database, schema)
-
-        await _insert_extra_membership(database)
-        with pytest.raises(DatasetRehydrationError, match="proof_failed"):
-            await rehydrate_current_dataset(
-                _runtime(database, schema), _request("run_fixture_extra")
-            )
-        assert await _persistence_counts(database, schema) == (4, 4, 4)
-        assert (await _checkpoint_state(database, schema))[0] == "proof_failed"
+        monkeypatch.setattr(preparation, "projected_pages", original_pages)
+        await _complete_and_replay(case, entry)
+        await _assert_extra_membership_refused(case)
         assert values_upsert.await_count == 0
 
 
 @pytest.mark.asyncio
-async def test_postgres_rehydrates_exact_semantic_practitioner_union(
-    monkeypatch,
-):
-    """Prove typed and canonical rows retain the exact v3 name union."""
-
-    async with _fixture_database(monkeypatch) as (database, schema):
-        monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS", "1000")
-        expected_payload, expected_hash = await _replace_fixture_with_semantic_practitioner(
-            database, schema
-        )
-        completed_summary = await rehydrate_current_dataset(
-            _runtime(database, schema),
-            _request("run_fixture_semantic"),
-        )
-
-        assert completed_summary["resources"]["Practitioner"]["typed"] == 1
-        assert completed_summary["resources"]["Organization"]["typed"] == 1
-        organization_record = await database.first(
-            f"SELECT name, npi FROM {schema}.provider_directory_organization "
-            "WHERE source_id=:source_id "
-            "AND resource_id='organization-linked-1';",
-            source_id=SOURCE_ID,
-        )
-        assert tuple(organization_record) == ("Linked Organization", 1234567890)
-        typed_record = await database.first(
-            f"SELECT names, family_name, given_names, full_name FROM {schema}."
-            "provider_directory_practitioner "
-            "WHERE source_id=:source_id AND resource_id='practitioner-1';",
-            source_id=SOURCE_ID,
-        )
-        assert list(typed_record[0]) == expected_payload["names"]
-        assert typed_record[1] == expected_payload["family_name"]
-        assert list(typed_record[2]) == expected_payload["given_names"]
-        assert typed_record[3] == expected_payload["full_name"]
-
-        canonical_record = await database.first(
-            f"SELECT payload_hash, payload_json FROM {schema}."
-            "provider_directory_canonical_resource "
-            "WHERE canonical_api_base=:canonical_base "
-            "AND resource_type='Practitioner' "
-            "AND resource_id='practitioner-1';",
-            canonical_base=CANONICAL_BASE,
-        )
-        canonical_payload = canonical_record[1]
-        if isinstance(canonical_payload, str):
-            canonical_payload = json.loads(canonical_payload)
-        assert canonical_record[0] == expected_hash
-        assert canonical_payload == expected_payload
-        assert resource_payload_sha256_for_contract(
-            canonical_payload,
-            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-        ) == expected_hash
+async def test_postgres_rehydrates_exact_semantic_practitioner_union(monkeypatch):
+    """Publish exactly the retained Practitioner name union and its linked Organization."""
+    expected_payload, expected_hash, retained = _semantic_retained_resources()
+    async with rehydration_case(monkeypatch, retained, semantic=True) as case:
+        completed = await fhir._rehydrate_prepared_dataset(case.runtime, case.request)
+        assert completed["resources"]["Practitioner"]["typed"] == 1
+        assert completed["resources"]["Organization"]["typed"] == 1
+        async with source_transaction(case.database):
+            organization = await case.database.first(
+                f'SELECT name,npi FROM "{case.schema}".provider_directory_organization '
+                "WHERE source_id=:source AND resource_id='organization-linked-1'",
+                source=SOURCE_ID,
+            )
+            typed = await case.database.first(
+                f'SELECT names,family_name,given_names,full_name FROM "{case.schema}".provider_directory_practitioner '
+                "WHERE source_id=:source AND resource_id='practitioner-1'",
+                source=SOURCE_ID,
+            )
+            canonical = await case.database.first(
+                f'SELECT payload_hash,payload_json FROM "{case.schema}".provider_directory_canonical_resource '
+                "WHERE canonical_api_base=:base AND resource_type='Practitioner' AND resource_id='practitioner-1'",
+                base=CANONICAL_BASE,
+            )
+        assert tuple(organization) == ("Linked Organization", 1234567890)
+        assert list(typed[0]) == expected_payload["names"]
+        assert typed[1] == expected_payload["family_name"]
+        assert list(typed[2]) == expected_payload["given_names"]
+        assert typed[3] == expected_payload["full_name"]
+        assert canonical[0] == expected_hash and canonical[1] is None
+        assert await source_rows(case.database) == case.original_source
+        source_record = next(resource_row for resource_row in case.original_source if resource_row[0] == "Practitioner")
+        assert source_record[2:] == (expected_hash, expected_payload)

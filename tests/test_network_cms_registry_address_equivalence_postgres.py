@@ -20,7 +20,9 @@ from process.entity_address_snapshot_ownership import (
     capture_created_entity_address_archive_stage,
     entity_address_archive_stage_schema,
 )
-from process.entity_address_snapshot_source import _clone_entity_address_evidence_sequence
+from process.entity_address_snapshot_source import _SOURCE_INDEX_PREDICATES, _clone_entity_address_evidence_sequence
+from process.network_cms_registry_address_capture import native_driver
+from tests.registry_native_unique_trigger_test_support import verify_native_unique_trigger_predicate
 
 
 def _engine():
@@ -46,6 +48,20 @@ async def _source(session, schema):
         await session.execute(text(statement))
     await session.execute(text(f'ALTER TABLE "{schema}".entity_address_unified DROP COLUMN discarded_column'))
     await session.execute(text(f'CREATE INDEX checksum_copy ON "{schema}".entity_address_unified (checksum)'))
+    await session.execute(
+        text(
+            f'ALTER TABLE "{schema}".entity_address_unified '
+            "ADD CONSTRAINT checksum_deferred UNIQUE (checksum) DEFERRABLE INITIALLY DEFERRED"
+        )
+    )
+    for names, predicate in _SOURCE_INDEX_PREDICATES.items():
+        for name in names:
+            original_predicate = predicate.replace("])::text[]", "])")
+            await session.execute(
+                text(
+                    f'CREATE INDEX "{name}" ON "{schema}".entity_address_unified (checksum) WHERE {original_predicate}'
+                )
+            )
     await session.execute(
         text(f'ALTER SEQUENCE "{schema}".entity_address_evidence_evidence_id_seq RENAME TO promoted_evidence_id_seq')
     )
@@ -126,6 +142,7 @@ async def test_native_copy_preserves_receipts_and_rejects_drift():
             witness = await equivalence.validate_registry_cms_address_copy(
                 session, source_capture=source_capture, clone_ownership=owner
             )
+            await verify_native_unique_trigger_predicate(await native_driver(session), owner.schema_oid)
             assert witness.source.semantic_receipt.schema_sha256 != witness.clone_receipt.schema_sha256
             assert witness.source.semantic_receipt.main_input_sha256 == witness.clone_receipt.main_input_sha256
             assert [table_receipt.row_count for table_receipt in witness.clone_receipt.tables][:2] == [1, 1]

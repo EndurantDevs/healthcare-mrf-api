@@ -11,9 +11,7 @@ from uuid import uuid4
 import asyncpg
 import pytest
 from sqlalchemy import event, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from db.connection import Database
 from db.models import CMSDoctorEducation, CMSDoctorGroupSite
 from process import cms_doctors_education as education
 from process import cms_doctors_groups as groups
@@ -22,8 +20,9 @@ from process import reference_family_archive as archive_native
 from process.cms_doctors_source_provenance import read_doctors_source_provenance
 from process.ext import utils
 from process.ext.utils import make_class
+from process.provider_directory_generic_source_policy import source_copy_session
 from tests.cms_doctors_preparation_postgres_support import doctors_database, stage_family, stage_oids
-from tests.cms_npd_admission_postgres_support import _database_url
+from tests.cms_doctors_preparation_postgres_support import doctors_source_template as doctors_source_template
 from tests.test_cms_doctors_source_provenance import source_metrics
 
 
@@ -86,32 +85,26 @@ SOURCE_URL = "https://example.test/sidecars.csv"
 
 
 @pytest.fixture
-async def cms_sidecar_storage():
-    """Use the selected CMS family's UUID-owned DSN guard and a real isolated schema."""
-    url = _database_url().set(drivername="postgresql+asyncpg")
-    engine = create_async_engine(url)
-    schema = "cms_sidecar_" + uuid4().hex
-    connection = None
-    try:
-        connection = await asyncpg.connect(url.set(drivername="postgresql").render_as_string(hide_password=False))
-        await connection.execute(f'CREATE SCHEMA "{schema}"')
-        yield connection, schema, async_sessionmaker(engine)
-    finally:
-        await engine.dispose()
-        if connection is not None:
-            try:
-                await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-                assert await connection.fetchval("SELECT to_regnamespace($1)", schema) is None
-            finally:
-                await connection.close()
+async def cms_sidecar_storage(monkeypatch):
+    """Observe genuine Source writes from the same owned database's independent administrator."""
+    async with doctors_database(monkeypatch, cms_active=False) as fixture:
+        url = fixture.engine.url.set(drivername="postgresql")
+        connection = await asyncpg.connect(url.render_as_string(hide_password=False))
+        try:
+            assert await connection.fetchval("SELECT session_user=current_user") is True
+            assert await connection.fetchval("SELECT session_user") == url.username
+            yield connection, fixture
+        finally:
+            await connection.close()
+            assert connection.is_closed()
 
 
 @pytest.fixture
 async def sidecar_db(cms_sidecar_storage, monkeypatch):
-    """Use the existing isolated schema and ordinary model-backed Database."""
-    connection, schema, sessions = cms_sidecar_storage
-    engine = sessions.kw["bind"]
-    database = Database(engine=engine, session_factory=sessions)
+    """Keep real COPY on the original Source owner and observe only committed rows."""
+    connection, fixture = cms_sidecar_storage
+    database, schema = fixture.database, fixture.schema
+    engine = database.engine
     for module in (education, groups, utils):
         monkeypatch.setattr(module, "db", database)
     for model in (CMSDoctorEducation, CMSDoctorGroupSite):
@@ -123,7 +116,11 @@ async def sidecar_db(cms_sidecar_storage, monkeypatch):
         records, columns = options["records"], options["columns"]
         attempted.append(len(records))
         if completed:
-            visible.append(await connection.fetchval(f'SELECT count(*) FROM "{schema}"."{model.__tablename__}"'))
+            relation = f'"{schema}"."{model.__tablename__}"'
+            # The outer Source transaction also keeps its stage DDL uncommitted.
+            exists = await connection.fetchval("SELECT to_regclass($1)", relation)
+            visible.append(0 if exists is None else await connection.fetchval(f"SELECT count(*) FROM {relation}"))
+        assert session is source_copy_session()
         assert session.in_transaction() and 0 < len(records) <= 5000
         assert columns == tuple(model.__table__.columns.keys())
         assert all(isinstance(row[columns.index("source_json")], str) for row in records)
@@ -201,9 +198,11 @@ def _stage(kind, context):
 
 
 async def _import(kind, source, context, manifest):
-    if kind == "education":
-        return await education.import_doctor_education(source, SOURCE_URL, context, {}, source_manifest=manifest)
-    return await groups.import_group_site_rows(source, context, {}, manifest)
+    """Retain the production sidecar family's outer Source transaction."""
+    async with education.db.transaction():
+        if kind == "education":
+            return await education.import_doctor_education(source, SOURCE_URL, context, {}, source_manifest=manifest)
+        return await groups.import_group_site_rows(source, context, {}, manifest)
 
 
 async def _assert_native_json(fixture, stage, manifest, expected_count):
@@ -232,7 +231,7 @@ async def _assert_education(fixture, stage, context, receipt):
     relation = f'"{fixture.schema}"."{stage.__tablename__}"'
     assert receipt["source_rows"] == 10002 and receipt["education_rows"] == 10001
     assert fixture.attempted == fixture.completed == [5000, 4999, 2]
-    assert fixture.visible == [5000, 9999]
+    assert fixture.visible == [0, 0]
     assert (
         await fixture.connection.fetchval(
             f"SELECT count(*) FROM {relation} WHERE (source_json->>'row_number')::bigint=5001"
@@ -246,21 +245,23 @@ async def _assert_education(fixture, stage, context, receipt):
         == "Example École 1"
     )
     assert await fixture.connection.fetchval(f"SELECT count(DISTINCT education_key) FROM {relation}") == 10001
-    await education.validate_education_stage(context["import_date"], fixture.schema, receipt)
+    async with fixture.database.transaction():
+        await education.validate_education_stage(context["import_date"], fixture.schema, receipt)
 
 
 async def _assert_groups(fixture, stage, context, receipt):
     relation = f'"{fixture.schema}"."{stage.__tablename__}"'
     assert receipt["source_rows"] == 10002
     assert fixture.attempted == fixture.completed == [5000, 5000, 2]
-    assert fixture.visible == [5000, 10000]
+    assert fixture.visible == [0, 0]
     counts = await fixture.connection.fetchrow(
         f"SELECT min(row_number),max(row_number),count(DISTINCT row_number), "
         f"count(DISTINCT address_checksum),count(DISTINCT org_pac_id), "
         f"bool_and(membership_start_at IS NULL AND membership_end_at IS NULL) FROM {relation}"
     )
     assert tuple(counts) == (1, 10002, 10002, 1, 2, True)
-    await groups.validate_group_site_stage(context["import_date"], fixture.schema, receipt)
+    async with fixture.database.transaction():
+        await groups.validate_group_site_stage(context["import_date"], fixture.schema, receipt)
 
 
 @pytest.mark.asyncio
@@ -287,25 +288,28 @@ async def test_real_second_copy_failure_drops_only_owned_stage(sidecar_db, tmp_p
     worker_context_by_key = {"import_date": uuid4().hex, "context": {}}
     stage = _stage(kind, worker_context_by_key)
     database = sidecar_db.database
-    original_create = database.create_table
+    module = education if kind == "education" else groups
+    original_create = module.create_doctors_stage
     sentinel = f'"{sidecar_db.schema}".sidecar_cleanup_sentinel'
-    await database.status(f"CREATE TABLE {sentinel} (marker integer PRIMARY KEY)")
+    async with database.transaction():
+        await database.status(f"CREATE TABLE {sentinel} (marker integer PRIMARY KEY)")
 
-    async def reject_second_batch(table, **options):
-        await original_create(table, **options)
-        relation = f'"{table.schema}"."{table.name}"'
+    async def reject_second_batch(current, model, import_date, schema):
+        created = await original_create(current, model, import_date, schema)
+        relation = f'"{schema}"."{created.__tablename__}"'
         await database.status(
             f"ALTER TABLE {relation} ADD CONSTRAINT sidecar_test_second_batch "
             "CHECK ((source_json->>'row_number')::bigint<=5000)"
         )
+        return created
 
-    monkeypatch.setattr(database, "create_table", reject_second_batch)
+    monkeypatch.setattr(module, "create_doctors_stage", reject_second_batch)
     with pytest.raises(asyncpg.CheckViolationError) as failure:
         await _import(kind, source_path, worker_context_by_key, manifest)
     assert failure.value.sqlstate == "23514"
     assert failure.value.constraint_name == "sidecar_test_second_batch"
     assert sidecar_db.attempted == [5000, 1] and sidecar_db.completed == [5000]
-    assert sidecar_db.visible == [5000]
+    assert sidecar_db.visible == [0]
     assert f"{kind}_stage_owned" not in worker_context_by_key["context"]
     assert (
         await sidecar_db.connection.fetchval("SELECT to_regclass($1)", f"{sidecar_db.schema}.{stage.__tablename__}")

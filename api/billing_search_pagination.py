@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import hmac
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from sqlalchemy import text
@@ -47,6 +47,7 @@ _GENERATION_BUNDLE_DOMAIN = b"HEALTHPORTA_BILLING_SEARCH_GENERATION_BUNDLE_V1\x0
 _IMPORT_REQUEST_DOMAIN = b"BILLING_SEARCH_IMPORT_CURSOR_REQUEST_V1\x00"
 _IMPORT_AUTHORITY_DOMAIN = b"BILLING_SEARCH_IMPORT_CURSOR_AUTHORITY_V1\x00"
 _IMPORT_GENERATION_DOMAIN = b"BILLING_SEARCH_IMPORT_CURSOR_GENERATION_V1\x00"
+_NETWORK_GENERATION_DOMAIN = b"BILLING_SEARCH_NETWORK_CURSOR_GENERATION_V1\x00"
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}", flags=re.ASCII)
 _SCHEMA_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}", flags=re.ASCII)
 _ADDRESS_TABLES = (
@@ -101,6 +102,7 @@ class BillingSearchCursorBinding:
     trusted_now: int
     import_scope: BillingSearchImportCursorScope | None = None
     native_generation_bundle_sha256: str | None = None
+    network_scope_sha256: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -117,11 +119,13 @@ class BillingSearchCursorBinding:
             _strict_sha256(digest_value)
         if type(trusted_now) is not int or not 0 <= trusted_now < 2**63:
             raise _invalid_generation()
-        if self.import_scope is None:
+        if self.import_scope is None and self.network_scope_sha256 is None:
             if self.native_generation_bundle_sha256 is not None:
                 raise _invalid_generation()
         elif self.generation_bundle_sha256 != billing_search_cursor_generation_sha256(
-            self.native_generation_bundle_sha256, import_scope=self.import_scope
+            self.native_generation_bundle_sha256,
+            import_scope=self.import_scope,
+            network_scope_sha256=self.network_scope_sha256,
         ):
             raise _invalid_generation()
 
@@ -185,16 +189,20 @@ def billing_search_cursor_authorization_sha256(authorization_context, *, trusted
     return _import_bound_digest(native_digest, import_scope.authorization_scope_sha256, domain=_IMPORT_AUTHORITY_DOMAIN)
 
 
-def billing_search_cursor_generation_sha256(native_digest, *, import_scope=None) -> str:
+def billing_search_cursor_generation_sha256(native_digest, *, import_scope=None, network_scope_sha256=None) -> str:
     """Keep the native bundle and independently pin the import generation."""
 
     native_digest = _strict_sha256(native_digest)
-    if import_scope is None:
-        return native_digest
-    if type(import_scope) is not BillingSearchImportCursorScope:
-        raise _invalid_generation()
-    import_scope.__post_init__()
-    return _import_bound_digest(native_digest, import_scope.generation_bundle_sha256, domain=_IMPORT_GENERATION_DOMAIN)
+    if import_scope is not None:
+        if type(import_scope) is not BillingSearchImportCursorScope:
+            raise _invalid_generation()
+        import_scope.__post_init__()
+        native_digest = _import_bound_digest(
+            native_digest, import_scope.generation_bundle_sha256, domain=_IMPORT_GENERATION_DOMAIN
+        )
+    if network_scope_sha256 is not None:
+        native_digest = _import_bound_digest(native_digest, network_scope_sha256, domain=_NETWORK_GENERATION_DOMAIN)
+    return native_digest
 
 
 def _optional_generation_text(
@@ -211,12 +219,15 @@ def _optional_generation_text(
 
 def _binding_generation_payload(
     selection: PlanReleaseServingSelection,
+    *,
+    contributing_bindings=None,
 ) -> list[dict[str, Any]]:
-    serving_tables_by_snapshot = selection.network_tables_by_snapshot()
+    options = {} if contributing_bindings is None else {"contributing_bindings": contributing_bindings}
+    serving_tables_by_snapshot = selection.network_tables_by_snapshot(**options)
     if serving_tables_by_snapshot is None or not selection.in_network_bindings:
         raise _invalid_generation()
     binding_payloads: list[dict[str, Any]] = []
-    for binding in selection.in_network_bindings:
+    for binding in selection.in_network_bindings if contributing_bindings is None else contributing_bindings:
         serving_tables = serving_tables_by_snapshot.get(binding.snapshot_id)
         if (
             serving_tables is None
@@ -257,6 +268,8 @@ def _binding_generation_payload(
 
 def billing_search_snapshot_set_sha256(
     selection: PlanReleaseServingSelection,
+    *,
+    contributing_bindings=None,
 ) -> str:
     """Digest the ordered canonical release and immutable snapshot bindings."""
 
@@ -264,10 +277,12 @@ def billing_search_snapshot_set_sha256(
         raise _invalid_generation()
     snapshot_set_by_name = {
         "binding_set_digest": _strict_sha256(selection.binding_set_digest),
-        "bindings": _binding_generation_payload(selection),
+        "bindings": _binding_generation_payload(selection, contributing_bindings=contributing_bindings),
         "plan_release_id": selection.plan_release_id,
         "serving_revision_id": selection.serving_revision_id,
     }
+    if contributing_bindings is not None:
+        snapshot_set_by_name["canonical_release_bindings"] = [asdict(binding) for binding in selection.bindings]
     return _framed_sha256(
         _SNAPSHOT_SET_DOMAIN,
         _canonical_json_bytes(snapshot_set_by_name),
@@ -319,10 +334,12 @@ async def _locked_address_relation_oids(session) -> tuple[int, int]:
 async def capture_billing_search_generation_pin(
     session,
     selection: PlanReleaseServingSelection,
+    *,
+    contributing_bindings=None,
 ) -> BillingSearchGenerationPin:
     """Lock the address relation and capture the complete serving generation."""
 
-    snapshot_set_sha256 = billing_search_snapshot_set_sha256(selection)
+    snapshot_set_sha256 = billing_search_snapshot_set_sha256(selection, contributing_bindings=contributing_bindings)
     address_relation_oid, address_evidence_relation_oid = await _locked_address_relation_oids(session)
     generation_bundle_sha256 = _framed_sha256(
         _GENERATION_BUNDLE_DOMAIN,
@@ -350,6 +367,7 @@ def build_billing_search_cursor_binding(
     *,
     trusted_now: str,
     import_scope: BillingSearchImportCursorScope | None = None,
+    network_scope_sha256: str | None = None,
 ) -> BillingSearchCursorBinding:
     """Build stable cursor bindings from fully validated request state."""
 
@@ -366,12 +384,17 @@ def build_billing_search_cursor_binding(
             import_scope=import_scope,
         ),
         generation_bundle_sha256=billing_search_cursor_generation_sha256(
-            generation_pin.generation_bundle_sha256, import_scope=import_scope
+            generation_pin.generation_bundle_sha256,
+            import_scope=import_scope,
+            network_scope_sha256=network_scope_sha256,
         ),
         snapshot_set_sha256=generation_pin.snapshot_set_sha256,
         trusted_now=int(trusted_time.timestamp()),
         import_scope=import_scope,
-        native_generation_bundle_sha256=generation_pin.generation_bundle_sha256 if import_scope is not None else None,
+        native_generation_bundle_sha256=generation_pin.generation_bundle_sha256
+        if import_scope is not None or network_scope_sha256 is not None
+        else None,
+        network_scope_sha256=network_scope_sha256,
     )
 
 

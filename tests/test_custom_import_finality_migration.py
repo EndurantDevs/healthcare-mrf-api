@@ -13,9 +13,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
-PLANS_MIGRATION_PATH = ROOT / "alembic" / "versions" / "20261005020000_custom_import_sealed_append_plans.py"
-_SEALED_APPEND_FOLLOWUP_REVISIONS = (
+_SEALED_APPEND_UPGRADE_TAIL = (
     "20261005030000_source_profile_statement_pins",
     "20261005100000_rooted_graph_set_validation",
     "20261005110000_ptg_set_validation",
@@ -58,6 +56,8 @@ _SEALED_APPEND_FOLLOWUP_REVISIONS = (
     "20261012010000_company_registry_name_origin",
     "20261013010000_registry_custom_history_events",
     "20261015020000_custom_import_query_projections",
+    "20261016070000_registry_allowed_plan_scope",
+    "20261017010000_registry_cms_source_notifications",
     "20261017210000_provider_directory_readiness_indexes",
     "20261017010000_custom_import_raw_objects",
     "20261019010000_custom_import_build_continuation",
@@ -65,7 +65,31 @@ _SEALED_APPEND_FOLLOWUP_REVISIONS = (
     "20261020180000_custom_import_verification_arms",
     "20261020190000_custom_import_verification_root_ranges",
     "20261020200000_custom_import_manual_acceptance",
+    "20261021110000_ptg_membership_import_idempotency",
+    "20261015010000_plan_release_binding_cohorts",
+    "20261015015000_generic_source_candidates",
+    "20261016010000_cms_registry_source_pair_slot",
+    "20261016030000_cms_source_guard_argument_types",
+    "20261016040000_source_validator_argument_types",
+    "20261016050000_acquisition_validator_argument_types",
+    "20261016060000_uhc_official_cohort_snapshots",
+    "20261017020000_source_registry_snapshot_join",
+    "20261017030000_registry_ptg_office_recipe_selection",
+    "20261017040000_nppes_evidence_candidates",
+    "20261018011000_network_candidate_custody",
+    "20261018040000_registry_aca_source_notifications",
+    "20261019010000_registry_raw_object_join",
+    "20261019020000_registry_continuation_join",
+    "20261019030000_provider_directory_role_schema",
+    "20261019130000_cms_archive_transaction_guard",
+    "20261019140000_plan_pricing_attribution_idempotency",
+    "20261019150000_registry_source_check_idempotency",
+    "20261020160000_registry_staged_verification_join",
+    "20261020210000_registry_manual_acceptance_join",
 )
+
+MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
+PLANS_MIGRATION_PATH = ROOT / "alembic" / "versions" / "20261005020000_custom_import_sealed_append_plans.py"
 
 
 def _migration():
@@ -204,22 +228,89 @@ def test_sealed_append_plans_replace_only_an_existing_function(monkeypatch, oper
         assert statements[1] == original.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION", 1)
 
 
-def test_sealed_append_plans_extend_the_single_installed_migration_head():
-    """Preserve the complete sealed-append upgrade chain through the sole current head."""
-    config = Config(str(ROOT / "alembic.ini"))
-    config.set_main_option("script_location", str(ROOT / "alembic"))
-    script = ScriptDirectory.from_config(config)
-    revision = _plans_migration().revision
-    assert script.get_heads() == ["20261020200000_custom_import_manual_acceptance"]
+def _assert_custom_import_manual_acceptance_lineage(script):
+    """Preserve the joined custom-import verification and acceptance ancestry."""
+    assert script.get_revision("20261020210000_registry_manual_acceptance_join").down_revision == (
+        "20261020160000_registry_staged_verification_join",
+        "20261021110000_ptg_membership_import_idempotency",
+    )
+    assert script.get_revision("20261021110000_ptg_membership_import_idempotency").down_revision == (
+        "20261020200000_custom_import_manual_acceptance"
+    )
+    assert script.get_revision("20261020200000_custom_import_manual_acceptance").down_revision == (
+        "20261020190000_custom_import_verification_root_ranges"
+    )
+    assert script.get_revision("20261020190000_custom_import_verification_root_ranges").down_revision == (
+        "20261020180000_custom_import_verification_arms"
+    )
+    assert script.get_revision("20261020180000_custom_import_verification_arms").down_revision == (
+        "20261020150000_custom_import_staged_verification"
+    )
+    assert script.get_revision("20261020150000_custom_import_staged_verification").down_revision == (
+        "20261019010000_custom_import_build_continuation"
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261017010000_custom_import_raw_objects").down_revision == (
+        "20261017210000_provider_directory_readiness_indexes"
+    )
+    assert script.get_revision("20261017210000_provider_directory_readiness_indexes").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+
+
+def _assert_finality_migration_chain(script):
+    """Keep the exact accepted migration head and predecessor assertions."""
+    assert script.get_heads() == ["20261020210000_registry_manual_acceptance_join"]
+    _assert_custom_import_manual_acceptance_lineage(script)
+    assert (
+        script.get_revision("20261019030000_provider_directory_role_schema").down_revision
+        == "20261019020000_registry_continuation_join"
+    )
+    assert script.get_revision("20261019020000_registry_continuation_join").down_revision == (
+        "20261019010000_registry_raw_object_join",
+        "20261019010000_custom_import_build_continuation",
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261017020000_source_registry_snapshot_join").down_revision == (
+        "20261016060000_uhc_official_cohort_snapshots",
+        "20261017010000_registry_cms_source_notifications",
+    )
+    assert script.get_revision("20261017010000_registry_cms_source_notifications").down_revision == (
+        "20261016070000_registry_allowed_plan_scope"
+    )
+    assert script.get_revision("20261016070000_registry_allowed_plan_scope").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261016060000_uhc_official_cohort_snapshots").down_revision == (
+        "20261016050000_acquisition_validator_argument_types"
+    )
+    assert script.get_revision("20261015010000_plan_release_binding_cohorts").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261015020000_custom_import_query_projections").down_revision == (
+        "20261013010000_registry_custom_history_events"
+    )
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )
     assert script.get_revision("20261010030000_registry_source_admission_receipt").down_revision == (
         "20261010020000_registry_ptg_office_retention"
     )
+
+
+def test_sealed_append_plans_extend_the_single_installed_migration_head():
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    revision = _plans_migration().revision
+    _assert_finality_migration_chain(script)
     assert tuple(
         step.revision.revision for step in script._upgrade_revs("head", "20261001110000_profile_initial_publication")
-    ) == (revision, *_SEALED_APPEND_FOLLOWUP_REVISIONS)
+    ) == (revision, *_SEALED_APPEND_UPGRADE_TAIL)
 
 
 def test_sealed_append_plans_preserve_query_order_bindings_and_exact_dynamic_fallback():

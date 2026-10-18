@@ -14,7 +14,7 @@ class ManualLocationBindingConflict(ValueError):
 
 
 _PAIRS_SQL = """WITH pairs AS MATERIALIZED (
- SELECT member.provider_system,member.provider_id,member.location_id,
+ SELECT DISTINCT member.provider_system,member.provider_id,member.location_id,
    encode(sha256(convert_to(jsonb_build_array('network_custom',member.provider_system,
      member.provider_id,member.location_id)::text,'UTF8')),'hex') AS location_key
  FROM {stage} member JOIN {locations} location USING(location_id)
@@ -39,7 +39,7 @@ _CONFLICT_SQL = """SELECT EXISTS (
 
 
 async def retain_manual_location_bindings(connection, copy_bytes, row_count, relations_by_name):
-    """COPY one already validated batch and retain exact pairs without changing prior bindings."""
+    """COPY validated additions, preserving evidence duplicates and retaining exact pairs."""
     if not connection.is_in_transaction():
         raise ValueError("registry_requires_caller_transaction")
     if not row_count:
@@ -49,8 +49,7 @@ async def retain_manual_location_bindings(connection, copy_bytes, row_count, rel
     stage_relations_by_name = {**relations_by_name, "stage": stage}
     await connection.execute(f"""CREATE TEMP TABLE {stage} (
       network_id integer NOT NULL,provider_system text NOT NULL,provider_id text NOT NULL,
-      location_id uuid NOT NULL,evidence_id text NOT NULL,
-      PRIMARY KEY(provider_system,provider_id,location_id)) ON COMMIT DROP""")
+      location_id uuid NOT NULL,evidence_id text NOT NULL) ON COMMIT DROP""")
     with io.BytesIO(copy_bytes) as source:
         status = await connection.copy_to_table(
             stage_name, schema_name="pg_temp", columns=COPY_COLUMNS, format="binary", source=source

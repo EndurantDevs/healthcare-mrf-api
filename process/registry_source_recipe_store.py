@@ -141,24 +141,47 @@ def _decode_ownership(document):
     )
 
 
-def _decode_aca_pin(document):
-    document = _closed_document(document, PinnedACAMembershipSource)
-    prepared = document["prepared"]
+def _decode_aca_pin(pin_by_field):
+    fields_before = {field.name for field in fields(PinnedACAMembershipSource)} - {
+        "retained_successor",
+        "retained_epoch",
+    }
+    if type(pin_by_field) is not dict or set(pin_by_field) not in (
+        fields_before,
+        fields_before | {"retained_successor"},
+        fields_before | {"retained_epoch"},
+    ):
+        raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+    pin_by_field = dict(pin_by_field)
+    if "retained_successor" in pin_by_field:
+        successor = pin_by_field["retained_successor"]
+        if type(successor) is not dict or set(successor) != fields_before:
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+        pin_by_field["retained_successor"] = _decode_aca_pin(successor)
+    if "retained_epoch" in pin_by_field:
+        from process.registry_aca_global_epoch import decode_pinned_aca_global_epoch
+
+        pin_by_field["retained_epoch"] = decode_pinned_aca_global_epoch(pin_by_field["retained_epoch"])
+    prepared = pin_by_field["prepared"]
     if type(prepared) is not dict or set(prepared) != {"manifest", "ownership"}:
         raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-    if type(document["runtime_roles"]) is not list:
+    if type(pin_by_field["runtime_roles"]) is not list:
         raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-    if type(document["validation"]) is not dict or type(document["validation"].get("package_id")) is not str:
+    if type(pin_by_field["validation"]) is not dict or type(pin_by_field["validation"].get("package_id")) is not str:
         raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-    _oid(document["validation"].get("sealed_owner_oid"))
+    _oid(pin_by_field["validation"].get("sealed_owner_oid"))
     return PinnedACAMembershipSource(
         ReferenceFamilyPreparedSource(
             validate_reference_family_manifest(prepared["manifest"]),
             _decode_ownership(prepared["ownership"]),
         ),
-        validate_reference_family_validation_receipt(document["validation"]),
-        **{key: value for key, value in document.items() if key not in {"prepared", "validation", "runtime_roles"}},
-        runtime_roles=tuple(document["runtime_roles"]),
+        validate_reference_family_validation_receipt(pin_by_field["validation"]),
+        **{
+            key: field_value
+            for key, field_value in pin_by_field.items()
+            if key not in {"prepared", "validation", "runtime_roles"}
+        },
+        runtime_roles=tuple(pin_by_field["runtime_roles"]),
     )
 
 
@@ -225,6 +248,24 @@ def _recipe_document(recipe):
             "prepared": {"manifest": recipe.source_pin.prepared.manifest.as_dict(), "ownership": ownership_document},
             "validation": recipe.source_pin.validation.as_dict(),
         }
+    if type(recipe.source_pin) is PinnedACAMembershipSource and recipe.source_pin.retained_successor is not None:
+        successor = recipe.source_pin.retained_successor
+        source_by_field["retained_successor"] = _recipe_document(
+            RegistrySourceMembershipRecipe(
+                successor,
+                RegistryNetworkSourceCoordinates(
+                    **{
+                        key: coordinate_value
+                        for key, coordinate_value in successor.prepared.manifest.source_metadata[
+                            "network_bindings"
+                        ].items()
+                        if key != "source_key_kind"
+                    }
+                ),
+            )
+        )["source_pin"]
+    if type(recipe.source_pin) is PinnedACAMembershipSource and recipe.source_pin.retained_epoch is not None:
+        source_by_field["retained_epoch"] = recipe.source_pin.retained_epoch.as_dict()
     return {
         "source_kind": source_kind,
         "source_pin": source_by_field,
@@ -346,5 +387,5 @@ async def resolve_retained_registry_source_recipes(connection, pinned_manifest, 
         if candidate is None:
             raise RegistrySourceRecipeError("registry_source_recipes_unavailable")
         return verify_registry_source_recipes(dict(candidate))
-    except ValueError, TypeError, KeyError, UnicodeError, RecursionError, asyncpg.PostgresError:
-        raise RegistrySourceRecipeError("registry_source_recipes_unavailable") from None
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, asyncpg.PostgresError) as error:
+        raise RegistrySourceRecipeError("registry_source_recipes_unavailable") from error

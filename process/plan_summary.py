@@ -5,16 +5,16 @@ from __future__ import annotations
 import logging
 from typing import Any, Sequence
 
-from sqlalchemy import (Float, MetaData, and_, case, cast, func, or_, select,
-                        text)
+from sqlalchemy import Float, MetaData, and_, case, cast, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from db.connection import db
-from db.models import (Plan, PlanAttributes, PlanBenefits, PlanPrices,
-                       PlanSearchSummary)
+from db.models import Plan, PlanAttributes, PlanBenefits, PlanPrices, PlanSearchSummary
+from db.plan_release_storage import storage_identifier
 from process.ext.utils import ensure_database
-from process.mrf_publication_receipt import capture_summary_inputs, complete_publication, qualified
 from process.mrf_address_publication import lock_publication_family
+from process.mrf_publication_receipt import capture_summary_inputs, complete_publication, qualified
+from process.native_publication_read_access import preserve_publication_reads
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ PRICE_RATE_COLUMNS = (
     plan_prices_table.c.couple_and_three_or_more_dependents,
 )
 MIN_SENTINEL = 10**12
-MAX_SENTINEL = -10**12
+MAX_SENTINEL = -(10**12)
 ADULT_DENTAL_KEYWORDS = ("dental", "adult")
 CHILD_DENTAL_KEYWORDS = ("dental", "child")
 ADULT_VISION_KEYWORDS = (("vision", "adult"), ("eye", "adult"))
@@ -137,9 +137,12 @@ def _benefit_flag_case(keywords: Sequence[Sequence[str]] | Sequence[str]):
 def _attribute_payload_expr():
     return func.jsonb_agg(
         func.jsonb_build_object(
-            "attr_name", plan_attributes_table.c.attr_name,
-            "attr_value", plan_attributes_table.c.attr_value,
-            "full_plan_id", plan_attributes_table.c.full_plan_id,
+            "attr_name",
+            plan_attributes_table.c.attr_name,
+            "attr_value",
+            plan_attributes_table.c.attr_value,
+            "full_plan_id",
+            plan_attributes_table.c.full_plan_id,
         )
     ).filter(plan_attributes_table.c.attr_name.isnot(None))
 
@@ -147,25 +150,44 @@ def _attribute_payload_expr():
 def _benefit_payload_expr():
     return func.jsonb_agg(
         func.jsonb_build_object(
-            "plan_id", plan_benefits_table.c.plan_id,
-            "full_plan_id", plan_benefits_table.c.full_plan_id,
-            "benefit_name", plan_benefits_table.c.benefit_name,
-            "copay_inn_tier1", plan_benefits_table.c.copay_inn_tier1,
-            "copay_inn_tier2", plan_benefits_table.c.copay_inn_tier2,
-            "copay_outof_net", plan_benefits_table.c.copay_outof_net,
-            "coins_inn_tier1", plan_benefits_table.c.coins_inn_tier1,
-            "coins_inn_tier2", plan_benefits_table.c.coins_inn_tier2,
-            "coins_outof_net", plan_benefits_table.c.coins_outof_net,
-            "is_ehb", plan_benefits_table.c.is_ehb,
-            "is_covered", plan_benefits_table.c.is_covered,
-            "quant_limit_on_svc", plan_benefits_table.c.quant_limit_on_svc,
-            "limit_qty", plan_benefits_table.c.limit_qty,
-            "limit_unit", plan_benefits_table.c.limit_unit,
-            "exclusions", plan_benefits_table.c.exclusions,
-            "explanation", plan_benefits_table.c.explanation,
-            "ehb_var_reason", plan_benefits_table.c.ehb_var_reason,
-            "is_excl_from_inn_mo", plan_benefits_table.c.is_excl_from_inn_mo,
-            "is_excl_from_oon_mo", plan_benefits_table.c.is_excl_from_oon_mo,
+            "plan_id",
+            plan_benefits_table.c.plan_id,
+            "full_plan_id",
+            plan_benefits_table.c.full_plan_id,
+            "benefit_name",
+            plan_benefits_table.c.benefit_name,
+            "copay_inn_tier1",
+            plan_benefits_table.c.copay_inn_tier1,
+            "copay_inn_tier2",
+            plan_benefits_table.c.copay_inn_tier2,
+            "copay_outof_net",
+            plan_benefits_table.c.copay_outof_net,
+            "coins_inn_tier1",
+            plan_benefits_table.c.coins_inn_tier1,
+            "coins_inn_tier2",
+            plan_benefits_table.c.coins_inn_tier2,
+            "coins_outof_net",
+            plan_benefits_table.c.coins_outof_net,
+            "is_ehb",
+            plan_benefits_table.c.is_ehb,
+            "is_covered",
+            plan_benefits_table.c.is_covered,
+            "quant_limit_on_svc",
+            plan_benefits_table.c.quant_limit_on_svc,
+            "limit_qty",
+            plan_benefits_table.c.limit_qty,
+            "limit_unit",
+            plan_benefits_table.c.limit_unit,
+            "exclusions",
+            plan_benefits_table.c.exclusions,
+            "explanation",
+            plan_benefits_table.c.explanation,
+            "ehb_var_reason",
+            plan_benefits_table.c.ehb_var_reason,
+            "is_excl_from_inn_mo",
+            plan_benefits_table.c.is_excl_from_inn_mo,
+            "is_excl_from_oon_mo",
+            plan_benefits_table.c.is_excl_from_oon_mo,
         )
     ).filter(plan_benefits_table.c.benefit_name.isnot(None))
 
@@ -255,23 +277,38 @@ def _build_price_summary_subquery():
     )
 
 
-async def _ensure_summary_indexes() -> None:
-    schema = summary_table.schema
-    schema_prefix = f'"{schema}".' if schema else ""
-    qualified_table = f'{schema_prefix}"{summary_table.name}"'
-    for spec in getattr(PlanSearchSummary, "__my_additional_indexes__", []) or []:
+def _summary_index_specs(stage_name):
+    """Bind existing reviewed index declarations to distinct private-stage names."""
+    for ordinal, spec in enumerate(getattr(PlanSearchSummary, "__my_additional_indexes__", []) or []):
         columns = spec.get("index_elements")
-        if not columns:
-            continue
-        name = spec.get("name") or f"{summary_table.name}_{'_'.join(columns)}_idx"
+        if columns:
+            name = spec.get("name") or f"{summary_table.name}_{'_'.join(columns)}_idx"
+            yield f"{stage_name}_idx_{ordinal}", name, columns, spec
+
+
+async def _ensure_summary_indexes(session, schema, stage_name) -> None:
+    """Build and analyze only the loaded private heap before live cutover locks."""
+    target = qualified(str(schema), stage_name)
+    for stage_index, _, columns, spec in _summary_index_specs(stage_name):
+        index_name = storage_identifier(stage_index)
         using_clause = f" USING {spec['using']}" if spec.get("using") else ""
         where_clause = f" WHERE {spec['where']}" if spec.get("where") else ""
-        column_clause = ", ".join(columns)
-        stmt = (
-            f"CREATE INDEX IF NOT EXISTS {name} "
-            f"ON {qualified_table}{using_clause} ({column_clause}){where_clause};"
+        await session.execute(
+            text(f"CREATE INDEX {index_name} ON {target}{using_clause} ({', '.join(columns)}){where_clause}")
         )
-        await db.status(stmt)
+    await session.execute(text(f"ANALYZE {target}"))
+
+
+async def _publish_summary_index_names(session, schema, stage_name):
+    """Free fixed staging names after dropping the old heap; do metadata work only."""
+    for stage_index, live_index, _, _ in _summary_index_specs(stage_name):
+        target = qualified(str(schema), stage_index)
+        name = storage_identifier(live_index)
+        await session.execute(text(f"ALTER INDEX {target} RENAME TO {name}"))
+    target = qualified(str(schema), str(summary_table.name))
+    old_name = storage_identifier(f"{stage_name}_pkey")
+    new_name = storage_identifier(f"{summary_table.name}_pkey")
+    await session.execute(text(f"ALTER TABLE {target} RENAME CONSTRAINT {old_name} TO {new_name}"))
 
 
 async def _ensure_summary_columns() -> None:
@@ -288,6 +325,15 @@ async def _ensure_summary_columns() -> None:
         await db.status(stmt)
 
 
+async def _preserve_summary_reads(session, schema, stage_name):
+    """Carry established read/fence grants through this session's exact native swap."""
+    connection = await session.connection()
+    driver = (await connection.get_raw_connection()).driver_connection
+    await preserve_publication_reads(
+        driver, schema=str(schema), live_table=str(summary_table.name), stage_table=stage_name
+    )
+
+
 async def rebuild_plan_search_summary(test_mode: bool = False, *, publication=None) -> int:
     """
     Materialize plan_search_summary with pre-calculated filters so /plan/search can run without large joins.
@@ -295,7 +341,6 @@ async def rebuild_plan_search_summary(test_mode: bool = False, *, publication=No
     await ensure_database(test_mode)
     await db.create_table(summary_table, checkfirst=True)
     await _ensure_summary_columns()
-    await _ensure_summary_indexes()
 
     attr_subq = _build_attribute_summary_subquery()
     benefit_subq = _build_benefit_summary_subquery()
@@ -305,13 +350,14 @@ async def rebuild_plan_search_summary(test_mode: bool = False, *, publication=No
     temp_metadata = MetaData()
     temp_table = summary_table.tometadata(temp_metadata, name=temp_name)
     temp_table.schema = schema
+    temp_table.primary_key.name = f"{temp_name}_pkey"
 
     qualified_temp = f'"{schema}"."{temp_name}"'
     qualified_base = f'"{schema}"."{summary_table.name}"'
     qualified_backup = f'"{schema}"."{summary_table.name}_old"'
 
     async with db.session() as session:
-        await session.execute(text(f'DROP TABLE IF EXISTS {qualified_temp};'))
+        await session.execute(text(f"DROP TABLE IF EXISTS {qualified_temp};"))
 
     await db.create_table(temp_table, checkfirst=False)
 
@@ -328,40 +374,37 @@ async def rebuild_plan_search_summary(test_mode: bool = False, *, publication=No
         plan_table.c.year == price_subq.c.year,
     )
 
-    data_stmt = (
-        select(
-            plan_table.c.plan_id,
-            plan_table.c.year,
-            plan_table.c.state,
-            plan_table.c.issuer_id,
-            plan_table.c.marketing_name,
-            attr_subq.c.market_coverage,
-            func.coalesce(attr_subq.c.is_on_exchange, False).label("is_on_exchange"),
-            func.coalesce(attr_subq.c.is_off_exchange, False).label("is_off_exchange"),
-            func.coalesce(attr_subq.c.is_hsa, False).label("is_hsa"),
-            func.coalesce(attr_subq.c.is_dental_only, False).label("is_dental_only"),
-            func.coalesce(attr_subq.c.is_catastrophic, False).label("is_catastrophic"),
-            attr_subq.c.deductible_inn_individual,
-            attr_subq.c.moop_inn_individual,
-            price_subq.c.premium_min,
-            price_subq.c.premium_max,
-            attr_subq.c.plan_type,
-            attr_subq.c.metal_level,
-            attr_subq.c.csr_variation,
-            func.coalesce(benefit_subq.c.has_adult_dental, False).label("has_adult_dental"),
-            func.coalesce(benefit_subq.c.has_child_dental, False).label("has_child_dental"),
-            func.coalesce(benefit_subq.c.has_adult_vision, False).label("has_adult_vision"),
-            func.coalesce(benefit_subq.c.has_child_vision, False).label("has_child_vision"),
-            func.coalesce(benefit_subq.c.telehealth_supported, False).label("telehealth_supported"),
-            attr_subq.c.attributes,
-            benefit_subq.c.plan_benefits,
-            func.now().label("updated_at"),
-        )
-        .select_from(
-            plan_table.outerjoin(attr_subq, join_attr)
-            .outerjoin(benefit_subq, join_benefits)
-            .outerjoin(price_subq, join_prices)
-        )
+    data_stmt = select(
+        plan_table.c.plan_id,
+        plan_table.c.year,
+        plan_table.c.state,
+        plan_table.c.issuer_id,
+        plan_table.c.marketing_name,
+        attr_subq.c.market_coverage,
+        func.coalesce(attr_subq.c.is_on_exchange, False).label("is_on_exchange"),
+        func.coalesce(attr_subq.c.is_off_exchange, False).label("is_off_exchange"),
+        func.coalesce(attr_subq.c.is_hsa, False).label("is_hsa"),
+        func.coalesce(attr_subq.c.is_dental_only, False).label("is_dental_only"),
+        func.coalesce(attr_subq.c.is_catastrophic, False).label("is_catastrophic"),
+        attr_subq.c.deductible_inn_individual,
+        attr_subq.c.moop_inn_individual,
+        price_subq.c.premium_min,
+        price_subq.c.premium_max,
+        attr_subq.c.plan_type,
+        attr_subq.c.metal_level,
+        attr_subq.c.csr_variation,
+        func.coalesce(benefit_subq.c.has_adult_dental, False).label("has_adult_dental"),
+        func.coalesce(benefit_subq.c.has_child_dental, False).label("has_child_dental"),
+        func.coalesce(benefit_subq.c.has_adult_vision, False).label("has_adult_vision"),
+        func.coalesce(benefit_subq.c.has_child_vision, False).label("has_child_vision"),
+        func.coalesce(benefit_subq.c.telehealth_supported, False).label("telehealth_supported"),
+        attr_subq.c.attributes,
+        benefit_subq.c.plan_benefits,
+        func.now().label("updated_at"),
+    ).select_from(
+        plan_table.outerjoin(attr_subq, join_attr)
+        .outerjoin(benefit_subq, join_benefits)
+        .outerjoin(price_subq, join_prices)
     )
 
     insert_columns = [
@@ -403,16 +446,23 @@ async def rebuild_plan_search_summary(test_mode: bool = False, *, publication=No
         count_result = await session.execute(select(func.count()).select_from(temp_table))
         rowcount = count_result.scalar() or 0
 
-        await session.execute(text(f'DROP TABLE IF EXISTS {qualified_backup};'))
+        await _ensure_summary_indexes(session, schema, temp_name)
+        await _preserve_summary_reads(session, schema, temp_name)
+        await session.execute(text(f"DROP TABLE IF EXISTS {qualified_backup};"))
         await session.execute(text(f'ALTER TABLE IF EXISTS {qualified_base} RENAME TO "{summary_table.name}_old";'))
         await session.execute(text(f'ALTER TABLE {qualified_temp} RENAME TO "{summary_table.name}"'))
-        await session.execute(text(f'DROP TABLE IF EXISTS {qualified_backup};'))
+        await session.execute(text(f"DROP TABLE IF EXISTS {qualified_backup};"))
 
-        await _ensure_summary_indexes()
+        await _publish_summary_index_names(session, schema, temp_name)
         if publication:
             attempt, generation, address_resolution_performed = publication
             await complete_publication(
-                session, schema, attempt, generation, summary_inputs, address_resolution_performed,
+                session,
+                schema,
+                attempt,
+                generation,
+                summary_inputs,
+                address_resolution_performed,
             )
 
     logger.info("Rebuilt plan_search_summary with %s rows", rowcount)

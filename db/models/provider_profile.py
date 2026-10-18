@@ -41,11 +41,16 @@ _SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
 class CMSDoctorEducation(Base, JSONOutputMixin):
     """Distinct education assertions from one published CMS source file."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "cms_doctor_education"
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("npi", "education_key"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["npi", "education_key"]
 
@@ -61,11 +66,16 @@ class CMSDoctorEducation(Base, JSONOutputMixin):
 class CMSDoctorGroupSite(Base, JSONOutputMixin):
     """One source row at clinician, enrollment, group, and site grain."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "cms_doctor_group_site"
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("row_number"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_additional_indexes__ = [
         {"index_elements": ("npi",), "name": "npi"},

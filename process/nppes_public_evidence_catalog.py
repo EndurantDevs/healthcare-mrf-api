@@ -19,16 +19,13 @@ from process.nppes_public_evidence_rows import (
 )
 from process.nppes_public_evidence_writer_contract import writer_error
 
-
 _ADMISSION = "public_evidence_nppes_registry_admission"
 _ADMISSION_SEAL = "public_evidence_nppes_registry_admission_seal"
 _MEMBER = "public_evidence_nppes_registry_member"
 _CHAIN = "public_evidence_nppes_registry_chain_admission"
 _CHAIN_SEAL = "public_evidence_nppes_registry_chain_admission_seal"
 _CHAIN_ARCHIVE = "public_evidence_nppes_registry_chain_archive"
-_ADMISSION_VALIDATOR = (
-    "validate_public_evidence_nppes_registry_admission_lifecycle_v2"
-)
+_ADMISSION_VALIDATOR = "validate_public_evidence_nppes_registry_admission_lifecycle_v2"
 _CHAIN_VALIDATOR = "validate_public_evidence_nppes_chain_admission"
 _SOURCE_IDENTITY = "public_evidence_source_identity"
 _SOURCE_RELEASE = "public_evidence_source_release"
@@ -171,12 +168,13 @@ _REWIRED_FKS = {
 }
 
 
-async def _column_records(connection: object, schema: str) -> tuple[object, ...]:
+async def _column_records(connection: object, schema: str, tables=None) -> tuple[object, ...]:
     return tuple(
         await connection.fetch(
             "SELECT relation.relname, attribute.attname, "
             "format_type(attribute.atttypid, attribute.atttypmod) AS data_type, "
             "attribute.attnotnull, "
+            "attribute.attidentity::text AS identity_mode, attribute.attgenerated::text AS generated_mode, "
             "pg_get_expr(default_value.adbin, default_value.adrelid) AS default_expr "
             "FROM pg_class AS relation JOIN pg_namespace AS namespace "
             "ON namespace.oid=relation.relnamespace JOIN pg_attribute AS attribute "
@@ -186,7 +184,7 @@ async def _column_records(connection: object, schema: str) -> tuple[object, ...]
             "AND relation.relkind='r' AND attribute.attnum>0 "
             "AND NOT attribute.attisdropped ORDER BY relation.relname, attribute.attnum",
             schema,
-            list(_TABLE_COLUMNS),
+            list(_TABLE_COLUMNS if tables is None else tables),
         )
     )
 
@@ -194,9 +192,7 @@ async def _column_records(connection: object, schema: str) -> tuple[object, ...]
 def _has_exact_columns(column_records: tuple[object, ...]) -> bool:
     columns_by_table = {
         table_name: tuple(
-            column_record["attname"]
-            for column_record in column_records
-            if column_record["relname"] == table_name
+            column_record["attname"] for column_record in column_records if column_record["relname"] == table_name
         )
         for table_name in _TABLE_COLUMNS
     }
@@ -211,11 +207,7 @@ def _has_exact_columns(column_records: tuple[object, ...]) -> bool:
             is_nullable = table_name == _MEMBER and column_name in _NULLABLE_MEMBER_COLUMNS
             if column_record["attnotnull"] is is_nullable:
                 return False
-            expected_default = (
-                "transaction_timestamp()"
-                if column_name in {"created_at", "sealed_at"}
-                else None
-            )
+            expected_default = "transaction_timestamp()" if column_name in {"created_at", "sealed_at"} else None
             if column_record["default_expr"] != expected_default:
                 return False
         if column_name == "nppes_admission_ref":
@@ -247,24 +239,17 @@ async def _has_exact_constraints(connection: object, schema: str) -> bool:
         if constraint_record["relname"] in _NEW_TABLES
     }
     rewired_records = [
-        constraint_record
-        for constraint_record in constraint_records
-        if constraint_record["conname"] in _REWIRED_FKS
+        constraint_record for constraint_record in constraint_records if constraint_record["conname"] in _REWIRED_FKS
     ]
     return (
         new_names == _REQUIRED_NEW_CONSTRAINTS
-        and {
-            constraint_record["conname"]
-            for constraint_record in rewired_records
-        } == _REWIRED_FKS
+        and {constraint_record["conname"] for constraint_record in rewired_records} == _REWIRED_FKS
         and all(
-            constraint_record["convalidated"]
-            and constraint_record["conenforced"]
+            constraint_record["convalidated"] and constraint_record["conenforced"]
             for constraint_record in constraint_records
         )
         and all(
-            not constraint_record["condeferrable"]
-            and not constraint_record["condeferred"]
+            not constraint_record["condeferrable"] and not constraint_record["condeferred"]
             for constraint_record in constraint_records
             if constraint_record["contype"] == "f"
         )
@@ -279,25 +264,20 @@ def _classify_trigger_records(
     task_trigger_records = [
         trigger_record
         for trigger_record in trigger_records
-        if trigger_record["relname"] in _NEW_TABLES
-        or trigger_record["relname"] in _APPEND_TABLES
+        if trigger_record["relname"] in _NEW_TABLES or trigger_record["relname"] in _APPEND_TABLES
     ]
     integrity_trigger_records = [
-        trigger_record
-        for trigger_record in task_trigger_records
-        if "integrity_guard" in trigger_record["tgname"]
+        trigger_record for trigger_record in task_trigger_records if "integrity_guard" in trigger_record["tgname"]
     ]
     append_trigger_records = [
         trigger_record
         for trigger_record in task_trigger_records
-        if trigger_record["relname"] in _APPEND_TABLES
-        and trigger_record["tgtype"] == 4
+        if trigger_record["relname"] in _APPEND_TABLES and trigger_record["tgtype"] == 4
     ]
     immutable_trigger_records = [
         trigger_record
         for trigger_record in task_trigger_records
-        if trigger_record["relname"] in _NEW_TABLES
-        and trigger_record["tgtype"] in {27, 34}
+        if trigger_record["relname"] in _NEW_TABLES and trigger_record["tgtype"] in {27, 34}
     ]
     return (
         task_trigger_records,
@@ -308,21 +288,24 @@ def _classify_trigger_records(
 
 
 async def _trigger_records(connection: object, schema: str) -> list[object]:
-    return list(await connection.fetch(
-        "SELECT relation.relname, trigger_record.tgname, trigger_record.tgtype::integer, "
-        "trigger_record.tgenabled::text, trigger_record.tgdeferrable, "
-        "trigger_record.tginitdeferred, procedure_namespace.nspname AS function_schema, "
-        "procedure.proname AS function_name, procedure.prosecdef AS security_definer, "
-        "procedure.proconfig = ARRAY['search_path=pg_catalog']::text[] "
-        "AS exact_search_path "
-        "FROM pg_trigger AS trigger_record JOIN pg_class AS relation "
-        "ON relation.oid=trigger_record.tgrelid JOIN pg_namespace AS namespace "
-        "ON namespace.oid=relation.relnamespace JOIN pg_proc AS procedure "
-        "ON procedure.oid=trigger_record.tgfoid JOIN pg_namespace AS procedure_namespace "
-        "ON procedure_namespace.oid=procedure.pronamespace WHERE namespace.nspname=$1 "
-        "AND NOT trigger_record.tgisinternal",
-        schema,
-    ))
+    return list(
+        await connection.fetch(
+            "SELECT relation.relname, trigger_record.tgname, trigger_record.tgtype::integer, "
+            "trigger_record.tgenabled::text, trigger_record.tgdeferrable, "
+            "trigger_record.tginitdeferred, procedure_namespace.nspname AS function_schema, "
+            "procedure.proname AS function_name, procedure.prosecdef AS security_definer, "
+            "trigger_record.tgnewtable::text AS new_table, trigger_record.tgoldtable::text AS old_table, "
+            "procedure.proconfig = ARRAY['search_path=pg_catalog']::text[] "
+            "AS exact_search_path "
+            "FROM pg_trigger AS trigger_record JOIN pg_class AS relation "
+            "ON relation.oid=trigger_record.tgrelid JOIN pg_namespace AS namespace "
+            "ON namespace.oid=relation.relnamespace JOIN pg_proc AS procedure "
+            "ON procedure.oid=trigger_record.tgfoid JOIN pg_namespace AS procedure_namespace "
+            "ON procedure_namespace.oid=procedure.pronamespace WHERE namespace.nspname=$1 "
+            "AND NOT trigger_record.tgisinternal",
+            schema,
+        )
+    )
 
 
 async def _has_exact_triggers(connection: object, schema: str) -> bool:
@@ -335,10 +318,7 @@ async def _has_exact_triggers(connection: object, schema: str) -> bool:
         append_trigger_records,
         immutable_trigger_records,
     ) = _classify_trigger_records(trigger_records)
-    old_names = {
-        f"{table_name}_integrity_guard"
-        for table_name in (_COMMON, _SOURCE_LINK, _TYPED)
-    }
+    old_names = {f"{table_name}_integrity_guard" for table_name in (_COMMON, _SOURCE_LINK, _TYPED)}
     expected_integrity_function_by_table = {
         _ADMISSION: _ADMISSION_VALIDATOR,
         _CHAIN: _CHAIN_VALIDATOR,
@@ -346,23 +326,11 @@ async def _has_exact_triggers(connection: object, schema: str) -> bool:
     return (
         len(integrity_trigger_records) == 2
         and len(append_trigger_records) == len(_APPEND_TABLES)
-        and {
-            trigger_record["relname"]
-            for trigger_record in append_trigger_records
-        } == set(_APPEND_TABLES)
+        and {trigger_record["relname"] for trigger_record in append_trigger_records} == set(_APPEND_TABLES)
         and len(immutable_trigger_records) == 2 * len(_NEW_TABLES)
-        and not any(
-            trigger_record["tgname"] in old_names
-            for trigger_record in trigger_records
-        )
-        and all(
-            trigger_record["tgenabled"] == "A"
-            for trigger_record in task_trigger_records
-        )
-        and all(
-            trigger_record["function_schema"] == schema
-            for trigger_record in task_trigger_records
-        )
+        and not any(trigger_record["tgname"] in old_names for trigger_record in trigger_records)
+        and all(trigger_record["tgenabled"] == "A" for trigger_record in task_trigger_records)
+        and all(trigger_record["function_schema"] == schema for trigger_record in task_trigger_records)
         and all(
             trigger_record["tgtype"] == 5
             and trigger_record["tgdeferrable"]
@@ -371,10 +339,8 @@ async def _has_exact_triggers(connection: object, schema: str) -> bool:
             and trigger_record["exact_search_path"]
             for trigger_record in integrity_trigger_records
         )
-        and {
-            trigger_record["relname"]: trigger_record["function_name"]
-            for trigger_record in integrity_trigger_records
-        } == expected_integrity_function_by_table
+        and {trigger_record["relname"]: trigger_record["function_name"] for trigger_record in integrity_trigger_records}
+        == expected_integrity_function_by_table
     )
 
 
@@ -434,4 +400,331 @@ async def assert_nppes_admission_catalog(connection: object, schema: str) -> Non
     raise normalized_error
 
 
-__all__ = ("assert_nppes_admission_catalog",)
+_STORAGE = "public_evidence_nppes_registry_storage"
+_CONTROL_TABLES = (_SOURCE_IDENTITY, _SOURCE_RELEASE, _ADMISSION, _ADMISSION_SEAL, _CHAIN, _CHAIN_SEAL, _CHAIN_ARCHIVE)
+_CONTROL_COLUMNS = {table: _TABLE_COLUMNS[table] for table in _CONTROL_TABLES}
+_CONTROL_COLUMNS[_STORAGE] = (
+    "admission_ref",
+    "source_release_ref",
+    "candidate_storage_json",
+    "created_at",
+    "updated_at",
+)
+_CONTROL_TYPES = {
+    **_NEW_TYPE_BY_COLUMN,
+    "identity_ref": "character varying(49)",
+    "identity_kind": "character varying(24)",
+    "content_identity_kind": "character varying(96)",
+    "content_sha256": "bytea",
+    "foundation_scope": "character varying(64)",
+    "authority_classification": "character varying(96)",
+    "trust_classification": "character varying(96)",
+    "semantic_limits": "text[]",
+    "artifact_identity_ref": "character varying(49)",
+    "artifact_identity_kind": "character varying(24)",
+    "artifact_content_identity_kind": "character varying(96)",
+    "artifact_content_sha256": "bytea",
+    "completeness_mode": "character varying(32)",
+    "completeness_evidence_contract_id": "character varying(96)",
+    "completeness_count_unit": "character varying(96)",
+    "completeness_subject_sha256": "bytea",
+    "expected_record_count": "bigint",
+    "observed_record_count": "bigint",
+    "rights_classification": "character varying(96)",
+    "source_binding_contract_id": "character varying(64)",
+    "source_artifact_source_type": "character varying(64)",
+    "source_artifact_identity_kind": "character varying(96)",
+    "source_artifact_sha256": "bytea",
+    "source_binding_sha256": "bytea",
+    "shadow_bundle_binding_sha256": "bytea",
+    "observed_start_at": "timestamp with time zone",
+    "observed_end_at": "timestamp with time zone",
+    "effective_start_at": "timestamp with time zone",
+    "effective_end_at": "timestamp with time zone",
+    "import_run_ref": "character varying(50)",
+    "lifecycle_state": "character varying(24)",
+    "current_pointer_authority": "character varying(16)",
+    "candidate_storage_json": "jsonb",
+    "updated_at": "timestamp with time zone",
+}
+_NULLABLE_RELEASE = {
+    "expected_record_count",
+    "source_binding_contract_id",
+    "source_artifact_source_type",
+    "source_artifact_identity_kind",
+    "source_artifact_sha256",
+    "source_binding_sha256",
+    "shadow_bundle_binding_sha256",
+    "effective_end_at",
+}
+_CONTROL_CONSTRAINTS = (
+    {name for name in _REQUIRED_NEW_CONSTRAINTS if not name.startswith(_MEMBER + "_")}
+    | {_SOURCE_IDENTITY + "_" + suffix for suffix in ("pkey", "content_key", "owner_key", "shape_check")}
+    | {
+        _SOURCE_RELEASE + "_" + suffix
+        for suffix in (
+            "pkey",
+            "import_run_key",
+            "contract_key",
+            "owner_key",
+            "artifact_fkey",
+            "fixed_check",
+            "digest_check",
+            "count_check",
+            "interval_check",
+            "policy_check",
+            "reference_check",
+            "kind_owner_key",
+        )
+    }
+    | {_STORAGE + "_pkey", _STORAGE + "_source_release_ref_key", _STORAGE + "_object_check"}
+)
+_CONTROL_FOREIGN_KEYS = {
+    _SOURCE_RELEASE + "_artifact_fkey": (
+        _SOURCE_RELEASE,
+        (
+            "artifact_identity_ref",
+            "artifact_identity_kind",
+            "artifact_content_identity_kind",
+            "artifact_content_sha256",
+        ),
+        _SOURCE_IDENTITY,
+        SOURCE_IDENTITY_COLUMNS,
+    ),
+    _ADMISSION + "_release_fkey": (
+        _ADMISSION,
+        ("source_release_ref", "source_release_contract_sha256", "source_kind"),
+        _SOURCE_RELEASE,
+        ("source_release_ref", "contract_sha256", "source_kind"),
+    ),
+    _ADMISSION_SEAL + "_parent_fkey": (_ADMISSION_SEAL, ("admission_ref",), _ADMISSION, ("admission_ref",)),
+    _CHAIN_SEAL + "_parent_fkey": (_CHAIN_SEAL, ("chain_ref",), _CHAIN, ("chain_ref",)),
+    _CHAIN_ARCHIVE + "_parent_fkey": (
+        _CHAIN_ARCHIVE,
+        ("chain_ref", "archive_count"),
+        _CHAIN,
+        ("chain_ref", "archive_count"),
+    ),
+    _CHAIN_ARCHIVE + "_admission_fkey": (
+        _CHAIN_ARCHIVE,
+        (
+            "admission_ref",
+            "source_release_ref",
+            "archive_name",
+            "snapshot_at",
+            "artifact_sha256",
+            "manifest_sha256",
+            "source_record_count",
+            "projected_record_count",
+            "excluded_record_count",
+        ),
+        _ADMISSION,
+        (
+            "admission_ref",
+            "source_release_ref",
+            "archive_name",
+            "snapshot_at",
+            "artifact_sha256",
+            "manifest_sha256",
+            "source_record_count",
+            "projected_record_count",
+            "excluded_record_count",
+        ),
+    ),
+}
+_CONTROL_KEYS = {
+    _SOURCE_IDENTITY + "_pkey": (_SOURCE_IDENTITY, "p", ("identity_ref",)),
+    _SOURCE_IDENTITY + "_content_key": (_SOURCE_IDENTITY, "u", SOURCE_IDENTITY_COLUMNS[1:]),
+    _SOURCE_IDENTITY + "_owner_key": (_SOURCE_IDENTITY, "u", SOURCE_IDENTITY_COLUMNS),
+    _SOURCE_RELEASE + "_pkey": (_SOURCE_RELEASE, "p", ("source_release_ref",)),
+    _SOURCE_RELEASE + "_import_run_key": (_SOURCE_RELEASE, "u", ("import_run_ref",)),
+    _SOURCE_RELEASE + "_contract_key": (_SOURCE_RELEASE, "u", ("contract_sha256",)),
+    _SOURCE_RELEASE + "_owner_key": (_SOURCE_RELEASE, "u", ("source_release_ref", "contract_sha256")),
+    _SOURCE_RELEASE + "_kind_owner_key": (
+        _SOURCE_RELEASE,
+        "u",
+        ("source_release_ref", "contract_sha256", "source_kind"),
+    ),
+    _ADMISSION + "_pkey": (_ADMISSION, "p", ("admission_ref",)),
+    _ADMISSION + "_release_key": (_ADMISSION, "u", ("source_release_ref",)),
+    _ADMISSION + "_owner_key": (
+        _ADMISSION,
+        "u",
+        ("admission_ref", "source_release_ref", "source_release_contract_sha256", "source_kind"),
+    ),
+    _ADMISSION + "_chain_owner_key": (_ADMISSION, "u", _CONTROL_FOREIGN_KEYS[_CHAIN_ARCHIVE + "_admission_fkey"][3]),
+    _ADMISSION_SEAL + "_pkey": (_ADMISSION_SEAL, "p", ("admission_ref",)),
+    _CHAIN + "_pkey": (_CHAIN, "p", ("chain_ref",)),
+    _CHAIN + "_owner_key": (_CHAIN, "u", ("chain_ref", "archive_count")),
+    "public_evidence_nppes_registry_chain_listing_key": (_CHAIN, "u", ("listing_sha256",)),
+    _CHAIN_SEAL + "_pkey": (_CHAIN_SEAL, "p", ("chain_ref",)),
+    _CHAIN_ARCHIVE + "_pkey": (_CHAIN_ARCHIVE, "p", ("chain_ref", "archive_ordinal")),
+    **{
+        _CHAIN_ARCHIVE + "_" + label + "_key": (_CHAIN_ARCHIVE, "u", ("chain_ref", column))
+        for label, column in (
+            ("admission", "admission_ref"),
+            ("release", "source_release_ref"),
+            ("name", "archive_name"),
+            ("artifact", "artifact_sha256"),
+            ("manifest", "manifest_sha256"),
+        )
+    },
+    _STORAGE + "_pkey": (_STORAGE, "p", ("admission_ref",)),
+    _STORAGE + "_source_release_ref_key": (_STORAGE, "u", ("source_release_ref",)),
+}
+
+
+def _has_candidate_columns(records):
+    if {record["relname"] for record in records} != set(_CONTROL_COLUMNS):
+        return False
+    for table, expected in _CONTROL_COLUMNS.items():
+        columns = [record for record in records if record["relname"] == table]
+        if tuple(record["attname"] for record in columns) != expected:
+            return False
+        for record in columns:
+            column = record["attname"]
+            is_nullable = table == _SOURCE_RELEASE and column in _NULLABLE_RELEASE
+            default = "transaction_timestamp()" if column in {"created_at", "updated_at", "sealed_at"} else None
+            if (
+                record["data_type"] != _CONTROL_TYPES[column]
+                or record["attnotnull"] is is_nullable
+                or record["default_expr"] != default
+                or record.get("identity_mode", "") != ""
+                or record.get("generated_mode", "") != ""
+            ):
+                return False
+    return True
+
+
+async def _candidate_constraints(connection, schema):
+    return await connection.fetch(
+        "SELECT c.relname,k.conname,k.contype::text,k.condeferrable,k.condeferred,k.convalidated,k.conenforced,"
+        "pn.nspname AS parent_schema,p.relname AS parent_table,k.confdeltype::text,k.confupdtype::text,"
+        "k.confmatchtype::text,ARRAY(SELECT a.attname::text FROM unnest(k.conkey) WITH ORDINALITY f(num,pos) "
+        "JOIN pg_attribute a ON a.attrelid=k.conrelid AND a.attnum=f.num ORDER BY f.pos) AS columns,"
+        "ARRAY(SELECT a.attname::text FROM unnest(k.confkey) WITH ORDINALITY f(num,pos) "
+        "JOIN pg_attribute a ON a.attrelid=k.confrelid AND a.attnum=f.num ORDER BY f.pos) AS parent_columns "
+        "FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "LEFT JOIN pg_class p ON p.oid=k.confrelid LEFT JOIN pg_namespace pn ON pn.oid=p.relnamespace "
+        "WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND k.contype NOT IN ('n','t')",
+        schema,
+        list(_CONTROL_COLUMNS),
+    )
+
+
+def _has_candidate_constraints(prepared_records, schema):
+    if {catalog_record["conname"] for catalog_record in prepared_records} != _CONTROL_CONSTRAINTS or len(
+        prepared_records
+    ) != len(_CONTROL_CONSTRAINTS):
+        return False
+    foreign_by_key = {}
+    keys_by_key = {}
+    for catalog_record in prepared_records:
+        if (
+            catalog_record["relname"] not in _CONTROL_COLUMNS
+            or catalog_record["contype"] not in {"p", "u", "c", "f"}
+            or not catalog_record["convalidated"]
+            or not catalog_record["conenforced"]
+            or catalog_record["condeferrable"]
+            or catalog_record["condeferred"]
+        ):
+            return False
+        if catalog_record["contype"] == "f":
+            if (
+                catalog_record["parent_schema"] != schema
+                or catalog_record["confdeltype"] != "r"
+                or catalog_record["confupdtype"] != "a"
+                or catalog_record["confmatchtype"] != "s"
+            ):
+                return False
+            foreign_by_key[catalog_record["conname"]] = (
+                catalog_record["relname"],
+                tuple(catalog_record["columns"]),
+                catalog_record["parent_table"],
+                tuple(catalog_record["parent_columns"]),
+            )
+        elif catalog_record["contype"] in {"p", "u"}:
+            keys_by_key[catalog_record["conname"]] = (
+                catalog_record["relname"],
+                catalog_record["contype"],
+                tuple(catalog_record["columns"]),
+            )
+    return foreign_by_key == _CONTROL_FOREIGN_KEYS and keys_by_key == _CONTROL_KEYS
+
+
+def _candidate_triggers():
+    expected_by_key = {}
+    for table in _CONTROL_TABLES:
+        for suffix, kind in (("mutation_guard", 27), ("truncate_guard", 34)):
+            expected_by_key[table, (table + "_" + suffix)[:63]] = (
+                kind,
+                "guard_public_evidence_immutable_catalog",
+                False,
+                False,
+                True,
+                None,
+            )
+    expected_by_key[_CHAIN, "public_evidence_nppes_registry_chain_integrity_guard"] = (
+        5,
+        _CHAIN_VALIDATOR,
+        True,
+        True,
+        True,
+        None,
+    )
+    expected_by_key[_CHAIN_ARCHIVE, (_CHAIN_ARCHIVE + "_admission_append_guard")[:63]] = (
+        4,
+        ("guard_" + _CHAIN_ARCHIVE + "_admission_append")[:63],
+        False,
+        False,
+        True,
+        "inserted_rows",
+    )
+    return expected_by_key
+
+
+def _has_candidate_triggers(records, schema):
+    records = [record for record in records if record["relname"] in _CONTROL_COLUMNS]
+    expected = _candidate_triggers()
+    if len(records) != len(expected) or {(record["relname"], record["tgname"]) for record in records} != set(expected):
+        return False
+    for record in records:
+        actual = (
+            record["tgtype"],
+            record["function_name"],
+            record["tgdeferrable"],
+            record["tginitdeferred"],
+            record["security_definer"],
+            record["new_table"],
+        )
+        if (
+            actual != expected[record["relname"], record["tgname"]]
+            or record["function_schema"] != schema
+            or record["tgenabled"] != "A"
+            or not record["exact_search_path"]
+            or record["old_table"] is not None
+        ):
+            return False
+    return True
+
+
+async def assert_nppes_candidate_catalog(connection, schema, policy):
+    """Require authenticated control custody before accepting retired archive guards."""
+    try:
+        from process.nppes_public_evidence_control_custody import assert_nppes_control_custody
+
+        await assert_nppes_control_custody(connection, schema, policy)
+        if (
+            not _has_candidate_columns(await _column_records(connection, schema, _CONTROL_COLUMNS))
+            or not _has_candidate_constraints(await _candidate_constraints(connection, schema), schema)
+            or not _has_candidate_triggers(await _trigger_records(connection, schema), schema)
+        ):
+            raise writer_error()
+    except Exception:
+        normalized_error = writer_error()
+    else:
+        return
+    raise normalized_error
+
+
+__all__ = ("assert_nppes_admission_catalog", "assert_nppes_candidate_catalog")

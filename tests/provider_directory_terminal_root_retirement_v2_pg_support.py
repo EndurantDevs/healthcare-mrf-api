@@ -13,18 +13,14 @@ import pytest
 from db import (
     migration_provider_directory_terminal_root_retirement_guards as legacy_guards,
 )
+from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from tests.provider_directory_terminal_root_retirement_pg_support import (
     RetirementPostgres,
     SqlCapture,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = (
-    ROOT
-    / "alembic/versions"
-    / "20260810120000_provider_directory_terminal_root_retirement_v2.py"
-)
+MIGRATION_PATH = ROOT / "alembic/versions" / "20260810120000_provider_directory_terminal_root_retirement_v2.py"
 
 
 def load_v2_migration() -> Any:
@@ -45,14 +41,21 @@ async def run_v2_migration(
     migration: Any,
     action: str,
 ) -> None:
-    """Execute captured migration statements atomically."""
+    """Execute all captured SQL on the scenario's authentic actor in one transaction."""
 
     capture = SqlCapture()
     migration.op = capture
     getattr(migration, action)()
-    async with scenario.connection.transaction():
+    if scenario.database is None:
+        async with scenario.connection.transaction():
+            for statement in capture.statements:
+                await scenario.connection.execute(statement)
+        return
+    async with source_transaction(scenario.database, isolation="read committed"):
+        publisher = bound_publisher()
+        assert publisher.policy.schema == scenario.schema_name
         for statement in capture.statements:
-            await scenario.connection.execute(statement)
+            await publisher.connection.execute(statement)
 
 
 async def retirement_trigger_state(
@@ -130,7 +133,7 @@ def drop_trigger_sql(
 ) -> str:
     """Return one exact trigger-drop mutation."""
 
-    return f'DROP TRIGGER "{trigger_name}" ON ' f'{scenario.schema}."{table_name}"'
+    return f'DROP TRIGGER "{trigger_name}" ON {scenario.schema}."{table_name}"'
 
 
 def disable_trigger_sql(
@@ -140,10 +143,7 @@ def disable_trigger_sql(
 ) -> str:
     """Return one exact trigger-disable mutation."""
 
-    return (
-        f'ALTER TABLE {scenario.schema}."{table_name}" '
-        f'DISABLE TRIGGER "{trigger_name}"'
-    )
+    return f'ALTER TABLE {scenario.schema}."{table_name}" DISABLE TRIGGER "{trigger_name}"'
 
 
 def function_signature_sql(

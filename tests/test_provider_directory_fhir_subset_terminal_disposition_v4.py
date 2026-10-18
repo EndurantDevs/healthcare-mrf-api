@@ -8,11 +8,14 @@ from copy import deepcopy
 
 import pytest
 
+from process import provider_directory_fhir_subset_terminal_disposition as facade
+from process import (
+    provider_directory_fhir_subset_terminal_disposition_v4_selection as v4_selection,
+)
 from process.provider_directory_fhir_subset_terminal_disposition import (
     dispose_v4_census_drift_root,
     require_v4_disposition_gate,
 )
-from process import provider_directory_fhir_subset_terminal_disposition as facade
 from process.provider_directory_fhir_subset_terminal_disposition_contract import (
     TERMINAL_DISPOSITION_METADATA_KEY,
     ReviewedSubsetTerminalDispositionError,
@@ -29,30 +32,24 @@ from process.provider_directory_fhir_subset_terminal_disposition_profile import 
     TERMINAL_CENSUS_DRIFT_DISPOSITION,
     VERIFIED_COMPLETE_DISPOSITION,
 )
-from process.provider_directory_fhir_subset_terminal_disposition_store import (
-    sync_v4_terminal_disposition,
-)
 from process.provider_directory_fhir_subset_terminal_disposition_selection import (
     _locked_candidate_row as locked_legacy_candidate_row,
 )
-from process.provider_directory_fhir_subset_terminal_disposition_v4_selection import (
-    selected_direct_v4_terminal_disposition,
+from process.provider_directory_fhir_subset_terminal_disposition_store import (
+    sync_v4_terminal_disposition,
 )
 from process.provider_directory_fhir_subset_terminal_disposition_v4_contract import (
     validated_direct_v4_terminal_marker,
 )
-from process import (
-    provider_directory_fhir_subset_terminal_disposition_v4_selection
-    as v4_selection,
+from process.provider_directory_fhir_subset_terminal_disposition_v4_selection import (
+    selected_direct_v4_terminal_disposition,
 )
 from tests.provider_directory_fhir_subset_terminal_disposition_v4_support import (
     DirectV4TerminalDatabase,
 )
+from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
-
-_SYNTHETIC_MARKER_SHA256 = (
-    "e75f1f8addca0bc3079bb164baa6dc7bf39e0e424a0c8f8c53d2a3cdeae96489"
-)
+_SYNTHETIC_MARKER_SHA256 = "e75f1f8addca0bc3079bb164baa6dc7bf39e0e424a0c8f8c53d2a3cdeae96489"
 
 
 @pytest.fixture(autouse=True)
@@ -75,14 +72,8 @@ def _proof_copies(database: DirectV4TerminalDatabase, resource_type: str):
         source_metadata["last_resource_import"]["resources"],
     )
     for diagnostics_by_type in diagnostic_copies:
-        yield diagnostics_by_type[resource_type][
-            "server_issued_subset_completeness"
-        ]
-    checkpoint = next(
-        row
-        for row in database.checkpoint_rows
-        if row["resource_type"] == resource_type
-    )
+        yield diagnostics_by_type[resource_type]["server_issued_subset_completeness"]
+    checkpoint = next(row for row in database.checkpoint_rows if row["resource_type"] == resource_type)
     yield checkpoint["completeness_json"]
 
 
@@ -96,18 +87,10 @@ def test_direct_v4_profile_is_the_exact_final_four_three_partition():
     )
     assert len(DIRECT_V4_VERIFIED_RESOURCE_TYPES) == 4
     assert DIRECT_V4_DISPOSITION_BY_RESOURCE_TYPE == {
-        **{
-            resource_type: VERIFIED_COMPLETE_DISPOSITION
-            for resource_type in DIRECT_V4_VERIFIED_RESOURCE_TYPES
-        },
-        **{
-            resource_type: TERMINAL_CENSUS_DRIFT_DISPOSITION
-            for resource_type in DIRECT_V4_DRIFT_RESOURCE_TYPES
-        },
+        **{resource_type: VERIFIED_COMPLETE_DISPOSITION for resource_type in DIRECT_V4_VERIFIED_RESOURCE_TYPES},
+        **{resource_type: TERMINAL_CENSUS_DRIFT_DISPOSITION for resource_type in DIRECT_V4_DRIFT_RESOURCE_TYPES},
     }
-    assert DIRECT_V4_TERMINAL_MARKER_SHA256 == (
-        "e6f19eb70f8b5a84c76e61c19c379541bb6865b7de3114de01dd2a32181cb299"
-    )
+    assert DIRECT_V4_TERMINAL_MARKER_SHA256 == ("e6f19eb70f8b5a84c76e61c19c379541bb6865b7de3114de01dd2a32181cb299")
 
 
 def test_direct_v4_gate_is_exact_and_default_off(monkeypatch):
@@ -141,8 +124,7 @@ async def test_selector_builds_exact_direct_v4_marker():
 
     marker = validated_terminal_disposition_marker(selection.marker_by_field)
     disposition_by_type = {
-        resource_type: resource["disposition"]
-        for resource_type, resource in marker["resource_dispositions"].items()
+        resource_type: resource["disposition"] for resource_type, resource in marker["resource_dispositions"].items()
     }
     assert marker["contract_version"] == DIRECT_V4_CONTRACT_VERSION
     assert disposition_by_type == DIRECT_V4_DISPOSITION_BY_RESOURCE_TYPE
@@ -264,26 +246,24 @@ async def test_direct_v4_facade_redacts_catalog_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_single_existing_transaction_disposes_then_replays():
-    database = DirectV4TerminalDatabase()
+async def test_single_existing_transaction_disposes_then_replays(monkeypatch):
+    domain = DirectV4TerminalDatabase()
+    async with synthetic_source_database(monkeypatch, domain, schema="mrf") as database:
+        first = await sync_v4_terminal_disposition(
+            database,
+            "source-a",
+        )
+        second = await sync_v4_terminal_disposition(
+            database,
+            "source-a",
+        )
 
-    first = await sync_v4_terminal_disposition(
-        database,
-        "source-a",
-    )
-    second = await sync_v4_terminal_disposition(
-        database,
-        "source-a",
-    )
-
-    assert first.disposed is True
-    assert second.disposed is False
-    assert database.candidate_row["status"] == "acquisition_abandoned"
-    marker = database.candidate_row["publication_metadata_json"][
-        TERMINAL_DISPOSITION_METADATA_KEY
-    ]
-    assert marker["contract_version"] == DIRECT_V4_CONTRACT_VERSION
-    assert sum(call[0] == "transaction" and call[1] == "begin" for call in database.calls) == 2
+        assert first.disposed is True
+        assert second.disposed is False
+        assert database.candidate_row["status"] == "acquisition_abandoned"
+        marker = database.candidate_row["publication_metadata_json"][TERMINAL_DISPOSITION_METADATA_KEY]
+        assert marker["contract_version"] == DIRECT_V4_CONTRACT_VERSION
+        assert sum(call[0] == "transaction" and call[1] == "begin" for call in database.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -293,10 +273,7 @@ async def test_historical_v1_disposition_cannot_mask_failed_v4_candidate():
     historical["dataset_id"] = "historical-dataset"
     historical["status"] = "acquisition_abandoned"
     historical["publication_metadata_json"][TERMINAL_DISPOSITION_METADATA_KEY] = {
-        "contract_version": (
-            "healthporta.provider-directory.reviewed-subset-terminal-"
-            "disposition.v1"
-        )
+        "contract_version": ("healthporta.provider-directory.reviewed-subset-terminal-disposition.v1")
     }
     database.candidate_rows.insert(0, historical)
 
@@ -318,34 +295,30 @@ async def test_historical_v1_disposition_cannot_mask_failed_v4_candidate():
 
 
 @pytest.mark.asyncio
-async def test_v1_and_v2_replay_select_their_own_inner_contract():
-    database = DirectV4TerminalDatabase()
-    await sync_v4_terminal_disposition(
-        database,
-        "source-a",
-    )
-    historical = deepcopy(database.candidate_row)
-    historical["dataset_id"] = "historical-dataset"
-    historical["publication_metadata_json"][TERMINAL_DISPOSITION_METADATA_KEY] = {
-        "contract_version": (
-            "healthporta.provider-directory.reviewed-subset-terminal-"
-            "disposition.v1"
+async def test_v1_and_v2_replay_select_their_own_inner_contract(monkeypatch):
+    domain = DirectV4TerminalDatabase()
+    async with synthetic_source_database(monkeypatch, domain, schema="mrf") as database:
+        await sync_v4_terminal_disposition(
+            database,
+            "source-a",
         )
-    }
-    database.candidate_rows.insert(0, historical)
+        historical = deepcopy(database.candidate_row)
+        historical["dataset_id"] = "historical-dataset"
+        historical["publication_metadata_json"][TERMINAL_DISPOSITION_METADATA_KEY] = {
+            "contract_version": ("healthporta.provider-directory.reviewed-subset-terminal-disposition.v1")
+        }
+        database.candidate_rows.insert(0, historical)
 
-    direct_selection, direct_rows = (
-        await selected_direct_v4_terminal_disposition(database, "source-a")
-    )
-    legacy_candidate = await locked_legacy_candidate_row(
-        database,
-        "source-a",
-        "endpoint-a",
-    )
+        direct_selection, direct_rows = await selected_direct_v4_terminal_disposition(database, "source-a")
+        legacy_candidate = await locked_legacy_candidate_row(
+            database,
+            "source-a",
+            "endpoint-a",
+        )
 
-    assert direct_selection.dataset_id == "dataset-a"
-    assert direct_rows == ()
-    assert legacy_candidate["dataset_id"] == "historical-dataset"
+        assert direct_selection.dataset_id == "dataset-a"
+        assert direct_rows == ()
+        assert legacy_candidate["dataset_id"] == "historical-dataset"
 
 
 @pytest.mark.asyncio
@@ -392,19 +365,20 @@ async def test_replay_fails_closed_at_marker_and_candidate_boundaries(
     monkeypatch,
     mutation_name: str,
 ):
-    database = DirectV4TerminalDatabase()
-    await sync_v4_terminal_disposition(database, "source-a")
-    if mutation_name == "marker_hash":
-        monkeypatch.setattr(
-            v4_selection,
-            "DIRECT_V4_TERMINAL_MARKER_SHA256",
-            "f" * 64,
-        )
-    else:
-        database.candidate_row["publication_metadata_json"]["error"] = "changed"
+    domain = DirectV4TerminalDatabase()
+    async with synthetic_source_database(monkeypatch, domain, schema="mrf") as database:
+        await sync_v4_terminal_disposition(database, "source-a")
+        if mutation_name == "marker_hash":
+            monkeypatch.setattr(
+                v4_selection,
+                "DIRECT_V4_TERMINAL_MARKER_SHA256",
+                "f" * 64,
+            )
+        else:
+            database.candidate_row["publication_metadata_json"]["error"] = "changed"
 
-    with pytest.raises(ReviewedSubsetTerminalDispositionError):
-        await selected_direct_v4_terminal_disposition(database, "source-a")
+        with pytest.raises(ReviewedSubsetTerminalDispositionError):
+            await selected_direct_v4_terminal_disposition(database, "source-a")
 
 
 @pytest.mark.asyncio
@@ -480,8 +454,7 @@ async def test_malformed_proof_shard_stops_before_aggregate_casts():
     shard_query = next(
         statement
         for call_type, statement, _parameters in database.calls
-        if call_type == "scalar"
-        and "provider_directory_dataset_proof_shard" in statement
+        if call_type == "scalar" and "provider_directory_dataset_proof_shard" in statement
     )
     assert "jsonb_object_keys" in shard_query
     assert "jsonb_typeof(resource.value) <> 'number'" in shard_query

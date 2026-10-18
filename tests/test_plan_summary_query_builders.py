@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from sqlalchemy.dialects import postgresql
 
@@ -21,12 +23,11 @@ def _compiled_sql(statement) -> str:
 
 def test_keyword_groups_and_conditions_cover_empty_single_and_alternative_terms():
     assert plan_summary._normalize_keyword_groups(()) == []
-    assert plan_summary._normalize_keyword_groups((" Dental ", "", 1)) == [
-        ("dental",)
+    assert plan_summary._normalize_keyword_groups((" Dental ", "", 1)) == [("dental",)]
+    assert plan_summary._normalize_keyword_groups(((" Vision ", "Adult"), ("eye", "adult"), ())) == [
+        ("vision", "adult"),
+        ("eye", "adult"),
     ]
-    assert plan_summary._normalize_keyword_groups(
-        ((" Vision ", "Adult"), ("eye", "adult"), ())
-    ) == [("vision", "adult"), ("eye", "adult")]
 
     benefit_name = plan_summary.plan_benefits_table.c.benefit_name
     assert plan_summary._keyword_condition(benefit_name, ()) is None
@@ -60,19 +61,13 @@ def test_summary_expression_builders_compile_complete_postgresql_queries():
         plan_summary._attribute_text("PlanType", upper=True),
         plan_summary._attribute_text("PlanType", lower=True, upper=True),
     )
-    compiled_expressions = "\n".join(
-        _compiled_sql(expression) for expression in expression_list
-    )
+    compiled_expressions = "\n".join(_compiled_sql(expression) for expression in expression_list)
     assert "plan_id" in compiled_expressions
     assert "MarketCoverage" in compiled_expressions
     assert "jsonb_agg" in compiled_expressions
 
-    attribute_sql = _compiled_sql(
-        plan_summary._build_attribute_summary_subquery().select()
-    )
-    benefit_sql = _compiled_sql(
-        plan_summary._build_benefit_summary_subquery().select()
-    )
+    attribute_sql = _compiled_sql(plan_summary._build_attribute_summary_subquery().select())
+    benefit_sql = _compiled_sql(plan_summary._build_benefit_summary_subquery().select())
     price_sql = _compiled_sql(plan_summary._build_price_summary_subquery().select())
     assert "plan_attributes" in attribute_sql and "GROUP BY" in attribute_sql
     assert "plan_benefits" in benefit_sql and "telehealth_supported" in benefit_sql
@@ -105,10 +100,20 @@ async def test_summary_schema_helpers_emit_bounded_idempotent_ddl(monkeypatch):
     )
     monkeypatch.setattr(plan_summary.db, "status", record_status)
 
-    await plan_summary._ensure_summary_indexes()
+    session = SimpleNamespace(execute=lambda statement: record_status(str(statement)))
+    await plan_summary._ensure_summary_indexes(session, "mrf", "summary_candidate")
     await plan_summary._ensure_summary_columns()
 
-    assert len(emitted_statements) == 7
-    assert any("plan_search_summary_year_idx" in sql for sql in emitted_statements)
+    assert len(emitted_statements) == 8
+    assert [entry[1] for entry in plan_summary._summary_index_specs("summary_candidate")] == [
+        "plan_search_summary_year_idx",
+        "plan_search_summary_state_partial_idx",
+    ]
+    assert all(
+        'ON "mrf"."summary_candidate"' in sql and "IF NOT EXISTS" not in sql
+        for sql in emitted_statements
+        if sql.startswith("CREATE INDEX")
+    )
+    assert 'ANALYZE "mrf"."summary_candidate"' in emitted_statements
     assert any("USING btree" in sql and "WHERE state IS NOT NULL" in sql for sql in emitted_statements)
     assert sum("ADD COLUMN IF NOT EXISTS" in sql for sql in emitted_statements) == 5

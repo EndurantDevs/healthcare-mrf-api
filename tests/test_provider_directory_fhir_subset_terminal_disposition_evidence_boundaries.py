@@ -8,8 +8,8 @@ from copy import deepcopy
 
 import pytest
 
-from process import provider_directory_fhir_subset_terminal_disposition_evidence as evidence
 from process import provider_directory_fhir_subset_terminal_disposition_contract as contract
+from process import provider_directory_fhir_subset_terminal_disposition_evidence as evidence
 from process import provider_directory_fhir_subset_terminal_disposition_selection as selection
 from process import provider_directory_fhir_subset_terminal_disposition_source as source
 from process.provider_directory_fhir_census_binding import CurrentVersionCensusContract
@@ -149,11 +149,7 @@ class _CandidateCardinalityDatabase(TerminalDispositionDatabase):
 
     async def all(self, statement, **parameters):
         if "SELECT dataset.*" in statement:
-            count = (
-                self.disposed_count
-                if "disposed_status" in parameters
-                else self.failed_count
-            )
+            count = self.disposed_count if "disposed_status" in parameters else self.failed_count
             return [deepcopy(self.candidate_row) for _index in range(count)]
         return await super().all(statement, **parameters)
 
@@ -176,26 +172,29 @@ async def test_candidate_selection_rejects_ambiguous_cardinality(database):
 
 
 @pytest.mark.asyncio
-async def test_replay_rejects_cross_version_and_tampered_marker():
-    database = TerminalDispositionDatabase()
-    await sync_reviewed_subset_terminal_disposition_transaction(
-        database,
-        "source-a",
-    )
-    database.candidate_row["publication_metadata_json"][ABANDONMENT_METADATA_KEY] = {}
-    with pytest.raises(ReviewedSubsetTerminalDispositionError):
-        await selection.selected_reviewed_subset_terminal_disposition(
-            database,
-            "source-a",
-        )
+async def test_replay_rejects_cross_version_and_tampered_marker(monkeypatch):
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
-    database.candidate_row["publication_metadata_json"].pop(ABANDONMENT_METADATA_KEY)
-    database.candidate_row["resource_count"] += 1
-    with pytest.raises(ReviewedSubsetTerminalDispositionError):
-        await selection.selected_reviewed_subset_terminal_disposition(
+    database = TerminalDispositionDatabase()
+    async with synthetic_source_database(monkeypatch, database) as database:
+        await sync_reviewed_subset_terminal_disposition_transaction(
             database,
             "source-a",
         )
+        database.candidate_row["publication_metadata_json"][ABANDONMENT_METADATA_KEY] = {}
+        with pytest.raises(ReviewedSubsetTerminalDispositionError):
+            await selection.selected_reviewed_subset_terminal_disposition(
+                database,
+                "source-a",
+            )
+
+        database.candidate_row["publication_metadata_json"].pop(ABANDONMENT_METADATA_KEY)
+        database.candidate_row["resource_count"] += 1
+        with pytest.raises(ReviewedSubsetTerminalDispositionError):
+            await selection.selected_reviewed_subset_terminal_disposition(
+                database,
+                "source-a",
+            )
 
 
 class _BulkCheckpointDatabase(TerminalDispositionDatabase):
@@ -230,10 +229,14 @@ async def test_new_selection_rejects_retained_count_mismatch(monkeypatch):
 
     async def inconsistent_evidence(_database, _candidate_row, _source_row):
         resource_count = database.candidate_row["resource_count"] + 1
-        return database.checkpoint_rows, CHECKPOINT_SCOPE_SHA256, (
-            resource_count,
-            3,
-            resource_count,
+        return (
+            database.checkpoint_rows,
+            CHECKPOINT_SCOPE_SHA256,
+            (
+                resource_count,
+                3,
+                resource_count,
+            ),
         )
 
     monkeypatch.setattr(
@@ -254,28 +257,25 @@ async def test_new_selection_rejects_retained_count_mismatch(monkeypatch):
 
 def test_policy_helpers_reject_wrong_state_and_documents():
     assert source.is_policy_one_pending({}) is False
-    assert source.is_policy_one_pending(
-        {
-            "provider_directory_candidate_status": "pending_reviewed_subset_acquisition",
-            "provider_directory_reviewed_root_policy_v1": {},
-        }
-    ) is False
-    assert source.is_candidate_policy_one(
-        {"provider_directory_reviewed_root_policy_v1": {}}
-    ) is False
+    assert (
+        source.is_policy_one_pending(
+            {
+                "provider_directory_candidate_status": "pending_reviewed_subset_acquisition",
+                "provider_directory_reviewed_root_policy_v1": {},
+            }
+        )
+        is False
+    )
+    assert source.is_candidate_policy_one({"provider_directory_reviewed_root_policy_v1": {}}) is False
 
 
 @pytest.mark.parametrize("mutation", ("start_urls", "identity"))
 def test_source_contract_rejects_invalid_profile_inputs(mutation):
     source_row, candidate_row, _checkpoint_rows, diagnostics = _fixture_evidence()
     if mutation == "start_urls":
-        source_row["metadata_json"][
-            "provider_directory_current_version_census_start_urls"
-        ] = None
+        source_row["metadata_json"]["provider_directory_current_version_census_start_urls"] = None
     else:
-        source_row["metadata_json"][
-            "provider_directory_current_version_census_contract_version"
-        ] = "invalid"
+        source_row["metadata_json"]["provider_directory_current_version_census_contract_version"] = "invalid"
     with pytest.raises(ReviewedSubsetTerminalDispositionError):
         source.expected_terminal_start_hashes(
             source_row,

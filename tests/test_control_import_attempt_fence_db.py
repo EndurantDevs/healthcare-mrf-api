@@ -9,25 +9,34 @@ from api import control, control_imports
 from db.models import ImportRun, db
 from process import control_lifecycle, ptg_control
 from process.control_lifecycle import mark_control_run
-from process.ptg_parts.frozen_rate_files import (
-    FrozenRateFileValidationError,
-)
 from process.live_progress import (
     reset_live_progress_context,
     set_live_progress_context,
 )
+from process.ptg_parts.frozen_rate_files import (
+    FrozenRateFileValidationError,
+)
+from tests.ptg_frozen_test_support import protected_control_payload
 from tests.test_control_imports_db import (
     _drop_import_run_schema,
     _reset_import_run_schema,
 )
-from tests.ptg_frozen_test_support import protected_control_payload
-
+from tests.test_provider_directory_cms_registry_worker import (
+    address_build_case as address_build_case,
+)
+from tests.test_provider_directory_cms_registry_worker import (
+    execution as execution,
+)
+from tests.test_provider_directory_cms_registry_worker import (
+    signed_case as signed_case,
+)
+from tests.test_provider_directory_cms_registry_worker import (
+    terminal_cms_case as terminal_cms_case,
+)
 
 pytestmark = [
     pytest.mark.asyncio(loop_scope="module"),
-    pytest.mark.filterwarnings(
-        "ignore:coroutine 'Connection._cancel' was never awaited:RuntimeWarning"
-    ),
+    pytest.mark.filterwarnings("ignore:coroutine 'Connection._cancel' was never awaited:RuntimeWarning"),
 ]
 
 
@@ -94,9 +103,7 @@ class _FrozenValidationFailureHarness:
         self.heartbeat_events.append("thread-stop")
 
     async def stop_live_heartbeat(self, heartbeat_task):
-        self.heartbeat_events.append(
-            "live-stop" if heartbeat_task is not None else "live-stop-empty"
-        )
+        self.heartbeat_events.append("live-stop" if heartbeat_task is not None else "live-stop-empty")
         await self._stop_live_heartbeat(heartbeat_task)
 
     def fail_if_lane_selected(self, _params_by_name):
@@ -266,13 +273,7 @@ async def test_postgres_attempt_claim_and_terminal_updates_are_fenced(
         await _insert_attempt_fence_run()
         newer_id, newer_started_at = await _apply_fenced_attempt_transitions()
 
-        stored_run = (
-            await db.execute(
-                select(ImportRun).where(
-                    ImportRun.run_id == "run_attempt_fence"
-                )
-            )
-        ).scalar_one()
+        stored_run = (await db.execute(select(ImportRun).where(ImportRun.run_id == "run_attempt_fence"))).scalar_one()
         assert stored_run.status == "succeeded"
         assert stored_run.progress["attempt_id"] == newer_id
         assert stored_run.progress["attempt_started_at"] == newer_started_at
@@ -280,10 +281,64 @@ async def test_postgres_attempt_claim_and_terminal_updates_are_fenced(
         await _drop_import_run_schema()
 
 
+async def test_postgres_cms_failed_job_preserves_attempt_and_refuses_old_observation(
+    monkeypatch,
+    terminal_cms_case,
+):
+    """Exercise the actual failed-Job UPDATE CAS and terminal start fence."""
+    observed, _request = terminal_cms_case
+    observed["status"] = "running"
+    old_progress_by_field = dict(observed["progress"])
+    current_progress_by_field = {**old_progress_by_field, "attempt_id": observed["run_id"] + ":" + "d" * 32}
+    await _reset_import_run_schema()
+    try:
+        await db.execute(
+            control_imports.insert(ImportRun).values(
+                run_id=observed["run_id"],
+                engine=control_imports.ENGINE_NAME,
+                importer=observed["importer"],
+                family="provider-directory",
+                status="running",
+                params=observed["params"],
+                metrics=observed["metrics"],
+                progress=current_progress_by_field,
+                created_at=control_imports.utc_now(),
+                heartbeat_at=control_imports.utc_now(),
+            )
+        )
+        monkeypatch.setattr(control_imports, "read_live_progress", lambda *_args, **_kwargs: None)
+
+        async def failed_worker(_run):
+            return {"items": [{"job_status": "failed", "job_name": "synthetic", "failure": {}}]}
+
+        monkeypatch.setattr(control_imports, "_active_worker_state", failed_worker)
+        stale = await control_imports._sync_terminal_worker_failure(observed)
+        assert stale["status"] == "running" and stale["progress"] == current_progress_by_field
+        current_by_field = {**observed, "progress": current_progress_by_field}
+        terminal = await control_imports._sync_terminal_worker_failure(current_by_field)
+        assert terminal["status"] == "failed"
+        stored = (await db.execute(select(ImportRun).where(ImportRun.run_id == observed["run_id"]))).scalar_one()
+        assert stored.status == "failed"
+        assert {key: stored.progress[key] for key in current_progress_by_field} == current_progress_by_field
+        assert stored.finished_at is not None
+        monkeypatch.setattr(control_lifecycle, "write_live_progress", lambda **_kwargs: True)
+        assert (
+            await mark_control_run(
+                observed["run_id"],
+                status="running",
+                phase_detail="older delayed restart",
+                progress_message="running",
+                attempt_id=old_progress_by_field["attempt_id"],
+                attempt_started_at="2099-01-01T00:00:00.000000+00:00",
+            )
+            is not True
+        )
+    finally:
+        await _drop_import_run_schema()
+
+
 async def _raise_frozen_validation_failure(run_id: str) -> None:
-    protected_request = control._validated_control_import_payload(
-        protected_control_payload()
-    )
+    protected_request = control._validated_control_import_payload(protected_control_payload())
     with pytest.raises(
         FrozenRateFileValidationError,
         match="outer and nested",
@@ -303,16 +358,11 @@ async def _assert_frozen_failure_persisted(
     run_id: str,
     harness: _FrozenValidationFailureHarness,
 ) -> None:
-    stored_run = (
-        await db.execute(
-            select(ImportRun).where(ImportRun.run_id == run_id)
-        )
-    ).scalar_one()
-    assert [
-        (status, accepted)
-        for status, accepted, _attempt_id, _started_at
-        in harness.mark_results
-    ] == [("running", True), ("failed", True)]
+    stored_run = (await db.execute(select(ImportRun).where(ImportRun.run_id == run_id))).scalar_one()
+    assert [(status, accepted) for status, accepted, _attempt_id, _started_at in harness.mark_results] == [
+        ("running", True),
+        ("failed", True),
+    ]
     assert harness.mark_results[0][2:] == harness.mark_results[1][2:]
     assert harness.heartbeat_events == [
         "thread-start",
@@ -324,10 +374,7 @@ async def _assert_frozen_failure_persisted(
     assert stored_run.phase_detail == "ptg import failed"
     assert stored_run.error == {
         "code": "ptg_frozen_rate_file_contract_failed",
-        "message": (
-            "protected outer and nested source_file_import_id and "
-            "import_id must all match"
-        ),
+        "message": ("protected outer and nested source_file_import_id and import_id must all match"),
         "retryable": False,
     }
     assert stored_run.progress["attempt_id"] == harness.mark_results[0][2]
@@ -352,9 +399,7 @@ async def test_frozen_validation_failure_claims_then_persists_terminal_attempt(
             "read_live_progress",
             lambda _run_id: None,
         )
-        harness = _FrozenValidationFailureHarness(
-            ptg_control._stop_live_progress_heartbeat
-        )
+        harness = _FrozenValidationFailureHarness(ptg_control._stop_live_progress_heartbeat)
         _install_frozen_failure_harness(monkeypatch, harness)
         await _insert_attempt_fence_run(run_id)
         await _raise_frozen_validation_failure(run_id)

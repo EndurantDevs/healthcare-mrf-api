@@ -113,6 +113,35 @@ class EntityAddressSourceCopy:
         _require_source_copy(self.copy_rows, self.max_bytes, self.timeout)
 
 
+@dataclass(frozen=True)
+class EntityAddressArchiveStageHooks:
+    """The three trusted lifecycle callbacks for one bounded archive export."""
+
+    archive_copy: Callable[[EntityAddressArchiveStageCapture], Awaitable[None]]
+    stage_created: Callable[[object], Awaitable[None]]
+    source_captured: Callable[[object, EntityAddressArchiveSourceCapture], Awaitable[None]] | None = None
+
+    def __post_init__(self):
+        if not callable(self.archive_copy) or not callable(self.stage_created):
+            raise ValueError("entity-address source requires archive and empty-stage custody callbacks")
+        if self.source_captured is not None and not callable(self.source_captured):
+            raise ValueError("entity-address source capture callback is invalid")
+
+
+def _stage_export_hooks(hooks, callbacks):
+    if set(callbacks) - {"archive_copy", "stage_created", "source_captured"}:
+        raise TypeError("entity-address archive callback keyword is unsupported")
+    if hooks is not None and callbacks:
+        raise ValueError("entity-address archive callbacks are ambiguous")
+    if hooks is None:
+        if not {"archive_copy", "stage_created"} <= set(callbacks):
+            raise ValueError("entity-address source requires archive and empty-stage custody callbacks")
+        hooks = EntityAddressArchiveStageHooks(**callbacks)
+    if not isinstance(hooks, EntityAddressArchiveStageHooks):
+        raise ValueError("entity-address archive callback bundle is invalid")
+    return hooks
+
+
 @dataclass
 class _EntityAddressExportEvidence:
     """Collect source and stage receipts across the owned export lifecycle."""
@@ -321,12 +350,20 @@ async def _clone_entity_address_archive_source(
     snapshot = source_capture.postgres_snapshot
     if not _SNAPSHOT_TOKEN.fullmatch(snapshot):
         raise RuntimeError("entity-address archive source snapshot is invalid")
-    if source_capture.contract == CONTRACT:
-        _require_copy_bundle(source_copy)
-        if not callable(on_precreated):
-            raise ValueError("entity-address v2 source requires protected empty-stage custody")
-        if copy_deadline is None or copy_deadline <= asyncio.get_running_loop().time():
-            raise TimeoutError("entity-address source COPY deadline exceeded")
+    _require_copy_bundle(source_copy)
+    if not callable(on_precreated):
+        raise ValueError("entity-address source requires empty-stage custody")
+    if type(copy_deadline) not in (int, float) or not math.isfinite(copy_deadline):
+        raise ValueError("entity-address source COPY deadline is invalid")
+    if copy_deadline <= asyncio.get_running_loop().time():
+        raise TimeoutError("entity-address source COPY deadline exceeded")
+    if source_capture.contract not in (
+        LEGACY_CONTRACT,
+        CONTRACT,
+    ) or source_capture.relations != entity_address_archive_relations(source_capture.contract):
+        raise ValueError("entity-address source relation family differs")
+    _schema_name(source_capture.schema_name)
+    _schema_name(stage_schema)
     await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     await session.execute(text(f"SET TRANSACTION SNAPSHOT '{snapshot}'"))
     await session.execute(text(f"CREATE SCHEMA {_quoted_identifier(stage_schema)}"))
@@ -340,13 +377,277 @@ async def _clone_entity_address_archive_source(
             on_precreated=on_precreated,
         )
         return
-    for relation in source_capture.relations:
-        source_ref = f"{_quoted_identifier(source_capture.schema_name)}.{_quoted_identifier(relation.table_name)}"
-        stage_ref = f"{_quoted_identifier(stage_schema)}.{_quoted_identifier(relation.table_name)}"
-        await session.execute(text(f"CREATE TABLE {stage_ref} (LIKE {source_ref} INCLUDING ALL)"))
-        if relation.table_name == _EVIDENCE_TABLE_NAME:
-            await _clone_entity_address_evidence_sequence(session, stage_schema=stage_schema)
-        await session.execute(text(f"INSERT INTO {stage_ref} SELECT * FROM {source_ref}"))
+    await _clone_legacy_source(session, source_capture, stage_schema, source_copy, copy_deadline, on_precreated)
+
+
+def native_entity_address_source_copy(*, max_bytes, timeout):
+    """Bind explicitly trusted limits to the existing transaction-owned native copier."""
+    return EntityAddressSourceCopy(family_archive.native_copy_projection, max_bytes, timeout)
+
+
+_LEGACY_SOURCE_CATALOG_SQL = text(
+    "SELECT c.oid::bigint AS relation_oid, c.relname::text AS relation_name, n.oid::bigint AS schema_oid,"
+    "n.nspname::text AS schema_name,n.nspowner::bigint AS schema_owner_oid, c.relowner::bigint AS owner_o"
+    "id,pg_catalog.pg_relation_filenode(c.oid)::bigint AS relfilenode, ARRAY(SELECT a.attname::text FROM "
+    "pg_catalog.pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.at"
+    "tnum) AS columns FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace W"
+    "HERE c.oid=pg_catalog.to_regclass(:relation) AND c.relkind='r' AND c.relpersistence='p' AND NOT c.re"
+    "lispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND NOT EXISTS(SELECT 1 FROM pg_"
+    "catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AND NOT EXISTS(SELECT 1 FROM pg_catalog"
+    ".pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_rew"
+    "rite WHERE ev_class=c.oid) AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid=c.oi"
+    "d AND (contype NOT IN ('p','u','c','n') OR NOT convalidated)) AND NOT EXISTS(SELECT 1 FROM pg_catalo"
+    "g.pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND (a.attgenerated<>'"
+    "' OR a.attidentity<>'')) AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_attrdef ad JOIN pg_catalog.pg_at"
+    "tribute a ON a.attrelid=ad.adrelid AND a.attnum=ad.adnum JOIN pg_catalog.pg_depend d ON d.classid='p"
+    "g_catalog.pg_attrdef'::regclass AND d.objid=ad.oid AND d.refclassid='pg_catalog.pg_class'::regclass "
+    "AND d.deptype='n' WHERE ad.adrelid=c.oid AND NOT (c.relname='entity_address_evidence' AND a.attname="
+    "'evidence_id' AND EXISTS(SELECT 1 FROM pg_catalog.pg_class seq JOIN pg_catalog.pg_depend owned ON ow"
+    "ned.classid='pg_catalog.pg_class'::regclass AND owned.objid=seq.oid AND owned.refclassid='pg_catalog"
+    ".pg_class'::regclass AND owned.refobjid=c.oid AND owned.refobjsubid=a.attnum AND owned.deptype='a' W"
+    "HERE seq.oid=d.refobjid AND seq.relkind='S' AND seq.relnamespace=c.relnamespace))) AND NOT EXISTS(SE"
+    "LECT 1 FROM pg_catalog.pg_depend d WHERE ((d.classid='pg_catalog.pg_attrdef'::regclass AND d.objid I"
+    "N (SELECT oid FROM pg_catalog.pg_attrdef WHERE adrelid=c.oid)) OR (d.classid='pg_catalog.pg_constrai"
+    "nt'::regclass AND d.objid IN (SELECT oid FROM pg_catalog.pg_constraint WHERE conrelid=c.oid))) AND ("
+    "(d.refclassid='pg_catalog.pg_proc'::regclass AND EXISTS (SELECT 1 FROM pg_catalog.pg_proc p WHERE p."
+    "oid=d.refobjid AND p.pronamespace<>'pg_catalog'::regnamespace)) OR (d.refclassid='pg_catalog.pg_oper"
+    "ator'::regclass AND EXISTS (SELECT 1 FROM pg_catalog.pg_operator o WHERE o.oid=d.refobjid AND o.oprn"
+    "amespace<>'pg_catalog'::regnamespace))))"
+)
+
+
+async def _legacy_source_catalog(session, capture):
+    """Admit only the fixed native model family before cloning executable structure."""
+    from process.entity_address_native_publication import _require_stage_execution_catalog
+
+    models = (entity_address_unified.EntityAddressUnified, *entity_address_unified.SUPPORT_TABLE_MODELS)
+    relation_records = []
+    for model in models:
+        source_ref = f"{_quoted_identifier(capture.schema_name)}.{_quoted_identifier(model.__tablename__)}"
+        relation_record = (
+            (
+                await session.execute(
+                    _LEGACY_SOURCE_CATALOG_SQL,
+                    {"relation": source_ref},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if (
+            relation_record is None
+            or type(relation_record["relation_oid"]) is not int
+            or relation_record["relation_oid"] <= 0
+            or set(relation_record["columns"]) != set(model.__table__.columns.keys())
+            or len(relation_record["columns"]) != len(model.__table__.columns)
+        ):
+            raise RuntimeError("entity-address source native relation_records differs")
+        relation_records.append({"model": model, "source_ref": source_ref, **dict(relation_record)})
+    await _require_stage_execution_catalog(
+        session, {"stage_relations": [{"relation_oid": entry["relation_oid"]} for entry in relation_records]}
+    )
+    return relation_records
+
+
+async def _legacy_source_indexes(session, entry):
+    """Capture bounded native index DDL under the fixed source relation lock."""
+    rows = list(
+        (
+            await session.execute(
+                text(
+                    "WITH inventory AS MATERIALIZED(SELECT i.indexrelid::bigint AS index_oid, idx.relname AS index_name, i.indisunique, "
+                    "pg_catalog.pg_get_indexdef(i.indexrelid,0,false) AS definition, "
+                    "pg_catalog.format('CREATE %sINDEX %I ON %I.%I', CASE WHEN i.indisunique THEN 'UNIQUE ' ELSE '' END, "
+                    "idx.relname,n.nspname,c.relname) AS source_prefix, "
+                    "con.conname AS constraint_name, con.contype::text AS constraint_type, con.condeferrable, con.condeferred "
+                    "FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indrelid "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+                    "JOIN pg_catalog.pg_class idx ON idx.oid=i.indexrelid "
+                    "LEFT JOIN pg_catalog.pg_constraint con ON con.conindid=i.indexrelid AND con.conrelid=i.indrelid "
+                    "WHERE i.indrelid=:oid ORDER BY i.indisprimary DESC,i.indexrelid LIMIT 257), "
+                    "bounds AS (SELECT count(*)::bigint AS row_count, "
+                    "COALESCE(sum(octet_length(row_to_json(inventory)::text)),0)::bigint AS payload_bytes FROM inventory) "
+                    "SELECT bounds.*, inventory.* FROM bounds LEFT JOIN inventory "
+                    "ON bounds.row_count<=256 AND bounds.payload_bytes<=1048576 ORDER BY inventory.index_oid"
+                ),
+                {"oid": entry["relation_oid"]},
+            )
+        ).mappings()
+    )
+    if not rows or rows[0]["row_count"] > 256 or rows[0]["payload_bytes"] > 1048576:
+        raise RuntimeError("entity-address source index inventory exceeds its bound")
+    return [dict(row) for row in rows if row["index_oid"] is not None]
+
+
+def _legacy_index_statements(index, *, schema, table):
+    """Replace only PostgreSQL's exact verified index header, never its expressions."""
+    name = index["index_name"]
+    prefix, definition = index["source_prefix"], index["definition"]
+    if (
+        not isinstance(name, str)
+        or not _IDENTIFIER.fullmatch(name)
+        or not isinstance(prefix, str)
+        or not isinstance(definition, str)
+        or len(definition.encode("utf-8")) > 131072
+        or not definition.startswith(prefix + " USING ")
+    ):
+        raise RuntimeError("entity-address source index definition differs")
+    stage_ref = f"{_quoted_identifier(schema)}.{_quoted_identifier(table)}"
+    statements = [
+        f"CREATE {'UNIQUE ' if index['indisunique'] else ''}INDEX {_quoted_identifier(name)} ON "
+        f"{stage_ref}{definition[len(prefix) :]}"
+    ]
+    constraint = index["constraint_name"]
+    if constraint is not None:
+        kind = index["constraint_type"]
+        if kind not in ("p", "u") or not _IDENTIFIER.fullmatch(constraint):
+            raise RuntimeError("entity-address source index constraint differs")
+        timing = " DEFERRABLE" if index["condeferrable"] else " NOT DEFERRABLE"
+        if index["condeferred"]:
+            if not index["condeferrable"]:
+                raise RuntimeError("entity-address source constraint timing differs")
+            timing += " INITIALLY DEFERRED"
+        statements.append(
+            f"ALTER TABLE {stage_ref} ADD CONSTRAINT {_quoted_identifier(constraint)} "
+            f"{'PRIMARY KEY' if kind == 'p' else 'UNIQUE'} USING INDEX {_quoted_identifier(name)}{timing}"
+        )
+    return statements
+
+
+# Native deparsing makes this implicit varchar-array coercion explicit. Reparse
+# these exact declared predicates without it to preserve the original index tree.
+_SOURCE_INDEX_PREDICATES = {
+    ("serving_zip5_npi", "serving_zip5_taxonomy"): (
+        "((type)::text = ANY ((ARRAY['practice'::character varying, 'site'::character varying, "
+        "'primary'::character varying, 'secondary'::character varying])::text[]))"
+    ),
+    ("service_phone_lookup_npi",): (
+        "(((type)::text = ANY ((ARRAY['primary'::character varying, 'secondary'::character varying, "
+        "'practice'::character varying, 'site'::character varying])::text[])) AND "
+        "(COALESCE(NULLIF((phone_number)::text, ''::text), regexp_replace((COALESCE(telephone_number, "
+        "''::character varying))::text, '[^0-9]'::text, ''::text, 'g'::text)) <> ''::text))"
+    ),
+    ("service_phone_digits_npi",): (
+        "(((type)::text = ANY ((ARRAY['primary'::character varying, 'secondary'::character varying, "
+        "'practice'::character varying, 'site'::character varying])::text[])) AND "
+        "(regexp_replace((COALESCE(telephone_number, ''::character varying))::text, '[^0-9]'::text, "
+        "''::text, 'g'::text) <> ''::text))"
+    ),
+    ("service_phone_number_npi",): (
+        "(((type)::text = ANY ((ARRAY['primary'::character varying, 'secondary'::character varying, "
+        "'practice'::character varying, 'site'::character varying])::text[])) AND (phone_number IS NOT "
+        "NULL) AND ((phone_number)::text <> ''::text))"
+    ),
+    ("service_address_key_npi",): (
+        "(((type)::text = ANY ((ARRAY['primary'::character varying, 'secondary'::character varying, "
+        "'practice'::character varying, 'site'::character varying])::text[])) AND (address_key IS NOT "
+        "NULL))"
+    ),
+    ("service_premise_key_npi",): (
+        "(((type)::text = ANY ((ARRAY['primary'::character varying, 'secondary'::character varying, "
+        "'practice'::character varying, 'site'::character varying])::text[])) AND (premise_key IS NOT "
+        "NULL))"
+    ),
+    ("service_plans_network_array",): (
+        "((type)::text = ANY ((ARRAY['primary'::character varying, 'secondary'::character varying, "
+        "'practice'::character varying, 'site'::character varying])::text[]))"
+    ),
+    ("geo_idx", "geo_taxonomy", "geo_bbox"): (
+        "(((type)::text = ANY ((ARRAY['primary'::character varying, 'secondary'::character varying, "
+        "'practice'::character varying, 'site'::character varying])::text[])) AND "
+        "((COALESCE(address_precision, ''::character varying))::text <> 'city_zip'::text) AND (lat IS "
+        "NOT NULL) AND (long IS NOT NULL))"
+    ),
+}
+
+
+def _source_index_statements(index_by_field, *, schema, table, source_stage=None):
+    """Restore declared native predicates for a pinned live table or its exact prepared stage."""
+    if (
+        table == "entity_address_unified"
+        and index_by_field["indisunique"] is False
+        and index_by_field["constraint_name"] is None
+    ):
+        for names, expected in _SOURCE_INDEX_PREDICATES.items():
+            if source_stage is not None and index_by_field["index_name"] not in {
+                entity_address_unified._stage_index_name(source_stage, name) for name in names
+            }:
+                continue
+            prefix, separator, predicate = index_by_field["definition"].rpartition(" WHERE ")
+            if separator and predicate == expected:
+                restored = expected.replace("])::text[]", "])")
+                index_by_field = {**index_by_field, "definition": prefix + separator + restored}
+                break
+            if source_stage is not None:
+                break
+    return _legacy_index_statements(index_by_field, schema=schema, table=table)
+
+
+async def _require_legacy_target_custody(session, capture, schema):
+    """Refuse callback or DDL-hook side effects and every foreign payload writer."""
+    from dataclasses import replace
+
+    targets = await _legacy_source_catalog(session, replace(capture, schema_name=schema))
+    owner_oid = await session.scalar(text("SELECT current_user::regrole::oid::bigint"))
+    if any(entry["owner_oid"] != owner_oid or entry["schema_owner_oid"] != owner_oid for entry in targets):
+        raise RuntimeError("entity-address source clone owner differs")
+    await family_archive._require_selected_mrf_catalog(session, targets, owner_oid)
+    closed = await session.scalar(
+        text(
+            "SELECT NOT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace n, "
+            "LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl,pg_catalog.acldefault('n',n.nspowner))) acl "
+            "WHERE n.oid=:schema_oid AND acl.grantee<>CAST(:owner AS oid) AND acl.privilege_type='CREATE')"
+        ),
+        {"schema_oid": targets[0]["schema_oid"], "owner": owner_oid},
+    )
+    if closed is not True:
+        raise RuntimeError("entity-address source clone namespace writers differ")
+
+
+async def _clone_legacy_source(session, capture, schema, source_copy, deadline, on_precreated):
+    """Preserve legacy native shape while loading all heaps before their indexes."""
+    catalog = await _legacy_source_catalog(session, capture)
+    indexes_by_table = {}
+    for entry in catalog:
+        model = entry["model"]
+        indexes_by_table[model.__tablename__] = await _legacy_source_indexes(session, entry)
+        stage_ref = f"{_quoted_identifier(schema)}.{_quoted_identifier(model.__tablename__)}"
+        await session.execute(
+            text(f"CREATE TABLE {stage_ref} (LIKE {entry['source_ref']} INCLUDING ALL EXCLUDING INDEXES)")
+        )
+    await _clone_entity_address_evidence_sequence(session, stage_schema=schema)
+    await on_precreated(session)
+    await _require_legacy_target_custody(session, capture, schema)
+    remaining = source_copy.max_bytes
+    for entry in catalog:
+        remaining = await _copy_pinned_model_rows(
+            session,
+            entry["model"],
+            source_schema=capture.schema_name,
+            target_schema=schema,
+            copy_source_rows=source_copy.copy_rows,
+            max_bytes=remaining,
+            deadline=deadline,
+        )
+    metadata = MetaData(schema=schema)
+    for entry in catalog:
+        model = entry["model"]
+        model.__table__.to_metadata(metadata, schema=schema)
+        for index in indexes_by_table[model.__tablename__]:
+            for statement in _source_index_statements(index, schema=schema, table=model.__tablename__):
+                await session.execute(text(statement))
+    await family_archive._validate_model_foreign_keys(session, metadata)
+    for entry in catalog:
+        model = entry["model"]
+        if not await family_archive._is_model_table_equal(
+            session,
+            model,
+            left_schema=capture.schema_name,
+            left_name=model.__tablename__,
+            right_schema=schema,
+            right_name=model.__tablename__,
+        ):
+            raise RuntimeError("entity-address pinned source content differs")
 
 
 async def _create_clone_model_indexes(session, schema, models):
@@ -368,9 +669,9 @@ async def _create_clone_model_indexes(session, schema, models):
 
 
 def _require_source_copy(copy_source_rows, max_copy_bytes, copy_timeout):
-    """V2 must have a bounded trusted-local native copier before any candidate work."""
+    """Require a bounded trusted-local native copier before any candidate work."""
     if not callable(copy_source_rows):
-        raise ValueError("entity-address v2 source requires native COPY")
+        raise ValueError("entity-address source requires native COPY")
     if type(max_copy_bytes) is not int or not 0 < max_copy_bytes < 2**63:
         raise ValueError("entity-address source COPY byte limit is invalid")
     if type(copy_timeout) not in (int, float) or not math.isfinite(copy_timeout) or not 0 < copy_timeout <= 86400:
@@ -380,7 +681,7 @@ def _require_source_copy(copy_source_rows, max_copy_bytes, copy_timeout):
 def _require_copy_bundle(source_copy):
     """No callback or limit may originate from request or archive metadata."""
     if not isinstance(source_copy, EntityAddressSourceCopy):
-        raise ValueError("entity-address v2 source requires bounded native COPY")
+        raise ValueError("entity-address source requires bounded native COPY")
     _require_source_copy(source_copy.copy_rows, source_copy.max_bytes, source_copy.timeout)
 
 
@@ -570,46 +871,58 @@ async def export_entity_address_archive_stage(
     *,
     schema_name: str,
     dataset_id: UUID,
-    archive_copy: Callable[[EntityAddressArchiveStageCapture], Awaitable[None]],
     queued_serving_capture: Mapping[str, Any] | EntityAddressObservedServingCapture | None = None,
-    stage_created: Callable[[object], Awaitable[None]] | None = None,
-    source_captured: Callable[[object, EntityAddressArchiveSourceCapture], Awaitable[None]] | None = None,
+    source_copy: EntityAddressSourceCopy | None = None,
     contract=LEGACY_CONTRACT,
+    hooks: EntityAddressArchiveStageHooks | None = None,
+    **callbacks,
 ) -> EntityAddressArchiveStageManifest:
-    """Clone and dump the exact family without passing live names to ``pg_dump``.
+    """Clone and dump one bounded family, preserving the three original callback keywords.
 
-    The UUID-derived schema is intentionally not dropped here.  The coordinator
-    that owns ``dataset_id`` must retain it through restore verification and clean
-    it up by that exact derived name on every terminal path.
+    The coordinator retains the UUID-owned clone until its exact terminal cleanup.
+    A typed hook bundle and the legacy callback keywords cannot be combined.
     """
-
-    stage_schema = entity_address_archive_stage_schema(dataset_id)
+    entity_address_archive_stage_schema(dataset_id)
     if contract == CONTRACT:
         raise ValueError("entity-address v2 stage requires the bounded native COPY coordinator")
-    async with session_factory() as source_session, source_session.begin():
-        source_capture = await capture_entity_address_archive_source(
-            source_session,
-            schema_name=schema_name,
-            queued_serving_capture=queued_serving_capture,
-            contract=contract,
-        )
-        if source_captured is not None:
-            await source_captured(source_session, source_capture)
-        async with session_factory() as clone_session, clone_session.begin():
-            await _clone_entity_address_archive_source(
-                clone_session,
-                source_capture=source_capture,
-                stage_schema=stage_schema,
+    if contract != LEGACY_CONTRACT:
+        raise ValueError("entity-address archive contract is unsupported")
+    _require_copy_bundle(source_copy)
+    hooks = _stage_export_hooks(hooks, callbacks)
+    return await _export_archive_stage(
+        session_factory, schema_name, dataset_id, queued_serving_capture, source_copy, hooks
+    )
+
+
+async def _export_archive_stage(session_factory, schema_name, dataset_id, queued_serving_capture, source_copy, hooks):
+    """Keep capture, clone, complete validation and dump inside one absolute deadline."""
+    stage_schema = entity_address_archive_stage_schema(dataset_id)
+    async with asyncio.timeout(source_copy.timeout) as deadline:
+        async with session_factory() as source_session, source_session.begin():
+            source_capture = await capture_entity_address_archive_source(
+                source_session,
+                schema_name=schema_name,
+                queued_serving_capture=queued_serving_capture,
+                contract=LEGACY_CONTRACT,
             )
-            if stage_created is not None:
-                await stage_created(clone_session)
-    async with session_factory() as stage_session, stage_session.begin():
-        capture = await _capture_entity_address_archive_stage(
-            stage_session,
-            dataset_id=dataset_id,
-            contract=contract,
-        )
-        await archive_copy(capture)
+            if hooks.source_captured is not None:
+                await hooks.source_captured(source_session, source_capture)
+            async with session_factory() as clone_session, clone_session.begin():
+                await _clone_entity_address_archive_source(
+                    clone_session,
+                    source_capture=source_capture,
+                    stage_schema=stage_schema,
+                    source_copy=source_copy,
+                    copy_deadline=deadline.when(),
+                    on_precreated=hooks.stage_created,
+                )
+        async with session_factory() as stage_session, stage_session.begin():
+            capture = await _capture_entity_address_archive_stage(
+                stage_session,
+                dataset_id=dataset_id,
+                contract=LEGACY_CONTRACT,
+            )
+            await hooks.archive_copy(capture)
     return EntityAddressArchiveStageManifest(
         capture.contract, capture.dataset_id, capture.schema_name, capture.relations
     )
@@ -660,6 +973,7 @@ async def export_entity_address_archive_with_receipt(
             stage_created=evidence.record_created_stage,
             source_captured=evidence.capture_source_aliases,
             contract=contract,
+            source_copy=source_copy,
         )
     finally:
         if evidence.owned_stages:
@@ -693,6 +1007,8 @@ __all__ = [
     "EntityAddressArchiveStageCapture",
     "EntityAddressArchiveStageManifest",
     "EntityAddressSourceCopy",
+    "EntityAddressArchiveStageHooks",
+    "native_entity_address_source_copy",
     "EntityAddressObservedServingCapture",
     "capture_entity_address_archive_source",
     "capture_entity_address_observed_serving",

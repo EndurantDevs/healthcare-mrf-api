@@ -38,24 +38,24 @@ _PROVIDER_ADDRESS_GEO_CAPABILITY_SQL = """
                AND column_name IN ('zcta5ce', 'the_geom')
         ) AS has_zcta_columns,
         (
-            to_regtype('geometry') IS NOT NULL
-            AND to_regtype('geography') IS NOT NULL
-            AND to_regprocedure('st_covers(geometry,geometry)') IS NOT NULL
-            AND to_regprocedure('st_setsrid(geometry,integer)') IS NOT NULL
+            to_regtype('public.geometry') IS NOT NULL
+            AND to_regtype('public.geography') IS NOT NULL
+            AND to_regprocedure('public.st_covers(public.geometry,public.geometry)') IS NOT NULL
+            AND to_regprocedure('public.st_setsrid(public.geometry,integer)') IS NOT NULL
             AND to_regprocedure(
-                'st_makepoint(double precision,double precision)'
+                'public.st_makepoint(double precision,double precision)'
             ) IS NOT NULL
             AND to_regprocedure(
-                'st_dwithin(geography,geography,double precision,boolean)'
+                'public.st_dwithin(public.geography,public.geography,double precision,boolean)'
             ) IS NOT NULL
-            AND to_regprocedure('postgis_typmod_srid(integer)') IS NOT NULL
-            AND to_regprocedure('postgis_typmod_type(integer)') IS NOT NULL
+            AND to_regprocedure('public.postgis_typmod_srid(integer)') IS NOT NULL
+            AND to_regprocedure('public.postgis_typmod_type(integer)') IS NOT NULL
         ) AS has_spatial_functions,
         COALESCE(
             (
-                SELECT attribute.atttypid = to_regtype('geometry')
-                       AND postgis_typmod_srid(attribute.atttypmod) = 4269
-                       AND postgis_typmod_type(attribute.atttypmod) IN (
+                SELECT attribute.atttypid = to_regtype('public.geometry')
+                       AND public.postgis_typmod_srid(attribute.atttypmod) = 4269
+                       AND public.postgis_typmod_type(attribute.atttypmod) IN (
                            'Polygon', 'MultiPolygon'
                        )
                   FROM pg_attribute AS attribute
@@ -116,10 +116,7 @@ def _validated_sql_identifier(value: str, *, field_name: str) -> str:
 
 def _display_zip5_sql(alias: str) -> str:
     alias = _validated_sql_identifier(alias, field_name="address alias")
-    return (
-        "NULLIF(LEFT(REGEXP_REPLACE(COALESCE("
-        f"{alias}.postal_code, ''), '[^0-9]', '', 'g'), 5), '')"
-    )
+    return f"NULLIF(LEFT(REGEXP_REPLACE(COALESCE({alias}.postal_code, ''), '[^0-9]', '', 'g'), 5), '')"
 
 
 def _canonical_zip_state_sql(
@@ -141,10 +138,7 @@ def _canonical_zip_state_sql(
             _validated_sql_identifier(reference_alias, field_name="reference alias")
             for reference_alias in reference_aliases
         )
-        return (
-            f"({geo_zip_alias}.zip_code IS NOT NULL "
-            f"OR {zip_state_alias}.zip IS NOT NULL)"
-        )
+        return f"({geo_zip_alias}.zip_code IS NOT NULL OR {zip_state_alias}.zip IS NOT NULL)"
     return f"""(
         EXISTS (
             SELECT 1
@@ -222,11 +216,13 @@ def provider_address_identity_coherence_sql(
         AND {normalized_country} IN (
             'US', 'USA', 'UNITED STATES', 'UNITED STATES OF AMERICA', '840'
         )
-        AND {_canonical_zip_state_sql(
+        AND {
+        _canonical_zip_state_sql(
             alias,
             schema_name,
             reference_aliases=reference_aliases,
-        )}
+        )
+    }
     )"""
     if not use_projection:
         return legacy_sql
@@ -248,28 +244,27 @@ def provider_address_point_coherence_sql(
     """Require one usable point to fall inside its address ZIP polygon."""
 
     alias = _validated_sql_identifier(alias, field_name="address alias")
-    zcta_alias = (
-        _validated_sql_identifier(zcta_alias, field_name="reference alias")
-        if zcta_alias
-        else None
-    )
-    point_covered_sql = f"""ST_Covers(
+    zcta_alias = _validated_sql_identifier(zcta_alias, field_name="reference alias") if zcta_alias else None
+    point_covered_sql = (
+        f"""public.ST_Covers(
                     {zcta_alias}.the_geom,
-                    ST_SetSRID(
-                        ST_MakePoint(
+                    public.ST_SetSRID(
+                        public.ST_MakePoint(
                             {alias}.long::double precision,
                             {alias}.lat::double precision
                         ),
                         4269
                     )
-               )""" if zcta_alias else f"""EXISTS (
+               )"""
+        if zcta_alias
+        else f"""EXISTS (
             SELECT 1
               FROM tiger.zcta5 AS address_zcta
              WHERE address_zcta.zcta5ce = BTRIM({alias}.zip5)
-               AND ST_Covers(
+               AND public.ST_Covers(
                     address_zcta.the_geom,
-                    ST_SetSRID(
-                        ST_MakePoint(
+                    public.ST_SetSRID(
+                        public.ST_MakePoint(
                             {alias}.long::double precision,
                             {alias}.lat::double precision
                         ),
@@ -277,6 +272,7 @@ def provider_address_point_coherence_sql(
                     )
                )
         )"""
+    )
     legacy_sql = f"""(
         {alias}.lat IS NOT NULL
         AND {alias}.long IS NOT NULL
@@ -307,13 +303,8 @@ def provider_address_point_reference_join_sql(
 
     alias = _validated_sql_identifier(alias, field_name="address alias")
     zcta_alias = _validated_sql_identifier(zcta_alias, field_name="reference alias")
-    relation = projection_dependency_relation_sql(
-        schema_name, "tiger.zcta5", dependency_bindings=dependency_bindings
-    )
-    return (
-        f"JOIN {relation} AS {zcta_alias} "
-        f"ON {zcta_alias}.zcta5ce = BTRIM({alias}.zip5)"
-    )
+    relation = projection_dependency_relation_sql(schema_name, "tiger.zcta5", dependency_bindings=dependency_bindings)
+    return f"JOIN {relation} AS {zcta_alias} ON {zcta_alias}.zcta5ce = BTRIM({alias}.zip5)"
 
 
 def provider_address_location_filter_sql(
@@ -339,15 +330,10 @@ def provider_address_location_filter_sql(
     radius_sql = " AND ".join(radius_predicates)
     radius_branch = f"({point_sql} AND ({radius_sql}))" if radius_sql else None
     if exact_zip_predicate and radius_branch:
-        exact_without_point = (
-            f"({exact_zip_predicate} AND {missing_point_sql})"
-        )
+        exact_without_point = f"({exact_zip_predicate} AND {missing_point_sql})"
         return f"({identity_sql} AND ({exact_without_point} OR {radius_branch}))"
     if exact_zip_predicate:
-        return (
-            f"({exact_zip_predicate} AND {identity_sql} "
-            f"AND ({missing_point_sql} OR {point_sql}))"
-        )
+        return f"({exact_zip_predicate} AND {identity_sql} AND ({missing_point_sql} OR {point_sql}))"
     return f"({identity_sql} AND {radius_branch})" if radius_branch else None
 
 
@@ -389,9 +375,7 @@ async def is_provider_address_geo_capability_available(
                     "geo_schema": schema_name,
                     "geo_zip_table": f"{schema_name}.geo_zip_lookup",
                     "reference_schema": reference_schema,
-                    "reference_zip_state_table": (
-                        f"{reference_schema}.zip_state"
-                    ),
+                    "reference_zip_state_table": (f"{reference_schema}.zip_state"),
                     "reference_zcta_table": f"{reference_schema}.zcta5",
                 },
             )

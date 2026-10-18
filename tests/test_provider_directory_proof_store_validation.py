@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
-import zlib
 
 import pytest
 
@@ -22,13 +22,13 @@ from tests.test_provider_directory_proof_store import (
     ROOT_RUN_ID,
     SELECTED_RESOURCES,
     SOURCE_IDS,
-    _MemoryProofConnection,
     _dataset_resource,
-    _persist_rows_by_resource,
+    _MemoryProofConnection,
     _sample_dataset_resources,
     _stable_json,
     _stored_proof,
 )
+
 
 def test_record_spool_flushes_merges_and_rejects_unframed_runs(
     monkeypatch,
@@ -42,9 +42,7 @@ def test_record_spool_flushes_merges_and_rejects_unframed_runs(
         spool.add(line)
     paths = spool.bounded_paths()
     assert len(paths) == 2
-    assert list(
-        __import__("heapq").merge(*(spool.lines(path) for path in paths))
-    ) == [b"a", b"b", b"c"]
+    assert list(__import__("heapq").merge(*(spool.lines(path) for path in paths))) == [b"a", b"b", b"c"]
 
     bad_path = tmp_path / "bad"
     bad_path.write_bytes(b"unframed")
@@ -60,9 +58,7 @@ def test_record_spool_flushes_merges_and_rejects_unframed_runs(
         b"{}",
         b"[]",
         b'["Practitioner","p","bad","",0,0,0]',
-        b'["Practitioner","p","'
-        + hashlib.sha256(b"payload").hexdigest().encode()
-        + b'","",true,0,0]',
+        b'["Practitioner","p","' + hashlib.sha256(b"payload").hexdigest().encode() + b'","",true,0,0]',
     ],
 )
 def test_decoded_record_rejects_invalid_json_or_shape(line):
@@ -182,7 +178,27 @@ def _resign_metadata(proof):
 
 async def _valid_metadata():
     connection = _MemoryProofConnection()
-    await _persist_rows_by_resource(connection, _sample_dataset_resources())
+    resources = _sample_dataset_resources()
+    for resource_type in sorted({row["resource_type"] for row in resources}):
+        descriptor, payload = proof_store.build_dataset_proof_shard(
+            [row for row in resources if row["resource_type"] == resource_type],
+            dataset_id=DATASET_ID,
+            endpoint_id=ENDPOINT_ID,
+            acquisition_root_run_id=ROOT_RUN_ID,
+            source_ids=SOURCE_IDS,
+        )
+        persisted = proof_store._expected_persisted_shard_fields(descriptor, payload)
+        connection.shards[(DATASET_ID, descriptor["shard_id"])] = {
+            **persisted,
+            "shard_id": descriptor["shard_id"],
+            "endpoint_id": ENDPOINT_ID,
+            "acquisition_root_run_id": ROOT_RUN_ID,
+            "source_ids_json": descriptor["source_ids"],
+            "resource_counts_json": descriptor["resource_counts"],
+            "first_identity_json": descriptor["first_identity"],
+            "last_identity_json": descriptor["last_identity"],
+            "payload_bytes": payload,
+        }
     return (await _stored_proof(connection)).metadata
 
 
@@ -231,7 +247,10 @@ def test_validation_primitives_reject_invalid_values():
 
 
 @pytest.mark.asyncio
-async def test_metadata_validation_rejects_each_public_contract_mutation():
+async def test_metadata_validation_rejects_each_public_contract_mutation(monkeypatch):
+    from tests import provider_directory_proof_memory_support as memory
+
+    memory.proof_memory_authority.__wrapped__(monkeypatch)
     valid = await _valid_metadata()
     mutations = [
         ("raw_type", None),

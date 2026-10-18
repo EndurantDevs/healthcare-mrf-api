@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.ci.shard_pytest_nodeids import select_nodeids
+from scripts.ci.shard_pytest_nodeids import MAIN_TEST_SHARDS, select_nodeids
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -73,6 +73,32 @@ def _write_xdist_sample(tmp_path: Path) -> list[str]:
     ]
 
 
+def _write_main_cost_samples(tmp_path: Path) -> list[str]:
+    """Exercise the real cost override IDs without adding another worker-startup matrix."""
+    functions_by_path = {}
+    for node in MAIN_TEST_SHARDS:
+        filename, function = node.split("::")
+        name, separator, parameter = function.partition("[")
+        functions_by_path.setdefault(filename, {}).setdefault(name, []).append(parameter[:-1] if separator else None)
+    nodeids = []
+    for filename, functions_by_name in functions_by_path.items():
+        test_path = tmp_path / filename
+        test_path.parent.mkdir(parents=True, exist_ok=True)
+        source_lines = ["import pytest"]
+        for name, parameters in functions_by_name.items():
+            if parameters == [None]:
+                source_lines.append(f"def {name}(): pass")
+                nodeids.append(f"{filename}::{name}")
+            else:
+                source_lines.append(
+                    f"@pytest.mark.parametrize('case', {list(range(len(parameters)))!r}, ids={parameters!r})"
+                )
+                source_lines.append(f"def {name}(case): pass")
+                nodeids.extend(f"{filename}::{name}[{parameter}]" for parameter in parameters)
+        test_path.write_text("\n".join(source_lines) + "\n", encoding="utf-8")
+    return nodeids
+
+
 @pytest.mark.parametrize(
     ("workers", "distribution", "shard_count"),
     [(1, "loadscope", 2), (4, "worksteal", 2), (1, "loadscope", 6)],
@@ -86,6 +112,8 @@ def test_xdist_shards_execute_the_legacy_sorted_assignment_once(
     """Require identical worker collections and exact-once execution."""
 
     nodeids = _write_xdist_sample(tmp_path)
+    if shard_count == 6:
+        nodeids.extend(_write_main_cost_samples(tmp_path))
     executed_ids = []
     for shard in range(shard_count):
         pytest_result = _run_pytest(
@@ -112,7 +140,10 @@ def test_xdist_shards_execute_the_legacy_sorted_assignment_once(
             path.unlink()
         assert sorted(observed_ids) == expected
         if workers == 1:
-            assert observed_ids == expected
+            for filename in {node.split("::", 1)[0] for node in expected}:
+                assert [node for node in observed_ids if node.split("::", 1)[0] == filename] == [
+                    node for node in expected if node.split("::", 1)[0] == filename
+                ]
         executed_ids.extend(observed_ids)
     assert sorted(executed_ids) == sorted(nodeids)
 
@@ -148,3 +179,43 @@ def test_shard_errors_never_pass(
     )
     assert result.returncode != 0
     assert error in result.stdout + result.stderr
+
+
+def test_sixteen_shard_publication_workers(tmp_path: Path) -> None:
+    nodeids = _write_xdist_sample(tmp_path)
+    publication_tests = tmp_path / "tests"
+    publication_tests.mkdir()
+    publication_file = publication_tests / "test_network_cms_registry_complete_publication_postgres.py"
+    publication_file.write_text(
+        "def test_complete_publication_and_retained_pair(): pass\n"
+        "def test_native_retention_input_keeps_independent_source_and_profile_dates(): pass\n",
+        encoding="utf-8",
+    )
+    publication = f"tests/{publication_file.name}::test_complete_publication_and_retained_pair"
+    nodeids.extend(
+        [
+            publication,
+            f"tests/{publication_file.name}::test_native_retention_input_keeps_independent_source_and_profile_dates",
+        ]
+    )
+    custody_file = publication_tests / "test_registry_publication_consumer_postgres.py"
+    custody_file.write_text(
+        "def test_provider_custody_timeout_retains_lease_and_resumes_exact_request(): pass\n", encoding="utf-8"
+    )
+    custody_retry = f"tests/{custody_file.name}::test_provider_custody_timeout_retains_lease_and_resumes_exact_request"
+    nodeids.append(custody_retry)
+    pytest_result = _run_pytest(
+        tmp_path, "-n", "2", "--dist", "loadscope", "--ci-shard-count", "16", "--ci-shard-index", "15"
+    )
+
+    assert pytest_result.returncode == 0, pytest_result.stdout + pytest_result.stderr
+    expected = select_nodeids(nodeids, shard_count=16, shard_index=15)
+    assert publication in expected
+    assert custody_retry in expected
+    collections = list(tmp_path.glob("collected-*.txt"))
+    assert len(collections) == 2
+    assert all(path.read_text(encoding="utf-8").splitlines() == expected for path in collections)
+    observed_ids = [
+        node for path in tmp_path.glob("observed-*.txt") for node in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert sorted(observed_ids) == expected

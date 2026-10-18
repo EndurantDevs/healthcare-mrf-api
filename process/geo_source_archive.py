@@ -1,0 +1,175 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Fixed Geo physical SOURCE custody; retained clone authority stays separate."""
+
+from contextlib import asynccontextmanager
+from dataclasses import replace
+from uuid import UUID
+
+from sqlalchemy import text
+
+from db.models import GeoZipLookup
+from db.plan_release_storage import storage_identifier, storage_relation
+from process.cms_doctors_immutable import _heap_custody, _writer
+from process.geo_source_storage import ROOT, replay_geo_reads, require
+from process.provider_directory_generic_source_policy import _PUBLISHER, bound_publisher, source_publisher_body
+
+
+def is_source_geo_active(importer):
+    """Only an actual same-task physical SourcePublisher selects this body."""
+    return importer == "geo" and _PUBLISHER.get() is not None and bound_publisher() is not None
+
+
+async def create_geo_archive_schema(session, schema, protected_owner=None):
+    """Honor explicit retained custody before choosing a physical SOURCE creator."""
+    from process.reference_family_archive import _STAGE_PREFIX, reference_family_stage_schema
+
+    if protected_owner is not None or not is_source_geo_active("geo"):
+        return None
+    require(schema == reference_family_stage_schema(UUID(schema.removeprefix(_STAGE_PREFIX))), "stage_scope_changed")
+    owner = await _writer(session)
+    async with source_publisher_body(session) as publisher:
+        await session.execute(
+            text(
+                f"CREATE SCHEMA {storage_identifier(schema)} AUTHORIZATION {storage_identifier(publisher.policy.owner_role)}"
+            )
+        )
+    return owner
+
+
+async def create_geo_export_clone(session, spec, schema, protected_owner=None):
+    """Close the explicit physical or retained destination before payload COPY."""
+    from process import reference_family_archive as archive
+
+    require(spec.importer_id == "geo" and spec.model_types == (GeoZipLookup,), "family_changed")
+    await archive._create_model_family(
+        session,
+        spec,
+        schema,
+        create_indexes=False,
+        ordinary_heaps=True,
+        protected_owner_oid=protected_owner,
+    )
+    ownership = await archive._capture_model_family_ownership(
+        session,
+        spec,
+        UUID(schema.removeprefix(archive._STAGE_PREFIX)),
+    )
+    owner = protected_owner if protected_owner is not None else await _writer(session)
+    await archive.seal_model_family_storage(session, ownership, owner, require_empty=True)
+    return ownership
+
+
+async def seal_geo_model_relation(session, ownership, oid, owner):
+    """Close actual private stage writes without pretending its indexes are finished."""
+    from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation
+    from process.mrf_address_publication import require_native_read_catalog
+    from process.provider_directory_generic_source_storage import _close_grants
+
+    require(await _writer(session) == owner and not ownership.sequence_oids, "owner_changed")
+    require(ownership.importer_id == "geo" and ownership.relation_oids == ((ROOT, oid),), "family_changed")
+    policy = replace(bound_publisher().policy, schema=ownership.schema_name)
+    await _close_grants(bound_publisher().connection, policy, ROOT)
+    await _require_no_untrusted_mutation(session, [oid], owner)
+    await require_native_read_catalog(session, (oid,))
+
+
+async def create_geo_predecessor_schema(session, schema):
+    """Retain the original Publisher's CREATE authority and physical SourceOwner."""
+    from process.reference_family_archive import _PREDECESSOR_PREFIX, reference_family_predecessor_schema
+
+    require(
+        schema == reference_family_predecessor_schema(UUID(schema.removeprefix(_PREDECESSOR_PREFIX))),
+        "predecessor_scope_changed",
+    )
+    await _writer(session)
+    async with source_publisher_body(session) as publisher:
+        await session.execute(
+            text(
+                f"CREATE SCHEMA {storage_identifier(schema)} AUTHORIZATION {storage_identifier(publisher.policy.owner_role)}"
+            )
+        )
+
+
+async def preserve_geo_cut_reads(session, ownership, incumbent):
+    """Replay only actual incumbent SELECT on the exact locked private successor."""
+    from process.geo_source_storage import require_geo_storage
+
+    owner = await _writer(session)
+    require(ownership.importer_id == incumbent.importer_id == "geo", "family_changed")
+    old_oid, new_oid = dict(incumbent.relation_oids)[ROOT], dict(ownership.relation_oids)[ROOT]
+    require(type(old_oid) is int and old_oid != new_oid, "incumbent_changed")
+    await require_geo_storage(session, schema_name=incumbent.schema_name, expected_oid=old_oid)
+    await _heap_custody(session, GeoZipLookup, ownership.schema_name, ROOT, new_oid, owner)
+    locked = await session.scalar(
+        text(
+            "SELECT count(DISTINCT relation)=2 FROM pg_locks WHERE pid=pg_backend_pid() "
+            "AND locktype='relation' AND mode='AccessExclusiveLock' AND granted AND relation=ANY(:oids)"
+        ),
+        {"oids": [old_oid, new_oid]},
+    )
+    require(locked is True, "cut_locks_required")
+    await replay_geo_reads(session, old_oid, storage_relation(ownership.schema_name, ROOT))
+
+
+@asynccontextmanager
+async def geo_cut_savepoint(session, importer):
+    """A caught physical Geo cut failure cannot commit its partial rotation."""
+    if importer == "geo":
+        await _writer(session)
+        async with session.begin_nested():
+            yield
+    else:
+        from process.cms_doctors_immutable import doctors_cut_savepoint
+
+        async with doctors_cut_savepoint(session, importer):
+            yield
+
+
+async def create_model_family_archive_schema(session, importer, schema, protected_owner):
+    """Keep existing families unchanged and honor explicit retained destination first."""
+    if importer == "geo":
+        return await create_geo_archive_schema(session, schema, protected_owner)
+    if importer == "cms-doctors":
+        from process.cms_doctors_immutable import create_doctors_archive_schema
+
+        return await create_doctors_archive_schema(session, schema, protected_owner)
+    return False
+
+
+async def create_model_family_export_clone(session, spec, schema):
+    """Dispatch only physical Geo while retained and other families keep their API."""
+    if spec.importer_id == "geo":
+        from process.reference_family_archive import protected_publisher_owner
+
+        owner = None if is_source_geo_active("geo") else await protected_publisher_owner(session)
+        return await create_geo_export_clone(session, spec, schema, owner)
+    from process.cms_doctors_immutable import create_model_family_export_clone as original
+
+    return await original(session, spec, schema)
+
+
+async def create_model_family_predecessor_schema(session, importer, schema):
+    """Physical Geo requires its genuine writer; other families retain their creator."""
+    if importer == "geo":
+        return await create_geo_predecessor_schema(session, schema)
+    from process.cms_doctors_immutable import create_model_family_predecessor_schema as original
+
+    return await original(session, importer, schema)
+
+
+async def model_family_publisher_owner(session, importer):
+    """Keep the physical SourceOwner distinct from existing protected RetOwner."""
+    if is_source_geo_active(importer):
+        return await _writer(session)
+    from process.cms_doctors_immutable import model_family_publisher_owner as original
+
+    return await original(session, importer)
+
+
+async def seal_model_family_relation(session, ownership, oid, owner):
+    """Only an original physical Geo publisher chooses SourceOwner stage custody."""
+    if is_source_geo_active(ownership.importer_id):
+        return await seal_geo_model_relation(session, ownership, oid, owner)
+    from process.cms_doctors_immutable import seal_model_family_relation as original
+
+    return await original(session, ownership, oid, owner)

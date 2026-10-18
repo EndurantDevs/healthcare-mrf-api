@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Actual migration and retained eight-file fixtures for CMS admission proofs."""
 
+import asyncio
 import importlib
 import importlib.util
 import json
@@ -18,6 +19,7 @@ import pytest
 import pytest_asyncio
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -100,6 +102,7 @@ MIGRATION_PREFIXES = (
     "20260814000000",
     "20260816010000",
     "20260818020000",
+    "20260824143000",
     "20260830100000",
     "20260904163000",
     "20260904223000",
@@ -123,7 +126,10 @@ MIGRATION_PREFIXES = (
     "20260930140000",
     "20261001100000",
 )
-LEGACY_MIGRATION_PREFIXES = MIGRATION_PREFIXES[: MIGRATION_PREFIXES.index("20260930100000")]
+LEGACY_MIGRATION_PREFIXES = (
+    *MIGRATION_PREFIXES[: MIGRATION_PREFIXES.index("20260930100000")],
+    "20261015015000",
+)
 
 
 def _database_url():
@@ -283,6 +289,195 @@ async def admission_database(monkeypatch, *, migration_prefixes=None):
                     await database.status('DROP SCHEMA "mrf" CASCADE')
             finally:
                 await database.disconnect()
+
+
+@asynccontextmanager
+async def legacy_source_admission_database(monkeypatch, *, before_provision=None):
+    """Run historical publication through actual Source custody and separate administration."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from process.provider_directory_generic_source_policy import bind_generic_source_transaction_factory
+    from tests.provider_directory_source_postgres_support import (
+        legacy_source_component_migrations,
+        source_component_database,
+    )
+
+    async with source_component_database(
+        monkeypatch,
+        bind_factory=False,
+        before_provision=before_provision,
+        migration_prefixes=legacy_source_component_migrations(),
+    ) as component:
+        await _provision_cms_epoch_controls(component)
+        database = Database(
+            engine=component.admin_engine,
+            session_factory=async_sessionmaker(component.admin_engine, expire_on_commit=False),
+        )
+        database._source_component = component
+        async with bind_generic_source_transaction_factory(component.factory):
+            with monkeypatch.context() as bindings:
+                bindings.setattr(fhir, "db", component.database)
+                bindings.setattr(control_lifecycle, "db", component.database)
+                yield database
+
+
+@asynccontextmanager
+async def protected_admission_database(
+    monkeypatch, *, before_provision=None, migration_prefixes=None, publisher_pool_size=None
+):
+    """Separate genuine SOURCE acquisition from native component administration."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from tests.provider_directory_source_postgres_support import source_component_database
+
+    publisher_options = {} if publisher_pool_size is None else {"publisher_pool_size": publisher_pool_size}
+    async with source_component_database(
+        monkeypatch,
+        bind_factory=False,
+        before_provision=before_provision,
+        migration_prefixes=migration_prefixes,
+        **publisher_options,
+    ) as component:
+        if migration_prefixes is None or "20261016010000" not in migration_prefixes:
+            async with component.admin_engine.begin() as connection:
+                await connection.run_sync(_run_migrations, ("20261016010000",))
+        await _provision_cms_epoch_controls(component)
+        database = Database(
+            engine=component.admin_engine,
+            session_factory=async_sessionmaker(component.admin_engine, expire_on_commit=False),
+        )
+        database._source_component = component
+        with monkeypatch.context() as source_bindings:
+            source_bindings.setattr(fhir, "db", component.database)
+            source_bindings.setattr(control_lifecycle, "db", component.database)
+            yield database
+
+
+@asynccontextmanager
+async def intake_admission_database(monkeypatch, *, migration_prefixes=None):
+    """Enroll original intake calls while keeping fixture administration separate."""
+    from process import provider_directory_cms_npd as cms
+    from process import provider_directory_generic_source_policy as policy
+
+    assert migration_prefixes in (None, MIGRATION_PREFIXES, LEGACY_MIGRATION_PREFIXES)
+    fixture = (
+        legacy_source_admission_database
+        if migration_prefixes == LEGACY_MIGRATION_PREFIXES
+        else protected_admission_database
+    )
+    with monkeypatch.context() as bindings:
+        async with fixture(bindings) as database:
+            component = database._source_component
+            original = cms._run_acquired
+
+            async def enrolled(*args, **kwargs):
+                if policy.is_source_storage_required():
+                    return await original(*args, **kwargs)
+                async with policy.bind_generic_source_transaction_factory(component.factory):
+                    return await original(*args, **kwargs)
+
+            bindings.setattr(cms, "_run_acquired", enrolled)
+            if policy.is_source_storage_required():
+                yield database
+            else:
+                async with policy.bind_generic_source_transaction_factory(component.factory):
+                    yield database
+
+
+async def _original_source_identity(component, session, isolation):
+    """Prove the original protected Source actor and its native transaction."""
+    from process import provider_directory_cms_serving_receipt as serving
+    from process import provider_directory_generic_source_policy as policy
+
+    driver = await serving.require_registry_receipt_owner(session, component.policy.schema)
+    assert policy.bound_publisher().policy is component.policy
+    assert policy.source_copy_session() is session
+    assert component.database._transaction_binding().session is session
+    assert await driver.fetchval("SHOW transaction_isolation") == isolation
+    return driver, driver.get_server_pid(), await driver.fetchval("SELECT pg_current_xact_id()::text")
+
+
+@asynccontextmanager
+async def original_source_transaction(database, *, isolation):
+    """Reenter the genuine Source factory only for the original publication block."""
+    from process import provider_directory_generic_source_policy as policy
+
+    component = database._source_component
+    assert database.engine is component.admin_engine
+    assert not policy.is_source_storage_required()
+    try:
+        async with policy.bind_generic_source_transaction_factory(component.factory):
+            async with policy.source_transaction(component.database, isolation=isolation) as session:
+                identity = await _original_source_identity(component, session, isolation)
+                yield session
+                assert await _original_source_identity(component, session, isolation) == identity
+    finally:
+        assert not policy.is_source_storage_required()
+        assert component.database._transaction_binding() is None
+
+
+async def _provision_cms_epoch_controls(component):
+    """Use the real administrator cut and prove ordinary runtime writers are closed."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from process.provider_directory_projection_stage import _copy_driver
+    from process.provider_directory_source_cms_epoch_control import (
+        EPOCH_CONTROL_ROOTS,
+        provision_source_cms_epoch_controls,
+    )
+    from tests.provider_directory_source_postgres_support import verify_native_source_profile
+
+    async def writers(connection, policy):
+        assert policy == component.policy
+        assert not await connection.fetchval(
+            "SELECT EXISTS(SELECT FROM pg_class c,pg_roles r WHERE c.relnamespace=$1::regnamespace "
+            "AND c.relname=ANY($2::text[]) AND r.rolname=ANY($3::text[]) AND "
+            "(has_table_privilege(r.oid,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') OR "
+            "has_any_column_privilege(r.oid,c.oid,'INSERT,UPDATE,REFERENCES')))",
+            component.policy.schema,
+            list(EPOCH_CONTROL_ROOTS),
+            list(component.policy.runtime_roles),
+        )
+
+    async with async_sessionmaker(component.admin_engine)() as session, session.begin():
+        assert await session.scalar(text("SELECT current_user=session_user"))
+        await provision_source_cms_epoch_controls(
+            await _copy_driver(session),
+            component.policy,
+            verify_role_profile=verify_native_source_profile,
+            verify_writer_closure=writers,
+        )
+
+
+async def run_protected_admission(database, monkeypatch, run_id, directory, receipt, client):
+    """Acquire through the actual original publisher, never the fixture administrator."""
+    from process import provider_directory_cms_npd as cms
+    from process import provider_directory_generic_source_policy as policy
+
+    component = database._source_component
+    assert database.engine is component.admin_engine
+    assert component.database.engine.url.database == database.engine.url.database
+    assert not policy.is_source_storage_required()
+    before = asyncio.all_tasks()
+    with monkeypatch.context() as source_bindings:
+        source_bindings.setattr(fhir, "db", component.database)
+        source_bindings.setattr(control_lifecycle, "db", component.database)
+        async with policy.bind_generic_source_transaction_factory(component.factory):
+            assert policy.is_source_storage_required()
+            result = await cms._run_acquired({"context": {}}, {}, run_id, directory, receipt, client)
+            assert policy.is_source_storage_required() and policy.source_transaction_available() is None
+            async with component.database.transaction():
+                dataset = await component.database.first(
+                    "SELECT status,candidate_storage_json FROM mrf.provider_directory_endpoint_dataset "
+                    "WHERE dataset_id=:dataset",
+                    dataset=result["registry_source_admission"]["network_bindings"]["dataset_id"],
+                )
+                assert dataset._mapping["status"] == "validated"
+                assert dataset._mapping["candidate_storage_json"]["phase"] == "published"
+            assert policy.source_transaction_available() is None
+            assert not {pending for pending in asyncio.all_tasks() - before if not pending.done()}
+    assert not policy.is_source_storage_required()
+    return result
 
 
 @pytest.fixture

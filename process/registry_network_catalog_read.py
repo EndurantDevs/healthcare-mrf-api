@@ -5,24 +5,30 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from uuid import UUID
 
 import asyncpg
 
+from db.models import GeoZipLookup, Plan, PlanNetworkTierRaw, PlanRatingAreas
 from db.registry_schema import registry_schema
+from db.tiger_models import ZipState
 from process.network_address_projection import _identifier, _membership_accounting
 from process.network_approved_membership_source import (
     pin_retained_approved_membership_source,
 )
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_serving_read import resolve_network_serving_manifest
+from process.registry_catalog_policy import RegistryOrganizationVisibility
 
 MAX_PAGE = 100
 MAX_OFFSET = 1_000_000
 MAX_EXCLUSIONS = 50_000
 MAX_RESPONSE_BYTES = 1_048_576
 _BENEFIT_CODES = ("medical", "dental", "vision")
+_PINNED_READ = ContextVar("registry_catalog_pinned_read", default=None)
 
 
 class RegistryNetworkCatalogError(ValueError):
@@ -213,6 +219,32 @@ class RegistryNetworkCatalogLegacySelector:
             raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
 
 
+@dataclass(frozen=True)
+class RegistryNetworkCatalogLegacyBatchSelector:
+    """Resolve a bounded set of typed legacy values across approved sources."""
+
+    namespace: str
+    values: tuple[str, ...]
+
+    def __post_init__(self):
+        if type(self.namespace) is not str or self.namespace not in {"checksum_network", "legacy_fhir_uuid"}:
+            raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
+        if type(self.values) is not tuple or not 1 <= len(self.values) <= 50:
+            raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
+        for value in self.values:
+            if self.namespace == "checksum_network":
+                if type(value) is not str or re.fullmatch(r"-?(0|[1-9][0-9]{0,9})", value) is None:
+                    raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
+                if value == "-0" or not -2147483648 <= int(value) <= 2147483647:
+                    raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
+            elif self.namespace == "legacy_fhir_uuid":
+                _uuid(value)
+            else:
+                raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
+        if len(set(self.values)) != len(self.values):
+            raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
+
+
 _BASE_SQL = """
 WITH approved AS MATERIALIZED (
   SELECT record_kind,record_key,record_revision,record_json
@@ -247,7 +279,7 @@ WITH approved AS MATERIALIZED (
         AND ARRAY[binding.record_json->>'source_system',binding.record_json->>'source_id',
           binding.record_json->>'dataset_schema',binding.record_json->>'dataset_id',
           binding.record_json->>'producer_id',binding.record_json->>'edition_id']=$5::text[]))
-    AND ($6::integer IS NULL OR network_id=$6)
+    AND ($6::integer[] IS NULL OR network_id=ANY($6::integer[]))
     AND ($10::text IS NULL OR EXISTS(SELECT 1 FROM declared_benefits declaration
       WHERE declaration.network_id=network.network_id AND $10=ANY(declaration.benefit_codes)))
 ), page AS MATERIALIZED (
@@ -306,6 +338,19 @@ SELECT (SELECT count(*) FROM filtered)::bigint AS total,bounds.bounded,
 """
 
 
+_ORGANIZATION_SQL = _BASE_SQL.replace(
+    "AND company.record_json->'archived'='false'::jsonb",
+    "AND company.record_json->'archived'='false'::jsonb AND NOT company.record_key=ANY($11::text[])",
+).replace(
+    "'group_id',links.record_json->'group_id'",
+    """'group_id',CASE WHEN NOT (links.record_json->>'group_id')=ANY($12::text[])
+      AND EXISTS(SELECT 1 FROM approved target WHERE target.record_kind='group'
+        AND target.record_key=links.record_json->>'group_id'
+        AND target.record_json->'archived'='false'::jsonb)
+      THEN links.record_json->'group_id' ELSE 'null'::jsonb END""",
+)
+
+
 async def _pin(connection, generation_id, control_schema):
     if not connection.is_in_transaction():
         raise RegistryNetworkCatalogError("registry_network_catalog_transaction_required")
@@ -323,6 +368,11 @@ async def _pin(connection, generation_id, control_schema):
     )
     if manifest.source_generations.get("custom_membership") != approved.generation_id:
         raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
+    seal_sha256 = getattr(manifest, "_custody_seal_sha256", None)
+    if seal_sha256 is not None:
+        if type(seal_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", seal_sha256) is None:
+            raise RegistryNetworkCatalogError("registry_network_catalog_directory_unavailable")
+        return manifest
     candidate = _identifier(manifest.schema_name)
     counts = await _membership_accounting(
         connection,
@@ -355,6 +405,38 @@ async def _pin(connection, generation_id, control_schema):
     if parity["changed_arrays"] != 0 or parity["address_rows"] != report["candidate_readiness"]["address_rows"]:
         raise RegistryNetworkCatalogError("registry_network_catalog_directory_unavailable")
     return manifest
+
+
+@asynccontextmanager
+async def registry_catalog_read_snapshot(connection, generation_id, control_schema):
+    """Reuse only a manifest verified on this connection in the active read scope."""
+    manifest = await _pin(connection, generation_id, control_schema)
+    token = _PINNED_READ.set((connection, manifest, control_schema))
+    try:
+        yield manifest
+    finally:
+        _PINNED_READ.reset(token)
+
+
+def _reuse_manifest(connection, manifest, generation_id, control_schema):
+    pinned = _PINNED_READ.get()
+    if (
+        pinned is None
+        or pinned[0] is not connection
+        or pinned[1] is not manifest
+        or pinned[2] != control_schema
+        or not connection.is_in_transaction()
+        or (generation_id is not None and generation_id != manifest.generation_id)
+    ):
+        raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
+    return manifest
+
+
+async def _catalog_manifest(connection, generation_id, control_schema, manifest):
+    """Require a verified active proof when reusing an already pinned manifest."""
+    if manifest is None:
+        return await _pin(connection, generation_id, control_schema)
+    return _reuse_manifest(connection, manifest, generation_id, control_schema)
 
 
 def _company_document(company):
@@ -445,19 +527,26 @@ def _network_document(document):
     return document
 
 
-async def _page(connection, manifest, query, exclusions, control_schema, network_id=None):
-    entry = await connection.fetchrow(
-        _BASE_SQL.format(control=_identifier(control_schema), candidate=_identifier(manifest.schema_name)),
+async def _page(connection, manifest, query, exclusions, control_schema, network_ids=None, organization_policy=None):
+    if organization_policy is not None and type(organization_policy) is not RegistryOrganizationVisibility:
+        raise RegistryNetworkCatalogError("registry_network_catalog_policy_invalid")
+    sql = _BASE_SQL if organization_policy is None else _ORGANIZATION_SQL
+    parameters = (
         manifest.approved_custom_revision,
         exclusions,
         query.archived,
         query.search,
         query.source.sql_parameters if query.source else None,
-        network_id,
+        network_ids,
         query.offset,
         query.limit,
         MAX_RESPONSE_BYTES,
         query.benefit_code,
+    )
+    if organization_policy is not None:
+        parameters += (organization_policy.excluded_company_ids, organization_policy.excluded_group_ids)
+    entry = await connection.fetchrow(
+        sql.format(control=_identifier(control_schema), candidate=_identifier(manifest.schema_name)), *parameters
     )
     if entry is None or entry["bounded"] is not True:
         raise RegistryNetworkCatalogError("registry_network_catalog_response_bounds")
@@ -469,6 +558,13 @@ async def _page(connection, manifest, query, exclusions, control_schema, network
         query.benefit_code not in (network["benefit_codes"] or []) for network in networks
     ):
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+    if organization_policy is not None and any(
+        company["company_id"] in organization_policy.excluded_company_ids
+        or company["group_id"] in organization_policy.excluded_group_ids
+        for network in networks
+        for company in network["companies"]
+    ):
+        raise RegistryNetworkCatalogError("registry_network_catalog_policy_invalid")
     total = _integer(entry["total"], 9223372036854775807, minimum=0)
     if len(networks) != min(query.limit, max(total - query.offset, 0)) or len(
         {network["network_id"] for network in networks}
@@ -486,7 +582,9 @@ async def _page(connection, manifest, query, exclusions, control_schema, network
     }
 
 
-async def read_registry_network_catalog(connection, query, *, excluded_network_ids, control_schema=None):
+async def read_registry_network_catalog(
+    connection, query, *, excluded_network_ids, organization_policy=None, control_schema=None
+):
     """Read authorized approved totals and pages without opening a transaction."""
     if type(query) is not RegistryNetworkCatalogQuery:
         raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
@@ -495,7 +593,9 @@ async def read_registry_network_catalog(connection, query, *, excluded_network_i
     _identifier(control_schema)
     try:
         manifest = await _pin(connection, query.generation_id, control_schema)
-        return await _page(connection, manifest, query, exclusions, control_schema)
+        return await _page(
+            connection, manifest, query, exclusions, control_schema, organization_policy=organization_policy
+        )
     except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
         if isinstance(error, RegistryNetworkCatalogError):
             raise
@@ -503,7 +603,7 @@ async def read_registry_network_catalog(connection, query, *, excluded_network_i
 
 
 async def read_registry_network_catalog_detail(
-    connection, network_id, *, excluded_network_ids, generation_id=None, control_schema=None
+    connection, network_id, *, excluded_network_ids, organization_policy=None, generation_id=None, control_schema=None
 ):
     """Return one permitted exact canonical identity or a value-free refusal."""
     _integer(network_id, 2147483647)
@@ -515,7 +615,7 @@ async def read_registry_network_catalog_detail(
     _identifier(control_schema)
     try:
         manifest = await _pin(connection, generation_id, control_schema)
-        page = await _page(connection, manifest, query, exclusions, control_schema, network_id)
+        page = await _page(connection, manifest, query, exclusions, control_schema, (network_id,), organization_policy)
         if page["total"] != 1 or len(page["items"]) != 1 or page["items"][0]["network_id"] != network_id:
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
         return page
@@ -526,9 +626,26 @@ async def read_registry_network_catalog_detail(
 
 
 async def resolve_registry_network_catalog_legacy(
-    connection, selector, *, excluded_network_ids, generation_id=None, control_schema=None
+    connection,
+    selector,
+    *,
+    excluded_network_ids,
+    organization_policy=None,
+    generation_id=None,
+    control_schema=None,
+    manifest=None,
 ):
     """Resolve an exact approved source-scoped legacy reference, never a name."""
+    if type(selector) is RegistryNetworkCatalogLegacyBatchSelector:
+        return await _resolve_legacy_batch(
+            connection,
+            selector,
+            excluded_network_ids=excluded_network_ids,
+            organization_policy=organization_policy,
+            generation_id=generation_id,
+            control_schema=control_schema,
+            manifest=manifest,
+        )
     if type(selector) is not RegistryNetworkCatalogLegacySelector:
         raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
     exclusions = _exclusions(excluded_network_ids)
@@ -536,9 +653,28 @@ async def resolve_registry_network_catalog_legacy(
     control_schema = control_schema if control_schema is not None else registry_schema()
     control = _identifier(control_schema)
     try:
-        manifest = await _pin(connection, generation_id, control_schema)
+        manifest = await _catalog_manifest(connection, generation_id, control_schema, manifest)
         match = await connection.fetchrow(
-            f"""WITH matches AS MATERIALIZED (
+            _LEGACY_SCOPE_SQL.format(control=control),
+            manifest.approved_custom_revision,
+            selector.source.sql_parameters,
+            selector.source_scope_json.decode("utf-8"),
+            exclusions,
+        )
+        if match is None or match["ambiguous"] is not False or match["permitted_count"] != 1:
+            raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
+        network_id = _integer(match["network_id"], 2147483647)
+        page = await _page(connection, manifest, query, exclusions, control_schema, (network_id,), organization_policy)
+        if page["total"] != 1 or page["items"][0]["network_id"] != network_id:
+            raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
+        return page
+    except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
+        if isinstance(error, RegistryNetworkCatalogError):
+            raise
+        raise RegistryNetworkCatalogError("registry_network_catalog_unavailable") from error
+
+
+_LEGACY_SCOPE_SQL = """WITH matches AS MATERIALIZED (
               SELECT DISTINCT (binding.record_json->>'network_id')::integer AS network_id
               FROM {control}.registry_approved_record binding
               JOIN {control}.registry_approved_record network
@@ -554,19 +690,244 @@ async def resolve_registry_network_catalog_legacy(
             ), permitted AS (
               SELECT network_id FROM matches WHERE NOT network_id=ANY($4::integer[])
             ) SELECT EXISTS(SELECT 1 FROM matches OFFSET 1) AS ambiguous,
-              count(*)::bigint AS permitted_count,min(network_id) AS network_id FROM permitted""",
+              count(*)::bigint AS permitted_count,min(network_id) AS network_id FROM permitted"""
+
+_LEGACY_BATCH_SQL = """WITH selected AS (SELECT unnest($2::text[]) AS value), matches AS MATERIALIZED (
+  SELECT DISTINCT selected.value,(binding.record_json->>'network_id')::integer AS network_id
+  FROM selected JOIN {control}.registry_approved_record binding ON binding.approved_revision=$1
+    AND binding.record_kind='network_binding' AND binding.record_json->'archived'='false'::jsonb
+  JOIN {control}.registry_approved_record network ON network.approved_revision=$1
+    AND network.record_kind='network' AND network.record_key=binding.record_json->>'network_id'
+    AND network.record_json->'archived'='false'::jsonb
+  WHERE ($3='checksum_network' AND binding.record_json->>'source_system'='aca'
+      AND jsonb_typeof(binding.record_json->'source_scope_json'->'checksum_network')='number'
+      AND binding.record_json->'source_scope_json'->>'checksum_network'=selected.value)
+    OR ($3='legacy_fhir_uuid' AND binding.record_json->>'source_system'='fhir'
+      AND jsonb_typeof(binding.record_json->'source_scope_json'->'legacy_uuid')='string'
+      AND binding.record_json->'source_scope_json'->>'legacy_uuid'=selected.value)
+), resolved AS (
+  SELECT selected.value,count(DISTINCT matches.network_id) AS targets,min(matches.network_id) AS network_id
+  FROM selected LEFT JOIN matches USING(value) GROUP BY selected.value
+)
+SELECT bool_and(targets=1 AND NOT network_id=ANY($4::integer[])) AS complete,
+  array_agg(DISTINCT network_id ORDER BY network_id) FILTER(WHERE targets=1) AS network_ids FROM resolved"""
+
+
+async def _resolve_legacy_batch(
+    connection, selector, *, excluded_network_ids, organization_policy, generation_id, control_schema, manifest=None
+):
+    """Require unique global mappings before excluding any client-hidden target."""
+    exclusions = _exclusions(excluded_network_ids)
+    control_schema = control_schema if control_schema is not None else registry_schema()
+    control = _identifier(control_schema)
+    try:
+        manifest = await _catalog_manifest(connection, generation_id, control_schema, manifest)
+        matches = await connection.fetchrow(
+            _LEGACY_BATCH_SQL.format(control=control),
             manifest.approved_custom_revision,
-            selector.source.sql_parameters,
-            selector.source_scope_json.decode("utf-8"),
+            selector.values,
+            selector.namespace,
             exclusions,
         )
-        if match is None or match["ambiguous"] is not False or match["permitted_count"] != 1:
+        if matches is None or matches["complete"] is not True:
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
-        network_id = _integer(match["network_id"], 2147483647)
-        page = await _page(connection, manifest, query, exclusions, control_schema, network_id)
-        if page["total"] != 1 or page["items"][0]["network_id"] != network_id:
+        network_ids = tuple(matches["network_ids"])
+        if (
+            not 1 <= len(network_ids) <= len(selector.values)
+            or any(type(network_id) is not int or not 0 < network_id <= 2147483647 for network_id in network_ids)
+            or tuple(sorted(set(network_ids))) != network_ids
+        ):
+            raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+        query = RegistryNetworkCatalogQuery(limit=len(network_ids), generation_id=generation_id)
+        page = await _page(connection, manifest, query, exclusions, control_schema, network_ids, organization_policy)
+        if page["total"] != len(network_ids) or {network["network_id"] for network in page["items"]} != set(
+            network_ids
+        ):
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
         return page
+    except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
+        if isinstance(error, RegistryNetworkCatalogError):
+            raise
+        raise RegistryNetworkCatalogError("registry_network_catalog_unavailable") from error
+
+
+@dataclass(frozen=True)
+class RegistryNetworkAutocompleteQuery:
+    """Closed display search with one optional retained generation and ZIP."""
+
+    query: str
+    limit: int = 10
+    zip_code: str | None = None
+    generation_id: int | None = None
+
+    def __post_init__(self):
+        import unicodedata
+
+        if (
+            type(self.query) is not str
+            or not 1 <= len(self.query) <= 128
+            or self.query.strip() != self.query
+            or any(unicodedata.category(char) == "Cc" for char in self.query)
+        ):
+            raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
+        try:
+            self.query.encode("utf-8")
+        except UnicodeError:
+            raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid") from None
+        _integer(self.limit, 50)
+        if self.generation_id is not None:
+            _integer(self.generation_id, 9223372036854775807)
+        if self.zip_code is not None and (
+            type(self.zip_code) is not str or re.fullmatch(r"[0-9]{5}", self.zip_code) is None
+        ):
+            raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
+
+
+_AUTOCOMPLETE_SQL = """WITH bindings AS MATERIALIZED (
+  SELECT binding.record_json->'source_scope_json' AS scope,
+    (binding.record_json->>'network_id')::integer AS network_id
+  FROM {control}.registry_approved_record binding JOIN {control}.registry_approved_record network
+    ON network.approved_revision=binding.approved_revision AND network.record_kind='network'
+    AND network.record_key=binding.record_json->>'network_id' AND network.record_json->'archived'='false'::jsonb
+  WHERE binding.approved_revision=$1 AND binding.record_kind='network_binding'
+    AND binding.record_json->'archived'='false'::jsonb AND binding.record_json->>'source_system'='aca'
+    AND jsonb_typeof(binding.record_json->'source_scope_json'->'checksum_network')='number'
+), unique_checksums AS MATERIALIZED (
+  SELECT (scope->>'checksum_network')::bigint AS checksum,min(network_id) AS network_id
+  FROM bindings GROUP BY (scope->>'checksum_network')::bigint HAVING count(DISTINCT network_id)=1
+), qualified AS MATERIALIZED (
+  SELECT plan.plan_id,plan.year,plan.issuer_id,plan.state,plan.marketing_name,tier.checksum_network,tier.network_tier
+  FROM {plans} plan JOIN {tiers} tier ON tier.plan_id=plan.plan_id AND tier.year=plan.year
+    AND tier.issuer_id=plan.issuer_id
+  WHERE (plan.marketing_name ILIKE $3 OR plan.plan_id ILIKE $3)
+    AND ($5::text[] IS NULL OR plan.state=ANY($5::text[]))
+    AND tier.checksum_network BETWEEN -2147483648 AND 2147483647
+    AND EXISTS(SELECT 1 FROM bindings binding JOIN unique_checksums unique_checksum
+      ON unique_checksum.checksum=(binding.scope->>'checksum_network')::bigint
+      WHERE NOT unique_checksum.network_id=ANY($2::integer[])
+        AND binding.scope->>'plan_id'=plan.plan_id AND (binding.scope->>'plan_year')::integer=plan.year
+        AND (binding.scope->>'issuer_id')::integer=plan.issuer_id AND binding.scope->>'state'=plan.state
+        AND (binding.scope->>'checksum_network')::bigint=tier.checksum_network)
+), page AS MATERIALIZED (
+  SELECT * FROM (SELECT DISTINCT plan_id,year,issuer_id,state,marketing_name FROM qualified) eligible
+  ORDER BY plan_id COLLATE "C",year,issuer_id,state LIMIT $4
+), selected_tiers AS MATERIALIZED (
+  SELECT qualified.* FROM qualified JOIN page USING(plan_id,year,issuer_id,state)
+), choice AS (SELECT count(*)::integer AS plan_count,NOT $7::boolean OR count(*)=$4 AS emit FROM page),
+bounds AS (
+  SELECT CASE WHEN NOT emit THEN true ELSE
+    coalesce((SELECT sum(octet_length(to_json(plan_id)::text)+octet_length(to_json(state)::text)
+      +coalesce(octet_length(to_json(marketing_name)::text),4)+32) FROM page),0)
+    +coalesce((SELECT sum(octet_length(to_json(checksum_network::text)::text)
+      +coalesce(octet_length(to_json(network_tier)::text),4)+4) FROM selected_tiers),0)
+    +$4::bigint*1024 <= $6 END AS bounded,emit,plan_count FROM choice
+), checksum_maps AS (
+  SELECT plan_id,year,issuer_id,state,jsonb_object_agg(checksum_network::text,network_tier) AS checksums
+  FROM selected_tiers,bounds WHERE bounded AND emit GROUP BY plan_id,year,issuer_id,state
+), documents AS (
+  SELECT page.plan_id,page.year,jsonb_build_object('plan_id',page.plan_id,'marketing_name',page.marketing_name,
+    'state',page.state,'year',page.year,'network_checksum',checksum_maps.checksums) AS document
+  FROM page JOIN checksum_maps USING(plan_id,year,issuer_id,state)
+)
+SELECT plan_count AS plan_count,bounded,
+  coalesce((SELECT jsonb_agg(document ORDER BY plan_id COLLATE "C",year) FROM documents),'[]'::jsonb)::text
+    AS plans_json FROM bounds"""
+
+
+def _autocomplete_table(model):
+    """Quote only the source model's server-owned physical table identity."""
+    return _identifier(str(model.__table__.schema)) + "." + _identifier(str(model.__table__.name))
+
+
+async def _autocomplete_zip_states(connection, zip_code):
+    """Probe optional lookup tables in savepoints without aborting the pinned read."""
+    for model, column, selector, selected in (
+        (GeoZipLookup, "state", "zip_code", zip_code),
+        (PlanRatingAreas, "state", "zip3", zip_code[:3]),
+        (ZipState, "stusps", "zip", zip_code),
+    ):
+        try:
+            async with connection.transaction():
+                states = await connection.fetch(
+                    f"SELECT DISTINCT {_identifier(column)} AS state FROM {_autocomplete_table(model)} "
+                    f"WHERE {_identifier(selector)}=$1 AND {_identifier(column)} IS NOT NULL "
+                    f"ORDER BY {_identifier(column)} LIMIT $2",
+                    selected,
+                    MAX_PAGE + 1,
+                )
+        except asyncpg.UndefinedTableError:
+            continue
+        if len(states) > MAX_PAGE:
+            raise RegistryNetworkCatalogError("registry_network_catalog_response_bounds")
+        if states:
+            return tuple(entry["state"] for entry in states)
+    return ()
+
+
+def _autocomplete_document(document):
+    fields = {"plan_id", "marketing_name", "state", "year", "network_checksum"}
+    if type(document) is not dict or set(document) != fields:
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+    _text(document["plan_id"], 17)
+    _text(document["state"], 2)
+    _integer(document["year"], 2100, minimum=2010)
+    if document["marketing_name"] is not None and type(document["marketing_name"]) is not str:
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+    checksums = document["network_checksum"]
+    if type(checksums) is not dict or not checksums:
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+    for checksum, tier in checksums.items():
+        if str(int(checksum)) != checksum or not -2147483648 <= int(checksum) <= 2147483647:
+            raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+        if tier is not None and type(tier) is not str:
+            raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+    return document
+
+
+async def _autocomplete_page(connection, manifest, query, exclusions, control_schema, states):
+    entry = await connection.fetchrow(
+        _AUTOCOMPLETE_SQL.format(
+            control=_identifier(control_schema),
+            plans=_autocomplete_table(Plan),
+            tiers=_autocomplete_table(PlanNetworkTierRaw),
+        ),
+        manifest.approved_custom_revision,
+        exclusions,
+        "%" + query.query.lower() + "%",
+        query.limit,
+        states,
+        MAX_RESPONSE_BYTES,
+        states is not None,
+    )
+    if entry is None or entry["bounded"] is not True:
+        raise RegistryNetworkCatalogError("registry_network_catalog_response_bounds")
+    count = _integer(entry["plan_count"], query.limit, minimum=0)
+    if states is not None and count < query.limit:
+        return None
+    plans = _closed_json(entry["plans_json"].encode(), MAX_RESPONSE_BYTES)
+    if type(plans) is not list or len(plans) != count:
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+    return [_autocomplete_document(document) for document in plans]
+
+
+async def read_registry_network_autocomplete(connection, query, *, excluded_network_ids, control_schema=None):
+    """Search source-qualified visible metadata in one pinned request snapshot."""
+    if type(query) is not RegistryNetworkAutocompleteQuery:
+        raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
+    exclusions = _exclusions(excluded_network_ids)
+    control_schema = control_schema if control_schema is not None else registry_schema()
+    _identifier(control_schema)
+    try:
+        manifest = await _pin(connection, query.generation_id, control_schema)
+        states = await _autocomplete_zip_states(connection, query.zip_code) if query.zip_code is not None else None
+        plans = await _autocomplete_page(connection, manifest, query, exclusions, control_schema, states)
+        if plans is None:
+            plans = await _autocomplete_page(connection, manifest, query, exclusions, control_schema, None)
+        return {
+            "generation": str(manifest.generation_id),
+            "approved_custom_revision": str(manifest.approved_custom_revision),
+            "plans": plans,
+        }
     except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
         if isinstance(error, RegistryNetworkCatalogError):
             raise

@@ -16,11 +16,11 @@ from sqlalchemy import text
 from process import provider_directory_cms_serving_receipt as common_receipts
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
+from process.cms_doctors_identity_candidate import discard_doctors_identities, reprepare_publication_conflict
 from process.cms_doctors_source_provenance import mint_doctors_source_provenance
+from process.provider_directory_generic_source_policy import source_owner_transaction, source_transaction
 
 _IMPORTER = "cms-doctors"
-_SEAL_TRIGGER = "cms_doctors_prepared_write_seal"
-_SEAL_BODY = "BEGIN RAISE EXCEPTION 'cms_doctors_prepared_read_only'; END;"
 
 
 def _native():
@@ -124,7 +124,7 @@ async def _finalize_stages(prepared):
     """Finish persistence, indexes, and statistics outside the serving transaction."""
     native = _native()
     for model, (_target, stage, oid) in zip(_models(), prepared.stage_oids, strict=True):
-        async with native.db.transaction() as session:
+        async with source_transaction(native.db) as session:
             await archive._lock_family(session, prepared.schema, (stage,), "ACCESS EXCLUSIVE", nowait=True)
             await _assert_stage(session, prepared.schema, stage, oid, logged=False)
             stage_cls = native.make_class(model, prepared.import_date)
@@ -134,75 +134,45 @@ async def _finalize_stages(prepared):
             await _assert_stage_indexes(session, prepared.schema, stage_cls)
 
 
-async def _assert_seal_function(session, schema):
-    """Require the migrated unconditional statement rejection function, including its execution settings."""
-    function_oid = await session.scalar(
-        text(
-            "SELECT p.oid::bigint FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang "
-            "WHERE p.oid=to_regprocedure(:function) AND p.prosrc=:body AND l.lanname='plpgsql' "
-            "AND p.prorettype='trigger'::regtype AND p.pronargs=0 AND p.prokind='f' "
-            "AND NOT p.prosecdef AND NOT p.proisstrict AND NOT p.proleakproof AND NOT p.proretset "
-            "AND p.provolatile='v' AND p.proparallel='u' AND p.proconfig=ARRAY['search_path=pg_catalog']::text[]"
-        ),
-        {"function": f'"{schema}".cms_doctors_prepared_immutable()', "body": _SEAL_BODY},
-    )
-    if function_oid is None:
-        raise RuntimeError("cms_doctors_prepared_seal_function_changed")
-    return int(function_oid)
-
-
 async def assert_prepared_cms_doctors_seal(session, prepared, *, applied=False):
-    """Check exact guarded heaps while the caller holds their relation locks."""
+    """Re-attest native custody and exact physical storage under the caller's locks."""
+    from process.cms_doctors_immutable import require_doctors_storage
+
     if tuple(oid for oid, _filenode in prepared.sealed_filenodes) != tuple(
         oid for _target, _stage, oid in prepared.stage_oids
     ):
         raise RuntimeError("cms_doctors_prepared_physical_seal_changed")
-    filenodes_by_oid = dict(prepared.sealed_filenodes)
-    function_oid = await _assert_seal_function(session, prepared.schema)
-    for target, stage, oid in prepared.stage_oids:
-        filenode = await _assert_stage(session, prepared.schema, target if applied else stage, oid, logged=True)
-        if filenode != filenodes_by_oid[oid]:
+    pairs = tuple((target if applied else stage, oid) for target, stage, oid in prepared.stage_oids)
+    await require_doctors_storage(session, schema_name=prepared.schema, relation_pairs=pairs)
+    for name, oid in pairs:
+        if (
+            await _assert_stage(session, prepared.schema, name, oid, logged=True)
+            != dict(prepared.sealed_filenodes)[oid]
+        ):
             raise RuntimeError("cms_doctors_prepared_physical_seal_changed")
-        valid = await session.scalar(
-            text(
-                "SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=:oid AND tgname=:name "
-                "AND tgfoid=:function AND tgtype=62 AND tgenabled='A' AND NOT tgisinternal "
-                "AND NOT tgdeferrable AND NOT tginitdeferred AND tgconstrrelid=0 AND tgconstraint=0 "
-                "AND tgnargs=0 AND octet_length(tgargs)=0 AND tgattr=''::int2vector AND tgqual IS NULL "
-                "AND tgoldtable IS NULL AND tgnewtable IS NULL)"
-            ),
-            {"oid": oid, "name": _SEAL_TRIGGER, "function": function_oid},
-        )
-        if not valid:
-            raise RuntimeError("cms_doctors_prepared_write_seal_changed")
 
 
 async def _seal_finalized_stages(prepared):
-    """Freeze only completed source heaps and retain their guard across every native rename."""
-    async with _native().db.transaction() as session, archive._bounded_capture(session):
+    """Close grants only after all source payload, indexes and set checks finish."""
+    from process.cms_doctors_immutable import seal_doctors_stages
+
+    async with source_transaction(_native().db) as session, archive._bounded_capture(session):
         stages = tuple(stage for _target, stage, _oid in prepared.stage_oids)
         await archive._lock_family(session, prepared.schema, stages, "ACCESS EXCLUSIVE", nowait=True)
-        await _assert_seal_function(session, prepared.schema)
-        filenodes = []
-        for _target, stage, oid in prepared.stage_oids:
-            filenode = await _assert_stage(session, prepared.schema, stage, oid, logged=True)
-            filenodes.append((oid, filenode))
-            relation = f'"{prepared.schema}"."{stage}"'
-            await session.execute(
-                text(
-                    f"CREATE TRIGGER {_SEAL_TRIGGER} BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON {relation} "
-                    f'FOR EACH STATEMENT EXECUTE FUNCTION "{prepared.schema}".cms_doctors_prepared_immutable()'
-                )
-            )
-            await session.execute(text(f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER {_SEAL_TRIGGER}"))
-        prepared.sealed_filenodes = tuple(filenodes)
+        await seal_doctors_stages(_native().db, prepared.schema, prepared.import_date)
+        prepared.sealed_filenodes = tuple(
+            [
+                (oid, await _assert_stage(session, prepared.schema, stage, oid, logged=True))
+                for _target, stage, oid in prepared.stage_oids
+            ]
+        )
         await assert_prepared_cms_doctors_seal(session, prepared)
 
 
 async def _drop_owned_stages(schema, stage_oids):
     """Recheck OIDs under native locks and preserve any replacement bearing a reused name."""
     native = _native()
-    async with native.db.transaction() as session:
+    async with source_transaction(native.db) as session:
         await session.execute(text("SET LOCAL lock_timeout='500ms'"))
         await session.execute(text("SET LOCAL statement_timeout='5s'"))
         for _target, stage, expected_oid in reversed(stage_oids):
@@ -220,8 +190,13 @@ async def cleanup_prepared_cms_doctors(prepared):
     """Clean an unconsumed family only after the owner's serving transaction finishes."""
     if _native().db._transaction_binding() is not None:
         raise RuntimeError("cms_doctors_preparation_cleanup_transaction_active")
-    if not prepared.committed:
-        await _shielded_cleanup(prepared.schema, prepared.stage_oids)
+    try:
+        if not prepared.committed:
+            await _shielded_cleanup(prepared.schema, prepared.stage_oids)
+    finally:
+        await discard_doctors_identities(
+            _native().db, {"import_date": prepared.import_date, "context": prepared.context}
+        )
 
 
 async def _shielded_cleanup(schema, stage_oids):
@@ -270,16 +245,17 @@ async def prepare_cms_doctors_generation(ctx):
         raise RuntimeError("cms_doctors_preparation_requires_completed_import")
     schema = archive._schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     await native.ensure_database(False)
-    async with native.db.transaction() as session:
+    async with source_transaction(native.db) as session:
         stage_oids = await _stage_inventory(session, schema, import_date)
     prepared = None
     try:
         if len(stage_oids) != len(_models()):
             raise RuntimeError("cms_doctors_preparation_family_incomplete")
-        async with native.db.transaction() as session:
+        async with source_transaction(native.db) as session:
             incumbent, authority = await _capture_incumbent(session, schema)
         stage_cls = native.make_class(native.DoctorClinicianAddress, import_date)
-        stage_rows = int(await native.db.scalar(f'SELECT count(*) FROM "{schema}"."{stage_cls.__tablename__}"'))
+        async with source_transaction(native.db):
+            stage_rows = int(await native.db.scalar(f'SELECT count(*) FROM "{schema}"."{stage_cls.__tablename__}"'))
         metrics = await native._prepare_cms_doctors_sources(ctx, stage_cls, schema, stage_rows)
         prepared = PreparedCMSDoctorsGeneration(schema, import_date, stage_oids, incumbent, authority, metrics, context)
         if "artifact" in metrics:
@@ -292,12 +268,16 @@ async def prepare_cms_doctors_generation(ctx):
         metrics.update(published=False, publication_state="prepared")
         yield prepared
     finally:
-        if prepared is None or not prepared.committed:
-            if native.db._transaction_binding() is not None:
-                raise RuntimeError("cms_doctors_preparation_cleanup_transaction_active")
-            await _shielded_cleanup(schema, stage_oids)
-        context.pop("education_stage_owned", None)
-        context.pop("group_site_stage_owned", None)
+        try:
+            if prepared is None or not prepared.committed:
+                if native.db._transaction_binding() is not None:
+                    raise RuntimeError("cms_doctors_preparation_cleanup_transaction_active")
+                await _shielded_cleanup(schema, stage_oids)
+        finally:
+            if native.db._transaction_binding() is None:
+                await discard_doctors_identities(native.db, ctx)
+                context.pop("education_stage_owned", None)
+                context.pop("group_site_stage_owned", None)
 
 
 async def apply_prepared_cms_doctors_generation(prepared):
@@ -308,7 +288,18 @@ async def apply_prepared_cms_doctors_generation(prepared):
         raise RuntimeError("cms_doctors_publication_requires_transaction")
     if prepared.committed:
         raise RuntimeError("cms_doctors_preparation_already_committed")
-    session = binding.session
+    try:
+        async with source_owner_transaction(native.db):
+            receipt = await _apply_prepared_family(prepared, native, binding.session)
+    except Exception as error:
+        reprepare_publication_conflict(error)
+        raise
+    prepared.native_receipt = receipt
+    return receipt
+
+
+async def _apply_prepared_family(prepared, native, session):
+    """Keep all native postconditions inside the same rollback boundary as the cut."""
     stage_cls = native.make_class(native.DoctorClinicianAddress, prepared.import_date)
     await native._lock_cms_doctors_publication(session, stage_cls, prepared.schema, prepared.import_date)
     await archive._verify_incumbent(session, prepared.incumbent)
@@ -324,11 +315,12 @@ async def apply_prepared_cms_doctors_generation(prepared):
         await _assert_stage(session, prepared.schema, stage, oid, logged=True)
         await _assert_stage_indexes(session, prepared.schema, native.make_class(model, prepared.import_date))
     await assert_prepared_cms_doctors_seal(session, prepared)
-    prepared.native_receipt = await native._apply_locked_cms_doctors_stage(
+    receipt = await native._apply_locked_cms_doctors_stage(
         stage_cls,
         prepared.schema,
         prepared.import_date,
+        identity_ctx={"import_date": prepared.import_date, "context": prepared.context},
     )
-    if prepared.native_receipt.relation_oids != tuple(oid for _, _, oid in prepared.stage_oids):
+    if receipt.relation_oids != tuple(oid for _, _, oid in prepared.stage_oids):
         raise RuntimeError("cms_doctors_preparation_result_changed")
-    return prepared.native_receipt
+    return receipt

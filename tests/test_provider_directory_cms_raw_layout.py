@@ -263,6 +263,36 @@ async def test_pinned_source_oid_rejected():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("root", layout._TABLES)
+async def test_only_payload_roots_permit_partitioned_source_column_metadata(root):
+    """Logical payload parents supply column ABI after the original child pin closes."""
+    fixture = _fixture()
+    relation = replace(fixture.relation, relation=root)
+    directory = _fhir(fixture)
+    directory.db.scalar = AsyncMock(wraps=directory.db.scalar)
+    await layout._require_source_columns(directory, relation, fixture.policy, fixture.attributes)
+    directory.db.scalar.assert_awaited_once_with(
+        "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass(:name) AND relpersistence='p' "
+        "AND (relkind='r' OR (relkind='p' AND :partitioned_payload))",
+        name=f'"{fixture.policy["source_pin"]["schema_name"]}"."{root}"',
+        partitioned_payload=root in (layout.RESOURCE, layout.WITNESS, layout.RELATIONSHIP),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_oid", [None, 0, True])
+async def test_source_column_metadata_still_requires_a_native_oid(source_oid):
+    """Absent or malformed catalog identity cannot reach the column comparison."""
+    fixture = _fixture()
+    directory = _fhir(fixture)
+    directory.db.scalar = AsyncMock(return_value=source_oid)
+    directory._profile_capacity_relation_catalog = AsyncMock()
+    with pytest.raises(RuntimeError, match="raw_storage_shape_unsupported"):
+        await layout._require_source_columns(directory, fixture.relation, fixture.policy, fixture.attributes)
+    directory._profile_capacity_relation_catalog.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "field,replacement",
     [

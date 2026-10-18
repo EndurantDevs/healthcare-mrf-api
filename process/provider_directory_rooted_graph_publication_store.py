@@ -4,18 +4,18 @@
 
 from __future__ import annotations
 
-from datetime import date
 import re
+from datetime import date
 from typing import Any
 
 from db.connection import db
 from process.provider_directory_dataset_candidate import prepare_dataset_candidate
 from process.provider_directory_dataset_scoped_publication import (
+    EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
+    ProviderDirectoryDatasetScopedPublicationError,
     exact_current_matches_root,
     exact_uhc_dataset_pair,
-    EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
     lock_exact_current_dataset,
-    ProviderDirectoryDatasetScopedPublicationError,
     supersede_exact_current_dataset,
 )
 from process.provider_directory_fhir import (
@@ -25,18 +25,18 @@ from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
 )
 from process.provider_directory_rooted_graph_publication import (
-    build_provider_directory_rooted_graph_dataset_identity,
-    canonical_json,
-    provider_directory_rooted_graph_publication_metadata,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND,
     ProviderDirectoryRootedGraphDatasetIdentity,
     ProviderDirectoryRootedGraphPublicationError,
     ProviderDirectoryRootedGraphPublicationResult,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND,
+    build_provider_directory_rooted_graph_dataset_identity,
+    canonical_json,
+    provider_directory_rooted_graph_publication_metadata,
 )
 from process.provider_directory_rooted_graph_publication_materialization import (
-    materialize_provider_directory_rooted_graph_dataset,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_MATERIALIZATION_MAX_BATCH_ROWS,
+    materialize_provider_directory_rooted_graph_dataset,
 )
 from process.provider_directory_rooted_graph_publication_readiness_store import (
     load_dataset_readiness,
@@ -44,6 +44,8 @@ from process.provider_directory_rooted_graph_publication_readiness_store import 
 )
 from process.provider_directory_rooted_graph_publication_store_support import (
     publication_row_fields as _row_fields,
+)
+from process.provider_directory_rooted_graph_publication_store_support import (
     publication_table as _table,
 )
 from process.provider_directory_rooted_graph_twin_contract import (
@@ -52,7 +54,6 @@ from process.provider_directory_rooted_graph_twin_contract import (
 from process.provider_directory_rooted_graph_twin_store import (
     require_provider_directory_rooted_graph_admission,
 )
-
 
 _HEADER = "provider_directory_rooted_graph_dataset"
 _PARENT = "provider_directory_endpoint_dataset"
@@ -66,8 +67,8 @@ async def _preflight_counts(
         f"""
         SELECT EXISTS (
             SELECT 1
-              FROM {_table('provider_directory_rooted_graph_resource')} AS raw
-              JOIN {_table('provider_directory_rooted_graph_work')} AS work
+              FROM {_table("provider_directory_rooted_graph_resource")} AS raw
+              JOIN {_table("provider_directory_rooted_graph_work")} AS work
                 ON work.acquisition_id = raw.acquisition_id
                AND work.query_id = raw.query_id
                AND work.attempt_count = raw.attempt
@@ -86,8 +87,8 @@ async def _preflight_counts(
     count_rows = await database.all(
         f"""
         SELECT raw.resource_type, count(DISTINCT raw.resource_id)::bigint AS count
-          FROM {_table('provider_directory_rooted_graph_resource')} AS raw
-          JOIN {_table('provider_directory_rooted_graph_work')} AS work
+          FROM {_table("provider_directory_rooted_graph_resource")} AS raw
+          JOIN {_table("provider_directory_rooted_graph_work")} AS work
             ON work.acquisition_id = raw.acquisition_id
            AND work.query_id = raw.query_id
            AND work.attempt_count = raw.attempt
@@ -99,19 +100,13 @@ async def _preflight_counts(
         """,
         acquisition_id=admission.publication_acquisition_id,
     )
-    count_by_resource_type = {
-        resource_type: 0
-        for resource_type in PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES
-    }
+    count_by_resource_type = {resource_type: 0 for resource_type in PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES}
     count_by_resource_type["Practitioner"] = admission.root_resource_count
     for count_row in count_rows:
         fields = _row_fields(count_row)
         resource_type = fields.get("resource_type")
         count = fields.get("count")
-        if (
-            resource_type not in count_by_resource_type
-            or resource_type == "Practitioner"
-        ):
+        if resource_type not in count_by_resource_type or resource_type == "Practitioner":
             raise ProviderDirectoryRootedGraphPublicationError("content")
         if type(count) is not int or count < 0:
             raise ProviderDirectoryRootedGraphPublicationError("content")
@@ -157,15 +152,9 @@ def _identity_header_by_field(
         "rooted_graph_complete",
         "request_failure_coverage",
     )
-    identity_by_field = {
-        field_name: getattr(identity, field_name) for field_name in field_names
-    }
-    identity_by_field["publication_kind"] = (
-        PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND
-    )
-    identity_by_field["semantic_projection_as_of"] = date.fromisoformat(
-        identity.semantic_projection_as_of
-    )
+    identity_by_field = {field_name: getattr(identity, field_name) for field_name in field_names}
+    identity_by_field["publication_kind"] = PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND
+    identity_by_field["semantic_projection_as_of"] = date.fromisoformat(identity.semantic_projection_as_of)
     identity_by_field["previous_dataset_id"] = identity.root_dataset_id
     return identity_by_field
 
@@ -203,9 +192,7 @@ def _admission_header_by_field(
         "edge_set_sha256",
         "rooted_graph_sha256",
     )
-    admission_by_field = {
-        field_name: getattr(admission, field_name) for field_name in field_names
-    }
+    admission_by_field = {field_name: getattr(admission, field_name) for field_name in field_names}
     admission_by_field.update(
         graph_resource_count=admission.resource_count,
         graph_edge_count=admission.edge_count,
@@ -219,14 +206,10 @@ def _count_header_by_field(count_by_resource_type: dict[str, int]) -> dict[str, 
         "resource_count": sum(count_by_resource_type.values()),
         "practitioner_resource_count": count_by_resource_type["Practitioner"],
         "practitioner_role_resource_count": count_by_resource_type["PractitionerRole"],
-        "organization_affiliation_resource_count": count_by_resource_type[
-            "OrganizationAffiliation"
-        ],
+        "organization_affiliation_resource_count": count_by_resource_type["OrganizationAffiliation"],
         "organization_resource_count": count_by_resource_type["Organization"],
         "location_resource_count": count_by_resource_type["Location"],
-        "healthcare_service_resource_count": count_by_resource_type[
-            "HealthcareService"
-        ],
+        "healthcare_service_resource_count": count_by_resource_type["HealthcareService"],
         "insurance_plan_resource_count": count_by_resource_type["InsurancePlan"],
         "endpoint_resource_count": count_by_resource_type["Endpoint"],
     }
@@ -278,23 +261,20 @@ async def _insert_rooted_header(
 ) -> int:
     columns = tuple(header_by_field)
     placeholders = tuple(
-        "CAST(:request_failure_coverage AS jsonb)"
-        if column == "request_failure_coverage" else ":" + column
+        "CAST(:request_failure_coverage AS jsonb)" if column == "request_failure_coverage" else ":" + column
         for column in columns
     )
     value_by_column = dict(header_by_field)
     coverage = value_by_column.get("request_failure_coverage")
-    value_by_column["request_failure_coverage"] = (
-        None if coverage is None else canonical_json(coverage)
-    )
+    value_by_column["request_failure_coverage"] = None if coverage is None else canonical_json(coverage)
     return await database.status(
         f"""
-        INSERT INTO {_table(_HEADER)} ({', '.join(columns)},
+        INSERT INTO {_table(_HEADER)} ({", ".join(columns)},
             dataset_hash, resource_hash_contract,
             endpoint_collection_complete,
             endpoint_complete, status, is_current, created_at,
             validated_at, published_at, superseded_at
-        ) VALUES ({', '.join(placeholders)},
+        ) VALUES ({", ".join(placeholders)},
             NULL, :resource_hash_contract, false, false,
             'building', false, transaction_timestamp(), NULL, NULL, NULL
         );
@@ -334,7 +314,7 @@ async def _dataset_hash(database: Any, dataset_id: str) -> str:
                        '["' || resource_type || '","' || resource_id ||
                        '","' || payload_hash || '"]', E'\\n'
                        ORDER BY resource_type, resource_id), ''), 'UTF8')), 'hex')
-          FROM {_table('provider_directory_dataset_resource')}
+          FROM {_table("provider_directory_dataset_resource")}
          WHERE dataset_id = :dataset_id;
         """,
         dataset_id=dataset_id,
@@ -473,30 +453,30 @@ async def publish_admitted_rooted_graph_dataset(
     batch_size: int = PROVIDER_DIRECTORY_ROOTED_GRAPH_MATERIALIZATION_MAX_BATCH_ROWS,
 ) -> ProviderDirectoryRootedGraphPublicationResult:
     """Build, prove, supersede, and publish under one logical-current lock."""
+    from process.provider_directory_generic_source_adapters import require_source_transaction
+    from process.provider_directory_generic_source_policy import source_owner_transaction, source_transaction
+
+    require_source_transaction(repeatable_read=True)
 
     if (
         type(batch_size) is not int
-        or not 1
-        <= batch_size
-        <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MATERIALIZATION_MAX_BATCH_ROWS
+        or not 1 <= batch_size <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MATERIALIZATION_MAX_BATCH_ROWS
     ):
         raise ValueError("provider_directory_rooted_graph_batch_size_invalid")
     try:
-        async with database.transaction():
-            await database.scalar(
-                "SELECT pg_catalog.pg_advisory_xact_lock("
-                "pg_catalog.hashtextextended(:lock_identity, 0));",
-                lock_identity=EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
-            )
-            return await _locked_publication_result(
-                database,
-                publication_acquisition_id,
-                batch_size,
-            )
+        async with source_transaction(database, isolation="repeatable read"):
+            async with source_owner_transaction(database):
+                await database.scalar(
+                    "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:lock_identity, 0));",
+                    lock_identity=EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
+                )
+                return await _locked_publication_result(
+                    database,
+                    publication_acquisition_id,
+                    batch_size,
+                )
     except ProviderDirectoryDatasetScopedPublicationError as error:
-        code = (
-            error.code if error.code in {"foreign_current", "source_drift"} else "state"
-        )
+        code = error.code if error.code in {"foreign_current", "source_drift"} else "state"
         raise ProviderDirectoryRootedGraphPublicationError(code) from error
 
 

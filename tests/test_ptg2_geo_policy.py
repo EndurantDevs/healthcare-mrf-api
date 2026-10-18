@@ -75,10 +75,8 @@ async def test_geo_capability_probe_uses_configured_schema():
         "reference_zcta_table": "geo_reference.zcta5",
     }
     capability_sql = str(session.execute_args[0])
-    assert "st_covers(geometry,geometry)" in capability_sql
-    assert "st_dwithin(geography,geography,double precision,boolean)" in (
-        capability_sql
-    )
+    assert "public.st_covers(public.geometry,public.geometry)" in capability_sql
+    assert "public.st_dwithin(public.geography,public.geography,double precision,boolean)" in (capability_sql)
     assert "postgis_typmod_srid(attribute.atttypmod) = 4269" in capability_sql
 
 
@@ -207,3 +205,34 @@ def test_geo_policy_rejects_unsafe_sql_identifiers(
             exact_zip_predicate="TRUE",
             radius_predicates=[],
         )
+
+
+@pytest.mark.parametrize("zcta_alias", [None, "held_zcta"])
+def test_point_policy_qualifies_native_extension_calls(zcta_alias):
+    from api.ptg2_geo_policy import provider_address_point_coherence_sql
+
+    statement = provider_address_point_coherence_sql("addr", use_projection=False, zcta_alias=zcta_alias)
+    for name in ("ST_Covers", "ST_SetSRID", "ST_MakePoint"):
+        assert "public." + name + "(" in statement
+        assert statement.replace("public." + name + "(", "").find(name + "(") == -1
+    assert "4269" in statement and "BETWEEN -90.0 AND 90.0" in statement
+    assert "BETWEEN -180.0 AND 180.0" in statement
+
+
+async def test_capability_probe_qualifies_complete_native_extension_contract():
+    session = _CapabilitySession(_available_capabilities())
+    assert await is_provider_address_geo_capability_available(session, schema_name="tenant_data")
+    statement = str(session.execute_args[0])
+    for signature in (
+        "public.geometry",
+        "public.geography",
+        "public.st_covers(public.geometry,public.geometry)",
+        "public.st_setsrid(public.geometry,integer)",
+        "public.st_makepoint(double precision,double precision)",
+        "public.st_dwithin(public.geography,public.geography,double precision,boolean)",
+        "public.postgis_typmod_srid(integer)",
+        "public.postgis_typmod_type(integer)",
+    ):
+        assert "'" + signature + "'" in statement
+    assert "public.postgis_typmod_srid(attribute.atttypmod) = 4269" in statement
+    assert "public.postgis_typmod_type(attribute.atttypmod) IN" in statement

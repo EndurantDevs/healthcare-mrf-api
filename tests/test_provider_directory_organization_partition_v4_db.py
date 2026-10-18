@@ -10,10 +10,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process.provider_directory_generic_source_adapters import source_family_rows
 from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
 )
 from tests.provider_directory_organization_union_v4_postgres_support import (
+    materialized_organization,
     stored_dataset_row,
     stored_proof,
 )
@@ -21,11 +23,14 @@ from tests.provider_directory_semantic_proof_v3_postgres_support import (
     CANONICAL_BASE,
     PROJECTION_AS_OF,
     SOURCE_ID,
+    _completed_semantic_scope,
     _insert_parent,
     _semantic_database,
     importer,
 )
-
+from tests.provider_directory_semantic_proof_v3_postgres_support import (
+    semantic_source_template as semantic_source_template,
+)
 
 DATASET_ID = "dataset-organization-partition-v4"
 
@@ -64,9 +69,7 @@ def _source(
         "endpoint_id": f"endpoint-{DATASET_ID}"[:64],
         "api_base": CANONICAL_BASE,
         "canonical_api_base": CANONICAL_BASE,
-        "_resource_hash_contract": (
-            SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-        ),
+        "_resource_hash_contract": (SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT),
         "_semantic_projection_as_of": PROJECTION_AS_OF,
         "last_validated_status": "valid",
         "metadata_json": {
@@ -112,10 +115,7 @@ def _bundle(resources=(), *, total=None) -> dict[str, object]:
         "type": "searchset",
     }
     if resources:
-        bundle_by_field["entry"] = [
-            {"resource": resource_by_field}
-            for resource_by_field in resources
-        ]
+        bundle_by_field["entry"] = [{"resource": resource_by_field} for resource_by_field in resources]
     if total is not None:
         bundle_by_field["total"] = total
     return bundle_by_field
@@ -144,11 +144,7 @@ class _StablePartitionEndpoint:
         if "_summary=count" in request_url:
             return 200, _bundle(total=2), None, 1
         self.page_count += 1
-        observations = (
-            self.observations
-            if self.page_count == 1
-            else self.observations[::-1]
-        )
+        observations = self.observations if self.page_count == 1 else self.observations[::-1]
         return 200, _bundle(observations), None, 1
 
 
@@ -160,15 +156,11 @@ class _SplitPartitionEndpoint:
 
     @staticmethod
     def _bounds(request_url: str) -> tuple[str, ...]:
-        query_by_name = urllib.parse.parse_qs(
-            urllib.parse.urlsplit(request_url).query
-        )
+        query_by_name = urllib.parse.parse_qs(urllib.parse.urlsplit(request_url).query)
         return tuple(query_by_name.get("_lastUpdated", ()))
 
     def _resources(self, bounds: tuple[str, ...]):
-        if bounds[0].startswith("ge2024-01-01") and bounds[1].startswith(
-            "lt2024-01-02"
-        ):
+        if bounds[0].startswith("ge2024-01-01") and bounds[1].startswith("lt2024-01-02"):
             return (
                 _organization(
                     "Community Health Center",
@@ -188,10 +180,17 @@ class _SplitPartitionEndpoint:
         assert timeout == 3
         bounds = self._bounds(request_url)
         if "_summary=count" in request_url:
-            return 200, _bundle(total=1 if len(bounds) == 2 and (
-                bounds[1].startswith("lt2024-01-02")
-                or bounds[0].startswith("ge2024-01-02")
-            ) else 2), None, 1
+            return (
+                200,
+                _bundle(
+                    total=1
+                    if len(bounds) == 2
+                    and (bounds[1].startswith("lt2024-01-02") or bounds[0].startswith("ge2024-01-02"))
+                    else 2
+                ),
+                None,
+                1,
+            )
         self.page_count += 1
         return 200, _bundle(self._resources(bounds)), None, 1
 
@@ -286,19 +285,11 @@ async def _run_partition(
 async def _partition_counts(database, schema: str) -> tuple[int, int, int]:
     """Return unique candidates and raw occurrence proof counts."""
 
-    counts = await database.first(
-        f'SELECT (SELECT count(*) FROM "{schema}".'
-        "provider_directory_dataset_resource WHERE dataset_id=:dataset_id "
-        "AND resource_type='Organization'), "
-        f'(SELECT count(*) FROM "{schema}".'
-        "provider_directory_dataset_resource WHERE dataset_id=:dataset_id "
-        "AND resource_type='LU:Organization:pass:1'), "
-        f'(SELECT count(*) FROM "{schema}".'
-        "provider_directory_dataset_resource WHERE dataset_id=:dataset_id "
-        "AND resource_type='LU:Organization:pass:2');",
-        dataset_id=DATASET_ID,
+    types = ("Organization", "LU:Organization:pass:1", "LU:Organization:pass:2")
+    resource_rows = await source_family_rows(importer, DATASET_ID, types)
+    return tuple(
+        sum(resource_row["resource_type"] == resource_type for resource_row in resource_rows) for resource_type in types
     )
-    return tuple(int(value) for value in counts)
 
 
 @pytest.mark.asyncio
@@ -310,23 +301,15 @@ async def test_postgres_v4_partition_unions_occurrences(monkeypatch) -> None:
             database,
             schema,
             DATASET_ID,
-            resource_hash_contract=(
-                SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-            ),
+            resource_hash_contract=(SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT),
             selected_resources=("Organization",),
         )
-        fetch_result, output_batches, endpoint, save_plan = await _run_partition(
-            monkeypatch
-        )
+        fetch_result, output_batches, endpoint, save_plan = await _run_partition(monkeypatch)
         assert fetch_result.complete is True
         assert fetch_result.rows_fetched == 2
         assert fetch_result.rows_written == 1
         assert endpoint.page_count == 2
-        assert len(output_batches) == 1
-        assert output_batches[0][0]["name_variants"] == [
-            "Community Health Center",
-            "COMMUNITY HEALTH SERVICES",
-        ]
+        assert output_batches == []
         assert await _partition_counts(database, schema) == (1, 2, 2)
         _payload_hash, payload_by_field = await stored_dataset_row(
             database,
@@ -339,15 +322,14 @@ async def test_postgres_v4_partition_unions_occurrences(monkeypatch) -> None:
         ]
         proof = await stored_proof(database, schema, DATASET_ID)
         assert proof.resource_count == 1
-        direct_proof = await importer._endpoint_dataset_content_proof(
-            database,
-            DATASET_ID,
-            ("Organization",),
-            verify_payload_hashes=True,
-            resource_hash_contract=(
-                SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-            ),
-        )
+        async with _completed_semantic_scope(database, DATASET_ID):
+            direct_proof = await importer._endpoint_dataset_content_proof(
+                database,
+                DATASET_ID,
+                database.semantic_candidates[DATASET_ID].proof_resource_scope,
+                verify_payload_hashes=True,
+                resource_hash_contract=(SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT),
+            )
         assert direct_proof.dataset_hash == proof.dataset_hash
         assert direct_proof.resource_hashes == proof.resource_hashes
         assert direct_proof.resource_count == proof.resource_count
@@ -358,6 +340,9 @@ async def test_postgres_v4_partition_unions_occurrences(monkeypatch) -> None:
             "union_name_count": 2,
         }
         assert save_plan.await_count >= 2
+        typed, canonical_hash = await materialized_organization(database, schema, DATASET_ID)
+        assert typed["name_variants"] == ["Community Health Center", "COMMUNITY HEALTH SERVICES"]
+        assert canonical_hash == _payload_hash
 
 
 @pytest.mark.asyncio
@@ -369,9 +354,7 @@ async def test_postgres_v4_partition_unions_across_windows(monkeypatch) -> None:
             database,
             schema,
             DATASET_ID,
-            resource_hash_contract=(
-                SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-            ),
+            resource_hash_contract=(SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT),
             selected_resources=("Organization",),
         )
         endpoint = _SplitPartitionEndpoint()
@@ -385,7 +368,7 @@ async def test_postgres_v4_partition_unions_across_windows(monkeypatch) -> None:
         assert fetch_result.rows_fetched == 2
         assert fetch_result.rows_written == 1
         assert endpoint.page_count == 4
-        assert len(output_batches) == 1
+        assert output_batches == []
         assert await _partition_counts(database, schema) == (1, 2, 2)
         _payload_hash, payload_by_field = await stored_dataset_row(
             database,
@@ -407,9 +390,7 @@ async def test_postgres_v4_partition_resumes_pass_one(monkeypatch) -> None:
             database,
             schema,
             DATASET_ID,
-            resource_hash_contract=(
-                SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-            ),
+            resource_hash_contract=(SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT),
             selected_resources=("Organization",),
         )
         source_by_field = _source()
@@ -438,5 +419,5 @@ async def test_postgres_v4_partition_resumes_pass_one(monkeypatch) -> None:
         assert fetch_result.rows_fetched == 2
         assert fetch_result.rows_written == 1
         assert endpoint.page_count == 1
-        assert len(output_batches) == 1
+        assert output_batches == []
         assert await _partition_counts(database, schema) == (1, 2, 2)

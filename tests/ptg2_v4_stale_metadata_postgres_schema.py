@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-
 SCHEMA_DDL = (
     """
     CREATE TABLE {schema}.ptg2_snapshot (
@@ -60,6 +59,14 @@ SCHEMA_DDL = (
     """
     CREATE TABLE {schema}.ptg2_snapshot_pin (
         snapshot_id varchar(96)
+    )
+    """,
+    """
+    CREATE TABLE {schema}.plan_release_snapshot_pin (
+        serving_revision_id varchar(64) NOT NULL,
+        snapshot_id varchar(128) NOT NULL,
+        reason varchar(256),
+        PRIMARY KEY (serving_revision_id, snapshot_id)
     )
     """,
     """

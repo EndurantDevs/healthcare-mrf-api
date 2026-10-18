@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, Mock
+
 import pytest
 
 from api import control_workers
+from api import provider_directory_source_worker as fhir_source_worker
 
 
 @pytest.fixture(autouse=True)
@@ -30,6 +34,37 @@ def isolate_ptg_capacity_from_worker_units(monkeypatch):
         )
 
     monkeypatch.setattr(control_workers, "_guarded_ptg_family_ensure", unit_guard)
+
+
+@pytest.fixture
+def fhir_worker_fence(monkeypatch):
+    """Keep the real launch guard while isolating its native action lock."""
+    connection = object()
+    action_lock = AsyncMock()
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    monkeypatch.setattr(control_workers.db, "acquire", acquire)
+    monkeypatch.setattr(control_workers, "acquire_control_run_worker_action_lock", action_lock)
+    return connection, action_lock
+
+
+@pytest.fixture
+def fhir_admitted_run(monkeypatch):
+    run_id = "run_provider_directory_running"
+    monkeypatch.setenv(fhir_source_worker.IMAGE_ENV, "example/source-worker@sha256:" + "c" * 64)
+    return {
+        "run_id": run_id,
+        "importer": "provider-directory-fhir",
+        "status": "running",
+        "metrics": {
+            "queue": "arq:ProviderDirectoryFHIR",
+            "function": "control_single_job_start",
+            "job_id": "provider_directory_start_" + run_id,
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -61,9 +96,7 @@ async def test_guarded_ptg_ensure_requires_exact_source_identity(monkeypatch):
     )
 
     assert response["status"] == "already_running"
-    assert admitted_calls[0]["expected_source_file_import_id"] == (
-        "source-attempt-1"
-    )
+    assert admitted_calls[0]["expected_source_file_import_id"] == ("source-attempt-1")
 
 
 @pytest.mark.asyncio
@@ -87,9 +120,7 @@ async def test_guarded_ptg_ensure_rejects_missing_source_identity(monkeypatch):
     )
 
     assert response["status"] == "failed"
-    assert response["message"] == (
-        "PTG source-attempt identity is invalid or changed"
-    )
+    assert response["message"] == ("PTG source-attempt identity is invalid or changed")
 
 
 @pytest.mark.asyncio
@@ -115,9 +146,7 @@ async def test_guarded_ptg_ensure_rejects_conflicting_source_aliases(
     )
 
     assert response["status"] == "failed"
-    assert response["message"] == (
-        "PTG source-attempt identity is invalid or changed"
-    )
+    assert response["message"] == ("PTG source-attempt identity is invalid or changed")
 
 
 @pytest.mark.asyncio
@@ -127,12 +156,11 @@ async def test_guarded_ptg_ensure_rejects_conflicting_source_aliases(
 )
 async def test_guarded_fhir_ensure_rejects_non_launchable_control_status(
     monkeypatch,
+    fhir_worker_fence,
     status,
 ):
     async def admit(**kwargs):
-        assert kwargs["worker_selection"].allowed_importers == frozenset(
-            {"provider-directory-fhir"}
-        )
+        assert kwargs["worker_selection"].allowed_importers == frozenset({"provider-directory-fhir"})
         return {
             "importer": "provider-directory-fhir",
             "status": status,
@@ -157,17 +185,25 @@ async def test_guarded_fhir_ensure_rejects_non_launchable_control_status(
 
     assert response["status"] == "failed"
     assert response["message"] == f"control run is not launchable: {status}"
+    connection, action_lock = fhir_worker_fence
+    action_lock.assert_awaited_once_with(connection, "run_provider_directory_terminal")
 
 
 @pytest.mark.asyncio
-async def test_guarded_fhir_ensure_allows_running_control_status(monkeypatch):
+async def test_guarded_fhir_ensure_allows_running_control_status(monkeypatch, fhir_worker_fence, fhir_admitted_run):
     async def admit(**_kwargs):
-        return {
-            "importer": "provider-directory-fhir",
-            "status": "running",
-        }
+        return fhir_admitted_run
 
-    def ensure(_worker_payload):
+    def ensure(worker_payload):
+        connection, action_lock = fhir_worker_fence
+        action_lock.assert_awaited_once_with(connection, fhir_admitted_run["run_id"])
+        spec = control_workers._BY_WORKER_CLASS["process.ProviderDirectoryFHIR"]
+        launch = fhir_source_worker.authorized_fhir_source_worker_launch(spec, worker_payload)
+        assert launch == fhir_source_worker.FHIRSourceWorkerLaunch(
+            fhir_admitted_run["run_id"],
+            fhir_admitted_run["metrics"]["job_id"],
+            "example/source-worker@sha256:" + "c" * 64,
+        )
         return {"status": "already_running", "items": []}
 
     monkeypatch.setattr(
@@ -185,6 +221,33 @@ async def test_guarded_fhir_ensure_allows_running_control_status(monkeypatch):
     )
 
     assert response["status"] == "already_running"
+    connection, action_lock = fhir_worker_fence
+    action_lock.assert_awaited_once_with(connection, "run_provider_directory_running")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ("run_id", "metrics", "queue", "function", "job_id", "image"))
+async def test_guarded_fhir_ensure_rejects_incomplete_source_admission(
+    monkeypatch, fhir_worker_fence, fhir_admitted_run, missing
+):
+    run_id = fhir_admitted_run["run_id"]
+    if missing == "image":
+        monkeypatch.delenv(fhir_source_worker.IMAGE_ENV)
+    elif missing in {"run_id", "metrics"}:
+        fhir_admitted_run.pop(missing)
+    else:
+        fhir_admitted_run["metrics"].pop(missing)
+    monkeypatch.setattr(control_workers, "admit_existing_outer_run_action", AsyncMock(return_value=fhir_admitted_run))
+    launch = Mock(side_effect=AssertionError("incomplete admission must not launch a worker"))
+    monkeypatch.setattr(control_workers, "ensure_worker", launch)
+
+    response = await control_workers.guarded_ensure_worker({"run_id": run_id, "importer": "provider-directory-fhir"})
+
+    assert response["status"] == "failed"
+    assert response["message"] == "FHIR source worker admission is unavailable"
+    launch.assert_not_called()
+    connection, action_lock = fhir_worker_fence
+    action_lock.assert_awaited_once_with(connection, run_id)
 
 
 @pytest.mark.asyncio
@@ -210,14 +273,10 @@ async def test_ptg_run_rejects_non_ptg_worker_selector(
     if request_importer is not None:
         worker_request_by_field["importer"] = request_importer
 
-    response = await control_workers.guarded_ensure_worker(
-        worker_request_by_field
-    )
+    response = await control_workers.guarded_ensure_worker(worker_request_by_field)
 
     assert response["status"] == "failed"
-    assert response["message"] == (
-        "PTG source-attempt identity is invalid or changed"
-    )
+    assert response["message"] == ("PTG source-attempt identity is invalid or changed")
 
 
 def test_worker_registry_exposes_shared_and_finish_workers():
@@ -237,22 +296,10 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     assert by_importer["ms-drg"]["worker_class"] == "process.MSDRG"
     assert by_importer["terminology-synonyms"]["worker_class"] == "process.TerminologySynonyms"
     assert by_importer["openaddresses"]["worker_class"] == "process.OpenAddresses"
-    assert (
-        by_importer["address-formatted-address"]["worker_class"]
-        == "process.AddressArchive"
-    )
-    assert (
-        by_importer["address-numeric-grid-alias"]["worker_class"]
-        == "process.AddressArchive"
-    )
-    assert (
-        by_importer["address-strict-source-backfill"]["worker_class"]
-        == "process.AddressArchive"
-    )
-    assert (
-        by_importer["address-numeric-grid-alias-revoke"]["worker_class"]
-        == "process.AddressArchive"
-    )
+    assert by_importer["address-formatted-address"]["worker_class"] == "process.AddressArchive"
+    assert by_importer["address-numeric-grid-alias"]["worker_class"] == "process.AddressArchive"
+    assert by_importer["address-strict-source-backfill"]["worker_class"] == "process.AddressArchive"
+    assert by_importer["address-numeric-grid-alias-revoke"]["worker_class"] == "process.AddressArchive"
     assert by_importer["ptg-candidate-audit"]["worker_class"] == "process.PTGCandidateAudit"
     assert by_queue["arq:PTGCandidateAudit"]["role"] == "start"
     assert by_queue["arq:OpenAddresses"]["role"] == "start"
@@ -267,17 +314,13 @@ def test_worker_registry_exposes_shared_and_finish_workers():
 
 
 def test_resolve_specs_prefers_finish_role_over_stale_start_queue():
-    specs = control_workers._resolve_specs(
-        {"importer": "mrf", "role": "finish", "queue": "arq:MRF"}
-    )
+    specs = control_workers._resolve_specs({"importer": "mrf", "role": "finish", "queue": "arq:MRF"})
 
     assert [spec.queue for spec in specs] == ["arq:MRF_finish"]
 
 
 def test_resolve_specs_prefers_finalizing_status_over_stale_start_queue():
-    specs = control_workers._resolve_specs(
-        {"importer": "mrf", "status": "finalizing", "queue": "arq:MRF"}
-    )
+    specs = control_workers._resolve_specs({"importer": "mrf", "status": "finalizing", "queue": "arq:MRF"})
 
     assert [spec.queue for spec in specs] == ["arq:MRF_finish"]
 
@@ -316,9 +359,7 @@ def test_ensure_worker_starts_registered_burst_worker(monkeypatch, tmp_path):
     )
 
     assert worker_response["status"] == "started"
-    assert worker_response["contract_id"] == (
-        control_workers.WORKER_ENSURE_RUN_IDENTITY_CONTRACT
-    )
+    assert worker_response["contract_id"] == (control_workers.WORKER_ENSURE_RUN_IDENTITY_CONTRACT)
     assert worker_response["run_id"] == "run_1"
     assert worker_response["items"][0]["run_id"] == "run_1"
     assert worker_response["items"][0]["worker_class"] == "process.ClaimsPricing"
@@ -414,45 +455,11 @@ def test_ensure_worker_uses_explicit_ptg_lane(monkeypatch, tmp_path):
     assert captured_by_field["env"]["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "ptg_start_run_ptg"
 
 
-def test_ensure_worker_targets_exact_npi_job(monkeypatch, tmp_path):
-    class FakeProcess:
-        pid = 790
-
-    captured_by_field: dict[str, object] = {}
-
-    monkeypatch.setenv("HLTHPRT_WORKER_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setenv("HLTHPRT_WORKER_LOG_DIR", str(tmp_path / "logs"))
-
-    def fake_popen(cmd, *, env, **_kwargs):
-        captured_by_field["cmd"] = cmd
-        captured_by_field["env"] = env
-        return FakeProcess()
-
-    monkeypatch.setattr(control_workers.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(
-        control_workers,
-        "_is_pid_running",
-        lambda pid: pid == FakeProcess.pid,
-    )
-    monkeypatch.setattr(control_workers, "_is_pid_spec_match", lambda pid, spec: True)
-
-    worker_result_by_field = control_workers.ensure_worker(
-        {
-            "importer": "npi",
-            "run_id": "run_npi",
-            "job_id": "npi_start_run_npi",
-        }
-    )
-
-    assert worker_result_by_field["status"] == "started"
-    assert worker_result_by_field["items"][0]["worker_class"] == "process.NPI"
-    assert captured_by_field["cmd"][-2:] == ["worker-once", "process.NPI"]
-    assert captured_by_field["env"]["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:NPI"
-    assert captured_by_field["env"]["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.NPI"
-    assert (
-        captured_by_field["env"]["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"]
-        == "npi_start_run_npi"
-    )
+def test_ensure_worker_refuses_unadmitted_npi_job(monkeypatch):
+    monkeypatch.setattr(control_workers, "_start_process", lambda *args: pytest.fail("unadmitted NPI worker started"))
+    result = control_workers.ensure_worker({"importer": "npi", "run_id": "run_npi", "job_id": "npi_start_run_npi"})
+    assert result["status"] == "failed"
+    assert "exact admitted job" in result["items"][0]["message"]
 
 
 def test_ensure_worker_starts_entity_address_unified_shared_worker(monkeypatch, tmp_path):

@@ -316,6 +316,26 @@ async def test_commit_reconciliation_finishes_its_owned_readback_before_classify
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed", ("synthetic", None, "other"))
+async def test_native_handoff_stores_utc_and_preserves_its_original_attempt_cas(changed):
+    handoff = _handoff_observations().handoff
+    session = SimpleNamespace(scalar=AsyncMock(return_value=changed))
+    if changed == handoff["run_id"]:
+        await archive._nucc_record_handoff_run(session, handoff)
+    else:
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="handoff attempt changed"):
+            await archive._nucc_record_handoff_run(session, handoff)
+    statement, parameters = session.scalar.await_args.args
+    assert "heartbeat_at=clock_timestamp() AT TIME ZONE 'UTC'" in str(statement)
+    assert "status='running'" in str(statement) and "finished_at IS NULL" in str(statement)
+    assert "metrics->'nucc_handoff' IS NULL" in str(statement)
+    assert (
+        parameters["attempt_id"] == handoff["attempt_id"]
+        and parameters["attempt_started_at"] == handoff["attempt_started_at"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ("synthetic", None, "other"))
 async def test_native_completion_uses_one_exact_attempt_cas_and_preserves_unrelated_metrics(changed):
     receipt = _publication(_handoff_observations().handoff)
     session = SimpleNamespace(scalar=AsyncMock(return_value=changed))
@@ -326,6 +346,8 @@ async def test_native_completion_uses_one_exact_attempt_cas_and_preserves_unrela
         await archive._finish_nucc_native_attempt(session, receipt)
     query, parameters = session.scalar.await_args.args
     sql = str(query)
+    assert "heartbeat_at=clock_timestamp() AT TIME ZONE 'UTC'" in sql
+    assert "finished_at=clock_timestamp() AT TIME ZONE 'UTC'" in sql
     assert "metrics=(metrics::jsonb||jsonb_build_object" in sql and "progress=(progress::jsonb||" in sql
     for predicate in (
         "status='finalizing'",
@@ -1045,7 +1067,12 @@ def test_immutable_source_contract_requires_exact_nucc_tracked_provenance(fault)
     if fault:
         field, value = ("importer_id", "geo") if fault == "importer" else ("publication_authority", "manual-only")
         document[field] = value
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="immutable capture requires the NUCC family"):
+        reason = (
+            "reference family table receipt is invalid"
+            if fault == "importer"
+            else "immutable capture requires a supported sealed family"
+        )
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match=reason):
             archive.validate_reference_family_manifest(document)
     else:
         assert archive.validate_reference_family_manifest(document) == manifest

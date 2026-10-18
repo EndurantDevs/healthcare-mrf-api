@@ -18,6 +18,7 @@ from process.provider_directory_fhir_census_contract import (
     CURRENT_VERSION_CENSUS_CONTRACT_FIELD,
     CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY,
 )
+from tests.provider_directory_checkpoint_unit_support import checkpoint_unit_scope as checkpoint_unit_scope
 
 importer = importlib.import_module("process.provider_directory_fhir")
 BASE = "https://directory.example.test/fhir"
@@ -252,9 +253,7 @@ async def test_retryable_http_exhaustion_is_fixed_and_redacted(
     assert fetch_result == (status_code, response_by_field, None, 21)
     assert retry_count == 2
     assert attempt.await_count == 3
-    assert all(
-        attempt_call.args[1] == request_url for attempt_call in attempt.await_args_list
-    )
+    assert all(attempt_call.args[1] == request_url for attempt_call in attempt.await_args_list)
     assert sleep.await_args_list == [call(1.0), call(1.0)]
     generic_attempts.assert_not_called()
     recorder.assert_called_once()
@@ -323,10 +322,7 @@ async def test_transport_error_exhaustion_records_aggregate_diagnostic(monkeypat
     assert retry_count == 2
     assert attempt.await_count == 3
     assert sleep.await_args_list == [call(1.0), call(1.0)]
-    assert (
-        source_record[importer.SOURCE_FETCH_DIAGNOSTIC_FIELD]["response_class"]
-        == "transient_transport_error"
-    )
+    assert source_record[importer.SOURCE_FETCH_DIAGNOSTIC_FIELD]["response_class"] == "transient_transport_error"
 
 
 @pytest.mark.asyncio

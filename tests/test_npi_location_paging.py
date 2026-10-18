@@ -1,16 +1,23 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-from copy import deepcopy
 import json
 import types
+from copy import deepcopy
+from types import MappingProxyType
 from unittest.mock import AsyncMock
+from urllib.parse import urlencode
 
 import pytest
-
-from tests.provider_profile_snapshot_test_support import stub_provider_profile_snapshot as stub_provider_profile_snapshot
+from sanic import Request
+from sanic.compat import Header
+from sanic.exceptions import InvalidUsage
 
 from api.endpoint import npi as npi_module
-
+from api.network_address_scope import network_address_read_scope
+from process.network_serving_read import PinnedNetworkServingManifest
+from tests.provider_profile_snapshot_test_support import (
+    stub_provider_profile_snapshot as stub_provider_profile_snapshot,
+)
 
 ADDRESS_A = "00000000-0000-0000-0000-000000000001"
 ADDRESS_B = "00000000-0000-0000-0000-000000000002"
@@ -39,9 +46,7 @@ def _address(
         "state_code": "IL",
         "postal_code": "60001",
         "country_code": "US",
-        "formatted_address": (
-            f"{first_line}, Suite 100, Example City, IL 60001"
-        ),
+        "formatted_address": (f"{first_line}, Suite 100, Example City, IL 60001"),
         "address_precision": "street",
         "address_sources": [source_id],
         "source_count": 1,
@@ -124,9 +129,7 @@ def _prepare_hydrated_address_maps(
             }
         )
     for address_map in address_maps:
-        address_map["_base_row_identities"] = [
-            npi_module._base_address_row_identity(address_map)
-        ]
+        address_map["_base_row_identities"] = [npi_module._base_address_row_identity(address_map)]
     return address_maps
 
 
@@ -141,8 +144,7 @@ def _build_detail_mock(build_calls):
             detail["address_list"] = [
                 address
                 for address in detail["address_list"]
-                if npi_module._base_address_row_identity(address)
-                in selected_identities
+                if npi_module._base_address_row_identity(address) in selected_identities
             ]
         return detail
 
@@ -154,9 +156,7 @@ def _location_candidate_mock(candidate_calls):
         candidate_calls.append(kwargs)
         candidates = deepcopy(_detail_payload()["address_list"])
         for candidate in candidates:
-            candidate["_base_row_identities"] = [
-                npi_module._base_address_row_identity(candidate)
-            ]
+            candidate["_base_row_identities"] = [npi_module._base_address_row_identity(candidate)]
         return candidates
 
     return fake_candidates
@@ -173,8 +173,7 @@ def _address_row_mock(address_row_calls, *, degraded_hydration):
             address_maps = [
                 address
                 for address in address_maps
-                if npi_module._base_address_row_identity(address)
-                in selected_identities
+                if npi_module._base_address_row_identity(address) in selected_identities
             ]
         return address_maps
 
@@ -417,9 +416,7 @@ async def test_get_npi_pages_after_overlay_merge_and_dedupe(monkeypatch):
         ADDRESS_A,
         ADDRESS_C,
     ]
-    assert [address["address_key"] for address in second_page["address_list"]] == [
-        ADDRESS_B
-    ]
+    assert [address["address_key"] for address in second_page["address_list"]] == [ADDRESS_B]
     assert first_page["address_list"][0]["formatted_address"] == (
         "100 Example Avenue, Suite 100, Example City, IL 60001"
     )
@@ -476,3 +473,96 @@ async def test_get_npi_all_returns_complete_combined_location_set(monkeypatch):
     assert len(route_calls["candidates"]) == 1
     assert len(route_calls["address_rows"]) == 1
     assert len(route_calls["address_rows"][0]["address_row_identities"]) == 2
+
+
+def _real_detail_request(arguments):
+    return Request(
+        ("/api/v1/npi/id/1234567890?" + urlencode(arguments)).encode(),
+        Header({}),
+        "1.1",
+        "GET",
+        None,
+        types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": False}),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selection",
+    [
+        {"address_limit": 1, "address_offset": 1},
+        {"address_grouping": "premise", "address_limit": 1, "address_offset": 1},
+        {"address_key": ADDRESS_B, "address_limit": 1},
+    ],
+)
+async def test_internal_detail_matches_route_and_uses_explicit_args_without_request_mutation(monkeypatch, selection):
+    _install_route_mocks(monkeypatch)
+    detail_args_by_name = {
+        "view": "summary",
+        "include_profile": False,
+        "sync_geocode": False,
+        "lookup_stored_geocode": False,
+        **selection,
+    }
+    ordinary_request = _real_detail_request(detail_args_by_name)
+    expected = await npi_module.get_npi(ordinary_request, "1234567890")
+    request = _real_detail_request(
+        {"address_grouping": "invalid", "address_limit": "all", "force_address_update": "true", "debug": "true"}
+    )
+    original_args = deepcopy(dict(request.args))
+    original_app = request.app
+    request.ctx.caller_marker = object()
+    original_marker = request.ctx.caller_marker
+    explicit_args = MappingProxyType(detail_args_by_name)
+    actual = await npi_module.read_npi_detail(request, "1234567890", native_args=explicit_args)
+    assert actual.status == expected.status == 200
+    assert actual.body == expected.body
+    assert actual.content_type == expected.content_type == "application/json"
+    assert dict(request.args) == original_args
+    assert request.app is original_app and request.ctx.caller_marker is original_marker
+    assert dict(explicit_args) == detail_args_by_name
+    document = json.loads(actual.body)
+    if selection.get("address_grouping") == "premise":
+        assert document["address_groups"][0]["members"][0]["address_key"] == ADDRESS_C
+    elif "address_key" in selection:
+        assert [address["address_key"] for address in document["address_list"]] == [ADDRESS_B]
+    else:
+        assert [address["address_key"] for address in document["address_list"]] == [ADDRESS_C]
+
+
+@pytest.mark.asyncio
+async def test_internal_detail_empty_args_ignore_browser_values(monkeypatch):
+    route_calls = _install_route_mocks(monkeypatch)
+    from api import provider_profile_network_read
+
+    profile_read = AsyncMock(return_value=None)
+    monkeypatch.setattr(provider_profile_network_read, "read_detail_directory_profile", profile_read)
+    request = _real_detail_request({"address_grouping": "invalid", "address_limit": "1", "debug": "true"})
+    original_args = deepcopy(dict(request.args))
+    operation_response = await npi_module.read_npi_detail(request, "1234567890", native_args=MappingProxyType({}))
+    payload = json.loads(operation_response.body)
+    assert payload["address_pagination"]["limit"] == npi_module.NPI_DETAIL_ADDRESS_DEFAULT_LIMIT
+    assert [address["address_key"] for address in payload["address_list"]] == [ADDRESS_A, ADDRESS_C, ADDRESS_B]
+    assert "include_evidence" not in route_calls["build"][0]
+    profile_read.assert_awaited_once_with(None, 1234567890, include_evidence=False)
+    assert dict(request.args) == original_args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_option", ["force_address_update", "sync_geocode"])
+async def test_internal_detail_scoped_write_options_refuse_before_loading(monkeypatch, write_option):
+    build = AsyncMock()
+    writer = AsyncMock()
+    monkeypatch.setattr(npi_module, "_build_npi_details", build)
+    monkeypatch.setattr(npi_module, "run_as_writer", writer)
+    candidate_id = "11111111-1111-4111-8111-111111111111"
+    manifest = PinnedNetworkServingManifest(
+        9, candidate_id, "network_candidate_" + candidate_id.replace("-", ""), 1, {}, 4, "a" * 64, 123
+    )
+    request = _real_detail_request({write_option: "false"})
+    with network_address_read_scope(manifest, (7,)):
+        with pytest.raises(InvalidUsage, match="cannot update address data"):
+            await npi_module.read_npi_detail(request, "1234567890", native_args={write_option: True})
+    build.assert_not_awaited()
+    writer.assert_not_awaited()
+    assert request.args[write_option] == ["false"]

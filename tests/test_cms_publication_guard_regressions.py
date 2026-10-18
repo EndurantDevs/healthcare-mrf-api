@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -480,6 +480,21 @@ async def _lock_composite_delta(monkeypatch, session, profile_delta):
         await _preflight_fhir._lock_profile_delta_relations(_preflight_fhir._profile_delta_relations(profile_delta))
 
 
+async def _lock_composite_live(monkeypatch, session, relations):
+    """Model the real bundle helper's common lock phase before its callback."""
+
+    async def status(sql):
+        await session.execute(publication.text(sql))
+
+    async def attribute(_schema, name, _attribute):
+        return await session.scalar(publication.text("SELECT c.relkind"), {"name": name})
+
+    with monkeypatch.context() as context:
+        context.setattr(_preflight_fhir, "db", SimpleNamespace(status=status, _transaction_binding=lambda: None))
+        context.setattr(_preflight_fhir, "_provider_directory_relation_attribute", attribute)
+        await _preflight_fhir._lock_provider_directory_artifact_live_tables("synthetic", relations)
+
+
 def _composite_prepared(fhir, with_forecast):
     admission = _wal_tracker_admission()
     fhir._provider_directory_profile_capacity_admission = lambda: admission
@@ -532,8 +547,26 @@ def _assert_composite_completion(fhir, session, prepared, has_doctors, forecast)
         )
     else:
         assert '"provider_directory_profile"' in locks[0]
-        prepared.assert_ready.assert_awaited_once_with(cutover=True, archive_applied=True)
+        assert prepared.assert_ready.await_args_list == [call(cutover=True, archive_applied=True)] * 2
         fhir._validate_profile_delta_total_wal.assert_not_awaited()
+    assert publication.preserve_publication_reads.await_args_list == [
+        call(session, schema=stage.schema, live_table=stage.target_relation, stage_table=stage.stage_table)
+        for stage in prepared.stages
+    ]
+
+
+def _observe_composite_read_access(monkeypatch, session, events, stages, prior_events):
+    """Require the original owner and the complete live lock set before preserving reads."""
+
+    async def preserve_reads(driver, **coordinates):
+        assert driver is session and events == [*prior_events, "all-live-locked"]
+        assert coordinates in [
+            dict(schema=stage.schema, live_table=stage.target_relation, stage_table=stage.stage_table)
+            for stage in stages
+        ]
+
+    monkeypatch.setattr(publication, "_copy_driver", AsyncMock(return_value=session))
+    monkeypatch.setattr(publication, "preserve_publication_reads", AsyncMock(side_effect=preserve_reads))
 
 
 @pytest.mark.parametrize("with_doctors,with_forecast", [(False, False), (False, True), (True, False), (True, True)])
@@ -557,6 +590,9 @@ async def test_composite_publication_locks_live_set_before_swaps_and_receipt(mon
         if with_forecast:
             await _lock_composite_delta(monkeypatch, session, prepared.profile_delta)
             events.extend(prior_events)
+        await _lock_composite_live(
+            monkeypatch, session, set(options["extra_live_relations"]) | {stage.target_relation for stage in stages}
+        )
         await options["before_swaps"]()
         assert events[len(prior_events)] == "all-live-locked"
         if with_doctors:
@@ -574,6 +610,7 @@ async def test_composite_publication_locks_live_set_before_swaps_and_receipt(mon
         assert actual is address and events[-1] == (last_delta_event if with_forecast else "profile-applied")
         events.append("address-applied")
 
+    _observe_composite_read_access(monkeypatch, session, events, prepared.stages, prior_events)
     monkeypatch.setattr(publication, "apply_prepared_artifact_bundle", apply_bundle)
     monkeypatch.setattr(publication, "apply_prepared_cms_doctors_generation", apply_doctors)
     monkeypatch.setattr(publication, "publish_prepared_entity_address_generation", apply_address)

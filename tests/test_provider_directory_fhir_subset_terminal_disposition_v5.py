@@ -4,16 +4,16 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
 from process import provider_directory_fhir_subset_terminal_disposition as facade
+from process import provider_directory_fhir_subset_terminal_disposition_store as disposition_store
 from process import (
-    provider_directory_fhir_subset_terminal_disposition_v5_selection
-    as v5_selection,
+    provider_directory_fhir_subset_terminal_disposition_v5_selection as v5_selection,
 )
 from process.provider_directory_fhir_subset_terminal_disposition import (
     dispose_v5_terminal_root,
@@ -57,13 +57,15 @@ from tests.provider_directory_fhir_subset_terminal_disposition_v5_support import
     direct_v5_inputs,
 )
 
+_SYNTHETIC_MARKER_SHA256 = "f419b51652df88f110e7f1f8ea61298c7342d19427e9f6209d839ce54434eb83"
+_FROZEN_MARKER_PATH = Path(__file__).with_name("fixtures") / ("provider_directory_v5_http410_terminal_marker.json")
 
-_SYNTHETIC_MARKER_SHA256 = (
-    "f419b51652df88f110e7f1f8ea61298c7342d19427e9f6209d839ce54434eb83"
-)
-_FROZEN_MARKER_PATH = Path(__file__).with_name("fixtures") / (
-    "provider_directory_v5_http410_terminal_marker.json"
-)
+
+@pytest.fixture(autouse=True)
+def checkpoint_transport(monkeypatch):
+    monkeypatch.setattr(
+        disposition_store, "source_checkpoint_transaction", lambda database, **_coordinates: database.transaction()
+    )
 
 
 def _synthetic_marker() -> dict:
@@ -104,9 +106,7 @@ def _synthetic_marker() -> dict:
 def _frozen_live_marker() -> dict:
     """Load the independently reconstructed identifier-free live marker."""
 
-    return json.loads(
-        _FROZEN_MARKER_PATH.read_text(encoding="utf-8")
-    )
+    return json.loads(_FROZEN_MARKER_PATH.read_text(encoding="utf-8"))
 
 
 @pytest.fixture(autouse=True)
@@ -121,31 +121,19 @@ def _bind_synthetic_marker(monkeypatch):
 
 
 def test_v5_marker_hashes_are_frozen():
-    assert canonical_evidence_sha256(_synthetic_marker()) == (
-        _SYNTHETIC_MARKER_SHA256
-    )
-    assert DIRECT_V5_TERMINAL_MARKER_SHA256 == (
-        "87f1c25625562037f9544b30a62e8b1bbf625018c73076bb083b8680225b23d9"
-    )
-    frozen_live_marker = validated_direct_v5_terminal_marker(
-        _frozen_live_marker()
-    )
-    assert canonical_evidence_sha256(frozen_live_marker) == (
-        DIRECT_V5_TERMINAL_MARKER_SHA256
-    )
+    assert canonical_evidence_sha256(_synthetic_marker()) == (_SYNTHETIC_MARKER_SHA256)
+    assert DIRECT_V5_TERMINAL_MARKER_SHA256 == ("87f1c25625562037f9544b30a62e8b1bbf625018c73076bb083b8680225b23d9")
+    frozen_live_marker = validated_direct_v5_terminal_marker(_frozen_live_marker())
+    assert canonical_evidence_sha256(frozen_live_marker) == (DIRECT_V5_TERMINAL_MARKER_SHA256)
 
 
 def test_v5_profile_is_exactly_six_complete_and_one_http410():
-    assert DIRECT_V5_DISPOSITION_BY_RESOURCE_TYPE["HealthcareService"] == (
-        TERMINAL_HTTP_410_DISPOSITION
-    )
+    assert DIRECT_V5_DISPOSITION_BY_RESOURCE_TYPE["HealthcareService"] == (TERMINAL_HTTP_410_DISPOSITION)
     assert set(DIRECT_V5_DISPOSITION_BY_RESOURCE_TYPE.values()) == {
         TERMINAL_HTTP_410_DISPOSITION,
         VERIFIED_COMPLETE_DISPOSITION,
     }
-    assert list(DIRECT_V5_DISPOSITION_BY_RESOURCE_TYPE.values()).count(
-        VERIFIED_COMPLETE_DISPOSITION
-    ) == 6
+    assert list(DIRECT_V5_DISPOSITION_BY_RESOURCE_TYPE.values()).count(VERIFIED_COMPLETE_DISPOSITION) == 6
 
 
 def test_v5_gate_is_exact_and_default_off(monkeypatch):
@@ -179,13 +167,9 @@ async def test_selector_builds_exact_v5_marker():
         "source-a",
     )
 
-    marker_by_field = validated_direct_v5_terminal_marker(
-        selection.marker_by_field
-    )
+    marker_by_field = validated_direct_v5_terminal_marker(selection.marker_by_field)
     assert marker_by_field["contract_version"] == DIRECT_V5_CONTRACT_VERSION
-    assert marker_by_field["resource_dispositions"]["HealthcareService"][
-        "advertised_post"
-    ] is None
+    assert marker_by_field["resource_dispositions"]["HealthcareService"]["advertised_post"] is None
     assert marker_by_field["terminal_page_delta"] == 0
     assert len(checkpoint_rows) == 7
 
@@ -209,9 +193,7 @@ async def test_store_seals_once_and_replays(monkeypatch):
 
     assert first.disposed is True
     assert second.is_already_applied is True
-    assert TERMINAL_DISPOSITION_METADATA_KEY in (
-        database.candidate_row["publication_metadata_json"]
-    )
+    assert TERMINAL_DISPOSITION_METADATA_KEY in (database.candidate_row["publication_metadata_json"])
     monkeypatch.setenv(
         DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_ENABLED_ENV,
         "true",
@@ -283,25 +265,18 @@ async def test_v5_selection_rejects_independent_evidence_drift(
 async def test_v5_http410_evidence_is_exact(mutation_name):
     database = DirectV5TerminalDatabase()
     if mutation_name == "continuation":
-        checkpoint = next(
-            row
-            for row in database.checkpoint_rows
-            if row["resource_type"] == "HealthcareService"
-        )
+        checkpoint = next(row for row in database.checkpoint_rows if row["resource_type"] == "HealthcareService")
         checkpoint["next_url"] = None
     else:
         candidate_metadata = database.candidate_row["publication_metadata_json"]
         diagnostic_copies = (
             candidate_metadata["resource_diagnostics"],
             candidate_metadata["completion_proof_v1"]["resource_diagnostics"],
-            database.source_row["metadata_json"]["last_resource_import"][
-                "resources"
-            ],
+            database.source_row["metadata_json"]["last_resource_import"]["resources"],
         )
         for diagnostics_by_type in diagnostic_copies:
             diagnostics_by_type["HealthcareService"]["error"] = (
-                "provider_directory_current_version_census_completeness_blocked:"
-                "http_404"
+                "provider_directory_current_version_census_completeness_blocked:http_404"
             )
 
     with pytest.raises(ReviewedSubsetTerminalDispositionError):

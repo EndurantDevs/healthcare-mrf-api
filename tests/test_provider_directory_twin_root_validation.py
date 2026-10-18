@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -35,14 +34,9 @@ def _candidate(
         verification_source_scope_hash="scope-v1",
         verification_role=verification_role,
         verification_baseline_dataset_id=(
-            "dataset_baseline"
-            if verification_role
-            == importer.TWIN_ROOT_VERIFICATION_CANDIDATE_ROLE
-            else None
+            "dataset_baseline" if verification_role == importer.TWIN_ROOT_VERIFICATION_CANDIDATE_ROLE else None
         ),
-        resource_hash_contract=(
-            importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
-        ),
+        resource_hash_contract=(importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT),
     )
 
 
@@ -77,21 +71,14 @@ def _content_proof(
         for resource_entry in resource_rows
     )
     overall_digest = hashlib.sha256(
-        "\n".join(
-            importer._stable_identity_json(identity) for identity in identities
-        ).encode()
+        "\n".join(importer._stable_identity_json(identity) for identity in identities).encode()
     ).hexdigest()
     hashes_by_resource = {}
     counts_by_resource = {}
     for resource_type in ("Organization", "Practitioner"):
-        resource_identities = [
-            identity for identity in identities if identity[0] == resource_type
-        ]
+        resource_identities = [identity for identity in identities if identity[0] == resource_type]
         hashes_by_resource[resource_type] = hashlib.sha256(
-            "\n".join(
-                importer._stable_identity_json(identity)
-                for identity in resource_identities
-            ).encode()
+            "\n".join(importer._stable_identity_json(identity) for identity in resource_identities).encode()
         ).hexdigest()
         counts_by_resource[resource_type] = len(resource_identities)
     return importer.EndpointDatasetContentProof(
@@ -118,29 +105,21 @@ def _baseline_dataset_map(
         "resource_count": content_proof.resource_count,
         "verification_baseline_count": 1,
         "publication_metadata_json": {
-            importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: (
-                candidate.resource_hash_contract
-            ),
+            importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: (candidate.resource_hash_contract),
             "source_ids": list(candidate.source_ids),
             "selected_resources": list(candidate.selected_resources),
             "expected_resources": list(candidate.expected_resources),
             "requires_twin_root_verification": True,
-            importer.TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: (
-                candidate.verification_campaign_id
-            ),
-            importer.TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: (
-                candidate.verification_source_scope_hash
-            ),
-            importer.TWIN_ROOT_VERIFICATION_ROLE_KEY: (
-                importer.TWIN_ROOT_BASELINE_CANDIDATE_ROLE
-            ),
+            importer.TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: (candidate.verification_campaign_id),
+            importer.TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: (candidate.verification_source_scope_hash),
+            importer.TWIN_ROOT_VERIFICATION_ROLE_KEY: (importer.TWIN_ROOT_BASELINE_CANDIDATE_ROLE),
             importer.TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY: None,
             importer.TWIN_ROOT_VERIFICATION_METADATA_KEY: {
                 "role": "baseline",
                 "admission_role": importer.TWIN_ROOT_BASELINE_CANDIDATE_ROLE,
                 "result": "baseline_recorded",
                 "proof": proof,
-            }
+            },
         },
     }
 
@@ -151,6 +130,7 @@ class _ValidationHarness:
         self.resource_rows = resource_rows
         self.baseline_dataset_map = baseline_dataset_map
         self.saved_params = None
+        self.statements = []
         self.is_committed = False
 
     async def __aenter__(self):
@@ -179,9 +159,7 @@ class _ValidationHarness:
                 "status": importer.ENDPOINT_DATASET_ACQUIRING,
                 "previous_dataset_id": self.candidate.previous_dataset_id,
                 "publication_metadata_json": {
-                    importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: (
-                        self.candidate.resource_hash_contract
-                    )
+                    importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: (self.candidate.resource_hash_contract)
                 },
             }
         return {"dataset_id": self.candidate.previous_dataset_id}
@@ -206,6 +184,7 @@ class _ValidationHarness:
         ][: params["batch_size"]]
 
     async def status(self, sql, **params):
+        self.statements.append(str(sql))
         if str(sql).startswith("SET TRANSACTION"):
             return 1
         self.saved_params = params
@@ -237,21 +216,22 @@ async def _validate(
         "_candidate_endpoint_dataset_content_proof",
         AsyncMock(return_value=_content_proof(resource_rows)),
     )
-    monkeypatch.setattr(
-        importer, "_build_endpoint_dataset_serving_relations", relations
-    )
-    summary = await importer._validate_endpoint_dataset_candidate(
-        candidate, _diagnostics()
-    )
+    monkeypatch.setattr(importer, "_build_endpoint_dataset_serving_relations", relations)
+    from process.provider_directory_generic_source_policy import source_transaction
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+
+    async with synthetic_source_database(monkeypatch, harness) as database:
+        monkeypatch.setattr(importer, "db", database)
+        async with source_transaction(database, isolation="repeatable read"), harness as connection:
+            validation = await importer._persist_endpoint_dataset_validation(connection, candidate, _diagnostics())
+            summary = importer._endpoint_dataset_validation_summary(candidate, *validation)
     return summary, harness, relations
 
 
 @pytest.mark.asyncio
 async def test_first_root_is_hash_only_non_publishable_baseline(monkeypatch):
     candidate = _candidate("dataset_first", "root_first")
-    summary, harness, relations = await _validate(
-        monkeypatch, candidate, _resource_rows()
-    )
+    summary, harness, relations = await _validate(monkeypatch, candidate, _resource_rows())
     assert harness.is_committed is True
     assert summary["status"] == importer.ENDPOINT_DATASET_VERIFICATION_BASELINE
     assert summary["validated"] is False
@@ -274,20 +254,16 @@ async def test_exact_second_root_is_the_only_validated_candidate(monkeypatch):
     )
     resource_rows = _resource_rows()
     baseline_dataset_map = _baseline_dataset_map(candidate, resource_rows)
-    summary, harness, relations = await _validate(
-        monkeypatch, candidate, resource_rows, baseline_dataset_map
-    )
+    summary, harness, relations = await _validate(monkeypatch, candidate, resource_rows, baseline_dataset_map)
     assert summary["status"] == importer.ENDPOINT_DATASET_VALIDATED
     assert summary["validated"] is True
     metadata = json.loads(harness.saved_params["publication_metadata_json"])
     verification = metadata[importer.TWIN_ROOT_VERIFICATION_METADATA_KEY]
     assert verification["result"] == "matched"
     assert verification["baseline_dataset_id"] == "dataset_baseline"
-    assert summary["baseline_payload_rows_retired"] == 1
-    assert verification["baseline_payload_retirement"] == {
-        "baseline_dataset_id": "dataset_baseline",
-        "deleted_resource_rows": 1,
-    }
+    assert summary["baseline_payload_rows_retired"] == 0
+    assert "baseline_payload_retirement" not in verification
+    assert not any("DELETE FROM" in statement.upper() for statement in harness.statements)
     relations.assert_awaited_once_with(harness, candidate)
 
 
@@ -301,9 +277,7 @@ async def test_second_root_mismatch_is_terminal_without_serving_build(monkeypatc
     baseline_rows = _resource_rows()
     baseline_dataset_map = _baseline_dataset_map(candidate, baseline_rows)
     changed_rows = [dict(baseline_rows[0], payload_hash="changed"), baseline_rows[1]]
-    summary, harness, relations = await _validate(
-        monkeypatch, candidate, changed_rows, baseline_dataset_map
-    )
+    summary, harness, relations = await _validate(monkeypatch, candidate, changed_rows, baseline_dataset_map)
     assert summary["status"] == importer.ENDPOINT_DATASET_VERIFICATION_MISMATCH
     assert summary["validated"] is False
     assert "dataset_hash" in summary["mismatch_fields"]
@@ -332,9 +306,7 @@ async def test_terminal_mismatch_clears_checkpoints_then_fails_run(monkeypatch):
         clear,
     )
     with pytest.raises(RuntimeError, match="verification_mismatch"):
-        await importer._finalize_candidate_and_clear_checkpoints(
-            candidate, _diagnostics()
-        )
+        await importer._finalize_candidate_and_clear_checkpoints(candidate, _diagnostics())
     clear.assert_awaited_once()
 
 
@@ -346,9 +318,7 @@ async def test_terminal_mismatch_clears_checkpoints_then_fails_run(monkeypatch):
         importer.ENDPOINT_DATASET_VERIFICATION_MISMATCH,
     ],
 )
-async def test_terminal_verification_states_are_checkpoint_finalized(
-    monkeypatch, status
-):
+async def test_terminal_verification_states_are_checkpoint_finalized(monkeypatch, status):
     candidate = dataclasses.replace(
         _candidate("dataset_candidate", "root_candidate"),
         checkpoint_context=importer.PaginationCheckpointContext(

@@ -1,17 +1,23 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 """Real-PostgreSQL lifecycle proof for reviewed subset abandonment."""
+
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
 import importlib
 import json
+from contextlib import AsyncExitStack, suppress
 
 from process import provider_directory_fhir_subset_abandonment as abandonment
 from process import provider_directory_fhir_subset_abandonment_store as store
 from process.provider_directory_fhir_subset_abandonment_contract import (
     ABANDONMENT_ENABLED_ENV,
+)
+from tests.provider_directory_fhir_subset_abandonment_pg_assertions import (
+    assert_scope_domains_are_distinct,
+    assert_serving_alias_and_decoy_preserved,
+    prove_collapsed_scope_domains_are_rejected,
 )
 from tests.provider_directory_fhir_subset_abandonment_pg_support import (
     CANONICAL_API_BASE,
@@ -20,19 +26,15 @@ from tests.provider_directory_fhir_subset_abandonment_pg_support import (
     OWNER_RUN_ID,
     ROOT_RUN_ID,
     SOURCE_ID,
+    _current_writer,
     authorize_operator,
     close_abandonment_scenario,
     create_abandonment_relations,
     guard_handoff_context,
     install_admission_query_surface,
     retained_evidence_snapshot,
-    runtime_database,
     seed_expired_root,
-)
-from tests.provider_directory_fhir_subset_abandonment_pg_assertions import (
-    assert_scope_domains_are_distinct,
-    assert_serving_alias_and_decoy_preserved,
-    prove_collapsed_scope_domains_are_rejected,
+    upgrade_abandonment_writer,
 )
 from tests.provider_directory_reviewed_subset_activation_pg_support import (
     load_activation_migration,
@@ -93,13 +95,13 @@ async def _prove_adoption_rejects_preenacted_state(
                 scenario.connection,
             )
         except asyncpg.PostgresError as error:
-            assert "provider_directory_subset_abandonment_adoption_forbidden" in str(
-                error
-            )
+            assert "provider_directory_subset_abandonment_adoption_forbidden" in str(error)
         else:
             raise AssertionError("pre-enacted abandonment was adopted")
     finally:
         await adoption_transaction.rollback()
+
+
 async def _prove_busy_locks_preserve_evidence(scenario, database) -> None:
     for lock_key in (
         f"provider-directory-pagination:{CANONICAL_API_BASE}",
@@ -110,14 +112,11 @@ async def _prove_busy_locks_preserve_evidence(scenario, database) -> None:
         await lock_transaction.start()
         try:
             await scenario.connection.fetchval(
-                "SELECT pg_catalog.pg_advisory_xact_lock("
-                "pg_catalog.hashtextextended($1, 0))",
+                "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))",
                 lock_key,
             )
             try:
-                await abandonment.abandon_reviewed_subset_expired_root(
-                    database=database
-                )
+                await abandonment.abandon_reviewed_subset_expired_root(database=database)
             except abandonment.ReviewedSubsetAbandonmentError as error:
                 assert error.code == "busy"
             else:
@@ -174,9 +173,7 @@ async def _admit_fresh_candidate_after_guard(importer, database):
         selected_resources=tuple(RESOURCE_TYPES),
         import_run_id="owner-fresh-admission",
         previous_dataset_id=None,
-        resource_hash_contract=(
-            importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
-        ),
+        resource_hash_contract=(importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT),
     )
     async with database.acquire() as connection:
         return await importer._assert_no_conflicting_endpoint_candidate(
@@ -195,14 +192,12 @@ async def _fresh_admission_after_guard(
     """Wait for the crawl guard, then inspect and admit production state."""
 
     await waiter.fetchval(
-        "SELECT pg_catalog.pg_advisory_lock("
-        "pg_catalog.hashtextextended($1, 0))",
+        "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended($1, 0))",
         lock_key,
     )
     try:
         old_status = await waiter.fetchval(
-            f"SELECT status FROM {scenario.quoted_schema}."
-            "provider_directory_endpoint_dataset WHERE dataset_id = $1",
+            f"SELECT status FROM {scenario.quoted_schema}.provider_directory_endpoint_dataset WHERE dataset_id = $1",
             DATASET_ID,
         )
         resume_state = await _checkpoint_resume_after_guard(
@@ -217,8 +212,7 @@ async def _fresh_admission_after_guard(
         return old_status, resume_state, admitted_candidate
     finally:
         await waiter.fetchval(
-            "SELECT pg_catalog.pg_advisory_unlock("
-            "pg_catalog.hashtextextended($1, 0))",
+            "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0))",
             lock_key,
         )
 
@@ -237,16 +231,30 @@ async def _install_guard_handoff_scenario(scenario) -> None:
         )
 
 
+async def _seal_guarded_subset(lease, database):
+    """Use the held guard's issued original transaction only for the terminal seal."""
+    async with lease.transaction() as guard_database:
+        assert guard_database is database
+        return await store.sync_reviewed_subset_abandonment_transaction(
+            guard_database,
+            SOURCE_ID,
+            tuple(RESOURCE_TYPES),
+            held_pagination_guard_key=lease.lock_key,
+        )
+
+
 async def prove_reviewed_subset_abandonment_guard_handoff(monkeypatch) -> None:
     """Commit the seal before a queued fresh worker can acquire its guard."""
 
     importer = importlib.import_module("process.provider_directory_fhir")
     scenario = await create_committed_subset_schema(monkeypatch)
-    database = runtime_database()
+    writer_scope = AsyncExitStack()
     waiter = await open_test_connection()
     fresh_task = None
     try:
         await _install_guard_handoff_scenario(scenario)
+        await upgrade_abandonment_writer(scenario)
+        database = await writer_scope.enter_async_context(_current_writer(scenario, monkeypatch))
         monkeypatch.setattr(importer, "db", database)
         context = guard_handoff_context(importer)
         async with importer._pagination_checkpoint_worker_guard(context) as lease:
@@ -265,21 +273,17 @@ async def prove_reviewed_subset_abandonment_guard_handoff(monkeypatch) -> None:
                 waiter.get_server_pid(),
                 fresh_task,
             )
-            abandonment_result = (
-                await store.sync_reviewed_subset_abandonment_transaction(
-                    lease.database,
-                    SOURCE_ID,
-                    tuple(RESOURCE_TYPES),
-                    held_pagination_guard_key=lease.lock_key,
-                )
-            )
+            abandonment_result = await _seal_guarded_subset(lease, database)
             assert abandonment_result.abandoned is True
             assert fresh_task.done() is False
-            assert await scenario.connection.fetchval(
-                f"SELECT status FROM {scenario.quoted_schema}."
-                "provider_directory_endpoint_dataset WHERE dataset_id = $1",
-                DATASET_ID,
-            ) == "acquisition_abandoned"
+            assert (
+                await scenario.connection.fetchval(
+                    f"SELECT status FROM {scenario.quoted_schema}."
+                    "provider_directory_endpoint_dataset WHERE dataset_id = $1",
+                    DATASET_ID,
+                )
+                == "acquisition_abandoned"
+            )
         old_status, resume_state, admitted_candidate = await asyncio.wait_for(
             fresh_task,
             timeout=5,
@@ -292,7 +296,8 @@ async def prove_reviewed_subset_abandonment_guard_handoff(monkeypatch) -> None:
             fresh_task.cancel()
             with suppress(asyncio.CancelledError):
                 await fresh_task
-        await close_abandonment_scenario(scenario, database, waiter)
+        await writer_scope.aclose()
+        await close_abandonment_scenario(scenario, waiter)
 
 
 async def _assert_postgres_marker(task, marker: str) -> None:
@@ -315,9 +320,7 @@ async def _seal_while_writer_waits(monkeypatch, scenario, database, writer) -> N
         return await original_abandon_checkpoints(*args, **kwargs)
 
     monkeypatch.setattr(store, "_abandon_checkpoints", paused_abandon_checkpoints)
-    operator_task = asyncio.create_task(
-        abandonment.abandon_reviewed_subset_expired_root(database=database)
-    )
+    operator_task = asyncio.create_task(abandonment.abandon_reviewed_subset_expired_root(database=database))
     writer_task = None
     try:
         await asyncio.wait_for(selection_locked.wait(), timeout=5)
@@ -375,10 +378,7 @@ async def _assert_sealed_state(scenario, migration, before_by_relation) -> None:
     assert parent_by_field["completion_proof_sha256"] is None
     assert parent_by_field["validated_at"] is None
     assert parent_by_field["published_at"] is None
-    assert (
-        "provider_directory_reviewed_subset_abandonment_v1"
-        in parent_by_field["metadata"]
-    )
+    assert "provider_directory_reviewed_subset_abandonment_v1" in parent_by_field["metadata"]
     checkpoint_count = await scenario.connection.fetchval(
         f"""
         SELECT count(*)
@@ -393,7 +393,7 @@ async def _assert_sealed_state(scenario, migration, before_by_relation) -> None:
     await assert_serving_alias_and_decoy_preserved(scenario)
     await assert_scope_domains_are_distinct(scenario)
     is_valid = await scenario.connection.fetchval(
-        f"SELECT {scenario.quoted_schema}." f'"{migration._VALID}"($1)',
+        f'SELECT {scenario.quoted_schema}."{migration._VALID}"($1)',
         DATASET_ID,
     )
     assert is_valid is True
@@ -446,9 +446,9 @@ def _bulk_root_poison_sql(scenario) -> str:
             endpoint_id, dataset_id, start_url_hash, state,
             rows_written, created_at, updated_at
         ) VALUES (
-            'bulk-poison', '{CANONICAL_API_BASE}', 'Location', '{'1' * 64}',
+            'bulk-poison', '{CANONICAL_API_BASE}', 'Location', '{"1" * 64}',
             'synthetic-v1', $1, 'owner-fresh', '{ENDPOINT_ID}',
-            'dataset-fresh', '{'2' * 64}', 'accepted', 0, now(), now()
+            'dataset-fresh', '{"2" * 64}', 'accepted', 0, now(), now()
         )
     """
 
@@ -471,7 +471,7 @@ async def prove_reviewed_subset_abandonment_lifecycle(monkeypatch) -> None:
 
     scenario = await create_committed_subset_schema(monkeypatch)
     migration = load_abandonment_migration()
-    database = runtime_database()
+    writer_scope = AsyncExitStack()
     writer = await open_test_connection()
     try:
         await _install_abandonment_predecessors(scenario)
@@ -479,6 +479,8 @@ async def prove_reviewed_subset_abandonment_lifecycle(monkeypatch) -> None:
         await _prove_adoption_rejects_preenacted_state(scenario, migration)
         async with scenario.connection.transaction():
             await run_subset_migration(migration, "upgrade", scenario.connection)
+        await upgrade_abandonment_writer(scenario)
+        database = await writer_scope.enter_async_context(_current_writer(scenario, monkeypatch))
         authorize_operator(monkeypatch, ABANDONMENT_ENABLED_ENV)
         await prove_collapsed_scope_domains_are_rejected(
             scenario,
@@ -489,12 +491,12 @@ async def prove_reviewed_subset_abandonment_lifecycle(monkeypatch) -> None:
         before_by_relation = await retained_evidence_snapshot(scenario)
         await _seal_while_writer_waits(monkeypatch, scenario, database, writer)
         await _assert_sealed_state(scenario, migration, before_by_relation)
-        replay_result = await abandonment.abandon_reviewed_subset_expired_root(
-            database=database
-        )
+        replay_result = await abandonment.abandon_reviewed_subset_expired_root(database=database)
         assert replay_result.abandoned is False
         assert replay_result.is_already_applied is True
+        await writer_scope.aclose()
         await _prove_post_seal_guards(scenario)
         await _prove_downgrade_is_blocked(scenario, migration)
     finally:
-        await close_abandonment_scenario(scenario, database, writer)
+        await writer_scope.aclose()
+        await close_abandonment_scenario(scenario, writer)

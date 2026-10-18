@@ -136,6 +136,7 @@ def _bootstrap(connection):
         migration._ORIGINAL._create_table(_SCHEMA)
         migration._ORIGINAL._create_guards(_SCHEMA)
         _migration("20260930120000_cms_native_input_revision.py").upgrade()
+        op.execute(_migration("20261019130000_cms_archive_transaction_guard.py")._counter_sql(_SCHEMA))
         _migration("20260930130000_cms_doctors_prepared_seal.py").upgrade()
         migration._PREVIOUS.upgrade()
         predecessor = _migration("20261001100000_profile_failed_cleanup_claim.py")

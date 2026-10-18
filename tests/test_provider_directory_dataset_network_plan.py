@@ -7,6 +7,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process.provider_directory_generic_source_policy import source_transaction
+from tests.test_provider_directory_generic_source_policy import synthetic_source_factory
+
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -231,6 +234,15 @@ def _mock_validation_dependencies(
     )
 
 
+async def _validate_candidate_rows(monkeypatch, candidate, diagnostics):
+    """Check the validation body under real Source authority; attachment has separate coverage."""
+    async with synthetic_source_factory(monkeypatch, importer.db, schema=importer._schema()):
+        async with source_transaction(importer.db, isolation="repeatable read"):
+            async with importer.db.acquire() as connection:
+                state = await importer._persist_endpoint_dataset_validation(connection, candidate, diagnostics)
+    return importer._endpoint_dataset_validation_summary(candidate, *state)
+
+
 def test_network_plan_proof_sql_is_dataset_scoped_and_normalizes_refs():
     sql = importer._dataset_network_plan_proof_sql(
         should_verify_acquisition_root=True,
@@ -424,7 +436,8 @@ async def test_validation_builds_edges_before_storing_and_uses_root_identity(
         validated_store,
     )
 
-    validation_summary = await importer._validate_endpoint_dataset_candidate(
+    validation_summary = await _validate_candidate_rows(
+        monkeypatch,
         _candidate(),
         {"InsurancePlan": {"complete": True}},
     )
@@ -472,7 +485,8 @@ async def test_relation_build_failure_rolls_back_before_candidate_validation(
     )
 
     with pytest.raises(RuntimeError, match="edge build failed"):
-        await importer._validate_endpoint_dataset_candidate(
+        await _validate_candidate_rows(
+            monkeypatch,
             _candidate(),
             {"InsurancePlan": {"complete": True}},
         )

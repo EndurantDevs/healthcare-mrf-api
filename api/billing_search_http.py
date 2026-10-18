@@ -124,7 +124,7 @@ async def _encoded_service_response(
     trusted_now: str,
 ) -> bytes:
     has_transaction = session.in_transaction()
-    if has_transaction and (
+    if (
         not has_reader_session(db)
         or current_session() is not session
         or session.info.get("api_reader_verified") is not True

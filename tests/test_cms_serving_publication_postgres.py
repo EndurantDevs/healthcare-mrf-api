@@ -107,7 +107,7 @@ def _publication_backend(database, schema):
     return fhir
 
 
-async def _prepare_publication(monkeypatch, engine, schema, failure, *, lose_ack=False):
+async def _prepare_publication(monkeypatch, engine, schema, failure, *, lose_ack=False, doctors=None):
     """Bind a sealed fixture to real transaction ownership and deferred guards."""
     database = _Database(engine, lose_ack=lose_ack)
     fhir = _publication_backend(database, schema)
@@ -149,7 +149,7 @@ async def _prepare_publication(monkeypatch, engine, schema, failure, *, lose_ack
     monkeypatch.setattr(publication, "admitted_native_input_fence", admitted_input_fence)
     monkeypatch.setattr(publication, "assert_native_address_input_fence", assert_input_fence)
 
-    _bind_family_applications(monkeypatch, database, schema, failure, prepared, address)
+    _bind_family_applications(monkeypatch, database, schema, failure, prepared, address, doctors)
     proof_by_field = {
         "dataset_id": "dataset",
         "endpoint_id": "endpoint",
@@ -280,12 +280,15 @@ async def test_retained_fence_precedes_native_input_checks(monkeypatch):
             assert calls == ["retained-fence", "native-input"]
 
 
-def _bind_family_applications(monkeypatch, database, schema, failure, prepared, address):
+def _bind_family_applications(monkeypatch, database, schema, failure, prepared, address, doctors):
     """Exercise the owning transaction with writes to both native family ledgers."""
 
-    async def apply_profile(_fhir, _stages, *, profile_delta, cutover_timeout, settings_configured, before_swaps):
+    async def apply_profile(
+        _fhir, _stages, *, profile_delta, cutover_timeout, settings_configured, before_swaps, extra_live_relations
+    ):
         assert profile_delta is prepared.profile_delta
         assert cutover_timeout is None and settings_configured is True
+        assert extra_live_relations == publication._live_swap_relations(prepared, address, doctors)
         await database.connection.execute(text(f"INSERT INTO {schema}.provider_directory_profile VALUES (2)"))
         await before_swaps()
         await database.connection.execute(
@@ -713,8 +716,10 @@ async def test_doctors_participates_in_common_commit_and_rollback(monkeypatch, f
         predecessor = await native._publish_initial(engine, schema)
         await _enable_candidate_checks(engine, schema)
         before, counts_by_table = await _serving_state(engine, schema)
-        fhir, prepared, address, proof_by_field = await _prepare_publication(monkeypatch, engine, schema, failure)
         doctors = SimpleNamespace(committed=False, native_receipt=None)
+        fhir, prepared, address, proof_by_field = await _prepare_publication(
+            monkeypatch, engine, schema, failure, doctors=doctors
+        )
 
         async def apply_doctors(owned):
             assert owned is doctors and fhir.db.connection is not None

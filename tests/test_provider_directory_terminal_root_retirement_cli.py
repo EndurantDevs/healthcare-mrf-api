@@ -14,7 +14,6 @@ import pytest
 from process import provider_directory_terminal_root_retirement_contract as contract
 from scripts.smoke import provider_directory_terminal_root_retirement as cli
 
-
 SELECTOR_ARGUMENTS = [
     "--source-id",
     "source-private",
@@ -81,6 +80,24 @@ def test_enabled_parser_redacts_missing_and_unknown_arguments(
     assert "private" not in captured.err
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_issued_runner_stays_behind_retirement_gate(monkeypatch, capsys, enabled):
+    from unittest.mock import AsyncMock
+
+    runner = AsyncMock(return_value='{"status":"ok"}')
+    monkeypatch.setenv(contract.RETIREMENT_ENABLED_ENV, "true" if enabled else "false")
+    monkeypatch.setattr(cli, "_run_operator", AsyncMock(side_effect=AssertionError("unbound operator")))
+    assert cli.run_command(["preview", *SELECTOR_ARGUMENTS], operation_runner=runner) == (0 if enabled else 1)
+    if enabled:
+        parsed = runner.await_args.args[0]
+        assert parsed.command == "preview" and parsed.dataset_id == "dataset-private"
+        runner.assert_awaited_once()
+    else:
+        runner.assert_not_awaited()
+    output = capsys.readouterr()
+    assert "private" not in output.out + output.err
+
+
 def test_parser_separates_preview_from_token_bound_apply() -> None:
     preview = cli._parser().parse_args(["preview", *SELECTOR_ARGUMENTS])
     apply = cli._parser().parse_args(
@@ -109,9 +126,7 @@ async def test_execute_renders_identifier_free_preview_and_apply(
         assert database is marker_database
         return "a" * 64
 
-    async def apply(
-        _request: Any, *, database: Any
-    ) -> contract.TerminalRootRetirementResult:
+    async def apply(_request: Any, *, database: Any) -> contract.TerminalRootRetirementResult:
         assert database is marker_database
         return contract.TerminalRootRetirementResult(
             retired=True,

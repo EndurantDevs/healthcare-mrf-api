@@ -4,14 +4,17 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 import datetime
 import importlib
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from process import provider_directory_generic_source_completion as completion
+from process.provider_directory_generic_candidate import reduce_sorted_resources
+from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from tests.provider_directory_semantic_v3_coverage_support import (
     LEGACY_CONTRACT,
     NEUTRAL_CONTRACT,
@@ -22,7 +25,7 @@ from tests.provider_directory_semantic_v3_coverage_support import (
     generic_dataset_row,
     semantic_parent_metadata,
 )
-
+from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
 importer = importlib.import_module("process.provider_directory_fhir")
 resource_hash = importlib.import_module("process.provider_directory_resource_hash")
@@ -94,12 +97,15 @@ def test_semantic_artifact_requires_stored_content_proof(
 def test_nonpractitioner_semantic_payloads_merge_by_content() -> None:
     payload = {"resource_id": "resource-edge", "active": True}
 
-    assert importer._merge_resource_payload_for_contract(
-        object,
-        payload,
-        dict(payload),
-        SEMANTIC_CONTRACT,
-    ) == payload
+    assert (
+        importer._merge_resource_payload_for_contract(
+            object,
+            payload,
+            dict(payload),
+            SEMANTIC_CONTRACT,
+        )
+        == payload
+    )
 
 
 def test_dataset_payload_index_rejects_raw_hash_conflict() -> None:
@@ -131,36 +137,37 @@ def test_dataset_payload_index_rejects_raw_hash_conflict() -> None:
 )
 def test_source_projection_date_accepts_only_exact_iso_date(value, expected) -> None:
     if expected is not None:
-        assert importer._source_semantic_projection_as_of(
-            {"_semantic_projection_as_of": value}
-        ) == expected
+        assert importer._source_semantic_projection_as_of({"_semantic_projection_as_of": value}) == expected
         return
 
     with pytest.raises(ValueError, match="semantic_projection_as_of_invalid"):
-        importer._source_semantic_projection_as_of(
-            {"_semantic_projection_as_of": value}
-        )
+        importer._source_semantic_projection_as_of({"_semantic_projection_as_of": value})
 
 
 @pytest.mark.asyncio
-async def test_proof_persistence_requires_hash_contract() -> None:
-    with pytest.raises(RuntimeError, match="resource_hash_contract_required"):
-        await importer._upsert_dataset_resource_rows_on_connection(
-            SimpleNamespace(),
-            [_generic_dataset_row()],
-            persist_content_proof=True,
-        )
+async def test_proof_persistence_requires_hash_contract(monkeypatch) -> None:
+    domain = SimpleNamespace(status=AsyncMock(), first=AsyncMock(), all=AsyncMock())
+    async with synthetic_source_database(monkeypatch, domain) as database, source_transaction(database):
+        native = bound_publisher().connection
+        with pytest.raises(RuntimeError, match="resource_hash_contract_required"):
+            await importer._upsert_dataset_resource_rows_on_connection(
+                native,
+                [_generic_dataset_row()],
+                persist_content_proof=True,
+            )
+        native.copy_records_to_table.assert_not_awaited()
+    domain.status.assert_not_awaited()
+    domain.first.assert_not_awaited()
+    domain.all.assert_not_awaited()
 
 
 def test_resumed_source_proof_scope_accepts_only_canonical_resource_scope() -> None:
-    assert importer._source_proof_resource_scope(
-        {"_proof_resource_scope": ["Practitioner"]}
-    ) == frozenset({"Practitioner"})
+    assert importer._source_proof_resource_scope({"_proof_resource_scope": ["Practitioner"]}) == frozenset(
+        {"Practitioner"}
+    )
 
     with pytest.raises(RuntimeError, match="resource_scope_invalid"):
-        importer._source_proof_resource_scope(
-            {"_proof_resource_scope": ["UnknownResource"]}
-        )
+        importer._source_proof_resource_scope({"_proof_resource_scope": ["UnknownResource"]})
 
 
 @pytest.mark.asyncio
@@ -210,9 +217,7 @@ def test_endpoint_parent_metadata_decodes_json_and_rejects_invalid_values() -> N
 
     for metadata in ("{", []):
         with pytest.raises(RuntimeError, match="resource_scope_invalid"):
-            importer._endpoint_dataset_parent_metadata(
-                {"publication_metadata_json": metadata}
-            )
+            importer._endpoint_dataset_parent_metadata({"publication_metadata_json": metadata})
 
 
 def test_parent_proof_scope_rejects_contract_and_subset_mismatches() -> None:
@@ -224,59 +229,50 @@ def test_parent_proof_scope_rejects_contract_and_subset_mismatches() -> None:
 
     with pytest.raises(RuntimeError, match="resource_scope_invalid"):
         importer._endpoint_dataset_parent_proof_resource_scope(
-            {
-                "publication_metadata_json": _semantic_parent_metadata(
-                    proof_resource_scope=["Location"]
-                )
-            },
+            {"publication_metadata_json": _semantic_parent_metadata(proof_resource_scope=["Location"])},
             SEMANTIC_CONTRACT,
         )
 
 
 @pytest.mark.asyncio
 async def test_existing_dataset_resources_decode_payload_or_fail_closed() -> None:
-    empty_connection = SimpleNamespace(all=AsyncMock())
-    assert await importer._existing_endpoint_dataset_resources(
-        empty_connection,
-        "dataset-edge",
-        "Organization",
-        [],
-    ) == {}
-    empty_connection.all.assert_not_awaited()
-
-    valid_connection = SimpleNamespace(
-        all=AsyncMock(
-            return_value=[
-                {
-                    "resource_id": "resource-edge",
-                    "payload_json": '{"resource_id": "resource-edge"}',
-                }
-            ]
-        )
-    )
-    decoded = await importer._existing_endpoint_dataset_resources(
-        valid_connection,
-        "dataset-edge",
-        "Organization",
-        ["resource-edge"],
-    )
-    assert decoded["resource-edge"]["payload_json"] == {
-        "resource_id": "resource-edge"
-    }
-
-    for record_by_field in (
-        {"resource_id": "resource-edge", "payload_json": "{"},
-        {"resource_id": None, "payload_json": {}},
-    ):
-        connection = SimpleNamespace(
-            all=AsyncMock(return_value=[record_by_field])
-        )
-        with pytest.raises(RuntimeError, match="semantic_.*payload_invalid"):
+    connection = SimpleNamespace(all=AsyncMock())
+    for resource_ids in ([], ["resource-edge"]):
+        with pytest.raises(RuntimeError, match="complete_key_reduction_required"):
             await importer._existing_endpoint_dataset_resources(
                 connection,
                 "dataset-edge",
                 "Organization",
-                ["resource-edge"],
+                resource_ids,
+            )
+    connection.all.assert_not_awaited()
+
+    prepare, merge = completion._resource_callbacks(importer, _candidate())
+    resource_row = _generic_dataset_row()
+    resource_row["payload_json"] = json.dumps(resource_row["payload_json"])
+    decoded_rows = list(
+        reduce_sorted_resources(
+            [resource_row],
+            "dataset-edge",
+            prepare_row=prepare,
+            merge_rows=merge,
+        )
+    )
+    assert decoded_rows[0]["payload_json"] == {"resource_id": "resource-edge"}
+    assert decoded_rows[0]["payload_hash"] == resource_row["payload_hash"]
+    for overrides, error in (
+        ({"payload_json": "{"}, "Expecting property name"),
+        ({"resource_id": None}, "resource_identity_invalid"),
+        ({"payload_hash": ZERO_HASH}, "payload_hash_changed"),
+    ):
+        with pytest.raises(ValueError, match=error):
+            list(
+                reduce_sorted_resources(
+                    [resource_row | overrides],
+                    "dataset-edge",
+                    prepare_row=prepare,
+                    merge_rows=merge,
+                )
             )
 
 
@@ -336,13 +332,18 @@ def test_incoming_semantic_batch_rejects_invalid_or_duplicate_identity() -> None
 
 
 @pytest.mark.asyncio
-async def test_dataset_accumulator_rejects_unknown_hash_contract() -> None:
-    with pytest.raises(RuntimeError, match="resource_hash_contract_required"):
-        await importer._accumulated_endpoint_dataset_rows(
-            SimpleNamespace(),
-            [_generic_dataset_row()],
-            resource_hash_contract="unknown-contract",
-        )
+async def test_dataset_accumulator_rejects_unknown_hash_contract(monkeypatch) -> None:
+    domain = SimpleNamespace(first=AsyncMock(), all=AsyncMock(), status=AsyncMock())
+    async with synthetic_source_database(monkeypatch, domain) as database, source_transaction(database):
+        with pytest.raises(RuntimeError, match="resource_hash_contract_required"):
+            await importer._accumulated_endpoint_dataset_rows(
+                database,
+                [_generic_dataset_row()],
+                resource_hash_contract="unknown-contract",
+            )
+    domain.first.assert_not_awaited()
+    domain.all.assert_not_awaited()
+    domain.status.assert_not_awaited()
 
 
 def test_materialization_requires_matching_observation_and_payload() -> None:
@@ -414,9 +415,7 @@ def test_candidate_proof_scope_rejects_contract_and_subset_mismatches() -> None:
         )
 
     with pytest.raises(RuntimeError, match="resource_scope_invalid"):
-        importer._candidate_proof_resource_scope(
-            _candidate(proof_resource_scope=("Location",))
-        )
+        importer._candidate_proof_resource_scope(_candidate(proof_resource_scope=("Location",)))
 
 
 def test_dataset_proof_scope_rejects_selected_resource_drift() -> None:
@@ -450,26 +449,26 @@ def test_optional_twin_proof_requires_mapping_shapes() -> None:
 async def test_uncheckpointed_cleanup_requires_locked_parent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database_executor = SimpleNamespace(
-        first=AsyncMock(return_value=None),
-        status=AsyncMock(),
-    )
+    domain = SimpleNamespace(first=AsyncMock(return_value=None), status=AsyncMock())
+    async with synthetic_source_database(monkeypatch, domain) as database, source_transaction(database):
+        monkeypatch.setattr(importer, "db", database)
+        native = bound_publisher().connection
 
-    @asynccontextmanager
-    async def mutation_scope(_dataset_ids):
-        yield database_executor
+        async def parent_or_actor(query, *arguments):
+            if "candidate_storage_json FROM" in query:
+                assert arguments == ("dataset-edge",)
+                return None
+            assert query == "SELECT session_user::text AS session,current_user::text AS current"
+            return native.fetchrow.return_value
 
-    monkeypatch.setattr(
-        importer,
-        "_mutable_endpoint_dataset_resource_mutation",
-        mutation_scope,
-    )
-
-    with pytest.raises(RuntimeError, match="cleanup_parent_changed"):
-        await importer._clear_uncheckpointed_endpoint_dataset_candidate(
-            _candidate()
+        native.fetchrow.side_effect = parent_or_actor
+        with pytest.raises(ValueError, match="header_missing"):
+            await importer._clear_uncheckpointed_endpoint_dataset_candidate(_candidate())
+        native.copy_records_to_table.assert_not_awaited()
+        assert all(
+            not call.args[0].startswith(("UPDATE", "DELETE", "INSERT")) for call in native.execute.await_args_list
         )
-    database_executor.status.assert_not_awaited()
+    domain.status.assert_not_awaited()
 
 
 def test_payload_hash_validator_covers_subset_and_explicit_contract_paths() -> None:
@@ -477,9 +476,7 @@ def test_payload_hash_validator_covers_subset_and_explicit_contract_paths() -> N
     importer._assert_endpoint_dataset_resource_payload_hash(
         {
             "payload_json": payload,
-            "payload_hash": importer.subset_payload_sha256(
-                resource_hash.resource_content_hash_payload(payload)
-            ),
+            "payload_hash": importer.subset_payload_sha256(resource_hash.resource_content_hash_payload(payload)),
             "acquired_resource_sha256": ZERO_HASH,
         }
     )

@@ -202,3 +202,51 @@ async def test_identical_input_bytes_can_describe_distinct_reporting_editions(se
             await connection.execute(
                 f"INSERT INTO \"{schema}\".hios_issuer_registry(hios_issuer_id,business_state) VALUES ('00000','CA')"
             )
+
+
+@pytest.mark.asyncio
+async def test_native_copy_failure_keeps_outer_work_and_retries_same_edition(serving_schema):
+    connection, schema, _ = serving_schema
+    prepared = _input()
+    edition = _edition(prepared)
+    namespace = f'"{schema}"'
+    async with connection.transaction():
+        await connection.execute("CREATE TEMP TABLE source_outer_work (value integer) ON COMMIT DROP")
+        await connection.execute("INSERT INTO source_outer_work VALUES(7)")
+        await connection.execute(
+            f"ALTER TABLE {namespace}.registry_source_observation "
+            "ADD CONSTRAINT fixture_reject_copy_row CHECK(source_row_number<3)"
+        )
+        with pytest.raises(CheckViolationError) as caught:
+            await admit_cms_mlr_edition(connection, prepared, edition, control_schema=schema)
+        assert caught.value.constraint_name == "fixture_reject_copy_row"
+        assert "COPY" in caught.value.context
+        assert connection.is_in_transaction()
+        assert await connection.fetchval("SELECT value FROM source_outer_work") == 7
+        for table in (
+            "registry_source_snapshot",
+            "registry_source_observation",
+            "registry_source_admission_receipt",
+            "registry_identifier_observation",
+            "registry_issuer_company_assertion",
+            "registry_company_group_assertion",
+            "company_registry",
+            "company_group_registry",
+            "registry_identifier_binding",
+        ):
+            assert await connection.fetchval(f"SELECT count(*) FROM {namespace}.{table}") == 0
+        assert (
+            await connection.fetchval(
+                "SELECT count(*) FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
+                "AND relname LIKE 'registry_landing_%'"
+            )
+            == 0
+        )
+        await connection.execute(
+            f"ALTER TABLE {namespace}.registry_source_observation DROP CONSTRAINT fixture_reject_copy_row"
+        )
+        receipt = await admit_cms_mlr_edition(connection, prepared, edition, control_schema=schema)
+        assert receipt["observations"] == receipt["accepted"] == 2
+        assert receipt["replayed"] is False
+    assert await connection.fetchval(f"SELECT count(*) FROM {namespace}.registry_source_snapshot") == 1
+    assert await connection.fetchval(f"SELECT count(*) FROM {namespace}.registry_source_observation") == 2

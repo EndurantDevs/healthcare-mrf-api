@@ -15,6 +15,7 @@ from process.ptg_parts.ptg2_physical_binding import _require_closed_local_custod
 
 
 def attachment_name(identity):
+    """Derive a native identifier containing the complete identity digest."""
     return _attachment_for_digest(digest(identity))
 
 
@@ -23,6 +24,7 @@ def _attachment_for_digest(key):
 
 
 async def protected_owner(session):
+    """Resolve the retention namespace owner and reject unsafe role custody."""
     row = (
         await session.execute(
             text(
@@ -39,6 +41,7 @@ async def protected_owner(session):
 
 
 async def lock_identity(session, identity):
+    """Serialize builds and retirement for exactly one source/code identity."""
     await session.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"), {"key": CONTRACT + ":" + digest(identity)}
     )
@@ -49,6 +52,7 @@ def _pin(identity):
 
 
 async def source_pin(session, identity, *, create=False):
+    """Verify or create the durable source-snapshot retention reference."""
     from api.ptg2_serving import PTG2_SCHEMA
 
     schema = native._quoted(PTG2_SCHEMA)
@@ -73,11 +77,7 @@ async def source_pin(session, identity, *, create=False):
     return params
 
 
-async def locate(session, identity):
-    """Only a protected native view authorizes an active index; comments do not."""
-    owner = await protected_owner(session)
-    if owner is None:
-        return None
+async def _active_view(session, identity, owner):
     name = attachment_name(identity)
     row = (
         await session.execute(
@@ -94,6 +94,10 @@ async def locate(session, identity):
     if view_owner != owner or kind is not True or persistence is not True:
         raise PTG2ManifestArtifactError("membership active attachment custody differs")
     await _require_no_untrusted_mutation(session, [view_oid], owner)
+    return view_oid
+
+
+async def _attachment_storage(session, view_oid, owner):
     dependencies = (
         await session.execute(
             text(
@@ -105,8 +109,8 @@ async def locate(session, identity):
             {"view": view_oid},
         )
     ).all()
-    schemas = {(int(row[1]), row[2]) for row in dependencies}
-    if len(schemas) != 1 or {row[3] for row in dependencies} != set(SPEC.table_names):
+    schemas = {(int(dependency[1]), dependency[2]) for dependency in dependencies}
+    if len(schemas) != 1 or {dependency[3] for dependency in dependencies} != set(SPEC.table_names):
         raise PTG2ManifestArtifactError("membership active attachment dependencies differ")
     schema_oid, schema = schemas.pop()
     prefix = "reference_family_archive_"
@@ -118,9 +122,15 @@ async def locate(session, identity):
         raise PTG2ManifestArtifactError("membership index namespace differs") from error
     await native._lock_family(session, schema, SPEC.table_names, "ACCESS SHARE", nowait=True)
     ownership = await native.capture_model_family_stage_ownership(session, SPEC, dataset)
-    if ownership.schema_oid != schema_oid or set(ownership.relation_oids) != {(r[3], int(r[0])) for r in dependencies}:
+    if ownership.schema_oid != schema_oid or set(ownership.relation_oids) != {
+        (dependency[3], int(dependency[0])) for dependency in dependencies
+    }:
         raise PTG2ManifestArtifactError("membership index storage identity changed")
     await _require_closed_local_custody(session, ownership, owner)
+    return ownership
+
+
+async def _sealed_header(session, schema, identity):
     header = (
         (
             await session.execute(
@@ -132,7 +142,7 @@ async def locate(session, identity):
     )
     if header["identity"] != identity or re.fullmatch("[0-9a-f]{64}", header["content_digest"] or "") is None:
         raise PTG2ManifestArtifactError("membership index sealed identity differs")
-    coverage = [
+    coverage_rows = [
         dict(row)
         for row in (
             await session.execute(
@@ -142,10 +152,23 @@ async def locate(session, identity):
             )
         ).mappings()
     ]
-    if coverage != header["counts"].get("code_coverage"):
+    if coverage_rows != header["counts"].get("code_coverage"):
         raise PTG2ManifestArtifactError("membership index code coverage differs")
+    return dict(header)
+
+
+async def locate(session, identity):
+    """Only a protected native view authorizes an active index; comments do not."""
+    owner = await protected_owner(session)
+    if owner is None:
+        return None
+    view_oid = await _active_view(session, identity, owner)
+    if view_oid is None:
+        return None
+    ownership = await _attachment_storage(session, view_oid, owner)
+    header = await _sealed_header(session, ownership.schema_name, identity)
     pin = await source_pin(session, identity)
-    return ownership, dict(header), owner, view_oid, pin
+    return ownership, header, owner, view_oid, pin
 
 
 async def seal(session, ownership, identity, *, reader_principals):
@@ -185,6 +208,7 @@ async def seal(session, ownership, identity, *, reader_principals):
 
 
 def receipt(found):
+    """Expose the sealed identity, accounting and retained storage coordinates."""
     ownership, header, owner, view_oid, pin = found
     return dict(
         header["identity"],
@@ -204,30 +228,20 @@ def receipt(found):
     )
 
 
-async def retire_unreferenced(session, identity):
-    """Explicit retirement; active, rollback, release and external pins veto it."""
+async def _require_no_references(session, schema, identity):
     from api.ptg2_serving import PTG2_SCHEMA
-    from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
     from process.ptg_parts.source_snapshot_references import load_snapshot_reference_rows
 
-    await native.protected_publisher_owner(session)
-    await acquire_ptg2_lifecycle_lock(session)
-    await lock_identity(session, identity)
-    found = await locate(session, identity)
-    if found is None:
-        return False
-    schema = native._quoted(PTG2_SCHEMA)
-    await session.execute(
-        text(f"SELECT snapshot_id FROM {schema}.ptg2_snapshot WHERE snapshot_id=:snapshot_id FOR UPDATE"),
-        {"snapshot_id": identity["snapshot_id"]},
-    )
-
-    async def load(_schema, snapshot_id, *, table, selected_fields, reference_field):
+    async def load_reference_rows(
+        _schema, snapshot_id, *, table, selected_fields, reference_field="snapshot_id", order_fields=None
+    ):
+        """Read exact source-reference rows inside the held lifecycle fence."""
         return (
             (
                 await session.execute(
                     text(
-                        f"SELECT {selected_fields} FROM {schema}.{native._quoted(table)} WHERE {native._quoted(reference_field)}=:snapshot_id"
+                        f"SELECT {selected_fields} FROM {schema}.{native._quoted(table)} "
+                        f"WHERE {native._quoted(reference_field)}=:snapshot_id ORDER BY {order_fields or selected_fields}"
                     ),
                     {"snapshot_id": snapshot_id},
                 )
@@ -236,34 +250,61 @@ async def retire_unreferenced(session, identity):
             .all()
         )
 
-    references = await load_snapshot_reference_rows(PTG2_SCHEMA, identity["snapshot_id"], load)
+    references = await load_snapshot_reference_rows(PTG2_SCHEMA, identity["snapshot_id"], load_reference_rows)
     expected = _pin(identity)
-    for kind, rows in references.items():
+    for kind, reference_rows in references.items():
         if kind == "pin":
-            external = []
-            for row in rows:
-                if row["owner_type"] != CONTRACT:
-                    external.append(row)
-                elif row["owner_id"] != expected["owner_id"]:
-                    key = row["owner_id"]
-                    if re.fullmatch("[0-9a-f]{64}", key or "") is None:
-                        raise PTG2ManifestArtifactError("membership sibling retention pin is invalid")
-                    sibling = await session.scalar(
-                        text(
-                            f"SELECT identity FROM hp_snapshot_retention.{native._quoted(_attachment_for_digest(key))}"
-                        )
-                    )
-                    if (
-                        not isinstance(sibling, dict)
-                        or digest(sibling) != key
-                        or sibling.get("snapshot_id") != identity["snapshot_id"]
-                        or sibling.get("source_key") != identity["source_key"]
-                        or await locate(session, sibling) is None
-                    ):
-                        raise PTG2ManifestArtifactError("membership sibling retention pin is invalid")
-            rows = external
-        if rows:
+            reference_rows = await _external_pins(session, identity, expected, reference_rows)
+        if reference_rows:
             raise PTG2ManifestArtifactError("membership index source still has retention references")
+    return expected
+
+
+async def _external_pins(session, identity, expected, pin_rows):
+    external_pins = []
+    for pin_row in pin_rows:
+        if pin_row["owner_type"] != CONTRACT:
+            external_pins.append(pin_row)
+        elif pin_row["owner_id"] != expected["owner_id"]:
+            await _require_sibling_pin(session, identity, pin_row["owner_id"])
+    return external_pins
+
+
+async def _require_sibling_pin(session, identity, key):
+    if re.fullmatch("[0-9a-f]{64}", key or "") is None:
+        raise PTG2ManifestArtifactError("membership sibling retention pin is invalid")
+    sibling = await session.scalar(
+        text(f"SELECT identity FROM hp_snapshot_retention.{native._quoted(_attachment_for_digest(key))}")
+    )
+    if (
+        not isinstance(sibling, dict)
+        or digest(sibling) != key
+        or sibling.get("snapshot_id") != identity["snapshot_id"]
+        or sibling.get("source_key") != identity["source_key"]
+        or await locate(session, sibling) is None
+    ):
+        raise PTG2ManifestArtifactError("membership sibling retention pin is invalid")
+
+
+async def retire_unreferenced(session, identity):
+    """Explicit retirement; active, rollback, release and external pins veto it."""
+    from api.ptg2_serving import PTG2_SCHEMA
+    from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
+
+    await native.protected_publisher_owner(session)
+    await acquire_ptg2_lifecycle_lock(session)
+    await lock_identity(session, identity)
+    found = await locate(session, identity)
+    has_attachment = found is not None
+    if not has_attachment:
+        return has_attachment
+    schema = native._quoted(PTG2_SCHEMA)
+    await session.execute(
+        text(f"SELECT snapshot_id FROM {schema}.ptg2_snapshot WHERE snapshot_id=:snapshot_id FOR UPDATE"),
+        {"snapshot_id": identity["snapshot_id"]},
+    )
+
+    expected = await _require_no_references(session, schema, identity)
     ownership = found[0]
     # A concurrent reader already holds ACCESS SHARE on the family; NOWAIT makes
     # this retirement roll back without detaching its view or pin under that reader.
@@ -277,4 +318,4 @@ async def retire_unreferenced(session, identity):
         expected,
     )
     await native.cleanup_model_family_stage(session, SPEC, ownership)
-    return True
+    return has_attachment

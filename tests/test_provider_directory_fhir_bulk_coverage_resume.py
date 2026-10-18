@@ -12,21 +12,23 @@ from unittest.mock import AsyncMock
 import pytest
 
 from db.models import ProviderDirectoryLocation, ProviderDirectoryPractitioner
+from tests.provider_directory_checkpoint_unit_support import checkpoint_unit_scope as checkpoint_unit_scope
 from tests.provider_directory_fhir_bulk_test_support import (
-    _Connection,
-    _Response,
-    _Session,
     _acquire,
     _checkpoint,
     _checkpoint_context,
     _client_session,
+    _Connection,
     _fetch_options,
     _identity,
     _manifest_payload,
+    _Response,
+    _Session,
     _source,
     _stream_options,
     importer,
 )
+
 
 @pytest.mark.asyncio
 async def test_bulk_stream_response_and_length_failures(monkeypatch):
@@ -109,13 +111,16 @@ def test_bulk_output_response_rejects_length_and_range_variants(
     offset,
     expected,
 ):
-    assert importer._bulk_output_response_error(
-        206 if offset else 200,
-        headers,
-        resume_offset=offset,
-        expected_etag='"one"',
-        expected_content_length=100,
-    ) == expected
+    assert (
+        importer._bulk_output_response_error(
+            206 if offset else 200,
+            headers,
+            resume_offset=offset,
+            expected_etag='"one"',
+            expected_content_length=100,
+        )
+        == expected
+    )
 
 
 @pytest.mark.asyncio
@@ -134,10 +139,7 @@ def test_bulk_manifest_rejects_request_mismatch_and_missing_resource():
         importer._bulk_export_manifest_from_payload(
             _manifest_payload(),
             "Practitioner",
-            expected_request_url=(
-                f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}"
-                "/$export?_type=Location"
-            ),
+            expected_request_url=(f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}/$export?_type=Location"),
         )
     with pytest.raises(ValueError, match="missing_resource_output"):
         importer._bulk_export_manifest_from_payload(
@@ -256,13 +258,9 @@ def test_stored_bulk_validator_rejects_bounds_and_etag_tampering(monkeypatch):
         "output_expires_at": None,
     }
     with pytest.raises(ValueError, match="validator_checkpoint_corrupt"):
-        importer._stored_bulk_output_validator(
-            {**validator_checkpoint_map, "committed_bytes": 101}
-        )
+        importer._stored_bulk_output_validator({**validator_checkpoint_map, "committed_bytes": 101})
     with pytest.raises(ValueError, match="validator_checkpoint_corrupt"):
-        importer._stored_bulk_output_validator(
-            {**validator_checkpoint_map, "etag_hash": "bad"}
-        )
+        importer._stored_bulk_output_validator({**validator_checkpoint_map, "etag_hash": "bad"})
 
 
 def test_bulk_manifest_checkpoint_rejects_partial_and_tampered_state(monkeypatch):
@@ -271,9 +269,7 @@ def test_bulk_manifest_checkpoint_rejects_partial_and_tampered_state(monkeypatch
         "bulk-coverage-key",
     )
     payload = _manifest_payload()
-    ciphertext = importer._encrypt_bulk_capability(
-        json.dumps(payload, sort_keys=True)
-    )
+    ciphertext = importer._encrypt_bulk_capability(json.dumps(payload, sort_keys=True))
     with pytest.raises(ValueError, match="manifest_checkpoint_corrupt"):
         importer._bulk_manifest_from_checkpoint(
             {"manifest_hash": "hash", "manifest_ciphertext": None},
@@ -290,13 +286,16 @@ def test_bulk_manifest_checkpoint_rejects_partial_and_tampered_state(monkeypatch
 
 @pytest.mark.asyncio
 async def test_terminal_status_hash_without_capability_is_valid():
-    assert importer._bulk_checkpoint_status_url_error(
-        {
-            "state": importer.BULK_EXPORT_CHECKPOINT_COMPLETE,
-            "status_url_ciphertext": None,
-            "status_url_hash": "audit-only",
-        }
-    ) is None
+    assert (
+        importer._bulk_checkpoint_status_url_error(
+            {
+                "state": importer.BULK_EXPORT_CHECKPOINT_COMPLETE,
+                "status_url_ciphertext": None,
+                "status_url_hash": "audit-only",
+            }
+        )
+        is None
+    )
     assert importer._is_bulk_export_error_terminal(None) is False
     with pytest.raises(ValueError, match="terminal_checkpoint_state_invalid"):
         # Invalid states must never enter the owner-independent repair SQL.
@@ -304,6 +303,7 @@ async def test_terminal_status_hash_without_capability_is_valid():
             _identity(),
             "streaming",
         )
+
 
 @pytest.mark.asyncio
 async def test_stream_checkpointed_outputs_short_circuits_validation_errors(
@@ -405,25 +405,31 @@ async def test_bulk_fetch_dispatches_durable_checkpoint_path(monkeypatch):
         "_fetch_checkpointed_bulk_export_resource_rows",
         checkpointed_fetch,
     )
-    assert await importer._fetch_bulk_export_resource_rows(
-        source_map,
-        "Practitioner",
-        per_resource_limit=0,
-        timeout=3,
-        run_id="run-coverage",
-        row_batch_handler=AsyncMock(return_value=0),
-    ) is expected_result
+    assert (
+        await importer._fetch_bulk_export_resource_rows(
+            source_map,
+            "Practitioner",
+            per_resource_limit=0,
+            timeout=3,
+            run_id="run-coverage",
+            row_batch_handler=AsyncMock(return_value=0),
+        )
+        is expected_result
+    )
 
 
 @pytest.mark.asyncio
 async def test_bulk_fetch_rejects_unknown_legacy_resource():
-    assert await importer._fetch_bulk_export_resource_rows(
-        _source(),
-        "Patient",
-        per_resource_limit=1,
-        timeout=3,
-        run_id="run-coverage",
-    ) is None
+    assert (
+        await importer._fetch_bulk_export_resource_rows(
+            _source(),
+            "Patient",
+            per_resource_limit=1,
+            timeout=3,
+            run_id="run-coverage",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

@@ -6,22 +6,23 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import BigInteger
-from sqlalchemy import Boolean
-from sqlalchemy import CheckConstraint
-from sqlalchemy import Column
-from sqlalchemy import Date
-from sqlalchemy import ForeignKeyConstraint
-from sqlalchemy import PrimaryKeyConstraint
-from sqlalchemy import String
-from sqlalchemy import TIMESTAMP
-from sqlalchemy import UniqueConstraint
-from sqlalchemy import text
+from sqlalchemy import (
+    TIMESTAMP,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    Date,
+    ForeignKeyConstraint,
+    PrimaryKeyConstraint,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
-
 
 __all__ = (
     "ProviderDirectoryUHCFlexPractitionerTwinAdmission",
@@ -40,19 +41,13 @@ def _schema() -> str:
 _SCHEMA = _schema()
 _ACQUISITION = "provider_directory_uhc_flex_practitioner_acquisition"
 _ATTEMPT = "provider_directory_uhc_flex_practitioner_twin_attempt"
-_ATTEMPT_CONTRACT = (
-    "healthporta.provider-directory.uhc-flex-practitioner-twin-attempt.v1"
-)
-_ADMISSION_CONTRACT = (
-    "healthporta.provider-directory.uhc-flex-practitioner-matched-admission.v1"
-)
+_ATTEMPT_CONTRACT = "healthporta.provider-directory.uhc-flex-practitioner-twin-attempt.v1"
+_ADMISSION_CONTRACT = "healthporta.provider-directory.uhc-flex-practitioner-matched-admission.v1"
 _SINGLE_ROOT_ADMISSION_CONTRACT = (
-    "healthporta.provider-directory.uhc-flex-practitioner-"
-    "reviewed-single-root-admission.v1"
+    "healthporta.provider-directory.uhc-flex-practitioner-reviewed-single-root-admission.v1"
 )
 _SINGLE_ROOT_POLICY = (
-    "'{\"policy_version\":\"provider-directory-reviewed-root-policy-v1\","
-    "\"required_root_count\"\\:1}'::jsonb"
+    '\'{"policy_version":"provider-directory-reviewed-root-policy-v1","required_root_count"\\:1}\'::jsonb'
 )
 
 
@@ -63,6 +58,7 @@ def _reference(table_name: str, column_name: str) -> str:
 class UHCFlexPractitionerTwinAttemptModel(Base, JSONOutputMixin):
     """One immutable, one-use comparison of two independently sealed roots."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = _ATTEMPT
     __main_table__ = __tablename__
     __table_args__ = (
@@ -148,6 +144,7 @@ class UHCFlexPractitionerTwinAttemptModel(Base, JSONOutputMixin):
 class UHCFlexPractitionerTwinAdmissionModel(Base, JSONOutputMixin):
     """Immutable twin or reviewed single-root publication authority."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_uhc_flex_practitioner_twin_admission"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -182,7 +179,8 @@ class UHCFlexPractitionerTwinAdmissionModel(Base, JSONOutputMixin):
             "admission_id ~ '^pdufpad_[0-9a-f]{48}$' AND "
             "operation_key ~ '^[0-9a-f]{64}$' AND "
             "semantic_projection_as_of BETWEEN DATE '0001-01-01' "
-            "AND DATE '9999-12-31' AND expected_npi_count > 0 AND "
+            "AND DATE '9999-12-31' AND candidate_acquisition_id IS NOT NULL "
+            "AND candidate_run_id IS NOT NULL AND expected_npi_count > 0 AND "
             "resource_count >= 0 AND terminal_set_sha256 ~ '^[0-9a-f]{64}$' "
             "AND publication_authority IS TRUE AND (("
             f"admission_contract_id = '{_ADMISSION_CONTRACT}' AND "
@@ -193,7 +191,8 @@ class UHCFlexPractitionerTwinAdmissionModel(Base, JSONOutputMixin):
             "reviewed_root_policy_json IS NULL) OR ("
             f"admission_contract_id = '{_SINGLE_ROOT_ADMISSION_CONTRACT}' AND "
             "attempt_id IS NULL AND baseline_acquisition_id IS NULL AND "
-            "baseline_run_id IS NULL AND reviewed_root_policy_json = "
+            "baseline_run_id IS NULL AND reviewed_root_policy_json IS NOT NULL "
+            "AND reviewed_root_policy_json = "
             f"{_SINGLE_ROOT_POLICY}))",
             name="pd_uhc_flex_practitioner_twin_admission_check",
         ),
@@ -228,9 +227,5 @@ class UHCFlexPractitionerTwinAdmissionModel(Base, JSONOutputMixin):
     )
 
 
-ProviderDirectoryUHCFlexPractitionerTwinAttempt = (
-    UHCFlexPractitionerTwinAttemptModel
-)
-ProviderDirectoryUHCFlexPractitionerTwinAdmission = (
-    UHCFlexPractitionerTwinAdmissionModel
-)
+ProviderDirectoryUHCFlexPractitionerTwinAttempt = UHCFlexPractitionerTwinAttemptModel
+ProviderDirectoryUHCFlexPractitionerTwinAdmission = UHCFlexPractitionerTwinAdmissionModel

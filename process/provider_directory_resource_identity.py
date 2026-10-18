@@ -3,13 +3,7 @@
 
 import json
 import re
-from datetime import datetime, timezone
 from uuid import UUID, uuid5
-
-from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert
-
-from db.models.provider_directory_resource_identity import ProviderDirectoryResourceIdentity
 
 # A permanent public namespace, unrelated to operators, deployments or releases.
 RESOURCE_ID_NAMESPACE = UUID("f923f6f9-55b3-5c1f-8308-ed036b2f223e")
@@ -28,74 +22,23 @@ def source_resource_uuid(source_id, resource_type, resource_id):
     return uuid5(RESOURCE_ID_NAMESPACE, json.dumps([source_id, resource_type, resource_id], separators=(",", ":")))
 
 
-def _inserted_resource_identity_mapping(inserted_rows, source_id, resource_type, identities_by_resource_id):
-    """Validate every returned scope and reject duplicate resource mappings."""
-    stored_by_resource_id = {}
-    for stored_source_id, stored_resource_type, stored_resource_id, stored_entity_id in inserted_rows:
-        if (
-            stored_source_id != source_id
-            or stored_resource_type != resource_type
-            or stored_resource_id not in identities_by_resource_id
-            or stored_resource_id in stored_by_resource_id
-        ):
-            raise ValueError("provider_directory_resource_identity_conflict")
-        stored_by_resource_id[stored_resource_id] = stored_entity_id
-    return stored_by_resource_id
-
-
 async def bind_resource_identity_batch(session, *, source_id, resource_type, resource_ids):
-    """Bind at most 1,000 already-validated IDs; caller commits each batch before cutover.
+    """Stage at most 1,000 validated IDs for the authenticated source candidate.
 
-    This stores identity only. Admission must first reject conflicting duplicate
-    resource payloads and must verify complete accepted-dataset binding coverage.
-    It grants no publication authority, and replay cannot replace an existing ID.
+    Intake never changes accepted identities. The complete candidate is reduced,
+    indexed and checked before its atomic publication; UUID5 inputs stay exact.
     """
+    from process.provider_directory_resource_identity_candidate import stage_resource_identities
+
     if not isinstance(resource_ids, list) or not resource_ids or len(resource_ids) > 1_000:
         raise ValueError("provider_directory_resource_identity_batch_invalid")
     identities_by_resource_id = {
         resource_id: source_resource_uuid(source_id, resource_type, resource_id) for resource_id in resource_ids
     }
-    table = ProviderDirectoryResourceIdentity.__table__
-    inserted_rows = (
-        await session.execute(
-            insert(table)
-            .values(
-                [
-                    {
-                        "source_id": source_id,
-                        "resource_type": resource_type,
-                        "resource_id": resource_id,
-                        "entity_id": entity_id,
-                        "created_at": datetime.now(timezone.utc),
-                    }
-                    for resource_id, entity_id in identities_by_resource_id.items()
-                ]
-            )
-            .on_conflict_do_nothing(index_elements=["source_id", "resource_type", "resource_id"])
-            .returning(table.c.source_id, table.c.resource_type, table.c.resource_id, table.c.entity_id)
-        )
-    ).all()
-    stored_by_resource_id = _inserted_resource_identity_mapping(
-        inserted_rows, source_id, resource_type, identities_by_resource_id
+    await stage_resource_identities(
+        session,
+        source_id=source_id,
+        resource_type=resource_type,
+        identities_by_resource_id=identities_by_resource_id,
     )
-    missing_resource_ids = [
-        resource_id for resource_id in identities_by_resource_id if resource_id not in stored_by_resource_id
-    ]
-    if missing_resource_ids:
-        # A separate statement observes committed conflicting inserts at READ COMMITTED.
-        stored_by_resource_id.update(
-            dict(
-                (
-                    await session.execute(
-                        select(table.c.resource_id, table.c.entity_id).where(
-                            table.c.source_id == source_id,
-                            table.c.resource_type == resource_type,
-                            table.c.resource_id.in_(missing_resource_ids),
-                        )
-                    )
-                ).all()
-            )
-        )
-    if stored_by_resource_id != identities_by_resource_id:
-        raise ValueError("provider_directory_resource_identity_conflict")
     return [identities_by_resource_id[resource_id] for resource_id in resource_ids]

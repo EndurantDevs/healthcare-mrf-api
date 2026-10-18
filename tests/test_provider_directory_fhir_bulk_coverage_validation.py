@@ -12,21 +12,23 @@ from unittest.mock import AsyncMock
 import pytest
 
 from db.models import ProviderDirectoryLocation, ProviderDirectoryPractitioner
+from tests.provider_directory_checkpoint_unit_support import checkpoint_unit_scope as checkpoint_unit_scope
 from tests.provider_directory_fhir_bulk_test_support import (
-    _Connection,
-    _Response,
-    _Session,
     _acquire,
     _checkpoint,
     _checkpoint_context,
     _client_session,
+    _Connection,
     _fetch_options,
     _identity,
     _manifest_payload,
+    _Response,
+    _Session,
     _source,
     _stream_options,
     importer,
 )
+
 
 @pytest.mark.asyncio
 async def test_poll_boundary_detects_deadline_crossed_while_sleeping(monkeypatch):
@@ -133,9 +135,7 @@ def test_status_url_and_manifest_checkpoint_fail_closed(monkeypatch):
     )
     ciphertext = importer._encrypt_bulk_capability(json.dumps(["not", "object"]))
     with pytest.raises(RuntimeError, match="manifest_checkpoint_corrupt"):
-        importer._bulk_manifest_payload_from_checkpoint(
-            {"manifest_ciphertext": ciphertext}
-        )
+        importer._bulk_manifest_payload_from_checkpoint({"manifest_ciphertext": ciphertext})
 
 
 @pytest.mark.asyncio
@@ -155,11 +155,14 @@ def test_manifest_output_identity_and_validator_changes_are_rejected():
         _manifest_payload(),
         "Practitioner",
     )
-    assert importer._bulk_output_checkpoint_error(
-        _identity().checkpoint_id,
-        manifest,
-        [],
-    ) == "bulk_export_manifest_output_checkpoint_mismatch"
+    assert (
+        importer._bulk_output_checkpoint_error(
+            _identity().checkpoint_id,
+            manifest,
+            [],
+        )
+        == "bulk_export_manifest_output_checkpoint_mismatch"
+    )
 
     stored = importer.BulkExportOutputValidator(
         content_length_bytes=100,

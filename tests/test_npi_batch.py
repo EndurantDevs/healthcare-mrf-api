@@ -270,6 +270,8 @@ async def test_batch_shaping_reuses_selected_addresses_and_card_projection(monke
     monkeypatch.setattr(npi_module, "_hydrate_npi_batch_addresses", hydrate)
     monkeypatch.setattr(npi_module, "_fetch_other_names_map", names)
     monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", summaries)
+    projection = AsyncMock(side_effect=lambda providers, **kwargs: providers)
+    monkeypatch.setattr(npi_module, "_project_provider_network_metadata", projection)
     params = npi_module._normalize_npi_batch_request({"npis": [identity], "address_limit": 1, "address_offset": 1})
     provider_rows = await provider_batch._hydrate_native_batch(
         [identity], state, params, provider_batch.parse_native_batch_query({"view": view}), object()
@@ -277,6 +279,10 @@ async def test_batch_shaping_reuses_selected_addresses_and_card_projection(monke
     assert hydrate.await_args.args[1] == {identity: [addresses[1]]}
     assert hydrate.await_count == names.await_count == summaries.await_count == 1
     if view == "full":
+        projection.assert_awaited_once()
+        assert projection.await_args.args[0][0] is provider_rows[0]["provider"]
+        assert projection.await_args.kwargs["include_sources"] is False
+        assert projection.await_args.kwargs["include_evidence"] is False
         assert provider_rows[0]["provider"]["address_pagination"] == {
             "limit": 1,
             "offset": 1,
@@ -286,6 +292,7 @@ async def test_batch_shaping_reuses_selected_addresses_and_card_projection(monke
         }
         assert provider_rows[0]["provider"]["address_list"][0]["first_line"] == "2 Main Street"
     else:
+        projection.assert_not_awaited()
         assert provider_rows[0]["provider"] == npi_module._provider_card_from_mapping(
             {**state.details[identity], **addresses[1], "npi": identity}
         )

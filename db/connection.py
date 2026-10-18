@@ -468,20 +468,30 @@ class Database:
         """Create a table and its schema when either is absent."""
         if self.has_reader_session():
             raise RuntimeError("Reader scopes cannot create tables")
+        if table.info.get("managed_immutable_storage"):
+            raise RuntimeError("Managed immutable storage requires its migration and administrator custody cut")
+        binding = self._transaction_binding()
+        if binding is not None:
+            await self._create_table_on_connection(await binding.session.connection(), table, **kwargs)
+            return
         if self.engine is None:
             await self.connect()
         assert self.engine is not None
         async with self.engine.begin() as connection:
-            if table.schema:
-                schema_exists = await connection.scalar(
-                    sa_text("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = :schema)"),
-                    {"schema": table.schema},
-                )
-                if not schema_exists:
-                    preparer = connection.dialect.identifier_preparer
-                    schema_name = preparer.quote_schema(table.schema)
-                    await connection.exec_driver_sql(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
-            await connection.run_sync(table.create, **kwargs)
+            await self._create_table_on_connection(connection, table, **kwargs)
+
+    @staticmethod
+    async def _create_table_on_connection(connection, table, **kwargs):
+        if table.schema:
+            schema_exists = await connection.scalar(
+                sa_text("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = :schema)"),
+                {"schema": table.schema},
+            )
+            if not schema_exists:
+                preparer = connection.dialect.identifier_preparer
+                schema_name = preparer.quote_schema(table.schema)
+                await connection.exec_driver_sql(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
+        await connection.run_sync(table.create, **kwargs)
 
     async def disconnect(self) -> None:
         """Dispose the active engine and clear connection state."""
@@ -509,7 +519,7 @@ class Database:
             await autocommit_conn.exec_driver_sql(statement)
 
     @asynccontextmanager
-    async def session(self) -> AsyncIterator[AsyncSession]:
+    async def session(self, *, connection=None) -> AsyncIterator[AsyncSession]:
         """Yield a context-bound session with commit and rollback handling."""
         reader = self._reader_binding()
         if reader is not None:
@@ -524,7 +534,7 @@ class Database:
         if self.session_factory is None:
             await self.connect()
         assert self.session_factory is not None
-        session = self.session_factory()
+        session = self.session_factory(bind=connection) if connection is not None else self.session_factory()
         token = _SESSION.set(session)
         try:
             yield session
@@ -595,8 +605,16 @@ class Database:
         return reader
 
     @asynccontextmanager
-    async def reader_session(self, *, independent: bool = False) -> AsyncIterator[AsyncSession]:
+    async def reader_session(
+        self, *, independent: bool = False, temporary_setup=None, prepare_plan_workspace: bool = False
+    ) -> AsyncIterator[AsyncSession]:
         """Own a genuine Reader transaction, or reuse this task's exact Reader."""
+        if temporary_setup is not None and not callable(temporary_setup):
+            raise TypeError("Reader temporary setup must be an async callable")
+        if prepare_plan_workspace and not independent:
+            raise RuntimeError("Plan Reader workspace requires independent ownership")
+        if temporary_setup is not None and prepare_plan_workspace:
+            raise RuntimeError("Reader preparation modes require separate ownership")
         binding = _READER.get()
         if (
             binding
@@ -604,28 +622,131 @@ class Database:
             and binding.owner_task is asyncio.current_task()
             and not independent
         ):
+            if temporary_setup is not None:
+                raise RuntimeError("Temporary setup requires a fresh Reader session")
             yield binding.session
             return
         if self._transaction_binding() is not None:
             raise RuntimeError("Cannot open a Reader inside a Writer transaction")
         reader = await self._connect_reader()
-        async with reader.session() as session:
+        from contextlib import nullcontext
+
+        from db.reader_plan_workspace import plan_reader_connection
+
+        connection_scope = plan_reader_connection(reader) if prepare_plan_workspace else nullcontext(None)
+        async with connection_scope as connection:
+            scope = (
+                self._prepared_reader_session(reader, temporary_setup)
+                if temporary_setup is not None
+                else reader.session(connection=connection)
+                if prepare_plan_workspace
+                else reader.session()
+            )
+            async with self._verified_reader_session(
+                reader,
+                scope,
+                temporary_setup=temporary_setup is not None,
+                prepare_plan_workspace=prepare_plan_workspace,
+            ) as session:
+                yield session
+
+    @asynccontextmanager
+    async def _verified_reader_session(self, reader, scope, *, temporary_setup, prepare_plan_workspace):
+        """Verify login and prepared modes while owning binding cleanup and cancellation."""
+        prepared = temporary_setup or prepare_plan_workspace
+        async with scope as session:
             reader_context_token = None
             try:
                 identity_result = await session.execute(sa_text("SELECT session_user, current_user"))
                 if tuple(identity_result.first()) != (reader._reader_login[0], reader._reader_login[0]):
                     raise RuntimeError("Reader session login identity differs")
+                if prepared:
+                    modes = await session.execute(
+                        sa_text(
+                            "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')"
+                        )
+                    )
+                    if tuple(modes.first()) != ("repeatable read", "on"):
+                        raise RuntimeError("Prepared Reader must remain repeatable read and read only")
                 session.info["api_reader_verified"] = True
+                if prepare_plan_workspace:
+                    session.info["native_plan_workspace"] = True
                 reader_context_token = _READER.set(_TransactionBinding(id(self), session, asyncio.current_task()))
                 yield session
             except asyncio.CancelledError:
-                if session.in_transaction():
+                if not temporary_setup and session.in_transaction():
                     await session.rollback()
                 raise
             finally:
                 if reader_context_token is not None:
                     _READER.reset(reader_context_token)
                 session.info.pop("api_reader_verified", None)
+                session.info.pop("native_plan_workspace", None)
+
+    async def bind_request_reader(self, request):
+        """Replace only this request's unused ordinary session with a genuine Reader."""
+        session = getattr(request.ctx, "sa_session", None)
+        if session is not None and self.has_reader_session() and current_session() is session:
+            if session.info.get("api_reader_verified") is not True:
+                raise RuntimeError("Request Reader identity is unavailable")
+            return session
+        if (
+            session is None
+            or session.in_transaction()
+            or getattr(request.ctx, "_sa_session_token", None) is None
+            or getattr(request.ctx, "_sa_reader_scope", None) is not None
+            or current_session() is not session
+        ):
+            raise RuntimeError("Request Reader requires an unused request-owned session")
+        await self._close_request_session(request, success=False)
+        scope = self.reader_session(independent=True)
+        session = await scope.__aenter__()
+        request.ctx._sa_reader_scope = scope
+        request.ctx.sa_session = request.ctx.session = session
+        from api.reference_family_reads import pin_claims_reader
+
+        try:
+            await pin_claims_reader(session)
+        except BaseException:
+            await self._close_request_session(request, success=False)
+            raise
+        return session
+
+    @asynccontextmanager
+    async def _prepared_reader_session(self, reader, temporary_setup):
+        """Prepare fixed TEMP objects before the first query and preserve primary failures."""
+        assert reader.session_factory is not None
+        session = reader.session_factory()
+        session_token = _SESSION.set(session)
+        primary_failure = None
+        try:
+            await session.execute(sa_text("SET TRANSACTION READ WRITE"))
+            await temporary_setup(session)
+            await session.execute(sa_text("SET TRANSACTION READ ONLY"))
+            yield session
+            if session.in_transaction():
+                await session.commit()
+        except BaseException as failure:
+            primary_failure = failure
+            await self._rollback_reader_failure(session, failure)
+            raise
+        finally:
+            try:
+                await session.close()
+            except BaseException as cleanup_failure:
+                if primary_failure is None:
+                    raise
+                primary_failure.add_note("Reader cleanup failed: " + type(cleanup_failure).__name__)
+            finally:
+                _SESSION.reset(session_token)
+
+    @staticmethod
+    async def _rollback_reader_failure(session, failure):
+        if session.in_transaction():
+            try:
+                await session.rollback()
+            except BaseException as rollback_failure:
+                failure.add_note("Reader rollback failed: " + type(rollback_failure).__name__)
 
     async def _close_request_session(self, request, *, success):
         """Release the request owner even when pinning or response handling fails."""

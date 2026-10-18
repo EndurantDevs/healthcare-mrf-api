@@ -4,15 +4,15 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import fields
 from datetime import date, datetime
-import json
 from typing import Any
 
 from db.connection import db
-from process.fhir_request_failure_policy import can_tolerate_fhir_request_failures
 from process import uhc_flex_official_cohort_store as official_cohort
 from process import uhc_flex_practitioner_single_root_contract as single_root
+from process.fhir_request_failure_policy import can_tolerate_fhir_request_failures
 from process.uhc_flex_practitioner_acquisition_contract import (
     UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE,
 )
@@ -26,17 +26,16 @@ from process.uhc_flex_practitioner_store_support import (
     table_ref,
 )
 from process.uhc_flex_practitioner_twin_store_contract import (
-    build_uhc_flex_practitioner_twin_admission,
-    build_uhc_flex_practitioner_twin_attempt,
-    canonical_semantic_projection_as_of,
+    UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID,
+    UHC_FLEX_PRACTITIONER_TWIN_ATTEMPT_CONTRACT_ID,
     UHCFlexPractitionerSealedRoot,
     UHCFlexPractitionerTwinAdmission,
     UHCFlexPractitionerTwinAttempt,
     UHCFlexPractitionerTwinStoreError,
-    UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID,
-    UHC_FLEX_PRACTITIONER_TWIN_ATTEMPT_CONTRACT_ID,
+    build_uhc_flex_practitioner_twin_admission,
+    build_uhc_flex_practitioner_twin_attempt,
+    canonical_semantic_projection_as_of,
 )
-
 
 ATTEMPT_TABLE = "provider_directory_uhc_flex_practitioner_twin_attempt"
 ADMISSION_TABLE = "provider_directory_uhc_flex_practitioner_twin_admission"
@@ -64,18 +63,10 @@ _ROOT_COLUMNS = (
     "terminal_set_sha256",
     "sealed_at",
 )
-_ATTEMPT_COLUMNS = tuple(
-    field.name for field in fields(UHCFlexPractitionerTwinAttempt)
-)
-_ADMISSION_COLUMNS = tuple(
-    field.name for field in fields(UHCFlexPractitionerTwinAdmission)
-)
-_ATTEMPT_IDENTITY_COLUMNS = tuple(
-    column_name for column_name in _ATTEMPT_COLUMNS if column_name != "attempted_at"
-)
-_ADMISSION_IDENTITY_COLUMNS = tuple(
-    column_name for column_name in _ADMISSION_COLUMNS if column_name != "admitted_at"
-)
+_ATTEMPT_COLUMNS = tuple(field.name for field in fields(UHCFlexPractitionerTwinAttempt))
+_ADMISSION_COLUMNS = tuple(field.name for field in fields(UHCFlexPractitionerTwinAdmission))
+_ATTEMPT_IDENTITY_COLUMNS = tuple(column_name for column_name in _ATTEMPT_COLUMNS if column_name != "attempted_at")
+_ADMISSION_IDENTITY_COLUMNS = tuple(column_name for column_name in _ADMISSION_COLUMNS if column_name != "admitted_at")
 
 
 def _date_text(value: object) -> str:
@@ -154,16 +145,10 @@ def _attempt_from_row(database_row: Any) -> UHCFlexPractitionerTwinAttempt:
     database_fields = row_fields(database_row)
     if not database_fields:
         raise UHCFlexPractitionerTwinStoreError("state")
-    database_fields["semantic_projection_as_of"] = _date_text(
-        database_fields.get("semantic_projection_as_of")
-    )
-    database_fields["attempted_at"] = _timestamp(
-        database_fields.get("attempted_at")
-    )
+    database_fields["semantic_projection_as_of"] = _date_text(database_fields.get("semantic_projection_as_of"))
+    database_fields["attempted_at"] = _timestamp(database_fields.get("attempted_at"))
     try:
-        return UHCFlexPractitionerTwinAttempt(
-            **{name: database_fields.get(name) for name in _ATTEMPT_COLUMNS}
-        )
+        return UHCFlexPractitionerTwinAttempt(**{name: database_fields.get(name) for name in _ATTEMPT_COLUMNS})
     except ValueError as error:
         raise UHCFlexPractitionerTwinStoreError("state") from error
 
@@ -172,9 +157,7 @@ def _admission_from_row(database_row: Any) -> single_root.UHCFlexPractitionerAdm
     database_fields = row_fields(database_row)
     if not database_fields:
         raise UHCFlexPractitionerTwinStoreError("missing")
-    database_fields["semantic_projection_as_of"] = _date_text(
-        database_fields.get("semantic_projection_as_of")
-    )
+    database_fields["semantic_projection_as_of"] = _date_text(database_fields.get("semantic_projection_as_of"))
     database_fields["admitted_at"] = _timestamp(database_fields.get("admitted_at"))
     admission_type = (
         single_root.UHCFlexPractitionerSingleRootAdmission
@@ -183,9 +166,7 @@ def _admission_from_row(database_row: Any) -> single_root.UHCFlexPractitionerAdm
         else UHCFlexPractitionerTwinAdmission
     )
     try:
-        return admission_type(
-            **{name: database_fields.get(name) for name in _ADMISSION_COLUMNS}
-        )
+        return admission_type(**{name: database_fields.get(name) for name in _ADMISSION_COLUMNS})
     except ValueError as error:
         raise UHCFlexPractitionerTwinStoreError("state") from error
 
@@ -220,13 +201,9 @@ def _attempt_parameter_map(
     attempt: UHCFlexPractitionerTwinAttempt,
 ) -> dict[str, object]:
     parameter_map = {
-        column_name: getattr(attempt, column_name)
-        for column_name in _ATTEMPT_COLUMNS
-        if column_name != "attempted_at"
+        column_name: getattr(attempt, column_name) for column_name in _ATTEMPT_COLUMNS if column_name != "attempted_at"
     }
-    parameter_map["semantic_projection_as_of"] = date.fromisoformat(
-        attempt.semantic_projection_as_of
-    )
+    parameter_map["semantic_projection_as_of"] = date.fromisoformat(attempt.semantic_projection_as_of)
     return parameter_map
 
 
@@ -238,12 +215,10 @@ def _admission_parameter_map(
         for column_name in _ADMISSION_COLUMNS
         if column_name != "admitted_at"
     }
-    parameter_map["semantic_projection_as_of"] = date.fromisoformat(
-        admission.semantic_projection_as_of
-    )
+    parameter_map["semantic_projection_as_of"] = date.fromisoformat(admission.semantic_projection_as_of)
     policy = admission.reviewed_root_policy_json
-    parameter_map["reviewed_root_policy_json"] = None if policy is None else json.dumps(
-        policy, sort_keys=True, separators=(",", ":")
+    parameter_map["reviewed_root_policy_json"] = (
+        None if policy is None else json.dumps(policy, sort_keys=True, separators=(",", ":"))
     )
     return parameter_map
 
@@ -252,9 +227,7 @@ async def _insert_attempt(
     database: Any,
     attempt: UHCFlexPractitionerTwinAttempt,
 ) -> None:
-    column_names = tuple(
-        column_name for column_name in _ATTEMPT_COLUMNS if column_name != "attempted_at"
-    )
+    column_names = tuple(column_name for column_name in _ATTEMPT_COLUMNS if column_name != "attempted_at")
     await database.status(
         f"INSERT INTO {table_ref(ATTEMPT_TABLE)} "
         f"({', '.join(column_names)}) VALUES "
@@ -282,8 +255,8 @@ async def _insert_admission(
 ) -> None:
     column_names = tuple(name for name in _ADMISSION_COLUMNS if name != "admitted_at")
     value_placeholders = tuple(
-        "CAST(:reviewed_root_policy_json AS jsonb)"
-        if name == "reviewed_root_policy_json" else ":" + name for name in column_names
+        "CAST(:reviewed_root_policy_json AS jsonb)" if name == "reviewed_root_policy_json" else ":" + name
+        for name in column_names
     )
     await database.status(
         f"INSERT INTO {table_ref(ADMISSION_TABLE)} "
@@ -315,25 +288,27 @@ async def _lock_single_root(database: Any, candidate_acquisition_id: str) -> UHC
     )
     candidate = _sealed_root(row_fields(candidate_row))
     cohort_row = await database.first(
-        f"SELECT * FROM {table_ref(COHORT_TABLE)} "
-        "WHERE cohort_id = :cohort_id FOR SHARE;",
+        f"SELECT * FROM {table_ref(COHORT_TABLE)} WHERE cohort_id = :cohort_id;",
         cohort_id=candidate.cohort_id,
     )
     try:
         cohort = official_cohort._cohort_from_row(cohort_row)
-        snapshot = await official_cohort._current_official_snapshot(database)
+        replay = await official_cohort.sync_uhc_flex_official_cohort(database=database, expected_cohort=cohort)
     except official_cohort.UHCFlexOfficialCohortError as error:
         raise UHCFlexPractitionerTwinStoreError("state") from error
     if candidate.acquisition_role != "candidate" or (
-        candidate.expected_npi_count != cohort.npi_count
-        or not official_cohort._is_cohort_snapshot_match(cohort, snapshot)
+        candidate.expected_npi_count != cohort.npi_count or replay.created or replay.cohort != cohort
     ):
         raise UHCFlexPractitionerTwinStoreError("state")
     return candidate
 
 
 async def admit_uhc_flex_practitioner_single_root(
-    candidate_acquisition_id: str, *, semantic_projection_as_of: str, operation_key: str, database: Any = db,
+    candidate_acquisition_id: str,
+    *,
+    semantic_projection_as_of: str,
+    operation_key: str,
+    database: Any = db,
 ) -> single_root.UHCFlexPractitionerSingleRootAdmission:
     """Admit one sealed candidate under the explicit reviewed policy."""
 
@@ -344,17 +319,17 @@ async def admit_uhc_flex_practitioner_single_root(
         transaction_time = _timestamp(await database.scalar("SELECT transaction_timestamp();"))
         try:
             expected_admission = single_root.build_single_root_admission(
-                candidate, semantic_projection_as_of=projection_date,
-                operation_key=operation_key, admitted_at=transaction_time,
+                candidate,
+                semantic_projection_as_of=projection_date,
+                operation_key=operation_key,
+                admitted_at=transaction_time,
             )
         except ValueError as error:
             raise UHCFlexPractitionerTwinStoreError("identity") from error
         if not can_tolerate_fhir_request_failures(
             total_count=candidate.expected_npi_count,
             completed_count=candidate.expected_npi_count - candidate.error_count,
-            error_count_by_code={
-                UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE: candidate.error_count
-            },
+            error_count_by_code={UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE: candidate.error_count},
         ):
             # Historical admissions stay readable, but cannot be newly minted.
             stored_admission = await _read_admission(database, candidate_acquisition_id)
@@ -395,9 +370,7 @@ async def admit_uhc_flex_practitioner_twins(
             baseline_acquisition_id,
             candidate_acquisition_id,
         )
-        transaction_time = _timestamp(
-            await database.scalar("SELECT transaction_timestamp();")
-        )
+        transaction_time = _timestamp(await database.scalar("SELECT transaction_timestamp();"))
         expected_attempt = build_uhc_flex_practitioner_twin_attempt(
             baseline,
             candidate,
@@ -429,13 +402,18 @@ async def admit_uhc_flex_practitioner_twins(
 
 
 async def _rebuild_single_root_admission(
-    database: Any, admission: single_root.UHCFlexPractitionerSingleRootAdmission, projection_date: str, operation_key: str,
+    database: Any,
+    admission: single_root.UHCFlexPractitionerSingleRootAdmission,
+    projection_date: str,
+    operation_key: str,
 ) -> single_root.UHCFlexPractitionerSingleRootAdmission:
     candidate = await _lock_single_root(database, admission.candidate_acquisition_id)
     try:
         return single_root.build_single_root_admission(
-            candidate, semantic_projection_as_of=projection_date,
-            operation_key=operation_key, admitted_at=admission.admitted_at,
+            candidate,
+            semantic_projection_as_of=projection_date,
+            operation_key=operation_key,
+            admitted_at=admission.admitted_at,
         )
     except ValueError as error:
         raise UHCFlexPractitionerTwinStoreError("identity") from error
@@ -462,13 +440,9 @@ async def require_uhc_flex_practitioner_admission(
         projection_date = (
             admission.semantic_projection_as_of
             if semantic_projection_as_of is None
-            else canonical_semantic_projection_as_of(
-                semantic_projection_as_of
-            )
+            else canonical_semantic_projection_as_of(semantic_projection_as_of)
         )
-        expected_operation_key = (
-            admission.operation_key if operation_key is None else operation_key
-        )
+        expected_operation_key = admission.operation_key if operation_key is None else operation_key
         if admission.semantic_projection_as_of != projection_date or (
             admission.operation_key != expected_operation_key
         ):

@@ -200,6 +200,53 @@ def test_cli_hashes_whole_file_and_emits_only_aggregate_receipt(monkeypatch, tmp
     assert database.engine.echo is True and logging.root.manager.disable == previous_logging
 
 
+@pytest.mark.parametrize("failure", [None, "owner", "admission", "commit", "canceled"])
+def test_protected_owner_is_assumed_in_the_admission_transaction(monkeypatch, tmp_path, capsys, failure):
+    source_record = b"source\n"
+    path = tmp_path / "source.csv"
+    path.write_bytes(source_record)
+    database = _Database(failure)
+    owner_role = "synthetic_registry_owner"
+
+    async def assume_owner(connection, role):
+        assert connection is database and role == owner_role
+        assert database.events == ["connect", "acquire", "begin"]
+        database.events.append("assume_owner")
+        if failure == "owner":
+            raise ValueError(PRIVATE_MARKER)
+
+    async def admit(connection, actual_source, edition):
+        assert (connection, actual_source, edition) == (database, source_record, _edition(source_record))
+        assert database.events[-1] == "assume_owner"
+        database.events.append("admission")
+        if failure == "admission":
+            raise store.RegistryRequiredTargetError(PRIVATE_MARKER)
+        if failure == "canceled":
+            raise asyncio.CancelledError(PRIVATE_MARKER)
+        return _receipt(source_record)
+
+    monkeypatch.setattr(target_import, "Database", lambda: database)
+    monkeypatch.setattr("process.registry_management_permissions.assume_registry_source_owner", assume_owner)
+    monkeypatch.setattr(target_import, "admit_registry_required_targets", admit)
+    arguments = _arguments(path, source_record) + ["--protected-owner-role", owner_role]
+    assert target_import.run_command(arguments) == (0 if failure is None else 130 if failure == "canceled" else 1)
+    captured = capsys.readouterr()
+    expected_roles = ["connect", "acquire", "begin", "assume_owner"]
+    if failure != "owner":
+        expected_roles.append("admission")
+    expected_roles += ["commit" if failure is None else "rollback", "release", "disconnect"]
+    assert database.events == expected_roles
+    assert PRIVATE_MARKER not in captured.out + captured.err and owner_role not in captured.out + captured.err
+    if failure is None:
+        assert json.loads(captured.out) == {"status": "ok", **_receipt(source_record)} and captured.err == ""
+    else:
+        code = "canceled" if failure == "canceled" else "admission_failed"
+        assert (
+            captured.out == ""
+            and captured.err == json.dumps({"code": code, "status": "error"}, separators=(",", ":")) + "\n"
+        )
+
+
 @pytest.mark.parametrize("extra", ["raw_cells", "input_file", "dsn"])
 def test_cli_does_not_publish_unexpected_admission_data(monkeypatch, tmp_path, capsys, extra):
     source = b"source\n"

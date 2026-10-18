@@ -5,14 +5,13 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import shutil
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import asyncpg
 
 from tests.public_evidence_nppes_admission_postgres_support import qualified
-
 
 SCALE_TABLES = (
     "public_evidence_source_identity",
@@ -24,13 +23,6 @@ SCALE_TABLES = (
     "public_evidence_nppes_registry_admission",
     "public_evidence_nppes_registry_admission_seal",
     "public_evidence_nppes_registry_member",
-)
-STAGE_TABLES = (
-    "nppes_stage_source_record",
-    "nppes_stage_member",
-    "nppes_stage_common",
-    "nppes_stage_source_link",
-    "nppes_stage_typed",
 )
 
 
@@ -73,9 +65,7 @@ async def database_settings(connection: asyncpg.Connection) -> dict[str, object]
         "track_io_timing",
     )
     settings_by_name = {
-        setting_name: await connection.fetchval(
-            "SELECT current_setting($1)", setting_name
-        )
+        setting_name: await connection.fetchval("SELECT current_setting($1)", setting_name)
         for setting_name in setting_names
     }
     assert 180_000 <= int(settings_by_name["server_version_num"]) < 190_000
@@ -111,8 +101,7 @@ async def cluster_lsn_delta(connection: asyncpg.Connection, before_lsn: str) -> 
     """Return a diagnostic cluster-wide WAL delta from one exact LSN."""
 
     return await connection.fetchval(
-        "SELECT pg_wal_lsn_diff("
-        "pg_current_wal_insert_lsn(), $1::text::pg_lsn)::bigint",
+        "SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), $1::text::pg_lsn)::bigint",
         before_lsn,
     )
 
@@ -127,8 +116,7 @@ async def backend_wal_snapshot(
     await connection.execute("SELECT pg_stat_force_next_flush()")
     await observer.execute("SELECT pg_stat_clear_snapshot()")
     backend_wal = await observer.fetchrow(
-        "SELECT wal_records, wal_fpi, wal_bytes "
-        "FROM pg_catalog.pg_stat_get_backend_wal($1)",
+        "SELECT wal_records, wal_fpi, wal_bytes FROM pg_catalog.pg_stat_get_backend_wal($1)",
         backend_pid,
     )
     assert backend_wal is not None
@@ -146,8 +134,7 @@ def backend_wal_delta(
     """Return exact monotonic per-backend WAL counter differences."""
 
     delta_by_name = {
-        metric_name: after_by_name[metric_name] - before_by_name[metric_name]
-        for metric_name in before_by_name
+        metric_name: after_by_name[metric_name] - before_by_name[metric_name] for metric_name in before_by_name
     }
     assert all(metric_value >= 0 for metric_value in delta_by_name.values())
     return delta_by_name
@@ -159,8 +146,15 @@ async def relation_sizes(
 ) -> dict[str, dict[str, int]]:
     """Return heap, index, and total bytes for every admitted table."""
 
+    from process.nppes_public_evidence_storage import HEADER, ROOTS
+    from tests.nppes_candidate_postgres_support import resolved_family
+
+    admission_ref = await connection.fetchval(f"SELECT admission_ref FROM {qualified(schema_name, HEADER)}")
+    family = await resolved_family(schema_name, admission_ref)
+    physical_by_template = {fields[0]: family[root]["name"] for root, fields in ROOTS.items()}
     sizes_by_table: dict[str, dict[str, int]] = {}
-    for table_name in SCALE_TABLES:
+    for table_name in (*SCALE_TABLES, HEADER):
+        table_name = physical_by_template.get(table_name, table_name)
         relation_name = f"{schema_name}.{table_name}"
         size_row = await connection.fetchrow(
             "SELECT pg_relation_size($1::regclass)::bigint AS heap_bytes, "
@@ -172,18 +166,6 @@ async def relation_sizes(
     return sizes_by_table
 
 
-async def stage_total_size(connection: asyncpg.Connection) -> int:
-    """Return peak total bytes for the five current temporary stage tables."""
-
-    total_bytes = 0
-    for stage_table in STAGE_TABLES:
-        total_bytes += await connection.fetchval(
-            "SELECT pg_total_relation_size(to_regclass($1))::bigint",
-            f"pg_temp.{stage_table}",
-        )
-    return total_bytes
-
-
 def _plan_summary(raw_plan: object, row_count: int) -> dict[str, object]:
     plan_payload = json.loads(raw_plan) if type(raw_plan) is str else raw_plan
     root = plan_payload[0]
@@ -193,9 +175,7 @@ def _plan_summary(raw_plan: object, row_count: int) -> dict[str, object]:
         actual_rows = int(plan_node.get("Actual Rows", 0))
         actual_loops = int(plan_node.get("Actual Loops", 0))
         rows_removed = sum(
-            int(metric_value)
-            for key, metric_value in plan_node.items()
-            if key.startswith("Rows Removed")
+            int(metric_value) for key, metric_value in plan_node.items() if key.startswith("Rows Removed")
         )
         node_work = (actual_rows + rows_removed) * actual_loops
         assert node_work <= 4 * row_count, (
@@ -236,23 +216,21 @@ async def explain_probes(
     admission_ref: str,
     row_count: int,
 ) -> dict[str, object]:
-    """Run the bounded Merkle, source-parity, and projected-topology plans."""
+    """Run native ordinal, source-parity, and projected-topology plans."""
 
-    member_table = qualified(schema_name, "public_evidence_nppes_registry_member")
-    source_table = qualified(schema_name, "public_evidence_source_record")
-    common_table = qualified(schema_name, "public_evidence_record")
-    link_table = qualified(schema_name, "public_evidence_record_source_link")
-    typed_table = qualified(schema_name, "public_evidence_npi_enumeration")
-    merkle_function = qualified(schema_name, "public_evidence_nppes_merkle_root")
-    explain_prefix = (
-        "EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, TIMING OFF, "
-        "SUMMARY ON, FORMAT JSON) "
-    )
+    from tests.nppes_candidate_postgres_support import resolved_family
+
+    family = await resolved_family(schema_name, admission_ref)
+    member_table = qualified(schema_name, family["member"]["name"])
+    source_table = qualified(schema_name, family["source_record"]["name"])
+    common_table = qualified(schema_name, family["common"]["name"])
+    link_table = qualified(schema_name, family["source_link"]["name"])
+    typed_table = qualified(schema_name, family["typed"]["name"])
+    explain_prefix = "EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, TIMING OFF, SUMMARY ON, FORMAT JSON) "
     queries_by_name = {
-        "member_merkle": (
-            "SELECT count(*), min(source_row_ordinal), max(source_row_ordinal), "
-            f"{merkle_function}(source_row_ordinal, leaf_sha256 "
-            f"ORDER BY source_row_ordinal) FROM {member_table} WHERE admission_ref=$1"
+        "member_ordinal_accounting": (
+            "SELECT count(*), min(source_row_ordinal), max(source_row_ordinal) "
+            f"FROM {member_table} WHERE admission_ref=$1"
         ),
         "member_source_parity": (
             f"SELECT count(*) FROM {member_table} member_row "
@@ -294,5 +272,4 @@ __all__ = (
     "machine_preflight",
     "relation_sizes",
     "require_loopback_test_database",
-    "stage_total_size",
 )

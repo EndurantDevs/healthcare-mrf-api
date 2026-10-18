@@ -2,6 +2,7 @@
 """Persisted draft CAS, replay and rollback on an explicitly isolated native DB."""
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -48,6 +49,7 @@ async def record_db():
             "20261007110000_registry_site_bindings.py",
             "20261007120000_company_network_assertions.py",
             "20261007130000_registry_network_bindings.py",
+            "20261017030000_registry_ptg_office_recipe_selection.py",
             "20261009020000_company_registry_assertions.py",
             "20261009030000_network_catalog_evidence.py",
             "20261011010000_company_registry_group_assertions.py",
@@ -849,3 +851,235 @@ async def test_group_search_filters_complete_scope_before_paging(record_db):
             await list_registry_records(
                 session, "group", record_ids=[UUID(selector) for selector in selectors], schema=schema
             )
+
+
+async def _retain_group_evidence(connection, schema, group_id, *, identifier="123", snapshot_id=None):
+    snapshot_id = snapshot_id or uuid4()
+    source_bytes = json.dumps({"group_id": str(group_id), "identifier": identifier}, sort_keys=True).encode()
+    digest = hashlib.sha256(source_bytes).hexdigest()
+    await connection.execute(
+        f'INSERT INTO "{schema}".registry_source_snapshot '
+        "(snapshot_id,source_system,source_id,edition_id,source_url,artifact_sha256,input_sha256,parser_version) "
+        "VALUES($1,'naic','company-listings',$2,'https://example.org/groups',$3,$3,'test/v1')",
+        snapshot_id,
+        uuid4().hex,
+        digest,
+    )
+    evidence_key = "group:" + identifier
+    await connection.execute(
+        f'INSERT INTO "{schema}".registry_source_observation '
+        "(snapshot_id,source_record_key,source_row_number,status,observation_json,issues_json) "
+        "VALUES($1,$2,1,'accepted',$3::jsonb,'[]')",
+        snapshot_id,
+        evidence_key,
+        source_bytes.decode(),
+    )
+    await connection.execute(
+        f"INSERT INTO \"{schema}\".registry_identifier_binding VALUES('group','naic_group',$1,$2,$3,$4)",
+        identifier,
+        group_id,
+        snapshot_id,
+        evidence_key,
+    )
+    return {
+        "identifier_system": "naic_group",
+        "identifier_value": identifier,
+        "snapshot_id": str(snapshot_id),
+        "evidence_key": evidence_key,
+        "source_system": "naic",
+        "source_id": "company-listings",
+        "edition_id": await connection.fetchval(
+            f'SELECT edition_id FROM "{schema}".registry_source_snapshot WHERE snapshot_id=$1', snapshot_id
+        ),
+        "snapshot_present": True,
+        "observation_present": True,
+        "observation_status": "accepted",
+    }
+
+
+@pytest.mark.asyncio
+async def test_group_evidence_reads_are_exact_scoped_and_leave_history_unenriched(record_db):
+    connection, schema, sessions = record_db
+    actor, command, other = _actor(), _create(), _create()
+    created = await _apply(sessions, schema, command, actor)
+    await _apply(sessions, schema, other, actor)
+    reference = await _retain_group_evidence(connection, schema, command.record_id)
+    await _retain_group_evidence(connection, schema, other.record_id, identifier="456")
+    # A different entity kind with the same UUID cannot contribute group evidence.
+    await connection.execute(
+        f'INSERT INTO "{schema}".registry_identifier_binding '
+        "VALUES('company','naic_company','99999',$1,$2,'unrelated')",
+        command.record_id,
+        uuid4(),
+    )
+    async with sessions() as session:
+        group_document = await get_registry_record(session, "group", command.record_id, schema=schema)
+        assert group_document["source_evidence"] == [reference]
+        listed = await list_registry_records(session, "group", record_ids=[command.record_id], schema=schema)
+        found = await search_registry_groups(session, "Unicode", record_ids=[str(command.record_id)], schema=schema)
+        assert listed == found == [group_document]
+        assert await search_registry_groups(session, "Unicode", record_ids=[], schema=schema) == []
+    assert "source_evidence" not in created["record"]
+    assert await _apply(sessions, schema, command, actor) == created
+    for operation, revision in [("archive", 1), ("restore", 2)]:
+        await _apply(
+            sessions,
+            schema,
+            replace(command, operation=operation, expected_revision=revision, fields={}, idempotency_key=uuid4().hex),
+            actor,
+        )
+        async with sessions() as session:
+            assert (await get_registry_record(session, "group", command.record_id, schema=schema))[
+                "source_evidence"
+            ] == [reference]
+    history = await connection.fetch(f'SELECT record_json FROM "{schema}".registry_record_history')
+    assert all("source_evidence" not in json.loads(history_row["record_json"]) for history_row in history)
+    assert await connection.fetchval(f'SELECT approved_revision FROM "{schema}".registry_revision_control') == 0
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_approved_record') == 0
+
+
+@pytest.mark.asyncio
+async def test_group_evidence_manual_and_missing_source_references_are_explicit(record_db):
+    connection, schema, sessions = record_db
+    command = _create()
+    await _apply(sessions, schema, command, _actor())
+    async with sessions() as session:
+        assert (await get_registry_record(session, "group", command.record_id, schema=schema))["source_evidence"] == []
+    missing = uuid4()
+    await connection.execute(
+        f'INSERT INTO "{schema}".registry_identifier_binding '
+        "VALUES('group','naic_group','789',$1,$2,'missing-group_document')",
+        command.record_id,
+        missing,
+    )
+    async with sessions() as session:
+        refs = (await get_registry_record(session, "group", command.record_id, schema=schema))["source_evidence"]
+    assert refs == [
+        {
+            "identifier_system": "naic_group",
+            "identifier_value": "789",
+            "snapshot_id": str(missing),
+            "evidence_key": "missing-group_document",
+            "source_system": None,
+            "source_id": None,
+            "edition_id": None,
+            "snapshot_present": False,
+            "observation_present": False,
+            "observation_status": None,
+        }
+    ]
+    linked = await _retain_group_evidence(connection, schema, command.record_id, identifier="790")
+    await connection.execute(
+        f'UPDATE "{schema}".registry_identifier_binding SET evidence_key=$1 '
+        "WHERE entity_kind='group' AND identifier_value='790'",
+        "absent-observation",
+    )
+    async with sessions() as session:
+        refs = (await get_registry_record(session, "group", command.record_id, schema=schema))["source_evidence"]
+    assert refs[1] == linked | {
+        "evidence_key": "absent-observation",
+        "observation_present": False,
+        "observation_status": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_group_evidence_uses_one_bounded_set_query_after_pagination(record_db):
+    from sqlalchemy import event
+
+    connection, schema, sessions = record_db
+    commands = [_create() for _ in range(4)]
+    for i, command in enumerate(commands):
+        await _apply(sessions, schema, command, _actor())
+        await _retain_group_evidence(connection, schema, command.record_id, identifier=str(i + 1))
+    statements = []
+
+    def observe(connection, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = sessions.kw["bind"].sync_engine
+    event.listen(engine, "before_cursor_execute", observe)
+    try:
+        async with sessions() as session:
+            group_documents = await list_registry_records(session, "group", limit=2, offset=1, schema=schema)
+        assert len(statements) == 2
+        assert len(group_documents) == 2 and all(
+            len(group_document["source_evidence"]) == 1 for group_document in group_documents
+        )
+        assert [group_document["group_id"] for group_document in group_documents] == sorted(
+            str(command.record_id) for command in commands
+        )[1:3]
+    finally:
+        event.remove(engine, "before_cursor_execute", observe)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overflow", ["rows", "bytes"])
+async def test_group_evidence_complete_response_bounds_refuse_without_truncation(record_db, overflow):
+    from process.registry_record_store import RegistryAddressUnavailable
+
+    connection, schema, sessions = record_db
+    command = _create()
+    await _apply(sessions, schema, command, _actor())
+    reference = await _retain_group_evidence(connection, schema, command.record_id)
+    count = 5001 if overflow == "rows" else 5000
+    if overflow == "bytes":
+        await connection.execute(
+            f'UPDATE "{schema}".registry_source_snapshot SET source_system=$1,source_id=$2,edition_id=$2',
+            "🟢" * 64,
+            "🟢" * 128,
+        )
+    await connection.execute(f'DELETE FROM "{schema}".registry_identifier_binding')
+    await connection.execute(
+        f'INSERT INTO "{schema}".registry_identifier_binding '
+        "SELECT 'group','naic_group',n::text,$1,$2,CASE WHEN $4 THEN repeat('🟢',128) ELSE 'group:'||n END "
+        "FROM generate_series(1,$3) n",
+        command.record_id,
+        UUID(reference["snapshot_id"]),
+        count,
+        overflow == "bytes",
+    )
+    async with sessions() as session:
+        with pytest.raises(RegistryAddressUnavailable, match="group_evidence_unavailable"):
+            await get_registry_record(session, "group", command.record_id, schema=schema)
+    assert await connection.fetchval(f'SELECT approved_revision FROM "{schema}".registry_revision_control') == 0
+    # Overflow on an unselected group neither leaks nor refuses the authorized page.
+    other = _create()
+    await _apply(sessions, schema, other, _actor())
+    async with sessions() as session:
+        group_documents = await list_registry_records(session, "group", record_ids=[other.record_id], schema=schema)
+    assert len(group_documents) == 1 and group_documents[0]["source_evidence"] == []
+
+
+@pytest.mark.asyncio
+async def test_materialized_group_first_history_excludes_management_source_metadata(record_db):
+    connection, schema, sessions = record_db
+    group_id = uuid4()
+    await connection.execute(
+        f'INSERT INTO "{schema}".company_group_registry(group_id,group_kind,display_name) '
+        "VALUES($1,'naic_group','Source Group')",
+        group_id,
+    )
+    reference = await _retain_group_evidence(connection, schema, group_id)
+    command = _create(
+        record_id=group_id,
+        operation="correct",
+        expected_revision=1,
+        fields={"group_kind": "naic_group", "display_name": "Reviewed Group", "aliases": ["Manual alias"]},
+    )
+    corrected = await _apply(sessions, schema, command, _actor())
+    assert "source_evidence" not in corrected["record"]
+    retained = await connection.fetch(
+        f'SELECT revision,record_json FROM "{schema}".registry_record_history ORDER BY revision'
+    )
+    assert [history_row["revision"] for history_row in retained] == [1, 2]
+    assert [json.loads(history_row["record_json"])["display_name"] for history_row in retained] == [
+        "Source Group",
+        "Reviewed Group",
+    ]
+    assert all("source_evidence" not in json.loads(history_row["record_json"]) for history_row in retained)
+    async with sessions() as session:
+        readback = await get_registry_record(session, "group", group_id, schema=schema)
+        assert readback["source_evidence"] == [reference]
+        assert readback["aliases"] == ["Manual alias"]
+    assert await connection.fetchval(f'SELECT approved_revision FROM "{schema}".registry_revision_control') == 0

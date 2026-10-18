@@ -753,3 +753,25 @@ def test_window_numbers_accept_native_unsigned_maximum(monkeypatch, capsys):
         'NATIVE_WAL_WINDOW {"actual_wal":18446744073709551615,"pending_control":0,'
         '"pending_relation":18446744073709551615}\n'
     )
+
+
+def test_complete_native_npi_inputs_select_the_current_lifecycle_migration():
+    import ast
+    from pathlib import Path
+
+    from tests import cms_registry_complete_publication_postgres_support as native
+
+    root = Path(__file__).resolve().parent
+    prefixes = native.source_component_native_migrations()
+    admission, lifecycle = "20260808220000", "20260809020000"
+    assert prefixes.count(admission) == prefixes.count(lifecycle) == 1
+    assert prefixes.index(admission) < prefixes.index(lifecycle)
+    basic = ast.parse((root / "cms_npd_admission_postgres_support.py").read_bytes())
+    basic_prefixes = next(
+        ast.literal_eval(node.value)
+        for node in basic.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "MIGRATION_PREFIXES" for target in node.targets)
+    )
+    assert "20260809010000" in basic_prefixes
+    assert admission not in basic_prefixes and lifecycle not in basic_prefixes

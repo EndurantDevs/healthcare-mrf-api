@@ -13,13 +13,26 @@ from sanic.exceptions import InvalidUsage
 from sqlalchemy import Float, and_, case, cast, func, or_, select
 from sqlalchemy.exc import ProgrammingError
 
+from api.endpoint.network_catalog import _catalog_response
 from api.endpoint.pagination import parse_bool_alias, parse_pagination
 from api.for_human import attributes_labels, benefits_labels
+from api.network_address_scope import canonical_network_read, current_network_address_scope, scoped_aca_plan_clause
 from db.connection import db as sa_db
-from db.models import (GeoZipLookup, ImportLog, Issuer, Plan, PlanAttributes,
-                       PlanBenefits, PlanDrugStats, PlanFormulary,
-                       PlanNetworkTierRaw, PlanNPIRaw, PlanPrices,
-                       PlanRatingAreas, PlanSearchSummary)
+from db.models import (
+    GeoZipLookup,
+    ImportLog,
+    Issuer,
+    Plan,
+    PlanAttributes,
+    PlanBenefits,
+    PlanDrugStats,
+    PlanFormulary,
+    PlanNetworkTierRaw,
+    PlanNPIRaw,
+    PlanPrices,
+    PlanRatingAreas,
+    PlanSearchSummary,
+)
 from db.tiger_models import ZipState
 
 plan_table = Plan.__table__
@@ -106,14 +119,14 @@ def _row_to_dict(row):
     if mapping is not None:
         try:
             row_by_field = dict(mapping)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             row_by_field = None
         if row_by_field is not None:
             return row_by_field
     if hasattr(row, "keys") and hasattr(row, "__getitem__"):
         try:
             row_by_field = {key: row[key] for key in row.keys()}
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             row_by_field = None
         if row_by_field is not None:
             return row_by_field
@@ -121,7 +134,7 @@ def _row_to_dict(row):
         return dict(row)
     try:
         return dict(row)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return {}
 
 
@@ -163,12 +176,8 @@ def _normalize_plan_variant(raw_variant):
             normalized_variant = normalized_variant[1:-1].strip()
             if normalized_variant.endswith(","):
                 normalized_variant = normalized_variant[:-1]
-            if (
-                normalized_variant.startswith("'")
-                and normalized_variant.endswith("'")
-            ) or (
-                normalized_variant.startswith('"')
-                and normalized_variant.endswith('"')
+            if (normalized_variant.startswith("'") and normalized_variant.endswith("'")) or (
+                normalized_variant.startswith('"') and normalized_variant.endswith('"')
             ):
                 normalized_variant = normalized_variant[1:-1]
     else:
@@ -189,11 +198,8 @@ def _unique_plan_variants(raw_variants):
     return ordered_variants
 
 
-
-
 def _plan_level_plan_id_column(table):
     return func.coalesce(table.c.plan_id, func.left(func.coalesce(table.c.full_plan_id, ""), 14))
-
 
 
 def _collect_price_bounds(result):
@@ -212,7 +218,7 @@ def _collect_price_bounds(result):
                 continue
             try:
                 values.append(float(value))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
         if not values:
             continue
@@ -349,7 +355,7 @@ def _summary_attributes_to_dict(payload):
     if isinstance(payload, str):
         try:
             data = json.loads(payload)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return {}
     if not isinstance(data, list):
         return {}
@@ -371,7 +377,7 @@ def _summary_benefits_to_dict(payload):
     if isinstance(payload, str):
         try:
             data = json.loads(payload)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return {}
     if not isinstance(data, list):
         return {}
@@ -391,11 +397,7 @@ def _summary_benefits_to_dict(payload):
 def _distinct_state_codes(query_result) -> list[str]:
     """Return sorted nonempty state codes from a one-column query."""
 
-    return sorted(
-        state_record[0]
-        for state_record in _result_rows(query_result)
-        if state_record[0]
-    )
+    return sorted(state_record[0] for state_record in _result_rows(query_result) if state_record[0])
 
 
 async def _states_for_zip(session, zip_code: str) -> list[str]:
@@ -403,10 +405,7 @@ async def _states_for_zip(session, zip_code: str) -> list[str]:
     if len(digits) < 3:
         return []
     padded_zip = digits.rjust(5, "0")
-    geo_stmt = (
-        select(func.distinct(geo_zip_lookup_table.c.state))
-        .where(geo_zip_lookup_table.c.zip_code == padded_zip)
-    )
+    geo_stmt = select(func.distinct(geo_zip_lookup_table.c.state)).where(geo_zip_lookup_table.c.zip_code == padded_zip)
     try:
         geo_result = await session.execute(geo_stmt)
     except ProgrammingError as exc:
@@ -419,10 +418,7 @@ async def _states_for_zip(session, zip_code: str) -> list[str]:
             return geo_states
 
     zip3 = digits[:3]
-    stmt = (
-        select(func.distinct(plan_rating_areas_table.c.state))
-        .where(plan_rating_areas_table.c.zip3 == zip3)
-    )
+    stmt = select(func.distinct(plan_rating_areas_table.c.state)).where(plan_rating_areas_table.c.zip3 == zip3)
     rating_area_result = await session.execute(stmt)
     states = _distinct_state_codes(rating_area_result)
     if states:
@@ -431,10 +427,7 @@ async def _states_for_zip(session, zip_code: str) -> list[str]:
     if len(digits) < 5:
         return []
 
-    fallback_stmt = (
-        select(zip_state_table.c.stusps)
-        .where(zip_state_table.c.zip == padded_zip)
-    )
+    fallback_stmt = select(zip_state_table.c.stusps).where(zip_state_table.c.zip == padded_zip)
     try:
         fallback_result = await session.execute(fallback_stmt)
     except ProgrammingError:
@@ -442,21 +435,15 @@ async def _states_for_zip(session, zip_code: str) -> list[str]:
     return _distinct_state_codes(fallback_result)
 
 
-
-
 @blueprint.get("/")
 async def index_status(request):
     """Return plan index readiness and generation metadata."""
     session = _get_session(request)
 
-    plan_count_res = await session.execute(
-        select(sa_db.func.count(plan_table.c.plan_id))
-    )
+    plan_count_res = await session.execute(select(sa_db.func.count(plan_table.c.plan_id)))
     plan_count = _result_scalar(plan_count_res) or 0
 
-    import_error_res = await session.execute(
-        select(sa_db.func.count(import_log_table.c.checksum))
-    )
+    import_error_res = await session.execute(select(sa_db.func.count(import_log_table.c.checksum)))
     import_errors = _result_scalar(import_error_res) or 0
 
     network_count_res = await session.execute(
@@ -526,7 +513,10 @@ async def all_plans_variants(request):
     return response.json(plan_variants, default=str)
 
 
-async def _fetch_network_entry(session, checksum):
+async def _fetch_networks_by_checksum(session, checksums):
+    """Read requested checksums together within the bound canonical scope."""
+    if not checksums:
+        return {}
     stmt = (
         select(
             plan_network_tier_table.c.plan_id,
@@ -544,14 +534,37 @@ async def _fetch_network_entry(session, checksum):
                 issuer_table.c.issuer_id == plan_network_tier_table.c.issuer_id,
             )
         )
-        .where(plan_network_tier_table.c.checksum_network == checksum)
+        .where(plan_network_tier_table.c.checksum_network.in_(checksums))
     )
 
+    if current_network_address_scope() is not None:
+        stmt = stmt.where(
+            scoped_aca_plan_clause(
+                plan_id=plan_network_tier_table.c.plan_id,
+                year=plan_network_tier_table.c.year,
+                issuer_id=plan_network_tier_table.c.issuer_id,
+                state=issuer_table.c.state,
+                checksum_network=plan_network_tier_table.c.checksum_network,
+            )
+        )
     network_result = await session.execute(stmt)
     network_rows = _result_rows(network_result)
-    if not network_rows:
-        return None
+    rows_by_checksum = {}
+    for network_row in network_rows:
+        rows_by_checksum.setdefault(_row_to_dict(network_row).get("checksum_network"), []).append(network_row)
+    return {
+        checksum: _network_entry_document(matching_network_rows)
+        for checksum, matching_network_rows in rows_by_checksum.items()
+    }
 
+
+async def _fetch_network_entry(session, checksum):
+    """Keep the existing single-checksum response on the bulk read path."""
+    return (await _fetch_networks_by_checksum(session, [checksum])).get(checksum)
+
+
+def _network_entry_document(network_rows):
+    """Shape complete permitted plan rows into the existing legacy response."""
     plans = []
     seen_plan_keys = set()
     first_row = _row_to_dict(network_rows[0])
@@ -579,8 +592,9 @@ async def _fetch_network_entry(session, checksum):
 
 
 @blueprint.get("/network/id/<checksum>")
+@canonical_network_read
 async def get_network_by_checksum(request, checksum):
-    """Return a network identified by its stable checksum."""
+    """Return legacy network metadata with optional approved canonical scope."""
     session = _get_session(request)
     entry = await _fetch_network_entry(session, int(checksum))
     if entry is None:
@@ -592,11 +606,12 @@ async def get_network_by_checksum(request, checksum):
     "/network/multiple/<checksums>",
     name="get_networks_by_checksums",
 )
+@canonical_network_read
 async def get_network_batch_by_checksums(request, checksums):
     """Return networks matching a collection of stable checksums."""
     session = _get_session(request)
     values = [value.strip() for value in checksums.split(",") if value.strip()]
-    payload = []
+    selected_checksums = []
     seen_checksums = set()
 
     for value in values:
@@ -607,14 +622,21 @@ async def get_network_batch_by_checksums(request, checksums):
         if checksum in seen_checksums:
             continue
         seen_checksums.add(checksum)
-        entry = await _fetch_network_entry(session, checksum)
-        if entry:
-            payload.append(entry)
+        selected_checksums.append(checksum)
+
+    entries = await _fetch_networks_by_checksum(session, selected_checksums)
+    payload = [entries[checksum] for checksum in selected_checksums if checksum in entries]
 
     if not payload:
         raise sanic.exceptions.NotFound
 
     return response.json(payload, default=str)
+
+
+@blueprint.post("/network/autocomplete")
+async def get_approved_autocomplete_list(request):
+    """Authorize approved ACA metadata before limits and geographic fallback."""
+    return await _catalog_response(request, "autocomplete")
 
 
 @blueprint.get("/network/autocomplete")
@@ -672,9 +694,7 @@ async def get_autocomplete_list(request):
         if plan_id in plans_by_id:
             plans_by_id[plan_id]["network_checksum"][str(checksum)] = tier
 
-    network_plans = [
-        plan for plan in plans_by_id.values() if plan["network_checksum"]
-    ]
+    network_plans = [plan for plan in plans_by_id.values() if plan["network_checksum"]]
     return response.json({"plans": network_plans}, default=str)
 
 
@@ -715,9 +735,7 @@ async def find_a_plan(request):
     moop_max = _parse_float(args.get("moop_max"), "moop_max")
     premium_min = _parse_float(args.get("premium_min"), "premium_min")
     premium_max = _parse_float(args.get("premium_max"), "premium_max")
-    plan_types = [
-        plan_type.upper() for plan_type in _get_list_param(args, "plan_types")
-    ]
+    plan_types = [plan_type.upper() for plan_type in _get_list_param(args, "plan_types")]
     metal_levels = _get_list_param(args, "metal_levels")
     csr_variations = _get_list_param(args, "csr_variations")
 
@@ -812,9 +830,7 @@ async def find_a_plan(request):
         _append_filter(filters_by_name, "zip_code", zip_code)
         zip_states = await _states_for_zip(session, zip_code)
         if not zip_states:
-            warnings.append(
-                {"code": "zip_not_found", "message": f"Could not resolve states for ZIP '{zip_code}'"}
-            )
+            warnings.append({"code": "zip_not_found", "message": f"Could not resolve states for ZIP '{zip_code}'"})
             return response.json(
                 {
                     "total": 0,
@@ -862,9 +878,7 @@ async def find_a_plan(request):
         column = SUMMARY_BOOLEAN_COLUMNS.get(key)
         if column is None:
             continue
-        summary_filters.append(
-            column.is_(True) if filter_value else column.is_(False)
-        )
+        summary_filters.append(column.is_(True) if filter_value else column.is_(False))
         _append_filter(filters_by_name, key, filter_value)
 
     if deductible_min is not None:
@@ -893,14 +907,8 @@ async def find_a_plan(request):
         summary_filters.append(func.lower(plan_search_summary_table.c.metal_level).in_(lowered_levels))
         _append_filter(filters_by_name, "metal_levels", metal_levels)
     if csr_variations:
-        normalized_csr_values = [
-            csr_variation.lower() for csr_variation in csr_variations
-        ]
-        summary_filters.append(
-            func.lower(plan_search_summary_table.c.csr_variation).in_(
-                normalized_csr_values
-            )
-        )
+        normalized_csr_values = [csr_variation.lower() for csr_variation in csr_variations]
+        summary_filters.append(func.lower(plan_search_summary_table.c.csr_variation).in_(normalized_csr_values))
         _append_filter(filters_by_name, "csr_variations", csr_variations)
 
     join_condition = and_(
@@ -962,17 +970,15 @@ async def find_a_plan(request):
         plan_search_summary_table.c.plan_benefits,
     ]
 
-    from_clause = (
-        plan_table.join(
-            filtered_plans,
-            and_(plan_table.c.plan_id == filtered_plans.c.plan_id, plan_table.c.year == filtered_plans.c.year),
-        ).join(
-            plan_search_summary_table,
-            and_(
-                plan_search_summary_table.c.plan_id == filtered_plans.c.plan_id,
-                plan_search_summary_table.c.year == filtered_plans.c.year,
-            ),
-        )
+    from_clause = plan_table.join(
+        filtered_plans,
+        and_(plan_table.c.plan_id == filtered_plans.c.plan_id, plan_table.c.year == filtered_plans.c.year),
+    ).join(
+        plan_search_summary_table,
+        and_(
+            plan_search_summary_table.c.plan_id == filtered_plans.c.plan_id,
+            plan_search_summary_table.c.year == filtered_plans.c.year,
+        ),
     )
 
     data_stmt = select(*select_columns).select_from(from_clause)
@@ -991,37 +997,33 @@ async def find_a_plan(request):
             continue
         plan_key = (plan_id, plan_year)
         plan_dict = {
-            key: field_value
-            for key, field_value in row_dict.items()
-            if key not in {"attributes", "plan_benefits"}
+            key: field_value for key, field_value in row_dict.items() if key not in {"attributes", "plan_benefits"}
         }
-        plan_dict.update({
-            "price_range": {"min": None, "max": None},
-            "has_adult_dental": row_dict.get("has_adult_dental"),
-            "has_child_dental": row_dict.get("has_child_dental"),
-            "has_adult_vision": row_dict.get("has_adult_vision"),
-            "has_child_vision": row_dict.get("has_child_vision"),
-            "telehealth_supported": row_dict.get("telehealth_supported"),
-            "is_hsa": row_dict.get("is_hsa"),
-            "is_dental_only": row_dict.get("is_dental_only"),
-            "is_catastrophic": row_dict.get("is_catastrophic"),
-            "is_on_exchange": row_dict.get("is_on_exchange"),
-            "is_off_exchange": row_dict.get("is_off_exchange"),
-            "market_coverage": row_dict.get("market_coverage"),
-            "deductible_inn_individual": row_dict.get("deductible_inn_individual"),
-            "moop_inn_individual": row_dict.get("moop_inn_individual"),
-            "premium_min": row_dict.get("premium_min"),
-            "premium_max": row_dict.get("premium_max"),
-            "plan_type": row_dict.get("plan_type"),
-            "metal_level": row_dict.get("metal_level"),
-            "csr_variation": row_dict.get("csr_variation"),
-        })
-        plan_dict["attributes"] = _normalize_attribute_map(
-            _summary_attributes_to_dict(row_dict.get("attributes"))
+        plan_dict.update(
+            {
+                "price_range": {"min": None, "max": None},
+                "has_adult_dental": row_dict.get("has_adult_dental"),
+                "has_child_dental": row_dict.get("has_child_dental"),
+                "has_adult_vision": row_dict.get("has_adult_vision"),
+                "has_child_vision": row_dict.get("has_child_vision"),
+                "telehealth_supported": row_dict.get("telehealth_supported"),
+                "is_hsa": row_dict.get("is_hsa"),
+                "is_dental_only": row_dict.get("is_dental_only"),
+                "is_catastrophic": row_dict.get("is_catastrophic"),
+                "is_on_exchange": row_dict.get("is_on_exchange"),
+                "is_off_exchange": row_dict.get("is_off_exchange"),
+                "market_coverage": row_dict.get("market_coverage"),
+                "deductible_inn_individual": row_dict.get("deductible_inn_individual"),
+                "moop_inn_individual": row_dict.get("moop_inn_individual"),
+                "premium_min": row_dict.get("premium_min"),
+                "premium_max": row_dict.get("premium_max"),
+                "plan_type": row_dict.get("plan_type"),
+                "metal_level": row_dict.get("metal_level"),
+                "csr_variation": row_dict.get("csr_variation"),
+            }
         )
-        plan_dict["plan_benefits"] = _summary_benefits_to_dict(
-            row_dict.get("plan_benefits")
-        )
+        plan_dict["attributes"] = _normalize_attribute_map(_summary_attributes_to_dict(row_dict.get("attributes")))
+        plan_dict["plan_benefits"] = _summary_benefits_to_dict(row_dict.get("plan_benefits"))
         plan_results.append(plan_dict)
         result_lookup[plan_key] = plan_dict
         plan_keys.append(plan_key)
@@ -1053,9 +1055,7 @@ async def find_a_plan(request):
         if rating_area:
             price_stmt = price_stmt.where(plan_prices_table.c.rating_area_id == rating_area)
         if age is not None:
-            price_stmt = price_stmt.where(
-                and_(plan_prices_table.c.min_age <= age, plan_prices_table.c.max_age >= age)
-            )
+            price_stmt = price_stmt.where(and_(plan_prices_table.c.min_age <= age, plan_prices_table.c.max_age >= age))
         if state:
             price_stmt = price_stmt.where(plan_prices_table.c.state == state)
         price_result = await session.execute(price_stmt)
@@ -1069,24 +1069,20 @@ async def find_a_plan(request):
                 "max": price_info["max"],
             }
 
-    issuer_join = (
-        plan_table.join(
-            filtered_plans,
-            and_(plan_table.c.plan_id == filtered_plans.c.plan_id, plan_table.c.year == filtered_plans.c.year),
-        ).join(
-            issuer_table,
-            issuer_table.c.issuer_id == plan_table.c.issuer_id,
-            isouter=True,
-        )
+    issuer_join = plan_table.join(
+        filtered_plans,
+        and_(plan_table.c.plan_id == filtered_plans.c.plan_id, plan_table.c.year == filtered_plans.c.year),
+    ).join(
+        issuer_table,
+        issuer_table.c.issuer_id == plan_table.c.issuer_id,
+        isouter=True,
     )
     issuer_stmt = select(
         plan_table.c.issuer_id.label("issuer_id"),
         func.max(issuer_table.c.issuer_name).label("issuer_name"),
         func.count().label("plan_count"),
     ).select_from(issuer_join)
-    issuer_stmt = issuer_stmt.group_by(plan_table.c.issuer_id).order_by(
-        func.count().desc(), plan_table.c.issuer_id
-    )
+    issuer_stmt = issuer_stmt.group_by(plan_table.c.issuer_id).order_by(func.count().desc(), plan_table.c.issuer_id)
     issuer_result = await session.execute(issuer_stmt)
     issuers = []
     for issuer_row in _result_rows(issuer_result):
@@ -1113,6 +1109,7 @@ async def find_a_plan(request):
         },
         default=str,
     )
+
 
 @blueprint.get("/price/<plan_id>", name="get_price_plan_by_plan_id")
 @blueprint.get("/price/<plan_id>/year", name="get_price_plan_by_plan_id_and_year")
@@ -1143,13 +1140,9 @@ async def get_price_plan(request, plan_id, year=None, variant=None):
     if year is not None:
         stmt = stmt.where(plan_prices_table.c.year == year)
     price_result = await session.execute(stmt)
-    plan_prices = [
-        _row_to_dict(price_row) for price_row in _result_rows(price_result)
-    ]
+    plan_prices = [_row_to_dict(price_row) for price_row in _result_rows(price_result)]
     if year is not None:
-        plan_prices = [
-            price_entry for price_entry in plan_prices if price_entry.get("year") == year
-        ]
+        plan_prices = [price_entry for price_entry in plan_prices if price_entry.get("year") == year]
     return response.json(plan_prices, default=str)
 
 
@@ -1195,21 +1188,15 @@ async def get_price_plans_bulk(request):
     if rating_area:
         stmt = stmt.where(plan_prices_table.c.rating_area_id == rating_area)
     if age is not None:
-        stmt = stmt.where(
-            and_(plan_prices_table.c.min_age <= age, plan_prices_table.c.max_age >= age)
-        )
+        stmt = stmt.where(and_(plan_prices_table.c.min_age <= age, plan_prices_table.c.max_age >= age))
     price_result = await session.execute(stmt)
-    price_rows = [
-        _row_to_dict(price_row) for price_row in _result_rows(price_result)
-    ]
+    price_rows = [_row_to_dict(price_row) for price_row in _result_rows(price_result)]
     prices_by_plan = {pid: [] for pid in plan_ids}
     for price_row in price_rows:
         pid = price_row.get("plan_id")
         if pid in prices_by_plan:
             prices_by_plan[pid].append(price_row)
-    missing_plan_ids = [
-        pid for pid, entries in prices_by_plan.items() if not entries
-    ]
+    missing_plan_ids = [pid for pid, entries in prices_by_plan.items() if not entries]
     return response.json(
         {"results": prices_by_plan, "missing": missing_plan_ids},
         default=str,
@@ -1249,9 +1236,7 @@ async def get_plan(request, plan_id, year=None, variant=None):
     for checksum, tier in _result_rows(network_result):
         plan_data.setdefault("network_checksum", {})[str(checksum)] = tier
 
-    issuer_stmt = select(issuer_table.c.issuer_name).where(
-        issuer_table.c.issuer_id == plan_data.get("issuer_id")
-    )
+    issuer_stmt = select(issuer_table.c.issuer_name).where(issuer_table.c.issuer_id == plan_data.get("issuer_id"))
     issuer_result = await session.execute(issuer_stmt)
     plan_data["issuer_name"] = _result_scalar(issuer_result)
 
@@ -1262,14 +1247,10 @@ async def get_plan(request, plan_id, year=None, variant=None):
         )
     )
     formulary_result = await session.execute(formulary_stmt)
-    plan_data["formulary"] = [
-        _row_to_dict(formulary_row)
-        for formulary_row in _result_rows(formulary_result)
-    ]
+    plan_data["formulary"] = [_row_to_dict(formulary_row) for formulary_row in _result_rows(formulary_result)]
 
-    drug_count_stmt = (
-        select(func.coalesce(plan_drug_stats_table.c.total_drugs, 0))
-        .where(plan_drug_stats_table.c.plan_id == plan_id)
+    drug_count_stmt = select(func.coalesce(plan_drug_stats_table.c.total_drugs, 0)).where(
+        plan_drug_stats_table.c.plan_id == plan_id
     )
     drug_count_result = await session.execute(drug_count_stmt)
     plan_data["formulary_drug_count"] = int(_result_scalar(drug_count_result) or 0)
@@ -1279,20 +1260,22 @@ async def get_plan(request, plan_id, year=None, variant=None):
     if not year:
         return response.json(plan_data, default=str)
 
-    variant_stmt = select(plan_attributes_table.c.full_plan_id).where(
-        and_(
-            plan_attributes_table.c.plan_id == plan_id,
-            plan_attributes_table.c.year == int(year),
+    variant_stmt = (
+        select(plan_attributes_table.c.full_plan_id)
+        .where(
+            and_(
+                plan_attributes_table.c.plan_id == plan_id,
+                plan_attributes_table.c.year == int(year),
+            )
         )
-    ).order_by(plan_attributes_table.c.full_plan_id.asc())
+        .order_by(plan_attributes_table.c.full_plan_id.asc())
+    )
 
     variant_result = await session.execute(variant_stmt)
 
     variants = _unique_plan_variants(
         [
-            variant_row[0]
-            if isinstance(variant_row, (list, tuple))
-            else variant_row
+            variant_row[0] if isinstance(variant_row, (list, tuple)) else variant_row
             for variant_row in _result_rows(variant_result)
         ]
     )
@@ -1372,18 +1355,20 @@ async def get_plan(request, plan_id, year=None, variant=None):
             plan_data["plan_benefits"][name] = benefit_entry
 
     if not variants:
-        fallback_stmt = select(plan_attributes_table.c.full_plan_id).where(
-            and_(
-                plan_attributes_table.c.full_plan_id.like(f"{plan_id}%"),
-                plan_attributes_table.c.year == int(year),
+        fallback_stmt = (
+            select(plan_attributes_table.c.full_plan_id)
+            .where(
+                and_(
+                    plan_attributes_table.c.full_plan_id.like(f"{plan_id}%"),
+                    plan_attributes_table.c.year == int(year),
+                )
             )
-        ).order_by(plan_attributes_table.c.full_plan_id.asc())
+            .order_by(plan_attributes_table.c.full_plan_id.asc())
+        )
         fallback_result = await session.execute(fallback_stmt)
         variants = _unique_plan_variants(
             [
-                fallback_row[0]
-                if isinstance(fallback_row, (list, tuple))
-                else fallback_row
+                fallback_row[0] if isinstance(fallback_row, (list, tuple)) else fallback_row
                 for fallback_row in _result_rows(fallback_result)
             ]
         )
@@ -1454,8 +1439,7 @@ async def get_plan(request, plan_id, year=None, variant=None):
         }
     if active_variant and not plan_data["variant_benefits"] and plan_data["plan_benefits"]:
         plan_data["variant_benefits"] = {
-            benefit_name: dict(benefit_values)
-            for benefit_name, benefit_values in plan_data["plan_benefits"].items()
+            benefit_name: dict(benefit_values) for benefit_name, benefit_values in plan_data["plan_benefits"].items()
         }
 
     plan_data["attributes"] = _normalize_attribute_map(plan_data.get("attributes"))

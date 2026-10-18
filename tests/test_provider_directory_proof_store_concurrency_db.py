@@ -10,12 +10,13 @@ import json
 import pytest
 
 from db.connection import Database
+from process.provider_directory_generic_source_adapters import candidate_resource_count, completed_source_scope
+from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
     ProviderDirectoryProofStoreError,
 )
 from tests import test_provider_directory_proof_store_db as proof_support
-
 
 importer = proof_support.importer
 SECOND_DATASET_ID = "dataset-proof-second"
@@ -31,27 +32,20 @@ async def _insert_candidate_dataset(
 ) -> None:
     """Insert the second mutable candidate with isolated source lineage."""
 
-    await database.status(
-        f"""
-        INSERT INTO "{schema}".provider_directory_endpoint_dataset (
-            dataset_id, endpoint_id, acquisition_root_run_id,
-            status, is_current, publication_metadata_json
-        ) VALUES (
-            :dataset_id, :endpoint_id, :root_run_id,
-            :status, false, CAST(:metadata_json AS jsonb)
-        );
-        """,
-        dataset_id=SECOND_DATASET_ID,
-        endpoint_id=SECOND_ENDPOINT_ID,
-        root_run_id=SECOND_ROOT_RUN_ID,
-        status=importer.ENDPOINT_DATASET_ACQUIRING,
-        metadata_json=json.dumps(
-            {
-                "selected_resources": list(SECOND_SELECTED_RESOURCES),
-                "source_ids": list(SECOND_SOURCE_IDS),
-            }
-        ),
-    )
+    async with source_transaction(database):
+        await database.status(
+            f'INSERT INTO "{schema}".provider_directory_api_endpoint '
+            "(endpoint_id,canonical_api_base,credential_descriptor_hash,endpoint_signature_hash) "
+            "VALUES (:endpoint,'https://second.example.test/fhir',repeat('c',64),repeat('d',64))",
+            endpoint=SECOND_ENDPOINT_ID,
+        )
+        await database.status(
+            f'INSERT INTO "{schema}".provider_directory_source '
+            "(source_id,org_name,endpoint_id,canonical_api_base,requires_registration,requires_api_key) "
+            "VALUES ('source-c','Second proof fixture',:endpoint,'https://second.example.test/fhir',false,false)",
+            endpoint=SECOND_ENDPOINT_ID,
+        )
+        await importer._ensure_endpoint_dataset_candidate(_second_candidate())
 
 
 def _second_resource_rows():
@@ -111,16 +105,14 @@ async def _materialize_candidate_summary(
 ):
     """Commit one candidate and finalize its source-local proof summary."""
 
-    async with database.acquire() as connection:
+    async with source_transaction(database), database.acquire() as connection:
         await proof_support._write_resource_batch(
             connection,
             dataset_resources,
         )
-        content_proof = (
-            await importer._candidate_endpoint_dataset_content_proof(
-                connection,
-                candidate,
-            )
+        content_proof = await importer._candidate_endpoint_dataset_content_proof(
+            connection,
+            candidate,
         )
         source_summary = await importer._endpoint_dataset_source_summary(
             connection,
@@ -128,6 +120,7 @@ async def _materialize_candidate_summary(
             content_proof,
             _complete_relation_proofs(),
         )
+    await _assert_completed_parity(database, candidate, content_proof)
     return content_proof, source_summary
 
 
@@ -138,7 +131,7 @@ async def _hold_candidate_then_fail(
 ) -> None:
     """Hold candidate A's row lock, then force its batch to roll back."""
 
-    async with database.acquire() as connection:
+    async with source_transaction(database), database.acquire() as connection:
         await proof_support._write_resource_batch(
             connection,
             proof_support._resource_rows(),
@@ -146,6 +139,67 @@ async def _hold_candidate_then_fail(
         lock_acquired.set()
         await release_failure.wait()
         raise RuntimeError("source-a-delayed-failure")
+
+
+async def _second_resource_count(database, resource_type):
+    context = importer.PaginationCheckpointContext(
+        canonical_api_base="https://second.example.test/fhir",
+        source_scope_hash="scope-proof-second",
+        source_ids=SECOND_SOURCE_IDS,
+        owner_run_id=SECOND_ROOT_RUN_ID,
+        acquisition_root_run_id=SECOND_ROOT_RUN_ID,
+        endpoint_id=SECOND_ENDPOINT_ID,
+        dataset_id=SECOND_DATASET_ID,
+        lineage_verified=True,
+    )
+    return await candidate_resource_count(importer, context, resource_type)
+
+
+async def _assert_completed_parity(database, candidate, content_proof):
+    """Compare the real completed native group, then restore its exact mutable input for replay."""
+    async with source_transaction(database, isolation="repeatable read"):
+        probe = bound_publisher().connection.transaction()
+        await probe.start()
+        try:
+            async with completed_source_scope(importer, candidate):
+                observed = await importer._endpoint_dataset_content_proof(
+                    database, candidate.dataset_id, candidate.selected_resources, verify_payload_hashes=True
+                )
+                assert (
+                    observed.dataset_hash,
+                    observed.resource_count,
+                    observed.resource_hashes,
+                    observed.resource_counts,
+                ) == (
+                    content_proof.dataset_hash,
+                    content_proof.resource_count,
+                    content_proof.resource_hashes,
+                    content_proof.resource_counts,
+                )
+        finally:
+            await probe.rollback()
+
+
+async def _assert_isolated_loading(database, schema):
+    """Only candidate B has committed private resources; neither public parent exposes input."""
+    assert (
+        await database.scalar(
+            f'SELECT count(*) FROM "{schema}".provider_directory_dataset_resource WHERE dataset_id=:dataset_id;',
+            dataset_id=proof_support.DATASET_ID,
+        )
+        == 0
+    )
+    assert (
+        await database.scalar(
+            f'SELECT count(*) FROM "{schema}".provider_directory_dataset_resource WHERE dataset_id=:dataset_id;',
+            dataset_id=SECOND_DATASET_ID,
+        )
+        == 0
+    )
+    assert await _second_resource_count(database, "Practitioner") == 1
+    assert await _second_resource_count(database, "Location") == 1
+    for resource_type in ("Practitioner", "Organization", "Location"):
+        assert await proof_support._active_resource_count(database, resource_type) == 0
 
 
 async def _assert_second_candidate_is_scoped(
@@ -156,23 +210,17 @@ async def _assert_second_candidate_is_scoped(
 ) -> None:
     """Assert candidate B committed only under its dataset/source keys."""
 
-    assert await database.scalar(
-        f'SELECT count(*) FROM "{schema}".provider_directory_dataset_resource '
-        "WHERE dataset_id=:dataset_id;",
-        dataset_id=proof_support.DATASET_ID,
-    ) == 0
-    assert await database.scalar(
-        f'SELECT count(*) FROM "{schema}".provider_directory_dataset_resource '
-        "WHERE dataset_id=:dataset_id;",
-        dataset_id=SECOND_DATASET_ID,
-    ) == 2
-    assert await database.scalar(
-        f'SELECT count(*) FROM "{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}" '
-        "WHERE dataset_id=:dataset_id;",
-        dataset_id=proof_support.DATASET_ID,
-    ) == 0
-    assert await database.scalar(
-        f"""
+    await _assert_isolated_loading(database, schema)
+    assert (
+        await database.scalar(
+            f'SELECT count(*) FROM "{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}" WHERE dataset_id=:dataset_id;',
+            dataset_id=proof_support.DATASET_ID,
+        )
+        == 0
+    )
+    assert (
+        await database.scalar(
+            f"""
         SELECT count(*)
           FROM "{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}"
          WHERE dataset_id=:dataset_id
@@ -180,30 +228,30 @@ async def _assert_second_candidate_is_scoped(
            AND acquisition_root_run_id=:root_run_id
            AND source_ids_json=CAST(:source_ids_json AS jsonb);
         """,
-        dataset_id=SECOND_DATASET_ID,
-        endpoint_id=SECOND_ENDPOINT_ID,
-        root_run_id=SECOND_ROOT_RUN_ID,
-        source_ids_json=json.dumps(list(SECOND_SOURCE_IDS)),
-    ) == 2
-    assert await database.scalar(
-        f'SELECT count(*) FROM "{schema}".provider_directory_endpoint_dataset '
-        "WHERE is_current=true;"
-    ) == 0
+            dataset_id=SECOND_DATASET_ID,
+            endpoint_id=SECOND_ENDPOINT_ID,
+            root_run_id=SECOND_ROOT_RUN_ID,
+            source_ids_json=json.dumps(list(SECOND_SOURCE_IDS)),
+        )
+        == 2
+    )
+    assert (
+        await database.scalar(
+            f'SELECT count(*) FROM "{schema}".provider_directory_endpoint_dataset WHERE is_current=true;'
+        )
+        == 0
+    )
     primary_key = await database.scalar(
         """
         SELECT pg_get_constraintdef(oid)
           FROM pg_constraint
          WHERE conrelid=to_regclass(:table_ref) AND contype='p';
         """,
-        table_ref=(
-            f'"{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}"'
-        ),
+        table_ref=(f'"{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}"'),
     )
     assert primary_key == "PRIMARY KEY (dataset_id, shard_id)"
     assert content_proof.proof_metadata["dataset_id"] == SECOND_DATASET_ID
-    assert content_proof.proof_metadata["source_ids"] == list(
-        SECOND_SOURCE_IDS
-    )
+    assert content_proof.proof_metadata["source_ids"] == list(SECOND_SOURCE_IDS)
     assert source_summary["dataset_id"] == SECOND_DATASET_ID
     assert source_summary["endpoint_id"] == SECOND_ENDPOINT_ID
     assert source_summary["source_ids"] == list(SECOND_SOURCE_IDS)
@@ -221,15 +269,16 @@ async def _assert_first_candidate_tamper_is_isolated(
         database,
         proof_support._resource_rows(),
     )
-    await database.status(
-        f"""
-        UPDATE "{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}"
-           SET payload_bytes = payload_bytes || decode('00', 'hex')
-         WHERE dataset_id = :dataset_id;
-        """,
-        dataset_id=proof_support.DATASET_ID,
-    )
-    async with database.acquire() as connection:
+    async with source_transaction(database):
+        await database.status(
+            f"""
+            UPDATE "{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}"
+               SET payload_bytes = payload_bytes || decode('00', 'hex')
+             WHERE dataset_id = :dataset_id;
+            """,
+            dataset_id=proof_support.DATASET_ID,
+        )
+    async with source_transaction(database), database.acquire() as connection:
         with pytest.raises(
             ProviderDirectoryProofStoreError,
             match="proof artifact changed",
@@ -268,17 +317,15 @@ async def test_two_source_candidates_finalize_without_global_lock_coupling(
                 release_first_failure,
             )
         )
-        await asyncio.wait_for(first_lock_acquired.wait(), timeout=5)
         try:
-            second_content_proof, second_source_summary = (
-                await asyncio.wait_for(
-                    _materialize_candidate_summary(
-                        database,
-                        _second_candidate(),
-                        _second_resource_rows(),
-                    ),
-                    timeout=5,
-                )
+            await asyncio.wait_for(first_lock_acquired.wait(), timeout=5)
+            second_content_proof, second_source_summary = await asyncio.wait_for(
+                _materialize_candidate_summary(
+                    database,
+                    _second_candidate(),
+                    _second_resource_rows(),
+                ),
+                timeout=5,
             )
             assert not first_task.done()
         finally:

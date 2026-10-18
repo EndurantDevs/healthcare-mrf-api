@@ -5,9 +5,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from copy import deepcopy
 from dataclasses import replace
-import json
 
 import pytest
 
@@ -71,14 +71,11 @@ async def test_facade_translates_catalog_and_runtime_failures(monkeypatch):
         raise RuntimeError("private detail")
 
     monkeypatch.setattr(
-        "process.provider_directory_fhir_manual_catalog."
-        "reviewed_manual_census_source_id",
+        "process.provider_directory_fhir_manual_catalog.reviewed_manual_census_source_id",
         invalid_source_id,
     )
     with pytest.raises(ReviewedSubsetTerminalDispositionError) as error:
-        await facade.dispose_reviewed_subset_census_drift_root(
-            database=TerminalDispositionDatabase()
-        )
+        await facade.dispose_reviewed_subset_census_drift_root(database=TerminalDispositionDatabase())
     assert error.value.code == "evidence"
 
 
@@ -86,8 +83,7 @@ async def test_facade_translates_catalog_and_runtime_failures(monkeypatch):
 async def test_facade_resolves_default_database(monkeypatch):
     monkeypatch.setenv(contract.TERMINAL_DISPOSITION_ENABLED_ENV, "true")
     monkeypatch.setattr(
-        "process.provider_directory_fhir_manual_catalog."
-        "reviewed_manual_census_source_id",
+        "process.provider_directory_fhir_manual_catalog.reviewed_manual_census_source_id",
         lambda: "source-a",
     )
     sentinel = object()
@@ -120,8 +116,7 @@ async def test_facade_preserves_control_errors(
 ):
     monkeypatch.setenv(contract.TERMINAL_DISPOSITION_ENABLED_ENV, "true")
     monkeypatch.setattr(
-        "process.provider_directory_fhir_manual_catalog."
-        "reviewed_manual_census_source_id",
+        "process.provider_directory_fhir_manual_catalog.reviewed_manual_census_source_id",
         lambda: "source-a",
     )
 
@@ -130,17 +125,14 @@ async def test_facade_preserves_control_errors(
 
     monkeypatch.setattr(facade, "sync_reviewed_subset_terminal_disposition_transaction", fail)
     with pytest.raises(expected_error):
-        await facade.dispose_reviewed_subset_census_drift_root(
-            database=TerminalDispositionDatabase()
-        )
+        await facade.dispose_reviewed_subset_census_drift_root(database=TerminalDispositionDatabase())
 
 
 @pytest.mark.asyncio
 async def test_facade_redacts_unexpected_runtime_error(monkeypatch):
     monkeypatch.setenv(contract.TERMINAL_DISPOSITION_ENABLED_ENV, "true")
     monkeypatch.setattr(
-        "process.provider_directory_fhir_manual_catalog."
-        "reviewed_manual_census_source_id",
+        "process.provider_directory_fhir_manual_catalog.reviewed_manual_census_source_id",
         lambda: "source-a",
     )
 
@@ -149,9 +141,7 @@ async def test_facade_redacts_unexpected_runtime_error(monkeypatch):
 
     monkeypatch.setattr(facade, "sync_reviewed_subset_terminal_disposition_transaction", fail)
     with pytest.raises(ReviewedSubsetTerminalDispositionError) as error:
-        await facade.dispose_reviewed_subset_census_drift_root(
-            database=TerminalDispositionDatabase()
-        )
+        await facade.dispose_reviewed_subset_census_drift_root(database=TerminalDispositionDatabase())
     assert error.value.code == "state"
     with pytest.raises(ReviewedSubsetTerminalDispositionError):
         facade.terminal_disposition_result_json(object())
@@ -159,6 +149,8 @@ async def test_facade_redacts_unexpected_runtime_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_store_rejects_checkpoint_guard_and_isolation_failures(monkeypatch):
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+
     database = TerminalDispositionDatabase()
     original_status = database.status
 
@@ -168,11 +160,12 @@ async def test_store_rejects_checkpoint_guard_and_isolation_failures(monkeypatch
         return await original_status(statement, **parameters)
 
     monkeypatch.setattr(database, "status", fail_checkpoint)
-    with pytest.raises(ReviewedSubsetTerminalDispositionError):
-        await store.sync_reviewed_subset_terminal_disposition_transaction(
-            database,
-            "source-a",
-        )
+    async with synthetic_source_database(monkeypatch, database) as database:
+        with pytest.raises(ReviewedSubsetTerminalDispositionError):
+            await store.sync_reviewed_subset_terminal_disposition_transaction(
+                database,
+                "source-a",
+            )
 
     database = TerminalDispositionDatabase()
     original_scalar = database.scalar
@@ -183,34 +176,39 @@ async def test_store_rejects_checkpoint_guard_and_isolation_failures(monkeypatch
         return await original_scalar(statement, **parameters)
 
     monkeypatch.setattr(database, "scalar", wrong_isolation)
-    with pytest.raises(ReviewedSubsetTerminalDispositionError):
-        await store.sync_reviewed_subset_terminal_disposition_transaction(
-            database,
-            "source-a",
-        )
+    async with synthetic_source_database(monkeypatch, database) as database:
+        with pytest.raises(ReviewedSubsetTerminalDispositionError):
+            await store.sync_reviewed_subset_terminal_disposition_transaction(
+                database,
+                "source-a",
+            )
 
 
 @pytest.mark.asyncio
-async def test_store_rejects_invalid_transition_and_replay_guards():
-    database = TerminalDispositionDatabase()
-    database.valid = False
-    with pytest.raises(ReviewedSubsetTerminalDispositionError):
-        await store.sync_reviewed_subset_terminal_disposition_transaction(
-            database,
-            "source-a",
-        )
+async def test_store_rejects_invalid_transition_and_replay_guards(monkeypatch):
+    from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
     database = TerminalDispositionDatabase()
-    await store.sync_reviewed_subset_terminal_disposition_transaction(
-        database,
-        "source-a",
-    )
-    database.valid = False
-    with pytest.raises(ReviewedSubsetTerminalDispositionError):
+    async with synthetic_source_database(monkeypatch, database) as database:
+        database.valid = False
+        with pytest.raises(ReviewedSubsetTerminalDispositionError):
+            await store.sync_reviewed_subset_terminal_disposition_transaction(
+                database,
+                "source-a",
+            )
+
+    database = TerminalDispositionDatabase()
+    async with synthetic_source_database(monkeypatch, database) as database:
         await store.sync_reviewed_subset_terminal_disposition_transaction(
             database,
             "source-a",
         )
+        database.valid = False
+        with pytest.raises(ReviewedSubsetTerminalDispositionError):
+            await store.sync_reviewed_subset_terminal_disposition_transaction(
+                database,
+                "source-a",
+            )
 
 
 @pytest.mark.asyncio
@@ -244,21 +242,15 @@ def _mutate_proof_shards(marker_by_field):
 
 
 def _mutate_resource_hash(marker_by_field):
-    marker_by_field["resource_dispositions"]["Organization"][
-        "diagnostic_sha256"
-    ] = "invalid"
+    marker_by_field["resource_dispositions"]["Organization"]["diagnostic_sha256"] = "invalid"
 
 
 def _mutate_page_binding(marker_by_field):
-    marker_by_field["resource_dispositions"]["Organization"][
-        "diagnostic_pages"
-    ] += 1
+    marker_by_field["resource_dispositions"]["Organization"]["diagnostic_pages"] += 1
 
 
 def _mutate_checkpoint_state(marker_by_field):
-    marker_by_field["resource_dispositions"]["Organization"][
-        "checkpoint_state"
-    ] = "active"
+    marker_by_field["resource_dispositions"]["Organization"]["checkpoint_state"] = "active"
 
 
 def _mutate_resource_set(marker_by_field):

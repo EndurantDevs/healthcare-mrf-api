@@ -13,6 +13,7 @@ import pytest
 
 from process import provider_directory_cms_address as cms_address
 from process import provider_directory_cms_capacity_contract as contract
+from process import provider_directory_cms_native_inputs as native_inputs
 from process import provider_directory_cms_preflight as producer
 from process import provider_directory_profile_capacity_preflight_contract as preflight
 from process import provider_directory_profile_runtime_observation as runtime
@@ -196,23 +197,23 @@ async def test_invalid_profile_signature_precedes_every_database_mutation(monkey
 
 @pytest.mark.asyncio
 async def test_registration_commits_before_read_snapshot_and_restores_context(monkeypatch):
+    """Operator enrollment precedes this lifecycle; Source preflight cannot repair inputs."""
     request = _request(projection=True)
     inputs, profile_lease = _inputs(request)
     _database_value, _session, events = _database(monkeypatch)
     monkeypatch.setattr(producer, "_verified_pair", AsyncMock(return_value=profile_lease))
 
-    async def register(session, schema):
-        assert fhir.db._transaction_binding().session is session
-        events.append("register")
+    register = AsyncMock(side_effect=AssertionError("Source preflight cannot register inputs"))
 
     async def read_inputs(*_args):
         assert fhir.db._transaction_binding() is None
-        assert events[-1] == "end" and "register" in events
+        assert events == []
         assert fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get() is request.execution
         events.append("read")
         return inputs
 
-    monkeypatch.setattr(producer, "register_native_address_inputs", register)
+    monkeypatch.setattr(native_inputs, "register_native_address_inputs", register)
+    monkeypatch.setattr(producer, "register_native_address_inputs", register, raising=False)
     monkeypatch.setattr(producer, "_read_inputs", read_inputs)
     prior = fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get()
     result = await producer.capacity_authority_projection(fhir, request)
@@ -221,6 +222,8 @@ async def test_registration_commits_before_read_snapshot_and_restores_context(mo
     assert result["database_binding"] == inputs.database_binding
     assert result["capacity_geometry"] == inputs.plan.payload
     assert fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get() is prior
+    assert events == ["read"]
+    register.assert_not_awaited()
 
 
 def _retention_preflight_inputs(monkeypatch, request, inputs, address_build_case, policy):

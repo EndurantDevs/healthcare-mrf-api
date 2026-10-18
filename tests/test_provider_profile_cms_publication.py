@@ -16,9 +16,11 @@ from api import provider_profile as profile
 from api import provider_profile_cms as cms
 from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi
+from process import cms_doctors_immutable as immutable
 from process import cms_doctors_preparation as preparation
 from process import reference_family_result_generation as generation
 from process import reference_source_generation as revisions
+from tests.test_cms_doctors_organizations import _unit_source_transaction
 from tests.test_provider_profile_cms import CMS_GENERATION, NPI, _credential_row, _education_row
 
 native = importlib.import_module("process.cms_doctors")
@@ -37,6 +39,17 @@ async def _reader_scope(session, state_by_field):
     finally:
         session.info.pop("api_reader_verified", None)
         state_by_field.pop("reader", None)
+
+
+def _mock_doctors_owner(monkeypatch):
+    """Only model transaction ownership; genuine Publisher custody is native proof."""
+    monkeypatch.setattr(native, "source_transaction", lambda database, **kwargs: database.transaction())
+    monkeypatch.setattr(native, "source_owner_transaction", _unit_source_transaction)
+    monkeypatch.setattr(preparation, "source_owner_transaction", _unit_source_transaction)
+    monkeypatch.setattr(native, "publish_doctors_identities", AsyncMock())
+    monkeypatch.setattr(native, "seal_doctors_stages", AsyncMock())
+    monkeypatch.setattr(immutable, "_writer", AsyncMock())
+    monkeypatch.setattr(immutable, "require_doctors_storage", AsyncMock(return_value=tuple(zip(RELATIONS, OIDS))))
 
 
 @pytest.fixture
@@ -74,12 +87,13 @@ def runtime(monkeypatch):
     async def first(_database, statement, **params):
         if str(statement).lstrip().startswith("UPDATE "):
             state_by_field["authority"].update(
-                local_generation=params["next_generation"],
-                origin_generation=params["next_generation"],
-                relation_oids=list(params["relation_oids"]),
+                local_generation=params["next"],
+                origin_generation=params["generation"],
+                relation_oids=list(params["oids"]),
             )
         return state_by_field["authority"]
 
+    _mock_doctors_owner(monkeypatch)
     database.transaction, database.all = transaction, rows
     database.reader_session = lambda: _reader_scope(session, state_by_field)
     monkeypatch.setattr(cms, "db", database)

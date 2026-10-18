@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.test_provider_directory_generic_source_policy import synthetic_checkpoint_factory
 
 fhir = importlib.import_module("process.provider_directory_fhir")
 
@@ -102,12 +103,7 @@ def test_last_updated_page_validation_rejects_type_and_window_drift():
         datetime.datetime(2026, 7, 23, tzinfo=datetime.UTC),
     )
     resources, error = fhir._validated_last_updated_page_resources(
-        {
-            "resourceType": "Bundle",
-            "entry": [
-                {"resource": {"resourceType": "Practitioner", "id": "p1"}}
-            ]
-        },
+        {"resourceType": "Bundle", "entry": [{"resource": {"resourceType": "Practitioner", "id": "p1"}}]},
         "Organization",
         window,
     )
@@ -123,7 +119,7 @@ def test_last_updated_page_validation_rejects_type_and_window_drift():
                         "meta": {"lastUpdated": "2026-07-24T00:00:00Z"},
                     }
                 }
-            ]
+            ],
         },
         "Organization",
         window,
@@ -163,23 +159,32 @@ async def test_last_updated_fetch_pipeline_returns_each_failed_phase(monkeypatch
         "injected",
     )
     monkeypatch.setattr(fhir, "_partition_preflight_failure", lambda *_args: failure)
-    assert await fhir._fetch_last_updated_partition_resource_rows(
-        {}, "Organization", fhir.ProviderDirectoryOrganization, config, options
-    ) is failure
+    assert (
+        await fhir._fetch_last_updated_partition_resource_rows(
+            {}, "Organization", fhir.ProviderDirectoryOrganization, config, options
+        )
+        is failure
+    )
 
     monkeypatch.setattr(fhir, "_partition_preflight_failure", lambda *_args: None)
     monkeypatch.setattr(fhir, "_prepare_partition_state", AsyncMock(return_value=failure))
-    assert await fhir._fetch_last_updated_partition_resource_rows(
-        {}, "Organization", fhir.ProviderDirectoryOrganization, config, options
-    ) is failure
+    assert (
+        await fhir._fetch_last_updated_partition_resource_rows(
+            {}, "Organization", fhir.ProviderDirectoryOrganization, config, options
+        )
+        is failure
+    )
 
     state = SimpleNamespace()
     monkeypatch.setattr(fhir, "_prepare_partition_state", AsyncMock(return_value=state))
     monkeypatch.setattr(fhir, "_observe_partition_pre_census", AsyncMock(return_value=None))
     monkeypatch.setattr(fhir, "_observe_partition_counts", AsyncMock(return_value=failure))
-    assert await fhir._fetch_last_updated_partition_resource_rows(
-        {}, "Organization", fhir.ProviderDirectoryOrganization, config, options
-    ) is failure
+    assert (
+        await fhir._fetch_last_updated_partition_resource_rows(
+            {}, "Organization", fhir.ProviderDirectoryOrganization, config, options
+        )
+        is failure
+    )
 
 
 def test_artifact_dependency_and_metric_contracts_fail_closed():
@@ -232,9 +237,7 @@ async def test_artifact_empty_scope_and_eligible_selection_boundaries():
 
 def test_endpoint_and_pagination_identity_helpers_fail_closed():
     with pytest.raises(ValueError, match="multiple endpoint"):
-        fhir._endpoint_id_for_source_records(
-            [{"endpoint_id": "one"}, {"endpoint_id": "two"}]
-        )
+        fhir._endpoint_id_for_source_records([{"endpoint_id": "one"}, {"endpoint_id": "two"}])
     context = _checkpoint_context()
     checkpoint_by_field = {
         "source_ids": list(context.source_ids),
@@ -245,32 +248,44 @@ def test_endpoint_and_pagination_identity_helpers_fail_closed():
         "state": fhir.PAGINATION_CHECKPOINT_ACTIVE,
         "next_url": None,
     }
-    assert fhir._compatible_pagination_resume_state(
-        checkpoint_by_field,
-        context,
-        "start",
-    ) is None
+    assert (
+        fhir._compatible_pagination_resume_state(
+            checkpoint_by_field,
+            context,
+            "start",
+        )
+        is None
+    )
     with pytest.raises(ValueError, match="compatibility source"):
         fhir._compatibility_storage_source_id([])
 
 
 @pytest.mark.asyncio
 async def test_checkpoint_clear_and_alohr_resume_boundaries(monkeypatch):
-    assert await fhir._checkpoint_candidate_dataset_id(
-        None,
-        "endpoint-a",
-        ("Organization",),
-    ) is None
-    await fhir._clear_checkpoint_dataset_resource_type(
-        _checkpoint_context(dataset_id=None),
-        "Organization",
+    assert (
+        await fhir._checkpoint_candidate_dataset_id(
+            None,
+            "endpoint-a",
+            ("Organization",),
+        )
+        is None
     )
-    assert await fhir._clear_pagination_checkpoints(_checkpoint_context(), []) == 0
-    monkeypatch.setattr(fhir.db, "status", AsyncMock(return_value="DELETE 2"))
-    assert await fhir._clear_pagination_checkpoints(
-        _checkpoint_context(),
-        ["Organization"],
-    ) == 2
+    async with synthetic_checkpoint_factory(monkeypatch, fhir.db, schema=fhir._schema()):
+        await fhir._clear_checkpoint_dataset_resource_type(
+            _checkpoint_context(dataset_id=None),
+            "Organization",
+        )
+        assert await fhir._clear_pagination_checkpoints(_checkpoint_context(), []) == 0
+        monkeypatch.setattr(fhir.db, "status", AsyncMock(return_value="DELETE 2"))
+        assert (
+            await fhir._clear_pagination_checkpoints(
+                _checkpoint_context(),
+                ["Organization"],
+            )
+            == 2
+        )
+        assert fhir.db.status.await_args.kwargs["owner_run_id"] == "run"
+        assert fhir.db.status.await_args.kwargs["resource_types"] == ["Organization"]
 
     resume_required_entries: set[str] = set()
     state = _alohr_import_state(
@@ -278,9 +293,7 @@ async def test_checkpoint_clear_and_alohr_resume_boundaries(monkeypatch):
             checkpoint_context=_checkpoint_context(),
             resume_required_entries=resume_required_entries,
         ),
-        checkpoint_diagnostics_by_resource={
-            "alohr:Organization": {"complete": False, "error": "offline"}
-        },
+        checkpoint_diagnostics_by_resource={"alohr:Organization": {"complete": False, "error": "offline"}},
     )
     await fhir._finalize_alohr_checkpoints(state)
     assert resume_required_entries == {"source-a:alohr:Organization"}
@@ -315,16 +328,22 @@ async def test_alohr_limited_items_and_transport_failure(monkeypatch):
 @pytest.mark.asyncio
 async def test_address_overlay_remaining_noop_and_validation_boundaries(monkeypatch):
     monkeypatch.setattr(fhir, "_is_table_present", AsyncMock(return_value=False))
-    assert await fhir._backfill_address_overlay_stage_coordinates(
-        "mrf",
-        '"mrf"."stage"',
-    ) == 0
-    assert await fhir._copy_existing_address_overlay(
-        '"mrf"."stage"',
-        '"mrf"."target"',
-        "source_id",
-        [],
-    ) == 0
+    assert (
+        await fhir._backfill_address_overlay_stage_coordinates(
+            "mrf",
+            '"mrf"."stage"',
+        )
+        == 0
+    )
+    assert (
+        await fhir._copy_existing_address_overlay(
+            '"mrf"."stage"',
+            '"mrf"."target"',
+            "source_id",
+            [],
+        )
+        == 0
+    )
     with pytest.raises(ValueError, match="unknown Provider Directory"):
         fhir._address_overlay_component_insert_sql(
             "mrf",
@@ -367,22 +386,20 @@ async def test_existing_pacing_lock_and_zero_wait_preserve_source_order(monkeypa
 
 
 def test_catalog_rejects_duplicate_and_unmatched_contra_costa_rows(tmp_path):
-    link = (
-        "<a href='https://example.test/provider-directory/metadata'>"
-        "Provider Directory API Base URL</a>"
-    )
+    link = "<a href='https://example.test/provider-directory/metadata'>Provider Directory API Base URL</a>"
     rows = fhir._contra_costa_seed_rows_from_html(link + link)
     assert len(rows) == 1
-    assert fhir._contra_costa_seed_rows_from_html(
-        link,
-        source_query="not-this-source",
-    ) == []
+    assert (
+        fhir._contra_costa_seed_rows_from_html(
+            link,
+            source_query="not-this-source",
+        )
+        == []
+    )
 
     empty_catalog = tmp_path / "empty.html"
     empty_catalog.write_text("<html></html>", encoding="utf-8")
-    fallback_rows, fallback_metrics = fhir._seed_rows_from_contra_costa_catalog(
-        catalog_path=str(empty_catalog)
-    )
+    fallback_rows, fallback_metrics = fhir._seed_rows_from_contra_costa_catalog(catalog_path=str(empty_catalog))
     assert len(fallback_rows) == 1
     assert fallback_metrics["fallback"] is True
 
@@ -403,10 +420,13 @@ def test_retest_query_and_metadata_merge_reject_unrelated_identity(tmp_path):
         ),
         encoding="utf-8",
     )
-    assert fhir._seed_rows_from_retest_results(
-        retest_path,
-        source_query="other payer",
-    ) == []
+    assert (
+        fhir._seed_rows_from_retest_results(
+            retest_path,
+            source_query="other payer",
+        )
+        == []
+    )
 
     target_by_field = {"api_base": "https://example.test/fhir", "metadata_json": {}}
     fhir._merge_skipped_source_row_metadata(target_by_field, {"metadata_json": {}})
@@ -457,9 +477,7 @@ async def test_artifact_candidate_selection_covers_empty_and_valid_rows():
         {"endpoint_id": "endpoint-a", "dataset_id": "candidate-a"},
         {"endpoint_id": None, "dataset_id": "ignored"},
     ]
-    assert await fhir._artifact_eligible_validated_ids(fence, executor) == {
-        "endpoint-a": ["candidate-a"]
-    }
+    assert await fhir._artifact_eligible_validated_ids(fence, executor) == {"endpoint-a": ["candidate-a"]}
     selection_sql = executor.all.await_args.args[0]
     normalized_sql = " ".join(selection_sql.split())
     assert "candidate_source_ids AS MATERIALIZED" in normalized_sql

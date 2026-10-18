@@ -11,7 +11,7 @@ import json
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, AsyncIterator
 
 from process.provider_directory_cms_native_layout import RetainedNativeSourceLayout
@@ -126,6 +126,8 @@ class RetainedNativeRelation:
     oid: int
     policy_json: str
     source_layout: RetainedNativeSourceLayout
+    phase: str = "finished"
+    source_input: Any = None
 
 
 def retained_raw_policy(lease: VerifiedDatabaseCapacityLease) -> dict[str, Any]:
@@ -265,25 +267,70 @@ class NonprofileAdmission:
 
     async def measure(self, fhir: Any, schema: str, names: tuple[str, ...] = ()) -> tuple[OwnedRelation, ...]:
         """Measure exact owned names, rejecting OID replacement or disappearance."""
+        from process.provider_directory_cms_nonprofile_observation import active_observations
+
+        scope = active_observations(admission=self)
+        if scope is None:
+            return await self._measure(fhir, schema, names)
+        async with scope.observers() as observers:
+            return await self._measure(fhir, schema, names, observers=observers)
+
+    async def _measure(self, fhir, schema, names, *, observers=None):
+        """Retain the complete original inventory while selecting its native reader."""
         if not self._started:
             raise RuntimeError("provider_directory_nonprofile_admission_not_started")
         for name in names:
             self._relations.setdefault((schema, name), 0)
-        measured_relations = []
-        for (relation_schema, name), previous_oid in sorted(self._relations.items()):
-            row = await fhir.db.first(
-                "SELECT oid::bigint AS oid, pg_total_relation_size(oid)::bigint AS total_bytes, "
-                "relpersistence::text AS persistence FROM pg_class WHERE oid=to_regclass(:relation_ref);",
-                relation_ref=fhir._unscoped_qt(relation_schema, name),
+        inventory = sorted(self._relations.items())
+        group_by_executor_id = {}
+        for (relation_schema, name), previous_oid in inventory:
+            database = (
+                None
+                if observers is None
+                else observers.database_for(OwnedRelation(relation_schema, name, previous_oid, 0, "p"))
             )
-            values = fhir._pagination_checkpoint_row_mapping(row) if row is not None else {}
-            oid, total_bytes = values.get("oid"), values.get("total_bytes")
+            database = fhir.db if database is None else database
+            group_by_executor_id.setdefault(id(database), (database, []))[1].append((relation_schema, name))
+        measured_by_coordinate = {}
+        for database, coordinates in group_by_executor_id.values():
+            coordinate_by_ref = {fhir._unscoped_qt(*coordinate): coordinate for coordinate in coordinates}
+            if len(coordinate_by_ref) != len(coordinates):
+                raise RuntimeError("provider_directory_nonprofile_relation_changed")
+            catalog_records = await database.all(
+                "SELECT requested.relation_ref, relation.oid::bigint AS oid, "
+                "pg_total_relation_size(relation.oid)::bigint AS total_bytes, "
+                "relation.relpersistence::text AS persistence "
+                "FROM unnest(CAST(:relation_refs AS text[])) AS requested(relation_ref) "
+                "JOIN pg_class AS relation ON relation.oid=to_regclass(requested.relation_ref);",
+                relation_refs=list(coordinate_by_ref),
+            )
+            observed_refs = set()
+            for catalog_record in catalog_records:
+                relation_values = fhir._pagination_checkpoint_row_mapping(catalog_record)
+                relation_ref = relation_values.get("relation_ref")
+                if (
+                    type(relation_ref) is not str
+                    or relation_ref not in coordinate_by_ref
+                    or relation_ref in observed_refs
+                ):
+                    raise RuntimeError("provider_directory_nonprofile_relation_changed")
+                observed_refs.add(relation_ref)
+                measured_by_coordinate[coordinate_by_ref[relation_ref]] = relation_values
+            if observed_refs != coordinate_by_ref.keys():
+                raise RuntimeError("provider_directory_nonprofile_relation_changed")
+        measured_relations = []
+        for (relation_schema, name), previous_oid in inventory:
+            relation_values = measured_by_coordinate[(relation_schema, name)]
+            oid, total_bytes = relation_values.get("oid"), relation_values.get("total_bytes")
             if type(oid) is not int or oid <= 0 or (previous_oid and previous_oid != oid):
                 raise RuntimeError("provider_directory_nonprofile_relation_changed")
-            if type(total_bytes) is not int or total_bytes < 0 or values.get("persistence") not in {"u", "p"}:
+            if type(total_bytes) is not int or total_bytes < 0 or relation_values.get("persistence") not in {"u", "p"}:
                 raise RuntimeError("provider_directory_nonprofile_relation_storage_invalid")
             self._relations[(relation_schema, name)] = oid
-            measured_relations.append(OwnedRelation(relation_schema, name, oid, total_bytes, values["persistence"]))
+            measured = OwnedRelation(relation_schema, name, oid, total_bytes, relation_values["persistence"])
+            if observers is not None:
+                observers.record(measured)
+            measured_relations.append(measured)
         return tuple(measured_relations)
 
     async def before_logging(self, fhir: Any, schema: str, name: str) -> None:
@@ -369,7 +416,7 @@ class NonprofileAdmission:
 
     async def _record_native_relation(self, fhir, schema, name, oid, native_relation, raw_relation):
         """Enroll strict source evidence once; later checks never consult a renamed source heap."""
-        from process.provider_directory_cms_native_layout import _retained_source_model, capture_retained_native_source
+        from process.provider_directory_cms_native_layout import _retained_source_model
 
         coordinate = (schema, name)
         previous = self._native_relations.get(coordinate)
@@ -403,6 +450,16 @@ class NonprofileAdmission:
             if previous != native_relation:
                 raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
             return
+        if native_relation.source_input is not None:
+            from process.network_registry_cms_prepared_address_pin import PinnedRegistryCMSAddressInput
+
+            if type(native_relation.source_input) is not PinnedRegistryCMSAddressInput:
+                raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
+            await native_relation.source_input.register_relation(native_relation, self)
+            self._native_relations[coordinate] = native_relation
+            return
+        if native_relation.phase != "finished":
+            raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
         source_coordinate = (source_layout.schema, source_layout.relation)
         if (
             source_coordinate not in self._external_relations
@@ -410,6 +467,16 @@ class NonprofileAdmission:
             or any(entry.source_layout.oid == source_layout.oid for entry in self._native_relations.values())
         ):
             raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
+        await self._require_legacy_native_source(fhir, source_layout, source_coordinate)
+        self._native_relations[coordinate] = native_relation
+
+    async def _require_legacy_native_source(self, fhir, source_layout, source_coordinate):
+        """The historical path may re-read its source only outside SOURCE orchestration."""
+        from process.provider_directory_cms_native_layout import capture_retained_native_source
+        from process.provider_directory_generic_source_policy import is_source_storage_required
+
+        if is_source_storage_required():
+            raise RuntimeError("provider_directory_nonprofile_native_source_pin_required")
         source_relations = await self.measure(fhir, source_layout.schema)
         source_relation = next(
             (entry for entry in source_relations if (entry.schema, entry.relation) == source_coordinate), None
@@ -420,7 +487,24 @@ class NonprofileAdmission:
             != source_layout
         ):
             raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
-        self._native_relations[coordinate] = native_relation
+
+    async def advance_retained_native_relation(self, fhir, schema, name, phase):
+        """Keep each index phase inside its issued native recipe and real budget checks."""
+        coordinate = (schema, name)
+        previous = self._native_relations.get(coordinate)
+        if previous is None or previous.source_input is None:
+            raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
+        annotation = replace(previous, phase=phase)
+        await previous.source_input.advance_relation(previous, annotation)
+        self._native_relations[coordinate] = annotation
+        await self._check("readiness", await self.measure(fhir, schema))
+
+    def _require_finished_native_relations(self):
+        for annotation in self._native_relations.values():
+            if annotation.phase != "finished":
+                raise RuntimeError("provider_directory_nonprofile_native_incomplete")
+            if annotation.source_input is not None:
+                annotation.source_input.require_annotation(annotation, final=True)
 
     async def assert_external_relation(
         self,
@@ -431,13 +515,17 @@ class NonprofileAdmission:
         *,
         raw_relation: RetainedRawRelation | None = None,
         native_relation: RetainedNativeRelation | None = None,
+        require_ready: bool = False,
     ) -> None:
         """Recheck fresh aggregate availability before growth, without inventing its bound."""
         if (schema, name) not in self._external_relations or self._relations.get((schema, name)) != oid:
             raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
         await self._record_native_relation(fhir, schema, name, oid, native_relation, raw_relation)
         self._record_raw_relation(schema, name, oid, raw_relation)
-        await self._check("readiness", await self.measure(fhir, schema))
+        if require_ready:
+            await self.assert_ready(fhir, schema)
+        else:
+            await self._check("readiness", await self.measure(fhir, schema))
 
     async def retire_external_relation(self, fhir: Any, schema: str, name: str, oid: int) -> None:
         """Retire only an exact externally owned OID after native verified removal."""
@@ -475,6 +563,8 @@ class NonprofileAdmission:
 
     async def assert_ready(self, fhir: Any, schema: str, *, cutover: bool = False) -> None:
         """Revalidate physical identities, reservations and runtime at cutover."""
+        if cutover:
+            self._require_finished_native_relations()
         relations = await self.measure(fhir, schema)
         if any(
             relation.persistence != "p"
@@ -505,6 +595,7 @@ class NonprofileAdmission:
         """Check local consumption, measured WAL and expiry before the owner commits."""
         if not self._cutover_active or not callable(self.check_cutover):
             raise RuntimeError("provider_directory_nonprofile_cutover_authorization_required")
+        self._require_finished_native_relations()
         self._assert_lease()
         await self.check_cutover(None)
 
@@ -702,6 +793,14 @@ def _scope_plan(fhir: Any) -> Any:
 @asynccontextmanager
 async def _full_scope(fhir: Any, fence: Any, types: frozenset[str], projection: Any, admission: NonprofileAdmission):
     """Keep full typed inputs alive without entering the Profile recovery guard."""
+    from process.provider_directory_artifact_scratch_scope import prepared_scratch_scope
+    from process.provider_directory_generic_source_policy import is_source_storage_required
+
+    if is_source_storage_required():
+        async with prepared_scratch_scope(fhir, admission, fence, types, projection) as overrides:
+            await admission.assert_ready(fhir, fhir._schema())
+            yield overrides
+        return
     schema, plan = fhir._schema(), _scope_plan(fhir)
     if await fhir._artifact_scope_relation_identities(schema, plan.relation_by_table.values()):
         raise RuntimeError("provider_directory_nonprofile_scope_already_exists")
@@ -792,7 +891,12 @@ class PreparedServingArtifacts:
         if self.nonprofile_admission is not None:
             await self.nonprofile_admission.assert_ready(self.fhir, self.fhir._schema(), cutover=cutover)
         if self.archive_delta is not None:
-            async with nonprofile_sql_transaction(self.fhir, self.nonprofile_admission):
+            from process.provider_directory_generic_source_policy import source_transaction
+
+            async with (
+                source_transaction(self.fhir.db),
+                nonprofile_sql_transaction(self.fhir, self.nonprofile_admission),
+            ):
                 if archive_applied:
                     await self.archive_delta.assert_applied_backend(self.fhir.db)
                 else:
@@ -926,10 +1030,14 @@ async def _admit_full_preparation(
     fhir._assert_profile_selection_matches_artifact_fence(execution, fence)
     publish_targets = set(fhir.PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS) - {"profile", "corroboration"}
     types = fhir._provider_directory_artifact_resource_types(publish_targets, publish_corroboration=False)
-    async with nonprofile_sql_transaction(fhir, nonprofile_admission):
-        projection = await fhir._provider_directory_artifact_scope_exact_projection(
-            fhir._schema(), fence, types, source_fence=fence, batch_size=nonprofile_admission.plan.batch_size
-        )
+    from process.provider_directory_profile_scope_copy import input_transaction
+    from process.provider_directory_profile_source_inputs import profile_source_input_scope
+
+    async with profile_source_input_scope(fhir, fence, fence), input_transaction(fhir):
+        async with nonprofile_sql_transaction(fhir, nonprofile_admission):
+            projection = await fhir._provider_directory_artifact_scope_exact_projection(
+                fhir._schema(), fence, types, source_fence=fence, batch_size=nonprofile_admission.plan.batch_size
+            )
     fhir._assert_provider_directory_artifact_scope_exact_capacity(projection)
     await nonprofile_admission.before_scratch(execution, fence, projection, publish_targets, types)
     await _admit_profile_before_full_build(fhir, execution, fence, run_id, control_run_id, nonprofile_admission)
@@ -970,12 +1078,16 @@ async def _prepare_registry_source_pair(prepared, address_preparation):
     """Retain the complete address and raw source before Profile WAL resumes."""
     from process.network_registry_cms_prepared_pair import prepare_registry_cms_source_pair
     from process.provider_directory_cms_source_runtime import BoundCMSRegistrySourceJob
+    from process.provider_directory_generic_source_policy import is_source_storage_required
 
     job = getattr(prepared.nonprofile_admission, "registry_source_job", None)
     if job is None:
         return
     if type(job) is not BoundCMSRegistrySourceJob:
         raise RuntimeError("cms_registry_source_runtime_invalid")
+    if is_source_storage_required() and job.retention_session_factory is None:
+        raise RuntimeError("cms_registry_source_retention_handles_required")
+    retention_sessions = job.retention_session_factory or job.source_session_factory
     prepared.source_session_factory = job.source_session_factory
     prepared.registry_source_pair = await prepare_registry_cms_source_pair(
         prepared,
@@ -984,7 +1096,7 @@ async def _prepare_registry_source_pair(prepared, address_preparation):
         capture_id=job.capture_id,
         owner_role=job.owner_role,
         runtime_roles=job.runtime_roles,
-        source_session_factory=job.source_session_factory,
+        source_session_factory=retention_sessions,
         source_attempt=job.source_attempt,
     )
 
@@ -1066,28 +1178,46 @@ async def _manifest_profile_relations(prepared, relations, run_id):
         )
 
 
-async def _prepared_manifest_relations(prepared, run_id):
+def _manifest_resource_scope_relations(prepared, relations, inventory):
+    """Use exact prepared index identities for enrolled scratch, preserving legacy layouts."""
+    fhir = prepared.fhir
+    for model in (fhir.ProviderDirectorySource, *fhir.RESOURCE_MODELS):
+        root = model.__tablename__
+        name = prepared.relation_overrides.get(root)
+        if name is None:
+            raise RuntimeError("provider_directory_prepared_manifest_ownership_changed")
+        if inventory is None:
+            required = [fhir._artifact_scope_pk_names(name)[1]] if model.__table__.primary_key.columns else []
+            if model in (fhir.ProviderDirectoryPractitionerRole, fhir.ProviderDirectoryOrganizationAffiliation):
+                required.append(fhir._provider_directory_profile_bucket_index_sql(fhir._schema(), name)[0])
+            _manifest_relation(
+                relations, fhir._schema(), name, target=root, role="resource_scope", required_indexes=required
+            )
+            continue
+        indexes = inventory.get(root)
+        if indexes is None or indexes["schema"] != fhir._schema() or indexes["relation"] != name:
+            raise RuntimeError("provider_directory_prepared_manifest_ownership_changed")
+        _manifest_relation(
+            relations,
+            indexes["schema"],
+            name,
+            target=root,
+            role="resource_scope",
+            required_indexes=[index_name for index_name, _oid in indexes["indexes"]],
+            primary_key=bool(model.__table__.primary_key.columns),
+            oid=indexes["oid"],
+        )
+        relations[(indexes["schema"], name)]["prepared_index_identities"] = indexes["indexes"]
+
+
+async def _prepared_manifest_relations(prepared, run_id, *, scratch_indexes=None):
     """Inventory the complete prepared scopes using only their actual owner objects."""
     fhir, admission = prepared.fhir, prepared.nonprofile_admission
     relation_by_coordinate = {
         (relation.schema, relation.relation): asdict(relation)
         for relation in await admission.measure(fhir, fhir._schema())
     }
-    for model in (fhir.ProviderDirectorySource, *fhir.RESOURCE_MODELS):
-        name = prepared.relation_overrides.get(model.__tablename__)
-        if name is None:
-            raise RuntimeError("provider_directory_prepared_manifest_ownership_changed")
-        required_indexes = [fhir._artifact_scope_pk_names(name)[1]] if model.__table__.primary_key.columns else []
-        if model in (fhir.ProviderDirectoryPractitionerRole, fhir.ProviderDirectoryOrganizationAffiliation):
-            required_indexes.append(fhir._provider_directory_profile_bucket_index_sql(fhir._schema(), name)[0])
-        _manifest_relation(
-            relation_by_coordinate,
-            fhir._schema(),
-            name,
-            target=model.__tablename__,
-            role="resource_scope",
-            required_indexes=required_indexes,
-        )
+    _manifest_resource_scope_relations(prepared, relation_by_coordinate, scratch_indexes)
     for stage in prepared.nonprofile_bundle.stages:
         _manifest_relation(
             relation_by_coordinate,
@@ -1151,6 +1281,11 @@ async def _prepared_manifest_catalog(fhir, relations):
             if catalog_row["relation_oid"] == relation["oid"]
         ]
         relation["indexes"] = [catalog_row for catalog_row in indexes if catalog_row["relation_oid"] == relation["oid"]]
+        expected_indexes = relation.get("prepared_index_identities")
+        if expected_indexes is not None and tuple(
+            sorted((index["index_name"], index["index_oid"]) for index in relation["indexes"])
+        ) != tuple(expected_indexes):
+            raise RuntimeError("provider_directory_prepared_manifest_index_identity_changed")
         required_indexes = set(relation.get("required_indexes", ()))
         if (
             not relation["columns"]
@@ -1172,8 +1307,13 @@ async def _emit_prepared_manifest(prepared, run_id, control_run_id):
     fhir, admission = prepared.fhir, prepared.nonprofile_admission
     if fhir.db._transaction_binding() is not None:
         raise RuntimeError("provider_directory_prepared_manifest_requires_no_transaction")
+    from process.provider_directory_artifact_scratch_indexes import scratch_index_metadata
+    from process.provider_directory_artifact_scratch_inputs import active_scratch_inputs
+
+    scope = active_scratch_inputs(fhir)
+    scratch_indexes = await scratch_index_metadata(fhir, scope) if scope is not None else None
     async with nonprofile_sql_transaction(fhir, admission):
-        relations = await _prepared_manifest_relations(prepared, run_id)
+        relations = await _prepared_manifest_relations(prepared, run_id, scratch_indexes=scratch_indexes)
         await _prepared_manifest_catalog(fhir, relations)
     selection = prepared.execution.attestation
     manifest_by_field = {
@@ -1248,16 +1388,20 @@ async def _admit_profile_before_full_build(
     fhir: Any, execution: Any, fence: Any, run_id: str, control_run_id: str | None, admission: NonprofileAdmission
 ) -> None:
     """Consume the exact Profile lease while its signed observation remains fresh."""
+    from process.provider_directory_profile_scope_copy import resource_fence as resolve_resource_fence
+    from process.provider_directory_profile_source_inputs import profile_source_input_scope
+
     types = fhir._provider_directory_artifact_resource_types({"profile"}, publish_corroboration=False)
-    resource_fence = await fhir._provider_directory_profile_resource_scope_fence(fence, {"profile"})
-    capacity = await fhir._admit_provider_directory_profile_capacity(
-        run_id=run_id,
-        control_run_id=control_run_id,
-        execution=execution,
-        fence=fence,
-        resource_fence=resource_fence,
-        artifact_resource_types=types,
-    )
+    resource_fence = await resolve_resource_fence(fhir, fence, {"profile"})
+    async with profile_source_input_scope(fhir, fence, resource_fence):
+        capacity = await fhir._admit_provider_directory_profile_capacity(
+            run_id=run_id,
+            control_run_id=control_run_id,
+            execution=execution,
+            fence=fence,
+            resource_fence=resource_fence,
+            artifact_resource_types=types,
+        )
     if (
         capacity.lease.reservation_id == admission.lease.reservation_id
         or capacity.lease.lease_digest == admission.lease.lease_digest
@@ -1279,15 +1423,34 @@ async def _profile_scope(
     admission: NonprofileAdmission | None,
 ):
     """Keep the exact original changed-source workload and lease intact."""
+    from process.provider_directory_profile_scope_copy import resource_fence as resolve_resource_fence
+    from process.provider_directory_profile_source_inputs import profile_source_input_scope
+
     profile_targets = {"profile"}
-    types = fhir._provider_directory_artifact_resource_types(profile_targets, publish_corroboration=False)
-    resource_fence = await fhir._provider_directory_profile_resource_scope_fence(fence, profile_targets)
+    resource_fence = await resolve_resource_fence(fhir, fence, profile_targets)
+    async with profile_source_input_scope(fhir, fence, resource_fence):
+        async with _profile_scope_from_inputs(
+            fhir, execution, fence, resource_fence, run_id, control_run_id, metrics, admission
+        ) as prepared:
+            yield prepared
+
+
+@asynccontextmanager
+async def _profile_scope_from_inputs(
+    fhir, execution, fence, resource_fence, run_id, control_run_id, metrics, admission
+):
+    """Retain distinct admission and resume only the existing signed workload."""
+    from process.provider_directory_profile_scope_copy import input_transaction
+
+    types = fhir._provider_directory_artifact_resource_types({"profile"}, publish_corroboration=False)
+
     if admission is not None:
         capacity = admission.profile_admission
         if capacity is None:
             raise RuntimeError("provider_directory_nonprofile_profile_admission_missing")
         if admission.resume_profile is not None:
-            capacity = await admission.resume_profile(capacity, resource_fence, types)
+            async with input_transaction(fhir):
+                capacity = await admission.resume_profile(capacity, resource_fence, types)
     else:
         capacity = await fhir._admit_provider_directory_profile_capacity(
             run_id=run_id,
@@ -1310,7 +1473,7 @@ async def _profile_scope(
             metrics=dict(metrics),
             source_ids=list(fence.source_ids),
             publish_corroboration=False,
-            publish_artifacts_targets=profile_targets,
+            publish_artifacts_targets={"profile"},
         )
         from process.provider_directory_cms_nonprofile_capacity import original_profile_input_scope
 

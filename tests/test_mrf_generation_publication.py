@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -24,6 +25,7 @@ class _Transaction:
     async def __aenter__(self):
         assert not self.database.in_transaction
         self.database.in_transaction = True
+        return self.database
 
     async def __aexit__(self, exception_type, _exception, _traceback):
         self.database.in_transaction = False
@@ -55,6 +57,18 @@ async def test_mrf_finalizer_records_exact_family_generation_in_rotation_transac
     database = _Database()
     observed_scopes = []
 
+    async def prepare(session, **scope):
+        assert session is database and database.in_transaction and not database.statements
+        assert scope == dict(
+            ledger_schema="mrf_test",
+            relations=tuple(
+                (model.__main_table__, model.__main_table__ + "_stage") for model in initial._MRF_PUBLICATION_MODELS
+            ),
+        )
+
+    prepared = AsyncMock(side_effect=prepare)
+    monkeypatch.setattr(initial, "prepare_local_native_input_publication", prepared)
+
     async def generation_writer(session, *, importer_id, schema_name):
         assert session is database
         assert database.in_transaction
@@ -71,6 +85,7 @@ async def test_mrf_finalizer_records_exact_family_generation_in_rotation_transac
     assert spec.model_types[-1].__tablename__ == "plan_search_summary"
     await initial._publish_mrf_table_generation("synthetic-generation", "mrf_test")
 
+    prepared.assert_awaited_once()
     assert observed_scopes == [("mrf", "mrf_test"), ("mrf-address", "mrf_test")]
     assert database.exit_exception is None
     for table_name in (model.__tablename__ for model in initial._MRF_PUBLICATION_MODELS):
@@ -81,6 +96,7 @@ async def test_mrf_finalizer_records_exact_family_generation_in_rotation_transac
 async def test_mrf_finalizer_generation_failure_rolls_back_rotation(monkeypatch):
     database = _Database()
     observed_importers = []
+    monkeypatch.setattr(initial, "prepare_local_native_input_publication", AsyncMock())
 
     async def generation_writer(_session, *, importer_id, **_scope):
         assert database.in_transaction
@@ -97,3 +113,18 @@ async def test_mrf_finalizer_generation_failure_rolls_back_rotation(monkeypatch)
 
     assert observed_importers == ["mrf", "mrf-address"]
     assert database.exit_exception is RuntimeError
+
+
+@pytest.mark.asyncio
+async def test_mrf_enrollment_failure_prevents_any_rotation(monkeypatch):
+    database = _Database()
+    monkeypatch.setattr(initial, "db", database)
+    monkeypatch.setattr(initial, "make_class", _stage_model)
+    monkeypatch.setattr(
+        initial,
+        "prepare_local_native_input_publication",
+        AsyncMock(side_effect=PermissionError("native INSERT denied")),
+    )
+    with pytest.raises(PermissionError, match="native INSERT denied"):
+        await initial._publish_mrf_table_generation("synthetic-generation", "mrf_test")
+    assert database.statements == [] and database.exit_exception is PermissionError

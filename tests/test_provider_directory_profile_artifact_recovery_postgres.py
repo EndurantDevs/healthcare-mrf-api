@@ -16,7 +16,6 @@ from tests.provider_directory_profile_artifact_pg_support import (
     _capacity_geometry,
 )
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 _CURRENT_RUN_ID = "run_" + "a" * 32
 _PRIOR_RUN_ID = "run_" + "b" * 32
@@ -24,9 +23,7 @@ _PRIOR_RUN_ID = "run_" + "b" * 32
 
 async def _drop_fixture_scope(fixture) -> None:
     for relation_name in fixture.relation_by_table.values():
-        await fixture.database.status(
-            f"DROP TABLE {importer._unscoped_qt(fixture.schema, relation_name)};"
-        )
+        await fixture.database.status(f"DROP TABLE {importer._unscoped_qt(fixture.schema, relation_name)};")
 
 
 async def _create_recovery_metadata_tables(fixture) -> None:
@@ -97,29 +94,17 @@ async def _insert_owner(
     status: str,
     finished_at: datetime.datetime | None,
 ) -> None:
-    owner_fields_by_name = dict(
-        importer._expected_profile_capacity_consumption(admission)
-    )
+    owner_fields_by_name = dict(importer._expected_profile_capacity_consumption(admission))
     owner_fields_by_name["run_id"] = run_id
-    owner_fields_by_name["attestation_id"] = (
-        admission.lease.attestation_id
-        if run_id == admission.run_id
-        else "3" * 64
-    )
-    owner_fields_by_name["build_id"] = (
-        admission.build_id
-        if run_id == admission.run_id
-        else "pdpb_" + "c" * 32
-    )
+    owner_fields_by_name["attestation_id"] = admission.lease.attestation_id if run_id == admission.run_id else "3" * 64
+    owner_fields_by_name["build_id"] = admission.build_id if run_id == admission.run_id else "pdpb_" + "c" * 32
     for purpose in ("profile", "cms_nonprofile"):
         purpose_fields_by_name = {
             **owner_fields_by_name,
             "admission_purpose": purpose,
         }
         if purpose == "cms_nonprofile":
-            purpose_fields_by_name["attestation_id"] = (
-                "4" if run_id == admission.run_id else "5"
-            ) * 64
+            purpose_fields_by_name["attestation_id"] = ("4" if run_id == admission.run_id else "5") * 64
         fields = tuple(purpose_fields_by_name)
         await fixture.database.status(
             f"INSERT INTO {importer._unscoped_qt(fixture.schema, 'provider_directory_profile_capacity_lease_consumption')} "
@@ -144,6 +129,8 @@ async def _insert_owner(
 async def _create_owner_scope(
     fixture,
     owner_run_id: str,
+    *,
+    index_phase: str = "heap",
 ) -> tuple[dict[str, str], dict[str, int]]:
     relation_by_base: dict[str, str] = {}
     oid_by_base: dict[str, int] = {}
@@ -158,6 +145,16 @@ async def _create_owner_scope(
             fixture.schema,
             relation_name,
         )
+        if index_phase != "heap":
+            statements = importer._artifact_scope_pk_sql(model, fixture.schema, relation_name)
+            for statement in statements[:1] if index_phase == "pk_build" else statements:
+                await fixture.database.status(statement)
+        if index_phase == "completed" and model in {
+            importer.ProviderDirectoryPractitionerRole,
+            importer.ProviderDirectoryOrganizationAffiliation,
+        }:
+            _name, statement = importer._provider_directory_profile_bucket_index_sql(fixture.schema, relation_name)
+            await fixture.database.status(statement)
         relation_by_base[base_name] = relation_name
         oid_by_base[base_name] = int(
             await fixture.database.scalar(
@@ -177,11 +174,7 @@ async def _recovery_admission(fixture):
         artifact_scratch_cap=1024 * 1024 * 1024,
         artifact_wal_cap=1024 * 1024 * 1024,
     )
-    initial_wal_lsn = str(
-        await fixture.database.scalar(
-            "SELECT pg_current_wal_insert_lsn()::text;"
-        )
-    )
+    initial_wal_lsn = str(await fixture.database.scalar("SELECT pg_current_wal_insert_lsn()::text;"))
     return _admission(geometry, initial_wal_lsn)
 
 
@@ -207,17 +200,22 @@ async def _assert_scope_replaced(
             )
             is None
         )
-        assert int(
-            await fixture.database.scalar(
-                "SELECT to_regclass(:relation_ref)::oid::bigint;",
-                relation_ref=current_ref,
+        assert (
+            int(
+                await fixture.database.scalar(
+                    "SELECT to_regclass(:relation_ref)::oid::bigint;",
+                    relation_ref=current_ref,
+                )
             )
-        ) != prior_oid
+            != prior_oid
+        )
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("index_phase", ["heap", "pk_build", "primary", "completed"])
 async def test_pg18_fresh_child_recovers_only_terminal_parent_scope(
     monkeypatch,
+    index_phase,
 ):
     async with _artifact_fixture(monkeypatch) as fixture:
         await _drop_fixture_scope(fixture)
@@ -225,6 +223,7 @@ async def test_pg18_fresh_child_recovers_only_terminal_parent_scope(
         prior_relations, prior_oids = await _create_owner_scope(
             fixture,
             _PRIOR_RUN_ID,
+            index_phase=index_phase,
         )
         admission = await _recovery_admission(fixture)
         await _insert_owner(
@@ -241,28 +240,18 @@ async def test_pg18_fresh_child_recovers_only_terminal_parent_scope(
             status="running",
             finished_at=None,
         )
-        token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
-            admission
-        )
+        token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(admission)
         try:
-            plan = importer._artifact_scope_materialization_plan(
-                _CURRENT_RUN_ID
-            )
-            recovered = (
-                await importer._recover_provider_directory_artifact_scope(
-                    fixture.schema,
-                    plan,
-                )
+            plan = importer._artifact_scope_materialization_plan(_CURRENT_RUN_ID)
+            recovered = await importer._recover_provider_directory_artifact_scope(
+                fixture.schema,
+                plan,
             )
         finally:
-            importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(
-                token
-            )
+            importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(token)
 
         assert set(recovered) == set(prior_relations.values())
-        assert set(plan.created_tables) == set(
-            plan.relation_by_table.values()
-        )
+        assert set(plan.created_tables) == set(plan.relation_by_table.values())
         await _assert_scope_replaced(
             fixture,
             prior_relations,
@@ -290,13 +279,9 @@ async def test_pg18_current_owner_refusal_preserves_every_scope_oid(
             status="running",
             finished_at=None,
         )
-        token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
-            admission
-        )
+        token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(admission)
         try:
-            plan = importer._artifact_scope_materialization_plan(
-                _CURRENT_RUN_ID
-            )
+            plan = importer._artifact_scope_materialization_plan(_CURRENT_RUN_ID)
             with pytest.raises(
                 importer.ProviderDirectoryArtifactBuildStale,
                 match="current_owner_present",
@@ -306,18 +291,19 @@ async def test_pg18_current_owner_refusal_preserves_every_scope_oid(
                     plan,
                 )
         finally:
-            importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(
-                token
-            )
+            importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(token)
 
         assert plan.created_tables == []
         for base_name, relation_name in current_relations.items():
-            assert int(
-                await fixture.database.scalar(
-                    "SELECT to_regclass(:relation_ref)::oid::bigint;",
-                    relation_ref=importer._unscoped_qt(
-                        fixture.schema,
-                        relation_name,
-                    ),
+            assert (
+                int(
+                    await fixture.database.scalar(
+                        "SELECT to_regclass(:relation_ref)::oid::bigint;",
+                        relation_ref=importer._unscoped_qt(
+                            fixture.schema,
+                            relation_name,
+                        ),
+                    )
                 )
-            ) == current_oids[base_name]
+                == current_oids[base_name]
+            )

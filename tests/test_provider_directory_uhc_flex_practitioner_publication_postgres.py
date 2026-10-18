@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-import uuid
 
+import pytest
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
-import pytest
 
-from db.connection import Database
 import process.uhc_flex_practitioner_publication as publication
+from db.connection import Database
 from process.uhc_flex_practitioner_query import (
     validate_uhc_flex_practitioner_search_bundle,
 )
@@ -28,60 +28,46 @@ from process.uhc_flex_practitioner_twin_store import (
     admit_uhc_flex_practitioner_twins,
 )
 from process.uhc_flex_practitioner_twin_store_contract import (
+    UHCFlexPractitionerTwinStoreError,
     build_uhc_flex_practitioner_dataset_intent_id,
     build_uhc_flex_practitioner_run_id,
-    UHCFlexPractitionerTwinStoreError,
 )
-from tests.formulary_fhir_twin_admission_pg_support import assert_sqlstate
-from tests.formulary_fhir_twin_admission_pg_support import connect
-from tests.formulary_fhir_twin_admission_pg_support import database_url
-from tests.formulary_fhir_twin_admission_pg_support import drop_schema
-from tests.formulary_fhir_twin_admission_pg_support import load_migration
-from tests.formulary_fhir_twin_admission_pg_support import quoted
-from tests.formulary_fhir_twin_admission_pg_support import run_migration
-from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
-    cohort_fixture,
+from tests.formulary_fhir_twin_admission_pg_support import (
+    assert_sqlstate,
+    connect,
+    database_url,
+    drop_schema,
+    load_migration,
+    quoted,
+    run_migration,
 )
-from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
-    create_provider_foundation,
-)
-from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
-    insert_valid_cohort,
-)
-from tests.provider_directory_uhc_flex_npi_cohort_pg_support import DATASET_ID
-from tests.provider_directory_uhc_flex_npi_cohort_pg_support import MEMBER_NPIS
-from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
-    seed_official_dataset,
-)
+from tests.nppes_candidate_postgres_support import candidate_component
 from tests.provider_directory_rooted_graph_pg_support import (
     extend_publication_foundation as extend_rooted_publication_foundation,
 )
+from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
+    DATASET_ID,
+    MEMBER_NPIS,
+    cohort_fixture,
+    create_provider_foundation,
+    insert_valid_cohort,
+    seed_official_dataset,
+)
 from tests.provider_directory_uhc_flex_publication_pg_support import (
     extend_flex_publication_foundation as _extend_provider_foundation,
+)
+from tests.provider_directory_uhc_flex_publication_pg_support import (
     seed_exact_publication_registry as _seed_exact_source,
 )
 
-
 VERSIONS = Path(__file__).resolve().parents[1] / "alembic/versions"
 COHORT_PATH = VERSIONS / "20260810050000_provider_directory_uhc_flex_npi_cohort.py"
-ACQUISITION_PATH = VERSIONS / (
-    "20260810060000_provider_directory_uhc_flex_practitioner_acquisition.py"
-)
-TWIN_PATH = VERSIONS / (
-    "20260810070000_provider_directory_uhc_flex_practitioner_twin_admission.py"
-)
-PUBLICATION_PATH = VERSIONS / (
-    "20260810080000_provider_directory_uhc_flex_practitioner_publication.py"
-)
-ROOTED_PUBLICATION_PATH = VERSIONS / (
-    "20260811020000_provider_directory_rooted_graph_acquisition.py"
-)
-SINGLE_ROOT_PATH = VERSIONS / (
-    "20260812030000_provider_directory_specialized_single_root_admission.py"
-)
-RETRY_EXHAUSTION_PATH = VERSIONS / (
-    "20260830090000_uhc_flex_retry_exhaustion.py"
-)
+ACQUISITION_PATH = VERSIONS / ("20260810060000_provider_directory_uhc_flex_practitioner_acquisition.py")
+TWIN_PATH = VERSIONS / ("20260810070000_provider_directory_uhc_flex_practitioner_twin_admission.py")
+PUBLICATION_PATH = VERSIONS / ("20260810080000_provider_directory_uhc_flex_practitioner_publication.py")
+ROOTED_PUBLICATION_PATH = VERSIONS / ("20260811020000_provider_directory_rooted_graph_acquisition.py")
+SINGLE_ROOT_PATH = VERSIONS / ("20260812030000_provider_directory_specialized_single_root_admission.py")
+RETRY_EXHAUSTION_PATH = VERSIONS / ("20260830090000_uhc_flex_retry_exhaustion.py")
 DATASET_CANDIDATES_PATH = VERSIONS / "20261005130000_provider_dataset_candidates.py"
 PROJECTION_DATE = "2026-08-10"
 SOURCE_ID = "pdfhir_1ceb7c0986c320b7eb924881"
@@ -206,10 +192,14 @@ async def _prepare_publication_schema(
     finally:
         await connection.close()
     await run_migration(engine, migrations[1], "upgrade")
-    await run_migration(engine, load_migration(
-        VERSIONS / "20261005120000_practitioner_set_validation.py",
-        "flex_publication_set_validation",
-    ), "upgrade")
+    await run_migration(
+        engine,
+        load_migration(
+            VERSIONS / "20261005120000_practitioner_set_validation.py",
+            "flex_publication_set_validation",
+        ),
+        "upgrade",
+    )
     await run_migration(engine, migrations[2], "upgrade")
     connection = await connect(url)
     try:
@@ -230,62 +220,23 @@ async def _prepare_publication_schema(
 
 @asynccontextmanager
 async def _publication_test_scope(monkeypatch):
-    url = database_url()
-    schema_name = f"fhir_twin_test_{uuid.uuid4().hex}"
-    schema = quoted(schema_name)
-    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
-    monkeypatch.setenv("DB_SCHEMA", schema_name)
-    engine = create_async_engine(url.set(drivername="postgresql+asyncpg"))
-    database = _configure_database(monkeypatch, url)
-    migrations = tuple(
-        load_migration(path, f"flex_publication_{index}")
-        for index, path in enumerate(
-            (COHORT_PATH, ACQUISITION_PATH, TWIN_PATH, PUBLICATION_PATH)
-        )
-    )
-    rooted_migration = load_migration(
-        ROOTED_PUBLICATION_PATH,
-        "flex_publication_rooted",
-    )
-    single_root_migration = load_migration(
-        SINGLE_ROOT_PATH,
-        "flex_publication_single_root",
-    )
-    retry_exhaustion_migration = load_migration(RETRY_EXHAUSTION_PATH, "flex_publication_retry_exhaustion")
-    try:
-        await _prepare_publication_schema(
-            engine,
-            url,
-            schema_name,
-            schema,
-            migrations,
-            include_rooted_registry=True,
-        )
-        connection = await connect(url)
-        try:
-            await extend_rooted_publication_foundation(connection, schema_name)
-        finally:
-            await connection.close()
-        await run_migration(engine, rooted_migration, "upgrade")
-        await run_migration(engine, single_root_migration, "upgrade")
-        await run_migration(engine, retry_exhaustion_migration, "upgrade")
-        await run_migration(engine, load_migration(DATASET_CANDIDATES_PATH, "flex_dataset_candidates"), "upgrade")
-        from tests.provider_directory_fhir_failure_pg_support import install_request_failure_budget
+    from process.provider_directory_generic_source_policy import source_transaction
+    from process.provider_directory_rooted_graph_registration import register_provider_directory_rooted_graph_source
+    from process.uhc_flex_practitioner_registration import register_uhc_flex_practitioner_source
+    from tests.provider_directory_specialized_source_postgres_support import specialized_source_scope
 
-        await install_request_failure_budget(engine, schema_name)
-        await database.connect()
+    async with specialized_source_scope(monkeypatch) as context:
+        async with source_transaction(context.database):
+            await register_uhc_flex_practitioner_source(database=context.database)
+            await register_provider_directory_rooted_graph_source(database=context.database)
         yield (
-            url,
-            schema,
-            database,
-            engine,
-            migrations[3],
-            retry_exhaustion_migration,
+            context.url,
+            context.schema,
+            context.database,
+            context.engine,
+            load_migration(PUBLICATION_PATH, "flex_publication"),
+            load_migration(RETRY_EXHAUSTION_PATH, "flex_publication_retry_exhaustion"),
         )
-    finally:
-        await database.disconnect()
-        await drop_schema(engine, schema_name)
-        await engine.dispose()
 
 
 async def _assert_admission_gate(database: Database, schema: str) -> None:
@@ -301,13 +252,7 @@ async def _assert_admission_gate(database: Database, schema: str) -> None:
             database=database,
             batch_size=1,
         )
-    assert (
-        await database.scalar(
-            f"SELECT count(*) FROM {schema}."
-            "provider_directory_uhc_flex_practitioner_dataset"
-        )
-        == 0
-    )
+    assert await database.scalar(f"SELECT count(*) FROM {schema}.provider_directory_uhc_flex_practitioner_dataset") == 0
 
 
 async def _publish_successive_datasets(database: Database):
@@ -346,10 +291,7 @@ async def _publish_successive_datasets(database: Database):
     assert empty.replayed is False
     assert empty.readiness.resource_count == 0
     assert empty.readiness.previous_dataset_id == first.readiness.dataset_id
-    assert (
-        await publication.load_current_uhc_flex_dataset_readiness(database=database)
-        == empty.readiness
-    )
+    assert await publication.load_current_uhc_flex_dataset_readiness(database=database) == empty.readiness
     with pytest.raises(
         publication.UHCFlexPractitionerPublicationError,
         match="replay is not current",
@@ -381,18 +323,20 @@ async def _assert_exact_removal(connection, schema: str, first, empty) -> None:
     )
     assert current_resource_count == 0
     old_resource_count = await connection.fetchval(
-        f"SELECT count(*) FROM {schema}.provider_directory_dataset_resource "
-        "WHERE dataset_id = $1",
+        f"SELECT count(*) FROM {schema}.provider_directory_dataset_resource WHERE dataset_id = $1",
         first.readiness.dataset_id,
     )
     assert old_resource_count == 1
 
 
 async def _assert_official_dataset_rotation_revokes_readiness(
+    database,
     connection,
     schema: str,
     dataset_id: str,
 ) -> None:
+    from tests.provider_directory_specialized_source_postgres_support import publish_official_source
+
     ready_function = f"{schema}.provider_directory_uhc_flex_practitioner_dataset_ready"
     assert (
         await connection.fetchval(
@@ -401,11 +345,11 @@ async def _assert_official_dataset_rotation_revokes_readiness(
         )
         is True
     )
-    await connection.execute(
-        f"UPDATE {schema}.provider_directory_endpoint_dataset "
-        "SET status = 'superseded', is_current = false, "
-        "superseded_at = transaction_timestamp() WHERE dataset_id = $1",
-        DATASET_ID,
+    await publish_official_source(
+        database,
+        dataset_id="dataset-2026-rotated",
+        root_run_id="s" * 64,
+        previous_dataset_id=DATASET_ID,
     )
     assert (
         await connection.fetchval(
@@ -416,7 +360,7 @@ async def _assert_official_dataset_rotation_revokes_readiness(
     )
 
 
-async def _assert_mutation_guards(connection, schema: str) -> None:
+async def _assert_mutation_guards(connection, schema: str, *, restricted) -> None:
     guarded_statements = (
         (
             "55000",
@@ -427,11 +371,6 @@ async def _assert_mutation_guards(connection, schema: str) -> None:
             {"23514", "55000"},
             f"UPDATE {schema}.provider_directory_endpoint_dataset "
             "SET publication_metadata_json = '{}'::jsonb WHERE is_current",
-        ),
-        (
-            "55000",
-            f"UPDATE {schema}.provider_directory_uhc_flex_practitioner_"
-            "dataset_resource SET payload_hash = repeat('0', 64)",
         ),
         (
             "55000",
@@ -447,17 +386,19 @@ async def _assert_mutation_guards(connection, schema: str) -> None:
         ),
         (
             "55000",
-            f"TRUNCATE TABLE {schema}."
-            "provider_directory_uhc_flex_practitioner_dataset_resource",
-        ),
-        (
-            "55000",
-            f"TRUNCATE TABLE {schema}."
-            "provider_directory_uhc_flex_practitioner_dataset CASCADE",
+            f"TRUNCATE TABLE {schema}.provider_directory_uhc_flex_practitioner_dataset CASCADE",
         ),
     )
     for expected_sqlstate, statement in guarded_statements:
         await assert_sqlstate(connection, expected_sqlstate, statement)
+    resources = f"{schema}.provider_directory_uhc_flex_practitioner_dataset_resource"
+    original_rows = await connection.fetch(f"SELECT * FROM {resources} ORDER BY dataset_id,resource_id")
+    for statement in (
+        f"UPDATE {resources} SET payload_hash = repeat('0', 64)",
+        f"TRUNCATE TABLE {resources}",
+    ):
+        await assert_sqlstate(restricted, "42501", statement)
+    assert await connection.fetch(f"SELECT * FROM {resources} ORDER BY dataset_id,resource_id") == original_rows
 
 
 @pytest.mark.asyncio
@@ -483,8 +424,18 @@ async def test_flex_practitioner_publication_lifecycle_replay_and_removal(
         connection = await connect(url)
         try:
             await _assert_exact_removal(connection, schema, first, empty)
-            await _assert_mutation_guards(connection, schema)
+            builder = candidate_component(publication._schema_name()).builder
+            restricted = await connect(url.set(username=builder))
+            try:
+                assert tuple(await restricted.fetchrow("SELECT session_user::text,current_user::text")) == (
+                    builder,
+                    builder,
+                )
+                await _assert_mutation_guards(connection, schema, restricted=restricted)
+            finally:
+                await restricted.close()
             await _assert_official_dataset_rotation_revokes_readiness(
+                database,
                 connection,
                 schema,
                 empty.readiness.dataset_id,

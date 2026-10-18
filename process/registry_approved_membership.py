@@ -31,8 +31,12 @@ _DIAGNOSTICS_SQL = """
           AND network.record_key=binding.record_json->>'network_id'
         WHERE binding.record_kind='network_binding'
       ), members AS MATERIALIZED (
-        SELECT head.record_key AS network_key, member.*
-        FROM active head CROSS JOIN LATERAL jsonb_to_recordset(head.record_json->'memberships_json')
+        SELECT head.record_key AS network_key,member.*,
+          entry.document ? 'operation' AND entry.document->'operation' NOT IN ('"add"'::jsonb,'"remove"'::jsonb)
+            AS invalid_operation
+        FROM active head CROSS JOIN LATERAL jsonb_array_elements(CASE
+          WHEN head.record_kind='membership' THEN head.record_json->'memberships_json' ELSE '[]'::jsonb END)
+          entry(document) CROSS JOIN LATERAL jsonb_to_record(entry.document)
           AS member(network_id integer,provider_system text,provider_id text,location_id uuid,evidence_id text)
         WHERE head.record_kind='membership'
       ), unresolved AS (
@@ -55,7 +59,7 @@ _DIAGNOSTICS_SQL = """
         (SELECT count(*) FROM source_bindings)::bigint AS source_binding_rows,
         (SELECT count(*) FROM source_bindings WHERE network_missing)::bigint AS source_binding_unresolved_count,
         EXISTS(SELECT 1 FROM binding_conflicts) AS binding_conflict,
-        count(*) FILTER(WHERE network_missing OR provider_missing OR location_missing
+        count(*) FILTER(WHERE invalid_operation OR network_missing OR provider_missing OR location_missing
           OR network_id::text<>network_key)::bigint AS unresolved_count,
         count(*) FILTER(WHERE network_missing)::bigint AS unapproved_network_count,
         count(*) FILTER(WHERE provider_missing)::bigint AS unapproved_provider_count,

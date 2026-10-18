@@ -14,16 +14,14 @@ from process import (
     provider_directory_profile_capacity_control_budget as control_budget,
 )
 from process import (
-    provider_directory_profile_capacity_control_projection
-    as control_projection,
+    provider_directory_profile_capacity_control_projection as control_projection,
 )
 from process import provider_directory_profile_capacity_cutover as cutover
 from process import (
     provider_directory_profile_capacity_cutover_contract as cutover_contract,
 )
 from process import (
-    provider_directory_profile_capacity_cutover_projection
-    as cutover_projection,
+    provider_directory_profile_capacity_cutover_projection as cutover_projection,
 )
 from process import provider_directory_profile_capacity_physical as physical
 from process import provider_directory_profile_capacity_target as target
@@ -67,16 +65,12 @@ def test_target_projection_rejects_overflow_shape_order_and_named_caps():
 
 def test_target_projection_enforces_deleted_and_wal_caps():
     relation_cap = next(
-        cap
-        for cap in _projection_geometry().relation_byte_caps
-        if cap.relation_name == "evidence_target"
+        cap for cap in _projection_geometry().relation_byte_caps if cap.relation_name == "evidence_target"
     )
     projection_values = (
         {
             "target_growth_bytes": 0,
-            "deleted_logical_bytes": (
-                relation_cap.max_deleted_logical_bytes + 1
-            ),
+            "deleted_logical_bytes": (relation_cap.max_deleted_logical_bytes + 1),
             "wal_bytes": 0,
         },
         {
@@ -96,7 +90,7 @@ def test_target_projection_enforces_deleted_and_wal_caps():
 def test_scratch_and_metadata_projection_reject_invalid_inputs():
     geometry_state = _projection_geometry()
     failure_operations = (
-        lambda: physical._validate_scratch_input(None),
+        lambda: physical._validate_scratch_input(geometry_state, None),
         lambda: physical._scratch_relation_cap(
             geometry_state,
             "unknown_stage",
@@ -222,15 +216,9 @@ def test_control_projection_rejects_shape_and_total_drift():
         total_control_wal_bytes=projection.total_control_wal_bytes + 1,
     )
     failure_operations = (
-        lambda: control_projection._validate_control_operation_shape(
-            invalid_operation
-        ),
-        lambda: control_projection._assert_control_wal_projection_shape(
-            invalid_projection
-        ),
-        lambda: control_projection._assert_control_wal_projection_shape(
-            invalid_totals
-        ),
+        lambda: control_projection._validate_control_operation_shape(invalid_operation),
+        lambda: control_projection._assert_control_wal_projection_shape(invalid_projection),
+        lambda: control_projection._assert_control_wal_projection_shape(invalid_totals),
     )
     _assert_projection_errors(failure_operations)
 
@@ -405,13 +393,9 @@ def test_cutover_evidence_rejects_metadata_shape_and_payload_drift():
         capacity.ProviderDirectoryProfileCapacityError,
         match="metadata_projection_invalid",
     ):
-        cutover._validated_metadata_evidence(
-            {"metadata_projection": None}
-        )
+        cutover._validated_metadata_evidence({"metadata_projection": None})
     metadata_by_field = {
-        "build_checkpoint_payload_upper_bytes": (
-            capacity.METADATA_PAYLOAD_UPPER_BOUND_BYTES + 1
-        ),
+        "build_checkpoint_payload_upper_bytes": (capacity.METADATA_PAYLOAD_UPPER_BOUND_BYTES + 1),
         "serving_payload_upper_bytes": 0,
         "receipt_payload_upper_bytes": 0,
         "pending_commit_items": 0,
@@ -442,9 +426,7 @@ def test_cutover_projection_rejects_total_wal_overage():
     geometry_state = _projection_geometry()
     target_evidence, metadata_evidence = _empty_cutover_evidence()
     forecast_by_field = {
-        "wal_bytes_before": (
-            geometry_state.reservation_bytes_by_storage_class["wal"]
-        ),
+        "wal_bytes_before": (geometry_state.reservation_bytes_by_storage_class["wal"]),
         "evidence_target_bytes_before": 0,
         "profile_target_bytes_before": 0,
     }

@@ -10,7 +10,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from db.connection import Database
 from db.models import EntityAddressUnified, MRFAddress
 from process.ext.address_pub28 import (
     PUB28_DIRECTIONAL_MAP,
@@ -85,12 +87,12 @@ def test_address_canonical_current_rekey_migration_uses_single_current_format():
 def test_sql_street_alias_helpers_keep_original_next_token_context():
     migration = _load_migration("20260611100000_address_canonical_foundation.py")
     sql = migration._create_functions_sql("mrf")
-    suffixless_sql = sql.split("CREATE OR REPLACE FUNCTION \"mrf\".addr_street_suffixless_norm_v1", 1)[1].split(
-        "CREATE OR REPLACE FUNCTION \"mrf\".addr_street_direction_index_v1",
+    suffixless_sql = sql.split('CREATE OR REPLACE FUNCTION "mrf".addr_street_suffixless_norm_v1', 1)[1].split(
+        'CREATE OR REPLACE FUNCTION "mrf".addr_street_direction_index_v1',
         1,
     )[0]
-    completion_sql = sql.split("CREATE OR REPLACE FUNCTION \"mrf\".addr_street_completion_norm_v1", 1)[1].split(
-        "CREATE OR REPLACE FUNCTION \"mrf\".addr_city_norm_v1",
+    completion_sql = sql.split('CREATE OR REPLACE FUNCTION "mrf".addr_street_completion_norm_v1', 1)[1].split(
+        'CREATE OR REPLACE FUNCTION "mrf".addr_city_norm_v1',
         1,
     )[0]
 
@@ -106,9 +108,7 @@ def test_archive_resolver_has_no_unreviewed_completion_alias_path():
     assert "_completion_alias_sql" not in source
     assert "address_completion_aliases" not in source
     assert "_apply_persisted_address_aliases" in source
-    assert source.index("_has_rust_materialized_keys") < source.index(
-        "_apply_persisted_address_aliases"
-    )
+    assert source.index("_has_rust_materialized_keys") < source.index("_apply_persisted_address_aliases")
 
 
 def test_unit_is_delivery_point_not_premise_identity():
@@ -227,14 +227,17 @@ def _assert_compound_unit_identity() -> None:
 
 
 def _assert_unit_identity_edge_cases() -> None:
-    assert address_canon.identity_key_v1(
-        "123 Main St Ste 200",
-        "Suite",
-        "Austin",
-        "TX",
-        "78701",
-        "US",
-    ) == "v2|123mainstste200suite|||TX|78701|US|street"
+    assert (
+        address_canon.identity_key_v1(
+            "123 Main St Ste 200",
+            "Suite",
+            "Austin",
+            "TX",
+            "78701",
+            "US",
+        )
+        == "v2|123mainstste200suite|||TX|78701|US|street"
+    )
     assert address_canon.identity_key_v1(
         "123 Main St Ste 200",
         "West Wing",
@@ -310,22 +313,28 @@ def test_unit_extraction_handles_high_confidence_free_text_variants():
 def test_non_us_addresses_are_not_keyed():
     assert address_canon.country_code("canada") == "CANADA"
     assert address_canon.country_code("Usa") == "US"
-    assert address_canon.identity_key_v1(
-        "1 Burrard Street",
-        "",
-        "Vancouver",
-        "British Columbia",
-        "V6B 2W9",
-        "canada",
-    ) is None
-    assert address_canon.address_key_v1(
-        "1 Burrard Street",
-        "",
-        "Vancouver",
-        "British Columbia",
-        "V6B 2W9",
-        "canada",
-    ) is None
+    assert (
+        address_canon.identity_key_v1(
+            "1 Burrard Street",
+            "",
+            "Vancouver",
+            "British Columbia",
+            "V6B 2W9",
+            "canada",
+        )
+        is None
+    )
+    assert (
+        address_canon.address_key_v1(
+            "1 Burrard Street",
+            "",
+            "Vancouver",
+            "British Columbia",
+            "V6B 2W9",
+            "canada",
+        )
+        is None
+    )
 
 
 def test_python_address_canonical_golden_corpus_matches_frozen_expected_values():
@@ -354,11 +363,13 @@ def test_address_fast_python_fallback_matches_reference(monkeypatch):
     address_fast = importlib.import_module("process.ext.address_fast")
     monkeypatch.setattr(address_fast, "_fast_module", lambda: None)
 
-    result = address_fast.canonicalize_batch([
-        ("123 Main St", "Suite 200", "Austin", "TX", "78701-1234", "US"),
-    ])[0]
+    canonical_address = address_fast.canonicalize_batch(
+        [
+            ("123 Main St", "Suite 200", "Austin", "TX", "78701-1234", "US"),
+        ]
+    )[0]
 
-    assert result["identity_key"] == address_canon.identity_key_v1(
+    assert canonical_address["identity_key"] == address_canon.identity_key_v1(
         "123 Main St",
         "Suite 200",
         "Austin",
@@ -366,16 +377,18 @@ def test_address_fast_python_fallback_matches_reference(monkeypatch):
         "78701-1234",
         "US",
     )
-    assert result["address_key"] == str(address_canon.address_key_v1(
-        "123 Main St",
-        "Suite 200",
-        "Austin",
-        "TX",
-        "78701-1234",
-        "US",
-    ))
-    assert result["zip4"] == "1234"
-    assert result["country_code"] == "US"
+    assert canonical_address["address_key"] == str(
+        address_canon.address_key_v1(
+            "123 Main St",
+            "Suite 200",
+            "Austin",
+            "TX",
+            "78701-1234",
+            "US",
+        )
+    )
+    assert canonical_address["zip4"] == "1234"
+    assert canonical_address["country_code"] == "US"
 
 
 def test_rust_canon_version_match_requires_ruleset_version():
@@ -395,12 +408,15 @@ async def test_rust_materialize_default_on_falls_back_when_binary_missing(monkey
     monkeypatch.delenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, raising=False)
     monkeypatch.setattr(address_canon, "_ptg2_rust_scanner_binary", lambda: None)
 
-    assert await address_canon._has_rust_materialized_keys(
-        None,
-        keyed_table='"address_archive_resolve_keyed"',
-        keyed_table_name="address_archive_resolve_keyed",
-        raw_copy_sql="SELECT 1",
-    ) is False
+    assert (
+        await address_canon._has_rust_materialized_keys(
+            None,
+            keyed_table='"address_archive_resolve_keyed"',
+            keyed_table_name="address_archive_resolve_keyed",
+            raw_copy_sql="SELECT 1",
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -416,12 +432,15 @@ async def test_rust_materialize_falls_back_on_version_mismatch(monkeypatch, tmp_
         _is_not_current,
     )
 
-    assert await address_canon._has_rust_materialized_keys(
-        None,
-        keyed_table='"address_archive_resolve_keyed"',
-        keyed_table_name="address_archive_resolve_keyed",
-        raw_copy_sql="SELECT 1",
-    ) is False
+    assert (
+        await address_canon._has_rust_materialized_keys(
+            None,
+            keyed_table='"address_archive_resolve_keyed"',
+            keyed_table_name="address_archive_resolve_keyed",
+            raw_copy_sql="SELECT 1",
+        )
+        is False
+    )
 
 
 def test_equivalence_group_cases_are_mirrored_into_explicit_cases():
@@ -438,9 +457,27 @@ def test_equivalence_group_cases_are_mirrored_into_explicit_cases():
 
 
 def test_pub28_suffix_directional_and_unit_tables_are_used():
-    assert address_canon.street_norm("10 NorthEast Mountain Expressway", "",) == "10nemtnexpy"
-    assert address_canon.street_norm("11 Noreste Turnpike", "",) == "11netpke"
-    assert address_canon.street_norm("12 County Underpass", "",) == "12countyupas"
+    assert (
+        address_canon.street_norm(
+            "10 NorthEast Mountain Expressway",
+            "",
+        )
+        == "10nemtnexpy"
+    )
+    assert (
+        address_canon.street_norm(
+            "11 Noreste Turnpike",
+            "",
+        )
+        == "11netpke"
+    )
+    assert (
+        address_canon.street_norm(
+            "12 County Underpass",
+            "",
+        )
+        == "12countyupas"
+    )
     assert address_canon.unit_norm("100 Main Street Basement", "") == "bsmt"
     assert address_canon.unit_norm("100 Main Street", "Penthouse") == "ph"
     assert address_canon.unit_norm("100 Main Street", "Office") == "ofc"
@@ -460,11 +497,23 @@ def test_pub28_raw_maps_are_single_application_idempotent():
 
 
 def test_ordinal_and_saint_street_tokens_are_canonicalized_safely():
-    assert address_canon.street_norm("200 14 St", "",) == address_canon.street_norm("200 14th St", "")
-    assert address_canon.street_norm("200 14h St", "",) == address_canon.street_norm("200 14th St", "")
-    assert address_canon.street_norm("200 First Ave", "",) == address_canon.street_norm("200 1st Ave", "")
+    assert address_canon.street_norm(
+        "200 14 St",
+        "",
+    ) == address_canon.street_norm("200 14th St", "")
+    assert address_canon.street_norm(
+        "200 14h St",
+        "",
+    ) == address_canon.street_norm("200 14th St", "")
+    assert address_canon.street_norm(
+        "200 First Ave",
+        "",
+    ) == address_canon.street_norm("200 1st Ave", "")
     assert address_canon.street_norm("1200 First Street, NE", "") == address_canon.street_norm("1200 1ST ST NE", "")
-    assert address_canon.street_norm("200 Saint Clair Ave", "",) == address_canon.street_norm("200 St Clair Ave", "")
+    assert address_canon.street_norm(
+        "200 Saint Clair Ave",
+        "",
+    ) == address_canon.street_norm("200 St Clair Ave", "")
 
     assert address_canon.street_norm("14H Main St", "") != address_canon.street_norm("14 Main St", "")
     assert address_canon.street_norm("200 First National Way", "") != address_canon.street_norm(
@@ -523,10 +572,7 @@ def test_zip5_norm_left_pads_short_us_zips():
 
 def test_foundation_migration_qualifies_postgis_probe():
     migration_sql = (
-        Path(__file__).resolve().parents[1]
-        / "alembic"
-        / "versions"
-        / "20260611100000_address_canonical_foundation.py"
+        Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260611100000_address_canonical_foundation.py"
     ).read_text()
 
     assert "to_regtype('public.geography')" in migration_sql
@@ -715,6 +761,53 @@ async def test_stamp_address_keys_rejects_invalid_env_shard_override(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["stamp", "restore", "propagate"])
+@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError])
+async def test_address_shards_preserve_transaction_owner(monkeypatch, operation, failure):
+    """Each write stays on its transaction owner and stops after failure or cancellation."""
+    database = Database(session_factory=AsyncSession)
+    calls = []
+    owner = asyncio.current_task()
+
+    async def work(shard, **options):
+        assert asyncio.current_task() is owner
+        assert database._transaction_binding().session is session
+        calls.append(shard)
+        await asyncio.sleep(0)
+        if failure is not None and shard == 1:
+            raise failure()
+        if "progress_by_metric" in options:
+            options["progress_by_metric"]["updated"] += 2
+            options["progress_by_metric"]["completed"] += 1
+        return 2
+
+    monkeypatch.setattr(address_canon, "db", database)
+    monkeypatch.setattr(address_canon, "enqueue_live_progress", lambda **_payload: None)
+    monkeypatch.setattr(address_canon, "_prepare_address_key_stamp", AsyncMock(return_value=("mrf", 3, 3)))
+    monkeypatch.setattr(
+        address_canon, "_prepare_zip_restore", AsyncMock(return_value=("mrf", "zip", 3, 3, "lat", "long", True))
+    )
+    monkeypatch.setattr(address_canon, "_stamp_address_key_shard", work)
+    monkeypatch.setattr(address_canon, "_restore_missing_zip_shard", work)
+    monkeypatch.setattr(address_canon, "_propagate_child_address_key_shard", work)
+    monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_STAMP_SHARDS", "3")
+    functions_by_operation = {
+        "stamp": address_canon.stamp_address_keys,
+        "restore": address_canon.restore_missing_zip_from_tiger_zcta,
+        "propagate": address_canon.propagate_child_address_keys,
+    }
+    async with database.transaction() as session:
+        arguments = ("child", "parent") if operation == "propagate" else ("stage", {})
+        if failure is None:
+            assert await functions_by_operation[operation](*arguments, schema="mrf") == 6
+        else:
+            with pytest.raises(failure):
+                await functions_by_operation[operation](*arguments, schema="mrf")
+    assert calls == ([0, 1, 2] if failure is None else [0, 1])
+    assert database._transaction_binding() is None
+
+
+@pytest.mark.asyncio
 async def test_stamp_address_keys_can_run_shards_concurrently(monkeypatch):
     calls = []
     concurrency_by_metric = {"active": 0, "max_active": 0}
@@ -816,7 +909,8 @@ async def _assert_tiger_restore_state_contract(concurrency_by_metric, progress, 
     sql = statements[0][0]
     assert 'UPDATE "mrf"."address_stage" AS target' in sql
     assert 'SET "postal_code" = unique_matches.zip5' in sql
-    assert "ST_Covers(" in sql
+    assert "public.ST_Covers(" in sql
+    assert "public.ST_SetSRID(public.ST_Point(" in sql
     assert "JOIN tiger.zcta5 AS z" in sql
     assert 'JOIN "mrf".geo_zip_lookup AS zip_lookup' in sql
     assert "zip_lookup.state = normalized.state_code" in sql
@@ -1062,14 +1156,20 @@ def test_entity_address_unified_publish_decision_defaults_to_stage_only_for_test
 
     assert entity_address_unified._is_publish_requested({}, test_mode=True) is False
     assert entity_address_unified._is_publish_requested({}, test_mode=False) is True
-    assert entity_address_unified._is_publish_requested(
-        {"publish": True},
-        test_mode=True,
-    ) is True
-    assert entity_address_unified._is_publish_requested(
-        {"skip_publish": True},
-        test_mode=False,
-    ) is False
+    assert (
+        entity_address_unified._is_publish_requested(
+            {"publish": True},
+            test_mode=True,
+        )
+        is True
+    )
+    assert (
+        entity_address_unified._is_publish_requested(
+            {"skip_publish": True},
+            test_mode=False,
+        )
+        is False
+    )
 
 
 def test_entity_address_unified_publish_decision_allows_env_override(monkeypatch):
@@ -1092,9 +1192,7 @@ def test_entity_address_unified_refresh_mode_aliases_obsolete_ptg_to_full(monkey
     assert entity_address_unified._entity_address_refresh_mode({"refresh_mode": "ptg-partial"}) == "full"
     assert entity_address_unified._entity_address_refresh_mode({"mode": "partial-ptg"}) == "full"
     assert (
-        entity_address_unified._entity_address_refresh_mode(
-            {"refresh_mode": "provider-directory-partial"}
-        )
+        entity_address_unified._entity_address_refresh_mode({"refresh_mode": "provider-directory-partial"})
         == "provider-directory-partial"
     )
     assert (
@@ -1164,10 +1262,7 @@ def test_provider_directory_partial_sql_uses_live_and_current_fhir_groups():
     assert "WHERE src.npi IS NOT NULL" in filtered[0]
     assert "affected.entity_npi = src.npi" in filtered[0]
     assert "affected.entity_type = src.entity_type" not in filtered[0]
-    assert any(
-        "provider_directory_practitioner_role AS role" in source_select
-        for source_select in filtered
-    )
+    assert any("provider_directory_practitioner_role AS role" in source_select for source_select in filtered)
 
 
 def test_provider_directory_organization_address_sql_can_skip_address_key_without_canon():
@@ -1271,9 +1366,7 @@ async def test_latest_provider_directory_partial_scope_returns_scope_sources(mon
     )
     monkeypatch.setattr(entity_address_unified.db, "first", first_mock)
 
-    run_id, source_ids, scope_sources = await entity_address_unified._latest_provider_directory_partial_scope(
-        "mrf"
-    )
+    run_id, source_ids, scope_sources = await entity_address_unified._latest_provider_directory_partial_scope("mrf")
 
     assert run_id == "run_123"
     assert source_ids == ["pdfhir_a", "pdfhir_b"]
@@ -1308,7 +1401,9 @@ def test_ffs_parent_source_is_not_a_unified_address_source():
             "geo_zip_lookup": False,
         },
     )
-    child_source = next(sql_text for sql_text in selects if "'provider_enrollment_ffs_address'::varchar AS address_source" in sql_text)
+    child_source = next(
+        sql_text for sql_text in selects if "'provider_enrollment_ffs_address'::varchar AS address_source" in sql_text
+    )
 
     assert not any("'provider_enrollment_ffs'::varchar AS address_source" in sql_text for sql_text in selects)
     assert "NULL::varchar AS first_line" in child_source
@@ -1327,11 +1422,15 @@ def test_ffs_address_source_filters_unkeyable_practice_locations():
         },
     )
 
-    child_source = next(sql_text for sql_text in selects if "'provider_enrollment_ffs_address'::varchar AS address_source" in sql_text)
+    child_source = next(
+        sql_text for sql_text in selects if "'provider_enrollment_ffs_address'::varchar AS address_source" in sql_text
+    )
     assert "WHERE f.npi IS NOT NULL" in child_source
     assert "NULLIF(BTRIM(COALESCE(fa.state, '')), '') IS NOT NULL" in child_source
     assert "NOT IN ('NULL', 'NONE', 'NA', 'NAN', 'UN', 'UNKNOWN', 'UNSPECIFIED', 'XX', 'ZZ')" in child_source
-    assert "NULLIF(LEFT(regexp_replace(COALESCE(fa.zip_code, ''), '[^0-9]', '', 'g'), 5), '') IS NOT NULL" in child_source
+    assert (
+        "NULLIF(LEFT(regexp_replace(COALESCE(fa.zip_code, ''), '[^0-9]', '', 'g'), 5), '') IS NOT NULL" in child_source
+    )
     assert "NOT IN ('00000', '99999')" in child_source
     assert "NULLIF(BTRIM(COALESCE(fa.city, '')), '') IS NOT NULL" in child_source
     assert "'provider_enrollment_ffs'::varchar AS address_source" not in child_source
@@ -1371,7 +1470,9 @@ def test_entity_address_unified_mrf_source_filters_placeholder_addresses():
     assert "WHERE a.npi IS NOT NULL" in mrf_source
     assert "NULLIF(BTRIM(COALESCE(a.state_name, '')), '') IS NOT NULL" in mrf_source
     assert "NOT IN ('NULL', 'NONE', 'NA', 'NAN', 'UN', 'UNKNOWN', 'UNSPECIFIED', 'XX', 'ZZ')" in mrf_source
-    assert "NULLIF(LEFT(regexp_replace(COALESCE(a.postal_code, ''), '[^0-9]', '', 'g'), 5), '') IS NOT NULL" in mrf_source
+    assert (
+        "NULLIF(LEFT(regexp_replace(COALESCE(a.postal_code, ''), '[^0-9]', '', 'g'), 5), '') IS NOT NULL" in mrf_source
+    )
     assert "NOT IN ('00000', '99999')" in mrf_source
     assert "BTRIM(COALESCE(a.country_code, ''))" in mrf_source
     assert "UNITEDSTATESOFAMERICA" in mrf_source
@@ -1549,7 +1650,10 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "LEFT JOIN mrf.address_alias_v1 AS active_alias" in enrich_sql
     assert "LEFT JOIN LATERAL" in enrich_sql
     assert "active_alias.target_address_key" in enrich_sql
-    assert "mrf.addr_key_v1(r.first_line, r.second_line, r.city_name, r.state_name, r.postal_code, r.country_code)" in enrich_sql
+    assert (
+        "mrf.addr_key_v1(r.first_line, r.second_line, r.city_name, r.state_name, r.postal_code, r.country_code)"
+        in enrich_sql
+    )
     assert "JOIN mrf.address_archive_v2 AS archive_row" in enrich_sql
     assert "ORDER BY candidate.priority" in enrich_sql
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_TRUST_SOURCE_ADDRESS_KEY", "0")
@@ -1658,9 +1762,7 @@ def test_entity_address_unified_can_split_array_aggregates(monkeypatch):
     assert "FROM aggregated\n      LEFT JOIN array_aggregates arr" in split_sql
     assert "LEFT JOIN evidence e" in split_inline_sql
     assert "LEFT JOIN array_aggregates arr" in split_inline_sql
-    assert split_inline_sql.rfind("LEFT JOIN evidence e") < split_inline_sql.rfind(
-        "LEFT JOIN array_aggregates arr"
-    )
+    assert split_inline_sql.rfind("LEFT JOIN evidence e") < split_inline_sql.rfind("LEFT JOIN array_aggregates arr")
     assert "WHERE evidence_shard = 7 AND (" in split_sharded_inline_sql
     assert "COALESCE(CARDINALITY(group_plan_array), 0) > 0" in split_sharded_inline_sql
 
@@ -1828,25 +1930,30 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
     """Unified support staging reports timing for each bulk phase."""
     statements = []
     events = []
-
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_WORK_MEM", "32MB")
+
     class FakeModel:
         __tablename__ = "entity_address_evidence"
+
     class FakeStage:
         __tablename__ = "entity_address_evidence_20260614"
+
     class FakeConn:
         async def status(self, statement):
             statements.append(statement)
             if "INSERT INTO mrf.entity_address_evidence_20260614" in statement:
                 return 11
             return None
+
     class FakeDB:
         @asynccontextmanager
         async def acquire(self):
             yield FakeConn()
+
         async def scalar(self, statement):
             statements.append(statement)
             return 3
+
     def fake_support_stage_statements(*_args, **_kwargs):
         return [
             entity_address_unified._SupportStageStatement(
@@ -1855,16 +1962,12 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
                 parallel=False,
             ),
             entity_address_unified._SupportStageStatement(
-                "evidence",
-                "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;",
+                "evidence", "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;"
             ),
         ]
+
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
-    monkeypatch.setattr(
-        entity_address_unified,
-        "_support_stage_statements",
-        fake_support_stage_statements,
-    )
+    monkeypatch.setattr(entity_address_unified, "_support_stage_statements", fake_support_stage_statements)
     monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", lambda **payload: events.append(payload))
     support_context_map = {}
     counts = await entity_address_unified._populate_support_stage_tables(
@@ -1890,10 +1993,13 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
     """Independent unified support inserts execute concurrently."""
     concurrency_map = {"active": 0, "max_active": 0}
     operation_order_list = []
+
     class FakeModel:
         __tablename__ = "entity_address_evidence"
+
     class FakeStage:
         __tablename__ = "entity_address_evidence_20260614"
+
     class FakeDB:
         async def status(self, statement):
             if "TRUNCATE TABLE" in statement:
@@ -1905,8 +2011,10 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
             await asyncio.sleep(0.01)
             concurrency_map["active"] -= 1
             return 1
+
         async def scalar(self, _statement):
             return 0
+
     def fake_support_stage_statements(*_args, **_kwargs):
         return [
             entity_address_unified._SupportStageStatement(
@@ -1915,8 +2023,7 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
                 parallel=False,
             ),
             entity_address_unified._SupportStageStatement(
-                "evidence",
-                "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;",
+                "evidence", "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;"
             ),
             entity_address_unified._SupportStageStatement(
                 "procedure bridge",
@@ -1927,13 +2034,10 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
                 "INSERT INTO mrf.entity_address_medication_bridge_20260614 SELECT 1;",
             ),
         ]
+
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CONCURRENCY", "2")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
-    monkeypatch.setattr(
-        entity_address_unified,
-        "_support_stage_statements",
-        fake_support_stage_statements,
-    )
+    monkeypatch.setattr(entity_address_unified, "_support_stage_statements", fake_support_stage_statements)
     support_context_map = {}
     await entity_address_unified._populate_support_stage_tables(
         "mrf",
@@ -2189,18 +2293,10 @@ def test_entity_address_unified_support_statements_shard_facility_candidates(mon
         "entity_address_unified_20260614",
         {
             entity_address_unified.EntityAddressEvidence: stage("entity_address_evidence_20260614"),
-            entity_address_unified.EntityAddressPlanBridge: stage(
-                "entity_address_plan_bridge_20260614"
-            ),
-            entity_address_unified.EntityAddressProcedureBridge: stage(
-                "entity_address_procedure_bridge_20260614"
-            ),
-            entity_address_unified.EntityAddressMedicationBridge: stage(
-                "entity_address_medication_bridge_20260614"
-            ),
-            entity_address_unified.FacilityAnchorNPICandidate: stage(
-                "facility_anchor_npi_candidate_20260614"
-            ),
+            entity_address_unified.EntityAddressPlanBridge: stage("entity_address_plan_bridge_20260614"),
+            entity_address_unified.EntityAddressProcedureBridge: stage("entity_address_procedure_bridge_20260614"),
+            entity_address_unified.EntityAddressMedicationBridge: stage("entity_address_medication_bridge_20260614"),
+            entity_address_unified.FacilityAnchorNPICandidate: stage("facility_anchor_npi_candidate_20260614"),
         },
         plan=entity_address_unified._SupportStagePlan(
             source_run_id="run_1",
@@ -2214,9 +2310,7 @@ def test_entity_address_unified_support_statements_shard_facility_candidates(mon
     )
 
     facility_statements = [
-        statement
-        for statement in statements
-        if statement.label.startswith("facility anchor npi candidate")
+        statement for statement in statements if statement.label.startswith("facility anchor npi candidate")
     ]
 
     assert [statement.label for statement in facility_statements] == [
@@ -2242,15 +2336,9 @@ def test_entity_address_unified_support_statements_shard_code_bridges(monkeypatc
         "entity_address_unified_20260614",
         {
             entity_address_unified.EntityAddressEvidence: stage("entity_address_evidence_20260614"),
-            entity_address_unified.EntityAddressPlanBridge: stage(
-                "entity_address_plan_bridge_20260614"
-            ),
-            entity_address_unified.EntityAddressProcedureBridge: stage(
-                "entity_address_procedure_bridge_20260614"
-            ),
-            entity_address_unified.EntityAddressMedicationBridge: stage(
-                "entity_address_medication_bridge_20260614"
-            ),
+            entity_address_unified.EntityAddressPlanBridge: stage("entity_address_plan_bridge_20260614"),
+            entity_address_unified.EntityAddressProcedureBridge: stage("entity_address_procedure_bridge_20260614"),
+            entity_address_unified.EntityAddressMedicationBridge: stage("entity_address_medication_bridge_20260614"),
         },
         plan=entity_address_unified._SupportStagePlan(
             source_run_id="run_1",
@@ -2260,12 +2348,8 @@ def test_entity_address_unified_support_statements_shard_code_bridges(monkeypatc
         ),
     )
 
-    procedure_statements = [
-        statement for statement in statements if statement.label.startswith("procedure bridge")
-    ]
-    medication_statements = [
-        statement for statement in statements if statement.label.startswith("medication bridge")
-    ]
+    procedure_statements = [statement for statement in statements if statement.label.startswith("procedure bridge")]
+    medication_statements = [statement for statement in statements if statement.label.startswith("medication bridge")]
 
     assert [statement.label for statement in procedure_statements] == [
         "procedure bridge shard 1/3",
@@ -2299,18 +2383,10 @@ def test_entity_address_unified_support_statements_can_skip_optional_serving_tab
         "entity_address_unified_20260614",
         {
             entity_address_unified.EntityAddressEvidence: stage("entity_address_evidence_20260614"),
-            entity_address_unified.EntityAddressPlanBridge: stage(
-                "entity_address_plan_bridge_20260614"
-            ),
-            entity_address_unified.EntityAddressProcedureBridge: stage(
-                "entity_address_procedure_bridge_20260614"
-            ),
-            entity_address_unified.EntityAddressMedicationBridge: stage(
-                "entity_address_medication_bridge_20260614"
-            ),
-            entity_address_unified.FacilityAnchorNPICandidate: stage(
-                "facility_anchor_npi_candidate_20260614"
-            ),
+            entity_address_unified.EntityAddressPlanBridge: stage("entity_address_plan_bridge_20260614"),
+            entity_address_unified.EntityAddressProcedureBridge: stage("entity_address_procedure_bridge_20260614"),
+            entity_address_unified.EntityAddressMedicationBridge: stage("entity_address_medication_bridge_20260614"),
+            entity_address_unified.FacilityAnchorNPICandidate: stage("facility_anchor_npi_candidate_20260614"),
         },
         plan=entity_address_unified._SupportStagePlan(
             source_run_id="run_1",
@@ -2628,47 +2704,35 @@ def test_entity_address_unified_provider_directory_replacement_copies_unaffected
 
 
 def _provider_directory_replacement_sql_parts():
-    heap_name = _entity_address_unified_private(
-        "_provider_directory_replacement_stage_table_name"
-    )("entity_address_unified_20260614")
-    affected_location_table = _entity_address_unified_private(
-        "_affected_live_location_table"
-    )(
+    heap_name = _entity_address_unified_private("_provider_directory_replacement_stage_table_name")(
         "entity_address_unified_20260614"
     )
-    create_sql = _entity_address_unified_private(
-        "_create_provider_directory_replacement_stage_sql"
-    )(
+    affected_location_table = _entity_address_unified_private("_affected_live_location_table")(
+        "entity_address_unified_20260614"
+    )
+    create_sql = _entity_address_unified_private("_create_provider_directory_replacement_stage_sql")(
         "mrf",
         replacement_stage_table=heap_name,
         stage_table="entity_address_unified_20260614",
     )
-    prepare_affected_sql = _entity_address_unified_private(
-        "_prepare_affected_live_locations_sql"
-    )(
+    prepare_affected_sql = _entity_address_unified_private("_prepare_affected_live_locations_sql")(
         "mrf",
         live_table="entity_address_unified",
         affected_group_table="entity_address_unified_20260614_pd_groups",
         replacement_lookup_table="entity_address_unified_20260614",
         affected_location_table=affected_location_table,
     )
-    index_affected_sql = _entity_address_unified_private(
-        "_index_affected_live_locations_sql"
-    )(
+    index_affected_sql = _entity_address_unified_private("_index_affected_live_locations_sql")(
         "mrf",
         affected_location_table,
     )
-    copy_live_sql = _entity_address_unified_private(
-        "_copy_unaffected_rows_by_location_sql"
-    )(
+    copy_live_sql = _entity_address_unified_private("_copy_unaffected_rows_by_location_sql")(
         "mrf",
         live_table="entity_address_unified",
         target_stage_table=heap_name,
         affected_location_table=affected_location_table,
     )
-    copy_stage_sql = _entity_address_unified_private(
-        "_copy_stage_entity_rows_sql"
-    )(
+    copy_stage_sql = _entity_address_unified_private("_copy_stage_entity_rows_sql")(
         "mrf",
         source_stage_table="entity_address_unified_20260614",
         target_stage_table=heap_name,
@@ -2718,9 +2782,7 @@ def test_entity_address_unified_provider_directory_replacement_can_copy_into_hea
 
 def test_provider_directory_replacement_stage_rebuilds_indexes_after_promote():
     source = inspect.getsource(entity_address_unified.process_data)
-    publish_source = inspect.getsource(
-        entity_address_unified.publish_entity_address_unified_generation
-    )
+    publish_source = inspect.getsource(entity_address_unified.publish_entity_address_unified_generation)
     promote = "ALTER TABLE {db_schema}.{replacement_stage_table} RENAME TO {stage_table};"
     invalidate = 'context["stage_indexes_prepared"] = False'
     rebuild = "await _create_stage_indexes(stage_cls, db_schema, context=context)"
@@ -2763,9 +2825,7 @@ def _partial_shutdown_payload():
             "stage_indexes_prepared": True,
             "support_stage_indexes_prepared": True,
             "partial_provider_directory_replacement_publish": True,
-            "partial_provider_directory_coordinate_scope_table": (
-                "entity_address_unified_20260614_pd_live_locations"
-            ),
+            "partial_provider_directory_coordinate_scope_table": ("entity_address_unified_20260614_pd_live_locations"),
             "partial_provider_directory_replacement_rows": 120,
             "partial_provider_directory_unaffected_live_rows_copied": 100,
             "partial_provider_directory_affected_stage_rows_copied": 20,
@@ -3028,8 +3088,7 @@ async def test_entity_address_unified_can_compact_source_record_ids_by_rewrite(m
     assert compacted_row_count == 42
     assert statements[0] == "DROP TABLE IF EXISTS mrf.entity_address_unified_stage_compact;"
     assert (
-        statements[1]
-        == "CREATE TABLE mrf.entity_address_unified_stage_compact "
+        statements[1] == "CREATE TABLE mrf.entity_address_unified_stage_compact "
         "(LIKE mrf.entity_address_unified_stage INCLUDING ALL);"
     )
     insert_sql = statements[2]
@@ -3040,8 +3099,7 @@ async def test_entity_address_unified_can_compact_source_record_ids_by_rewrite(m
     assert "UPDATE mrf.entity_address_unified_stage" not in "\n".join(statements)
     assert statements[3] == "DROP TABLE mrf.entity_address_unified_stage;"
     assert (
-        statements[4]
-        == "ALTER TABLE mrf.entity_address_unified_stage_compact RENAME TO entity_address_unified_stage;"
+        statements[4] == "ALTER TABLE mrf.entity_address_unified_stage_compact RENAME TO entity_address_unified_stage;"
     )
 
 
@@ -3090,9 +3148,7 @@ async def test_entity_address_unified_skips_support_code_location_indexes_by_def
 
     await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=index_context_map)
 
-    assert "entity_address_medication_bridge_20260614.code_location" in index_context_map[
-        "skipped_stage_indexes"
-    ]
+    assert "entity_address_medication_bridge_20260614.code_location" in index_context_map["skipped_stage_indexes"]
     assert not any("idx_code_location" in statement for statement in statements)
     assert any("idx_npi" in statement for statement in statements)
 
@@ -3158,10 +3214,7 @@ def _assert_serving_stage_indexes(statements, index_context_map) -> None:
         "zip5",
         "ptg_plan_array",
     ):
-        assert (
-            f"entity_address_unified_20260614.{skipped_name}"
-            in index_context_map["skipped_stage_indexes"]
-        )
+        assert f"entity_address_unified_20260614.{skipped_name}" in index_context_map["skipped_stage_indexes"]
 
 
 class _StageIndexRecorder:
@@ -3188,9 +3241,7 @@ class _EntityAddressServingStage:
         },
         {
             "index_elements": (
-                "COALESCE(NULLIF(phone_number, ''), "
-                "regexp_replace(COALESCE(telephone_number, ''), "
-                "'[^0-9]', '', 'g'))",
+                "COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g'))",
                 "npi",
             ),
             "name": "service_phone_lookup_npi",
@@ -3203,8 +3254,7 @@ class _EntityAddressServingStage:
         },
         {
             "index_elements": (
-                "regexp_replace(COALESCE(telephone_number, ''), "
-                "'[^0-9]', '', 'g')",
+                "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
                 "npi",
             ),
             "name": "primary_phone_digits_npi",
@@ -3213,15 +3263,11 @@ class _EntityAddressServingStage:
         {
             "index_elements": ("telephone_number", "npi"),
             "name": "primary_phone_npi",
-            "where": (
-                "type='primary' AND telephone_number IS NOT NULL "
-                "AND telephone_number <> ''"
-            ),
+            "where": ("type='primary' AND telephone_number IS NOT NULL AND telephone_number <> ''"),
         },
         {
             "index_elements": (
-                "regexp_replace(COALESCE(telephone_number, ''), "
-                "'[^0-9]', '', 'g')",
+                "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
                 "npi",
             ),
             "name": "service_phone_digits_npi",
@@ -3242,18 +3288,12 @@ class _EntityAddressServingStage:
         {
             "index_elements": ("address_key", "npi"),
             "name": "service_address_key_npi",
-            "where": (
-                "type IN ('primary', 'secondary', 'practice', 'site') "
-                "AND address_key IS NOT NULL"
-            ),
+            "where": ("type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL"),
         },
         {
             "index_elements": ("premise_key", "npi"),
             "name": "service_premise_key_npi",
-            "where": (
-                "type IN ('primary', 'secondary', 'practice', 'site') "
-                "AND premise_key IS NOT NULL"
-            ),
+            "where": ("type IN ('primary', 'secondary', 'practice', 'site') AND premise_key IS NOT NULL"),
         },
         {
             "index_elements": ("address_sources",),
@@ -3279,18 +3319,14 @@ class _EntityAddressServingStage:
             "name": "procedures_array",
         },
         {
-            "index_elements": (
-                "Geography(ST_MakePoint((long)::double precision, "
-                "(lat)::double precision))",
-            ),
+            "index_elements": ("Geography(ST_MakePoint((long)::double precision, (lat)::double precision))",),
             "using": "gist",
             "name": "geo_idx",
             "where": "lat IS NOT NULL AND long IS NOT NULL",
         },
         {
             "index_elements": (
-                "public.Geography(public.ST_MakePoint((long)::double precision, "
-                "(lat)::double precision))",
+                "public.Geography(public.ST_MakePoint((long)::double precision, (lat)::double precision))",
                 "taxonomy_array public.gist__intbig_ops",
             ),
             "using": "gist",
@@ -3325,15 +3361,13 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
     geo_taxonomy_ddl = next(
         statement
         for statement in statements
-        if statement.lstrip().startswith("CREATE INDEX")
-        and "idx_geo_taxonomy" in statement
+        if statement.lstrip().startswith("CREATE INDEX") and "idx_geo_taxonomy" in statement
     )
     assert "taxonomy_array public.gist__intbig_ops" in geo_taxonomy_ddl
     service_network_ddl = next(
         statement
         for statement in statements
-        if statement.lstrip().startswith("CREATE INDEX")
-        and "idx_service_plans_network_array" in statement
+        if statement.lstrip().startswith("CREATE INDEX") and "idx_service_plans_network_array" in statement
     )
     assert "USING gin (plans_network_array gin__int_ops)" in service_network_ddl
     assert "type IN ('primary', 'secondary', 'practice', 'site')" in service_network_ddl
@@ -3732,7 +3766,7 @@ def test_entity_address_unified_phase_timing_rows_reads_insert_rowcount():
     }
 
     assert (
-            entity_address_unified._phase_timing_rows(
+        entity_address_unified._phase_timing_rows(
             phase_context_map,
             "entity-address-unified aggregating",
         )
@@ -3830,9 +3864,7 @@ def test_provider_directory_partial_post_build_mutations_only_touch_scoped_stage
     assert "JOIN mrf.address_archive_v2 AS a" in same_key_sql
     assert "JOIN mrf.entity_address_unified_20260614_pd_live_locations AS scope" in inherited_sql
     assert "scope.location_key = target.location_key" in inherited_sql
-    source_rows_sql, scoped_targets_sql = same_provider_sql.split(
-        "scoped_targets AS MATERIALIZED", maxsplit=1
-    )
+    source_rows_sql, scoped_targets_sql = same_provider_sql.split("scoped_targets AS MATERIALIZED", maxsplit=1)
     assert "FROM mrf.entity_address_unified_20260614" in source_rows_sql
     assert scope_table not in source_rows_sql
     assert f"mrf.{scope_table} AS scope" in scoped_targets_sql
@@ -3930,8 +3962,7 @@ def _assert_unified_address_index_contract(index_by_name):
         "index_elements": ("phone_number", "npi"),
         "name": "service_phone_number_npi",
         "where": (
-            "type IN ('primary', 'secondary', 'practice', 'site') "
-            "AND phone_number IS NOT NULL AND phone_number <> ''"
+            "type IN ('primary', 'secondary', 'practice', 'site') AND phone_number IS NOT NULL AND phone_number <> ''"
         ),
     }
     assert index_by_name["service_address_key_npi"] == {
@@ -3951,7 +3982,7 @@ def _assert_unified_address_index_contract(index_by_name):
     }
     assert index_by_name["taxonomy_plans_network"]["where"] == "type='primary'"
     assert index_by_name["service_plans_network_array"] == {
-        "index_elements": ("plans_network_array gin__int_ops",),
+        "index_elements": ("plans_network_array public.gin__int_ops",),
         "using": "gin",
         "name": "service_plans_network_array",
         "where": "type IN ('primary', 'secondary', 'practice', 'site')",
@@ -3977,9 +4008,7 @@ def _assert_unified_address_index_contract(index_by_name):
 
 def test_entity_address_unified_indexes_cover_primary_serving_queries():
     """Unified address indexes cover the primary API lookup predicates."""
-    index_by_name = {
-        index["name"]: index for index in EntityAddressUnified.__my_additional_indexes__
-    }
+    index_by_name = {index["name"]: index for index in EntityAddressUnified.__my_additional_indexes__}
 
     assert index_by_name["primary_npi"] == {
         "index_elements": ("npi",),
@@ -4107,12 +4136,8 @@ async def test_push_objects_rewrite_dedupes_mrf_address_on_full_unique_key(monke
 
 
 def test_repeated_bare_line2_unit_value_matches_inline_unit():
-    repeated = address_canon.identity_key_v1(
-        "2227 HALTOM RD STE F", "F", "HALTOM CITY", "TX", "76117", "US"
-    )
-    inline = address_canon.identity_key_v1(
-        "2227 HALTOM RD STE F", "", "HALTOM CITY", "TX", "76117", "US"
-    )
+    repeated = address_canon.identity_key_v1("2227 HALTOM RD STE F", "F", "HALTOM CITY", "TX", "76117", "US")
+    inline = address_canon.identity_key_v1("2227 HALTOM RD STE F", "", "HALTOM CITY", "TX", "76117", "US")
 
     assert repeated == inline == "v2|2227haltomrd|stef||TX|76117|US|street"
     assert address_canon.street_norm("2227 HALTOM RD STE F", "F") == "2227haltomrd"
@@ -4120,12 +4145,8 @@ def test_repeated_bare_line2_unit_value_matches_inline_unit():
 
 
 def test_incomplete_line2_unit_designator_stays_address_text():
-    identity = address_canon.identity_key_v1(
-        "209 S HOUSTON AVE DEPT", "DEPARTMENT", "CAMERON", "TX", "76520", ""
-    )
+    identity = address_canon.identity_key_v1("209 S HOUSTON AVE DEPT", "DEPARTMENT", "CAMERON", "TX", "76520", "")
 
     assert identity == "v2|209shoustonavedeptdepartment|||TX|76520|US|street"
-    assert address_canon.street_norm(
-        "209 S HOUSTON AVE DEPT", "DEPARTMENT"
-    ) == "209shoustonavedeptdepartment"
+    assert address_canon.street_norm("209 S HOUSTON AVE DEPT", "DEPARTMENT") == "209shoustonavedeptdepartment"
     assert address_canon.unit_norm("209 S HOUSTON AVE DEPT", "DEPARTMENT") == ""

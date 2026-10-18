@@ -15,6 +15,7 @@ from process.network_approved_membership_source import (
     copy_approved_membership_batch,
     pin_approved_membership_source,
     read_approved_membership_batch,
+    read_approved_membership_commands,
 )
 from process.network_membership_candidate_lifecycle import (
     MembershipCandidateError,
@@ -373,3 +374,121 @@ async def test_new_approval_rejects_older_source_pin(approved_source):
         )
     assert current.total_rows == source.total_rows == 1
     assert current.generation_id != source.generation_id
+
+
+async def test_command_reader_keeps_document_mode_and_legacy_copy_bytes(approved_source):
+    connection, schema, source_pin, *_ = approved_source
+    async with connection.transaction(isolation="repeatable_read"):
+        positive = await read_approved_membership_batch(connection, source_pin, control_schema=schema)
+        compiled = await read_approved_membership_commands(connection, source_pin, control_schema=schema)
+        assert compiled.additions_copy_bytes == native_copy._encode(positive.input_bytes)[0]
+        assert compiled.input_bytes == positive.input_bytes
+        assert compiled.removals_count == 0 and compiled.command_count == compiled.additions_count == 1
+    document = await connection.fetchval(
+        f"SELECT record_json::text FROM \"{schema}\".registry_approved_record WHERE record_kind='membership'"
+    )
+    document = json.loads(document)
+    member = document["memberships_json"][0]
+    network_key = str(member["network_id"])
+    other_key = str(member["network_id"] + 1)
+    await connection.execute(
+        f"UPDATE \"{schema}\".registry_approved_record SET record_json=jsonb_set(record_json,'{{memberships_json}}',$1::jsonb) WHERE record_kind='membership'",
+        json.dumps([member, member]),
+    )
+    for kind in ("network", "membership"):
+        await connection.execute(
+            f'INSERT INTO "{schema}".registry_approved_record SELECT approved_revision,record_kind,$1,record_revision,custom_revision,jsonb_set(record_json,\'{{network_id}}\',$2::jsonb) FROM "{schema}".registry_approved_record WHERE record_kind=$3 AND record_key=$4',
+            other_key,
+            other_key,
+            kind,
+            network_key,
+        )
+    removal_by_field = {**member, "network_id": int(other_key), "operation": "remove"}
+    await connection.execute(
+        f"UPDATE \"{schema}\".registry_approved_record SET record_json=jsonb_set(record_json,'{{memberships_json}}',$1::jsonb) WHERE record_kind='membership' AND record_key=$2",
+        json.dumps([removal_by_field]),
+        other_key,
+    )
+    async with connection.transaction(isolation="repeatable_read"):
+        pin = await pin_approved_membership_source(
+            connection, approved_revision=source_pin.approved_revision, control_schema=schema
+        )
+        assert pin.total_rows == 3
+        with pytest.raises(ApprovedMembershipSourceError, match="separate add/remove"):
+            await read_approved_membership_batch(connection, pin, control_schema=schema)
+        batches = []
+        key = None
+        while batch := await read_approved_membership_commands(
+            connection, pin, after_network_key=key, control_schema=schema
+        ):
+            batches.append(batch)
+            key = batch.network_key
+        legacy = next(batch for batch in batches if batch.network_key == network_key)
+        commands = next(batch for batch in batches if batch.network_key == other_key)
+        assert (legacy.command_count, legacy.additions_count, legacy.removals_count) == (2, 2, 0)
+        assert (commands.command_count, commands.additions_count, commands.removals_count) == (1, 0, 1)
+        assert legacy.additions_copy_bytes == native_copy._encode(legacy.input_bytes)[0]
+        assert commands.input_sha256 == hashlib.sha256(commands.input_bytes).hexdigest()
+        assert json.loads(commands.input_bytes)[0]["operation"] == "remove"
+
+
+async def test_command_reader_checks_complete_document_without_repeated_map_scan(approved_source):
+    connection, schema, source_pin, *_ = approved_source
+    async with connection.transaction(isolation="repeatable_read"):
+        pin = await pin_approved_membership_source(
+            connection, approved_revision=source_pin.approved_revision, control_schema=schema
+        )
+        counted = CountingConnection(connection)
+        batch = await read_approved_membership_commands(counted, pin, control_schema=schema)
+        assert counted.statements == 1
+        assert (
+            await read_approved_membership_commands(
+                counted, pin, after_network_key=batch.network_key, control_schema=schema
+            )
+            is None
+        )
+        assert counted.statements == 2
+    await connection.execute(
+        f"UPDATE \"{schema}\".registry_approved_record SET record_json=jsonb_set(record_json,'{{memberships_json}}',jsonb_build_array(record_json#>'{{memberships_json,0}}',(record_json#>'{{memberships_json,0}}')||'{{\"operation\":\"remove\"}}'::jsonb)) WHERE record_kind='membership'"
+    )
+    async with connection.transaction(isolation="repeatable_read"):
+        pin = await pin_approved_membership_source(
+            connection, approved_revision=source_pin.approved_revision, control_schema=schema
+        )
+        with pytest.raises(ApprovedMembershipSourceError, match="native validation"):
+            await read_approved_membership_commands(connection, pin, control_schema=schema)
+
+
+@pytest.mark.parametrize("count", [5000, 5001])
+async def test_command_document_limit_refuses_partial_compilation(approved_source, count):
+    connection, schema, *_ = approved_source
+    source_pin = await _bulk_map(approved_source, count)
+    async with connection.transaction(isolation="repeatable_read"):
+        if count > 5000:
+            with pytest.raises(ApprovedMembershipSourceError, match="native bounds"):
+                await read_approved_membership_commands(connection, source_pin, control_schema=schema)
+        else:
+            batch = await read_approved_membership_commands(connection, source_pin, control_schema=schema)
+            assert batch.command_count == batch.additions_count == count
+            assert batch.removals_count == 0
+
+
+async def test_empty_command_document_keeps_seek_identity(approved_source):
+    connection, schema, source_pin, *_ = approved_source
+    await connection.execute(
+        f"UPDATE \"{schema}\".registry_approved_record SET record_json=jsonb_set(record_json,'{{memberships_json}}','[]'::jsonb) WHERE record_kind='membership'"
+    )
+    async with connection.transaction(isolation="repeatable_read"):
+        pin = await pin_approved_membership_source(
+            connection, approved_revision=source_pin.approved_revision, control_schema=schema
+        )
+        batch = await read_approved_membership_commands(connection, pin, control_schema=schema)
+        assert batch.input_bytes == b"[]" and batch.command_count == batch.additions_count == batch.removals_count == 0
+        assert (
+            await read_approved_membership_commands(
+                connection, pin, after_network_key=batch.network_key, control_schema=schema
+            )
+            is None
+        )
+        with pytest.raises(ApprovedMembershipSourceError, match="seek key"):
+            await read_approved_membership_commands(connection, pin, after_network_key="01", control_schema=schema)

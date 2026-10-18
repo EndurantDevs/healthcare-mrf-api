@@ -5,6 +5,7 @@ import contextvars
 import copy
 import datetime
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -30,6 +31,11 @@ def _signed_plan(plan):
 
 def _producer():
     """Construct a real signature-verified producer with bounded fake database reads."""
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
     plan, fence, profile = _plan()
     lease = _signed_plan(plan)
     execution = cms_execution()
@@ -37,7 +43,9 @@ def _producer():
         _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION=contextvars.ContextVar("capacity", default=None),
         PROFILE_EXECUTION_CONTRACT_ID="execution-contract",
         _profile_capacity_preflight_clock=AsyncMock(return_value=VALIDATION_TIME),
-        db=SimpleNamespace(scalar=AsyncMock(return_value=0)),
+        db=SimpleNamespace(
+            scalar=AsyncMock(return_value=0), transaction=transaction, _transaction_binding=lambda: None
+        ),
         _profile_capacity_expected_execution_identity=lambda _execution: lease.signing_preflight_guard[
             "healthcare_receipt"
         ]["profile_execution_identity"],
@@ -46,6 +54,34 @@ def _producer():
         fhir, execution, fence, "run_" + "a" * 32, lease, profile, plan, AsyncMock(), "0/10"
     )
     return producer
+
+
+@pytest.mark.parametrize("source_required", [False, True])
+async def test_consumption_establishes_serializable_before_source_identity(monkeypatch, source_required):
+    from process import provider_directory_generic_source_policy as policy
+    from process import provider_directory_profile_scope_copy as scope
+
+    producer = _producer()
+    producer.fhir._schema = lambda: "fixture"
+    producer.fhir.db.status = AsyncMock()
+    producer.fhir._lock_profile_capacity_preflight_state = AsyncMock(side_effect=RuntimeError("lock reached"))
+    entries = []
+
+    @asynccontextmanager
+    async def transaction(directory, *, isolation, readonly):
+        assert directory is producer.fhir and isolation == "serializable" and readonly is False
+        entries.append(isolation)
+        yield
+
+    monkeypatch.setattr(scope, "preflight_transaction", transaction)
+    monkeypatch.setattr(policy, "is_source_storage_required", lambda: source_required)
+    with pytest.raises(RuntimeError, match="lock reached"):
+        await producer._consume({})
+    assert entries == ["serializable"]
+    if source_required:
+        producer.fhir.db.status.assert_not_awaited()
+    else:
+        producer.fhir.db.status.assert_awaited_once_with("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
 
 
 def _cutover_producer(monkeypatch):
@@ -171,6 +207,126 @@ async def test_logging_reserve_uses_measured_owned_storage_before_rewrite(data_b
     else:
         await producer._assert_physical(request, {"data_tablespace_oid": 2})
         producer.fhir._provider_directory_profile_relation_storage_fingerprint.assert_awaited_once()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("replaced", [False, True])
+async def test_physical_pass_reuses_original_binding_and_checks_every_relation(existing, replaced):
+    producer = _producer()
+    database, original, events = producer.fhir.db, object(), []
+    database.binding = original if existing else None
+    database._transaction_binding = lambda: database.binding
+
+    @asynccontextmanager
+    async def transaction():
+        assert database.binding is None
+        database.binding = original
+        events.append("opened")
+        try:
+            yield
+        finally:
+            database.binding = None
+            events.append("closed")
+
+    async def capture(relation, *_args):
+        assert database.binding is original
+        events.append(relation.relation)
+        return SimpleNamespace(
+            relation_oid=relation.oid + int(replaced and relation.relation == "second"),
+            effective_tablespace_oids=(2,),
+        )
+
+    database.transaction = transaction
+    producer._capture_relation_layout = AsyncMock(side_effect=capture)
+    relations = tuple(
+        OwnedRelation("synthetic", name, oid, 100, "p") for oid, name in enumerate(("first", "second"), 1)
+    )
+    request = NonprofileAdmissionCheck("readiness", producer.lease, producer.plan, relations)
+    if replaced:
+        with pytest.raises(RuntimeError, match="physical_tablespace_changed"):
+            await producer._assert_physical(request, {"data_tablespace_oid": 2})
+    else:
+        await producer._assert_physical(request, {"data_tablespace_oid": 2})
+    assert events == (["first", "second"] if existing else ["opened", "first", "second", "closed"])
+    assert database.binding is (original if existing else None)
+
+
+@pytest.mark.parametrize("changed", [None, "oid", "tablespace"])
+async def test_physical_pass_batches_only_scratch_and_keeps_original_backend(monkeypatch, changed):
+    from process import provider_directory_cms_native_layout as layout
+
+    producer = _producer()
+    database, events = producer.fhir.db, []
+    original = object()
+    database._transaction_binding = lambda: original
+    relations = tuple(
+        OwnedRelation("synthetic", name, oid, 100, "p") for oid, name in enumerate(("scratch", "ordinary"), 1)
+    )
+
+    @asynccontextmanager
+    async def batch(actual, members, *, database_for):
+        assert actual is producer.fhir and members == relations and database_for is None
+        assert database._transaction_binding() is original
+        events.append("before")
+        yield {
+            ("synthetic", "scratch"): SimpleNamespace(
+                relation_oid=1 + int(changed == "oid"), effective_tablespace_oids=(3 if changed == "tablespace" else 2,)
+            )
+        }
+        events.append("after")
+
+    async def ordinary(relation, *_args):
+        assert database._transaction_binding() is original
+        events.append(relation.relation)
+        return SimpleNamespace(relation_oid=relation.oid, effective_tablespace_oids=(2,))
+
+    monkeypatch.setattr(layout, "scratch_layout_batch", batch)
+    producer._capture_relation_layout = AsyncMock(side_effect=ordinary)
+    request = NonprofileAdmissionCheck("readiness", producer.lease, producer.plan, relations)
+    if changed:
+        with pytest.raises(RuntimeError, match="physical_tablespace_changed"):
+            await producer._assert_physical(request, {"data_tablespace_oid": 2})
+        producer._capture_relation_layout.assert_not_awaited()
+    else:
+        await producer._assert_physical(request, {"data_tablespace_oid": 2})
+        assert events == ["before", "ordinary", "after"]
+        producer._capture_relation_layout.assert_awaited_once()
+
+
+@pytest.mark.parametrize("kind", ["raw", "native"])
+async def test_scratch_batch_cannot_replace_stronger_retained_policy(monkeypatch, kind):
+    from process import provider_directory_cms_native_layout as layout
+
+    producer, policy = _producer(), object()
+    relation = OwnedRelation("synthetic", "scratch", 11, 100, "p")
+    coordinate = (relation.schema, relation.relation)
+    producer._raw_relation_policies = lambda _request: {coordinate: policy} if kind == "raw" else {}
+    producer._native_relation_policies = lambda _request: {coordinate: policy} if kind == "native" else {}
+
+    @asynccontextmanager
+    async def batch(_fhir, members, **_kwargs):
+        assert members == ()
+        yield {}
+
+    monkeypatch.setattr(layout, "scratch_layout_batch", batch)
+    observed_catalog = ({"relation": {"relation_oid": relation.oid}}, None)
+    native_capture = AsyncMock(return_value={(relation.schema, relation.relation, relation.oid): observed_catalog})
+    monkeypatch.setattr(layout, "observe_native_catalog_batch", native_capture)
+    producer._capture_relation_layout = AsyncMock(
+        return_value=SimpleNamespace(relation_oid=11, effective_tablespace_oids=(2,))
+    )
+    request = NonprofileAdmissionCheck("readiness", producer.lease, producer.plan, (relation,))
+    await producer._assert_physical(request, {"data_tablespace_oid": 2})
+    assert producer._capture_relation_layout.await_args.args == (
+        relation,
+        policy if kind == "raw" else None,
+        policy if kind == "native" else None,
+    )
+    if kind == "native":
+        native_capture.assert_awaited_once_with(producer.fhir, [relation], database=producer.fhir.db)
+        assert producer._capture_relation_layout.await_args.kwargs == {"observed_catalog": observed_catalog}
+    else:
+        native_capture.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

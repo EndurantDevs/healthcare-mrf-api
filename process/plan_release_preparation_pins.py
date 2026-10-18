@@ -1,0 +1,241 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Short native retention cuts between isolated preparation and durable jobs."""
+
+from db.plan_release_storage import BINDING_TABLE, PIN_TABLE, REVISION_TABLE, storage_identifier, storage_relation
+from process.plan_release_preparation_pin_catalog import require_preparation_pin_heap
+from process.plan_release_preparation_pin_contract import (
+    PreparationPinAuthority,
+    PreparationPinInputs,
+    PreparationPinReceipt,
+    PreparationPinScope,
+    require,
+)
+from process.plan_release_storage_custody import require_plan_release_storage_custody
+from process.ptg_parts.ptg2_lifecycle_lock import PTG2_SOURCE_LIFECYCLE_LOCK_NAMESPACE, PTG2_SOURCE_POINTER_GC_LOCK_KEY
+
+
+def _roles(owner_role, publisher_role, reader_roles, control_reader_roles=()):
+    return dict(
+        owner_role=owner_role,
+        publisher_role=publisher_role,
+        reader_roles=reader_roles,
+        control_reader_roles=control_reader_roles,
+    )
+
+
+def _pin_options(options_by_name):
+    """Keep authority and the explicit control subset as closed optional keywords."""
+    require(set(options_by_name) <= {"authority", "control_reader_roles"}, "unknown_pin_options")
+    return options_by_name.get("authority"), options_by_name.get("control_reader_roles", ())
+
+
+async def _authorize(connection, scope, authority, *, action, phase, observed):
+    witness = await authority(connection, scope, action=action, phase=phase, observed=observed)
+    require(type(witness) is PreparationPinAuthority, "native_authority_witness_required")
+    return witness.validate(scope)
+
+
+async def _entry(connection, storage_schema, scope, authority, roles):
+    require(connection.is_in_transaction(), "caller_transaction_required")
+    require(type(scope) is PreparationPinScope and callable(authority), "native_authority_required")
+    scope.validate()
+    baseline = await require_plan_release_storage_custody(connection, storage_schema, **roles)
+    await connection.execute("SET LOCAL lock_timeout='500ms'")
+    await connection.execute("SET LOCAL statement_timeout='5s'")
+    await _owner(connection, roles)
+    roots = ",".join(
+        "ONLY " + storage_relation(storage_schema, name) for name in (PIN_TABLE, BINDING_TABLE, REVISION_TABLE)
+    )
+    await connection.execute("LOCK TABLE " + roots + " IN ACCESS SHARE MODE")
+    await _publisher(connection, roles)
+    await connection.execute("SELECT pg_advisory_xact_lock_shared(hashtext($1))", PTG2_SOURCE_POINTER_GC_LOCK_KEY)
+    for source_key in scope.source_keys:
+        await connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            PTG2_SOURCE_LIFECYCLE_LOCK_NAMESPACE + ":" + source_key,
+        )
+    root_oid = next(
+        row["oid"] for row in baseline["relations"] if row["nspname"] == storage_schema and row["relname"] == PIN_TABLE
+    )
+    return root_oid, baseline["owner_oid"]
+
+
+async def _owner(connection, roles):
+    await connection.execute(f"SET LOCAL ROLE {storage_identifier(roles['owner_role'])}")
+
+
+async def _publisher(connection, roles):
+    await connection.execute(f"SET LOCAL ROLE {storage_identifier(roles['publisher_role'])}")
+
+
+async def _unserved(connection, storage_schema, revision_ids):
+    header_relation = storage_relation(storage_schema, REVISION_TABLE)
+    binding_relation = storage_relation(storage_schema, BINDING_TABLE)
+    require(
+        not await connection.fetchval(
+            f"SELECT EXISTS(SELECT FROM {header_relation} WHERE serving_revision_id=ANY($1::text[])) "
+            f"OR EXISTS(SELECT FROM {binding_relation} WHERE serving_revision_id=ANY($1::text[]))",
+            list(revision_ids),
+        ),
+        "revision_has_serving_history",
+    )
+
+
+async def _planned_inputs(connection, storage_schema, scope, binding_heap, pin_heap):
+    binding_relation = storage_relation(binding_heap.schema, binding_heap.name)
+    pin_relation = storage_relation(pin_heap.schema, pin_heap.name)
+    snapshots = storage_relation(storage_schema, "ptg2_snapshot")
+    plan_scopes = storage_relation(storage_schema, "ptg2_v3_snapshot_plan_scope")
+    require(
+        not await connection.fetchval(
+            f"WITH expected AS (SELECT unnest($1::text[]) AS serving_revision_id) SELECT EXISTS("
+            f"(SELECT DISTINCT serving_revision_id FROM {binding_relation} EXCEPT SELECT * FROM expected) UNION ALL "
+            f"(SELECT * FROM expected EXCEPT SELECT DISTINCT serving_revision_id FROM {binding_relation}))",
+            list(scope.revision_ids),
+        ),
+        "binding_revision_cohort_changed",
+    )
+    require(
+        not await connection.fetchval(
+            f"SELECT EXISTS((SELECT serving_revision_id,snapshot_id FROM {binding_relation} EXCEPT SELECT serving_revision_id,snapshot_id FROM {pin_relation}) UNION ALL "
+            f"(SELECT serving_revision_id,snapshot_id FROM {pin_relation} EXCEPT SELECT serving_revision_id,snapshot_id FROM {binding_relation}))"
+        ),
+        "pin_binding_antijoin_failed",
+    )
+    require(
+        not await connection.fetchval(
+            f"SELECT EXISTS(SELECT FROM {binding_relation} b LEFT JOIN {snapshots} s USING(snapshot_id) "
+            "WHERE s.snapshot_id IS NULL OR s.status<>'published' OR s.manifest->'serving_index'->>'source_key' IS DISTINCT FROM b.source_key "
+            f"OR NOT EXISTS(SELECT FROM {plan_scopes} p WHERE p.snapshot_id=b.snapshot_id AND p.plan_id=b.plan_id "
+            "AND (b.plan_market_type IS NULL OR p.plan_market_type=b.plan_market_type)))"
+        ),
+        "physical_source_antijoin_failed",
+    )
+    actual_sources = await connection.fetchval(
+        f"SELECT array_agg(DISTINCT source_key ORDER BY source_key) FROM {binding_relation}"
+    )
+    require(actual_sources == list(scope.source_keys), "source_cohort_changed")
+
+
+def _bounds(revision_ids):
+    # All values are already canonical identifiers, never caller SQL.
+    return ",".join("'" + revision + "'" for revision in revision_ids)
+
+
+async def _attach(connection, storage_schema, heap, revision_ids):
+    await connection.execute(
+        f"ALTER TABLE {storage_relation(storage_schema, PIN_TABLE)} ATTACH PARTITION {storage_relation(heap.schema, heap.name)} FOR VALUES IN ({_bounds(revision_ids)})"
+    )
+
+
+async def _heap(connection, storage_schema, expected, roles, *, pin, parent_oid=None):
+    return await require_preparation_pin_heap(
+        connection, expected, storage_schema=storage_schema, pin=pin, parent_oid=parent_oid, **roles
+    )
+
+
+async def _post_storage(connection, storage_schema, roles, root_oid, owner_oid):
+    proof = await require_plan_release_storage_custody(connection, storage_schema, **roles)
+    root = next(row for row in proof["relations"] if row["nspname"] == storage_schema and row["relname"] == PIN_TABLE)
+    require((root["oid"], proof["owner_oid"]) == (root_oid, owner_oid), "root_identity_changed")
+
+
+async def retain_preparation_pins(
+    connection,
+    storage_schema,
+    scope,
+    inputs,
+    *,
+    owner_role,
+    publisher_role,
+    reader_roles,
+    **admission_options,
+):
+    """Commit future pin custody before any network request; never switch serving."""
+    authority, control_reader_roles = _pin_options(admission_options)
+    roles = _roles(owner_role, publisher_role, reader_roles, control_reader_roles)
+    require(type(inputs) is PreparationPinInputs, "native_heap_receipts_required")
+    inputs.validate()
+    binding_heap, pin_heap = inputs.binding_heap, inputs.pin_heap
+    async with connection.transaction():
+        root_oid, owner_oid = await _entry(connection, storage_schema, scope, authority, roles)
+        before = await _authorize(connection, scope, authority, action="retain", phase="before", observed=None)
+        require(before.preparation_status in {"admitting", "sealed"}, "preparation_not_active")
+        require(
+            before.binding_heap == binding_heap and before.prepared_pin_heap == pin_heap,
+            "protected_heap_inventory_changed",
+        )
+        await _owner(connection, roles)
+        await _unserved(connection, storage_schema, scope.revision_ids)
+        await _heap(connection, storage_schema, binding_heap, roles, pin=False)
+        registered = before.registered_receipt
+        if registered is None:
+            require(
+                before.preparation_status == "admitting"
+                and not before.detached_receipts
+                and not before.cleaned_receipts
+                and all(
+                    admission.status == "reserved" and admission.dispatch_count == 0 and admission.engine_run_id is None
+                    for admission in before.admissions
+                ),
+                "late_pin_admission_refused",
+            )
+            await _heap(connection, storage_schema, pin_heap, roles, pin=True)
+            await _planned_inputs(connection, storage_schema, scope, binding_heap, pin_heap)
+            await _attach(connection, storage_schema, pin_heap, scope.revision_ids)
+            receipt = PreparationPinReceipt(scope, pin_heap, root_oid, owner_oid, scope.revision_ids).validate()
+        else:
+            require(
+                registered == PreparationPinReceipt(scope, pin_heap, root_oid, owner_oid, scope.revision_ids),
+                "registered_pin_custody_changed",
+            )
+            await _heap(connection, storage_schema, pin_heap, roles, pin=True, parent_oid=root_oid)
+            await _planned_inputs(connection, storage_schema, scope, binding_heap, pin_heap)
+            receipt = registered
+        await _publisher(connection, roles)
+        after = await _authorize(connection, scope, authority, action="retain", phase="after", observed=receipt)
+        require(after.registered_receipt == receipt, "pin_enrollment_not_persisted")
+        await _post_storage(connection, storage_schema, roles, root_oid, owner_oid)
+        return receipt
+
+
+async def require_preparation_pins(
+    connection,
+    storage_schema,
+    receipt,
+    *,
+    owner_role,
+    publisher_role,
+    reader_roles,
+    authority=None,
+    control_reader_roles=(),
+):
+    """Accept only this exact retained cohort before the caller's one serving cut."""
+    require(connection.is_in_transaction(), "caller_transaction_required")
+    require(type(receipt) is PreparationPinReceipt, "pin_receipt_required")
+    receipt.validate()
+    roles = _roles(owner_role, publisher_role, reader_roles, control_reader_roles)
+    async with connection.transaction():
+        root_oid, owner_oid = await _entry(connection, storage_schema, receipt.scope, authority, roles)
+        before = await _authorize(
+            connection, receipt.scope, authority, action="serving", phase="before", observed=receipt
+        )
+        require(
+            before.registered_receipt == receipt and (root_oid, owner_oid) == (receipt.root_oid, receipt.owner_oid),
+            "registered_pin_custody_changed",
+        )
+        retained = before.require_settled()
+        require(
+            before.preparation_status == "sealed" and retained == receipt.retained_revision_ids,
+            "pin_serving_members_changed",
+        )
+        await _owner(connection, roles)
+        await _unserved(connection, storage_schema, receipt.retained_revision_ids)
+        await _heap(connection, storage_schema, receipt.heap, roles, pin=True, parent_oid=root_oid)
+        await _publisher(connection, roles)
+        after = await _authorize(
+            connection, receipt.scope, authority, action="serving", phase="after", observed=receipt
+        )
+        require(after.registered_receipt == receipt, "pin_serving_custody_changed")
+        await _post_storage(connection, storage_schema, roles, root_oid, owner_oid)
+        return receipt

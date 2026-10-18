@@ -10,9 +10,7 @@ from sqlalchemy.schema import CreateTable
 from db.models import (
     ProviderDirectoryDatasetAffiliationOrganization,
     ProviderDirectoryDatasetNetworkPlan,
-    ProviderDirectoryEndpointDataset,
 )
-
 
 MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
@@ -51,10 +49,9 @@ class _OpRecorder:
 
 def test_dataset_network_plan_model_is_dataset_scoped_with_reverse_lookup():
     table = ProviderDirectoryDatasetNetworkPlan.__table__
-    primary_key_columns = tuple(
-        column.name for column in table.primary_key.columns
-    )
-    dataset_foreign_key = next(iter(table.c.dataset_id.foreign_keys))
+    primary_key_columns = tuple(column.name for column in table.primary_key.columns)
+    assert not table.foreign_keys
+    assert table.info["managed_immutable_storage"] is True
     lookup_index = ProviderDirectoryDatasetNetworkPlan.__my_additional_indexes__[0]
     ddl = str(CreateTable(table).compile(dialect=postgresql.dialect()))
 
@@ -64,11 +61,6 @@ def test_dataset_network_plan_model_is_dataset_scoped_with_reverse_lookup():
         "network_resource_id",
         "insurance_plan_resource_id",
     )
-    assert dataset_foreign_key.target_fullname == (
-        f"{ProviderDirectoryEndpointDataset.__table__.schema}."
-        "provider_directory_endpoint_dataset.dataset_id"
-    )
-    assert dataset_foreign_key.ondelete == "CASCADE"
     assert lookup_index == {
         "index_elements": ("dataset_id", "insurance_plan_resource_id"),
         "include": ("network_resource_id",),
@@ -85,10 +77,9 @@ def test_dataset_network_plan_model_is_dataset_scoped_with_reverse_lookup():
 
 def test_dataset_affiliation_organization_model_is_dataset_scoped_through_pk():
     table = ProviderDirectoryDatasetAffiliationOrganization.__table__
-    primary_key_columns = tuple(
-        column.name for column in table.primary_key.columns
-    )
-    dataset_foreign_key = next(iter(table.c.dataset_id.foreign_keys))
+    primary_key_columns = tuple(column.name for column in table.primary_key.columns)
+    assert not table.foreign_keys
+    assert table.info["managed_immutable_storage"] is True
     ddl = str(CreateTable(table).compile(dialect=postgresql.dialect()))
 
     assert primary_key_columns == (
@@ -96,10 +87,7 @@ def test_dataset_affiliation_organization_model_is_dataset_scoped_through_pk():
         "participating_organization_resource_id",
         "affiliation_resource_id",
     )
-    assert dataset_foreign_key.ondelete == "CASCADE"
-    assert "__my_additional_indexes__" not in (
-        ProviderDirectoryDatasetAffiliationOrganization.__dict__
-    )
+    assert "__my_additional_indexes__" not in (ProviderDirectoryDatasetAffiliationOrganization.__dict__)
     assert {
         "acquisition_root_run_id",
         "build_run_id",
@@ -117,47 +105,29 @@ def test_dataset_serving_relations_migration_matches_models(monkeypatch):
 
     migration.upgrade()
 
-    assert migration.revision == (
-        "20260713213000_provider_directory_dataset_serving_relations"
-    )
-    assert migration.down_revision == (
-        "20260713210000_provider_directory_profile_fields"
-    )
+    assert migration.revision == ("20260713213000_provider_directory_dataset_serving_relations")
+    assert migration.down_revision == ("20260713210000_provider_directory_profile_fields")
     model_by_table_name = {
-        "provider_directory_dataset_network_plan": (
-            ProviderDirectoryDatasetNetworkPlan
-        ),
-        "provider_directory_dataset_affiliation_organization": (
-            ProviderDirectoryDatasetAffiliationOrganization
-        ),
+        "provider_directory_dataset_network_plan": (ProviderDirectoryDatasetNetworkPlan),
+        "provider_directory_dataset_affiliation_organization": (ProviderDirectoryDatasetAffiliationOrganization),
     }
     assert set(recorder.tables) == set(model_by_table_name)
     for table_name, relation_model in model_by_table_name.items():
         recorded_table = recorder.tables[table_name]
         recorded_columns = [
-            schema_item.name for schema_item in recorded_table["items"]
-            if isinstance(schema_item, sa.Column)
+            schema_item.name for schema_item in recorded_table["items"] if isinstance(schema_item, sa.Column)
         ]
         assert recorded_columns == list(relation_model.__table__.columns.keys())
         assert recorded_table["schema"] == "mrf"
         foreign_key = next(
-            schema_item for schema_item in recorded_table["items"]
-            if isinstance(schema_item, sa.ForeignKeyConstraint)
+            schema_item for schema_item in recorded_table["items"] if isinstance(schema_item, sa.ForeignKeyConstraint)
         )
         assert foreign_key.ondelete == "CASCADE"
-    assert set(recorder.indexes) == {
-        "provider_directory_dataset_network_plan_reverse_lookup_idx"
-    }
-    lookup_index = recorder.indexes[
-        "provider_directory_dataset_network_plan_reverse_lookup_idx"
-    ]
-    assert lookup_index["table_name"] == (
-        "provider_directory_dataset_network_plan"
-    )
+    assert set(recorder.indexes) == {"provider_directory_dataset_network_plan_reverse_lookup_idx"}
+    lookup_index = recorder.indexes["provider_directory_dataset_network_plan_reverse_lookup_idx"]
+    assert lookup_index["table_name"] == ("provider_directory_dataset_network_plan")
     assert lookup_index["columns"] == [
         "dataset_id",
         "insurance_plan_resource_id",
     ]
-    assert lookup_index["postgresql_include"] == [
-        "network_resource_id"
-    ]
+    assert lookup_index["postgresql_include"] == ["network_resource_id"]

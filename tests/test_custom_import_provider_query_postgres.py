@@ -54,6 +54,7 @@ from tests import test_custom_import_provider_list as list_fixture
 from tests import test_custom_import_read_core_postgres as read_fixture
 from tests import test_custom_import_read_http as http_fixture
 from tests.custom_import_postgres_support import _database_url, digest, isolated_publication_case, transaction_session
+from tests.custom_import_signed_reader_postgres_support import grant_signed_reader_tables, signed_publication_reader
 from tests.test_custom_import_plan_pricing import (
     _import_context,
     _install_code_lookup_scope,
@@ -450,14 +451,42 @@ async def test_provider_query_order_only_left_join_keeps_absent_native_npis_last
         assert [provider_row.npi for provider_row in first_page + second_page] == [_NPI, _ABSENT_NPI]
 
 
+def _signed_provider_service_payload(dataset_key, target):
+    """Build the existing signed provider request for the selected published target."""
+    target_map = {
+        "dataset_key": dataset_key,
+        "generation_id": target.generation_id,
+        "definition_revision_id": target.definition_revision_id,
+        "schema_revision_id": target.schema_revision_id,
+        "profile_id": target.profile_id,
+    }
+    body = transport._canonical_json_bytes(
+        {
+            "target": target_map,
+            "native_query": {
+                "code": "99213",
+                "code_system": "HP_PROCEDURE_CODE",
+                "year": "2024",
+                "limit": "2",
+            },
+            "context": [{"field_id": "synthetic_alpha", "operator": "eq", "value": "low-1"}],
+            "filters": [],
+            "order": None,
+            "require_match": True,
+        }
+    )
+    return target_map, body
+
+
 @pytest.mark.asyncio
 async def test_signed_provider_service_http_joins_imported_npi_to_real_claim_rows(monkeypatch):
     """A signed extension read reaches the native claims handler and hydrates its match."""
 
     _seed_npi_bindings(monkeypatch)
-    http_fixture._install_keyring(monkeypatch)
-    async with isolated_publication_case() as case:
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
+    async with isolated_publication_case() as raw_case, signed_publication_reader(raw_case, monkeypatch) as case:
         await _create_pricing_claim_tables(case)
+        await grant_signed_reader_tables(case, pricing.provider_table.name, pricing.provider_procedure_table.name)
         async with case.sessions() as seed_session, seed_session.begin():
             fixture = await _seed_npi_fixture(seed_session)
             dataset_key = await seed_session.scalar(
@@ -468,28 +497,7 @@ async def test_signed_provider_service_http_joins_imported_npi_to_real_claim_row
             assert dataset_key is not None
             await _seed_pricing_claim_rows(seed_session)
         monkeypatch.setattr(pricing, "PRICING_SCHEMA", case.schema_name)
-        target_map = {
-            "dataset_key": dataset_key,
-            "generation_id": fixture.target.generation_id,
-            "definition_revision_id": fixture.target.definition_revision_id,
-            "schema_revision_id": fixture.target.schema_revision_id,
-            "profile_id": fixture.target.profile_id,
-        }
-        body = transport._canonical_json_bytes(
-            {
-                "target": target_map,
-                "native_query": {
-                    "code": "99213",
-                    "code_system": "HP_PROCEDURE_CODE",
-                    "year": "2024",
-                    "limit": "2",
-                },
-                "context": [{"field_id": "synthetic_alpha", "operator": "eq", "value": "low-1"}],
-                "filters": [],
-                "order": None,
-                "require_match": True,
-            }
-        )
+        target_map, body = _signed_provider_service_payload(dataset_key, fixture.target)
         async with case.sessions() as session:
             request = SimpleNamespace(
                 args=RequestParameters({}),
@@ -505,6 +513,8 @@ async def test_signed_provider_service_http_joins_imported_npi_to_real_claim_row
                 ctx=SimpleNamespace(sa_session=session),
             )
             reply = await service_http.serve_custom_import_provider_service(request, session)
+            assert not session.in_transaction()
+        assert len(case.reader_sessions) == 1
     reply_payload = json.loads(reply.body)
     assert reply.status == 200
     assert reply_payload["pagination"]["total"] == 1

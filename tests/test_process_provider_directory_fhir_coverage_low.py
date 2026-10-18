@@ -14,11 +14,11 @@ from tests.provider_directory_fhir_coverage_low_support import (
     AsyncContext,
     GuardConnection,
     GuardEngine,
+    artifact_dataset,
     assert_address_publication_edges,
     assert_artifact_summary_edges,
     assert_network_publication_edges,
     assert_seed_fetch_edges,
-    artifact_dataset,
     bulk_identity,
     run_nonvalid_probe_batch,
 )
@@ -43,12 +43,8 @@ async def test_reverse_lookup_control_edges(monkeypatch):
     await state.produce_seed_rows(request, queue, 1)
     assert state.seed_count == 1
 
-    cancel_options = importer.ScanPractitionerRoleFetchOptions(
-        0, 0, 10, 1, None, cancel_ctx={"run_id": "run-1"}
-    )
-    cancel_request = importer._PractitionerRoleReverseLookupRequest(
-        request.source, {}, cancel_options, 1, None
-    )
+    cancel_options = importer.ScanPractitionerRoleFetchOptions(0, 0, 10, 1, None, cancel_ctx={"run_id": "run-1"})
+    cancel_request = importer._PractitionerRoleReverseLookupRequest(request.source, {}, cancel_options, 1, None)
     monkeypatch.setattr(importer, "_raise_if_resource_import_cancelled", AsyncMock())
     monkeypatch.setattr(importer, "_scan_practitioner_role_reverse_lookup_url", Mock(return_value="next"))
     monkeypatch.setattr(state, "has_reached_page_limit", AsyncMock(return_value=True))
@@ -57,20 +53,21 @@ async def test_reverse_lookup_control_edges(monkeypatch):
 
 
 def test_small_normalization_edges(monkeypatch):
-    assert importer._minimal_resource_id_rows(
-        [{"resource_id": " 123 "}, {"resource_id": None}]
-    ) == [{"resource_id": "123"}]
-    assert importer._amerihealth_caritas_plan_code(
-        {"org_name": "AmeriHealth Caritas Pennsylvania"}
-    ) == importer.AMERIHEALTH_CARITAS_PLAN_CODES_BY_ALIAS[
-        importer._payer_alias_key("AmeriHealth Caritas Pennsylvania")
+    assert importer._minimal_resource_id_rows([{"resource_id": " 123 "}, {"resource_id": None}]) == [
+        {"resource_id": "123"}
     ]
+    assert (
+        importer._amerihealth_caritas_plan_code({"org_name": "AmeriHealth Caritas Pennsylvania"})
+        == importer.AMERIHEALTH_CARITAS_PLAN_CODES_BY_ALIAS[
+            importer._payer_alias_key("AmeriHealth Caritas Pennsylvania")
+        ]
+    )
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT", "true")
     assert importer._is_bulk_export_enabled(None) is True
     assert importer._is_bulk_export_enabled(False) is False
-    assert importer._source_fetch_candidate_urls(
+    assert importer._source_fetch_candidate_urls("https://example.test/fhir/Practitioner?_count=invalid") == [
         "https://example.test/fhir/Practitioner?_count=invalid"
-    ) == ["https://example.test/fhir/Practitioner?_count=invalid"]
+    ]
     assert importer._is_safe_bulk_https_url("https://example.test:bad/fhir") is False
 
 
@@ -118,9 +115,7 @@ def test_oauth_transport_failure_is_local(monkeypatch):
 
 
 def test_credential_options_tolerate_empty_oauth_token(monkeypatch):
-    credential_spec_by_field = {
-        "oauth2": {"token_url": "https://auth.example.test/token"}
-    }
+    credential_spec_by_field = {"oauth2": {"token_url": "https://auth.example.test/token"}}
     monkeypatch.setattr(
         importer,
         "_credential_spec_for_source",
@@ -151,9 +146,19 @@ async def test_coordinate_empty_scope_and_backfill(monkeypatch):
     assert all("source_id = ANY" not in clause for clause in clauses)
     monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
     monkeypatch.setattr(importer.db, "first", AsyncMock(return_value={"candidate_rows": 0}))
-    assert await importer.backfill_provider_directory_location_coordinates(
-        "public", run_id=None, source_ids=None
-    ) == 0
+    previous = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()
+    token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+        {**previous, "provider_directory_location": "owned_coordinate_stage"}
+    )
+    try:
+        assert (
+            await importer.backfill_provider_directory_location_coordinates("public", run_id=None, source_ids=None) == 0
+        )
+    finally:
+        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(token)
+    statement = str(importer.db.first.await_args.args[0])
+    assert '"public"."owned_coordinate_stage"' in statement
+    assert importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get() == previous
     monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value="public.addr_key_v1"))
     assert await importer._has_address_canon_functions("public") is True
 
@@ -180,9 +185,7 @@ async def test_artifact_summary_invalid_and_missing(monkeypatch):
 
 def test_relation_aggregation_without_network():
     affiliation_key = importer.PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY
-    proof = importer._aggregate_dataset_serving_relation_proofs(
-        {affiliation_key: []}, build_run_id=None
-    )
+    proof = importer._aggregate_dataset_serving_relation_proofs({affiliation_key: []}, build_run_id=None)
     assert importer.PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY not in proof
     assert affiliation_key in proof
 
@@ -198,18 +201,21 @@ async def test_unpromoted_stages_are_not_removed(monkeypatch):
     remove = AsyncMock()
     monkeypatch.setattr(importer, "_remove_provider_directory_artifact_stage", remove)
     with pytest.raises(RuntimeError, match="promotion failed"):
-        await importer._finalize_provider_directory_profile_stages(
-            {}, stages, defer_cutover=False
-        )
+        await importer._finalize_provider_directory_profile_stages({}, stages, defer_cutover=False)
     remove.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_resource_npi_empty_scope_and_missing_copy(monkeypatch):
-    monkeypatch.setattr(importer.db, "status", AsyncMock(return_value="UPDATE 1"))
-    assert await importer.backfill_provider_directory_resource_id_npis(
-        "public", run_id=None, seen_table=None
-    ) == {"Practitioner": 1, "Organization": 1}
+    from process import provider_directory_output_npi_backfill as repair
+
+    staged = AsyncMock(return_value={"Practitioner": 1, "Organization": 1})
+    monkeypatch.setattr(repair, "backfill_resource_id_npis", staged)
+    assert await importer.backfill_provider_directory_resource_id_npis("public", run_id=None, seen_table=None) == {
+        "Practitioner": 1,
+        "Organization": 1,
+    }
+    staged.assert_awaited_once_with(importer, "public", run_id=None, source_ids=None, seen_table=None)
 
     raw_connection = SimpleNamespace()
     connection = SimpleNamespace(raw_connection=raw_connection)
@@ -235,9 +241,10 @@ async def test_network_catalog_small_edges(monkeypatch):
     monkeypatch.setattr(importer.db, "status", status)
     await importer._rename_network_catalog_stage_indexes("public", "stage")
     status.assert_not_awaited()
-    assert importer._provider_directory_network_catalog_scope_filter(
-        "row", run_id="run-1", source_ids=None
-    ).count("AND") == 1
+    assert (
+        importer._provider_directory_network_catalog_scope_filter("row", run_id="run-1", source_ids=None).count("AND")
+        == 1
+    )
     assert importer._location_archive_stage_table_name("stable").startswith(
         importer.PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_STAGE_PREFIX
     )
@@ -271,18 +278,19 @@ def test_catalog_filters_skip_unmatched_public_rows():
 State,Provider Directory Production Base URL,Status - Drop Down List,Is the API public? (Y/N) - Drop Down List,FHIR Capability Statement link
 Iowa,https://fixture.test/fhir/Practitioner,Active,Yes,
 """
-    assert importer._cms_sma_seed_rows_from_csv(
-        cms_csv, source_query="not-iowa", source_url="fixture.csv"
-    ) == []
+    assert importer._cms_sma_seed_rows_from_csv(cms_csv, source_query="not-iowa", source_url="fixture.csv") == []
     amerigroup_html = """
     <table><tr>
       <td>5400</td><td>AmeriHealth Caritas District of Columbia</td>
       <td><a href="https://api-ext.amerihealthcaritas.com/5400/provider-api/swagger-ui/">API</a></td>
     </tr></table>
     """
-    assert importer._amerihealth_seed_rows_from_catalog_html(
-        amerigroup_html, source_query="not-amerihealth", source_url="fixture.html"
-    ) == []
+    assert (
+        importer._amerihealth_seed_rows_from_catalog_html(
+            amerigroup_html, source_query="not-amerihealth", source_url="fixture.html"
+        )
+        == []
+    )
 
 
 def test_seed_resolution_and_sync_fetch_edges(monkeypatch):
@@ -295,9 +303,10 @@ async def test_async_fetch_wrappers(monkeypatch):
     to_thread = AsyncMock(return_value=expected)
     monkeypatch.setattr(importer.asyncio, "to_thread", to_thread)
     assert await importer._fetch_json("https://fixture.test/fhir", timeout=1) == expected
-    assert await importer._fetch_json_with_options(
-        "https://fixture.test/fhir", timeout=1, extra_headers={"X-Test": "1"}
-    ) == expected
+    assert (
+        await importer._fetch_json_with_options("https://fixture.test/fhir", timeout=1, extra_headers={"X-Test": "1"})
+        == expected
+    )
     assert to_thread.await_count == 2
 
 
@@ -305,15 +314,16 @@ def test_molina_and_quota_edges():
     current_url = f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=10"
     same_origin = f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Practitioner?cursorMark=next"
     assert importer._resolved_molina_next_url(current_url, same_origin) == same_origin
-    invalid_duration_by_field = {
-        "message": "Out of call volume quota. Quota will be replenished in 01:99:99."
-    }
-    assert importer._molina_quota_retry_not_before(
-        {"api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE},
-        403,
-        invalid_duration_by_field,
-        now_utc=datetime.datetime(2026, 7, 22, tzinfo=datetime.UTC),
-    ) is None
+    invalid_duration_by_field = {"message": "Out of call volume quota. Quota will be replenished in 01:99:99."}
+    assert (
+        importer._molina_quota_retry_not_before(
+            {"api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE},
+            403,
+            invalid_duration_by_field,
+            now_utc=datetime.datetime(2026, 7, 22, tzinfo=datetime.UTC),
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -331,9 +341,7 @@ async def test_public_resolver_edges(monkeypatch):
 @pytest.mark.asyncio
 async def test_guard_owner_and_lock_failures(monkeypatch):
     identity = bulk_identity()
-    owner_connection = SimpleNamespace(
-        scalar=AsyncMock(side_effect=RuntimeError("connection lost"))
-    )
+    owner_connection = SimpleNamespace(scalar=AsyncMock(side_effect=RuntimeError("connection lost")))
     with pytest.raises(RuntimeError, match="worker_guard_lost"):
         await importer._assert_bulk_checkpoint_guard_owner(owner_connection, identity)
 
@@ -366,3 +374,19 @@ async def test_guard_unlock_is_best_effort(monkeypatch, unlock_result):
 async def test_probe_batch_nonvalid_capabilities(monkeypatch):
     observed = await run_nonvalid_probe_batch(monkeypatch)
     assert observed == (40, 0, set())
+
+
+@pytest.mark.asyncio
+async def test_coordinate_schema_mismatch_refuses_before_rebuild(monkeypatch):
+    from process import provider_directory_output_location_rebuild as rebuild
+
+    publish = AsyncMock(side_effect=AssertionError("rebuild reached"))
+    monkeypatch.setattr(importer, "_schema", lambda: "mrf")
+    monkeypatch.setattr(rebuild, "rebuild_location_snapshot", publish)
+    token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set({})
+    try:
+        with pytest.raises(RuntimeError, match="schema_changed"):
+            await importer.backfill_provider_directory_location_coordinates("other")
+    finally:
+        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(token)
+    publish.assert_not_awaited()

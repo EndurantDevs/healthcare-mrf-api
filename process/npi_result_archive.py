@@ -2011,6 +2011,21 @@ async def _admit_automatic_cutover(
         raise NpiResultArchiveError("NPI automatic generation is stale or unrelated") from error
 
 
+async def _preserve_npi_input_reads(session, ownership, incumbent):
+    from process.native_publication_read_access import preserve_publication_reads
+
+    connection = await session.connection()
+    driver = (await connection.get_raw_connection()).driver_connection
+    for name in RELATION_NAMES:
+        await preserve_publication_reads(
+            driver,
+            schema=incumbent.schema_name,
+            live_table=name,
+            stage_schema=ownership.schema_name,
+            stage_table=name,
+        )
+
+
 async def _activate_npi_relations(
     session: Any,
     *,
@@ -2019,6 +2034,7 @@ async def _activate_npi_relations(
     manifest: NpiResultManifest,
     validation: NpiValidationReceipt,
 ) -> NpiActivationReceipt:
+    await _preserve_npi_input_reads(session, ownership, incumbent)
     await _remove_npi_clone_freeze(session, ownership)
     await install_npi_stage_mutation_guards(
         session,

@@ -73,7 +73,7 @@ def _scope(monkeypatch, **selector):
 
 
 def _coordinates(importer="ptg-candidate-audit"):
-    """Use the actual four importer adapters, not a caller-selected queue/function."""
+    """Use the actual importer adapters, not a caller-selected queue/function."""
     from api.control_imports import _SINGLE_JOB_ADAPTERS
 
     adapter = _SINGLE_JOB_ADAPTERS[importer]
@@ -134,10 +134,11 @@ def _drifted_request(request, recorded, drift):
         "plan-pricing-projection",
         "plan-pricing-prewarm",
         "plan-pricing-em-distance",
+        "plan-pricing-em-attribution",
     ),
 )
 def test_shared_class_scopes_secrets_to_admitted_importer(monkeypatch, importer):
-    """The three sibling jobs retain ordinary credentials on the unchanged class."""
+    """Sibling jobs retain ordinary credentials on the shared class."""
     _scope(monkeypatch)
     request, recorded = _coordinates(importer)
     environment = _secrets(_admitted(request, recorded))
@@ -224,7 +225,8 @@ def _guarded_setup(monkeypatch, recorded, events):
     async def acquire():
         events.append("enter")
         try:
-            yield object()
+            driver = SimpleNamespace(fetchrow=AsyncMock(return_value=deepcopy(recorded)))
+            yield SimpleNamespace(raw_connection=SimpleNamespace(driver_connection=driver))
         finally:
             events.append("exit")
 
@@ -299,3 +301,62 @@ async def test_refused_admission_never_emits_scoped_credentials(monkeypatch, fai
     else:
         assert (await workers.guarded_ensure_worker(request))["status"] == "failed"
     assert external_calls == [] and events[-1] == "exit"
+
+
+@pytest.mark.parametrize("proof", ["ordinary", "serialized", "cms"])
+def test_fhir_publisher_secret_requires_its_exact_native_purpose(monkeypatch, proof):
+    """Shared worker classes cannot mix ordinary Source and signed CMS credentials."""
+    from api import provider_directory_cms_registry_worker as cms
+    from api import provider_directory_source_worker as source
+
+    monkeypatch.setenv(source.IMAGE_ENV, "example/source-worker@sha256:" + "a" * 64)
+    request, recorded = _coordinates("provider-directory-fhir")
+    admitted = _admitted(request, recorded)
+    admitted.fhir_source_launch = source.admit_fhir_source_worker_launch(recorded)
+    if proof == "serialized":
+        admitted = json.loads(json.dumps({**admitted, "fhir_source_launch": {"image": "untrusted"}}))
+    elif proof == "cms":
+        admitted.cms_registry_launch = cms.CMSRegistryWorkerLaunch(
+            request["run_id"], "example/cms@sha256:" + "b" * 64, "c" * 64
+        )
+    selector_by_field = {
+        "name": "SOURCE_USER",
+        "secretName": "synthetic-source-publisher",
+        "key": "username",
+        "workerClasses": ["process.ProviderDirectoryFHIR"],
+        "importers": ["provider-directory-fhir"],
+        "purposes": [source.PURPOSE],
+    }
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_SECRET_ENV_JSON", json.dumps([selector_by_field]))
+    environment = workers._worker_job_secret_env("process.ProviderDirectoryFHIR", launch_request=admitted)
+    assert bool(environment) is (proof == "ordinary")
+    if proof == "ordinary":
+        assert environment[0]["valueFrom"]["secretKeyRef"]["name"] == "synthetic-source-publisher"
+
+
+@pytest.mark.asyncio
+async def test_shared_audit_worker_keeps_native_pricing_authorization(monkeypatch):
+    """Sharing a class never bypasses the real native importer guard."""
+    from api import plan_pricing_worker_policy as pricing
+
+    request, recorded = _coordinates()
+    _guarded_setup(monkeypatch, recorded, [])
+    failure = RuntimeError("native pricing admission unavailable")
+    admission = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(pricing, "admit_pricing_worker", admission)
+    launch = AsyncMock(side_effect=AssertionError("worker launched without native guard"))
+    monkeypatch.setattr(workers, "ensure_worker", launch)
+    with pytest.raises(RuntimeError) as caught:
+        await workers.guarded_ensure_worker(request)
+    assert caught.value is failure
+    native_connection, run_id, admitted = admission.await_args.args
+    assert callable(native_connection.fetchrow) and run_id == recorded["run_id"]
+    assert admitted.admitted_job == (
+        recorded["run_id"],
+        recorded["importer"],
+        recorded["metrics"]["queue"],
+        recorded["metrics"]["function"],
+        recorded["metrics"]["job_id"],
+    )
+    admission.assert_awaited_once()
+    launch.assert_not_called()

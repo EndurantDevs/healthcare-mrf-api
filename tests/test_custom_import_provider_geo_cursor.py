@@ -4,7 +4,7 @@
 import hashlib
 import hmac
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -57,6 +57,52 @@ def test_anchor_round_trip_has_no_offset_or_metric_values():
         "issued_at",
         "expires_at",
     }
+
+
+def test_unmanaged_cursor_retains_exact_version_one_bytes():
+    document = asdict(STATE)
+    document.pop("network_generation")
+    payload = canonical_read_document({"version": 1, **document})
+    expected = _base64url_encode(payload + hmac.digest(SECRET, geo._DOMAIN + payload, hashlib.sha256))
+    assert geo.issue_geo_cursor(STATE, secret=SECRET) == expected
+
+
+def test_managed_cursor_round_trip_requires_exact_retained_network_generation():
+    state = replace(STATE, network_generation=17)
+    token = geo.issue_geo_cursor(state, secret=SECRET)
+    document = json.loads(_base64url_decode(token)[:-32])
+    assert document["version"] == 2 and document["network_generation"] == 17
+    assert _open(token, network_generation=17) == state
+    for generation in (None, 18, True, 0, -1, 2**63, "17"):
+        with pytest.raises(CustomImportReadCursorError):
+            _open(token, network_generation=generation)
+    with pytest.raises(CustomImportReadCursorError):
+        _open(geo.issue_geo_cursor(STATE, secret=SECRET), network_generation=17)
+
+
+@pytest.mark.parametrize("generation", [True, 0, -1, 2**63, "17", 17.0])
+def test_invalid_managed_generation_cannot_be_issued(generation):
+    with pytest.raises(CustomImportReadCursorError):
+        geo.issue_geo_cursor(replace(STATE, network_generation=generation), secret=SECRET)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"version": 1, "network_generation": 17},
+        {"version": 2},
+        {"version": 2, "network_generation": None},
+        {"version": 2, "network_generation": True},
+        {"version": 2, "network_generation": "17"},
+        {"version": 2, "network_generation": 0},
+    ],
+)
+def test_signed_malformed_managed_cursor_is_rejected(change):
+    document = json.loads(_base64url_decode(geo.issue_geo_cursor(STATE, secret=SECRET))[:-32])
+    payload = canonical_read_document({**document, **change})
+    token = _base64url_encode(payload + hmac.digest(SECRET, geo._DOMAIN + payload, hashlib.sha256))
+    with pytest.raises(CustomImportReadCursorError):
+        _open(token, network_generation=17)
 
 
 @pytest.mark.parametrize(

@@ -23,7 +23,6 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
-    ARRAY,
     Column,
     DefaultClause,
     ForeignKeyConstraint,
@@ -34,14 +33,31 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.schema import AddConstraint, CreateIndex, CreateSequence, CreateTable, MetaData
+from sqlalchemy.schema import CreateSequence, CreateTable, MetaData
 from sqlalchemy.sql.elements import TextClause
 
 from db import models
 from db.tiger_models import Zip_zcta5, ZipState
 from process import entity_address_snapshot_receipt as catalog_identity
+from process.cms_doctors_immutable import (
+    capture_doctors_serving_generation,
+    doctors_capture_contract,
+    doctors_manifest_spec,
+    require_doctors_storage,
+)
 from process.entity_address_snapshot_receipt import _projected_row_identity
 from process.ext.address_canon import archive_table_name
+from process.geo_source_archive import (
+    create_model_family_archive_schema,
+    create_model_family_export_clone,
+    create_model_family_predecessor_schema,
+    model_family_publisher_owner,
+    preserve_geo_cut_reads,
+    seal_model_family_relation,
+)
+from process.geo_source_archive import (
+    geo_cut_savepoint as _doctors_cut_savepoint,
+)
 from process.mrf_address_publication import (
     MODEL_CLOSURE_CONTRACT,
     STAGE_TABLE,
@@ -50,7 +66,6 @@ from process.mrf_address_publication import (
     canonical_contribution_model,
     canonical_reference_filter,
     canonical_schema_identity,
-    canonical_spatial_index,
     merge_canonical_contribution,
     referenced_address_filter,
     require_canonical_source_fence,
@@ -58,6 +73,7 @@ from process.mrf_address_publication import (
     validate_canonical_closure,
 )
 from process.mrf_publication_receipt import require_completed_publication
+from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner, native_model_copy_driver
 from process.provider_quality_parts.table_helpers import _index_name_for_table
 from process.reference_family_composition import (
     ReferenceModelContribution as ReferenceModelContribution,
@@ -129,10 +145,37 @@ from process.reference_family_dictionary import (
     validate_reference_dictionary_effects as validate_reference_dictionary_effects,
 )
 from process.reference_family_model_indexes import (
+    _additional_index_sql as _additional_index_sql,
+)
+from process.reference_family_model_indexes import (
     _create_model_indexes as _create_model_indexes,
 )
 from process.reference_family_model_indexes import (
+    _create_table_constraints as _create_table_constraints,
+)
+from process.reference_family_model_indexes import (
+    _declared_index_statements as _declared_index_statements,
+)
+from process.reference_family_model_indexes import (
+    _is_reviewed_index_element as _is_reviewed_index_element,
+)
+from process.reference_family_model_indexes import (
+    _model_index_catalog_inputs as _model_index_catalog_inputs,
+)
+from process.reference_family_model_indexes import (
+    _model_index_catalog_plan as _model_index_catalog_plan,
+)
+from process.reference_family_model_indexes import (
+    _model_index_input as _model_index_input,
+)
+from process.reference_family_model_indexes import (
+    _reviewed_index_where as _reviewed_index_where,
+)
+from process.reference_family_model_indexes import (
     _validate_declared_model_relationships as _validate_declared_model_relationships,
+)
+from process.reference_family_model_indexes import (
+    _witness_index_element as _witness_index_element,
 )
 from process.reference_family_result_generation import (
     RELATION_NAMES_BY_IMPORTER,
@@ -167,6 +210,7 @@ from process.reference_family_result_generation import (
 from process.reference_family_result_generation import (
     _require_nucc_precreated_handoff_binding as _require_nucc_precreated_handoff_binding,
 )
+from process.reference_family_source_capture_contract import _validate_source_capture_contract
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +248,7 @@ NUCC_CLEANUP_CONTRACT = "nucc-native-candidate-cleanup.v1"
 VALIDATION_CONTRACT = "reference-replacement-family.validation.v1"
 GUARDED_SOURCE_CAPTURE_CONTRACT = "reference-family.guarded-source-capture.v1"
 CAPTURED_TIGER_CONTRACT = "tiger.immutable-captured-epoch.v1"
+CAPTURED_TIGER_SNAPSHOT_CONTRACT = "tiger.readonly-snapshot-captured-epoch.v2"
 TERMINAL_CAPTURE_IMPORTERS = frozenset({"claims-pricing", "drug-claims"})
 TERMINAL_CAPTURE_CONTRACT = "reference-family-terminal-capture.v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -320,6 +365,7 @@ class ReferenceFamilySourceCapture:
     schema_name: str
     postgres_snapshot: str
     canonical_source_fence: CanonicalSourceFence | None = None
+    frozen_source_projection: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -830,6 +876,7 @@ async def _table_receipt(
     schema_name: str,
     model_type: type,
     is_source: bool = False,
+    frozen_source_projection: tuple | None = None,
 ) -> ReferenceTableReceipt:
     table_name = model_type.__tablename__
     storage_name = _source_model_name(model_type) if is_source else table_name
@@ -845,9 +892,10 @@ async def _table_receipt(
     except Exception as error:
         raise ReferenceFamilyArchiveError("reference family schema identity is unavailable") from error
     predicate = _source_model_predicate(model_type, schema_name) if is_source else ""
-    row_count = await session.scalar(
-        text(f"SELECT count(*)::bigint FROM {_quoted(schema_name)}.{_quoted(storage_name)} canonical {predicate}")
-    )
+    source_sql = f"{_quoted(schema_name)}.{_quoted(storage_name)}"
+    if frozen_source_projection is not None:
+        source_sql = "(" + _frozen_source_query(frozen_source_projection, model_type) + ")"
+    row_count = await session.scalar(text(f"SELECT count(*)::bigint FROM {source_sql} canonical {predicate}"))
     if type(row_count) is not int or row_count < 0:
         raise ReferenceFamilyArchiveError("reference family row count is invalid")
     return ReferenceTableReceipt(model_type.__name__, table_name, schema_sha256, row_count)
@@ -1128,41 +1176,7 @@ def _manifest_family_spec(manifest_value) -> ReferenceFamilySpec:
         if manifest_value["contract"] == TYPED_MRF_CONTRACT
         else reference_family_spec(manifest_value["importer_id"])
     )
-    if (
-        spec.importer_id == "cms-doctors"
-        and isinstance(manifest_value["tables"], list)
-        and len(manifest_value["tables"]) == 2
-    ):
-        # Historical payloads remain byte-identical; restore ownership still uses
-        # the current three-table family, with an independently verified empty group table.
-        spec = ReferenceFamilySpec(spec.importer_id, (models.DoctorClinicianAddress, models.CMSDoctorEducation))
-    return spec
-
-
-def _validate_source_capture_contract(manifest_value: Mapping[str, Any]) -> None:
-    """Recognize guarded non-Label capture without upgrading legacy provenance."""
-
-    if manifest_value["source_capture_contract"] == IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT:
-        if (
-            manifest_value.get("importer_id") != "nucc"
-            or manifest_value.get("publication_authority") != "tracked-generation"
-        ):
-            raise ReferenceFamilyArchiveError("immutable capture requires the NUCC family")
-    elif manifest_value["source_capture_contract"] == CAPTURED_TIGER_CONTRACT:
-        from process.tiger_captured_epoch import validate_captured_origin
-
-        if (
-            manifest_value.get("publication_authority") != "captured-epoch"
-            or manifest_value.get("importer_id") != "tiger"
-        ):
-            raise ReferenceFamilyArchiveError("captured epoch requires the TIGER family")
-        validate_captured_origin(manifest_value.get("source_metadata"))
-    elif (
-        manifest_value["source_capture_contract"] != GUARDED_SOURCE_CAPTURE_CONTRACT
-        or manifest_value.get("publication_authority") != "tracked-generation"
-        or manifest_value.get("importer_id") == "label"
-    ):
-        raise ReferenceFamilyArchiveError("reference family source capture contract is invalid")
+    return doctors_manifest_spec(spec, manifest_value)
 
 
 def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamilyManifest:
@@ -1244,7 +1258,10 @@ def _validate_manifest_authority(manifest_value: Mapping[str, Any], authority: o
         "captured-epoch",
     }:
         raise ReferenceFamilyArchiveError("reference family manifest authority is invalid")
-    if authority == "captured-epoch" and manifest_value.get("source_capture_contract") != CAPTURED_TIGER_CONTRACT:
+    if authority == "captured-epoch" and manifest_value.get("source_capture_contract") not in {
+        CAPTURED_TIGER_CONTRACT,
+        CAPTURED_TIGER_SNAPSHOT_CONTRACT,
+    }:
         raise ReferenceFamilyArchiveError("captured epoch contract is required")
 
 
@@ -1409,6 +1426,15 @@ async def _capture_reference_family_source(
         publication = None
         if importer_id == "mrf":
             publication = await require_completed_publication(session, schema, native_set=native_auxiliary)
+        if spec.importer_id == "cms-doctors":
+            source_capture_contract = await doctors_capture_contract(session, schema, source_capture_contract)
+        if spec.importer_id == "geo":
+            from process.geo_source_storage import require_geo_storage
+
+            await require_geo_storage(session, schema_name=schema)
+            if source_capture_contract not in (None, IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT):
+                raise ReferenceFamilyArchiveError("Geo capture requires immutable native storage")
+            source_capture_contract = IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT
         source_serving_generation = await _capture_source_generation(
             session, spec, schema, source_metadata, source_capture_contract
         )
@@ -1499,6 +1525,12 @@ async def capture_terminal_reference_source(session, *, importer_id, schema_name
 
 async def _capture_source_generation(session, spec, schema, source_metadata, source_capture_contract):
     """Keep captured and ordinary generation admission meanings unchanged."""
+    if source_capture_contract == IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT and spec.importer_id == "cms-doctors":
+        return await capture_doctors_serving_generation(session, schema)
+    if source_capture_contract == IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT and spec.importer_id == "geo":
+        from process.geo_source_storage import capture_geo_generation
+
+        return await capture_geo_generation(session, schema)
     if source_capture_contract == IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT:
         if spec.importer_id != "nucc":
             raise ReferenceFamilyArchiveError("immutable capture requires the NUCC family")
@@ -1577,9 +1609,11 @@ async def _clone_source(
     source_copy: ReferenceFamilySourceCopy | None = None,
     deadline: float | None = None,
     on_precreated: Callable[..., Awaitable[None]] | None = None,
+    authorize_creation: Callable[..., Awaitable[None]] | None = None,
 ) -> None:
     """Precreate the complete empty family before loading its pinned source snapshot."""
     _require_native_source_copy(source_copy, on_precreated)
+    _require_frozen_source_capture(capture)
     if type(deadline) not in (int, float) or not math.isfinite(deadline):
         raise ReferenceFamilyArchiveError("reference family source COPY deadline is unavailable")
     if deadline <= asyncio.get_running_loop().time():
@@ -1590,13 +1624,14 @@ async def _clone_source(
         raise ReferenceFamilyArchiveError("NUCC protected source requires dedicated preparation")
     await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     await session.execute(text(f"SET TRANSACTION SNAPSHOT '{capture.postgres_snapshot}'"))
+    if authorize_creation is not None:
+        await authorize_creation(session)
     if capture.canonical_source_fence is not None:
         await require_canonical_source_fence(session, capture.canonical_source_fence, capture.schema_name)
     spec = _manifest_family_spec(capture.manifest.as_dict())
     if spec.importer_id == "mrf" and STAGE_TABLE not in spec.table_names:
         raise ReferenceFamilyArchiveError("new MRF source requires the canonical model contract")
-    await _create_model_family(session, spec, stage_schema, create_indexes=False, ordinary_heaps=True)
-    ownership = await _capture_model_family_ownership(session, spec, UUID(stage_schema.removeprefix(_STAGE_PREFIX)))
+    ownership = await create_model_family_export_clone(session, spec, stage_schema)
     await on_precreated(session, ownership)
     await _copy_source_tables(session, capture, stage_schema, spec, source_copy, deadline)
     await _create_model_indexes(session, spec, stage_schema, create_constraints=True)
@@ -1619,7 +1654,11 @@ async def _copy_source_tables(session, capture, stage_schema, spec, source_copy,
             if table.table_name == STAGE_TABLE
             else _source_model_predicate(models_by_table[table.table_name], capture.schema_name)
         )
-        query = f"SELECT {columns} FROM {source_ref} canonical {predicate}"
+        query = (
+            _frozen_source_query(capture.frozen_source_projection, models_by_table[table.table_name])
+            if capture.frozen_source_projection is not None
+            else f"SELECT {columns} FROM {source_ref} canonical {predicate}"
+        )
         remaining_bytes = await _copy_source_projection(
             session, source_copy, query, stage_schema, table.table_name, column_names, remaining_bytes, deadline
         )
@@ -1665,24 +1704,16 @@ async def native_copy_projection(session, query, *args, schema_name, table_name,
     ):
         raise ReferenceFamilyArchiveError("native model projection COPY bounds differ")
     driver = await _native_model_copy_driver(session, ("copy_from_query", "copy_to_table"))
-    return await _copy_native_projection(driver, query, schema_name, table_name, columns, max_bytes, timeout, *args)
+    try:
+        return await _copy_native_projection(driver, query, schema_name, table_name, columns, max_bytes, timeout, *args)
+    except asyncio.CancelledError, TimeoutError:
+        await invalidate_copy_owner(session, driver)
+        raise
 
 
 async def _native_model_copy_driver(session, methods):
     """Require the caller's actual driver transaction before any native protocol command."""
-    if callable(getattr(session, "is_in_transaction", None)):
-        driver = session
-    else:
-        _require_transaction(session)
-        connection = await session.connection()
-        driver = (await connection.get_raw_connection()).driver_connection
-    if (
-        not callable(getattr(driver, "is_in_transaction", None))
-        or not driver.is_in_transaction()
-        or any(not callable(getattr(driver, name, None)) for name in methods)
-    ):
-        raise ReferenceFamilyArchiveError("native model acquisition COPY is unavailable")
-    return driver
+    return await native_model_copy_driver(session, methods, _require_transaction, ReferenceFamilyArchiveError)
 
 
 async def _capture_native_projection(driver, query, spool, max_bytes, deadline, *query_args, copy_format="binary"):
@@ -1733,7 +1764,7 @@ async def _copy_native_projection(driver, query, schema_name, table_name, column
                 if not isinstance(captured, str) or not re.fullmatch(r"COPY [0-9]+", captured) or captured != restored:
                     raise ReferenceFamilyArchiveError("native model projection COPY count differs")
         except asyncio.CancelledError, TimeoutError:
-            driver.terminate()
+            await close_interrupted_copy(driver)
             raise
     return copied_bytes
 
@@ -1767,10 +1798,9 @@ async def native_copy_record_batch(session, model_type, *, schema_name, table_na
 
 async def seal_model_family_storage(session, ownership, owner_oid, *, require_empty=False):
     """Close real model heaps/sequences with the existing native owner/ACL attester."""
-    from process.entity_address_snapshot_preparation import _seal_published_relation
     from process.ptg_parts.ptg2_physical_binding import _require_closed_local_custody
 
-    if await protected_publisher_owner(session) != owner_oid:
+    if await model_family_publisher_owner(session, ownership.importer_id) != owner_oid:
         raise ReferenceFamilyArchiveError("native model publisher owner differs")
     if (
         await session.scalar(
@@ -1786,7 +1816,7 @@ async def seal_model_family_storage(session, ownership, owner_oid, *, require_em
             raise ReferenceFamilyArchiveError("native model heap identity differs")
         if require_empty and await session.scalar(text(f"SELECT EXISTS(SELECT 1 FROM {schema}.{_quoted(name)})")):
             raise ReferenceFamilyArchiveError("native model heap is not empty")
-        await _seal_published_relation(session, oid, owner_oid)
+        await seal_model_family_relation(session, ownership, oid, owner_oid)
     grantees = (
         (
             await session.execute(
@@ -1861,6 +1891,9 @@ async def _copy_model_run_scope(
 async def _validate_source_clone_sets(session, capture, stage_schema):
     """Compare every indexed model and the exact canonical projection in the pinned snapshot."""
     spec = _manifest_family_spec(capture.manifest.as_dict())
+    if capture.frozen_source_projection is not None:
+        await _validate_frozen_source_clone(session, capture, stage_schema, spec)
+        return
     for model in spec.model_types:
         if not await _is_model_table_equal(
             session,
@@ -2546,15 +2579,12 @@ async def require_nucc_unretained_rotation(session, *, schema_name):
         oids.append(oid)
     if not oids:
         return
-    for ledger in ("relation", "preparation_relation", "reference_preparation_relation", "legacy_archive_relation"):
-        relation = f"hp_snapshot_retention.{ledger}"
-        if await session.scalar(text("SELECT to_regclass(:ledger)::oid"), {"ledger": relation}) is not None:
-            claimed = await session.scalar(
-                text(f"SELECT EXISTS(SELECT 1 FROM {relation} WHERE relation_oid=ANY(CAST(:oids AS bigint[])))"),
-                {"oids": oids},
-            )
-            if claimed is not False:
-                raise ReferenceFamilyArchiveError("NUCC protected custody requires publisher rotation")
+    from process.nucc_retention_read_view import NuccRetentionReadError, require_unretained_nucc_oids
+
+    try:
+        await require_unretained_nucc_oids(session, oids)
+    except NuccRetentionReadError as error:
+        raise ReferenceFamilyArchiveError(str(error)) from error
 
 
 def nucc_native_digest(value):
@@ -2863,7 +2893,7 @@ async def _nucc_record_handoff_run(session, handoff):
         text(
             f"UPDATE {_quoted(handoff['schema_name'])}.import_run SET status='finalizing',phase_detail=:phase,"
             "metrics=(COALESCE(metrics::jsonb,'{}'::jsonb)||jsonb_build_object('nucc_handoff',CAST(:handoff AS jsonb)))::json,"
-            "heartbeat_at=clock_timestamp() WHERE run_id=:run_id AND node_id=:node_id "
+            "heartbeat_at=clock_timestamp() AT TIME ZONE 'UTC' WHERE run_id=:run_id AND node_id=:node_id "
             "AND engine='healthcare-mrf-api' AND importer='nucc' AND status='running' "
             "AND progress->>'attempt_id'=:attempt_id AND progress->>'attempt_started_at'=:attempt_started_at "
             "AND metrics->'nucc_handoff' IS NULL AND finished_at IS NULL RETURNING run_id"
@@ -3271,7 +3301,7 @@ async def _finish_nucc_native_attempt(session, receipt):
     changed = await session.scalar(
         text(
             f"UPDATE {_quoted(handoff['schema_name'])}.import_run SET status='succeeded',phase_detail='nucc published',"
-            "finished_at=clock_timestamp(),heartbeat_at=clock_timestamp(),error=NULL,"
+            "finished_at=clock_timestamp() AT TIME ZONE 'UTC',heartbeat_at=clock_timestamp() AT TIME ZONE 'UTC',error=NULL,"
             "metrics=(metrics::jsonb||jsonb_build_object('nucc_native_publication',CAST(:receipt AS jsonb)))::json,"
             "progress=(progress::jsonb||jsonb_build_object('phase','nucc published','pct',100,'unit','rows',"
             "'done',CAST(:rows AS bigint),'total',CAST(:rows AS bigint),'message','succeeded'))::json "
@@ -3585,6 +3615,35 @@ async def export_reference_family_archive(
         return prepared_source.manifest
 
 
+async def _capture_source_dependencies(
+    source_session,
+    importer_id,
+    schema_name,
+    source_metadata,
+    source_metadata_factory,
+    dependency_factory,
+    canonical_source_fence,
+):
+    """Capture metadata and dependency packages under the original source-family fence."""
+    effective_source_metadata = source_metadata
+    package_by_dataset = {}
+    if source_metadata_factory is not None or dependency_factory is not None:
+        spec = (
+            reference_family_spec(importer_id, canonical=True)
+            if importer_id == "mrf"
+            else reference_family_spec(importer_id)
+        )
+        async with _bounded_capture(source_session):
+            await _lock_source_family(source_session, spec, _schema_name(schema_name), canonical_source_fence)
+            if source_metadata_factory is not None:
+                effective_source_metadata = await source_metadata_factory(source_session)
+            if dependency_factory is not None:
+                package_by_dataset = await dependency_factory(source_session)
+    if effective_source_metadata is None:
+        raise ReferenceFamilyArchiveError("reference family source metadata is required")
+    return effective_source_metadata, package_by_dataset
+
+
 async def prepare_reference_family_archive_source(
     session_factory: Any,
     *,
@@ -3615,22 +3674,15 @@ async def prepare_reference_family_archive_source(
                 _schema_name(schema_name),
                 canonical_source_fence,
             )
-        effective_source_metadata = source_metadata
-        package_by_dataset = {}
-        if source_metadata_factory is not None or dependency_factory is not None:
-            spec = (
-                reference_family_spec(importer_id, canonical=True)
-                if importer_id == "mrf"
-                else reference_family_spec(importer_id)
-            )
-            async with _bounded_capture(source_session):
-                await _lock_source_family(source_session, spec, _schema_name(schema_name), canonical_source_fence)
-                if source_metadata_factory is not None:
-                    effective_source_metadata = await source_metadata_factory(source_session)
-                if dependency_factory is not None:
-                    package_by_dataset = await dependency_factory(source_session)
-        if effective_source_metadata is None:
-            raise ReferenceFamilyArchiveError("reference family source metadata is required")
+        effective_source_metadata, package_by_dataset = await _capture_source_dependencies(
+            source_session,
+            importer_id,
+            schema_name,
+            source_metadata,
+            source_metadata_factory,
+            dependency_factory,
+            canonical_source_fence,
+        )
         capture = await _capture_reference_family_source(
             source_session,
             importer_id=importer_id,
@@ -3641,19 +3693,30 @@ async def prepare_reference_family_archive_source(
             canonical_source_fence=canonical_source_fence,
         )
         return await _prepare_source_clone(
-            session_factory, capture, dataset_id, on_prepared, source_copy, on_precreated, deadline.when()
+            session_factory,
+            capture,
+            dataset_id,
+            on_prepared,
+            source_copy,
+            on_precreated,
+            deadline.when(),
+            authorize_creation=source_options.get("authorize_creation"),
         )
 
 
 def _source_capture_options(session_factory, importer_id, source_options):
     """Fail closed at the shared creation root without changing historical readers."""
-    if set(source_options) - {
+    allowed_keys = {
         "source_metadata_factory",
         "source_copy",
         "on_precreated",
         "source_sessions",
         "canonical_source_fence",
-    }:
+        "authorize_creation",
+    }
+    if set(source_options) - allowed_keys or (
+        source_options.get("authorize_creation") is not None and not callable(source_options["authorize_creation"])
+    ):
         raise ReferenceFamilyArchiveError("reference family source options are invalid")
     if importer_id != "mrf" and source_options.get("canonical_source_fence") is not None:
         raise ReferenceFamilyArchiveError("reference family canonical source fence scope differs")
@@ -3668,7 +3731,7 @@ def _source_capture_options(session_factory, importer_id, source_options):
 
 
 async def _prepare_source_clone(
-    session_factory, capture, dataset_id, on_prepared, source_copy, on_precreated, deadline
+    session_factory, capture, dataset_id, on_prepared, source_copy, on_precreated, deadline, authorize_creation=None
 ):
     """Commit exact clone custody only with its creation transaction's successful recorder."""
     stage_schema = reference_family_stage_schema(dataset_id)
@@ -3680,6 +3743,7 @@ async def _prepare_source_clone(
             source_copy=source_copy,
             deadline=deadline,
             on_precreated=on_precreated,
+            authorize_creation=authorize_creation,
         )
         ownership = await _capture_model_family_ownership(
             clone_session,
@@ -3827,208 +3891,6 @@ async def export_prepared_reference_family_archive(
     return manifest
 
 
-def _additional_index_sql(
-    schema_name: str,
-    model_type: type,
-    index_spec: Mapping[str, Any],
-    *,
-    table_name=None,
-    index_schema_name=None,
-    resolved_opclasses=None,
-) -> str:
-    """Compile reviewed local index options with unchanged native naming and SQL."""
-    allowed_keys = {"index_elements", "name", "using", "unique", "include", "where", "staging_name"}
-    if set(index_spec) - allowed_keys:
-        raise ReferenceFamilyArchiveError("reference family model index is unsupported")
-    staging_name = index_spec.get("staging_name")
-    if staging_name is not None and (not isinstance(staging_name, str) or _IDENTIFIER.fullmatch(staging_name) is None):
-        raise ReferenceFamilyArchiveError("reference family model staging index name is invalid")
-    elements = index_spec.get("index_elements")
-    if (
-        not isinstance(elements, (tuple, list))
-        or not elements
-        or not all(_is_reviewed_index_element(index_element) for index_element in elements)
-    ):
-        raise ReferenceFamilyArchiveError("reference family model index is invalid")
-    suffix = index_spec.get("name", "_".join(elements))
-    if not isinstance(suffix, str) or _IDENTIFIER.fullmatch(suffix) is None:
-        raise ReferenceFamilyArchiveError("reference family model index is invalid")
-    index_name = _index_name_for_table(
-        model_type.__tablename__,
-        f"{index_schema_name or schema_name}_{model_type.__tablename__}_idx_{suffix}",
-    )
-    method = index_spec.get("using")
-    if method is not None and method not in {"btree", "gin", "gist", "hash", "brin", "spgist"}:
-        raise ReferenceFamilyArchiveError("reference family model index method is invalid")
-    is_unique = index_spec.get("unique", False)
-    if type(is_unique) is not bool:
-        raise ReferenceFamilyArchiveError("reference family model index uniqueness is invalid")
-    included_columns = index_spec.get("include", ())
-    if not isinstance(included_columns, (tuple, list)) or not all(
-        isinstance(column_name, str) and _IDENTIFIER.fullmatch(column_name) is not None
-        for column_name in included_columns
-    ):
-        raise ReferenceFamilyArchiveError("reference family model index include is invalid")
-    using = f" USING {method}" if method else ""
-    unique = "UNIQUE " if is_unique else ""
-    include = f" INCLUDE ({', '.join(included_columns)})" if included_columns else ""
-    where = _reviewed_index_where(index_spec.get("where"))
-    compiled_elements = [
-        _witness_index_element(model_type, method or "btree", element, resolved_opclasses) for element in elements
-    ]
-    return (
-        f"CREATE {unique}INDEX {_quoted(index_name)} ON {_quoted(schema_name)}."
-        f"{_quoted(table_name or model_type.__tablename__)}{using} ({', '.join(compiled_elements)}){include}{where}"
-    )
-
-
-def _reviewed_index_where(where_clause):
-    """Keep the existing predicate boundary and exact suffix for trusted local indexes."""
-    if where_clause not in {
-        None,
-        "estimated_gross_margin IS NOT NULL",
-        "rx_code_system = 'HP_RX_CODE'",
-        "geography_scope = 'zip5'",
-        "type='practice'",
-        "type='practice' AND phone_number IS NOT NULL AND phone_number <> ''",
-    }:
-        raise ReferenceFamilyArchiveError("reference family model index predicate is unsupported")
-    return "" if where_clause is None else f" WHERE {where_clause}"
-
-
-def _declared_index_statements(
-    model, table, schema_name, indexes, *, index_schema_name=None, native_indexes=True, resolved_opclasses=None
-):
-    """Compile the same declarations for an isolated heap or its native catalog witness."""
-    native = (
-        tuple(CreateIndex(index) for index in sorted(table.indexes, key=lambda item: item.name))
-        if native_indexes
-        else ()
-    )
-    return native + tuple(
-        text(
-            _additional_index_sql(
-                schema_name,
-                model,
-                index,
-                table_name=table.name,
-                index_schema_name=index_schema_name,
-                resolved_opclasses=resolved_opclasses,
-            )
-        )
-        for index in indexes
-    )
-
-
-def _model_index_catalog_plan(model, schema_name, *, resolved_opclasses=None):
-    """Compile only trusted local indexes on an empty transaction-local native witness."""
-    from process.entity_address_native_publication import _model_catalog_table
-
-    table = _model_catalog_table(model, allow_model_relationships=True)
-    table.schema = "pg_temp"
-    for constraint in tuple(table.constraints):
-        if not isinstance(constraint, (PrimaryKeyConstraint, UniqueConstraint)):
-            table.constraints.remove(constraint)
-    for column in table.columns:
-        column.identity = None
-        column.server_default = None
-        column.default = None
-    if any(not all(isinstance(column, Column) for column in index.expressions) for index in table.indexes):
-        raise ReferenceFamilyArchiveError("model witness index expression is unsupported")
-    if resolved_opclasses is not None:
-        for index in table.indexes:
-            options = index.dialect_options["postgresql"]
-            method = options.get("using") or "btree"
-            options["ops"] = {
-                column.name: ".".join(
-                    _quoted(part)
-                    for part in resolved_opclasses[(method, (options.get("ops") or {}).get(column.name), column.name)]
-                )
-                for column in index.expressions
-            }
-    indexes = tuple(getattr(model, "__my_initial_indexes__", ()) or ()) + tuple(
-        getattr(model, "__my_additional_indexes__", ()) or ()
-    )
-    statements = _declared_index_statements(
-        model, table, "pg_temp", indexes, index_schema_name=schema_name, resolved_opclasses=resolved_opclasses
-    )
-    return table, (CreateTable(table), *statements)
-
-
-def _model_index_input(model, method, element):
-    """Read one already reviewed declaration's native input, not a SQL statement."""
-    parts = element.split()
-    opclass = parts[-1] if parts[-1].endswith("_ops") else None
-    column = parts[0] if parts[0] in model.__table__.columns else None
-    return method, opclass, column
-
-
-def _witness_index_element(model, method, element, resolved_opclasses):
-    """Bind only a source-verified native class while keeping function lookup in pg_catalog."""
-    if resolved_opclasses is None:
-        return element
-    key = _model_index_input(model, method, element)
-    expression = element.rsplit(" ", 1)[0] if key[1] is not None else element
-    ordering = ""
-    if expression.endswith((" DESC", " ASC")):
-        expression, ordering = expression.rsplit(" ", 1)
-        ordering = " " + ordering
-    opclass = ".".join(_quoted(part) for part in resolved_opclasses[key])
-    return f"{expression} {opclass}{ordering}"
-
-
-def _model_index_catalog_inputs(model):
-    """Select compiler-owned operator-class inputs, never portable index metadata."""
-    inputs = []
-    for constraint in model.__table__.constraints:
-        if isinstance(constraint, (PrimaryKeyConstraint, UniqueConstraint)):
-            inputs.extend(("btree", None, column.name) for column in constraint.columns)
-    for index in model.__table__.indexes:
-        options = index.dialect_options["postgresql"]
-        for column in index.expressions:
-            if not isinstance(column, Column):
-                raise ReferenceFamilyArchiveError("model witness index expression is unsupported")
-            inputs.append((options.get("using") or "btree", (options.get("ops") or {}).get(column.name), column.name))
-    indexes = tuple(getattr(model, "__my_initial_indexes__", ()) or ()) + tuple(
-        getattr(model, "__my_additional_indexes__", ()) or ()
-    )
-    for index in indexes:
-        _additional_index_sql("pg_temp", model, index)
-        for element in index["index_elements"]:
-            inputs.append(_model_index_input(model, index.get("using") or "btree", element))
-    return inputs
-
-
-def _is_reviewed_index_element(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    tokens = value.split()
-    if 0 < len(tokens) <= 2 and all(_IDENTIFIER.fullmatch(token) is not None for token in tokens):
-        return True
-    return value in {
-        "lower(synonym)",
-        "lower(provider_type)",
-        "lower(provider_name)",
-        "lower(service_description)",
-        "lower(reported_code)",
-        "lower(display_name)",
-        "lower(rx_name)",
-        "lower(generic_name)",
-        "lower(brand_name)",
-        "lower(COALESCE(rx_name, '')) gin_trgm_ops",
-        "lower(COALESCE(generic_name, '')) gin_trgm_ops",
-        "lower(COALESCE(brand_name, '')) gin_trgm_ops",
-        "lower(COALESCE(rx_code, '')) gin_trgm_ops",
-        "lower(short_description)",
-        "upper(from_system)",
-        "upper(from_code)",
-        "upper(to_system)",
-        "upper(to_code)",
-        "LEFT(postal_code, 5)",
-        "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
-    }
-
-
 async def precreate_reference_family_restore(
     session: Any,
     *,
@@ -4100,6 +3962,11 @@ async def _create_model_family(
     protected_owner_oid: int | None = None,
 ) -> None:
     """Clone installed model types, optionally as unpartitioned isolated heaps."""
+    if await create_model_family_archive_schema(session, spec.importer_id, schema_name, protected_owner_oid):
+        await _create_model_heaps(
+            session, spec, schema_name, create_indexes=create_indexes, ordinary_heaps=ordinary_heaps
+        )
+        return
     authorization = ""
     if protected_owner_oid is not None:
         if await protected_publisher_owner(session) != protected_owner_oid:
@@ -4190,26 +4057,6 @@ def _defer_table_constraints(table: Table) -> None:
             table.append_constraint(constraint)
     for constraint in table.constraints:
         constraint.ddl_if(callable_=lambda *_args, **_kwargs: False)
-
-
-async def _create_table_constraints(session: Any, table: Table, *, backing_indexes: bool = True) -> None:
-    """Finish model keys or checks; relationships use indexed set checks instead."""
-    if not backing_indexes:
-        for column in table.columns:
-            for constraint in tuple(column.constraints):
-                column.constraints.remove(constraint)
-                table.append_constraint(constraint)
-    constraints = (
-        constraint
-        for constraint in table.constraints
-        if not isinstance(constraint, ForeignKeyConstraint)
-        and isinstance(constraint, (PrimaryKeyConstraint, UniqueConstraint)) == backing_indexes
-        and (not isinstance(constraint, PrimaryKeyConstraint) or constraint.columns)
-    )
-    for constraint in sorted(
-        constraints, key=lambda item: (type(item).__name__, str(item.name or ""), tuple(item.columns.keys()))
-    ):
-        await _execute_model_statement(session, AddConstraint(constraint))
 
 
 async def _validate_model_foreign_keys(session: Any, metadata: MetaData) -> None:
@@ -4548,9 +4395,11 @@ async def _rotate_family_relations(
     predecessor_schema = None
     if any(oid is not None for oid in incumbent_oids_by_name.values()):
         predecessor_schema = reference_family_predecessor_schema(ownership.dataset_id)
+        if spec.importer_id == "geo":
+            await preserve_geo_cut_reads(session, ownership, expected_incumbent)
         # Never infer ownership from a UUID-shaped name or replace content
         # already present there: CREATE is the collision/CAS fence.
-        await session.execute(text(f"CREATE SCHEMA {_quoted(predecessor_schema)}"))
+        await create_model_family_predecessor_schema(session, spec.importer_id, predecessor_schema)
     for table_name in spec.table_names:
         incumbent_oid = incumbent_oids_by_name[table_name]
         if incumbent_oid is not None:
@@ -4967,6 +4816,12 @@ async def _activation_receipt(
     )
 
 
+async def _return_manual_mrf_ownership(session, ownership, schema_name):
+    """Return the verified locked heaps and their attached sequences to the ordinary publisher."""
+    for table_name, _relation_oid in ownership.relation_oids:
+        await session.execute(text(f"ALTER TABLE {_quoted(schema_name)}.{_quoted(table_name)} OWNER TO CURRENT_USER"))
+
+
 async def activate_reference_family_stage(
     session: Any,
     *,
@@ -5002,14 +4857,12 @@ async def activate_reference_family_stage(
     ):
         raise ReferenceFamilyArchiveError("NUCC protected custody requires validated publisher activation")
     await _lock_and_verify_activation(session, spec, ownership, expected_incumbent)
-    tables = await _validate_stage_manifest(
-        session,
-        ownership=ownership,
-        manifest=validated_manifest,
-    )
+    tables = await _validate_stage_manifest(session, ownership=ownership, manifest=validated_manifest)
     predecessor_schema_name, _live_pairs, canonical_publication = await _complete_validated_stage_activation(
         session, spec, ownership, expected_incumbent, validated_manifest
     )
+    if spec.importer_id == "mrf":
+        await _return_manual_mrf_ownership(session, ownership, expected_incumbent.schema_name)
     await publish_adopted_reference_family_generation(
         session,
         importer_id=spec.importer_id,
@@ -5096,6 +4949,18 @@ def _require_cutover_authority(ownership, expected_incumbent, cutover) -> None:
         raise ReferenceFamilyArchiveError("reference family activation ownership is invalid")
 
 
+def _validated_activation_inputs(session, ownership, manifest, expected_incumbent, validation_receipt, cutover):
+    """Validate the complete activation authority before acquiring any cutover lock."""
+    _require_transaction(session)
+    _require_cutover_authority(ownership, expected_incumbent, cutover)
+    validated_manifest = validate_reference_family_manifest(manifest)
+    validation = validate_reference_family_validation_receipt(validation_receipt)
+    _require_validated_cutover_binding(ownership, expected_incumbent, validated_manifest, validation, cutover)
+    spec = _ownership_spec(ownership)
+    _require_terminal_manual_cutover(spec, validated_manifest, cutover)
+    return validated_manifest, validation, spec
+
+
 async def activate_validated_reference_family_stage(
     session: Any,
     *,
@@ -5108,13 +4973,9 @@ async def activate_validated_reference_family_stage(
 ) -> ReferenceFamilyActivationReceipt:
     """CAS-rotate one publisher-validated immutable stage without recounting."""
 
-    _require_transaction(session)
-    _require_cutover_authority(ownership, expected_incumbent, cutover)
-    validated_manifest = validate_reference_family_manifest(manifest)
-    validation = validate_reference_family_validation_receipt(validation_receipt)
-    _require_validated_cutover_binding(ownership, expected_incumbent, validated_manifest, validation, cutover)
-    spec = _ownership_spec(ownership)
-    _require_terminal_manual_cutover(spec, validated_manifest, cutover)
+    validated_manifest, validation, spec = _validated_activation_inputs(
+        session, ownership, manifest, expected_incumbent, validation_receipt, cutover
+    )
     await _lock_and_verify_activation(
         session,
         spec,
@@ -5135,17 +4996,18 @@ async def activate_validated_reference_family_stage(
             incoming_generation,
             source_capture_contract=validated_manifest.source_capture_contract,
         )
-    await _apply_validated_contribution(session, ownership, expected_incumbent, contribution_effect_receipt)
-    predecessor_schema_name, live_pairs, canonical_publication = await _complete_validated_stage_activation(
-        session,
-        spec,
-        ownership,
-        expected_incumbent,
-        validated_manifest,
-    )
-    published_authority = await _adopt_validated_family_generation(
-        session, validated_manifest, expected_incumbent, incoming_generation, live_pairs, immutable_predecessor
-    )
+    async with _doctors_cut_savepoint(session, spec.importer_id):
+        await _apply_validated_contribution(session, ownership, expected_incumbent, contribution_effect_receipt)
+        predecessor_schema_name, live_pairs, canonical_publication = await _complete_validated_stage_activation(
+            session,
+            spec,
+            ownership,
+            expected_incumbent,
+            validated_manifest,
+        )
+        published_authority = await _adopt_validated_family_generation(
+            session, validated_manifest, expected_incumbent, incoming_generation, live_pairs, immutable_predecessor
+        )
     return ReferenceFamilyActivationReceipt(
         spec.importer_id,
         validated_manifest.source_metadata_sha256,
@@ -5201,7 +5063,7 @@ def _require_validated_cutover_binding(ownership, expected_incumbent, manifest, 
         and manifest.importer_id != "label"
         and manifest.source_capture_contract != GUARDED_SOURCE_CAPTURE_CONTRACT
         and not (
-            manifest.importer_id == "nucc"
+            manifest.importer_id in {"nucc", "cms-doctors", "geo"}
             and manifest.source_capture_contract == IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT
         )
     ):
@@ -5302,6 +5164,12 @@ async def _require_automatic_cutover_generation(
             schema_name=expected_incumbent.schema_name,
             expected_relation_oid=current_authority.relation_oids[0],
         )
+    elif spec.importer_id == "geo":
+        from process.geo_source_storage import capture_geo_generation
+
+        await capture_geo_generation(session, expected_incumbent.schema_name)
+    elif spec.importer_id == "cms-doctors":
+        await require_doctors_storage(session, schema_name=expected_incumbent.schema_name, legacy=True)
     elif spec.importer_id != "label":
         from process.reference_source_generation import require_reference_revision_tracking
 
@@ -5369,3 +5237,104 @@ __all__ = [
     "verify_reference_family_stage_ownership",
     "verify_model_family_stage_ownership",
 ]
+
+
+def _frozen_source_query(projection, model):
+    """Render only a finite native TIGER projection, never recursive canonical reads."""
+    if (
+        type(projection) is not tuple
+        or len(projection) != 2
+        or any(type(pair) is not tuple or len(pair) != 2 or type(pair[1]) is not tuple for pair in projection)
+        or tuple(pair[0] for pair in projection) != ("zip_state", "zcta5")
+    ):
+        raise ReferenceFamilyArchiveError("frozen TIGER projection is invalid")
+    statements, oids, names = [], set(), set()
+    columns = ", ".join(_quoted(column.name) for column in model.__table__.columns)
+    for logical_table, relations in projection:
+        if not 1 <= len(relations) <= 4096:
+            raise ReferenceFamilyArchiveError("frozen TIGER projection is empty or unbounded")
+        group_oids = []
+        for physical in relations:
+            if type(physical) is not tuple or len(physical) != 4:
+                raise ReferenceFamilyArchiveError("frozen TIGER physical identity is invalid")
+            schema, table, oid, filenode = physical
+            if (
+                any(type(number) is not int or not 0 < number < 2**32 for number in (oid, filenode))
+                or oid in oids
+                or (schema, table) in names
+            ):
+                raise ReferenceFamilyArchiveError("frozen TIGER physical identity is invalid")
+            qualified = _quoted(schema) + "." + _quoted(table)
+            oids.add(oid)
+            names.add((schema, table))
+            group_oids.append(oid)
+            if logical_table == model.__tablename__:
+                statements.append(f"SELECT {columns} FROM ONLY {qualified}")
+        if (
+            group_oids != sorted(group_oids)
+            or sum(physical[:2] == ("tiger", logical_table) for physical in relations) != 1
+        ):
+            raise ReferenceFamilyArchiveError("frozen TIGER canonical root differs")
+    if not statements or len(oids) > 4096:
+        raise ReferenceFamilyArchiveError("frozen TIGER projection is empty or unbounded")
+    return " UNION ALL ".join(statements)
+
+
+def _require_frozen_source_capture(capture):
+    """A new finite projection cannot be relabeled as a legacy captured origin."""
+    is_finite = capture.manifest.source_capture_contract == CAPTURED_TIGER_SNAPSHOT_CONTRACT
+    if is_finite != (capture.frozen_source_projection is not None):
+        raise ReferenceFamilyArchiveError("frozen TIGER capture contract differs")
+    if is_finite:
+        if capture.manifest.importer_id != "tiger" or capture.schema_name != "tiger":
+            raise ReferenceFamilyArchiveError("frozen projection requires the TIGER source")
+        _validate_source_capture_contract(capture.manifest.as_dict())
+        for model in reference_family_spec("tiger").model_types:
+            _frozen_source_query(capture.frozen_source_projection, model)
+
+
+async def _validate_frozen_source_clone(session, capture, stage_schema, spec):
+    """Compare full model multisets against exactly the same finite COPY projection."""
+    _require_frozen_source_capture(capture)
+    for model in spec.model_types:
+        source = "(" + _frozen_source_query(capture.frozen_source_projection, model) + ")"
+        fields = ", ".join(
+            _quoted(column.name) + ("::text" if str(column.type).lower().startswith(("geometry", "geography")) else "")
+            for column in model.__table__.columns
+        )
+        target = f"{_quoted(stage_schema)}.{_quoted(model.__tablename__)}"
+        equal = await session.scalar(
+            text(
+                f"SELECT NOT EXISTS((SELECT {fields} FROM {source} canonical EXCEPT ALL SELECT {fields} FROM {target}) "
+                f"UNION ALL (SELECT {fields} FROM {target} EXCEPT ALL SELECT {fields} FROM {source} canonical))"
+            )
+        )
+        if equal is not True:
+            raise ReferenceFamilyArchiveError("reference family source clone differs from its pinned source")
+
+
+async def _frozen_source_manifest(session, *, source_metadata, frozen_source_projection):
+    """Count a finite TIGER model with the same ONLY projection later copied."""
+    spec = reference_family_spec("tiger")
+    metadata, metadata_sha256 = _source_metadata(source_metadata)
+    receipts = tuple(
+        [
+            await _table_receipt(
+                session,
+                importer_id="tiger",
+                schema_name="tiger",
+                model_type=model,
+                frozen_source_projection=frozen_source_projection,
+            )
+            for model in spec.model_types
+        ]
+    )
+    return ReferenceFamilyManifest(
+        "tiger",
+        receipts,
+        metadata,
+        metadata_sha256,
+        _schema_digest(receipts),
+        publication_authority="captured-epoch",
+        source_capture_contract=CAPTURED_TIGER_SNAPSHOT_CONTRACT,
+    )

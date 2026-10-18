@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 
+from tests.provider_directory_checkpoint_unit_support import checkpoint_unit_scope as checkpoint_unit_scope
+
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -85,8 +87,7 @@ class _ReviewedTimeoutResumeHarness:
         self.checkpoint_context = _reviewed_timeout_context()
         self.start_url = f"{self.reviewed_base}/PractitionerRole?_count=100"
         self.resume_url = (
-            f"{self.reviewed_base}/PractitionerRole?"
-            "_getpages=opaque-review&_getpagesoffset=2000&_count=100"
+            f"{self.reviewed_base}/PractitionerRole?_getpages=opaque-review&_getpagesoffset=2000&_count=100"
         )
         self.checkpoint_loads: list[tuple[Any, str, str]] = []
         self.fetches: list[tuple[str, int]] = []
@@ -143,9 +144,7 @@ class _ReviewedTimeoutResumeHarness:
         assert fetch_result.complete is True
         assert fetch_result.pages_fetched == 21
         assert fetch_result.rows_fetched == 2001
-        assert self.checkpoint_loads == [
-            (self.checkpoint_context, "PractitionerRole", self.start_url)
-        ]
+        assert self.checkpoint_loads == [(self.checkpoint_context, "PractitionerRole", self.start_url)]
         assert self.fetches == [
             (
                 self.resume_url,

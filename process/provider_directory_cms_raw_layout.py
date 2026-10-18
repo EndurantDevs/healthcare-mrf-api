@@ -8,6 +8,7 @@ from uuid import UUID
 from process.network_fhir_source_epoch import _LOOKUP_INDEXES, _PRIMARY_KEYS, _TABLES
 from process.provider_directory_cms_capacity_contract import validated_registry_source_retention_policy
 from process.provider_directory_cms_native_layout import NativeRelationLayout, _index_physical_details
+from process.provider_directory_generic_source_storage import RELATIONSHIP, RESOURCE, WITNESS
 
 _COLUMN_TYPES = {16, 20, 21, 23, 25, 114, 1015, 1043, 1114, 1184, 2950, 3802}
 _KEY_CLASSES = {21: "int2_ops", 23: "int4_ops", 25: "text_ops", 26: "oid_ops", 1043: "text_ops", 2950: "uuid_ops"}
@@ -61,12 +62,20 @@ def _main_attributes(attributes, oid):
     return [attribute for attribute in attributes if attribute["relation_oid"] == oid]
 
 
-async def _require_source_columns(fhir, relation, policy, attributes):
-    """Compare the exact LIKE column shape, excluding options the creator omits."""
+async def _require_source_columns(fhir, relation, policy, attributes, source_input=None):
+    """Compare LIKE columns with the pinned child or fixed logical parent's ABI."""
+    if source_input is not None:
+        from process.provider_directory_cms_nonprofile_observation import pinned_raw_attributes
+
+        source_oid, source_attributes = await pinned_raw_attributes(fhir, source_input, policy, relation.relation)
+        _compare_source_columns(relation, attributes, source_oid, source_attributes)
+        return
     source_ref = fhir._unscoped_qt(policy["source_pin"]["schema_name"], relation.relation)
     source_oid = await fhir.db.scalar(
-        "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass(:name) AND relkind='r' AND relpersistence='p'",
+        "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass(:name) AND relpersistence='p' "
+        "AND (relkind='r' OR (relkind='p' AND :partitioned_payload))",
         name=source_ref,
+        partitioned_payload=relation.relation in (RESOURCE, WITNESS, RELATIONSHIP),
     )
     if (
         type(source_oid) is not int
@@ -75,6 +84,11 @@ async def _require_source_columns(fhir, relation, policy, attributes):
     ):
         _reject()
     source_attributes, _, _, _ = await fhir._profile_capacity_relation_catalog([source_oid])
+    _compare_source_columns(relation, attributes, source_oid, source_attributes)
+
+
+def _compare_source_columns(relation, attributes, source_oid, source_attributes):
+    """Keep the historical exact column comparison for either authenticated origin."""
     expected_attributes = [
         {**attribute, "relation_oid": relation.oid, "attnum": ordinal, **_UNCOPIED_FIELDS}
         for ordinal, attribute in enumerate(_main_attributes(source_attributes, source_oid), 1)
@@ -207,8 +221,13 @@ def _require_constraints(constraints, relation, profiles):
         _reject()
 
 
-async def capture_retained_raw_layout(fhir, relation, raw_policy, expected_index_names):
+async def capture_retained_raw_layout(
+    fhir, relation, raw_policy, expected_index_names, *, database=None, source_input=None
+):
     """Observe a signed recipe prefix without changing Profile projections or byte caps."""
+    from process.provider_directory_cms_nonprofile_observation import catalog_observation
+
+    fhir = catalog_observation(fhir, database)
     policy, profiles = _require_raw_request(relation, raw_policy, expected_index_names)
     relation_map, toast_oid = await fhir._profile_capacity_relation_row(relation.oid, "p", 0)
     if (
@@ -227,7 +246,7 @@ async def capture_retained_raw_layout(fhir, relation, raw_policy, expected_index
     )
     if triggers:
         _reject()
-    await _require_source_columns(fhir, relation, policy, attributes)
+    await _require_source_columns(fhir, relation, policy, attributes, source_input)
     _require_constraints(constraints, relation, profiles)
     await _index_physical_details(fhir, indexes)
     opclasses = await _default_opclasses(fhir) if indexes else {}

@@ -494,5 +494,5 @@ async def verify_registry_ptg_graph_page(
         return await _verify_page(session, specification, witness_page, read_budget=read_budget)
     except RegistryPTGGraphReadError:
         raise
-    except KeyError, TypeError, ValueError, RuntimeError, struct.error:
-        raise RegistryPTGGraphReadError("registry_ptg_graph_invalid") from None
+    except (KeyError, TypeError, ValueError, RuntimeError, struct.error) as error:
+        raise RegistryPTGGraphReadError("registry_ptg_graph_invalid") from error

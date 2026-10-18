@@ -11,7 +11,7 @@ pub const MAX_ROWS: usize = 5_000;
 pub const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_COPY_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_EXPECTED_REVISION: i64 = i64::MAX - 2;
-pub const COPY_COLUMNS: [&str; 16] = [
+pub const COPY_COLUMNS: [&str; 17] = [
     "binding_id",
     "source_system",
     "source_id",
@@ -28,6 +28,7 @@ pub const COPY_COLUMNS: [&str; 16] = [
     "operation",
     "expected_revision",
     "expected_network_id",
+    "office_recipe_json",
 ];
 const KEY_DOMAIN: &[u8] = b"registry_network_source_binding:v1:";
 const JURISDICTIONS: &str = "AL AK AZ AR CA CO CT DE DC FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY AS GU MP PR VI";
@@ -62,6 +63,8 @@ fn failure(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BindingInput {
+    #[serde(default, deserialize_with = "present_office_recipe")]
+    office_recipe_json: Option<Option<OfficeRecipeSelection>>,
     binding_id: String,
     source_system: String,
     source_id: String,
@@ -82,6 +85,19 @@ struct BindingInput {
 
 fn required_network_id<'de, D: Deserializer<'de>>(decoder: D) -> Result<Option<i32>, D::Error> {
     Option::<i32>::deserialize(decoder)
+}
+
+fn present_office_recipe<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<Option<OfficeRecipeSelection>>, D::Error> {
+    Option::<OfficeRecipeSelection>::deserialize(decoder).map(Some)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfficeRecipeSelection {
+    pub capture_id: String,
+    pub recipe_sha256: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -124,6 +140,8 @@ struct FhirScope {
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
 pub struct ValidatedSourceBinding {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub office_recipe_json: Option<Option<OfficeRecipeSelection>>,
     pub binding_id: String,
     pub source_system: String,
     pub source_id: String,
@@ -218,9 +236,17 @@ fn ptg_scope(raw: &str) -> Option<serde_json::Value> {
 }
 
 fn published_plan_scope(scope: PublishedPlanScope) -> Option<serde_json::Value> {
-    if scope.review_type != "published_complete_snapshot_plan"
-        || scope.selection_mode != "complete_snapshot_source_set"
-        || !canonical_uuid(&scope.scope_id)
+    let allowed_plan = scope.review_type == "published_allowed_amount_plan";
+    if !matches!(
+        (scope.review_type.as_str(), scope.selection_mode.as_str()),
+        (
+            "published_complete_snapshot_plan",
+            "complete_snapshot_source_set"
+        ) | (
+            "published_allowed_amount_plan",
+            "complete_allowed_snapshot_source_set"
+        )
+    ) || !canonical_uuid(&scope.scope_id)
         || scope.approval_sha256.len() != 64
         || !scope
             .approval_sha256
@@ -230,7 +256,8 @@ fn published_plan_scope(scope: PublishedPlanScope) -> Option<serde_json::Value> 
         || scope.snapshot_id.chars().count() > 96
         || !valid_text(&scope.plan_id, usize::MAX)
         || scope.plan_id.chars().count() > 64
-        || !valid_text(&scope.plan_market_type, usize::MAX)
+        || !(valid_text(&scope.plan_market_type, usize::MAX)
+            || allowed_plan && scope.plan_market_type.is_empty())
         || scope.plan_market_type.chars().count() > 32
         || scope.plan_market_type != scope.plan_market_type.to_lowercase()
     {
@@ -341,8 +368,26 @@ pub(crate) fn validate_row(
         _ => None,
     }
     .ok_or_else(|| failure("invalid_scope", Some(index), Some("source_scope_json")))?;
+    if let Some(Some(selection)) = &input.office_recipe_json
+        && (input.source_system != "ptg"
+            || scope.get("review_type").and_then(serde_json::Value::as_str)
+                != Some("published_complete_snapshot_plan")
+            || !canonical_uuid(&selection.capture_id)
+            || selection.recipe_sha256.len() != 64
+            || !selection
+                .recipe_sha256
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    {
+        return Err(failure(
+            "invalid_office_recipe",
+            Some(index),
+            Some("office_recipe_json"),
+        ));
+    }
     let binding_key = binding_key(&input, &scope);
     Ok(ValidatedSourceBinding {
+        office_recipe_json: input.office_recipe_json,
         binding_id: input.binding_id,
         source_system: input.source_system,
         source_id: input.source_id,
@@ -363,7 +408,7 @@ pub(crate) fn validate_row(
 }
 
 fn copy_row(row: &ValidatedSourceBinding, output: &mut Vec<u8>) {
-    output.extend_from_slice(&16i16.to_be_bytes());
+    output.extend_from_slice(&17i16.to_be_bytes());
     write_field(
         &uuid_bytes(&row.binding_id).expect("validated UUID"),
         output,
@@ -392,6 +437,15 @@ fn copy_row(row: &ValidatedSourceBinding, output: &mut Vec<u8>) {
     write_field(&row.expected_revision.to_be_bytes(), output);
     if let Some(network) = row.expected_network_id {
         write_field(&network.to_be_bytes(), output);
+    } else {
+        output.extend_from_slice(&(-1i32).to_be_bytes());
+    }
+    if let Some(selection) = &row.office_recipe_json {
+        let mut jsonb = vec![1];
+        jsonb.extend_from_slice(
+            &serde_json::to_vec(selection).expect("validated selection serializes"),
+        );
+        write_field(&jsonb, output);
     } else {
         output.extend_from_slice(&(-1i32).to_be_bytes());
     }

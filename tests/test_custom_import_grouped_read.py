@@ -791,8 +791,8 @@ async def test_unicode_detail_and_page_keep_their_wire_bounds(monkeypatch, child
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("children_per_group", "status"), [(80, 200), (160, 503)])
 async def test_grouped_detail_enforces_final_utf8_envelope(monkeypatch, children_per_group, status):
-    http_fixture._install_keyring(monkeypatch)
     session = provider_fixture._Session()
+    http_fixture._install_keyring(monkeypatch, session)
     child_projections = tuple(
         SimpleNamespace(
             collection="rates", fields=(read_core.ReadFieldValue("service_code", "string", "value", "界" * 300),)
@@ -833,7 +833,7 @@ async def test_grouped_detail_enforces_final_utf8_envelope(monkeypatch, children
     assert children_per_group * 2 <= read_core.MAX_DETAIL_CHILDREN
     assert (len(encoded) <= transport._MAX_RESPONSE_BYTES) is (status == 200)
 
-    reply = await transport.serve_custom_import_detail(request, session)
+    reply = await transport.serve_custom_import_detail(request, http_fixture.cold_caller())
 
     assert reply.status == status
     assert reply.headers["cache-control"] == "private, no-store"

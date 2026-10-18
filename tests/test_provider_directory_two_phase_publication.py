@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
+from dataclasses import replace
 
 import pytest
 
 from db.connection import Database
+from process.provider_directory_generic_source_adapters import persist_source_rows
+from process.provider_directory_generic_source_policy import source_transaction
+from tests import provider_directory_semantic_proof_v3_postgres_support as semantic
+from tests.provider_directory_dataset_artifact_pg_support import (
+    seal_validated_dataset,
+)
+from tests.provider_directory_source_postgres_support import source_component_templates
 from tests.test_provider_directory_artifact_cutover import (
     _artifact_relation_value,
     _assert_artifact_relation_values,
@@ -21,16 +30,11 @@ from tests.test_provider_directory_dataset_artifact_db import (
     _dataset_database,
     _insert_validated_shared_dataset,
 )
-from tests.provider_directory_dataset_artifact_pg_support import (
-    seal_validated_dataset,
-)
 
 
 @contextlib.contextmanager
 def _active_dataset_fence(dataset_fence):
-    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(
-        dataset_fence
-    )
+    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(dataset_fence)
     try:
         yield
     finally:
@@ -67,10 +71,7 @@ async def _insert_second_endpoint_identity(
             "provider_directory_fully_enumerable_resources": ["Location"],
         }
     )
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_api_endpoint (endpoint_id) "
-        "VALUES ('endpoint_z');"
-    )
+    await database.status(f"INSERT INTO {schema}.provider_directory_api_endpoint (endpoint_id) VALUES ('endpoint_z');")
     await database.status(
         f"INSERT INTO {schema}.provider_directory_source ("
         "source_id, org_name, endpoint_id, requires_registration, "
@@ -129,9 +130,7 @@ async def _artifact_bundle_stages(
     *,
     should_fail_second: bool = False,
 ):
-    second_index_handler = (
-        _fail_stage_indexes if should_fail_second else _keep_stage_indexes
-    )
+    second_index_handler = _fail_stage_indexes if should_fail_second else _keep_stage_indexes
     return (
         await _prepared_bundle_stage(
             schema,
@@ -222,15 +221,9 @@ async def test_full_scope_uses_candidate_while_targeted_uses_current(monkeypatch
             ["source_primary"],
             should_select_validated_candidates=False,
         )
-        assert full_fence.dataset_id_by_endpoint_id == {
-            "endpoint_shared": "dataset_candidate"
-        }
-        assert [
-            dataset.dataset_id for dataset in full_fence.promotion_datasets
-        ] == ["dataset_candidate"]
-        assert targeted_fence.dataset_id_by_endpoint_id == {
-            "endpoint_shared": "dataset_shared"
-        }
+        assert full_fence.dataset_id_by_endpoint_id == {"endpoint_shared": "dataset_candidate"}
+        assert [dataset.dataset_id for dataset in full_fence.promotion_datasets] == ["dataset_candidate"]
+        assert targeted_fence.dataset_id_by_endpoint_id == {"endpoint_shared": "dataset_shared"}
         assert targeted_fence.promotion_datasets == []
         async with importer._provider_directory_artifact_dataset_scope(
             run_id="artifact-candidate",
@@ -242,8 +235,7 @@ async def test_full_scope_uses_candidate_while_targeted_uses_current(monkeypatch
                 "provider_directory_location"
             ]
             scoped_names = await database.all(
-                f"SELECT source_id, name FROM {schema}.{location_scope} "
-                "ORDER BY source_id;"
+                f"SELECT source_id, name FROM {schema}.{location_scope} ORDER BY source_id;"
             )
             assert [tuple(scope_name_row) for scope_name_row in scoped_names] == [
                 ("source_primary", "Candidate Clinic"),
@@ -268,6 +260,7 @@ async def test_full_selection_rejects_multiple_validated_candidates(monkeypatch)
                 ["source_primary"],
                 should_select_validated_candidates=True,
             )
+
 
 @pytest.mark.asyncio
 async def test_explicit_selection_rejects_same_endpoint_unrelated_candidate(
@@ -330,9 +323,7 @@ async def test_bundle_failure_rolls_back_relations_and_pointers(monkeypatch):
         )
         with _active_dataset_fence(dataset_fence):
             with pytest.raises(RuntimeError, match="second target failed"):
-                await importer._promote_provider_directory_artifact_bundle_transaction(
-                    failing_stages
-                )
+                await importer._promote_provider_directory_artifact_bundle_transaction(failing_stages)
             assert await _selected_dataset_states(database, schema) == [
                 ("dataset_candidate", importer.ENDPOINT_DATASET_VALIDATED, False),
                 ("dataset_shared", importer.ENDPOINT_DATASET_PUBLISHED, True),
@@ -348,9 +339,7 @@ async def test_bundle_failure_rolls_back_relations_and_pointers(monkeypatch):
                 },
             )
             successful_stages = await _artifact_bundle_stages(schema)
-            await importer._promote_provider_directory_artifact_bundle_transaction(
-                successful_stages
-            )
+            await importer._promote_provider_directory_artifact_bundle_transaction(successful_stages)
         await _assert_artifact_relation_values(
             database,
             schema,
@@ -372,20 +361,17 @@ async def test_multi_endpoint_reader_sees_atomic_bundle_and_pointers(monkeypatch
             ["source_primary", "source_z"],
             should_select_validated_candidates=True,
         )
-        assert [
-            dataset.endpoint_id for dataset in dataset_fence.promotion_datasets
-        ] == ["endpoint_shared", "endpoint_z"]
+        assert [dataset.endpoint_id for dataset in dataset_fence.promotion_datasets] == [
+            "endpoint_shared",
+            "endpoint_z",
+        ]
         artifact_stages = await _artifact_bundle_stages(schema)
         promotion_entered, release_promotion = _install_pointer_pause(monkeypatch)
         async with _publication_observer() as observer:
             with _active_dataset_fence(dataset_fence):
-                assert await _artifact_relation_value(
-                    observer, schema, "artifact_target_a"
-                ) == "old-a"
+                assert await _artifact_relation_value(observer, schema, "artifact_target_a") == "old-a"
                 promotion_task = importer.asyncio.create_task(
-                    importer._promote_provider_directory_artifact_bundle_transaction(
-                        artifact_stages
-                    )
+                    importer._promote_provider_directory_artifact_bundle_transaction(artifact_stages)
                 )
                 relation_reader_task = None
                 try:
@@ -395,9 +381,7 @@ async def test_multi_endpoint_reader_sees_atomic_bundle_and_pointers(monkeypatch
                         ("endpoint_z", "dataset_z_current"),
                     ]
                     relation_reader_task = importer.asyncio.create_task(
-                        _artifact_relation_value(
-                            observer, schema, "artifact_target_a"
-                        )
+                        _artifact_relation_value(observer, schema, "artifact_target_a")
                     )
                     await importer.asyncio.sleep(0.05)
                     assert not relation_reader_task.done()
@@ -416,85 +400,130 @@ async def test_multi_endpoint_reader_sees_atomic_bundle_and_pointers(monkeypatch
                     )
 
 
-async def _prepare_retry_cleanup_failure(database, schema):
-    """Create finalized retry state whose second delete fails."""
-    dataset_fence = await _prepare_retry_cleanup_state(database, schema)
-    await database.status(
-        f"CREATE FUNCTION {schema}.fail_retry_cleanup() RETURNS trigger "
-        "LANGUAGE plpgsql AS $$ BEGIN "
-        "RAISE EXCEPTION 'forced retry cleanup failure'; END; $$;"
-    )
-    await database.status(
-        f"CREATE TRIGGER fail_retry_cleanup BEFORE DELETE ON "
-        f"{schema}.provider_directory_pagination_checkpoint "
-        f"FOR EACH STATEMENT EXECUTE FUNCTION {schema}.fail_retry_cleanup();"
-    )
-    return dataset_fence
+async def _retry_source_binding(database, schema, dataset_id):
+    async with source_transaction(database):
+        binding = await database.scalar(
+            f"SELECT candidate_storage_json FROM {schema}.provider_directory_endpoint_dataset "
+            "WHERE dataset_id=:dataset_id",
+            dataset_id=dataset_id,
+        )
+    return json.loads(binding) if isinstance(binding, str) else binding
 
 
-async def _prepare_retry_cleanup_state(database, schema):
-    """Create finalized candidate retry state eligible for cleanup."""
-    await _insert_validated_shared_dataset(database, schema)
-    dataset_fence = await importer._resolve_provider_directory_artifact_datasets(
-        ["source_primary"],
-        should_select_validated_candidates=True,
+async def _publish_retry_dataset(database, schema, dataset_id):
+    """Use genuine acquisition, checkpoint, proof and immutable Source attachment."""
+    await semantic._insert_parent(database, schema, dataset_id)
+    candidate = database.semantic_candidates[dataset_id]
+    context = importer.PaginationCheckpointContext(
+        canonical_api_base=semantic.CANONICAL_BASE,
+        source_scope_hash=hashlib.sha256(dataset_id.encode()).hexdigest(),
+        source_ids=(semantic.SOURCE_ID,),
+        owner_run_id=candidate.import_run_id,
+        acquisition_root_run_id=candidate.acquisition_root_run_id,
+        endpoint_id=candidate.endpoint_id,
+        dataset_id=dataset_id,
     )
-    await database.status(
-        f"UPDATE {schema}.provider_directory_endpoint_dataset "
-        "SET status = :superseded_status, is_current = false, "
-        "superseded_at = now() WHERE dataset_id = 'dataset_shared';",
-        superseded_status=importer.ENDPOINT_DATASET_SUPERSEDED,
+    await importer._load_or_initialize_pagination_checkpoint(
+        context, "Practitioner", semantic.CANONICAL_BASE + "/Practitioner"
     )
-    await database.status(
-        f"UPDATE {schema}.provider_directory_endpoint_dataset "
-        "SET status = :published_status, is_current = true, "
-        "published_at = now() WHERE dataset_id = 'dataset_candidate';",
-        published_status=importer.ENDPOINT_DATASET_PUBLISHED,
+    await semantic._write_page(dataset_id, semantic._observation("Alex Example", page_number=1))
+    await persist_source_rows(
+        importer,
+        [
+            dict(
+                dataset_id=dataset_id,
+                resource_type="LU:Practitioner:pass:1",
+                resource_id="pass-row",
+                payload_hash=hashlib.sha256(b"{}").hexdigest(),
+                payload_json={},
+            )
+        ],
+        resource_hash_contract=None,
+        semantic_projection_as_of=None,
     )
-    await database.status(
-        f"CREATE TABLE {schema}.provider_directory_pagination_checkpoint ("
-        "dataset_id varchar(96) NOT NULL);"
-    )
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_pagination_checkpoint "
-        "VALUES ('dataset_candidate');"
-    )
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_dataset_resource ("
-        "dataset_id, resource_type, resource_id, payload_hash, payload_json"
-        ") VALUES ('dataset_candidate', 'LU:Location:pass:1', 'pass-row', "
-        ":payload_hash, CAST('{}' AS json));",
-        payload_hash="7" * 64,
-    )
-    return dataset_fence
+    binding = await _retry_source_binding(database, schema, dataset_id)
+    inputs = [binding["tables"][key]["name"] for key in ("resource_input", "witness_input")]
+    async with source_transaction(database):
+        assert (
+            await database.scalar(
+                f"SELECT count(*) FROM {schema}.{inputs[0]} WHERE resource_type='LU:Practitioner:pass:1'"
+            )
+            == 1
+        )
+    await semantic._publish_semantic_source(database, dataset_id)
+    assert (await _retry_source_binding(database, schema, dataset_id))["phase"] == "published"
+    async with source_transaction(database):
+        assert all(
+            [await database.scalar("SELECT to_regclass(:name)", name=f"{schema}.{name}") is None for name in inputs]
+        )
+        selected = await importer._resolve_provider_directory_artifact_datasets(
+            [semantic.SOURCE_ID],
+            should_select_validated_candidates=False,
+        )
+    return selected.datasets[0]
+
+
+@contextlib.asynccontextmanager
+async def _published_retry_database(monkeypatch, *, peer=False):
+    """Each cleanup case starts with real published payload and owned retry cursors."""
+    async with source_component_templates(), semantic._semantic_database(monkeypatch) as (database, schema):
+        datasets = []
+        if peer:
+            datasets.append(await _publish_retry_dataset(database, schema, "dataset_z_current"))
+        candidate = await _publish_retry_dataset(database, schema, "dataset_candidate")
+        database.retry_publication_fence = importer.ProviderDirectoryArtifactDatasetFence(
+            (replace(candidate, promote_on_cutover=True), *datasets),
+            should_select_validated_candidates=True,
+        )
+        database.retry_payloads_before = await _retry_payloads(database, schema)
+        assert len(database.retry_payloads_before) == 1 + int(peer)
+        assert await _retry_cleanup_counts(database, schema) == (0, 1)
+        yield database, schema
+
+
+async def _retry_payloads(database, schema):
+    async with source_transaction(database):
+        rows = await database.all(
+            f"SELECT dataset_id,resource_type,resource_id,payload_hash,payload_json::text "
+            f"FROM {schema}.provider_directory_dataset_resource ORDER BY dataset_id,resource_type,resource_id"
+        )
+    return [tuple(row) for row in rows]
 
 
 async def _retry_cleanup_counts(database, schema):
-    count_row = await database.first(
-        "SELECT "
-        f"(SELECT count(*) FROM {schema}.provider_directory_dataset_resource "
-        "WHERE dataset_id = 'dataset_candidate' "
-        "AND resource_type LIKE 'LU:%:pass:%') AS pass_rows, "
-        f"(SELECT count(*) FROM {schema}.provider_directory_pagination_checkpoint "
-        "WHERE dataset_id = 'dataset_candidate') AS checkpoints;"
-    )
-    return tuple(count_row)
+    async with source_transaction(database):
+        row = await database.first(
+            "SELECT "
+            f"(SELECT count(*) FROM {schema}.provider_directory_dataset_resource "
+            "WHERE dataset_id='dataset_candidate' AND resource_type LIKE 'LU:%:pass:%'), "
+            f"(SELECT count(*) FROM {schema}.provider_directory_pagination_checkpoint "
+            "WHERE dataset_id='dataset_candidate')"
+        )
+    return tuple(row)
 
 
 @pytest.mark.asyncio
 async def test_retry_cleanup_rolls_back_and_recovers_after_publication(monkeypatch):
-    """A cleanup failure cannot half-delete state and a replay can finish it."""
-    async with _dataset_database(monkeypatch) as (database, schema):
-        await _prepare_retry_cleanup_failure(database, schema)
-        assert await importer._clear_promoted_endpoint_dataset_retry_state(
-            ["dataset_candidate"]
-        ) == []
-        assert await _retry_cleanup_counts(database, schema) == (1, 1)
-        await database.status(
-            f"DROP TRIGGER fail_retry_cleanup ON "
-            f"{schema}.provider_directory_pagination_checkpoint;"
-        )
-        assert await importer._clear_promoted_endpoint_dataset_retry_state(
-            ["dataset_candidate"]
-        ) == ["dataset_candidate"]
+    """A real checkpoint delete rolls back after failure and can be replayed exactly."""
+    async with _published_retry_database(monkeypatch) as (database, schema):
+        original_status = database.status
+        delete_results = []
+
+        async def fail_after_delete(statement, *args, **kwargs):
+            result = await original_status(statement, *args, **kwargs)
+            if statement.lstrip().startswith("DELETE FROM") and "provider_directory_pagination_checkpoint" in statement:
+                delete_results.append(result)
+                raise RuntimeError("forced retry cleanup failure")
+            return result
+
+        with monkeypatch.context() as fault:
+            fault.setattr(database, "status", fail_after_delete)
+            assert await importer._clear_promoted_endpoint_dataset_retry_state(["dataset_candidate"]) == []
+        assert len(delete_results) == 1
+        assert await _retry_cleanup_counts(database, schema) == (0, 1)
+        assert await _retry_payloads(database, schema) == database.retry_payloads_before
+        assert await importer._clear_promoted_endpoint_dataset_retry_state(["dataset_candidate"]) == [
+            "dataset_candidate"
+        ]
         assert await _retry_cleanup_counts(database, schema) == (0, 0)
+        assert await _retry_payloads(database, schema) == database.retry_payloads_before

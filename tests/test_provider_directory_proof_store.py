@@ -21,7 +21,7 @@ from process.provider_directory_proof_store import (
 from process.provider_directory_resource_hash import (
     LEGACY_RESOURCE_HASH_CONTRACT,
 )
-
+from tests.provider_directory_proof_memory_support import proof_memory_authority as proof_memory_authority
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -48,9 +48,7 @@ def _dataset_resource(resource_type, resource_id, payload):
         "dataset_id": DATASET_ID,
         "resource_type": resource_type,
         "resource_id": resource_id,
-        "payload_hash": hashlib.sha256(
-            json.dumps(payload, sort_keys=True).encode()
-        ).hexdigest(),
+        "payload_hash": hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
         "payload_json": payload,
     }
 
@@ -100,20 +98,12 @@ class _MemoryProofConnection:
                 {
                     "shard_id": params["shard_id"],
                     "endpoint_id": params["endpoint_id"],
-                    "acquisition_root_run_id": params[
-                        "acquisition_root_run_id"
-                    ],
+                    "acquisition_root_run_id": params["acquisition_root_run_id"],
                     "source_ids_json": json.loads(params["source_ids_json"]),
                     "resource_count": params["resource_count"],
-                    "resource_counts_json": json.loads(
-                        params["resource_counts_json"]
-                    ),
-                    "first_identity_json": json.loads(
-                        params["first_identity_json"]
-                    ),
-                    "last_identity_json": json.loads(
-                        params["last_identity_json"]
-                    ),
+                    "resource_counts_json": json.loads(params["resource_counts_json"]),
+                    "first_identity_json": json.loads(params["first_identity_json"]),
+                    "last_identity_json": json.loads(params["last_identity_json"]),
                     "input_sha256": params["input_sha256"],
                     "artifact_sha256": params["artifact_sha256"],
                     "artifact_byte_count": params["artifact_byte_count"],
@@ -130,11 +120,8 @@ class _MemoryProofConnection:
     async def all(self, _sql, **params):
         shard_rows = [
             dict(shard_by_field)
-            for (dataset_id, shard_id), shard_by_field in sorted(
-                self.shards.items()
-            )
-            if dataset_id == params["dataset_id"]
-            and shard_id > params["after_shard_id"]
+            for (dataset_id, shard_id), shard_by_field in sorted(self.shards.items())
+            if dataset_id == params["dataset_id"] and shard_id > params["after_shard_id"]
         ]
         return shard_rows[:128]
 
@@ -153,12 +140,7 @@ async def _stored_proof(connection):
 
 async def _persist_rows_by_resource(connection, dataset_resources):
     descriptors = []
-    for resource_type in sorted(
-        {
-            dataset_resource["resource_type"]
-            for dataset_resource in dataset_resources
-        }
-    ):
+    for resource_type in sorted({dataset_resource["resource_type"] for dataset_resource in dataset_resources}):
         descriptors.append(
             await persist_dataset_proof_shard(
                 connection,
@@ -212,13 +194,8 @@ async def test_durable_shards_reuse_retried_batch_and_build_exact_summary():
         )
         for dataset_resource in dataset_resources
     )
-    assert proof.dataset_hash == hashlib.sha256(
-        "\n".join(identities).encode()
-    ).hexdigest()
-    assert all(
-        shard["dataset_id"] == DATASET_ID
-        for shard in proof.metadata["shards"]
-    )
+    assert proof.dataset_hash == hashlib.sha256("\n".join(identities).encode()).hexdigest()
+    assert all(shard["dataset_id"] == DATASET_ID for shard in proof.metadata["shards"])
 
 
 def _linked_family_artifact_row(proof_metadata_by_field):
@@ -236,9 +213,7 @@ def _linked_family_artifact_row(proof_metadata_by_field):
             "source_id": "source-a",
             "metadata_json": {
                 "provider_directory_supported_resources": ["Practitioner"],
-                "provider_directory_fully_enumerable_resources": [
-                    "Practitioner"
-                ],
+                "provider_directory_fully_enumerable_resources": ["Practitioner"],
             },
         },
         "dataset_id": DATASET_ID,
@@ -254,9 +229,7 @@ async def test_legacy_sealed_proof_retains_a_linked_family_outside_roots():
     """Derive artifact scope from every family sealed by a legacy proof."""
 
     connection = _MemoryProofConnection()
-    connection.parent["publication_metadata_json"]["selected_resources"] = [
-        "Practitioner"
-    ]
+    connection.parent["publication_metadata_json"]["selected_resources"] = ["Practitioner"]
     dataset_resources = [
         _dataset_resource(
             "Practitioner",
@@ -298,18 +271,10 @@ async def test_legacy_sealed_proof_retains_a_linked_family_outside_roots():
 @pytest.mark.asyncio
 async def test_durable_shards_reject_conflicting_retry_identity():
     connection = _MemoryProofConnection()
-    original = _dataset_resource(
-        "Practitioner", "practitioner-1", {"npi": "123"}
-    )
-    changed = _dataset_resource(
-        "Practitioner", "practitioner-1", {"npi": "456"}
-    )
-    await persist_dataset_proof_shard(
-        connection, "mrf", [original], dataset_id=DATASET_ID
-    )
-    await persist_dataset_proof_shard(
-        connection, "mrf", [changed], dataset_id=DATASET_ID
-    )
+    original = _dataset_resource("Practitioner", "practitioner-1", {"npi": "123"})
+    changed = _dataset_resource("Practitioner", "practitioner-1", {"npi": "456"})
+    await persist_dataset_proof_shard(connection, "mrf", [original], dataset_id=DATASET_ID)
+    await persist_dataset_proof_shard(connection, "mrf", [changed], dataset_id=DATASET_ID)
 
     with pytest.raises(
         ProviderDirectoryProofStoreError,
@@ -351,10 +316,7 @@ async def test_stored_proof_rejects_tampered_artifact_and_metadata():
 
 
 def test_generic_content_proof_uses_stable_publication_metadata_key():
-    assert (
-        PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
-        == "provider_directory_content_proof_v1"
-    )
+    assert PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY == "provider_directory_content_proof_v1"
 
 
 def _artifact_context(proof):
@@ -392,9 +354,7 @@ async def test_published_generic_dataset_reuses_metadata_without_json_scan(
     await _persist_rows_by_resource(connection, _sample_dataset_resources())
     proof = await _stored_proof(connection)
     dataset, candidate = _artifact_context(proof)
-    legacy_scan = AsyncMock(
-        side_effect=AssertionError("published proof must not scan JSON")
-    )
+    legacy_scan = AsyncMock(side_effect=AssertionError("published proof must not scan JSON"))
     source_summary = AsyncMock(return_value={"dataset_id": DATASET_ID})
     record_proof = AsyncMock()
     monkeypatch.setattr(
@@ -422,7 +382,5 @@ async def test_published_generic_dataset_reuses_metadata_without_json_scan(
 
     assert observed == {"dataset_id": DATASET_ID}
     legacy_scan.assert_not_awaited()
-    assert source_summary.await_args.args[2].source_metrics == (
-        proof.source_metrics
-    )
+    assert source_summary.await_args.args[2].source_metrics == (proof.source_metrics)
     assert record_proof.await_count == 2

@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import MetaData, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from db.models import EntityAddressUnified
 from process import reference_family_archive as archive
@@ -98,9 +98,16 @@ def _office_fixture(serving_schema, count):
 @pytest.fixture
 async def office_db(serving_schema, request):
     """Register exact isolated schema/role cleanup before any native creation."""
-    fixture = _office_fixture(serving_schema, getattr(request, "param", 2))
+    requested = getattr(request, "param", 2)
+    is_typed = requested == "typed"
+    fixture = _office_fixture(serving_schema, 2 if is_typed else requested)
+    canonical_type = None
     try:
-        prepared, validation = await _archive(fixture)
+        if is_typed:
+            from tests.test_mrf_result_archive_postgres import _provision_canonical_type
+
+            canonical_type = await _provision_canonical_type(async_sessionmaker(fixture.engine))
+        prepared, validation = await _archive(fixture, typed=is_typed)
         fixture.source = PinnedACAMembershipSource(prepared, validation, **fixture.source_metadata_by_field)
         await _prepare_addresses(fixture)
         fixture.batch = await _reviewed_batch(fixture)
@@ -118,6 +125,10 @@ async def office_db(serving_schema, request):
         yield fixture
     finally:
         await _cleanup_offices(fixture)
+        if canonical_type is not None:
+            from tests.test_mrf_result_archive_postgres import _retire_canonical_type
+
+            await _retire_canonical_type(async_sessionmaker(fixture.engine), canonical_type)
 
 
 async def _prepare_addresses(fixture):
@@ -182,13 +193,14 @@ async def _cleanup_offices(fixture):
         assert not await connection.fetchval("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)", role)
 
 
-async def _archive(fixture):
+async def _archive(fixture, *, typed=False):
     engine, coordinates = fixture.engine, fixture.coordinates
     metadata, owner, reader = fixture.source_metadata_by_field, fixture.owner, fixture.reader
     count, sites, raw, canonical = fixture.count, fixture.sites, fixture.raw, fixture.canonical
     schema = coordinates.dataset_schema
+    spec = archive.reference_family_spec("mrf", canonical=typed)
     async with AsyncSession(engine) as session, session.begin():
-        await archive._create_model_family(session, archive.reference_family_spec("mrf"), schema)
+        await archive._create_model_family(session, spec, schema)
         entries = [(index, 42 if index % 2 else 43, sites[(index - 1) % 2]) for index in range(1, count + 1)]
         await _insert_evidence(session, schema, entries)
         await _insert_reviewed_lineage(session, schema)
@@ -210,13 +222,10 @@ async def _archive(fixture):
                 "source_bits": 16,
                 "merged_into": None,
             }
-            await session.execute(
-                text(f'INSERT INTO "{schema}".mrf_canonical_address VALUES(:key,CAST(:payload AS jsonb))'),
-                {"key": sites[index], "payload": json.dumps(canonical_payload)},
-            )
+            await _insert_canonical_office(session, schema, sites[index], canonical_payload, typed=typed)
         manifest = await archive._family_manifest(
             session,
-            spec=archive.reference_family_spec("mrf"),
+            spec=spec,
             schema_name=schema,
             source_metadata={
                 "network_membership": metadata,
@@ -225,19 +234,39 @@ async def _archive(fixture):
             dependencies={"plan-attributes": "b" * 64},
             auxiliary={"archive_name": archive.archive_table_name(), "publication_sha256": "a" * 64},
         )
-        ownership = await archive.capture_reference_family_stage_ownership(
-            session, importer_id="mrf", dataset_id=UUID(coordinates.dataset_id)
-        )
+        ownership = await archive.capture_model_family_stage_ownership(session, spec, UUID(coordinates.dataset_id))
         owner_oid = await _seal_reviewed_archive(session, ownership, owner, reader)
         validation = await archive.prepare_reference_family_activation(
             session,
             ownership=ownership,
             manifest=manifest,
             package_id=hashlib.sha256(json.dumps(entries, default=str).encode()).hexdigest(),
-            profile_contract=archive.CONTRACT,
+            profile_contract=archive.TYPED_MRF_CONTRACT if typed else archive.CONTRACT,
             sealed_owner_oid=owner_oid,
         )
     return archive.ReferenceFamilyPreparedSource(manifest, ownership), validation
+
+
+async def _insert_canonical_office(session, schema, site, canonical_by_field, *, typed):
+    """Populate the actual declared model without introducing JSON payload columns."""
+    if not typed:
+        await session.execute(
+            text(f'INSERT INTO "{schema}".mrf_canonical_address VALUES(:key,CAST(:payload AS jsonb))'),
+            {"key": site, "payload": json.dumps(canonical_by_field)},
+        )
+        return
+    fields = tuple(name for name in canonical_by_field if name != "premise_identity_key")
+    columns = ",".join('"' + name + '"' for name in fields)
+    parameters = ",".join(":" + name for name in fields)
+    await session.execute(
+        text(f'INSERT INTO "{schema}".mrf_canonical_address ({columns}) VALUES ({parameters})'),
+        {
+            name: UUID(canonical_by_field[name])
+            if name in {"address_key", "premise_key"} and canonical_by_field[name] is not None
+            else canonical_by_field[name]
+            for name in fields
+        },
+    )
 
 
 async def _target(fixture, **changes):
@@ -1035,3 +1064,53 @@ async def test_complete_raw_fact_office_pages_use_exact_evidence_and_replay_curs
             pins.append(pin.selected_offices_sha256)
             cursor = batch.next_source_position
     assert pins[0] != pins[1]
+
+
+@pytest.mark.parametrize("office_db", ["typed"], indirect=True)
+async def test_typed_canonical_model_exact_two_offices_copy_and_native_oid_receipt(office_db):
+    """The real typed archive is validated and sealed without a payload auxiliary."""
+    fixture = office_db
+    ownership = fixture.source.prepared.ownership
+    assert ownership.auxiliary_oid is None
+    assert fixture.source.prepared.manifest.as_dict()["contract"] == archive.TYPED_MRF_CONTRACT
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        copy_target = await _target(fixture)
+        receipt = await _copy(fixture, copy_target)
+        assert receipt["office_count"] == 2
+        assert receipt["aca_source"]["canonical_address_oid"] == dict(ownership.relation_oids)["mrf_canonical_address"]
+        assert await _copy(fixture, copy_target) == receipt
+        bindings = await fixture.connection.fetch(
+            f'SELECT location_id,location_key FROM "{copy_target.schema_name}".provider_location_binding'
+        )
+        assert {tuple(binding) for binding in bindings} == {(fixture.sites[0], "1" * 64), (fixture.sites[1], "2" * 64)}
+
+
+@pytest.mark.parametrize("office_db", ["typed"], indirect=True)
+@pytest.mark.parametrize("damage", ["canonical_row", "canonical_oid"])
+async def test_typed_canonical_model_refuses_changed_native_proof_before_binding_writes(office_db, damage):
+    fixture = office_db
+    if damage == "canonical_row":
+        await fixture.connection.execute(
+            f'UPDATE "{fixture.coordinates.dataset_schema}".mrf_canonical_address SET source_bits=0'
+        )
+    else:
+        namespace = '"' + fixture.coordinates.dataset_schema + '"'
+        await fixture.connection.execute(f"ALTER TABLE {namespace}.mrf_canonical_address RENAME TO old_canonical")
+        await fixture.connection.execute(
+            f"CREATE TABLE {namespace}.mrf_canonical_address (LIKE {namespace}.old_canonical INCLUDING ALL)"
+        )
+        await fixture.connection.execute(
+            f"INSERT INTO {namespace}.mrf_canonical_address SELECT * FROM {namespace}.old_canonical"
+        )
+        await fixture.connection.execute(f'ALTER TABLE {namespace}.mrf_canonical_address OWNER TO "{fixture.owner}"')
+        await fixture.connection.execute(f'GRANT SELECT ON {namespace}.mrf_canonical_address TO "{fixture.reader}"')
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        copy_target = await _target(fixture)
+        with pytest.raises(ValueError):
+            await _copy(fixture, copy_target)
+        assert (
+            await fixture.connection.fetchval(
+                "SELECT to_regclass($1)", copy_target.schema_name + ".provider_location_binding"
+            )
+            is None
+        )

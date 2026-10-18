@@ -10,10 +10,11 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from db.models import ProviderDirectoryPractitioner
+from tests.provider_directory_checkpoint_unit_support import checkpoint_unit_scope as checkpoint_unit_scope
 from tests.provider_directory_fhir_bulk_test_support import (
-    _Connection,
     _acquire,
     _checkpoint,
+    _Connection,
     _fetch_options,
     _identity,
     _manifest_payload,
@@ -84,10 +85,7 @@ def test_capability_refresh_attempt_limit_is_bounded(monkeypatch):
         "HLTHPRT_PROVIDER_DIRECTORY_BULK_CAPABILITY_REFRESH_ATTEMPTS",
         "999",
     )
-    assert (
-        importer._bulk_capability_refresh_attempt_limit()
-        == importer.BULK_EXPORT_MAX_CAPABILITY_REFRESH_ATTEMPTS
-    )
+    assert importer._bulk_capability_refresh_attempt_limit() == importer.BULK_EXPORT_MAX_CAPABILITY_REFRESH_ATTEMPTS
 
 
 def test_manifest_output_checkpoint_mismatch_raises():
@@ -118,9 +116,7 @@ def test_retained_validator_proof_rejects_corruption(overrides):
         ValueError,
         match="bulk_export_output_validator_checkpoint_corrupt",
     ):
-        importer._bulk_output_validator_proof(
-            _refresh_output_checkpoint(**overrides)
-        )
+        importer._bulk_output_validator_proof(_refresh_output_checkpoint(**overrides))
 
 
 def test_refresh_output_pair_shape_is_exact():
@@ -279,12 +275,10 @@ def test_validated_refresh_manifest_accepts_only_safe_outputs():
     )
     assert manifest is not None and error is None
 
-    invalid_manifest, error = (
-        importer._validated_bulk_capability_refresh_manifest(
-            _source(),
-            _refresh_identity(),
-            {"requiresAccessToken": False},
-        )
+    invalid_manifest, error = importer._validated_bulk_capability_refresh_manifest(
+        _source(),
+        _refresh_identity(),
+        {"requiresAccessToken": False},
     )
     assert invalid_manifest is None
     assert error == "bulk_export_manifest_missing_transaction_time"
@@ -330,15 +324,13 @@ async def test_refresh_request_outcomes(
             AsyncMock(return_value=poll_result),
         )
 
-    manifest, error, polls = (
-        await importer._request_bulk_capability_refresh_manifest(
-            object(),
-            _source(),
-            _refresh_identity(),
-            timeout=3,
-            max_pending_seconds=10,
-            runtime_probe=AsyncMock(),
-        )
+    manifest, error, polls = await importer._request_bulk_capability_refresh_manifest(
+        object(),
+        _source(),
+        _refresh_identity(),
+        timeout=3,
+        max_pending_seconds=10,
+        runtime_probe=AsyncMock(),
     )
 
     assert error == expected_error
@@ -384,9 +376,7 @@ def test_validator_expiration_is_normalized():
         "a" * 64,
         expires_at,
     )
-    assert importer._bulk_validator_expiration(validator) == expires_at.replace(
-        tzinfo=None
-    )
+    assert importer._bulk_validator_expiration(validator) == expires_at.replace(tzinfo=None)
 
 
 @pytest.mark.asyncio

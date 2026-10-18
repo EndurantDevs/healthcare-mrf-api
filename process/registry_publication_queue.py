@@ -245,6 +245,82 @@ def _source_rollback_publication_result(result_by_name, command_by_name, state):
         raise ValueError("registry_source_rollback_publication_result_invalid") from None
 
 
+def _source_rollback_diff(result_by_name):
+    if type(result_by_name["diff_version"]) is not int or result_by_name["diff_version"] != 1:
+        raise ValueError
+    if type(result_by_name["changes"]) is not int or not 0 <= result_by_name["changes"] <= 2**53 - 1:
+        raise ValueError
+    _source_rollback_samples(result_by_name)
+    _source_rollback_validation(result_by_name["validation"])
+
+
+def _source_rollback_samples(result_by_name):
+    samples_by_category = result_by_name["samples"]
+    if type(samples_by_category) is not dict or set(samples_by_category) != {"additions", "removals", "changes"}:
+        raise ValueError
+    seen_units = set()
+    for category, units in samples_by_category.items():
+        if type(units) is not list or len(units) > min(20, result_by_name[category]):
+            raise ValueError
+        previous = None
+        for unit in units:
+            if type(unit) is not list or len(unit) != 4:
+                raise ValueError
+            network, system, provider, location = unit
+            if (
+                type(network) is not int
+                or not 0 < network < 2**31
+                or system not in ("npi", "provider_directory", "manual")
+                or type(provider) is not str
+                or not provider.strip(" ")
+                or len(provider.encode("utf-8")) > 1024
+                or type(location) is not str
+                or str(UUID(location)) != location
+                or not UUID(location).int
+                or previous is not None
+                and tuple(unit) <= previous
+                or tuple(unit) in seen_units
+            ):
+                raise ValueError
+            previous = tuple(unit)
+            seen_units.add(previous)
+    if len(json.dumps(samples_by_category, sort_keys=True, allow_nan=False).encode("utf-8")) > 64 * 1024:
+        raise ValueError
+
+
+def _source_rollback_validation(validation_by_name):
+    counters = {
+        "membership_rows",
+        "distinct_memberships",
+        "projected_locations",
+        "orphan_bindings",
+        "unknown_network_rows",
+    }
+    if type(validation_by_name) is not dict or set(validation_by_name) != counters | {
+        "state",
+        "validated",
+        "index_ready",
+        "writer_closed",
+    }:
+        raise ValueError
+    if validation_by_name["state"] != "ready" or any(
+        validation_by_name[field] is not True for field in ("validated", "index_ready", "writer_closed")
+    ):
+        raise ValueError
+    if any(
+        type(validation_by_name[field]) is not int or not 0 <= validation_by_name[field] <= 2**53 - 1
+        for field in counters
+    ):
+        raise ValueError
+    if (
+        not validation_by_name["projected_locations"]
+        <= validation_by_name["distinct_memberships"]
+        <= validation_by_name["membership_rows"]
+        or validation_by_name["unknown_network_rows"] != 0
+    ):
+        raise ValueError
+
+
 def _source_rollback_result(result_by_name, command, state):
     if state in {"queued", "running", "rejected"}:
         _reactivation_result(result_by_name, command, state)
@@ -261,9 +337,12 @@ def _source_rollback_result(result_by_name, command, state):
         "unresolved_rows",
         "source_selection",
     }
-    if type(result_by_name) is not dict or set(result_by_name) != required_fields:
+    extended_fields = required_fields | {"diff_version", "changes", "samples", "validation"}
+    if type(result_by_name) is not dict or set(result_by_name) not in (required_fields, extended_fields):
         raise ValueError("registry_source_rollback_result_invalid")
     try:
+        if set(result_by_name) == extended_fields:
+            _source_rollback_diff(result_by_name)
         candidate_id = UUID(result_by_name["candidate_id"])
         if not candidate_id.int or str(candidate_id) != result_by_name["candidate_id"]:
             raise ValueError

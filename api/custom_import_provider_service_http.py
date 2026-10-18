@@ -10,8 +10,8 @@ from typing import Any
 
 from sanic.exceptions import InvalidUsage
 from sanic.request.parameters import RequestParameters
-from sqlalchemy import text
 
+from api import custom_import_provider_collection as managed_collection
 from api import custom_import_read_http as transport
 from api.custom_import_provider_http import (
     _hydrate_provider_rows,
@@ -20,7 +20,11 @@ from api.custom_import_provider_http import (
     _provider_response_limit,
     _ProviderScopePreparer,
 )
+from api.custom_import_provider_network import provider_network_read_scope, provider_network_response
 from api.custom_import_provider_service_sql import ProviderServiceImportQuery
+from api.provider_collection_network_read import ProviderCollectionServiceRefusal
+from api.provider_service_legacy_selection import has_legacy_service_selectors, legacy_service_selection
+from api.signed_request_reader import signed_request_reader
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     MAX_NPI_PAGE_SIZE,
@@ -42,12 +46,19 @@ _NATIVE_FIELDS = frozenset(
 )
 
 
-def _parse_service_native_query(document: object) -> RequestParameters:
-    """Admit only the ordinary claims lane, with code selectors bound in the signed body."""
+_MANAGED_SELECTOR_FIELDS = frozenset(
+    "plan_id plan_external_id plan_id_type plan_market_type market_type source_key snapshot_id".split()
+)
+
+
+def _parse_service_native_query(document: object, *, allow_legacy_selectors=False) -> RequestParameters:
+    """Close signed service options; legacy routing needs the full managed policy."""
 
     if (
         type(document) is not dict
-        or not {"code", "code_system"} <= set(document) <= _NATIVE_FIELDS
+        or not {"code", "code_system"}
+        <= set(document)
+        <= (_NATIVE_FIELDS | _MANAGED_SELECTOR_FIELDS if allow_legacy_selectors else _NATIVE_FIELDS)
         or any(
             type(entry_id) is not str or len(entry_id) > 2048 or "\x00" in entry_id for entry_id in document.values()
         )
@@ -59,7 +70,7 @@ def _parse_service_native_query(document: object) -> RequestParameters:
 
 
 async def serve_custom_import_provider_service(request: Any, session: Any):
-    """Authorize and serve one exact claims page in one read-only snapshot."""
+    """Authorize and serve one exact service page in one read-only snapshot."""
 
     if (
         getattr(request, "method", None) != "POST"
@@ -67,11 +78,29 @@ async def serve_custom_import_provider_service(request: Any, session: Any):
         or getattr(request, "query_string", "")
     ):
         return transport._error(404)
+    is_managed_mode = False
     try:
         body = getattr(request, "body", None)
-        if type(body) is not bytes or not 1 <= len(body) <= transport._MAX_BODY_BYTES:
+        if type(body) is not bytes or not 1 <= len(body) <= managed_collection.MAX_MANAGED_BODY_BYTES:
             raise transport._fail()
-        parsed = _parse_provider_request(body, native_query_parser=_parse_service_native_query)
+        parsed = _parse_provider_request(
+            body,
+            native_query_parser=lambda document: _parse_service_native_query(document, allow_legacy_selectors=True),
+            allow_network_binding=True,
+            allow_managed_collection=True,
+            collection_kind="by-service",
+        )
+        is_managed_mode = parsed.managed_collection is not None
+        if not is_managed_mode and any(name in parsed.native_args for name in _MANAGED_SELECTOR_FIELDS):
+            raise CustomImportReadRequestError("native provider-service query is invalid")
+        if not is_managed_mode and len(body) > transport._MAX_BODY_BYTES:
+            raise transport._fail()
+        if is_managed_mode:
+            from api.endpoint.pagination import _parse_non_negative_int
+
+            limit = _parse_non_negative_int(parsed.native_args.get("limit"), "limit")
+            if limit is not None and limit > 50:
+                raise CustomImportReadRequestError("provider-service page exceeds its bound")
         verified = transport._verify_provider_transport(
             headers=request.headers,
             body=body,
@@ -79,34 +108,67 @@ async def serve_custom_import_provider_service(request: Any, session: Any):
             trusted_now=transport._trusted_now(),
             keyring=transport._keyring(),
             path=CUSTOM_IMPORT_PROVIDER_SERVICE_PATH,
+            managed_collection=is_managed_mode,
         )
-        if session is None or session.in_transaction():
-            raise CustomImportReadUnavailableError("fresh provider-service read session is required")
-        async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), session.begin():
-            await _prepare_service_snapshot(session, parsed.native_args)
-            async with _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS):
-                service_payload = await _read_service_payload(request, session, parsed, verified)
-                encoded = transport._canonical_json_bytes(service_payload)
-                if len(encoded) > _provider_response_limit(parsed, len(service_payload["items"])):
-                    raise CustomImportReadUnavailableError("provider-service response is unavailable")
-                return transport._response(encoded, 200)
+        if is_managed_mode:
+            return await _serve_managed_service_page(request, parsed, verified)
+        return await _serve_legacy_service_page(request, session, parsed, verified)
+    except ProviderCollectionServiceRefusal as failure:
+        if not is_managed_mode:
+            return transport._error(503)
+        reply = transport._response(transport._canonical_json_bytes(failure.document), 422)
+        reply.headers["X-Network-Access-Scope"] = parsed.managed_collection.scope_sha256
+        return reply
     except Exception as failure:
         transport._log_failure(failure)
+        if is_managed_mode:
+            return managed_collection.managed_collection_error(failure)
         status = 400 if isinstance(failure, InvalidUsage) else transport._failure_status(failure)
         return transport._error(status)
 
 
-async def _prepare_service_snapshot(session, native_args):
-    """Allocate plan-only TEMP storage before entering the shared read-only snapshot."""
+async def _serve_legacy_service_page(request, session, parsed, verified):
+    async with (
+        asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000),
+        signed_request_reader(
+            request, session, plan_workspace=bool(parsed.native_args.get("plan_release_id"))
+        ) as session,
+    ):
+        await _prepare_service_snapshot(session, parsed.native_args)
+        async with (
+            _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS),
+            provider_network_read_scope(session, parsed.network_binding) as manifest,
+        ):
+            service_payload = await _read_service_payload(request, session, parsed, verified)
+            encoded = transport._canonical_json_bytes(service_payload)
+            if len(encoded) > _provider_response_limit(parsed, len(service_payload["items"])):
+                raise CustomImportReadUnavailableError("provider-service response is unavailable")
+            return provider_network_response(encoded, manifest)
 
-    if native_args.get("plan_release_id"):
+
+async def _serve_managed_service_page(request, parsed, verified):
+    temporary_setup = None
+    if parsed.native_args.get("plan_release_id") or has_legacy_service_selectors(parsed.native_args):
         from api.custom_import_plan_sql import prepare_plan_query_tables
 
-        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-        await prepare_plan_query_tables(session)
-        await session.execute(text("SET TRANSACTION READ ONLY"))
-    else:
-        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        temporary_setup = prepare_plan_query_tables
+    async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000):
+        async with managed_collection.managed_import_collection_scope(
+            request, parsed.managed_collection, temporary_setup=temporary_setup
+        ) as (reader, manifest):
+            payload = await _read_service_payload(request, reader, parsed, verified)
+            return managed_collection.managed_collection_response(
+                payload,
+                parsed.managed_collection,
+                manifest,
+                maximum_bytes=_provider_response_limit(parsed, len(payload["items"])),
+            )
+
+
+async def _prepare_service_snapshot(session, native_args):
+    """Require fixed empty workspace preparation before the genuine RO snapshot."""
+    if native_args.get("plan_release_id") and session.info.get("native_plan_workspace") is not True:
+        raise CustomImportReadUnavailableError("plan Reader workspace is unavailable")
 
 
 async def _read_service_payload(request, session, parsed, verified):
@@ -128,15 +190,24 @@ async def _read_service_payload(request, session, parsed, verified):
     )
 
     scope_preparer = _ProviderScopePreparer(session, service, authorization, pinned_target, query, prepared)
-    reply = await _service_page(
-        request,
-        native_args=parsed.native_args,
-        import_context=ProviderServiceImportQuery(prepared, query.require_match, scope_preparer.prepare),
-    )
+    async with legacy_service_selection(session, parsed.native_args) as native_args:
+        reply = await _service_page(
+            request,
+            native_args=native_args,
+            import_context=ProviderServiceImportQuery(prepared, query.require_match, scope_preparer.prepare),
+        )
+        plan_release_id = native_args.get("plan_release_id")
+    if reply.status == 422 and parsed.managed_collection is not None:
+        raise ProviderCollectionServiceRefusal(reply.body)
+    if reply.status != 200 and parsed.managed_collection is not None:
+        from sanic.exceptions import SanicException
+
+        status = reply.status if reply.status in {400, 403, 404, 409, 503} else 503
+        raise SanicException("Provider data is unavailable.", status_code=status)
     maximum_native_bytes = _provider_response_limit(parsed, parsed.maximum_family_rows)
     if reply.status != 200 or len(reply.body) > maximum_native_bytes:
         raise CustomImportReadUnavailableError("provider-service response is unavailable")
-    response_by_field = _service_payload(reply.body, plan_release_id=parsed.native_args.get("plan_release_id"))
+    response_by_field = _service_payload(reply.body, plan_release_id=plan_release_id)
     if len(reply.body) > _provider_response_limit(parsed, len(response_by_field["items"])):
         raise CustomImportReadUnavailableError("provider-service response is unavailable")
     # The public default omits this duplicate legacy alias while retaining all prices.
@@ -208,7 +279,15 @@ async def _service_page(request: Any, **kwargs: Any):
 
     from api.endpoint.pricing import list_providers_by_procedure
 
-    return await list_providers_by_procedure(request, **kwargs)
+    native_args = kwargs.get("native_args")
+    if native_args is None:
+        return await list_providers_by_procedure(request, **kwargs)
+    from api.network_address_scope import current_network_address_scope
+
+    if current_network_address_scope() is None or not has_legacy_service_selectors(native_args):
+        return await list_providers_by_procedure(request, **kwargs)
+    async with legacy_service_selection(request.ctx.sa_session, native_args) as normalized:
+        return await list_providers_by_procedure(request, **(kwargs | {"native_args": normalized}))
 
 
 __all__ = ("CUSTOM_IMPORT_PROVIDER_SERVICE_PATH", "serve_custom_import_provider_service")

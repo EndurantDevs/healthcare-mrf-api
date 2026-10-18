@@ -51,6 +51,13 @@ ATTEMPT_ATTACHMENTS = (
         "plan_release_binding",
         "plan_release_snapshot_binding",
         ("snapshot_id",),
+        statement_trigger=False,
+    ),
+    AttemptAttachment(
+        "plan_release_pin",
+        "plan_release_snapshot_pin",
+        ("snapshot_id",),
+        statement_trigger=False,
     ),
     AttemptAttachment("plan_month", "ptg2_plan_month", ("snapshot_id",)),
     AttemptAttachment(
@@ -164,8 +171,7 @@ ATTEMPT_STATE_TABLES = (
 )
 
 ATTEMPT_ATTACHMENT_BY_TABLE = {
-    attachment.table_name: attachment
-    for attachment in (*ATTEMPT_STATE_TABLES, *ATTEMPT_ATTACHMENTS)
+    attachment.table_name: attachment for attachment in (*ATTEMPT_STATE_TABLES, *ATTEMPT_ATTACHMENTS)
 }
 
 
@@ -175,6 +181,7 @@ def attempt_attachment_for_table(
     """Return the single registry entry governing a durable PTG table."""
 
     return ATTEMPT_ATTACHMENT_BY_TABLE.get(str(table_name or ""))
+
 
 MANIFEST_STAGE_KINDS = (
     "serving",
@@ -193,10 +200,7 @@ def manifest_stage_token(source_key: str, snapshot_id: str) -> str:
 def manifest_stage_name_for_kind(kind: str, token: str) -> str:
     """Return one deterministic manifest-stage table name."""
 
-    safe_token = "".join(
-        character if character.isalnum() else "_"
-        for character in token.lower()
-    ).strip("_")
+    safe_token = "".join(character if character.isalnum() else "_" for character in token.lower()).strip("_")
     return f"ptg2_manifest_stage_{kind}_{safe_token}"[:63]
 
 
@@ -207,10 +211,7 @@ def manifest_stage_table_names(
     """Return every deterministic stage table owned by one attempt."""
 
     token = manifest_stage_token(source_key, snapshot_id)
-    return tuple(
-        manifest_stage_name_for_kind(kind, token)
-        for kind in MANIFEST_STAGE_KINDS
-    )
+    return tuple(manifest_stage_name_for_kind(kind, token) for kind in MANIFEST_STAGE_KINDS)
 
 
 __all__ = [

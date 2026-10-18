@@ -53,6 +53,7 @@ _MODULES = (
     "process.entity_address_unified",
     "process.entity_address_candidate_preparation",
     "process.entity_address_preparation_admission",
+    "process.entity_address_source_preparation",
     "process.entity_address_prepared_doctors",
     "process.cms_doctors_preparation",
     "process.cms_doctors_source_provenance",
@@ -188,7 +189,12 @@ def _desired_doctors(fhir, doctors):
 
 def _desired_geo_bindings(schema, native_input_fence, doctors, dependency_bindings):
     """Keep the incumbent physical fence intact and substitute only the exact sealed source."""
-    expected_by_name = source_dependencies._validate_bindings(schema, None, native_input_fence["geo_bindings"])
+    expected_by_name = source_dependencies._validate_bindings(
+        schema,
+        None,
+        native_input_fence["geo_bindings"],
+        **({"tiger_captured": native_input_fence["tiger_captured"]} if "tiger_captured" in native_input_fence else {}),
+    )
     if doctors is not None:
         _target, stage, oid = doctors.stage_oids[0]
         expected_by_name[f"{schema}.doctor_clinician_address"] = {
@@ -266,7 +272,7 @@ def _with_doctors_input(fhir, input_json, doctors, dependency_bindings):
     return _json(input_by_field)
 
 
-def _with_registry_source_retention_input(input_json, execution, raw_policy):
+def _with_registry_source_retention_input(input_json, execution, raw_policy, source_as_of):
     """Bind a closed retention request to this factory's actual fence and selection."""
     from process.provider_directory_cms_capacity_contract import validated_registry_source_retention_policy
 
@@ -277,7 +283,8 @@ def _with_registry_source_retention_input(input_json, execution, raw_policy):
     if (
         len(cms_pins) != 1
         or pin["schema_name"] != inputs["database_schema"]
-        or pin["as_of"] != inputs["profile_as_of"]
+        or pin["as_of"] != source_as_of
+        or inputs["profile_as_of"] != execution.attestation.desired_profile_as_of
         or policy["selection_proof_id"] != getattr(execution.attestation, "proof_id", None)
         or any(pin[name] != cms_pins[0][name] for name in ("source_id", "endpoint_id", "dataset_id"))
         or pin["dataset_sha256"] != cms_pins[0]["dataset_hash"]
@@ -297,6 +304,7 @@ class CMSAddressPreparation:
     run_id: str
     input_json: str
     doctors: Any = None
+    cms_source_as_of: str | None = None
 
     @property
     def input_hash(self) -> str:
@@ -322,6 +330,7 @@ class CMSAddressPreparation:
             self.run_id,
             _with_doctors_input(self.fhir, self.input_json, doctors, dependency_bindings),
             doctors,
+            self.cms_source_as_of,
         )
 
     def with_registry_source_retention(self, policy) -> CMSAddressPreparation:
@@ -330,8 +339,9 @@ class CMSAddressPreparation:
             self.fhir,
             self.execution,
             self.run_id,
-            _with_registry_source_retention_input(self.input_json, self.execution, policy),
+            _with_registry_source_retention_input(self.input_json, self.execution, policy, self.cms_source_as_of),
             self.doctors,
+            self.cms_source_as_of,
         )
 
     def _current_input(self, fence, expected):
@@ -349,7 +359,7 @@ class CMSAddressPreparation:
             input_json = _with_doctors_input(self.fhir, input_json, self.doctors, expected["desired_geo_bindings"])
         if "registry_source_retention" in expected:
             input_json = _with_registry_source_retention_input(
-                input_json, self.execution, expected["registry_source_retention"]
+                input_json, self.execution, expected["registry_source_retention"], _cms_source_as_of(fence)
             )
         return input_json
 
@@ -369,12 +379,21 @@ class CMSAddressPreparation:
             raise RuntimeError("cms_address_admitted_inputs_changed")
         return expected
 
-    async def _assert_dependencies(self, expected):
+    async def _assert_dependencies(self, expected, admission=None):
         """Compare every native input in one repeatable, read-only snapshot."""
-        async with self.fhir.db.session() as session:
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-            actual = await capture_native_dependencies(session, self.fhir._schema())
-            native_input_fence = await capture_native_address_input_fence(session, self.fhir._schema())
+        from process.provider_directory_generic_source_policy import is_source_storage_required
+
+        if is_source_storage_required():
+            from process.entity_address_source_preparation import source_dependency_session
+
+            async with source_dependency_session(self.fhir.db, admission, self.input_hash) as session:
+                actual = await capture_native_dependencies(session, self.fhir._schema())
+                native_input_fence = await capture_native_address_input_fence(session, self.fhir._schema())
+        else:
+            async with self.fhir.db.session() as session:
+                await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+                actual = await capture_native_dependencies(session, self.fhir._schema())
+                native_input_fence = await capture_native_address_input_fence(session, self.fhir._schema())
         if actual != expected["native_dependencies"] or native_input_fence != expected["native_input_fence"]:
             raise RuntimeError("cms_address_native_dependencies_changed")
 
@@ -384,7 +403,7 @@ class CMSAddressPreparation:
         if self.fhir.db is not _native().db or self.fhir.db._transaction_binding() is not None:
             raise RuntimeError("cms_address_preparation_requires_shared_unbound_database")
         expected = self._assert_inputs(fence, admission)
-        await self._assert_dependencies(expected)
+        await self._assert_dependencies(expected, admission)
         overrides_by_name = dict(relation_overrides)
         for name in RELATION_NAMES_BY_IMPORTER["cms-doctors"]:
             stage = self.source_relation_overrides.get(name)
@@ -395,14 +414,7 @@ class CMSAddressPreparation:
         inputs = _preparation_inputs(
             fence, overrides_by_name, overlay, expected["native_dependencies"], expected["profile_as_of"]
         )
-        await source_dependencies.capture_dependencies(
-            self.fhir.db,
-            self.fhir._schema(),
-            inputs.relation_overrides,
-            doctors=self.doctors,
-            dependency_bindings=expected["desired_geo_bindings"],
-            archive=archive,
-        )
+        await self._assert_prepared_dependencies(inputs, expected, admission, archive)
         context = await _new_context(self.run_id, self.fhir._schema())
         prepared = await prepare_provider_directory_entity_address(
             context,
@@ -418,13 +430,38 @@ class CMSAddressPreparation:
             raise RuntimeError("cms_address_preparation_incomplete")
         try:
             self._assert_inputs(fence, admission)
-            await self._assert_dependencies(expected)
+            await self._assert_dependencies(expected, admission)
             if tuple(sorted(table for table, _stage, _oid in prepared.stage_oids)) != self.native_targets:
                 raise RuntimeError("cms_address_native_targets_changed")
             prepared.context["cms_native_address_input_json"] = self.input_json
+            from process.provider_directory_generic_source_policy import is_source_storage_required
+
+            if is_source_storage_required():
+                from process.entity_address_source_preparation import require_source_generation
+
+                require_source_generation(prepared, admission)
             yield prepared
         finally:
             await cleanup_prepared_entity_address_generation(prepared)
+
+    async def _assert_prepared_dependencies(self, inputs, expected, admission, archive):
+        """Keep the complete desired input verifier before stage creation on its actual actor."""
+        from process.provider_directory_generic_source_policy import is_source_storage_required
+
+        options_by_name = dict(
+            doctors=self.doctors, dependency_bindings=expected["desired_geo_bindings"], archive=archive
+        )
+        if is_source_storage_required():
+            from process.entity_address_source_preparation import source_dependency_transaction
+
+            async with source_dependency_transaction(self.fhir.db, admission, self.input_hash):
+                await source_dependencies.capture_dependencies(
+                    self.fhir.db, self.fhir._schema(), inputs.relation_overrides, **options_by_name
+                )
+        else:
+            await source_dependencies.capture_dependencies(
+                self.fhir.db, self.fhir._schema(), inputs.relation_overrides, **options_by_name
+            )
 
 
 def _preparation_inputs(fence, overrides, overlay, dependencies, semantic_as_of):
@@ -469,6 +506,12 @@ async def _new_context(run_id: str, schema: str) -> dict[str, Any]:
     return context_by_field
 
 
+def _cms_source_as_of(fence):
+    """Read the exact CMS date already bound by the authenticated desired fence."""
+    datasets = [dataset for dataset in fence.datasets if dataset.source_id == "cms-npd"]
+    return getattr(datasets[0], "semantic_projection_as_of", None) if len(datasets) == 1 else None
+
+
 def cms_address_preparation(
     fhir,
     execution,
@@ -496,6 +539,7 @@ def cms_address_preparation(
             worker_count,
             temp_file_limit_bytes_per_backend,
         ),
+        cms_source_as_of=_cms_source_as_of(fence),
     )
 
 

@@ -4,6 +4,8 @@
 import asyncio
 import copy
 
+from process import provider_directory_profile_native_copy as native_copy
+
 
 def statement(statement, params):
     """Hold the original statement and bound values before its single execution."""
@@ -44,7 +46,7 @@ async def execute(fhir, custody):
 
 def matches(fhir, custody, outcome, task):
     """Missing, borrowed or replaced evidence retains incomplete exposure."""
-    return (
+    exact = (
         isinstance(custody, dict)
         and custody.get("task") is task
         and custody.get("attempted") is True
@@ -54,10 +56,35 @@ def matches(fhir, custody, outcome, task):
         and custody.get("statement") is custody.get("original_statement")
         and custody.get("params") == custody.get("original_params")
         and custody.get("witness") is custody.get("original_witness")
-        and isinstance(custody.get("witness"), fhir.profile_statement_wal.TargetStatementWalWitness)
+    )
+    if not exact:
+        return False
+    if type(custody.get("witness")) is native_copy.NativeCopyWitness:
+        if not native_copy.matches(custody["witness"], outcome, task):
+            return False
+        custody["native_copy_measurement"] = native_copy.transaction_capture(custody["witness"], outcome, task)
+        return True
+    return (
+        isinstance(custody.get("witness"), fhir.profile_statement_wal.TargetStatementWalWitness)
         and outcome.measurement is not None
         and fhir._profile_evidence_statement_capture(outcome.measurement, custody["witness"])[
             "statement_reconciliation_status"
         ]
         == "complete"
     )
+
+
+async def execute_copy(fhir, custody, request, pages, outcome):
+    """Execute one exact native COPY coordinate without an INSERT witness fallback."""
+    if (
+        custody["task"] is not asyncio.current_task()
+        or custody["attempted"] is not False
+        or custody["statement"] is not request
+        or custody["params"] != request.projection_params
+    ):
+        raise RuntimeError("provider_directory_profile_payload_statement_owner_invalid")
+    custody["attempted"] = True
+    custody["outcome"], custody["session"] = outcome, outcome.session
+    witness = await native_copy.execute_profile_copy(fhir, request, pages, outcome=outcome)
+    custody["witness"] = custody["original_witness"] = witness
+    return witness.affected_rows

@@ -145,8 +145,6 @@ async def _verify_recipe_source(session, driver, pin, approved, store, control_s
     from process.registry_ptg_office_witness import verify_registry_ptg_office_witness
 
     document, hold = await _retained_documents(session, store, pin)
-    if document["command"]["source"]["approved_revision"] != approved.approved_revision:
-        raise ValueError("registry_ptg_office_recipe_approval_changed")
     context, request = await _recipe_context(session, store, document, pin, control_schema)
     retained = await lock_ptg_published_result_for_clone(
         session, schema_name=context.source_specification.ptg_schema_name, authority=document["source_pin"]
@@ -157,7 +155,14 @@ async def _verify_recipe_source(session, driver, pin, approved, store, control_s
     ):
         raise ValueError("registry_ptg_office_recipe_source_changed")
     descriptor = await _descriptor(session, context, request)
-    witness = await verify_registry_ptg_office_witness(session, context, request, descriptor, read_budget=read_budget)
+    witness = await verify_registry_ptg_office_witness(
+        session,
+        context,
+        request,
+        descriptor,
+        read_budget=read_budget,
+        retained_approved_revision=approved.approved_revision,
+    )
     observed = witness.as_dict()
     if {name: field_value for name, field_value in observed.items() if name != "graph_budget"} != {
         name: field_value for name, field_value in document["witness"].items() if name != "graph_budget"
@@ -170,8 +175,8 @@ async def _verify_recipe_source(session, driver, pin, approved, store, control_s
     return _VerifiedOfficeSource(session, driver, transaction, pin, context, request, descriptor, serving)
 
 
-async def require_ptg_office_recipe(driver, recipe, approved, control_schema, office_authority):
-    """Require real fenced reader, immutable holds and fresh full source/office witness."""
+async def require_ptg_office_authority(driver, control_schema, office_authority):
+    """Bind the original fenced reader to its exact native transaction."""
     from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 
     if type(office_authority) is not tuple or len(office_authority) != 3:
@@ -189,6 +194,13 @@ async def require_ptg_office_recipe(driver, recipe, approved, control_schema, of
         raise ValueError("registry_ptg_office_recipe_owner_unavailable")
     transaction = session.get_transaction()
     _same_transaction(session, driver, transaction)
+    return session, store, read_budget
+
+
+async def require_ptg_office_recipe(driver, recipe, approved, control_schema, office_authority):
+    """Require real fenced reader, immutable holds and fresh full source/office witness."""
+    session, store, read_budget = await require_ptg_office_authority(driver, control_schema, office_authority)
+    transaction = session.get_transaction()
     original_path = (await session.execute(text("SELECT pg_catalog.current_setting('search_path')"))).scalar_one()
     await session.execute(text("SELECT pg_catalog.set_config('search_path','pg_catalog,pg_temp',true)"))
     original_error = None
