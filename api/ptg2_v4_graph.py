@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import operator
 import os
 import struct
 import threading
@@ -32,12 +31,6 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_PROJECTION_ID_SCOPE,
     decode_v4_snapshot_map_pack,
 )
-
-try:
-    from ptg2_address_canon import ptg2_decode_u32_le as _native_u32_decoder
-except ImportError, AttributeError:
-    _native_u32_decoder = None
-
 
 PTG2_V4_MEMBER_PAGE_BYTES = 16 * 1024
 PTG2_V4_MEMBER_WIDTH_BYTES = 4
@@ -1612,21 +1605,9 @@ def _decode_member_page(
         raise PTG2SharedBlockError("PTG V4 member page is malformed")
     if not member_page_payload:
         return ()
-    if _native_u32_decoder is None:
-        return struct.unpack(f"<{entry_count}I", member_page_payload)
-    try:
-        decoded_members = tuple(
-            operator.index(member_value) for member_value in _native_u32_decoder(member_page_payload)
-        )
-    except (OverflowError, TypeError, ValueError) as exc:
-        raise PTG2SharedBlockError("PTG V4 native member decoder failed") from exc
-    if len(decoded_members) != entry_count or any(
-        member_value < 0 or member_value > 0xFFFFFFFF for member_value in decoded_members
-    ):
-        raise PTG2SharedBlockError("PTG V4 native member decoder changed framing")
     # Pages may straddle owners, so ordering is checked after each owner's
     # complete member span has been reconstructed below.
-    return decoded_members
+    return struct.unpack(f"<{entry_count}I", member_page_payload)
 
 
 def _validated_heavy_bitmap(
