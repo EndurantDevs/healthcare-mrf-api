@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from inspect import getattr_static
 
+from sqlalchemy import exc as database_errors
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
@@ -73,6 +74,24 @@ _DATABASE_REASONS = {
     "57P03": "cannot_connect_now",
 }
 DATABASE_REASONS = frozenset(_DATABASE_REASONS.values()) | {"not_applicable", "unknown", "connection_pool_timeout"}
+_DATABASE_SUBTYPES = (
+    (database_errors.PendingRollbackError, "sqlalchemy_pending_rollback"),
+    (database_errors.ResourceClosedError, "sqlalchemy_resource_closed"),
+    (database_errors.InvalidRequestError, "sqlalchemy_invalid_request"),
+    (database_errors.DisconnectionError, "sqlalchemy_disconnection"),
+    (database_errors.InterfaceError, "sqlalchemy_interface"),
+    (database_errors.OperationalError, "sqlalchemy_operational"),
+    (database_errors.ProgrammingError, "sqlalchemy_programming"),
+    (database_errors.IntegrityError, "sqlalchemy_integrity"),
+    (database_errors.DataError, "sqlalchemy_data"),
+    (database_errors.InternalError, "sqlalchemy_internal"),
+    (database_errors.DatabaseError, "sqlalchemy_database"),
+    (database_errors.DBAPIError, "sqlalchemy_dbapi"),
+    (database_errors.StatementError, "sqlalchemy_statement"),
+    (SQLAlchemyTimeoutError, "sqlalchemy_timeout"),
+    (SQLAlchemyError, "unknown"),
+)
+DATABASE_SUBTYPES = frozenset(label for _kind, label in _DATABASE_SUBTYPES) | {"not_applicable"}
 
 
 def _static_attribute(error: BaseException, name: str):
@@ -84,8 +103,8 @@ def _static_attribute(error: BaseException, name: str):
         return None
 
 
-def _database_reason(error: BaseException) -> str:
-    pending, seen, database_error = [error], set(), False
+def _failure_chain(error: BaseException):
+    pending, seen = [error], set()
     for _ in range(8):
         if not pending:
             break
@@ -93,17 +112,39 @@ def _database_reason(error: BaseException) -> str:
         if id(current) in seen:
             continue
         seen.add(id(current))
-        database_error |= issubclass(type(current), SQLAlchemyError)
+        yield current
+        cause = BaseException.__cause__.__get__(current, BaseException)
+        original = _static_attribute(current, "orig")
+        pending.extend(value for value in (original, cause) if issubclass(type(value), BaseException))
+
+
+def _database_reason(error: BaseException) -> str:
+    has_database_error = False
+    for current in _failure_chain(error):
+        has_database_error |= issubclass(type(current), SQLAlchemyError)
         if issubclass(type(current), SQLAlchemyTimeoutError):
             return "connection_pool_timeout"
         for name in ("sqlstate", "pgcode"):
             code = _static_attribute(current, name)
             if type(code) is str and code in _DATABASE_REASONS:
                 return _DATABASE_REASONS[code]
-        cause = BaseException.__cause__.__get__(current, BaseException)
-        original = _static_attribute(current, "orig")
-        pending.extend(value for value in (original, cause) if issubclass(type(value), BaseException))
-    return "unknown" if database_error else "not_applicable"
+    return "unknown" if has_database_error else "not_applicable"
+
+
+def database_failure_details(error: BaseException) -> tuple[str, bool, bool]:
+    """Classify known wrappers without reading class names or invoking descriptors."""
+
+    subtype, connection_invalidated, retry_blocked = "not_applicable", False, False
+    for current in _failure_chain(error):
+        retry_blocked |= _static_attribute(current, "_custom_import_retry_blocked") is True
+        if issubclass(type(current), database_errors.DBAPIError):
+            connection_invalidated |= _static_attribute(current, "connection_invalidated") is True
+        if subtype == "not_applicable":
+            for kind, label in _DATABASE_SUBTYPES:
+                if issubclass(type(current), kind):
+                    subtype = label
+                    break
+    return subtype, connection_invalidated, retry_blocked
 
 
 def classify_failure(error: BaseException) -> tuple[str, str]:
