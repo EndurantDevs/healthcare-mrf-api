@@ -18,8 +18,9 @@ from datetime import datetime, timedelta, timezone
 from sanic import Blueprint, response
 from sanic.exceptions import BadRequest, PayloadTooLarge
 from sqlalchemy import and_, func, select, text
+from sqlalchemy.exc import InterfaceError, OperationalError
 
-from api.control_batch_diagnostics import BatchFailureStage, log_batch_failure
+from api.control_batch_diagnostics import BatchFailureStage, can_retry_batch_operation, log_batch_failure
 from db.connection import db
 from db.models.custom_import import CustomImportBuildAttempt, CustomImportExecution
 from process.custom_import import admission_sql
@@ -330,6 +331,24 @@ async def _load_admission_request(request, session_factory, verified, trusted_no
     return retained
 
 
+async def _admission_operation(session_factory, retained, verified):
+    """Retry only a fully closed invalidated page with the same retained scope."""
+
+    for attempt in range(2):
+        try:
+            return await admission_sql.admit_source_batch(
+                session_factory,
+                retained,
+                verified.pins.build_id,
+                verified.pins.expected_after_occurrence_id,
+                admission_permit=verified.permit,
+            )
+        except (InterfaceError, OperationalError) as error:
+            if attempt or not can_retry_batch_operation(error):
+                raise
+            log_batch_failure(BatchFailureStage.ADMISSION_EXECUTE, error, is_retry=True)
+
+
 async def serve_admission_batch(
     request,
     session_factory,
@@ -355,13 +374,7 @@ async def serve_admission_batch(
         stage = BatchFailureStage.ADMISSION_RETAINED
         retained = await _load_admission_request(request, session_factory, verified, trusted_now)
         stage = BatchFailureStage.ADMISSION_EXECUTE
-        admission_result = await admission_sql.admit_source_batch(
-            session_factory,
-            retained,
-            verified.pins.build_id,
-            verified.pins.expected_after_occurrence_id,
-            admission_permit=verified.permit,
-        )
+        admission_result = await _admission_operation(session_factory, retained, verified)
         stage = BatchFailureStage.ADMISSION_RECEIPT
         return _reply(_receipt(verified, admission_result))
     except AdmissionAuthorizationError:

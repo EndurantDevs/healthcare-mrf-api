@@ -2,12 +2,31 @@
 
 """Closed, payload-free diagnostics for unavailable batch outcomes."""
 
+import asyncio
 import logging
 from enum import StrEnum
+from inspect import getattr_static
+
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 from process.custom_import.failure_diagnostics import classify_failure, database_failure_details
 
 logger = logging.getLogger(__name__)
+
+
+def can_retry_batch_operation(error: Exception) -> bool:
+    """Require an invalidated connection and completed, uncanceled cleanup."""
+
+    try:
+        task = asyncio.current_task()
+        return (
+            isinstance(error, (InterfaceError, OperationalError))
+            and getattr_static(error, "connection_invalidated", False) is True
+            and getattr_static(error, "_custom_import_retry_blocked", False) is False
+            and (task is None or not task.cancelling())
+        )
+    except Exception:
+        return False
 
 
 class BatchFailureStage(StrEnum):
