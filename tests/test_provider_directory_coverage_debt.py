@@ -238,10 +238,13 @@ def test_catalog_url_helpers_reject_non_bases(function, value):
 
 def test_catalog_url_helpers_cover_unrelated_hosts_and_missing_cells():
     assert importer._is_cms_sma_base_pair_related(None, None) is False
-    assert importer._is_cms_sma_base_pair_related(
-        "https://one.test/fhir",
-        "https://two.test/fhir",
-    ) is False
+    assert (
+        importer._is_cms_sma_base_pair_related(
+            "https://one.test/fhir",
+            "https://two.test/fhir",
+        )
+        is False
+    )
     assert importer._cms_sma_column_index(["one"], {"missing"}) is None
     assert importer._cms_sma_cell([], None) is None
     assert importer._cms_sma_cell([], 2) is None
@@ -250,9 +253,7 @@ def test_catalog_url_helpers_cover_unrelated_hosts_and_missing_cells():
 def _cms_edge_csv(rows: list[list[str]]) -> str:
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(
-        ["", "Provider Directory Endpoint Information", "", "", ""]
-    )
+    writer.writerow(["", "Provider Directory Endpoint Information", "", "", ""])
     writer.writerow(
         [
             "State",
@@ -268,9 +269,7 @@ def _cms_edge_csv(rows: list[list[str]]) -> str:
 
 def test_cms_sma_parser_covers_skips_and_capability_only_fallback():
     missing_headers = "ignored\nignored\n"
-    assert importer._cms_sma_seed_rows_from_csv(
-        missing_headers
-    ) == []
+    assert importer._cms_sma_seed_rows_from_csv(missing_headers) == []
     csv_text = _cms_edge_csv(
         [
             ["", "", "Active", "", "Yes"],
@@ -308,18 +307,22 @@ def test_capability_splash_and_coding_helpers_cover_invalid_items():
     ) == {"Practitioner"}
     source_url = "https://example.test/developers"
     assert importer._external_splash_target_url(None, source_url=source_url) is None
-    assert importer._external_splash_target_url(
-        "?splash=https%3A%2F%2Ftarget.test%2Ffhir",
-        source_url=source_url,
-    ) == "https://target.test/fhir"
-    assert importer._external_splash_target_url(
-        "/plain",
-        source_url=source_url,
-    ) == "https://example.test/plain"
+    assert (
+        importer._external_splash_target_url(
+            "?splash=https%3A%2F%2Ftarget.test%2Ffhir",
+            source_url=source_url,
+        )
+        == "https://target.test/fhir"
+    )
+    assert (
+        importer._external_splash_target_url(
+            "/plain",
+            source_url=source_url,
+        )
+        == "https://example.test/plain"
+    )
     assert importer._codings("invalid") == []
-    assert importer._codings(
-        {"coding": ["invalid", {"system": None}], "text": "fallback"}
-    ) == [{"text": "fallback"}]
+    assert importer._codings({"coding": ["invalid", {"system": None}], "text": "fallback"}) == [{"text": "fallback"}]
 
 
 @pytest.mark.asyncio
@@ -375,9 +378,7 @@ def test_seed_rows_from_sqlite_covers_query_and_limit(tmp_path):
     database_path = tmp_path / "provider-directory.db"
     connection = sqlite3.connect(database_path)
     try:
-        connection.execute(
-            "CREATE TABLE payers (id INTEGER, org_name TEXT, plan_name TEXT)"
-        )
+        connection.execute("CREATE TABLE payers (id INTEGER, org_name TEXT, plan_name TEXT)")
         connection.executemany(
             "INSERT INTO payers VALUES (?, ?, ?)",
             [(1, "First", "Alpha"), (2, "Second", "Beta")],
@@ -387,43 +388,34 @@ def test_seed_rows_from_sqlite_covers_query_and_limit(tmp_path):
         connection.close()
 
     assert len(importer._seed_rows_from_sqlite(database_path)) == 2
-    assert importer._seed_rows_from_sqlite(
-        database_path,
-        limit=1,
-        source_query="second",
-    )[0]["id"] == 2
+    assert (
+        importer._seed_rows_from_sqlite(
+            database_path,
+            limit=1,
+            source_query="second",
+        )[0]["id"]
+        == 2
+    )
 
 
 @pytest.mark.asyncio
 async def test_canonical_backfill_covers_unknown_and_known_resources(
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        importer,
-        "_ensure_provider_directory_tables",
-        AsyncMock(),
-    )
-    monkeypatch.setattr(
-        importer,
-        "_selected_resources",
-        lambda _resources: ["Unknown", "Practitioner"],
-    )
-    monkeypatch.setattr(
-        importer,
-        "_canonical_backfill_resource_sql",
-        lambda *_args: ("canonical", "edges"),
-    )
-    monkeypatch.setattr(
-        importer.db,
-        "status",
-        AsyncMock(side_effect=["INSERT 0 3", "INSERT 0 4"]),
-    )
+    from process import provider_directory_output_canonical_backfill as repair
 
+    monkeypatch.setattr(importer, "_selected_resources", lambda _resources: ["Unknown", "Practitioner"])
+    assert repair._selected(importer, None) == ["Practitioner"]
+    expected_summary_by_key = {
+        "resources": {"Practitioner": {"canonical_rows": 3, "source_edge_rows": 4}},
+        "canonical_rows": 3,
+        "source_edge_rows": 4,
+    }
+    backfill = AsyncMock(return_value=expected_summary_by_key)
+    monkeypatch.setattr(repair, "backfill_canonical_resources", backfill)
     summary = await importer.backfill_provider_directory_canonical_resources()
-
-    assert summary["canonical_rows"] == 3
-    assert summary["source_edge_rows"] == 4
-    assert set(summary["resources"]) == {"Practitioner"}
+    backfill.assert_awaited_once_with(importer, resources=None)
+    assert summary == expected_summary_by_key
 
 
 def test_retest_loader_and_metadata_merge_cover_rejected_shapes(tmp_path):
@@ -461,6 +453,4 @@ def test_retest_loader_and_metadata_merge_cover_rejected_shapes(tmp_path):
         "metadata_json": {"provider_directory_override": "manual"},
     }
     importer._merge_skipped_source_row_metadata(target_map, skipped_map)
-    assert target_map["metadata_json"]["provider_directory_merged_overrides"] == [
-        "manual"
-    ]
+    assert target_map["metadata_json"]["provider_directory_merged_overrides"] == ["manual"]

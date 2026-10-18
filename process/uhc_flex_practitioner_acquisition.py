@@ -17,21 +17,21 @@ from process.uhc_flex_official_cohort_store import (
     UHCFlexOfficialCohortSyncResult,
 )
 from process.uhc_flex_practitioner_acquisition_contract import (
-    ProgressCallback,
     ROOT_ROLES,
     SHA256_PATTERN,
-    strict_nonnegative_seconds,
+    UHC_FLEX_PRACTITIONER_ACQUISITION_DEFAULT_ATTEMPTS,
+    UHC_FLEX_PRACTITIONER_ACQUISITION_DEFAULT_CONCURRENCY,
+    UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS,
+    UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_CONCURRENCY,
+    UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_RETRY_SECONDS,
+    ProgressCallback,
     UHCFlexPractitionerAcquisitionConfig,
     UHCFlexPractitionerAcquisitionDependencies,
     UHCFlexPractitionerAcquisitionError,
     UHCFlexPractitionerAcquisitionProgress,
     UHCFlexPractitionerAcquisitionReceipt,
     UHCFlexPractitionerRootReceipt,
-    UHC_FLEX_PRACTITIONER_ACQUISITION_DEFAULT_ATTEMPTS,
-    UHC_FLEX_PRACTITIONER_ACQUISITION_DEFAULT_CONCURRENCY,
-    UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS,
-    UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_CONCURRENCY,
-    UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_RETRY_SECONDS,
+    strict_nonnegative_seconds,
 )
 from process.uhc_flex_practitioner_acquisition_runtime import (
     default_dependencies,
@@ -42,30 +42,29 @@ from process.uhc_flex_practitioner_contract import (
     UHC_FLEX_PRACTITIONER_SOURCE_ID,
 )
 from process.uhc_flex_practitioner_registration import (
-    uhc_flex_practitioner_endpoint_identity,
     UHCFlexPractitionerRegistrationResult,
+    uhc_flex_practitioner_endpoint_identity,
 )
 from process.uhc_flex_practitioner_single_root_contract import (
-    build_single_root_context,
-    build_single_root_receipt,
-    is_exact_single_root_admission,
     UHCFlexPractitionerSingleRootAdmission,
     UHCFlexPractitionerSingleRootContext,
     UHCFlexPractitionerSingleRootReceipt,
+    build_single_root_context,
+    build_single_root_receipt,
+    is_exact_single_root_admission,
 )
 from process.uhc_flex_practitioner_store import (
-    build_uhc_flex_practitioner_acquisition_identity,
     UHCFlexPractitionerAcquisitionIdentity,
     UHCFlexPractitionerAcquisitionSummary,
+    build_uhc_flex_practitioner_acquisition_identity,
 )
 from process.uhc_flex_practitioner_twin_store_contract import (
+    UHCFlexPractitionerTwinAdmission,
+    UHCFlexPractitionerTwinStoreError,
     build_uhc_flex_practitioner_dataset_intent_id,
     build_uhc_flex_practitioner_run_id,
     canonical_semantic_projection_as_of,
-    UHCFlexPractitionerTwinAdmission,
-    UHCFlexPractitionerTwinStoreError,
 )
-
 
 _ROOT_ROLES = ROOT_ROLES
 _SHA256_PATTERN = SHA256_PATTERN
@@ -112,10 +111,7 @@ def _root_receipt(
     summary: UHCFlexPractitionerAcquisitionSummary,
     elapsed_seconds: float,
 ) -> UHCFlexPractitionerRootReceipt:
-    if (
-        summary.acquisition_id != identity.acquisition_id
-        or summary.expected_npi_count != identity.expected_npi_count
-    ):
+    if summary.acquisition_id != identity.acquisition_id or summary.expected_npi_count != identity.expected_npi_count:
         raise UHCFlexPractitionerAcquisitionError("state")
     return UHCFlexPractitionerRootReceipt(
         acquisition_role=identity.acquisition_role,
@@ -144,8 +140,7 @@ def _validate_admission(
         or admission.candidate_acquisition_id != candidate.acquisition_id
         or admission.cohort_id != context.cohort.cohort_id
         or admission.dataset_intent_id != context.dataset_intent_id
-        or admission.semantic_projection_as_of
-        != context.semantic_projection_as_of
+        or admission.semantic_projection_as_of != context.semantic_projection_as_of
         or admission.operation_key != context.operation_key
         or admission.expected_npi_count != context.cohort.npi_count
         or baseline.terminal_set_sha256 != candidate.terminal_set_sha256
@@ -166,13 +161,8 @@ def _validated_runtime_inputs(
 ) -> tuple[str, UHCFlexPractitionerAcquisitionDependencies]:
     if type(config) is not UHCFlexPractitionerAcquisitionConfig:
         raise ValueError("Flex Practitioner acquisition config is invalid")
-    projection_date = canonical_semantic_projection_as_of(
-        semantic_projection_as_of
-    )
-    if (
-        type(operation_key) is not str
-        or _SHA256_PATTERN.fullmatch(operation_key) is None
-    ):
+    projection_date = canonical_semantic_projection_as_of(semantic_projection_as_of)
+    if type(operation_key) is not str or _SHA256_PATTERN.fullmatch(operation_key) is None:
         raise ValueError("Flex Practitioner operation key is invalid")
     if config.enabled is not True:
         raise UHCFlexPractitionerAcquisitionError("disabled")
@@ -189,12 +179,8 @@ async def _initialize_context(
     dependencies: UHCFlexPractitionerAcquisitionDependencies,
     database: Any,
 ) -> _AcquisitionContext:
-    registration = _validate_registration(
-        await dependencies.register_source(database=database)
-    )
-    cohort = _validated_cohort_sync(
-        await dependencies.sync_cohort(database=database)
-    )
+    registration = _validate_registration(await dependencies.register_source(database=database))
+    cohort = _validated_cohort_sync(await dependencies.sync_cohort(database=database))
     dataset_intent_id = build_uhc_flex_practitioner_dataset_intent_id(
         cohort.cohort_id,
         projection_date,
@@ -232,16 +218,14 @@ async def _revalidate_locked_inputs(
     dependencies: UHCFlexPractitionerAcquisitionDependencies,
     database: Any,
 ) -> None:
-    replayed_registration = _validate_registration(
-        await dependencies.register_source(database=database)
-    )
+    replayed_registration = _validate_registration(await dependencies.register_source(database=database))
     if (
         replayed_registration.source_id != context.registration.source_id
         or replayed_registration.endpoint_id != context.registration.endpoint_id
         or replayed_registration.created
     ):
         raise UHCFlexPractitionerAcquisitionError("source_drift")
-    replayed_cohort_sync = await dependencies.sync_cohort(database=database)
+    replayed_cohort_sync = await dependencies.sync_cohort(database=database, expected_cohort=context.cohort)
     replayed_cohort = _validated_cohort_sync(replayed_cohort_sync)
     if replayed_cohort_sync.created or replayed_cohort != context.cohort:
         raise UHCFlexPractitionerAcquisitionError("cohort_drift")
@@ -297,7 +281,8 @@ async def _admit_single_root(
     database: Any,
 ) -> UHCFlexPractitionerSingleRootAdmission:
     locked_context = _AcquisitionContext(
-        registration=context.registration, cohort=context.cohort,
+        registration=context.registration,
+        cohort=context.cohort,
         dataset_intent_id=context.dataset_intent_id,
         identity_by_role={"candidate": context.candidate_identity},
         semantic_projection_as_of=context.semantic_projection_as_of,
@@ -309,9 +294,7 @@ async def _admit_single_root(
             admit_uhc_flex_practitioner_single_root as admit_single_root,
         )
     async with database.transaction():
-        await _revalidate_locked_inputs(
-            locked_context, dependencies=dependencies, database=database
-        )
+        await _revalidate_locked_inputs(locked_context, dependencies=dependencies, database=database)
         admission = await admit_single_root(
             candidate.acquisition_id,
             semantic_projection_as_of=context.semantic_projection_as_of,
@@ -340,9 +323,7 @@ def _build_receipt(
         cohort_id=context.cohort.cohort_id,
         official_dataset_id=context.cohort.official_dataset_id,
         official_dataset_hash=context.cohort.official_dataset_hash,
-        official_content_proof_sha256=(
-            context.cohort.official_content_proof_sha256
-        ),
+        official_content_proof_sha256=(context.cohort.official_content_proof_sha256),
         dataset_intent_id=context.dataset_intent_id,
         expected_npi_count=context.cohort.npi_count,
         baseline=_root_receipt(
@@ -365,9 +346,7 @@ async def acquire_uhc_flex_practitioner_twins(
     *,
     operation_key: str,
     semantic_projection_as_of: str,
-    config: UHCFlexPractitionerAcquisitionConfig = (
-        UHCFlexPractitionerAcquisitionConfig()
-    ),
+    config: UHCFlexPractitionerAcquisitionConfig = (UHCFlexPractitionerAcquisitionConfig()),
     database: Any = db,
     dependencies: UHCFlexPractitionerAcquisitionDependencies | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -437,12 +416,8 @@ async def acquire_uhc_flex_single_root(
     started_at = runtime_dependencies.monotonic()
     registration = _validate_registration(await runtime_dependencies.register_source(database=database))
     cohort = _validated_cohort_sync(await runtime_dependencies.sync_cohort(database=database))
-    context = build_single_root_context(
-        registration, cohort, projection_date, operation_key
-    )
-    created_count = await runtime_dependencies.initialize_root(
-        context.candidate_identity, database=database
-    )
+    context = build_single_root_context(registration, cohort, projection_date, operation_key)
+    created_count = await runtime_dependencies.initialize_root(context.candidate_identity, database=database)
     if type(created_count) is not int or created_count not in {0, 1}:
         raise UHCFlexPractitionerAcquisitionError("state")
     candidate_started_at = runtime_dependencies.monotonic()

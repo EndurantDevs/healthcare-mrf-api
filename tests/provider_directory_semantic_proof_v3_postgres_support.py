@@ -4,46 +4,39 @@
 
 from __future__ import annotations
 
-import asyncio
-from contextlib import asynccontextmanager
 import datetime
+import hashlib
 import importlib
 import json
-from types import SimpleNamespace
-import uuid
-from unittest.mock import AsyncMock
 import zlib
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy.exc import OperationalError
-
-from tests.provider_directory_semantic_proof_v3_schema import (
-    _create_tables,
-    _fixture_models,
-)
+from sqlalchemy import text
 
 from db.connection import Database
 from db.models import (
-    ProviderDirectoryCanonicalResource,
-    ProviderDirectoryDatasetResource,
     ProviderDirectoryOrganization,
     ProviderDirectoryPractitioner,
-    ProviderDirectorySourceResource,
 )
+from process.provider_directory_dataset_rehydrate_types import RehydrationRequest, RehydrationRuntime
+from process.provider_directory_generic_source_adapters import completed_source_scope, source_family_rows
+from process.provider_directory_generic_source_policy import source_transaction
 from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
     ProviderDirectoryStoredProofOptions,
     build_stored_dataset_proof,
 )
 from process.provider_directory_resource_hash import (
-    LEGACY_RESOURCE_HASH_CONTRACT,
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-    TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     canonical_practitioner_payload,
     is_semantic_resource_hash_contract,
-    resource_payload_sha256_for_contract,
 )
-
+from tests.cms_output_snapshot_postgres_support import provision_native_outputs
+from tests.provider_directory_dataset_rehydrate_postgres_support import _migrations as rehydration_migrations
+from tests.provider_directory_source_postgres_support import source_component_database, source_component_templates
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -58,40 +51,35 @@ V3_DATASET_CONCURRENT = "dataset-semantic-concurrent"
 V3_DATASET_ROLLBACK = "dataset-semantic-rollback"
 
 
-async def _require_disposable_postgres(database: Database) -> None:
-    try:
-        database_name = str(
-            await database.scalar("SELECT current_database();") or ""
-        )
-    except (OSError, OperationalError):
-        pytest.skip("semantic proof tests need disposable PostgreSQL")
-    if "test" not in database_name.lower():
-        pytest.skip("semantic proof tests refuse a non-test database")
+@pytest.fixture(scope="module", autouse=True)
+async def semantic_source_template():
+    """Reuse closed migrations while each test provisions fresh Source custody."""
+    async with source_component_templates():
+        yield
 
 
 @asynccontextmanager
 async def _semantic_database(monkeypatch):
-    schema = f"provider_directory_semantic_{uuid.uuid4().hex[:12]}"
-    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
-    monkeypatch.setenv("HLTHPRT_DB_POOL_MIN_SIZE", "1")
-    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "6")
-    database = Database()
-    is_schema_created = False
-    try:
-        await database.connect()
-        await _require_disposable_postgres(database)
-        for model in _fixture_models():
-            monkeypatch.setattr(model.__table__, "schema", schema)
-        await _create_tables(database, schema)
-        is_schema_created = True
+    """Use the genuine Source Factory, Publisher, Owner, and native migrations."""
+    async with source_component_database(
+        monkeypatch,
+        before_provision=provision_native_outputs,
+        migration_prefixes=rehydration_migrations(),
+    ) as component:
+        database, schema = component.database, component.policy.schema
+        database.semantic_candidates = {}
+        database.semantic_component = component
+        database.semantic_published = set()
         monkeypatch.setattr(importer, "db", database)
-        yield database, schema
-    finally:
-        if is_schema_created:
+        async with source_transaction(database):
             await database.status(
-                f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;'
+                f'INSERT INTO "{schema}".provider_directory_source '
+                "(source_id,org_name,canonical_api_base,requires_registration,requires_api_key) "
+                "VALUES (:source_id,'Semantic fixture',:base,false,false)",
+                source_id=SOURCE_ID,
+                base=CANONICAL_BASE,
             )
-        await database.disconnect()
+        yield database, schema
 
 
 async def _insert_parent(
@@ -103,39 +91,135 @@ async def _insert_parent(
     semantic_projection_as_of: str | None = PROJECTION_AS_OF,
     selected_resources: tuple[str, ...] = ("Practitioner",),
 ) -> None:
-    metadata = {
-        "source_ids": [SOURCE_ID],
-        "selected_resources": list(selected_resources),
-        "resource_hash_contract": resource_hash_contract,
-        **(
-            {"semantic_projection_as_of": semantic_projection_as_of}
-            if semantic_projection_as_of is not None
-            else {}
-        ),
-        **(
-            {
-                "proof_resource_scope": list(
-                    importer._provider_directory_proof_resource_scope(
-                        selected_resources
-                    )
-                )
-            }
-            if is_semantic_resource_hash_contract(resource_hash_contract)
-            else {}
-        ),
-    }
-    await database.status(
-        f"INSERT INTO \"{schema}\".provider_directory_endpoint_dataset ("
-        "dataset_id, endpoint_id, acquisition_root_run_id, status, "
-        "is_current, publication_metadata_json) VALUES ("
-        ":dataset_id, :endpoint_id, :root_run_id, :status, false, "
-        "CAST(:metadata_json AS jsonb));",
-        dataset_id=dataset_id,
+    """Admit a real private Source candidate with the original semantic identity."""
+    candidate = importer.EndpointDatasetCandidate(
         endpoint_id=f"endpoint-{dataset_id}"[:64],
-        root_run_id=f"root-{dataset_id}"[:64],
-        status=importer.ENDPOINT_DATASET_ACQUIRING,
-        metadata_json=json.dumps(metadata),
+        dataset_id=dataset_id,
+        acquisition_root_run_id=f"root-{dataset_id}"[:64],
+        source_ids=(SOURCE_ID,),
+        selected_resources=selected_resources,
+        expected_resources=selected_resources,
+        import_run_id="run-semantic-proof",
+        previous_dataset_id=None,
+        resource_hash_contract=resource_hash_contract,
+        semantic_projection_as_of=semantic_projection_as_of,
+        proof_resource_scope=(
+            importer._provider_directory_proof_resource_scope(selected_resources)
+            if is_semantic_resource_hash_contract(resource_hash_contract)
+            else None
+        ),
     )
+    async with source_transaction(database):
+        await database.status(
+            f'INSERT INTO "{schema}".provider_directory_api_endpoint '
+            "(endpoint_id,canonical_api_base,credential_descriptor_hash,endpoint_signature_hash) "
+            "VALUES (:endpoint_id,:base,:credential_hash,repeat('d',64))",
+            endpoint_id=candidate.endpoint_id,
+            base=CANONICAL_BASE,
+            credential_hash=hashlib.sha256(dataset_id.encode()).hexdigest(),
+        )
+        database.semantic_candidates[dataset_id] = await importer._ensure_endpoint_dataset_candidate(candidate)
+
+
+@asynccontextmanager
+async def _completed_semantic_scope(database, dataset_id):
+    """Observe real completed heaps, then roll preparation back so intake can continue."""
+    async with source_transaction(database, isolation="repeatable read") as session:
+        if dataset_id in database.semantic_published:
+            yield
+            return
+        savepoint = await session.begin_nested()
+        try:
+            async with completed_source_scope(importer, database.semantic_candidates[dataset_id]):
+                yield
+        finally:
+            await savepoint.rollback()
+
+
+async def _publish_semantic_source(database, dataset_id):
+    """Validate and publish the acquired Source with the real admission and attach path."""
+    candidate = database.semantic_candidates[dataset_id]
+    proof = await _candidate_stored_proof(database, candidate)
+    async with source_transaction(database):
+        await database.status(
+            f'UPDATE "{importer._schema()}".provider_directory_source SET endpoint_id=:endpoint WHERE source_id=:source',
+            endpoint=candidate.endpoint_id,
+            source=SOURCE_ID,
+        )
+    diagnostics_by_resource = {
+        resource: {"rows_fetched": proof.resource_counts.get(resource, 0), "complete": True}
+        for resource in candidate.selected_resources
+    }
+    validated = await importer._validate_endpoint_dataset_candidate(candidate, diagnostics_by_resource)
+    assert validated["validated"] and not validated["published"]
+    async with source_transaction(database):
+        await importer._publish_validated_artifact_dataset(
+            importer.ProviderDirectoryArtifactDataset(
+                SOURCE_ID,
+                candidate.endpoint_id,
+                dataset_id,
+                candidate.acquisition_root_run_id,
+                dataset_hash=validated["dataset_hash"],
+                selected_resources=candidate.selected_resources,
+                retained_resources=tuple(sorted(proof.resource_counts)),
+            )
+        )
+    database.semantic_published.add(dataset_id)
+
+
+async def _materialize_semantic_dataset(database, dataset_id):
+    """Build and atomically publish typed, canonical, and source-edge output stages."""
+    if dataset_id not in database.semantic_published:
+        await _publish_semantic_source(database, dataset_id)
+    candidate = database.semantic_candidates[dataset_id]
+    runtime = RehydrationRuntime(
+        database=database,
+        schema=importer._schema(),
+        models_by_type=importer.RESOURCE_MODELS_BY_TYPE,
+        upsert_batch=importer._reject_rehydration_upsert,
+        directory=importer,
+    )
+    request = RehydrationRequest(
+        SOURCE_ID,
+        dataset_id,
+        candidate.acquisition_root_run_id,
+        "semantic-output-" + hashlib.sha256(dataset_id.encode()).hexdigest()[:32],
+        batch_size=1,
+    )
+    return await importer._rehydrate_prepared_dataset(runtime, request)
+
+
+async def _candidate_stored_proof(database, candidate):
+    """Read all original proof fields under the genuine Source transaction."""
+    async with source_transaction(database, isolation="repeatable read"):
+        return await build_stored_dataset_proof(
+            database,
+            importer._schema(),
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=candidate.acquisition_root_run_id,
+            source_ids=[SOURCE_ID],
+            selected_resources=candidate.selected_resources,
+            options=ProviderDirectoryStoredProofOptions(
+                proof_resource_scope=candidate.proof_resource_scope,
+                expected_resource_hash_contract=candidate.resource_hash_contract,
+                expected_semantic_projection_as_of=candidate.semantic_projection_as_of,
+            ),
+        )
+
+
+async def _admin_update_semantic_input(database, dataset_id, statement, parameters):
+    """Inject native input drift as the explicit independent administrator fault actor."""
+    async with source_transaction(database):
+        binding = await database.scalar(
+            f'SELECT candidate_storage_json FROM "{importer._schema()}".provider_directory_endpoint_dataset '
+            "WHERE dataset_id=:dataset_id",
+            dataset_id=dataset_id,
+        )
+    binding = json.loads(binding) if isinstance(binding, str) else binding
+    relation = importer._unscoped_qt(importer._schema(), binding["tables"]["resource_input"]["name"])
+    async with database.semantic_component.admin_engine.begin() as connection:
+        await connection.execute(text(f"UPDATE {relation} {statement}"), parameters)
 
 
 def _observation(
@@ -160,16 +244,12 @@ def _observation(
             ],
             "fhir_meta": {
                 "versionId": "1",
-                "lastUpdated": (
-                    f"2026-08-09T12:00:0{page_number}Z"
-                ),
+                "lastUpdated": (f"2026-08-09T12:00:0{page_number}Z"),
                 "source": CANONICAL_BASE,
             },
             "resource_url": f"{CANONICAL_BASE}/Practitioner/{RESOURCE_ID}",
             "fhir_self_url": f"{CANONICAL_BASE}/Practitioner/{RESOURCE_ID}",
-            "fhir_fetch_url": (
-                f"{CANONICAL_BASE}/Practitioner?page={page_number}"
-            ),
+            "fhir_fetch_url": (f"{CANONICAL_BASE}/Practitioner?page={page_number}"),
             "fhir_fetch_mode": "rest_bundle",
         }
     )
@@ -276,11 +356,7 @@ async def _write_partition_page(
     dataset_row = _dataset_row(dataset_id, resource_row_by_field)
     stage = importer.LastUpdatedPartitionStage(
         rows=(dataset_row,),
-        candidate_hashes_by_id={
-            str(dataset_row["resource_id"]): str(
-                dataset_row["payload_hash"]
-            )
-        },
+        candidate_hashes_by_id={str(dataset_row["resource_id"]): str(dataset_row["payload_hash"])},
         resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
         semantic_projection_as_of=PROJECTION_AS_OF,
     )
@@ -317,17 +393,18 @@ async def _stored_dataset_row(
     schema: str,
     dataset_id: str,
 ) -> tuple[str, dict[str, object]]:
-    record = await database.first(
-        f"SELECT payload_hash, payload_json FROM \"{schema}\"."
-        "provider_directory_dataset_resource WHERE dataset_id=:dataset_id "
-        "AND resource_type='Practitioner' AND resource_id=:resource_id;",
-        dataset_id=dataset_id,
-        resource_id=RESOURCE_ID,
-    )
-    payload = record[1]
-    if isinstance(payload, str):
-        payload = json.loads(payload)
-    return str(record[0]), payload
+    async with _completed_semantic_scope(database, dataset_id):
+        record = await database.first(
+            f"SELECT payload_hash, payload_json FROM {importer._qt(schema, 'provider_directory_dataset_resource')} "
+            "WHERE dataset_id=:dataset_id "
+            "AND resource_type='Practitioner' AND resource_id=:resource_id;",
+            dataset_id=dataset_id,
+            resource_id=RESOURCE_ID,
+        )
+        payload = record[1]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        return str(record[0]), payload
 
 
 async def _shard_records(
@@ -335,21 +412,19 @@ async def _shard_records(
     schema: str,
     dataset_id: str,
 ) -> tuple[list[str], list[list[object]]]:
-    records = await database.all(
-        f"SELECT input_sha256, payload_bytes FROM \"{schema}\"."
-        f'"{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}" '
-        "WHERE dataset_id=:dataset_id ORDER BY shard_id;",
-        dataset_id=dataset_id,
-    )
-    input_hashes: list[str] = []
-    proof_records: list[list[object]] = []
-    for input_hash, payload_bytes in records:
-        input_hashes.append(str(input_hash))
-        proof_records.extend(
-            json.loads(line)
-            for line in zlib.decompress(bytes(payload_bytes)).splitlines()
+    async with source_transaction(database, isolation="repeatable read"):
+        records = await database.all(
+            f'SELECT input_sha256, payload_bytes FROM "{schema}".'
+            f'"{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}" '
+            "WHERE dataset_id=:dataset_id ORDER BY shard_id;",
+            dataset_id=dataset_id,
         )
-    return sorted(input_hashes), proof_records
+        input_hashes: list[str] = []
+        proof_records: list[list[object]] = []
+        for input_hash, payload_bytes in records:
+            input_hashes.append(str(input_hash))
+            proof_records.extend(json.loads(line) for line in zlib.decompress(bytes(payload_bytes)).splitlines())
+        return sorted(input_hashes), proof_records
 
 
 async def _proof(
@@ -357,22 +432,7 @@ async def _proof(
     schema: str,
     dataset_id: str,
 ):
-    return await build_stored_dataset_proof(
-        database,
-        schema,
-        dataset_id=dataset_id,
-        endpoint_id=f"endpoint-{dataset_id}"[:64],
-        acquisition_root_run_id=f"root-{dataset_id}"[:64],
-        source_ids=[SOURCE_ID],
-        selected_resources=["Practitioner"],
-        options=ProviderDirectoryStoredProofOptions(
-            proof_resource_scope=["Practitioner"],
-            expected_resource_hash_contract=(
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
-            expected_semantic_projection_as_of=PROJECTION_AS_OF,
-        ),
-    )
+    return await _candidate_stored_proof(database, database.semantic_candidates[dataset_id])
 
 
 async def _dataset_and_shard_counts(
@@ -380,27 +440,37 @@ async def _dataset_and_shard_counts(
     schema: str,
     dataset_id: str,
 ) -> tuple[int, int]:
-    counts = await database.first(
-        f"SELECT (SELECT count(*) FROM \"{schema}\"."
-        "provider_directory_dataset_resource WHERE dataset_id=:dataset_id), "
-        f'(SELECT count(*) FROM "{schema}".'
-        f'"{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}" '
-        "WHERE dataset_id=:dataset_id);",
-        dataset_id=dataset_id,
-    )
-    return int(counts[0]), int(counts[1])
+    if dataset_id in database.semantic_published:
+        async with source_transaction(database):
+            count = await database.scalar(
+                f'SELECT count(*) FROM "{schema}".provider_directory_dataset_resource WHERE dataset_id=:dataset_id',
+                dataset_id=dataset_id,
+            )
+    else:
+        count = 0
+        for family in database.semantic_candidates[dataset_id].selected_resources:
+            count += len(
+                await source_family_rows(importer, dataset_id, (family, f"LU:{family}:pass:1", f"LU:{family}:pass:2"))
+            )
+    async with source_transaction(database):
+        shards = await database.scalar(
+            f'SELECT count(*) FROM "{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}" WHERE dataset_id=:dataset_id',
+            dataset_id=dataset_id,
+        )
+    return int(count), int(shards)
 
 
 async def _compatibility_counts(
     database: Database,
     schema: str,
 ) -> tuple[int, int, int]:
-    counts = await database.first(
-        f'SELECT (SELECT count(*) FROM "{schema}".'
-        "provider_directory_canonical_resource), "
-        f'(SELECT count(*) FROM "{schema}".'
-        "provider_directory_source_resource), "
-        f'(SELECT count(*) FROM "{schema}".'
-        "provider_directory_practitioner);"
-    )
-    return int(counts[0]), int(counts[1]), int(counts[2])
+    async with source_transaction(database):
+        counts = await database.first(
+            f'SELECT (SELECT count(*) FROM "{schema}".'
+            "provider_directory_canonical_resource), "
+            f'(SELECT count(*) FROM "{schema}".'
+            "provider_directory_source_resource), "
+            f'(SELECT count(*) FROM "{schema}".'
+            "provider_directory_practitioner);"
+        )
+        return int(counts[0]), int(counts[1]), int(counts[2])

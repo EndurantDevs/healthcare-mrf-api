@@ -7,11 +7,15 @@ import struct
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import asyncpg
 import pytest
+from sqlalchemy import text
 
 from process import registry_ptg_graph_reader as reader
 from process.ptg_parts.ptg2_shared_blocks import SharedBlock
 from process.ptg_parts.ptg2_v4_snapshot_maps import encode_v4_snapshot_map_pack
+from process.ptg_parts.result_archive_source_authority import _bounded_clone_lock_reads
+from process.registry_publication_consumer import _has_database_cause
 
 
 def _identity():
@@ -381,3 +385,36 @@ async def test_native_graph_page_cap_refuses_before_cas_metadata_or_payload(monk
         await state._load(((kind, 5, 0), (kind, 6, 0)))
     assert len(state.packs) == 1 and state.blocks == {}
     assert len(session.queries) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_storage_failure", [True, False])
+async def test_source_lock_deferral_keeps_explicit_storage_cause(monkeypatch, is_storage_failure):
+    failure = (
+        asyncpg.LockNotAvailableError("source lock is busy")
+        if is_storage_failure
+        else RuntimeError("semantic source refusal")
+    )
+
+    class LockSession(_Session):
+        async def execute(self, query, parameters=None):
+            sql = str(query)
+            if sql == "SELECT synthetic_locked_source":
+                raise failure
+            if sql.startswith("SELECT current_setting"):
+                return SimpleNamespace(one=lambda: ("0", "0"))
+            if sql.startswith("SELECT set_config"):
+                return _Result()
+            return await super().execute(query, parameters)
+
+    async def source_state(session, *arguments):
+        async with _bounded_clone_lock_reads(session):
+            await session.execute(text("SELECT synthetic_locked_source"))
+
+    monkeypatch.setattr(reader.authority, "_source_state", source_state)
+    with pytest.raises(reader.RegistryPTGGraphReadError, match="registry_ptg_graph_invalid") as caught:
+        await _verify(LockSession())
+    assert _has_database_cause(caught.value) is is_storage_failure
+    assert caught.value.__cause__ is not None
+    if is_storage_failure:
+        assert caught.value.__cause__.__cause__ is failure

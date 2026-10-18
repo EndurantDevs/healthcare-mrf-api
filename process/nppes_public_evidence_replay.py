@@ -4,14 +4,21 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import inspect
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
+from process.control_cancel import ImportCancelledError
+from process.nppes_public_evidence_archive import (
+    PreparedNppesArchive,
+    archive_error,
+    validate_prepared_nppes_archive,
+)
+from process.nppes_public_evidence_import import validate_nppes_evidence_runtime_config
+from process.nppes_public_evidence_members import NppesPrimaryCsvRows
 from public_evidence.evidence_record_primitives import _canonical_sha256
 from public_evidence.nppes_registry_metrics import nppes_manifest_metrics
-from public_evidence.nppes_registry_primitives import build_nppes_archive_identity
-from public_evidence.nppes_registry_primitives import nppes_header_sha256
+from public_evidence.nppes_registry_primitives import build_nppes_archive_identity, nppes_header_sha256
 from public_evidence.nppes_registry_replay_contract import (
     NppesRegistryArchiveManifest,
     NppesRegistryArchiveScanner,
@@ -22,18 +29,6 @@ from public_evidence.nppes_registry_storage_contract import (
     NppesRegistryArchiveObservation,
     build_nppes_registry_admission_row,
 )
-from process.control_cancel import ImportCancelledError
-from process.nppes_public_evidence_archive import (
-    PreparedNppesArchive,
-    archive_error,
-    validate_prepared_nppes_archive,
-)
-from process.nppes_public_evidence_import import (
-    NppesEvidenceRuntimeConfig,
-    validate_nppes_evidence_runtime_config,
-)
-from process.nppes_public_evidence_members import NppesPrimaryCsvRows
-
 
 CancelCheck = Callable[[], Awaitable[None] | None]
 ProgressCallback = Callable[[int], Awaitable[None] | None]
@@ -90,20 +85,18 @@ def _layout_sha256(prepared: PreparedNppesArchive) -> str:
 
 
 def _archive_identity(
-    prepared: PreparedNppesArchive,
-    config: NppesEvidenceRuntimeConfig,
+    validated_archive: PreparedNppesArchive,
+    rights_proof_sha256: str,
 ):
-    config = validate_nppes_evidence_runtime_config(config)
-    prepared = validate_prepared_nppes_archive(prepared)
-    retained = prepared.retained
-    rights_digest = config.rights_proof_sha256
+    """Build from the archive and rights proof already validated by the caller."""
+    retained = validated_archive.retained
     return build_nppes_archive_identity(
         source_url=retained.candidate.source_url,
         archive_name=retained.candidate.archive_name,
-        primary_member_name=prepared.layout.primary_member_name,
+        primary_member_name=validated_archive.layout.primary_member_name,
         artifact_sha256=retained.artifact_sha256,
         artifact_byte_count=retained.artifact_byte_count,
-        rights_proof_sha256=rights_digest,
+        rights_proof_sha256=rights_proof_sha256,
     )
 
 
@@ -114,15 +107,13 @@ def validate_prepared_nppes_registry_replay(
     """Rebuild every retained identity and deterministic receipt relationship."""
 
     try:
-        if (
-            type(candidate) is not PreparedNppesRegistryReplay
-        ):
+        if type(candidate) is not PreparedNppesRegistryReplay:
             raise archive_error()
         config = validate_nppes_evidence_runtime_config(config)
         if not config.required:
             raise archive_error()
         archive = validate_prepared_nppes_archive(candidate.archive)
-        identity = _archive_identity(archive, config)
+        identity = _archive_identity(archive, config.rights_proof_sha256)
         manifest = validate_nppes_registry_manifest(candidate.manifest)
         if (
             manifest.identity != identity
@@ -136,10 +127,7 @@ def validate_prepared_nppes_registry_replay(
             zip_member_census_sha256=_layout_sha256(archive),
         )
         admission = build_nppes_registry_admission_row(manifest, observation)
-        if (
-            candidate.archive_observation != observation
-            or candidate.admission_row != admission
-        ):
+        if candidate.archive_observation != observation or candidate.admission_row != admission:
             raise archive_error()
         rebuilt = PreparedNppesRegistryReplay(
             archive=archive,
@@ -166,17 +154,14 @@ async def prepare_nppes_registry_replay(
     """Read every primary row and freeze the exact manifest before any DB write."""
 
     try:
-        if (
-            type(check_interval) is not int
-            or check_interval <= 0
-        ):
+        if type(check_interval) is not int or check_interval <= 0:
             raise archive_error()
         prepared = validate_prepared_nppes_archive(prepared)
         config = validate_nppes_evidence_runtime_config(config)
         if not config.required:
             raise archive_error()
         await _invoke(cancel_check)
-        identity = _archive_identity(prepared, config)
+        identity = _archive_identity(prepared, config.rights_proof_sha256)
         with NppesPrimaryCsvRows(prepared) as primary_rows:
             header = primary_rows.header
             scanner = NppesRegistryArchiveScanner(identity, header)
@@ -203,7 +188,7 @@ async def prepare_nppes_registry_replay(
             admission_row=admission,
         )
         nppes_manifest_metrics(prepared_replay.manifest)
-    except (asyncio.CancelledError, ImportCancelledError, KeyboardInterrupt):
+    except asyncio.CancelledError, ImportCancelledError, KeyboardInterrupt:
         raise
     except Exception:
         normalized_error = archive_error()

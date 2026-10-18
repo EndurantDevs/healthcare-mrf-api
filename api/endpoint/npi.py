@@ -41,6 +41,7 @@ from api.network_address_scope import (
     current_network_address_scope,
     is_scoped_address_relation,
     scoped_address_cache_key,
+    scoped_address_insurance_predicate,
     scoped_address_parameters,
     scoped_address_relation_sql,
     scoped_address_statement,
@@ -52,6 +53,12 @@ from api.npi_detail_cache_identity import (
     npi_detail_cache_key as _format_npi_detail_cache_key,
 )
 from api.provider_demographic_filters import normalize_provider_sex_code
+from api.provider_detail_network_metadata import (
+    attach_provider_source_details as _attach_selected_address_source_details,
+)
+from api.provider_detail_network_metadata import (
+    project_provider_network_metadata as _project_provider_network_metadata,
+)
 from api.provider_detail_sql import _npi_detail_address_filters, _npi_detail_taxonomy_aggregate
 from api.provider_directory_dataset_sql import (
     PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
@@ -4413,23 +4420,6 @@ async def _attach_mrf_source_details(
     _apply_mrf_source_details(addresses, details_by_pair)
 
 
-async def _attach_selected_address_source_details(
-    addresses: Sequence[Any],
-    *,
-    include_sources: bool,
-    include_role_evidence: bool = False,
-    session: Any = None,
-) -> None:
-    """Attach opt-in source details through one shared response path."""
-    await _attach_provider_directory_source_details(
-        addresses,
-        include_role_evidence=include_role_evidence,
-        session=session,
-    )
-    if include_sources:
-        await _attach_mrf_source_details(addresses, session=session)
-
-
 async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict[str, Any]] = None):
     stmt, params = scoped_address_statement(stmt), scoped_address_parameters(params or {})
     if session is not None:
@@ -7994,7 +7984,11 @@ async def list_providers(
     request, *, native_args=None, import_context=None, native_npis=None, native_scope_preparer=None
 ):
     """Search, count, or page through public NPI provider records."""
-    if (native_args is None) != (import_context is None) and native_npis is None:
+    if (
+        (native_args is None) != (import_context is None)
+        and native_npis is None
+        and (native_args is None or current_network_address_scope() is None)
+    ):
         raise sanic.exceptions.InvalidUsage("custom-import provider arguments are invalid")
     if import_context is not None and type(import_context) is not ProviderImportQuery:
         raise sanic.exceptions.InvalidUsage("custom-import provider context is invalid")
@@ -8544,7 +8538,7 @@ async def list_providers(
         if plan_network_ids:
             address_clauses.append("plans_network_array && :plan_network_array")
         if has_insurance:
-            address_clauses.append("NOT (plans_network_array @@ '0'::query_int)")
+            address_clauses.append(scoped_address_insurance_predicate())
         if city:
             address_clauses.append("city_name = :city")
         if state:
@@ -8807,7 +8801,7 @@ async def list_providers(
         if plan_network_ids:
             address_clauses.append("plans_network_array && :plan_network_array")
         if has_insurance:
-            address_clauses.append("NOT (plans_network_array @@ '0'::query_int)")
+            address_clauses.append(scoped_address_insurance_predicate())
         if city:
             address_clauses.append("city_name = :city")
         if state:
@@ -9085,7 +9079,7 @@ async def list_providers(
         if plan_network_ids:
             address_clauses.append("plans_network_array && :plan_network_array")
         if has_insurance:
-            address_clauses.append("NOT (plans_network_array @@ '0'::query_int)")
+            address_clauses.append(scoped_address_insurance_predicate())
         if city:
             address_clauses.append("city_name = :city")
         if state:
@@ -9839,6 +9833,10 @@ async def list_providers(
             summary = summary_map.get(int(npi_value))
             if summary:
                 provider_result["provider_enrichment_summary"] = summary
+    if view_mode != "card":
+        result_rows = await _project_provider_network_metadata(
+            result_rows, session=request_session, include_sources=include_sources, include_evidence=include_evidence
+        )
     if view_mode != "card" and (include_sources or include_evidence):
         source_detail_targets = list(result_rows)
         source_detail_targets.extend(
@@ -10290,7 +10288,9 @@ async def get_near_npi(
     request, *, native_args=None, import_context=None, prepare_cursor=None, native_scope_preparer=None
 ):
     """Return providers near coordinates under optional taxonomy filters."""
-    if (native_args is None) != (import_context is None):
+    if (native_args is None) != (import_context is None) and (
+        native_args is None or current_network_address_scope() is None
+    ):
         raise sanic.exceptions.InvalidUsage("custom-import geo arguments are invalid")
     if import_context is not None and type(import_context) is not ProviderImportQuery:
         raise sanic.exceptions.InvalidUsage("custom-import geo context is invalid")
@@ -10945,6 +10945,10 @@ async def get_near_npi(
             provider_result.pop("_cursor_npi", None)
             provider_result.pop("_cursor_address_key", None)
             _add_canonical_contact_fields_to_address(provider_result)
+    if view_mode != "card":
+        provider_results = await _project_provider_network_metadata(
+            provider_results, session=request_session, include_sources=False, include_evidence=False
+        )
     _redact_internal_address_fields(provider_results)
     if view_mode == "card":
         provider_results = [_provider_card_from_mapping(provider_result) for provider_result in provider_results]
@@ -11459,16 +11463,10 @@ def _npi_batch_dba_names(
     provider_detail_map: Mapping[str, Any],
     other_names: Sequence[Mapping[str, Any]],
 ) -> list[str]:
-    existing_dba_names = [name for name in (provider_detail_map.get("do_business_as") or []) if name]
-    if existing_dba_names:
-        return list(dict.fromkeys(existing_dba_names))
-    return list(
-        dict.fromkeys(
-            entry.get("other_provider_identifier")
-            for entry in other_names
-            if entry.get("other_provider_identifier_type_code") == "3" and entry.get("other_provider_identifier")
-        )
-    )
+    """Use the shared native batch name projection."""
+    from api.provider_batch import native_batch_dba_names
+
+    return native_batch_dba_names(provider_detail_map, other_names)
 
 
 def _npi_batch_provider_result(
@@ -11482,7 +11480,8 @@ def _npi_batch_provider_result(
 ) -> tuple[dict[str, Any], bool]:
     """Format one success or not-found entry without extra reads."""
     address_total = len(ranked_addresses)
-    if address_total == 0 and (provider_detail_map is None or current_network_address_scope() is not None):
+    scope = current_network_address_scope()
+    if address_total == 0 and (provider_detail_map is None or (scope is not None and scope.network_ids is not None)):
         return (
             {
                 "npi": npi,
@@ -11549,44 +11548,51 @@ async def get_npi_batch(request):
 @canonical_network_read
 async def get_npi(request, npi):
     """Return one NPPES- or profile-backed provider with optional provenance."""
-    should_force_address_update = _is_truthy_arg(request.args.get("force_address_update"), default=False)
-    include_sources = _is_truthy_arg(request.args.get("include_sources"), default=False)
-    include_evidence = _is_truthy_arg(request.args.get("include_evidence"), default=False)
+    return await read_npi_detail(request, npi)
+
+
+async def read_npi_detail(request, npi, *, native_args=None):
+    """Assemble provider detail on the real request with optional normalized arguments."""
+    args = request.args if native_args is None else native_args
+    network_scope = current_network_address_scope()
+    should_force_address_update = _is_truthy_arg(args.get("force_address_update"), default=False)
+    include_sources = _is_truthy_arg(args.get("include_sources"), default=False)
+    include_evidence = _is_truthy_arg(args.get("include_evidence"), default=False)
     include_profile = _is_truthy_arg(
-        request.args.get("include_profile"),
+        args.get("include_profile"),
         default=True,
     )
-    if _is_truthy_arg(request.args.get("debug"), default=False):
+    if _is_truthy_arg(args.get("debug"), default=False):
         include_sources = True
         include_evidence = True
-    include_extra_info = _is_truthy_arg(request.args.get("extra_info"), default=False)
+    include_extra_info = _is_truthy_arg(args.get("extra_info"), default=False)
     should_sync_geocode = _is_truthy_arg(
-        request.args.get("sync_geocode"),
-        default=current_network_address_scope() is None
+        args.get("sync_geocode"),
+        default=network_scope is None
         and _is_environment_flag_enabled(
             "HLTHPRT_NPI_DETAIL_SYNC_GEOCODE",
             "HLTHPRT_NPI_API_SYNC_GEOCODE",
             default=False,
         ),
     )
-    if current_network_address_scope() is not None and (should_force_address_update or should_sync_geocode):
+    if network_scope is not None and (should_force_address_update or should_sync_geocode):
         raise sanic.exceptions.InvalidUsage("Canonical network reads cannot update address data.")
     should_lookup_stored_geocode = _is_truthy_arg(
-        request.args.get("lookup_stored_geocode"),
+        args.get("lookup_stored_geocode"),
         default=_is_environment_flag_enabled(
             "HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE",
             "HLTHPRT_NPI_API_LOOKUP_STORED_GEOCODE",
             default=False,
         ),
     )
-    include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
-    provider_enrichment_view = _normalize_provider_enrichment_view(request.args.get("view"))
-    address_grouping = str(request.args.get("address_grouping") or ADDRESS_GROUPING_FLAT).strip().lower()
+    include_chain_enrichment = _include_chain_provider_enrichment(args.get("show"))
+    provider_enrichment_view = _normalize_provider_enrichment_view(args.get("view"))
+    address_grouping = str(args.get("address_grouping") or ADDRESS_GROUPING_FLAT).strip().lower()
     if address_grouping not in ADDRESS_GROUPING_VALUES:
         raise sanic.exceptions.InvalidUsage("address_grouping must be one of: flat, premise")
     # address_list paging: default-bounded so high-volume providers never serialize
     # 1k+ addresses; address_limit=all (or 0) opts out and returns the full list.
-    raw_address_limit = request.args.get("address_limit")
+    raw_address_limit = args.get("address_limit")
     if address_grouping == ADDRESS_GROUPING_PREMISE:
         normalized_group_limit = str(raw_address_limit or "").strip().lower()
         if normalized_group_limit in ("all", "0", "-1"):
@@ -11609,12 +11615,12 @@ async def get_npi(request, npi):
         except TypeError, ValueError:
             address_limit = NPI_DETAIL_ADDRESS_DEFAULT_LIMIT
     try:
-        address_offset = max(int(request.args.get("address_offset") or 0), 0)
+        address_offset = max(int(args.get("address_offset") or 0), 0)
     except TypeError, ValueError:
         address_offset = 0
-    include_address_total = _is_truthy_arg(request.args.get("include_address_total"), default=True)
-    raw_address_key = request.args.get("address_key")
-    raw_address_site_key = request.args.get("address_site_key")
+    include_address_total = _is_truthy_arg(args.get("include_address_total"), default=True)
+    raw_address_key = args.get("address_key")
+    raw_address_site_key = args.get("address_site_key")
     if address_grouping == ADDRESS_GROUPING_PREMISE and (
         str(raw_address_key or "").strip() or str(raw_address_site_key or "").strip()
     ):
@@ -12092,7 +12098,7 @@ async def get_npi(request, npi):
                 except Exception as exc:
                     logger.warning("Google geocoding failed for %s: %s", t_addr, exc)
 
-            if should_update_geo and address_by_field.get("lat") and current_network_address_scope() is None:
+            if should_update_geo and address_by_field.get("lat") and network_scope is None:
                 request.app.add_task(
                     run_as_writer(
                         update_addr_coordinates,
@@ -12111,21 +12117,11 @@ async def get_npi(request, npi):
     async with provider_profile_read_snapshot(db, _runtime_db_schema(), include_detail=True) as request_session:
         profile_record: dict[str, Any] | None = None
         if include_profile:
-            try:
-                async with provider_read_savepoint(request_session):
-                    profile_record = (
-                        await _fetch_provider_directory_profile_map(
-                            [npi],
-                            include_evidence=include_evidence,
-                            session=request_session,
-                        )
-                    ).get(npi)
-            except Exception as exc:
-                logger.debug(
-                    "Provider Directory profile fetch failed for npi=%s: %s",
-                    npi,
-                    exc,
-                )
+            from api.provider_profile_network_read import read_detail_directory_profile
+
+            profile_record = await read_detail_directory_profile(
+                request_session, npi, include_evidence=include_evidence
+            )
         is_response_cache_enabled = bool(
             not should_force_address_update
             and _NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS > 0
@@ -12212,7 +12208,7 @@ async def get_npi(request, npi):
 
         overlay_addresses = (
             []
-            if current_network_address_scope() is not None
+            if network_scope is not None
             else await _fetch_provider_directory_address_overlay(
                 npi,
                 address_key=address_key,
@@ -12237,7 +12233,7 @@ async def get_npi(request, npi):
             session=request_session,
             use_request_session=True,
         )
-        addresses = base_candidates + (overlay_addresses if current_network_address_scope() is None else [])
+        addresses = base_candidates + (overlay_addresses if network_scope is None else [])
         if address_key is not None:
             addresses = [
                 address
@@ -12254,7 +12250,7 @@ async def get_npi(request, npi):
             addresses = [address for address in addresses if _is_public_street_level_address(address)]
         addresses = _rank_provider_locations(_dedupe_addresses_by_key(addresses))
         if not addresses and (
-            current_network_address_scope() is not None or (not has_provider_detail and not profile_record)
+            network_scope and network_scope.network_ids is not None or not (has_provider_detail or profile_record)
         ):
             raise sanic.exceptions.NotFound
         address_total = len(addresses)

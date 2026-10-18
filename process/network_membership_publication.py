@@ -9,6 +9,7 @@ from uuid import UUID
 
 from db.registry_schema import registry_schema
 from process.network_address_projection import PinnedAddressSource, _identifier
+from process.network_candidate_custody import verify_network_candidate_custody
 from process.network_membership_candidate_indexes import _ready_replay
 from process.network_membership_candidate_lifecycle import _locked_candidate
 from process.network_membership_copy import MembershipCopyTarget
@@ -56,6 +57,16 @@ def _publication_readiness(candidate):
 
 
 def _publication_writer_closure(candidate, report):
+    from process.registry_source_retention import (
+        SOURCE_TABLE,
+        RegistrySourceRetentionError,
+        verify_registry_source_retention,
+    )
+
+    try:
+        retention = verify_registry_source_retention(candidate)
+    except RegistrySourceRetentionError:
+        raise NetworkPublicationError("Candidate source retention differs from its retained digest") from None
     closure = report.get("writer_closure")
     expected_scope_dict = {
         field: str(candidate[field])
@@ -76,16 +87,27 @@ def _publication_writer_closure(candidate, report):
     )
     if any(closure[role_group] != expected for role_group, expected in roles_by_group.items()):
         raise NetworkPublicationError("Candidate writer roles differ from their canonical receipt")
-    if type(closure.get("relation_oids")) is not dict or set(closure["relation_oids"]) != {
-        "network_membership",
-        "provider_location_binding",
-        "entity_address_unified",
-    }:
+    required_heaps = {"network_membership", "provider_location_binding", "entity_address_unified"}
+    if retention is not None:
+        required_heaps.add(SOURCE_TABLE)
+    if type(closure.get("relation_oids")) is not dict or set(closure["relation_oids"]) != required_heaps:
         raise NetworkPublicationError("Candidate writer closure lacks the projected address heap")
     return closure
 
 
 def _complete_accounting(report):
+    from process.registry_source_retention import RegistrySourceRetentionError, verify_registry_source_retention
+
+    try:
+        retention = verify_registry_source_retention(
+            {
+                "source_generations": report.get("source_generations", {}),
+                "validation_json": report,
+                "expected_rows": report.get("expected_rows"),
+            }
+        )
+    except RegistrySourceRetentionError:
+        raise NetworkPublicationError("Candidate retained source accounting is invalid") from None
     counted_fields = (
         "raw_rows",
         "batch_rows",
@@ -98,10 +120,12 @@ def _complete_accounting(report):
     )
     if (
         any(type(report.get(field)) is not int or report[field] < 0 for field in counted_fields)
-        or any(report[field] != report["expected_rows"] for field in ("raw_rows", "batch_rows", "membership_rows"))
+        or any(report[field] != report["expected_rows"] for field in ("raw_rows", "membership_rows"))
         or report["accepted_rows"] != report["expected_rows"]
         or report["unknown_network_rows"] != 0
-        or (report["raw_rows"] > 0 and report["batch_count"] == 0)
+        or (retention is not None and (report["batch_rows"] != 0 or report["batch_count"] != 0))
+        or (retention is None and report["batch_rows"] != report["expected_rows"])
+        or (retention is None and report["raw_rows"] > 0 and report["batch_count"] == 0)
         or report.get("accounting_errors") != []
         or report["distinct_memberships"] > report["membership_rows"]
         or report["projected_locations"] > report["distinct_memberships"]
@@ -194,6 +218,20 @@ async def _insert_manifest(connection, namespace, candidate, readiness):
     return _retained_manifest(manifest, readiness, replayed=False)
 
 
+async def _verify_provider_custody(connection, candidate, closure):
+    from process.network_em_provider_inputs import verify_candidate_em_provider_inputs
+
+    runtime_roles = tuple(sorted(set(closure["loader_roles"] + closure["reader_roles"])))
+    return await verify_candidate_em_provider_inputs(connection, candidate, runtime_roles=runtime_roles)
+
+
+async def _candidate_custody(connection, candidate, control_schema):
+    target = MembershipCopyTarget(
+        *(str(candidate[field]) for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name"))
+    )
+    return await verify_network_candidate_custody(connection, target, control_schema=control_schema, required=False)
+
+
 async def _publish_candidate(connection, copy_target, namespace):
     approved_revision, current_head = await _lock_publication_controls(connection, namespace)
     candidate = await _locked_candidate(connection, copy_target, namespace)
@@ -201,14 +239,17 @@ async def _publish_candidate(connection, copy_target, namespace):
         raise NetworkPublicationError("Candidate must be fully ready before publication")
     readiness = _publication_readiness(candidate)
     closure = readiness[3]
-    await verify_network_candidate_writer_closure(
-        connection,
-        copy_target,
-        owner_role=closure["owner_role"],
-        loader_roles=tuple(closure["loader_roles"]),
-        reader_roles=tuple(closure["reader_roles"]),
-        control_schema=namespace[1:-1],
-    )
+    custody = await _candidate_custody(connection, candidate, namespace[1:-1])
+    if custody is None:
+        await verify_network_candidate_writer_closure(
+            connection,
+            copy_target,
+            owner_role=closure["owner_role"],
+            loader_roles=tuple(closure["loader_roles"]),
+            reader_roles=tuple(closure["reader_roles"]),
+            control_schema=namespace[1:-1],
+        )
+    await _verify_provider_custody(connection, candidate, closure)
     manifest = await connection.fetchrow(
         f"SELECT * FROM {namespace}.network_serving_manifest WHERE candidate_id=$1", UUID(copy_target.candidate_id)
     )
@@ -228,8 +269,8 @@ async def _publish_candidate(connection, copy_target, namespace):
 async def publish_network_candidate(connection, copy_target, *, control_schema=None):
     """Atomically publish trusted readiness, or replay its retained manifest.
 
-    Caller owns commit/rollback. Native writer closure is verified against the
-    final retained receipt before initial publication and every replay.
+    Caller owns commit/rollback. Protected custody or legacy native writer
+    closure is verified before initial publication and every replay.
     """
     if type(copy_target) is not MembershipCopyTarget:
         raise NetworkPublicationError("Trusted candidate scope is required")

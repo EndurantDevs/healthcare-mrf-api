@@ -402,3 +402,175 @@ async def test_captured_owned_sequence_set_still_rejects_drift(monkeypatch, incl
                 session, spec, _ownership().dataset_id, include_identity=include_identity
             )
     owned_sequences.assert_awaited_once_with(session, 10, include_identity=include_identity)
+
+
+def _finite_tiger_capture():
+    projection = (
+        ("zip_state", (("tiger", "zip_state", 101, 1101), ("tiger_data", "fixed_zip", 103, 1103))),
+        ("zcta5", (("tiger", "zcta5", 102, 1102), ("tiger_data", "fixed_zcta", 104, 1104))),
+    )
+    tables = tuple(
+        archive.ReferenceTableReceipt(model.__name__, model.__tablename__, "a" * 64, 1)
+        for model in archive.reference_family_spec("tiger").model_types
+    )
+    metadata = dict(
+        contract="tiger.captured-origin.v2",
+        epoch_id="00000000-0000-0000-0000-000000000001",
+        source_graph_sha256="b" * 64,
+    )
+    _, digest = archive._source_metadata(metadata)
+    manifest = archive.ReferenceFamilyManifest(
+        "tiger",
+        tables,
+        metadata,
+        digest,
+        archive._schema_digest(tables),
+        publication_authority="captured-epoch",
+        source_capture_contract=archive.CAPTURED_TIGER_SNAPSHOT_CONTRACT,
+    )
+    return archive.ReferenceFamilySourceCapture(
+        manifest, "tiger", "00000001-00000001-1", frozen_source_projection=projection
+    )
+
+
+def test_frozen_projection_uses_only_exact_physical_relations_and_contract():
+    capture = _finite_tiger_capture()
+    archive._require_frozen_source_capture(capture)
+    query = archive._frozen_source_query(
+        capture.frozen_source_projection, archive.reference_family_spec("tiger").model_types[0]
+    )
+    assert (
+        query
+        == 'SELECT "zip", "stusps", "statefp" FROM ONLY "tiger"."zip_state" UNION ALL SELECT "zip", "stusps", "statefp" FROM ONLY "tiger_data"."fixed_zip"'
+    )
+    assert archive.validate_reference_family_manifest(capture.manifest.as_dict()) == capture.manifest
+    for changed in [
+        replace(capture, frozen_source_projection=None),
+        replace(capture, manifest=replace(capture.manifest, source_capture_contract=archive.CAPTURED_TIGER_CONTRACT)),
+    ]:
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="contract"):
+            archive._require_frozen_source_capture(changed)
+
+
+@pytest.mark.asyncio
+async def test_frozen_count_copy_and_multiset_validation_share_one_projection(monkeypatch):
+    capture = _finite_tiger_capture()
+    spec = archive.reference_family_spec("tiger")
+    sql_calls, copied_queries = [], []
+
+    async def scalar(statement, parameters=None):
+        sql_calls.append(str(statement))
+        return 1 if "count(*)" in str(statement) else True
+
+    session = SimpleNamespace(in_transaction=lambda: True, scalar=scalar)
+    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(return_value=101))
+    monkeypatch.setattr(archive, "_family_schema_identity", AsyncMock(return_value="a" * 64))
+
+    async def copy(_session, _source_copy, query, *_args):
+        copied_queries.append(query)
+        return 4000
+
+    monkeypatch.setattr(archive, "_copy_source_projection", copy)
+    await archive._table_receipt(
+        session,
+        importer_id="tiger",
+        schema_name="tiger",
+        model_type=spec.model_types[0],
+        frozen_source_projection=capture.frozen_source_projection,
+    )
+    await archive._copy_source_tables(
+        session, capture, "fixture_stage", spec, archive.ReferenceFamilySourceCopy(AsyncMock(), 4096, 30), 123
+    )
+    await archive._validate_source_clone_sets(session, capture, "fixture_stage")
+    assert len(copied_queries) == 2 and len(sql_calls) == 3
+    assert copied_queries[0] in sql_calls[0] and copied_queries[0] in sql_calls[1]
+    assert copied_queries[1] in sql_calls[2]
+    assert all(sql.count("EXCEPT ALL") == 2 for sql in sql_calls[1:])
+    assert 'FROM "tiger".' not in " ".join(copied_queries)
+    session.scalar = AsyncMock(return_value=False)
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="differs"):
+        await archive._validate_source_clone_sets(session, capture, "fixture_stage")
+
+
+@pytest.mark.asyncio
+async def test_finite_clone_imports_snapshot_before_authorization_or_creation(monkeypatch):
+    capture = _finite_tiger_capture()
+    events = []
+    session = SimpleNamespace(
+        in_transaction=lambda: True, execute=AsyncMock(side_effect=lambda sql: events.append(str(sql)))
+    )
+
+    async def authorize(actual):
+        assert actual is session
+        events.append("authorize")
+
+    async def create(*_args):
+        events.append("create")
+        return "owned"
+
+    monkeypatch.setattr(archive, "create_model_family_export_clone", create)
+    for name in [
+        "_copy_source_tables",
+        "_create_model_indexes",
+        "_rebase_owned_sequences",
+        "_validate_source_clone_sets",
+    ]:
+        monkeypatch.setattr(archive, name, AsyncMock())
+    precreated = AsyncMock()
+    await archive._clone_source(
+        session,
+        capture,
+        "fixture_stage",
+        source_copy=archive.ReferenceFamilySourceCopy(AsyncMock(), 4096, 30),
+        on_precreated=precreated,
+        authorize_creation=authorize,
+        deadline=asyncio.get_running_loop().time() + 30,
+    )
+    assert events == [
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        "SET TRANSACTION SNAPSHOT '00000001-00000001-1'",
+        "authorize",
+        "create",
+    ]
+    precreated.assert_awaited_once_with(session, "owned")
+
+
+@pytest.mark.parametrize(
+    "fault", ["mutable", "empty", "wrong_root", "duplicate_oid", "duplicate_name", "bool_oid", "zero_file", "reordered"]
+)
+def test_finite_projection_refuses_ambiguous_or_unbound_physical_identity(fault):
+    capture = _finite_tiger_capture()
+    projection = capture.frozen_source_projection
+    table, relations = projection[0]
+    if fault == "mutable":
+        bad_relations = list(projection)
+    elif fault == "empty":
+        bad_relations = ((table, ()), projection[1])
+    else:
+        first_relation_by_fault = {
+            "wrong_root": ("other", "zip_state", 101, 1101),
+            "duplicate_oid": ("tiger", "zip_state", 102, 1101),
+            "duplicate_name": relations[0],
+            "bool_oid": ("tiger", "zip_state", True, 1101),
+            "zero_file": ("tiger", "zip_state", 101, 0),
+            "reordered": relations[1],
+        }
+        second = relations[0] if fault in {"duplicate_name", "reordered"} else relations[1]
+        bad_relations = ((table, (first_relation_by_fault[fault], second)), projection[1])
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="frozen TIGER"):
+        archive._require_frozen_source_capture(replace(capture, frozen_source_projection=bad_relations))
+
+
+def test_captured_origin_versions_cannot_relabel_snapshot_or_writer_fenced_evidence():
+    from process import tiger_captured_epoch as captured
+
+    manifest = _finite_tiger_capture().manifest
+    old_origin_by_field = dict(manifest.source_metadata, contract=captured.ORIGIN_CONTRACT)
+    assert captured.validate_captured_origin(old_origin_by_field)["contract"] == captured.ORIGIN_CONTRACT
+    assert captured.validate_captured_origin(manifest.source_metadata)["contract"] == captured.SNAPSHOT_ORIGIN_CONTRACT
+    for changed in [
+        replace(manifest, source_metadata=old_origin_by_field),
+        replace(manifest, source_capture_contract=archive.CAPTURED_TIGER_CONTRACT),
+    ]:
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="origin and snapshot"):
+            changed.as_dict()

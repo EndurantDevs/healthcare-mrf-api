@@ -13,6 +13,7 @@ from process.network_approved_membership_source import (
     ApprovedMembershipSource,
     ApprovedMembershipSourceError,
     pin_approved_membership_source,
+    pin_retained_approved_membership_source,
 )
 from process.registry_source_observation_store import _TRIM_CHARACTERS, _namespace
 
@@ -127,8 +128,9 @@ _VALIDATION_SQL = """WITH {bindings},scoped AS MATERIALIZED (
       THEN record_json->'source_scope_json' ELSE '{{}}'::jsonb END AS scope
   ) document WHERE NOT COALESCE(CASE $2
     WHEN 'ptg' THEN (
-      (scope->>'review_type'='published_complete_snapshot_plan'
-        AND scope->>'selection_mode'='complete_snapshot_source_set'
+      ((scope->>'review_type',scope->>'selection_mode') IN (
+          ('published_complete_snapshot_plan','complete_snapshot_source_set'),
+          ('published_allowed_amount_plan','complete_allowed_snapshot_source_set'))
         AND (SELECT array_agg(key ORDER BY key) FROM jsonb_object_keys(scope) key)
           =ARRAY['approval_sha256','plan_id','plan_market_type','review_type','scope_id','selection_mode','snapshot_id']::text[]
         AND NOT EXISTS(SELECT 1 FROM jsonb_each(scope) field WHERE jsonb_typeof(field.value)<>'string')
@@ -137,7 +139,8 @@ _VALIDATION_SQL = """WITH {bindings},scoped AS MATERIALIZED (
         AND scope->>'approval_sha256' ~ '^[0-9a-f]{{64}}$'
         AND char_length(scope->>'snapshot_id') BETWEEN 1 AND 96
         AND char_length(scope->>'plan_id') BETWEEN 1 AND 64
-        AND char_length(scope->>'plan_market_type') BETWEEN 1 AND 32
+        AND char_length(scope->>'plan_market_type') BETWEEN
+          CASE WHEN scope->>'review_type'='published_allowed_amount_plan' THEN 0 ELSE 1 END AND 32
         AND scope->>'plan_market_type'=lower(scope->>'plan_market_type')
         AND NOT EXISTS(SELECT 1 FROM jsonb_each(scope) field WHERE
           btrim(field.value#>>'{{}}',$8)<>field.value#>>'{{}}' OR field.value#>>'{{}}' ~ '[[:cntrl:]]'))
@@ -204,19 +207,53 @@ async def require_approved_network_source_bindings(
     control_schema=None,
     published_plan_store=None,
 ):
-    """Validate one exact approved scope and return only its active binding count.
+    """Validate the current approved scope without admitting immutable source data."""
+    return await _require_network_source_bindings(
+        connection,
+        approved_source,
+        coordinates,
+        control_schema=control_schema,
+        published_plan_store=published_plan_store,
+        retained=False,
+    )
 
-    The caller owns repeatable-read/serializable isolation and independently
-    verifies these coordinates against admitted immutable source evidence.
-    This helper neither admits source data nor consults mutable draft heads.
+
+async def require_retained_approved_network_source_bindings(
+    connection,
+    approved_source: ApprovedMembershipSource,
+    coordinates: RegistryNetworkSourceCoordinates,
+    *,
+    control_schema=None,
+    published_plan_store=None,
+):
+    """Validate one exact retained map after the caller verifies its serving manifest.
+
+    Keep every document, target, bounds and published-plan proof while allowing the
+    current approved revision to advance. Coordinates do not confer source admission.
+    The caller owns repeatable-read/serializable isolation and native archive proof.
     """
+    return await _require_network_source_bindings(
+        connection,
+        approved_source,
+        coordinates,
+        control_schema=control_schema,
+        published_plan_store=published_plan_store,
+        retained=True,
+    )
+
+
+async def _require_network_source_bindings(
+    connection, approved_source, coordinates, *, control_schema, published_plan_store, retained
+):
+    """Share complete validation; only the exact approved-map pin policy differs."""
     if (
         type(approved_source) is not ApprovedMembershipSource
         or type(coordinates) is not RegistryNetworkSourceCoordinates
     ):
         raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_invalid")
     try:
-        current = await pin_approved_membership_source(
+        pin_source = pin_retained_approved_membership_source if retained else pin_approved_membership_source
+        current = await pin_source(
             connection,
             approved_revision=approved_source.approved_revision,
             control_schema=control_schema,
@@ -233,8 +270,8 @@ async def require_approved_network_source_bindings(
             *coordinates.sql_parameters,
             _TRIM_CHARACTERS,
         )
-    except asyncpg.PostgresError, ApprovedMembershipSourceError:
-        raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_unavailable") from None
+    except (asyncpg.PostgresError, ApprovedMembershipSourceError) as error:
+        raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_unavailable") from error
     if checks is None or checks["invalid"]:
         raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_invalid")
     if checks["published_count"]:

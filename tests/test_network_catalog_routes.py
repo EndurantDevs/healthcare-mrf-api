@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 import json
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
@@ -173,7 +173,7 @@ async def test_empty_and_beyond_end_preserve_authorized_total_and_pin(context, o
 async def test_exact_canonical_detail_preserves_reader_page(context):
     http_response = await send(context, envelope({"network_id": 7, "network_generation": "9"}), path=_PATH + "/detail")
     assert http_response.status == 200 and http_response.json["items"][0]["network_id"] == 7
-    assert context.driver.calls[-1][1][5:] == (7, 0, 1, 1048576, None)
+    assert context.driver.calls[-1][1][5:] == ((7,), 0, 1, 1048576, None)
 
 
 @pytest.mark.asyncio
@@ -219,6 +219,84 @@ async def test_excluded_detail_never_reads_candidate_or_approved_metadata(contex
     http_response = await send(context, envelope({"network_id": 7}, excluded_network_ids=[7]), path=_PATH + "/detail")
     assert http_response.status == 404 and context.driver.calls == []
     assert context.session.events[-1] == ("exit", catalog.RegistryNetworkCatalogError)
+
+
+def v2_envelope(query=None, **changes):
+    document = (
+        envelope(query)
+        | {
+            "contract_version": "registry-catalog-policy/v2",
+            "organization_visibility_default": "system_wide",
+            "excluded_company_ids": [],
+            "excluded_group_ids": [],
+        }
+        | changes
+    )
+    normalized_by_field = {key: value for key, value in document.items() if key not in {"query", "access_scope_sha256"}}
+    normalized_by_field["policy_revision"] = int(document["policy_revision"])
+    document["access_scope_sha256"] = hashlib.sha256(
+        json.dumps(normalized_by_field, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+    return document
+
+
+@pytest.mark.asyncio
+async def test_v2_integer_digest_translation_and_typed_sql_scope(context):
+    identity = str(uuid4())
+    document = v2_envelope(
+        client_id="sample-é",
+        policy_revision="9223372036854775807",
+        excluded_company_ids=[identity],
+        excluded_group_ids=[identity],
+    )
+    result = await send(context, document)
+    assert result.status == 200
+    assert result.headers["X-Network-Access-Scope"] == document["access_scope_sha256"]
+    sql, parameters = context.driver.calls[-1]
+    assert parameters[-2:] == ((identity,), (identity,))
+    assert sql.count("NOT company.record_key=ANY($11::text[])") == 2
+    assert sql.index("NOT company.record_key=ANY($11::text[])") < sql.index("declared_benefits AS")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"contract_version": "unknown"},
+        {"organization_visibility_default": "restricted"},
+        {"excluded_company_ids": ["bad"]},
+        {"excluded_group_ids": [str(UUID(int=0))]},
+        {"access_scope_sha256": "a" * 64},
+        {"policy_revision": 1},
+        {"unknown": True},
+    ],
+)
+async def test_v2_refusal_never_falls_back_or_opens_database(context, change):
+    document = v2_envelope() | change
+    result = await send(context, document)
+    assert result.status == 400 and context.session.events == []
+
+
+@pytest.mark.asyncio
+async def test_organization_route_uses_v2_exceptions_before_page_and_detail(context):
+    identity = str(uuid4())
+    context.driver.page.update(total=0, rows_json="[]")
+    document = v2_envelope({"record_kind": "company", "offset": 2, "limit": 1}, excluded_company_ids=[identity])
+    result = await send(context, document, path="/api/v1/registry/serving/organizations")
+    assert result.status == 200 and result.json["total"] == 0 and result.json["record_kind"] == "company"
+    sql, parameters = context.driver.calls[-1]
+    assert parameters[2] == (identity,) and parameters[4:6] == (2, 1)
+    assert sql.index("NOT record_key=ANY") < sql.index("OFFSET $5 LIMIT $6")
+    detail = v2_envelope({"record_kind": "company", "record_id": identity}, excluded_company_ids=[identity])
+    result = await send(context, detail, path="/api/v1/registry/serving/organizations/detail")
+    assert result.status == 404 and result.headers["X-Network-Access-Scope"] == detail["access_scope_sha256"]
+    assert context.driver.calls[-1][1][-1] == (identity,)
+
+
+@pytest.mark.asyncio
+async def test_organization_route_requires_explicit_v2(context):
+    result = await send(context, envelope({"record_kind": "company"}), path="/api/v1/registry/serving/organizations")
+    assert result.status == 400 and context.session.events == []
 
 
 @pytest.mark.asyncio
@@ -463,8 +541,9 @@ async def test_reader_error_categories_remain_value_free(context, monkeypatch, c
 @pytest.mark.asyncio
 @pytest.mark.parametrize("suffix", ["", "/detail", "/legacy"])
 @pytest.mark.parametrize("method", ["get", "head", "options", "put", "patch", "delete"])
-async def test_framework_method_refusals_are_private_without_database(context, suffix, method):
-    _, http_response = await getattr(context.app.asgi_client, method)(_PATH + suffix)
+@pytest.mark.parametrize("trailing", ["", "/"])
+async def test_framework_method_refusals_are_private_without_database(context, suffix, method, trailing):
+    _, http_response = await getattr(context.app.asgi_client, method)(_PATH + suffix + trailing)
     assert http_response.status == 405 and http_response.headers["Cache-Control"] == "private, no-store"
     assert context.session.events == [] and context.driver.calls == []
 
@@ -502,3 +581,257 @@ async def test_declared_benefit_filter_routes_to_existing_pinned_reader(context)
 async def test_declared_benefit_filter_rejects_unsupported_types_before_transaction(context, code):
     http_response = await send(context, envelope({"benefit_code": code}))
     assert http_response.status == 400 and context.session.events == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_batch_v2_policy_scope_generation_and_private_headers(context):
+    document = v2_envelope({"namespace": "checksum_network", "values": ["42", "0"], "network_generation": "9"})
+    reply = await send(context, document, path=_PATH + "/legacy")
+    assert reply.status == 200 and reply.json["items"][0]["network_id"] == 7
+    assert reply.headers["X-Network-Generation"] == "9"
+    assert reply.headers["X-Network-Access-Scope"] == document["access_scope_sha256"]
+    assert context.driver.calls[-2][1] == (4, ("42", "0"), "checksum_network", ())
+    assert context.driver.calls[-1][1][5] == (7,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"source": {}},
+        {"source_scope": {}},
+        {"value": "42"},
+        {"values": "42"},
+        {"values": []},
+        {"values": ["42", "42"]},
+        {"values": ["+42"]},
+        {"network_generation": "0"},
+    ],
+)
+async def test_legacy_batch_closed_input_refuses_before_database(context, changes):
+    query = {"namespace": "checksum_network", "values": ["42"]} | changes
+    reply = await send(context, v2_envelope(query), path=_PATH + "/legacy")
+    assert reply.status == 400 and context.driver.calls == [] and context.session.events == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_batch_refusal_is_value_free_and_never_falls_back(context):
+    context.driver.legacy_batch["complete"] = False
+    document = v2_envelope({"namespace": "checksum_network", "values": ["42", "-17"]}, excluded_network_ids=[7])
+    reply = await send(context, document, path=_PATH + "/legacy")
+    assert reply.status == 404 and reply.json == {"error": {"code": "network_catalog_not_found"}}
+    assert reply.headers["X-Network-Access-Scope"] == document["access_scope_sha256"]
+    assert "X-Network-Generation" not in reply.headers
+    assert context.driver.calls[-1][1][-1] == (7,)
+
+
+_AUTOCOMPLETE_PATH = "/api/v1/plan/network/autocomplete"
+
+
+@pytest.fixture
+def autocomplete_context(context, monkeypatch):
+    from api.endpoint import plan
+
+    context.app.blueprint(Blueprint.group([plan.blueprint], version_prefix="/api/v"))
+    context.autocomplete_calls = []
+    context.autocomplete_page = {
+        "generation": "9",
+        "approved_custom_revision": "4",
+        "plans": [
+            {
+                "plan_id": "12345CA0000001",
+                "marketing_name": "Example é",
+                "state": "CA",
+                "year": 2026,
+                "network_checksum": {"42": None, "-17": ""},
+            }
+        ],
+    }
+
+    async def read(connection, query, *, excluded_network_ids):
+        assert connection is context.driver and connection.in_transaction
+        context.autocomplete_calls.append((query, excluded_network_ids))
+        return context.autocomplete_page
+
+    monkeypatch.setattr(endpoint, "read_registry_network_autocomplete", read)
+    return context
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_full_policy_pins_one_transaction_and_keeps_metadata_shape(autocomplete_context):
+    context = autocomplete_context
+    organization_id = str(UUID(int=1))
+    document = v2_envelope(
+        {"query": "É%_", "limit": 2, "zip_code": "01234", "network_generation": "9"},
+        client_id="sample-é",
+        policy_revision="12",
+        excluded_network_ids=[84],
+        excluded_company_ids=[organization_id],
+        excluded_group_ids=[organization_id],
+    )
+    http_response = await send(context, document, path=_AUTOCOMPLETE_PATH)
+    assert http_response.status == 200
+    assert http_response.json == {"client_id": "sample-é", "policy_revision": "12"} | context.autocomplete_page
+    assert http_response.headers["X-Network-Generation"] == "9"
+    assert http_response.headers["X-Network-Access-Scope"] == document["access_scope_sha256"]
+    query, exclusions = context.autocomplete_calls[0]
+    assert (query.query, query.limit, query.zip_code, query.generation_id, exclusions) == ("É%_", 2, "01234", 9, (84,))
+    assert len(context.autocomplete_calls) == 1 and context.driver.calls == []
+    assert context.session.events == [
+        "begin",
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+        "SET LOCAL lock_timeout='1s'",
+        "connection",
+        "driver",
+        ("exit", None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    [
+        {},
+        {"query": "x"},
+        {"query": "", "limit": 1},
+        {"query": " x", "limit": 1},
+        {"query": "x\u0090", "limit": 1},
+        {"query": "x" * 129, "limit": 1},
+        {"query": 1, "limit": 1},
+        {"query": "x", "limit": True},
+        {"query": "x", "limit": 0},
+        {"query": "x", "limit": 51},
+        {"query": "x", "limit": 1, "zip_code": None},
+        {"query": "x", "limit": 1, "zip_code": "１２３４５"},
+        {"query": "x", "limit": 1, "network_generation": "01"},
+        {"query": "x", "limit": 1, "network_ids": [84]},
+        {"query": "x", "limit": 1, "state": "CA"},
+    ],
+)
+async def test_autocomplete_closed_inputs_refuse_before_transaction(autocomplete_context, query):
+    http_response = await send(autocomplete_context, v2_envelope(query), path=_AUTOCOMPLETE_PATH)
+    assert http_response.status == 400
+    assert autocomplete_context.session.events == [] and autocomplete_context.autocomplete_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer wrong"}])
+async def test_autocomplete_authentication_precedes_body_and_database(autocomplete_context, headers):
+    http_response = await send(autocomplete_context, path=_AUTOCOMPLETE_PATH, raw=b"\xff", headers=headers)
+    assert http_response.status == 403 and autocomplete_context.session.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["v1", "bad_digest", "duplicate", "query_string", "oversized"])
+async def test_autocomplete_policy_and_wire_refusals_are_private(autocomplete_context, kind):
+    document = v2_envelope({"query": "x", "limit": 1})
+    path = _AUTOCOMPLETE_PATH
+    raw = None
+    if kind == "v1":
+        document = envelope({"query": "x", "limit": 1})
+    elif kind == "bad_digest":
+        document["access_scope_sha256"] = "a" * 64
+    elif kind == "duplicate":
+        raw = json.dumps(document).replace('"query": "x"', '"query": "x", "query": "y"').encode()
+    elif kind == "query_string":
+        path += "?query=x"
+    else:
+        raw = b" " * (catalog.MAX_RESPONSE_BYTES + 1)
+    http_response = await send(autocomplete_context, document, path=path, raw=raw)
+    assert http_response.status == 400 and autocomplete_context.session.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["stale", "database", "oversized", "cancelled"])
+async def test_autocomplete_failure_never_retries_legacy_and_closes_transaction(
+    autocomplete_context, monkeypatch, kind
+):
+    context = autocomplete_context
+
+    async def refuse(*_args, **_kwargs):
+        context.autocomplete_calls.append(kind)
+        if kind == "cancelled":
+            raise asyncio.CancelledError
+        if kind == "database":
+            raise asyncpg.InterfaceError("synthetic detail must not escape")
+        if kind == "stale":
+            raise catalog.RegistryNetworkCatalogError("registry_network_catalog_source_changed")
+        return {"generation": "9", "plans": ["x" * catalog.MAX_RESPONSE_BYTES]}
+
+    monkeypatch.setattr(endpoint, "read_registry_network_autocomplete", refuse)
+    if kind == "cancelled":
+        request = SimpleNamespace(
+            ctx=SimpleNamespace(sa_session=context.session),
+            headers=_AUTH,
+            query_string="",
+            body=json.dumps(v2_envelope({"query": "x", "limit": 1})).encode(),
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await endpoint._catalog_response(request, "autocomplete")
+    else:
+        http_response = await send(context, v2_envelope({"query": "x", "limit": 1}), path=_AUTOCOMPLETE_PATH)
+        assert http_response.status == 503 and http_response.json == {"error": {"code": "network_catalog_unavailable"}}
+        assert "X-Network-Generation" not in http_response.headers
+    assert len(context.autocomplete_calls) == 1 and not context.driver.in_transaction
+    assert context.session.events[-1][0] == "exit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", [_AUTOCOMPLETE_PATH, _AUTOCOMPLETE_PATH + "/"])
+async def test_autocomplete_post_framework_error_is_private_without_changing_get(autocomplete_context, path):
+    from sanic.exceptions import PayloadTooLarge
+
+    context = autocomplete_context
+
+    @context.app.middleware("request")
+    async def refuse_body(request):
+        if request.method == "POST":
+            raise PayloadTooLarge("synthetic body exceeds the request bound")
+
+    _, refusal = await context.app.asgi_client.post(path, data=b"x")
+    assert refusal.status == 413 and refusal.headers["Cache-Control"] == "private, no-store"
+    _, legacy = await context.app.asgi_client.get(path)
+    assert legacy.status == 200 and legacy.json == {"plans": []}
+    assert "Cache-Control" not in legacy.headers and context.session.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy_version", ["v1", "v2"])
+@pytest.mark.parametrize("failure", ["source_changed", "malformed", "unavailable", "framework_conflict"])
+async def test_legacy_source_change_mapping_requires_exact_reader_error_and_full_policy(
+    context, monkeypatch, policy_version, failure
+):
+    from sanic.exceptions import SanicException
+
+    code = {
+        "source_changed": "registry_network_catalog_source_changed",
+        "malformed": "registry_network_catalog_source_changed:synthetic-private-detail",
+        "unavailable": "registry_network_catalog_unavailable",
+    }.get(failure)
+
+    async def refuse(*_args, **_kwargs):
+        if failure == "framework_conflict":
+            raise SanicException("synthetic-private-detail", status_code=409)
+        raise catalog.RegistryNetworkCatalogError(code)
+
+    monkeypatch.setattr(endpoint, "resolve_registry_network_catalog_legacy", refuse)
+    query_by_field = {"namespace": "checksum_network", "values": ["42"], "network_generation": "9"}
+    document = (v2_envelope if policy_version == "v2" else envelope)(query_by_field)
+    reply = await send(context, document, path=_PATH + "/legacy")
+    expected = 409 if policy_version == "v2" and failure == "source_changed" else 503
+    assert reply.status == expected
+    assert reply.json == {
+        "error": {"code": "network_catalog_source_changed" if expected == 409 else "network_catalog_unavailable"}
+    }
+    assert "synthetic-private-detail" not in reply.text and "X-Network-Generation" not in reply.headers
+    if policy_version == "v2":
+        assert reply.headers["X-Network-Access-Scope"] == document["access_scope_sha256"]
+    elif failure == "framework_conflict":
+        policy_by_field = {key: document[key] for key in ("client_id", "policy_revision", "excluded_network_ids")}
+        expected_scope = hashlib.sha256(
+            json.dumps(policy_by_field, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+        ).hexdigest()
+        assert reply.headers["X-Network-Access-Scope"] == expected_scope
+    else:
+        assert "X-Network-Access-Scope" not in reply.headers
+    assert not context.driver.in_transaction and context.session.events[-1][0] == "exit"

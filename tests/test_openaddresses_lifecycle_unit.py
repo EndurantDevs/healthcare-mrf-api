@@ -1,5 +1,5 @@
-import importlib
 import asyncio
+import importlib
 import json
 from unittest.mock import AsyncMock
 
@@ -7,9 +7,37 @@ import pytest
 
 from process.control_cancel import ImportCancelledError
 
-
 openaddresses = importlib.import_module("process.openaddresses")
 control_imports = importlib.import_module("api.control_imports")
+
+
+class _PublicationTransaction:
+    """Keep this lifecycle double independent of native database authority."""
+
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+class _PublicationDatabase:
+    """Supply the existing staged-row counts and publication transaction double."""
+
+    async def scalar(self, stmt, **_params):
+        if "WHERE zip5 IS NULL" in stmt:
+            return 0
+        return 3
+
+    async def execute_ddl(self, _stmt):
+        return None
+
+    async def status(self, _stmt, **_params):
+        return None
+
+    def transaction(self):
+        return _PublicationTransaction()
+
 
 @pytest.mark.asyncio
 async def test_openaddresses_task_import_id_controls_stage_suffix():
@@ -60,6 +88,7 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
     seen_by_field = {}
     create_indexes = AsyncMock()
     complete_generation = AsyncMock()
+    native_enrollment = AsyncMock()
 
     async def fake_ensure_database(_test_mode):
         return None
@@ -75,24 +104,10 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
 
     async def refresh_archive_geocodes(**_kwargs):
         return openaddresses.OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
+
     async def restore_zip_codes(**_kwargs):
         return openaddresses.OpenAddressesZipRestoreStats()
-    class FakeTransaction:
-        async def __aenter__(self):
-            return None
-        async def __aexit__(self, *_exc):
-            return False
-    class FakeDb:
-        async def scalar(self, stmt, **_params):
-            if "WHERE zip5 IS NULL" in stmt:
-                return 0
-            return 3
-        async def execute_ddl(self, _stmt):
-            return None
-        async def status(self, _stmt, **_params):
-            return None
-        def transaction(self):
-            return FakeTransaction()
+
     monkeypatch.setattr(openaddresses, "ensure_database", fake_ensure_database)
     monkeypatch.setattr(openaddresses, "_is_table_present", is_table_present)
     monkeypatch.setattr(openaddresses, "_published_recovery_generations", published_generations)
@@ -100,7 +115,8 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
     monkeypatch.setattr(openaddresses, "refresh_archive_geocodes_from_openaddresses_sharded", refresh_archive_geocodes)
     monkeypatch.setattr(openaddresses, "restore_openaddresses_zips", restore_zip_codes)
     monkeypatch.setattr(openaddresses, "_complete_published_generation", complete_generation)
-    monkeypatch.setattr(openaddresses, "db", FakeDb())
+    monkeypatch.setattr(openaddresses, "prepare_local_native_input_publication", native_enrollment)
+    monkeypatch.setattr(openaddresses, "db", _PublicationDatabase())
     monkeypatch.setattr(openaddresses, "print_time_info", lambda _started_at: None)
     await openaddresses.shutdown(
         {
@@ -114,6 +130,11 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
     )
     assert seen_by_field["table_exists"] == ("mrf", "openaddresses_geocode_oadev20260619")
     create_indexes.assert_awaited_once_with("openaddresses_geocode_oadev20260619", "mrf")
+    native_enrollment.assert_awaited_once_with(
+        None,
+        ledger_schema="mrf",
+        relations=(("openaddresses_geocode", "openaddresses_geocode_oadev20260619"),),
+    )
     assert complete_generation.await_args.kwargs["import_id"] == "oadev20260619"
 
 
@@ -243,10 +264,7 @@ def test_openaddresses_boolean_environment_guard(
     else:
         monkeypatch.setenv(environment_name, raw_value)
 
-    assert (
-        openaddresses._is_env_flag_enabled(environment_name, default)
-        is expected_value
-    )
+    assert openaddresses._is_env_flag_enabled(environment_name, default) is expected_value
 
 
 def test_openaddresses_identifier_helpers_are_stable_and_bounded():
@@ -302,13 +320,13 @@ def test_openaddresses_lookup_params_reject_incomplete_and_non_us_addresses():
         is None
     )
     assert (
-            openaddresses.lookup_params_from_address(
-                {
-                    "first_line": "1 Main Street",
-                    "country_code": "US",
-                    "postal_code": "78701",
-                }
-            )
+        openaddresses.lookup_params_from_address(
+            {
+                "first_line": "1 Main Street",
+                "country_code": "US",
+                "postal_code": "78701",
+            }
+        )
         is None
     )
 
@@ -330,9 +348,7 @@ def test_openaddresses_source_filter_and_task_bounds(monkeypatch):
         openaddresses.Path("/tmp/first.geojson"),
         openaddresses.Path("/tmp/second.geojson"),
     ]
-    assert openaddresses._local_files_from_task_or_env(
-        {"local_files": "/tmp/one.geojson, /tmp/two.geojson"}
-    ) == [
+    assert openaddresses._local_files_from_task_or_env({"local_files": "/tmp/one.geojson, /tmp/two.geojson"}) == [
         openaddresses.Path("/tmp/one.geojson"),
         openaddresses.Path("/tmp/two.geojson"),
     ]

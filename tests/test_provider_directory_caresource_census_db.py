@@ -1,17 +1,15 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import importlib
 import hashlib
+import importlib
 import uuid
 
 import pytest
 from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
-from process.provider_directory_proof_store import (
-    ensure_dataset_proof_shard_table,
-)
-
+from process.provider_directory_generic_source_policy import source_transaction
+from tests.provider_directory_current_census_postgres_support import census_database
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -19,7 +17,7 @@ importer = importlib.import_module("process.provider_directory_fhir")
 async def _require_disposable_postgres(database: Database) -> None:
     try:
         database_name = str(await database.scalar("SELECT current_database();") or "")
-    except (OSError, OperationalError):
+    except OSError, OperationalError:
         pytest.skip("CareSource census tests need disposable Postgres")
     if "test" not in database_name.lower():
         pytest.skip("CareSource census tests need a test database")
@@ -86,50 +84,39 @@ async def test_real_postgres_counts_exact_unique_candidate_resource_ids(monkeypa
         await database.disconnect()
 
 
-async def _create_checkpoint_lifecycle_tables(database: Database, schema: str) -> None:
-    await database.status(
-        f"CREATE TABLE {schema}.provider_directory_endpoint_dataset ("
-        "dataset_id varchar(96) PRIMARY KEY, "
-        "endpoint_id varchar(96) NOT NULL, "
-        "acquisition_root_run_id varchar(128), "
-        "status varchar(32) NOT NULL);"
-    )
-    await database.status(
-        f"CREATE TABLE {schema}.provider_directory_dataset_resource ("
-        "dataset_id varchar(96) NOT NULL, resource_type varchar(64) NOT NULL, "
-        "resource_id varchar(256) NOT NULL, payload_hash varchar(64) NOT NULL, "
-        "payload_json jsonb NOT NULL, "
-        "PRIMARY KEY (dataset_id, resource_type, resource_id));"
-    )
-    await database.status(
-        f"CREATE TABLE {schema}.provider_directory_pagination_checkpoint ("
-        "canonical_api_base text NOT NULL, resource_type varchar(64) NOT NULL, "
-        "source_scope_hash varchar(64) NOT NULL, dataset_id varchar(96), "
-        "source_ids jsonb NOT NULL, acquisition_root_run_id varchar(128) NOT NULL, "
-        "owner_run_id varchar(128) NOT NULL, retry_of_run_id varchar(128), "
-        "start_url_hash varchar(64) NOT NULL, next_url text, state varchar(16) NOT NULL, "
-        "pages_processed bigint NOT NULL, rows_processed bigint NOT NULL, "
-        "recent_cursor_hashes jsonb NOT NULL, completeness_json jsonb NOT NULL, "
-        "created_at timestamp NOT NULL, updated_at timestamp NOT NULL, "
-        "completed_at timestamp, "
-        "UNIQUE (canonical_api_base, resource_type, source_scope_hash, "
-        "acquisition_root_run_id));"
-    )
-    await ensure_dataset_proof_shard_table(database, schema)
-
-
 async def _seed_checkpoint_lifecycle_rows(database: Database, schema: str) -> None:
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_endpoint_dataset "
-        "(dataset_id, endpoint_id, acquisition_root_run_id, status) VALUES "
-        "('dataset-caresource', 'endpoint-caresource', 'run-original', 'acquiring');"
+    """Create the genuine private input binding before testing family reset."""
+    async with source_transaction(database):
+        await database.status(
+            f'INSERT INTO "{schema}".provider_directory_api_endpoint '
+            "(endpoint_id, canonical_api_base, credential_descriptor_hash, endpoint_signature_hash) "
+            "VALUES ('endpoint-caresource', :api_base, :credential_hash, :signature_hash)",
+            api_base=importer.CARESOURCE_PROVIDER_DIRECTORY_BASE,
+            credential_hash="2" * 64,
+            signature_hash="3" * 64,
+        )
+    candidate = importer.EndpointDatasetCandidate(
+        endpoint_id="endpoint-caresource",
+        dataset_id="dataset-caresource",
+        acquisition_root_run_id="run-original",
+        source_ids=("caresource",),
+        selected_resources=("Practitioner", "PractitionerRole"),
+        import_run_id="run-original",
+        previous_dataset_id=None,
+        resource_hash_contract=importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     )
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_dataset_resource "
-        "(dataset_id, resource_type, resource_id, payload_hash, payload_json) VALUES "
-        "('dataset-caresource', 'PractitionerRole', 'role-old', repeat('1', 64), '{}'::jsonb), "
-        "('dataset-caresource', 'Practitioner', 'practitioner-keep', repeat('2', 64), '{}'::jsonb);"
-    )
+    await importer._ensure_endpoint_dataset_candidate(candidate)
+    for model, resource_id in (
+        (importer.ProviderDirectoryPractitionerRole, "role-old"),
+        (importer.ProviderDirectoryPractitioner, "practitioner-keep"),
+    ):
+        await importer._persist_endpoint_dataset_rows(
+            model,
+            [{"source_id": "caresource", "resource_id": resource_id}],
+            candidate.dataset_id,
+            resource_hash_contract=candidate.resource_hash_contract,
+            semantic_projection_as_of=None,
+        )
 
 
 async def _seed_synthetic_checkpoint(database: Database, schema: str) -> None:
@@ -154,9 +141,7 @@ def _caresource_lifecycle_checkpoint_context(owner_run_id="run-original-worker")
         source_scope_hash="scope",
         source_ids=("caresource",),
         owner_run_id=owner_run_id,
-        retry_of_run_id=(
-            None if owner_run_id == "run-original-worker" else "run-original-worker"
-        ),
+        retry_of_run_id=(None if owner_run_id == "run-original-worker" else "run-original-worker"),
         acquisition_root_run_id="run-original",
         endpoint_id="endpoint-caresource",
         dataset_id="dataset-caresource",
@@ -165,21 +150,15 @@ def _caresource_lifecycle_checkpoint_context(owner_run_id="run-original-worker")
 
 
 async def _assert_reset_checkpoint_state(database: Database, schema: str, start_url: str) -> None:
-    resource_type_records = await database.all(
-        f"SELECT resource_type FROM {schema}.provider_directory_dataset_resource "
-        "ORDER BY resource_type;"
-    )
-    assert [resource_type_record[0] for resource_type_record in resource_type_records] == [
-        "Practitioner"
-    ]
+    context = _caresource_lifecycle_checkpoint_context()
+    assert await importer._caresource_unique_candidate_count(context, "Practitioner") == 1
+    assert await importer._caresource_unique_candidate_count(context, "PractitionerRole") == 0
     checkpoint_record = await database.first(
         f"SELECT next_url, state, pages_processed, rows_processed, "
         f"completeness_json FROM {schema}.provider_directory_pagination_checkpoint;"
     )
     assert checkpoint_record is not None
-    checkpoint_by_field = importer._pagination_checkpoint_row_mapping(
-        checkpoint_record
-    )
+    checkpoint_by_field = importer._pagination_checkpoint_row_mapping(checkpoint_record)
     assert checkpoint_by_field["next_url"] == start_url
     assert checkpoint_by_field["state"] == importer.PAGINATION_CHECKPOINT_ACTIVE
     assert checkpoint_by_field["pages_processed"] == 0
@@ -210,10 +189,7 @@ async def _exercise_checkpoint_replay_cleanup(
     schema: str,
 ) -> None:
     checkpoint_context = _caresource_lifecycle_checkpoint_context()
-    start_url = (
-        f"{importer.CARESOURCE_PROVIDER_DIRECTORY_BASE}/"
-        "PractitionerRole?_count=1000"
-    )
+    start_url = f"{importer.CARESOURCE_PROVIDER_DIRECTORY_BASE}/PractitionerRole?_count=1000"
     await importer._reset_pagination_checkpoint(
         checkpoint_context,
         "PractitionerRole",
@@ -221,14 +197,11 @@ async def _exercise_checkpoint_replay_cleanup(
         hashlib.sha256(start_url.encode("utf-8")).hexdigest(),
     )
     await _assert_reset_checkpoint_state(database, schema, start_url)
-    await _seed_synthetic_checkpoint(database, schema)
+    async with source_transaction(database):
+        await _seed_synthetic_checkpoint(database, schema)
 
-    replay_checkpoint_context = _caresource_lifecycle_checkpoint_context(
-        "run-replay"
-    )
-    endpoint_candidate = _caresource_lifecycle_candidate(
-        replay_checkpoint_context
-    )
+    replay_checkpoint_context = _caresource_lifecycle_checkpoint_context("run-replay")
+    endpoint_candidate = _caresource_lifecycle_candidate(replay_checkpoint_context)
     await importer._clear_finalized_endpoint_dataset_pagination_checkpoints(
         endpoint_candidate,
         {
@@ -236,15 +209,14 @@ async def _exercise_checkpoint_replay_cleanup(
             "published": False,
         },
     )
-    checkpoint_count_sql = (
-        f"SELECT COUNT(*) FROM {schema}.provider_directory_pagination_checkpoint;"
-    )
+    checkpoint_count_sql = f"SELECT COUNT(*) FROM {schema}.provider_directory_pagination_checkpoint;"
     assert await database.scalar(checkpoint_count_sql) == 2
 
-    await database.status(
-        f"UPDATE {schema}.provider_directory_endpoint_dataset "
-        "SET status = 'validated' WHERE dataset_id = 'dataset-caresource';"
-    )
+    async with source_transaction(database):
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset "
+            "SET status = 'validated' WHERE dataset_id = 'dataset-caresource';"
+        )
     replay_candidate = _caresource_lifecycle_candidate(
         replay_checkpoint_context,
         is_already_validated=True,
@@ -259,24 +231,6 @@ async def _exercise_checkpoint_replay_cleanup(
 @pytest.mark.asyncio
 async def test_real_postgres_retains_census_until_dataset_validation(monkeypatch):
     """Retain complete CareSource census proof until candidate validation."""
-    schema = f"caresource_checkpoint_{uuid.uuid4().hex[:12]}"
-    database = Database()
-    is_schema_created = False
-    try:
-        await database.connect()
-        await _require_disposable_postgres(database)
-        await database.status(f"CREATE SCHEMA {schema};")
-        is_schema_created = True
-        await _create_checkpoint_lifecycle_tables(database, schema)
+    async with census_database(monkeypatch, seed_dataset=False) as (database, schema):
         await _seed_checkpoint_lifecycle_rows(database, schema)
-        monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
-        monkeypatch.setattr(importer, "db", database)
         await _exercise_checkpoint_replay_cleanup(database, schema)
-    except Exception:
-        if not is_schema_created:
-            pytest.skip("disposable Postgres is unavailable")
-        raise
-    finally:
-        if is_schema_created:
-            await database.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
-        await database.disconnect()

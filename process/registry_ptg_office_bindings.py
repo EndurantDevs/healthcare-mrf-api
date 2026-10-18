@@ -59,7 +59,9 @@ async def pin_ptg_office_address_source(
     if type(address_source) is not PinnedAddressSource or address_source.table_name != "entity_address_unified":
         raise ValueError("registry_ptg_office_binding_source_invalid")
     _validate_roles(runtime_roles)
-    identity = await _source_identity(connection, address_source, runtime_roles, address=True)
+    identity = await _source_identity(
+        connection, address_source, runtime_roles, address=True, control_schema=_control_namespace(control_schema)[1:-1]
+    )
     records = await _offices(connection, batch, address_source, after_ordinal, control_schema)
     return PinnedPTGOfficeAddressSource(
         address_source,

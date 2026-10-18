@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from typing import Any
+
 import pytest
 
 from process.provider_directory_fhir_census_binding import (
@@ -15,6 +16,7 @@ from process.provider_directory_fhir_census_execution import (
     CURRENT_VERSION_CENSUS_RETRYABLE_ERROR,
     current_version_census_proof_identity,
 )
+from process.provider_directory_generic_source_policy import source_transaction
 from tests.provider_directory_current_census_postgres_support import (
     CUTOFF,
     ENDPOINT_ID,
@@ -35,6 +37,7 @@ from tests.provider_directory_current_census_postgres_support import (
     practitioner_bundle,
     proof_shard_counts,
 )
+
 
 def checkpoint_page_geometry() -> dict[str, int]:
     """Return the exact durable geometry after the first full window."""
@@ -153,14 +156,10 @@ async def _run_initial_interrupted_phase(
     assert requested_urls == [count_url, start_url, NEXT_URL]
     assert fetch_result.fetch_mode == CURRENT_VERSION_CENSUS_FETCH_MODE
     assert fetch_result.complete is False
-    assert fetch_result.error == (
-        f"{CURRENT_VERSION_CENSUS_RETRYABLE_ERROR}:http_500"
-    )
+    assert fetch_result.error == (f"{CURRENT_VERSION_CENSUS_RETRYABLE_ERROR}:http_500")
     assert fetch_result.next_url_remaining is True
     assert_initial_checkpoint(checkpoint, contract)
-    assert await candidate_resource_ids(database, schema) == [
-        "practitioner-1"
-    ]
+    assert await candidate_resource_ids(database, schema) == ["practitioner-1"]
     assert await proof_shard_counts(database, schema) == (1, 1)
     return checkpoint
 
@@ -285,17 +284,16 @@ async def _seed_validation_source(
     schema: str,
     source_record: dict[str, Any],
 ) -> None:
-    await database.status(
-        f'CREATE TABLE "{schema}".provider_directory_source ('
-        'source_id varchar(64) PRIMARY KEY, endpoint_id varchar(64), '
-        "metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb);"
-    )
-    await database.status(
-        f'INSERT INTO "{schema}".provider_directory_source '
-        '(source_id, endpoint_id) VALUES (:source_id, :endpoint_id);',
-        source_id=source_record["source_id"],
-        endpoint_id=source_record["endpoint_id"],
-    )
+    async with source_transaction(database):
+        await database.status(
+            f'INSERT INTO "{schema}".provider_directory_source '
+            "(source_id, org_name, endpoint_id, canonical_api_base, requires_registration, requires_api_key, metadata_json) "
+            "VALUES (:source_id, :org_name, :endpoint_id, :canonical_api_base, false, false, '{}'::jsonb);",
+            source_id=source_record["source_id"],
+            org_name="Synthetic census source",
+            endpoint_id=source_record["endpoint_id"],
+            canonical_api_base=source_record["canonical_api_base"],
+        )
 
 
 async def _run_outer_resumable_phase(
@@ -335,9 +333,7 @@ async def _run_outer_resumable_phase(
     assert dataset["resource_count"] == 0
     assert checkpoint["dataset_id"] == dataset_id
     assert_initial_checkpoint(checkpoint, census_contract())
-    assert await candidate_resource_ids(database, schema, dataset_id) == [
-        "practitioner-1"
-    ]
+    assert await candidate_resource_ids(database, schema, dataset_id) == ["practitioner-1"]
     assert await proof_shard_counts(database, schema, dataset_id) == (1, 1)
 
 
@@ -365,21 +361,15 @@ async def _run_outer_retry_phase(
         if request_url == NEXT_URL:
             dataset = await endpoint_dataset_record(database, schema)
             checkpoint = await checkpoint_record(database, schema)
-            shard_count, proof_rows = await proof_shard_counts(
-                database, schema, dataset_id
-            )
-            observed_resume_states.append(
-                (dataset["status"], dataset["import_run_id"], shard_count, proof_rows)
-            )
+            shard_count, proof_rows = await proof_shard_counts(database, schema, dataset_id)
+            observed_resume_states.append((dataset["status"], dataset["import_run_id"], shard_count, proof_rows))
             assert dataset["dataset_id"] == checkpoint["dataset_id"] == dataset_id
             assert dataset["acquisition_root_run_id"] == ROOT_RUN_ID
             assert checkpoint["owner_run_id"] == "run-current-census-retry-outer"
             assert checkpoint["retry_of_run_id"] == ROOT_RUN_ID
             assert checkpoint["next_url"] == NEXT_URL
             assert checkpoint["pages_processed"] == checkpoint["rows_processed"] == 1
-            assert await candidate_resource_ids(database, schema, dataset_id) == [
-                "practitioner-1"
-            ]
+            assert await candidate_resource_ids(database, schema, dataset_id) == ["practitioner-1"]
             return 200, practitioner_bundle("practitioner-2"), None, 1
         assert request_url == count_url
         return 200, count_bundle(), None, 1
@@ -458,15 +448,9 @@ async def test_postgres_outer_lifecycle_resumes_acquiring_census_candidate(
     start_url = importer._resource_start_url(source_record, RESOURCE_TYPE, page_count=1)
     assert start_url is not None
     count_url = current_version_census_count_url(start_url)
-    dataset_id = importer._endpoint_dataset_candidate_id(
-        ENDPOINT_ID, (RESOURCE_TYPE,), ROOT_RUN_ID
-    )
+    dataset_id = importer._endpoint_dataset_candidate_id(ENDPOINT_ID, (RESOURCE_TYPE,), ROOT_RUN_ID)
 
     async with census_database(monkeypatch, seed_dataset=False) as (database, schema):
         await _seed_validation_source(database, schema, source_record)
-        await _run_outer_resumable_phase(
-            monkeypatch, source_record, database, schema, count_url, start_url, dataset_id
-        )
-        await _run_outer_retry_phase(
-            monkeypatch, source_record, database, schema, count_url, dataset_id
-        )
+        await _run_outer_resumable_phase(monkeypatch, source_record, database, schema, count_url, start_url, dataset_id)
+        await _run_outer_retry_phase(monkeypatch, source_record, database, schema, count_url, dataset_id)

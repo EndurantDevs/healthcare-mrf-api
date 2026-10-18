@@ -12,6 +12,7 @@ import re
 from dataclasses import fields, replace
 from uuid import UUID
 
+from process import provider_directory_cms_serving_receipt as serving
 from process.entity_address_result_generation import RELATION_NAMES
 from process.entity_address_snapshot_ownership import (
     EntityAddressArchiveOwnershipError,
@@ -41,6 +42,7 @@ from process.network_registry_cms_prepared_pair import (
     RegistryCMSRetentionRequest,
     _require_prepared_pair,
     _validate_preparation_request,
+    read_committed_registry_cms_pair,
 )
 from process.network_registry_cms_source_attempt import RegistryCMSSourceAttempt
 from process.registry_source_recipe_store import decode_registry_source_recipes
@@ -235,6 +237,13 @@ async def probe_registry_cms_source_capture(session, *, capture_id, owner_role, 
     )
     if comment.startswith((_PREPARED_COMMENT, _PREPARED_COMMENT_V2)):
         pair = decode_prepared_registry_cms_source_pair(comment)
+        finalized = await read_committed_registry_cms_pair(session, pair)
+        if finalized is not None:
+            pair = finalized
+        elif await serving.has_registry_source_pair_receipt(
+            session, pair.request.source_pin.schema_name, pair.recipe.source_pin.retained_epoch.epoch_id
+        ):
+            _invalid()
     else:
         prefix = next(
             (comment_prefix for comment_prefix in (_COMMENT, _COMMENT_V2) if comment.startswith(comment_prefix)), None

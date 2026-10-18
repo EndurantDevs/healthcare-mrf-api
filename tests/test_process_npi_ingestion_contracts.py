@@ -1,45 +1,42 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
-
-import importlib
-
-from pathlib import Path
-
-from types import SimpleNamespace
-
-from unittest.mock import AsyncMock
-
-import os
-
 import datetime
-
+import importlib
+import os
 import uuid
-
 from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from asyncpg import LockNotAvailableError
 
-from process.nppes_public_evidence_import import NPPES_RIGHTS_PROOF_SHA256
 from process.entity_address_cutover_contract import _ServingRelationLockTimeout
-
+from process.nppes_public_evidence_chain_rows import (
+    CHAIN_ARCHIVE_COLUMNS,
+    build_nppes_chain_storage_rows,
+    chain_archive_values,
+)
+from process.nppes_public_evidence_import import NPPES_RIGHTS_PROOF_SHA256
+from process.nppes_public_evidence_storage import ROOTS as NPPES_ROOTS
+from tests.test_nppes_public_evidence_import import _valid_receipt
 from tests.test_process_npi_unit import (
     ROOT,
     _AmbiguousPublicationConnection,
-    _ShutdownRawConnection,
     _build_minimal_row,
     _fake_make_class_factory,
     _install_shutdown_success_collaborators,
     _shutdown_stage_classes,
+    _ShutdownRawConnection,
     npi_module,
 )
 
+
 @pytest.mark.asyncio
 async def test_npi_import_lease_rejects_a_missing_advisory_lock(npi_module):
-    connection = SimpleNamespace(
-        fetchval=AsyncMock(side_effect=[941, False])
-    )
+    connection = SimpleNamespace(fetchval=AsyncMock(side_effect=[941, False]))
     worker_context_by_key = {
         npi_module._NPI_IMPORT_LEASE_KEY: npi_module._NpiImportLease(
             manager=object(),
@@ -65,11 +62,10 @@ async def test_npi_import_lease_rejects_a_missing_advisory_lock(npi_module):
     ):
         assert required_fragment in lock_query
 
+
 @pytest.mark.asyncio
 async def test_nppes_runtime_accepts_the_proved_postgres_configuration(npi_module):
-    connection = SimpleNamespace(
-        fetchrow=AsyncMock(return_value=(180002, "on", "on", "on", "pglz"))
-    )
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=(180002, "on", "on", "on", "pglz")))
     worker_context_by_key = {
         npi_module._NPI_IMPORT_LEASE_KEY: npi_module._NpiImportLease(
             manager=object(),
@@ -81,6 +77,7 @@ async def test_nppes_runtime_accepts_the_proved_postgres_configuration(npi_modul
     await npi_module._assert_nppes_postgres_runtime(worker_context_by_key)
 
     assert "current_setting('wal_compression')" in connection.fetchrow.await_args.args[0]
+
 
 @pytest.mark.parametrize(
     "settings",
@@ -112,28 +109,207 @@ async def test_nppes_runtime_rejects_unproved_postgres_settings(
     ):
         await npi_module._assert_nppes_postgres_runtime(worker_context_by_key)
 
+
 @pytest.mark.asyncio
-async def test_nppes_catalog_preflight_uses_the_lease_connection(
+async def test_nppes_catalog_preflight_uses_genuine_publisher_not_lease(
     monkeypatch,
     npi_module,
 ):
+    lease_connection = object()
     connection = object()
     worker_context_by_key = {
         npi_module._NPI_IMPORT_LEASE_KEY: npi_module._NpiImportLease(
             manager=object(),
-            connection=connection,
+            connection=lease_connection,
             backend_pid=941,
         )
     }
+    policy, transactions = _install_nppes_source_transaction(monkeypatch, npi_module, connection)
     assert_catalog = AsyncMock()
-    monkeypatch.setattr(npi_module, "assert_nppes_admission_catalog", assert_catalog)
+    monkeypatch.setattr(npi_module.nppes_catalog, "assert_nppes_candidate_catalog", assert_catalog)
 
     await npi_module._assert_nppes_storage_catalog(
         worker_context_by_key,
         "mrf",
     )
 
-    assert_catalog.assert_awaited_once_with(connection, "mrf")
+    assert_catalog.assert_awaited_once_with(connection, "mrf", policy)
+    assert transactions == ["read committed"]
+    assert worker_context_by_key[npi_module._NPI_IMPORT_LEASE_KEY].connection is lease_connection
+
+
+def _install_nppes_source_transaction(monkeypatch, npi_module, connection, *, schema="mrf"):
+    policy = SimpleNamespace(schema=schema)
+    transactions = []
+    transaction_state = SimpleNamespace(is_active=False)
+
+    @asynccontextmanager
+    async def transaction(database, *, isolation="read committed"):
+        assert database is npi_module.db and not transaction_state.is_active
+        transactions.append(isolation)
+        transaction_state.is_active = True
+        try:
+            yield
+        finally:
+            transaction_state.is_active = False
+
+    def bound_publisher():
+        assert transaction_state.is_active
+        return SimpleNamespace(connection=connection, policy=policy)
+
+    def forbidden_ambient_driver():
+        raise AssertionError("ambient driver must not be used")
+
+    monkeypatch.setattr(npi_module.source_policy, "source_transaction", transaction)
+    monkeypatch.setattr(npi_module.source_policy, "bound_publisher", bound_publisher)
+    monkeypatch.setattr(npi_module.db, "acquire_driver", forbidden_ambient_driver)
+    return policy, transactions
+
+
+@pytest.mark.asyncio
+async def test_nppes_catalog_preflight_keeps_lease_and_schema_requirements(monkeypatch, npi_module):
+    policy, transactions = _install_nppes_source_transaction(monkeypatch, npi_module, object(), schema="different")
+    assert_catalog = AsyncMock()
+    monkeypatch.setattr(npi_module.nppes_catalog, "assert_nppes_candidate_catalog", assert_catalog)
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="lease is missing"):
+        await npi_module._assert_nppes_storage_catalog({}, "mrf")
+    assert not transactions
+    context_by_key = {npi_module._NPI_IMPORT_LEASE_KEY: npi_module._NpiImportLease(object(), object(), 941)}
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="policy schema"):
+        await npi_module._assert_nppes_storage_catalog(context_by_key, "mrf")
+    assert_catalog.assert_not_awaited()
+    assert policy.schema == "different"
+
+
+def _nppes_family_proofs(count):
+    return tuple(
+        {
+            root: {
+                "name": f"npec_{ordinal + 1:032x}_{fields[3]}",
+                "oid": 1000 + ordinal * 10 + index,
+                "owner": 17,
+                "layout_sha256": "a" * 64,
+            }
+            for index, (root, fields) in enumerate(NPPES_ROOTS.items())
+        }
+        for ordinal in range(count)
+    )
+
+
+def _nppes_parity_setup(monkeypatch, npi_module):
+    receipt = _valid_receipt()
+    _, archives = build_nppes_chain_storage_rows(receipt)
+    families = _nppes_family_proofs(len(archives))
+    vector_entries = [dict(zip(CHAIN_ARCHIVE_COLUMNS, chain_archive_values(row))) for row in archives]
+    zero = dict.fromkeys(("missing_count", "mismatch_count", "unexpected_count", "private_count"), 0)
+    connection = SimpleNamespace(
+        fetch=AsyncMock(return_value=vector_entries),
+        fetchrow=AsyncMock(return_value=zero),
+        fetchval=AsyncMock(return_value=[family["member"]["oid"] for family in families]),
+        execute=AsyncMock(),
+    )
+    _, transactions = _install_nppes_source_transaction(monkeypatch, npi_module, connection)
+    resolver = AsyncMock(return_value=families)
+    monkeypatch.setattr(npi_module, "resolve_nppes_chain_families", resolver)
+    monkeypatch.setattr(npi_module, "make_class", _fake_make_class_factory("mrf"))
+    return receipt, families, connection, resolver, transactions
+
+
+@pytest.mark.asyncio
+async def test_nppes_parity_pins_one_complete_chain_and_verified_member_oid_vector(monkeypatch, npi_module):
+    receipt, families, connection, resolver, transactions = _nppes_parity_setup(monkeypatch, npi_module)
+    await npi_module._assert_nppes_canonical_stage_parity(receipt, "20260809", "mrf")
+    assert transactions == ["repeatable read"]
+    resolver.assert_awaited_once_with(connection, "mrf", receipt.chain_ref)
+    assert connection.fetch.await_args.args[1] == receipt.chain_ref
+    assert "ORDER BY archive_ordinal" in connection.fetch.await_args.args[0]
+    assert all(column in connection.fetch.await_args.args[0] for column in CHAIN_ARCHIVE_COLUMNS)
+    lock = connection.execute.await_args.args[0]
+    assert lock.startswith("LOCK TABLE ") and lock.endswith(" IN ACCESS SHARE MODE")
+    relations = [f'"mrf"."{family["member"]["name"]}"' for family in families]
+    assert all(relation in lock for relation in relations)
+    assert connection.fetchval.await_args.args[1] == relations
+    sql = connection.fetchrow.await_args.args[0]
+    assert len(connection.fetchrow.await_args.args) == 1
+    assert all(relation in sql for relation in relations)
+    assert sql.count("UNION ALL") == len(families) - 1
+    assert all(f"{ordinal}::bigint AS archive_ordinal" in sql for ordinal in range(len(families)))
+    assert "ORDER BY member.archive_ordinal DESC" in sql
+    assert "public_evidence_nppes_registry_member" not in sql
+    assert "nppes_registry_payload_digest" not in sql and "payload_sha256" not in sql
+    assert "IS DISTINCT FROM ROW(" in sql and "stage.entity_type_code::text" in sql
+    for field in (
+        "npi",
+        "entity_type_code",
+        "provider_enumeration_date",
+        "last_update_date",
+        "npi_deactivation_date",
+        "npi_reactivation_date",
+    ):
+        assert f"member.{field}" in sql and f"stage.{field}" in sql
+    for count in ("missing_count", "mismatch_count", "unexpected_count", "private_count"):
+        assert f"AS {count}" in sql
+    assert "employer_identification_number IS NOT NULL" in sql
+    assert "parent_organization_tin IS NOT NULL" in sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("column", CHAIN_ARCHIVE_COLUMNS)
+async def test_nppes_parity_rejects_each_changed_chain_vector_field(monkeypatch, npi_module, column):
+    receipt, _, connection, _, _ = _nppes_parity_setup(monkeypatch, npi_module)
+    rows = [dict(row) for row in connection.fetch.return_value]
+    rows[0][column] = None
+    connection.fetch.return_value = rows
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="chain vector"):
+        await npi_module._assert_nppes_canonical_stage_parity(receipt, "20260809", "mrf")
+    connection.execute.assert_not_awaited()
+    connection.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", ("empty", "reordered", "missing", "oid", "duplicate", "schema", "legacy"))
+async def test_nppes_parity_rejects_unpinned_or_unresolved_families(monkeypatch, npi_module, corruption):
+    receipt, families, connection, resolver, _ = _nppes_parity_setup(monkeypatch, npi_module)
+    match corruption:
+        case "empty":
+            resolver.return_value = ()
+        case "reordered":
+            connection.fetch.return_value = list(reversed(connection.fetch.return_value))
+        case "missing":
+            connection.fetch.return_value = connection.fetch.return_value[:-1]
+        case "oid":
+            connection.fetchval.return_value[0] += 1
+        case "duplicate":
+            resolver.return_value = (families[0], families[0], *families[2:])
+        case "schema":
+            _install_nppes_source_transaction(monkeypatch, npi_module, connection, schema="different")
+        case _:
+            resolver.side_effect = RuntimeError("synthetic missing family header")
+    with pytest.raises((npi_module.NPIPrerequisiteError, RuntimeError)):
+        await npi_module._assert_nppes_canonical_stage_parity(receipt, "20260809", "mrf")
+    connection.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("column", ("missing_count", "mismatch_count", "unexpected_count", "private_count"))
+async def test_nppes_parity_preserves_each_failure_count(monkeypatch, npi_module, column):
+    receipt, _, connection, _, _ = _nppes_parity_setup(monkeypatch, npi_module)
+    connection.fetchrow.return_value[column] = 1
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="Canonical NPI staging does not match"):
+        await npi_module._assert_nppes_canonical_stage_parity(receipt, "20260809", "mrf")
+
+
+@pytest.mark.asyncio
+async def test_nppes_preflight_and_parity_have_no_missing_factory_fallback(monkeypatch, npi_module):
+    ambient = AsyncMock(side_effect=AssertionError("ambient fallback called"))
+    monkeypatch.setattr(npi_module.db, "acquire_driver", ambient)
+    context_by_key = {npi_module._NPI_IMPORT_LEASE_KEY: npi_module._NpiImportLease(object(), object(), 941)}
+    with pytest.raises(npi_module.source_policy.GenericCandidateError):
+        await npi_module._assert_nppes_storage_catalog(context_by_key, "mrf")
+    with pytest.raises(npi_module.source_policy.GenericCandidateError):
+        await npi_module._assert_nppes_canonical_stage_parity(_valid_receipt(), "20260809", "mrf")
+    ambient.assert_not_called()
+
 
 @pytest.mark.asyncio
 async def test_npi_import_lease_rejects_a_parallel_attempt_and_closes_connection(
@@ -157,6 +333,7 @@ async def test_npi_import_lease_rejects_a_parallel_attempt_and_closes_connection
     assert npi_module._NPI_IMPORT_LEASE_KEY not in worker_context_by_key
     assert exit_events == [None]
 
+
 @pytest.mark.asyncio
 async def test_staged_write_failure_cancels_and_drains_its_sibling(npi_module):
     sibling_started = asyncio.Event()
@@ -177,6 +354,7 @@ async def test_staged_write_failure_cancels_and_drains_its_sibling(npi_module):
     assert waiting_task.cancelled()
     assert failing_task.done()
     assert owned_tasks == []
+
 
 @pytest.mark.asyncio
 async def test_controlled_test_mode_fails_before_database_or_staging(
@@ -201,6 +379,7 @@ async def test_controlled_test_mode_fails_before_database_or_staging(
     ensure_database.assert_not_awaited()
     staging_reset.assert_not_awaited()
     assert worker_context_by_key["context"]["run"] == 0
+
 
 @pytest.mark.asyncio
 async def test_shutdown_rejects_test_mode_before_database_or_publication(
@@ -228,6 +407,7 @@ async def test_shutdown_rejects_test_mode_before_database_or_publication(
     assert_lease.assert_awaited_once()
     ensure_database.assert_not_awaited()
     release_lease.assert_awaited_once()
+
 
 @pytest.mark.asyncio
 async def test_shutdown_normalizes_missing_required_evidence_receipt(
@@ -260,6 +440,7 @@ async def test_shutdown_normalizes_missing_required_evidence_receipt(
     assert caught.value.__context__ is None
     ensure_database.assert_not_awaited()
 
+
 @pytest.mark.asyncio
 async def test_process_data_failure_does_not_mark_run(monkeypatch, npi_module):
 
@@ -287,6 +468,7 @@ async def test_process_data_failure_does_not_mark_run(monkeypatch, npi_module):
         await npi_module.process_data(worker_context_map)
 
     assert worker_context_map["context"].get("run", 0) == 0
+
 
 @pytest.mark.asyncio
 async def test_startup_initializes_tables(monkeypatch, npi_module):
@@ -318,6 +500,7 @@ async def test_startup_initializes_tables(monkeypatch, npi_module):
     assert status_mock.await_count >= 1
     staging_reset.assert_not_awaited()
 
+
 @pytest.mark.asyncio
 async def test_startup_honors_import_id_override(monkeypatch, npi_module):
 
@@ -334,6 +517,7 @@ async def test_startup_honors_import_id_override(monkeypatch, npi_module):
     await npi_module.startup(startup_context_map)
 
     assert startup_context_map["import_date"] == "addrcanon_npi_timing"
+
 
 @pytest.mark.asyncio
 async def test_publication_transaction_reconciles_only_an_exact_commit(
@@ -385,11 +569,18 @@ async def test_publication_transaction_reconciles_only_an_exact_commit(
         ):
             state_by_name["second_body_entered"] = True
 
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure_count,error_type",
-    [(0, LockNotAvailableError), (1, LockNotAvailableError), (4, LockNotAvailableError), (1, RuntimeError),
-     (1, _ServingRelationLockTimeout), (4, _ServingRelationLockTimeout)],
+    [
+        (0, LockNotAvailableError),
+        (1, LockNotAvailableError),
+        (4, LockNotAvailableError),
+        (1, RuntimeError),
+        (1, _ServingRelationLockTimeout),
+        (4, _ServingRelationLockTimeout),
+    ],
 )
 async def test_shutdown_handles_rotation(monkeypatch, npi_module, failure_count, error_type):
     """Seal stage census, table rotation, receipt, and terminal state together."""
@@ -473,6 +664,15 @@ def _assert_npi_generation_published(
     assert stage_lock < projection_validation < final_count < first_swap
     assert raw_connection.events[-1] == "transaction:commit"
     assert shutdown_context_map["context"][npi_module._NPI_CONTROL_TERMINAL_COMMITTED_KEY] is True
+    assert not raw_connection.is_in_transaction()
+    for table in npi_module.NPI_CANONICAL_TABLES:
+        grant = f'GRANT SELECT ON TABLE "testschema"."{table}_20251108" TO "reader"'
+        swap = next(
+            index
+            for index, event in enumerate(raw_connection.events)
+            if f"DROP TABLE IF EXISTS testschema.{table}_old" in event
+        )
+        assert raw_connection.events.index(grant) < swap
     assert (
         shutdown_context_map["context"][npi_module._NPI_CONTROL_COMMITTED_FINISHED_AT_KEY]
         == "2026-08-09T02:03:04.000000+00:00"
@@ -486,6 +686,34 @@ def _assert_npi_generation_published(
         schema_name="testschema",
         receipt=publication_receipt,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", ("transaction", "owner", "rls", "grantor", "stage_missing"))
+async def test_npi_rotation_refuses_unproven_reader_preservation(npi_module, corruption):
+    connection = _ShutdownRawConnection({"npi_20251108": 1})
+    if corruption == "owner":
+        connection.read_relation_overrides["npi"] = {"owned": False}
+    elif corruption == "rls":
+        connection.read_relation_overrides["npi"] = {"relrowsecurity": True}
+    elif corruption == "grantor":
+        connection.read_grants[0]["grantor"] = 99
+    elif corruption == "stage_missing":
+        connection.read_relation_overrides["npi_20251108"] = {"oid": None}
+
+    async def rotate():
+        await npi_module._rotate_npi_canonical_table(
+            connection, schema="testschema", live_table="npi", stage_table="npi_20251108", index_suffixes=()
+        )
+
+    with pytest.raises(RuntimeError, match="publication_read_access"):
+        if corruption == "transaction":
+            await rotate()
+        else:
+            async with connection.transaction():
+                await rotate()
+    assert not connection.is_in_transaction()
+    assert not any(event.startswith(("GRANT", "DROP", "ALTER")) for event in connection.events)
 
 
 @pytest.mark.asyncio

@@ -3,8 +3,11 @@
 
 import json
 import re
+from uuid import UUID
 
 from sqlalchemy import text
+
+from db.cms_registry_source_pair_slot import COLUMN, MAX_BYTES
 
 _TABLE = "provider_directory_cms_serving_receipt"
 _PIN_FIELDS = {"source_id", "endpoint_id", "dataset_id", "dataset_hash", "acquisition_root_run_id"}
@@ -189,17 +192,121 @@ async def assert_native_dependencies(session, schema, expected):
         raise RuntimeError("cms_serving_native_dependencies_changed")
 
 
-async def append_serving_receipt(session, schema, payload):
+def registry_source_pair_document(prepared_pair):
+    """Bind the existing closed preparation to its canonical nonzero capture UUID."""
+    from process.network_registry_cms_prepared_pair import PreparedRegistryCMSSourcePair
+
+    if type(prepared_pair) is not PreparedRegistryCMSSourcePair:
+        raise ValueError("cms_serving_registry_pair_invalid")
+    slot_by_field = {
+        "protocol": 1,
+        "capture_id": str(prepared_pair.recipe.source_pin.retained_epoch.epoch_id),
+        "prepared_pair": prepared_pair.as_dict(),
+    }
+    slot_by_field = json.loads(json.dumps(slot_by_field, allow_nan=False))
+    decode_registry_source_pair_document(slot_by_field)
+    return slot_by_field
+
+
+def decode_registry_source_pair_document(document):
+    """Decode the bounded immutable slot; this grants no native custody or authority."""
+    from process.network_registry_cms_prepared_cleanup import decode_prepared_registry_cms_source_pair
+    from process.network_registry_cms_prepared_pair import _PREPARED_COMMENT, _PREPARED_COMMENT_V2
+
+    _fields(document, {"protocol", "capture_id", "prepared_pair"})
+    try:
+        capture_id = UUID(document["capture_id"])
+        if (
+            type(document["protocol"]) is not int
+            or document["protocol"] != 1
+            or not capture_id.int
+            or str(capture_id) != document["capture_id"]
+            or len(json.dumps(document, ensure_ascii=False, allow_nan=False).encode()) > MAX_BYTES
+        ):
+            raise ValueError
+        prefix = _PREPARED_COMMENT_V2 if "source_attempt" in document["prepared_pair"] else _PREPARED_COMMENT
+        prepared = decode_prepared_registry_cms_source_pair(prefix + json.dumps(document["prepared_pair"]))
+        if prepared.recipe.source_pin.retained_epoch.epoch_id != capture_id:
+            raise ValueError
+        return prepared
+    except ValueError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError:
+        raise ValueError("cms_serving_registry_pair_invalid") from None
+
+
+async def require_registry_receipt_owner(session, schema):
+    """Require the actual original same-task Source owner, not a retained publisher."""
+    from process.network_cms_registry_address_capture import native_driver
+    from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session
+
+    publisher = bound_publisher()
+    if source_copy_session() is not session or schema != publisher.policy.schema:
+        raise ValueError("cms_serving_registry_original_session_required")
+    connection = await native_driver(session)
+    if connection is not publisher.connection or not connection.is_in_transaction():
+        raise ValueError("cms_serving_registry_original_session_required")
+    actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
+    if actor is None or dict(actor) != {
+        "session": publisher.policy.publisher_role,
+        "current": publisher.policy.owner_role,
+    }:
+        raise ValueError("cms_serving_registry_original_session_required")
+    return connection
+
+
+async def append_serving_receipt(session, schema, payload, *, registry_source_pair=None):
     """Append the exact result inside the owner's transaction; deferred guards fence its commit."""
     if not session.in_transaction():
         raise ValueError("cms_serving_receipt_requires_transaction")
-    schema = _schema(schema)
     payload = validate_receipt_payload(payload)
+    document = None
+    if registry_source_pair is not None:
+        document = registry_source_pair_document(registry_source_pair)
+        await require_registry_receipt_owner(session, schema)
+    schema = _schema(schema)
+    columns = "receipt_id,payload" + (f",{COLUMN}" if document is not None else "")
+    selection = "encode(sha256(convert_to(p::text,'UTF8')),'hex'),p"
+    parameters_by_name = {"payload": json.dumps(payload)}
+    if document is not None:
+        selection += ",CAST(:registry_source_pair AS jsonb)"
+        parameters_by_name["registry_source_pair"] = json.dumps(document, allow_nan=False)
     return await session.scalar(
-        text(f"""INSERT INTO {schema}.{_TABLE} (receipt_id,payload)
-        SELECT encode(sha256(convert_to(p::text,'UTF8')),'hex'),p
+        text(f"""INSERT INTO {schema}.{_TABLE} ({columns})
+        SELECT {selection}
         FROM (SELECT CAST(:payload AS jsonb) p) value RETURNING receipt_id"""),
-        {"payload": json.dumps(payload)},
+        parameters_by_name,
+    )
+
+
+async def read_registry_source_pair_receipt(session, schema, capture_id):
+    """Read the unique committed capture slot; an own-XID row is never recovery proof."""
+    if type(capture_id) is not UUID or not capture_id.int:
+        raise ValueError("cms_serving_registry_pair_invalid")
+    namespace = _schema(schema)
+    result = await session.execute(
+        text(f"""SELECT receipt_id,payload,publication_xid::text AS publication_xid,profile_generation_id,
+        CASE WHEN octet_length({COLUMN}::text)<={MAX_BYTES} THEN {COLUMN} END AS {COLUMN}
+        FROM {namespace}.{_TABLE} WHERE {COLUMN} IS NOT NULL AND {COLUMN}->>'capture_id'=:capture
+        AND publication_xid IS DISTINCT FROM pg_current_xact_id_if_assigned()"""),
+        {"capture": str(capture_id)},
+    )
+    row = result.mappings().one_or_none()
+    if row is not None:
+        decode_registry_source_pair_document(row[COLUMN])
+    return dict(row) if row is not None else None
+
+
+async def has_registry_source_pair_receipt(session, schema, capture_id):
+    """Deny deletion for any visible slot, including an unfinished own-XID insert."""
+    if type(capture_id) is not UUID or not capture_id.int:
+        raise ValueError("cms_serving_registry_pair_invalid")
+    return bool(
+        await session.scalar(
+            text(
+                f"SELECT EXISTS(SELECT FROM {_schema(schema)}.{_TABLE} WHERE {COLUMN} IS NOT NULL "
+                f"AND {COLUMN}->>'capture_id'=:capture)"
+            ),
+            {"capture": str(capture_id)},
+        )
     )
 
 

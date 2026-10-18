@@ -6,83 +6,15 @@ import asyncio
 import contextlib
 
 import pytest
+from sqlalchemy import event, text
 
-from db.connection import Database
-from tests.test_provider_directory_dataset_artifact_db import (
-    _dataset_database,
-    _insert_validated_shared_dataset,
-)
+from process.provider_directory_generic_source_policy import source_transaction
 from tests.test_provider_directory_two_phase_publication import (
-    _insert_second_validated_endpoint,
-    _prepare_retry_cleanup_state,
+    _published_retry_database,
     _retry_cleanup_counts,
+    _retry_payloads,
     importer,
 )
-
-
-LARGE_ORDINARY_RESOURCE_ROW_COUNT = 100_000
-
-
-async def _mixed_candidate_current_fence(database):
-    """Select one validated candidate and one unchanged current peer."""
-    await _insert_validated_shared_dataset(database, importer._schema())
-    await _insert_second_validated_endpoint(database, importer._schema())
-    candidate_selection = await importer._resolve_provider_directory_artifact_datasets(
-        ["source_primary"],
-        should_select_validated_candidates=True,
-    )
-    current_selection = await importer._resolve_provider_directory_artifact_datasets(
-        ["source_z"],
-        should_select_validated_candidates=False,
-    )
-    return importer.ProviderDirectoryArtifactDatasetFence(
-        candidate_selection.datasets + current_selection.datasets,
-        should_select_validated_candidates=True,
-    )
-
-
-async def _insert_mixed_retry_state(database, schema: str) -> None:
-    """Create retry rows for both the candidate and its unchanged peer."""
-    await database.status(
-        f"CREATE TABLE {schema}.provider_directory_pagination_checkpoint ("
-        "dataset_id varchar(96) NOT NULL);"
-    )
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_pagination_checkpoint "
-        "VALUES ('dataset_candidate'), ('dataset_z_current');"
-    )
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_dataset_resource ("
-        "dataset_id, resource_type, resource_id, payload_hash, payload_json"
-        ") VALUES "
-        "('dataset_candidate', 'LU:Location:pass:2', 'candidate-pass', "
-        ":candidate_hash, CAST('{}' AS json)), "
-        "('dataset_z_current', 'LU:Location:pass:1', 'current-pass', "
-        ":current_hash, CAST('{}' AS json));",
-        candidate_hash="6" * 64,
-        current_hash="5" * 64,
-    )
-
-
-async def _remaining_retry_dataset_ids(database, schema: str) -> list[str]:
-    rows = await database.all(
-        "SELECT dataset_id FROM ("
-        f"SELECT dataset_id FROM {schema}.provider_directory_dataset_resource "
-        "WHERE resource_type LIKE 'LU:%:pass:%' UNION ALL "
-        f"SELECT dataset_id FROM {schema}.provider_directory_pagination_checkpoint"
-        ") retry_state ORDER BY dataset_id;"
-    )
-    return [str(row[0]) for row in rows]
-
-
-def _plan_nodes(raw_plan):
-    if isinstance(raw_plan, dict):
-        yield raw_plan
-        for value in raw_plan.values():
-            yield from _plan_nodes(value)
-    elif isinstance(raw_plan, list):
-        for value in raw_plan:
-            yield from _plan_nodes(value)
 
 
 def test_retry_cleanup_resource_types_are_exact_supported_markers(monkeypatch):
@@ -91,10 +23,7 @@ def test_retry_cleanup_resource_types_are_exact_supported_markers(monkeypatch):
         for resource_type in importer.DEFAULT_RESOURCES
         for pass_number in (1, 2)
     ]
-    assert (
-        importer._last_updated_partition_retry_resource_types()
-        == expected_resource_types
-    )
+    assert importer._last_updated_partition_retry_resource_types() == expected_resource_types
 
     monkeypatch.setattr(
         importer,
@@ -107,125 +36,87 @@ def test_retry_cleanup_resource_types_are_exact_supported_markers(monkeypatch):
     ]
 
 
-async def _seed_large_ordinary_candidate_resources(database, schema: str) -> None:
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_dataset_resource ("
-        "dataset_id, resource_type, resource_id, payload_hash, payload_json"
-        ") SELECT 'dataset_candidate', 'Location', "
-        "'ordinary-' || value::text, repeat('a', 64), CAST('{}' AS json) "
-        "FROM generate_series(1, :row_count) AS value;",
-        row_count=LARGE_ORDINARY_RESOURCE_ROW_COUNT,
-    )
-    await database.status(
-        f"ANALYZE {schema}.provider_directory_dataset_resource;"
-    )
-
-
-async def _retry_cleanup_delete_plan(database, schema: str):
-    return await database.scalar(
-        "EXPLAIN (FORMAT JSON) "
-        f"DELETE FROM {schema}.provider_directory_dataset_resource "
-        "WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[])) "
-        "AND resource_type = ANY(CAST(:retry_resource_types AS varchar[]));",
-        dataset_ids=["dataset_candidate"],
-        retry_resource_types=(
-            importer._last_updated_partition_retry_resource_types()
-        ),
-    )
-
-
 @contextlib.asynccontextmanager
-async def _locked_candidate_dataset(schema: str):
-    lock_database = Database()
-    await lock_database.connect()
-    try:
-        async with lock_database.transaction():
-            await lock_database.all(
+async def _locked_candidate_dataset(database, schema):
+    """Hold only the exact task-owned dataset through the independent administrator."""
+    async with database.semantic_component.admin_engine.begin() as connection:
+        await connection.execute(
+            text(
                 f"SELECT dataset_id FROM {schema}.provider_directory_endpoint_dataset "
-                "WHERE dataset_id = 'dataset_candidate' FOR UPDATE;"
+                "WHERE dataset_id='dataset_candidate' FOR UPDATE"
             )
-            yield
-    finally:
-        await lock_database.disconnect()
+        )
+        yield
 
 
 @pytest.mark.asyncio
 async def test_cleanup_only_clears_promoted_candidate_in_mixed_fence(monkeypatch):
-    """A candidate cutover retains retry state for an unchanged current peer."""
-    async with _dataset_database(monkeypatch) as (database, schema):
-        publication_fence = await _mixed_candidate_current_fence(database)
-        await importer._promote_provider_directory_artifact_datasets(publication_fence)
-        await _insert_mixed_retry_state(database, schema)
-
+    """Retain the unchanged current endpoint's cursor and both immutable payloads."""
+    async with _published_retry_database(monkeypatch, peer=True) as (database, schema):
+        async with source_transaction(database):
+            rows = await database.all(
+                f"SELECT dataset_id,status,is_current FROM {schema}.provider_directory_endpoint_dataset ORDER BY dataset_id"
+            )
+        assert [tuple(row) for row in rows] == [
+            ("dataset_candidate", importer.ENDPOINT_DATASET_PUBLISHED, True),
+            ("dataset_z_current", importer.ENDPOINT_DATASET_PUBLISHED, True),
+        ]
         metrics = await importer._record_artifact_promotion_metrics(
-            publication_fence,
+            database.retry_publication_fence,
             {},
             promoted_stage_count=1,
         )
-
         assert metrics["artifact_promoted_dataset_ids"] == ["dataset_candidate"]
-        assert metrics["artifact_retry_state_cleared_dataset_ids"] == [
-            "dataset_candidate"
-        ]
+        assert metrics["artifact_retry_state_cleared_dataset_ids"] == ["dataset_candidate"]
         assert metrics["artifact_retry_state_pending_dataset_ids"] == []
-        assert await _remaining_retry_dataset_ids(database, schema) == [
-            "dataset_z_current",
-            "dataset_z_current",
-        ]
+        async with source_transaction(database):
+            rows = await database.all(
+                f"SELECT dataset_id FROM {schema}.provider_directory_pagination_checkpoint ORDER BY dataset_id"
+            )
+        assert [row[0] for row in rows] == ["dataset_z_current"]
+        assert await _retry_payloads(database, schema) == database.retry_payloads_before
 
 
 @pytest.mark.asyncio
 async def test_cleanup_lock_contention_is_bounded_and_recoverable(monkeypatch):
-    """A concurrent dataset lock leaves retry state pending without blocking."""
-    async with _dataset_database(monkeypatch) as (database, schema):
-        await _prepare_retry_cleanup_state(database, schema)
-        async with _locked_candidate_dataset(schema):
+    """A concurrent dataset lock leaves its real cursor pending without blocking."""
+    async with _published_retry_database(monkeypatch) as (database, schema):
+        async with _locked_candidate_dataset(database, schema):
             started_at = asyncio.get_running_loop().time()
-            cleared_ids = await importer._clear_promoted_endpoint_dataset_retry_state(
-                ["dataset_candidate"]
-            )
-            elapsed_seconds = asyncio.get_running_loop().time() - started_at
-            assert cleared_ids == []
-            assert elapsed_seconds < (
+            assert await importer._clear_promoted_endpoint_dataset_retry_state(["dataset_candidate"]) == []
+            assert asyncio.get_running_loop().time() - started_at < (
                 importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
             )
-            assert await _retry_cleanup_counts(database, schema) == (1, 1)
-
-        assert await importer._clear_promoted_endpoint_dataset_retry_state(
-            ["dataset_candidate"]
-        ) == ["dataset_candidate"]
+            assert await _retry_cleanup_counts(database, schema) == (0, 1)
+        assert await importer._clear_promoted_endpoint_dataset_retry_state(["dataset_candidate"]) == [
+            "dataset_candidate"
+        ]
         assert await _retry_cleanup_counts(database, schema) == (0, 0)
+        assert await _retry_payloads(database, schema) == database.retry_payloads_before
 
 
 @pytest.mark.asyncio
-async def test_cleanup_uses_compound_key_under_one_second_budget(monkeypatch):
-    """Ordinary content volume cannot force retry cleanup into a dataset scan."""
-    async with _dataset_database(monkeypatch) as (database, schema):
-        await _prepare_retry_cleanup_state(database, schema)
-        await _seed_large_ordinary_candidate_resources(database, schema)
+async def test_cleanup_preserves_payload_and_budget(monkeypatch):
+    """Cleanup reads the control header and deletes cursors without scanning payload."""
+    async with _published_retry_database(monkeypatch) as (database, schema):
+        statements = []
 
-        raw_plan = await _retry_cleanup_delete_plan(database, schema)
-        plan_nodes = list(_plan_nodes(raw_plan))
-        index_conditions = [
-            str(node["Index Cond"])
-            for node in plan_nodes
-            if "Index Cond" in node
-        ]
+        def record_statement(_connection, _cursor, statement, _parameters, _context, _many):
+            statements.append(statement)
 
-        assert all(node.get("Node Type") != "Seq Scan" for node in plan_nodes)
+        engine = database.engine.sync_engine
+        event.listen(engine, "before_cursor_execute", record_statement)
+        try:
+            assert await importer._clear_promoted_endpoint_dataset_retry_state(["dataset_candidate"]) == [
+                "dataset_candidate"
+            ]
+        finally:
+            event.remove(engine, "before_cursor_execute", record_statement)
+        assert importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT == "1000ms"
         assert any(
-            "dataset_id" in condition and "resource_type" in condition
-            for condition in index_conditions
+            "DELETE FROM" in statement and "provider_directory_pagination_checkpoint" in statement
+            for statement in statements
         )
-        assert importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT == (
-            "1000ms"
-        )
-        assert await importer._clear_promoted_endpoint_dataset_retry_state(
-            ["dataset_candidate"]
-        ) == ["dataset_candidate"]
+        assert not any("provider_directory_dataset_resource" in statement for statement in statements)
         assert await _retry_cleanup_counts(database, schema) == (0, 0)
-        assert await database.scalar(
-            f"SELECT count(*) FROM {schema}.provider_directory_dataset_resource "
-            "WHERE dataset_id = 'dataset_candidate' "
-            "AND resource_type = 'Location' AND resource_id LIKE 'ordinary-%';"
-        ) == LARGE_ORDINARY_RESOURCE_ROW_COUNT
+        assert await _retry_payloads(database, schema) == database.retry_payloads_before

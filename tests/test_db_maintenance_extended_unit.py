@@ -5,9 +5,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from db import maintenance
 from sqlalchemy import Column, Computed, Integer, MetaData, String, Table
 from sqlalchemy.dialects import postgresql
+
+from db import maintenance
 
 
 class _AsyncBeginContext:
@@ -32,9 +33,7 @@ class _AsyncConnection:
 class _AsyncDatabase:
     def __init__(self) -> None:
         self.connection = _AsyncConnection()
-        self.engine = SimpleNamespace(
-            begin=lambda: _AsyncBeginContext(self.connection)
-        )
+        self.engine = SimpleNamespace(begin=lambda: _AsyncBeginContext(self.connection))
         self.connect_count = 0
 
     async def connect(self) -> None:
@@ -135,15 +134,13 @@ class _SyncStructureFixture:
         monkeypatch.setattr(
             maintenance,
             "_ensure_columns",
-            lambda connection, current_inspector, table, summary: (
-                self.column_tables.append(table)
-            ),
+            lambda connection, current_inspector, table, summary: self.column_tables.append(table),
         )
         monkeypatch.setattr(
             maintenance,
             "_ensure_indexes",
-            lambda connection, current_inspector, table, current_model, summary: (
-                self.index_tables.append((table, current_model))
+            lambda connection, current_inspector, table, current_model, summary: self.index_tables.append(
+                (table, current_model)
             ),
         )
         monkeypatch.setattr(
@@ -167,17 +164,14 @@ def test_sync_structure_routes_new_existing_and_unmanaged_tables(monkeypatch) ->
     maintenance._sync_structure(sync_connection, summary, True, True)
 
     assert summary["tables"] == [structure_fixture.new_table.fullname]
-    assert structure_fixture.new_table.create_calls == [
-        {"bind": sync_connection, "checkfirst": True}
-    ]
+    assert structure_fixture.new_table.create_calls == [{"bind": sync_connection, "checkfirst": True}]
     assert structure_fixture.column_tables == [
         structure_fixture.existing_without_model,
         structure_fixture.existing_with_model,
     ]
-    assert structure_fixture.index_tables == [
-        (structure_fixture.existing_with_model, structure_fixture.model)
-    ]
-    assert len(structure_fixture.pagination_calls) == 1
+    assert structure_fixture.index_tables == [(structure_fixture.existing_with_model, structure_fixture.model)]
+    assert structure_fixture.pagination_calls == []
+    assert maintenance.ProviderDirectoryPaginationCheckpoint.__runtime_schema_sync__ is False
 
 
 def test_sync_structure_can_skip_optional_work_and_pagination(monkeypatch) -> None:
@@ -270,9 +264,7 @@ def test_ensure_columns_adds_safe_columns_and_skips_unsafe_required_column() -> 
         "mrf.column_fixture.nullable_value",
         "mrf.column_fixture.required_with_default",
     ]
-    assert summary["skipped_columns"] == [
-        "mrf.column_fixture.required_without_default"
-    ]
+    assert summary["skipped_columns"] == ["mrf.column_fixture.required_without_default"]
     assert len(connection.statements) == 2
 
 
@@ -291,14 +283,20 @@ def test_compile_column_definition_covers_scalar_and_virtual_defaults() -> None:
     )
     dialect = postgresql.dialect()
 
-    assert maintenance._compile_column_definition(
-        scalar_default,
-        dialect,
-    ) == '"scalar_default" INTEGER DEFAULT 3 NOT NULL'
-    assert maintenance._compile_column_definition(
-        virtual_column,
-        dialect,
-    ) == '"virtual_value" INTEGER GENERATED ALWAYS AS (source_value + 1)'
+    assert (
+        maintenance._compile_column_definition(
+            scalar_default,
+            dialect,
+        )
+        == '"scalar_default" INTEGER DEFAULT 3 NOT NULL'
+    )
+    assert (
+        maintenance._compile_column_definition(
+            virtual_column,
+            dialect,
+        )
+        == '"virtual_value" INTEGER GENERATED ALWAYS AS (source_value + 1)'
+    )
     assert maintenance._compile_column_definition(callable_default, dialect) is None
 
 
@@ -396,10 +394,7 @@ def test_build_index_sql_supports_unique_index_without_optional_clauses() -> Non
         "sample",
         {"columns": ("value",), "unique": True},
     )
-    assert index_sql == (
-        "CREATE UNIQUE INDEX IF NOT EXISTS sample_unique "
-        'ON "sample" (value);'
-    )
+    assert index_sql == ('CREATE UNIQUE INDEX IF NOT EXISTS sample_unique ON "sample" (value);')
 
 
 def test_managed_schemas_and_public_schema_variants(monkeypatch) -> None:
@@ -425,8 +420,6 @@ def test_render_sync_summary_reports_each_nonempty_category(monkeypatch) -> None
     }
 
     maintenance.render_sync_summary(summary_by_category)
-    maintenance.render_sync_summary(
-        {category: [] for category in summary_by_category}
-    )
+    maintenance.render_sync_summary({category: [] for category in summary_by_category})
 
     assert len(messages) == 6

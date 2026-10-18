@@ -1,10 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Disposable native/CI PostgreSQL budget guards; no upstream requests."""
 
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 import json
 import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import asyncpg
 import pytest
@@ -14,10 +14,14 @@ from tests.test_fhir_request_failure_budget_migration import migration
 
 
 def proof(total=51, failed=1, rooted_total=50, rooted_failed=1):
-    return {"policy_id": "healthporta.fhir.request-failure-budget.v1",
-            "total_requests": total, "failed_requests": failed,
-            "rooted_total_requests": rooted_total, "rooted_failed_requests": rooted_failed,
-            "resource_coverage": "unknown"}
+    return {
+        "policy_id": "healthporta.fhir.request-failure-budget.v1",
+        "total_requests": total,
+        "failed_requests": failed,
+        "rooted_total_requests": rooted_total,
+        "rooted_failed_requests": rooted_failed,
+        "resource_coverage": "unknown",
+    }
 
 
 @asynccontextmanager
@@ -38,20 +42,32 @@ async def coverage_scope():
 async def test_postgres_strict_budget_and_closed_shape():
     async with coverage_scope() as (connection, schema, _):
         for value, expected in (
-            (proof(), True), (proof(total=50), False), (proof(total=100, failed=2), False),
-            (proof(total=101, failed=2), True), (proof(failed=0), False),
-            (proof(rooted_failed=2), False), (proof(rooted_total=51), False),
+            (proof(), True),
+            (proof(total=50), False),
+            (proof(total=100, failed=2), False),
+            (proof(total=101, failed=2), True),
+            (proof(failed=0), False),
+            (proof(rooted_failed=2), False),
+            (proof(rooted_total=51), False),
             (proof(rooted_total=0, rooted_failed=0), False),
             (proof(total=1000, failed=2, rooted_total=999, rooted_failed=0), False),
-            (proof(total=9007199254740991), True), (proof(total=9007199254740992), False),
-            ({**proof(), "extra": 1}, False), ({**proof(), "resource_coverage": "complete"}, False),
-            ({**proof(), "failed_requests": "1"}, False), ({**proof(), "failed_requests": True}, False),
-            ({**proof(), "failed_requests": 1.5}, False), (None, False), ([], False),
+            (proof(total=9007199254740991), True),
+            (proof(total=9007199254740992), False),
+            ({**proof(), "extra": 1}, False),
+            ({**proof(), "resource_coverage": "complete"}, False),
+            ({**proof(), "failed_requests": "1"}, False),
+            ({**proof(), "failed_requests": True}, False),
+            ({**proof(), "failed_requests": 1.5}, False),
+            (None, False),
+            ([], False),
         ):
-            assert await connection.fetchval(
-                f'SELECT "{schema}".provider_directory_fhir_request_failure_coverage_valid($1::jsonb)',
-                json.dumps(value),
-            ) is expected
+            assert (
+                await connection.fetchval(
+                    f'SELECT "{schema}".provider_directory_fhir_request_failure_coverage_valid($1::jsonb)',
+                    json.dumps(value),
+                )
+                is expected
+            )
 
 
 async def seed_census_tables(connection, schema, budget_migration):
@@ -102,14 +118,19 @@ async def test_postgres_census_counts_logical_keys_not_attempts_and_fails_closed
         with pytest.raises(asyncpg.CheckViolationError, match="budget_exceeded"):
             await connection.fetchval(query, "candidate")
         await connection.execute(f'UPDATE "{schema}".{rooted._LEGACY_COHORT} SET npi_count = 50')
-        for status, code in (("pending", None), ("leased", None), ("error", "response_invalid"),
-                             ("error", "http_status_404"), ("error", None)):
+        for status, code in (
+            ("pending", None),
+            ("leased", None),
+            ("error", "response_invalid"),
+            ("error", "http_status_404"),
+            ("error", None),
+        ):
             await connection.execute(f'UPDATE "{schema}".{rooted._WORK} SET status=$1,error_code=$2', status, code)
             with pytest.raises(asyncpg.CheckViolationError, match="terminal_invalid"):
                 await connection.fetchval(query, "candidate")
-        await connection.execute(f'UPDATE "{schema}".{rooted._WORK} SET status=\'completed\',error_code=NULL')
+        await connection.execute(f"UPDATE \"{schema}\".{rooted._WORK} SET status='completed',error_code=NULL")
         assert await connection.fetchval(query, "candidate") is None
-        await connection.execute(f'UPDATE "{schema}".{rooted._LEGACY_COHORT} SET cohort_id=\'different\'')
+        await connection.execute(f"UPDATE \"{schema}\".{rooted._LEGACY_COHORT} SET cohort_id='different'")
         with pytest.raises(asyncpg.CheckViolationError, match="lineage_invalid"):
             await connection.fetchval(query, "candidate")
 
@@ -122,31 +143,39 @@ async def install_budget(engine, schema_name):
 
 @pytest.mark.asyncio
 async def test_postgres_full_upgrade_legacy_publication_and_empty_proof_downgrade(monkeypatch):
-    from tests.test_provider_directory_rooted_graph_publication_postgres import _lifecycle_scope, _publish_generation
     from tests.provider_directory_rooted_graph_rotation_pg_support import publish_legacy_root
+    from tests.test_provider_directory_rooted_graph_publication_postgres import _lifecycle_scope, _publish_generation
 
     async with _lifecycle_scope(monkeypatch, request_failure_budget=False) as context:
         budget_migration = await install_budget(context.engine, context.schema_name)
         current = await publish_legacy_root(context.database)
         _, _, _, published = await _publish_generation(context, current, ("1", "2"), "3")
         assert published.readiness.rooted_graph_complete is True
-        assert await context.connection.fetchval(
-            f'SELECT request_failure_coverage FROM {context.schema}.provider_directory_rooted_graph_dataset'
-        ) is None
+        assert (
+            await context.connection.fetchval(
+                f"SELECT request_failure_coverage FROM {context.schema}.provider_directory_rooted_graph_dataset"
+            )
+            is None
+        )
         await run_migration(context.engine, budget_migration, "downgrade")
 
 
 @pytest.mark.asyncio
 async def test_postgres_fresh_admission_recomputes_policy_for_a_proofless_seal(monkeypatch):
+    from contextlib import AsyncExitStack
+
     from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from db.connection import Database
     from process.provider_directory_rooted_graph_single_root_contract import derive_single_root_identity
     from process.provider_directory_rooted_graph_twin_contract import build_rooted_graph_single_root_admission
     from process.provider_directory_rooted_graph_twin_store import _insert_authority, _lock_single_root
+    from tests.provider_directory_rooted_graph_rotation_pg_support import publish_legacy_root
     from tests.test_provider_directory_rooted_graph_acquisition_postgres import _complete_success
     from tests.test_provider_directory_rooted_graph_publication_postgres import _lifecycle_scope
-    from tests.provider_directory_rooted_graph_rotation_pg_support import publish_legacy_root
 
-    async with _lifecycle_scope(monkeypatch) as context:
+    async with _lifecycle_scope(monkeypatch) as context, AsyncExitStack() as cleanup:
         current = await publish_legacy_root(context.database)
         identity = derive_single_root_identity(current, operation_key="6" * 64)
         sealed = await _complete_success(context.database, identity.candidate)
@@ -156,9 +185,20 @@ async def test_postgres_fresh_admission_recomputes_policy_for_a_proofless_seal(m
         admission = build_rooted_graph_single_root_admission(
             sealed_root, acquisition_operation_key="6" * 64, admitted_at=datetime.now(timezone.utc)
         )
-        function = f'{context.schema}.provider_directory_rooted_graph_request_failure_coverage'
-        # Emulate a historical null-proof seal whose newly required policy
-        # census produces a proof or fails. The INSERT must consult that census.
+        function = f"{context.schema}.provider_directory_rooted_graph_request_failure_coverage"
+        builder = context.component.builder
+        builder_engine = create_async_engine(context.url.set(drivername="postgresql+asyncpg", username=builder))
+        builder_database = Database(
+            engine=builder_engine,
+            session_factory=async_sessionmaker(builder_engine, expire_on_commit=False),
+        )
+        cleanup.push_async_callback(builder_database.disconnect)
+        async with builder_database.transaction():
+            assert tuple(await builder_database.first("SELECT session_user::text,current_user::text")) == (
+                builder,
+                builder,
+            )
+        # Exercise Builder admission policy while the fixture intentionally changes the census callable.
         for body in (
             "RETURN '" + json.dumps(proof()) + "'::jsonb;",
             "RAISE EXCEPTION 'provider_directory_fhir_request_failure_budget_exceeded' USING ERRCODE='23514';",
@@ -168,25 +208,42 @@ async def test_postgres_fresh_admission_recomputes_policy_for_a_proofless_seal(m
                 f"LANGUAGE plpgsql STABLE AS $test$ BEGIN {body} END; $test$"
             )
             with pytest.raises(IntegrityError, match="single_root_admission_invalid|budget_exceeded"):
-                async with context.database.transaction():
-                    await _insert_authority(context.database, admission)
-            assert await context.connection.fetchval(
-                f"SELECT count(*) FROM {context.schema}.provider_directory_rooted_graph_twin_admission"
-            ) == 0
+                async with builder_database.transaction():
+                    await _insert_authority(builder_database, admission)
+            assert (
+                await context.connection.fetchval(
+                    f"SELECT count(*) FROM {context.schema}.provider_directory_rooted_graph_twin_admission"
+                )
+                == 0
+            )
 
 
 def many_practitioner_result(npi, matched):
     from process.uhc_flex_practitioner_query import validate_uhc_flex_practitioner_search_bundle
 
-    entries = [{"resource": {"resourceType": "Practitioner", "id": f"synthetic-{npi}-{index}",
-                             "identifier": [{"system": "http://hl7.org/fhir/sid/us-npi", "value": str(npi)}]}}
-               for index in range(15)] if matched else []
+    entries = (
+        [
+            {
+                "resource": {
+                    "resourceType": "Practitioner",
+                    "id": f"synthetic-{npi}-{index}",
+                    "identifier": [{"system": "http://hl7.org/fhir/sid/us-npi", "value": str(npi)}],
+                }
+            }
+            for index in range(15)
+        ]
+        if matched
+        else []
+    )
     return validate_uhc_flex_practitioner_search_bundle(
         npi, {"resourceType": "Bundle", "type": "searchset", "total": len(entries), "entry": entries}
     )
 
 
 async def complete_partial_root(database, identity, timeout_kind):
+    from process.provider_directory_rooted_graph_result_contract import (
+        build_provider_directory_rooted_graph_query_result,
+    )
     from process.provider_directory_rooted_graph_store import (
         claim_provider_directory_rooted_graph_census,
         claim_provider_directory_rooted_graph_work,
@@ -195,36 +252,48 @@ async def complete_partial_root(database, identity, timeout_kind):
         initialize_provider_directory_rooted_graph_acquisition,
         seal_provider_directory_rooted_graph_acquisition,
     )
-    from process.provider_directory_rooted_graph_result_contract import build_provider_directory_rooted_graph_query_result
 
     await initialize_provider_directory_rooted_graph_acquisition(identity, database=database)
     request_count = 0
     has_completed_role = False
     while claim := await claim_provider_directory_rooted_graph_work(identity.acquisition_id, database=database):
         if request_count == 0 and timeout_kind == "root":
-            await complete_provider_directory_rooted_graph_error(claim, error_code="transport_timeout", database=database)
+            await complete_provider_directory_rooted_graph_error(
+                claim, error_code="transport_timeout", database=database
+            )
         else:
             resources = []
             if claim.resource_type == "PractitionerRole" and not has_completed_role:
-                resources = [{"resourceType": "PractitionerRole", "id": "synthetic-role",
-                              "practitioner": {"reference": "Practitioner/" + claim.reference_id},
-                              "location": [{"reference": f"Location/synthetic-location-{index}"} for index in range(60)]}]
+                resources = [
+                    {
+                        "resourceType": "PractitionerRole",
+                        "id": "synthetic-role",
+                        "practitioner": {"reference": "Practitioner/" + claim.reference_id},
+                        "location": [{"reference": f"Location/synthetic-location-{index}"} for index in range(60)],
+                    }
+                ]
                 has_completed_role = True
             elif claim.kind == "direct_read":
                 resources = [{"resourceType": claim.resource_type, "id": claim.reference_id}]
             await complete_provider_directory_rooted_graph_result(
-                claim, build_provider_directory_rooted_graph_query_result(
+                claim,
+                build_provider_directory_rooted_graph_query_result(
                     claim, resources, advertised_total=len(resources) if claim.kind != "direct_read" else None
-                ), database=database
+                ),
+                database=database,
             )
         request_count += 1
     census = await claim_provider_directory_rooted_graph_census(identity, database=database)
     assert census is not None
     if timeout_kind == "census":
-        await complete_provider_directory_rooted_graph_error(census.work_claim, error_code="transport_timeout", database=database)
+        await complete_provider_directory_rooted_graph_error(
+            census.work_claim, error_code="transport_timeout", database=database
+        )
     else:
         await complete_provider_directory_rooted_graph_result(
-            census.work_claim, build_provider_directory_rooted_graph_query_result(census.work_claim, [], advertised_total=0), database=database
+            census.work_claim,
+            build_provider_directory_rooted_graph_query_result(census.work_claim, [], advertised_total=0),
+            database=database,
         )
     assert request_count == 75
     return await seal_provider_directory_rooted_graph_acquisition(identity, database=database)
@@ -234,13 +303,14 @@ async def complete_partial_root(database, identity, timeout_kind):
 @pytest.mark.parametrize("timeout_kind", ["root", "census"])
 async def test_postgres_partial_single_root_publication_retains_unknown_coverage(monkeypatch, timeout_kind):
     from sqlalchemy.exc import DBAPIError
-    from process.provider_directory_rooted_graph_single_root_contract import derive_single_root_identity
-    from process.provider_directory_rooted_graph_twin_store import admit_rooted_graph_single_root
-    from process.provider_directory_rooted_graph_publication import publish_provider_directory_rooted_graph_dataset
-    from process.provider_directory_rooted_graph_store import initialize_provider_directory_rooted_graph_acquisition
-    from tests.test_provider_directory_rooted_graph_publication_postgres import _lifecycle_scope
-    from tests.provider_directory_rooted_graph_rotation_pg_support import publish_legacy_root, locked_exact_current
+
     import tests.test_provider_directory_uhc_flex_practitioner_publication_postgres as flex_fixture
+    from process.provider_directory_rooted_graph_publication import publish_provider_directory_rooted_graph_dataset
+    from process.provider_directory_rooted_graph_single_root_contract import derive_single_root_identity
+    from process.provider_directory_rooted_graph_store import initialize_provider_directory_rooted_graph_acquisition
+    from process.provider_directory_rooted_graph_twin_store import admit_rooted_graph_single_root
+    from tests.provider_directory_rooted_graph_rotation_pg_support import locked_exact_current, publish_legacy_root
+    from tests.test_provider_directory_rooted_graph_publication_postgres import _lifecycle_scope
 
     monkeypatch.setattr(flex_fixture, "_query_result", many_practitioner_result)
     async with _lifecycle_scope(monkeypatch, request_failure_budget=False) as context:
@@ -265,10 +335,12 @@ async def test_postgres_partial_single_root_publication_retains_unknown_coverage
         assert published.readiness.request_failure_coverage == expected
         assert published.readiness.rooted_graph_complete is False
         assert published.readiness.cohort_complete is True
-        metadata = json.loads(await context.connection.fetchval(
-            f"SELECT publication_metadata_json::text FROM {context.schema}.provider_directory_endpoint_dataset WHERE dataset_id=$1",
-            published.readiness.dataset_id,
-        ))
+        metadata = json.loads(
+            await context.connection.fetchval(
+                f"SELECT publication_metadata_json::text FROM {context.schema}.provider_directory_endpoint_dataset WHERE dataset_id=$1",
+                published.readiness.dataset_id,
+            )
+        )
         assert metadata["request_failure_coverage"] == expected
         assert metadata["retry_exhausted_count"] == 0
         assert metadata["rooted_graph_complete"] is False
@@ -282,4 +354,9 @@ async def test_postgres_partial_single_root_publication_retains_unknown_coverage
             await run_migration(context.engine, budget_migration, "downgrade")
         next_current = await locked_exact_current(context.database)
         next_identity = derive_single_root_identity(next_current, operation_key="9" * 64)
-        assert await initialize_provider_directory_rooted_graph_acquisition(next_identity.candidate, database=context.database) == 1
+        assert (
+            await initialize_provider_directory_rooted_graph_acquisition(
+                next_identity.candidate, database=context.database
+            )
+            == 1
+        )

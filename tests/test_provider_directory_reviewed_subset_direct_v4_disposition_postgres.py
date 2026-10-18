@@ -5,21 +5,21 @@
 from __future__ import annotations
 
 import importlib.util
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 import pytest
 
 from process import (
-    provider_directory_fhir_subset_terminal_disposition_v4_selection
-    as v4_selection,
+    provider_directory_fhir_subset_terminal_disposition_v4_selection as v4_selection,
 )
 from process.provider_directory_fhir_subset_terminal_disposition_store import (
     sync_reviewed_subset_terminal_disposition_transaction,
     sync_v4_terminal_disposition,
 )
 from tests.provider_directory_fhir_subset_abandonment_pg_support import (
+    _current_writer,
     close_abandonment_scenario,
-    runtime_database,
 )
 from tests.provider_directory_fhir_subset_terminal_disposition_pg_support import (
     seed_mixed_terminal_root,
@@ -27,26 +27,23 @@ from tests.provider_directory_fhir_subset_terminal_disposition_pg_support import
 from tests.provider_directory_fhir_subset_terminal_disposition_v4_pg_support import (
     seed_direct_v4_terminal_root,
 )
-from tests.test_provider_directory_reviewed_subset_terminal_disposition_postgres import (
-    _install_committed_bounded_predecessor,
-    _load_migration as load_terminal_migration,
-    _load_scope_binding_migration,
-    _run_migration,
-)
 from tests.provider_directory_subset_completion_pg_concurrency import (
     create_committed_subset_schema,
 )
-
+from tests.test_provider_directory_reviewed_subset_terminal_disposition_postgres import (
+    _install_committed_bounded_predecessor,
+    _load_scope_binding_migration,
+    _run_migration,
+)
+from tests.test_provider_directory_reviewed_subset_terminal_disposition_postgres import (
+    _load_migration as load_terminal_migration,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = (
-    ROOT
-    / "alembic/versions"
-    / "20260810110000_provider_directory_reviewed_subset_direct_v4_disposition.py"
+    ROOT / "alembic/versions" / "20260810110000_provider_directory_reviewed_subset_direct_v4_disposition.py"
 )
-SYNTHETIC_MARKER_SHA256 = (
-    "e75f1f8addca0bc3079bb164baa6dc7bf39e0e424a0c8f8c53d2a3cdeae96489"
-)
+SYNTHETIC_MARKER_SHA256 = "e75f1f8addca0bc3079bb164baa6dc7bf39e0e424a0c8f8c53d2a3cdeae96489"
 
 
 def _load_migration():
@@ -83,11 +80,7 @@ async def _object_identity_by_kind(scenario, terminal) -> dict[str, tuple]:
         terminal._VALID,
         terminal._abandonment()._DATASET_GUARD,
         terminal._abandonment()._CHECKPOINT_GUARD,
-    ) + (
-        (terminal._DIRECT_VALID,)
-        if hasattr(terminal, "_DIRECT_VALID")
-        else ()
-    )
+    ) + ((terminal._DIRECT_VALID,) if hasattr(terminal, "_DIRECT_VALID") else ())
     function_rows = await scenario.connection.fetch(
         """
         SELECT function_row.proname, function_row.oid, function_row.proowner,
@@ -120,13 +113,29 @@ async def _object_identity_by_kind(scenario, terminal) -> dict[str, tuple]:
         (terminal._DATASET_CONSTRAINT, terminal._CHECKPOINT_CONSTRAINT),
     )
     return {
-        "functions": tuple(
-            tuple(function_record.values()) for function_record in function_rows
-        ),
-        "triggers": tuple(
-            tuple(trigger_record.values()) for trigger_record in trigger_rows
-        ),
+        "functions": tuple(tuple(function_record.values()) for function_record in function_rows),
+        "triggers": tuple(tuple(trigger_record.values()) for trigger_record in trigger_rows),
     }
+
+
+async def _assert_direct_validator_private(scenario, migration):
+    assert (
+        await scenario.connection.fetchval(
+            f"""
+        SELECT count(*)
+          FROM pg_catalog.pg_proc AS helper
+          CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+               helper.proacl,
+               pg_catalog.acldefault('f', helper.proowner)
+          )) AS helper_acl
+         WHERE helper.oid = pg_catalog.to_regprocedure($1)
+           AND helper_acl.privilege_type = 'EXECUTE'
+           AND helper_acl.grantee <> helper.proowner
+        """,
+            f'{scenario.schema}."{migration._DIRECT_VALID}"(text)',
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio
@@ -143,9 +152,10 @@ async def test_direct_v4_lifecycle_replay_acl_identity_and_downgrade_fence(
         "DIRECT_V4_TERMINAL_MARKER_SHA256",
         SYNTHETIC_MARKER_SHA256,
     )
-    database = runtime_database()
+    writer_scope = AsyncExitStack()
     try:
         terminal, _scope_binding = await _install_terminal_stack(scenario)
+        database = await writer_scope.enter_async_context(_current_writer(scenario, monkeypatch))
         before = await _object_identity_by_kind(scenario, terminal)
         await seed_direct_v4_terminal_root(scenario)
         async with scenario.connection.transaction():
@@ -157,36 +167,27 @@ async def test_direct_v4_lifecycle_replay_acl_identity_and_downgrade_fence(
         second = await sync_v4_terminal_disposition(database, "source-a")
         assert first.disposed is True
         assert second.disposed is False
-        assert await scenario.connection.fetchval(
-            f'SELECT {scenario.quoted_schema}."{migration._VALID}"($1)',
-            "dataset-a",
-        ) is True
-        assert await scenario.connection.fetchval(
-            f'SELECT {scenario.quoted_schema}."{migration._DIRECT_VALID}"($1)',
-            "dataset-a",
-        ) is True
-        assert await scenario.connection.fetchval(
-            f"""
-            SELECT count(*)
-              FROM pg_catalog.pg_proc AS helper
-              CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
-                   helper.proacl,
-                   pg_catalog.acldefault('f', helper.proowner)
-              )) AS helper_acl
-             WHERE helper.oid = pg_catalog.to_regprocedure($1)
-               AND helper_acl.privilege_type = 'EXECUTE'
-               AND helper_acl.grantee <> helper.proowner
-            """,
-            f'{scenario.schema}."{migration._DIRECT_VALID}"(text)',
-        ) == 0
+        assert (
+            await scenario.connection.fetchval(
+                f'SELECT {scenario.quoted_schema}."{migration._VALID}"($1)',
+                "dataset-a",
+            )
+            is True
+        )
+        assert (
+            await scenario.connection.fetchval(
+                f'SELECT {scenario.quoted_schema}."{migration._DIRECT_VALID}"($1)',
+                "dataset-a",
+            )
+            is True
+        )
+        await _assert_direct_validator_private(scenario, migration)
         with pytest.raises(AssertionError) as downgrade_error:
             async with scenario.connection.transaction():
                 await _run_migration(scenario, migration, "downgrade")
-        assert "provider_directory_subset_terminal_v4_downgrade_blocked" in str(
-            downgrade_error.value.__cause__
-        )
+        assert "provider_directory_subset_terminal_v4_downgrade_blocked" in str(downgrade_error.value.__cause__)
     finally:
-        await database.engine.dispose()
+        await writer_scope.aclose()
         await close_abandonment_scenario(scenario)
 
 
@@ -198,36 +199,44 @@ async def test_v1_evidence_survives_v2_upgrade_and_clean_downgrade(
 
     scenario = await create_committed_subset_schema(monkeypatch)
     migration = _load_migration()
-    database = runtime_database()
+    writer_scope = AsyncExitStack()
     try:
         terminal, _scope_binding = await _install_terminal_stack(scenario)
+        database = await writer_scope.enter_async_context(_current_writer(scenario, monkeypatch))
         await seed_mixed_terminal_root(scenario)
-        disposition_result = (
-            await sync_reviewed_subset_terminal_disposition_transaction(
-                database,
-                "source-a",
-            )
+        disposition_result = await sync_reviewed_subset_terminal_disposition_transaction(
+            database,
+            "source-a",
         )
         assert disposition_result.disposed is True
         old_valid = terminal._VALID
-        assert await scenario.connection.fetchval(
-            f'SELECT {scenario.quoted_schema}."{old_valid}"($1)',
-            "dataset-a",
-        ) is True
+        assert (
+            await scenario.connection.fetchval(
+                f'SELECT {scenario.quoted_schema}."{old_valid}"($1)',
+                "dataset-a",
+            )
+            is True
+        )
 
         async with scenario.connection.transaction():
             await _run_migration(scenario, migration, "upgrade")
-        assert await scenario.connection.fetchval(
-            f'SELECT {scenario.quoted_schema}."{old_valid}"($1)',
-            "dataset-a",
-        ) is True
+        assert (
+            await scenario.connection.fetchval(
+                f'SELECT {scenario.quoted_schema}."{old_valid}"($1)',
+                "dataset-a",
+            )
+            is True
+        )
 
         async with scenario.connection.transaction():
             await _run_migration(scenario, migration, "downgrade")
-        assert await scenario.connection.fetchval(
-            f'SELECT {scenario.quoted_schema}."{old_valid}"($1)',
-            "dataset-a",
-        ) is True
+        assert (
+            await scenario.connection.fetchval(
+                f'SELECT {scenario.quoted_schema}."{old_valid}"($1)',
+                "dataset-a",
+            )
+            is True
+        )
     finally:
-        await database.engine.dispose()
+        await writer_scope.aclose()
         await close_abandonment_scenario(scenario)

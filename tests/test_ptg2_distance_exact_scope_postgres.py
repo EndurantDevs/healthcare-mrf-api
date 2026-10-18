@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import ptg2_serving as serving
+from api import ptg_membership_reader
 from tests.ptg2_serving_address_evidence_postgres_coverage import (
     _invalid_fixture_npis,
 )
@@ -18,7 +19,6 @@ from tests.ptg2_serving_address_evidence_postgres_support import (
     _temporary_schema,
 )
 from tests.test_ptg2_graph_runtime_boundaries import _local_distance_tables
-
 
 _CREATE_SQL = (
     """CREATE TABLE {schema}.npi (
@@ -122,9 +122,7 @@ async def _prepare_rows(database, schema: str) -> tuple[int, int]:
         projection_positive_npis=[*exact_negative_npis, *exact_npis],
     )
     await database.status(_INSERT_SCOPE_SQL.format(schema=schema))
-    await database.status(
-        _INSERT_TAXONOMY_SQL.format(schema=schema), exact_npis=list(exact_npis)
-    )
+    await database.status(_INSERT_TAXONOMY_SQL.format(schema=schema), exact_npis=list(exact_npis))
     await database.status(
         _INSERT_PROJECTION_NEGATIVE_SQL.format(schema=schema),
         projection_negative_npis=list(projection_negative_npis),
@@ -201,9 +199,7 @@ def _recording_forward_reader(code_scope_probes):
         scan_budget,
     ):
         del scan_budget
-        code_scope_probes.append(
-            (tuple(row["code_key"] for row in code_rows), provider_set_keys)
-        )
+        code_scope_probes.append((tuple(row["code_key"] for row in code_rows), provider_set_keys))
         return [SimpleNamespace(provider_set_key=10)]
 
     return read
@@ -215,14 +211,10 @@ def _assert_scan_result(exact_npis, location_probes, candidates) -> None:
     assert first_location["npi"] is None
     assert first_location["_ptg_source_exhausted"] is False
     assert first_location["_ptg_probe_empty"] is True
-    assert [location["npi"] for location in candidates.location_rows] == list(
-        exact_npis
-    )
+    assert [location["npi"] for location in candidates.location_rows] == list(exact_npis)
     assert candidates.location_rows[0]["distance_miles"] is not None
     assert candidates.location_rows[1]["distance_miles"] is None
-    assert all(
-        location["_ptg_source_exhausted"] for location in candidates.location_rows
-    )
+    assert all(location["_ptg_source_exhausted"] for location in candidates.location_rows)
     assert candidates.provider_set_keys_by_npi == {
         exact_npis[0]: {10},
         exact_npis[1]: {10},
@@ -236,10 +228,12 @@ def _configure_serving(
     location_probes,
     membership_probes,
     code_scope_probes,
-) -> None:
-    """Bind the production caller to one disposable PostgreSQL schema."""
+) -> AsyncMock:
+    """Isolate real KNN/ZIP SQL from graph and optional-index storage."""
 
     provenance_sql = _schema_sql(serving._ADDRESS_PROVENANCE_SQL, schema)
+    unavailable_index = AsyncMock(return_value=None)
+    monkeypatch.setattr(ptg_membership_reader, "indexed_memberships", unavailable_index)
     monkeypatch.setenv("HLTHPRT_NPI_SEARCH_TAXONOMY_PROJECTION_ENABLED", "1")
     monkeypatch.setattr(serving, "PTG2_SCHEMA", schema)
     monkeypatch.setattr(serving, "_ADDRESS_PROVENANCE_SQL", provenance_sql)
@@ -274,17 +268,14 @@ def _configure_serving(
         "load_v4_graph_root",
         AsyncMock(return_value=SimpleNamespace(representation="pattern_v1")),
     )
-    monkeypatch.setattr(
-        serving, "_v4_sets_by_npi", _recording_v4_reader(membership_probes)
-    )
+    monkeypatch.setattr(serving, "_v4_sets_by_npi", _recording_v4_reader(membership_probes))
     monkeypatch.setattr(
         serving,
         "_shared_forward_entries_for_code_rows",
         _recording_forward_reader(code_scope_probes),
     )
-    monkeypatch.setattr(
-        serving, "_graph_location_probe_batch_size", lambda *_args, **_kwargs: 1
-    )
+    monkeypatch.setattr(serving, "_graph_location_probe_batch_size", lambda *_args, **_kwargs: 1)
+    return unavailable_index
 
 
 @pytest.mark.asyncio
@@ -295,7 +286,7 @@ async def test_coarse_taxonomy_knn_executes_prefix_and_zip_recovery(monkeypatch)
         location_probes = []
         membership_probes = []
         code_scope_probes = []
-        _configure_serving(
+        unavailable_index = _configure_serving(
             monkeypatch,
             schema,
             location_probes,
@@ -316,6 +307,11 @@ async def test_coarse_taxonomy_knn_executes_prefix_and_zip_recovery(monkeypatch)
             )
 
     assert candidates is not None
+    unavailable_index.assert_awaited_once()
+    assert unavailable_index.await_args.args[1] is tables
+    assert tuple(unavailable_index.await_args.args[2]) == tuple(exact_npis)
+    assert unavailable_index.await_args.args[3].code_system == "CPT"
+    assert unavailable_index.await_args.args[3].code == "73721"
     assert membership_probes == [tuple(exact_npis)]
     assert code_scope_probes == [((7,), (10, 20))]
     _assert_scan_result(exact_npis, location_probes, candidates)

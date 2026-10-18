@@ -49,10 +49,7 @@ def _top_level_sql_statement_count(sql: str) -> int:
     quote: str | None = None
     while index < len(sql):
         if quote is not None:
-            if (
-                quote in {"'", '"'}
-                and sql.startswith(quote * 2, index)
-            ):
+            if quote in {"'", '"'} and sql.startswith(quote * 2, index):
                 index += 2
             elif sql.startswith(quote, index):
                 index += len(quote)
@@ -69,7 +66,7 @@ def _top_level_sql_statement_count(sql: str) -> int:
         if character == "$":
             tag_end = sql.find("$", index + 1)
             if tag_end >= 0:
-                tag = sql[index:tag_end + 1]
+                tag = sql[index : tag_end + 1]
                 if tag == "$$" or tag[1:-1].replace("_", "a").isalnum():
                     quote = tag
                     has_content = True
@@ -122,30 +119,43 @@ def test_import_job_existence_is_decided_after_parent_locks():
 def test_runtime_registry_matches_the_frozen_migration_catalog():
     migration = load_attempt_fence_migration()
 
-    assert _attachment_signatures(ATTEMPT_ATTACHMENTS) == (
-        _attachment_signatures(migration.ATTEMPT_ATTACHMENTS)
+    legacy_signature_by_name = {
+        signature[0]: signature for signature in _attachment_signatures(migration.ATTEMPT_ATTACHMENTS)
+    }
+    current_signature_by_name = {signature[0]: signature for signature in _attachment_signatures(ATTEMPT_ATTACHMENTS)}
+    assert set(current_signature_by_name) == set(legacy_signature_by_name) | {"plan_release_pin"}
+    assert current_signature_by_name["plan_release_binding"] == (
+        *legacy_signature_by_name["plan_release_binding"][:-1],
+        False,
     )
-    assert _attachment_signatures(ATTEMPT_STATE_TABLES) == (
-        _attachment_signatures(migration.ATTEMPT_STATE_TABLES)
+    assert current_signature_by_name["plan_release_pin"] == (
+        "plan_release_pin",
+        "plan_release_snapshot_pin",
+        ("snapshot_id",),
+        (),
+        False,
     )
+    assert {
+        name: signature
+        for name, signature in current_signature_by_name.items()
+        if name not in {"plan_release_binding", "plan_release_pin"}
+    } == {name: signature for name, signature in legacy_signature_by_name.items() if name != "plan_release_binding"}
+    assert _attachment_signatures(ATTEMPT_STATE_TABLES) == (_attachment_signatures(migration.ATTEMPT_STATE_TABLES))
 
 
 def test_lock_order_migration_precedes_online_index_adoption():
     fence_migration = load_attempt_fence_migration()
-    lock_migration = _load_attempt_migration(
-        "20260724104500_ptg2_v4_attempt_lock_order.py"
-    )
-    index_migration = _load_attempt_migration(
-        "20260724103000_ptg2_v4_attempt_indexes.py"
-    )
-    hardening_migration = _load_attempt_migration(
-        "20260724110000_ptg2_v4_attempt_fence_hardening.py"
-    )
-    guarded_tables = tuple(
+    lock_migration = _load_attempt_migration("20260724104500_ptg2_v4_attempt_lock_order.py")
+    index_migration = _load_attempt_migration("20260724103000_ptg2_v4_attempt_indexes.py")
+    hardening_migration = _load_attempt_migration("20260724110000_ptg2_v4_attempt_fence_hardening.py")
+    guarded_tables = fence_migration._lifecycle_guarded_tables()
+    runtime_guarded_tables = {
         attachment.table_name
         for attachment in (*ATTEMPT_STATE_TABLES, *ATTEMPT_ATTACHMENTS)
         if attachment.statement_trigger
-    )
+    }
+    assert set(guarded_tables) - runtime_guarded_tables == {"plan_release_snapshot_binding"}
+    assert runtime_guarded_tables <= set(guarded_tables)
 
     assert lock_migration.down_revision == fence_migration.revision
     assert index_migration.down_revision == lock_migration.revision
@@ -160,23 +170,15 @@ def test_fence_migration_installs_lifecycle_locks_before_row_guards():
         "synthetic_ptg",
     )
     first_before_trigger = next(
-        index
-        for index, statement in enumerate(statements)
-        if "BEFORE INSERT OR UPDATE OR DELETE" in statement
+        index for index, statement in enumerate(statements) if "BEFORE INSERT OR UPDATE OR DELETE" in statement
     )
-    first_after_trigger = next(
-        index
-        for index, statement in enumerate(statements)
-        if "AFTER INSERT" in statement
-    )
+    first_after_trigger = next(index for index, statement in enumerate(statements) if "AFTER INSERT" in statement)
 
     assert first_before_trigger < first_after_trigger
 
 
 def test_hardening_revision_refuses_unverifiable_offline_adoption():
-    hardening_migration = _load_attempt_migration(
-        "20260724110000_ptg2_v4_attempt_fence_hardening.py"
-    )
+    hardening_migration = _load_attempt_migration("20260724110000_ptg2_v4_attempt_fence_hardening.py")
 
     statements = _migration_sql(hardening_migration, "synthetic_ptg")
 
@@ -186,19 +188,14 @@ def test_hardening_revision_refuses_unverifiable_offline_adoption():
 
 
 def test_attempt_migrations_emit_one_statement_per_execute():
-    hardening_migration = _load_attempt_migration(
-        "20260724110000_ptg2_v4_attempt_fence_hardening.py"
-    )
+    hardening_migration = _load_attempt_migration("20260724110000_ptg2_v4_attempt_fence_hardening.py")
     statements = (
         *_attempt_migration_sql("synthetic_ptg"),
         *_migration_sql(hardening_migration, "synthetic_ptg"),
     )
 
     assert statements
-    assert all(
-        _top_level_sql_statement_count(statement) == 1
-        for statement in statements
-    )
+    assert all(_top_level_sql_statement_count(statement) == 1 for statement in statements)
 
 
 @pytest.mark.parametrize(
@@ -255,10 +252,6 @@ def test_plan_digest_preserves_json_value_types_and_sql_null_state():
         )
         for report_value, is_sql_null, _status in report_shapes
     ]
-    assert [plan["status"] for plan in shaped_plans] == [
-        status for _value, _is_sql_null, status in report_shapes
-    ]
-    assert len({plan["plan_digest"] for plan in shaped_plans}) == len(
-        report_shapes
-    )
+    assert [plan["status"] for plan in shaped_plans] == [status for _value, _is_sql_null, status in report_shapes]
+    assert len({plan["plan_digest"] for plan in shaped_plans}) == len(report_shapes)
     assert database_json_digest({}) != database_json_digest("{}")

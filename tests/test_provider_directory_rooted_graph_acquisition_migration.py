@@ -7,8 +7,7 @@ import inspect
 from pathlib import Path
 
 import pytest
-from sqlalchemy import CheckConstraint, Column
-from sqlalchemy import ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint
+from sqlalchemy import CheckConstraint, Column, ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint
 
 from db.models import provider_directory_rooted_graph as rooted_graph_models
 from db.models.provider_directory_rooted_graph import (
@@ -26,6 +25,9 @@ from db.models.provider_directory_rooted_graph_twin import (
 from db.models.provider_directory_rooted_graph_witness import (
     ProviderDirectoryRootedGraphEdge,
     ProviderDirectoryRootedGraphResource,
+)
+from process.provider_directory_resource_hash import (
+    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
 )
 from process.provider_directory_rooted_graph_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_CONNECTOR_ID,
@@ -45,9 +47,6 @@ from process.provider_directory_rooted_graph_store_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_QUERY_CONTRACT_SHA256,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_STORAGE_CONTRACT_ID,
 )
-from process.provider_directory_resource_hash import (
-    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-)
 from process.uhc_flex_practitioner_contract import (
     UHC_FLEX_PRACTITIONER_SOURCE_ID,
 )
@@ -57,7 +56,6 @@ from process.uhc_flex_practitioner_publication import (
 from process.uhc_flex_practitioner_registration import (
     uhc_flex_practitioner_endpoint_identity,
 )
-
 
 MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
@@ -111,11 +109,7 @@ def _column_specs(schema_items) -> dict[str, tuple[object, ...]]:
         item.name: (
             str(item.type),
             item.nullable,
-            (
-                None
-                if item.server_default is None
-                else " ".join(str(item.server_default.arg).split()).lower()
-            ),
+            (None if item.server_default is None else " ".join(str(item.server_default.arg).split()).lower()),
         )
         for item in schema_items
         if isinstance(item, Column)
@@ -127,8 +121,7 @@ def _constraint_columns(constraint) -> tuple[str, ...]:
     if bound_columns:
         return bound_columns
     return tuple(
-        pending if isinstance(pending, str) else pending.name
-        for pending in getattr(constraint, "_pending_colargs", ())
+        pending if isinstance(pending, str) else pending.name for pending in getattr(constraint, "_pending_colargs", ())
     )
 
 
@@ -139,7 +132,9 @@ def _named_key_specs(schema_items) -> set[tuple[object, ...]]:
             (
                 "primary"
                 if isinstance(item, PrimaryKeyConstraint)
-                else "foreign" if isinstance(item, ForeignKeyConstraint) else "unique"
+                else "foreign"
+                if isinstance(item, ForeignKeyConstraint)
+                else "unique"
             ),
             item.name,
             _constraint_columns(item),
@@ -199,12 +194,8 @@ def _model_index_specs(models) -> dict[str, tuple[object, ...]]:
 def test_revision_is_the_single_linear_follow_up() -> None:
     migration = _migration()
 
-    assert migration.revision == (
-        "20260811020000_provider_directory_rooted_graph_acquisition"
-    )
-    assert migration.down_revision == (
-        "20260811010000_provider_directory_profile_capacity_preflight_receipt"
-    )
+    assert migration.revision == ("20260811020000_provider_directory_rooted_graph_acquisition")
+    assert migration.down_revision == ("20260811010000_provider_directory_profile_capacity_preflight_receipt")
 
 
 def test_migration_and_model_pin_the_current_graph_contract() -> None:
@@ -212,9 +203,7 @@ def test_migration_and_model_pin_the_current_graph_contract() -> None:
     legacy_endpoint = uhc_flex_practitioner_endpoint_identity()
 
     assert (
-        migration._CONNECTOR_ID
-        == rooted_graph_models._CONNECTOR_ID
-        == (PROVIDER_DIRECTORY_ROOTED_GRAPH_CONNECTOR_ID)
+        migration._CONNECTOR_ID == rooted_graph_models._CONNECTOR_ID == (PROVIDER_DIRECTORY_ROOTED_GRAPH_CONNECTOR_ID)
     )
     assert (
         migration._GRAPH_CONTRACT_SHA256
@@ -228,33 +217,16 @@ def test_migration_and_model_pin_the_current_graph_contract() -> None:
     )
     assert migration._ROOTED_SOURCE_ID == PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
     assert migration._ROOTED_ENDPOINT_ID == PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID
-    assert (
-        migration._ROOTED_ENDPOINT_SIGNATURE
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256
-    )
+    assert migration._ROOTED_ENDPOINT_SIGNATURE == PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256
     assert migration._SOURCE_AUTHORITY == PROVIDER_DIRECTORY_ROOTED_GRAPH_AUTHORITY_ID
     assert migration._LEGACY_SOURCE_ID == UHC_FLEX_PRACTITIONER_SOURCE_ID
     assert migration._LEGACY_ENDPOINT_ID == legacy_endpoint.endpoint_id
-    assert (
-        migration._LEGACY_ENDPOINT_SIGNATURE == legacy_endpoint.endpoint_signature_hash
-    )
-    assert (
-        migration._PUBLICATION_CONTRACT
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
-    )
-    assert (
-        migration._LEGACY_PUBLICATION_CONTRACT
-        == UHC_FLEX_PRACTITIONER_DATASET_PUBLICATION_CONTRACT_ID
-    )
-    assert (
-        migration._PUBLICATION_ROOT_CONTRACT
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_ROOT_CONTRACT_ID
-    )
+    assert migration._LEGACY_ENDPOINT_SIGNATURE == legacy_endpoint.endpoint_signature_hash
+    assert migration._PUBLICATION_CONTRACT == PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
+    assert migration._LEGACY_PUBLICATION_CONTRACT == UHC_FLEX_PRACTITIONER_DATASET_PUBLICATION_CONTRACT_ID
+    assert migration._PUBLICATION_ROOT_CONTRACT == PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_ROOT_CONTRACT_ID
     assert migration._HASH_CONTRACT == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-    assert (
-        migration._STORAGE_CONTRACT
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_STORAGE_CONTRACT_ID
-    )
+    assert migration._STORAGE_CONTRACT == PROVIDER_DIRECTORY_ROOTED_GRAPH_STORAGE_CONTRACT_ID
 
 
 def test_predecessor_model_checks_exactly_match_migration_adoption_checks() -> None:
@@ -269,9 +241,7 @@ def test_predecessor_model_checks_exactly_match_migration_adoption_checks() -> N
 
     assert {model.__tablename__ for model in models} < set(migration_items)
     for model in models:
-        assert _named_checks(model.__table__.constraints) == _named_checks(
-            migration_items[model.__tablename__]
-        )
+        assert _named_checks(model.__table__.constraints) == _named_checks(migration_items[model.__tablename__])
 
 
 def test_predecessor_model_columns_and_keys_exactly_match_migration_tables() -> None:
@@ -287,9 +257,42 @@ def test_predecessor_model_columns_and_keys_exactly_match_migration_tables() -> 
     for model in models:
         expected_items = migration_items[model.__tablename__]
         assert _column_specs(model.__table__.columns) == _column_specs(expected_items)
-        assert _named_key_specs(model.__table__.constraints) == _named_key_specs(
-            expected_items
-        )
+        model_keys = _named_key_specs(model.__table__.constraints)
+        legacy_keys = _named_key_specs(expected_items)
+        if model is ProviderDirectoryRootedGraphDatasetResource:
+            assert model.__runtime_schema_sync__ is False
+            assert model.__table__.info["managed_immutable_storage"] is True
+            assert not model.__table__.foreign_keys
+            legacy_foreign_keys = {
+                (
+                    "foreign",
+                    "pd_rooted_graph_dataset_resource_dataset_fkey",
+                    ("dataset_id",),
+                    ("mrf.provider_directory_rooted_graph_dataset.dataset_id",),
+                    None,
+                ),
+                (
+                    "foreign",
+                    "pd_rooted_graph_dataset_resource_parent_fkey",
+                    ("dataset_id", "resource_type", "resource_id"),
+                    (
+                        "mrf.provider_directory_dataset_resource.dataset_id",
+                        "mrf.provider_directory_dataset_resource.resource_type",
+                        "mrf.provider_directory_dataset_resource.resource_id",
+                    ),
+                    None,
+                ),
+                (
+                    "foreign",
+                    "pd_rooted_graph_dataset_resource_acquisition_fkey",
+                    ("publication_acquisition_id",),
+                    ("mrf.provider_directory_rooted_graph_acquisition.acquisition_id",),
+                    None,
+                ),
+            }
+            assert legacy_keys == model_keys | legacy_foreign_keys
+        else:
+            assert model_keys == legacy_keys
 
 
 def test_all_model_indexes_exactly_match_migration_indexes() -> None:
@@ -413,12 +416,8 @@ def test_guards_bind_root_census_discovery_and_fixed_point() -> None:
 def test_rooted_validity_traces_one_current_official_terminal_lineage() -> None:
     migration = _migration()
     schema = "rooted_graph_lineage_static"
-    intrinsic_sql = " ".join(
-        migration._rooted_intrinsic_valid_function_sql(schema).split()
-    )
-    lineage_sql = " ".join(
-        migration._rooted_official_lineage_current_function_sql(schema).split()
-    )
+    intrinsic_sql = " ".join(migration._rooted_intrinsic_valid_function_sql(schema).split())
+    lineage_sql = " ".join(migration._rooted_official_lineage_current_function_sql(schema).split())
     valid_sql = " ".join(migration._rooted_valid_function_sql(schema).split())
     header_guard_sql = " ".join(migration._rooted_header_guard_sql(schema).split())
     current_guard_sql = " ".join(migration._logical_current_guard_sql(schema).split())
@@ -464,19 +463,13 @@ def test_witnesses_are_insert_only_and_downgrade_is_nonempty_fenced() -> None:
     assert "actual_reference IS DISTINCT FROM" in edge_guard
     assert "extension_cursor" in edge_guard
     assert "valueReference" in edge_guard
-    assert all(
-        extension_url in edge_guard
-        for extension_url in migration._PLAN_NET_NETWORK_EXTENSION_URLS
-    )
+    assert all(extension_url in edge_guard for extension_url in migration._PLAN_NET_NETWORK_EXTENSION_URLS)
     edge_constraint_by_name = {
         constraint.name: str(constraint.sqltext)
         for constraint in ProviderDirectoryRootedGraphEdge.__table__.constraints
         if constraint.name and hasattr(constraint, "sqltext")
     }
-    assert (
-        "extension\\[[0-9]+\\]"
-        in edge_constraint_by_name["provider_directory_rooted_graph_edge_value_check"]
-    )
+    assert "extension\\[[0-9]+\\]" in edge_constraint_by_name["provider_directory_rooted_graph_edge_value_check"]
     assert "provider_directory_rooted_graph_downgrade_blocked" in source
     assert "create_table_or_validate" in source
     assert "create_index_if_missing" in source

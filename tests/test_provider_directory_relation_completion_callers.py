@@ -129,7 +129,7 @@ async def test_full_swap_preparation_failure_keeps_targets_open(monkeypatch, pha
 @pytest.mark.parametrize("failure", [None, RuntimeError("payload failed"), asyncio.CancelledError()])
 async def test_artifact_completion_waits_for_payload_and_never_cleanup(monkeypatch, failure):
     events = []
-    plan = SimpleNamespace(relation_by_table={"source": "scratch"}, created_tables=["scratch"])
+    plan = SimpleNamespace(relation_by_table={"source": "scratch"}, model_by_table_name={}, created_tables=["scratch"])
     monkeypatch.setattr(fhir, "_artifact_scope_materialization_plan", lambda _: plan)
 
     async def recover(*args):
@@ -148,6 +148,8 @@ async def test_artifact_completion_waits_for_payload_and_never_cleanup(monkeypat
 
     monkeypatch.setattr(fhir, "_recover_provider_directory_artifact_scope", recover)
     monkeypatch.setattr(fhir, "_materialize_artifact_scope_payload", payload)
+    indexes = AsyncMock(side_effect=lambda *_args: events.append("indexes"))
+    monkeypatch.setattr(fhir, "_finish_artifact_scope_indexes", indexes)
     monkeypatch.setattr(fhir, "_cleanup_failed_artifact_scope", cleanup)
     monkeypatch.setattr(fhir, "_complete_profile_capacity_relation_class", complete)
     if failure is None:
@@ -155,7 +157,7 @@ async def test_artifact_completion_waits_for_payload_and_never_cleanup(monkeypat
             plan.relation_by_table,
             plan.created_tables,
         )
-        assert events == ["recover", "payload", "close:artifact_scope"]
+        assert events == ["recover", "payload", "indexes", "close:artifact_scope"]
     else:
         with pytest.raises(type(failure)):
             await fhir._materialize_artifact_scope_tables("synthetic", None, object(), frozenset())
@@ -165,10 +167,11 @@ async def test_artifact_completion_waits_for_payload_and_never_cleanup(monkeypat
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [RuntimeError("completion unresolved"), asyncio.CancelledError()])
 async def test_artifact_completion_failure_cleans_exact_created_tables(monkeypatch, failure):
-    plan = SimpleNamespace(relation_by_table={"source": "scratch"}, created_tables=["scratch"])
+    plan = SimpleNamespace(relation_by_table={"source": "scratch"}, model_by_table_name={}, created_tables=["scratch"])
     monkeypatch.setattr(fhir, "_artifact_scope_materialization_plan", lambda _: plan)
     monkeypatch.setattr(fhir, "_recover_provider_directory_artifact_scope", AsyncMock())
     monkeypatch.setattr(fhir, "_materialize_artifact_scope_payload", AsyncMock())
+    monkeypatch.setattr(fhir, "_finish_artifact_scope_indexes", AsyncMock())
     monkeypatch.setattr(fhir, "_complete_profile_capacity_relation_class", AsyncMock(side_effect=failure))
     cleanup = AsyncMock()
     monkeypatch.setattr(fhir, "_cleanup_failed_artifact_scope", cleanup)

@@ -44,6 +44,7 @@ async def _create_gc_pointer_tables(connection, schema: str) -> None:
         )
         """
     )
+    await connection.status(f"CREATE TABLE {schema}.plan_release_snapshot_pin (snapshot_id varchar(128) PRIMARY KEY)")
     await connection.status(
         f"""
         CREATE TABLE {schema}.plan_release_snapshot_binding (
@@ -158,10 +159,7 @@ async def test_real_postgres_stale_cutoff_is_utc_naive_under_non_utc_session(
     """Use UTC-naive cutoffs even when the PostgreSQL session is non-UTC."""
 
     if os.getenv("HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST") != "1":
-        pytest.skip(
-            "set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 for the isolated "
-            "PostgreSQL test"
-        )
+        pytest.skip("set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 for the isolated PostgreSQL test")
     database = Database()
     schema_name = f"ptg2_source_gc_utc_{uuid.uuid4().hex}"
     schema = f'"{schema_name}"'
@@ -173,11 +171,13 @@ async def test_real_postgres_stale_cutoff_is_utc_naive_under_non_utc_session(
     monkeypatch.setattr(
         snapshot_gc,
         "build_shared_layout_release_plan",
-        AsyncMock(return_value=SimpleNamespace(
-            logical_layout_count=0,
-            candidate_hash_count=0,
-            stored_bytes=0,
-        )),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                logical_layout_count=0,
+                candidate_hash_count=0,
+                stored_bytes=0,
+            )
+        ),
     )
     await database.connect()
     try:

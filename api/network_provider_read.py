@@ -43,7 +43,7 @@ class NetworkProviderNotFound(LookupError):
     """This identity has no selected office in the pinned network."""
 
 
-_PROVIDERS_SQL = """WITH selected_addresses AS MATERIALIZED (
+_PROVIDERS_SQL = """WITH selected_addresses AS NOT MATERIALIZED (
   SELECT location_key,entity_type,entity_id,entity_name,npi,first_line,second_line,city_name,state_name,
     postal_code,country_code,lat,long FROM {namespace}.entity_address_unified
   WHERE canonical_network_ids && $1::text::integer[]
@@ -72,11 +72,13 @@ _PROVIDERS_SQL = """WITH selected_addresses AS MATERIALIZED (
       AND location_id<>'00000000-0000-0000-0000-000000000000'::uuid
       AND location_key ~ '^[0-9a-f]{{64}}$'),true)
     AND (SELECT count(*)=count(DISTINCT location_key) FROM selected_bindings)
-    AND NOT EXISTS(SELECT 1 FROM selected_bindings binding LEFT JOIN selected_memberships member
-      USING(provider_system,provider_id,location_id) WHERE member.location_id IS NULL)
-    AND ($2::text IS NOT NULL OR NOT EXISTS(SELECT 1 FROM selected_addresses address
-      LEFT JOIN selected_bindings binding ON (binding.location_key,binding.entity_type,binding.entity_id)
-        =(address.location_key,address.entity_type,address.entity_id) WHERE binding.location_key IS NULL)) AS valid
+    AND NOT EXISTS(SELECT provider_system,provider_id,location_id FROM selected_bindings
+      EXCEPT SELECT provider_system,provider_id,location_id FROM selected_memberships
+      WHERE provider_system IS NOT NULL AND provider_id IS NOT NULL AND location_id IS NOT NULL)
+    AND ($2::text IS NOT NULL OR NOT EXISTS(
+      SELECT location_key,entity_type,entity_id FROM selected_addresses
+      EXCEPT SELECT location_key,entity_type,entity_id FROM selected_bindings
+      WHERE location_key IS NOT NULL AND entity_type IS NOT NULL AND entity_id IS NOT NULL)) AS valid
   FROM selected
 ), eligible AS MATERIALIZED (
   SELECT * FROM selected

@@ -13,14 +13,18 @@ from uuid import UUID, uuid4
 from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_custom_address_source import _require_transaction, _source_identity
 from process.network_legacy_membership_source import (
+    ACAGlobalEpochReadScope,
     ACAMembershipBatch,
     ACARawFactPosition,
     PinnedACAMembershipSource,
+    aca_physical_source,
     read_aca_membership_batch,
     read_aca_raw_fact_batch,
 )
 from process.network_membership_candidate_lifecycle import _control_namespace, _locked_candidate, _require_open
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, MembershipCopyTarget, _encode
+from process.reference_family_archive import CONTRACT, MODEL_CLOSURE_CONTRACT, TYPED_MRF_CONTRACT
+from process.uhc_flex_practitioner_async_safety import drain_operation
 
 
 class InitialACAOfficeBindingError(ValueError):
@@ -63,7 +67,9 @@ async def pin_aca_office_address_source(
     await _verify_batch(
         connection, batch, _control_namespace(control_schema)[1:-1], after_evidence_checksum, after_source_position
     )
-    identity = await _source_identity(connection, address_source, runtime_roles, address=True)
+    identity = await _source_identity(
+        connection, address_source, runtime_roles, address=True, control_schema=_control_namespace(control_schema)[1:-1]
+    )
     office_records = await _office_records(connection, batch, address_source)
     bindings = await _canonical_bindings(connection, office_records)
     return PinnedACAOfficeAddressSource(
@@ -84,7 +90,7 @@ _OFFICES_SQL = """WITH pairs AS MATERIALIZED (
  SELECT DISTINCT provider_id,location_id FROM jsonb_to_recordset($1::jsonb)
  AS item(network_id integer,provider_system text,provider_id text,location_id uuid,evidence_id text)
 ), evidence AS MATERIALIZED (
- SELECT e.*,c.payload AS canonical FROM {source}.mrf_address_evidence e
+ SELECT e.*,{canonical} AS canonical FROM {source}.mrf_address_evidence e
  JOIN pairs p ON p.provider_id=e.npi::text AND p.location_id=e.address_key
  LEFT JOIN {source}.mrf_canonical_address c ON c.address_key=e.address_key
  WHERE e.import_id=$2 AND e.issuer_id=$3 AND e.year=$4 AND e.source_url=$5
@@ -120,6 +126,51 @@ SELECT (SELECT count(*) FROM pairs) AS pairs,
 FROM documents"""
 
 
+_TYPED_CANONICAL_FIELDS = (
+    "address_key",
+    "identity_key",
+    "premise_key",
+    "line1_norm",
+    "unit_norm",
+    "city_norm",
+    "state_code",
+    "zip5",
+    "zip4",
+    "country_code",
+    "identity_version",
+    "precision",
+    "source_bits",
+    "merged_into",
+)
+_TYPED_CANONICAL_SQL = (
+    "jsonb_build_object(" + ",".join("'" + name + "',c." + name for name in _TYPED_CANONICAL_FIELDS) + ")"
+)
+
+
+def _canonical_source(source_pin):
+    """Choose the exact closed model contract and its recorded native relation."""
+    if type(source_pin) is PinnedACAMembershipSource:
+        source_pin = aca_physical_source(source_pin)
+    manifest = source_pin.prepared.manifest
+    ownership = source_pin.prepared.ownership
+    contract = manifest.as_dict()["contract"]
+    relation_oid_by_name = dict(ownership.relation_oids)
+    model_contract = (manifest.auxiliary or {}).get("contract")
+    if contract == TYPED_MRF_CONTRACT and model_contract == MODEL_CLOSURE_CONTRACT:
+        canonical_oid = relation_oid_by_name.get("mrf_canonical_address")
+        canonical_sql = _TYPED_CANONICAL_SQL
+        has_valid_layout = ownership.auxiliary_oid is None
+    elif contract == CONTRACT and model_contract is None:
+        canonical_oid = ownership.auxiliary_oid
+        canonical_sql = "c.payload"
+        has_valid_layout = "mrf_canonical_address" not in relation_oid_by_name
+    else:
+        raise InitialACAOfficeBindingError("initial_aca_office_input_invalid")
+    if not has_valid_layout or type(canonical_oid) is not int or not 0 < canonical_oid < 2**32:
+        raise InitialACAOfficeBindingError("initial_aca_office_input_invalid")
+    return canonical_oid, canonical_sql
+
+
 def _digest(document):
     return hashlib.sha256(
         json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -143,13 +194,13 @@ def _validate_batch(batch):
         or batch.unresolved_rows
         or type(batch.source) is not PinnedACAMembershipSource
         or batch.source.prepared.manifest.importer_id != "mrf"
-        or batch.source.prepared.ownership.auxiliary_oid is None
         or type(batch.input_bytes) is not bytes
         or len(batch.input_bytes) > MAX_INPUT_BYTES
         or hashlib.sha256(batch.input_bytes).hexdigest() != batch.input_sha256
         or not 0 <= batch.source_rows <= MAX_ROWS
     ):
         raise InitialACAOfficeBindingError("initial_aca_office_input_invalid")
+    _canonical_source(batch.source)
 
 
 def _validate_input(batch, target, address_pin, runtime_roles):
@@ -168,7 +219,11 @@ def _validate_input(batch, target, address_pin, runtime_roles):
     ):
         raise InitialACAOfficeBindingError("initial_aca_office_source_pin_differs")
     _validate_roles(runtime_roles)
-    if target.schema_name in {address_source.schema_name, batch.source.prepared.ownership.schema_name}:
+    if target.schema_name in {
+        address_source.schema_name,
+        batch.source.prepared.ownership.schema_name,
+        aca_physical_source(batch.source).prepared.ownership.schema_name,
+    }:
         raise InitialACAOfficeBindingError("initial_aca_office_source_not_external")
 
 
@@ -193,7 +248,7 @@ async def _verify_batch(connection, batch, control_schema, after, after_source_p
     )
     if replay != batch:
         raise InitialACAOfficeBindingError("initial_aca_office_batch_differs")
-    _, rows = await asyncio.to_thread(_encode, batch.input_bytes)
+    _, rows = await drain_operation(asyncio.to_thread(_encode, batch.input_bytes), preserve_cancellation=True)
     if rows != batch.membership_rows:
         raise InitialACAOfficeBindingError("initial_aca_office_batch_accounting_invalid")
 
@@ -219,10 +274,15 @@ async def _candidate(connection, target, batch, address_source, control):
 
 
 async def _office_records(connection, batch, address_source):
-    source_pin = batch.source
+    source_pin = aca_physical_source(batch.source) if type(batch.source) is PinnedACAMembershipSource else batch.source
+    source_sql = _OFFICES_SQL
+    if type(source_pin) is ACAGlobalEpochReadScope:
+        source_sql = source_sql.replace("e.import_id=$2", "($2::text IS NULL OR e.import_id=$2)")
+        source_sql = source_sql.replace("e.source_url=$5", "($5::text IS NULL OR e.source_url=$5)")
     result = await connection.fetchrow(
-        _OFFICES_SQL.format(
+        source_sql.format(
             source=_identifier(source_pin.prepared.ownership.schema_name),
+            canonical=_canonical_source(source_pin)[1],
             address=f"{_identifier(address_source.schema_name)}.{_identifier(address_source.table_name)}",
         ),
         batch.input_bytes.decode(),
@@ -266,7 +326,9 @@ async def _canonical_bindings(connection, office_records):
     native = importlib.import_module("ptg2_address_canon")
     source_addresses = [tuple(office["evidence_address"]) for office in office_records]
     retained_addresses = [tuple(office["address"]) for office in office_records]
-    canonical_addresses = await asyncio.to_thread(native.canonicalize_batch, source_addresses + retained_addresses)
+    canonical_addresses = await drain_operation(
+        asyncio.to_thread(native.canonicalize_batch, source_addresses + retained_addresses), preserve_cancellation=True
+    )
     canonical_json = json.dumps(canonical_addresses, separators=(",", ":"), allow_nan=False)
     if len(canonical_json.encode()) > 2 * MAX_INPUT_BYTES:
         raise InitialACAOfficeBindingError("initial_aca_office_canonical_bound_exceeded")
@@ -349,7 +411,9 @@ async def copy_initial_aca_office_bindings(
     async with connection.transaction():
         await _candidate(connection, copy_target, batch, address_source, control)
         await _verify_batch(connection, batch, control[1:-1], after_evidence_checksum, after_source_position)
-        address_identity = await _source_identity(connection, address_source, runtime_roles, address=True)
+        address_identity = await _source_identity(
+            connection, address_source, runtime_roles, address=True, control_schema=control[1:-1]
+        )
         if address_identity != address_pin.address_identity:
             raise InitialACAOfficeBindingError("initial_aca_office_native_identity_differs")
         office_records = await _office_records(connection, batch, address_source)
@@ -364,7 +428,7 @@ async def copy_initial_aca_office_bindings(
 
 
 def _correspondence_receipt(copy_target, batch, address_source, address_identity, bindings, office_records):
-    source_pin = batch.source
+    source_pin = aca_physical_source(batch.source) if type(batch.source) is PinnedACAMembershipSource else batch.source
     ownership = source_pin.prepared.ownership
     receipt_by_field = {
         "component": "initial_aca_office_correspondence",
@@ -372,13 +436,13 @@ def _correspondence_receipt(copy_target, batch, address_source, address_identity
         "candidate": asdict(copy_target),
         "source_generation": batch.generation_id,
         "aca_source": {
-            "generation": source_pin.generation_id,
+            "generation": batch.source.generation_id,
             "coordinates": source_pin.coordinates,
             "manifest_sha256": source_pin.validation.manifest_sha256,
             "validation_sha256": source_pin.validation.validation_sha256,
             "schema_oid": ownership.schema_oid,
             "relation_oids": list(ownership.relation_oids),
-            "canonical_address_oid": ownership.auxiliary_oid,
+            "canonical_address_oid": _canonical_source(source_pin)[0],
             "owner_oid": source_pin.validation.sealed_owner_oid,
         },
         "address_source": asdict(address_source),

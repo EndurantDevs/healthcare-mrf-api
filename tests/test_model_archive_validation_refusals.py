@@ -641,17 +641,18 @@ async def test_retained_nucc_cleanup_rechecks_references_and_custody_before_rest
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [None, "protected", "replaced", "claimed", "uncertain", "empty"])
 async def test_legacy_nucc_rotation_cannot_erase_any_protected_ledger_claim(monkeypatch, failure):
+    from process import nucc_retention_read_view as claims
+
     session = _session()
     monkeypatch.setattr(archive, "is_nucc_native_handoff_required", AsyncMock(return_value=failure == "protected"))
     oids = [None, None] if failure == "empty" else [100, 999 if failure == "replaced" else 100, None]
     monkeypatch.setattr(archive, "_relation_oid", AsyncMock(side_effect=oids))
-    session.scalar.side_effect = [
-        200,
-        True if failure == "claimed" else None if failure == "uncertain" else False,
-        None,
-        None,
-        None,
-    ]
+    check = AsyncMock(
+        side_effect=claims.NuccRetentionReadError("protected claim exists or is uncertain")
+        if failure in {"claimed", "uncertain"}
+        else None
+    )
+    monkeypatch.setattr(claims, "require_unretained_nucc_oids", check)
     if failure in {"protected", "replaced", "claimed", "uncertain"}:
         with pytest.raises(archive.ReferenceFamilyArchiveError):
             await archive.require_nucc_unretained_rotation(session, schema_name="mrf")
@@ -666,8 +667,10 @@ async def test_legacy_nucc_rotation_cannot_erase_any_protected_ledger_claim(monk
             == 'LOCK TABLE ONLY "mrf"."nucc_taxonomy" IN ACCESS EXCLUSIVE MODE NOWAIT'
         )
         assert all("DROP" not in str(call.args[0]) for call in session.execute.await_args_list)
-    if failure not in {"protected", "empty", "replaced"}:
-        assert session.scalar.await_args_list[1].args[1] == {"oids": [100]}
+    if failure in {"protected", "empty", "replaced"}:
+        check.assert_not_awaited()
+    else:
+        check.assert_awaited_once_with(session, [100])
 
 
 @pytest.mark.asyncio

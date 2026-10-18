@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """OpenAddresses native batching parity and failure-safety proofs."""
+
 from __future__ import annotations
 
 import importlib
@@ -9,13 +10,15 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import MetaData
+from sqlalchemy import MetaData, text
 from sqlalchemy.engine import make_url
 
 from db.connection import Database
 from db.models import OpenAddressesGeocode, OpenAddressesZipRecovery
 from process.ext import address_canon, address_fast
 from process.ext import utils as ext_utils
+from tests.test_provider_directory_cms_serving_receipt_postgres import _apply, _migration
+
 openaddresses = importlib.import_module("process.openaddresses")
 POSTGRES_DSN_ENV = "HLTHPRT_OPENADDRESSES_BATCH_POSTGRES_DSN"
 
@@ -90,9 +93,7 @@ def test_native_batch_boundaries_have_exact_scalar_parity(
         )
     )
     actual_rows = [
-        {**address_record, "imported_at": None}
-        for record_batch in batches
-        for address_record in record_batch.rows
+        {**address_record, "imported_at": None} for record_batch in batches for address_record in record_batch.rows
     ]
 
     assert seen_batch_sizes == expected_batch_sizes
@@ -113,9 +114,7 @@ def test_native_batch_preserves_mixed_outcomes(monkeypatch):
     assert len(record_batch.zip_recovery_rows) == 1
     assert record_batch.rejection_counts == {"missing_zip5": 1, "not_point": 1}
     assert record_batch.rows[0]["identity_key"]
-    assert record_batch.rows[0]["address_key"] == address_canon.key_from_identity(
-        record_batch.rows[0]["identity_key"]
-    )
+    assert record_batch.rows[0]["address_key"] == address_canon.key_from_identity(record_batch.rows[0]["identity_key"])
 
 
 @pytest.mark.parametrize(
@@ -259,6 +258,9 @@ async def _prepare_postgres_case(monkeypatch, tmp_path, persisted_batches):
     database, isolated_class = _isolated_database(monkeypatch, schema)
     await database.connect()
     await database.status(f'CREATE SCHEMA "{schema}";')
+    async with database.engine.begin() as connection:
+        await connection.run_sync(lambda sync: _apply(sync, "20260930120000"))
+        await connection.execute(text(_migration("20261019130000")._counter_sql(schema)))
     live_table = OpenAddressesGeocode.__table__.to_metadata(MetaData(), schema=schema)
     await database.create_table(live_table)
     seed_row = openaddresses._record_from_feature(
@@ -272,18 +274,27 @@ async def _prepare_postgres_case(monkeypatch, tmp_path, persisted_batches):
     )
     import_id = f"failure{persisted_batches}{uuid.uuid4().hex[:8]}"
     task_by_name = {
-        "batch_size": 2, "import_id": import_id, "local_files": [str(source_path)],
-        "min_rows": 1, "source_concurrency": 1, "test_mode": True,
-        "zip_restore_concurrency": 1, "zip_restore_shards": 1,
+        "batch_size": 2,
+        "import_id": import_id,
+        "local_files": [str(source_path)],
+        "min_rows": 1,
+        "source_concurrency": 1,
+        "test_mode": True,
+        "zip_restore_concurrency": 1,
+        "zip_restore_shards": 1,
     }
     suffix = openaddresses._normalize_import_id(import_id)
     return SimpleNamespace(
-        database=database, schema=schema, task_by_name=task_by_name,
+        database=database,
+        schema=schema,
+        task_by_name=task_by_name,
         context_by_name={"context": {"run": 0}, "import_date": "bootstrap"},
         original_flush=openaddresses._flush_rows,
         stage_table=isolated_class(OpenAddressesGeocode, suffix).__tablename__,
         recovery_table=isolated_class(OpenAddressesZipRecovery, suffix).__tablename__,
-        published_recovery_table=openaddresses._published_zip_recovery_table_name(isolated_class(OpenAddressesZipRecovery, suffix).__tablename__),
+        published_recovery_table=openaddresses._published_zip_recovery_table_name(
+            isolated_class(OpenAddressesZipRecovery, suffix).__tablename__
+        ),
         live_oid=await _relation_oid(database, schema, OpenAddressesGeocode.__main_table__),
     )
 
@@ -305,21 +316,15 @@ async def _fail_then_retry(case, monkeypatch, persisted_batches):
     assert len(flushed_batch_sizes) == persisted_batches
     assert case.context_by_name["context"].get("run", 0) == 0
     partial_oid = await _relation_oid(case.database, case.schema, case.stage_table)
-    partial_count = await case.database.scalar(
-        f'SELECT count(*) FROM "{case.schema}"."{case.stage_table}";'
-    )
+    partial_count = await case.database.scalar(f'SELECT count(*) FROM "{case.schema}"."{case.stage_table}";')
     assert partial_count == persisted_batches * 2
     await openaddresses.shutdown(case.context_by_name)
-    assert await _relation_oid(
-        case.database, case.schema, OpenAddressesGeocode.__main_table__
-    ) == case.live_oid
+    assert await _relation_oid(case.database, case.schema, OpenAddressesGeocode.__main_table__) == case.live_oid
     monkeypatch.setattr(openaddresses, "_flush_rows", case.original_flush)
     await openaddresses.process_data(case.context_by_name, case.task_by_name)
     retry_oid = await _relation_oid(case.database, case.schema, case.stage_table)
     assert retry_oid != partial_oid
-    assert await case.database.scalar(
-        f'SELECT count(*) FROM "{case.schema}"."{case.stage_table}";'
-    ) == 8
+    assert await case.database.scalar(f'SELECT count(*) FROM "{case.schema}"."{case.stage_table}";') == 8
     return retry_oid
 
 
@@ -331,9 +336,7 @@ async def _publish_and_assert(case, monkeypatch, retry_oid):
         return openaddresses.OpenAddressesBackfillStats(0, 0, 0)
 
     monkeypatch.setattr(openaddresses, "restore_openaddresses_zips", no_zip_restore)
-    monkeypatch.setattr(
-        openaddresses, "refresh_archive_geocodes_from_openaddresses_sharded", no_backfill
-    )
+    monkeypatch.setattr(openaddresses, "refresh_archive_geocodes_from_openaddresses_sharded", no_backfill)
     monkeypatch.setattr(openaddresses, "print_time_info", lambda _started_at: None)
     await openaddresses.shutdown(case.context_by_name)
     live_table = OpenAddressesGeocode.__main_table__
@@ -344,16 +347,15 @@ async def _publish_and_assert(case, monkeypatch, retry_oid):
     assert await _relation_oid(case.database, case.schema, case.recovery_table) is None
     assert await _relation_oid(case.database, case.schema, case.published_recovery_table) is None
     assert await _relation_oid(case.database, case.schema, archived_table) == case.live_oid
-    assert await case.database.scalar(
-        f'SELECT count(*) FROM "{case.schema}"."{archived_table}";'
-    ) == 1
-    assert await case.database.scalar(
-        f'SELECT count(*) FROM "{case.schema}"."{live_table}" '
-        "WHERE identity_key IS NOT NULL AND address_key IS NOT NULL;"
-    ) == 8
-    assert await case.database.scalar(
-        f'SELECT count(DISTINCT row_hash) FROM "{case.schema}"."{live_table}";'
-    ) == 8
+    assert await case.database.scalar(f'SELECT count(*) FROM "{case.schema}"."{archived_table}";') == 1
+    assert (
+        await case.database.scalar(
+            f'SELECT count(*) FROM "{case.schema}"."{live_table}" '
+            "WHERE identity_key IS NOT NULL AND address_key IS NOT NULL;"
+        )
+        == 8
+    )
+    assert await case.database.scalar(f'SELECT count(DISTINCT row_hash) FROM "{case.schema}"."{live_table}";') == 8
 
 
 async def _loaded_postgres_case(monkeypatch, tmp_path):
@@ -373,9 +375,7 @@ async def _loaded_postgres_case(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("failure_phase", ["stage_rename", "marker_rename"])
 @pytest.mark.asyncio
-async def test_real_postgres_swap_failure_rolls_back_and_retries(
-    monkeypatch, tmp_path, failure_phase
-):
+async def test_real_postgres_swap_failure_rolls_back_and_retries(monkeypatch, tmp_path, failure_phase):
     case, stage_oid = await _loaded_postgres_case(monkeypatch, tmp_path)
     original_status = case.database.status
     failure_tracker = SimpleNamespace(has_failed=False)
@@ -384,8 +384,7 @@ async def test_real_postgres_swap_failure_rolls_back_and_retries(
         target_by_phase = {
             "stage_rename": f'ALTER TABLE "{case.schema}"."{case.stage_table}" RENAME TO "openaddresses_geocode";',
             "marker_rename": (
-                f'ALTER TABLE "{case.schema}"."{case.recovery_table}" '
-                f'RENAME TO "{case.published_recovery_table}";'
+                f'ALTER TABLE "{case.schema}"."{case.recovery_table}" RENAME TO "{case.published_recovery_table}";'
             ),
         }
         target = target_by_phase[failure_phase]
@@ -443,9 +442,7 @@ async def _assert_postpublish_restart(case, failure_tracker, live_oid, archived_
 
 @pytest.mark.parametrize("failure_phase", ["backfill", "recovery_drop"])
 @pytest.mark.asyncio
-async def test_real_postgres_postpublish_failure_resumes_without_second_swap(
-    monkeypatch, tmp_path, failure_phase
-):
+async def test_real_postgres_postpublish_failure_resumes_without_second_swap(monkeypatch, tmp_path, failure_phase):
     case, stage_oid = await _loaded_postgres_case(monkeypatch, tmp_path)
     original_status = case.database.status
     failure_tracker = SimpleNamespace(backfill_call_count=0, has_cleanup_failed=False)
@@ -458,11 +455,7 @@ async def test_real_postgres_postpublish_failure_resumes_without_second_swap(
 
     async def fail_cleanup_once(statement, **params):
         target = f'DROP TABLE "{case.schema}"."{case.published_recovery_table}";'
-        if (
-            failure_phase == "recovery_drop"
-            and not failure_tracker.has_cleanup_failed
-            and statement == target
-        ):
+        if failure_phase == "recovery_drop" and not failure_tracker.has_cleanup_failed and statement == target:
             failure_tracker.has_cleanup_failed = True
             raise RuntimeError("synthetic recovery drop failure")
         return await original_status(statement, **params)
@@ -487,9 +480,7 @@ async def test_real_postgres_postpublish_failure_resumes_without_second_swap(
 
 @pytest.mark.parametrize("persisted_batches", [0, 1, 3])
 @pytest.mark.asyncio
-async def test_real_postgres_failure_never_publishes_and_retry_resets(
-    monkeypatch, tmp_path, persisted_batches
-):
+async def test_real_postgres_failure_never_publishes_and_retry_resets(monkeypatch, tmp_path, persisted_batches):
     case = await _prepare_postgres_case(monkeypatch, tmp_path, persisted_batches)
     try:
         retry_oid = await _fail_then_retry(case, monkeypatch, persisted_batches)

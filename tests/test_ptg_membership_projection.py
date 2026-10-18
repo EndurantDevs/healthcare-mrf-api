@@ -10,6 +10,7 @@ import pytest
 from api import control_imports, control_workers
 from api import ptg2_serving as serving
 from api import ptg_membership_reader as reader
+from api import ptg_membership_storage as storage
 from api.ptg_membership_contract import IMPORTER, canonical_code, validate_params
 from api.ptg_membership_storage import attachment_name
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -59,6 +60,72 @@ def test_attachment_identifier_contains_full_digest_within_native_name_limit():
     assert name != attachment_name(PARAMS | {"snapshot_id": "next-snapshot"})
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blocking_group",
+    [
+        None,
+        "global",
+        "source",
+        "plan",
+        "previous_global",
+        "previous_source",
+        "previous_plan",
+        "pin",
+        "release_binding",
+        "release_pin",
+    ],
+)
+async def test_retirement_reads_all_reference_groups_and_refuses_every_external_reference(blocking_group):
+    """Use the shared loader, including default snapshot scope and ordered release pins."""
+    own_pin = storage._pin(PARAMS)
+    queries = []
+    specs = [
+        ("global", "ptg2_current_snapshot", "slot", "snapshot_id", "slot"),
+        ("source", "ptg2_current_source_snapshot", "source_key", "snapshot_id", "source_key"),
+        ("plan", "ptg2_current_plan_source", "plan_source_key", "snapshot_id", "plan_source_key"),
+        ("previous_global", "ptg2_current_snapshot", "slot", "previous_snapshot_id", "slot"),
+        ("previous_source", "ptg2_current_source_snapshot", "source_key", "previous_snapshot_id", "source_key"),
+        ("previous_plan", "ptg2_current_plan_source", "plan_source_key", "previous_snapshot_id", "plan_source_key"),
+        ("pin", "ptg2_snapshot_pin", "owner_type, owner_id", "snapshot_id", "owner_type, owner_id"),
+        (
+            "release_binding",
+            "plan_release_snapshot_binding",
+            "serving_revision_id, role, binding_ordinal",
+            "snapshot_id",
+            "serving_revision_id, role, binding_ordinal",
+        ),
+        (
+            "release_pin",
+            "plan_release_snapshot_pin",
+            "'plan_release_serving_revision'::text AS owner_type, serving_revision_id AS owner_id",
+            "snapshot_id",
+            "serving_revision_id",
+        ),
+    ]
+
+    async def execute(statement, parameters):
+        query = str(statement)
+        group, table, selected, reference, order = specs[len(queries)]
+        assert query == (
+            f'SELECT {selected} FROM "synthetic_schema"."{table}" WHERE "{reference}"=:snapshot_id ORDER BY {order}'
+        )
+        assert parameters == {"snapshot_id": PARAMS["snapshot_id"]}
+        queries.append(query)
+        rows = [own_pin] if group == "pin" else []
+        if group == blocking_group:
+            rows.append({"owner_type": "plan_release_serving_revision", "owner_id": "synthetic-release"})
+        return SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: rows))
+
+    session = SimpleNamespace(execute=AsyncMock(side_effect=execute))
+    if blocking_group is None:
+        assert await storage._require_no_references(session, '"synthetic_schema"', PARAMS) == own_pin
+    else:
+        with pytest.raises(PTG2ManifestArtifactError, match="retention references"):
+            await storage._require_no_references(session, '"synthetic_schema"', PARAMS)
+    assert len(queries) == len(specs)
+
+
 def _request(**overrides):
     budget = serving.ForwardReadBudget(
         maximum_fragments=256, maximum_raw_payload_bytes=4194304, maximum_row_capacity=6701
@@ -104,8 +171,8 @@ async def _prepare(monkeypatch, row, *, found=None):
 
 @pytest.mark.asyncio
 async def test_index_intersects_complete_code_scope_and_preserves_missing_npis(monkeypatch):
-    row = {"first_count": 2, "priced_count": 2, "pairs": [[1000000001, 31], [1000000001, 32]]}
-    session, resolve, locate = await _prepare(monkeypatch, row)
+    projection_by_field = {"first_count": 2, "priced_count": 2, "pairs": [[1000000001, 31], [1000000001, 32]]}
+    session, resolve, locate = await _prepare(monkeypatch, projection_by_field)
     state = serving._LocalDistanceGraphState()
     tables = SimpleNamespace(source_key="synthetic-network", snapshot_id="synthetic-snapshot", shared_snapshot_key=1)
     monkeypatch.setattr(serving, "_required_shared_snapshot_key", lambda _tables: 1)
@@ -167,8 +234,8 @@ async def test_present_corrupt_index_never_uses_guarded_fallback(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["retained", "projection", "sets", "bytes", "batches", "coverage"])
 async def test_native_path_keeps_cumulative_admission_caps(monkeypatch, kind):
-    row = {"first_count": 1, "priced_count": 1, "pairs": [[1000000001, 31]]}
-    session, _, _ = await _prepare(monkeypatch, row)
+    projection_by_field = {"first_count": 1, "priced_count": 1, "pairs": [[1000000001, 31]]}
+    session, _, _ = await _prepare(monkeypatch, projection_by_field)
     state = serving._LocalDistanceGraphState()
     request = _request()
     monkeypatch.setattr(serving, "_required_shared_snapshot_key", lambda _tables: 1)
@@ -208,13 +275,13 @@ async def test_distance_prefix_keeps_later_addresses_without_reloading_npi_membe
         probes.append(limit)
         return locations[:limit]
 
-    row = {"first_count": 2, "priced_count": 2, "pairs": [[1000000001, 31], [1000000002, 32]]}
-    session, _, _ = await _prepare(monkeypatch, row)
+    projection_by_field = {"first_count": 2, "priced_count": 2, "pairs": [[1000000001, 31], [1000000002, 32]]}
+    session, _, _ = await _prepare(monkeypatch, projection_by_field)
     monkeypatch.setattr(serving, "_required_shared_snapshot_key", lambda _tables: 1)
     monkeypatch.setattr(serving, "_payload_schema", lambda _tables: "mrf")
     monkeypatch.setattr(serving, "_membership_location_rows", location_rows)
     tables = SimpleNamespace(source_key="network", snapshot_id="snapshot")
-    result = await serving._scan_local_distance_graph(
+    candidates = await serving._scan_local_distance_graph(
         session,
         tables,
         {},
@@ -223,8 +290,8 @@ async def test_distance_prefix_keeps_later_addresses_without_reloading_npi_membe
         20,
         candidate_npis=(1000000001, 1000000002),
     )
-    assert result.location_rows == locations
-    assert result.provider_set_keys_by_npi == {1000000001: {31}, 1000000002: {32}}
+    assert candidates.location_rows == locations
+    assert candidates.provider_set_keys_by_npi == {1000000001: {31}, 1000000002: {32}}
     assert len(probes) == 2
     assert session.execute.await_count == 1
 
@@ -267,12 +334,12 @@ async def test_source_custody_is_fresh_with_supplied_descriptor_and_actual_audit
             "ptg2_v3_provider_group",
         }
     )
-    rows = [
+    storage_rows = [
         {"database_oid": 42, "schema_oid": 43, "relname": name, "relation_oid": index + 100}
         for index, name in enumerate(names)
     ]
-    result = SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: rows))
-    session = SimpleNamespace(execute=AsyncMock(return_value=result), scalar=AsyncMock(return_value="ab" * 32))
+    storage_result = SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: storage_rows))
+    session = SimpleNamespace(execute=AsyncMock(return_value=storage_result), scalar=AsyncMock(return_value="ab" * 32))
     _, _, identity = await source.source_identity(session, **PARAMS, tables=tables)
     resolver.assert_awaited_once_with(session, PARAMS["snapshot_id"])
     root.assert_awaited_once_with(session, 1, schema_name="synthetic", refresh=True)
@@ -297,7 +364,7 @@ async def test_explicit_root_refresh_does_not_authorize_from_a_warm_cache(monkey
 
     monkeypatch.setattr(graph, "_ROOT_CACHE", OrderedDict())
     monkeypatch.setattr(graph, "_graph_cache_scope", lambda *_args: "synthetic-database")
-    fields = {
+    fields_by_name = {
         "snapshot_key": 1,
         "representation": "pattern_v1",
         "map_digest": b"a" * 32,
@@ -305,9 +372,11 @@ async def test_explicit_root_refresh_does_not_authorize_from_a_warm_cache(monkey
         "map_format": graph.PTG2_V4_MAP_FORMAT,
         "projection_id_scope": graph.PTG2_V4_PROJECTION_ID_SCOPE,
     }
-    session = SimpleNamespace(execute=AsyncMock(side_effect=lambda *_args: SimpleNamespace(first=lambda: dict(fields))))
+    session = SimpleNamespace(
+        execute=AsyncMock(side_effect=lambda *_args: SimpleNamespace(first=lambda: dict(fields_by_name)))
+    )
     assert (await graph.load_v4_graph_root(session, 1, schema_name="synthetic")).map_digest == b"a" * 32
-    fields["map_digest"] = b"b" * 32
+    fields_by_name["map_digest"] = b"b" * 32
     assert (await graph.load_v4_graph_root(session, 1, schema_name="synthetic")).map_digest == b"a" * 32
     assert (await graph.load_v4_graph_root(session, 1, schema_name="synthetic", refresh=True)).map_digest == b"b" * 32
     assert session.execute.await_count == 2
@@ -321,12 +390,12 @@ async def test_readiness_get_has_exact_absent_shape_and_is_authenticated(monkeyp
 
     from api import control_ptg_membership as control
 
-    routes = {}
+    routes_by_path = {}
 
     class Blueprint:
         def get(self, path):
             def register(handler):
-                routes[path] = handler
+                routes_by_path[path] = handler
                 return handler
 
             return register
@@ -348,14 +417,50 @@ async def test_readiness_get_has_exact_absent_shape_and_is_authenticated(monkeyp
     monkeypatch.setattr(control, "source_identity", resolve)
     monkeypatch.setattr(control, "locate", AsyncMock(return_value=None))
     control.register_membership_projection_routes(Blueprint())
-    assert set(routes) == {"/ptg/provider-membership-projection"}
-    handler = routes["/ptg/provider-membership-projection"]
-    result = await handler(SimpleNamespace(args=RequestParameters({name: [value] for name, value in PARAMS.items()})))
+    assert set(routes_by_path) == {"/ptg/provider-membership-projection"}
+    handler = routes_by_path["/ptg/provider-membership-projection"]
+    response = await handler(
+        SimpleNamespace(args=RequestParameters({name: [parameter_value] for name, parameter_value in PARAMS.items()}))
+    )
     import json
 
-    assert json.loads(result.body) == dict(PARAMS, contract="ptg_provider_membership_v1", state="absent")
+    assert json.loads(response.body) == dict(PARAMS, contract="ptg_provider_membership_v1", state="absent")
     assert auth.calls == 1
     resolve.assert_awaited_once_with(session, **PARAMS)
     monkeypatch.setattr(control, "locate", AsyncMock(side_effect=PTG2ManifestArtifactError("corrupt attachment")))
     with pytest.raises(PTG2ManifestArtifactError, match="corrupt"):
-        await handler(SimpleNamespace(args=RequestParameters({name: [value] for name, value in PARAMS.items()})))
+        await handler(
+            SimpleNamespace(
+                args=RequestParameters({name: [parameter_value] for name, parameter_value in PARAMS.items()})
+            )
+        )
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "postgres"])
+def test_native_membership_fixture_accepts_disposable_ci_database(monkeypatch, host):
+    """Allow loopback and the CI service only with an isolated database name."""
+    from tests.test_ptg_membership_projection_postgres import _url
+
+    database_name = "hc_ptg_membership_" + "a" * 32
+    monkeypatch.setenv("HLTHPRT_PTG_MEMBERSHIP_TEST_DSN", f"postgresql://synthetic@{host}:5432/{database_name}")
+    url = _url()
+    assert url.host == host
+    assert url.database == database_name
+    assert url.drivername == "postgresql+asyncpg"
+
+
+@pytest.mark.parametrize(
+    "host,port,database_name",
+    [
+        ("remote.example", 5432, "hc_ptg_membership_" + "a" * 32),
+        ("postgres", 6432, "hc_ptg_membership_" + "a" * 32),
+        ("postgres", 5432, "postgres"),
+    ],
+)
+def test_native_membership_fixture_refuses_other_databases(monkeypatch, host, port, database_name):
+    """Keep remote hosts, other ports and shared databases outside the fixture."""
+    from tests.test_ptg_membership_projection_postgres import _url
+
+    monkeypatch.setenv("HLTHPRT_PTG_MEMBERSHIP_TEST_DSN", f"postgresql://synthetic@{host}:{port}/{database_name}")
+    with pytest.raises(pytest.fail.Exception, match="task-owned local PostgreSQL"):
+        _url()

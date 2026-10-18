@@ -5,7 +5,12 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from process.provider_directory_backend_wal_diagnostic import BackendWalDiagnosticResult
-from process.provider_directory_owned_wal_transaction import OwnedWalTransaction
+from process.provider_directory_generic_source_policy import is_source_storage_required
+from process.provider_directory_owned_wal_transaction import (
+    OwnedWalTransaction,
+    OwnedWalTransactionError,
+)
+from process.provider_directory_profile_source_wal import source_owned_wal_transaction
 
 
 def _retain_origin(group_by_field, outcome):
@@ -134,7 +139,15 @@ async def _owned_control_group(fhir, group_by_field):
     """Preserve the real native terminal outcome and original primary failure."""
     outcome = body_failure = None
     try:
-        async with fhir.profile_owned_wal.registry_owned_wal_transaction(fhir.db) as outcome:
+        original_owner = (
+            source_owned_wal_transaction(
+                fhir,
+                isolation="serializable" if group_by_field["identity"][0] == "capacity_admission" else "read committed",
+            )
+            if is_source_storage_required()
+            else fhir.profile_owned_wal.registry_owned_wal_transaction(fhir.db)
+        )
+        async with original_owner as outcome:
             _retain_origin(group_by_field, outcome)
             group_by_field["outcome"] = outcome
             try:
@@ -147,7 +160,13 @@ async def _owned_control_group(fhir, group_by_field):
         outcome = getattr(failure, "outcome", outcome)
         _retain_origin(group_by_field, outcome)
         group_by_field["outcome"] = outcome
-        primary = body_failure if body_failure is not None else failure.__cause__ or failure
+        primary = body_failure if body_failure is not None else failure
+        if isinstance(failure, asyncio.CancelledError):
+            primary = failure
+        elif isinstance(failure, OwnedWalTransactionError) and failure.__cause__ is not None:
+            primary = failure.__cause__
         group_by_field["failure"] = primary
-        raise primary from None
+        if primary is failure:
+            raise
+        raise primary from primary.__cause__
     consume_owned_groups(fhir, outcome, None, groups=[group_by_field])

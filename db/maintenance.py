@@ -98,7 +98,9 @@ def _sync_structure(
             )
 
     checkpoint_schema = ProviderDirectoryPaginationCheckpoint.__table__.schema
-    if checkpoint_schema in managed_schemas:
+    if checkpoint_schema in managed_schemas and getattr(
+        ProviderDirectoryPaginationCheckpoint, "__runtime_schema_sync__", True
+    ):
         ensure_provider_directory_pagination_root_identity(
             sync_conn,
             checkpoint_schema,
@@ -143,9 +145,7 @@ def _compile_column_definition(column, dialect) -> str | None:
 
     if column.computed is not None:
         persisted = " STORED" if column.computed.persisted is not False else ""
-        pieces.append(
-            f"GENERATED ALWAYS AS ({column.computed.sqltext}){persisted}"
-        )
+        pieces.append(f"GENERATED ALWAYS AS ({column.computed.sqltext}){persisted}")
         return " ".join(pieces)
 
     default = None
@@ -183,9 +183,7 @@ def _ensure_indexes(sync_conn, inspector, table, model, results: Dict[str, List[
                     schema=schema or "public",
                     unique=bool(spec.get("unique", False)),
                     postgresql_include=spec.get("include") or (),
-                    postgresql_where=(
-                        text(spec["where"]) if spec.get("where") else None
-                    ),
+                    postgresql_where=(text(spec["where"]) if spec.get("where") else None),
                     postgresql_using=spec.get("using"),
                 )
             continue
@@ -238,9 +236,7 @@ def _build_index_sql(name: str, schema_prefix: str, table_name: str, spec: Dict[
     unique_clause = "UNIQUE " if spec.get("unique") else ""
     where_clause = f" WHERE {spec['where']}" if spec.get("where") else ""
     include_columns = _normalize_index_columns(spec.get("include") or ())
-    include_clause = (
-        f" INCLUDE ({', '.join(include_columns)})" if include_columns else ""
-    )
+    include_clause = f" INCLUDE ({', '.join(include_columns)})" if include_columns else ""
     qualified_table = f'{schema_prefix}"{table_name}"'
     return (
         f"CREATE {unique_clause}INDEX IF NOT EXISTS {name} "
@@ -293,7 +289,4 @@ def render_sync_summary(results: Dict[str, List[str]]) -> None:
     if results["constraints"]:
         click.echo(f"Reconciled constraints: {', '.join(results['constraints'])}")
     if results["skipped_columns"]:
-        click.echo(
-            "Skipped non-nullable columns without defaults: "
-            + ", ".join(results["skipped_columns"])
-        )
+        click.echo("Skipped non-nullable columns without defaults: " + ", ".join(results["skipped_columns"]))

@@ -85,9 +85,7 @@ def _control_layout_by_oid() -> dict[int, object]:
     return {
         11: _control_layout(11, "1" * 64, "a" * 64, 101, "payload"),
         12: _control_layout(12, "2" * 64, "b" * 64, 102, "progress"),
-        13: _control_layout(
-            13, "3" * 64, "c" * 64, 103, "canonical_lease_json"
-        ),
+        13: _control_layout(13, "3" * 64, "c" * 64, 103, "canonical_lease_json"),
         14: _control_layout(14, "4" * 64, "d" * 64, 104, "source_vector_json"),
         15: _control_layout(15, "5" * 64, "e" * 64, 105, "receipt_json"),
     }
@@ -155,19 +153,16 @@ async def test_control_plan_excludes_signed_terminal_zero_probe(
     )
     monkeypatch.setattr(importer, "_schema", lambda: "mrf")
     database_identity, batch_plan, identity, fence = _control_plan_context()
-    plan_input = (
-        await importer._provider_directory_profile_control_wal_plan_input(
-            database_identity,
-            artifact_projection,
-            batch_plan,
-            identity,
-            fence,
-        )
+    plan_input = await importer._provider_directory_profile_control_wal_plan_input(
+        database_identity,
+        artifact_projection,
+        batch_plan,
+        identity,
+        fence,
     )
 
     batch_count_by_artifact = {
-        batch_count.artifact_name: batch_count.batch_count
-        for batch_count in plan_input.artifact_batch_counts
+        batch_count.artifact_name: batch_count.batch_count for batch_count in plan_input.artifact_batch_counts
     }
     assert batch_count_by_artifact["source"] == 2
     assert batch_count_by_artifact["InsurancePlan"] == 1
@@ -179,8 +174,7 @@ async def test_control_plan_excludes_signed_terminal_zero_probe(
     assert toast_counter.await_count == 1
     assert "build_id" in toast_counter.await_args.kwargs["params"]
     assert plan_input.import_run_update.deleted_toast_chunks == math.ceil(
-        capacity.METADATA_PAYLOAD_UPPER_BOUND_BYTES
-        / capacity.POSTGRES_TOAST_MAX_CHUNK_SIZE_BYTES
+        capacity.METADATA_PAYLOAD_UPPER_BOUND_BYTES / capacity.POSTGRES_TOAST_MAX_CHUNK_SIZE_BYTES
     )
 
 
@@ -205,18 +199,11 @@ def _two_source_profile_scope():
         )
         for suffix in ("a", "b")
     )
-    source_vector_pairs = tuple(
-        (dataset.source_id, dataset.dataset_id) for dataset in datasets
-    )
-    context_vector = (
-        importer._provider_directory_profile_source_context_vector(contexts)
-    )
+    source_vector_pairs = tuple((dataset.source_id, dataset.dataset_id) for dataset in datasets)
+    context_vector = importer._provider_directory_profile_source_context_vector(contexts)
     execution = SimpleNamespace(
         attestation=SimpleNamespace(
-            pairs=[
-                {"source_id": source_id, "dataset_id": dataset_id}
-                for source_id, dataset_id in source_vector_pairs
-            ]
+            pairs=[{"source_id": source_id, "dataset_id": dataset_id} for source_id, dataset_id in source_vector_pairs]
         )
     )
     return (
@@ -262,23 +249,17 @@ async def test_profile_resource_scope_materializes_changed_sources_only(
     monkeypatch,
 ):
     """Materialize only a source whose semantic context digest changed."""
-    fence, contexts, source_vector, context_vector, execution = (
-        _two_source_profile_scope()
-    )
+    fence, contexts, source_vector, context_vector, execution = _two_source_profile_scope()
     serving_state = _profile_serving_state(
         source_vector,
         context_vector,
     )
     _patch_profile_scope_resolution(monkeypatch, contexts, serving_state)
-    token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
-        execution
-    )
+    token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(execution)
     try:
-        no_op_fence = (
-            await importer._provider_directory_profile_resource_scope_fence(
-                fence,
-                {"profile"},
-            )
+        no_op_fence = await importer._provider_directory_profile_resource_scope_fence(
+            fence,
+            {"profile"},
         )
         assert no_op_fence.datasets == ()
 
@@ -296,19 +277,13 @@ async def test_profile_resource_scope_materializes_changed_sources_only(
                 )
             ),
         )
-        changed_fence = (
-            await importer._provider_directory_profile_resource_scope_fence(
-                fence,
-                {"profile"},
-            )
+        changed_fence = await importer._provider_directory_profile_resource_scope_fence(
+            fence,
+            {"profile"},
         )
-        assert tuple(
-            dataset.source_id for dataset in changed_fence.datasets
-        ) == ("source-b",)
+        assert tuple(dataset.source_id for dataset in changed_fence.datasets) == ("source-b",)
     finally:
-        importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(
-            token
-        )
+        importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(token)
 
 
 @pytest.mark.asyncio
@@ -319,11 +294,7 @@ async def test_attested_profile_delta_requires_capacity_before_transaction(
 
     transaction = Mock()
     monkeypatch.setattr(importer.db, "transaction", transaction)
-    execution_token = (
-        importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
-            SimpleNamespace()
-        )
-    )
+    execution_token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(SimpleNamespace())
     try:
         with pytest.raises(
             RuntimeError,
@@ -334,9 +305,7 @@ async def test_attested_profile_delta_requires_capacity_before_transaction(
                 profile_delta=SimpleNamespace(schema="mrf"),
             )
     finally:
-        importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(
-            execution_token
-        )
+        importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(execution_token)
     transaction.assert_not_called()
 
 
@@ -383,20 +352,14 @@ def _patch_profile_cutover_retry_dependencies(
         yield
 
     async def lock_dataset_fence(_fence):
-        reservation_counts.append(
-            admission.wal_tracker.accounted_control_operation_counts[
-                "cutover_row_lock"
-            ]
-        )
-        if len(reservation_counts) < (
-            importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS
-        ):
+        reservation_counts.append(admission.wal_tracker.accounted_control_operation_counts["cutover_row_lock"])
+        if len(reservation_counts) < (importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS):
             raise LockNotAvailable("dataset row lock")
 
     _patch_profile_cutover_noops(monkeypatch)
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=False))
-    monkeypatch.setattr(importer.db, "_transaction_binding", lambda: SimpleNamespace())
+    monkeypatch.setattr(importer.db, "_transaction_binding", lambda: SimpleNamespace(borrowed=False))
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_capacity_admission",
@@ -427,9 +390,7 @@ async def _run_profile_cutover_lock_retries(
         monkeypatch,
         admission,
     )
-    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(
-        fence
-    )
+    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
     profile_delta = SimpleNamespace(schema="mrf")
     try:
         await importer._retry_provider_directory_artifact_bundle_promotion(
@@ -438,11 +399,11 @@ async def _run_profile_cutover_lock_retries(
         )
         apply_rows = importer._apply_provider_directory_profile_delta_rows
         apply_rows.assert_awaited_once_with(profile_delta, pending_commit_items=0)
-        importer._finish_provider_directory_profile_delta.assert_awaited_once_with(profile_delta, apply_rows.return_value)
-    finally:
-        importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(
-            fence_token
+        importer._finish_provider_directory_profile_delta.assert_awaited_once_with(
+            profile_delta, apply_rows.return_value
         )
+    finally:
+        importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)
     return reservation_counts
 
 
@@ -452,14 +413,9 @@ async def test_profile_cutover_retry_reserves_every_row_lock_attempt(
 ):
     """Keep all three post-reservation lock attempts inside signed WAL."""
 
-    per_attempt_count = (
-        importer.PROVIDER_DIRECTORY_PROFILE_CUTOVER_FIXED_ROW_LOCK_COUNT
-    )
+    per_attempt_count = importer.PROVIDER_DIRECTORY_PROFILE_CUTOVER_FIXED_ROW_LOCK_COUNT
     plan_input = _control_wal_plan_input(
-        cutover_row_lock_count=(
-            per_attempt_count
-            * importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS
-        )
+        cutover_row_lock_count=(per_attempt_count * importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS)
     )
     geometry, control_projection = _bound_control_wal_projection(plan_input)
     admission = dataclasses.replace(
@@ -474,6 +430,4 @@ async def test_profile_cutover_retry_reserves_every_row_lock_attempt(
         fence,
     )
     assert reservation_counts == [6, 12, 18]
-    assert admission.wal_tracker.accounted_control_operation_counts[
-        "cutover_row_lock"
-    ] == 3 * per_attempt_count
+    assert admission.wal_tracker.accounted_control_operation_counts["cutover_row_lock"] == 3 * per_attempt_count

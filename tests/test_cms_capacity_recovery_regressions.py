@@ -24,6 +24,10 @@ from process import provider_directory_cms_storage_continuation as continuation
 from process import provider_directory_profile_capacity_preflight_contract as preflight
 from process import provider_directory_profile_runtime_observation as runtime
 from process.provider_directory_cms_preparation import NonprofileAdmissionCheck
+from process.provider_directory_generic_candidate import GenericCandidateError
+from process.provider_directory_generic_source_policy import source_transaction
+from process.provider_directory_generic_source_storage import CONTRACT as SOURCE_STORAGE_CONTRACT
+from process.provider_directory_registry_network_metadata import fhir_network_binding_metadata
 from tests.provider_directory_cms_capacity_test_support import (
     cms_guard,
     paired_profile_envelope,
@@ -35,6 +39,7 @@ from tests.test_provider_directory_cms_nonprofile_capacity import _producer
 from tests.test_provider_directory_cms_npd import _observation, _receipt
 from tests.test_provider_directory_cms_serving import _Database
 from tests.test_provider_directory_cms_storage_continuation import _envelope
+from tests.test_provider_directory_generic_source_policy import SyntheticSourceWorkflow, synthetic_source_factory
 from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME, _trust, _verify
 
 fhir = importlib.import_module("process.provider_directory_fhir")
@@ -381,7 +386,7 @@ def _candidate_state(identity):
 
 
 @pytest.fixture
-def npd_case():
+async def npd_case(monkeypatch):
     """Preserve candidate identity while recording importer transport effects."""
     identity = cms.release_identity(_receipt())
     state_dict = _candidate_state(identity)
@@ -433,7 +438,42 @@ def npd_case():
         semantic_projection_as_of=identity["generated_at"],
         source_release=identity,
     )
-    return SimpleNamespace(fhir=importer, state=state_dict, candidate=candidate, identity=identity)
+    async with synthetic_source_factory(monkeypatch, database, schema="synthetic"):
+        yield SimpleNamespace(fhir=importer, state=state_dict, candidate=candidate, identity=identity)
+
+
+@asynccontextmanager
+async def _source_header(case, header):
+    async with source_transaction(case.fhir.db) as connection:
+        connection.fetchrow.side_effect = lambda query, *args: (
+            header if "provider_directory_endpoint_dataset" in query else connection.fetchrow.return_value
+        )
+        yield connection
+
+
+@asynccontextmanager
+async def _completed_source_case(monkeypatch, case, *, completed=True):
+    coordinates = fhir_network_binding_metadata(
+        source_id="cms-npd",
+        dataset_schema="synthetic",
+        dataset_id=case.candidate.dataset_id,
+        producer_id="cms-npd-bulk-fhir-v1",
+        alias_scope="cms-npd",
+    )
+    case.candidate = SimpleNamespace(**vars(case.candidate), network_bindings=coordinates)
+    workflow = SyntheticSourceWorkflow(case.fhir if completed else fhir, case.candidate, case.identity)
+    from process import provider_directory_generic_source_adapters as adapters
+    from process import provider_directory_generic_source_auxiliary as auxiliary
+
+    with monkeypatch.context() as settings:
+        settings.setattr(adapters, "completed_source_scope", workflow.completed)
+        settings.setattr(auxiliary, "seal_identity_candidate", workflow.seal)
+        if completed:
+            async with source_transaction(case.fhir.db, isolation="repeatable read"):
+                async with workflow.completed(case.fhir, case.candidate):
+                    yield workflow
+        else:
+            yield workflow
 
 
 @pytest.mark.parametrize(
@@ -699,22 +739,29 @@ async def test_exact_stale_replay_drains_only_its_failed_resource_batches(npd_ca
         (case.candidate.dataset_id,),
     ]
     case.fhir.db.scalar.return_value = True
-    counts = iter([2, 0])
-
-    async def status(query, **params):
-        assert params["dataset_id"] == case.candidate.dataset_id
-        if "provider_directory_dataset_resource" in query:
-            assert "WHERE ctid IN (SELECT ctid FROM " in query
-            assert query.endswith("WHERE dataset_id=:dataset_id LIMIT :batch_size)")
-            assert params["batch_size"] == recovery.DELETE_BATCH_SIZE
-            return next(counts)
-        assert query.endswith("WHERE dataset_id=:dataset_id")
-        return 1
-
-    case.fhir.db.status.side_effect = status
-    await recovery.dispose_changed_vector(case.fhir, case.candidate, case.identity)
-    assert case.fhir.db.status.await_count == 4
-    assert all(call.args[0].startswith("DELETE") for call in case.fhir.db.status.await_args_list)
+    binding_by_field = {
+        "contract": SOURCE_STORAGE_CONTRACT,
+        "identity": {
+            "dataset_id": case.candidate.dataset_id,
+            "endpoint_id": case.candidate.endpoint_id,
+            "acquisition_root_run_id": case.candidate.acquisition_root_run_id,
+            "metadata": case.state["publication_metadata_json"],
+        },
+        "phase": "disposed",
+        "ordinal": 0,
+        "resets": {},
+        "tables": {},
+        "auxiliary": None,
+        "relationship_sha256": None,
+    }
+    header_by_field = {**case.state, "candidate_storage_json": binding_by_field}
+    async with _source_header(case, header_by_field) as native:
+        await recovery.dispose_changed_vector(case.fhir, case.candidate, case.identity)
+        assert all(
+            call.args[0] in ("SET LOCAL search_path=pg_catalog,pg_temp", 'SET LOCAL ROLE "source_owner"', "RESET ROLE")
+            for call in native.execute.await_args_list
+        )
+    case.fhir.db.status.assert_not_awaited()
     case.fhir.delete_dataset_proof_shards.assert_awaited_once_with(case.fhir.db, "synthetic", case.candidate.dataset_id)
     assert case.state["status"] == fhir.ENDPOINT_DATASET_FAILED and case.fhir.db.binding is None
 
@@ -722,7 +769,7 @@ async def test_exact_stale_replay_drains_only_its_failed_resource_batches(npd_ca
 @pytest.mark.parametrize(
     "fault,reason",
     [
-        ("parent", "cms_npd_stale_cleanup_parent_changed"),
+        ("parent", "provider_directory_generic_source_disposition_changed"),
         ("disposition", "cms_npd_stale_cleanup_parent_changed"),
         ("metadata", "cms_npd_stale_cleanup_identity_changed"),
         ("vector", "cms_npd_stale_cleanup_identity_changed"),
@@ -742,8 +789,14 @@ async def test_pending_cleanup_fails_before_deleting_changed_evidence(npd_case, 
         pending_dict["vector_sha256"] = "f" * 64
     case.fhir.db.first.side_effect = [pending_dict, None if fault == "parent" else (case.candidate.dataset_id,)]
     case.fhir.db.scalar.return_value = fault != "disposition"
-    with pytest.raises(RuntimeError, match=reason):
-        await recovery.resume_pending_cleanup(case.fhir, case.candidate.endpoint_id)
+    async with _source_header(case, None) as native:
+        error_type = GenericCandidateError if fault == "parent" else RuntimeError
+        with pytest.raises(error_type, match=reason):
+            await recovery.resume_pending_cleanup(case.fhir, case.candidate.endpoint_id)
+        assert all(
+            call.args[0] in ("SET LOCAL search_path=pg_catalog,pg_temp", 'SET LOCAL ROLE "source_owner"', "RESET ROLE")
+            for call in native.execute.await_args_list
+        )
     case.fhir.db.status.assert_not_awaited()
     case.fhir.delete_dataset_proof_shards.assert_not_awaited()
     assert case.fhir.db.binding is None
@@ -852,8 +905,17 @@ async def test_logging_rejects_changed_physical_tablespace_after_original_consum
     case = capacity_case
     admission = await _admission(case)
     await _start(admission, case)
-    case.producer.fhir.db.first.side_effect = None
-    case.producer.fhir.db.first.return_value = {"oid": 42, "total_bytes": 100, "persistence": "u"}
+    original_all = case.producer.fhir.db.all.side_effect
+
+    def all_rows(query, **params):
+        if "relation_refs" in params:
+            return [
+                {"relation_ref": relation_ref, "oid": 42, "total_bytes": 100, "persistence": "u"}
+                for relation_ref in params["relation_refs"]
+            ]
+        return original_all(query, **params)
+
+    case.producer.fhir.db.all.side_effect = all_rows
     case.producer.fhir._provider_directory_profile_relation_storage_fingerprint = AsyncMock(
         return_value=SimpleNamespace(relation_oid=42, effective_tablespace_oids=(1664,))
     )
@@ -1105,7 +1167,9 @@ async def test_identity_replay_flushes_complete_bounded_batches_without_losing_r
     monkeypatch.setattr(cms, "_assert_identity_evidence", complete)
     monkeypatch.setattr(cms, "_refresh_identity_statistics", refresh)
     ctx, task = {}, {}
-    await cms._materialize_identity_evidence(case.fhir, tmp_path, case.candidate, case.identity, ctx, task)
+    async with _completed_source_case(monkeypatch, case) as workflow:
+        await cms._materialize_identity_evidence(case.fhir, tmp_path, case.candidate, case.identity, ctx, task)
+        assert "identity.sealed" in workflow.events
     organization_resources = [resources for kind, resources in batches if kind == "Organization"]
     assert [len(resources) for resources in organization_resources] == [2, 1]
     assert [resource["id"] for resources in organization_resources for resource in resources] == [
@@ -1225,7 +1289,7 @@ async def test_plan_identity_sends_unresolved_references_unchanged_to_bulk_valid
 
     @asynccontextmanager
     async def session():
-        async with AsyncSession() as current:
+        async with AsyncSession() as current, current.begin():
             yield current
 
     transaction_states = []
@@ -1269,8 +1333,10 @@ async def test_failed_finalization_cannot_produce_serving_candidate(stage_case, 
     monkeypatch.setattr(cms.relationships, "materialize", AsyncMock())
     prepare = AsyncMock()
     monkeypatch.setattr(coverage, "prepare_cms_candidate_coverage", prepare)
-    with pytest.raises(RuntimeError, match="cms_npd_candidate_validation_failed"):
-        await cms._stage_acquired({}, {}, "run-synthetic", tmp_path, _receipt(), None, case.candidate.endpoint_id)
+    async with _completed_source_case(monkeypatch, case, completed=False):
+        cms._admission_candidate.return_value = case.candidate
+        with pytest.raises(RuntimeError, match="cms_npd_candidate_validation_failed"):
+            await cms._stage_acquired({}, {}, "run-synthetic", tmp_path, _receipt(), None, case.candidate.endpoint_id)
     diagnostics = case.fhir._finalize_endpoint_dataset_candidate.call_args.args[1]
     assert set(diagnostics) == set(cms.RESOURCE_TYPES)
     assert all(row_dict["rows_fetched"] == row_dict["rows_written"] == 1 for row_dict in diagnostics.values())
@@ -1577,14 +1643,17 @@ async def test_publication_rechecks_one_local_owner_after_honest_cutover(capacit
     profile = SimpleNamespace(run_id=owner.run_id, lease=owner.profile_lease)
     owner.resumed_profile = profile
     owner.preparation_wal_end_bytes = 0
-    original_first = case.producer.fhir.db.first.side_effect
+    original_all = case.producer.fhir.db.all.side_effect
 
-    async def first(query, **params):
-        if "relation_ref" in params:
-            return {"oid": 42, "total_bytes": 100, "persistence": "p"}
-        return await original_first(query, **params)
+    def all_rows(query, **params):
+        if "relation_refs" in params:
+            return [
+                {"relation_ref": relation_ref, "oid": 42, "total_bytes": 100, "persistence": "p"}
+                for relation_ref in params["relation_refs"]
+            ]
+        return original_all(query, **params)
 
-    case.producer.fhir.db.first.side_effect = first
+    case.producer.fhir.db.all.side_effect = all_rows
     case.producer.fhir._provider_directory_profile_relation_storage_fingerprint = AsyncMock(
         return_value=SimpleNamespace(relation_oid=42, effective_tablespace_oids=(1663,))
     )

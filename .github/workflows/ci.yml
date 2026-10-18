@@ -69,7 +69,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -133,7 +133,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -156,7 +156,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -193,7 +193,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -307,7 +307,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -366,7 +366,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -398,7 +398,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -450,7 +450,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -497,7 +497,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -535,7 +535,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -592,15 +592,16 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
       with:
         rust: ${{ (matrix.shard == 'core-services' || matrix.shard == 'core-services-2') || matrix.shard == 'core-snapshots'
-          || matrix.shard == 'core-snapshots-2' || matrix.shard == 'core-ptg' || matrix.shard == 'directory-source' || matrix.shard
-          == 'directory-address' || matrix.shard == 'profile-publication' || startsWith(matrix.shard, 'registry-') }}
+          || matrix.shard == 'core-snapshots-2' || matrix.shard == 'core-ptg' || startsWith(matrix.shard, 'directory-source')
+          || matrix.shard == 'directory-address' || matrix.shard == 'profile-publication' || startsWith(matrix.shard, 'registry-')
+          }}
     - name: Install PostgreSQL client
       run: "sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq\nsudo\
         \ apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --yes --no-install-recommends\
@@ -707,6 +708,7 @@ jobs:
       artifact_registry_46: ${{ steps.coverage-output.outputs.artifact_registry_46 }}
       artifact_registry_47: ${{ steps.coverage-output.outputs.artifact_registry_47 }}
       artifact_directory_source: ${{ steps.coverage-output.outputs.artifact_directory_source }}
+      artifact_directory_source_2: ${{ steps.coverage-output.outputs.artifact_directory_source_2 }}
       artifact_directory_storage: ${{ steps.coverage-output.outputs.artifact_directory_storage }}
       artifact_directory_address: ${{ steps.coverage-output.outputs.artifact_directory_address }}
       artifact_profile_storage: ${{ steps.coverage-output.outputs.artifact_profile_storage }}
@@ -883,6 +885,9 @@ jobs:
         - shard: directory-source
           label: Database tests (directory source)
           output: artifact_directory_source
+        - shard: directory-source-2
+          label: Database tests (directory source 2)
+          output: artifact_directory_source_2
         - shard: directory-storage
           label: Database tests (directory storage)
           output: artifact_directory_storage
@@ -930,7 +935,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -983,9 +988,10 @@ jobs:
           }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_42 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_43
           }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_44 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_45
           }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_46 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_47
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_storage
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_address }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_storage
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_publication }}
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source_2
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_storage }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_address
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_storage }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_publication
+          }}
         digest-mismatch: error
         path: ${{ runner.temp }}/healthcare-coverage-staging
         merge-multiple: false
@@ -1055,7 +1061,7 @@ jobs:
       actions: read
       packages: write
     env:
-      CI_REVISION: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+      CI_REVISION: a2fb12e14577b0cdefd78c978a89c71ed82a985d
       PYTHONDONTWRITEBYTECODE: '1'
       IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
       MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
@@ -1064,7 +1070,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -1139,7 +1145,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+        ref: a2fb12e14577b0cdefd78c978a89c71ed82a985d
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -1167,7 +1173,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
+  CI_REVISION: a2fb12e14577b0cdefd78c978a89c71ed82a985d
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'

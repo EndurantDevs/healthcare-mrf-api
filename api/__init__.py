@@ -54,6 +54,7 @@ from api.runtime_identity import add_runtime_identity_headers
 from api.server_timing import register_server_timing
 from api.worker_memory import register_worker_memory_lifecycle
 from db.connection import db
+from process.registry_benefit_plan_runtime import register_registry_benefit_plan_runtime
 from process.registry_ptg_scope_runtime import register_registry_ptg_scope_runtime
 
 profile_capacity_blueprint = Blueprint("profile_capacity_control", url_prefix="/control")
@@ -80,6 +81,7 @@ def init_api(api):
     register_server_timing(api)
     register_batch_response_deadline(api)
     register_registry_ptg_scope_runtime(api)
+    register_registry_benefit_plan_runtime(api)
     db.init_app(api)
     register_worker_memory_lifecycle(api)
     api.register_middleware(_capacity_process_request_guard, "request")

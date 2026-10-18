@@ -1,22 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
-
-import importlib
-
-from pathlib import Path
-
-from types import SimpleNamespace
-
-from unittest.mock import AsyncMock
-
-import os
-
 import datetime
-
+import importlib
+import os
 import uuid
-
 from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -33,9 +25,11 @@ pytest.importorskip("sqlalchemy")
 
 pytest.importorskip("asyncpg")
 
+
 @pytest.fixture
 def npi_module():
     return importlib.import_module("process.npi")
+
 
 def _build_minimal_row(npi: str) -> dict[str, str]:
     npi_row_map: dict[str, str] = {
@@ -76,6 +70,7 @@ def _build_minimal_row(npi: str) -> dict[str, str]:
 
     return npi_row_map
 
+
 def _fake_make_class_factory(schema: str = "mrf"):
     def _factory(base_cls, suffix):
         table_name = f"{base_cls.__tablename__}_{suffix}"
@@ -91,6 +86,7 @@ def _fake_make_class_factory(schema: str = "mrf"):
 
     return _factory
 
+
 def test_index_requires_postgis_matches_geo_idx_and_expressions(npi_module):
     assert npi_module._index_requires_postgis(
         {
@@ -105,9 +101,7 @@ def test_index_requires_postgis_matches_geo_idx_and_expressions(npi_module):
 def test_npi_search_taxonomy_projection_has_one_canonical_gin_index(npi_module):
     model = npi_module.NPIData
     projection_index = next(
-        index
-        for index in model.__my_additional_indexes__
-        if index.get("name") == "search_taxonomy_codes"
+        index for index in model.__my_additional_indexes__ if index.get("name") == "search_taxonomy_codes"
     )
 
     assert projection_index == {
@@ -116,6 +110,7 @@ def test_npi_search_taxonomy_projection_has_one_canonical_gin_index(npi_module):
         "name": "search_taxonomy_codes",
     }
     assert model.__table__.c.search_taxonomy_codes.nullable is False
+
 
 def test_npi_requires_nucc_defaults_to_full_imports_only(monkeypatch, npi_module):
     monkeypatch.delenv("HLTHPRT_NPI_REQUIRE_NUCC", raising=False)
@@ -129,6 +124,7 @@ def test_npi_requires_nucc_defaults_to_full_imports_only(monkeypatch, npi_module
 
     monkeypatch.setenv("HLTHPRT_NPI_REQUIRE_NUCC_IN_TEST", "1")
     assert npi_module._npi_requires_nucc({"test_mode": True}) is True
+
 
 @pytest.mark.parametrize(
     ("raw_value", "expected"),
@@ -145,6 +141,7 @@ def test_npi_positive_integer_configuration_is_fail_safe(
     monkeypatch.setenv("HLTHPRT_NPI_TEST_LIMIT", raw_value)
     assert npi_module._env_positive_int("HLTHPRT_NPI_TEST_LIMIT", 3) == expected
 
+
 def test_npi_archived_identifier_stays_inside_postgres_limit(npi_module):
     """Long archive names are deterministic and remain valid PostgreSQL identifiers."""
 
@@ -152,6 +149,7 @@ def test_npi_archived_identifier_stays_inside_postgres_limit(npi_module):
     archived_name = npi_module._archived_identifier("npi_" + "x" * 80)
     assert len(archived_name) == npi_module.POSTGRES_IDENTIFIER_MAX_LENGTH
     assert archived_name.endswith("_old")
+
 
 @pytest.mark.asyncio
 async def test_assert_nucc_ready_rejects_missing_table(monkeypatch, npi_module):
@@ -162,6 +160,7 @@ async def test_assert_nucc_ready_rejects_missing_table(monkeypatch, npi_module):
 
     with pytest.raises(npi_module.NPIPrerequisiteError, match="nucc_taxonomy"):
         await npi_module._assert_nucc_ready("mrf")
+
 
 @pytest.mark.asyncio
 async def test_assert_nucc_ready_rejects_empty_or_unusable_taxonomy(monkeypatch, npi_module):
@@ -175,6 +174,7 @@ async def test_assert_nucc_ready_rejects_empty_or_unusable_taxonomy(monkeypatch,
     with pytest.raises(npi_module.NPIPrerequisiteError, match="pharmacist_rows=0"):
         await npi_module._assert_nucc_ready("mrf")
 
+
 @pytest.mark.asyncio
 async def test_assert_nucc_ready_accepts_populated_taxonomy(monkeypatch, npi_module):
     values = iter(["mrf.nucc_taxonomy", 883, 18])
@@ -185,6 +185,7 @@ async def test_assert_nucc_ready_accepts_populated_taxonomy(monkeypatch, npi_mod
     monkeypatch.setattr(npi_module.db, "scalar", fake_scalar)
 
     await npi_module._assert_nucc_ready("mrf")
+
 
 @pytest.mark.asyncio
 async def test_assert_nppes_canonical_ready_rejects_missing_sql_function(monkeypatch, npi_module):
@@ -197,6 +198,7 @@ async def test_assert_nppes_canonical_ready_rejects_missing_sql_function(monkeyp
 
     with pytest.raises(npi_module.NPIPrerequisiteError, match="addr_key_v1"):
         await npi_module._assert_nppes_canonical_ready("mrf")
+
 
 @pytest.mark.asyncio
 async def test_assert_nppes_canonical_ready_validates_each_archive_prerequisite(
@@ -222,6 +224,7 @@ async def test_assert_nppes_canonical_ready_validates_each_archive_prerequisite(
 
     scalar.side_effect = ["addr_key_v1", "address_archive_v2", True]
     await npi_module._assert_nppes_canonical_ready("mrf")
+
 
 def test_npi_address_and_contact_helpers_preserve_empty_and_canonical_shapes(
     monkeypatch,
@@ -250,6 +253,7 @@ def test_npi_address_and_contact_helpers_preserve_empty_and_canonical_shapes(
     )
     assert attached["address_key"] == expected_key
 
+
 @pytest.mark.asyncio
 async def test_npi_taxonomy_code_map_requires_a_table_and_filters_bad_rows(
     monkeypatch,
@@ -271,9 +275,8 @@ async def test_npi_taxonomy_code_map_requires_a_table_and_filters_bad_rows(
         (None, 42),
         ("207R00000X", None),
     ]
-    assert await npi_module._load_nucc_taxonomy_int_code_map("mrf") == {
-        "207Q00000X": 41
-    }
+    assert await npi_module._load_nucc_taxonomy_int_code_map("mrf") == {"207Q00000X": 41}
+
 
 def test_npi_taxonomy_array_is_distinct_sorted_and_fail_safe(npi_module):
     """Address taxonomy arrays retain known distinct integers or the zero sentinel."""
@@ -289,11 +292,9 @@ def test_npi_taxonomy_array_is_distinct_sorted_and_fail_safe(npi_module):
     assert npi_module._taxonomy_array_from_npi_row(npi_row_map, {"A": 1, "B": 2}) == [1, 2]
     assert npi_module._taxonomy_array_from_npi_row(npi_row_map, {"C": 3}) == [0]
     assert npi_module._taxonomy_array_from_npi_row(npi_row_map, None) == [0]
-    full_npi_row_map = {
-        f"Healthcare Provider Taxonomy Code_{index}": "A"
-        for index in range(1, 16)
-    }
+    full_npi_row_map = {f"Healthcare Provider Taxonomy Code_{index}": "A" for index in range(1, 16)}
     assert npi_module._taxonomy_array_from_npi_row(full_npi_row_map, {"A": 1}) == [1]
+
 
 @pytest.mark.asyncio
 async def test_rebuild_phone_staffing_skips_missing_target(monkeypatch, npi_module):
@@ -313,6 +314,7 @@ async def test_rebuild_phone_staffing_skips_missing_target(monkeypatch, npi_modu
 
     status_mock.assert_not_awaited()
 
+
 @pytest.mark.asyncio
 async def test_rebuild_phone_staffing_rejects_missing_nucc(monkeypatch, npi_module):
     values = iter(["mrf.npi_phone_staffing_20260603", "mrf.npi_address_20260603", None])
@@ -329,6 +331,7 @@ async def test_rebuild_phone_staffing_rejects_missing_nucc(monkeypatch, npi_modu
             address_table="npi_address_20260603",
             schema="mrf",
         )
+
 
 @pytest.mark.asyncio
 async def test_rebuild_phone_staffing_rejects_missing_address_or_pharmacist_rows(
@@ -364,6 +367,7 @@ async def test_rebuild_phone_staffing_rejects_missing_address_or_pharmacist_rows
         )
 
     status.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 async def test_process_data_rejects_missing_nucc_before_download(monkeypatch, npi_module):
@@ -401,35 +405,83 @@ async def test_process_data_rejects_missing_nucc_before_download(monkeypatch, np
     release_lease.assert_awaited_once()
     download_mock.assert_not_awaited()
 
+
 def test_nppes_listing_regex_is_v2_only(npi_module):
     html = """
     <a href="NPPES_Data_Dissemination_March_2026.zip">legacy</a>
     <a href="NPPES_Data_Dissemination_20260301_20260331_V2.zip">current</a>
     """
-    matches = npi_module.re.findall(r'(NPPES_Data_Dissemination.*_V2.zip)', html)
+    matches = npi_module.re.findall(r"(NPPES_Data_Dissemination.*_V2.zip)", html)
     assert matches == ["NPPES_Data_Dissemination_20260301_20260331_V2.zip"]
+
 
 class _ShutdownRawConnection:
     def __init__(self, count_by_stage: dict[str, int]):
         self.count_by_stage = count_by_stage
         self.events: list[str] = []
+        self._transaction_depth = 0
+        names = set(count_by_stage) | {stage.rsplit("_", 1)[0] for stage in count_by_stage}
+        self.read_relation_oids = {name: 101 + ordinal for ordinal, name in enumerate(sorted(names))}
+        self.read_relation_overrides = {}
+        self.read_grants = [
+            dict(
+                column_name=None,
+                rolname="reader",
+                grantee=17,
+                grantor=19,
+                privilege_type="SELECT",
+                is_grantable=False,
+            )
+        ]
+
+    def is_in_transaction(self):
+        return self._transaction_depth > 0
 
     @asynccontextmanager
     async def transaction(self):
         self.events.append("transaction:begin")
+        self._transaction_depth += 1
         try:
             yield self
         except BaseException:
             self.events.append("transaction:rollback")
             raise
-        self.events.append("transaction:commit")
+        else:
+            self.events.append("transaction:commit")
+        finally:
+            self._transaction_depth -= 1
 
     async def execute(self, statement: object, *_args):
         self.events.append(str(statement))
         return "OK"
 
-    async def fetch(self, statement: object, _schema, names):
+    async def fetch(self, statement: object, *args):
+        from process.native_publication_read_access import _READS_SQL, _RELATIONS_SQL
+
         self.events.append(str(statement))
+        if statement == _READS_SQL:
+            assert len(args) == 1 and args[0] in self.read_relation_oids.values()
+            return [dict(grant) for grant in self.read_grants]
+        if statement == _RELATIONS_SQL:
+            schema, names = args
+            assert schema == "testschema"
+            return [
+                {
+                    **dict(
+                        name=name,
+                        oid=self.read_relation_oids.get(name),
+                        relowner=19,
+                        owned=True,
+                        relkind="r",
+                        relpersistence="p",
+                        relrowsecurity=False,
+                        relforcerowsecurity=False,
+                    ),
+                    **self.read_relation_overrides.get(name, {}),
+                }
+                for name in sorted(names)
+            ]
+        _schema, names = args
         return [{"name": name} for name in names if not name.endswith("_old")]
 
     async def fetchval(self, statement: object, *_args):
@@ -438,12 +490,9 @@ class _ShutdownRawConnection:
         if "search_taxonomy_codes" in statement_text and "FULL OUTER JOIN" in statement_text:
             return False
         if "count(*)::bigint" in statement_text:
-            return next(
-                count
-                for stage_name, count in self.count_by_stage.items()
-                if stage_name in statement_text
-            )
+            return next(count for stage_name, count in self.count_by_stage.items() if stage_name in statement_text)
         return 1
+
 
 class _AmbiguousPublicationConnection:
     @asynccontextmanager
@@ -451,11 +500,13 @@ class _AmbiguousPublicationConnection:
         yield self
         raise RuntimeError("synthetic ambiguous commit")
 
+
 def _shutdown_stage_classes(npi_module):
     return tuple(
         SimpleNamespace(__main_table__=table_name, __tablename__=table_name)
         for table_name in npi_module.NPI_CANONICAL_TABLES
     )
+
 
 def _install_shutdown_success_collaborators(monkeypatch, npi_module, raw_connection):
     monkeypatch.setenv("DB_SCHEMA", "testschema")
@@ -465,7 +516,9 @@ def _install_shutdown_success_collaborators(monkeypatch, npi_module, raw_connect
     monkeypatch.setattr(npi_module, "source_enabled", lambda _source: False)
     monkeypatch.setattr(npi_module, "_npi_requires_nucc", lambda _context: False)
     monkeypatch.setattr(npi_module, "_nppes_evidence_runtime_config", lambda _context: SimpleNamespace(required=True))
-    monkeypatch.setattr(npi_module, "_required_nppes_evidence_receipt", lambda _context: SimpleNamespace(chain_ref="penpc1_" + "a" * 43))
+    monkeypatch.setattr(
+        npi_module, "_required_nppes_evidence_receipt", lambda _context: SimpleNamespace(chain_ref="penpc1_" + "a" * 43)
+    )
     monkeypatch.setattr(npi_module, "_nppes_evidence_metrics", lambda _receipt: {"status": "complete"})
     monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
     monkeypatch.setattr(npi_module, "_assert_npi_import_lease", AsyncMock())
@@ -476,7 +529,9 @@ def _install_shutdown_success_collaborators(monkeypatch, npi_module, raw_connect
     publication_receipt = SimpleNamespace(publication_ref="nppub1_" + "b" * 43)
     monkeypatch.setattr(npi_module, "insert_npi_publication_receipt", AsyncMock(return_value=publication_receipt))
     monkeypatch.setattr(npi_module, "publish_local_npi_result_generation", AsyncMock())
-    monkeypatch.setattr(npi_module, "npi_publication_metrics", lambda receipt: {"publication_ref": receipt.publication_ref})
+    monkeypatch.setattr(
+        npi_module, "npi_publication_metrics", lambda receipt: {"publication_ref": receipt.publication_ref}
+    )
     publication_commit = npi_module.NpiCanonicalPublicationCommit(
         publication_receipt,
         "2026-08-09T02:03:04.000000+00:00",

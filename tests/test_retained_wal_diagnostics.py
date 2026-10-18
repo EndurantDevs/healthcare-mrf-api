@@ -1,14 +1,18 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Pure closed diagnostics and original native-failure annotation regressions."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 
 import pytest
 
 from tests.retained_wal_diagnostics import (
+    MAX_INSPECTION_BYTES,
     RetainedWalDiagnostic,
+    _closed_attribution,
     retained_bound_operands,
+    retained_wal_attribution,
 )
 
 
@@ -134,7 +138,7 @@ def _install_bound_probe(monkeypatch, wrapped):
         return (SimpleNamespace(total_bytes=1),)
 
     prepared = SimpleNamespace(
-        nonprofile_admission=SimpleNamespace(measure=measure),
+        nonprofile_admission=SimpleNamespace(measure=measure, _relations={}),
         fhir=object(),
         address=SimpleNamespace(db_schema="synthetic"),
     )
@@ -172,9 +176,18 @@ def _install_bound_probe(monkeypatch, wrapped):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("wrapped", [False, True])
-async def test_actual_bound_failure_keeps_exception_and_notes_through_fhir_wrapper(monkeypatch, wrapped):
+@pytest.mark.parametrize("diagnostic_error", [None, RuntimeError, asyncio.CancelledError])
+async def test_actual_bound_failure_keeps_exception_and_notes_through_fhir_wrapper(
+    monkeypatch, wrapped, diagnostic_error
+):
     """The final reservation and intermediate admission retain their original failure identity."""
     native, prepared, request, connection = _install_bound_probe(monkeypatch, wrapped)
+    if diagnostic_error is not None:
+
+        async def unavailable(*_args):
+            raise diagnostic_error("synthetic diagnostic failure")
+
+        monkeypatch.setattr(native, "retained_wal_attribution", unavailable)
     expected = native.epoch_capture.FHIRSourceEpochError if wrapped else ValueError
     with pytest.raises(expected) as captured:
         await native._prepare_observed(prepared, None, request, ("synthetic", "synthetic"), None, monkeypatch)
@@ -200,6 +213,40 @@ async def test_actual_bound_failure_keeps_exception_and_notes_through_fhir_wrapp
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "start,size",
+    [("private", 1), ("0/100", True), ("0/100", 0), ("0/100", MAX_INSPECTION_BYTES + 1), ("FFFFFFFF/FFFFFFFF", 1)],
+)
+async def test_attribution_refuses_unsafe_interval_before_connection_use(start, size):
+    assert await retained_wal_attribution(object(), start, size) is None
+
+
+def test_attribution_contains_only_closed_aggregate_metadata():
+    records = [{"kind": "Heap/INSERT", "records": 2, "record_bytes": 100, "fpi_bytes": 8000, "total_bytes": 8100}]
+    blocks = [
+        {
+            "reltablespace": 1663,
+            "reldatabase": 16384,
+            "relfilenode": 16400,
+            "relforknumber": 0,
+            "block_references": 2,
+            "block_data_bytes": 10,
+            "fpi_bytes": 8000,
+            "relation_groups": 1,
+        }
+    ]
+    document = _closed_attribution(records, blocks)
+    assert document["record_types"] == records and document["top_physical_relations"] == blocks
+    assert document["accounting_authority"] is False
+    with pytest.raises(ValueError):
+        _closed_attribution([{**records[0], "description": "synthetic private record"}], blocks)
+    with pytest.raises(ValueError):
+        _closed_attribution(records, [{**blocks[0], "fpi_bytes": True}])
+    with pytest.raises(ValueError):
+        _closed_attribution(records * 257, blocks)
 
 
 def test_original_bound_operands_survive_a_cyclic_wrapper_cause():

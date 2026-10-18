@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import asdict
 from datetime import date
 from types import SimpleNamespace
@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from process import provider_directory_generic_source_adapters as source_adapters
+from process import provider_directory_generic_source_policy as source_policy
 from process import uhc_flex_practitioner_publication as publication
 from process import uhc_flex_practitioner_publication_store as store
 from process.provider_directory_dataset_scoped_publication import (
@@ -55,9 +57,7 @@ async def test_readiness_rows_and_loaders_are_bounded() -> None:
     assert "dataset_ready" in sql
     assert "candidate.error_count AS retry_exhausted_count" in sql
 
-    database = SimpleNamespace(
-        first=AsyncMock(side_effect=[None, _readiness_row(), None, _readiness_row()])
-    )
+    database = SimpleNamespace(first=AsyncMock(side_effect=[None, _readiness_row(), None, _readiness_row()]))
     assert (
         await store.load_dataset_readiness(
             readiness.dataset_id,
@@ -72,26 +72,18 @@ async def test_readiness_rows_and_loaders_are_bounded() -> None:
         )
     ).dataset_id == readiness.dataset_id
     assert await store.load_current_readiness(database=database) is None
-    assert (
-        await store.load_current_readiness(database=database)
-    ).dataset_id == readiness.dataset_id
+    assert (await store.load_current_readiness(database=database)).dataset_id == readiness.dataset_id
 
 
 @pytest.mark.asyncio
 async def test_existing_and_orphan_parent_locks_fail_closed() -> None:
     identity, _admitted = _identity_and_admission()
-    database = SimpleNamespace(
-        first=AsyncMock(return_value={"dataset_id": identity.dataset_id})
-    )
-    assert await store._locked_existing_dataset(database, identity) == {
-        "dataset_id": identity.dataset_id
-    }
+    database = SimpleNamespace(first=AsyncMock(return_value={"dataset_id": identity.dataset_id}))
+    assert await store._locked_existing_dataset(database, identity) == {"dataset_id": identity.dataset_id}
 
     for parent_count, expected_code in ((2, "state"), (1, "source_drift")):
         count_database = SimpleNamespace(scalar=AsyncMock(return_value=parent_count))
-        with pytest.raises(
-            publication.UHCFlexPractitionerPublicationError
-        ) as error_info:
+        with pytest.raises(publication.UHCFlexPractitionerPublicationError) as error_info:
             await store._assert_no_orphan_parent(count_database, identity)
         assert error_info.value.code == expected_code
     await store._assert_no_orphan_parent(
@@ -119,9 +111,7 @@ async def test_current_lock_rejects_orphan_dedicated_header(monkeypatch) -> None
         require_ready=False,
     )
 
-    current_loader.side_effect = ProviderDirectoryDatasetScopedPublicationError(
-        "both_current"
-    )
+    current_loader.side_effect = ProviderDirectoryDatasetScopedPublicationError("both_current")
     with pytest.raises(
         publication.UHCFlexPractitionerPublicationError,
         match="state is invalid",
@@ -137,9 +127,7 @@ async def test_current_lock_rejects_foreign_and_returns_ready_parent(
     monkeypatch,
 ) -> None:
     identity, _admitted = _identity_and_admission()
-    current_loader = AsyncMock(
-        side_effect=ProviderDirectoryDatasetScopedPublicationError("foreign_current")
-    )
+    current_loader = AsyncMock(side_effect=ProviderDirectoryDatasetScopedPublicationError("foreign_current"))
     monkeypatch.setattr(store, "lock_exact_current_dataset", current_loader)
     with pytest.raises(
         publication.UHCFlexPractitionerPublicationError,
@@ -212,9 +200,7 @@ async def test_header_inserts_require_one_row_and_compose_metadata(
     )
     assert '"cohort_complete":false' in parent_insert.await_args.args[4]
     assert '"retry_exhausted_count":1' in parent_insert.await_args.args[4]
-    dedicated_insert.assert_awaited_once_with(
-        database, identity, admission, "pdufpd_" + "8" * 48, 1
-    )
+    dedicated_insert.assert_awaited_once_with(database, identity, admission, "pdufpd_" + "8" * 48, 1)
 
 
 @pytest.mark.asyncio
@@ -222,9 +208,7 @@ async def test_supersede_and_publish_require_exact_atomic_updates(
     monkeypatch,
 ) -> None:
     previous = _legacy_current()
-    superseder = AsyncMock(
-        side_effect=ProviderDirectoryDatasetScopedPublicationError("foreign_current")
-    )
+    superseder = AsyncMock(side_effect=ProviderDirectoryDatasetScopedPublicationError("foreign_current"))
     monkeypatch.setattr(store, "supersede_exact_current_dataset", superseder)
     with pytest.raises(
         publication.UHCFlexPractitionerPublicationError,
@@ -352,41 +336,69 @@ async def _transaction():
     yield
 
 
+def _publication_unit_boundaries(monkeypatch, database, admission_lock, admitted_publisher):
+    """Record the unit transaction boundary without issuing Source capabilities."""
+    events = []
+
+    @asynccontextmanager
+    async def source_transaction(original, *, isolation):
+        assert original is database and isolation == "repeatable read"
+        assert events == []
+        events.append("begin")
+        try:
+            yield
+        except BaseException:
+            events.append("rollback")
+            raise
+        else:
+            events.append("commit")
+
+    @asynccontextmanager
+    async def source_owner_transaction(original):
+        assert original is database and events == ["begin"]
+        admission_lock.assert_not_awaited()
+        admitted_publisher.assert_not_awaited()
+        events.append("owner")
+        try:
+            yield
+        finally:
+            assert admission_lock.await_count == 1
+            assert admitted_publisher.await_count == (0 if admission_lock.side_effect else 1)
+            events.append("owner_exit")
+
+    guard = Mock(return_value=None)
+    monkeypatch.setattr(source_adapters, "require_source_transaction", guard)
+    monkeypatch.setattr(source_policy, "source_transaction", source_transaction)
+    monkeypatch.setattr(source_policy, "source_owner_transaction", source_owner_transaction)
+    return events, guard
+
+
 @pytest.mark.asyncio
-async def test_public_store_wraps_lock_and_publication_in_one_transaction(
-    monkeypatch,
-) -> None:
+@pytest.mark.parametrize("failure", [None, "lock", "publication"])
+async def test_public_store_wraps_lock_and_publication_in_one_transaction(monkeypatch, failure) -> None:
     identity, admission = _identity_and_admission()
     readiness = _readiness()
-    expected = publication.UHCFlexPractitionerPublicationResult(
-        readiness,
-        replayed=False,
-    )
-    admission_lock = AsyncMock(return_value=(admission, 0))
-    admitted_publisher = AsyncMock(return_value=expected)
+    expected = publication.UHCFlexPractitionerPublicationResult(readiness, replayed=False)
+    error = RuntimeError("publication refused")
+    admission_lock = AsyncMock(return_value=(admission, 0), side_effect=error if failure == "lock" else None)
+    admitted_publisher = AsyncMock(return_value=expected, side_effect=error if failure == "publication" else None)
     monkeypatch.setattr(store, "_lock_admission", admission_lock)
-    monkeypatch.setattr(
-        store,
-        "_publish_admitted_dataset",
-        admitted_publisher,
-    )
+    monkeypatch.setattr(store, "_publish_admitted_dataset", admitted_publisher)
+    admission_reader = AsyncMock(return_value=admission)
+    monkeypatch.setattr(store, "_read_admission", admission_reader)
     database = SimpleNamespace(transaction=lambda: _transaction())
-    publication_result = await store.publish_registered_uhc_flex_dataset(
-        admission.candidate_acquisition_id,
-        identity.endpoint_id,
-        11,
-        database=database,
-    )
-    assert publication_result is expected
-    admission_lock.assert_awaited_once_with(
-        database,
-        admission.candidate_acquisition_id,
-        identity.endpoint_id,
-    )
-    admitted_publisher.assert_awaited_once_with(
-        database,
-        admission,
-        identity.endpoint_id,
-        11,
-        0,
-    )
+    events, guard = _publication_unit_boundaries(monkeypatch, database, admission_lock, admitted_publisher)
+    with pytest.raises(RuntimeError, match="publication refused") if failure else nullcontext():
+        publication_result = await store.publish_registered_uhc_flex_dataset(
+            admission.candidate_acquisition_id, identity.endpoint_id, 11, database=database
+        )
+    if failure is None:
+        assert publication_result is expected
+    guard.assert_called_once_with(repeatable_read=True)
+    admission_reader.assert_awaited_once_with(database, admission.candidate_acquisition_id)
+    admission_lock.assert_awaited_once_with(database, admission.candidate_acquisition_id, identity.endpoint_id)
+    if failure == "lock":
+        admitted_publisher.assert_not_awaited()
+    else:
+        admitted_publisher.assert_awaited_once_with(database, admission, identity.endpoint_id, 11, 0)
+    assert events == ["begin", "owner", "owner_exit", "rollback" if failure else "commit"]

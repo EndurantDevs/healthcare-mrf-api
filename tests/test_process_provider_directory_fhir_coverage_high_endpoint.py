@@ -17,7 +17,6 @@ from tests.test_provider_directory_dataset_selection_receipt_db import (
     _receipt_candidate_and_proof,
 )
 
-
 V2_HASH_CONTRACT = importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
 
 
@@ -75,9 +74,7 @@ def test_twin_root_and_terminal_proof_guards_reject_mismatches(monkeypatch):
         Mock(return_value={"endpoint_id": "wrong-endpoint"}),
     )
     with pytest.raises(RuntimeError, match="verification_baseline_invalid"):
-        importer._twin_root_baseline_proof(
-            {"publication_metadata_json": baseline_metadata_map}
-        )
+        importer._twin_root_baseline_proof({"publication_metadata_json": baseline_metadata_map})
 
     matched_metadata_map = {
         importer.TWIN_ROOT_VERIFICATION_METADATA_KEY: {
@@ -88,9 +85,7 @@ def test_twin_root_and_terminal_proof_guards_reject_mismatches(monkeypatch):
         importer.TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY: "baseline-1",
     }
     with pytest.raises(RuntimeError, match="verification_match_invalid"):
-        importer._assert_matched_twin_root_dataset_proof(
-            {"publication_metadata_json": matched_metadata_map}
-        )
+        importer._assert_matched_twin_root_dataset_proof({"publication_metadata_json": matched_metadata_map})
 
     monkeypatch.setattr(
         importer,
@@ -100,11 +95,7 @@ def test_twin_root_and_terminal_proof_guards_reject_mismatches(monkeypatch):
     with pytest.raises(RuntimeError, match="baseline_incompatible"):
         importer._assert_compatible_twin_root_baseline(
             endpoint_dataset_candidate(resource_hash_contract=V2_HASH_CONTRACT),
-            {
-                "publication_metadata_json": {
-                    importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: V2_HASH_CONTRACT
-                }
-            },
+            {"publication_metadata_json": {importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: V2_HASH_CONTRACT}},
         )
 
     with pytest.raises(RuntimeError, match="verification_mismatch_invalid"):
@@ -166,80 +157,89 @@ async def test_resumable_candidate_rejects_unproven_lineage(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pagination_adoption_rejects_unproven_lineage(monkeypatch):
-    checkpoint_map = {"owner_run_id": "run-old"}
-    with pytest.raises(RuntimeError, match="checkpoint_lineage_mismatch"):
-        await importer._adopt_pagination_checkpoint_owner(
-            pagination_checkpoint_context(
-                retry_of_run_id="different-run",
-                lineage_verified=False,
-            ),
-            "Practitioner",
-            "run-old",
-            checkpoint_map,
-            "start-hash",
-        )
+    from tests.test_provider_directory_generic_source_policy import synthetic_checkpoint_factory
 
-    monkeypatch.setattr(
-        importer,
-        "_compatible_pagination_resume_state",
-        Mock(return_value=None),
-    )
-    with pytest.raises(RuntimeError, match="checkpoint_lineage_mismatch"):
-        await importer._adopt_pagination_checkpoint_owner(
-            pagination_checkpoint_context(),
-            "Practitioner",
-            "run-old",
-            checkpoint_map,
-            "start-hash",
+    async with synthetic_checkpoint_factory(monkeypatch, importer.db, schema=importer._schema()):
+        checkpoint_map = {"owner_run_id": "run-old"}
+        with pytest.raises(RuntimeError, match="checkpoint_lineage_mismatch"):
+            await importer._adopt_pagination_checkpoint_owner(
+                pagination_checkpoint_context(
+                    retry_of_run_id="different-run",
+                    lineage_verified=False,
+                ),
+                "Practitioner",
+                "run-old",
+                checkpoint_map,
+                "start-hash",
+            )
+
+        monkeypatch.setattr(
+            importer,
+            "_compatible_pagination_resume_state",
+            Mock(return_value=None),
         )
+        with pytest.raises(RuntimeError, match="checkpoint_lineage_mismatch"):
+            await importer._adopt_pagination_checkpoint_owner(
+                pagination_checkpoint_context(),
+                "Practitioner",
+                "run-old",
+                checkpoint_map,
+                "start-hash",
+            )
 
 
 @pytest.mark.asyncio
 async def test_pagination_checkpoint_write_fences(monkeypatch):
-    monkeypatch.setattr(
-        importer.db,
-        "status",
-        AsyncMock(side_effect=["UPDATE 1", "UPDATE 0"]),
-    )
-    checkpoint_context = pagination_checkpoint_context()
-    await importer._save_pagination_checkpoint(
-        checkpoint_context,
-        "Practitioner",
-        next_url=None,
-        pages_processed=2,
-        rows_processed=3,
-        recent_url_hashes=["one", "two"],
-    )
-    with pytest.raises(RuntimeError, match="checkpoint_ownership_lost"):
+    from tests.test_provider_directory_generic_source_policy import synthetic_checkpoint_factory
+
+    async with synthetic_checkpoint_factory(monkeypatch, importer.db, schema=importer._schema()):
+        monkeypatch.setattr(
+            importer.db,
+            "status",
+            AsyncMock(side_effect=["UPDATE 1", "UPDATE 0"]),
+        )
+        checkpoint_context = pagination_checkpoint_context()
         await importer._save_pagination_checkpoint(
             checkpoint_context,
             "Practitioner",
-            next_url="https://example.test/next",
+            next_url=None,
             pages_processed=2,
             rows_processed=3,
-            recent_url_hashes=[],
+            recent_url_hashes=["one", "two"],
         )
+        with pytest.raises(RuntimeError, match="checkpoint_ownership_lost"):
+            await importer._save_pagination_checkpoint(
+                checkpoint_context,
+                "Practitioner",
+                next_url="https://example.test/next",
+                pages_processed=2,
+                rows_processed=3,
+                recent_url_hashes=[],
+            )
 
 
 @pytest.mark.asyncio
 async def test_pagination_completeness_write_fences(monkeypatch):
-    monkeypatch.setattr(
-        importer.db,
-        "status",
-        AsyncMock(side_effect=["UPDATE 1", "UPDATE 0"]),
-    )
-    checkpoint_context = pagination_checkpoint_context()
-    await importer._save_pagination_checkpoint_completeness(
-        checkpoint_context,
-        "Practitioner",
-        {"verified": True},
-    )
-    with pytest.raises(RuntimeError, match="checkpoint_ownership_lost"):
+    from tests.test_provider_directory_generic_source_policy import synthetic_checkpoint_factory
+
+    async with synthetic_checkpoint_factory(monkeypatch, importer.db, schema=importer._schema()):
+        monkeypatch.setattr(
+            importer.db,
+            "status",
+            AsyncMock(side_effect=["UPDATE 1", "UPDATE 0"]),
+        )
+        checkpoint_context = pagination_checkpoint_context()
         await importer._save_pagination_checkpoint_completeness(
             checkpoint_context,
             "Practitioner",
-            {"verified": False},
+            {"verified": True},
         )
+        with pytest.raises(RuntimeError, match="checkpoint_ownership_lost"):
+            await importer._save_pagination_checkpoint_completeness(
+                checkpoint_context,
+                "Practitioner",
+                {"verified": False},
+            )
 
 
 def test_serving_relation_and_projection_proof_guards():
@@ -309,11 +309,7 @@ async def test_dataset_content_and_twin_admission_guards(monkeypatch):
     monkeypatch.setattr(
         importer,
         "_candidate_with_locked_twin_root_admission",
-        Mock(
-            return_value=endpoint_dataset_candidate(
-                resource_hash_contract=V2_HASH_CONTRACT
-            )
-        ),
+        Mock(return_value=endpoint_dataset_candidate(resource_hash_contract=V2_HASH_CONTRACT)),
     )
     with pytest.raises(RuntimeError, match="verification_admission_missing"):
         await importer._locked_twin_root_verification_decision(
@@ -337,9 +333,7 @@ async def test_dataset_content_and_twin_admission_guards(monkeypatch):
 @pytest.mark.asyncio
 async def test_dataset_storage_rejects_invalid_admission_seal():
     connection = SimpleNamespace(status=AsyncMock(return_value="UPDATE 0"))
-    metadata_by_field = {
-        importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: []
-    }
+    metadata_by_field = {importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: []}
     with pytest.raises(RuntimeError, match="admission_seal_invalid"):
         await importer._store_validated_endpoint_dataset(
             connection,
@@ -382,12 +376,15 @@ async def test_normalized_receipt_selection_uses_compact_seal_fields():
         selected_resources=candidate.selected_resources,
         publication_metadata=metadata,
     ) == ("Location",)
-    assert len(
-        importer._artifact_publication_metadata_hash_from_row(
-            dataset_by_field,
-            metadata,
+    assert (
+        len(
+            importer._artifact_publication_metadata_hash_from_row(
+                dataset_by_field,
+                metadata,
+            )
         )
-    ) == 64
+        == 64
+    )
 
     base_cte = importer._artifact_fence_dataset_base_cte(
         "dataset_table",
@@ -408,9 +405,7 @@ async def test_normalized_receipt_selection_uses_compact_seal_fields():
         "baseline-1",
         metadata,
     )
-    assert connection.status.await_args.kwargs[
-        "content_proof_admission_kind"
-    ] == "generic"
+    assert connection.status.await_args.kwargs["content_proof_admission_kind"] == "generic"
 
 
 @pytest.mark.asyncio
@@ -442,9 +437,7 @@ async def test_profile_delta_metrics_bind_serving_totals(monkeypatch):
         "affected_npi_rows": 3,
     }
     with pytest.raises(RuntimeError, match="delta_identity_missing"):
-        importer._profile_delta_metric_refs(
-            SimpleNamespace(affected_npi_stage=None)
-        )
+        importer._profile_delta_metric_refs(SimpleNamespace(affected_npi_stage=None))
 
 
 @pytest.mark.asyncio
@@ -462,9 +455,7 @@ async def test_small_branch_only_helpers_remain_source_neutral(monkeypatch):
     )
     upsert = AsyncMock(return_value=1)
     monkeypatch.setattr(importer, "_upsert_rows", upsert)
-    assert await importer._upsert_provider_directory_source_rows(
-        [{"source_id": "source-1"}]
-    ) == 0
+    assert await importer._upsert_provider_directory_source_rows([{"source_id": "source-1"}]) == 0
     assert upsert.await_count == 1
 
     monkeypatch.setattr(

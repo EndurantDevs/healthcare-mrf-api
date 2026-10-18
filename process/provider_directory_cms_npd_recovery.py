@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
+from process.provider_directory_generic_source_policy import source_transaction
+
 DELETE_BATCH_SIZE = 5_000
 RECOVERY_PAGE_SIZE = 100
 TABLE = "provider_directory_cms_npd_stale_candidate"
@@ -171,46 +173,20 @@ async def _dispose_locked(fhir: Any, candidate: Any, identity: dict[str, Any]) -
 
 
 async def _clear_failed_rows(fhir: Any, candidate: Any, identity: dict[str, Any]) -> None:
-    """Reclaim mutable payload in bounded transactions; keep stable identity evidence."""
+    """Drop only exact unattached candidate heaps after the disposition is durable."""
+    from process.provider_directory_generic_source_storage import discard_generic_source_inputs
 
-    while True:
-        async with fhir.db.transaction():
-            parent = await fhir.db.first(
-                f"SELECT dataset_id FROM {_table(fhir, 'provider_directory_endpoint_dataset')} "
-                "WHERE dataset_id=:dataset_id AND endpoint_id=:endpoint_id "
-                "AND acquisition_root_run_id=:root_run_id AND status=:failed "
-                "AND is_current=false AND publication_metadata_json::jsonb "
-                "-> 'source_release' = CAST(:release AS jsonb) FOR SHARE",
-                dataset_id=candidate.dataset_id,
-                endpoint_id=candidate.endpoint_id,
-                root_run_id=candidate.acquisition_root_run_id,
-                failed=fhir.ENDPOINT_DATASET_FAILED,
-                release=json.dumps(identity, sort_keys=True),
-            )
-            if parent is None or not await is_disposed(fhir, candidate.dataset_id):
-                raise RuntimeError("cms_npd_stale_cleanup_parent_changed")
-            await fhir.db.status(
-                f"DELETE FROM {_table(fhir, 'provider_directory_cms_npd_relationship_receipt')} "
-                "WHERE dataset_id=:dataset_id",
-                dataset_id=candidate.dataset_id,
-            )
-            deleted = await fhir.db.status(
-                f"DELETE FROM {_table(fhir, 'provider_directory_dataset_resource')} "
-                "WHERE ctid IN (SELECT ctid FROM "
-                f"{_table(fhir, 'provider_directory_dataset_resource')} "
-                "WHERE dataset_id=:dataset_id LIMIT :batch_size)",
-                dataset_id=candidate.dataset_id,
-                batch_size=DELETE_BATCH_SIZE,
-            )
-            if fhir._coerce_rowcount(deleted) == 0:
-                await fhir.delete_dataset_proof_shards(fhir.db, fhir._schema(), candidate.dataset_id)
-                return
+    async with source_transaction(fhir.db):
+        if not await is_disposed(fhir, candidate.dataset_id):
+            raise RuntimeError("cms_npd_stale_cleanup_parent_changed")
+        await discard_generic_source_inputs(fhir.db, fhir, candidate, identity)
+        await fhir.delete_dataset_proof_shards(fhir.db, fhir._schema(), candidate.dataset_id)
 
 
 async def dispose_changed_vector(fhir: Any, candidate: Any, identity: dict[str, Any]) -> None:
     """Make a proven replaced release nonpublishable; clean only unsealed rows."""
 
-    async with fhir.db.transaction():
+    async with source_transaction(fhir.db):
         prior_status = await _dispose_locked(fhir, candidate, identity)
     if prior_status == fhir.ENDPOINT_DATASET_ACQUIRING:
         await _clear_failed_rows(fhir, candidate, identity)
@@ -219,7 +195,7 @@ async def dispose_changed_vector(fhir: Any, candidate: Any, identity: dict[str, 
 async def retire_unwitnessed_validated_candidate(fhir: Any, candidate: Any, identity: dict[str, Any]) -> None:
     """Exclude an exact old sealed candidate before witnessed reacquisition."""
 
-    async with fhir.db.transaction():
+    async with source_transaction(fhir.db):
         prior_status = await _dispose_locked(fhir, candidate, identity)
         if prior_status != fhir.ENDPOINT_DATASET_VALIDATED:
             raise RuntimeError("cms_npd_witness_upgrade_candidate_state_changed")
@@ -344,7 +320,7 @@ async def is_same_acquisition_replay(fhir, owner_run_id, task, run_id):
     """Accept only an actual owning run on the current retry chain, never a claimed root string."""
     from api.control_imports import _PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY
 
-    async with fhir.db.transaction():
+    async with source_transaction(fhir.db):
         await fhir.db.first(
             "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))",
             lock_key=_PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY,
@@ -411,7 +387,7 @@ async def repaired_candidate_selection(fhir, endpoint_id, identity, task, run_id
 
     declared_identity = _dispatch_identity(task, is_repair=True)
     prior_status = None
-    async with fhir.db.transaction():
+    async with source_transaction(fhir.db):
         await fhir.db.first(
             "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))",
             lock_key=_PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY,
@@ -491,7 +467,6 @@ async def resume_pending_cleanup(fhir: Any, endpoint_id: str) -> None:
     """Finish exact failed-candidate cleanup after an interrupted prior run."""
 
     parent = _table(fhir, "provider_directory_endpoint_dataset")
-    resource = _table(fhir, "provider_directory_dataset_resource")
     shard = _table(fhir, "provider_directory_dataset_proof_shard")
     while True:
         pending_record = await fhir.db.first(
@@ -501,7 +476,7 @@ async def resume_pending_cleanup(fhir: Any, endpoint_id: str) -> None:
             f"JOIN {parent} AS dataset USING (dataset_id) "
             "WHERE dataset.endpoint_id=:endpoint_id AND dataset.status=:failed "
             "AND stale.prior_status=:acquiring AND ("
-            f"EXISTS (SELECT 1 FROM {resource} WHERE dataset_id=dataset.dataset_id) OR "
+            "dataset.candidate_storage_json->>'phase' IN ('loading','prepared') OR "
             f"EXISTS (SELECT 1 FROM {shard} WHERE dataset_id=dataset.dataset_id)) "
             "ORDER BY stale.observed_at, dataset.dataset_id LIMIT 1",
             endpoint_id=endpoint_id,

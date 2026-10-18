@@ -5,11 +5,7 @@ from pathlib import Path
 
 import sqlalchemy as sa
 
-from db.models import (
-    ProviderDirectoryDatasetInsurancePlan,
-    ProviderDirectoryEndpointDataset,
-)
-
+from db.models import ProviderDirectoryDatasetInsurancePlan
 
 MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
@@ -47,17 +43,16 @@ class _OpRecorder:
 
 def test_dataset_insurance_plan_model_is_immutable_and_dataset_scoped():
     table = ProviderDirectoryDatasetInsurancePlan.__table__
-    foreign_key = next(iter(table.c.dataset_id.foreign_keys))
 
+    assert ProviderDirectoryDatasetInsurancePlan.__runtime_schema_sync__ is False
+    assert table.info["managed_immutable_storage"] is True
+    assert not table.foreign_keys
+    assert isinstance(table.c.dataset_id.type, sa.String) and table.c.dataset_id.type.length == 96
+    assert table.c.dataset_id.nullable is False
     assert tuple(column.name for column in table.primary_key.columns) == (
         "dataset_id",
         "resource_id",
     )
-    assert foreign_key.target_fullname == (
-        f"{ProviderDirectoryEndpointDataset.__table__.schema}."
-        "provider_directory_endpoint_dataset.dataset_id"
-    )
-    assert foreign_key.ondelete == "CASCADE"
     assert table.c.payload_hash.nullable is False
     assert table.c.payload_json.nullable is False
     assert {
@@ -77,20 +72,10 @@ def test_dataset_insurance_plan_migration_creates_and_backfills_projection(
 
     migration.upgrade()
 
-    assert migration.revision == (
-        "20260713236000_provider_directory_dataset_insurance_plan"
-    )
-    assert migration.down_revision == (
-        "20260713235000_import_run_provider_directory_retry_child"
-    )
-    recorded_table = operation_recorder.tables[
-        "provider_directory_dataset_insurance_plan"
-    ]
-    recorded_columns = [
-        table_item.name
-        for table_item in recorded_table["items"]
-        if isinstance(table_item, sa.Column)
-    ]
+    assert migration.revision == ("20260713236000_provider_directory_dataset_insurance_plan")
+    assert migration.down_revision == ("20260713235000_import_run_provider_directory_retry_child")
+    recorded_table = operation_recorder.tables["provider_directory_dataset_insurance_plan"]
+    recorded_columns = [table_item.name for table_item in recorded_table["items"] if isinstance(table_item, sa.Column)]
     assert recorded_columns == [
         "dataset_id",
         "resource_id",
@@ -98,9 +83,7 @@ def test_dataset_insurance_plan_migration_creates_and_backfills_projection(
         "payload_json",
     ]
     foreign_key = next(
-        table_item
-        for table_item in recorded_table["items"]
-        if isinstance(table_item, sa.ForeignKeyConstraint)
+        table_item for table_item in recorded_table["items"] if isinstance(table_item, sa.ForeignKeyConstraint)
     )
     assert foreign_key.ondelete == "CASCADE"
     assert recorded_table["schema"] == "mrf"

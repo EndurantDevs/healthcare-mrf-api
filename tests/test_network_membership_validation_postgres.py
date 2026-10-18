@@ -406,3 +406,102 @@ async def test_replay_metadata_types_remain_exact(validation_db, field):
     async with fixture.connection.transaction():
         with pytest.raises(NetworkMembershipValidationError, match="immutable pinned scope"):
             await _validate(fixture)
+
+
+@pytest.mark.asyncio
+async def test_validation_retains_source_receipt_and_refuses_changed_raw_count(validation_db):
+    from process.registry_source_retention import SUMMARY_KEY, registry_source_retention_sha256
+    from tests.test_registry_source_retention import retention_receipt
+
+    fixture = validation_db
+    receipt = retention_receipt(source_rows=4, add_rows=0, remove_rows=0, suppressed_source_rows=0, effective_rows=4)
+    source_relation = f'"{fixture.copy_target.schema_name}".network_membership_source'
+    await fixture.connection.execute(
+        f'CREATE TABLE {source_relation} (LIKE "{fixture.copy_target.schema_name}".network_membership INCLUDING CONSTRAINTS)'
+    )
+    await fixture.connection.execute(
+        f'INSERT INTO {source_relation} SELECT * FROM "{fixture.copy_target.schema_name}".network_membership'
+    )
+    await fixture.connection.execute(
+        f'UPDATE "{fixture.control_schema}".network_membership_candidate SET source_generations=source_generations||jsonb_build_object($1::text,$2::text),validation_json=$3::jsonb',
+        SUMMARY_KEY,
+        registry_source_retention_sha256(receipt),
+        json.dumps({SUMMARY_KEY: receipt}),
+    )
+    await fixture.connection.execute(f'DELETE FROM "{fixture.control_schema}".network_membership_batch')
+    async with fixture.connection.transaction():
+        report = await _validate(fixture)
+        assert report[SUMMARY_KEY] == receipt
+        assert report["batch_rows"] == report["batch_count"] == 0
+    assert json.loads((await _candidate_state(fixture))["validation_json"])[SUMMARY_KEY] == receipt
+    async with fixture.connection.transaction():
+        assert await _validate(fixture) == report
+    await fixture.connection.execute(
+        f"DELETE FROM {source_relation} WHERE ctid IN (SELECT ctid FROM {source_relation} LIMIT 1)"
+    )
+    async with fixture.connection.transaction():
+        with pytest.raises(NetworkMembershipValidationError, match="retention_accounting"):
+            await _validate(fixture)
+
+
+async def _qualified_validation(fixture, *, empty=False):
+    """Register genuine retained raw rows while leaving no legacy COPY receipts."""
+    from process.registry_source_retention import SUMMARY_KEY, registry_source_retention_sha256
+    from tests.test_registry_source_retention import retention_receipt
+
+    if empty:
+        await fixture.connection.execute(f'DELETE FROM "{fixture.copy_target.schema_name}".network_membership')
+        await fixture.connection.execute(
+            f'UPDATE "{fixture.control_schema}".network_membership_candidate SET accepted_rows=0,expected_rows=0'
+        )
+    count = 0 if empty else 4
+    receipt = retention_receipt(
+        source_rows=count, add_rows=0, remove_rows=0, suppressed_source_rows=0, effective_rows=count
+    )
+    source = f'"{fixture.copy_target.schema_name}".network_membership_source'
+    await fixture.connection.execute(
+        f'CREATE TABLE {source} (LIKE "{fixture.copy_target.schema_name}".network_membership INCLUDING CONSTRAINTS)'
+    )
+    await fixture.connection.execute(
+        f'INSERT INTO {source} SELECT * FROM "{fixture.copy_target.schema_name}".network_membership'
+    )
+    await fixture.connection.execute(f'DELETE FROM "{fixture.control_schema}".network_membership_batch')
+    await fixture.connection.execute(
+        f'UPDATE "{fixture.control_schema}".network_membership_candidate SET source_generations=source_generations||jsonb_build_object($1::text,$2::text),validation_json=$3::jsonb',
+        SUMMARY_KEY,
+        registry_source_retention_sha256(receipt),
+        json.dumps({SUMMARY_KEY: receipt}),
+    )
+    return receipt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row_count", [0, 1])
+async def test_qualified_validation_refuses_any_legacy_batch_receipt(validation_db, row_count):
+    fixture = validation_db
+    await _qualified_validation(fixture)
+    await _batch(fixture, row_count)
+    async with fixture.connection.transaction():
+        with pytest.raises(NetworkMembershipValidationError) as rejected:
+            await _validate(fixture)
+        assert rejected.value.report["accounting_errors"] == ["qualified_batch_accounting_nonzero"]
+        assert rejected.value.report["batch_count"] == 1
+    assert (await _candidate_state(fixture))["state"] == "sealed"
+
+
+@pytest.mark.asyncio
+async def test_qualified_empty_validation_and_retained_report_replay(validation_db):
+    fixture = validation_db
+    await _qualified_validation(fixture, empty=True)
+    async with fixture.connection.transaction():
+        report = await _validate(fixture)
+        assert report["valid"] and report["raw_rows"] == report["batch_rows"] == report["batch_count"] == 0
+        assert await _validate(fixture) == report
+    report["batch_count"] = 1
+    await fixture.connection.execute(
+        f'UPDATE "{fixture.control_schema}".network_membership_candidate SET validation_json=$1::jsonb',
+        json.dumps(report),
+    )
+    async with fixture.connection.transaction():
+        with pytest.raises(NetworkMembershipValidationError, match="immutable pinned scope"):
+            await _validate(fixture)

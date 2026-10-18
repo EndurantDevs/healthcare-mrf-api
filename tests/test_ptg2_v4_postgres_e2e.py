@@ -36,6 +36,7 @@ from db.connection import Database, db
 from db.migration_ptg2_frozen_source_file_binding import (
     install_frozen_source_file_binding,
 )
+from db.plan_release_storage import PIN_TABLE, storage_table_sql
 from process.ptg_parts import (
     frozen_rate_binding_store,
     ptg2_block_build_pins,
@@ -2206,6 +2207,7 @@ async def _create_failed_recovery_control_schema(
             snapshot_id varchar(96)
         )
         """,
+        storage_table_sql(schema_name, PIN_TABLE, pin=True),
     ):
         await database.execute_ddl(statement)
     migration = _load_attempt_fence_migration()

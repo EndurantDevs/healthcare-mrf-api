@@ -9,12 +9,15 @@ from contextvars import ContextVar
 from dataclasses import asdict
 from time import perf_counter
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import event, text
 
 from api import provider_profile_snapshot as snapshot
+from tests import provider_profile_detail_load_postgres_support as detail_support
 from tests.cms_doctors_preparation_postgres_support import authority, native, stage_oids
+from tests.cms_doctors_preparation_postgres_support import doctors_source_template as doctors_source_template
 from tests.provider_profile_detail_load_postgres_support import NPI, detail_database, npi_api
 
 
@@ -157,6 +160,43 @@ def _assert_detail(payload):
         assert len(enrichment["ffs_subfiles"][key]) == 1
 
 
+@pytest.mark.parametrize("failure", [None, "body", "cancel"])
+async def test_enrollment_fixture_preserves_existing_source_schema(failure):
+    """Existing Source relations survive successful use, body failure and cancellation."""
+    connection = SimpleNamespace(scalar=AsyncMock(return_value=1), execute=AsyncMock())
+
+    @asynccontextmanager
+    async def begin():
+        yield connection
+
+    fixture = SimpleNamespace(schema="mrf", engine=SimpleNamespace(begin=begin))
+    error = asyncio.CancelledError() if failure == "cancel" else RuntimeError("synthetic detail failure")
+    if failure is None:
+        async with detail_support._enrollment_schema_alias(fixture):
+            assert connection.scalar.await_count == 2
+    else:
+        with pytest.raises(type(error)) as caught:
+            async with detail_support._enrollment_schema_alias(fixture):
+                raise error
+        assert caught.value is error
+    connection.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize("missing", ["migration_role", "namespace_owner_role"])
+async def test_detail_nppes_reuse_refuses_missing_enrollment(missing):
+    """Incomplete caller enrollment cannot expose NPPES authority or open a transaction."""
+    from tests import nppes_candidate_postgres_support as nppes
+
+    role_by_attribute = {"migration_role": "fixture_migrator", "namespace_owner_role": "fixture_namespace"}
+    role_by_attribute.pop(missing)
+    component = SimpleNamespace(factory=SimpleNamespace(**role_by_attribute))
+    assert nppes._COMPONENT.get() is None
+    with pytest.raises(RuntimeError, match="caller_owned_nppes_enrollment_required"):
+        async with nppes.existing_nppes_component(component):
+            pytest.fail("incomplete enrollment cannot expose a component")
+    assert nppes._COMPONENT.get() is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cache_enabled", [False, True], ids=["full-loaders", "warm-cache"])
 async def test_full_detail_reads_during_native_doctors_publication(monkeypatch, tmp_path, cache_enabled):
@@ -191,7 +231,7 @@ async def test_full_detail_reads_during_native_doctors_publication(monkeypatch, 
                 try:
                     stage = native.make_class(native.DoctorClinicianAddress, fixture.stage["import_date"])
                     result = await native._publish_cms_doctors_stage(
-                        stage, fixture.schema, fixture.stage["import_date"]
+                        stage, fixture.schema, fixture.stage["import_date"], identity_ctx=fixture.stage
                     )
                     publication_by_field["committed_authority"] = asdict(result)
                 except Exception as error:

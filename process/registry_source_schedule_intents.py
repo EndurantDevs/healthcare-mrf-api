@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 MAX_SOURCE_SCOPES = 100
-_SUPPORTED_SCOPES = frozenset({("cms", "commercial-mlr"), ("cms", "plan-finder"), ("naic", "company-directory")})
+_SUPPORTED_SCOPES = frozenset({("cms", "commercial-mlr"), ("cms", "plan-finder"), ("naic", "company-listings")})
 _POLICIES = frozenset({"latest-verified", "fixed-year"})
 _KEY_DOMAIN = b"registry_source_refresh_window:v1:"
 

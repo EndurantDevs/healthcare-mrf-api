@@ -70,8 +70,14 @@ class ProviderServiceImportQuery:
 
 
 def provider_service_native_args(request_args, native_args, import_context):
-    """Keep native caller compatibility and reject unpaired imported arguments."""
+    """Accept explicit native options only with imported or trusted managed scope."""
 
+    if native_args is not None and import_context is None:
+        from api.network_address_scope import current_network_address_scope
+
+        scope = current_network_address_scope()
+        if scope is not None and _is_sha256(scope.access_scope_sha256):
+            return native_args
     if (native_args is None) != (import_context is None):
         raise InvalidUsage("custom-import provider-service arguments are invalid")
     if import_context is not None and type(import_context) is not ProviderServiceImportQuery:

@@ -4,6 +4,7 @@
 import asyncio
 import hashlib
 import json
+from contextlib import asynccontextmanager
 from contextvars import Context
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -11,12 +12,14 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from process import provider_directory_cms_npd as cms
 from process import provider_directory_cms_npd_relationship as relationships
 from process import provider_directory_cms_serving_coverage as coverage
-from process.provider_directory_entity_identity import bind_entity_batch
-from process.provider_directory_insurance_network_identity import record_insurance_network_plan
+from process import provider_directory_generic_source_policy as source_policy
+from process import provider_directory_generic_source_storage as source_storage
+from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_source_local_publication import publish_validated_source_local_dataset
 from tests import cms_npd_admission_postgres_support as support
 from tests.cms_npd_admission_postgres_support import cms_artifact_root, fhir
@@ -61,21 +64,38 @@ async def _insert_extra_witness(connection):
     )
 
 
+@asynccontextmanager
+async def _ordinary_runtime_connection(database):
+    """Use the genuine Reader login without the API engine's READ ONLY option."""
+    component = database._source_component
+    engine = create_async_engine(component.database.engine.url.set(username=component.reader))
+    try:
+        async with engine.begin() as connection:
+            assert await connection.scalar(text("SELECT current_user=session_user")) is True
+            assert await connection.scalar(text("SELECT current_user")) == component.reader
+            assert await connection.scalar(text("SHOW transaction_read_only")) == "off"
+            yield connection
+    finally:
+        await engine.dispose()
+
+
 async def _assert_seal_guards(database, proof):
     """Reject witness growth and bulk deletion after preparation but before publication."""
-    async with database.engine.begin() as connection:
+    async with _ordinary_runtime_connection(database) as connection:
         for sql in (
             "TRUNCATE mrf.provider_directory_insurance_network_plan_evidence",
             "TRUNCATE mrf.provider_directory_cms_candidate_coverage",
             "UPDATE mrf.provider_directory_cms_candidate_coverage SET relationship_count=0",
             "DELETE FROM mrf.provider_directory_cms_candidate_coverage",
         ):
-            with pytest.raises(DBAPIError):
+            with pytest.raises(DBAPIError) as denied:
                 async with connection.begin_nested():
                     await connection.execute(text(sql))
-        with pytest.raises(DBAPIError, match="covered_network_witness_immutable"):
+            assert denied.value.orig.sqlstate == "42501"
+        with pytest.raises(DBAPIError) as denied:
             async with connection.begin_nested():
                 await _insert_extra_witness(connection)
+        assert denied.value.orig.sqlstate == "42501"
     async with database.session() as session:
         await session.begin()
         await coverage.assert_sealed_cms_candidate_coverage(session, "mrf", proof)
@@ -90,7 +110,7 @@ async def test_candidate_coverage_is_unpublished_immutable_and_replayable(monkey
     """A full fixture seals once, preserves the current pointer, and rejects changed identities."""
     _include_candidate_migration(monkeypatch)
     migration_prefixes = support.LEGACY_MIGRATION_PREFIXES if published else support.MIGRATION_PREFIXES
-    async with support.admission_database(monkeypatch, migration_prefixes=migration_prefixes) as database:
+    async with support.intake_admission_database(monkeypatch, migration_prefixes=migration_prefixes) as database:
         candidate, release_id, dataset_hash = await _stage(monkeypatch, cms_artifact_root)
         if published:
             await publish_validated_source_local_dataset(
@@ -110,18 +130,25 @@ async def test_candidate_coverage_is_unpublished_immutable_and_replayable(monkey
         assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_cms_serving_coverage") == int(
             published
         )
-        monkeypatch.setattr(coverage, "require_cms_bindings", AsyncMock(side_effect=AssertionError("unexpected_scan")))
-        assert await coverage.prepare_cms_candidate_coverage(fhir, candidate, release_id, dataset_hash) == proof
+        with monkeypatch.context() as replay:
+            replay.setattr(coverage, "require_cms_bindings", AsyncMock(side_effect=AssertionError("unexpected_scan")))
+            assert await coverage.prepare_cms_candidate_coverage(fhir, candidate, release_id, dataset_hash) == proof
         await _assert_seal_guards(database, proof)
-        await _assert_other_source_writes(database, release_id)
+        await _assert_other_candidate_writes(monkeypatch, cms_artifact_root, database, candidate, proof)
 
 
 @pytest.mark.asyncio
-async def test_candidate_seal_serializes_first_network_witness_race(monkeypatch, cms_artifact_root):
-    """An insert waiting on first seal must recheck the committed receipt and roll back."""
+async def test_candidate_seal_refuses_network_witness_append_while_coverage_held(monkeypatch, cms_artifact_root):
+    """A sealed Source header rejects witness growth while coverage validation remains held."""
     _include_candidate_migration(monkeypatch)
-    async with support.admission_database(monkeypatch) as database:
+    async with support.intake_admission_database(monkeypatch) as database:
         candidate, release_id, dataset_hash = await _stage(monkeypatch, cms_artifact_root)
+        witnesses_before = await database.scalar(
+            "SELECT jsonb_agg(to_jsonb(w) ORDER BY resource_type,resource_id) "
+            "FROM mrf.provider_directory_cms_npd_resource_witness w WHERE dataset_id=:dataset",
+            dataset=candidate.dataset_id,
+        )
+        witness = witnesses_before[0]
         locked, release = asyncio.Event(), asyncio.Event()
         original = coverage.require_cms_bindings
 
@@ -131,26 +158,43 @@ async def test_candidate_seal_serializes_first_network_witness_race(monkeypatch,
             await release.wait()
 
         monkeypatch.setattr(coverage, "require_cms_bindings", pause_validation)
-        preparation = asyncio.create_task(
-            coverage.prepare_cms_candidate_coverage(fhir, candidate, release_id, dataset_hash), context=Context()
-        )
+
+        async def prepare():
+            async with source_policy.bind_generic_source_transaction_factory(database._source_component.factory):
+                return await coverage.prepare_cms_candidate_coverage(fhir, candidate, release_id, dataset_hash)
+
+        async def append():
+            async with source_policy.bind_generic_source_transaction_factory(database._source_component.factory):
+                async with source_policy.source_transaction(fhir.db):
+                    await source_storage.append_generic_source_batch(fhir.db, fhir, candidate, (), (witness,))
+
+        preparation = asyncio.create_task(prepare(), context=Context())
+        insertion = None
         try:
             await asyncio.wait_for(locked.wait(), 10)
-            async with database.engine.connect() as connection:
-                await connection.begin()
-                await connection.execute(text("SET LOCAL statement_timeout='5s'"))
-                insertion = asyncio.create_task(_insert_extra_witness(connection), context=Context())
-                with pytest.raises(TimeoutError):
-                    await asyncio.wait_for(asyncio.shield(insertion), 0.1)
-                release.set()
-                await preparation
-                with pytest.raises(DBAPIError, match="covered_network_witness_immutable"):
-                    await insertion
-                await connection.rollback()
-        finally:
+            insertion = asyncio.create_task(append(), context=Context())
+            with pytest.raises(GenericCandidateError, match="^provider_directory_generic_source_header_sealed$"):
+                await asyncio.wait_for(asyncio.shield(insertion), 10)
+            assert not release.is_set() and not preparation.done()
+            assert await _candidate_seal_snapshot(database, candidate) == (None, witnesses_before)
             release.set()
             await preparation
+        finally:
+            release.set()
+            if insertion is not None and not insertion.done():
+                insertion.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await insertion
+            await preparation
         assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_cms_candidate_coverage") == 1
+        assert (
+            await database.scalar(
+                "SELECT jsonb_agg(to_jsonb(w) ORDER BY resource_type,resource_id) "
+                "FROM mrf.provider_directory_cms_npd_resource_witness w WHERE dataset_id=:dataset",
+                dataset=candidate.dataset_id,
+            )
+            == witnesses_before
+        )
 
 
 @pytest.mark.asyncio
@@ -165,7 +209,7 @@ async def test_candidate_coverage_assertion_requires_transaction():
 async def test_failed_candidate_coverage_validation_leaves_no_seal(monkeypatch, cms_artifact_root, failure_boundary):
     """Failure before or after receipt insertion rolls back without freezing further candidate work."""
     _include_candidate_migration(monkeypatch)
-    async with support.admission_database(monkeypatch) as database:
+    async with support.intake_admission_database(monkeypatch) as database:
         candidate, release_id, dataset_hash = await _stage(monkeypatch, cms_artifact_root)
         monkeypatch.setattr(coverage, failure_boundary, AsyncMock(side_effect=RuntimeError("synthetic_failure")))
         with pytest.raises(RuntimeError, match="synthetic_failure"):
@@ -175,26 +219,31 @@ async def test_failed_candidate_coverage_validation_leaves_no_seal(monkeypatch, 
             await _insert_extra_witness(connection)
 
 
-async def _assert_other_source_writes(database, release_id):
-    """A sealed CMS release does not prevent another source from recording network evidence."""
-    async with database.session() as session:
-        await bind_entity_batch(
-            session,
-            source_id="example-directory",
-            release_id=release_id,
-            resources=[{"resourceType": "Organization", "id": "network-1"}],
-        )
-        await record_insurance_network_plan(
-            session,
-            source_id="example-directory",
-            release_id=release_id,
-            network_resource_id="network-1",
-            plan={
-                "resourceType": "InsurancePlan",
-                "id": "plan-1",
-                "network": [{"reference": "Organization/network-1"}],
-            },
-        )
+async def _candidate_seal_snapshot(database, candidate):
+    return (
+        await database.scalar(
+            "SELECT to_jsonb(c) FROM mrf.provider_directory_cms_candidate_coverage c WHERE dataset_id=:dataset",
+            dataset=candidate.dataset_id,
+        ),
+        await database.scalar(
+            "SELECT jsonb_agg(to_jsonb(w) ORDER BY resource_type,resource_id) "
+            "FROM mrf.provider_directory_cms_npd_resource_witness w WHERE dataset_id=:dataset",
+            dataset=candidate.dataset_id,
+        ),
+    )
+
+
+async def _assert_other_candidate_writes(monkeypatch, directory, database, candidate, proof):
+    """A sealed candidate leaves another endpoint's original Source writer usable."""
+    before = await _candidate_seal_snapshot(database, candidate)
+    with monkeypatch.context() as independent:
+        independent.setattr(cms.source, "DOWNLOADS_URL", "https://example.test/cms-independent/downloads")
+        other, release_id, dataset_hash = await _stage(independent, directory)
+        assert other.dataset_id != candidate.dataset_id and other.endpoint_id != candidate.endpoint_id
+        await coverage.prepare_cms_candidate_coverage(fhir, other, release_id, dataset_hash)
+    assert await _candidate_seal_snapshot(database, candidate) == before
+    async with database.transaction() as session:
+        await coverage.assert_sealed_cms_candidate_coverage(session, "mrf", proof)
 
 
 def _relationship_page_params(candidate, identity):
@@ -208,8 +257,8 @@ def _relationship_page_params(candidate, identity):
     }
 
 
-async def _stage_scoped_witnesses(monkeypatch, candidate, identity, endpoint_id):
-    resources = [
+def _page_resources():
+    return [
         {
             "resourceType": "Location",
             "id": resource_id,
@@ -219,30 +268,38 @@ async def _stage_scoped_witnesses(monkeypatch, candidate, identity, endpoint_id)
         }
         for resource_id in ("page-a", "page-b", "page-c")
     ]
-    original_insert = cms._insert_verified_witnesses
 
-    async def insert_hash_mismatch(session, witness_by_id):
-        changed_by_id = {key: dict(value) for key, value in witness_by_id.items()}
-        bad_witness = changed_by_id["page-a"]
-        bad_witness["normalized_payload_hash"] = (
-            "0" * 64 if bad_witness["normalized_payload_hash"] != "0" * 64 else "1" * 64
-        )
-        await original_insert(session, changed_by_id)
 
-    with monkeypatch.context() as changed:
-        changed.setattr(cms, "_insert_verified_witnesses", insert_hash_mismatch)
-        await _write_location_batch(candidate, resources)
-    with monkeypatch.context() as other_source:
-        other_source.setattr(cms.source, "DOWNLOADS_URL", "https://example.test/cms-key-join-other")
-        other_endpoint_id = await cms._register_source(fhir)
-    assert await cms._register_source(fhir) == endpoint_id
-    assert endpoint_id != other_endpoint_id
-    other = await cms._candidate(
-        fhir, other_endpoint_id, "cms-key-join-other", identity, candidate_key="cms-key-join-other"
-    )
-    assert other.dataset_id != candidate.dataset_id
-    await _write_location_batch(other, [{**resources[1], "name": "Other dataset"}])
-    return resources, other
+def _bind_location_rows(monkeypatch, locations):
+    original = support._resource_rows
+
+    def resources(revision):
+        resources_by_type = original(revision)
+        resources_by_type["Location"].extend(locations)
+        return resources_by_type
+
+    monkeypatch.setattr(support, "_resource_rows", resources)
+    return resources
+
+
+async def _refuse_corrupt_witness(monkeypatch, directory, database):
+    original = cms._insert_verified_witnesses
+
+    async def corrupt(session, witness_by_id):
+        changed_by_id = {key: dict(witness) for key, witness in witness_by_id.items()}
+        if "page-a" in changed_by_id:
+            witness = changed_by_id["page-a"]
+            witness["normalized_payload_hash"] = (
+                "0" * 64 if witness["normalized_payload_hash"] != "0" * 64 else "1" * 64
+            )
+        await original(session, changed_by_id)
+
+    with monkeypatch.context() as corrupted:
+        corrupted.setattr(cms, "_insert_verified_witnesses", corrupt)
+        with pytest.raises(RuntimeError, match="^cms_npd_witness_counts_incomplete$"):
+            await _stage(corrupted, directory)
+    assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_cms_npd_relationship_receipt") == 0
+    assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_endpoint_dataset WHERE is_current") == 0
 
 
 async def _relationship_page_rows(session, params_by_field):
@@ -259,14 +316,29 @@ async def _relationship_page_rows(session, params_by_field):
 
 @pytest.mark.asyncio
 async def test_relationship_key_join_preserves_scope_hash_and_raw_rows(monkeypatch, cms_artifact_root):
-    """Filtering after the key join retains exact scope, bounds and raw JSON."""
-    _, receipt = support.retained_release(cms_artifact_root)
-    identity = cms.release_identity(receipt)
-    async with support.admission_database(monkeypatch) as database:
-        endpoint_id = await cms._register_source(fhir)
-        candidate = await cms._admission_candidate(fhir, endpoint_id, "cms-key-join", identity, {})
-        resources, other = await _stage_scoped_witnesses(monkeypatch, candidate, identity, endpoint_id)
-        params_by_field = _relationship_page_params(candidate, identity)
+    """Completed private snapshots retain exact scope, bounds and raw JSON."""
+    resources = _page_resources()
+    resource_factory = _bind_location_rows(monkeypatch, resources)
+    async with support.intake_admission_database(monkeypatch) as database:
+        await _refuse_corrupt_witness(monkeypatch, cms_artifact_root, database)
+        monkeypatch.setattr(cms.source, "DOWNLOADS_URL", "https://example.test/cms-key-join-clean")
+        candidate, release_id, _ = await _stage(monkeypatch, cms_artifact_root)
+        with monkeypatch.context() as independent:
+            independent.setattr(cms.source, "DOWNLOADS_URL", "https://example.test/cms-key-join-other")
+
+            def other_rows(revision):
+                rows_by_type = resource_factory(revision)
+                rows_by_type["Location"] = [
+                    {**resource, "name": "Other dataset"} if resource["id"] == "page-b" else resource
+                    for resource in rows_by_type["Location"]
+                ]
+                return rows_by_type
+
+            independent.setattr(support, "_resource_rows", other_rows)
+            other, other_release, _ = await _stage(independent, cms_artifact_root)
+        assert other.dataset_id != candidate.dataset_id and other.endpoint_id != candidate.endpoint_id
+        params_by_field = _relationship_page_params(candidate, {"vector_sha256": release_id})
+        params_by_field.update(after_type="Location", after_id="page-a", last_type="Location", last_id="page-c")
         async with database.session() as session:
             witness_rows = await _relationship_page_rows(session, params_by_field)
             assert [witness_row[1] for witness_row in witness_rows] == ["page-b", "page-c"]
@@ -279,87 +351,84 @@ async def test_relationship_key_join_preserves_scope_hash_and_raw_rows(monkeypat
                 for witness_row in witness_rows
             )
             for fields, expected_ids in (
-                (
-                    {"after_type": "Location", "after_id": "page-a", "last_type": "Location", "last_id": "page-b"},
-                    ["page-b"],
-                ),
-                (
-                    {"after_type": "Location", "after_id": "page-b", "last_type": "Location", "last_id": "page-c"},
-                    ["page-c"],
-                ),
+                ({"last_id": "page-b"}, ["page-b"]),
+                ({"after_id": "page-b"}, ["page-c"]),
                 ({"release_id": "0" * 64}, []),
-                ({"dataset_id": other.dataset_id}, ["page-b"]),
+                ({"dataset_id": other.dataset_id, "release_id": other_release}, ["page-b", "page-c"]),
             ):
                 selected = await _relationship_page_rows(session, {**params_by_field, **fields})
                 assert [witness_row[1] for witness_row in selected] == expected_ids
                 if fields.get("dataset_id") == other.dataset_id:
                     assert selected[0][4]["name"] == "Other dataset"
-        assert (
-            await database.scalar(
-                "SELECT count(*) FROM mrf.provider_directory_cms_npd_relationship WHERE dataset_id=:dataset_id",
-                dataset_id=candidate.dataset_id,
-            )
-            == 0
-        )
 
 
 @pytest.mark.asyncio
 async def test_relationship_key_join_replay_completeness_and_rollback(monkeypatch, cms_artifact_root):
-    """The shared page preserves atomic inserts, NULL references and missing-link rejection."""
-    _, receipt = support.retained_release(cms_artifact_root)
-    identity = cms.release_identity(receipt)
-    async with support.admission_database(monkeypatch) as database:
-        endpoint_id = await cms._register_source(fhir)
-        candidate = await cms._admission_candidate(fhir, endpoint_id, "cms-key-join-rollback", identity, {})
-        await _write_location_batch(
-            candidate,
-            [
-                {
-                    "resourceType": "Location",
-                    "id": "page-site",
-                    "name": "Example",
-                    "endpoint": [{"reference": "Endpoint/example"}, {"display": "No reference"}],
-                }
-            ],
-        )
-        params_by_field = _relationship_page_params(candidate, identity)
-        with pytest.raises(RuntimeError, match="synthetic_relationship_page_failure"):
-            async with database.transaction() as session:
-                await session.execute(text(relationships._insert_sql(fhir)), params_by_field)
-                assert (
-                    await relationships._page_complete(
-                        fhir, session, candidate.dataset_id, identity["vector_sha256"], "", "", "zzzz", "zzzz"
-                    )
-                    == 2
+    """Real native COPY rolls back, replays once, and checks every NULL reference."""
+    _bind_location_rows(
+        monkeypatch,
+        [
+            {
+                "id": "page-site",
+                "name": "Example",
+                "endpoint": [{"reference": "Endpoint/example"}, {"display": "No reference"}],
+            }
+        ],
+    )
+    async with support.intake_admission_database(monkeypatch) as database:
+        original = relationships._copy_page
+        copied_datasets = []
+
+        async def fail_after_copy(directory, session, parameters):
+            assert source_policy.source_copy_session() is session
+            await original(directory, session, parameters)
+            copied_datasets.append(parameters["dataset_id"])
+            assert (
+                await relationships._page_complete(
+                    fhir,
+                    session,
+                    parameters["dataset_id"],
+                    parameters["release_id"],
+                    "Location",
+                    "",
+                    "Location",
+                    "page-site",
                 )
-                raise RuntimeError("synthetic_relationship_page_failure")
-        ledger_count = await database.scalar(
-            "SELECT count(*) FROM mrf.provider_directory_cms_npd_relationship WHERE dataset_id=:dataset_id",
-            dataset_id=candidate.dataset_id,
-        )
-        assert ledger_count == 0
-        for _ in range(2):
-            async with database.session() as session:
-                await session.execute(text(relationships._insert_sql(fhir)), params_by_field)
-                assert (
-                    await relationships._page_complete(
-                        fhir, session, candidate.dataset_id, identity["vector_sha256"], "", "", "zzzz", "zzzz"
-                    )
-                    == 2
-                )
+                == 2
+            )
+            raise RuntimeError("synthetic_relationship_page_failure")
+
+        with monkeypatch.context() as interrupted:
+            interrupted.setattr(relationships, "_copy_page", fail_after_copy)
+            with pytest.raises(RuntimeError, match="^synthetic_relationship_page_failure$"):
+                await _stage(interrupted, cms_artifact_root)
+        assert len(copied_datasets) == 1
+        assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_cms_npd_relationship") == 0
+        assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_cms_npd_relationship_receipt") == 0
+        candidate, release_id, _ = await _stage(monkeypatch, cms_artifact_root)
+        assert candidate.dataset_id == copied_datasets[0]
+        with monkeypatch.context() as replay:
+            replay.setattr(relationships, "_copy_page", AsyncMock(side_effect=AssertionError("unexpected_recopy")))
+            repeated, repeated_release, _ = await _stage(replay, cms_artifact_root)
+            assert repeated.dataset_id == candidate.dataset_id and repeated_release == release_id
         links = await database.all(
             "SELECT target_reference,resolution_status FROM mrf.provider_directory_cms_npd_relationship "
-            "WHERE dataset_id=:dataset_id ORDER BY reference_ordinal",
+            "WHERE dataset_id=:dataset_id AND resource_id='page-site' ORDER BY reference_ordinal",
             dataset_id=candidate.dataset_id,
         )
         assert [tuple(link) for link in links] == [("Endpoint/example", "unresolved"), (None, "unresolved")]
-        await database.status(
-            "DELETE FROM mrf.provider_directory_cms_npd_relationship "
-            "WHERE dataset_id=:dataset_id AND reference_ordinal=2",
-            dataset_id=candidate.dataset_id,
-        )
-        async with database.session() as session:
-            with pytest.raises(RuntimeError, match="cms_npd_relationship_projection_incomplete"):
-                await relationships._page_complete(
-                    fhir, session, candidate.dataset_id, identity["vector_sha256"], "", "", "zzzz", "zzzz"
-                )
+        await _assert_missing_relationship(database, candidate, release_id)
+
+
+async def _assert_missing_relationship(database, candidate, release_id):
+    """Detect an exact independent-administrator fault in the completed projection."""
+    await database.status(
+        "DELETE FROM mrf.provider_directory_cms_npd_relationship "
+        "WHERE dataset_id=:dataset_id AND resource_id='page-site' AND reference_ordinal=2",
+        dataset_id=candidate.dataset_id,
+    )
+    async with database.session() as session:
+        with pytest.raises(RuntimeError, match="^cms_npd_relationship_projection_incomplete$"):
+            await relationships._page_complete(
+                fhir, session, candidate.dataset_id, release_id, "Location", "", "Location", "page-site"
+            )

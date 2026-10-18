@@ -2,24 +2,25 @@
 
 from __future__ import annotations
 
-import asyncio
 import datetime
 import hashlib
 import logging
 import os
 import secrets
 import tempfile
-from pathlib import Path, PurePath
+from pathlib import Path
 
 from arq import create_pool
 
 from db.models import CMSDoctorEducation, CMSDoctorGroupSite, DoctorClinicianAddress, db
+from process import provider_directory_generic_source_storage as source_storage
 from process.cms_doctors_artifact import (
     retain_doctors_artifact,
     validate_doctors_artifact_root,
     verify_doctors_artifact,
 )
 from process.cms_doctors_education import (
+    _copy_sidecar_rows,
     discard_education_stage,
     import_doctor_education,
     open_doctors_csv,
@@ -32,6 +33,18 @@ from process.cms_doctors_groups import (
     swap_group_site_stage,
     validate_group_site_stage,
 )
+from process.cms_doctors_identity_candidate import (
+    discard_doctors_identities,
+    publish_doctors_identities,
+    reprepare_publication_conflict,
+    require_doctors_identity_roots,
+)
+from process.cms_doctors_immutable import (
+    capture_doctors_predecessor,
+    create_doctors_stage,
+    publish_doctors_generation,
+    seal_doctors_stages,
+)
 from process.cms_doctors_organizations import bind_group_site_organizations
 from process.cms_doctors_rows import doctor_address_row
 from process.cms_doctors_sites import bind_cms_doctors_sites
@@ -40,10 +53,15 @@ from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import mark_control_run
 from process.entity_address_cutover_contract import lock_live_serving_relations, wait_for_publication_lock
 from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
-from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info, push_objects
+from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
+from process.provider_directory_cms_identity_candidate import CMSIdentityReprepareRequired
+from process.provider_directory_generic_source_policy import (
+    bound_publisher,
+    source_owner_transaction,
+    source_transaction,
+)
 from process.redis_config import build_redis_settings
 from process.reference_family_archive import _lock_family
-from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.serialization import deserialize_job, serialize_job
 
 logger = logging.getLogger(__name__)
@@ -120,22 +138,6 @@ def _validate_schema_name(schema: str) -> str:
     return cleaned
 
 
-async def _ensure_schema_exists(db_schema: str) -> None:
-    db_schema = _validate_schema_name(db_schema)
-    try:
-        await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
-    except Exception as exc:
-        exists = bool(await db.scalar(f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;"))
-        if exists:
-            logger.warning(
-                "Schema %s already exists but CREATE SCHEMA failed (%s); continuing",
-                db_schema,
-                exc,
-            )
-            return
-        raise
-
-
 def _distribution_urls(dataset: dict) -> list[str]:
     urls: list[str] = []
     for dist in dataset.get("distribution", []):
@@ -202,6 +204,11 @@ async def _fetch_doctors_download_url(client) -> str:
     raise ValueError("Could not find CMS Doctors CSV/ZIP download URL in dataset.")
 
 
+async def _copy_clinical_rows(rows, stage):
+    complete_rows = [dict(latitude=None, longitude=None, address_key=None, **row) for row in rows]
+    await _copy_sidecar_rows(complete_rows, stage)
+
+
 async def _consume_doctors_reader(
     reader,
     *,
@@ -213,6 +220,9 @@ async def _consume_doctors_reader(
     test_row_limit: int,
 ) -> int:
     """Normalize reader rows and persist bounded, deduplicated batches."""
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("cms_doctors_copy_batch_size_invalid")
+    batch_size = min(batch_size, 5000)
     accepted_rows = 0
     provider_batch_rows = []
     seen_checksums: set[int] = set()
@@ -229,14 +239,14 @@ async def _consume_doctors_reader(
         provider_batch_rows.append(address_row)
         if len(provider_batch_rows) >= batch_size:
             await raise_if_cancelled(ctx, task)
-            await push_objects(provider_batch_rows, stage_cls)
+            await _copy_clinical_rows(provider_batch_rows, stage_cls)
             accepted_rows += len(provider_batch_rows)
             provider_batch_rows.clear()
         if test_mode and accepted_rows + len(provider_batch_rows) >= test_row_limit:
             break
     if provider_batch_rows:
         await raise_if_cancelled(ctx, task)
-        await push_objects(provider_batch_rows, stage_cls)
+        await _copy_clinical_rows(provider_batch_rows, stage_cls)
         accepted_rows += len(provider_batch_rows)
     return accepted_rows
 
@@ -260,11 +270,12 @@ async def _import_doctors_source(
         "test_mode": test_mode,
         "test_row_limit": test_row_limit,
     }
-    with open_doctors_csv(source_path) as reader:
-        return await _consume_doctors_reader(
-            reader,
-            **reader_kwargs_by_name,
-        )
+    async with source_transaction(db):
+        with open_doctors_csv(source_path) as reader:
+            return await _consume_doctors_reader(
+                reader,
+                **reader_kwargs_by_name,
+            )
 
 
 async def _download_doctors_source(client, url: str, source_path: str) -> None:
@@ -278,32 +289,37 @@ async def _download_doctors_source(client, url: str, source_path: str) -> None:
 
 async def _stage_doctors_sidecars(source_path, url, ctx, task, test_mode, *, source_manifest=None):
     """Stage the retained source, education, and group-site records together."""
-    if not test_mode and source_manifest is None:
-        ctx["context"]["artifact"] = retain_doctors_artifact(source_path, url)
-    manifest_kwargs = {"source_manifest": source_manifest} if source_manifest is not None else {}
-    ctx["context"]["education"] = await import_doctor_education(
-        source_path,
-        url,
-        ctx,
-        task,
-        source_manifest["dataset_id"] if source_manifest is not None else DEFAULT_DOCTORS_DATASET_ID,
-        **manifest_kwargs,
-    )
-    if not test_mode and (
-        ctx["context"]["artifact"]["content_sha256"] != ctx["context"]["education"]["content_sha256"]
-    ):
-        raise RuntimeError("cms_doctors_artifact_digest_mismatch")
-    ctx["context"]["group_site"] = await import_group_site_rows(
-        source_path,
-        ctx,
-        task,
-        ctx["context"]["education"],
-    )
-    group_stage = make_class(CMSDoctorGroupSite, ctx["import_date"])
-    await _create_stage_indexes(
-        group_stage,
-        _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"),
-    )
+    async with source_transaction(db):
+        if not test_mode and source_manifest is None:
+            ctx["context"]["artifact"] = retain_doctors_artifact(source_path, url)
+        manifest_kwargs = {"source_manifest": source_manifest} if source_manifest is not None else {}
+        ctx["context"]["education"] = await import_doctor_education(
+            source_path,
+            url,
+            ctx,
+            task,
+            source_manifest["dataset_id"] if source_manifest is not None else DEFAULT_DOCTORS_DATASET_ID,
+            **manifest_kwargs,
+        )
+        if not test_mode and (
+            ctx["context"]["artifact"]["content_sha256"] != ctx["context"]["education"]["content_sha256"]
+        ):
+            raise RuntimeError("cms_doctors_artifact_digest_mismatch")
+        ctx["context"]["group_site"] = await import_group_site_rows(
+            source_path,
+            ctx,
+            task,
+            ctx["context"]["education"],
+        )
+        group_stage = make_class(CMSDoctorGroupSite, ctx["import_date"])
+        await _create_stage_indexes(
+            group_stage,
+            _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"),
+        )
+        publisher = bound_publisher()
+        for model in (CMSDoctorEducation, CMSDoctorGroupSite):
+            name = make_class(model, ctx["import_date"]).__tablename__
+            await source_storage._close_grants(publisher.connection, publisher.policy, name)
 
 
 async def _replay_doctors_source(ctx, task, stage_cls, batch_size, test_mode, test_row_limit):
@@ -394,8 +410,9 @@ async def import_cms_doctors_data(ctx, task=None):
                     test_row_limit=test_row_limit,
                 )
     except BaseException:
-        await discard_group_site_stage(ctx)
-        await discard_education_stage(ctx)
+        async with source_transaction(db):
+            await discard_group_site_stage(ctx)
+            await discard_education_stage(ctx)
         raise
     finally:
         if client is not None:
@@ -426,9 +443,11 @@ async def startup(ctx):
 
     stage_cls = make_class(DoctorClinicianAddress, import_date)
 
-    await _ensure_schema_exists(db_schema)
-    await db.create_table(stage_cls.__table__, checkfirst=False)
-    await _create_stage_indexes(stage_cls, db_schema)
+    await require_doctors_identity_roots(db)
+    async with source_transaction(db):
+        await create_doctors_stage(db, DoctorClinicianAddress, import_date, db_schema)
+        publisher = bound_publisher()
+        await source_storage._close_grants(publisher.connection, publisher.policy, stage_cls.__tablename__)
 
     logger.info("CMS Doctors startup ready: schema=%s import_date=%s", db_schema, import_date)
 
@@ -458,14 +477,15 @@ async def _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema: str):
     return address_stats
 
 
-async def _publish_cms_doctors_stage(stage_cls, db_schema: str, import_date: str):
+async def _publish_cms_doctors_stage(stage_cls, db_schema: str, import_date: str, *, identity_ctx=None):
     """Keep ordinary publication on the same three-table transactional apply path."""
     max_attempts = 1 if db._transaction_binding() is not None else 4
     for attempt in range(1, max_attempts + 1):
         try:
-            async with db.transaction():
-                return await _apply_cms_doctors_stage(stage_cls, db_schema, import_date)
+            async with source_transaction(db, isolation="repeatable read"):
+                return await _apply_cms_doctors_stage(stage_cls, db_schema, import_date, identity_ctx=identity_ctx)
         except Exception as error:
+            reprepare_publication_conflict(error)
             await wait_for_publication_lock(error, attempt, max_attempts=max_attempts)
 
 
@@ -495,18 +515,28 @@ async def _lock_cms_doctors_publication(session, stage_cls, db_schema, import_da
         await _lock_family(session, db_schema, retired_names, "ACCESS EXCLUSIVE", nowait=True)
 
 
-async def _apply_cms_doctors_stage(stage_cls, db_schema: str, import_date: str):
+async def _apply_cms_doctors_stage(stage_cls, db_schema: str, import_date: str, *, identity_ctx=None):
     """Lock and swap every Doctors relation without committing the owner."""
     if db._transaction_binding() is None:
         raise RuntimeError("cms_doctors_publication_requires_transaction")
     await _lock_cms_doctors_publication(db._transaction_binding().session, stage_cls, db_schema, import_date)
-    return await _apply_locked_cms_doctors_stage(stage_cls, db_schema, import_date)
+    return await _apply_locked_cms_doctors_stage(stage_cls, db_schema, import_date, identity_ctx=identity_ctx)
 
 
-async def _apply_locked_cms_doctors_stage(stage_cls, db_schema: str, import_date: str):
-    """Swap the already-locked family and advance authority in the owner's transaction."""
+async def _apply_locked_cms_doctors_stage(stage_cls, db_schema: str, import_date: str, *, identity_ctx=None):
+    """Rollback map publication and every swap together, even if the caller catches."""
     if db._transaction_binding() is None:
         raise RuntimeError("cms_doctors_publication_requires_transaction")
+    async with source_owner_transaction(db):
+        session = db._transaction_binding().session
+        incumbent = await capture_doctors_predecessor(session, db_schema)
+        await seal_doctors_stages(db, db_schema, import_date)
+        await publish_doctors_identities(db, identity_ctx or {})
+        return await _swap_cms_doctors_tables(stage_cls, db_schema, import_date, incumbent)
+
+
+async def _swap_cms_doctors_tables(stage_cls, db_schema, import_date, incumbent):
+    """Apply only after the complete identity cut inside the shared savepoint."""
     table = DoctorClinicianAddress.__main_table__
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
     await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
@@ -530,14 +560,17 @@ async def _apply_locked_cms_doctors_stage(stage_cls, db_schema: str, import_date
         )
     await swap_education_stage(import_date, db_schema)
     await swap_group_site_stage(import_date, db_schema)
-    return await publish_local_reference_family_generation(db, importer_id="cms-doctors", schema_name=db_schema)
+    return await publish_doctors_generation(
+        db._transaction_binding().session, schema_name=db_schema, expected_authority=incumbent
+    )
 
 
 async def _finish_cms_doctors_test_run(ctx, db_schema: str, stage_rows: int) -> dict:
     """Discard this test run's stages and report success without publishing."""
-    for model in (DoctorClinicianAddress, CMSDoctorEducation, CMSDoctorGroupSite):
-        stage_cls = make_class(model, ctx["import_date"])
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__}")
+    async with source_transaction(db):
+        for model in (DoctorClinicianAddress, CMSDoctorEducation, CMSDoctorGroupSite):
+            stage_cls = make_class(model, ctx["import_date"])
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__}")
     context = ctx.get("context") or {}
     context.pop("education_stage_owned", None)
     context.pop("group_site_stage_owned", None)
@@ -574,33 +607,35 @@ async def _validate_cms_doctors_publication_sources(import_date, db_schema, cont
 
 async def _prepare_cms_doctors_sources(ctx, stage_cls, db_schema, stage_rows):
     """Complete source, stable identity, and address preparation before any serving swap."""
-    context = ctx.get("context") or {}
-    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
-    if stage_rows < DEFAULT_MIN_ROWS:
-        raise RuntimeError(f"CMS Doctors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting.")
-    education_manifest, group_receipt = await _validate_cms_doctors_publication_sources(
-        ctx["import_date"],
-        db_schema,
-        context,
-    )
-    organization_groups = await bind_group_site_organizations(ctx, ctx["import_date"], db_schema, group_receipt)
-    sites = await bind_cms_doctors_sites(ctx, ctx["import_date"], db_schema, group_receipt)
-    retained_source = context.get("retained_source")
-    if retained_source and (
-        organization_groups != retained_source["organization_groups"] or sites != retained_source["sites"]
-    ):
-        raise RuntimeError("cms_doctors_retained_source_binding_counts_changed")
-    address_stats = await _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema)
-    await raise_if_cancelled(ctx, {"run_id": run_id})
-    return {
-        "rows": stage_rows,
-        "education": education_manifest,
-        "group_site": group_receipt,
-        "organization_groups": organization_groups,
-        "sites": sites,
-        **({"artifact": context["artifact"]} if context.get("artifact") else {}),
-        **({"address_resolve": address_stats.__dict__} if address_stats else {}),
-    }
+    async with source_transaction(db):
+        context = ctx.get("context") or {}
+        run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
+        if stage_rows < DEFAULT_MIN_ROWS:
+            raise RuntimeError(f"CMS Doctors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting.")
+        await _create_stage_indexes(stage_cls, db_schema)
+        education_manifest, group_receipt = await _validate_cms_doctors_publication_sources(
+            ctx["import_date"],
+            db_schema,
+            context,
+        )
+        organization_groups = await bind_group_site_organizations(ctx, ctx["import_date"], db_schema, group_receipt)
+        sites = await bind_cms_doctors_sites(ctx, ctx["import_date"], db_schema, group_receipt)
+        retained_source = context.get("retained_source")
+        if retained_source and (
+            organization_groups != retained_source["organization_groups"] or sites != retained_source["sites"]
+        ):
+            raise RuntimeError("cms_doctors_retained_source_binding_counts_changed")
+        address_stats = await _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema)
+        await raise_if_cancelled(ctx, {"run_id": run_id})
+        return {
+            "rows": stage_rows,
+            "education": education_manifest,
+            "group_site": group_receipt,
+            "organization_groups": organization_groups,
+            "sites": sites,
+            **({"artifact": context["artifact"]} if context.get("artifact") else {}),
+            **({"address_resolve": address_stats.__dict__} if address_stats else {}),
+        }
 
 
 def _cms_doctors_terminal_progress(stage_rows):
@@ -615,6 +650,20 @@ def _cms_doctors_terminal_progress(stage_rows):
     }
 
 
+async def _prepare_and_publish_doctors(ctx, stage_cls, schema, stage_rows):
+    """Rebuild both private maps on a global winner; source payload has no minted IDs."""
+    for attempt in range(1, 5):
+        try:
+            metrics = await _prepare_cms_doctors_sources(ctx, stage_cls, schema, stage_rows)
+            await _publish_cms_doctors_stage(stage_cls, schema, ctx["import_date"], identity_ctx=ctx)
+            return metrics
+        except CMSIdentityReprepareRequired:
+            await discard_doctors_identities(db, ctx)
+            if attempt == 4:
+                raise
+            await raise_if_cancelled(ctx, {"run_id": (ctx.get("context") or {}).get("control_run_id")})
+
+
 async def _publish_cms_doctors_generation(ctx):
     """Publish a completed CMS Doctors stage or record its terminal failure."""
     import_date = ctx.get("import_date")
@@ -627,12 +676,12 @@ async def _publish_cms_doctors_generation(ctx):
     await ensure_database(bool(context.get("test_mode")))
     db_schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     stage_cls = make_class(DoctorClinicianAddress, import_date)
-    stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
+    async with source_transaction(db):
+        stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
     if context.get("test_mode"):
         logger.info("CMS Doctors test mode: staged rows=%d", stage_rows)
         return await _finish_cms_doctors_test_run(ctx, db_schema, stage_rows)
-    terminal_metrics_by_name = await _prepare_cms_doctors_sources(ctx, stage_cls, db_schema, stage_rows)
-    await _publish_cms_doctors_stage(stage_cls, db_schema, import_date)
+    terminal_metrics_by_name = await _prepare_and_publish_doctors(ctx, stage_cls, db_schema, stage_rows)
     context.pop("education_stage_owned", None)
     context.pop("group_site_stage_owned", None)
 
@@ -658,8 +707,14 @@ async def publish_cms_doctors_generation(ctx):
     try:
         return await _publish_cms_doctors_generation(ctx)
     finally:
-        await discard_group_site_stage(ctx)
-        await discard_education_stage(ctx)
+        try:
+            await discard_doctors_identities(db, ctx)
+        finally:
+            context = ctx.get("context") or {}
+            if context.get("group_site_stage_owned") or context.get("education_stage_owned"):
+                async with source_transaction(db):
+                    await discard_group_site_stage(ctx)
+                    await discard_education_stage(ctx)
 
 
 shutdown = publish_cms_doctors_generation

@@ -6,22 +6,23 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import BigInteger
-from sqlalchemy import Boolean
-from sqlalchemy import CheckConstraint
-from sqlalchemy import Column
-from sqlalchemy import ForeignKeyConstraint
-from sqlalchemy import Integer
-from sqlalchemy import PrimaryKeyConstraint
-from sqlalchemy import String
-from sqlalchemy import Text
-from sqlalchemy import TIMESTAMP
-from sqlalchemy import UniqueConstraint
-from sqlalchemy import text
+from sqlalchemy import (
+    TIMESTAMP,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    ForeignKeyConstraint,
+    Integer,
+    PrimaryKeyConstraint,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
-
 
 __all__ = (
     "ProviderDirectoryUHCFlexPractitionerAcquisition",
@@ -31,16 +32,10 @@ __all__ = (
 
 
 _SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-_STORAGE_CONTRACT = (
-    "healthporta.provider-directory.uhc-flex-practitioner-acquisition.v1"
-)
+_STORAGE_CONTRACT = "healthporta.provider-directory.uhc-flex-practitioner-acquisition.v1"
 _SOURCE_ID = "pdfhir_1ceb7c0986c320b7eb924881"
-_CONNECTOR_ID = (
-    "pdufpc_16ebdbf260dc9815ae38830a6991fea5d6533ab8db7389da"
-)
-_QUERY_CONTRACT = (
-    "healthporta.provider-directory.uhc-flex-practitioner-exact-npi.v1"
-)
+_CONNECTOR_ID = "pdufpc_16ebdbf260dc9815ae38830a6991fea5d6533ab8db7389da"
+_QUERY_CONTRACT = "healthporta.provider-directory.uhc-flex-practitioner-exact-npi.v1"
 
 
 def _reference(table: str, column: str) -> str:
@@ -54,6 +49,7 @@ def _table_args(*constraints):
 class ProviderDirectoryUHCFlexPractitionerAcquisition(Base, JSONOutputMixin):
     """One immutable-role run over an exact official NPI cohort."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_uhc_flex_practitioner_acquisition"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
@@ -102,9 +98,9 @@ class ProviderDirectoryUHCFlexPractitionerAcquisition(Base, JSONOutputMixin):
             "(status = 'sealed' AND "
             "pending_count = 0 AND leased_count = 0 AND matched_count >= 0 "
             "AND unmatched_count >= 0 AND error_count >= 0 AND "
-            "cohort_complete = (error_count = 0) AND "
             "matched_count + unmatched_count + error_count = "
-            "expected_npi_count AND resource_count >= 0 AND "
+            "expected_npi_count AND cohort_complete = (error_count = 0) "
+            "AND resource_count >= 0 AND "
             "terminal_set_sha256 ~ '^[0-9a-f]{64}$' AND sealed_at IS NOT NULL)",
             name="pd_uhc_flex_practitioner_acquisition_state_check",
         ),
@@ -148,6 +144,7 @@ class ProviderDirectoryUHCFlexPractitionerAcquisition(Base, JSONOutputMixin):
 class ProviderDirectoryUHCFlexPractitionerWork(Base, JSONOutputMixin):
     """One fenced pending, leased, or terminal exact-NPI query."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_uhc_flex_practitioner_work"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
@@ -257,6 +254,7 @@ class ProviderDirectoryUHCFlexPractitionerWork(Base, JSONOutputMixin):
 class ProviderDirectoryUHCFlexPractitionerResource(Base, JSONOutputMixin):
     """One immutable canonical FHIR payload for one lease attempt."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_uhc_flex_practitioner_resource"
     __main_table__ = __tablename__
     __table_args__ = _table_args(

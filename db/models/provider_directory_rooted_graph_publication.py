@@ -6,9 +6,20 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, Date
-from sqlalchemy import ForeignKeyConstraint, Integer, PrimaryKeyConstraint
-from sqlalchemy import String, TIMESTAMP, UniqueConstraint, text
+from sqlalchemy import (
+    TIMESTAMP,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    Date,
+    ForeignKeyConstraint,
+    Integer,
+    PrimaryKeyConstraint,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import Base
@@ -35,14 +46,10 @@ _ENDPOINT = "provider_directory_api_endpoint"
 _PUBLICATION_CONTRACT = "healthporta.provider-directory.rooted-graph-publication.v1"
 _PARTIAL_PUBLICATION_CONTRACT = "healthporta.provider-directory.rooted-graph-publication.v2"
 _FAILURE_VALID = '"' + _SCHEMA.replace('"', '""') + '"."provider_directory_fhir_request_failure_coverage_valid"'
-_LEGACY_PUBLICATION_CONTRACT = (
-    "healthporta.provider-directory.uhc-flex-practitioner-dataset-publication.v1"
-)
+_LEGACY_PUBLICATION_CONTRACT = "healthporta.provider-directory.uhc-flex-practitioner-dataset-publication.v1"
 _ROOTED_SOURCE_ID = "pdfhir_2b088f28554b9e51505b455e"
 _ROOTED_ENDPOINT_ID = "42d85e85d6214cf898aef33591756d0231d11f1ef250d8c404c804cda8f36161"
-_ROOTED_ENDPOINT_SIGNATURE = (
-    "ec925b980d5f937abd5ca144a2041dda0c2b224fbe3fa8b70ccbe088f2222140"
-)
+_ROOTED_ENDPOINT_SIGNATURE = "ec925b980d5f937abd5ca144a2041dda0c2b224fbe3fa8b70ccbe088f2222140"
 _LEGACY_SOURCE_ID = "pdfhir_1ceb7c0986c320b7eb924881"
 _LEGACY_ENDPOINT_ID = "ad53a7446514ed65b3a8ea7ab68ceb9a1ef85bf6c04fcb882219ecb50928bab5"
 _SOURCE_AUTHORITY = "unitedhealthcare"
@@ -308,6 +315,8 @@ class ProviderDirectoryRootedGraphDataset(Base, JSONOutputMixin):
 class ProviderDirectoryRootedGraphDatasetResource(Base, JSONOutputMixin):
     """Bind each canonical output key to exact root or acquisition evidence."""
 
+    __runtime_schema_sync__ = False
+
     __tablename__ = _PROVENANCE
     __main_table__ = __tablename__
     __table_args__ = (
@@ -316,25 +325,6 @@ class ProviderDirectoryRootedGraphDatasetResource(Base, JSONOutputMixin):
             "resource_type",
             "resource_id",
             name="pd_rooted_graph_dataset_resource_pkey",
-        ),
-        ForeignKeyConstraint(
-            ["dataset_id"],
-            [_ref(_HEADER, "dataset_id")],
-            name="pd_rooted_graph_dataset_resource_dataset_fkey",
-        ),
-        ForeignKeyConstraint(
-            ["dataset_id", "resource_type", "resource_id"],
-            [
-                _ref(_GENERIC_RESOURCE, "dataset_id"),
-                _ref(_GENERIC_RESOURCE, "resource_type"),
-                _ref(_GENERIC_RESOURCE, "resource_id"),
-            ],
-            name="pd_rooted_graph_dataset_resource_parent_fkey",
-        ),
-        ForeignKeyConstraint(
-            ["publication_acquisition_id"],
-            [_ref(_ACQUISITION, "acquisition_id")],
-            name="pd_rooted_graph_dataset_resource_acquisition_fkey",
         ),
         CheckConstraint(
             "resource_type IN ('Practitioner','PractitionerRole',"
@@ -351,7 +341,7 @@ class ProviderDirectoryRootedGraphDatasetResource(Base, JSONOutputMixin):
             "source_payload_sha256 ~ '^[0-9a-f]{64}$'))",
             name="pd_rooted_graph_dataset_resource_check",
         ),
-        {"schema": _SCHEMA, "extend_existing": True},
+        {"schema": _SCHEMA, "extend_existing": True, "info": {"managed_immutable_storage": True}},
     )
     __my_index_elements__ = ["dataset_id", "resource_type", "resource_id"]
     __my_additional_indexes__ = [

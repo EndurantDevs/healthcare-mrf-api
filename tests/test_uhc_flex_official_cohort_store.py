@@ -10,11 +10,8 @@ import process.uhc_flex_official_cohort_store as store
 from process.uhc_canonical_proof import UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY
 from process.uhc_flex_official_cohort_contract import (
     UHCFlexOfficialCohortError,
-    UHC_FLEX_OFFICIAL_COHORT_CONTRACT_ID,
-    UHC_FLEX_OFFICIAL_NPI_SYSTEM,
 )
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
-
 
 ENDPOINT_ID = "e" * 64
 DATASET_ID = "official-dataset"
@@ -37,9 +34,7 @@ def _source_row():
         "status": "published",
         "is_current": True,
         "resource_count": TOTAL_RESOURCE_COUNT,
-        "publication_metadata_json": {
-            UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY: {"sealed": True}
-        },
+        "publication_metadata_json": {UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY: {"sealed": True}},
     }
 
 
@@ -53,71 +48,6 @@ def _proof():
     }
 
 
-class _FakeDatabase:
-    def __init__(self, *, locked=True):
-        self.locked = locked
-        self.header = None
-        self.events = []
-        self.all_statements = []
-        self.status_calls = []
-
-    @asynccontextmanager
-    async def transaction(self):
-        self.events.append("transaction")
-        yield self
-
-    async def scalar(self, statement, **params):
-        assert "pg_try_advisory_xact_lock" in statement
-        assert UHC_PROVIDER_FILE_SOURCE_ID in params["lock_identity"]
-        self.events.append("lock")
-        return self.locked
-
-    async def all(self, statement, **params):
-        self.all_statements.append(statement)
-        if '"provider_directory_source"' in statement:
-            self.events.append("source")
-            return [_source_row()]
-        if '"provider_directory_uhc_flex_npi_cohort"' in statement:
-            self.events.append("read_header")
-            return [] if self.header is None else [dict(self.header)]
-        if '"provider_directory_dataset_resource"' in statement:
-            raise AssertionError("raw Practitioner rows must not be materialized")
-        raise AssertionError(statement)
-
-    async def first(self, statement, **params):
-        assert '"provider_directory_dataset_resource"' in statement
-        assert "count(DISTINCT npi)" in statement
-        assert "jsonb_array_elements" in statement
-        assert UHC_FLEX_OFFICIAL_NPI_SYSTEM in statement
-        assert "jsonb_typeof(identifier -> 'value') = 'string'" in statement
-        assert "identifier ->> 'value'" in statement
-        self.events.append("count_members")
-        return {
-            "practitioner_resource_count": PRACTITIONER_COUNT,
-            "invalid_npi_count": 0,
-            "npi_count": NPI_COUNT,
-        }
-
-    async def status(self, statement, **params):
-        self.status_calls.append((statement, dict(params)))
-        if 'INSERT INTO "mrf"."provider_directory_uhc_flex_npi_member"' in statement:
-            assert self.header is None
-            assert "SELECT DISTINCT" in statement
-            assert "jsonb_array_elements" in statement
-            assert UHC_FLEX_OFFICIAL_NPI_SYSTEM in statement
-            assert "jsonb_typeof(identifier -> 'value') = 'string'" in statement
-            assert "identifier ->> 'value'" in statement
-            assert "unnest" not in statement.lower()
-            assert "npis" not in params
-            self.events.append("write_members")
-            return NPI_COUNT
-        if 'INSERT INTO "mrf"."provider_directory_uhc_flex_npi_cohort"' in statement:
-            self.header = dict(params)
-            self.events.append("write_header")
-            return 1
-        raise AssertionError(statement)
-
-
 def _validated_proof(raw_proof, **bindings):
     assert raw_proof == {"sealed": True}
     assert bindings == {
@@ -129,38 +59,32 @@ def _validated_proof(raw_proof, **bindings):
 
 
 @pytest.mark.asyncio
-async def test_sync_writes_members_before_header_then_replays_exactly(monkeypatch):
-    database = _FakeDatabase()
-    monkeypatch.setattr(
-        store,
-        "validate_uhc_canonical_content_proof",
-        _validated_proof,
-    )
+async def test_sync_requires_source_factory_before_any_legacy_database_io():
+    class NoIO:
+        @asynccontextmanager
+        async def transaction(self):
+            raise AssertionError("ordinary transaction must not authorize fresh members")
+            yield
 
-    first_result = await store.sync_uhc_flex_official_cohort(database=database)
-    second_result = await store.sync_uhc_flex_official_cohort(database=database)
-
-    assert first_result.created is True
-    assert second_result.created is False
-    assert first_result.cohort == second_result.cohort
-    assert database.header["contract_id"] == UHC_FLEX_OFFICIAL_COHORT_CONTRACT_ID
-    assert database.events.index("write_members") < database.events.index("write_header")
-    assert not any(
-        '"provider_directory_dataset_resource"' in statement
-        for statement in database.all_statements
-    )
-    assert all("npis" not in params for _statement, params in database.status_calls)
+    with pytest.raises(ValueError, match="publisher_connection_required"):
+        await store.sync_uhc_flex_official_cohort(database=NoIO())
 
 
 @pytest.mark.asyncio
-async def test_sync_fails_before_source_read_when_advisory_lock_is_busy():
-    database = _FakeDatabase(locked=False)
+async def test_sync_rejects_unissued_expected_cohort_before_database_io():
+    from process.uhc_flex_official_cohort_contract import build_uhc_flex_official_cohort
 
-    with pytest.raises(UHCFlexOfficialCohortError) as error:
-        await store.sync_uhc_flex_official_cohort(database=database)
-
-    assert error.value.code == "busy"
-    assert database.events == ["transaction", "lock"]
+    cohort = build_uhc_flex_official_cohort(
+        official_endpoint_id=ENDPOINT_ID,
+        official_dataset_id=DATASET_ID,
+        official_acquisition_root_run_id=ROOT_RUN_ID,
+        official_dataset_hash=DATASET_HASH,
+        official_content_proof_sha256=PROOF_HASH,
+        practitioner_resource_count=PRACTITIONER_COUNT,
+        npi_count=NPI_COUNT,
+    )
+    with pytest.raises(UHCFlexOfficialCohortError):
+        await store.sync_uhc_flex_official_cohort(database=object(), expected_cohort=cohort)
 
 
 def test_snapshot_binds_current_official_dataset_and_content_proof(monkeypatch):

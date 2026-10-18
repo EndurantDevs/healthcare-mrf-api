@@ -4,12 +4,13 @@
 import asyncio
 import os
 import re
+import secrets
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import literal, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -29,8 +30,8 @@ def _url():
         pytest.skip("HLTHPRT_PTG_MEMBERSHIP_TEST_DSN is not set")
     url = make_url(raw)
     if (
-        url.host not in {"127.0.0.1", "localhost"}
-        or url.port not in {5432, 5440, 55486}
+        url.host not in {"127.0.0.1", "localhost", "postgres"}
+        or url.port not in {5432, 5440, 55486, 55487}
         or not re.fullmatch(
             r"(?:hc_ptg_membership_[0-9a-f]{32}|distance_factor_proto_[0-9]{8}_[0-9a-f]{8})", url.database or ""
         )
@@ -39,11 +40,94 @@ def _url():
     return url.set(drivername="postgresql+asyncpg")
 
 
+async def _prepare_database(admin, url, role_names, role_password_by_name):
+    owner, publisher, reader = role_names
+    async with admin.begin() as session:
+        # The supplied database is isolated; never replace pre-existing namespaces.
+        assert not await session.scalar(
+            text("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname IN ('mrf','hp_snapshot_retention'))")
+        )
+        await session.execute(text(f'CREATE ROLE "{owner}" NOLOGIN'))
+        for role in (publisher, reader):
+            password_literal = literal(role_password_by_name[role]).compile(
+                dialect=admin.dialect, compile_kwargs={"literal_binds": True}
+            )
+            await session.execute(text(f'CREATE ROLE "{role}" LOGIN PASSWORD {password_literal}'))
+        await session.execute(text(f'GRANT "{owner}" TO "{publisher}"'))
+        await session.execute(text(f'GRANT CREATE,CONNECT ON DATABASE "{url.database}" TO "{publisher}"'))
+        await session.execute(text(f'CREATE SCHEMA hp_snapshot_retention AUTHORIZATION "{owner}"'))
+        await session.execute(text(f'CREATE SCHEMA mrf AUTHORIZATION "{publisher}"'))
+        await session.execute(text(f'GRANT USAGE ON SCHEMA mrf,hp_snapshot_retention TO "{reader}"'))
+        await session.execute(text("CREATE TABLE mrf.ptg2_snapshot(snapshot_id text PRIMARY KEY)"))
+        await session.execute(
+            text(
+                "CREATE TABLE mrf.ptg2_snapshot_pin(owner_type text,owner_id text,snapshot_id text REFERENCES mrf.ptg2_snapshot(snapshot_id) ON DELETE RESTRICT,reason text,PRIMARY KEY(owner_type,owner_id,snapshot_id))"
+            )
+        )
+        await session.execute(text("INSERT INTO mrf.ptg2_snapshot VALUES ('synthetic-snapshot')"))
+        for table, columns in (
+            ("ptg2_current_snapshot", "slot text,snapshot_id text,previous_snapshot_id text"),
+            ("ptg2_current_source_snapshot", "source_key text,snapshot_id text,previous_snapshot_id text"),
+            ("ptg2_current_plan_source", "plan_source_key text,snapshot_id text,previous_snapshot_id text"),
+            (
+                "plan_release_snapshot_binding",
+                "serving_revision_id text,role text,binding_ordinal int,snapshot_id text",
+            ),
+            ("plan_release_snapshot_pin", "serving_revision_id text,snapshot_id text"),
+        ):
+            await session.execute(text(f"CREATE TABLE mrf.{table}({columns})"))
+        await session.execute(text(f'GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA mrf TO "{publisher}"'))
+        await session.execute(text(f'GRANT SELECT ON ALL TABLES IN SCHEMA mrf TO "{reader}"'))
+
+
+async def _cleanup_database(admin, url, role_names, stages):
+    owner, publisher, reader = role_names
+    async with admin.begin() as session:
+        # Exact task-owned database and roles: remove views first, then the captured heaps.
+        views = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='hp_snapshot_retention' AND c.relkind='v' AND c.relowner=(SELECT oid FROM pg_roles WHERE rolname=:owner)"
+                    ),
+                    {"owner": owner},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for name in views:
+            await session.execute(text(f'DROP VIEW hp_snapshot_retention."{name}" RESTRICT'))
+        for stage in stages:
+            exists = await session.scalar(text("SELECT to_regnamespace(:schema)::oid"), {"schema": stage.schema_name})
+            if exists is not None:
+                names = ",".join(f'"{stage.schema_name}"."{table}"' for table in SPEC.table_names)
+                await session.execute(text(f"DROP TABLE {names} RESTRICT"))
+                await session.execute(text(f'DROP SCHEMA "{stage.schema_name}" RESTRICT'))
+        for name in (
+            "ptg2_snapshot_pin",
+            "plan_release_snapshot_pin",
+            "plan_release_snapshot_binding",
+            "ptg2_current_plan_source",
+            "ptg2_current_source_snapshot",
+            "ptg2_current_snapshot",
+            "ptg2_snapshot",
+        ):
+            await session.execute(text(f"DROP TABLE IF EXISTS mrf.{name} RESTRICT"))
+        await session.execute(text("DROP SCHEMA IF EXISTS mrf RESTRICT"))
+        await session.execute(text("DROP SCHEMA IF EXISTS hp_snapshot_retention RESTRICT"))
+        await session.execute(text(f'REVOKE CREATE,CONNECT ON DATABASE "{url.database}" FROM "{publisher}"'))
+        for role in (reader, publisher, owner):
+            await session.execute(text(f'DROP ROLE IF EXISTS "{role}"'))
+
+
 @asynccontextmanager
 async def _database(monkeypatch):
     url = _url()
     suffix = uuid4().hex
-    owner, publisher, reader = ("pm_" + role + "_" + suffix for role in ("owner", "publisher", "reader"))
+    role_names = tuple("pm_" + role + "_" + suffix for role in ("owner", "publisher", "reader"))
+    _owner, publisher, reader = role_names
+    role_password_by_name = {role: secrets.token_hex(24) for role in (publisher, reader)}
     admin = create_async_engine(url)
     publisher_engine = None
     stages = []
@@ -56,84 +140,20 @@ async def _database(monkeypatch):
 
     monkeypatch.setattr(native, "precreate_model_family_stage", track_stage)
     try:
-        async with admin.begin() as session:
-            # The supplied database is isolated; never replace pre-existing namespaces.
-            assert not await session.scalar(
-                text("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname IN ('mrf','hp_snapshot_retention'))")
-            )
-            await session.execute(text(f'CREATE ROLE "{owner}" NOLOGIN'))
-            await session.execute(text(f'CREATE ROLE "{publisher}" LOGIN'))
-            await session.execute(text(f'CREATE ROLE "{reader}" LOGIN'))
-            await session.execute(text(f'GRANT "{owner}" TO "{publisher}"'))
-            await session.execute(text(f'GRANT CREATE,CONNECT ON DATABASE "{url.database}" TO "{publisher}"'))
-            await session.execute(text(f'CREATE SCHEMA hp_snapshot_retention AUTHORIZATION "{owner}"'))
-            await session.execute(text(f'CREATE SCHEMA mrf AUTHORIZATION "{publisher}"'))
-            await session.execute(text(f'GRANT USAGE ON SCHEMA mrf,hp_snapshot_retention TO "{reader}"'))
-            await session.execute(text("CREATE TABLE mrf.ptg2_snapshot(snapshot_id text PRIMARY KEY)"))
-            await session.execute(
-                text(
-                    "CREATE TABLE mrf.ptg2_snapshot_pin(owner_type text,owner_id text,snapshot_id text REFERENCES mrf.ptg2_snapshot(snapshot_id) ON DELETE RESTRICT,reason text,PRIMARY KEY(owner_type,owner_id,snapshot_id))"
-                )
-            )
-            await session.execute(text("INSERT INTO mrf.ptg2_snapshot VALUES ('synthetic-snapshot')"))
-            for table, columns in (
-                ("ptg2_current_snapshot", "slot text,snapshot_id text,previous_snapshot_id text"),
-                ("ptg2_current_source_snapshot", "source_key text,snapshot_id text,previous_snapshot_id text"),
-                ("ptg2_current_plan_source", "plan_source_key text,snapshot_id text,previous_snapshot_id text"),
-                (
-                    "plan_release_snapshot_binding",
-                    "serving_revision_id text,role text,binding_ordinal int,snapshot_id text",
-                ),
-            ):
-                await session.execute(text(f"CREATE TABLE mrf.{table}({columns})"))
-            await session.execute(
-                text(f'GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA mrf TO "{publisher}"')
-            )
-            await session.execute(text(f'GRANT SELECT ON ALL TABLES IN SCHEMA mrf TO "{reader}"'))
-        publisher_engine = create_async_engine(url.set(username=publisher))
+        await _prepare_database(admin, url, role_names, role_password_by_name)
+        publisher_engine = create_async_engine(url.set(username=publisher, password=role_password_by_name[publisher]))
         sessions = async_sessionmaker(publisher_engine, expire_on_commit=False)
-        yield SimpleNamespace(admin=admin, sessions=sessions, reader=reader, stages=stages, url=url)
+        yield SimpleNamespace(
+            admin=admin,
+            sessions=sessions,
+            reader=reader,
+            stages=stages,
+            reader_url=url.set(username=reader, password=role_password_by_name[reader]),
+        )
     finally:
         if publisher_engine is not None:
             await publisher_engine.dispose()
-        async with admin.begin() as session:
-            # Exact task-owned database and roles: remove views first, then the captured heaps.
-            views = (
-                (
-                    await session.execute(
-                        text(
-                            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='hp_snapshot_retention' AND c.relkind='v' AND c.relowner=(SELECT oid FROM pg_roles WHERE rolname=:owner)"
-                        ),
-                        {"owner": owner},
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            for name in views:
-                await session.execute(text(f'DROP VIEW hp_snapshot_retention."{name}" RESTRICT'))
-            for stage in stages:
-                exists = await session.scalar(
-                    text("SELECT to_regnamespace(:schema)::oid"), {"schema": stage.schema_name}
-                )
-                if exists is not None:
-                    names = ",".join(f'"{stage.schema_name}"."{table}"' for table in SPEC.table_names)
-                    await session.execute(text(f"DROP TABLE {names} RESTRICT"))
-                    await session.execute(text(f'DROP SCHEMA "{stage.schema_name}" RESTRICT'))
-            for name in (
-                "ptg2_snapshot_pin",
-                "plan_release_snapshot_binding",
-                "ptg2_current_plan_source",
-                "ptg2_current_source_snapshot",
-                "ptg2_current_snapshot",
-                "ptg2_snapshot",
-            ):
-                await session.execute(text(f"DROP TABLE IF EXISTS mrf.{name} RESTRICT"))
-            await session.execute(text("DROP SCHEMA IF EXISTS mrf RESTRICT"))
-            await session.execute(text("DROP SCHEMA IF EXISTS hp_snapshot_retention RESTRICT"))
-            await session.execute(text(f'REVOKE CREATE,CONNECT ON DATABASE "{url.database}" FROM "{publisher}"'))
-            for role in (reader, publisher, owner):
-                await session.execute(text(f'DROP ROLE IF EXISTS "{role}"'))
+        await _cleanup_database(admin, url, role_names, stages)
         await admin.dispose()
 
 
@@ -152,8 +172,8 @@ def _source(monkeypatch, *, fail_at=None, empty_code=False):
         "CPT",
         "99213",
     )
-    first = {0: (0, 1), 1: (1,), 2: ()}
-    second = {0: (10, 11), 1: (11, 12)}
+    first_by_owner = {0: (0, 1), 1: (1,), 2: ()}
+    second_by_owner = {0: (10, 11), 1: (11, 12)}
 
     async def source(*_args, **_kwargs):
         return tables, root, identity | {"code": _kwargs.get("code", "99213")}
@@ -163,7 +183,7 @@ def _source(monkeypatch, *, fail_at=None, empty_code=False):
             raise PTG2ManifestArtifactError("source CAS root differs")
 
     async def manifest(_session, *, relation, **_kwargs):
-        values = first if relation == "npi_patterns" else second
+        values = first_by_owner if relation == "npi_patterns" else second_by_owner
         count = sum(map(len, values.values()))
         return V4RelationManifest(
             1, relation, "members", "locators", 0, len(values), count, count, 4, 16384, 12288, 1024
@@ -172,7 +192,7 @@ def _source(monkeypatch, *, fail_at=None, empty_code=False):
     async def members(_session, *, relation, owner_keys, **_kwargs):
         if fail_at == "factor" and relation == "pattern_sets":
             raise asyncio.CancelledError
-        values = first if relation == "npi_patterns" else second
+        values = first_by_owner if relation == "npi_patterns" else second_by_owner
         return {key: values[key] for key in owner_keys}
 
     async def codes(*_args):
@@ -204,6 +224,74 @@ async def _build(db, code="99213"):
         )
 
 
+async def _assert_code_parity(db, schema):
+    async with db.sessions() as session, session.begin():
+        projection_row = (
+            (
+                await session.execute(
+                    membership_statement(schema),
+                    {
+                        "npis": [1000000001, 1000000002, 1000000003],
+                        "keys": [0, 1, 2],
+                        "code_keys": [7],
+                        "projection_limit": 100,
+                        "retained_limit": 100,
+                    },
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert projection_row["pairs"] == [[1000000001, 10], [1000000001, 11], [1000000002, 11]]
+        assert projection_row["first_count"] == 3
+        assert projection_row["priced_count"] == 3
+
+
+async def _assert_release_pin_retention(db, identity):
+    """Keep a source retained while a serving release owns its snapshot pin."""
+    async with db.sessions() as session, session.begin():
+        await session.execute(text("INSERT INTO mrf.plan_release_snapshot_pin VALUES('release','synthetic-snapshot')"))
+    async with db.sessions() as session:
+        with pytest.raises(PTG2ManifestArtifactError, match="retention references"):
+            async with session.begin():
+                await retire_unreferenced(session, identity)
+    async with db.sessions() as session, session.begin():
+        await session.execute(text("DELETE FROM mrf.plan_release_snapshot_pin"))
+
+
+async def _assert_retention(db, identity, ready_receipt):
+    # The retained native view protects all heaps after a GET transaction ends.
+    from sqlalchemy.exc import DBAPIError
+
+    async with db.sessions() as session:
+        with pytest.raises(DBAPIError):
+            async with session.begin():
+                await native.cleanup_model_family_stage(session, SPEC, db.stages[0])
+    async with db.sessions() as session, session.begin():
+        assert receipt(await locate(session, identity)) == ready_receipt
+        await session.execute(
+            text("INSERT INTO mrf.plan_release_snapshot_binding VALUES('release','in_network',0,'synthetic-snapshot')")
+        )
+    async with db.sessions() as session:
+        with pytest.raises(PTG2ManifestArtifactError, match="retention references"):
+            async with session.begin():
+                await retire_unreferenced(session, identity)
+    async with db.sessions() as session, session.begin():
+        await session.execute(text("DELETE FROM mrf.plan_release_snapshot_binding"))
+    await _assert_release_pin_retention(db, identity)
+    async with db.sessions() as pinned, pinned.begin():
+        await locate(pinned, identity)
+        async with db.sessions() as retire:
+            with pytest.raises(DBAPIError):
+                async with retire.begin():
+                    await retire_unreferenced(retire, identity)
+    async with db.sessions() as session, session.begin():
+        assert await retire_unreferenced(session, identity) is True
+    async with db.sessions() as session, session.begin():
+        assert await locate(session, identity) is None
+        assert await session.scalar(text("SELECT count(*) FROM mrf.ptg2_snapshot_pin")) == 0
+
+
 @pytest.mark.asyncio
 async def test_native_candidate_code_parity_adoption_dependency_retention_and_safe_retirement(monkeypatch):
     tables, identity = _source(monkeypatch)
@@ -213,67 +301,18 @@ async def test_native_candidate_code_parity_adoption_dependency_retention_and_sa
             return ['"' + db.reader + '"']
 
         monkeypatch.setattr(build, "_reader_principals", principals)
-        result = await _build(db)
-        assert result["state"] == "ready"
-        assert result["code_coverage"][0]["set_count"] == 2
-        assert result["code_coverage"][0]["occurrence_count"] == 3
-        assert result["source_pin"]["owner_type"] == CONTRACT
-        assert len(result["active_attachment"]["name"]) == 55
+        ready_receipt = await _build(db)
+        assert ready_receipt["state"] == "ready"
+        assert ready_receipt["code_coverage"][0]["set_count"] == 2
+        assert ready_receipt["code_coverage"][0]["occurrence_count"] == 3
+        assert ready_receipt["source_pin"]["owner_type"] == CONTRACT
+        assert len(ready_receipt["active_attachment"]["name"]) == 55
         # Duplicate normal runs converge on the same immutable candidate/storage.
-        assert await _build(db) == result
+        assert await _build(db) == ready_receipt
         assert len(db.stages) == 1
         schema = db.stages[0].schema_name
-        async with db.sessions() as session, session.begin():
-            row = (
-                (
-                    await session.execute(
-                        membership_statement(schema),
-                        {
-                            "npis": [1000000001, 1000000002, 1000000003],
-                            "keys": [0, 1, 2],
-                            "code_keys": [7],
-                            "projection_limit": 100,
-                            "retained_limit": 100,
-                        },
-                    )
-                )
-                .mappings()
-                .one()
-            )
-            assert row["pairs"] == [[1000000001, 10], [1000000001, 11], [1000000002, 11]]
-            assert row["first_count"] == 3
-            assert row["priced_count"] == 3
-        # The retained native view protects all heaps after a GET transaction ends.
-        from sqlalchemy.exc import DBAPIError
-
-        async with db.sessions() as session:
-            with pytest.raises(DBAPIError):
-                async with session.begin():
-                    await native.cleanup_model_family_stage(session, SPEC, db.stages[0])
-        async with db.sessions() as session, session.begin():
-            assert receipt(await locate(session, identity)) == result
-            await session.execute(
-                text(
-                    "INSERT INTO mrf.plan_release_snapshot_binding VALUES('release','in_network',0,'synthetic-snapshot')"
-                )
-            )
-        async with db.sessions() as session:
-            with pytest.raises(PTG2ManifestArtifactError, match="retention references"):
-                async with session.begin():
-                    await retire_unreferenced(session, identity)
-        async with db.sessions() as session, session.begin():
-            await session.execute(text("DELETE FROM mrf.plan_release_snapshot_binding"))
-        async with db.sessions() as pinned, pinned.begin():
-            await locate(pinned, identity)
-            async with db.sessions() as retire:
-                with pytest.raises(DBAPIError):
-                    async with retire.begin():
-                        await retire_unreferenced(retire, identity)
-        async with db.sessions() as session, session.begin():
-            assert await retire_unreferenced(session, identity) is True
-        async with db.sessions() as session, session.begin():
-            assert await locate(session, identity) is None
-            assert await session.scalar(text("SELECT count(*) FROM mrf.ptg2_snapshot_pin")) == 0
+        await _assert_code_parity(db, schema)
+        await _assert_retention(db, identity, ready_receipt)
 
 
 @pytest.mark.asyncio
@@ -324,7 +363,7 @@ async def test_concurrent_duplicate_builds_adopt_one_identity_and_reader_cannot_
         one, two = await asyncio.gather(_build(db), _build(db))
         assert one == two
         assert len(db.stages) == 1
-        reader_engine = create_async_engine(db.url.set(username=db.reader))
+        reader_engine = create_async_engine(db.reader_url)
         try:
             from sqlalchemy.exc import DBAPIError
 

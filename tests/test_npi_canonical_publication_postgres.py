@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import datetime as dt
 import json
 from pathlib import Path
 
@@ -18,16 +17,16 @@ from process.npi_canonical_publication import (
 )
 from process.npi_canonical_publication_store import (
     canonical_relation_oids,
+    has_settled_npi_publication,
     insert_npi_publication_receipt,
     load_committed_npi_publication,
-    has_settled_npi_publication,
     mark_npi_publication_succeeded,
 )
 from tests.npi_canonical_publication_postgres_support import (
     CANONICAL_TABLES,
     assert_published_state_is_frozen,
-    npi_publication_schema,
 )
+from tests.nppes_candidate_postgres_support import nppes_candidate_publication_schema as npi_publication_schema
 from tests.public_evidence_nppes_admission_postgres_support import (
     admit_chain,
     admit_replay,
@@ -35,9 +34,7 @@ from tests.public_evidence_nppes_admission_postgres_support import (
     prepared_replay,
     qualified,
 )
-from tests.public_evidence_storage_postgres_support import connect
-from tests.public_evidence_storage_postgres_support import run_migration_action
-
+from tests.public_evidence_storage_postgres_support import connect, run_migration_action
 
 RUN_ID = "run_npi_publication_pg"
 ATTEMPT_ID = RUN_ID + ":" + "c" * 32
@@ -62,8 +59,8 @@ async def _insert_running_attempt(
 ) -> None:
     await connection.execute(
         f"INSERT INTO {qualified(schema_name, 'import_run')} "
-        "(run_id, importer, status, phase_detail, heartbeat_at, progress, metrics) "
-        "VALUES ($1, 'npi', 'running', 'process_data running', "
+        "(run_id, engine, importer, status, phase_detail, heartbeat_at, progress, metrics) "
+        "VALUES ($1, 'python', 'npi', 'running', 'process_data running', "
         "transaction_timestamp() AT TIME ZONE 'UTC', $2::jsonb, '{}'::jsonb)",
         run_id,
         json.dumps(
@@ -151,10 +148,7 @@ async def test_atomic_publication_is_validated_sealed_and_frozen(tmp_path):
             assert stored["status"] == "succeeded"
             assert stored["snapshot_id"] == receipt.publication_ref
             assert stored["sealed_at"].tzinfo is not None
-            assert tuple(
-                stored[f"{table_name}_row_count"]
-                for table_name in CANONICAL_TABLES
-            ) == (1, 2, 3, 4, 5, 6)
+            assert tuple(stored[f"{table_name}_row_count"] for table_name in CANONICAL_TABLES) == (1, 2, 3, 4, 5, 6)
 
             await assert_published_state_is_frozen(connection, schema_name)
         finally:
@@ -181,13 +175,14 @@ async def test_forged_census_rolls_back_receipt_and_terminal_state(tmp_path):
                         chain.chain_ref,
                         row_counts=(9, 2, 3, 4, 5, 6),
                     )
-            assert await connection.fetchval(
-                f"SELECT count(*) FROM "
-                f"{qualified(schema_name, 'npi_canonical_publication_receipt')}"
-            ) == 0
+            assert (
+                await connection.fetchval(
+                    f"SELECT count(*) FROM {qualified(schema_name, 'npi_canonical_publication_receipt')}"
+                )
+                == 0
+            )
             run = await connection.fetchrow(
-                f"SELECT status, snapshot_id FROM {qualified(schema_name, 'import_run')} "
-                "WHERE run_id=$1",
+                f"SELECT status, snapshot_id FROM {qualified(schema_name, 'import_run')} WHERE run_id=$1",
                 RUN_ID,
             )
             assert tuple(run) == ("running", None)
@@ -231,10 +226,12 @@ async def test_preinserted_seal_and_contradictory_terminal_metrics_roll_back(
                         chain.chain_ref,
                         include_evidence_metrics=False,
                     )
-            assert await connection.fetchval(
-                f"SELECT count(*) FROM "
-                f"{qualified(schema_name, 'npi_canonical_publication_receipt')}"
-            ) == 0
+            assert (
+                await connection.fetchval(
+                    f"SELECT count(*) FROM {qualified(schema_name, 'npi_canonical_publication_receipt')}"
+                )
+                == 0
+            )
         finally:
             await connection.close()
 
@@ -257,17 +254,14 @@ async def test_early_constraint_validation_seals_against_late_table_writes(
                 async with connection.transaction():
                     await _publish(connection, schema_name, chain.chain_ref)
                     await connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
-                    await connection.execute(
-                        f"INSERT INTO {qualified(schema_name, 'npi')} "
-                        "(synthetic_id) VALUES (99)"
-                    )
-            assert await connection.fetchval(
-                f"SELECT count(*) FROM "
-                f"{qualified(schema_name, 'npi_canonical_publication_receipt')}"
-            ) == 0
-            assert await connection.fetchval(
-                f"SELECT count(*) FROM {qualified(schema_name, 'npi')}"
-            ) == 1
+                    await connection.execute(f"INSERT INTO {qualified(schema_name, 'npi')} (synthetic_id) VALUES (99)")
+            assert (
+                await connection.fetchval(
+                    f"SELECT count(*) FROM {qualified(schema_name, 'npi_canonical_publication_receipt')}"
+                )
+                == 0
+            )
+            assert await connection.fetchval(f"SELECT count(*) FROM {qualified(schema_name, 'npi')}") == 1
         finally:
             await connection.close()
 
@@ -341,30 +335,23 @@ async def _assert_publication_triggers(
     """Require the exact deferred validator and enabled-always write guards."""
 
     trigger_rows = await connection.fetch(
-                "SELECT relation.relname, trigger.tgname, trigger.tgenabled, "
-                "trigger.tgdeferrable, trigger.tginitdeferred "
-                "FROM pg_catalog.pg_trigger AS trigger "
-                "JOIN pg_catalog.pg_class AS relation ON relation.oid=trigger.tgrelid "
-                "JOIN pg_catalog.pg_namespace AS namespace "
-                "ON namespace.oid=relation.relnamespace "
-                "WHERE namespace.nspname=$1 AND NOT trigger.tgisinternal "
-                "AND (relation.relname LIKE 'npi_canonical_publication%' "
-                "OR (relation.relname='import_run' "
-                "AND trigger.tgname='npi_canonical_publication_import_run_guard'))",
-                schema_name,
-            )
-    trigger_by_name = {
-        trigger_row["tgname"]: trigger_row for trigger_row in trigger_rows
-    }
-    integrity_guard = trigger_by_name[
-        "npi_canonical_publication_receipt_integrity_guard"
-    ]
+        "SELECT relation.relname, trigger.tgname, trigger.tgenabled, "
+        "trigger.tgdeferrable, trigger.tginitdeferred "
+        "FROM pg_catalog.pg_trigger AS trigger "
+        "JOIN pg_catalog.pg_class AS relation ON relation.oid=trigger.tgrelid "
+        "JOIN pg_catalog.pg_namespace AS namespace "
+        "ON namespace.oid=relation.relnamespace "
+        "WHERE namespace.nspname=$1 AND NOT trigger.tgisinternal "
+        "AND (relation.relname LIKE 'npi_canonical_publication%' "
+        "OR (relation.relname='import_run' "
+        "AND trigger.tgname='npi_canonical_publication_import_run_guard'))",
+        schema_name,
+    )
+    trigger_by_name = {trigger_row["tgname"]: trigger_row for trigger_row in trigger_rows}
+    integrity_guard = trigger_by_name["npi_canonical_publication_receipt_integrity_guard"]
     assert integrity_guard["tgdeferrable"] is True
     assert integrity_guard["tginitdeferred"] is True
-    assert {
-        trigger_row["tgname"]: trigger_row["tgenabled"]
-        for trigger_row in trigger_rows
-    } == {
+    assert {trigger_row["tgname"]: trigger_row["tgenabled"] for trigger_row in trigger_rows} == {
         "npi_canonical_publication_import_run_guard": b"A",
         "npi_canonical_publication_receipt_integrity_guard": b"A",
         "npi_canonical_publication_receipt_mutation_guard": b"A",
@@ -373,24 +360,21 @@ async def _assert_publication_triggers(
         "npi_canonical_publication_receipt_truncate_guard": b"A",
     }
     canonical_guard_rows = await connection.fetch(
-                "SELECT relation.relname, trigger.tgname, trigger.tgenabled "
-                "FROM pg_catalog.pg_trigger AS trigger "
-                "JOIN pg_catalog.pg_class AS relation "
-                "ON relation.oid=trigger.tgrelid "
-                "JOIN pg_catalog.pg_namespace AS namespace "
-                "ON namespace.oid=relation.relnamespace "
-                "WHERE namespace.nspname=$1 AND NOT trigger.tgisinternal "
-                "AND relation.relname=ANY($2::text[]) "
-                "AND trigger.tgname LIKE "
-                "'npi_canonical_publication_postseal_%_guard'",
-                schema_name,
-                list(CANONICAL_TABLES),
-            )
-    assert len(canonical_guard_rows) == 12
-    assert all(
-        trigger_row["tgenabled"] == b"A"
-        for trigger_row in canonical_guard_rows
+        "SELECT relation.relname, trigger.tgname, trigger.tgenabled "
+        "FROM pg_catalog.pg_trigger AS trigger "
+        "JOIN pg_catalog.pg_class AS relation "
+        "ON relation.oid=trigger.tgrelid "
+        "JOIN pg_catalog.pg_namespace AS namespace "
+        "ON namespace.oid=relation.relnamespace "
+        "WHERE namespace.nspname=$1 AND NOT trigger.tgisinternal "
+        "AND relation.relname=ANY($2::text[]) "
+        "AND trigger.tgname LIKE "
+        "'npi_canonical_publication_postseal_%_guard'",
+        schema_name,
+        list(CANONICAL_TABLES),
     )
+    assert len(canonical_guard_rows) == 12
+    assert all(trigger_row["tgenabled"] == b"A" for trigger_row in canonical_guard_rows)
 
 
 @pytest.mark.asyncio
@@ -424,20 +408,23 @@ async def test_publication_catalog_has_always_guards_and_no_public_privileges():
                 "guard_npi_canonical_publication_run()",
                 "guard_npi_canonical_publication_after_seal()",
             ):
-                assert await connection.fetchval(
-                    "SELECT has_function_privilege('public', $1, 'EXECUTE')",
-                    f"{schema_name}.{function_name}",
-                ) is False
-            sequence_name = (
-                f"{schema_name}."
-                "npi_canonical_publication_receipt_publication_generation_seq"
-            )
+                assert (
+                    await connection.fetchval(
+                        "SELECT has_function_privilege('public', $1, 'EXECUTE')",
+                        f"{schema_name}.{function_name}",
+                    )
+                    is False
+                )
+            sequence_name = f"{schema_name}.npi_canonical_publication_receipt_publication_generation_seq"
             for privilege_name in ("SELECT", "USAGE", "UPDATE"):
-                assert await connection.fetchval(
-                    "SELECT has_sequence_privilege('public', $1, $2)",
-                    sequence_name,
-                    privilege_name,
-                ) is False
+                assert (
+                    await connection.fetchval(
+                        "SELECT has_sequence_privilege('public', $1, $2)",
+                        sequence_name,
+                        privilege_name,
+                    )
+                    is False
+                )
         finally:
             await connection.close()
 
@@ -453,10 +440,13 @@ async def test_publication_downgrade_is_empty_only_and_reversible(tmp_path):
         await run_migration_action(engine, migration, "downgrade")
         connection = await connect(database_url)
         try:
-            assert await connection.fetchval(
-                "SELECT to_regclass($1)",
-                f"{schema_name}.npi_canonical_publication_receipt",
-            ) is None
+            assert (
+                await connection.fetchval(
+                    "SELECT to_regclass($1)",
+                    f"{schema_name}.npi_canonical_publication_receipt",
+                )
+                is None
+            )
         finally:
             await connection.close()
         await run_migration_action(engine, migration, "upgrade")

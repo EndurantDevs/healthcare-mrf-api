@@ -10,16 +10,13 @@ from typing import Any, Mapping
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_lifecycle_lock import (
+    PTG2_SOURCE_LIFECYCLE_LOCK_NAMESPACE,
+    PTG2_SOURCE_POINTER_GC_LOCK_KEY,
     PTG2LifecycleLockDeferred,
     acquire_ptg2_source_lifecycle_lock,
     is_retryable_lifecycle_database_error,
 )
-from process.ptg_parts.source_snapshot_predecessor_retirement_types import (
-    PTG2PredecessorRetirementConflict,
-    PredecessorRetirementContext,
-    PredecessorRetirementDecision,
-    PredecessorRetirementRequest,
-)
+from process.ptg_parts.snapshot_tables import _normalize_source_key
 from process.ptg_parts.source_snapshot_predecessor_retirement_sql import (
     CONTROL_CONTEXT_QUERY_TEMPLATES,
     GLOBAL_POINTER_UPDATE,
@@ -29,10 +26,15 @@ from process.ptg_parts.source_snapshot_predecessor_retirement_sql import (
     ROLLBACK_PIN_DELETE,
     SOURCE_POINTER_UPDATE,
 )
+from process.ptg_parts.source_snapshot_predecessor_retirement_types import (
+    PredecessorRetirementContext,
+    PredecessorRetirementDecision,
+    PredecessorRetirementRequest,
+    PTG2PredecessorRetirementConflict,
+)
 from process.ptg_parts.source_snapshot_rollback_types import (
     ROLLBACK_PIN_OWNER_TYPE,
 )
-
 
 _LOCK_CONTENTION_SQLSTATES = frozenset({"40P01", "55P03"})
 _GLOBAL_POINTER_LOCK_IDENTITY = "legacy_global_snapshot_pointer"
@@ -116,6 +118,32 @@ async def load_retirement_audit(
     )
 
 
+async def _require_source_lifecycle_fence(session, request):
+    """Refuse protected immutable reads unless this transaction owns both fences."""
+    held = await _one(
+        session,
+        """WITH wanted(key,mode) AS (
+          VALUES(hashtext(:gc_lock_key)::bigint,'ShareLock'),
+                (hashtextextended(:source_lock_key,0),'ExclusiveLock')
+        ) SELECT bool_and(EXISTS(
+          SELECT FROM pg_locks l WHERE l.locktype='advisory'
+           AND l.pid=pg_backend_pid() AND l.granted AND l.objsubid=1
+           AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
+           AND l.classid=((wanted.key >> 32) & 4294967295)::oid
+           AND l.objid=(wanted.key & 4294967295)::oid
+           AND (l.mode=wanted.mode OR l.mode='ExclusiveLock')
+        )) AS held FROM wanted""",
+        {
+            "gc_lock_key": PTG2_SOURCE_POINTER_GC_LOCK_KEY,
+            "source_lock_key": PTG2_SOURCE_LIFECYCLE_LOCK_NAMESPACE
+            + ":"
+            + str(_normalize_source_key(request.source_key)),
+        },
+    )
+    if held.get("held") is not True:
+        raise PTG2PredecessorRetirementConflict("predecessor immutable reads require the source lifecycle fence")
+
+
 async def load_retirement_context(
     session: Any,
     *,
@@ -123,7 +151,9 @@ async def load_retirement_context(
     control_schema_name: str,
     request: PredecessorRetirementRequest,
 ) -> PredecessorRetirementContext:
-    """Lock control then MRF; NOWAIT until all writers share the lifecycle lock."""
+    """Keep mutable locks; read immutable cohorts under the source lifecycle fence."""
+
+    await _require_source_lifecycle_fence(session, request)
 
     schema = _quote_ident(schema_name)
     control_schema = _quote_ident(control_schema_name)
@@ -146,13 +176,7 @@ async def load_retirement_context(
         pair_params_by_name,
     )
     try:
-        await session.execute(
-            db.text(
-                f"LOCK TABLE {schema}.plan_release_snapshot_binding, "
-                f"{schema}.ptg2_snapshot_pin "
-                "IN SHARE ROW EXCLUSIVE MODE NOWAIT"
-            )
-        )
+        await session.execute(db.text(f"LOCK TABLE {schema}.ptg2_snapshot_pin IN SHARE ROW EXCLUSIVE MODE NOWAIT"))
     except Exception as exc:
         if _database_sqlstate(exc) not in _LOCK_CONTENTION_SQLSTATES:
             raise
@@ -172,6 +196,7 @@ async def load_retirement_context(
             pair_params_by_name,
         )
     )
+    context_records_by_surface["pin_records"] += context_records_by_surface.pop("plan_pin_records")
     context_records_by_surface["global_pointer_records"] = ()
     return PredecessorRetirementContext(**context_records_by_surface)
 
@@ -268,9 +293,7 @@ async def _clear_plan_predecessors(
         _schema_sql(PLAN_POINTER_UPDATE, schema),
         params_by_name,
         expected_count=expected_count,
-        conflict_message=(
-            "source plan pointers changed during predecessor retirement"
-        ),
+        conflict_message=("source plan pointers changed during predecessor retirement"),
     )
 
 
@@ -318,21 +341,13 @@ async def postcheck_predecessor_retirement(
         "control_release_references",
         "control_pin_references",
     )
-    if any(
-        int(postcheck_by_field.get(field) or 0) != 0
-        for field in reference_fields
-    ):
-        raise PTG2PredecessorRetirementConflict(
-            "predecessor still has live references after retirement"
-        )
+    if any(int(postcheck_by_field.get(field) or 0) != 0 for field in reference_fields):
+        raise PTG2PredecessorRetirementConflict("predecessor still has live references after retirement")
     if (
         int(postcheck_by_field.get("preserved_lineage") or 0) != 1
-        or int(postcheck_by_field.get("preserved_current_pointer") or 0)
-        != 1
+        or int(postcheck_by_field.get("preserved_current_pointer") or 0) != 1
     ):
-        raise PTG2PredecessorRetirementConflict(
-            "current snapshot or immutable snapshot lineage changed"
-        )
+        raise PTG2PredecessorRetirementConflict("current snapshot or immutable snapshot lineage changed")
 
 
 async def attempt_legacy_global_predecessor_clear(
@@ -361,9 +376,7 @@ async def attempt_legacy_global_predecessor_clear(
             )
             has_cleared_pointer = compatibility_result.one_or_none() is not None
     except Exception as exc:
-        if not isinstance(exc, PTG2LifecycleLockDeferred) and not (
-            is_retryable_lifecycle_database_error(exc)
-        ):
+        if not isinstance(exc, PTG2LifecycleLockDeferred) and not (is_retryable_lifecycle_database_error(exc)):
             logger.warning(
                 "Deferred legacy PTG global predecessor cleanup for %s: %s",
                 request.predecessor_snapshot_id,
@@ -428,13 +441,8 @@ async def insert_retirement_audit(
         """,
         params_by_name,
     )
-    if (
-        inserted_audit_by_field.get("idempotency_key")
-        != request.idempotency_key
-    ):
-        raise PTG2PredecessorRetirementConflict(
-            "predecessor retirement audit insert did not persist"
-        )
+    if inserted_audit_by_field.get("idempotency_key") != request.idempotency_key:
+        raise PTG2PredecessorRetirementConflict("predecessor retirement audit insert did not persist")
     return {**params_by_name, **inserted_audit_by_field}
 
 

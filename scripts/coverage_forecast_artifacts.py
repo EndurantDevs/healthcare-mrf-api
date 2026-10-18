@@ -109,6 +109,7 @@ SHARD_SPEC_BY_KIND = {
             "registry-46",
             "registry-47",
             "directory-source",
+            "directory-source-2",
             "directory-storage",
             "directory-address",
             "profile-storage",

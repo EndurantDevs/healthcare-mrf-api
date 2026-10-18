@@ -23,7 +23,6 @@ from process.provider_directory_cms_desired_fence import prepare_desired_fence
 from process.provider_directory_cms_native_inputs import (
     assert_native_address_input_fence,
     capture_native_address_input_fence,
-    register_native_address_inputs,
 )
 from process.provider_directory_cms_nonprofile_capacity import (
     _assert_runtime_storage,
@@ -82,14 +81,6 @@ async def _verified_pair(fhir, request):
     if (profile_lease.max_build_deadline - now).total_seconds() < seconds:
         raise _error("paired_profile_deadline_too_short")
     return profile_lease
-
-
-async def _register_inputs(fhir):
-    """Commit additive revision guards before the read-only preparation snapshot."""
-    async with fhir.db.transaction() as session:
-        await session.execute(text("SET LOCAL lock_timeout='5s'"))
-        await session.execute(text("SET LOCAL statement_timeout='5s'"))
-        await register_native_address_inputs(session, fhir._schema())
 
 
 def _monitored_plan(request, profile_lease, fence, projection, address, artifact_targets, resource_types):
@@ -155,18 +146,24 @@ async def _read_inputs(fhir, request, profile_lease):
     limits = request.cms_nonprofile_admission["limits"]
     artifact_targets = set(fhir.PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS) - {"profile", "corroboration"}
     resource_types = fhir._provider_directory_artifact_resource_types(artifact_targets, publish_corroboration=False)
-    async with fhir.db.transaction() as session:
-        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+    from process.provider_directory_generic_source_policy import is_source_storage_required
+    from process.provider_directory_profile_scope_copy import preflight_transaction
+    from process.provider_directory_profile_source_inputs import profile_source_input_scope
+
+    async with preflight_transaction(fhir, isolation="repeatable read", readonly=True) as session:
+        if not is_source_storage_required():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         await _runtime_settings(session, limits, fhir.db)
         await fhir.assert_profile_selection_current_in_transaction(
             execution.attestation, fhir._provider_directory_profile_selection_catalog()
         )
         await _paired_preflight(fhir, profile_lease)
         fence = await prepare_desired_fence(fhir, execution, run_id=None, metrics={}, publish_targets=artifact_targets)
-        projection = await fhir._provider_directory_artifact_scope_exact_projection(
-            schema, fence, resource_types, source_fence=fence, batch_size=limits["batch_size"]
-        )
-        fhir._assert_provider_directory_artifact_scope_exact_capacity(projection)
+        async with profile_source_input_scope(fhir, fence, fence):
+            projection = await fhir._provider_directory_artifact_scope_exact_projection(
+                schema, fence, resource_types, source_fence=fence, batch_size=limits["batch_size"]
+            )
+            fhir._assert_provider_directory_artifact_scope_exact_capacity(projection)
         dependencies = await receipts.capture_native_dependencies(session, schema)
         native_input_fence = await capture_native_address_input_fence(session, schema)
         # The factory is not invoked here. Its run id is deliberately absent from its input hash.
@@ -286,10 +283,14 @@ async def _assert_current_inputs(fhir, request, inputs, profile_lease, session):
 async def _issue_receipt(fhir, request, inputs, profile_lease):
     """Persist a CMS-purpose receipt through the existing serialized single-use ledger."""
     schema = fhir._schema()
-    async with fhir.db.transaction() as session:
+    from process.provider_directory_generic_source_policy import is_source_storage_required
+    from process.provider_directory_profile_scope_copy import preflight_transaction
+
+    async with preflight_transaction(fhir, isolation="read committed", readonly=False) as session:
+        if not is_source_storage_required():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
         # Fresh statement snapshots see writers committed before the NOWAIT locks.
         # Existing admission/table locks serialize every ledger read and write.
-        await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
         await session.execute(text("SET LOCAL statement_timeout='5s'"))
         await _runtime_settings(session, request.cms_nonprofile_admission["limits"], fhir.db)
         await _assert_current_inputs(fhir, request, inputs, profile_lease, session)
@@ -323,7 +324,7 @@ async def _issue_receipt(fhir, request, inputs, profile_lease):
 
 
 async def _produce(fhir, request, *, issue):
-    """Keep registration, read-only observation and bounded issuance in separate transactions."""
+    """Verify already enrolled inputs read-only before bounded receipt issuance."""
     if fhir.db._transaction_binding() is not None or fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get():
         raise _error("own_transaction_required")
     profile_lease = await _verified_pair(fhir, request)
@@ -333,7 +334,6 @@ async def _produce(fhir, request, *, issue):
 
     initial_token = initial.REQUESTED.set(initial_profile_for_request(request))
     try:
-        await _register_inputs(fhir)
         inputs = await _read_inputs(fhir, request, profile_lease)
         if issue:
             return await _issue_receipt(fhir, request, inputs, profile_lease)

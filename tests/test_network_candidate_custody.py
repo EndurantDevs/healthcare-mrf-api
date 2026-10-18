@@ -1,0 +1,647 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Synthetic custody boundaries; native privilege acceptance is separate."""
+
+import copy
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from uuid import UUID
+
+import pytest
+
+from process import network_candidate_custody as custody
+from process import network_membership_publication
+from process.network_membership_copy import MembershipCopyTarget
+
+pytestmark = pytest.mark.asyncio
+FINAL_PROOF = custody._final_proof
+TARGET = MembershipCopyTarget(*(str(UUID(int=i)) for i in range(1, 5)), "network_candidate_" + UUID(int=4).hex)
+
+
+def _candidate_catalog():
+    return {
+        "namespace": {"oid": 30, "nspowner": 31},
+        "heaps": {"network_membership": 40, "provider_location_binding": 41, "entity_address_unified": 42},
+        "relations": [
+            {"oid": 40 + i, "relname": name, "relkind": b"r", "relowner": 31}
+            for i, name in enumerate(("network_membership", "provider_location_binding", "entity_address_unified"))
+        ],
+    }
+
+
+class Connection:
+    def __init__(self):
+        self.active = False
+        self.calls = []
+        self.isolation = "repeatable read"
+        self.control = dict(
+            schema_oid=10,
+            owner_oid=11,
+            rolname="control_owner",
+            database_oid=12,
+            database_name="synthetic",
+            candidate_table_oid=13,
+            seal_table_oid=14,
+            owned=True,
+            closed=True,
+            **{
+                k: False
+                for k in ("rolcanlogin", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
+            },
+        )
+        self.actor = dict(
+            session="operator",
+            current="operator",
+            backend=20,
+            xid="21",
+            role_oid=22,
+            rolcanlogin=True,
+            rolsuper=False,
+            rolcreatedb=False,
+            rolcreaterole=False,
+            rolreplication=False,
+            rolbypassrls=False,
+        )
+        self.candidate = {key: getattr(TARGET, key) for key in custody._STABLE[:5]}
+        self.candidate.update(
+            schema_revision=1,
+            source_generations={"custom_membership": "a" * 64},
+            approved_custom_revision=1,
+            expected_head=0,
+            expected_rows=2,
+            accepted_rows=2,
+            index_ready=True,
+            source_recipes_json=[],
+            validation_json={"writer_closure": {}},
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            state="ready",
+        )
+        self.catalog = _candidate_catalog()
+        self.seal = None
+        self.exists = True
+        self.can_set = True
+        self.nonreaders = set()
+        self.forbidden = set()
+        self.heap_safe = True
+        self.safe = True
+        self.inherit = True
+        self.index = "b" * 64
+        self.proofs = 0
+        self.unknown_commit = False
+
+    def is_in_transaction(self):
+        return self.active
+
+    @asynccontextmanager
+    async def transaction(self, **options):
+        assert not self.active
+        before = copy.deepcopy((self.catalog, self.seal))
+        self.active = True
+        try:
+            yield
+        except BaseException:
+            self.catalog, self.seal = before
+            raise
+        finally:
+            self.active = False
+        if self.unknown_commit:
+            self.unknown_commit = False
+            raise RuntimeError("commit acknowledgement lost")
+
+    async def fetchrow(self, sql, *args):
+        self.calls.append((sql, args))
+        if sql == custody._CONTROL_SQL:
+            return copy.deepcopy(self.control)
+        if sql == custody._IDENTITY_SQL:
+            return copy.deepcopy(self.actor)
+        if "network_membership_candidate WHERE" in sql:
+            return copy.deepcopy(self.candidate)
+        if "receipt_json::text" in sql:
+            return copy.deepcopy(self.seal)
+        raise AssertionError(sql)
+
+    async def fetch(self, sql, *args):
+        self.calls.append((sql, args))
+        assert sql == custody._READER_SQL
+        return [{"name": role} for role in sorted(args[0]) if role not in self.nonreaders]
+
+    async def fetchval(self, sql, *args):
+        self.calls.append((sql, args))
+        if sql == custody._CENSUS_SQL:
+            return not (set(args[0]) & self.forbidden)
+        if "FROM pg_class c WHERE c.oid=ANY" in sql:
+            return self.heap_safe
+        if "to_regclass" in sql:
+            return 14 if self.exists else None
+        if sql == "SHOW transaction_isolation":
+            return self.isolation
+        if "SELECT rolname FROM pg_roles" in sql:
+            return "control_owner" if args[0] == 11 else "loading_owner"
+        if "pg_has_role" in sql and "USAGE" in sql:
+            return self.inherit
+        if "pg_has_role" in sql or "has_database_privilege" in sql:
+            return self.can_set
+        if "quote_ident(current_user)" in sql:
+            return '"operator"'
+        if "SELECT oid::bigint" in sql:
+            return 11
+        raise AssertionError(sql)
+
+    async def execute(self, sql, *args):
+        self.calls.append((sql, args))
+        if sql.startswith("ALTER SCHEMA"):
+            self.catalog["namespace"]["nspowner"] = 11
+        if sql.startswith("ALTER TABLE"):
+            for row in self.catalog["relations"]:
+                if '"' + row["relname"] + '"' in sql:
+                    row["relowner"] = 11
+        if sql.startswith("INSERT INTO"):
+            assert self.seal is None
+            self.seal = {"seal_sha256": args[1], "receipt_json": args[2]}
+
+
+@pytest.fixture
+def boundary(monkeypatch):
+    connection = Connection()
+
+    async def catalog(conn, target, candidate):
+        assert conn is connection and target == TARGET
+        return copy.deepcopy(conn.catalog)
+
+    async def closed(conn, roles, catalog):
+        custody._require(
+            conn.safe
+            and catalog["namespace"]["nspowner"] == 11
+            and all(row["relowner"] == 11 for row in catalog["relations"])
+        )
+
+    async def proof(conn, *args):
+        conn.proofs += 1
+
+    async def index(conn, *args):
+        return conn.index
+
+    async def no_op(*args):
+        return None
+
+    monkeypatch.setattr(custody, "_catalog", catalog)
+    monkeypatch.setattr(custody, "_check_closed", closed)
+    monkeypatch.setattr(custody, "_final_proof", proof)
+    monkeypatch.setattr(custody, "_index_digest", index)
+    monkeypatch.setattr(custody, "_remove_grants", no_op)
+    monkeypatch.setattr(custody, "_remove_default_grants", no_op)
+    monkeypatch.setattr(
+        network_membership_publication,
+        "_publication_readiness",
+        lambda candidate: (None, None, None, {"owner_role": "loading_owner"}),
+    )
+    return connection
+
+
+async def is_authorized(connection, target):
+    assert target == TARGET
+    return True
+
+
+async def seal(connection, authorize=is_authorized):
+    return await custody.seal_network_candidate_custody(
+        connection, TARGET, control_schema="control", runtime_roles=("execution", "reader"), authorize=authorize
+    )
+
+
+async def verify(connection, **options):
+    connection.active = True
+    try:
+        return await custody.verify_network_candidate_custody(connection, TARGET, control_schema="control", **options)
+    finally:
+        connection.active = False
+
+
+async def test_seal_transfers_only_registered_candidate_and_replay_does_not_revalidate(boundary):
+    connection = boundary
+    before = copy.deepcopy(connection.candidate)
+    result = await seal(connection)
+    assert connection.candidate == before
+    assert result["receipt"]["closure"]["owner_role"] == "control_owner"
+    assert connection.proofs == 1
+    connection.calls.clear()
+    assert await seal(connection) == result
+    assert connection.proofs == 1
+    assert not any(sql.startswith(("ALTER", "INSERT", "GRANT", "REVOKE")) for sql, _ in connection.calls)
+    connection.candidate["state"] = "published"
+    assert await verify(connection) == result
+    assert all(f'FROM "{TARGET.schema_name}".' not in sql for sql, _ in connection.calls)
+    assert any("ACCESS SHARE MODE NOWAIT" in sql for sql, _ in connection.calls)
+
+
+@pytest.mark.parametrize(
+    "part", ["scope", "validation", "source", "created", "oid", "index", "acl", "control", "seal", "owner"]
+)
+async def test_changed_identity_or_evidence_never_uses_legacy_fallback(boundary, part):
+    connection = boundary
+    await seal(connection)
+    match part:
+        case "scope":
+            connection.candidate["producer_id"] = str(UUID(int=77))
+        case "validation":
+            connection.candidate["validation_json"]["extra"] = True
+        case "source":
+            connection.candidate["source_generations"]["custom_membership"] = "c" * 64
+        case "created":
+            connection.candidate["created_at"] = datetime(2026, 2, 1, tzinfo=timezone.utc)
+        case "oid":
+            connection.catalog["heaps"]["network_membership"] = 99
+        case "index":
+            connection.index = "c" * 64
+        case "acl":
+            connection.safe = False
+        case "control":
+            connection.control["database_oid"] += 1
+        case "seal":
+            connection.seal["seal_sha256"] = "0" * 64
+        case "owner":
+            connection.control["owned"] = False
+    with pytest.raises((ValueError, KeyError)):
+        await verify(connection, required=False)
+
+
+@pytest.mark.parametrize("missing", ["table", "row"])
+async def test_optional_absence_preserves_legacy_read_committed(boundary, missing):
+    connection = boundary
+    connection.isolation = "read committed"
+    if missing == "table":
+        connection.exists = False
+    assert await verify(connection, required=False) is None
+    with pytest.raises(ValueError):
+        await verify(connection)
+
+
+@pytest.mark.parametrize(
+    "drift", ["set_role", "native_set", "authority", "final_actor", "uncommitted", "published", "full_proof"]
+)
+async def test_actor_authority_and_final_failure_leave_no_seal_or_transfer(boundary, drift, monkeypatch):
+    connection = boundary
+    before = copy.deepcopy(connection.catalog)
+    authorization_calls = []
+
+    async def is_authorized(conn, target):
+        authorization_calls.append(None)
+        if drift == "final_actor" and len(authorization_calls) == 2:
+            conn.actor["backend"] += 1
+        return drift != "authority"
+
+    match drift:
+        case "set_role":
+            connection.actor["current"] = "other"
+        case "native_set":
+            connection.can_set = False
+        case "uncommitted":
+            connection.active = True
+        case "published":
+            connection.candidate["state"] = "published"
+        case "full_proof":
+
+            async def fail(*args):
+                raise RuntimeError("malformed family")
+
+            monkeypatch.setattr(custody, "_final_proof", fail)
+    with pytest.raises((ValueError, RuntimeError)):
+        await seal(connection, is_authorized)
+    assert connection.seal is None and connection.catalog == before
+
+
+async def test_existing_seal_still_requires_original_operator_authority(boundary):
+    await seal(boundary)
+    boundary.can_set = False
+    with pytest.raises(ValueError):
+        await seal(boundary)
+
+
+async def test_sealed_verification_requires_repeatable_read(boundary):
+    await seal(boundary)
+    boundary.isolation = "read committed"
+    with pytest.raises(ValueError):
+        await verify(boundary, required=False)
+
+
+async def test_safe_set_only_operator_restores_role_and_replays(boundary):
+    boundary.inherit = False
+    result = await seal(boundary)
+    assert await seal(boundary) == result
+    assert any('SET LOCAL ROLE "loading_owner"' == sql for sql, _ in boundary.calls)
+    assert any('SET LOCAL ROLE "operator"' == sql for sql, _ in boundary.calls)
+
+
+async def test_complete_128_role_census_is_not_truncated(boundary):
+    roles = tuple(f"runtime_{number:03d}" for number in range(128))
+    result = await custody.seal_network_candidate_custody(
+        boundary, TARGET, control_schema="control", runtime_roles=roles, authorize=is_authorized
+    )
+    assert result["receipt"]["closure"]["reader_roles"] == list(roles)
+    assert len([sql for sql, _ in boundary.calls if sql.startswith('GRANT SELECT ON "control".')]) == 128
+    assert await verify(boundary) == result
+
+
+async def test_census_above_128_is_refused_before_sql(boundary):
+    with pytest.raises(ValueError):
+        await custody.seal_network_candidate_custody(
+            boundary,
+            TARGET,
+            control_schema="control",
+            runtime_roles=tuple(f"runtime_{i}" for i in range(129)),
+            authorize=is_authorized,
+        )
+    assert boundary.calls == []
+
+
+async def test_lost_seal_commit_is_recovered_by_exact_replay(boundary):
+    boundary.unknown_commit = True
+    with pytest.raises(RuntimeError, match="acknowledgement lost"):
+        await seal(boundary)
+    assert boundary.seal is not None
+    result = await seal(boundary)
+    assert result["seal_sha256"] == boundary.seal["seal_sha256"] and boundary.proofs == 1
+
+
+@pytest.mark.parametrize("failure", ["relationships", "retention", "provider", "index"])
+async def test_final_custodian_uses_full_existing_verification_and_propagates_failure(boundary, monkeypatch, failure):
+    boundary.candidate["validation_json"]["address_source"] = {
+        "schema_name": "source",
+        "table_name": "addresses",
+        "generation_id": "a" * 64,
+    }
+    monkeypatch.setattr(
+        network_membership_publication,
+        "_publication_readiness",
+        lambda candidate: (None, None, {"index_definition_sha256": "b" * 64}, {}),
+    )
+    calls = []
+
+    async def matching(*args):
+        calls.append("relationships")
+        if failure == "relationships":
+            raise RuntimeError("relationships refused")
+
+    async def retention(*args):
+        calls.append("retention")
+        if failure == "retention":
+            raise RuntimeError("retention refused")
+
+    async def provider(*args):
+        calls.append("provider")
+        if failure == "provider":
+            raise RuntimeError("provider refused")
+
+    async def semantics(*args, **kwargs):
+        assert kwargs == {"replay": True}
+
+    monkeypatch.setattr(custody, "_matching_inputs", matching)
+    monkeypatch.setattr(custody, "verify_registry_source_retention_rows", retention)
+    monkeypatch.setattr(network_membership_publication, "_verify_provider_custody", provider)
+    monkeypatch.setattr(custody, "_source_semantics", semantics)
+    if failure == "index":
+        boundary.index = "0" * 64
+    with pytest.raises((RuntimeError, custody.NetworkCandidateCustodyError)):
+        await FINAL_PROOF(boundary, TARGET, boundary.candidate, "control")
+    assert calls[0] == "retention"
+    if failure != "retention":
+        assert "relationships" in calls
+
+
+async def test_empty_legacy_table_does_not_require_new_protected_owner(boundary):
+    boundary.control["owned"] = False
+    boundary.isolation = "read committed"
+    assert await verify(boundary, required=False) is None
+    with pytest.raises(ValueError):
+        await seal(boundary)
+
+
+async def test_native_heap_behavior_drift_is_terminal_even_with_unchanged_oids(boundary):
+    await seal(boundary)
+    boundary.heap_safe = False
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await verify(boundary, required=False)
+
+
+async def test_lifecycle_and_authority_census_never_creates_candidate_read_access(boundary):
+    boundary.nonreaders = {"lifecycle", "api", "authority"}
+    roles = ("loading_owner", "execution", "reader", "lifecycle", "api", "authority")
+    result = await custody.seal_network_candidate_custody(
+        boundary, TARGET, control_schema="control", runtime_roles=roles, authorize=is_authorized
+    )
+    assert result["receipt"]["runtime_roles"] == sorted(roles)
+    assert result["receipt"]["closure"]["reader_roles"] == ["execution", "loading_owner", "reader"]
+    fact_grants = [sql for sql, _ in boundary.calls if sql.startswith('GRANT SELECT ON "' + TARGET.schema_name + '".')]
+    assert len(fact_grants) == 9
+    select_grants = [sql for sql, _ in boundary.calls if sql.startswith("GRANT SELECT")]
+    assert not any('TO "' + role + '"' in sql for sql in select_grants for role in boundary.nonreaders)
+    assert not any('TO "' + role + '"' in sql for sql in fact_grants for role in boundary.nonreaders)
+    assert await verify(boundary) == result
+    boundary.forbidden = {"lifecycle"}
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await verify(boundary)
+
+
+async def test_large_census_protects_nonreaders_without_granting_them_reads(boundary):
+    roles = tuple(f"runtime_{i:03d}" for i in range(100))
+    boundary.nonreaders = set(roles[2:])
+    result = await custody.seal_network_candidate_custody(
+        boundary, TARGET, control_schema="control", runtime_roles=roles, authorize=is_authorized
+    )
+    assert result["receipt"]["runtime_roles"] == list(roles)
+    assert result["receipt"]["closure"]["reader_roles"] == list(roles[:2])
+    boundary.forbidden = {roles[-1]}
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await verify(boundary, required=False)
+
+
+async def test_seal_replay_requires_exact_forbidden_census_even_if_reader_subset_matches(boundary):
+    boundary.nonreaders = {"lifecycle"}
+    await custody.seal_network_candidate_custody(
+        boundary,
+        TARGET,
+        control_schema="control",
+        runtime_roles=("execution", "reader", "lifecycle"),
+        authorize=is_authorized,
+    )
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary)
+
+
+def _event_assertion(kind):
+    checkpoint_by_name = {"event_id": str(UUID(int=7)), "attempt_id": str(UUID(int=8))}
+    if kind == "cms":
+        coordinates_by_name = dict(
+            source_system="fhir",
+            source_id="cms-npd",
+            dataset_schema="source_schema",
+            dataset_id="dataset",
+            producer_id="producer",
+            edition_id="edition",
+        )
+        checkpoint_by_name.update(
+            notification_sha256="a" * 64,
+            pair_sha256="b" * 64,
+            recipe_sha256="c" * 64,
+            coordinates=coordinates_by_name,
+            replaced_coordinates=coordinates_by_name,
+        )
+    elif kind == "aca":
+        checkpoint_by_name.update(
+            header={"capture_id": str(UUID(int=9)), "recipe_sha256": "a" * 64, "notification_sha256": "b" * 64},
+            reader_identity_sha256="c" * 64,
+        )
+    else:
+        checkpoint_by_name.update(
+            header={"capture_id": str(UUID(int=9)), "approval_sha256": "a" * 64, "hold_sha256": "b" * 64},
+            reader_identity_sha256="c" * 64,
+        )
+    return {"revision": 1, "kind": kind, "checkpoint": checkpoint_by_name}
+
+
+@pytest.mark.parametrize("kind", ["cms", "ptg", "aca"])
+async def test_revision_two_seal_binds_assertion_and_atomic_checkpoint_without_rehashing(boundary, kind):
+    connection = boundary
+    assertion = _event_assertion(kind)
+    report = connection.candidate["validation_json"]
+    report[custody.SOURCE_EVENT_ASSERTION] = assertion
+    actual = await seal(connection)
+    assert actual["receipt"]["revision"] == 2
+    assert custody._SOURCE_CHECKPOINTS[kind] not in report
+    report[custody._SOURCE_CHECKPOINTS[kind]] = copy.deepcopy(assertion["checkpoint"])
+    assert await verify(connection) == actual
+    connection.candidate["state"] = "published"
+    assert await verify(connection) == actual
+    assert connection.proofs == 1
+    del report[custody._SOURCE_CHECKPOINTS[kind]]
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await verify(connection)
+
+
+@pytest.mark.parametrize("kind", ["cms", "ptg", "aca"])
+@pytest.mark.parametrize(
+    "damage", ["checkpoint", "other_checkpoint", "assertion", "extra_json", "missing_assertion", "bool"]
+)
+async def test_revision_two_rejects_every_change_except_exact_redundant_checkpoint(boundary, kind, damage):
+    connection = boundary
+    assertion = _event_assertion(kind)
+    report = connection.candidate["validation_json"]
+    report[custody.SOURCE_EVENT_ASSERTION] = assertion
+    await seal(connection)
+    match damage:
+        case "checkpoint":
+            report[custody._SOURCE_CHECKPOINTS[kind]] = {**assertion["checkpoint"], "attempt_id": str(UUID(int=99))}
+        case "other_checkpoint":
+            report[custody._SOURCE_CHECKPOINTS["ptg" if kind == "cms" else "cms"]] = assertion["checkpoint"]
+        case "assertion":
+            assertion["checkpoint"]["event_id"] = str(UUID(int=99))
+        case "extra_json":
+            report["unrelated"] = True
+        case "missing_assertion":
+            del report[custody.SOURCE_EVENT_ASSERTION]
+        case _:
+            report[custody._SOURCE_CHECKPOINTS[kind]] = {**assertion["checkpoint"], "attempt_id": True}
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await verify(connection)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "revision",
+        "bool_revision",
+        "kind",
+        "extra",
+        "checkpoint_type",
+        "checkpoint_extra",
+        "uuid",
+        "sha",
+        "coordinates",
+        "completed",
+    ],
+)
+async def test_initial_assertion_shape_is_closed_and_completed_checkpoint_refuses_before_transfer(boundary, damage):
+    connection = boundary
+    assertion = _event_assertion("cms")
+    report = connection.candidate["validation_json"]
+    report[custody.SOURCE_EVENT_ASSERTION] = assertion
+    match damage:
+        case "revision":
+            assertion["revision"] = 2
+        case "bool_revision":
+            assertion["revision"] = True
+        case "kind":
+            assertion["kind"] = "other"
+        case "extra":
+            assertion["extra"] = True
+        case "checkpoint_type":
+            assertion["checkpoint"] = []
+        case "checkpoint_extra":
+            assertion["checkpoint"]["extra"] = True
+        case "uuid":
+            assertion["checkpoint"]["attempt_id"] = "invalid"
+        case "sha":
+            assertion["checkpoint"]["notification_sha256"] = "invalid"
+        case "coordinates":
+            assertion["checkpoint"]["coordinates"]["extra"] = True
+        case _:
+            report["cms_source_notification"] = copy.deepcopy(assertion["checkpoint"])
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(connection)
+    assert connection.seal is None and connection.catalog["namespace"]["nspowner"] == 31
+
+
+async def test_revision_one_hash_still_includes_every_checkpoint_and_assertion_byte(boundary):
+    connection = boundary
+    actual = await seal(connection)
+    assert actual["receipt"]["revision"] == 1
+    report = connection.candidate["validation_json"]
+    assertion = _event_assertion("cms")
+    report[custody.SOURCE_EVENT_ASSERTION] = assertion
+    report["cms_source_notification"] = copy.deepcopy(assertion["checkpoint"])
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await verify(connection)
+
+
+@pytest.mark.parametrize("kind", ["cms", "ptg", "aca"])
+async def test_revision_two_unknown_commit_reuses_exact_ready_assertion_and_seal(boundary, kind):
+    connection = boundary
+    connection.candidate["validation_json"][custody.SOURCE_EVENT_ASSERTION] = _event_assertion(kind)
+    connection.unknown_commit = True
+    with pytest.raises(RuntimeError, match="acknowledgement"):
+        await seal(connection)
+    retained = copy.deepcopy(connection.seal)
+    assert (await seal(connection))["receipt"]["revision"] == 2
+    assert connection.seal == retained and connection.proofs == 1
+
+
+async def test_initial_cms_assertion_is_closed_and_preserves_exact_initial_mode(boundary):
+    assertion = _event_assertion("cms")
+    assertion["checkpoint"].update(replaced_coordinates=None, mode="initial", base_manifest=None)
+    boundary.candidate["validation_json"][custody.SOURCE_EVENT_ASSERTION] = assertion
+    assert (await seal(boundary))["receipt"]["revision"] == 2
+
+
+@pytest.mark.parametrize("damage", ["missing", "extra", "digest"])
+async def test_ptg_assertion_requires_closed_native_header(boundary, damage):
+    assertion = _event_assertion("ptg")
+    header = assertion["checkpoint"]["header"]
+    if damage == "missing":
+        del header["hold_sha256"]
+    elif damage == "extra":
+        header["extra"] = True
+    else:
+        header["approval_sha256"] = "invalid"
+    boundary.candidate["validation_json"][custody.SOURCE_EVENT_ASSERTION] = assertion
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary)
+    assert boundary.seal is None and boundary.catalog["namespace"]["nspowner"] == 31
+
+
+@pytest.mark.parametrize("field", ["recipe_sha256", "notification_sha256", "capture_id", "extra"])
+async def test_aca_assertion_rejects_changed_or_unclosed_native_header(boundary, field):
+    assertion = _event_assertion("aca")
+    assertion["checkpoint"]["header"][field] = "invalid"
+    boundary.candidate["validation_json"][custody.SOURCE_EVENT_ASSERTION] = assertion
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary)
+    assert boundary.seal is None

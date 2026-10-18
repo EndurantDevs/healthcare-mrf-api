@@ -57,6 +57,8 @@ from tests.custom_import_postgres_support import (
     isolated_publication_case,
     transaction_session,
 )
+from tests.custom_import_signed_reader_postgres_support import grant_signed_reader_tables, signed_publication_reader
+from tests.signed_request_reader_postgres_support import native_reader_witness
 
 
 @pytest.mark.asyncio
@@ -170,8 +172,8 @@ def _children():
 
 
 @asynccontextmanager
-async def _case(*, children=None, roots=None):
-    async with isolated_publication_case() as case:
+async def _case(*, children=None, roots=None, monkeypatch=None):
+    async with isolated_publication_case() as raw_case, signed_publication_reader(raw_case, monkeypatch) as case:
         seed = await runner_fixture._seed_case(case, "grouped", fixture.definition())
         execution_id, token = await runner_fixture._new_execution(case, seed, "grouped")
         result = await run_candidate(
@@ -339,8 +341,8 @@ async def _page(session, target, query):
 
 @pytest.mark.asyncio
 async def test_signed_exact_batch_hydrates_full_families_without_membership_filtering(monkeypatch):
-    http_fixture._install_keyring(monkeypatch)
-    async with _case() as (case, pinned_target):
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
+    async with _case(monkeypatch=monkeypatch) as (case, pinned_target):
         external_target_map = transport._target_document(_external_target(pinned_target))
         npi_values = [_B, "1999999999", _A]
         body = transport._canonical_json_bytes(
@@ -360,6 +362,7 @@ async def test_signed_exact_batch_hydrates_full_families_without_membership_filt
         )
         async with case.sessions() as session:
             reply = await batch_http.serve_custom_import_detail_batch(request, session)
+            assert not session.in_transaction()
         assert reply.status == 200, reply.body
         provider_items = json.loads(reply.body)["items"]
         assert [provider["npi"] for provider in provider_items] == npi_values
@@ -372,13 +375,16 @@ async def test_signed_exact_batch_hydrates_full_families_without_membership_filt
 
 
 @asynccontextmanager
-async def _ordinary_root_case():
+async def _ordinary_root_case(monkeypatch=None):
     """Publish a family whose complete root projection exceeds its query fields."""
 
     ordinary_definition_map = json.loads(runner_fixture._definition().canonical)
     ordinary_definition_map["query"]["root_fields"] = ["npi"]
     ordinary_definition = CustomImportDefinition.from_mapping(ordinary_definition_map)
-    async with isolated_publication_case() as ordinary_case:
+    async with (
+        isolated_publication_case() as raw_case,
+        signed_publication_reader(raw_case, monkeypatch) as ordinary_case,
+    ):
         ordinary_seed = await runner_fixture._seed_case(ordinary_case, "batch_ordinary", ordinary_definition)
         execution_id, lease_token = await runner_fixture._new_execution(ordinary_case, ordinary_seed, "batch_ordinary")
         run_result = await run_candidate(
@@ -409,8 +415,8 @@ async def _ordinary_root_case():
 async def test_signed_ordinary_batch_matches_full_detail_without_expanding_provider_projection(monkeypatch):
     """Keep batch detail complete without widening legacy provider projections."""
 
-    http_fixture._install_keyring(monkeypatch)
-    async with _ordinary_root_case() as (ordinary_case, pinned_target):
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
+    async with _ordinary_root_case(monkeypatch=monkeypatch) as (ordinary_case, pinned_target):
         external_target = _external_target(pinned_target, "synthetic_runner_batch_ordinary")
         target_map = transport._target_document(external_target)
         requested_npis = [_A, "1999999999"]
@@ -434,6 +440,7 @@ async def test_signed_ordinary_batch_matches_full_detail_without_expanding_provi
             signed_request = http_fixture._Request(canonical_body, signed_headers, path=path)
             async with ordinary_case.sessions() as session:
                 http_reply = await detail_endpoint(signed_request, session)
+                assert not session.in_transaction()
             assert http_reply.status == 200, http_reply.body
             response_documents.append(json.loads(http_reply.body))
         batch_document, detail_document = response_documents
@@ -638,9 +645,9 @@ async def test_explicit_year_and_full_detail_preserve_exact_family_set():
 
 @pytest.mark.asyncio
 async def test_signed_detail_checks_descriptor_against_pinned_definition(monkeypatch):
-    http_fixture._install_keyring(monkeypatch)
-    async with _case() as (case, target):
-        external = transport._target_document(_external_target(target))
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
+    async with _case(monkeypatch=monkeypatch) as (case, pinned_target):
+        external = transport._target_document(_external_target(pinned_target))
         document_map = {
             "target": external,
             "entity": {"adapter_id": "npi", "value": _A},
@@ -663,6 +670,7 @@ async def test_signed_detail_checks_descriptor_against_pinned_definition(monkeyp
             )
             async with case.sessions() as session:
                 response = await transport.serve_custom_import_detail(request, session)
+                assert not session.in_transaction()
             assert response.status == status, (mode, response.body)
             if mode == "valid":
                 assert len(json.loads(response.body)["families"]) == 2
@@ -746,11 +754,12 @@ def _grouped_service_request(session, pinned_target, entitlement, *, is_native=F
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entitlement", [None, "full_family"])
 async def test_signed_grouped_service_read_matches_native_claims_and_families(monkeypatch, entitlement):
-    http_fixture._install_keyring(monkeypatch)
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
     monkeypatch.setattr(npi_fixture, "_NPI", _A)
     monkeypatch.setattr(npi_fixture, "_ABSENT_NPI", _C)
-    async with _case() as (case, pinned_target):
+    async with _case(monkeypatch=monkeypatch) as (case, pinned_target):
         await npi_fixture._create_pricing_claim_tables(case)
+        await grant_signed_reader_tables(case, pricing.provider_table.name, pricing.provider_procedure_table.name)
         monkeypatch.setattr(pricing, "PRICING_SCHEMA", case.schema_name)
         async with case.sessions() as seed_session, seed_session.begin():
             await npi_fixture._seed_pricing_claim_rows(seed_session)
@@ -764,6 +773,8 @@ async def test_signed_grouped_service_read_matches_native_claims_and_families(mo
                     if imported
                     else await pricing.list_providers_by_procedure(request)
                 )
+                if imported:
+                    assert not session.in_transaction()
                 assert reply.status == 200, reply.body
                 documents.append(json.loads(reply.body))
         native, composed = documents
@@ -942,11 +953,14 @@ class _ScopedNativeProxy:
 
 
 @asynccontextmanager
-async def _native_scope_case(monkeypatch, *, is_geo):
+async def _native_scope_case(monkeypatch, *, is_geo, signed=False):
     npi_by_fixture_identity = dict(zip((_A, _B, _C), _NATIVE_SCOPE_NPIS[:3], strict=True))
     root_rows = [{**row, "npi": npi_by_fixture_identity[row["npi"]]} for row in _roots()]
     child_rows = [{**row, "rate_npi": npi_by_fixture_identity[row["rate_npi"]]} for row in _page_children()]
-    async with _case(roots=root_rows, children=child_rows) as (case, target):
+    async with _case(roots=root_rows, children=child_rows, monkeypatch=monkeypatch if signed else None) as (
+        case,
+        target,
+    ):
         async with case.sessions() as seed_session, seed_session.begin():
             native_session = _NativeSeedSession(seed_session)
             if is_geo:
@@ -961,6 +975,8 @@ async def _native_scope_case(monkeypatch, *, is_geo):
             await native_session.execute(
                 text("UPDATE mrf.npi_address SET state_name = 'NY', lat = 1 WHERE npi = 1000000002")
             )
+        if signed:
+            await grant_signed_reader_tables(case, "npi", "npi_address", "npi_taxonomy", "nucc_taxonomy")
         list_fixture._configure_postgres_provider_list(monkeypatch)
         monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _ScopedNativeProxy)
         yield case, target
@@ -1074,9 +1090,9 @@ async def test_postgres_scoped_native_pages_execute_full_ctes_and_preserve_paylo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("include_filter", [False, True])
 async def test_postgres_bare_import_sync_keeps_state_latest_selection_and_exact_pages(monkeypatch, include_filter):
-    http_fixture._install_keyring(monkeypatch)
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
     path = provider_http.CUSTOM_IMPORT_PROVIDERS_PATH
-    async with _native_scope_case(monkeypatch, is_geo=False) as (case, pinned_target):
+    async with _native_scope_case(monkeypatch, is_geo=False, signed=True) as (case, pinned_target):
         for offset in (0, 1):
             document = json.loads(_page_request(pinned_target, path, full_family=True).body)
             document.update(
@@ -1105,7 +1121,8 @@ async def test_postgres_bare_import_sync_keeps_state_latest_selection_and_exact_
                 for provider_row in page_payload["rows"]:
                     assert provider_row["state_name"] == "CA"
                     assert ("custom_import" in provider_row) is include_filter
-                page_sql = session.info["scoped_native_sql"][0][0]
+                assert not session.in_transaction()
+                page_sql = case.reader_sessions[-1].info["scoped_native_sql"][0][0]
                 assert "native_eligible_npis AS MATERIALIZED" not in page_sql
                 assert "INTERSECT SELECT imported.entity_value" in page_sql
 
@@ -1205,10 +1222,10 @@ def _strip_scoped_batch_imports(successes, *, offset, include_filter):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("include_filter", [False, True])
 async def test_postgres_filtered_batch_executes_native_scope_and_full_hydration(monkeypatch, include_filter):
-    http_fixture._install_keyring(monkeypatch)
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
     _configure_native_batch_projection(monkeypatch)
     scopes, hydrations = _track_native_scope_hydration(monkeypatch)
-    async with _native_scope_case(monkeypatch, is_geo=False) as (case, pinned_target):
+    async with _native_scope_case(monkeypatch, is_geo=False, signed=True) as (case, pinned_target):
         for offset in range(4):
             async with case.sessions() as session, session.begin():
                 await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
@@ -1223,7 +1240,8 @@ async def test_postgres_filtered_batch_executes_native_scope_and_full_hydration(
                     session,
                 )
                 assert reply.status == 200, reply.body
-                sql, parameters = session.info["scoped_native_sql"][0]
+                assert not session.in_transaction()
+                sql, parameters = case.reader_sessions[-1].info["scoped_native_sql"][0]
                 native_sql, score_sql = sql.split("custom_import_provider_relation AS", 1)
                 assert "native_eligible_npis AS MATERIALIZED" in native_sql and "state_name = :state" in native_sql
                 assert "LIMIT" not in native_sql and "native_eligible_npis.npi" in score_sql
@@ -1281,18 +1299,20 @@ async def _native_page_reply(session, import_context, *, is_geo):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_geo", [False, True])
 async def test_signed_full_pages_preserve_native_order_counts_absence_and_geo_repeats(monkeypatch, is_geo):
-    http_fixture._install_keyring(monkeypatch)
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
     module = geo_http if is_geo else provider_http
     path = geo_http.CUSTOM_IMPORT_PROVIDER_GEO_PATH if is_geo else provider_http.CUSTOM_IMPORT_PROVIDERS_PATH
     endpoint = geo_http.serve_custom_import_provider_geo if is_geo else provider_http.serve_custom_import_providers
-    async with _case(children=_page_children()) as (case, target):
+    async with _case(children=_page_children(), monkeypatch=monkeypatch) as (case, target):
         seen_statements = []
 
         async def native_page(request, *, native_args, import_context, prepare_cursor=None, native_scope_preparer=None):
+            reader_session = request.ctx.sa_session
+            await native_reader_witness(reader_session, case.reader)
             seen_statements.append(str(import_context.prepared.statement))
             if prepare_cursor is not None:
-                await prepare_cursor(session=session, coordinates=[40, -73])
-            return await _native_page_reply(session, import_context, is_geo=is_geo)
+                await prepare_cursor(session=reader_session, coordinates=[40, -73])
+            return await _native_page_reply(reader_session, import_context, is_geo=is_geo)
 
         monkeypatch.setattr(module, "_geo_page" if is_geo else "_provider_page", native_page)
         # Unique selected families contain four children; repeated addresses must not multiply the preflight.
@@ -1301,6 +1321,7 @@ async def test_signed_full_pages_preserve_native_order_counts_absence_and_geo_re
         for full_family in (False, True):
             async with case.sessions() as session:
                 reply = await endpoint(_page_request(target, path, full_family=full_family), session)
+                assert not session.in_transaction()
             assert reply.status == 200, reply.body
             replies.append(json.loads(reply.body))
         _assert_complete_page_parity(replies, is_geo=is_geo)
@@ -1324,8 +1345,8 @@ def _assert_complete_page_parity(replies, *, is_geo):
 
 @pytest.mark.asyncio
 async def test_signed_page_entitlement_cannot_be_added_after_signing(monkeypatch):
-    http_fixture._install_keyring(monkeypatch)
-    async with _case() as (case, target), case.sessions() as session:
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
+    async with _case(monkeypatch=monkeypatch) as (case, target), case.sessions() as session:
         path = provider_http.CUSTOM_IMPORT_PROVIDERS_PATH
         projected = _page_request(target, path, full_family=False)
         complete = _page_request(target, path, full_family=True)
@@ -1364,7 +1385,7 @@ def _filtered_provider_batch_request(target, *, include_filter, offset):
 
 @pytest.mark.asyncio
 async def test_signed_provider_batch_filters_counts_and_pages_before_optional_full_hydration(monkeypatch):
-    http_fixture._install_keyring(monkeypatch)
+    http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
     identities = [int(canonical_npi) for canonical_npi in (_A, _B, _C)]
     monkeypatch.setattr(
         native_npi,
@@ -1378,7 +1399,7 @@ async def test_signed_provider_batch_filters_counts_and_pages_before_optional_fu
     )
     monkeypatch.setattr(native_npi, "_fetch_other_names_map", AsyncMock(return_value={}))
     monkeypatch.setattr(native_npi, "_fetch_provider_enrichment_summary_map", AsyncMock(return_value={}))
-    async with _case(children=_page_children()) as (case, pinned_target):
+    async with _case(children=_page_children(), monkeypatch=monkeypatch) as (case, pinned_target):
         for include_filter, offset in ((False, 0), (True, 0), (True, 1), (False, 2)):
             async with case.sessions() as session:
                 reply = await provider_batch_http.serve_custom_import_provider_batch(

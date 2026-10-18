@@ -15,17 +15,17 @@ from process.provider_directory_dataset_scoped_publication import (
     lock_exact_current_dataset,
     supersede_exact_current_dataset,
 )
+from process.provider_directory_rooted_graph_source_contract import (
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+)
 from process.provider_directory_rooted_graph_store import (
     complete_provider_directory_rooted_graph_missing,
     initialize_provider_directory_rooted_graph_acquisition,
 )
 from process.provider_directory_rooted_graph_store_contract import _sha256_text
 from process.provider_directory_rooted_graph_store_support import set_store_action
-from process.provider_directory_rooted_graph_source_contract import (
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
-)
 from process.provider_directory_rooted_graph_terminal import (
     _edge_hash,
     _missing_terminal_hash,
@@ -34,7 +34,6 @@ from process.provider_directory_rooted_graph_terminal import (
 from tests.formulary_fhir_twin_admission_pg_support import (
     assert_sqlstate,
     connect,
-    database_url,
     quoted,
 )
 from tests.provider_directory_rooted_graph_pg_support import resources_for_kind
@@ -48,7 +47,6 @@ from tests.test_provider_directory_rooted_graph_publication_postgres import (
     _prove_first_generation,
     _publish_legacy_root,
 )
-
 
 PARENT_RELATION = "provider_directory_endpoint_dataset"
 LEGACY_RELATION = "provider_directory_uhc_flex_practitioner_dataset"
@@ -92,24 +90,20 @@ async def _isolate_logical_current_triggers(connection, schema_name: str) -> Non
     schema = quoted(schema_name)
     for relation in (PARENT_RELATION, LEGACY_RELATION, ROOTED_RELATION):
         trigger = f"pd_exact_logical_current_{relation}_guard"
-        await connection.execute(
-            f"ALTER TABLE {schema}.{quoted(relation)} DISABLE TRIGGER ALL"
-        )
-        await connection.execute(
-            f"ALTER TABLE {schema}.{quoted(relation)} ENABLE ALWAYS TRIGGER "
-            f"{quoted(trigger)}"
-        )
+        await connection.execute(f"ALTER TABLE {schema}.{quoted(relation)} DISABLE TRIGGER ALL")
+        await connection.execute(f"ALTER TABLE {schema}.{quoted(relation)} ENABLE ALWAYS TRIGGER {quoted(trigger)}")
 
 
 async def _commit_direct_current(
     *,
+    url,
     schema_name: str,
     dataset_id: str,
     dedicated_relation: str,
     ready: asyncio.Event,
     release: asyncio.Event,
 ) -> str:
-    connection = await connect(database_url())
+    connection = await connect(url)
     transaction = connection.transaction()
     await transaction.start()
     schema = quoted(schema_name)
@@ -162,12 +156,8 @@ async def _probe_direct_readiness(
             else "provider_directory_uhc_flex_practitioner_dataset_ready"
         )
         validity_function = readiness_function.replace("_ready", "_valid")
-        readiness = await connection.fetchval(
-            f"SELECT {schema}.{quoted(readiness_function)}($1)", dataset_id
-        )
-        validity = await connection.fetchval(
-            f"SELECT {schema}.{quoted(validity_function)}($1)", dataset_id
-        )
+        readiness = await connection.fetchval(f"SELECT {schema}.{quoted(readiness_function)}($1)", dataset_id)
+        validity = await connection.fetchval(f"SELECT {schema}.{quoted(validity_function)}($1)", dataset_id)
         return bool(readiness), bool(validity)
     finally:
         await transaction.rollback()
@@ -221,6 +211,7 @@ async def commit_logical_current_race(
     task_by_relation = {
         relation: asyncio.create_task(
             _commit_direct_current(
+                url=context.url,
                 schema_name=context.schema_name,
                 dataset_id=id_by_relation[relation],
                 dedicated_relation=relation,
@@ -231,9 +222,7 @@ async def commit_logical_current_race(
         for relation in (LEGACY_RELATION, ROOTED_RELATION)
     }
     await asyncio.gather(*(event.wait() for event in ready_by_relation.values()))
-    second_relation = (
-        LEGACY_RELATION if first_relation == ROOTED_RELATION else ROOTED_RELATION
-    )
+    second_relation = LEGACY_RELATION if first_relation == ROOTED_RELATION else ROOTED_RELATION
     release_by_relation[first_relation].set()
     first_outcome = await task_by_relation[first_relation]
     release_by_relation[second_relation].set()
@@ -300,9 +289,7 @@ async def complete_valid_missing(database, claim) -> None:
     await complete_provider_directory_rooted_graph_missing(
         claim,
         missing_http_status=404,
-        missing_response_sha256=hashlib.sha256(
-            response_text.encode("utf-8")
-        ).hexdigest(),
+        missing_response_sha256=hashlib.sha256(response_text.encode("utf-8")).hexdigest(),
         missing_response_bytes=response_bytes,
         missing_response_json_text=response_text,
         database=database,
@@ -323,9 +310,7 @@ def forged_missing_by_field(claim) -> dict[str, object]:
     forged_sha = hashlib.sha256(forged_text.encode("utf-8")).hexdigest()
     resource_set_sha = _resource_hash(())
     edge_set_sha = _edge_hash(())
-    result_sha = _sha256_text(
-        "\x1f".join((resource_set_sha, edge_set_sha, forged_sha, str(forged_bytes)))
-    )
+    result_sha = _sha256_text("\x1f".join((resource_set_sha, edge_set_sha, forged_sha, str(forged_bytes))))
     return {
         "result_sha": result_sha,
         "resource_set_sha": resource_set_sha,
@@ -383,8 +368,7 @@ async def assert_graph_registry_drift_fences(context) -> None:
         PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
     )
     source_row = await context.connection.fetchrow(
-        f"SELECT source_id, endpoint_id FROM {context.schema}."
-        "provider_directory_source WHERE source_id = $1",
+        f"SELECT source_id, endpoint_id FROM {context.schema}.provider_directory_source WHERE source_id = $1",
         PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
     )
     assert tuple(endpoint_row.values()) == (
@@ -410,8 +394,7 @@ async def assert_graph_registry_drift_fences(context) -> None:
         f"'{PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID}'",
     )
     signature = await context.connection.fetchval(
-        f"SELECT endpoint_signature_hash FROM {context.schema}."
-        "provider_directory_api_endpoint WHERE endpoint_id = $1",
+        f"SELECT endpoint_signature_hash FROM {context.schema}.provider_directory_api_endpoint WHERE endpoint_id = $1",
         PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
     )
     assert signature == PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256

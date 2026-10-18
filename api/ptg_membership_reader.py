@@ -12,6 +12,7 @@ from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 
 def membership_statement(schema):
+    """Intersect complete requested-code coverage before expanding local memberships."""
     schema = native._quoted(schema)
     return text(f"""
         WITH local_first AS MATERIALIZED (
@@ -38,10 +39,7 @@ def membership_statement(schema):
     """)
 
 
-async def indexed_memberships(session, tables, npis, request, state):
-    """None means unindexed; an attached invalid candidate never falls back."""
-    if not request.code_system or not request.code:
-        return None
+async def _attached_index(session, tables, request, state):
     if not state.membership_index_checked:
         _, _, identity = await source_identity(
             session,
@@ -53,18 +51,13 @@ async def indexed_memberships(session, tables, npis, request, state):
         )
         state.membership_index = await locate(session, identity)
         state.membership_index_checked = True
-    found = state.membership_index
-    if found is None:
-        return None
-    ownership, header, _owner, _view, _pin = found
-    code_keys = tuple(sorted({int(row["code_key"]) for row in request.code_rows}))
-    covered = {row["code_key"] for row in header["counts"]["code_coverage"]}
-    if not set(code_keys).issubset(covered):
-        raise PTG2ManifestArtifactError("membership index does not cover the complete requested physical code scope")
-    _charge_v4_taxonomy_projection_work(batch_count=1)
+    return state.membership_index
+
+
+async def _membership_pairs(session, tables, npis, request, state, ownership, code_keys):
     from api import ptg2_serving as serving
 
-    keys = await v4_npi_keys_for_values(
+    npi_keys_by_value = await v4_npi_keys_for_values(
         session,
         snapshot_key=serving._required_shared_snapshot_key(tables),
         npis=npis,
@@ -72,13 +65,13 @@ async def indexed_memberships(session, tables, npis, request, state):
     )
     remaining = request.forward_limits.maximum_retained_memberships - state.retained_memberships
     projection_remaining = request.forward_limits.maximum_projection_members - state.indexed_projection_members
-    row = (
+    projection_row = (
         (
             await session.execute(
                 membership_statement(ownership.schema_name),
                 {
-                    "npis": list(keys),
-                    "keys": list(keys.values()),
+                    "npis": list(npi_keys_by_value),
+                    "keys": list(npi_keys_by_value.values()),
                     "code_keys": list(code_keys),
                     "projection_limit": max(projection_remaining, 0) + 1,
                     "retained_limit": max(remaining, 0) + 1,
@@ -88,25 +81,51 @@ async def indexed_memberships(session, tables, npis, request, state):
         .mappings()
         .one()
     )
-    pairs = row["pairs"]
-    projected = int(row["first_count"]) + int(row["priced_count"]) + len(pairs)
+    return projection_row, remaining, projection_remaining, len(npi_keys_by_value)
+
+
+def _admit_memberships(projection_row, npis, request, state, allowances):
+    from api import ptg2_serving as serving
+
+    remaining, projection_remaining, npi_key_count = allowances
+    pairs = projection_row["pairs"]
+    projected = int(projection_row["first_count"]) + int(projection_row["priced_count"]) + len(pairs)
     if len(pairs) > remaining:
         raise serving.PTG2OnlineWorkBudgetExceeded("retained_memberships")
     if projected > projection_remaining:
         raise serving.PTG2OnlineWorkBudgetExceeded("projection_members")
     # Native index reads issue no CAS page fetches. Charge their complete bounded
     # intermediate/output projection and serialized bytes to the same request budget.
-    byte_count = 16 * (int(row["first_count"]) + int(row["priced_count"]) + len(keys)) + len(encoded(pairs))
+    byte_count = 16 * (int(projection_row["first_count"]) + int(projection_row["priced_count"]) + npi_key_count) + len(
+        encoded(pairs)
+    )
     _charge_v4_taxonomy_projection_work(member_count=projected, byte_count=byte_count)
-    memberships = {npi: [] for npi in npis}
+    memberships_by_npi = {npi: [] for npi in npis}
     for npi, provider_set_key in pairs:
-        if npi not in memberships:
+        if npi not in memberships_by_npi:
             raise PTG2ManifestArtifactError("membership index returned an out-of-scope NPI")
-        memberships[npi].append(provider_set_key)
-    code_sets = {key for values in memberships.values() for key in values}
+        memberships_by_npi[npi].append(provider_set_key)
+    code_sets = {key for set_keys in memberships_by_npi.values() for key in set_keys}
     if len(state.code_sets | code_sets) > request.forward_limits.maximum_code_sets:
         raise serving.PTG2OnlineWorkBudgetExceeded("code_sets")
     state.indexed_projection_members += projected
     state.retained_memberships += len(pairs)
     state.code_sets.update(code_sets)
-    return {npi: tuple(values) for npi, values in memberships.items()}
+    return {npi: tuple(set_keys) for npi, set_keys in memberships_by_npi.items()}
+
+
+async def indexed_memberships(session, tables, npis, request, state):
+    """None means unindexed; an attached invalid candidate never falls back."""
+    if not request.code_system or not request.code:
+        return None
+    found = await _attached_index(session, tables, request, state)
+    if found is None:
+        return None
+    ownership, header, _owner, _view, _pin = found
+    code_keys = tuple(sorted({int(code_row["code_key"]) for code_row in request.code_rows}))
+    covered_keys = {code_row["code_key"] for code_row in header["counts"]["code_coverage"]}
+    if not set(code_keys).issubset(covered_keys):
+        raise PTG2ManifestArtifactError("membership index does not cover the complete requested physical code scope")
+    _charge_v4_taxonomy_projection_work(batch_count=1)
+    projection_row, *allowances = await _membership_pairs(session, tables, npis, request, state, ownership, code_keys)
+    return _admit_memberships(projection_row, npis, request, state, allowances)

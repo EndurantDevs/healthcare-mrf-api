@@ -23,6 +23,7 @@ import orjson
 from sanic import response
 from sqlalchemy import select, text
 
+from api.signed_request_reader import signed_request_reader
 from db.models.custom_import import CustomImportDataset
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
@@ -68,6 +69,7 @@ CUSTOM_IMPORT_READ_MAX_TTL_SECONDS = 60
 
 _CACHE_CONTROL = "private, no-store"
 _MAX_BODY_BYTES = 16 * 1024
+_MAX_MANAGED_PROVIDER_BODY_BYTES = 1024 * 1024
 _MAX_RESPONSE_BYTES = MAX_FAMILY_RESPONSE_BYTES
 _MAX_CONTEXT_BYTES = 2048
 _MAX_CONTEXT_CHARACTERS = 3072
@@ -110,7 +112,9 @@ _UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", fla
 _DATASET_KEY = re.compile(r"[a-z][a-z0-9_]{0,62}", flags=re.ASCII)
 _ERRORS = {
     400: ("custom_import_read_request_invalid", "Invalid custom import read request."),
+    403: ("custom_import_read_forbidden", "Custom import read is not authorized."),
     404: ("resource_not_found", "Resource not found."),
+    409: ("custom_import_read_source_changed", "Custom import read source changed."),
     503: ("custom_import_read_unavailable", "Custom import read is temporarily unavailable."),
 }
 _ENTITY_ABSENT_ERROR = ("custom_import_entity_absent", "Requested custom import entity was not found.")
@@ -155,6 +159,14 @@ def custom_import_provider_body_sha256(body: bytes) -> str:
     """Return the provider-v2 framed digest for one canonical body."""
 
     if type(body) is not bytes or not 1 <= len(body) <= _MAX_BODY_BYTES:
+        raise _fail()
+    return _framed_sha256(_PROVIDER_BODY_HASH_DOMAIN, body)
+
+
+def managed_provider_body_sha256(body: bytes) -> str:
+    """Keep provider-v2 framing with the bounded managed-provider body allowance."""
+
+    if type(body) is not bytes or not 1 <= len(body) <= _MAX_MANAGED_PROVIDER_BODY_BYTES:
         raise _fail()
     return _framed_sha256(_PROVIDER_BODY_HASH_DOMAIN, body)
 
@@ -212,6 +224,12 @@ _GENERIC_TRANSPORT = _TransportContract(
 _PROVIDER_TRANSPORT = _TransportContract(
     CUSTOM_IMPORT_PROVIDER_TRANSPORT_CONTRACT,
     custom_import_provider_body_sha256,
+    custom_import_provider_signature_message,
+    _PROVIDER_SIGNATURE_DOMAIN,
+)
+_MANAGED_PROVIDER_TRANSPORT = _TransportContract(
+    CUSTOM_IMPORT_PROVIDER_TRANSPORT_CONTRACT,
+    managed_provider_body_sha256,
     custom_import_provider_signature_message,
     _PROVIDER_SIGNATURE_DOMAIN,
 )
@@ -723,9 +741,33 @@ def _verify_provider_transport(
     trusted_now: str,
     keyring: _Keyring,
     path: str,
+    managed_detail: bool = False,
+    managed_collection: bool = False,
 ) -> _VerifiedTransport:
     """Verify the provider-only v2 transport without changing generic reads."""
 
+    if (
+        type(managed_detail) is not bool
+        or type(managed_collection) is not bool
+        or (managed_detail and managed_collection)
+    ):
+        raise _fail()
+    if managed_detail:
+        from api.custom_import_provider_batch import CUSTOM_IMPORT_PROVIDER_BATCH_PATH
+
+        if path != CUSTOM_IMPORT_PROVIDER_BATCH_PATH or getattr(request, "managed_detail", None) is None:
+            raise _fail()
+    if managed_collection:
+        collection = getattr(request, "managed_collection", None)
+        path_by_kind = {
+            "list": "/api/v1/extensions/custom-import/providers",
+            "geo": "/api/v1/extensions/custom-import/providers/geo",
+            "batch": "/api/v1/extensions/custom-import/providers/batch",
+            "by-service": "/api/v1/extensions/custom-import/providers/by-service",
+            "billing-search": "/api/v1/extensions/custom-import/providers/billing-search",
+        }
+        if collection is None or path_by_kind.get(collection.query.kind) != path:
+            raise _fail()
     return _verify_transport(
         headers=headers,
         body=body,
@@ -733,7 +775,7 @@ def _verify_provider_transport(
         trusted_now=trusted_now,
         keyring=keyring,
         path=path,
-        transport_contract=_PROVIDER_TRANSPORT,
+        transport_contract=_MANAGED_PROVIDER_TRANSPORT if managed_detail or managed_collection else _PROVIDER_TRANSPORT,
     )
 
 
@@ -909,25 +951,25 @@ async def serve_custom_import_search(request: Any, session: Any):
         cursor_secret = _cursor_secret()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + DEFAULT_READ_TIMEOUT_MS / 1_000
-        async with asyncio.timeout_at(deadline):
+        async with asyncio.timeout_at(deadline), signed_request_reader(request, session) as session:
             pinned_target = await _resolve_pinned_target(session, parsed_request.target)
-        remaining_timeout_ms = int((deadline - loop.time()) * 1_000)
-        if remaining_timeout_ms < 1:
-            raise CustomImportReadUnavailableError("custom import read timed out")
-        search_request = parsed_request.bind(pinned_target.dataset_id)
-        service = CustomImportReadService(
-            authorizer=_TransportAuthorizer(verified, pinned_target),
-            cursor_secret=cursor_secret,
-            statement_timeout_ms=remaining_timeout_ms,
-        )
-        page = await service.search(
-            session,
-            authorization=ExtensionReadAuthorization(verified.credential),
-            request=search_request,
-        )
-        encoded = orjson.dumps(_page_payload(page, parsed_request.target))
-        if len(encoded) > _MAX_RESPONSE_BYTES:
-            raise CustomImportReadUnavailableError("custom import response exceeds the bound")
+            remaining_timeout_ms = int((deadline - loop.time()) * 1_000)
+            if remaining_timeout_ms < 1:
+                raise CustomImportReadUnavailableError("custom import read timed out")
+            search_request = parsed_request.bind(pinned_target.dataset_id)
+            service = CustomImportReadService(
+                authorizer=_TransportAuthorizer(verified, pinned_target),
+                cursor_secret=cursor_secret,
+                statement_timeout_ms=remaining_timeout_ms,
+            )
+            page = await service.search(
+                session,
+                authorization=ExtensionReadAuthorization(verified.credential),
+                request=search_request,
+            )
+            encoded = orjson.dumps(_page_payload(page, parsed_request.target))
+            if len(encoded) > _MAX_RESPONSE_BYTES:
+                raise CustomImportReadUnavailableError("custom import response exceeds the bound")
     except Exception as failure:
         _log_failure(failure)
         return _error(_failure_status(failure))
@@ -953,31 +995,31 @@ async def serve_custom_import_detail(request: Any, session: Any):
             keyring=keyring,
             path=CUSTOM_IMPORT_DETAIL_PATH,
         )
-        if parsed_request.grouped_entity_selection is not None:
-            return await _serve_grouped_detail(session, parsed_request, verified)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + DEFAULT_READ_TIMEOUT_MS / 1_000
-        async with asyncio.timeout_at(deadline):
+        async with asyncio.timeout_at(deadline), signed_request_reader(request, session) as session:
+            if parsed_request.grouped_entity_selection is not None:
+                return await _serve_grouped_detail(session, parsed_request, verified)
             pinned_target = await _resolve_pinned_target(session, parsed_request.target)
-        remaining_timeout_ms = int((deadline - loop.time()) * 1_000)
-        if remaining_timeout_ms < 1:
-            raise CustomImportReadUnavailableError("custom import read timed out")
-        detail_request = parsed_request.bind(pinned_target.dataset_id)
-        service = CustomImportReadService(
-            authorizer=_TransportAuthorizer(verified, pinned_target),
-            statement_timeout_ms=remaining_timeout_ms,
-        )
-        try:
-            detail = await service.root_detail_for_entity(
-                session,
-                authorization=ExtensionReadAuthorization(verified.credential),
-                request=detail_request,
+            remaining_timeout_ms = int((deadline - loop.time()) * 1_000)
+            if remaining_timeout_ms < 1:
+                raise CustomImportReadUnavailableError("custom import read timed out")
+            detail_request = parsed_request.bind(pinned_target.dataset_id)
+            service = CustomImportReadService(
+                authorizer=_TransportAuthorizer(verified, pinned_target),
+                statement_timeout_ms=remaining_timeout_ms,
             )
-        except CustomImportReadEntityAbsentError:
-            return _error(404, detail=_ENTITY_ABSENT_ERROR)
-        encoded = orjson.dumps(_detail_payload(detail, parsed_request.target))
-        if len(encoded) > _MAX_RESPONSE_BYTES:
-            raise CustomImportReadUnavailableError("custom import response exceeds the bound")
+            try:
+                detail = await service.root_detail_for_entity(
+                    session,
+                    authorization=ExtensionReadAuthorization(verified.credential),
+                    request=detail_request,
+                )
+            except CustomImportReadEntityAbsentError:
+                return _error(404, detail=_ENTITY_ABSENT_ERROR)
+            encoded = orjson.dumps(_detail_payload(detail, parsed_request.target))
+            if len(encoded) > _MAX_RESPONSE_BYTES:
+                raise CustomImportReadUnavailableError("custom import response exceeds the bound")
     except Exception as failure:
         _log_failure(failure)
         return _error(_failure_status(failure))
@@ -987,10 +1029,7 @@ async def serve_custom_import_detail(request: Any, session: Any):
 async def _serve_grouped_detail(session, parsed, verified):
     """Resolve, select, and hydrate the opt-in set in one read-only snapshot."""
 
-    if session is None or session.in_transaction():
-        raise CustomImportReadUnavailableError("fresh grouped detail session is required")
-    async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), session.begin():
-        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+    async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000):
         pinned = await _resolve_pinned_target(session, parsed.target)
         service = CustomImportReadService(authorizer=_TransportAuthorizer(verified, pinned))
         try:
@@ -1022,6 +1061,7 @@ __all__ = (
     "CUSTOM_IMPORT_READ_TRANSPORT_KEYRING_ENV",
     "CUSTOM_IMPORT_PROVIDER_TRANSPORT_CONTRACT",
     "custom_import_provider_body_sha256",
+    "managed_provider_body_sha256",
     "custom_import_provider_signature_message",
     "custom_import_read_body_sha256",
     "custom_import_read_signature_message",

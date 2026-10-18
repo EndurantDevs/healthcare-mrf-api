@@ -42,10 +42,10 @@ class Driver(BoundConnection):
             return dict(self.settings)
         return await super().fetchrow(statement, *parameters)
 
-    async def execute(self, statement, *parameters):
-        if statement == custody._SET_SETTING:
-            assert not self.in_transaction
-            name, value = parameters
+    async def fetch(self, statement, *parameters):
+        assert statement == custody._SET_SETTINGS and not self.in_transaction
+        setting_names, setting_values = parameters
+        for name, value in zip(setting_names, setting_values, strict=True):
             if (
                 self.connection.state.mode == "restore_failure"
                 and "commit" in self.connection.events
@@ -53,8 +53,7 @@ class Driver(BoundConnection):
             ):
                 raise OSError("synthetic settings restore failure")
             self.settings[name] = value
-            return "SELECT 1"
-        return await super().execute(statement)
+        return [{"name": name, "value": self.settings[name]} for name in setting_names]
 
     async def _command(self, name):
         self.connection.events.append(name)
@@ -456,14 +455,14 @@ async def test_owner_catalog_path_precedes_diagnostic_and_restores_saved_namespa
 async def test_owner_path_readback_mismatch_retires_before_baseline_or_payload(owned_wave, monkeypatch):
     """A transport that fails to apply the path cannot expose a borrowed writer."""
     state, database, *_ = owned_wave
-    original_execute = Driver.execute
+    original_fetch = Driver.fetch
 
-    async def execute(self, statement, *parameters):
-        if statement == custody._SET_SETTING and parameters[0] == "search_path":
-            return "SELECT 1"
-        return await original_execute(self, statement, *parameters)
+    async def fetch(self, statement, *parameters):
+        setting_records = await original_fetch(self, statement, *parameters)
+        self.settings["search_path"] = self.original["search_path"]
+        return setting_records
 
-    monkeypatch.setattr(Driver, "execute", execute)
+    monkeypatch.setattr(Driver, "fetch", fetch)
     with pytest.raises(custody.OwnedWalTransactionError) as caught:
         async with custody.registry_owned_wal_transaction(database):
             pytest.fail("unverified search path reached the payload")
@@ -479,14 +478,14 @@ async def test_owner_path_readback_mismatch_retires_before_baseline_or_payload(o
 async def test_owner_path_restore_failure_preserves_commit_and_retires_connection(owned_wave, monkeypatch):
     """A failed path restore cannot return a contaminated connection to the pool."""
     state, database, *_ = owned_wave
-    original_execute = Driver.execute
+    original_fetch = Driver.fetch
 
-    async def execute(self, statement, *parameters):
-        if statement == custody._SET_SETTING and parameters[0] == "search_path" and "commit" in self.connection.events:
+    async def fetch(self, statement, *parameters):
+        if statement == custody._SET_SETTINGS and "commit" in self.connection.events:
             raise OSError("synthetic search path restore failure")
-        return await original_execute(self, statement, *parameters)
+        return await original_fetch(self, statement, *parameters)
 
-    monkeypatch.setattr(Driver, "execute", execute)
+    monkeypatch.setattr(Driver, "fetch", fetch)
     with pytest.raises(custody.OwnedWalTransactionError) as caught:
         async with custody.registry_owned_wal_transaction(database) as outcome:
             assert outcome.session.in_transaction()
@@ -494,6 +493,90 @@ async def test_owner_path_restore_failure_preserves_commit_and_retires_connectio
     assert outcome.is_committed and outcome.status == "committed_accounting_incomplete"
     assert outcome.measurement is None and outcome.cleanup_complete
     assert state.connections[0].closed and state.connections[0].invalidated
+
+
+async def test_owner_applies_and_restores_one_complete_setting_batch(owned_wave, monkeypatch):
+    state, database, *_ = owned_wave
+    original_fetch = Driver.fetch
+    batches = []
+
+    async def fetch(driver, statement, *parameters):
+        batches.append((statement, parameters))
+        return await original_fetch(driver, statement, *parameters)
+
+    monkeypatch.setattr(Driver, "fetch", fetch)
+    async with custody.registry_owned_wal_transaction(database) as outcome:
+        assert outcome.session.in_transaction()
+    assert outcome.status == "committed_measured" and outcome.cleanup_complete
+    assert len(batches) == 2
+    assert all(
+        statement == custody._SET_SETTINGS and parameters[0] == list(custody._SETTINGS)
+        for statement, parameters in batches
+    )
+    assert batches[0][1][1] == ["0", "0", "0", "off", "pg_catalog, pg_temp"]
+    assert batches[1][1][1] == list(state.connections[0].driver.original.values())
+
+
+@pytest.mark.parametrize("damage", ["missing", "extra", "duplicate", "value"])
+async def test_setting_batch_coverage_refuses_before_baseline(owned_wave, monkeypatch, damage):
+    state, database, *_ = owned_wave
+    original_fetch = Driver.fetch
+
+    async def fetch(driver, statement, *parameters):
+        setting_records = await original_fetch(driver, statement, *parameters)
+        if damage == "missing":
+            return setting_records[:-1]
+        if damage == "extra":
+            return [*setting_records, {"name": "other", "value": "0"}]
+        if damage == "duplicate":
+            return [*setting_records[:-1], setting_records[0]]
+        return [{**record, "value": "changed"} for record in setting_records]
+
+    monkeypatch.setattr(Driver, "fetch", fetch)
+    with pytest.raises(custody.OwnedWalTransactionError) as caught:
+        async with custody.registry_owned_wal_transaction(database):
+            pytest.fail("incomplete setting batch exposed the owner")
+    outcome = caught.value.outcome
+    assert str(caught.value.__cause__) == "provider_directory_owned_wal_settings_changed"
+    assert outcome.commit_state == "not_attempted" and outcome.measurement is None and outcome.cleanup_complete
+    assert state.connections[0].invalidated and "preflight" not in state.connections[0].events
+
+
+@pytest.mark.parametrize("damage", ["missing", "extra", "value"])
+async def test_setting_inventory_refuses_before_native_io(damage):
+    settings_by_name = dict(zip(custody._SETTINGS, ("0", "0", "0", "off", "pg_catalog, pg_temp"), strict=True))
+    if damage == "missing":
+        settings_by_name.pop("search_path")
+    elif damage == "extra":
+        settings_by_name["other"] = "0"
+    else:
+        settings_by_name["search_path"] = None
+    driver = SimpleNamespace(fetch=AsyncMock(side_effect=AssertionError("invalid setting inventory reached native IO")))
+    with pytest.raises(RuntimeError, match="owned_wal_settings_changed"):
+        await custody._set_settings(driver, 0, settings_by_name)
+    driver.fetch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("phase", ["apply", "restore"])
+async def test_partial_setting_cancellation_retires_original_driver(owned_wave, monkeypatch, phase):
+    state, database, *_ = owned_wave
+    original_fetch = Driver.fetch
+    primary = asyncio.CancelledError("synthetic setting batch cancellation")
+
+    async def fetch(driver, statement, *parameters):
+        if ("commit" in driver.connection.events) == (phase == "restore"):
+            driver.settings[parameters[0][0]] = parameters[1][0]
+            raise primary
+        return await original_fetch(driver, statement, *parameters)
+
+    monkeypatch.setattr(Driver, "fetch", fetch)
+    with pytest.raises(custody.OwnedWalTransactionCancelled) as caught:
+        async with custody.registry_owned_wal_transaction(database):
+            assert phase == "restore"
+    outcome = caught.value.outcome
+    assert outcome.is_committed is (phase == "restore")
+    assert outcome.measurement is None and outcome.cleanup_complete
+    assert state.connections[0].invalidated and state.connections[0].driver.closed
 
 
 @pytest.mark.parametrize("phase", ["start", "raw_capture"])

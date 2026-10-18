@@ -95,6 +95,7 @@ def _committed_target_result(
     if (
         target_module
         not in {
+            "process.nucc",
             "process.npi",
             "process.massachusetts_profile",
             "process.kentucky_profile",
@@ -303,6 +304,7 @@ async def control_single_job_start(
             progress_message="running",
             attempt_id=attempt_id,
             attempt_started_at=started_at if run_id else None,
+            pricing_claim_task=control_task_by_field,
         )
     except BaseException:
         if live_token is not None:
@@ -311,6 +313,8 @@ async def control_single_job_start(
     if run_id and attempt_claimed is not True:
         if live_token is not None:
             reset_live_progress_context(live_token)
+        if importer == "nucc" and isinstance(attempt_claimed, dict):
+            return await _project_acknowledged_nucc_claim(attempt_claimed)
         return {
             "status": "skipped",
             "run_id": run_id,
@@ -347,6 +351,12 @@ async def control_single_job_start(
             )
         )
     try:
+        if "cms_registry_source_runtime" in ctx:
+            from process.provider_directory_cms_source_runtime import (
+                bind_claimed_cms_registry_source_runtime,
+            )
+
+            await bind_claimed_cms_registry_source_runtime(ctx, control_task_by_field, target_task_by_field)
         module = import_module(target_module)
         target_result = await _invoke_control_target(
             module,
@@ -972,6 +982,7 @@ async def mark_control_run(
     database_heartbeat_at: object = None,
     database_finished_at: object = None,
     expected_state: tuple[str, str] | None = None,
+    pricing_claim_task: dict[str, Any] | None = None,
 ):
     """Persist and publish one authoritative control-run lifecycle transition."""
 
@@ -982,25 +993,18 @@ async def mark_control_run(
         attempt_id=attempt_id,
         attempt_started_at=attempt_started_at,
     )
-    is_terminal = status in {
-        "succeeded",
-        "failed",
-        "canceled",
-        "cancelled",
-        "dead_letter",
-    }
     progress_by_field = _control_progress_by_field(
         run_id,
         status=status,
         progress_message=progress_message,
         supplied_progress=progress,
-        is_terminal=is_terminal,
+        is_terminal=status in _TERMINAL_STATUSES,
         attempt_id=attempt_id,
         attempt_started_at=attempt_started_at,
     )
     transition_times = _control_transition_times(
         status=status,
-        is_terminal=is_terminal,
+        is_terminal=status in _TERMINAL_STATUSES,
         attempt_started_at=attempt_started_at,
         preserve_finished_at=preserve_finished_at,
         database_state_committed=database_state_committed,
@@ -1015,7 +1019,9 @@ async def mark_control_run(
         "error": error,
     }
     if metrics is not None:
-        update_values_by_field["metrics"] = metrics
+        from process.plan_pricing_control import preserve_delivery
+
+        update_values_by_field["metrics"] = preserve_delivery(ImportRun, metrics)
     if snapshot_id:
         update_values_by_field["snapshot_id"] = snapshot_id
     if status == "running":
@@ -1024,7 +1030,7 @@ async def mark_control_run(
             transition_times.now,
         )
         update_values_by_field["finished_at"] = None
-    if is_terminal and not preserve_finished_at:
+    if status in _TERMINAL_STATUSES and not preserve_finished_at:
         update_values_by_field["finished_at"] = transition_times.now
     should_update_database = not database_state_committed and (
         bool(status == "running" and attempt_id and attempt_started_at)
@@ -1045,9 +1051,11 @@ async def mark_control_run(
             )
         if status == "running":
             stmt = stmt.where(ImportRun.status.notin_(sorted(_TERMINAL_STATUSES | {"canceling"})))
+            if pricing_claim_task is not None:
+                stmt = stmt.where(ImportRun.importer == pricing_claim_task.get("importer"))
             if not (attempt_id and attempt_started_at):
                 stmt = stmt.where(ImportRun.progress["attempt_started_at"].as_string().is_(None))
-        elif is_terminal:
+        elif status in _TERMINAL_STATUSES:
             stmt = stmt.where(
                 or_(
                     ImportRun.status.notin_(sorted(_TERMINAL_STATUSES)),
@@ -1062,15 +1070,32 @@ async def mark_control_run(
                 attempt_id=attempt_id,
                 attempt_started_at=attempt_started_at,
             )
-        elif is_terminal and attempt_id and attempt_started_at:
+        elif status in _TERMINAL_STATUSES and attempt_id and attempt_started_at:
             stmt = _where_control_attempt(
                 stmt,
                 attempt_id=attempt_id,
                 attempt_started_at=attempt_started_at,
             )
         affected_rows = await _execute_control_run_update(
-            stmt.values(**update_values_by_field).returning(ImportRun.run_id)
+            stmt.values(**update_values_by_field).returning(ImportRun.run_id),
+            **(
+                {"pricing_claim_task": pricing_claim_task}
+                if pricing_claim_task is not None and pricing_claim_task.get("importer") == "plan-pricing-projection"
+                else {"nucc_claim_run_id": run_id}
+                if status == "running"
+                and attempt_id
+                and attempt_started_at
+                and pricing_claim_task is not None
+                and pricing_claim_task.get("importer") == "nucc"
+                else {}
+            ),
         )
+        if (
+            isinstance(affected_rows, dict)
+            and pricing_claim_task is not None
+            and pricing_claim_task.get("importer") == "nucc"
+        ):
+            return affected_rows
         if affected_rows != 1:
             return _CONTROL_RUN_NOT_MARKED
     live_update_by_field = {
@@ -1295,13 +1320,63 @@ def _require_control_run_bound_transaction(binding: Any, base_database: str) -> 
         raise RuntimeError("control_run_bound_transaction_invalid")
 
 
-async def _execute_control_run_update(stmt: Any) -> int:
+async def _is_protected_nucc_claim_parent(session) -> bool:
+    """Route only from the fixed native relation; all other shapes refuse."""
+    kind = await session.scalar(
+        text(
+            "SELECT c.relkind::text FROM pg_catalog.pg_class c "
+            "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE n.nspname='mrf' AND c.relname='nucc_taxonomy'"
+        )
+    )
+    if kind not in (None, "r", "p"):
+        raise RuntimeError("NUCC claim parent kind differs")
+    return kind == "p"
+
+
+async def _execute_nucc_claim_update(stmt, run_id) -> int | dict[str, Any]:
+    """Commit the Source action/claim before the wrapper starts importer work."""
+    async with db.transaction() as session:
+        if await _is_protected_nucc_claim_parent(session):
+            from process.nucc_protected_control import (
+                _read_acknowledged_source_outcome,
+                reconcile_source_publication,
+            )
+            from process.nucc_snapshot_partition import capture_nucc_parent
+
+            receipt = await reconcile_source_publication(session, run_id)
+            if receipt is None:
+                from process.nucc_protected_source import reconcile_nucc_source_handoff
+
+                if await reconcile_nucc_source_handoff(session, run_id) is not None:
+                    return 0
+            await capture_nucc_parent(session)
+            if receipt is not None:
+                run = await _read_acknowledged_source_outcome(session, run_id, receipt)
+                for field in ("heartbeat_at", "finished_at"):
+                    _committed_control_timestamp(isoformat_utc(run[field], timespec="microseconds"))
+                return run
+        return await _execute_control_run_update(stmt)
+
+
+async def _execute_control_run_update(
+    stmt: Any, *, pricing_claim_task=None, nucc_claim_run_id=None
+) -> int | dict[str, Any]:
+    if pricing_claim_task is not None:
+        from process.plan_pricing_control_transaction import (
+            pricing_worker_claim_transaction,
+        )
+
+        async with pricing_worker_claim_transaction(pricing_claim_task):
+            return await _execute_control_run_update(stmt)
     if db._reader_binding() is not None:
         raise RuntimeError("control_run_bound_transaction_invalid")
     binding = db._transaction_binding()
     if binding is not None:
         base_database = os.getenv("HLTHPRT_DB_DATABASE", "postgres")
         _require_control_run_bound_transaction(binding, base_database)
+        if nucc_claim_run_id is not None and await _is_protected_nucc_claim_parent(binding.session):
+            raise RuntimeError("protected NUCC claim requires its own short transaction")
         update_result = await db.execute(stmt)
         _require_control_run_bound_transaction(binding, base_database)
         if update_result is None:
@@ -1316,6 +1391,8 @@ async def _execute_control_run_update(stmt: Any) -> int:
     db._database_override = base_database
     try:
         await db.connect()
+        if nucc_claim_run_id is not None:
+            return await _execute_nucc_claim_update(stmt, nucc_claim_run_id)
         update_result = await db.execute(stmt)
         if update_result is None:
             return 0
@@ -1333,6 +1410,7 @@ async def _execute_control_run_update(stmt: Any) -> int:
 def _isolated_control_job_context(ctx: dict[str, Any], run_id: str) -> dict[str, Any]:
     """Copy mutable run state so concurrent ARQ jobs cannot overwrite each other."""
     isolated_context_map = dict(ctx)
+    isolated_context_map.pop("_nucc_database", None)
     shared_context_map = ctx.get("context")
     job_context_map = dict(shared_context_map) if isinstance(shared_context_map, dict) else {}
     for key in (
@@ -1347,6 +1425,9 @@ def _isolated_control_job_context(ctx: dict[str, Any], run_id: str) -> dict[str,
         "_control_attempt_id",
         "_control_attempt_started_at",
         "nucc_native_stage",
+        "nucc_plain_stage",
+        "nucc_source_stage_bound",
+        "nucc_source_files",
         "nucc_native_predecessor",
         "nucc_native_commit_unknown",
         "source_profile_commit_unknown",
@@ -1374,3 +1455,24 @@ def _control_failure_error(exc: Exception) -> dict[str, Any]:
     if isinstance(retryable, bool):
         error_by_field["retryable"] = retryable
     return error_by_field
+
+
+async def _project_acknowledged_nucc_claim(run_by_field) -> dict[str, Any]:
+    """Project the committed outcome without a claim, target, heartbeat or database write."""
+    progress_by_field = run_by_field["progress"]
+    await _drain_committed_terminal_projection(
+        _mark_and_flush_terminal_control_run(
+            run_by_field["run_id"],
+            phase_detail=run_by_field["phase_detail"],
+            progress_message=progress_by_field.get("message") or "succeeded",
+            metrics=run_by_field["metrics"],
+            progress=progress_by_field,
+            attempt_id=progress_by_field["attempt_id"],
+            attempt_started_at=progress_by_field["attempt_started_at"],
+            snapshot_id=run_by_field["snapshot_id"],
+            database_state_committed=True,
+            database_heartbeat_at=isoformat_utc(run_by_field["heartbeat_at"], timespec="microseconds"),
+            database_finished_at=isoformat_utc(run_by_field["finished_at"], timespec="microseconds"),
+        )
+    )
+    return {"status": run_by_field["status"], "run_id": run_by_field["run_id"], "result": run_by_field["metrics"]}

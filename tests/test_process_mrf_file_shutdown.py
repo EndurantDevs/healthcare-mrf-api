@@ -2,16 +2,15 @@
 
 import asyncio
 import datetime
+import importlib
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import importlib
-import os
-
-from asyncpg.exceptions import DeadlockDetectedError
 import pytest
+from asyncpg.exceptions import DeadlockDetectedError
 from sqlalchemy import BigInteger, column
 
 os.environ.setdefault("HLTHPRT_REDIS_ADDRESS", "redis://localhost")
@@ -76,6 +75,11 @@ def _install_mrf_shutdown_finalizer_mocks(monkeypatch, operations, mark_run, cre
         ),
     )
     monkeypatch.setattr(process_initial, "_create_named_indexes", create_indexes)
+    monkeypatch.setattr(
+        process_initial,
+        "prepare_local_native_input_publication",
+        AsyncMock(side_effect=lambda *_args, **_kwargs: operations.append(("native_enrollment",))),
+    )
     monkeypatch.setattr(process_initial, "publish_local_reference_family_generation", AsyncMock())
     monkeypatch.setattr(process_initial, "source_enabled", lambda _source: False)
     monkeypatch.setattr(
@@ -83,6 +87,23 @@ def _install_mrf_shutdown_finalizer_mocks(monkeypatch, operations, mark_run, cre
         "_plan_summary_dependencies_ready",
         AsyncMock(return_value=(False, ["mrf.plan_attributes"])),
     )
+
+
+def _assert_mrf_native_enrollment(operations, import_date):
+    """Keep the full enrollment boundary before the mocked publication swap."""
+    process_initial.prepare_local_native_input_publication.assert_awaited_once_with(
+        None,
+        ledger_schema="mrf",
+        relations=tuple(
+            (model.__main_table__, f"{model.__tablename__}_{import_date}")
+            for model in process_initial._MRF_PUBLICATION_MODELS
+        ),
+    )
+    first_swap = next(
+        index for index, operation in enumerate(operations) if operation[0] == "sql" and "ALTER TABLE" in operation[1]
+    )
+    assert operations.index(("native_enrollment",)) < first_swap
+
 
 @pytest.mark.asyncio
 async def test_process_json_index_marks_terminal_parse_error_done(monkeypatch):
@@ -130,11 +151,14 @@ async def test_process_json_index_marks_terminal_parse_error_done(monkeypatch):
         },
     )
 
-    assert process_initial._mrf_url_job_id(
-        "index",
-        "run_test_terminal",
-        "https://example.test/bad-index.json",
-    ) in redis.sets[process_initial._mrf_state_key("run_test_terminal", "done_work")]
+    assert (
+        process_initial._mrf_url_job_id(
+            "index",
+            "run_test_terminal",
+            "https://example.test/bad-index.json",
+        )
+        in redis.sets[process_initial._mrf_state_key("run_test_terminal", "done_work")]
+    )
 
 
 def test_split_json_array_file_to_chunks(tmp_path, monkeypatch):
@@ -169,11 +193,11 @@ def test_split_json_array_file_to_chunks(tmp_path, monkeypatch):
 async def test_download_it_and_save_supports_file_urls(tmp_path):
     source = tmp_path / "source.json"
     target = tmp_path / "target.json"
-    source.write_text("[{\"ok\": true}]", encoding="utf-8")
+    source.write_text('[{"ok": true}]', encoding="utf-8")
 
     await utils_module.download_it_and_save(source.absolute().as_uri(), str(target))
 
-    assert target.read_text(encoding="utf-8") == "[{\"ok\": true}]"
+    assert target.read_text(encoding="utf-8") == '[{"ok": true}]'
 
 
 @pytest.mark.asyncio
@@ -219,7 +243,9 @@ async def test_mrf_shutdown_requeues_while_parser_jobs_run(monkeypatch):
         },
     }
 
-    outcome_by_field = await process_initial.shutdown(context_by_field, {"context": context_by_field["context"], "test_mode": True})
+    outcome_by_field = await process_initial.shutdown(
+        context_by_field, {"context": context_by_field["context"], "test_mode": True}
+    )
 
     assert outcome_by_field == 1
     assert context_by_field["redis"].enqueued
@@ -277,9 +303,9 @@ async def test_mrf_shutdown_fails_after_unrecoverable_work_wait(monkeypatch):
     assert mark_run.await_args.kwargs["error"]["code"] == "mrf_parser_recovery_failed"
 
 
-@pytest.mark.asyncio
-async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(monkeypatch):
-    """Verify mrf shutdown cleans stale finalize jobs when already finalized."""
+def _finalized_mrf_redis():
+    """Model a completed import with stale finish jobs from two dates."""
+
     class FakeRedis:
         def __init__(self):
             self.zrem_calls = []
@@ -289,6 +315,7 @@ async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(mo
             if key.endswith(":finalized"):
                 return b"1"
             return None
+
         async def zrange(self, *args):
             assert args == (process_initial.MRF_FINISH_QUEUE_NAME, 0, -1)
             return [
@@ -297,23 +324,34 @@ async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(mo
                 b"shutdown_mrf_20260626_lock_wait_13",
                 b"shutdown_mrf_20260625_wait_4",
             ]
+
         async def zrem(self, *args):
             self.zrem_calls.append(args)
             return 1
+
         async def delete(self, *args):
             self.delete_calls.append(args)
             return len(args)
+
+    return FakeRedis()
+
+
+@pytest.mark.asyncio
+async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(monkeypatch):
+    """Verify mrf shutdown cleans stale finalize jobs when already finalized."""
     mark_run = AsyncMock()
     monkeypatch.setattr(process_initial, "mark_control_run", mark_run)
     context_by_field = {
-        "redis": FakeRedis(),
+        "redis": _finalized_mrf_redis(),
         "context": {
             "import_date": "20260626",
             "control_run_id": "run_mrf_done",
             "test_mode": True,
         },
     }
-    outcome_by_field = await process_initial.shutdown(context_by_field, {"context": context_by_field["context"], "test_mode": True})
+    outcome_by_field = await process_initial.shutdown(
+        context_by_field, {"context": context_by_field["context"], "test_mode": True}
+    )
     assert outcome_by_field == 1
     assert set(context_by_field["redis"].zrem_calls) == {
         (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626"),
@@ -369,10 +407,10 @@ async def test_mrf_shutdown_defers_serving_indexes_and_reports_phase_timings(mon
         {"context": context_by_field},
     )
 
+    _assert_mrf_native_enrollment(operations, context_by_field["import_date"])
     assert ("summary", False) in operations
     assert [
-        call.kwargs["importer_id"]
-        for call in process_initial.publish_local_reference_family_generation.await_args_list
+        call.kwargs["importer_id"] for call in process_initial.publish_local_reference_family_generation.await_args_list
     ] == ["mrf", "mrf-address"]
     index_operations = [operation for operation in operations if operation[0] == "indexes"]
     assert index_operations == [
@@ -388,10 +426,7 @@ async def test_mrf_shutdown_defers_serving_indexes_and_reports_phase_timings(mon
     terminal_metrics = mark_run.await_args.kwargs["metrics"]
     assert terminal_metrics["plans_count"] == 1
     assert terminal_metrics["summary_rows"] == 0
-    phase_names = [
-        timing["phase"]
-        for timing in terminal_metrics["mrf_finalize_phase_timings"]
-    ]
+    phase_names = [timing["phase"] for timing in terminal_metrics["mrf_finalize_phase_timings"]]
     assert phase_names[:4] == [
         "plan_drug_statistics",
         "mrf_address_summary",
@@ -425,7 +460,5 @@ async def test_mrf_shutdown_does_not_publish_when_fast_path_index_build_fails(mo
             {"context": context_by_field},
         )
 
-    assert not any(
-        operation[0] == "sql" and "ALTER TABLE" in operation[1]
-        for operation in operations
-    )
+    assert not any(operation[0] == "sql" and "ALTER TABLE" in operation[1] for operation in operations)
+    process_initial.prepare_local_native_input_publication.assert_not_awaited()

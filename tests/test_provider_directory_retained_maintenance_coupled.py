@@ -59,6 +59,7 @@ class Retained(Connection, AsyncConnection):
         self.rollback_started = asyncio.Event()
         self.commit_failure = None
         self.has_nested_transaction = False
+        self.logical_transaction = None
         self.driver.terminate = self.terminate_driver
 
     def terminate_driver(self):
@@ -67,7 +68,10 @@ class Retained(Connection, AsyncConnection):
         self.driver.in_transaction = False
 
     def in_transaction(self):
-        return self.driver.in_transaction
+        return self.logical_transaction is not None or self.driver.in_transaction
+
+    def get_transaction(self):
+        return self.logical_transaction
 
     def in_nested_transaction(self):
         return self.has_nested_transaction
@@ -77,9 +81,15 @@ class Retained(Connection, AsyncConnection):
 
     async def begin_transaction(self):
         self.events.append("begin")
-        self.driver.in_transaction = True
+        self.logical_transaction = object()
+        assert not self.driver.in_transaction
+        return self.logical_transaction
 
     async def execute(self, statement, parameters=None):
+        assert self.in_transaction()
+        if not self.driver.in_transaction:
+            assert self.logical_transaction is not None
+            self.driver.in_transaction = True
         assert self.driver.in_transaction
         self.events.append((str(statement), parameters))
         return SimpleNamespace(scalar_one=lambda: 5)
@@ -90,6 +100,7 @@ class Retained(Connection, AsyncConnection):
         if self.commit_gate is not None:
             await self.commit_gate.wait()
         self.driver.in_transaction = False
+        self.logical_transaction = None
         if self.commit_failure is not None:
             raise self.commit_failure
 
@@ -99,6 +110,7 @@ class Retained(Connection, AsyncConnection):
         if self.rollback_gate is not None:
             await self.rollback_gate.wait()
         self.driver.in_transaction = False
+        self.logical_transaction = None
 
 
 def _install_callback_owner(fhir):
@@ -193,6 +205,9 @@ async def test_native_begin_once_held_until_original_release_and_capture_before_
     fhir, connection, events, admission, captures = await coupled_fixture()
     async with maintenance.control_maintenance_fence(fhir, connection):
         assert connection.events.count("begin") == 1 and "commit" not in connection.events
+        assert connection.driver.is_in_transaction()
+        assert owner._RETAINED_OWNED_TRANSACTION.get()[-1] is connection.get_transaction()
+        assert [statement for statement in connection.events if isinstance(statement, tuple)][0][0] == "SELECT 1"
         assert admission.wal_tracker.owned_control_maintenance_outcome is None
         await maintenance.assert_held(fhir)
         await maintenance.release_before_cutover(fhir)
@@ -407,18 +422,18 @@ async def test_restore_and_termination_dual_failure_preserves_first_cleanup_exce
     state, database, *_ = owned_wave
     primary = OSError("synthetic first settings restore failure")
     retirement = OSError("synthetic second native termination failure")
-    original_execute = Driver.execute
+    original_fetch = Driver.fetch
 
-    async def execute(driver, statement, *parameters):
+    async def fetch(driver, statement, *parameters):
         target_owner = kind == "worker" or isinstance(driver.connection, Retained)
-        if target_owner and statement == owner._SET_SETTING and "commit" in driver.connection.events:
+        if target_owner and statement == owner._SET_SETTINGS and "commit" in driver.connection.events:
             raise primary
-        return await original_execute(driver, statement, *parameters)
+        return await original_fetch(driver, statement, *parameters)
 
     def terminate(driver):
         raise retirement
 
-    monkeypatch.setattr(Driver, "execute", execute)
+    monkeypatch.setattr(Driver, "fetch", fetch)
     monkeypatch.setattr(Driver, "terminate", terminate)
     if kind == "retained":
         fhir, connection, _, admission, _ = await coupled_fixture()
@@ -474,3 +489,48 @@ async def test_worker_installed_pool_suppression_checks_in_only_verified_termina
     assert checkins == [True] and state.checkedout == 0 and pools[0].checkedout() == 0
     assert state.connections[0].events.count("native_terminate") == 1
     pools[0].dispose()
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_first_statement_failure_retires_before_body(monkeypatch, cancelled):
+    connection = Retained("success")
+    await connection.start()
+    primary = (
+        asyncio.CancelledError("synthetic first statement cancellation")
+        if cancelled
+        else OSError("synthetic first statement failure")
+    )
+
+    async def failed_statement(statement, parameters=None):
+        assert str(statement) == "SELECT 1" and connection.in_transaction()
+        assert not connection.driver.is_in_transaction()
+        connection.events.append("first_statement")
+        raise primary
+
+    monkeypatch.setattr(connection, "execute", failed_statement)
+    expected = owner.OwnedWalTransactionCancelled if cancelled else owner.OwnedWalTransactionError
+    with pytest.raises(expected) as caught:
+        async with owner.registry_retained_wal_transaction(connection):
+            pytest.fail("failed native BEGIN exposed its body")
+    outcome = caught.value.outcome
+    if cancelled:
+        assert isinstance(caught.value.__cause__, asyncio.CancelledError)
+    else:
+        assert caught.value.__cause__ is primary
+    assert outcome.commit_state == "rolled_back" and not outcome.is_committed
+    assert outcome.cleanup_complete and outcome.measurement is None
+    assert connection.events.count("begin") == connection.events.count("first_statement") == 1
+    assert connection.events.count("rollback") == 1 and "commit" not in connection.events
+    assert connection.closed and connection.driver.is_closed() and connection.state.checkedout == 0
+    assert owner._RETAINED_OWNED_TRANSACTION.get() is None
+
+
+async def test_lazy_begin_starts_native_before_owner_body():
+    connection = Retained("success")
+    await connection.start()
+    async with owner.registry_retained_wal_transaction(connection) as outcome:
+        assert connection.driver.is_in_transaction()
+        assert owner._RETAINED_OWNED_TRANSACTION.get()[-1] is connection.get_transaction()
+        assert outcome.retained_driver is connection.driver and outcome.retained_pid == connection.driver.pid
+    assert outcome.is_committed and outcome.cleanup_complete and outcome.measurement is not None
+    await close_healthy(connection)

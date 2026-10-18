@@ -12,21 +12,23 @@ from unittest.mock import AsyncMock
 import pytest
 
 from db.models import ProviderDirectoryLocation, ProviderDirectoryPractitioner
+from tests.provider_directory_checkpoint_unit_support import checkpoint_unit_scope as checkpoint_unit_scope
 from tests.provider_directory_fhir_bulk_test_support import (
-    _Connection,
-    _Response,
-    _Session,
     _acquire,
     _checkpoint,
     _checkpoint_context,
     _client_session,
+    _Connection,
     _fetch_options,
     _identity,
     _manifest_payload,
+    _Response,
+    _Session,
     _source,
     _stream_options,
     importer,
 )
+
 
 @pytest.mark.asyncio
 async def test_load_bulk_checkpoint_handles_empty_identity_and_status_errors(
@@ -48,9 +50,7 @@ async def test_load_bulk_checkpoint_handles_empty_identity_and_status_errors(
         await importer._load_bulk_export_checkpoint(identity)
     with pytest.raises(RuntimeError, match="status_url_hash_mismatch"):
         await importer._load_bulk_export_checkpoint(identity)
-    assert (await importer._load_bulk_export_checkpoint(identity))["dataset_id"] == (
-        identity.dataset_id
-    )
+    assert (await importer._load_bulk_export_checkpoint(identity))["dataset_id"] == (identity.dataset_id)
 
 
 @pytest.mark.asyncio
@@ -138,9 +138,7 @@ async def test_accept_bulk_checkpoint_fails_closed_on_owner_and_url_mismatch(
         "bulk_export_status_url_mismatch",
         terminal=True,
     )
-    assert await importer._accept_bulk_export_checkpoint(identity, None) == (
-        _checkpoint(identity)
-    )
+    assert await importer._accept_bulk_export_checkpoint(identity, None) == (_checkpoint(identity))
 
 
 @pytest.mark.asyncio
@@ -326,9 +324,7 @@ async def test_recover_failed_capability_rejects_lost_state(
         "_load_bulk_export_checkpoint",
         AsyncMock(return_value={}),
     )
-    expected_error = (
-        "ownership_conflict" if status_count == 0 else "adoption_lost"
-    )
+    expected_error = "ownership_conflict" if status_count == 0 else "adoption_lost"
     with pytest.raises(RuntimeError, match=expected_error):
         await importer._recover_failed_bulk_export_capability_checkpoint(
             identity,
@@ -351,13 +347,11 @@ async def test_claim_existing_checkpoint_covers_lineage_and_adoption_errors(
         "state": importer.BULK_EXPORT_CHECKPOINT_RETRYABLE,
     }
     cancel_probe = AsyncMock()
-    claimed, initial_status_payload, error = (
-        await importer._claim_existing_bulk_export_checkpoint(
+    claimed, initial_status_payload, error = await importer._claim_existing_bulk_export_checkpoint(
         identity,
         checkpoint_map,
         ownership_probe=AsyncMock(),
         cancel_probe=cancel_probe,
-    )
     )
     assert claimed == checkpoint_map and initial_status_payload is None
     assert error == "bulk_export_checkpoint_lineage_mismatch"
@@ -373,12 +367,10 @@ async def test_claim_existing_checkpoint_covers_lineage_and_adoption_errors(
         "_adopt_bulk_export_checkpoint",
         AsyncMock(side_effect=RuntimeError("bulk_export_checkpoint_adoption_lost")),
     )
-    claimed, initial_status_payload, error = (
-        await importer._claim_existing_bulk_export_checkpoint(
-            retry_identity,
-            checkpoint_map,
-            ownership_probe=AsyncMock(),
-        )
+    claimed, initial_status_payload, error = await importer._claim_existing_bulk_export_checkpoint(
+        retry_identity,
+        checkpoint_map,
+        ownership_probe=AsyncMock(),
     )
     assert claimed == checkpoint_map and initial_status_payload is None
     assert error == "bulk_export_checkpoint_adoption_lost"
@@ -397,17 +389,13 @@ async def test_claim_existing_checkpoint_times_out_or_observes_deleted_row(
         "owner_run_id": "prior-run",
         "state": importer.BULK_EXPORT_CHECKPOINT_STARTING,
     }
-    conflict = AsyncMock(
-        side_effect=RuntimeError("bulk_export_checkpoint_ownership_conflict")
-    )
+    conflict = AsyncMock(side_effect=RuntimeError("bulk_export_checkpoint_ownership_conflict"))
     monkeypatch.setattr(importer, "_adopt_bulk_export_checkpoint", conflict)
     monkeypatch.setattr(importer, "_bulk_checkpoint_lease_seconds", lambda: 0)
-    claimed, initial_status_payload, error = (
-        await importer._claim_existing_bulk_export_checkpoint(
-            identity,
-            checkpoint_map,
-            ownership_probe=AsyncMock(),
-        )
+    claimed, initial_status_payload, error = await importer._claim_existing_bulk_export_checkpoint(
+        identity,
+        checkpoint_map,
+        ownership_probe=AsyncMock(),
     )
     assert claimed == checkpoint_map and initial_status_payload is None
     assert error == "bulk_export_acceptance_outcome_unknown"
@@ -423,15 +411,13 @@ async def test_claim_existing_checkpoint_times_out_or_observes_deleted_row(
         "_load_bulk_export_checkpoint",
         AsyncMock(return_value={}),
     )
-    claimed, initial_status_payload, error = (
-        await importer._claim_existing_bulk_export_checkpoint(
-            identity,
-            {
-                **checkpoint_map,
-                "state": importer.BULK_EXPORT_CHECKPOINT_RETRYABLE,
-            },
-            ownership_probe=AsyncMock(),
-        )
+    claimed, initial_status_payload, error = await importer._claim_existing_bulk_export_checkpoint(
+        identity,
+        {
+            **checkpoint_map,
+            "state": importer.BULK_EXPORT_CHECKPOINT_RETRYABLE,
+        },
+        ownership_probe=AsyncMock(),
     )
     assert claimed == {} and initial_status_payload is None
     assert error == "bulk_export_checkpoint_adoption_lost"

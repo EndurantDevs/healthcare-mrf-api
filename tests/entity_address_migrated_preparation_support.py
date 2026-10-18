@@ -21,52 +21,85 @@ from tests.test_entity_address_alias_guard_postgres import _admin_url, _owned_gu
 from tests.test_provider_directory_profile_capacity_adoption_postgres import _upgrade_disposable_schema_to_head
 
 _SCHEMA = "migrated_address"
+_HEAD = "20261020210000_registry_manual_acceptance_join"
+_ROLE_SCHEMA_REVISION = "20261019030000_provider_directory_role_schema"
+
+
+def _assert_address_migration_chain(script):
+    """Keep the exact accepted migration head and predecessor assertions."""
+    assert script.get_heads() == [_HEAD]
+    assert script.get_revision(_ROLE_SCHEMA_REVISION).down_revision == "20261019020000_registry_continuation_join"
+    assert script.get_revision("20261019020000_registry_continuation_join").down_revision == (
+        "20261019010000_registry_raw_object_join",
+        "20261019010000_custom_import_build_continuation",
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261017020000_source_registry_snapshot_join").down_revision == (
+        "20261016060000_uhc_official_cohort_snapshots",
+        "20261017010000_registry_cms_source_notifications",
+    )
+    assert script.get_revision("20261017010000_registry_cms_source_notifications").down_revision == (
+        "20261016070000_registry_allowed_plan_scope"
+    )
+    assert script.get_revision("20261016070000_registry_allowed_plan_scope").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261016060000_uhc_official_cohort_snapshots").down_revision == (
+        "20261016050000_acquisition_validator_argument_types"
+    )
+    assert script.get_revision("20261015010000_plan_release_binding_cohorts").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261015020000_custom_import_query_projections").down_revision == (
+        "20261013010000_registry_custom_history_events"
+    )
+    assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
+        "20261010000000_custom_import_admission_indexes"
+    )
+    assert (
+        script.get_revision("20261010030000_registry_source_admission_receipt").down_revision
+        == "20261010020000_registry_ptg_office_retention"
+    )
+    assert script.get_revision("20261010020000_registry_ptg_office_retention").down_revision == (
+        "20261010010000_registry_ptg_office_approval"
+    )
+    assert script.get_revision("20261010010000_registry_ptg_office_approval").down_revision == (
+        "20261009040000_registry_ptg_published_plan_scope"
+    )
+    assert script.get_revision("20261009040000_registry_ptg_published_plan_scope").down_revision == (
+        "20261009030000_network_catalog_evidence"
+    )
+    assert script.get_revision("20261006010000_nucc_reference_result_generation").down_revision == (
+        "20261007000000_custom_import_rejection_anti_joins"
+    )
+    assert script.get_revision("20261009000000_custom_import_child_presence_decode").down_revision == (
+        "20261006010000_nucc_reference_result_generation"
+    )
+    assert script.get_revision("20261010000000_custom_import_admission_indexes").down_revision == (
+        "20261009000000_custom_import_child_presence_decode"
+    )
+    assert script.get_revision("20261007010000_managed_network_registry").down_revision == (
+        "20261010010000_custom_import_materialization_contract"
+    )
 
 
 async def _migrated_tables(resources, monkeypatch):
+    """Migrate an isolated schema, seed inputs and provision its genuine roles."""
     database_name = await resources.admin.fetchval("SELECT current_database()")
     url = _admin_url().set(database=database_name, drivername="postgresql+asyncpg")
     engine = create_async_engine(url, pool_size=1, max_overflow=0, hide_parameters=True)
     database = Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
     try:
         script = ScriptDirectory.from_config(Config("alembic.ini"))
-        assert script.get_heads() == ["20261020200000_custom_import_manual_acceptance"]
-        assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
-            "20261010000000_custom_import_admission_indexes"
-        )
-        assert (
-            script.get_revision("20261010030000_registry_source_admission_receipt").down_revision
-            == "20261010020000_registry_ptg_office_retention"
-        )
-        assert script.get_revision("20261010020000_registry_ptg_office_retention").down_revision == (
-            "20261010010000_registry_ptg_office_approval"
-        )
-        assert script.get_revision("20261010010000_registry_ptg_office_approval").down_revision == (
-            "20261009040000_registry_ptg_published_plan_scope"
-        )
-        assert script.get_revision("20261009040000_registry_ptg_published_plan_scope").down_revision == (
-            "20261009030000_network_catalog_evidence"
-        )
-        assert script.get_revision("20261006010000_nucc_reference_result_generation").down_revision == (
-            "20261007000000_custom_import_rejection_anti_joins"
-        )
-        assert script.get_revision("20261009000000_custom_import_child_presence_decode").down_revision == (
-            "20261006010000_nucc_reference_result_generation"
-        )
-        assert script.get_revision("20261010000000_custom_import_admission_indexes").down_revision == (
-            "20261009000000_custom_import_child_presence_decode"
-        )
-        assert script.get_revision("20261007010000_managed_network_registry").down_revision == (
-            "20261010010000_custom_import_materialization_contract"
-        )
+        _assert_address_migration_chain(script)
         await fixture._install_destination_extensions(database)
         await database.status(f'CREATE SCHEMA "{_SCHEMA}"')
         monkeypatch.setenv("DB_SCHEMA", _SCHEMA)
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", _SCHEMA)
         await _upgrade_disposable_schema_to_head(url.render_as_string(hide_password=False), _SCHEMA)
-        assert await database.scalar(f'SELECT version_num FROM "{_SCHEMA}".alembic_version') == (
-            "20261020200000_custom_import_manual_acceptance"
-        )
+        assert await database.scalar(f'SELECT version_num FROM "{_SCHEMA}".alembic_version') == _HEAD
         metadata = MetaData(schema=_SCHEMA)
         for model in preparation.destination.restore._models():
             model.__table__.to_metadata(metadata, schema=_SCHEMA)
@@ -341,11 +374,40 @@ async def _guard_refusals(resources, proof):
             await preparation._lock_publication_state(session, _SCHEMA, proof["frozen_owner_oid"])
 
 
+async def _receipt_index_refusals(resources, proof):
+    schema = f'"{_SCHEMA}"'
+    index = preparation.REGISTRY_CAPTURE_INDEX
+    for unique, expression, predicate, include in (
+        ("UNIQUE", "registry_source_pair_json->>'protocol'", "registry_source_pair_json IS NOT NULL", ""),
+        ("", "registry_source_pair_json->>'capture_id'", "registry_source_pair_json IS NOT NULL", ""),
+        ("UNIQUE", "registry_source_pair_json->>'capture_id'", "registry_source_pair_json IS NULL", ""),
+        ("UNIQUE", "registry_source_pair_json->>'capture_id'", None, ""),
+        (
+            "UNIQUE",
+            "registry_source_pair_json->>'capture_id'",
+            "registry_source_pair_json IS NOT NULL",
+            " INCLUDE (receipt_id)",
+        ),
+    ):
+        with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="CMS receipt catalog"):
+            async with resources.publisher.transaction() as session:
+                await session.execute(text(f'DROP INDEX {schema}."{index}"'))
+                await session.execute(
+                    text(
+                        f'CREATE {unique} INDEX "{index}" ON {schema}.{preparation._CMS_RECEIPT_TABLE} (({expression}))'
+                        + include
+                        + (f" WHERE {predicate}" if predicate is not None else "")
+                    )
+                )
+                await preparation._lock_publication_state(session, _SCHEMA, proof["frozen_owner_oid"])
+
+
 async def migrated_head_sealed_activation(monkeypatch):
     async with _owned_guard_database(monkeypatch) as resources:
         await _migrated_tables(resources, monkeypatch)
         owner, stored, incumbent = await _prepared_candidate()
         proof = await _freeze_candidate(resources, owner)
+        await _receipt_index_refusals(resources, proof)
         await _guard_refusals(resources, proof)
         events = []
         with pytest.raises(RuntimeError, match="synthetic late publication failure"):

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from process import provider_directory_generic_source_adapters as source_adapters
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -121,11 +122,7 @@ def test_partition_census_rejects_incomplete_checkpoint_chains(control, error):
         ({"windows": None}, "windows missing"),
         ({"windows": [None]}, "window invalid"),
         (
-            {
-                "windows": [
-                    {"window_id": "window-1", "completed_passes": [2]}
-                ]
-            },
+            {"windows": [{"window_id": "window-1", "completed_passes": [2]}]},
             "pass markers invalid",
         ),
     ],
@@ -136,15 +133,11 @@ def test_partition_windows_reject_malformed_checkpoint_markers(control, error):
 
 
 def test_partition_pass_restore_rejects_missing_and_uncounted_windows():
-    counted_plan = SimpleNamespace(
-        windows={"window-1": SimpleNamespace(count=1, passes={})}
-    )
+    counted_plan = SimpleNamespace(windows={"window-1": SimpleNamespace(count=1, passes={})})
     with pytest.raises(ValueError, match="repeats a window ID"):
         importer._restore_partition_pass_markers(counted_plan, {})
 
-    uncounted_plan = SimpleNamespace(
-        windows={"window-1": SimpleNamespace(count=None, passes={})}
-    )
+    uncounted_plan = SimpleNamespace(windows={"window-1": SimpleNamespace(count=None, passes={})})
     with pytest.raises(ValueError, match="completed an uncounted window"):
         importer._restore_partition_pass_markers(
             uncounted_plan,
@@ -181,9 +174,11 @@ def test_partition_fingerprint_row_returns_complete_identity():
 
 
 @pytest.mark.asyncio
-async def test_partition_window_proof_handles_empty_and_candidate_hash_rows():
+async def test_partition_window_proof_handles_empty_and_candidate_hash_rows(monkeypatch):
     database = AsyncMock()
-    database.all.return_value = []
+    retry_rows = AsyncMock()
+    monkeypatch.setattr(source_adapters, "source_retry_rows", retry_rows)
+    retry_rows.return_value = []
 
     assert await importer._load_last_updated_partition_window_proof(
         _context(),
@@ -193,7 +188,7 @@ async def test_partition_window_proof_handles_empty_and_candidate_hash_rows():
         database_connection=database,
     ) == ({}, {})
 
-    database.all.return_value = [
+    retry_rows.return_value = [
         {
             "resource_id": "resource-1",
             "payload_json": {
@@ -213,9 +208,11 @@ async def test_partition_window_proof_handles_empty_and_candidate_hash_rows():
 
 
 @pytest.mark.asyncio
-async def test_partition_window_proof_rejects_duplicate_or_wrong_window_rows():
+async def test_partition_window_proof_rejects_duplicate_or_wrong_window_rows(monkeypatch):
     database = AsyncMock()
-    database.all.return_value = [
+    retry_rows = AsyncMock()
+    monkeypatch.setattr(source_adapters, "source_retry_rows", retry_rows)
+    retry_rows.return_value = [
         {
             "resource_id": "resource-1",
             "payload_json": {
@@ -241,7 +238,7 @@ async def test_partition_window_proof_rejects_duplicate_or_wrong_window_rows():
             "fingerprint": "hash-1",
         },
     }
-    database.all.return_value = [duplicate_row_by_field, duplicate_row_by_field]
+    retry_rows.return_value = [duplicate_row_by_field, duplicate_row_by_field]
     with pytest.raises(RuntimeError, match="fingerprint_row_invalid"):
         await importer._load_last_updated_partition_window_proof(
             _context(),
@@ -262,9 +259,7 @@ async def test_partition_fingerprint_replay_is_empty_exact_or_mismatched(
         "_load_partition_pass_proof",
         loader,
     )
-    assert not await importer._has_partition_fingerprint_replay(
-        _context(), _pass_proof({})
-    )
+    assert not await importer._has_partition_fingerprint_replay(_context(), _pass_proof({}))
 
     loader.return_value = _pass_proof({"resource-1": "hash-1"})
     assert await importer._has_partition_fingerprint_replay(
@@ -279,8 +274,10 @@ async def test_partition_fingerprint_replay_is_empty_exact_or_mismatched(
 
 
 @pytest.mark.asyncio
-async def test_partition_resource_identity_is_empty_exact_or_conflicting():
+async def test_partition_resource_identity_is_empty_exact_or_conflicting(monkeypatch):
     database = AsyncMock()
+    retry_rows = AsyncMock()
+    monkeypatch.setattr(source_adapters, "source_retry_rows", retry_rows)
     await importer._assert_partition_resource_ids_unique(
         _context(),
         "LU:Practitioner:pass:1",
@@ -288,9 +285,9 @@ async def test_partition_resource_identity_is_empty_exact_or_conflicting():
         {},
         database_connection=database,
     )
-    database.all.assert_not_awaited()
+    retry_rows.assert_not_awaited()
 
-    database.all.return_value = []
+    retry_rows.return_value = []
     await importer._assert_partition_resource_ids_unique(
         _context(),
         "LU:Practitioner:pass:1",
@@ -299,7 +296,7 @@ async def test_partition_resource_identity_is_empty_exact_or_conflicting():
         database_connection=database,
     )
 
-    database.all.return_value = [
+    retry_rows.return_value = [
         {
             "resource_id": "resource-1",
             "payload_json": {
@@ -316,7 +313,7 @@ async def test_partition_resource_identity_is_empty_exact_or_conflicting():
         database_connection=database,
     )
 
-    database.all.return_value[0]["payload_json"]["fingerprint"] = "old-hash"
+    retry_rows.return_value[0]["payload_json"]["fingerprint"] = "old-hash"
     with pytest.raises(RuntimeError, match="duplicate_resource_id"):
         await importer._assert_partition_resource_ids_unique(
             _context(),
@@ -328,9 +325,9 @@ async def test_partition_resource_identity_is_empty_exact_or_conflicting():
 
 
 def test_partition_fingerprint_rows_cover_empty_and_candidate_payloads():
-    assert importer._partition_fingerprint_rows(
-        _context(), "LU:Practitioner:pass:1", "window-1", "proof-1", {}, {}
-    ) == []
+    assert (
+        importer._partition_fingerprint_rows(_context(), "LU:Practitioner:pass:1", "window-1", "proof-1", {}, {}) == []
+    )
     rows = importer._partition_fingerprint_rows(
         _context(),
         "LU:Practitioner:pass:1",
@@ -396,9 +393,7 @@ async def test_partition_fingerprint_store_writes_only_nonempty_new_proof(
         writer,
     )
 
-    await importer._store_last_updated_partition_window_fingerprints(
-        _context(), _pass_proof({})
-    )
+    await importer._store_last_updated_partition_window_fingerprints(_context(), _pass_proof({}))
     writer.assert_not_awaited()
 
     await importer._store_last_updated_partition_window_fingerprints(
@@ -454,9 +449,7 @@ async def test_partition_window_staging_handles_empty_invalid_and_exact_rows(
             _partition_stage_options(),
         )
 
-    endpoint_rows.return_value = [
-        {"resource_id": "p1", "payload_hash": "payload-1"}
-    ]
+    endpoint_rows.return_value = [{"resource_id": "p1", "payload_hash": "payload-1"}]
     staged = await importer._stage_last_updated_partition_window(
         _context(),
         _partition_stage_source(),
@@ -465,4 +458,8 @@ async def test_partition_window_staging_handles_empty_invalid_and_exact_rows(
         ({"resourceType": "Practitioner", "id": "p1"},),
         _partition_stage_options(),
     )
-    assert (staged.candidate_hashes_by_id, staged.resource_hash_contract, staged.semantic_projection_as_of) == ({"p1": "payload-1"}, importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT, None)
+    assert (staged.candidate_hashes_by_id, staged.resource_hash_contract, staged.semantic_projection_as_of) == (
+        {"p1": "payload-1"},
+        importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+        None,
+    )

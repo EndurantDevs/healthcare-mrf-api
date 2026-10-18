@@ -35,17 +35,13 @@ from tests.ptg2_v4_stale_metadata_postgres_support import (
 
 
 def _attachment_row(attachment) -> dict[str, str]:
-    row_by_field = {
-        column: SNAPSHOT_ID
-        for column in attachment.snapshot_columns
-    }
-    row_by_field.update(
-        {
-            column: INTERNAL_RUN_ID
-            for column in attachment.run_columns
-        }
-    )
+    row_by_field = {column: SNAPSHOT_ID for column in attachment.snapshot_columns}
+    row_by_field.update({column: INTERNAL_RUN_ID for column in attachment.run_columns})
     extra_value_by_table = {
+        "plan_release_snapshot_pin": (
+            "serving_revision_id",
+            "hpserve_" + "0" * 26,
+        ),
         "ptg2_plan_month": ("plan_month_id", "registry-plan-month"),
         "ptg2_artifact_manifest": ("artifact_id", "registry-artifact"),
         "ptg2_import_job": ("import_job_id", "registry-import-job"),
@@ -80,14 +76,14 @@ def _attachment_row(attachment) -> dict[str, str]:
 async def _wait_until_advisory_blocked(connection, backend_pid: int) -> None:
     for _attempt in range(100):
         activity = await connection.fetchrow(
-            "SELECT wait_event_type, wait_event "
-            "FROM pg_stat_activity WHERE pid = $1",
+            "SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1",
             backend_pid,
         )
         if (
             activity is not None
             and activity["wait_event_type"] == "Lock"
-            and str(activity["wait_event"]).lower() in {
+            and str(activity["wait_event"]).lower()
+            in {
                 "advisory",
                 "advisorylock",
             }
@@ -106,14 +102,9 @@ async def _set_registry_attachment(
 ) -> None:
     row_by_field = _attachment_row(attachment)
     columns = tuple(row_by_field)
-    qualified_table = (
-        f"{quoted(schema_name)}.{quoted(attachment.table_name)}"
-    )
+    qualified_table = f"{quoted(schema_name)}.{quoted(attachment.table_name)}"
     if is_present:
-        placeholders = ", ".join(
-            f"${parameter_index}"
-            for parameter_index in range(1, len(columns) + 1)
-        )
+        placeholders = ", ".join(f"${parameter_index}" for parameter_index in range(1, len(columns) + 1))
         await connection.execute(
             f"INSERT INTO {qualified_table} "
             f"({', '.join(quoted(column) for column in columns)}) "
@@ -204,8 +195,7 @@ async def test_non_v4_multi_snapshot_run_remains_outside_the_fence():
             """
         )
         update_status = await setup_connection.execute(
-            f"UPDATE {schema}.ptg2_import_run "
-            "SET status = status WHERE import_run_id = 'legacy-run'"
+            f"UPDATE {schema}.ptg2_import_run SET status = status WHERE import_run_id = 'legacy-run'"
         )
         assert update_status == "UPDATE 1"
     finally:
@@ -242,9 +232,7 @@ async def test_legacy_schema_alias_reaches_a_real_fenced_writer(
         )
 
         artifact_count = await setup_connection.fetchval(
-            f"SELECT COUNT(*) FROM "
-            f"{quoted(schema_name)}.ptg2_artifact_manifest "
-            "WHERE snapshot_id = $1",
+            f"SELECT COUNT(*) FROM {quoted(schema_name)}.ptg2_artifact_manifest WHERE snapshot_id = $1",
             SNAPSHOT_ID,
         )
         assert artifact_count == 1
@@ -286,12 +274,7 @@ async def test_every_registry_attachment_is_an_eligibility_blocker(
             )
             assert blocked_plan["status"] == "ineligible"
             assert "attached_state_present" in blocked_plan["reason_codes"]
-            assert (
-                blocked_plan["observations"]["attachment_counts"][
-                    attachment.name
-                ]
-                == 1
-            )
+            assert blocked_plan["observations"]["attachment_counts"][attachment.name] == 1
             await _set_registry_attachment(
                 setup_connection,
                 schema_name,
@@ -351,9 +334,7 @@ async def test_raw_high_volume_attachment_invalidates_idempotent_retry(
         assert retry_plan["status"] == "ineligible"
         assert retry_plan["idempotent"] is False
         assert "attached_state_present" in retry_plan["reason_codes"]
-        assert retry_plan["observations"]["attachment_counts"][
-            "serving_rate"
-        ] == 1
+        assert retry_plan["observations"]["attachment_counts"]["serving_rate"] == 1
     finally:
         await setup_connection.close()
         await test_database.disconnect()
@@ -377,22 +358,17 @@ async def test_direct_writer_takes_lifecycle_lock_before_snapshot_row_lock():
         writer_pid = await direct_writer.fetchval("SELECT pg_backend_pid()")
         await lifecycle_owner.execute("BEGIN")
         is_owner_in_transaction = True
-        await lifecycle_owner.execute(
-            "SELECT pg_advisory_xact_lock("
-            "hashtext('ptg2_source_pointer_gc_v1'))"
-        )
+        await lifecycle_owner.execute("SELECT pg_advisory_xact_lock(hashtext('ptg2_source_pointer_gc_v1'))")
         writer_task = asyncio.create_task(
             direct_writer.execute(
-                f"UPDATE {quoted(schema_name)}.ptg2_snapshot "
-                "SET status = status WHERE snapshot_id = $1",
+                f"UPDATE {quoted(schema_name)}.ptg2_snapshot SET status = status WHERE snapshot_id = $1",
                 SNAPSHOT_ID,
             )
         )
         await _wait_until_advisory_blocked(setup_connection, writer_pid)
         await lifecycle_owner.execute("SET LOCAL lock_timeout = '500ms'")
         locked_snapshot_id = await lifecycle_owner.fetchval(
-            f"SELECT snapshot_id FROM {quoted(schema_name)}.ptg2_snapshot "
-            "WHERE snapshot_id = $1 FOR UPDATE",
+            f"SELECT snapshot_id FROM {quoted(schema_name)}.ptg2_snapshot WHERE snapshot_id = $1 FOR UPDATE",
             SNAPSHOT_ID,
         )
         assert locked_snapshot_id == SNAPSHOT_ID

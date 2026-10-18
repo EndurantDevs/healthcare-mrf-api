@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import uuid
+from pathlib import Path
 
 import asyncpg
 import pytest
@@ -21,12 +21,9 @@ from tests.test_control_imports_db import (
     _reset_import_run_schema,
 )
 
-
 pytestmark = [
     pytest.mark.asyncio(loop_scope="module"),
-    pytest.mark.filterwarnings(
-        "ignore:coroutine 'Connection._cancel' was never awaited:RuntimeWarning"
-    ),
+    pytest.mark.filterwarnings("ignore:coroutine 'Connection._cancel' was never awaited:RuntimeWarning"),
 ]
 
 
@@ -105,15 +102,11 @@ async def _assert_active_index_definition() -> None:
     assert set(index_record_by_name) == {
         "import_run_importer_active_idempotency_idx",
     }
-    composite_index = index_record_by_name[
-        "import_run_importer_active_idempotency_idx"
-    ]
+    composite_index = index_record_by_name["import_run_importer_active_idempotency_idx"]
     assert "(importer, idempotency_key)" in str(composite_index.index_definition)
     assert composite_index.is_unique is True
     predicate = str(composite_index._mapping["predicate"])
-    assert set(re.findall(r"'([^']+)'", predicate)) == set(
-        control_imports.ACTIVE_STATUSES
-    ), predicate
+    assert set(re.findall(r"'([^']+)'", predicate)) == set(control_imports.ACTIVE_STATUSES), predicate
 
 
 def _alembic_env(schema: str) -> dict[str, str]:
@@ -162,10 +155,7 @@ async def _index_state(
 
 
 async def _create_activation_schema(connection, schema: str) -> None:
-    predicate = (
-        "status IN ('queued', 'starting', 'running', "
-        "'finalizing', 'canceling')"
-    )
+    predicate = "status IN ('queued', 'starting', 'running', 'finalizing', 'canceling')"
     await connection.execute(f'CREATE SCHEMA "{schema}"')
     await connection.execute(
         f"""
@@ -205,11 +195,14 @@ async def _assert_activation_upgrade(connection, schema: str) -> None:
         "20260829100000_activate_import_run_idempotency_scope",
     )
     assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
-    assert await _index_state(
-        connection,
-        schema,
-        "import_run_active_idempotency_idx",
-    ) is None
+    assert (
+        await _index_state(
+            connection,
+            schema,
+            "import_run_active_idempotency_idx",
+        )
+        is None
+    )
 
 
 async def _assert_failed_restore_cleanup(connection, schema: str) -> None:
@@ -226,20 +219,24 @@ async def _assert_failed_restore_cleanup(connection, schema: str) -> None:
         "20260829090000_import_run_idempotency_scope",
     )
     assert failed.returncode != 0
-    assert await _index_state(
-        connection,
-        schema,
-        "import_run_active_idempotency_idx",
-    ) is None
+    assert (
+        await _index_state(
+            connection,
+            schema,
+            "import_run_active_idempotency_idx",
+        )
+        is None
+    )
     composite_state = await _index_state(
         connection,
         schema,
         "import_run_importer_active_idempotency_idx",
     )
     assert tuple(composite_state) == ("import_run", True, True, True)
-    assert await connection.fetchval(
-        f'SELECT version_num FROM "{schema}".alembic_version'
-    ) == "20260829100000_activate_import_run_idempotency_scope"
+    assert (
+        await connection.fetchval(f'SELECT version_num FROM "{schema}".alembic_version')
+        == "20260829100000_activate_import_run_idempotency_scope"
+    )
 
 
 async def _assert_restore_recovery(connection, schema: str) -> None:
@@ -256,11 +253,14 @@ async def _assert_restore_recovery(connection, schema: str) -> None:
         "import_run_active_idempotency_idx",
     )
     assert tuple(global_state) == ("import_run", True, True, True)
-    assert await _index_state(
-        connection,
-        schema,
-        "import_run_importer_active_idempotency_idx",
-    ) is not None
+    assert (
+        await _index_state(
+            connection,
+            schema,
+            "import_run_importer_active_idempotency_idx",
+        )
+        is not None
+    )
 
 
 async def test_activation_migration_cleans_failed_global_restore():
@@ -294,7 +294,7 @@ async def test_active_idempotency_key_is_unique_per_importer(
 
     await _reset_import_run_schema()
     try:
-        monkeypatch.setattr(control_imports, "_enqueue_import_start", _fake_enqueue)
+        monkeypatch.setattr(control_imports, "_enqueue_selected_import", _fake_enqueue)
         first, first_created = await _create_run("run_first", "nucc")
         assert first_created is True and first["run_id"] == "run_first"
 
@@ -306,9 +306,7 @@ async def test_active_idempotency_key_is_unique_per_importer(
         assert cross_importer["run_id"] == "run_cross_importer"
         await _assert_active_index_definition()
 
-        real_find, real_find_importer = await _assert_same_importer_integrity_recovery(
-            monkeypatch
-        )
+        real_find, real_find_importer = await _assert_same_importer_integrity_recovery(monkeypatch)
         await db.execute(
             update(ImportRun)
             .where(ImportRun.run_id == "run_first")
@@ -328,11 +326,7 @@ async def test_active_idempotency_key_is_unique_per_importer(
         after_terminal, created = await _create_run("run_after_terminal", "nucc")
         assert created is True
         assert after_terminal["run_id"] == "run_after_terminal"
-        import_runs = (
-            (await db.execute(select(ImportRun).order_by(ImportRun.run_id)))
-            .scalars()
-            .all()
-        )
+        import_runs = (await db.execute(select(ImportRun).order_by(ImportRun.run_id))).scalars().all()
         assert [run.run_id for run in import_runs] == [
             "run_after_terminal",
             "run_cross_importer",

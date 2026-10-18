@@ -83,12 +83,13 @@ async def _verified_scope_choice(session, schema_name, ownership, approval_recor
     return choice_by_field
 
 
-async def _published_choices_page(session, schema_name, ownership, authority):
+async def _published_choices_page(session, schema_name, ownership, authority, *, inventory_by_field=None):
     from process.registry_ptg_published_plan_source import published_plan_inventory
 
-    inventory_by_field = await published_plan_inventory(
-        session, schema_name, ownership, operation_id=authority["operation_id"]
-    )
+    if inventory_by_field is None:
+        inventory_by_field = await published_plan_inventory(
+            session, schema_name, ownership, operation_id=authority["operation_id"]
+        )
     if inventory_by_field["identity"]["import_run_id"] != ownership["engine_run_id"]:
         raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")
     page_by_field = {
@@ -107,6 +108,8 @@ async def _published_choices_page(session, schema_name, ownership, authority):
         },
         "review_status": "fresh_client_company_network_review_required",
     }
+    if authority["contract"] == "ptg_published_allowed_source_authority.v1":
+        page_by_field["published_plan"]["review_type"] = "published_allowed_amount_plan"
     if len(_canonical(page_by_field).encode("utf-8")) > _MAX_BYTES:
         raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")
     return page_by_field
@@ -115,6 +118,17 @@ async def _published_choices_page(session, schema_name, ownership, authority):
 async def read_registry_ptg_source_choices(session, schema_name, ownership, selection, store):
     """Recheck durable approvals in the caller's restricted stable transaction."""
     table = await _protected_store(session, store, write=False)
+    from process.registry_ptg_allowed_plan_source import allowed_plan_inventory, is_allowed_snapshot
+    from process.registry_ptg_published_provisioning import require_published_lock_privileges
+
+    if await is_allowed_snapshot(session, schema_name, ownership["snapshot_id"]):
+        await require_published_lock_privileges(session, schema_name, pin_writer=False)
+        inventory_by_field = await allowed_plan_inventory(
+            session, schema_name, ownership, operation_id="registry_ptg_inventory_" + _digest(ownership)
+        )
+        return await _published_choices_page(
+            session, schema_name, ownership, inventory_by_field["authority"], inventory_by_field=inventory_by_field
+        )
     # An observation operation is not a fabricated scope or approval identity.
     authority = (
         await prepare_ptg_result_archive_source_authority(

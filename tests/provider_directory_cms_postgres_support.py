@@ -26,7 +26,7 @@ from process.provider_directory_admission_seal import (
     ADMISSION_GENERIC_PROOF_SUMMARY_KEY,
 )
 from process.provider_directory_cms_serving_coverage import build_cms_coverage
-from process.provider_directory_resource_identity import bind_resource_identity_batch
+from process.provider_directory_resource_identity import source_resource_uuid
 from tests.provider_directory_entities_postgres_support import directory_database
 
 ORG_ID = "00000000-0000-0000-0000-000000000010"
@@ -229,8 +229,25 @@ async def _seed_catalog(session):
             )
         )
     for kind in ("InsurancePlan", "PractitionerRole"):
-        await bind_resource_identity_batch(
-            session, source_id="cms-npd", resource_type=kind, resource_ids=[resource_payloads()[kind]["resource_id"]]
+        await seed_resource_identities(
+            session, resource_type=kind, resource_ids=[resource_payloads()[kind]["resource_id"]]
+        )
+
+
+async def seed_resource_identities(session, *, resource_type, resource_ids):
+    """Seed accepted fixture history explicitly, outside the candidate intake API."""
+    for resource_id in resource_ids:
+        await session.execute(
+            text(
+                "INSERT INTO provider_directory_resource_identity "
+                "(source_id,resource_type,resource_id,entity_id,created_at) "
+                "VALUES('cms-npd',:kind,:resource_id,:entity_id,now())"
+            ),
+            {
+                "kind": resource_type,
+                "resource_id": resource_id,
+                "entity_id": source_resource_uuid("cms-npd", resource_type, resource_id),
+            },
         )
 
 

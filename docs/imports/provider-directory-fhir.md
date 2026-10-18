@@ -9,6 +9,43 @@ Maintained endpoint support and configuration are listed in
 That generated matrix is deliberately separate from current runtime and import
 status, which is recorded in the endpoint-acquisition campaign report.
 
+## Issued Source command lifecycle
+
+Protected Source work requires the deployment's issued transaction factory.
+Starting the ordinary command or registered worker alone does not create that
+authority. The authorized launcher must bind the existing
+`bind_generic_source_transaction_factory` context around startup, the command or
+worker jobs, and shutdown. It must use separately issued publisher credentials,
+the verified role policy and runtime manifest; ordinary database credentials are
+not a fallback.
+
+Before native-input registration and signed CMS preparation, the canonical
+`address_archive_v2` table must be enrolled under the declared Source Owner,
+with only SELECT access for ordinary runtime roles. Preserve its exact native
+OID, data and ALWAYS mutation guard; the common publication transaction merges
+prepared archive rows under that Owner. Source preflight refuses an archive
+owned by another role.
+
+A command launcher reuses the existing Click parser by invoking
+`provider_directory_fhir.main(arguments, standalone_mode=False, obj={
+"provider_directory_operation_runner": issued_operation_runner})`.
+The runner receives the original command callable and its normalized options,
+and awaits that command inside the issued factory context. This preserves all
+public options and admission checks. The command examples below describe those
+forwarded options; they require that authorized launcher context rather than an
+unbound standalone invocation. A worker launcher must select the actual
+`process.ProviderDirectoryFHIR` settings and keep the same factory context across
+its complete lifecycle, without holding one physical transaction across jobs.
+
+Ordinary API and scheduled launches require a native stored-job admission for
+the exact Provider Directory importer, queue, function and enqueue ID. That
+server-held capability selects the fixed Source worker purpose and immutable
+paired image; serialized request fields cannot select its credentials or
+command. Publisher secret selectors must name only that exact purpose,
+importer and worker class. Missing image configuration or an existing worker
+with changed purpose, target or process isolation is refused. The separately
+signed CMS Registry launch retains precedence and its own admission boundary.
+
 ## Support Documentation Lifecycle
 
 Keep these authorities separate when reviewing Provider Directory coverage:
@@ -625,10 +662,12 @@ The request must name exactly one source, its current published dataset, and
 the acquisition root. Before writes, it verifies source-to-endpoint identity,
 current/published state, source provenance in publication metadata, the
 declared resource count, and the ordered retained-payload digest. It repeats
-the digest after processing. Each batch restores typed, canonical, and
-source-edge rows through the normal upsert path and commits its checkpoint in
-the same transaction. Interrupted runs resume from the committed resource ID;
-a completed run proves exact membership and does no writes.
+the digest after processing. Bounded COPY prepares isolated typed, canonical,
+and source-edge replacements while the immutable Source reader stays pinned.
+Exact row parity and native receipts precede one atomic output/checkpoint cut.
+Interrupted preparation retains resumable custody. A completed replay requires
+the same admitted operation except for the control run ID, exact output
+membership, and fresh native catalog receipts; it performs no Source writes.
 
 The checkpoint migration adopts a relation created by runtime schema sync only
 after validating its columns, primary key, foreign keys, and supporting indexes.
@@ -2192,3 +2231,8 @@ unscoped rebuild, pass `provider_directory_partial_scope=all`, or pass
 known run. Use `provider_directory_source_batch_size` (or
 `--provider-directory-source-batch-size` for manual CLI launches) to tune source
 batching; `0` disables source batching for deliberate one-off runs.
+
+Apply the current forward migration atomically before using the updated Source custody checks.
+The nullable transaction stamp preserves existing revision history; an unstamped baseline does
+not prove a fresh archive mutation. Serving snapshot rollback is independent of binary or
+schema downgrade compatibility.

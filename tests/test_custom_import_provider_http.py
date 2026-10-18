@@ -80,7 +80,7 @@ class _Session:
 
 
 def _install_window(monkeypatch, session):
-    fixtures._install_keyring(monkeypatch)
+    fixtures._install_keyring(monkeypatch, session)
 
     @asynccontextmanager
     async def bounded(same_session, *, timeout_ms):

@@ -11,6 +11,7 @@ from contextlib import nullcontext
 
 from sqlalchemy import text
 
+from db.cms_registry_source_pair_slot import INDEX_NAME as REGISTRY_CAPTURE_INDEX
 from process import entity_address_alias_guard as alias_guard
 from process import entity_address_snapshot_alias as alias
 from process import entity_address_snapshot_destination as destination
@@ -540,12 +541,22 @@ async def _lock_empty_cms_receipts(session, schema, receipt_oid):
             "JOIN pg_catalog.pg_class idx ON idx.oid=i.indexrelid JOIN pg_catalog.pg_am am ON am.oid=idx.relam, "
             "pg_catalog.unnest(i.indclass) cls(oid) JOIN pg_catalog.pg_opclass op ON op.oid=cls.oid "
             "WHERE i.indrelid=c.oid AND (am.amname<>'btree' OR op.opcnamespace<>'pg_catalog'::regnamespace "
-            "OR (i.indexprs IS NOT NULL AND pg_catalog.pg_get_expr(i.indexprs,i.indrelid)<>'true') "
-            "OR (i.indpred IS NOT NULL AND pg_catalog.pg_get_expr(i.indpred,i.indrelid)<>'(predecessor_receipt_id IS NULL)'))) "
+            "OR (NOT coalesce(idx.relname=:capture_index AND i.indisunique AND i.indnkeyatts=1 AND i.indnatts=1 "
+            "AND pg_catalog.pg_get_expr(i.indexprs,i.indrelid)=:capture_expression "
+            "AND pg_catalog.pg_get_expr(i.indpred,i.indrelid)=:capture_predicate,false) "
+            "AND ((i.indexprs IS NOT NULL AND pg_catalog.pg_get_expr(i.indexprs,i.indrelid)<>'true') "
+            "OR (i.indpred IS NOT NULL AND pg_catalog.pg_get_expr(i.indpred,i.indrelid)<>'(predecessor_receipt_id IS NULL)'))))) "
             "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
             "WHERE n.nspname=:schema AND c.relname=:name"
         ),
-        {"oid": receipt_oid, "schema": schema, "name": _CMS_RECEIPT_TABLE},
+        {
+            "oid": receipt_oid,
+            "schema": schema,
+            "name": _CMS_RECEIPT_TABLE,
+            "capture_index": REGISTRY_CAPTURE_INDEX,
+            "capture_expression": "(registry_source_pair_json ->> 'capture_id'::text)",
+            "capture_predicate": "(registry_source_pair_json IS NOT NULL)",
+        },
     )
     _require(safe is True, "CMS receipt catalog is unsupported")
     populated = await session.scalar(text(f'SELECT EXISTS(SELECT 1 FROM "{schema}"."{_CMS_RECEIPT_TABLE}")'))

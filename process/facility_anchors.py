@@ -31,6 +31,7 @@ from process.facility_address_contribution_capture import (
     require_capture_bounds,
     require_local_family_publication,
 )
+from process.provider_directory_cms_native_inputs import prepare_local_native_input_publication
 from process.redis_config import build_redis_settings
 from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.serialization import deserialize_job, serialize_job
@@ -40,10 +41,7 @@ logger = logging.getLogger(__name__)
 FACILITY_ANCHORS_QUEUE_NAME = "arq:FacilityAnchors"
 POSTGRES_IDENTIFIER_MAX_LENGTH = 63
 
-HRSA_FQHC_URL = (
-    "https://data.hrsa.gov/DataDownload/DD_Files/"
-    "Health_Center_Service_Delivery_and_Lookalike_Sites.csv"
-)
+HRSA_FQHC_URL = "https://data.hrsa.gov/DataDownload/DD_Files/Health_Center_Service_Delivery_and_Lookalike_Sites.csv"
 CMS_PROVIDER_DATA_JSON_URL = "https://data.cms.gov/provider-data/data.json"
 DEFAULT_CMS_HOSPITAL_DATASET_ID = os.getenv("HLTHPRT_CMS_HOSPITAL_DATASET_ID", "xubh-q36u").lower()
 DEFAULT_BATCH_SIZE = 5000
@@ -121,9 +119,7 @@ async def _ensure_schema_exists(db_schema: str) -> None:
     try:
         await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
     except Exception as exc:
-        exists = bool(
-            await db.scalar(f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;")
-        )
+        exists = bool(await db.scalar(f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;"))
         if exists:
             logger.warning(
                 "Schema %s already exists but CREATE SCHEMA failed (%s); continuing",
@@ -144,11 +140,11 @@ def _parse_lat_lng(address_row: dict) -> tuple[float | None, float | None]:
 
     try:
         lat = float(str(lat_raw).strip()) if lat_raw not in (None, "") else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         lat = None
     try:
         lng = float(str(lng_raw).strip()) if lng_raw not in (None, "") else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         lng = None
 
     if lat is not None and lng is not None:
@@ -162,7 +158,7 @@ def _parse_lat_lng(address_row: dict) -> tuple[float | None, float | None]:
     if wkt:
         try:
             return float(wkt.group("lat")), float(wkt.group("lng"))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return lat, lng
 
     tokens = re.findall(r"-?\d+(?:\.\d+)?", location)
@@ -175,7 +171,7 @@ def _parse_lat_lng(address_row: dict) -> tuple[float | None, float | None]:
                 return first, second
             if -180 <= first <= 180 and -90 <= second <= 90:
                 return second, first
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return lat, lng
 
     return lat, lng
@@ -199,16 +195,18 @@ async def _has_table_column(db_schema: str, table_name: str, column_name: str) -
 
 async def _canonical_archive_table(db_schema: str) -> str | None:
     requested = archive_table_name()
-    if (
-        await _has_table_column(db_schema, requested, "address_key")
-        and await _has_table_column(db_schema, requested, "geo_source")
+    if await _has_table_column(db_schema, requested, "address_key") and await _has_table_column(
+        db_schema, requested, "geo_source"
     ):
         return requested
     return None
 
 
 async def _refresh_archive_geocodes_from_facility_anchors(
-    stage_table: str, db_schema: str, *, contribution_table: str | None = None,
+    stage_table: str,
+    db_schema: str,
+    *,
+    contribution_table: str | None = None,
 ) -> int:
     archive_table = await _canonical_archive_table(db_schema)
     if not archive_table:
@@ -230,11 +228,13 @@ async def _refresh_archive_geocodes_from_facility_anchors(
     """
     geocode_cte = (
         captured_geocode_cte(schema=db_schema, contribution_table=contribution_table, winner_sql=winner_sql)
-        if contribution_table else f"facility_geocodes AS ({winner_sql})"
+        if contribution_table
+        else f"facility_geocodes AS ({winner_sql})"
     )
     async with db.transaction() as session:
-        updated = int(await db.status(
-            f"""
+        updated = int(
+            await db.status(
+                f"""
             WITH {geocode_cte}
             UPDATE {db_schema}.{archive_table} AS archive
                SET lat = facility_geocodes.lat,
@@ -248,7 +248,9 @@ async def _refresh_archive_geocodes_from_facility_anchors(
                AND archive.lat IS NULL
                AND archive.long IS NULL;
             """
-        ) or 0)
+            )
+            or 0
+        )
         if contribution_table:
             await require_capture_bounds(session, schema=db_schema, contribution_table=contribution_table)
         return updated
@@ -337,7 +339,7 @@ def _hrsa_anchor_payload(facility_row: dict, now: datetime.datetime) -> dict | N
             or facility_row.get("Geocoding Artifact Address Primary X Coordinate")
             or 0.0
         )
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
     if lat == 0.0 and lng == 0.0:
@@ -365,9 +367,7 @@ def _hrsa_anchor_payload(facility_row: dict, now: datetime.datetime) -> dict | N
         "health_center_organization_address_line1": facility_row.get("Health Center Organization Street Address"),
         "health_center_organization_city": facility_row.get("Health Center Organization City"),
         "health_center_organization_state": facility_row.get("Health Center Organization State"),
-        "health_center_organization_zip_code": str(
-            facility_row.get("Health Center Organization ZIP Code") or ""
-        )[:5],
+        "health_center_organization_zip_code": str(facility_row.get("Health Center Organization ZIP Code") or "")[:5],
         "source_dataset": "HRSA_HEALTH_CENTER_SITES",
         "updated_at": now,
     }
@@ -545,6 +545,7 @@ async def process_facility_anchors_data(ctx, task=None):
     test_limit = 500
 
     import aiohttp
+
     client = aiohttp.ClientSession()
     try:
         hrsa_count = await _fetch_and_parse_hrsa(client, stage_cls, batch_size, test_mode, test_limit)
@@ -625,28 +626,30 @@ async def publish_facility_anchors_generation(ctx):
             backfilled_hospital_coords,
         )
 
-    stage_rows = int(await db.scalar(
-        f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
-    ) or 0)
-    hospital_rows = int(await db.scalar(
-        f"""
+    stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
+    hospital_rows = int(
+        await db.scalar(
+            f"""
         SELECT COUNT(*)
           FROM {db_schema}.{stage_cls.__tablename__}
          WHERE facility_type = 'Hospital'
         """
-    ) or 0)
-    hospital_with_coords = int(await db.scalar(
-        f"""
+        )
+        or 0
+    )
+    hospital_with_coords = int(
+        await db.scalar(
+            f"""
         SELECT COUNT(*)
           FROM {db_schema}.{stage_cls.__tablename__}
          WHERE facility_type = 'Hospital'
            AND latitude IS NOT NULL
            AND longitude IS NOT NULL
         """
-    ) or 0)
-    hospital_coord_ratio = (
-        hospital_with_coords / hospital_rows if hospital_rows else 0.0
+        )
+        or 0
     )
+    hospital_coord_ratio = hospital_with_coords / hospital_rows if hospital_rows else 0.0
     min_hospital_coord_ratio = float(
         os.getenv(
             "HLTHPRT_FACILITY_ANCHORS_MIN_HOSPITAL_COORD_RATIO",
@@ -657,9 +660,7 @@ async def publish_facility_anchors_generation(ctx):
     if context.get("test_mode"):
         logger.info("Facility Anchors test mode: staged rows=%d", stage_rows)
     elif stage_rows < DEFAULT_MIN_ROWS:
-        raise RuntimeError(
-            f"Facility Anchors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting."
-        )
+        raise RuntimeError(f"Facility Anchors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting.")
     elif hospital_rows > 0 and hospital_coord_ratio < min_hospital_coord_ratio:
         raise RuntimeError(
             "Facility Anchors hospital geocode coverage "
@@ -700,34 +701,44 @@ async def publish_facility_anchors_generation(ctx):
                 priority=4,
                 schema=db_schema,
                 source_capture=partial(
-                    capture_canonical_observations, contribution_table=contribution_stage,
+                    capture_canonical_observations,
+                    contribution_table=contribution_stage,
                 ),
                 zip_restore_complete=True,
             )
             logger.info("Facility Anchors canonical address resolve complete: %s", address_stats)
             geocode_updates = await _refresh_archive_geocodes_from_facility_anchors(
-                stage_cls.__tablename__, db_schema, contribution_table=contribution_stage,
+                stage_cls.__tablename__,
+                db_schema,
+                contribution_table=contribution_stage,
             )
             logger.info("Facility Anchors archive geocode refresh updated %d canonical rows.", geocode_updates)
         else:
             async with db.transaction() as session:
                 await capture_metadata(
-                    session, schema=db_schema, contribution_table=contribution_stage, enabled=False,
+                    session,
+                    schema=db_schema,
+                    contribution_table=contribution_stage,
+                    enabled=False,
                 )
 
+        await prepare_local_native_input_publication(
+            session,
+            ledger_schema=db_schema,
+            relations=(
+                (FacilityAnchor.__main_table__, stage_cls.__tablename__),
+                (FacilityAddressContribution.__main_table__, contribution_stage),
+            ),
+        )
         async with db.transaction():
             table = FacilityAnchor.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-            await db.status(
-                f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
-            )
+            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
 
             archived = _archived_identifier(f"{table}_idx_primary")
             await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
-            await db.status(
-                f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};"
-            )
+            await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
             await db.status(
                 f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
                 f"RENAME TO {table}_idx_primary;"
@@ -740,8 +751,7 @@ async def publish_facility_anchors_generation(ctx):
                     archived_live_name = _archived_identifier(old_live_name)
                     await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
                     await db.status(
-                        f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} "
-                        f"RENAME TO {archived_live_name};"
+                        f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} RENAME TO {archived_live_name};"
                     )
                     await db.status(
                         f"ALTER INDEX IF EXISTS "
@@ -754,12 +764,9 @@ async def publish_facility_anchors_generation(ctx):
                 f"ALTER TABLE IF EXISTS {db_schema}.{contribution_table} RENAME TO {contribution_table}_old;"
             )
             await db.status(
-                f"ALTER INDEX IF EXISTS {db_schema}.{contribution_table}_pkey "
-                f"RENAME TO {contribution_table}_old_pkey;"
+                f"ALTER INDEX IF EXISTS {db_schema}.{contribution_table}_pkey RENAME TO {contribution_table}_old_pkey;"
             )
-            await db.status(
-                f"ALTER TABLE {db_schema}.{contribution_stage} RENAME TO {contribution_table};"
-            )
+            await db.status(f"ALTER TABLE {db_schema}.{contribution_stage} RENAME TO {contribution_table};")
             await db.status(
                 f"ALTER INDEX {db_schema}.{_archived_identifier(contribution_stage, '_pkey')} "
                 f"RENAME TO {contribution_table}_pkey;"

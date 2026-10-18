@@ -134,8 +134,16 @@ def _files(versions):
 
 def validated_intent(document):
     """No company/cohort labels or producer evidence may be supplied as authority."""
+    if type(document) is dict and document.get("review_type") == "published_allowed_amount_plan":
+        from process.registry_ptg_allowed_plan_contract import validated_intent as allowed_intent
+
+        return allowed_intent(document)
     _object(document, INTENT_FIELDS)
     _require(document["review_type"] == REVIEW_TYPE and document["selection_mode"] == SELECTION_MODE)
+    return _validated_intent_fields(document, allow_empty_market=False)
+
+
+def _validated_intent_fields(document, *, allow_empty_market):
     for name in ("scope_id", "statement_id", "legal_company_id"):
         _uuid(document[name])
     _require(type(document["network_id"]) is int and 1 <= document["network_id"] <= 2147483647)
@@ -144,7 +152,8 @@ def validated_intent(document):
         _text(document[name], maximum)
     _require(document["client_id"] not in {"system", "__platform__"})
     _text(document["plan_id"], 64, characters=True)
-    _text(document["plan_market_type"], 32, characters=True)
+    if not (allow_empty_market and type(document["plan_market_type"]) is str and document["plan_market_type"] == ""):
+        _text(document["plan_market_type"], 32, characters=True)
     _require(document["plan_market_type"] == document["plan_market_type"].lower())
     return {**document, "file_versions": _files(document["file_versions"])}
 
@@ -187,6 +196,10 @@ def _ownership(document):
 
 def validated_command(document):
     """Bind a distinct published plan review without a fabricated frozen witness."""
+    if type(document) is dict and document.get("review_type") == "published_allowed_amount_plan":
+        from process.registry_ptg_allowed_plan_contract import validated_command as allowed_command
+
+        return allowed_command(document)
     _object(document, FULL_FIELDS)
     intent = validated_intent({name: document[name] for name in INTENT_FIELDS})
     _require(document["operation"] == OPERATION)

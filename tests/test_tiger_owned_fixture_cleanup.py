@@ -94,3 +94,70 @@ async def test_fixture_attempts_all_owned_cleanup_after_failure(monkeypatch, kin
         assert state.events.index("engine.0.dispose") < state.events.index("database.drop")
     if kind == "capture" and state.is_created:
         assert state.events.index("connection.close") < state.events.index("database.drop")
+
+
+def _em_heap_resources(failure):
+    import asyncpg
+
+    sentinel_by_field = {"oid": 17, "sentinel_by_field": "preserve"}
+    schemas = {"tiger": sentinel_by_field} if failure == "preexisting" else {}
+    statements = []
+
+    async def execute(statement):
+        statements.append(statement)
+        if statement.startswith("CREATE SCHEMA"):
+            namespace = statement.split('"')[1] if '"' in statement else statement.split()[-1]
+            if namespace in schemas:
+                raise asyncpg.DuplicateSchemaError("synthetic existing schema")
+            schemas[namespace] = {"oid": 100 + len(schemas)}
+        elif statement.startswith("CREATE TABLE tiger.zcta5"):
+            if failure == "replacement":
+                schemas["tiger"] = sentinel_by_field
+            raise RuntimeError("synthetic table failure")
+        elif statement.startswith("DROP SCHEMA"):
+            schemas.pop(statement.split('"')[1], None)
+
+    async def fetchval(statement, *arguments):
+        if "current_user" in statement:
+            return "synthetic_operator"
+        if "to_regnamespace" in statement:
+            return schemas.get(arguments[0], {}).get("oid")
+        return False
+
+    connection = SimpleNamespace(
+        execute=execute, fetchval=fetchval, fetch=AsyncMock(return_value=[]), close=AsyncMock()
+    )
+    return connection, schemas, statements, sentinel_by_field
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ("published", "native"))
+@pytest.mark.parametrize("failure", ("preexisting", "partial", "replacement"))
+async def test_em_heap_cleanup_preserves_unowned_schema(monkeypatch, caller, failure):
+    """Failed creation and same-name replacements never authorize schema cleanup."""
+    import asyncpg
+
+    from db import connection as database_module
+    from tests import managed_em_resolution_postgres_support as resolver_fixture
+    from tests import test_plan_pricing_source_policy_postgres as provider_fixture
+
+    connection, schemas, statements, sentinel_by_field = _em_heap_resources(failure)
+    monkeypatch.setenv("NETWORK_REGISTRY_TEST_DSN", "postgresql://synthetic@127.0.0.1/postgres")
+    monkeypatch.setattr(resolver_fixture, "_allow_composition_owner", AsyncMock())
+    monkeypatch.setattr(provider_fixture, "_em_provider_create_roles", AsyncMock())
+    monkeypatch.setattr(asyncpg, "connect", AsyncMock(return_value=connection))
+    monkeypatch.setattr(database_module, "Database", lambda: SimpleNamespace(_reader_database=None))
+    error = asyncpg.DuplicateSchemaError if failure == "preexisting" else RuntimeError
+    with pytest.raises(error, match="synthetic"):
+        if caller == "published":
+            fixture = SimpleNamespace(
+                connection=connection, roles={"owner": "owner", "reader": "reader"}, control_schema="control"
+            )
+            await resolver_fixture.test_published_provider_resolver(fixture, monkeypatch)
+        else:
+            async with provider_fixture._em_provider_native_context((connection, "control", None), monkeypatch):
+                pytest.fail("fixture setup must fail")
+    assert schemas == ({"tiger": sentinel_by_field} if failure != "partial" else {})
+    dropped_names = [statement.split('"')[1] for statement in statements if statement.startswith("DROP SCHEMA")]
+    assert ("tiger" in dropped_names) is (failure == "partial")
+    assert "RESET ROLE" in statements

@@ -28,6 +28,7 @@ _REQUIRED_RELATIONS = (
     "ptg2_snapshot",
     "ptg2_v3_snapshot_plan_scope",
     "ptg2_snapshot_pin",
+    "plan_release_snapshot_pin",
 )
 _OPTIONAL_STORAGE_ERRORS = (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError)
 _AVAILABILITY_SQL = """SELECT relation_name,to_regclass(relation_name) IS NOT NULL AS available

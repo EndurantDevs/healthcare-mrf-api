@@ -6,21 +6,22 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import BigInteger
-from sqlalchemy import Boolean
-from sqlalchemy import CheckConstraint
-from sqlalchemy import Column
-from sqlalchemy import Date
-from sqlalchemy import ForeignKeyConstraint
-from sqlalchemy import PrimaryKeyConstraint
-from sqlalchemy import String
-from sqlalchemy import TIMESTAMP
-from sqlalchemy import UniqueConstraint
-from sqlalchemy import text
+from sqlalchemy import (
+    TIMESTAMP,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    Date,
+    ForeignKeyConstraint,
+    PrimaryKeyConstraint,
+    String,
+    UniqueConstraint,
+    text,
+)
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
-
 
 __all__ = (
     "ProviderDirectoryUHCFlexPractitionerDataset",
@@ -44,9 +45,7 @@ _GENERIC_RESOURCE = "provider_directory_dataset_resource"
 _ADMISSION = "provider_directory_uhc_flex_practitioner_twin_admission"
 _SOURCE = "provider_directory_source"
 _ENDPOINT = "provider_directory_api_endpoint"
-_PUBLICATION_CONTRACT = (
-    "healthporta.provider-directory.uhc-flex-practitioner-dataset-publication.v1"
-)
+_PUBLICATION_CONTRACT = "healthporta.provider-directory.uhc-flex-practitioner-dataset-publication.v1"
 
 
 def _reference(table_name: str, column_name: str) -> str:
@@ -190,6 +189,8 @@ class ProviderDirectoryFlexPractitionerDatasetResource(
 ):
     """Bind one semantic row to the admitted raw candidate resource."""
 
+    __runtime_schema_sync__ = False
+
     __tablename__ = _DATASET_RESOURCE
     __main_table__ = __tablename__
     __table_args__ = (
@@ -197,25 +198,6 @@ class ProviderDirectoryFlexPractitionerDatasetResource(
             "dataset_id",
             "resource_id",
             name="pd_uhc_flex_dataset_resource_pkey",
-        ),
-        ForeignKeyConstraint(
-            ["dataset_id"],
-            [_reference(_DATASET, "dataset_id")],
-            name="pd_uhc_flex_dataset_resource_dataset_fkey",
-        ),
-        ForeignKeyConstraint(
-            ["candidate_acquisition_id"],
-            [_reference(_ADMISSION, "candidate_acquisition_id")],
-            name="pd_uhc_flex_dataset_resource_candidate_fkey",
-        ),
-        ForeignKeyConstraint(
-            ["dataset_id", "resource_type", "resource_id"],
-            [
-                _reference(_GENERIC_RESOURCE, "dataset_id"),
-                _reference(_GENERIC_RESOURCE, "resource_type"),
-                _reference(_GENERIC_RESOURCE, "resource_id"),
-            ],
-            name="pd_uhc_flex_dataset_resource_parent_fkey",
         ),
         CheckConstraint(
             "resource_type = 'Practitioner' AND "
@@ -225,7 +207,7 @@ class ProviderDirectoryFlexPractitionerDatasetResource(
             "acquired_resource_sha256 ~ '^[0-9a-f]{64}$'",
             name="pd_uhc_flex_dataset_resource_check",
         ),
-        {"schema": _SCHEMA, "extend_existing": True},
+        {"schema": _SCHEMA, "extend_existing": True, "info": {"managed_immutable_storage": True}},
     )
     __my_index_elements__ = ["dataset_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -244,6 +226,4 @@ class ProviderDirectoryFlexPractitionerDatasetResource(
     acquired_resource_sha256 = Column(String(64), nullable=False)
 
 
-ProviderDirectoryUHCFlexPractitionerDatasetResource = (
-    ProviderDirectoryFlexPractitionerDatasetResource
-)
+ProviderDirectoryUHCFlexPractitionerDatasetResource = ProviderDirectoryFlexPractitionerDatasetResource

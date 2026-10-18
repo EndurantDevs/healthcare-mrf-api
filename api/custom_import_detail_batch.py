@@ -5,9 +5,8 @@ from __future__ import annotations
 
 import asyncio
 
-from sqlalchemy import text
-
 from api import custom_import_read_http as transport
+from api.signed_request_reader import signed_request_reader
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     MAX_FULL_FAMILY_PAGE_SIZE,
@@ -69,10 +68,7 @@ async def serve_custom_import_detail_batch(request, session):
             keyring=transport._keyring(),
             path=CUSTOM_IMPORT_DETAIL_BATCH_PATH,
         )
-        if session is None or session.in_transaction():
-            raise CustomImportReadUnavailableError("fresh detail batch session is required")
-        async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), session.begin():
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), signed_request_reader(request, session) as session:
             async with _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS):
                 encoded = await _read_batch_payload(session, parsed, npi_values, verified)
                 return transport._response(encoded, 200)

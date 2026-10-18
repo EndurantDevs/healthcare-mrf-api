@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 import datetime as dt
 import json
 import logging
@@ -12,6 +11,7 @@ import os
 import threading
 import time
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,11 +25,12 @@ _TIMESTAMP_KEYS = ("created_at", "started_at", "finished_at", "heartbeat_at")
 logger = logging.getLogger(__name__)
 
 
-def isoformat_utc(value: Any) -> Any:
+def isoformat_utc(value: Any, *, timespec: str = "auto") -> Any:
     """Serialize a naive-UTC datetime (or ISO string) as timezone-aware UTC ISO-8601.
 
     DB columns store naive UTC. Attach UTC at the serialization boundary so
     generic event consumers do not have to infer the storage convention.
+    The optional timespec uses datetime precision rules; existing callers keep auto.
     """
     if isinstance(value, str):
         raw = value.strip()
@@ -42,8 +43,9 @@ def isoformat_utc(value: Any) -> Any:
     if isinstance(value, dt.datetime):
         if value.tzinfo is None:
             value = value.replace(tzinfo=dt.UTC)
-        return value.astimezone(dt.UTC).isoformat()
+        return value.astimezone(dt.UTC).isoformat(timespec=timespec)
     return value
+
 
 @dataclass
 class _PublisherState:
@@ -56,9 +58,7 @@ class _PublisherState:
     flush_handle_by_run: dict[str, asyncio.TimerHandle] = field(default_factory=dict)
     pending_terminal_events: deque[dict[str, Any]] = field(default_factory=deque)
     terminal_event_by_run: dict[str, dict[str, Any]] = field(default_factory=dict)
-    terminal_delivery_by_run: dict[str, asyncio.Future[bool]] = field(
-        default_factory=dict
-    )
+    terminal_delivery_by_run: dict[str, asyncio.Future[bool]] = field(default_factory=dict)
 
 
 _publisher_state = _PublisherState()
@@ -142,25 +142,21 @@ def _append_pending_event_locked(event: dict[str, Any]) -> None:
     if run_id:
         has_pending_terminal = any(
             str(pending.get("run_id") or "").strip() == run_id
-            and str(pending.get("status") or "").strip().lower()
-            in TERMINAL_STATUSES
+            and str(pending.get("status") or "").strip().lower() in TERMINAL_STATUSES
             for pending in _publisher_state.pending
         )
         status = str(event.get("status") or "").strip().lower()
         if has_pending_terminal and status not in TERMINAL_STATUSES:
             return
         _publisher_state.pending = deque(
-            pending
-            for pending in _publisher_state.pending
-            if str(pending.get("run_id") or "").strip() != run_id
+            pending for pending in _publisher_state.pending if str(pending.get("run_id") or "").strip() != run_id
         )
     while len(_publisher_state.pending) >= pending_limit:
         progress_event = next(
             (
                 pending
                 for pending in _publisher_state.pending
-                if str(pending.get("status") or "").strip().lower()
-                not in TERMINAL_STATUSES
+                if str(pending.get("status") or "").strip().lower() not in TERMINAL_STATUSES
             ),
             None,
         )
@@ -376,17 +372,11 @@ def _ensure_queue(loop: asyncio.AbstractEventLoop) -> asyncio.Queue[dict[str, An
 async def _publisher_worker(queue: asyncio.Queue[dict[str, Any]]) -> None:
     while True:
         is_from_queue = not _publisher_state.pending_terminal_events
-        event = (
-            await queue.get()
-            if is_from_queue
-            else _publisher_state.pending_terminal_events.popleft()
-        )
+        event = await queue.get() if is_from_queue else _publisher_state.pending_terminal_events.popleft()
         run_id = str(event.get("run_id") or "").strip()
         terminal_event = _publisher_state.terminal_event_by_run.get(run_id)
         delivery = _publisher_state.terminal_delivery_by_run.get(run_id)
-        if terminal_event is not None and (
-            event is not terminal_event or (delivery is not None and delivery.done())
-        ):
+        if terminal_event is not None and (event is not terminal_event or (delivery is not None and delivery.done())):
             if is_from_queue:
                 queue.task_done()
             continue

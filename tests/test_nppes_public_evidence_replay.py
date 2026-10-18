@@ -6,9 +6,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
+from process import nppes_public_evidence_archive as archive_module
+from process import nppes_public_evidence_replay as replay_module
 from process.control_cancel import ImportCancelledError
 from process.nppes_public_evidence_archive import NppesPublicEvidenceArchiveError
 from process.nppes_public_evidence_import import (
@@ -28,7 +31,6 @@ from tests.public_evidence_nppes_registry_support import (
     sparse_deactivated_row,
 )
 
-
 _ARCHIVE_NAME = "NPPES_Data_Dissemination_July_2026_V2.zip"
 
 
@@ -43,6 +45,45 @@ def _prepared(tmp_path: Path):
 
 def _config() -> NppesEvidenceRuntimeConfig:
     return NppesEvidenceRuntimeConfig("required", NPPES_RIGHTS_PROOF_SHA256)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("prepare", "validate"))
+async def test_public_replay_boundary_validates_archive_and_config_once(tmp_path, monkeypatch, operation):
+    archive, config = _prepared(tmp_path), _config()
+    replay = await prepare_nppes_registry_replay(archive, config)
+    archive_check = Mock(wraps=replay_module.validate_prepared_nppes_archive)
+    config_check = Mock(wraps=replay_module.validate_nppes_evidence_runtime_config)
+    stream_digest = Mock(wraps=archive_module._verified_stream_digest)
+    monkeypatch.setattr(replay_module, "validate_prepared_nppes_archive", archive_check)
+    monkeypatch.setattr(replay_module, "validate_nppes_evidence_runtime_config", config_check)
+    monkeypatch.setattr(archive_module, "_verified_stream_digest", stream_digest)
+    if operation == "prepare":
+        assert await prepare_nppes_registry_replay(archive, config) == replay
+    else:
+        assert validate_prepared_nppes_registry_replay(replay, config) == replay
+    archive_check.assert_called_once_with(archive)
+    config_check.assert_called_once_with(config)
+    # The primary CSV reader independently rehashes its opened archive before streaming.
+    assert stream_digest.call_count == (2 if operation == "prepare" else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("prepare", "validate"))
+@pytest.mark.parametrize("corruption", ("archive", "rights-proof"))
+async def test_public_replay_boundary_refuses_corrupt_archive_or_rights_proof(tmp_path, operation, corruption):
+    archive, config = _prepared(tmp_path), _config()
+    replay = await prepare_nppes_registry_replay(archive, config)
+    if corruption == "archive":
+        content = archive.retained.path.read_bytes()
+        archive.retained.path.write_bytes(bytes([content[0] ^ 1]) + content[1:])
+    else:
+        config = NppesEvidenceRuntimeConfig("required", "0" * 64)
+    with pytest.raises(NppesPublicEvidenceArchiveError):
+        if operation == "prepare":
+            await prepare_nppes_registry_replay(archive, config)
+        else:
+            validate_prepared_nppes_registry_replay(replay, config)
 
 
 @pytest.mark.asyncio

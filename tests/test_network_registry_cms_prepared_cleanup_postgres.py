@@ -23,7 +23,7 @@ from process.network_cms_registry_source_pair import (
 from process.network_registry_cms_source_attempt import RegistryCMSSourceAttempt
 from tests import cms_npd_admission_postgres_support as support
 from tests.provider_directory_cms_capacity_test_support import cms_execution
-from tests.test_network_cms_registry_source_pair_postgres import _publish_pair
+from tests.test_network_cms_registry_source_pair_postgres import _bounded_source_copy, _publish_pair
 from tests.test_network_registry_cms_prepared_pair_postgres import _prepared_input, _publish_stages
 from tests.test_provider_directory_cms_resource_batch_postgres import cms_resource_template as cms_resource_template
 
@@ -36,13 +36,13 @@ async def prepared_capture(monkeypatch, tmp_path, request):
     capture_id = uuid4()
     journal = tmp_path / "prepared-cleanup-roles.json"
     journal.write_text(json.dumps({"phase": "registered", "roles": roles}))
-    async with support.admission_database(monkeypatch) as database:
+    async with support.protected_admission_database(monkeypatch) as database:
+        roles = (*roles, database._source_component.owner)
         try:
             async with database.engine.begin() as connection:
-                for role in roles:
+                for role in roles[:2]:
                     await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
-            with support.release_probe_client(directory) as client:
-                initial = await cms._run_acquired({"context": {}}, {}, "cleanup-component", directory, acquired, client)
+            initial = await _acquire_cleanup_source(database, monkeypatch, directory, acquired)
             has_physical_layout = getattr(request, "param", None) == "finalized_v2"
             execution = cms_execution(day=initial["registry_source_admission"]["semantic_projection_as_of"])
             proof = await _publish_pair(
@@ -59,7 +59,8 @@ async def prepared_capture(monkeypatch, tmp_path, request):
                     proof,
                     capture_id=capture_id,
                     owner_role=roles[0],
-                    runtime_roles=(roles[1],),
+                    runtime_roles=tuple(sorted(roles[1:])),
+                    source_copy=_bounded_source_copy(),
                 )
             else:
                 prepared, factory, retention_request = await _prepared_input(
@@ -78,14 +79,22 @@ async def prepared_capture(monkeypatch, tmp_path, request):
                     retention_request,
                     capture_id=capture_id,
                     owner_role=roles[0],
-                    runtime_roles=(roles[1],),
+                    runtime_roles=tuple(sorted(roles[1:])),
                     source_attempt=attempt,
                 )
                 pair = None
             yield SimpleNamespace(database=database, retained=retained, pair=pair, roles=roles, capture_id=capture_id)
         finally:
-            await _remove_roles(database, roles)
+            await _remove_roles(database, roles[:2])
             journal.write_text(json.dumps({"phase": "cleanup_verified", "roles": roles}))
+
+
+async def _acquire_cleanup_source(database, monkeypatch, directory, acquired):
+    """Complete genuine SOURCE acquisition before any historical retained capture."""
+    with support.release_probe_client(directory) as client:
+        return await support.run_protected_admission(
+            database, monkeypatch, "cleanup-component", directory, acquired, client
+        )
 
 
 async def _remove_roles(database, roles):
@@ -103,7 +112,10 @@ async def _repeatable_read(session):
 
 async def _probe(session, capture):
     return await cleanup.probe_registry_cms_source_capture(
-        session, capture_id=capture.capture_id, owner_role=capture.roles[0], runtime_roles=(capture.roles[1],)
+        session,
+        capture_id=capture.capture_id,
+        owner_role=capture.roles[0],
+        runtime_roles=tuple(sorted(capture.roles[1:])),
     )
 
 
@@ -189,20 +201,21 @@ async def test_native_catalog_identity_preserves_search_path_and_rejects_index_l
 
 
 @pytest.mark.asyncio
-async def test_native_finalized_pair_is_preserved(prepared_capture):
-    capture = prepared_capture
-    async with capture.database.session_factory() as session, session.begin():
-        await _repeatable_read(session)
-        predecessor = await serving.read_current_receipt(session, "mrf")
-        receipt_id, payload = await _publish_stages(session, capture.retained, predecessor)
-        pair = await retention.bind_prepared_registry_cms_source_pair(
-            session, capture.retained, receipt_id=receipt_id, receipt_payload=payload
+async def test_native_finalized_pair_is_preserved(monkeypatch, tmp_path):
+    from tests.cms_registry_native_producer_postgres_support import genuine_first_prepared_publication
+
+    async with genuine_first_prepared_publication(monkeypatch, tmp_path, (32, 64 * 1024)) as state:
+        capture = SimpleNamespace(
+            database=state.database,
+            retained=state.retained,
+            roles=state.roles,
+            capture_id=state.retained.recipe.source_pin.retained_epoch.epoch_id,
         )
-    async with capture.database.session_factory() as session, session.begin():
-        await _repeatable_read(session)
-        assert await _probe(session, capture) == pair
-        assert await cleanup.cleanup_prepared_registry_cms_source_pair(session, capture.retained) == "finalized"
-        assert await require_registry_cms_source_pair(session, pair) == pair
+        async with capture.database.session_factory() as session, session.begin():
+            await _repeatable_read(session)
+            assert await _probe(session, capture) == state.pair
+            assert await cleanup.cleanup_prepared_registry_cms_source_pair(session, capture.retained) == "finalized"
+            assert await require_registry_cms_source_pair(session, state.pair) == state.pair
 
 
 @pytest.mark.asyncio

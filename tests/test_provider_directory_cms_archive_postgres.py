@@ -3,8 +3,9 @@
 
 import datetime
 import importlib
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import text
@@ -13,9 +14,16 @@ from sqlalchemy.exc import DBAPIError
 from process import provider_directory_cms_archive as archive
 from process import provider_directory_cms_native_inputs as native_inputs
 from process import provider_directory_cms_preparation as preparation
+from process import provider_directory_generic_source_policy as source_policy
 from process.ext import address_canon
 from tests import test_provider_directory_cms_native_inputs_postgres as input_proof
 from tests import test_provider_directory_cms_overlay_projection_postgres as overlay
+from tests.cms_native_inputs_postgres_support import (
+    enroll_native_input_custody,
+    native_input_actor,
+    ordinary_input_reader,
+    source_input_custody,
+)
 from tests.provider_directory_profile_delta_test_support import _delta_database
 from tests.test_address_format_db import _load_migration
 from tests.test_provider_directory_cms_preparation import _admission, _signed_lease
@@ -147,39 +155,53 @@ async def _fixture(monkeypatch):
         monkeypatch.setattr(address_canon, "db", database)
         await _seed_archive(database, schema)
         fence = await _typed_sources(database, schema)
-        admission = _admission()
-        admission.plan = replace(
-            admission.plan,
-            reservation_bytes=(("data", 10_000_000), ("temp", 10_000_000), ("wal", 10_000_000)),
-            temp_file_limit_bytes_per_backend=10_000_000 // 1024 * 1024,
-        )
-        admission.lease = _signed_lease(admission.plan)
-        admission._started = True
-        checks = []
-
-        async def approve(request):
-            checks.append(request)
-            for relation in request.relations:
-                await archive.capture_archive_layout(fhir, relation)
-            return preparation.NonprofileAdmissionReceipt(
-                request.phase,
-                request.lease.lease_digest,
-                request.lease.reservation_id,
-                request.plan.capacity_geometry_hash,
-                request.relations,
-                request.logging_relations,
+        async with source_input_custody(database, schema, monkeypatch) as component:
+            archive_oid = await archive._oid(database, schema, "address_archive_v2")
+            await database.status(f'ALTER TABLE {schema}.address_archive_v2 OWNER TO "{component.owner}"')
+            assert (
+                await database.scalar(
+                    "SELECT oid=:oid AND relowner=CAST(:owner AS regrole) FROM pg_class WHERE oid=to_regclass(:name)",
+                    oid=archive_oid,
+                    owner=component.owner,
+                    name=f"{schema}.address_archive_v2",
+                )
+                is True
             )
+            monkeypatch.setattr(fhir, "db", component.database)
+            monkeypatch.setattr(address_canon, "db", component.database)
+            admission = _admission()
+            admission.plan = replace(
+                admission.plan,
+                reservation_bytes=(("data", 10_000_000), ("temp", 10_000_000), ("wal", 10_000_000)),
+                temp_file_limit_bytes_per_backend=10_000_000 // 1024 * 1024,
+            )
+            admission.lease = _signed_lease(admission.plan)
+            admission._started = True
+            checks = []
 
-        async def clock():
-            return admission.lease.max_build_deadline - datetime.timedelta(minutes=5)
+            async def approve(request):
+                checks.append(request)
+                for relation in request.relations:
+                    await archive.capture_archive_layout(fhir, relation)
+                return preparation.NonprofileAdmissionReceipt(
+                    request.phase,
+                    request.lease.lease_digest,
+                    request.lease.reservation_id,
+                    request.plan.capacity_geometry_hash,
+                    request.relations,
+                    request.logging_relations,
+                )
 
-        admission.check_phase = approve
-        monkeypatch.setattr(fhir, "_profile_capacity_preflight_clock", clock)
-        token = preparation._ACTIVE.set(admission)
-        try:
-            yield database, schema, fence, admission, checks
-        finally:
-            preparation._ACTIVE.reset(token)
+            async def clock():
+                return admission.lease.max_build_deadline - datetime.timedelta(minutes=5)
+
+            admission.check_phase = approve
+            monkeypatch.setattr(fhir, "_profile_capacity_preflight_clock", clock)
+            token = preparation._ACTIVE.set(admission)
+            try:
+                yield component.database, schema, fence, admission, checks
+            finally:
+                preparation._ACTIVE.reset(token)
 
 
 async def _prepare(schema, fence):
@@ -188,26 +210,46 @@ async def _prepare(schema, fence):
 
 async def _baseline(database, schema, fence):
     """Run unchanged resolver and OA behavior against a complete incumbent copy."""
-    await database.status(f"CREATE TABLE {schema}.baseline (LIKE {schema}.address_archive_v2 INCLUDING DEFAULTS)")
-    await database.status(f"INSERT INTO {schema}.baseline SELECT * FROM {schema}.address_archive_v2")
-    await database.status(f"ALTER TABLE {schema}.baseline ADD PRIMARY KEY (address_key)")
-    await database.status(
-        fhir.provider_directory_location_archive_stage_sql(schema, "baseline_input", source_ids=fence.source_ids),
-        source_ids=list(fence.source_ids),
-    )
-    stats = await _resolve(
-        database,
-        schema,
-        "baseline_input",
-        "baseline",
-        bit=fhir.PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT,
-        priority=fhir.PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY,
-    )
-    metrics_by_name = dict(stats.__dict__)
-    metrics_by_name["openaddresses_coordinate_backfill_rows"] = await fhir._backfill_archive_openaddresses_coordinates(
-        schema, "baseline_input", archive_table="baseline"
-    )
-    return metrics_by_name
+    component = database._input_component
+    async with source_policy.source_transaction(database):
+        assert (
+            await database.scalar(
+                "SELECT current_user=:owner AND session_user=:publisher",
+                owner=component.owner,
+                publisher=component.publisher,
+            )
+            is True
+        )
+        await database.status(f"CREATE TABLE {schema}.baseline (LIKE {schema}.address_archive_v2 INCLUDING DEFAULTS)")
+        await database.status(f"INSERT INTO {schema}.baseline SELECT * FROM {schema}.address_archive_v2")
+        await database.status(f"ALTER TABLE {schema}.baseline ADD PRIMARY KEY (address_key)")
+        await database.status(
+            fhir.provider_directory_location_archive_stage_sql(schema, "baseline_input", source_ids=fence.source_ids),
+            source_ids=list(fence.source_ids),
+        )
+        assert (
+            await database.scalar(
+                "SELECT count(*)=2 AND bool_and(c.relowner=(SELECT oid FROM pg_roles WHERE rolname=:owner)) "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname=:schema AND c.relname IN ('baseline','baseline_input')",
+                owner=component.owner,
+                schema=schema,
+            )
+            is True
+        )
+        stats = await _resolve(
+            database,
+            schema,
+            "baseline_input",
+            "baseline",
+            bit=fhir.PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT,
+            priority=fhir.PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY,
+        )
+        metrics_by_name = dict(stats.__dict__)
+        metrics_by_name[
+            "openaddresses_coordinate_backfill_rows"
+        ] = await fhir._backfill_archive_openaddresses_coordinates(schema, "baseline_input", archive_table="baseline")
+        return metrics_by_name
 
 
 @pytest.mark.asyncio
@@ -330,17 +372,21 @@ async def test_prepared_identity_drift_fails_closed_and_cleanup_preserves_replac
     async with _fixture(monkeypatch) as (database, schema, fence, admission, _checks):
         prepared, _metrics = await _prepare(schema, fence)
         try:
-            with pytest.raises(DBAPIError, match="prepared_read_only"):
-                await database.status(f"UPDATE {schema}.{prepared.delta_table} SET first_line=first_line")
+            async with ordinary_input_reader(database) as reader:
+                with pytest.raises(DBAPIError, match="permission denied"):
+                    await reader.execute(text(f"UPDATE {schema}.{prepared.delta_table} SET first_line=first_line"))
             statements_by_corruption = {
                 "live_write": f"UPDATE {schema}.address_archive_v2 SET first_line=first_line WHERE false",
                 "view": f"CREATE OR REPLACE VIEW {schema}.{prepared.effective_relation} AS SELECT * FROM {schema}.address_archive_v2",
-                "seal": f"ALTER TABLE {schema}.{prepared.delta_table} DISABLE TRIGGER {archive._SEAL}",
+                "seal": f'GRANT UPDATE ON {schema}.{prepared.delta_table} TO "{database._input_component.reader}"',
                 "delta_swap": f"ALTER TABLE {schema}.{prepared.delta_table} RENAME TO retired_delta",
             }
             await database.status(statements_by_corruption[corruption])
             if corruption == "delta_swap":
                 await database.status(f"CREATE TABLE {schema}.{prepared.delta_table} (value text)")
+                await database.status(
+                    f'ALTER TABLE {schema}.{prepared.delta_table} OWNER TO "{database._input_component.owner}"'
+                )
             with pytest.raises(RuntimeError, match="(preparation_changed|write_seal_changed)"):
                 await prepared.assert_ready(fhir)
         finally:
@@ -355,6 +401,12 @@ async def test_prepared_identity_drift_fails_closed_and_cleanup_preserves_replac
 @pytest.mark.asyncio
 async def test_actual_archive_dispatch_routes_overlay_and_requires_prepared_completion(monkeypatch):
     async with _fixture(monkeypatch) as (database, schema, fence, _admission_value, _checks):
+        # This archive fixture excludes the independent immutable NPI output family.
+        monkeypatch.setattr(
+            fhir,
+            "backfill_provider_directory_resource_id_npis",
+            AsyncMock(return_value={"Practitioner": 0, "Organization": 0}),
+        )
 
         async def overlay_builder(**_options):
             effective_ref = fhir._qt(schema, "address_archive_v2")
@@ -399,6 +451,12 @@ async def test_actual_archive_dispatch_routes_overlay_and_requires_prepared_comp
 @pytest.mark.asyncio
 async def test_unadmitted_cms_bundle_fails_before_any_live_archive_statement(monkeypatch):
     async with _fixture(monkeypatch) as (database, schema, fence, _admission_value, _checks):
+        # This archive fixture excludes the independent immutable NPI output family.
+        monkeypatch.setattr(
+            fhir,
+            "backfill_provider_directory_resource_id_npis",
+            AsyncMock(return_value={"Practitioner": 0, "Organization": 0}),
+        )
         before = await _rows(database, schema, "address_archive_v2")
         oid = await archive._oid(database, schema, "address_archive_v2")
         revision = await archive._revision(database, schema, oid)
@@ -427,9 +485,12 @@ async def test_optional_coordinate_heap_presence_and_mutation_are_native_inputs(
         await database.status(f"DROP TABLE {schema}.openaddresses_geocode")
         absent = await input_proof._capture(database, schema)
         await database.status(f"CREATE TABLE {schema}.openaddresses_geocode (value int)")
+        await enroll_native_input_custody(
+            database, schema, database._native_input_component, replacement_name="openaddresses_geocode"
+        )
         with pytest.raises(RuntimeError, match="revision_guard_unavailable"):
             await input_proof._capture(database, schema)
-        async with database.engine.begin() as connection:
+        async with native_input_actor(database) as connection:
             await native_inputs.register_native_address_inputs(connection, schema)
         present = await input_proof._capture(database, schema)
         with pytest.raises(RuntimeError, match="native_inputs_changed"):
@@ -449,8 +510,35 @@ async def _assert_view_locked(database, schema, name):
             )
 
 
+async def _assert_archive_owner_transactions(database, schema, prepared, savepoint):
+    async with database.transaction() as session:
+        if savepoint:
+            with pytest.raises(RuntimeError, match="synthetic savepoint rollback"):
+                async with session.begin_nested():
+                    await prepared.before_lock(fhir, session)
+                    await prepared.apply(fhir, session)
+                    await prepared.assert_applied_backend(database)
+                    raise RuntimeError("synthetic savepoint rollback")
+            with pytest.raises(RuntimeError, match="preparation_changed"):
+                await prepared.assert_applied_backend(database)
+        async with session.begin_nested() if savepoint else nullcontext():
+            await prepared.before_lock(fhir, session)
+            await prepared.apply(fhir, session)
+            revision_identity = await database.first(
+                f'SELECT xmin::text,pg_current_xact_id()::text FROM "{schema}".cms_native_input_revision '
+                "WHERE relation_oid=:oid",
+                oid=prepared.target_oid,
+            )
+            assert revision_identity[0] != revision_identity[1]
+        await prepared.assert_applied_backend(database)
+    with pytest.raises(RuntimeError, match="applied_owner_changed"):
+        async with database.transaction():
+            await prepared.assert_applied_backend(database)
+
+
 @pytest.mark.asyncio
-async def test_native_acquired_backend_guard_and_applied_owner_are_exact(monkeypatch):
+@pytest.mark.parametrize("savepoint", [False, True])
+async def test_native_acquired_backend_guard_and_applied_owner_are_exact(monkeypatch, savepoint):
     async with _fixture(monkeypatch) as (database, schema, fence, _admission_value, _checks):
         prepared, _metrics = await _prepare(schema, fence)
         try:
@@ -460,12 +548,105 @@ async def test_native_acquired_backend_guard_and_applied_owner_are_exact(monkeyp
                 await prepared.lock_read_backend(backend)
                 assert await backend.scalar(f"SELECT count(*) FROM {schema}.{prepared.effective_relation}") > 0
                 await _assert_view_locked(database, schema, prepared.effective_relation)
-            async with database.transaction() as session:
-                await prepared.before_lock(fhir, session)
-                await prepared.apply(fhir, session)
-                await prepared.assert_applied_backend(database)
-            with pytest.raises(RuntimeError, match="applied_owner_changed"):
-                async with database.transaction():
-                    await prepared.assert_applied_backend(database)
+            await _assert_archive_owner_transactions(database, schema, prepared, savepoint)
         finally:
             await prepared.cleanup(fhir)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("values", [(None,), (True,), (42, False)])
+async def test_native_archive_custody_refuses_missing_owner_or_open_acl(values):
+    """Malformed physical ownership and an opened ordinary ACL cannot authorize reads."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    database = SimpleNamespace(scalar=AsyncMock(side_effect=values))
+    with pytest.raises(RuntimeError, match="cms_archive_write_seal_changed"):
+        await archive._assert_backend_seal(database, "synthetic_schema", 123)
+    assert database.scalar.await_count == len(values)
+
+
+@pytest.mark.asyncio
+async def test_native_archive_custody_checks_exact_owner_and_oid():
+    """Backend proof binds the requested native identity and checks all ordinary writers."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    database = SimpleNamespace(scalar=AsyncMock(side_effect=(42, True)))
+    await archive._assert_backend_seal(database, "synthetic_schema", 123)
+    query = database.scalar.await_args
+    assert query.kwargs == {"oid": 123, "schema": "synthetic_schema", "owner_oid": 42}
+    assert "pg_trigger" in query.args[0] and "pg_rewrite" in query.args[0]
+    assert "has_any_column_privilege" in query.args[0]
+
+
+def test_source_header_metadata_preserves_complete_fk_dependency_order():
+    """Both fixture entry points compile the genuine fixed models, without dropping FKs."""
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateTable
+
+    from tests.cms_native_inputs_postgres_support import source_header_models
+
+    tables = source_header_models("synthetic_schema")
+    assert [table.name for table in tables] == [
+        "provider_directory_api_endpoint",
+        "provider_directory_endpoint_dataset",
+    ]
+    statements = [str(CreateTable(table).compile(dialect=postgresql.dialect())) for table in tables]
+    assert (
+        "FOREIGN KEY(endpoint_id) REFERENCES synthetic_schema.provider_directory_api_endpoint (endpoint_id)"
+        in statements[1]
+    )
+    assert len(tables[0].foreign_keys) == 0 and len(tables[1].foreign_keys) == 1
+
+
+@pytest.mark.asyncio
+async def test_archive_baseline_owns_creation_resolution_and_backfill(monkeypatch):
+    """The reference pipeline enters Source before creating either scratch heap."""
+    from types import SimpleNamespace
+
+    events = []
+    state_by_field = {"is_source": False}
+
+    async def is_source_statement(statement, **parameters):
+        assert state_by_field["is_source"]
+        events.append(str(statement))
+        return True
+
+    database = SimpleNamespace(
+        status=is_source_statement,
+        scalar=is_source_statement,
+        _input_component=SimpleNamespace(owner="synthetic_source_owner", publisher="synthetic_source_publisher"),
+    )
+
+    @asynccontextmanager
+    async def transaction(actual):
+        assert actual is database and not state_by_field["is_source"]
+        state_by_field["is_source"] = True
+        events.append("source_enter")
+        try:
+            yield
+        finally:
+            state_by_field["is_source"] = False
+            events.append("source_exit")
+
+    async def resolve(actual, schema, source, target, **options):
+        assert actual is database and state_by_field["is_source"]
+        assert (schema, source, target) == ("synthetic_schema", "baseline_input", "baseline")
+        events.append("resolve")
+        return SimpleNamespace(inserted=1)
+
+    async def backfill(schema, source, *, archive_table):
+        assert state_by_field["is_source"] and (source, archive_table) == ("baseline_input", "baseline")
+        events.append("backfill")
+        return 2
+
+    monkeypatch.setattr(source_policy, "source_transaction", transaction)
+    monkeypatch.setitem(globals(), "_resolve", resolve)
+    monkeypatch.setattr(fhir, "_backfill_archive_openaddresses_coordinates", backfill)
+    metrics = await _baseline(database, "synthetic_schema", SimpleNamespace(source_ids=("synthetic",)))
+    assert metrics == {"inserted": 1, "openaddresses_coordinate_backfill_rows": 2}
+    assert events[0] == "source_enter" and events[-3:] == ["resolve", "backfill", "source_exit"]
+    assert "CREATE TABLE synthetic_schema.baseline" in events[2]
+    assert 'CREATE UNLOGGED TABLE "synthetic_schema"."baseline_input"' in events[5]
+    assert not state_by_field["is_source"]

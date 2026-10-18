@@ -235,7 +235,7 @@ async def test_invalid_selector_has_no_database_calls(changes):
         )
 
 
-async def test_transaction_contract_and_three_reads(catalog_db):
+async def test_transaction_contract_and_five_reads(catalog_db):
     fixture = catalog_db
     with pytest.raises(RegistrySourceSiteCatalogError):
         await read_registry_source_sites(fixture.connection, **_arguments(fixture))
@@ -249,13 +249,14 @@ async def test_transaction_contract_and_three_reads(catalog_db):
             queries.clear()
             await read_registry_source_sites(fixture.connection, **_arguments(fixture, limit=1))
             await asyncio.sleep(0)
-            assert len(queries) == 3 and all(query.query.lstrip().split()[0] in ("SELECT", "WITH") for query in queries)
+            assert len(queries) == 5 and all(query.query.lstrip().split()[0] in ("SELECT", "WITH") for query in queries)
+            assert sum("network_candidate_custody" in query.query for query in queries) == 1
     finally:
         fixture.connection.remove_query_logger(queries.append)
 
 
 @pytest.mark.parametrize("catalog_db", [(100, "npi")], indirect=True)
-async def test_maximum_page_uses_the_same_three_reads(catalog_db):
+async def test_maximum_page_uses_the_same_five_reads(catalog_db):
     fixture = catalog_db
     queries = []
     fixture.connection.add_query_logger(queries.append)
@@ -265,7 +266,8 @@ async def test_maximum_page_uses_the_same_three_reads(catalog_db):
             queries.clear()
             result = await read_registry_source_sites(fixture.connection, **_arguments(fixture, limit=100))
             await asyncio.sleep(0)
-            assert len(result["sites"]) == 100 and not result["has_more"] and len(queries) == 3
+            assert len(result["sites"]) == 100 and not result["has_more"] and len(queries) == 5
+            assert sum("network_candidate_custody" in query.query for query in queries) == 1
     finally:
         fixture.connection.remove_query_logger(queries.append)
 

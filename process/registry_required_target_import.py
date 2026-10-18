@@ -29,16 +29,21 @@ def _parser():
     parser.add_argument("--snapshot-id", type=UUID, required=True)
     parser.add_argument("--source-url", required=True)
     parser.add_argument("--input-sha256", required=True)
+    parser.add_argument("--protected-owner-role", help="explicit trusted operator role for a closed registry")
     return parser
 
 
-async def _run_import(input_bytes, edition):
+async def _run_import(input_bytes, edition, protected_owner_role=None):
     database = Database()
     with _receipt_only_database_output(database):
         try:
             await database.connect()
             _set_engine_echo(database, False)
             async with database.acquire_driver() as connection, connection.transaction():
+                if protected_owner_role is not None:
+                    from process.registry_management_permissions import assume_registry_source_owner
+
+                    await assume_registry_source_owner(connection, protected_owner_role)
                 admission = await admit_registry_required_targets(connection, input_bytes, edition)
                 fields = _DESCRIPTOR_FIELDS | {"copy_sha256", "copy_bytes", "replayed"}
                 receipt = json.dumps(
@@ -71,7 +76,7 @@ def run_command(arguments=None):
         print(_error_json("invalid_arguments"), file=sys.stderr)
         return 2
     try:
-        receipt = asyncio.run(_run_import(input_bytes, edition))
+        receipt = asyncio.run(_run_import(input_bytes, edition, parsed.protected_owner_role))
     except KeyboardInterrupt, asyncio.CancelledError:
         print(_error_json("canceled"), file=sys.stderr)
         return 130

@@ -3,26 +3,33 @@
 
 import asyncio
 import hashlib
-import importlib.util
 import json
-from pathlib import Path
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from types import SimpleNamespace
 from uuid import uuid4
 
 import asyncpg
 import pytest
-from alembic.migration import MigrationContext
-from alembic.operations import Operations
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from process import provider_directory_insurance_network_batch as batch
+from process.provider_directory_generic_candidate import GenericCandidateError
+from process.provider_directory_generic_source_auxiliary import identity_candidate_scope
+from process.provider_directory_generic_source_policy import bound_publisher
 from process.provider_directory_insurance_network_identity import (
     record_insurance_network_organization,
     record_insurance_network_plan,
 )
 from process.registry_record_store import RegistryAddressUnavailable
-from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
+from tests.provider_directory_resource_identity_postgres_support import (
+    prepare_resource_candidate,
+)
+from tests.provider_directory_source_postgres_support import source_component_database
+from tests.test_provider_directory_cms_resource_batch_postgres import (
+    cms_resource_template as cms_resource_template,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -46,25 +53,44 @@ def _plan(resource_id="plan-one", refs=None):
     }
 
 
+@dataclass
+class NetworkBatchDatabase:
+    """Observe private stages independently of the genuine Publisher transaction."""
+
+    connection: object
+    schema: str
+    engine: object
+    staged: object
+
+    def relation(self, root):
+        receipt = self.staged.binding["auxiliary"]["tables"].get(root)
+        name = root if receipt is None else receipt["name"]
+        return f'"{self.schema}"."{name}"'
+
+    @asynccontextmanager
+    async def session(self):
+        async with self.staged.transaction() as session:
+            async with identity_candidate_scope(bound_publisher(), self.staged.binding):
+                yield session
+
+
 @pytest.fixture
-async def network_batch_db(serving_schema):
-    connection, schema, engine = serving_schema
-    async with engine.begin() as migration_connection:
-        for filename in (
-            "20260929010000_provider_directory_entity_identity.py",
-            "20260929020000_provider_directory_insurance_network_identity.py",
-        ):
-            path = Path(__file__).parents[1] / "alembic/versions" / filename
-            spec = importlib.util.spec_from_file_location(filename.removesuffix(".py"), path)
-            migration = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(migration)
-
-            def upgrade(sync_connection):
-                with Operations.context(MigrationContext.configure(sync_connection)):
-                    migration.upgrade()
-
-            await migration_connection.run_sync(upgrade)
-    yield connection, schema, engine.execution_options(schema_translate_map={"mrf": schema})
+async def network_batch_db(monkeypatch, cms_resource_template):
+    async with source_component_database(monkeypatch) as component:
+        async with component.admin_engine.connect() as observer:
+            driver = (await observer.get_raw_connection()).driver_connection
+            await observer.rollback()
+            global_identity_sql = (
+                f'SELECT network_id,created_at FROM "{component.policy.schema}".'
+                "provider_directory_insurance_network_identity ORDER BY network_id"
+            )
+            accepted_before = await driver.fetch(global_identity_sql)
+            staged = await prepare_resource_candidate(component, [])
+            try:
+                yield NetworkBatchDatabase(driver, component.policy.schema, component.database.engine, staged)
+            finally:
+                # The private map allocates UUIDs; global identity minting belongs to publication.
+                assert await driver.fetch(global_identity_sql) == accepted_before
 
 
 def _organization_evidence_document(resources):
@@ -88,34 +114,47 @@ def _organization_evidence_document(resources):
     return json.dumps(organization_rows)
 
 
-async def _seed(db, resources, *, source="source-one", release="release-one"):
-    connection, schema, _ = db
+async def _seed(
+    db,
+    resources,
+    *,
+    source_id="cms-npd",
+    release="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+):
+    connection = db.connection
     document = _organization_evidence_document(resources)
     await connection.execute(
-        f'INSERT INTO "{schema}".provider_directory_organization_identity '
+        f'INSERT INTO "{db.schema}".provider_directory_organization_identity '
         "SELECT organization_id,now() FROM jsonb_to_recordset($1::jsonb) r(organization_id uuid)",
         document,
     )
     await connection.execute(
-        f'INSERT INTO "{schema}".provider_directory_entity_source_binding '
+        f"INSERT INTO {db.relation('provider_directory_entity_source_binding')} "
         "(source_id,resource_type,resource_id,organization_id,created_at) "
         "SELECT $2,'Organization',resource_id,organization_id,now() FROM jsonb_to_recordset($1::jsonb) "
         "r(resource_id text,organization_id uuid)",
         document,
-        source,
+        source_id,
     )
     if release is not None:
         await connection.execute(
-            f'INSERT INTO "{schema}".provider_directory_entity_release_evidence '
+            f"INSERT INTO {db.relation('provider_directory_entity_release_evidence')} "
             "SELECT $2,'Organization',resource_id,$3,payload_sha256,payload_json,now() "
             "FROM jsonb_to_recordset($1::jsonb) r(resource_id text,payload_sha256 text,payload_json jsonb)",
             document,
-            source,
+            source_id,
             release,
         )
 
 
-async def _apply(session, resources, *, kind=None, source="source-one", release="release-one"):
+async def _apply(
+    session,
+    resources,
+    *,
+    kind=None,
+    source="cms-npd",
+    release="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+):
     return await batch.record_insurance_network_batch(
         session,
         source_id=source,
@@ -126,19 +165,20 @@ async def _apply(session, resources, *, kind=None, source="source-one", release=
 
 
 async def _counts(db):
-    connection, schema, _ = db
+    """Count private allocated UUIDs and physical map/evidence rows; globals are checked separately."""
+    connection = db.connection
     return tuple(
         await connection.fetchrow(
-            f'SELECT (SELECT count(*) FROM "{schema}".provider_directory_insurance_network_identity),'
-            f'(SELECT count(*) FROM "{schema}".provider_directory_insurance_network_source_binding),'
-            f'(SELECT count(*) FROM "{schema}".provider_directory_insurance_network_plan_evidence)'
+            f"SELECT (SELECT count(DISTINCT network_id) FROM {db.relation('provider_directory_insurance_network_source_binding')}),"
+            f"(SELECT count(*) FROM {db.relation('provider_directory_insurance_network_source_binding')}),"
+            f"(SELECT count(*) FROM {db.relation('provider_directory_insurance_network_plan_evidence')})"
         )
     )
 
 
 async def test_organization_plan_replay_and_raw_evidence(network_batch_db):
     db = network_batch_db
-    connection, schema, engine = db
+    connection, schema = db.connection, db.schema
     org = _org()
     await _seed(db, [org])
     plan = _plan(
@@ -148,7 +188,7 @@ async def test_organization_plan_replay_and_raw_evidence(network_batch_db):
             "https://directory.example.test/Organization/network-one",
         ]
     )
-    async with AsyncSession(engine) as session, session.begin():
+    async with db.session() as session:
         receipt = await _apply(session, [org, org, _org("payer", role=False)])
         assert receipt == {
             "input_count": 3,
@@ -170,22 +210,28 @@ async def test_organization_plan_replay_and_raw_evidence(network_batch_db):
         }
         assert (await _apply(session, [plan]))["new_plan_evidence_count"] == 0
     assert await _counts(db) == (1, 1, 1)
-    evidence = await connection.fetchrow(f'SELECT * FROM "{schema}".provider_directory_insurance_network_plan_evidence')
+    evidence = await connection.fetchrow(
+        f"SELECT network_refs::text AS network_refs,plan_payload_json::text AS plan_payload_json,"
+        f"owned_by_ref,administered_by_ref FROM {db.relation('provider_directory_insurance_network_plan_evidence')}"
+    )
     assert json.loads(evidence["network_refs"]) == [
         network_reference["reference"] for network_reference in plan["network"]
     ]
     assert json.loads(evidence["plan_payload_json"]) == plan
     assert evidence["owned_by_ref"] == "Organization/payer-one"
     assert evidence["administered_by_ref"] == "Organization/administrator-one"
-    assert tuple(
-        await connection.fetchrow(f'SELECT draft_revision,approved_revision FROM "{schema}".registry_revision_control')
-    ) == (0, 0)
+    assert (
+        await connection.fetchval(
+            f'SELECT count(*) FROM "{schema}".provider_directory_insurance_network_source_binding'
+        )
+        == 0
+    )
 
 
 async def test_plan_allocates_only_retained_local_targets(network_batch_db):
     db = network_batch_db
     await _seed(db, [_org(), _org("network-two", role=False)])
-    async with AsyncSession(db[2]) as session, session.begin():
+    async with db.session() as session:
         receipt = await _apply(
             session,
             [
@@ -208,7 +254,7 @@ async def test_plan_allocates_only_retained_local_targets(network_batch_db):
 async def test_padded_retained_reference_rejects_whole_batch(network_batch_db, refs):
     db = network_batch_db
     await _seed(db, [_org()])
-    async with AsyncSession(db[2]) as session, session.begin():
+    async with db.session() as session:
         with pytest.raises(ValueError, match="_ref_missing$"):
             await _apply(session, [_plan("good"), _plan("padded", refs)])
         assert await session.scalar(text("SELECT 1")) == 1
@@ -218,12 +264,15 @@ async def test_padded_retained_reference_rejects_whole_batch(network_batch_db, r
 async def test_cross_batch_conflict_even_without_current_refs(network_batch_db):
     db = network_batch_db
     await _seed(db, [_org(), _org("network-two")])
-    async with AsyncSession(db[2]) as session, session.begin():
+    async with db.session() as session:
         await _apply(session, [_plan()])
         with pytest.raises(ValueError, match="release_plan_conflict$"):
             await _apply(
                 session,
-                [_plan("new", ["Organization/network-two"]), _plan(refs=["https://directory.example.test/foreign"])],
+                [
+                    _plan("new", ["Organization/network-two"]),
+                    _plan(refs=["https://directory.example.test/foreign"]),
+                ],
             )
     assert await _counts(db) == (1, 1, 1)
 
@@ -233,10 +282,16 @@ async def test_explicit_role_requires_exact_entity_and_release(network_batch_db,
     db = network_batch_db
     organization_dict = _org()
     if failure != "entity":
-        await _seed(db, [organization_dict], release=None if failure == "release" else "release-one")
+        await _seed(
+            db,
+            [organization_dict],
+            release=None
+            if failure == "release"
+            else "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
     if failure == "payload":
         organization_dict = {**organization_dict, "name": "Changed synthetic payload"}
-    async with AsyncSession(db[2]) as session, session.begin():
+    async with db.session() as session:
         with pytest.raises(ValueError, match="_(organization_binding|release_evidence)_missing$"):
             await _apply(session, [organization_dict])
     assert await _counts(db) == (0, 0, 0)
@@ -245,28 +300,21 @@ async def test_explicit_role_requires_exact_entity_and_release(network_batch_db,
 async def test_missing_release_skips_plan_without_allocation(network_batch_db):
     db = network_batch_db
     await _seed(db, [_org()], release=None)
-    async with AsyncSession(db[2]) as session, session.begin():
+    async with db.session() as session:
         result = await _apply(session, [_plan()])
         assert result["plan_link_count"] == result["new_identity_count"] == 0
     assert await _counts(db) == (0, 0, 0)
 
 
-async def test_source_and_release_coordinates_remain_independent(network_batch_db):
+@pytest.mark.parametrize("coordinates", [{"source": "other-source"}, {"release": "b" * 64}])
+async def test_candidate_source_and_release_coordinates_cannot_be_rebound(network_batch_db, coordinates):
     db = network_batch_db
     await _seed(db, [_org()])
-    await _seed(db, [_org()], source="source-two")
-    async with AsyncSession(db[2]) as session, session.begin():
-        await _apply(session, [_plan()])
-        await _apply(session, [_plan()], source="source-two")
-        assert (await _apply(session, [_plan()], release="release-two"))["plan_link_count"] == 0
-    connection, schema, _ = db
-    assert await _counts(db) == (2, 2, 2)
-    assert (
-        await connection.fetchval(
-            f'SELECT count(DISTINCT network_id) FROM "{schema}".provider_directory_insurance_network_source_binding'
-        )
-        == 2
-    )
+    async with db.session() as session:
+        with pytest.raises(ValueError, match="scope_changed$"):
+            await _apply(session, [_plan()], **coordinates)
+        assert await session.scalar(text("SELECT 1")) == 1
+    assert await _counts(db) == (0, 0, 0)
 
 
 async def test_fixed_sql_count_and_one_copy_for_one_and_thousand(network_batch_db, monkeypatch):
@@ -274,7 +322,11 @@ async def test_fixed_sql_count_and_one_copy_for_one_and_thousand(network_batch_d
     resources = [_org(f"network-{index}") for index in range(1000)]
     await _seed(db, resources)
     statements, copies = [], []
-    event.listen(db[2].sync_engine, "before_cursor_execute", lambda *args: statements.append(args[2]))
+    event.listen(
+        db.engine.sync_engine,
+        "before_cursor_execute",
+        lambda *args: statements.append(args[2]),
+    )
     original = asyncpg.Connection.copy_to_table
 
     async def record_copy(connection, *args, **kwargs):
@@ -282,10 +334,11 @@ async def test_fixed_sql_count_and_one_copy_for_one_and_thousand(network_batch_d
         return await original(connection, *args, **kwargs)
 
     monkeypatch.setattr(asyncpg.Connection, "copy_to_table", record_copy)
-    async with AsyncSession(db[2]) as session, session.begin():
+    async with db.session() as session:
+        statements.clear()
         first = await _apply(session, resources[:1])
         first_count = len(statements)
-        assert first_count == 12
+        assert first_count == 11
         statements.clear()
         second = await _apply(session, resources)
         assert len(statements) == first_count
@@ -295,10 +348,12 @@ async def test_fixed_sql_count_and_one_copy_for_one_and_thousand(network_batch_d
     assert await _counts(db) == (1000, 1000, 0)
 
 
-async def test_last_invalid_row_and_conflicting_duplicate_have_no_writes(network_batch_db):
+async def test_last_invalid_row_and_conflicting_duplicate_have_no_writes(
+    network_batch_db,
+):
     db = network_batch_db
     await _seed(db, [_org()])
-    async with AsyncSession(db[2]) as session, session.begin():
+    async with db.session() as session:
         for resources in (
             [_org(), {"resourceType": "Organization"}],
             [_org(), {**_org(), "name": "Conflicting payload"}],
@@ -310,13 +365,16 @@ async def test_last_invalid_row_and_conflicting_duplicate_have_no_writes(network
 
 async def test_native_unavailable_and_caller_transaction_required(network_batch_db, monkeypatch):
     db = network_batch_db
-    async with AsyncSession(db[2]) as session:
+    async with AsyncSession(db.engine) as session:
         with pytest.raises(ValueError, match="transaction_required$"):
             await _apply(session, [_org()])
         async with session.begin():
-            monkeypatch.setattr(batch, "_fast_module", lambda: None)
-            with pytest.raises(RegistryAddressUnavailable, match="native_unavailable$"):
+            with pytest.raises(GenericCandidateError, match="physical_session_required$"):
                 await _apply(session, [_org()])
+    async with db.session() as session:
+        monkeypatch.setattr(batch, "_fast_module", lambda: None)
+        with pytest.raises(RegistryAddressUnavailable, match="native_unavailable$"):
+            await _apply(session, [_org()])
     assert await _counts(db) == (0, 0, 0)
 
 
@@ -328,42 +386,47 @@ async def test_copy_failure_preserves_caller_transaction(network_batch_db, monke
         raise asyncpg.DataError("synthetic COPY failure")
 
     monkeypatch.setattr(asyncpg.Connection, "copy_to_table", fail_copy)
-    async with AsyncSession(db[2]) as session, session.begin():
+    async with db.session() as session:
         with pytest.raises(RegistryAddressUnavailable, match="store_unavailable$"):
             await _apply(session, [_org()])
         assert await session.scalar(text("SELECT 1")) == 1
     assert await _counts(db) == (0, 0, 0)
 
 
-async def test_cancel_drains_real_copy_and_rolls_back_savepoint(network_batch_db, monkeypatch):
+async def test_cancel_drains_real_copy_and_rolls_back_original_transaction(network_batch_db, monkeypatch):
     db = network_batch_db
     await _seed(db, [_org()])
     copied, release = asyncio.Event(), asyncio.Event()
     original = asyncpg.Connection.copy_to_table
+    drivers = []
 
     async def pause_copy(connection, *args, **kwargs):
         result = await original(connection, *args, **kwargs)
+        drivers.append(connection)
         copied.set()
         await release.wait()
         return result
 
+    async def apply_in_original_task():
+        async with db.session() as session:
+            await _apply(session, [_org()])
+
     monkeypatch.setattr(asyncpg.Connection, "copy_to_table", pause_copy)
-    async with AsyncSession(db[2]) as session, session.begin():
-        task = asyncio.create_task(_apply(session, [_org()]))
-        try:
-            await asyncio.wait_for(copied.wait(), 5)
+    task = asyncio.create_task(apply_in_original_task())
+    try:
+        await asyncio.wait_for(copied.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert len(drivers) == 1 and drivers[0].is_closed()
+    finally:
+        release.set()
+        if not task.done():
             task.cancel()
-            await asyncio.sleep(0)
-            assert not task.done()
-            release.set()
-            with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, 5)
-            assert await session.scalar(text("SELECT 1")) == 1
-        finally:
-            release.set()
-            if not task.done():
-                task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        await asyncio.gather(task, return_exceptions=True)
     assert await _counts(db) == (0, 0, 0)
 
 
@@ -372,55 +435,76 @@ async def test_expansion_limit_rejects_before_identity_allocation(network_batch_
     organizations = [_org(f"network-{index}") for index in range(6)]
     await _seed(db, organizations)
     plans = [_plan(f"plan-{index}", [f"Organization/{org['id']}" for org in organizations]) for index in range(834)]
-    async with AsyncSession(db[2]) as session, session.begin():
+    async with db.session() as session:
         with pytest.raises(ValueError, match="expansion_limit$"):
             await _apply(session, plans)
     assert await _counts(db) == (0, 0, 0)
 
 
-async def _wait_for_advisory(connection, pid, task):
+async def _wait_for_candidate_lock(connection, pid, task):
     for _ in range(100):
-        waiting = await connection.fetchval(
-            "SELECT count(*) FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted",
+        if await connection.fetchval(
+            "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=$1 AND locktype='transactionid' AND NOT granted)",
             pid,
-        )
-        if waiting:
-            assert waiting == 1
+        ):
             assert not task.done()
             return
         await asyncio.sleep(0.01)
-    pytest.fail("source fence did not block concurrent batch")
+    pytest.fail("candidate header did not serialize concurrent batch")
 
 
-async def test_compatibility_writer_and_batch_share_source_fence(network_batch_db):
+async def test_compatibility_writer_and_batch_share_candidate_header_fence(
+    network_batch_db,
+):
     db = network_batch_db
     await _seed(db, [_org()])
-    async with AsyncSession(db[2]) as session, session.begin():
-        await _apply(session, [_org()])
-    async with AsyncSession(db[2]) as old_session, AsyncSession(db[2]) as new_session:
-        async with new_session.begin():
-            pid = await new_session.scalar(text("SELECT pg_backend_pid()"))
-            async with old_session.begin():
-                stable_id = await record_insurance_network_plan(
-                    old_session,
-                    source_id="source-one",
-                    release_id="release-one",
-                    network_resource_id="network-one",
-                    plan=_plan(),
-                )
-                task = asyncio.create_task(_apply(new_session, [_plan()]))
-                try:
-                    await _wait_for_advisory(db[0], pid, task)
-                except BaseException:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-                    raise
-            receipt = await asyncio.wait_for(task, 5)
-            assert receipt["new_identity_count"] == receipt["new_plan_evidence_count"] == 0
+    allocated, release, started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    observations_by_field = {}
+
+    async def compatibility_write():
+        async with db.session() as session:
+            observations_by_field["stable_id"] = await record_insurance_network_plan(
+                session,
+                source_id="cms-npd",
+                release_id="a" * 64,
+                network_resource_id="network-one",
+                plan=_plan(),
+            )
+            allocated.set()
+            await release.wait()
+
+    async def batch_write():
+        async with db.session() as session:
+            observations_by_field["pid"] = await session.scalar(text("SELECT pg_backend_pid()"))
+            started.set()
+            return await _apply(session, [_plan()])
+
+    first = asyncio.create_task(compatibility_write())
+    second = None
+    try:
+        await asyncio.wait_for(allocated.wait(), 5)
+        second = asyncio.create_task(batch_write())
+        await asyncio.wait_for(started.wait(), 5)
+        await _wait_for_candidate_lock(db.connection, observations_by_field["pid"], second)
+        release.set()
+        await asyncio.wait_for(first, 5)
+        receipt = await asyncio.wait_for(second, 5)
+        assert receipt["new_identity_count"] == receipt["new_plan_evidence_count"] == 0
+    finally:
+        release.set()
+        for task in (first, second):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (first, second) if task is not None),
+            return_exceptions=True,
+        )
     assert await _counts(db) == (1, 1, 1)
     assert (
-        await db[0].fetchval(f'SELECT network_id FROM "{db[1]}".provider_directory_insurance_network_source_binding')
-        == stable_id
+        await db.connection.fetchval(
+            f"SELECT network_id FROM {db.relation('provider_directory_insurance_network_source_binding')}"
+        )
+        == observations_by_field["stable_id"]
     )
 
 
@@ -428,11 +512,11 @@ async def test_fresh_compatibility_organization_allocation_is_reused(network_bat
     db = network_batch_db
     organization_dict = {**_org(), "name": "Café example"}
     await _seed(db, [organization_dict])
-    async with AsyncSession(db[2]) as session, session.begin():
+    async with db.session() as session:
         stable_id = await record_insurance_network_organization(
             session,
-            source_id="source-one",
-            release_id="release-one",
+            source_id="cms-npd",
+            release_id="a" * 64,
             organization=organization_dict,
         )
         receipt = await _apply(session, [organization_dict])
@@ -440,7 +524,9 @@ async def test_fresh_compatibility_organization_allocation_is_reused(network_bat
         assert receipt["new_identity_count"] == 0
     assert await _counts(db) == (1, 1, 0)
     assert (
-        await db[0].fetchval(f'SELECT network_id FROM "{db[1]}".provider_directory_insurance_network_source_binding')
+        await db.connection.fetchval(
+            f"SELECT network_id FROM {db.relation('provider_directory_insurance_network_source_binding')}"
+        )
         == stable_id
     )
 
@@ -456,17 +542,18 @@ async def test_constraint_failure_rolls_back_already_inserted_identities(network
             "NULL::jsonb",
         ),
     )
-    async with AsyncSession(db[2]) as session, session.begin():
-        await session.execute(text(f'UPDATE "{db[1]}".registry_revision_control SET draft_revision=7 WHERE id=1'))
+    async with db.session() as session:
+        await session.execute(text("CREATE TEMP TABLE preserved_caller_work(value integer) ON COMMIT DROP"))
+        await session.execute(text("INSERT INTO preserved_caller_work VALUES(7)"))
         with pytest.raises(RegistryAddressUnavailable, match="store_unavailable$"):
             await _apply(session, [_plan()])
-        assert await session.scalar(text("SELECT 1")) == 1
+        assert await session.scalar(text("SELECT value FROM preserved_caller_work")) == 7
     assert await _counts(db) == (0, 0, 0)
-    assert await db[0].fetchval(f'SELECT draft_revision FROM "{db[1]}".registry_revision_control') == 7
 
 
 @pytest.mark.parametrize(
-    "resources", [[], [_org()] * 1001, (_org(),), [{"value": float("nan")}], [{"value": "\ud800"}]]
+    "resources",
+    [[], [_org()] * 1001, (_org(),), [{"value": float("nan")}], [{"value": "\ud800"}]],
 )
 async def test_envelope_rejects_unbounded_or_non_json_input(resources):
     with pytest.raises(ValueError, match="batch_invalid$"):
@@ -527,7 +614,7 @@ async def test_native_last_row_validation_precedes_copy(network_batch_db, monkey
         pytest.fail("invalid native batch reached COPY")
 
     monkeypatch.setattr(asyncpg.Connection, "copy_to_table", unexpected_copy)
-    async with AsyncSession(network_batch_db[2]) as session, session.begin():
+    async with network_batch_db.session() as session:
         with pytest.raises(ValueError, match="batch_invalid$"):
             await _apply(session, [_org(), resource])
     assert await _counts(network_batch_db) == (0, 0, 0)

@@ -10,7 +10,6 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
-from process import provider_directory_cms_publication as publication
 from process import provider_directory_profile_initial as initial
 from process import provider_directory_profile_initial_contract as contract
 from process import provider_directory_profile_selection as selection
@@ -99,9 +98,6 @@ async def _publish_census(database, admission, stages, composite, observations_b
             observations_by_field["live_timeout_ms"] = (await fhir._profile_capacity_observed_settings())[
                 "statement_timeout_ms"
             ]
-            await publication._lock_live_swap_relations(
-                fhir, database._transaction_binding().session, SimpleNamespace(stages=stages), None, None
-            )
             assert (
                 await database.scalar(
                     "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid=l.relation "

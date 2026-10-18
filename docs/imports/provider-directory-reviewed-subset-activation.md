@@ -49,6 +49,12 @@ not enable activation or publication.
 
 ## Run the one-shot sync
 
+Run these command parsers through a trusted launcher that binds the issued SOURCE
+transaction factory through `operation_runner`. Standalone execution does not
+infer publisher authority from an ordinary database session. Each mutation gate
+is checked before the launcher opens credentials; evidence rendering stays
+read-only under the same issued custody.
+
 Use the exact deployed image in a one-shot Job with no source or dataset
 selectors. The gate is absent from shared API, worker, scheduler, ConfigMap,
 and Secret configuration and is enabled only for this Job:

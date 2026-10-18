@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
-
 from dataclasses import fields
 from datetime import date
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -91,9 +90,7 @@ def test_publication_store_support_rejects_schema_and_row_drift(monkeypatch) -> 
     monkeypatch.delenv("DB_SCHEMA", raising=False)
     assert support.publication_table("dataset") == '"mrf"."dataset"'
     assert support.publication_row_fields(None) == {}
-    assert support.publication_row_fields(SimpleNamespace(_mapping={"id": 1})) == {
-        "id": 1
-    }
+    assert support.publication_row_fields(SimpleNamespace(_mapping={"id": 1})) == {"id": 1}
     with pytest.raises(ProviderDirectoryRootedGraphPublicationError):
         support.publication_row_fields(object())
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "runtime")
@@ -281,9 +278,7 @@ async def test_materialize_publish_pipeline_proves_counts_and_readiness(
     monkeypatch.setattr(store, "_assert_no_orphan_parent", _no_op)
     monkeypatch.setattr(store, "_insert_headers", _no_op)
     monkeypatch.setattr(store, "prepare_dataset_candidate", _candidate_scope)
-    monkeypatch.setattr(
-        store, "build_provider_directory_dataset_serving_relations", _no_op
-    )
+    monkeypatch.setattr(store, "build_provider_directory_dataset_serving_relations", _no_op)
     monkeypatch.setattr(store, "_validate_and_publish", _no_op)
 
     async def preflight(*_arguments):
@@ -308,9 +303,7 @@ async def test_materialize_publish_pipeline_proves_counts_and_readiness(
         current,
         64,
     )
-    assert publication_result == ProviderDirectoryRootedGraphPublicationResult(
-        ready, False
-    )
+    assert publication_result == ProviderDirectoryRootedGraphPublicationResult(ready, False)
 
 
 @pytest.mark.asyncio
@@ -324,18 +317,14 @@ async def test_materialize_publish_pipeline_rejects_unproved_outputs(
     monkeypatch.setattr(store, "_assert_no_orphan_parent", _no_op)
     monkeypatch.setattr(store, "_insert_headers", _no_op)
     monkeypatch.setattr(store, "prepare_dataset_candidate", _candidate_scope)
-    monkeypatch.setattr(
-        store, "build_provider_directory_dataset_serving_relations", _no_op
-    )
+    monkeypatch.setattr(store, "build_provider_directory_dataset_serving_relations", _no_op)
     monkeypatch.setattr(store, "_validate_and_publish", _no_op)
 
     async def preflight(*_arguments):
         return counts_by_resource_type
 
     async def mismatched(*_arguments, **_keywords):
-        return ProviderDirectoryRootedGraphMaterialization(
-            {**counts_by_resource_type, "Organization": 1}
-        )
+        return ProviderDirectoryRootedGraphMaterialization({**counts_by_resource_type, "Organization": 1})
 
     monkeypatch.setattr(store, "_preflight_counts", preflight)
     monkeypatch.setattr(
@@ -406,13 +395,22 @@ async def test_locked_result_handles_replay_drift_and_new_publication(
         return expected
 
     monkeypatch.setattr(store, "_materialize_and_publish", publish)
-    assert (
-        await store._locked_publication_result(object(), "acquisition", 64) == expected
-    )
+    assert await store._locked_publication_result(object(), "acquisition", 64) == expected
 
 
 @pytest.mark.asyncio
 async def test_public_store_validates_batch_and_maps_shared_errors(monkeypatch) -> None:
+    from process import provider_directory_generic_source_adapters as adapters
+    from process import provider_directory_generic_source_policy as policy
+
+    @asynccontextmanager
+    async def transaction(database, **_coordinates):
+        async with database.transaction():
+            yield
+
+    monkeypatch.setattr(adapters, "require_source_transaction", lambda **_coordinates: None)
+    monkeypatch.setattr(policy, "source_transaction", transaction)
+    monkeypatch.setattr(policy, "source_owner_transaction", transaction)
     for invalid_batch in (False, 0, 4097):
         with pytest.raises(ValueError, match="batch_size_invalid"):
             await store.publish_admitted_rooted_graph_dataset(

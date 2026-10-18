@@ -12,9 +12,11 @@ from process.network_membership_candidate_lifecycle import _locked_candidate
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_publication import (
     NetworkPublicationError,
+    _candidate_custody,
     _lock_publication_controls,
     _publication_readiness,
     _retained_manifest,
+    _verify_provider_custody,
     publish_network_candidate,
 )
 from process.network_membership_serving_indexes import (
@@ -75,18 +77,28 @@ async def _close_raw_phase(connection, copy_target, roles_by_group, control_sche
         await _retain_closure(connection, copy_target, control_schema, closure)
 
 
-async def _prepare_phase(connection, copy_target, source, roles_by_group, control_schema):
-    async with connection.transaction():
+def _require_configured_writer_roles(roles_by_group, closure):
+    if any(closure[field] != expected for field, expected in _role_names(**roles_by_group).items()):
+        raise NetworkMembershipPipelineError("Configured writer roles differ from retained closure")
+
+
+async def _prepare_phase(connection, copy_target, address_source, roles_by_group, control_schema):
+    async with connection.transaction(isolation="repeatable_read"):
         candidate = await _locked_candidate(connection, copy_target, _identifier(control_schema))
         if candidate["state"] == "published":
             return
         if candidate["state"] == "ready":
-            _validated_replay(candidate, _scope_report(candidate, source))
-            _publication_readiness(candidate)
+            _validated_replay(candidate, _scope_report(candidate, address_source))
+            readiness = _publication_readiness(candidate)
+            if await _candidate_custody(connection, candidate, control_schema) is not None:
+                _require_configured_writer_roles(roles_by_group, readiness[3])
+                return
             await verify_network_candidate_writer_closure(
                 connection, copy_target, **roles_by_group, control_schema=control_schema
             )
-            await prepare_network_serving_indexes(connection, copy_target, source, control_schema=control_schema)
+            await prepare_network_serving_indexes(
+                connection, copy_target, address_source, control_schema=control_schema
+            )
             return
         if candidate["state"] not in ("sealed", "validated"):
             raise NetworkMembershipPipelineError("Candidate state changed before preparation")
@@ -94,10 +106,12 @@ async def _prepare_phase(connection, copy_target, source, roles_by_group, contro
             "SELECT pg_has_role(current_user,$1::name,'USAGE')", roles_by_group["owner_role"]
         ):
             raise NetworkMembershipPipelineError("Publisher must inherit protected ownership for native preparation")
-        await validate_network_membership_candidate(connection, copy_target, source, control_schema=control_schema)
-        await project_network_address_arrays(connection, copy_target, source, control_schema=control_schema)
-        await prepare_network_candidate_indexes(connection, copy_target, source, control_schema=control_schema)
-        await prepare_network_serving_indexes(connection, copy_target, source, control_schema=control_schema)
+        await validate_network_membership_candidate(
+            connection, copy_target, address_source, control_schema=control_schema
+        )
+        await project_network_address_arrays(connection, copy_target, address_source, control_schema=control_schema)
+        await prepare_network_candidate_indexes(connection, copy_target, address_source, control_schema=control_schema)
+        await prepare_network_serving_indexes(connection, copy_target, address_source, control_schema=control_schema)
         final_closure = await freeze_network_candidate_writers(
             connection, copy_target, **roles_by_group, control_schema=control_schema
         )
@@ -105,7 +119,7 @@ async def _prepare_phase(connection, copy_target, source, roles_by_group, contro
 
 
 async def _publish_phase(connection, copy_target, roles_by_group, control_schema):
-    async with connection.transaction():
+    async with connection.transaction(isolation="repeatable_read"):
         namespace = _identifier(control_schema)
         approved_revision, current_head = await _lock_publication_controls(connection, namespace)
         candidate = await _locked_candidate(connection, copy_target, namespace)
@@ -117,10 +131,13 @@ async def _publish_phase(connection, copy_target, roles_by_group, control_schema
             raise NetworkPublicationError("Approved custom revision changed before publication")
         if current_head != candidate["expected_head"]:
             raise NetworkPublicationError("Expected serving head changed before publication")
-        closure = await freeze_network_candidate_writers(
-            connection, copy_target, **roles_by_group, control_schema=control_schema
-        )
-        await _retain_closure(connection, copy_target, control_schema, closure)
+        if await _candidate_custody(connection, candidate, control_schema) is not None:
+            _require_configured_writer_roles(roles_by_group, _publication_readiness(candidate)[3])
+        else:
+            closure = await freeze_network_candidate_writers(
+                connection, copy_target, **roles_by_group, control_schema=control_schema
+            )
+            await _retain_closure(connection, copy_target, control_schema, closure)
         return await publish_network_candidate(connection, copy_target, control_schema=control_schema)
 
 
@@ -131,9 +148,9 @@ async def _published_replay(connection, copy_target, address_source, roles_by_gr
             raise NetworkMembershipPipelineError("Candidate is not published for retained replay")
         _validated_replay(candidate, _scope_report(candidate, address_source))
         readiness = _publication_readiness(candidate)
-        configured_roles = _role_names(**roles_by_group)
-        if any(readiness[3][field] != expected for field, expected in configured_roles.items()):
-            raise NetworkMembershipPipelineError("Configured writer roles differ from retained closure")
+        custody = await _candidate_custody(connection, candidate, control_schema)
+        await _verify_provider_custody(connection, candidate, readiness[3])
+        _require_configured_writer_roles(roles_by_group, readiness[3])
         manifest = await connection.fetchrow(
             f"SELECT * FROM {_identifier(control_schema)}.network_serving_manifest WHERE candidate_id=$1",
             UUID(copy_target.candidate_id),
@@ -145,7 +162,9 @@ async def _published_replay(connection, copy_target, address_source, roles_by_gr
         )
         if entry is None:
             raise NetworkMembershipPipelineError("Published candidate is not physically retained")
-        _pinned_manifest(entry)
+        _pinned_manifest(entry, custody=custody)
+        if custody is not None:
+            return _retained_manifest(manifest, readiness, replayed=True)
         await _matching_inputs(connection, candidate, copy_target, address_source, control_schema)
         await _source_semantics(
             connection,
@@ -193,9 +212,11 @@ async def prepare_network_candidate(
 
 
 async def prepare_and_publish_network_candidate(
-    connection, copy_target, source, *, owner_role, loader_roles, reader_roles, control_schema=None
+    connection, copy_target, source, *, owner_role, loader_roles, reader_roles, control_schema=None, seal_candidate=None
 ):
-    """Commit isolated preparation, then publish with the existing short atomic CAS."""
+    """Commit preparation, optionally seal under separate authority, then publish."""
+    if seal_candidate is not None and not callable(seal_candidate):
+        raise NetworkMembershipPipelineError("Candidate seal callback must be callable")
     roles_by_group = {"owner_role": owner_role, "loader_roles": loader_roles, "reader_roles": reader_roles}
     schema_name = control_schema if control_schema is not None else registry_schema()
     candidate = await prepare_network_candidate(
@@ -203,6 +224,8 @@ async def prepare_and_publish_network_candidate(
     )
     if candidate["state"] == "published":
         return await _published_replay(connection, copy_target, source, roles_by_group, schema_name)
+    if seal_candidate is not None:
+        await seal_candidate(copy_target)
     manifest = await _publish_phase(connection, copy_target, roles_by_group, schema_name)
     return (
         manifest

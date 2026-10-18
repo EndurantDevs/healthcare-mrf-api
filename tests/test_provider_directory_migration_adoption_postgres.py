@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import re
 import subprocess
@@ -14,6 +15,8 @@ from uuid import uuid4
 import asyncpg
 import pytest
 import sqlalchemy as sa
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -119,6 +122,10 @@ async def main():
         def seed(sync_connection):
             models_by_table = _model_by_table_fullname()
             future_strict_tables = {
+                "provider_directory_dataset_resource",
+                "provider_directory_dataset_insurance_plan",
+                "provider_directory_dataset_network_plan",
+                "provider_directory_dataset_affiliation_organization",
                 "provider_directory_organization_identity",
                 "provider_directory_site_identity",
                 "provider_directory_entity_source_binding",
@@ -178,6 +185,9 @@ async def main():
                 model = models_by_table.get(table.fullname)
                 if model is not None:
                     _ensure_indexes(sync_connection, inspector, table, model, summary)
+            header = next(table for table in target_tables if table.name == "provider_directory_endpoint_dataset")
+            header_sql = sync_connection.dialect.identifier_preparer.format_table(header)
+            sync_connection.exec_driver_sql(f"ALTER TABLE {header_sql} DROP COLUMN candidate_storage_json")
 
         await connection.run_sync(seed)
     await db.disconnect()
@@ -443,6 +453,63 @@ def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
         asyncio.run(_assert_adopted_schema(url, ADOPTION_SCHEMA))
     finally:
         asyncio.run(drop_adoption_schema())
+
+
+def test_membership_idempotency_index_creation_adoption_and_drift_refusal(monkeypatch):
+    """Preserve matching runtime indexes and refuse a conflicting definition."""
+    url = _database_url()
+    schema = "membership_index_adoption_" + uuid4().hex
+    path = ROOT / "alembic" / "versions" / "20261021110000_ptg_membership_import_idempotency.py"
+    spec = importlib.util.spec_from_file_location("membership_index_adoption_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    monkeypatch.setenv("DB_SCHEMA", schema)
+    index = "import_run_ptg_membership_idempotency_idx"
+
+    async def exercise():
+        engine = create_async_engine(url.set(drivername="postgresql+asyncpg"))
+        has_created_schema = False
+
+        def upgrade(connection):
+            monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(connection)))
+            migration.upgrade()
+
+        async def index_oid(connection):
+            return await connection.scalar(sa.text("SELECT to_regclass(:name)::oid"), {"name": f'"{schema}".{index}'})
+
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+                await connection.execute(
+                    sa.text(f'CREATE TABLE "{schema}".import_run (importer text,idempotency_key text)')
+                )
+            has_created_schema = True
+            async with engine.begin() as connection:
+                await connection.run_sync(upgrade)
+                oid = await index_oid(connection)
+                assert oid is not None
+            async with engine.begin() as connection:
+                await connection.run_sync(upgrade)
+                assert await index_oid(connection) == oid
+                await connection.execute(sa.text(f'DROP INDEX "{schema}".{index}'))
+                await connection.execute(sa.text(f'CREATE INDEX {index} ON "{schema}".import_run (idempotency_key)'))
+                wrong_oid = await index_oid(connection)
+                assert wrong_oid is not None
+            with pytest.raises(RuntimeError, match="existing_schema_index_mismatch"):
+                async with engine.begin() as connection:
+                    await connection.run_sync(upgrade)
+            async with engine.connect() as connection:
+                assert await index_oid(connection) == wrong_oid
+        finally:
+            try:
+                if has_created_schema:
+                    async with engine.begin() as connection:
+                        await connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+            finally:
+                await engine.dispose()
+
+    asyncio.run(exercise())
 
 
 def test_reviewed_cms_payer_contract_in_database_lane(monkeypatch):

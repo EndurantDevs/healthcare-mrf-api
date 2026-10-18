@@ -9,6 +9,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from process import code_sets_result_archive as codes
+from process import ms_drg_result_generation as drg
 from process import reference_family_archive as native
 
 
@@ -97,6 +99,9 @@ async def catalog_actors(engine, owned_schemas):
 
 async def seal_catalog(resources, schema, models, generation_table):
     """Transfer a registered fixture family, then run the actual publisher custody guard."""
+    importer = {codes.TABLE: "code-sets", drg.TABLE: "ms-drg"}.get(generation_table)
+    if importer is None:
+        raise ValueError("unsupported scoped catalog generation table")
     owner = resources.roles["owner"]
     builder = resources.roles["builder"]
     publisher = resources.roles["publisher"]
@@ -111,6 +116,7 @@ async def seal_catalog(resources, schema, models, generation_table):
             await connection.execute(text(f'GRANT SELECT ON "{schema}"."{name}" TO "{builder}"'))
     async with resources.publisher.begin() as session:
         ownership = SimpleNamespace(
+            importer_id=importer,
             schema_name=schema,
             schema_oid=await native._schema_oid(session, schema),
             relation_oids=tuple([(name, await native._relation_oid(session, schema, name)) for name in names]),

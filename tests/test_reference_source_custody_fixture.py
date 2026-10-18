@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.engine import make_url
 
 from process import reference_family_archive as archive
 from tests.reference_family_generation_fixture import ReferenceSourceCustody
@@ -19,7 +20,7 @@ from tests.reference_family_generation_fixture import ReferenceSourceCustody
     [
         ("cms_doctors_archive", 2, 1),
         ("tiger_result_archive", 1, 1),
-        ("tiger_captured_epoch", 2, 1),
+        ("tiger_captured_epoch", 2, 2),
         ("tiger_snapshot_inheritance", 1, 0),
         ("label_archive", 1, 1),
     ],
@@ -44,7 +45,7 @@ def test_native_fixture_clone_and_export_calls_keep_custody(module_name, expecte
 
 
 @pytest.mark.asyncio
-async def test_readable_archive_uses_retained_owner_for_activation(monkeypatch):
+async def test_readable_archive_uses_retained_owner_for_activation(monkeypatch, tmp_path):
     """Reader cutover must validate the closed owner, not the bootstrap session's identity."""
     from tests import test_cms_doctors_archive_postgres as fixture
 
@@ -62,23 +63,37 @@ async def test_readable_archive_uses_retained_owner_for_activation(monkeypatch):
         yield session
 
     session.begin = transaction
-    observed = SimpleNamespace(database=SimpleNamespace(session_factory=transaction), schema="synthetic")
+    observed = SimpleNamespace(
+        database=SimpleNamespace(transaction=transaction),
+        component=SimpleNamespace(retained_sessions=transaction),
+        schema="synthetic",
+    )
 
     async def prepare(_sessions, **options):
+        assert _sessions is observed.component.retained_sessions
         assert options["source_copy"] is custody.source_copy
         assert options["on_precreated"] == custody.precreate
         await options["on_prepared"](session, prepared)
         return prepared
 
+    async def restore(sessions, actual, path, retained_custody, component):
+        assert sessions is observed.component.retained_sessions and actual is prepared
+        assert path == tmp_path / "readable.dump" and retained_custody is custody and component is observed.component
+        await retained_custody.verify(session, actual)
+        return ownership
+
     monkeypatch.setattr(fixture, "_create_source", AsyncMock())
+    monkeypatch.setattr(fixture, "_restore_retained_archive", restore)
     monkeypatch.setattr(archive, "prepare_reference_family_archive_source", prepare)
     monkeypatch.setattr(archive, "capture_reference_family_incumbent", AsyncMock())
     validate = AsyncMock()
     monkeypatch.setattr(archive, "prepare_reference_family_activation", validate)
-    activation_by_field = await fixture._prepare_readable_archive(observed, ownership.dataset_id, custody)
+    owner = AsyncMock(return_value=712)
+    monkeypatch.setattr(archive, "model_family_publisher_owner", owner)
+    activation_by_field = await fixture._prepare_readable_archive(observed, ownership.dataset_id, custody, tmp_path)
     custody.retain.assert_awaited_once_with(session, prepared)
     custody.verify.assert_awaited_once_with(session, prepared)
-    assert session.scalar.call_args.args[1] == {"owner": custody.owner}
+    owner.assert_awaited_once_with(session, "cms-doctors")
     assert validate.call_args.kwargs["sealed_owner_oid"] == 712
     assert (
         activation_by_field["cutover"].sealed_owner_oid
@@ -104,12 +119,7 @@ async def test_clinician_fixture_drains_owner_and_engine_after_failure(monkeypat
         if cleanup_fails:
             raise RuntimeError("synthetic cleanup failure")
 
-    @asynccontextmanager
-    async def custody_context(_sessions):
-        try:
-            yield ReferenceSourceCustody("synthetic_owner", ())
-        finally:
-            events.append("owner")
+    custody = Mock(side_effect=AssertionError("custody entered before Source preparation"))
 
     @asynccontextmanager
     async def transaction():
@@ -119,7 +129,7 @@ async def test_clinician_fixture_drains_owner_and_engine_after_failure(monkeypat
     monkeypatch.setattr(fixture, "_database_url", lambda: "postgresql+asyncpg://localhost/unused")
     monkeypatch.setattr(fixture, "create_async_engine", lambda *_args: engine)
     monkeypatch.setattr(fixture, "async_sessionmaker", lambda *_args, **_kwargs: transaction)
-    monkeypatch.setattr(fixture, "native_reference_source", custody_context)
+    monkeypatch.setattr(fixture, "native_reference_source", custody)
     monkeypatch.setattr(fixture, "_drop_test_schemas", drop_schemas)
     monkeypatch.setattr(fixture, "_create_source", fail_source)
     with pytest.raises(RuntimeError, match="synthetic .* failure"):
@@ -128,37 +138,39 @@ async def test_clinician_fixture_drains_owner_and_engine_after_failure(monkeypat
                 monkeypatch, tmp_path, True
             )
         elif case == "continuous":
-            await fixture.test_validated_archive_completes_with_continuous_snapshot_readers(monkeypatch)
+            await fixture.test_validated_archive_completes_with_continuous_snapshot_readers(monkeypatch, tmp_path)
         else:
-            await fixture.test_archive_activation_preserves_late_readers(monkeypatch, True)
-    assert events == (["schemas", "owner", "engine"] if case == "roundtrip" else ["schemas", "engine"])
+            await fixture.test_archive_activation_preserves_late_readers(monkeypatch, True, tmp_path)
+    assert events == ["schemas", "engine"]
+    custody.assert_not_called()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 @pytest.mark.parametrize("clone_fails", [False, True])
 async def test_readable_archive_admits_reader_before_custody_and_drains_after_failure(
-    monkeypatch, cleanup_fails, clone_fails
+    monkeypatch, tmp_path, cleanup_fails, clone_fails
 ):
     """Stage grants disappear before owner and Reader removal; current schema retires last."""
     from tests import test_cms_doctors_archive_postgres as fixture
 
     events = []
     dataset_id = uuid4()
-    observed = SimpleNamespace(engine=object(), schema="synthetic", database=SimpleNamespace())
+    observed = SimpleNamespace(
+        engine=SimpleNamespace(url=make_url("postgresql+asyncpg://synthetic@localhost/example")),
+        schema="synthetic",
+        database=object(),
+    )
 
     @asynccontextmanager
     async def transaction():
         yield SimpleNamespace(begin=transaction)
 
-    async def create_source(_session, schema):
-        assert schema == observed.schema
-        events.append("source")
+    component_context, custody_context = _readable_authority_contexts(observed, events, transaction)
 
-    reader_context, custody_context = _readable_authority_contexts(observed, events, transaction)
-
-    async def prepare_clone(actual, identity, custody):
+    async def prepare_clone(actual, identity, custody, archive_path):
         assert actual is observed and identity == dataset_id and custody.readers == ("synthetic_reader",)
+        assert archive_path is tmp_path
         events.append("clone")
         if clone_fails:
             raise RuntimeError("synthetic clone failure")
@@ -176,9 +188,7 @@ async def test_readable_archive_admits_reader_before_custody_and_drains_after_fa
             if cleanup_fails:
                 raise RuntimeError("synthetic cleanup failure")
 
-    observed.database.session_factory = transaction
-    monkeypatch.setattr(fixture, "_create_source", create_source)
-    monkeypatch.setattr(fixture, "profile_reader", reader_context)
+    monkeypatch.setattr(fixture, "_archive_source", component_context)
     monkeypatch.setattr(fixture, "native_reference_source", custody_context)
     monkeypatch.setattr(fixture, "_prepare_readable_archive", prepare_clone)
     monkeypatch.setattr(fixture, "_drop_test_schemas", drop_schemas)
@@ -188,7 +198,7 @@ async def test_readable_archive_admits_reader_before_custody_and_drains_after_fa
     with pytest.raises(RuntimeError, match="synthetic .* failure"):
         async with AsyncExitStack() as cleanup:
             cleanup.push_async_callback(AsyncMock(side_effect=lambda: events.append("engine_cleanup")))
-            async with fixture._readable_archive(observed, dataset_id, monkeypatch) as prepared:
+            async with fixture._readable_archive(observed, dataset_id, monkeypatch, tmp_path) as prepared:
                 assert not clone_fails and prepared == "prepared"
                 raise RuntimeError("synthetic caller failure")
     assert ",".join(events) == (
@@ -216,29 +226,40 @@ async def test_promoted_reader_fixture_cleanup_retires_only_declared_payloads():
 
 
 def _readable_authority_contexts(observed, events, transaction):
-    """Bind the mocked authority contexts to the exact Reader admitted after source creation."""
+    """Admit the component Reader before custody and unwind it after owned stage cleanup."""
+    database = SimpleNamespace(
+        session_factory=transaction,
+        _connect_reader=AsyncMock(side_effect=lambda: events.append("reader")),
+    )
 
     @asynccontextmanager
-    async def reader_context(database, schema, _patch):
-        assert events == ["source"] and schema == observed.schema
-        database._reader_database = SimpleNamespace(_reader_login=("synthetic_reader", "unused"))
-        events.append("reader")
+    async def component_context(engine, schema, _patch):
+        assert engine is observed.engine and schema == observed.schema and events == []
+        events.append("source")
         try:
-            yield
+            yield SimpleNamespace(
+                database=database,
+                reader="synthetic_reader",
+                owner="synthetic_owner",
+                publisher="synthetic_publisher",
+                retention_owner="synthetic_owner",
+                retained_sessions=transaction,
+            )
         finally:
+            database._connect_reader.assert_awaited_once()
             events.append("reader_cleanup")
 
     @asynccontextmanager
-    async def custody_context(sessions, *, readers):
-        assert sessions is transaction and readers == ("synthetic_reader",)
-        assert events == ["source", "reader"]
+    async def custody_context(sessions, *, readers, owner):
+        assert sessions is transaction and readers == ("synthetic_reader",) and owner == "synthetic_owner"
+        assert observed.database is database and events == ["source", "reader"]
         events.append("custody")
         try:
-            yield ReferenceSourceCustody("synthetic_owner", readers)
+            yield ReferenceSourceCustody(owner, readers)
         finally:
             events.append("owner_cleanup")
 
-    return reader_context, custody_context
+    return component_context, custody_context
 
 
 def _ownership():

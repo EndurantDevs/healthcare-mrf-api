@@ -214,3 +214,11 @@ async def test_choices_expired_budget_refuses_before_any_session():
     )
     with pytest.raises(engine.RegistryPTGScopeDeadlineExpired):
         await service.choices(envelope(), deadline=asyncio.get_running_loop().time() - 1)
+
+
+@pytest.fixture(autouse=True)
+def legacy_source_discriminator(monkeypatch):
+    """Keep existing negotiated/frozen fixture focus; allowed discovery has separate coverage."""
+    from process import registry_ptg_allowed_plan_source
+
+    monkeypatch.setattr(registry_ptg_allowed_plan_source, "is_allowed_snapshot", AsyncMock(return_value=False))

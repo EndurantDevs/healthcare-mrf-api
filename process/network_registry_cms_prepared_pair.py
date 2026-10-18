@@ -16,7 +16,6 @@ from process.network_approved_source_bindings import RegistryNetworkSourceCoordi
 from process.network_cms_registry_address_capture import address_clone_identity, native_driver
 from process.network_cms_registry_source_pair import (
     _CMS_FIELDS,
-    _COMMENT,
     RegistryCMSPublicationProof,
     RegistryCMSRetainedSourcePair,
     _digest,
@@ -31,6 +30,7 @@ from process.network_fhir_source_epoch import (
     MAX_COPY_BATCH_BYTES,
     MAX_COPY_BATCH_ROWS,
     capture_retained_cms_fhir_source_epoch,
+    capture_source_cms_fhir_source_epoch,
     require_retained_cms_fhir_source_epoch,
 )
 from process.network_registry_cms_prepared_address import prepare_retained_registry_address, prepared_address_stages
@@ -251,8 +251,17 @@ class RegistryCMSRawEpochAdmission:
             self._next_index += 1
         return indexes
 
-    async def capture(self, capture_id, owner_role, runtime_roles):
+    async def capture(self, capture_id, owner_role, runtime_roles, source_input=None):
         """Retain the exact admitted raw tables through this batch accounting."""
+        if source_input is not None:
+            return await capture_source_cms_fhir_source_epoch(
+                self.connection,
+                source_input,
+                epoch_id=capture_id,
+                owner_role=owner_role,
+                runtime_roles=runtime_roles,
+                copy_admission=self,
+            )
         return await capture_retained_cms_fhir_source_epoch(
             self.connection,
             self.request.source_pin,
@@ -290,10 +299,13 @@ class RegistryCMSRawEpochAdmission:
             )
         else:
             await admission.assert_external_relation(
-                self.prepared.fhir, schema, logical, oid, raw_relation=raw_relation
+                self.prepared.fhir,
+                schema,
+                logical,
+                oid,
+                raw_relation=raw_relation,
+                require_ready=phase in {"after_copy_batch", "after_insert", "after_index"},
             )
-        if phase in {"after_copy_batch", "after_insert", "after_index"}:
-            await admission.assert_ready(self.prepared.fhir, schema)
         await _assert_retained_bounds(self.connection, self.prepared, self.request, self.before_bytes, self.wal_start)
 
 
@@ -323,6 +335,8 @@ async def prepare_registry_cms_source_pair(
     source_attempt=None,
 ):
     """Prepare closed native copies before the owner resumes its Profile WAL meter."""
+    from process.provider_directory_cms_nonprofile_observation import retained_nonprofile_observations
+
     _validate_preparation_request(request, capture_id, owner_role, runtime_roles)
     before_bytes = await _retention_admission(prepared, address_factory, request, capture_id, owner_role, runtime_roles)
     if source_attempt is not None and (
@@ -332,40 +346,87 @@ async def prepare_registry_cms_source_pair(
     prepared_address_stages(prepared.address)
     previous_registered_relations = set(prepared.nonprofile_admission._external_relations)
     try:
-        async with _retention_transaction(prepared.fhir, source_session_factory, capture_id=capture_id) as session:
+        async with (
+            _source_epoch_input(prepared.fhir, request) as source_input,
+            _prepared_address_input(prepared, source_input) as address_input,
+            _retention_transaction(prepared.fhir, source_session_factory, capture_id=capture_id) as session,
+        ):
             await _limit_retention_sql(session, prepared)
             await _normalize_receipt_session(session, request.source_pin.schema_name)
-            connection = await native_driver(session)
-            copy_admission = await _raw_copy_admission(prepared, request, connection, before_bytes)
-            wal_start = copy_admission.wal_start
-            epoch = await copy_admission.capture(capture_id, owner_role, runtime_roles)
-            ownership, receipt, catalog, stages = await prepare_retained_registry_address(
-                session, prepared, capture_id=capture_id, owner_role=owner_role, runtime_roles=runtime_roles
-            )
-            admission = prepared.nonprofile_admission
-            retained = PreparedRegistryCMSSourcePair(
-                request,
-                RegistrySourceMembershipRecipe(
-                    replace(request.source_pin, retained_epoch=epoch), request.binding_coordinates
-                ),
-                ownership,
-                receipt,
-                catalog,
-                stages,
-                owner_role,
-                runtime_roles,
-                admission.plan.capacity_geometry_hash,
-                admission.lease.lease_digest,
-                admission.plan.native_address_input_hash,
-                source_attempt,
-            )
-            await _stamp_prepared(connection, retained)
-            await admission.assert_ready(prepared.fhir, prepared.address.db_schema)
-            await _assert_retained_bounds(connection, prepared, request, before_bytes, wal_start)
+            async with retained_nonprofile_observations(prepared, source_input, address_input, session):
+                connection = await native_driver(session)
+                copy_admission = await _raw_copy_admission(prepared, request, connection, before_bytes)
+                wal_start = copy_admission.wal_start
+                epoch = await copy_admission.capture(capture_id, owner_role, runtime_roles, source_input)
+                address_copy = await prepare_retained_registry_address(
+                    session,
+                    prepared,
+                    capture_id=capture_id,
+                    owner_role=owner_role,
+                    runtime_roles=runtime_roles,
+                    **({"source_input": address_input} if address_input is not None else {}),
+                )
+                if address_input is not None:
+                    address_input.require_complete()
+                retained = _prepared_from_copies(
+                    prepared, request, epoch, address_copy, (owner_role, runtime_roles), source_attempt
+                )
+                await _stamp_prepared(connection, retained)
+                await prepared.nonprofile_admission.assert_ready(prepared.fhir, prepared.address.db_schema)
+                await _assert_retained_bounds(connection, prepared, request, before_bytes, wal_start)
         return retained
     except BaseException:
         await drain_operation(_retire_rolled_back(prepared, previous_registered_relations), preserve_cancellation=True)
         raise
+
+
+def _prepared_from_copies(prepared, request, epoch, address_copy, roles, source_attempt):
+    """Keep the existing immutable pair fields behind the two complete native copies."""
+    ownership, receipt, catalog, stages = address_copy
+    owner_role, runtime_roles = roles
+    admission = prepared.nonprofile_admission
+    return PreparedRegistryCMSSourcePair(
+        request,
+        RegistrySourceMembershipRecipe(replace(request.source_pin, retained_epoch=epoch), request.binding_coordinates),
+        ownership,
+        receipt,
+        catalog,
+        stages,
+        owner_role,
+        runtime_roles,
+        admission.plan.capacity_geometry_hash,
+        admission.lease.lease_digest,
+        admission.plan.native_address_input_hash,
+        source_attempt,
+    )
+
+
+@asynccontextmanager
+async def _prepared_address_input(prepared, source_input):
+    if source_input is None:
+        yield None
+        return
+    from process.network_registry_cms_prepared_address_pin import pinned_prepared_registry_address
+
+    async with pinned_prepared_registry_address(prepared, source_input) as address_input:
+        yield address_input
+
+
+@asynccontextmanager
+async def _source_epoch_input(fhir, request):
+    from process.network_fhir_source_epoch_pin import pinned_cms_source_epoch
+    from process.provider_directory_generic_source_policy import is_source_storage_required
+
+    if not is_source_storage_required():
+        yield None
+        return
+    async with pinned_cms_source_epoch(
+        fhir,
+        request.source_pin,
+        expected_admission_sha256=request.expected_admission_sha256,
+        expected_metadata_sha256=request.expected_metadata_sha256,
+    ) as source_input:
+        yield source_input
 
 
 @asynccontextmanager
@@ -500,16 +561,20 @@ async def _require_retained_authority(connection, prepared_pair, payload):
 
 async def bind_prepared_registry_cms_source_pair(session, prepared_pair, *, receipt_id, receipt_payload):
     """Bind a closed preparation to the actual own-transaction native receipt."""
+    if type(prepared_pair) is not PreparedRegistryCMSSourcePair:
+        raise ValueError("registry_cms_prepared_pair_invalid")
+    await serving.require_registry_receipt_owner(session, prepared_pair.request.source_pin.schema_name)
     connection = await _require_prepared_pair(session, prepared_pair)
     request = prepared_pair.request
     namespace = _identifier(request.source_pin.schema_name)
     receipt_row = await connection.fetchrow(
-        f"SELECT payload::text,publication_xid::text,profile_generation_id FROM {namespace}.provider_directory_cms_serving_receipt WHERE receipt_id=$1 AND publication_xid=pg_current_xact_id()",
+        f"SELECT receipt_id,payload::text,publication_xid::text,profile_generation_id,registry_source_pair_json::text FROM {namespace}.provider_directory_cms_serving_receipt WHERE receipt_id=$1 AND publication_xid=pg_current_xact_id()",
         receipt_id,
     )
     publication_document = serving.validate_receipt_payload(receipt_payload)
     if receipt_row is None or json.loads(receipt_row["payload"]) != publication_document:
         raise ValueError("registry_cms_prepared_receipt_invalid")
+    pair = _pair_from_prepared_receipt(prepared_pair, receipt_row)
     await _require_retained_authority(connection, prepared_pair, publication_document)
     current = await serving.capture_native_dependencies(session, request.source_pin.schema_name, lock=True)
     expected_oid_by_logical = {logical: oid for logical, _stage, oid in prepared_pair.address_stages}
@@ -521,10 +586,27 @@ async def bind_prepared_registry_cms_source_pair(session, prepared_pair, *, rece
         or publication_document["selection"]["proof_id"] != request.selection_proof_id
     ):
         raise ValueError("registry_cms_prepared_receipt_invalid")
+    return pair
+
+
+def _pair_from_prepared_receipt(prepared_pair, receipt_row):
+    """Construct identity from actual row fields; callers must prove row visibility and custody."""
+    document = receipt_row["registry_source_pair_json"]
+    if isinstance(document, str):
+        document = json.loads(document)
+    if serving.decode_registry_source_pair_document(document) != prepared_pair:
+        raise ValueError("registry_cms_prepared_receipt_invalid")
+    stored_payload = receipt_row["payload"]
+    publication_document = serving.validate_receipt_payload(
+        json.loads(stored_payload) if isinstance(stored_payload, str) else stored_payload
+    )
+    if receipt_row["profile_generation_id"] != publication_document["profile"]["generation_id"]:
+        raise ValueError("registry_cms_prepared_receipt_invalid")
+    request = prepared_pair.request
     proof = RegistryCMSPublicationProof(
         request.source_pin,
         request.binding_coordinates,
-        receipt_id,
+        receipt_row["receipt_id"],
         tuple(publication_document["cms"][field] for field in _CMS_FIELDS),
         receipt_row["publication_xid"],
         receipt_row["profile_generation_id"],
@@ -532,7 +614,7 @@ async def bind_prepared_registry_cms_source_pair(session, prepared_pair, *, rece
         request.expected_admission_sha256,
         request.expected_metadata_sha256,
     )
-    pair = RegistryCMSRetainedSourcePair(
+    return RegistryCMSRetainedSourcePair(
         proof,
         prepared_pair.recipe,
         PinnedAddressSource(
@@ -547,10 +629,17 @@ async def bind_prepared_registry_cms_source_pair(session, prepared_pair, *, rece
         prepared_pair.owner_role,
         prepared_pair.runtime_roles,
     )
-    await connection.execute(
-        f"COMMENT ON SCHEMA {_identifier(pair.address_ownership.schema_name)} IS '"
-        + (_COMMENT + _json(pair.as_dict())).replace("'", "''")
-        + "'"
+
+
+async def read_committed_registry_cms_pair(session, prepared_pair):
+    """Resolve a finalized prepared stamp from the unique committed immutable slot."""
+    if type(prepared_pair) is not PreparedRegistryCMSSourcePair:
+        raise ValueError("registry_cms_prepared_pair_invalid")
+    row = await serving.read_registry_source_pair_receipt(
+        session, prepared_pair.request.source_pin.schema_name, prepared_pair.recipe.source_pin.retained_epoch.epoch_id
     )
+    if row is None:
+        return None
+    pair = _pair_from_prepared_receipt(prepared_pair, row)
     await require_registry_cms_source_pair(session, pair, verify_content=False)
     return pair

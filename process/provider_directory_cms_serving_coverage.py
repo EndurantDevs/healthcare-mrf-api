@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """One-time completeness proof for an exact published CMS directory dataset."""
 
+from contextlib import asynccontextmanager
+
 from sqlalchemy import text
 
 from api.provider_directory_cms_generation import accepted_cms_generation
@@ -68,6 +70,40 @@ async def validate_cms_candidate_coverage(session, dataset_id, release_id):
 async def seal_cms_candidate_coverage(fhir, candidate, release_id, dataset_hash):
     """Commit the checked generation's receipt with the source-local pointer."""
 
+    async with _source_publication_body(fhir):
+        await _insert_cms_candidate_coverage(fhir, candidate, release_id, dataset_hash)
+
+
+@asynccontextmanager
+async def _source_publication_body(fhir, session=None):
+    """Borrow only the already authenticated original SOURCE owner; keep legacy callers."""
+    from process.provider_directory_cms_serving_receipt import require_registry_receipt_owner
+    from process.provider_directory_generic_source_policy import (
+        bound_publisher,
+        is_source_storage_required,
+        source_copy_session,
+        source_transaction,
+    )
+    from process.provider_directory_source_cms_epoch_control import capture_source_cms_epoch_controls
+
+    if not is_source_storage_required():
+        yield
+        return
+    publisher = bound_publisher()
+    original = source_copy_session()
+    if publisher.policy.schema != fhir._schema() or (session is not None and session is not original):
+        raise RuntimeError("cms_serving_coverage_original_session_required")
+    await require_registry_receipt_owner(original, fhir._schema())
+    async with source_transaction(fhir.db) as borrowed:
+        if borrowed is not original:
+            raise RuntimeError("cms_serving_coverage_original_session_required")
+        await capture_source_cms_epoch_controls(publisher.connection, publisher.policy)
+        yield
+
+
+async def _insert_cms_candidate_coverage(fhir, candidate, release_id, dataset_hash):
+    """Use the caller-owned publication body; never open another physical transaction."""
+
     table = fhir._qt(fhir._schema(), _TABLE)
     dataset = fhir._qt(fhir._schema(), "provider_directory_endpoint_dataset")
     sealed = await fhir.db.first(
@@ -91,6 +127,10 @@ async def seal_cms_candidate_coverage(fhir, candidate, release_id, dataset_hash)
 
 async def build_cms_coverage(session):
     """Run expensive checks once after publication, outside the bounded cutover."""
+    from process.provider_directory_generic_source_policy import is_source_storage_required
+
+    if is_source_storage_required():
+        raise RuntimeError("cms_source_candidate_coverage_preparation_required")
     if session.in_transaction():
         raise ValueError("cms_serving_coverage_requires_own_transaction")
     schema = _schema_name()
@@ -168,6 +208,9 @@ async def assert_sealed_cms_candidate_coverage(session, schema, proof):
 
 async def prepare_cms_candidate_coverage(fhir, candidate, release_id, dataset_hash):
     """Validate once and commit an immutable proof before the bounded composite cutover."""
+    from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
+    from process.provider_directory_source_coverage_control import capture_source_coverage_control
+
     schema = _schema_name()
     proof_by_field = {
         "dataset_id": candidate.dataset_id,
@@ -176,7 +219,9 @@ async def prepare_cms_candidate_coverage(fhir, candidate, release_id, dataset_ha
         "dataset_hash": dataset_hash,
         "proof_version": _PROOF_VERSION,
     }
-    async with fhir.db.session() as session:
+    async with source_transaction(fhir.db, isolation="repeatable read") as session:
+        publisher = bound_publisher()
+        await capture_source_coverage_control(publisher.connection, publisher.policy)
         await session.execute(text("SET LOCAL lock_timeout = '5s'"))
         await session.execute(text("SET LOCAL statement_timeout = '15min'"))
         current = (await session.execute(text(_candidate_dataset_sql(schema)), proof_by_field)).mappings().one_or_none()

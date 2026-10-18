@@ -7,13 +7,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass, field
 import os
-from pathlib import Path
 import signal
 import sys
-from typing import Any, Sequence
-
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Sequence
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -25,25 +24,16 @@ EVIDENCE_COMMAND = "render-neutral-evidence"
 ABANDON_COMMAND = "abandon-expired-root"
 TERMINAL_DISPOSITION_COMMAND = "seal-terminal-root"
 DIRECT_V4_TERMINAL_DISPOSITION_COMMAND = "seal-direct-v4-terminal-root"
-DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_COMMAND = (
-    "seal-direct-v5-http410-root"
-)
+DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_COMMAND = "seal-direct-v5-http410-root"
 _ENABLED_ENV_BY_COMMAND = {
     COMMAND: "HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED",
-    ABANDON_COMMAND: (
-        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED"
-    ),
-    TERMINAL_DISPOSITION_COMMAND: (
-        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_"
-        "TERMINAL_DISPOSITION_ENABLED"
-    ),
+    ABANDON_COMMAND: ("HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED"),
+    TERMINAL_DISPOSITION_COMMAND: ("HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_TERMINAL_DISPOSITION_ENABLED"),
     DIRECT_V4_TERMINAL_DISPOSITION_COMMAND: (
-        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V4_"
-        "TERMINAL_DISPOSITION_ENABLED"
+        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V4_TERMINAL_DISPOSITION_ENABLED"
     ),
     DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_COMMAND: (
-        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V5_HTTP410_"
-        "TERMINAL_DISPOSITION_ENABLED"
+        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_ENABLED"
     ),
 }
 SIGNALS = (signal.SIGTERM, signal.SIGINT)
@@ -62,9 +52,7 @@ SAFE_ERROR_CODES = frozenset(
 
 
 def _error_json(code: object) -> str:
-    safe_code = (
-        code if type(code) is str and code in SAFE_ERROR_CODES else "failed"
-    )
+    safe_code = code if type(code) is str and code in SAFE_ERROR_CODES else "failed"
     return f'{{"code":"{safe_code}","status":"error"}}'
 
 
@@ -108,9 +96,7 @@ def _parser() -> argparse.ArgumentParser:
 @dataclass(slots=True)
 class _SignalRegistration:
     operation_loop: Any
-    previous_handler_by_signal: dict[signal.Signals, Any] = field(
-        default_factory=dict
-    )
+    previous_handler_by_signal: dict[signal.Signals, Any] = field(default_factory=dict)
     is_restored: bool = False
 
     def restore(self) -> None:
@@ -142,10 +128,8 @@ def _install_signal_handlers(
                 active_task.cancel,
                 signal_number,
             )
-            registration.previous_handler_by_signal[signal_number] = (
-                previous_handler
-            )
-    except (NotImplementedError, RuntimeError, ValueError):
+            registration.previous_handler_by_signal[signal_number] = previous_handler
+    except NotImplementedError, RuntimeError, ValueError:
         registration.restore()
         raise RuntimeError("reviewed subset signal setup failed") from None
     return registration
@@ -183,8 +167,6 @@ async def _drain_disconnect(
 async def _execute_state_sync(database: Any) -> str:
     from process.provider_directory_fhir_subset_activation import (
         reviewed_subset_activation_result_json,
-    )
-    from process.provider_directory_fhir_subset_activation import (
         sync_reviewed_subset_verified_state,
     )
 
@@ -228,9 +210,7 @@ async def _execute_direct_v4_terminal_disposition(database: Any) -> str:
         terminal_disposition_result_json,
     )
 
-    result = await dispose_v4_census_drift_root(
-        database=database
-    )
+    result = await dispose_v4_census_drift_root(database=database)
     return terminal_disposition_result_json(result)
 
 
@@ -260,18 +240,19 @@ async def _execute_operation(database: Any, command: str) -> str:
     raise RuntimeError("reviewed subset operator command is invalid")
 
 
+def _require_operator_gate(command: str) -> None:
+    enabled_environment = _ENABLED_ENV_BY_COMMAND.get(command)
+    if enabled_environment is not None and os.getenv(enabled_environment) != "true":
+        raise _DormantGateError()
+
+
 async def _run_operator(
     command: str,
     *,
     database: Any | None = None,
 ) -> str:
-    enabled_environment = _ENABLED_ENV_BY_COMMAND.get(command)
-    if (
-        database is None
-        and enabled_environment is not None
-        and os.getenv(enabled_environment) != "true"
-    ):
-        raise _DormantGateError()
+    if database is None:
+        _require_operator_gate(command)
     active_task = asyncio.current_task()
     if active_task is None:
         raise RuntimeError("reviewed subset operator task is unavailable")
@@ -318,12 +299,19 @@ def _print_error(code: str) -> None:
     print(_error_json(code), file=sys.stderr)
 
 
-def run_command(arguments: Sequence[str] | None = None) -> int:
+def run_command(
+    arguments: Sequence[str] | None = None,
+    *,
+    operation_runner: Callable[[str], Awaitable[str]] | None = None,
+) -> int:
     """Run one selector-free operation with deterministic JSON output."""
 
     parsed_arguments = _parser().parse_args(arguments)
     try:
-        rendered_result = asyncio.run(_run_operator(parsed_arguments.command))
+        if operation_runner is not None:
+            _require_operator_gate(parsed_arguments.command)
+        runner = _run_operator if operation_runner is None else operation_runner
+        rendered_result = asyncio.run(runner(parsed_arguments.command))
     except asyncio.CancelledError as error:
         _print_error("canceled")
         return _cancellation_exit_code(error)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
@@ -68,17 +68,30 @@ def test_stage_schema_is_derived_only_from_a_uuid_dataset_owner():
 
 
 @pytest.mark.asyncio
-async def test_stage_export_clones_pinned_family():
+async def test_stage_export_clones_pinned_family(monkeypatch):
     dataset_id = UUID("550e8400-e29b-41d4-a716-446655440000")
     stage_schema = source.entity_address_archive_stage_schema(dataset_id)
     live, clone, stage = _session("00000003-0000001B-1"), _session(), _session("00000004-0000001C-1")
     copied = AsyncMock()
+    native_copy = AsyncMock(return_value=0)
+    created = AsyncMock()
+    models = (source.entity_address_unified.EntityAddressUnified, *source.entity_address_unified.SUPPORT_TABLE_MODELS)
+    monkeypatch.setattr(
+        source,
+        "_legacy_source_catalog",
+        AsyncMock(return_value=[{"model": model, "source_ref": f'"mrf"."{model.__tablename__}"'} for model in models]),
+    )
+    monkeypatch.setattr(source, "_legacy_source_indexes", AsyncMock(return_value=[]))
+    monkeypatch.setattr(source, "_require_legacy_target_custody", AsyncMock())
+    monkeypatch.setattr(source.family_archive, "_is_model_table_equal", AsyncMock(return_value=True))
 
     manifest = await source.export_entity_address_archive_stage(
         _session_factory(live, clone, stage),
         schema_name="mrf",
         dataset_id=dataset_id,
         archive_copy=copied,
+        stage_created=created,
+        source_copy=source.EntityAddressSourceCopy(native_copy, 1024, 10),
     )
 
     copied.assert_awaited_once()
@@ -93,15 +106,10 @@ async def test_stage_export_clones_pinned_family():
         "SET TRANSACTION SNAPSHOT '00000003-0000001B-1'",
         f'CREATE SCHEMA "{stage_schema}"',
     ]
-    assert len(clone_statements) == 20
-    assert all(
-        f'CREATE TABLE "{stage_schema}".' in statement
-        or f'INSERT INTO "{stage_schema}".' in statement
-        or f'CREATE SEQUENCE "{stage_schema}"."entity_address_evidence_evidence_id_seq"' in statement
-        or f'ALTER SEQUENCE "{stage_schema}"."entity_address_evidence_evidence_id_seq"' in statement
-        or f'ALTER TABLE "{stage_schema}"."entity_address_evidence" ALTER COLUMN "evidence_id"' in statement
-        for statement in clone_statements[3:]
-    )
+    assert not any("INSERT INTO" in statement for statement in clone_statements)
+    assert len([statement for statement in clone_statements if "EXCLUDING INDEXES" in statement]) == 7
+    assert native_copy.await_count == 7
+    created.assert_awaited_once_with(clone)
     stage_statements = [str(call.args[0]) for call in stage.execute.await_args_list]
     assert all(f'LOCK TABLE "{stage_schema}".' in statement for statement in stage_statements[1:-1])
 
@@ -122,11 +130,12 @@ async def test_stage_export_rejects_non_uuid_owner_before_opening_any_session():
 
 
 @pytest.mark.asyncio
-async def test_stage_callback_failure_releases_pins():
+async def test_stage_callback_failure_releases_pins(monkeypatch):
     dataset_id = UUID("550e8400-e29b-41d4-a716-446655440000")
     live, clone, stage = _session("00000003-0000001B-1"), _session(), _session("00000004-0000001C-1")
     exits: list[tuple[object, BaseException | None]] = []
     failure = RuntimeError("native dump failed")
+    monkeypatch.setattr(source, "_clone_entity_address_archive_source", AsyncMock())
 
     async def fail_archive_copy(_capture):
         raise failure
@@ -137,6 +146,8 @@ async def test_stage_callback_failure_releases_pins():
             schema_name="mrf",
             dataset_id=dataset_id,
             archive_copy=fail_archive_copy,
+            stage_created=AsyncMock(),
+            source_copy=source.native_entity_address_source_copy(max_bytes=1024, timeout=10),
         )
 
     assert exits == [(clone, None), (live, None), (stage, failure)]
@@ -284,10 +295,18 @@ def test_restore_uses_native_safe_stage_mapping_for_all_seven_models():
 
 @pytest.mark.asyncio
 async def test_stage_receipt_pins_the_closed_family_and_rejects_unsafe_relations():
-    session = SimpleNamespace(execute=AsyncMock())
+    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(side_effect=["off", "repeatable read"]))
+    transaction_calls = Mock()
+    transaction_calls.attach_mock(session.scalar, "scalar")
+    transaction_calls.attach_mock(session.execute, "execute")
 
     await receipt._lock_model_family(session, "address_stage", receipt._models())
 
+    assert [call[0] for call in transaction_calls.mock_calls] == ["scalar", "scalar", "execute"]
+    assert [str(call.args[0]) for call in session.scalar.await_args_list] == [
+        "SHOW transaction_read_only",
+        "SHOW transaction_isolation",
+    ]
     statement = str(session.execute.await_args.args[0])
     assert statement == (
         'LOCK TABLE "address_stage"."entity_address_evidence", '

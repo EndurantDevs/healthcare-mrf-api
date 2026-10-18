@@ -62,6 +62,7 @@ from db.models.ptg_snapshot_local import (
 from db.models.ptg_snapshot_local import (
     PTG2V4ProviderGraphDiagnostic as PTG2V4ProviderGraphDiagnostic,
 )
+from db.models.registry_aca_source_notification import *
 from db.models.registry_approval import *
 from db.models.registry_evidence import *
 from db.models.registry_network_binding import *

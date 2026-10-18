@@ -2,11 +2,12 @@
 """Native provider HTTP reads through approved composition and protected reader roles."""
 
 import asyncio
+from contextlib import aclosing
 from types import SimpleNamespace
 from uuid import uuid4, uuid5
 
 import pytest
-from sanic import Blueprint, Sanic
+from sanic import Blueprint, Sanic, response
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -298,3 +299,267 @@ async def test_native_catalog_lock_timeout_is_bounded_and_releases_transaction(p
         _PATH + f"?network_ids={context.seed.network['record_id']}", headers=_AUTH
     )
     assert recovered.status == 200
+
+
+@pytest.mark.parametrize("damage", ["orphan_binding", "unbound_address", "duplicate_office_binding"])
+async def test_integrity_outside_the_requested_page_still_refuses(provider_app, damage):
+    context = provider_app
+    networks = f"{context.source_network_id},{context.seed.network['record_id']}"
+    path = _PATH + f"?network_ids={networks}&limit=1"
+    _, original = await context.app.asgi_client.get(path, headers=_AUTH)
+    assert original.status == 200
+    assert original.json["providers"][0]["provider_system"] == "manual"
+    namespace = f'"{context.current_schema}"'
+    new_key = uuid4().hex + uuid4().hex
+    if damage != "duplicate_office_binding":
+        await context.fixture.connection.execute(
+            f"""INSERT INTO {namespace}.entity_address_unified
+            SELECT (jsonb_populate_record(NULL::{namespace}.entity_address_unified,
+              to_jsonb(address)||jsonb_build_object('location_key',$1::text))).*
+            FROM {namespace}.entity_address_unified address WHERE entity_type='npi'""",
+            new_key,
+        )
+    if damage != "unbound_address":
+        await context.fixture.connection.execute(
+            f"""INSERT INTO {namespace}.provider_location_binding
+            SELECT provider_system,provider_id,$1::uuid,
+              CASE WHEN $2::boolean THEN location_key ELSE $3::text END,entity_type,entity_id
+            FROM {namespace}.provider_location_binding WHERE provider_system='npi'""",
+            uuid4(),
+            damage == "duplicate_office_binding",
+            new_key,
+        )
+    _, unavailable = await context.app.asgi_client.get(path, headers=_AUTH)
+    assert unavailable.status == 503
+    assert unavailable.json == {"error": {"code": "network_provider_unavailable"}}
+    assert unavailable.headers["Cache-Control"] == "private, no-store"
+    assert "X-Network-Generation" not in unavailable.headers
+
+
+@pytest.fixture
+async def inflight_provider_http(provider_app, monkeypatch):
+    """Own a real loopback listener without changing the protected request middleware."""
+    import socket
+
+    import httpx
+
+    monkeypatch.setattr(Sanic, "test_mode", True)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(16)
+    listener.setblocking(False)
+    address = listener.getsockname()
+    server = None
+    try:
+        server = await provider_app.app.create_server(
+            sock=listener, access_log=False, asyncio_server_kwargs={"start_serving": False}
+        )
+        await server.startup()
+        await server.before_start()
+        await server.start_serving()
+        await server.after_start()
+        async with httpx.AsyncClient(base_url=f"http://{address[0]}:{address[1]}", timeout=35) as client:
+            yield client
+    finally:
+        if server is not None:
+            await asyncio.wait_for(server.before_stop(), timeout=5)
+            await asyncio.wait_for(server.close(), timeout=5)
+            await asyncio.wait_for(server.after_stop(), timeout=5)
+            assert not server.is_serving()
+        listener.close()
+
+
+async def test_loopback_startup_preserves_later_asgi_middleware(monkeypatch):
+    """A real listener must not poison Sanic's original methods for the next ASGI app."""
+    monkeypatch.setattr(Sanic, "test_mode", False)
+    applications = [Sanic("provider_startup_" + uuid4().hex) for _ in range(2)]
+    for application in applications:
+        application.get("/startup")(lambda _request: response.json({"ready": True}))
+
+    @applications[1].middleware("response")
+    async def mark_response(_request, reply):
+        reply.headers["X-Startup-Order"] = "preserved"
+
+    try:
+        fixture = inflight_provider_http.__wrapped__(SimpleNamespace(app=applications[0]), monkeypatch)
+        async with aclosing(fixture):
+            client = await anext(fixture)
+            reply = await client.get("/startup")
+            assert reply.status_code == 200 and reply.json() == {"ready": True}
+        for _ in range(2):
+            _, reply = await applications[1].asgi_client.get("/startup")
+            assert reply.status == 200 and reply.json == {"ready": True}
+            assert reply.headers["X-Startup-Order"] == "preserved"
+    finally:
+        for application in applications:
+            Sanic.unregister_app(application)
+
+
+async def _observe_provider_pin(connection, manifest, context):
+    """Read the real request role and exact INTEGER office arrays before holding it."""
+    settings = await connection.fetchrow(
+        "SELECT current_user,pg_backend_pid() AS pid,"
+        "current_setting('transaction_isolation') AS isolation,"
+        "current_setting('transaction_read_only') AS readonly"
+    )
+    assert tuple(settings[name] for name in ("current_user", "isolation", "readonly")) == (
+        context.fixture.roles["reader"],
+        "repeatable read",
+        "on",
+    )
+    assert settings["pid"] != await context.fixture.connection.fetchval("SELECT pg_backend_pid()")
+    office_rows = await connection.fetch(
+        "SELECT binding.provider_system,binding.provider_id,binding.location_id::text AS location_id,"
+        "address.canonical_network_ids,pg_typeof(address.canonical_network_ids)::text AS array_type "
+        f'FROM "{manifest.schema_name}".provider_location_binding binding '
+        f'JOIN "{manifest.schema_name}".entity_address_unified address '
+        "USING(location_key,entity_type,entity_id) "
+        "WHERE address.canonical_network_ids && $1::integer[] ORDER BY provider_system,provider_id,location_id",
+        [context.source_network_id, context.seed.network["record_id"]],
+    )
+    assert all(office["array_type"] == "integer[]" for office in office_rows)
+    assert all(
+        type(value) is int and 1 <= value <= 2147483647
+        for office in office_rows
+        for value in office["canonical_network_ids"]
+    )
+    return office_rows
+
+
+def _held_manifest_resolver(native_manifest, context, pinned, release, snapshots):
+    """Forward real resolution, then use Events to control only the in-flight reader."""
+
+    async def resolve(connection, **kwargs):
+        manifest = await native_manifest(connection, **kwargs)
+        office_rows = await _observe_provider_pin(connection, manifest, context)
+        snapshots[manifest.generation_id] = (manifest, office_rows)
+        if not pinned.is_set():
+            pinned.set()
+            await asyncio.wait_for(release.wait(), timeout=30)
+            assert await _observe_provider_pin(connection, manifest, context) == office_rows
+        return manifest
+
+    return resolve
+
+
+async def _publish_provider_replacement(context, old_manifest, request_id, copy_targets):
+    """Approve a different office and run the actual composed COPY/publication pipeline."""
+    from dataclasses import replace
+
+    from tests.test_network_custom_address_source_postgres import _draft
+    from tests.test_network_membership_draft_store_postgres import _member
+    from tests.test_registry_approval_store_postgres import _approve, _command
+
+    fixture = context.fixture
+    correction = replace(
+        context.seed.membership_command,
+        operation="correct",
+        expected_revision=1,
+        fields={
+            "memberships_json": [
+                _member(
+                    context.seed.network["record_id"],
+                    context.seed.provider["record_id"],
+                    context.seed.second["record_id"],
+                )
+            ]
+        },
+        idempotency_key=uuid4().hex,
+    )
+    corrected = await _draft(fixture, correction, context.seed.actor)
+    approval = await _approve(
+        fixture.connection,
+        fixture.control_schema,
+        await _command(fixture.connection, fixture.control_schema, corrected),
+        context.seed.actor,
+    )
+    replacement = SimpleNamespace(**{**vars(context.seed), "revision": approval["approved_revision"]})
+    await _composed_candidate(fixture, replacement, old_manifest, request_id, copy_targets)
+    published = await fixture.connection.fetchrow(
+        f'SELECT manifest.generation_id,candidate.state,candidate.schema_name FROM "{fixture.control_schema}".network_serving_control control '
+        f'JOIN "{fixture.control_schema}".network_serving_manifest manifest USING(generation_id) '
+        f'JOIN "{fixture.control_schema}".network_membership_candidate candidate USING(candidate_id)'
+    )
+    assert published["state"] == "published" and published["generation_id"] != old_manifest.generation_id
+    assert published["schema_name"] == copy_targets[-1].schema_name
+    assert not fixture.connection.is_in_transaction()
+    return approval["approved_revision"], published
+
+
+def _assert_provider_cutover(context, baseline, held_response, fresh_response, published, snapshots, revision):
+    """Compare complete HTTP identities and physical office arrays on both pinned generations."""
+    old_document, fresh_document = baseline.json(), fresh_response.json()
+    assert held_response.status_code == 200 and held_response.json() == old_document
+    assert held_response.headers["X-Network-Generation"] == str(old_document["generation_id"])
+    assert fresh_response.status_code == 200 and fresh_document["generation_id"] == published["generation_id"]
+    assert fresh_response.headers["X-Network-Generation"] == str(published["generation_id"])
+    assert held_response.headers["Cache-Control"] == fresh_response.headers["Cache-Control"] == "private, no-store"
+    old_by_system = {provider["provider_system"]: provider for provider in old_document["providers"]}
+    fresh_by_system = {provider["provider_system"]: provider for provider in fresh_document["providers"]}
+    assert old_document["total_count"] == fresh_document["total_count"] == 2
+    assert len(old_document["providers"]) == len(fresh_document["providers"]) == 2
+    assert old_by_system["manual"]["provider_id"] == context.seed.provider["record_id"]
+    assert fresh_by_system["manual"] == {**old_by_system["manual"], "locations": fresh_by_system["manual"]["locations"]}
+    assert fresh_by_system["npi"] == old_by_system["npi"]
+    assert [office["location_id"] for office in old_by_system["manual"]["locations"]] == [
+        context.seed.first["record_id"]
+    ]
+    assert [office["location_id"] for office in fresh_by_system["manual"]["locations"]] == [
+        context.seed.second["record_id"]
+    ]
+    assert snapshots[published["generation_id"]][0].approved_custom_revision == revision
+    for generation, manual_office in (
+        (old_document["generation_id"], context.seed.first["record_id"]),
+        (published["generation_id"], context.seed.second["record_id"]),
+    ):
+        assert {
+            (
+                office["provider_system"],
+                office["provider_id"],
+                office["location_id"],
+                tuple(office["canonical_network_ids"]),
+            )
+            for office in snapshots[generation][1]
+        } == {
+            ("manual", context.seed.provider["record_id"], manual_office, (context.seed.network["record_id"],)),
+            ("npi", "1000000004", old_by_system["npi"]["locations"][0]["location_id"], (context.source_network_id,)),
+        }
+
+
+async def test_inflight_http_reader_keeps_old_offices_through_actual_publication(
+    provider_app, inflight_provider_http, monkeypatch
+):
+    """Complete atomic publication while a genuine HTTP Reader retains its old native snapshot."""
+    context, client = provider_app, inflight_provider_http
+    path = _PATH + f"?network_ids={context.source_network_id},{context.seed.network['record_id']}"
+    headers_by_name = {**_AUTH, "X-Network-Access-Scope": "a" * 64}
+    pinned, release, snapshots = asyncio.Event(), asyncio.Event(), {}
+    copy_targets, request_id, held = [], uuid4(), None
+    try:
+        async with asyncio.timeout(45):
+            baseline = await client.get(path, headers=headers_by_name)
+            assert baseline.status_code == 200
+            monkeypatch.setattr(
+                providers,
+                "resolve_network_serving_manifest",
+                _held_manifest_resolver(
+                    providers.resolve_network_serving_manifest, context, pinned, release, snapshots
+                ),
+            )
+            held = asyncio.create_task(client.get(path, headers=headers_by_name))
+            await asyncio.wait_for(pinned.wait(), timeout=5)
+            old_manifest = snapshots[baseline.json()["generation_id"]][0]
+            assert old_manifest.schema_name == context.current_schema and not held.done()
+            revision, published = await asyncio.wait_for(
+                _publish_provider_replacement(context, old_manifest, request_id, copy_targets), timeout=20
+            )
+            assert not held.done() and not release.is_set()
+            release.set()
+            old_response = await asyncio.wait_for(held, timeout=5)
+            fresh_response = await client.get(path, headers=headers_by_name)
+            _assert_provider_cutover(context, baseline, old_response, fresh_response, published, snapshots, revision)
+    finally:
+        release.set()
+        if held is not None:
+            await asyncio.wait_for(asyncio.gather(held, return_exceptions=True), timeout=5)
+        await _remove_candidates(context.fixture, copy_targets, request_id)

@@ -2,6 +2,7 @@
 """Pure custody, complete-edition ordering and caller refusal checks."""
 
 import hashlib
+import io
 import json
 import os
 import struct
@@ -509,3 +510,60 @@ async def test_admission_refuses_missing_complete_input_or_caller_transaction(tm
     with pytest.raises(RegistrySourceAdmissionError, match="caller transaction"):
         await source.admit_naic_edition(connection, prepared, control_schema="synthetic")
     assert not connection.events
+
+
+def _listing_with_archive_layouts(root, *, omit=None):
+    prepared, original, layouts_by_member = _fetched_listing_archive(root)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(original.artifact_path) as inputs, zipfile.ZipFile(buffer, "w") as output:
+        for name in inputs.namelist():
+            if name != omit:
+                output.writestr(name, inputs.read(name))
+        for name, path in layouts_by_member.items():
+            pdf = name.removesuffix(".csv") + ".pdf"
+            if pdf != omit:
+                output.writestr(pdf, path.read_bytes())
+    encoded = buffer.getvalue()
+    digest = hashlib.sha256(encoded).hexdigest()
+    path = root / (digest + ".artifact")
+    path.write_bytes(encoded)
+    receipt = replace(original.receipt, artifact_sha256=digest, artifact_bytes=len(encoded))
+    return prepared, replace(original, receipt=receipt, artifact_path=path), layouts_by_member
+
+
+def test_archive_preparation_binds_same_source_csv_and_pdf_bytes(tmp_path):
+    original, fetched, layouts_by_member = _listing_with_archive_layouts(tmp_path)
+    root = tmp_path / "retained"
+    prepared = source.prepare_naic_source_archive(fetched, root, snapshot_id=original.edition.snapshot_id)
+    assert type(prepared) is source.RegistryNaicPreparedInput
+    assert prepared.edition.retrieved_at == fetched.receipt.retrieved_at
+    assert prepared.edition.published_at is None
+    assert tuple(member.member_name for member in prepared.members) == source.MEMBERS
+    for member in prepared.members:
+        assert (
+            member.layout_pdf_sha256 == hashlib.sha256(layouts_by_member[member.member_name].read_bytes()).hexdigest()
+        )
+        assert (root / (member.layout_pdf_sha256 + ".pdf")).is_file()
+        assert member.input_sha256 == hashlib.sha256(member.input_path.read_bytes()).hexdigest()
+    assert source.prepare_naic_source_archive(fetched, root, snapshot_id=original.edition.snapshot_id) == prepared
+    assert not list(root.glob(".registry-input-*"))
+
+
+@pytest.mark.parametrize("omit", ["HLTH.csv", "GPAL.csv", "GPNM.csv", "HLTH.pdf", "GPAL.pdf", "GPNM.pdf"])
+def test_archive_preparation_refuses_incomplete_closed_six_member_input(tmp_path, omit):
+    original, fetched, _ = _listing_with_archive_layouts(tmp_path, omit=omit)
+    root = tmp_path / "retained"
+    with pytest.raises(ValueError):
+        source.prepare_naic_source_archive(fetched, root, snapshot_id=original.edition.snapshot_id)
+    assert not list(root.glob(".registry-input-*"))
+
+
+def test_archive_preparation_rehashes_existing_layout_before_replay(tmp_path):
+    original, fetched, _ = _listing_with_archive_layouts(tmp_path)
+    root = tmp_path / "retained"
+    prepared = source.prepare_naic_source_archive(fetched, root, snapshot_id=original.edition.snapshot_id)
+    path = root / (prepared.members[0].layout_pdf_sha256 + ".pdf")
+    path.write_bytes(b"changed layout")
+    with pytest.raises(ValueError):
+        source.prepare_naic_source_archive(fetched, root, snapshot_id=original.edition.snapshot_id)
+    assert not list(root.glob(".registry-input-*"))

@@ -38,6 +38,20 @@ def _row(**overrides):
     return source_row_by_name
 
 
+@pytest.fixture(autouse=True)
+def _unit_stage_creation(monkeypatch):
+    """Only model the fixed DDL seam; native role/custody proof is separate."""
+    from process import cms_doctors_education as education
+
+    async def create_stage(database, model, import_date, schema):
+        stage = groups.make_class(model, import_date)
+        await database.create_table(stage.__table__, checkfirst=False)
+        return stage
+
+    for module in (groups, education):
+        monkeypatch.setattr(module, "create_doctors_stage", create_stage)
+
+
 def test_group_site_observations_preserve_group_grain_and_unknown_dates():
     first = groups.doctor_group_site_row(_row(), 1, MANIFEST)
     second = groups.doctor_group_site_row(

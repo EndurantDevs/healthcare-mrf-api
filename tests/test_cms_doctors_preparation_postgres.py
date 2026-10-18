@@ -2,13 +2,20 @@
 """Caller-owned Doctors publication, exact cleanup, and immutable acknowledgment proofs."""
 
 import asyncio
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from process import cms_doctors_identity_candidate as identities
 from process import cms_doctors_preparation as preparation
+from process import provider_directory_generic_source_policy as source_policy
 from process.entity_address_cutover_contract import _ServingRelationLockTimeout
+from tests import cms_doctors_component_postgres_support as component_support
+from tests import cms_doctors_preparation_postgres_support as fixture_support
 from tests.cms_doctors_preparation_postgres_support import (
     append_common_receipt,
     authority,
@@ -19,6 +26,7 @@ from tests.cms_doctors_preparation_postgres_support import (
     stage_family,
     stage_oids,
 )
+from tests.cms_doctors_preparation_postgres_support import doctors_source_template as doctors_source_template
 
 
 @pytest.mark.asyncio
@@ -28,6 +36,9 @@ async def test_preparation_finishes_three_stages_without_publishing(monkeypatch)
         incumbent = await authority(fixture)
         async with preparation.prepare_cms_doctors_generation(ctx) as prepared:
             assert prepared.incumbent_authority == incumbent
+            candidates = identities._candidates(ctx)
+            assert set(candidates) == {"group", "site"}
+            assert all(candidate.count == candidate.source_rows == 1 for candidate in candidates.values())
             assert len(prepared.stage_oids) == 3
             assert len(prepared.relation_overrides) == 3
             assert not prepared.committed and not prepared.metrics["published"]
@@ -219,16 +230,16 @@ async def test_legacy_publication_without_cms_keeps_native_authority(monkeypatch
     async with doctors_database(monkeypatch, cms_active=False) as fixture:
         ctx = await stage_family(fixture.database, fixture.schema)
         incumbent = await authority(fixture)
-        for model in preparation._models():
-            stage_cls = native.make_class(model, ctx["import_date"])
-            await fixture.database.status(f'ALTER TABLE "{fixture.schema}"."{stage_cls.__tablename__}" SET LOGGED')
-            await native._create_stage_indexes(stage_cls, fixture.schema)
-        result = await native._publish_cms_doctors_stage(
-            native.make_class(native.DoctorClinicianAddress, ctx["import_date"]), fixture.schema, ctx["import_date"]
-        )
-        assert result == await authority(fixture)
-        assert result.local_generation == incumbent.local_generation + 1
-        assert await stage_oids(fixture, ctx) == ()
+        async with preparation.prepare_cms_doctors_generation(ctx):
+            result = await native._publish_cms_doctors_stage(
+                native.make_class(native.DoctorClinicianAddress, ctx["import_date"]),
+                fixture.schema,
+                ctx["import_date"],
+                identity_ctx=ctx,
+            )
+            assert result == await authority(fixture)
+            assert result.local_generation == incumbent.local_generation + 1
+            assert await stage_oids(fixture, ctx) == ()
 
 
 @pytest.mark.asyncio
@@ -238,16 +249,18 @@ async def test_ordinary_publisher_keeps_late_readers_on_incumbent(monkeypatch):
         ctx = await stage_family(fixture.database, fixture.schema)
         incumbent = await authority(fixture)
         stages = await stage_oids(fixture, ctx)
+        stage_cls = native.make_class(native.DoctorClinicianAddress, ctx["import_date"])
+        await native._prepare_cms_doctors_sources(ctx, stage_cls, fixture.schema, 1)
         for model in preparation._models():
-            stage_cls = native.make_class(model, ctx["import_date"])
-            await fixture.database.status(f'ALTER TABLE "{fixture.schema}"."{stage_cls.__tablename__}" SET LOGGED')
-            await native._create_stage_indexes(stage_cls, fixture.schema)
+            stage = native.make_class(model, ctx["import_date"])
+            await fixture.database.status(f'ALTER TABLE "{fixture.schema}"."{stage.__tablename__}" SET LOGGED')
+            await native._create_stage_indexes(stage, fixture.schema)
         transaction_ids = []
         original_apply = native._apply_cms_doctors_stage
 
-        async def observed_apply(*args):
+        async def observed_apply(*args, **kwargs):
             transaction_ids.append(await fixture.database.scalar("SELECT txid_current()"))
-            return await original_apply(*args)
+            return await original_apply(*args, **kwargs)
 
         monkeypatch.setattr(native, "_apply_cms_doctors_stage", observed_apply)
         entered, release = asyncio.Event(), asyncio.Event()
@@ -260,6 +273,7 @@ async def test_ordinary_publisher_keeps_late_readers_on_incumbent(monkeypatch):
                     native.make_class(native.DoctorClinicianAddress, ctx["import_date"]),
                     fixture.schema,
                     ctx["import_date"],
+                    identity_ctx=ctx,
                 )
             )
             pending = await pending_publisher_locks(fixture, publisher)
@@ -272,7 +286,10 @@ async def test_ordinary_publisher_keeps_late_readers_on_incumbent(monkeypatch):
             release.set()
             assert await reader == (("incumbent",) * 3, incumbent)
             published = await native._publish_cms_doctors_stage(
-                native.make_class(native.DoctorClinicianAddress, ctx["import_date"]), fixture.schema, ctx["import_date"]
+                native.make_class(native.DoctorClinicianAddress, ctx["import_date"]),
+                fixture.schema,
+                ctx["import_date"],
+                identity_ctx=ctx,
             )
             assert published.local_generation == incumbent.local_generation + 1
             assert published.relation_oids == tuple(oid for _, _, oid in stages)
@@ -284,3 +301,97 @@ async def test_ordinary_publisher_keeps_late_readers_on_incumbent(monkeypatch):
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await preparation.discard_doctors_identities(fixture.database, ctx)
+
+
+@pytest.mark.asyncio
+async def test_scalar_receipt_proof_remains_independent_of_current_doctors_candidates(monkeypatch):
+    """Retain the historical scalar proof without claiming a complete source publication."""
+    async with fixture_support._legacy_scalar_doctors_database(monkeypatch) as fixture:
+        first = fixture.initial
+        async with fixture.database.transaction() as session:
+            await fixture_support.receipt_fixture._advance_native(session, fixture.schema, doctors=True)
+            second = await append_common_receipt(session, fixture, first)
+        assert second["receipt_id"] != first["receipt_id"]
+        async with fixture.database.session() as session:
+            assert await fixture_support.receipt_fixture.receipts.verify_historical_receipt(
+                session, fixture.schema, **first
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cms_active", [False, True])
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_before_provision_failure_closes_doctors_fixture_without_preparing(monkeypatch, cms_active, failure):
+    """Keep callback failures inside the actual outer fixture cleanup boundary."""
+    events = []
+    component = SimpleNamespace()
+
+    async def before_provision(actual):
+        assert actual is component
+        events.append("setup")
+        raise failure("native setup refused")
+
+    @asynccontextmanager
+    async def creator(actual_patch, *, before_provision):
+        assert actual_patch is monkeypatch
+        events.append("open")
+        try:
+            await before_provision(component)
+            pytest.fail("failed setup reached fixture body")
+            yield component
+        finally:
+            events.append("close")
+
+    if cms_active:
+        monkeypatch.setattr(fixture_support.admission, "protected_admission_database", creator)
+    else:
+        monkeypatch.setattr(component_support, "source_component_database", creator)
+    prepare = AsyncMock()
+    monkeypatch.setattr(component_support, "prepare_doctors_component", prepare)
+    monkeypatch.setattr(fixture_support, "prepare_doctors_component", prepare)
+    with pytest.raises(failure, match="native setup refused"):
+        async with doctors_database(monkeypatch, cms_active=cms_active, before_provision=before_provision):
+            pytest.fail("failed setup yielded a database")
+    assert events == ["open", "setup", "close"]
+    prepare.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cms_active", [False, True])
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_incumbent_preparation_failure_closes_doctors_component_and_factory(monkeypatch, cms_active, failure):
+    """A failed real setup collaborator must not leak the issued factory scope."""
+    events = []
+    factory = SimpleNamespace(transaction=AsyncMock())
+    component = SimpleNamespace(factory=factory)
+    administrator = SimpleNamespace(_source_component=component)
+
+    @asynccontextmanager
+    async def creator(actual_patch, *, before_provision):
+        assert actual_patch is monkeypatch and before_provision is None
+        events.append("open")
+        try:
+            yield administrator if cms_active else component
+        finally:
+            events.append("close")
+
+    async def refuse(actual):
+        assert actual is component
+        if cms_active:
+            assert source_policy._FACTORY.get() is factory
+        events.append("prepare")
+        raise failure("incumbent preparation refused")
+
+    if cms_active:
+        monkeypatch.setattr(fixture_support.admission, "protected_admission_database", creator)
+    else:
+        monkeypatch.setattr(component_support, "source_component_database", creator)
+    monkeypatch.setattr(component_support, "prepare_doctors_component", refuse)
+    monkeypatch.setattr(fixture_support, "prepare_doctors_component", refuse)
+    assert source_policy._FACTORY.get() is None
+    with pytest.raises(failure, match="incumbent preparation refused"):
+        async with doctors_database(monkeypatch, cms_active=cms_active):
+            pytest.fail("failed preparation yielded a database")
+    assert source_policy._FACTORY.get() is None
+    assert events == ["open", "prepare", "close"]

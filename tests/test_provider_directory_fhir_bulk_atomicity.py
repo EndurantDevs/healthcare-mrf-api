@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from db.models import ProviderDirectoryPractitioner
-
+from tests.provider_directory_checkpoint_unit_support import checkpoint_unit_scope as checkpoint_unit_scope
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -44,9 +44,7 @@ def _retry_identity() -> importer.BulkExportCheckpointIdentity:
 
 
 def _source() -> dict:
-    return importer._source_row_from_seed(
-        importer._aetna_provider_directory_data_seed_rows(source_query="Aetna")[0]
-    )
+    return importer._source_row_from_seed(importer._aetna_provider_directory_data_seed_rows(source_query="Aetna")[0])
 
 
 def _manifest(output_count: int = 1) -> importer.BulkExportManifest:
@@ -58,10 +56,7 @@ def _manifest(output_count: int = 1) -> importer.BulkExportManifest:
             "output": [
                 {
                     "type": "Practitioner",
-                    "url": (
-                        "https://storage.googleapis.com/aetna/"
-                        f"part-{output_index}.ndjson?sig=x"
-                    ),
+                    "url": (f"https://storage.googleapis.com/aetna/part-{output_index}.ndjson?sig=x"),
                 }
                 for output_index in range(output_count)
             ],
@@ -230,9 +225,7 @@ async def test_stream_output_fencing_loss_skips_failure_write(monkeypatch):
     monkeypatch.setattr(importer, "_record_bulk_export_output_error", record_error)
     options = dataclasses.replace(
         _stream_options(),
-        ownership_probe=AsyncMock(
-            side_effect=RuntimeError("bulk_export_checkpoint_worker_guard_lost")
-        ),
+        ownership_probe=AsyncMock(side_effect=RuntimeError("bulk_export_checkpoint_worker_guard_lost")),
     )
 
     with pytest.raises(
@@ -267,9 +260,7 @@ async def test_terminal_repair_is_state_scoped_not_retry_owner_scoped(monkeypatc
     assert "owner_run_id" not in statement
     assert "sum(output.rows_written)" in statement
     assert "output_url_ciphertext = NULL" in statement
-    assert status.await_args.kwargs["terminal_state"] == (
-        importer.BULK_EXPORT_CHECKPOINT_FAILED
-    )
+    assert status.await_args.kwargs["terminal_state"] == (importer.BULK_EXPORT_CHECKPOINT_FAILED)
 
 
 @pytest.mark.asyncio
@@ -300,9 +291,7 @@ def _atomic_fetch_options():
 async def test_terminal_reload_repairs_capability_scrubbing(monkeypatch):
     """Terminal reload repairs without requiring ownership of the old run."""
     repair_terminal = AsyncMock()
-    ownership_probe = AsyncMock(
-        side_effect=AssertionError("terminal reload must not require retry ownership")
-    )
+    ownership_probe = AsyncMock(side_effect=AssertionError("terminal reload must not require retry ownership"))
     terminal_checkpoint_by_field = {
         "state": importer.BULK_EXPORT_CHECKPOINT_FAILED,
         "rows_written": 7,
@@ -357,6 +346,22 @@ async def test_terminal_reload_repairs_capability_scrubbing(monkeypatch):
     ownership_probe.assert_not_awaited()
 
 
+async def _fetch_atomic_checkpoint_rows(identity, ownership_probe):
+    return await importer._fetch_owned_checkpointed_bulk_resource_rows(
+        _source(),
+        identity,
+        ProviderDirectoryPractitioner,
+        importer.BulkExportFetchOptions(
+            timeout=3,
+            run_id=identity.owner_run_id,
+            row_batch_handler=AsyncMock(return_value=0),
+            row_batch_size=1,
+            retain_rows=False,
+        ),
+        ownership_probe,
+    )
+
+
 @pytest.mark.asyncio
 async def test_new_checkpoint_is_reserved_before_ownership_probe(monkeypatch):
     """A new reservation must exist before its advisory ownership probe."""
@@ -386,28 +391,18 @@ async def test_new_checkpoint_is_reserved_before_ownership_probe(monkeypatch):
 
     async def ownership_probe():
         events.append("ownership")
+
     async def stop_after_claim(*_args, **_kwargs):
         events.append("manifest")
         return None, "bulk_export_test_stop", 0
+
     monkeypatch.setattr(importer, "_bulk_client_session", client_session)
     monkeypatch.setattr(importer, "_load_bulk_export_checkpoint", load_checkpoint)
     monkeypatch.setattr(importer, "_reserve_bulk_export_checkpoint", reserve_checkpoint)
     monkeypatch.setattr(importer, "_start_checkpointed_bulk_export", start_checkpoint)
     monkeypatch.setattr(importer, "_bulk_checkpoint_primary_secret", lambda: "key")
     monkeypatch.setattr(importer, "_checkpointed_bulk_export_manifest", stop_after_claim)
-    fetch_result = await importer._fetch_owned_checkpointed_bulk_resource_rows(
-        _source(),
-        identity,
-        ProviderDirectoryPractitioner,
-        importer.BulkExportFetchOptions(
-            timeout=3,
-            run_id=identity.owner_run_id,
-            row_batch_handler=AsyncMock(return_value=0),
-            row_batch_size=1,
-            retain_rows=False,
-        ),
-        ownership_probe,
-    )
+    fetch_result = await _fetch_atomic_checkpoint_rows(identity, ownership_probe)
     assert fetch_result is not None
     assert fetch_result.error == "bulk_export_test_stop"
     assert events == [
@@ -418,6 +413,7 @@ async def test_new_checkpoint_is_reserved_before_ownership_probe(monkeypatch):
         "ownership",
         "manifest",
     ]
+
 
 @pytest.mark.asyncio
 async def test_retry_checkpoint_is_adopted_before_ownership_probe(monkeypatch):
@@ -437,37 +433,31 @@ async def test_retry_checkpoint_is_adopted_before_ownership_probe(monkeypatch):
     @contextlib.asynccontextmanager
     async def client_session():
         yield object()
+
     async def load_checkpoint(_identity):
         events.append("load")
         return prior_checkpoint_by_field
+
     async def adopt_checkpoint(_identity):
         events.append("adopt")
         return adopted_checkpoint_by_field
+
     async def ownership_probe():
         events.append("ownership")
+
     async def cancel_probe(_ctx, _task, _deadline_at):
         events.append("cancel")
+
     async def stop_after_claim(*_args, **_kwargs):
         events.append("manifest")
         return None, "bulk_export_test_stop", 0
+
     monkeypatch.setattr(importer, "_bulk_client_session", client_session)
     monkeypatch.setattr(importer, "_load_bulk_export_checkpoint", load_checkpoint)
     monkeypatch.setattr(importer, "_adopt_bulk_export_checkpoint", adopt_checkpoint)
     monkeypatch.setattr(importer, "_bulk_cancel_probe", cancel_probe)
     monkeypatch.setattr(importer, "_checkpointed_bulk_export_manifest", stop_after_claim)
-    fetch_result = await importer._fetch_owned_checkpointed_bulk_resource_rows(
-        _source(),
-        identity,
-        ProviderDirectoryPractitioner,
-        importer.BulkExportFetchOptions(
-            timeout=3,
-            run_id=identity.owner_run_id,
-            row_batch_handler=AsyncMock(return_value=0),
-            row_batch_size=1,
-            retain_rows=False,
-        ),
-        ownership_probe,
-    )
+    fetch_result = await _fetch_atomic_checkpoint_rows(identity, ownership_probe)
     assert fetch_result is not None
     assert fetch_result.error == "bulk_export_test_stop"
     assert events == [

@@ -1,12 +1,11 @@
 import csv
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from process import geo_import
-
 
 CSV_FIELDNAMES = (
     "Zip Code",
@@ -51,84 +50,24 @@ def _write_geo_csv(
         writer.writerows(source_rows)
 
 
-class _TransactionSpy:
-    def __init__(self):
-        self.active = False
-        self.enter_count = 0
-        self.exit_count = 0
-        self.exit_exception_type = None
-
-    async def __aenter__(self):
-        assert not self.active
-        self.active = True
-        self.enter_count += 1
-        return self
-
-    async def __aexit__(self, exc_type, _exc, _traceback):
-        assert self.active
-        self.active = False
-        self.exit_count += 1
-        self.exit_exception_type = exc_type
-        return False
-
-
 @pytest.fixture
 def database_boundary(monkeypatch):
-    transaction_spy = _TransactionSpy()
-    database_mocks = SimpleNamespace(
-        ensure_database=AsyncMock(),
-        create_table=AsyncMock(),
-        status=AsyncMock(),
-        transaction=transaction_spy,
-    )
-    monkeypatch.setattr(
-        geo_import,
-        "ensure_database",
-        database_mocks.ensure_database,
-    )
-    monkeypatch.setattr(
-        geo_import.db,
-        "create_table",
-        database_mocks.create_table,
-    )
-    monkeypatch.setattr(geo_import.db, "status", database_mocks.status)
-    database_mocks.generation = AsyncMock()
-    monkeypatch.setattr(geo_import, "publish_local_reference_family_generation", database_mocks.generation)
-    monkeypatch.setattr(
-        geo_import.db,
-        "transaction",
-        lambda: transaction_spy,
-    )
-    return database_mocks
+    captured_rows = []
+
+    async def publish(database, rows, expected_count, *, deadline, test_mode):
+        assert database is geo_import.db and deadline > 0
+        captured_rows.extend(rows)
+        geo_import._validate_stable_source_row_count(len(captured_rows), expected_count)
+
+    boundary = SimpleNamespace(authority=Mock(), producer=AsyncMock(side_effect=publish), rows=captured_rows)
+    monkeypatch.setattr(geo_import, "source_transaction_available", boundary.authority)
+    monkeypatch.setattr(geo_import, "publish_geo_rows", boundary.producer)
+    return boundary
 
 
-def _assert_database_not_reached(database_boundary) -> None:
-    database_boundary.ensure_database.assert_not_awaited()
-    database_boundary.create_table.assert_not_awaited()
-    database_boundary.status.assert_not_awaited()
-    assert database_boundary.transaction.enter_count == 0
-
-
-class _InsertStatementSpy:
-    def __init__(self, table):
-        self.table = table
-        self.excluded = SimpleNamespace(
-            **{
-                column.name: f"excluded_{column.name}"
-                for column in table.c
-            }
-        )
-        self.submitted_geo_rows = None
-
-    def values(self, pending_geo_rows):
-        self.submitted_geo_rows = list(pending_geo_rows)
-        return self
-
-    def on_conflict_do_update(self, **_kwargs):
-        return self
-
-    async def status(self):
-        return None
+def _assert_database_not_reached(database_boundary):
+    database_boundary.authority.assert_not_called()
+    database_boundary.producer.assert_not_awaited()
 
 
 def test_qualified_geo_table_uses_and_quotes_model_identifiers():
@@ -137,10 +76,7 @@ def test_qualified_geo_table_uses_and_quotes_model_identifiers():
         name="geo_zip_lookup",
     )
 
-    assert (
-        geo_import._qualified_geo_zip_table(target_table)
-        == '"geo_test"."geo_zip_lookup"'
-    )
+    assert geo_import._qualified_geo_zip_table(target_table) == '"geo_test"."geo_zip_lookup"'
 
 
 @pytest.mark.parametrize(
@@ -165,151 +101,44 @@ def test_qualified_geo_table_rejects_missing_or_unsafe_identifiers(
 
 
 @pytest.mark.asyncio
-async def test_load_uses_one_model_table_for_quoted_truncate_and_test_upsert(
-    tmp_path,
-    monkeypatch,
-    database_boundary,
-):
+async def test_load_test_mode_still_uses_authenticated_snapshot(tmp_path, database_boundary):
     csv_path = tmp_path / "geo.csv"
     _write_geo_csv(csv_path, [_csv_fields_by_name()])
-    target_table = geo_import.GeoZipLookup.__table__
-    insert_spy = _InsertStatementSpy(target_table)
-    monkeypatch.setattr(
-        geo_import.db,
-        "insert",
-        lambda submitted_table: (
-            insert_spy
-            if submitted_table is target_table
-            else pytest.fail("upsert must use the validated model table")
-        ),
-    )
-    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "divergent_runtime_schema")
-
     await geo_import.load_geo_lookup(csv_path, test_mode=True)
-
-    database_boundary.ensure_database.assert_awaited_once_with(True)
-    database_boundary.create_table.assert_awaited_once_with(
-        target_table,
-        checkfirst=True,
-    )
-    database_boundary.status.assert_awaited_once_with(
-        f"TRUNCATE TABLE {geo_import._qualified_geo_zip_table(target_table)};"
-    )
-    assert insert_spy.table is target_table
-    assert insert_spy.submitted_geo_rows == [
-        geo_import._geo_zip_values_from_csv_fields(_csv_fields_by_name())
-    ]
-    assert database_boundary.transaction.enter_count == 1
-    assert database_boundary.transaction.exit_exception_type is None
+    database_boundary.authority.assert_called_once_with()
+    database_boundary.producer.assert_awaited_once()
+    assert database_boundary.rows == [geo_import._geo_zip_values_from_csv_fields(_csv_fields_by_name())]
 
 
 @pytest.mark.asyncio
-async def test_load_exposes_write_failure_to_one_atomic_transaction(
-    tmp_path,
-    monkeypatch,
-    database_boundary,
-):
+async def test_load_exposes_snapshot_failure_without_fallback(tmp_path, database_boundary):
     csv_path = tmp_path / "large-geo.csv"
-    _write_geo_csv(
-        csv_path,
-        [
-            _csv_fields_by_name(**{"Zip Code": str(zip_number)})
-            for zip_number in range(1, 2002)
-        ],
-    )
-    transaction_events = []
-    flush_sizes = []
-
-    async def capture_truncate(statement):
-        assert database_boundary.transaction.active
-        transaction_events.append(("truncate", statement))
-
-    async def fail_second_flush(pending_geo_rows, *, target_table):
-        assert database_boundary.transaction.active
-        assert target_table is geo_import.GeoZipLookup.__table__
-        flush_sizes.append(len(pending_geo_rows))
-        if len(flush_sizes) == 2:
-            raise RuntimeError("second batch failed")
-        pending_geo_rows.clear()
-
-    database_boundary.status.side_effect = capture_truncate
-    monkeypatch.setattr(geo_import, "_flush_rows", fail_second_flush)
-
+    _write_geo_csv(csv_path, [_csv_fields_by_name(**{"Zip Code": str(number)}) for number in range(1, 2002)])
+    database_boundary.producer.side_effect = RuntimeError("second batch failed")
     with pytest.raises(RuntimeError, match="second batch failed"):
         await geo_import.load_geo_lookup(csv_path)
-
-    transaction_events.extend(("flush", size) for size in flush_sizes)
-    assert transaction_events == [
-        (
-            "truncate",
-            f"TRUNCATE TABLE "
-            f"{geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};",
-        ),
-        ("flush", geo_import.IMPORT_BATCH_SIZE),
-        ("flush", 1),
-    ]
-    assert database_boundary.transaction.enter_count == 1
-    assert database_boundary.transaction.exit_count == 1
-    assert database_boundary.transaction.exit_exception_type is RuntimeError
-    assert not database_boundary.transaction.active
-    database_boundary.generation.assert_not_awaited()
+    database_boundary.producer.assert_awaited_once()
+    assert database_boundary.rows == []
 
 
 @pytest.mark.asyncio
-async def test_load_rolls_back_when_source_row_count_changes_after_preflight(
-    tmp_path,
-    monkeypatch,
-    database_boundary,
-):
+async def test_load_preserves_changed_source_refusal(tmp_path, monkeypatch, database_boundary):
     csv_path = tmp_path / "geo.csv"
     _write_geo_csv(csv_path, [_csv_fields_by_name()])
-    monkeypatch.setattr(
-        geo_import,
-        "_preflight_geo_source",
-        lambda _csv_path: 2,
-    )
-
-    async def capture_flush(pending_geo_rows, *, target_table):
-        assert database_boundary.transaction.active
-        assert target_table is geo_import.GeoZipLookup.__table__
-        pending_geo_rows.clear()
-
-    monkeypatch.setattr(geo_import, "_flush_rows", capture_flush)
-
-    with pytest.raises(
-        geo_import.GeoSourceValidationError,
-        match="changed after preflight",
-    ):
+    monkeypatch.setattr(geo_import, "_preflight_geo_source", lambda _path: 2)
+    with pytest.raises(geo_import.GeoSourceValidationError, match="changed after preflight"):
         await geo_import.load_geo_lookup(csv_path)
-
-    assert database_boundary.transaction.enter_count == 1
-    assert database_boundary.transaction.exit_count == 1
-    assert (
-        database_boundary.transaction.exit_exception_type
-        is geo_import.GeoSourceValidationError
-    )
-    database_boundary.generation.assert_not_awaited()
+    database_boundary.producer.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_generation_failure_keeps_geo_publication_in_one_transaction(tmp_path, monkeypatch, database_boundary):
+async def test_load_exposes_generation_refusal_without_retry(tmp_path, database_boundary):
     csv_path = tmp_path / "geo.csv"
     _write_geo_csv(csv_path, [_csv_fields_by_name()])
-
-    async def capture_flush(pending_geo_rows, *, target_table):
-        assert database_boundary.transaction.active
-        pending_geo_rows.clear()
-
-    monkeypatch.setattr(geo_import, "_flush_rows", capture_flush)
-    database_boundary.generation.side_effect = RuntimeError("generation unavailable")
-
+    database_boundary.producer.side_effect = RuntimeError("generation unavailable")
     with pytest.raises(RuntimeError, match="generation unavailable"):
         await geo_import.load_geo_lookup(csv_path)
-
-    assert database_boundary.transaction.exit_exception_type is RuntimeError
-    database_boundary.generation.assert_awaited_once_with(
-        geo_import.db, importer_id="geo", schema_name=geo_import.GeoZipLookup.__table__.schema
-    )
+    database_boundary.producer.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -318,9 +147,7 @@ async def test_generation_failure_keeps_geo_publication_in_one_transaction(tmp_p
     [
         ("", "required headers"),
         (
-            ",".join(CSV_FIELDNAMES)
-            + "\n60654,Chicago,IL,Illinois,23890,17031,Cook,"
-            "America/Chicago,\"41.89, -87.63\"\n",
+            ",".join(CSV_FIELDNAMES) + '\n60654,Chicago,IL,Illinois,23890,17031,Cook,America/Chicago,"41.89, -87.63"\n',
             "semicolon-delimited",
         ),
         (

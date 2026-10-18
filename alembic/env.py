@@ -1,20 +1,17 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import logging
-from logging.config import fileConfig
 import asyncio
+import logging
 import os
+from logging.config import fileConfig
 
 import sqlalchemy as sa
+from alembic.ddl.impl import DefaultImpl
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
-from alembic.ddl.impl import DefaultImpl
 from db.connection import db
-
-
-
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -44,28 +41,26 @@ def _wide_version_table_impl(self, *, version_table, version_table_schema, versi
 DefaultImpl.version_table_impl = _wide_version_table_impl
 
 
-exclude_tables = [name.strip() for name in config.get_section('alembic:exclude', {}).get('tables', '').split(',')]
+exclude_tables = [name.strip() for name in config.get_section("alembic:exclude", {}).get("tables", "").split(",")]
 
 
 def get_db_env(key, default=None):
     value = os.environ.get(key)
     if value is not None:
         return value
-    return os.environ.get(f'HLTHPRT_{key}', default)
+    return os.environ.get(f"HLTHPRT_{key}", default)
 
 
 def target_schema() -> str:
     runtime_schema = os.environ.get("HLTHPRT_DB_SCHEMA")
     legacy_schema = os.environ.get("DB_SCHEMA")
     if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
-        raise RuntimeError(
-            "DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema"
-        )
+        raise RuntimeError("DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema")
     return runtime_schema or legacy_schema or "mrf"
 
 
 def database_url(driver: str = "postgresql") -> str:
-    return '{driver}://{db_user}:{db_password}@{db_host}:{db_port}/{db_database}'.format(
+    return "{driver}://{db_user}:{db_password}@{db_host}:{db_port}/{db_database}".format(
         driver=driver,
         db_user=get_db_env("DB_USER"),
         db_password=get_db_env("DB_PASSWORD"),
@@ -82,6 +77,7 @@ def include_object(object, name, type_, reflected, compare_to):
         return False
     else:
         return True
+
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
@@ -114,7 +110,7 @@ def run_migrations_offline():
 
 def do_run_migrations(connection):
     schema = target_schema()
-    connection.dialect.default_schema_name = 'public'
+    connection.dialect.default_schema_name = "public"
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
@@ -133,14 +129,11 @@ def do_run_migrations(connection):
 async def run_async_migrations():
     schema = target_schema()
     config_dict = {
-        'sqlalchemy.url': database_url("postgresql+asyncpg"),
-        'sqlalchemy.connect_args': {'server_settings': {'search_path': f"{schema},public"}},
+        "sqlalchemy.url": database_url("postgresql+asyncpg"),
+        "sqlalchemy.connect_args": {"server_settings": {"search_path": f"{schema},public"}},
     }
 
-    connectable = async_engine_from_config(
-        config_dict,
-        prefix='sqlalchemy.',
-        poolclass=pool.NullPool)
+    connectable = async_engine_from_config(config_dict, prefix="sqlalchemy.", poolclass=pool.NullPool)
 
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
@@ -148,8 +141,12 @@ async def run_async_migrations():
 
 
 def run_migrations_online():
-    """Run migrations in online mode using the repo's asyncpg driver."""
-    asyncio.run(run_async_migrations())
+    """Use a caller-owned connection or the standalone asyncpg driver."""
+    connection = config.attributes.get("connection")
+    if connection is None:
+        asyncio.run(run_async_migrations())
+    else:
+        do_run_migrations(connection)
 
 
 if context.is_offline_mode():

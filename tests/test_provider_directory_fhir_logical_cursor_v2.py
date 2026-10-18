@@ -27,7 +27,6 @@ from process.provider_directory_fhir_census_page_geometry import (
     validate_current_version_census_checkpoint_geometry,
 )
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 BASE = "https://directory.example.test/fhir"
 CUTOFF = "2026-08-01T12:00:00.000000Z"
@@ -79,10 +78,7 @@ def _start_url() -> str:
 
 
 def _cursor_url(offset: int) -> str:
-    return (
-        f"{BASE}?_getpages=opaque&_getpagesoffset={offset}"
-        f"&_count={PAGE_COUNT}&_pretty=true"
-    )
+    return f"{BASE}?_getpages=opaque&_getpagesoffset={offset}&_count={PAGE_COUNT}&_pretty=true"
 
 
 def _count_bundle(total: int) -> dict[str, object]:
@@ -210,16 +206,19 @@ def test_resume_accepts_sparse_page_row_shapes(
     rows_processed: int,
 ):
     next_url = _cursor_url(pages_processed * PAGE_COUNT)
-    assert validated_current_version_census_resume_url(
-        _contract(),
-        RESOURCE_TYPE,
-        _start_url(),
-        next_url,
-        pages_processed=pages_processed,
-        rows_processed=rows_processed,
-        expected_page_count=PAGE_COUNT,
-        proof=_sparse_checkpoint_proof(pages_processed, rows_processed),
-    ) == next_url
+    assert (
+        validated_current_version_census_resume_url(
+            _contract(),
+            RESOURCE_TYPE,
+            _start_url(),
+            next_url,
+            pages_processed=pages_processed,
+            rows_processed=rows_processed,
+            expected_page_count=PAGE_COUNT,
+            proof=_sparse_checkpoint_proof(pages_processed, rows_processed),
+        )
+        == next_url
+    )
 
 
 @pytest.mark.parametrize(
@@ -328,28 +327,27 @@ def test_checkpoint_geometry_rejects_noninteger_metrics(
 async def test_empty_window_checkpoint_survives_transient_transport(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    operation_spies = _install_acquisition_spies(
-        monkeypatch,
-        (
-            (200, _count_bundle(501), None, 1),
-            (200, _resource_bundle((), next_url=_cursor_url(250)), None, 1),
-            (503, {}, "transient", 1),
-        ),
-    )
-    acquisition = await _run_acquisition(operation_spies)
-    assert acquisition.error == (
-        f"{CURRENT_VERSION_CENSUS_RETRYABLE_ERROR}:transient"
-    )
-    assert acquisition.next_url_remaining is True
-    operation_spies.row_write.assert_not_awaited()
-    operation_spies.checkpoint_write.assert_awaited_once()
-    checkpoint_by_field = operation_spies.checkpoint_write.await_args.kwargs
-    assert checkpoint_by_field["next_url"] == _cursor_url(250)
-    assert checkpoint_by_field["pages_processed"] == 1
-    assert checkpoint_by_field["rows_processed"] == 0
-    assert checkpoint_by_field["completeness"]["page_geometry"][
-        "empty_pages"
-    ] == 1
+    from tests.test_provider_directory_generic_source_policy import synthetic_checkpoint_factory
+
+    async with synthetic_checkpoint_factory(monkeypatch, importer.db, schema=importer._schema()):
+        operation_spies = _install_acquisition_spies(
+            monkeypatch,
+            (
+                (200, _count_bundle(501), None, 1),
+                (200, _resource_bundle((), next_url=_cursor_url(250)), None, 1),
+                (503, {}, "transient", 1),
+            ),
+        )
+        acquisition = await _run_acquisition(operation_spies)
+        assert acquisition.error == (f"{CURRENT_VERSION_CENSUS_RETRYABLE_ERROR}:transient")
+        assert acquisition.next_url_remaining is True
+        operation_spies.row_write.assert_not_awaited()
+        operation_spies.checkpoint_write.assert_awaited_once()
+        checkpoint_by_field = operation_spies.checkpoint_write.await_args.kwargs
+        assert checkpoint_by_field["next_url"] == _cursor_url(250)
+        assert checkpoint_by_field["pages_processed"] == 1
+        assert checkpoint_by_field["rows_processed"] == 0
+        assert checkpoint_by_field["completeness"]["page_geometry"]["empty_pages"] == 1
 
 
 @pytest.mark.asyncio
@@ -463,31 +461,32 @@ async def test_transient_terminal_post_count_writes_no_terminal_rows(
 async def test_sparse_terminal_deficit_remains_nonpublishing(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    operation_spies = _install_acquisition_spies(
-        monkeypatch,
-        (
-            (200, _count_bundle(501), None, 1),
+    from tests.test_provider_directory_generic_source_policy import synthetic_checkpoint_factory
+
+    async with synthetic_checkpoint_factory(monkeypatch, importer.db, schema=importer._schema()):
+        operation_spies = _install_acquisition_spies(
+            monkeypatch,
             (
-                200,
-                _resource_bundle(("org-1",), next_url=_cursor_url(250)),
-                None,
-                1,
+                (200, _count_bundle(501), None, 1),
+                (
+                    200,
+                    _resource_bundle(("org-1",), next_url=_cursor_url(250)),
+                    None,
+                    1,
+                ),
+                (200, _resource_bundle(()), None, 1),
+                (200, _count_bundle(501), None, 1),
             ),
-            (200, _resource_bundle(()), None, 1),
-            (200, _count_bundle(501), None, 1),
-        ),
-    )
-    monkeypatch.setattr(
-        importer,
-        "parse_fhir_resource",
-        Mock(return_value=_parsed_row("org-1")),
-    )
-    acquisition = await _run_acquisition(operation_spies)
-    assert acquisition.complete is False
-    assert acquisition.error.endswith(":cursor_loss")
-    assert acquisition.fetch_diagnostic["verified"] is False
-    assert acquisition.fetch_diagnostic["unreturned_count"] == 500
-    assert operation_spies.checkpoint_write.await_count == 1
-    assert operation_spies.checkpoint_write.await_args.kwargs["next_url"] == (
-        _cursor_url(250)
-    )
+        )
+        monkeypatch.setattr(
+            importer,
+            "parse_fhir_resource",
+            Mock(return_value=_parsed_row("org-1")),
+        )
+        acquisition = await _run_acquisition(operation_spies)
+        assert acquisition.complete is False
+        assert acquisition.error.endswith(":cursor_loss")
+        assert acquisition.fetch_diagnostic["verified"] is False
+        assert acquisition.fetch_diagnostic["unreturned_count"] == 500
+        assert operation_spies.checkpoint_write.await_count == 1
+        assert operation_spies.checkpoint_write.await_args.kwargs["next_url"] == (_cursor_url(250))

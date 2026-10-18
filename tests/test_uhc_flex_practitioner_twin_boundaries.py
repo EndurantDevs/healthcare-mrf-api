@@ -4,11 +4,10 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 import copy
+from contextlib import asynccontextmanager
 from dataclasses import fields, replace
-from datetime import date
-from datetime import timedelta
+from datetime import date, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -17,19 +16,19 @@ from process import uhc_flex_practitioner_twin_identity as twin_identity
 from process import uhc_flex_practitioner_twin_store as twin_store
 from process import uhc_flex_practitioner_twin_store_contract as twin_contract
 from process.uhc_flex_practitioner_single_root_contract import (
+    UHCFlexPractitionerSingleRootError,
+    UHCFlexPractitionerSingleRootReceipt,
     build_single_root_admission,
     single_root_dataset_intent_id,
     single_root_run_id,
-    UHCFlexPractitionerSingleRootError,
-    UHCFlexPractitionerSingleRootReceipt,
 )
 from process.uhc_flex_practitioner_store_contract import _acquisition_id
 from tests.provider_directory_uhc_flex_npi_cohort_pg_support import cohort_fixture
 from tests.test_uhc_flex_practitioner_twin_store_contract import (
-    _root,
     OPERATION_KEY,
     PROJECTION_DATE,
     TIMESTAMP,
+    _root,
 )
 
 
@@ -174,9 +173,7 @@ def test_twin_identity_and_contract_fail_closed_on_malformed_coordinates():
     assert twin_contract._has_valid_lineage(object()) is False
     attempt, _admission = _attempt_and_admission()
     with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError):
-        twin_contract.uhc_flex_practitioner_twin_admission_id(
-            _mutated(attempt, matched=False)
-        )
+        twin_contract.uhc_flex_practitioner_twin_admission_id(_mutated(attempt, matched=False))
 
 
 def test_single_root_contract_rejects_invalid_coordinates_and_receipts():
@@ -209,9 +206,7 @@ def test_single_root_contract_rejects_invalid_coordinates_and_receipts():
             official_dataset_id="dataset",
             official_dataset_hash="0" * 64,
             official_content_proof_sha256="1" * 64,
-            dataset_intent_id=single_root_dataset_intent_id(
-                cohort.cohort_id, PROJECTION_DATE, OPERATION_KEY
-            ),
+            dataset_intent_id=single_root_dataset_intent_id(cohort.cohort_id, PROJECTION_DATE, OPERATION_KEY),
             expected_npi_count=cohort.npi_count,
             candidate=object(),
             admission_id="pdufpad_" + "2" * 48,
@@ -296,51 +291,32 @@ async def test_twin_store_lock_and_public_require_input_boundaries():
 
 @pytest.mark.asyncio
 async def test_single_root_lock_revalidates_current_official_dataset(monkeypatch):
-    candidate, candidate_row, cohort_row, snapshot = _single_root_lock_row()
+    candidate, candidate_row, cohort_row, _snapshot = _single_root_lock_row()
     database = _Database(first_rows=(candidate_row, cohort_row))
+    calls = []
 
-    async def current_snapshot(_database):
-        assert _database is database
-        return snapshot
+    async def issued_replay(*, database, expected_cohort):
+        calls.append((database, expected_cohort))
+        return twin_store.official_cohort.UHCFlexOfficialCohortSyncResult(expected_cohort, False)
 
-    monkeypatch.setattr(
-        twin_store.official_cohort,
-        "_current_official_snapshot",
-        current_snapshot,
-    )
-
-    assert await twin_store._lock_single_root(
-        database,
-        candidate.acquisition_id,
-    ) == candidate
+    monkeypatch.setattr(twin_store.official_cohort, "sync_uhc_flex_official_cohort", issued_replay)
+    assert await twin_store._lock_single_root(database, candidate.acquisition_id) == candidate
     assert len(database.first_calls) == 2
-    assert "provider_directory_uhc_flex_practitioner_acquisition" in (
-        database.first_calls[0][0]
-    )
+    assert "provider_directory_uhc_flex_practitioner_acquisition" in database.first_calls[0][0]
     assert "FOR SHARE" in database.first_calls[0][0]
-    assert database.first_calls[0][1] == {
-        "candidate_acquisition_id": candidate.acquisition_id,
-    }
+    assert database.first_calls[0][1] == {"candidate_acquisition_id": candidate.acquisition_id}
     assert "provider_directory_uhc_flex_npi_cohort" in database.first_calls[1][0]
-    assert "FOR SHARE" in database.first_calls[1][0]
+    assert "FOR SHARE" not in database.first_calls[1][0]
     assert database.first_calls[1][1] == {"cohort_id": candidate.cohort_id}
+    assert len(calls) == 1 and calls[0][0] is database
+    assert calls[0][1] == twin_store.official_cohort._cohort_from_row(cohort_row)
 
-    drifted_snapshot = SimpleNamespace(**vars(snapshot))
-    drifted_snapshot.content_proof_sha256 = "0" * 64
+    async def refused_replay(**_kwargs):
+        raise twin_store.official_cohort.UHCFlexOfficialCohortError("state")
 
-    async def drifted_current_snapshot(_database):
-        return drifted_snapshot
-
-    monkeypatch.setattr(
-        twin_store.official_cohort,
-        "_current_official_snapshot",
-        drifted_current_snapshot,
-    )
+    monkeypatch.setattr(twin_store.official_cohort, "sync_uhc_flex_official_cohort", refused_replay)
     with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError):
-        await twin_store._lock_single_root(
-            _Database(first_rows=(candidate_row, cohort_row)),
-            candidate.acquisition_id,
-        )
+        await twin_store._lock_single_root(_Database(first_rows=(candidate_row, cohort_row)), candidate.acquisition_id)
 
 
 @pytest.mark.asyncio

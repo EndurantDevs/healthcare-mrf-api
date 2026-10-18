@@ -232,14 +232,46 @@ async def test_mrf_upgrade_preserves_npi_catalog_and_reference_rows(monkeypatch)
             await engine.dispose()
 
 
+async def _assert_native_publication_refused(connection, schema, importer_id):
+    """Keep native-only families unchanged when the generic publisher refuses them."""
+
+    authority_before = await generation.read_reference_family_result_generation_authority(
+        connection, importer_id=importer_id, schema_name=schema
+    )
+    oids_before = await generation.current_reference_family_relation_oids(
+        connection, importer_id=importer_id, schema_name=schema
+    )
+    failure_by_importer = {
+        "geo": "geo_source_native_publication_required",
+        "cms-doctors": "cms_doctors_native_publication_required",
+    }
+    with pytest.raises(RuntimeError, match=f"^{failure_by_importer[importer_id]}$"):
+        await generation.publish_local_reference_family_generation(
+            connection, importer_id=importer_id, schema_name=schema
+        )
+    assert (
+        await generation.read_reference_family_result_generation_authority(
+            connection, importer_id=importer_id, schema_name=schema
+        )
+        == authority_before
+    )
+    assert (
+        await generation.current_reference_family_relation_oids(connection, importer_id=importer_id, schema_name=schema)
+        == oids_before
+    )
+
+
 async def _publish_initial_generations(engine, schema):
-    """Publish generation one for each application-schema reference-ledger family."""
+    """Publish generic families and prove native-only families refuse this path."""
 
     authority_by_importer = {}
     for importer_id in generation.RELATION_NAMES_BY_IMPORTER:
         if importer_id in {"label", "tiger"}:
             continue
         async with engine.begin() as connection:
+            if importer_id in {"geo", "cms-doctors"}:
+                await _assert_native_publication_refused(connection, schema, importer_id)
+                continue
             first = await generation.publish_local_reference_family_generation(
                 connection,
                 importer_id=importer_id,

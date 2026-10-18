@@ -355,7 +355,15 @@ async def capture_reference_family_serving_generation(
     )
     if authority.serving_generation is None or authority.relation_oids != current_oids:
         raise RuntimeError("reference family serving generation is unavailable or drifted")
-    if importer_id != "label":
+    if importer_id == "geo":
+        from process.geo_source_storage import capture_geo_generation
+
+        return await capture_geo_generation(database, schema_name)
+    if importer_id == "cms-doctors":
+        from process.cms_doctors_immutable import require_doctors_storage
+
+        await require_doctors_storage(database, schema_name=schema_name, legacy=True)
+    elif importer_id != "label":
         from process.reference_source_generation import require_reference_revision_tracking
 
         await require_reference_revision_tracking(database, importer_id=importer_id, schema_name=schema_name)
@@ -380,6 +388,10 @@ async def publish_local_reference_family_generation(
                 database, importer_id="label", schema=schema, consumed_dependencies={}
             )
         )
+    if importer == "cms-doctors":
+        raise RuntimeError("cms_doctors_native_publication_required")
+    if importer == "geo":
+        raise RuntimeError("geo_source_native_publication_required")
     from process.reference_source_generation import install_reference_revision_guards
 
     await install_reference_revision_guards(database, importer_id=importer, schema_name=schema)
@@ -581,6 +593,26 @@ async def _adopted_generation_fields(database, importer, schema, source_generati
     }
 
 
+async def _adopt_native_doctors_generation(database, importer, schema, source_generation, source_revision_tracked):
+    """Adopt the immutable doctors generation without installing revision hooks."""
+    from process.cms_doctors_immutable import adopt_doctors_generation
+
+    if source_revision_tracked:
+        raise ValueError("cms_doctors_native_publication_cannot_install_revision_hooks")
+    current = await read_reference_family_result_generation_authority(
+        database,
+        importer_id=importer,
+        schema_name=schema,
+        lock=True,
+    )
+    return await adopt_doctors_generation(
+        database,
+        schema_name=schema,
+        expected_authority=current,
+        source_generation=source_generation,
+    )
+
+
 async def publish_adopted_reference_family_generation(
     database: Any,
     *,
@@ -590,13 +622,20 @@ async def publish_adopted_reference_family_generation(
     source_revision_tracked: bool = False,
 ) -> ReferenceFamilyResultGenerationAuthority:
     """Preserve provenance; trust revisions only with validated guarded capture."""
-
     importer = _importer_id(importer_id)
     schema = _schema_name(schema_name)
     if type(source_revision_tracked) is not bool or (source_revision_tracked and source_generation is None):
         raise ValueError("reference family adopted revision tracking is invalid")
     if importer == "label":
         return await _adopt_label_generation(database, schema, source_generation)
+    if importer == "geo":
+        from process.geo_source_storage import adopt_geo_generation
+
+        return await adopt_geo_generation(database, schema, source_generation, source_revision_tracked)
+    if importer == "cms-doctors":
+        return await _adopt_native_doctors_generation(
+            database, importer, schema, source_generation, source_revision_tracked
+        )
     from process.reference_source_generation import install_reference_revision_guards
 
     await install_reference_revision_guards(database, importer_id=importer, schema_name=schema)
@@ -1120,12 +1159,30 @@ async def _read_immutable_activation_predecessor(session, manifest, incumbent):
     """Observe the protected predecessor before physical receive rotation."""
     from process import reference_family_archive as native
 
+    if manifest.importer_id == "geo":
+        from process.geo_source_storage import capture_geo_predecessor
+
+        return await capture_geo_predecessor(session, incumbent.schema_name, incumbent.relation_oids)
+    if manifest.importer_id == "cms-doctors":
+        from process.cms_doctors_immutable import capture_doctors_predecessor
+
+        presence_flags = [oid is not None for _, oid in incumbent.relation_oids]
+        if any(presence_flags):
+            if not all(presence_flags):
+                raise native.ReferenceFamilyArchiveError("Doctors native predecessor is incomplete")
+            return await capture_doctors_predecessor(session, incumbent.schema_name)
+        authority = await read_reference_family_result_generation_authority(
+            session, importer_id="cms-doctors", schema_name=incumbent.schema_name, lock=True
+        )
+        if authority.relation_oids is not None:
+            raise native.ReferenceFamilyArchiveError("Doctors native predecessor differs")
+        return authority
     if (
         manifest.importer_id == "nucc"
         and manifest.source_capture_contract == native.IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT
     ):
         return await read_reference_family_result_generation_authority(
-            session, importer_id="nucc", schema_name=incumbent.schema_name, lock=True
+            session, importer_id=manifest.importer_id, schema_name=incumbent.schema_name, lock=True
         )
     return None
 
@@ -1138,7 +1195,26 @@ async def _adopt_validated_family_generation(
 
     if manifest.importer_id in native.TERMINAL_CAPTURE_IMPORTERS:
         return None
-    if predecessor is not None:
+    if predecessor is not None and manifest.importer_id == "geo":
+        from process.geo_source_storage import publish_geo_generation
+
+        published_authority = await publish_geo_generation(
+            session,
+            schema_name=incumbent.schema_name,
+            source_generation=incoming_generation,
+            expected_authority=predecessor,
+            local=False,
+        )
+    elif predecessor is not None and manifest.importer_id == "cms-doctors":
+        from process.cms_doctors_immutable import adopt_doctors_generation
+
+        published_authority = await adopt_doctors_generation(
+            session,
+            schema_name=incumbent.schema_name,
+            source_generation=incoming_generation,
+            expected_authority=predecessor,
+        )
+    elif predecessor is not None:
         published_authority = await adopt_immutable_nucc_generation(
             session,
             schema_name=incumbent.schema_name,

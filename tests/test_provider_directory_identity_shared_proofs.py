@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import datetime
 import importlib
 import json
@@ -11,6 +12,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from db.connection import ConnectionProxy
+from process import provider_directory_generic_source_adapters as source_adapters
+from process import provider_directory_generic_source_policy as source_policy
+from tests.test_provider_directory_generic_source_policy import (
+    synthetic_checkpoint_factory,
+    synthetic_source_factory,
+)
 
 fhir = importlib.import_module("process.provider_directory_fhir")
 
@@ -144,11 +152,14 @@ async def test_address_overlay_filter_owner_and_precreate_failure(monkeypatch):
         "status",
         AsyncMock(side_effect=["DELETE 2", RuntimeError("create failed")]),
     )
-    assert await fhir._dedupe_address_overlay_stage(
-        '"mrf"."stage"',
-        source_ids=["source-a"],
-        resource_types=["Organization"],
-    ) == 2
+    assert (
+        await fhir._dedupe_address_overlay_stage(
+            '"mrf"."stage"',
+            source_ids=["source-a"],
+            resource_types=["Organization"],
+        )
+        == 2
+    )
 
     monkeypatch.setattr(
         fhir.db,
@@ -180,9 +191,11 @@ async def test_address_overlay_filter_owner_and_precreate_failure(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_partition_fingerprint_writes_preserve_transaction_boundary(monkeypatch):
+    """Retry observations borrow the original Source writer and never legacy upserts."""
     fingerprint_rows = [{"resource_id": "practitioner-1"}]
     default_writer = AsyncMock()
     connection_writer = AsyncMock()
+    upsert_on_connection = fhir._upsert_dataset_resource_rows_on_connection
     monkeypatch.setattr(fhir, "_upsert_rows", default_writer)
     monkeypatch.setattr(
         fhir,
@@ -190,26 +203,27 @@ async def test_partition_fingerprint_writes_preserve_transaction_boundary(monkey
         connection_writer,
     )
 
-    await fhir._write_last_updated_partition_fingerprint_rows(
-        fingerprint_rows,
-        database_connection=None,
-    )
-    default_writer.assert_awaited_once_with(
-        fhir.ProviderDirectoryDatasetResource,
-        fingerprint_rows,
-    )
+    sessions = []
+
+    async def persist(directory, rows, **identity):
+        session = source_policy.source_copy_session()
+        assert directory is fhir and rows is fingerprint_rows
+        assert session is fhir.db._transaction_binding().session is source_policy.bound_publisher().connection
+        assert identity == {"resource_hash_contract": None, "semantic_projection_as_of": None}
+        sessions.append(session)
+
+    monkeypatch.setattr(source_adapters, "persist_source_rows", persist)
+    async with synthetic_source_factory(monkeypatch, fhir.db, schema=fhir._schema()):
+        await fhir._write_last_updated_partition_fingerprint_rows(fingerprint_rows, database_connection=None)
+        async with source_policy.source_transaction(fhir.db) as session:
+            connection = ConnectionProxy(fhir.db, session, None)
+            await fhir._write_last_updated_partition_fingerprint_rows(fingerprint_rows, database_connection=connection)
+            await upsert_on_connection(connection, [])
+            session.status.assert_not_awaited()
+            assert sessions[-1] is session
+    assert len(sessions) == 2 and sessions[0] is not sessions[1]
+    default_writer.assert_not_awaited()
     connection_writer.assert_not_awaited()
-
-    connection = object()
-    await fhir._write_last_updated_partition_fingerprint_rows(
-        fingerprint_rows,
-        database_connection=connection,
-    )
-    connection_writer.assert_awaited_once_with(connection, fingerprint_rows)
-
-    empty_connection = SimpleNamespace(status=AsyncMock())
-    await fhir._upsert_dataset_resource_rows_on_connection(empty_connection, [])
-    empty_connection.status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -316,9 +330,7 @@ async def test_partition_candidate_proof_and_stream_fail_closed(monkeypatch):
             _checkpoint_context(),
             {
                 "source_id": "source-a",
-                "_resource_hash_contract": (
-                    fhir.LEGACY_RESOURCE_HASH_CONTRACT
-                ),
+                "_resource_hash_contract": (fhir.LEGACY_RESOURCE_HASH_CONTRACT),
             },
             "Practitioner",
             object,
@@ -348,6 +360,14 @@ def test_partition_output_rows_reject_missing_or_non_object_payloads():
 async def test_location_coordinate_backfill_skips_absence_and_stalled_cursor(
     monkeypatch,
 ):
+    monkeypatch.setattr(
+        fhir,
+        "_PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES",
+        contextvars.ContextVar(
+            "test_coordinate_private_scope",
+            default={"provider_directory_location": "private_location"},
+        ),
+    )
     table_present = AsyncMock(side_effect=[False, True])
     monkeypatch.setattr(fhir, "_is_table_present", table_present)
     assert await fhir.backfill_provider_directory_location_coordinates("mrf") == 0
@@ -363,12 +383,15 @@ async def test_location_coordinate_backfill_skips_absence_and_stalled_cursor(
         "first",
         AsyncMock(side_effect=[repeated_cursor_by_field, repeated_cursor_by_field]),
     )
-    assert await fhir.backfill_provider_directory_location_coordinates(
-        "mrf",
-        run_id="run",
-        source_ids=["source-a"],
-        batch_size=10,
-    ) == 2
+    assert (
+        await fhir.backfill_provider_directory_location_coordinates(
+            "mrf",
+            run_id="run",
+            source_ids=["source-a"],
+            batch_size=10,
+        )
+        == 2
+    )
 
 
 @pytest.mark.asyncio
@@ -432,13 +455,22 @@ async def test_partition_checkpoint_save_rejects_lost_owner(monkeypatch):
         "_update_last_updated_partition_checkpoint",
         AsyncMock(return_value="UPDATE 0"),
     )
-    with pytest.raises(RuntimeError, match="checkpoint_ownership_lost"):
-        await fhir._save_last_updated_partition_plan(
-            _checkpoint_context(),
-            "Practitioner",
-            config,
-            plan,
-            census=fhir.LastUpdatedCompletenessCensus(),
-            pages_processed=2,
-            rows_processed=3,
-        )
+    async with synthetic_checkpoint_factory(monkeypatch, fhir.db, schema=fhir._schema()):
+        with pytest.raises(RuntimeError, match="checkpoint_ownership_lost"):
+            await fhir._save_last_updated_partition_plan(
+                _checkpoint_context(),
+                "Practitioner",
+                config,
+                plan,
+                census=fhir.LastUpdatedCompletenessCensus(),
+                pages_processed=2,
+                rows_processed=3,
+            )
+    fhir._update_last_updated_partition_checkpoint.assert_awaited_once()
+    executor, checkpoint = fhir._update_last_updated_partition_checkpoint.await_args.args
+    assert executor is fhir.db
+    assert (checkpoint["owner_run_id"], checkpoint["dataset_id"], checkpoint["rows_processed"]) == (
+        "run",
+        "dataset-a",
+        3,
+    )

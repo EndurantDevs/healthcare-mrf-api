@@ -14,9 +14,10 @@ from tests.ptg2_layout_build_schema_support import (
 )
 from tests.ptg_source_snapshot_removal_postgres_projection import (
     schema_sql as _schema_sql,
+)
+from tests.ptg_source_snapshot_removal_postgres_projection import (
     snapshot_manifest as _snapshot_manifest,
 )
-
 
 _SCHEMA_STATEMENTS = (
     """
@@ -56,6 +57,14 @@ _SCHEMA_STATEMENTS = (
         created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
         published_at timestamptz,
         retired_at timestamptz
+    )
+    """,
+    """
+    CREATE TABLE __SCHEMA__.plan_release_snapshot_pin (
+        serving_revision_id varchar(64) NOT NULL,
+        snapshot_id varchar(128) NOT NULL,
+        reason varchar(256),
+        PRIMARY KEY (serving_revision_id, snapshot_id)
     )
     """,
     """
@@ -285,10 +294,7 @@ async def create_production_shaped_schema(database: Any, schema_name: str) -> No
         for statement in _SCHEMA_STATEMENTS[:-1]:
             await connection.status(_schema_sql(statement, schema))
         for table_name in PTG2_V3_DENSE_LAYOUT_TABLES:
-            await connection.status(
-                f'CREATE TABLE {schema}."{table_name}" '
-                "(snapshot_key bigint NOT NULL)"
-            )
+            await connection.status(f'CREATE TABLE {schema}."{table_name}" (snapshot_key bigint NOT NULL)')
         await connection.status(_schema_sql(_SCHEMA_STATEMENTS[-1], schema))
 
 

@@ -18,6 +18,8 @@ from tests.provider_directory_semantic_proof_v3_postgres_support import (
     PROJECTION_AS_OF,
     RESOURCE_ID,
     SOURCE_ID,
+    _admin_update_semantic_input,
+    _completed_semantic_scope,
     _insert_parent,
     _observation,
     _proof,
@@ -27,7 +29,9 @@ from tests.provider_directory_semantic_proof_v3_postgres_support import (
     _write_page,
     importer,
 )
-
+from tests.provider_directory_semantic_proof_v3_postgres_support import (
+    semantic_source_template as semantic_source_template,
+)
 
 DATASET_ID = "dataset-semantic-candidate-proof"
 RESOURCE_SCOPE = ("Practitioner",)
@@ -73,24 +77,23 @@ async def _replace_retained_payload_v3(
         schema,
         DATASET_ID,
     )
-    mutated_payload_by_field = canonical_practitioner_payload(
-        {**stored_payload_by_field, "active": False}
-    )
+    mutated_payload_by_field = canonical_practitioner_payload({**stored_payload_by_field, "active": False})
     mutated_hash = resource_payload_sha256_for_contract(
         mutated_payload_by_field,
         SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
     )
     assert mutated_payload_by_field["active"] is False
     assert mutated_hash != original_hash
-    await database.status(
-        f'UPDATE "{schema}".provider_directory_dataset_resource '
-        "SET payload_hash=:payload_hash, payload_json=CAST(:payload_json AS jsonb) "
-        "WHERE dataset_id=:dataset_id AND resource_type='Practitioner' "
-        "AND resource_id=:resource_id;",
-        payload_hash=mutated_hash,
-        payload_json=json.dumps(mutated_payload_by_field),
-        dataset_id=DATASET_ID,
-        resource_id=RESOURCE_ID,
+    await _admin_update_semantic_input(
+        database,
+        DATASET_ID,
+        "SET payload_hash=:payload_hash, payload_json=CAST(:payload_json AS jsonb) WHERE dataset_id=:dataset_id AND resource_type='Practitioner' AND resource_id=:resource_id",
+        dict(
+            payload_hash=mutated_hash,
+            payload_json=json.dumps(mutated_payload_by_field),
+            dataset_id=DATASET_ID,
+            resource_id=RESOURCE_ID,
+        ),
     )
     persisted_hash, persisted_payload_by_field = await _stored_dataset_row(
         database,
@@ -108,10 +111,13 @@ async def test_postgres_v3_candidate_proof_parity_and_retained_mismatch(
     """Accept exact shard parity and reject independently valid retained drift."""
     async with _semantic_database(monkeypatch) as (database, schema):
         await _insert_parent(database, schema, DATASET_ID)
-        assert await _write_page(
-            DATASET_ID,
-            _observation("Alex Example", page_number=1),
-        ) == 1
+        assert (
+            await _write_page(
+                DATASET_ID,
+                _observation("Alex Example", page_number=1),
+            )
+            == 1
+        )
         candidate = _semantic_candidate()
         stored_proof = await _proof(database, schema, DATASET_ID)
         shard_hashes_before, shard_records_before = await _shard_records(
@@ -119,7 +125,7 @@ async def test_postgres_v3_candidate_proof_parity_and_retained_mismatch(
             schema,
             DATASET_ID,
         )
-        async with database.acquire() as connection:
+        async with _completed_semantic_scope(database, DATASET_ID), database.acquire() as connection:
             candidate_proof = await importer._candidate_endpoint_dataset_content_proof(
                 connection,
                 candidate,
@@ -131,7 +137,7 @@ async def test_postgres_v3_candidate_proof_parity_and_retained_mismatch(
             shard_hashes_before,
             shard_records_before,
         )
-        async with database.acquire() as connection:
+        async with _completed_semantic_scope(database, DATASET_ID), database.acquire() as connection:
             with pytest.raises(
                 RuntimeError,
                 match="provider_directory_semantic_content_proof_mismatch",

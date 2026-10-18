@@ -151,7 +151,8 @@ async def _normalize_receipt_session(session, schema_name: str) -> None:
         "SET LOCAL IntervalStyle TO 'iso_8601'",
         "SET LOCAL extra_float_digits TO 3",
         "SET LOCAL bytea_output TO 'hex'",
-        "SET LOCAL work_mem TO '64MB'",
+        "SELECT set_config('work_mem', "
+        "(least(pg_size_bytes(current_setting('work_mem')), 67108864)/1024)::text || 'kB', true)",
         f"SET LOCAL search_path TO {_quoted(schema_name)}, pg_catalog",
     ):
         await session.execute(text(setting))
@@ -159,9 +160,15 @@ async def _normalize_receipt_session(session, schema_name: str) -> None:
 
 async def _lock_relation_family(session, schema_name: str, table_names: tuple[str, ...]) -> None:
     """Pin the named closed family before inspecting schema or row contents."""
-
+    readonly = await session.scalar(text("SHOW transaction_read_only"))
+    isolation = await session.scalar(text("SHOW transaction_isolation"))
+    if readonly == "on" and isolation not in {"repeatable read", "serializable"}:
+        raise EntityAddressArchiveReceiptError("entity-address Reader requires one stable transaction")
+    if readonly not in {"on", "off"}:
+        raise EntityAddressArchiveReceiptError("entity-address transaction state is unavailable")
+    mode = "ACCESS SHARE" if readonly == "on" else "SHARE"
     relations = ", ".join(f"{_quoted(schema_name)}.{_quoted(table_name)}" for table_name in sorted(table_names))
-    await session.execute(text(f"LOCK TABLE {relations} IN SHARE MODE"))
+    await session.execute(text(f"LOCK TABLE {relations} IN {mode} MODE"))
 
 
 async def _lock_model_family(session, schema_name: str, models: tuple[type, ...]) -> None:

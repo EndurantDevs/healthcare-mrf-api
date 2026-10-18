@@ -17,7 +17,7 @@ from process.provider_directory_fhir_census_contract import (
     CURRENT_VERSION_CENSUS_CONTRACT_FIELD,
     CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY,
 )
-
+from tests.test_provider_directory_generic_source_policy import synthetic_checkpoint_factory
 
 importer = importlib.import_module("process.provider_directory_fhir")
 BASE = "https://directory.example.test/fhir"
@@ -70,10 +70,7 @@ def _start_url() -> str:
 
 
 def _cursor_url() -> str:
-    return (
-        f"{BASE}?_getpages=opaque&_getpagesoffset={PAGE_COUNT}"
-        f"&_count={PAGE_COUNT}&_pretty=true"
-    )
+    return f"{BASE}?_getpages=opaque&_getpagesoffset={PAGE_COUNT}&_count={PAGE_COUNT}&_pretty=true"
 
 
 def _count_bundle(total: int) -> dict[str, object]:
@@ -200,14 +197,15 @@ async def test_checkpoint_failure_is_quarantined_before_retry_transport(
 
     spies = _install_checkpoint_failure_harness(monkeypatch)
 
-    with pytest.raises(RuntimeError, match="checkpoint failed"):
-        await _run(spies)
+    async with synthetic_checkpoint_factory(monkeypatch, importer.db, schema=importer._schema()):
+        with pytest.raises(RuntimeError, match="checkpoint failed"):
+            await _run(spies)
 
-    spies.rows.assert_awaited_once()
-    initial_proof = spies.proof.await_args.args[2]
-    _install_ahead_candidate_resume(monkeypatch, spies, initial_proof)
+        spies.rows.assert_awaited_once()
+        initial_proof = spies.proof.await_args.args[2]
+        _install_ahead_candidate_resume(monkeypatch, spies, initial_proof)
 
-    retry_result = await _run(spies)
+        retry_result = await _run(spies)
 
     assert "candidate_checkpoint_mismatch" in retry_result.error
     spies.fetch.assert_not_awaited()

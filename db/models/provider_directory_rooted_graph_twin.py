@@ -6,9 +6,18 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column
-from sqlalchemy import ForeignKeyConstraint, PrimaryKeyConstraint, String
-from sqlalchemy import TIMESTAMP, UniqueConstraint, text
+from sqlalchemy import (
+    TIMESTAMP,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    ForeignKeyConstraint,
+    PrimaryKeyConstraint,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import Base
@@ -38,6 +47,7 @@ def _ref(table: str, column: str) -> str:
 class ProviderDirectoryRootedGraphTwinAttempt(Base, JSONOutputMixin):
     """One immutable comparison, including mismatches."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = _ATTEMPT
     __main_table__ = __tablename__
     __table_args__ = (
@@ -139,12 +149,11 @@ class ProviderDirectoryRootedGraphTwinAttempt(Base, JSONOutputMixin):
 class ProviderDirectoryRootedGraphTwinAdmission(Base, JSONOutputMixin):
     """One immutable authority for the candidate-role member of a match."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = _ADMISSION
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint(
-            "admission_id", name="pd_rooted_graph_twin_admission_pkey"
-        ),
+        PrimaryKeyConstraint("admission_id", name="pd_rooted_graph_twin_admission_pkey"),
         UniqueConstraint(
             "publication_acquisition_id",
             name="pd_rooted_graph_twin_admission_publication_key",
@@ -182,8 +191,8 @@ class ProviderDirectoryRootedGraphTwinAdmission(Base, JSONOutputMixin):
             "'healthporta.provider-directory.rooted-graph-single-root-admission.v1' "
             "AND attempt_id IS NULL AND comparison_acquisition_id IS NULL "
             "AND reviewed_root_policy_json IS NOT NULL AND reviewed_root_policy_json = "
-            "'{\"policy_version\":\"provider-directory-reviewed-root-policy-v1\","
-            "\"required_root_count\"\\:1}'::jsonb "
+            '\'{"policy_version":"provider-directory-reviewed-root-policy-v1",'
+            '"required_root_count"\\:1}\'::jsonb '
             "AND acquisition_operation_key IS NOT NULL "
             "AND acquisition_operation_key ~ '^[0-9a-f]{64}$'))",
             name="pd_rooted_graph_twin_admission_check",

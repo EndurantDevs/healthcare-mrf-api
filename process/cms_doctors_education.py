@@ -16,6 +16,7 @@ from io import TextIOWrapper
 from sqlalchemy import text
 
 from db.models import CMSDoctorEducation, db
+from process.cms_doctors_immutable import create_doctors_stage
 from process.control_cancel import raise_if_cancelled
 from process.ext.utils import make_class
 from process.provider_directory_profile import is_valid_npi
@@ -24,6 +25,36 @@ CMS_EDUCATION_SOURCE_KEY = "cms-doctors"
 CMS_EDUCATION_DATASET_ID = "mj5m-pzi6"
 MIN_EDUCATION_ROWS = 10_000
 MIN_EDUCATION_PUBLISH_RATIO = 0.80
+
+
+def _copy_record_bytes(record):
+    row_bytes = 2
+    for value in record:
+        if value is None:
+            size = 0
+        elif type(value) is str:
+            size = len(value.encode("utf-8")) + 1
+        elif type(value) in (int, float, datetime):
+            size = 8
+        else:
+            raise ValueError("cms_doctors_copy_value_invalid")
+        row_bytes += 4 + size
+    return row_bytes
+
+
+def _bounded_copy_records(records):
+    batch, batch_bytes = [], 21
+    for record in records:
+        row_bytes = _copy_record_bytes(record)
+        if 21 + row_bytes > 16 * 1024 * 1024:
+            raise ValueError("cms_doctors_copy_row_bytes_invalid")
+        if batch and batch_bytes + row_bytes > 16 * 1024 * 1024:
+            yield batch
+            batch, batch_bytes = [], 21
+        batch.append(record)
+        batch_bytes += row_bytes
+    if batch:
+        yield batch
 
 
 async def _copy_sidecar_rows(rows, stage):
@@ -35,23 +66,24 @@ async def _copy_sidecar_rows(rows, stage):
     columns = tuple(stage.__table__.columns.keys())
     if len(rows) > 5000 or any(set(row) != set(columns) for row in rows):
         raise ValueError("cms_doctors_sidecar_batch_shape_invalid")
-    records = [
+    records = (
         tuple(
             native._canonical_json(row[name]).decode("ascii") if name == "source_json" else row[name]
             for name in columns
         )
         for row in rows
-    ]
+    )
     async with db.transaction() as session:
         await session.execute(text("SELECT pg_current_xact_id()"))
-        await native.native_copy_record_batch(
-            session,
-            stage,
-            schema_name=stage.__table__.schema,
-            table_name=stage.__tablename__,
-            columns=columns,
-            records=records,
-        )
+        for batch in _bounded_copy_records(records):
+            await native.native_copy_record_batch(
+                session,
+                stage,
+                schema_name=str(stage.__table__.schema),
+                table_name=str(stage.__tablename__),
+                columns=columns,
+                records=batch,
+            )
 
 
 @contextmanager
@@ -164,7 +196,7 @@ async def import_doctor_education(
         if source_manifest is None
         else dict(source_manifest)
     )
-    await db.create_table(stage_cls.__table__, checkfirst=False)
+    await create_doctors_stage(db, CMSDoctorEducation, ctx["import_date"], str(stage_cls.__table__.schema))
     ctx.setdefault("context", {})["education_stage_owned"] = True
     try:
         return await _stage_education_rows(source_path, stage_cls, manifest, ctx, task)

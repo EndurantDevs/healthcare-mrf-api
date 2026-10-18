@@ -35,7 +35,7 @@ class _QueryParamCollector(ast.NodeVisitor):
         self.params: set[str] = set()
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        if isinstance(node.value, ast.Attribute) and self._is_request_args(node.value):
+        if self._is_request_args_resolution(node.value):
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     self.aliases.add(target.id)
@@ -49,7 +49,11 @@ class _QueryParamCollector(ast.NodeVisitor):
                     self.params.add(node.args[0].value)
         if isinstance(func, ast.Name) and func.id == "_get_list_param":
             if node.args and self._is_request_args_resolution(node.args[0]):
-                if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
+                if (
+                    len(node.args) > 1
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)
+                ):
                     self.params.add(node.args[1].value)
         if isinstance(func, ast.Name) and func.id == "parse_pagination":
             if node.args and self._is_request_args_resolution(node.args[0]):
@@ -60,16 +64,11 @@ class _QueryParamCollector(ast.NodeVisitor):
                     "allow_page_size": "page_size",
                 }
                 keyword_value_by_name = {
-                    keyword.arg: keyword.value
-                    for keyword in node.keywords
-                    if keyword.arg is not None
+                    keyword.arg: keyword.value for keyword in node.keywords if keyword.arg is not None
                 }
                 for keyword_name, parameter_name in pagination_parameter_by_flag.items():
                     keyword_value = keyword_value_by_name.get(keyword_name)
-                    if not (
-                        isinstance(keyword_value, ast.Constant)
-                        and keyword_value.value is False
-                    ):
+                    if not (isinstance(keyword_value, ast.Constant) and keyword_value.value is False):
                         self.params.add(parameter_name)
         self.generic_visit(node)
 
@@ -85,6 +84,14 @@ class _QueryParamCollector(ast.NodeVisitor):
     def _is_request_args_resolution(self, node: ast.AST) -> bool:
         if self._is_request_args(node):
             return True
+        if isinstance(node, ast.IfExp):
+            return self._is_request_args_resolution(node.body) or self._is_request_args_resolution(node.orelse)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"group_plan_arguments", "_report_args"}
+        ):
+            return bool(node.args) and isinstance(node.args[0], ast.Name) and node.args[0].id == "request"
         if isinstance(node, ast.Name) and node.id in self.aliases:
             return True
         return False
@@ -113,7 +120,11 @@ def _extract_blueprint_prefix(tree: ast.AST) -> str:
             continue
         if not any(isinstance(t, ast.Name) and t.id == "blueprint" for t in node.targets):
             continue
-        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == "Blueprint":
+        if (
+            isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "Blueprint"
+        ):
             for kw in node.value.keywords:
                 if kw.arg == "url_prefix" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
                     return kw.value.value
@@ -141,7 +152,9 @@ class _EndpointCollector(ast.NodeVisitor):
             if not isinstance(decorator, ast.Call):
                 continue
             func = decorator.func
-            if not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "blueprint"):
+            if not (
+                isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "blueprint"
+            ):
                 continue
             method = func.attr.lower()
             if method not in HTTP_METHODS:
@@ -326,31 +339,22 @@ def test_openapi_strict_ptg_pagination_exposes_exact_page_continuation():
     schemas = spec["components"]["schemas"]
     pagination_properties = schemas["PaginationMeta"]["properties"]
 
-    assert {"has_more", "total_is_exact", "total_lower_bound"} <= set(
-        pagination_properties
-    )
+    assert {"has_more", "total_is_exact", "total_lower_bound"} <= set(pagination_properties)
     assert pagination_properties["has_more"]["type"] == "boolean"
     assert pagination_properties["total_is_exact"]["type"] == "boolean"
     assert pagination_properties["total_lower_bound"] == {
         "type": "integer",
         "minimum": 0,
-        "description": (
-            "Optional proven lower bound when an exact total would require "
-            "exhaustive expansion."
-        ),
+        "description": ("Optional proven lower bound when an exact total would require exhaustive expansion."),
     }
 
     strict_pagination = schemas["PtgPricingPaginationMeta"]["allOf"]
-    assert strict_pagination[0] == {
-        "$ref": "#/components/schemas/PaginationMeta"
-    }
+    assert strict_pagination[0] == {"$ref": "#/components/schemas/PaginationMeta"}
     required_parameters = set(strict_pagination[1]["required"])
     assert required_parameters == {"total", "limit", "offset", "has_more"}
     assert {"total_is_exact", "total_lower_bound"}.isdisjoint(required_parameters)
     assert (
-        schemas["PricingProcedureProviderListResponse"]["properties"][
-            "pagination"
-        ]["$ref"]
+        schemas["PricingProcedureProviderListResponse"]["properties"]["pagination"]["$ref"]
         == "#/components/schemas/PtgPricingPaginationMeta"
     )
 
@@ -383,9 +387,7 @@ def test_openapi_exposes_strict_v3_allowed_amount_fallback():
         assert "rate-tolerance predicates do not fall back" in description
         assert "not negotiated rates" in description
 
-    response_schema = spec["components"]["schemas"][
-        "PricingProcedureProviderListResponse"
-    ]
+    response_schema = spec["components"]["schemas"]["PricingProcedureProviderListResponse"]
     response_properties = response_schema["properties"]
     assert set(response_properties["result_state"]["enum"]) == {
         "matched",
@@ -398,9 +400,7 @@ def test_openapi_exposes_strict_v3_allowed_amount_fallback():
         "plan_scoped_ptg",
         "plan_scoped_allowed_amounts",
     }
-    assert set(
-        response_properties["query"]["properties"]["status"]["enum"]
-    ) == {
+    assert set(response_properties["query"]["properties"]["status"]["enum"]) == {
         "matched",
         "allowed_amounts_found",
         "no_match",
@@ -444,17 +444,16 @@ def test_openapi_documents_allowed_unverified_location_suppression():
             for parameter_by_field in parameters
             if parameter_by_field.get("name") == "include_unverified_addresses"
         )
-        description = " ".join(
-            unverified_address_parameter["description"].split()
-        )
+        description = " ".join(unverified_address_parameter["description"].split())
         required_phrases = (
-            "Allowed-amount fallback never returns", "provider address", "distance",
-            "location filters", "apply internally",
+            "Allowed-amount fallback never returns",
+            "provider address",
+            "distance",
+            "location filters",
+            "apply internally",
             "no-address-binding metadata remains",
         )
-        assert all(
-            required_phrase in description for required_phrase in required_phrases
-        )
+        assert all(required_phrase in description for required_phrase in required_phrases)
 
 
 def test_npi_profile_contract_is_typed_and_address_refresh_is_boolean():
@@ -471,21 +470,14 @@ def test_npi_profile_contract_is_typed_and_address_refresh_is_boolean():
     assert schemas["ProviderDirectoryProfile"]["additionalProperties"] is False
     assert schemas["ProviderDirectoryProfileFact"]["additionalProperties"] is False
     assert schemas["ProviderDirectoryProfileFactEvidence"]["additionalProperties"] is False
-    profile_evidence = schemas["NpiRecord"]["properties"][
-        "provider_directory_profile_evidence"
-    ]
-    assert profile_evidence["$ref"] == (
-        "#/components/schemas/ProviderDirectoryProfileEvidence"
-    )
+    profile_evidence = schemas["NpiRecord"]["properties"]["provider_directory_profile_evidence"]
+    assert profile_evidence["$ref"] == ("#/components/schemas/ProviderDirectoryProfileEvidence")
 
 
 def test_provider_profile_endpoint_documents_compact_and_paged_contracts():
     spec = load_openapi_document(OPENAPI_PATH)
     operation = spec["paths"]["/npi/id/{npi}/profile"]["get"]
-    parameters_by_name = {
-        parameter["name"]: parameter
-        for parameter in operation["parameters"]
-    }
+    parameters_by_name = {parameter["name"]: parameter for parameter in operation["parameters"]}
     schemas = spec["components"]["schemas"]
 
     assert {
@@ -497,39 +489,28 @@ def test_provider_profile_endpoint_documents_compact_and_paged_contracts():
         "include_evidence",
         "include_sensitive",
     } <= parameters_by_name.keys()
-    assert parameters_by_name["category"]["schema"] == {
-        "$ref": "#/components/schemas/ProviderProfileCategory"
-    }
+    assert parameters_by_name["category"]["schema"] == {"$ref": "#/components/schemas/ProviderProfileCategory"}
     assert parameters_by_name["limit"]["schema"]["maximum"] == 50
-    assert parameters_by_name["generation_id"]["schema"]["pattern"] == (
-        "^[0-9a-f]{64}$"
-    )
+    assert parameters_by_name["generation_id"]["schema"]["pattern"] == ("^[0-9a-f]{64}$")
     assert len(schemas["ProviderProfileCategory"]["enum"]) == 30
-    assert operation["responses"]["200"]["content"]["application/json"][
-        "schema"
-    ] == {"$ref": "#/components/schemas/ProviderProfileResponse"}
-    assert operation["responses"]["409"]["content"]["application/json"][
-        "schema"
-    ] == {
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ProviderProfileResponse"
+    }
+    assert operation["responses"]["409"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/ProviderProfileGenerationConflict"
     }
-    display_description = schemas["ProviderProfileFact"]["properties"]["display"][
-        "description"
-    ]
+    display_description = schemas["ProviderProfileFact"]["properties"]["display"]["description"]
     assert display_description.startswith("Concise human-readable")
     assert "never contains serialized JSON" in display_description
-    assert schemas["ProviderProfileDocument"]["properties"]["composer_version"][
-        "example"
-    ] == "provider-profile-composer/v7"
+    assert (
+        schemas["ProviderProfileDocument"]["properties"]["composer_version"]["example"]
+        == "provider-profile-composer/v7"
+    )
     summary = schemas["ProviderProfessionalSummary"]
     assert summary["additionalProperties"] is False
     assert summary["required"] == ["label", "text", "authorship", "basis"]
-    assert summary["properties"]["label"]["enum"] == [
-        "Generated professional summary"
-    ]
-    assert summary["properties"]["authorship"]["enum"] == [
-        "generated_from_structured_source_data"
-    ]
+    assert summary["properties"]["label"]["enum"] == ["Generated professional summary"]
+    assert summary["properties"]["authorship"]["enum"] == ["generated_from_structured_source_data"]
     basis_item = summary["properties"]["basis"]["items"]
     assert basis_item["additionalProperties"] is False
     assert basis_item["required"] == ["category", "item_id"]
@@ -546,9 +527,7 @@ def test_npi_near_documents_exact_cursor_page_identity():
     parameter_names = {parameter["name"] for parameter in operation["parameters"]}
 
     assert {"cursor", "include_total", "provider_sex_code", "specialization"} <= parameter_names
-    response_schema = operation["responses"]["200"]["content"]["application/json"][
-        "schema"
-    ]
+    response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
     assert {"$ref": "#/components/schemas/NpiNearPage"} in response_schema["oneOf"]
     page_schema = spec["components"]["schemas"]["NpiNearPage"]
     assert page_schema["required"] == [

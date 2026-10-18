@@ -12,21 +12,23 @@ from unittest.mock import AsyncMock
 import pytest
 
 from db.models import ProviderDirectoryLocation, ProviderDirectoryPractitioner
+from tests.provider_directory_checkpoint_unit_support import checkpoint_unit_scope as checkpoint_unit_scope
 from tests.provider_directory_fhir_bulk_test_support import (
-    _Connection,
-    _Response,
-    _Session,
     _acquire,
     _checkpoint,
     _checkpoint_context,
     _client_session,
+    _Connection,
     _fetch_options,
     _identity,
     _manifest_payload,
+    _Response,
+    _Session,
     _source,
     _stream_options,
     importer,
 )
+
 
 @pytest.mark.parametrize(
     ("payload", "expected_error"),
@@ -78,13 +80,14 @@ def test_transaction_window_accepts_naive_reference_clock():
 
 def test_retry_after_and_payload_fallback_cover_untyped_values():
     current = datetime.datetime(2026, 7, 20, 12, tzinfo=datetime.UTC)
-    assert importer._bulk_export_retry_after_seconds(
-        "Sun, 20 Jul 2026 12:01:00",
-        now_utc=current,
-    ) == 60
-    assert importer._bulk_export_payload_error(
-        {"error": [{"unexpected": "shape"}]}
-    ) == "bulk_export_error_output"
+    assert (
+        importer._bulk_export_retry_after_seconds(
+            "Sun, 20 Jul 2026 12:01:00",
+            now_utc=current,
+        )
+        == 60
+    )
+    assert importer._bulk_export_payload_error({"error": [{"unexpected": "shape"}]}) == "bulk_export_error_output"
 
 
 @pytest.mark.asyncio
@@ -182,13 +185,16 @@ async def test_checkpointed_start_handles_unknown_and_invalid_success(monkeypatc
     release = AsyncMock()
     monkeypatch.setattr(importer, "_release_bulk_export_reservation", release)
 
-    assert await importer._start_checkpointed_bulk_export(
-        object(),
-        _source(),
-        identity,
-        timeout=3,
-        ownership_probe=ownership_probe,
-    ) == unknown
+    assert (
+        await importer._start_checkpointed_bulk_export(
+            object(),
+            _source(),
+            identity,
+            timeout=3,
+            ownership_probe=ownership_probe,
+        )
+        == unknown
+    )
     assert await importer._start_checkpointed_bulk_export(
         object(),
         _source(),

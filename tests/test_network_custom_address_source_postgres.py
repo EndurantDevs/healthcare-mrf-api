@@ -459,6 +459,8 @@ async def test_bulk_approved_pairs_have_fixed_native_query_count(custom_db):
     """Expand the actual approved-map fixture natively; no draft heads participate."""
     fixture = custom_db
     seed = await _seed(fixture)
+    # Warm the native driver type cache before comparing application query counts.
+    await _prepare(fixture, seed.revision)
     small, small_count = await _logged_prepare(fixture, seed.revision)
     await fixture.connection.execute(
         f'''WITH identities AS (SELECT gen_random_uuid()::text AS provider_id FROM generate_series(1,4999)),
@@ -1243,3 +1245,296 @@ async def test_bootstrap_spool_write_failure_closes_and_retries(bootstrap_db, mo
     )
     monkeypatch.setattr(bootstrap.tempfile, "TemporaryFile", original_temporary_file)
     assert await _bootstrap_prepare(fixture, specification)
+
+
+async def test_remove_commands_never_prepare_manual_address_or_binding(custom_db):
+    fixture = custom_db
+    seed = await _seed(fixture)
+    await fixture.connection.execute(
+        f"UPDATE \"{fixture.control_schema}\".registry_approved_record SET record_json=jsonb_set(record_json,'{{memberships_json}}',(record_json->'memberships_json')||jsonb_build_array((record_json#>'{{memberships_json,0}}')||jsonb_build_object('operation','remove','location_id',$1::text))) WHERE record_kind='membership'",
+        seed.second["record_id"],
+    )
+    receipt = await _prepare(fixture, seed.revision)
+    namespace = '"' + receipt.address_source.schema_name + '"'
+    locations = await fixture.connection.fetch(f"SELECT location_id FROM {namespace}.provider_location_binding")
+    assert [str(row["location_id"]) for row in locations] == [seed.first["record_id"]]
+    assert (
+        await fixture.connection.fetchval(
+            f"SELECT count(*) FROM {namespace}.entity_address_unified WHERE row_origin='network_custom'"
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize("byte_bound", [4096, 16384])
+async def test_custom_retained_binary_copy_bounds_and_full_row_parity(custom_db, monkeypatch, byte_bound):
+    """Keep complete native rows while replacing only the old custom offices."""
+    import process.network_bootstrap_sources as bootstrap
+
+    fixture = custom_db
+    seed = await _seed(fixture)
+    await _seed_bootstrap_copy_rows(fixture)
+    await fixture.connection.execute(
+        f"""UPDATE "{fixture.source_schema}".entity_address_unified
+      SET lat=12.12345678,long=-45.87654321,address_sources=ARRAY['source-a','source-b'],
+      source_record_ids=ARRAY['record-a'],date_added='2026-01-02',updated_at='2026-01-02 03:04:05',
+      entity_name='Native sample Ω' WHERE location_key<>$1""",
+        "a" * 64,
+    )
+    await fixture.connection.execute(
+        f"UPDATE \"{fixture.source_schema}\".entity_address_unified SET row_origin='network_custom' WHERE location_key=$1",
+        "a" * 64,
+    )
+    monkeypatch.setattr(bootstrap, "_COPY_BATCH_ROWS", 6 if byte_bound == 4096 else 2)
+    monkeypatch.setattr(bootstrap, "_COPY_BATCH_BYTES", byte_bound)
+    spools = _observe_bootstrap_spools(monkeypatch, bootstrap)
+    proxy = BootstrapCopyConnection(fixture.connection)
+    arguments = _arguments(fixture, seed.revision)
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        receipt = await prepare_custom_address_source(proxy, fixture.base, **arguments)
+    assert len(proxy.imports) >= 3 and all(0 < size <= byte_bound for size in proxy.import_bytes)
+    assert all(copy_file.closed for copy_file in spools)
+    assert all("OFFSET" not in query and "ORDER BY a.location_key" in query for query, _ in proxy.exports)
+    address_table = '"' + receipt.address_source.schema_name + '".entity_address_unified'
+    assert await fixture.connection.fetchval(f"""SELECT NOT EXISTS(
+      (SELECT * FROM "{fixture.source_schema}".entity_address_unified WHERE row_origin<>'network_custom'
+       EXCEPT ALL SELECT * FROM {address_table} WHERE row_origin<>'network_custom') UNION ALL
+      (SELECT * FROM {address_table} WHERE row_origin<>'network_custom' EXCEPT ALL
+       SELECT * FROM "{fixture.source_schema}".entity_address_unified WHERE row_origin<>'network_custom'))""")
+    assert await fixture.connection.fetchval(f"SELECT count(*) FROM {address_table}") == 6
+    assert not await fixture.connection.fetchval(
+        f"SELECT EXISTS(SELECT 1 FROM {address_table} WHERE location_key=$1)", "a" * 64
+    )
+    assert await _prepare(fixture, seed.revision, arguments=arguments) == receipt
+    assert await _verify(fixture, receipt) == receipt
+
+
+@pytest.mark.parametrize("failure", ["export_count", "import_count", "export_error", "import_error"])
+async def test_custom_retained_copy_failure_preserves_caller_and_retries(custom_db, monkeypatch, failure):
+    """Native count and driver failures leave neither partial heaps nor a broken caller."""
+    import process.network_bootstrap_sources as bootstrap
+
+    fixture = custom_db
+    seed = await _seed(fixture)
+    arguments = _arguments(fixture, seed.revision)
+    spools = _observe_bootstrap_spools(monkeypatch, bootstrap)
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        await fixture.connection.execute("CREATE TEMP TABLE custom_copy_marker(value int) ON COMMIT DROP")
+        await fixture.connection.execute("INSERT INTO custom_copy_marker VALUES(7)")
+        with pytest.raises(NetworkCustomAddressSourceError):
+            await prepare_custom_address_source(
+                BootstrapCopyConnection(fixture.connection, failure=failure), fixture.base, **arguments
+            )
+        assert await fixture.connection.fetchval("SELECT value FROM custom_copy_marker") == 7
+        assert (
+            await fixture.connection.fetchval(
+                "SELECT to_regnamespace($1)", "network_composition_" + UUID(arguments["composition_id"]).hex
+            )
+            is None
+        )
+        assert spools and all(copy_file.closed for copy_file in spools)
+        assert await prepare_custom_address_source(fixture.connection, fixture.base, **arguments)
+
+
+async def test_custom_retained_copy_cancel_closes_spool_and_preserves_caller(custom_db, monkeypatch):
+    """Cancellation rolls back imported rows before the same identity can retry."""
+    import process.network_bootstrap_sources as bootstrap
+
+    fixture = custom_db
+    seed = await _seed(fixture)
+    arguments = _arguments(fixture, seed.revision)
+    copying = asyncio.Event()
+    spools = _observe_bootstrap_spools(monkeypatch, bootstrap)
+    proxy = BootstrapCopyConnection(fixture.connection, copying=copying)
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        await fixture.connection.execute("CREATE TEMP TABLE custom_cancel_marker(value int) ON COMMIT DROP")
+        await fixture.connection.execute("INSERT INTO custom_cancel_marker VALUES(9)")
+        task = asyncio.create_task(prepare_custom_address_source(proxy, fixture.base, **arguments))
+        await asyncio.wait_for(copying.wait(), timeout=10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await fixture.connection.fetchval("SELECT value FROM custom_cancel_marker") == 9
+        assert (
+            await fixture.connection.fetchval(
+                "SELECT to_regnamespace($1)", "network_composition_" + UUID(arguments["composition_id"]).hex
+            )
+            is None
+        )
+        assert spools and all(copy_file.closed for copy_file in spools)
+        assert await prepare_custom_address_source(fixture.connection, fixture.base, **arguments)
+
+
+async def test_custom_retained_copy_requires_existing_key_and_bounded_row(custom_db, monkeypatch):
+    """Refuse missing native key before candidate DDL and overwide rows atomically."""
+    import process.network_bootstrap_sources as bootstrap
+
+    fixture = custom_db
+    seed = await _seed(fixture)
+    arguments = _arguments(fixture, seed.revision)
+    parent = '"' + fixture.source_schema + '".entity_address_unified'
+    await fixture.connection.execute(f"ALTER TABLE {parent} DROP CONSTRAINT entity_address_unified_pkey")
+    proxy = BootstrapCopyConnection(fixture.connection)
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        with pytest.raises(NetworkCustomAddressSourceError):
+            await prepare_custom_address_source(proxy, fixture.base, **arguments)
+        assert not proxy.exports
+        assert (
+            await fixture.connection.fetchval(
+                "SELECT to_regnamespace($1)", "network_composition_" + UUID(arguments["composition_id"]).hex
+            )
+            is None
+        )
+    await fixture.connection.execute(f"ALTER TABLE {parent} ADD PRIMARY KEY(location_key)")
+    with monkeypatch.context() as limited:
+        limited.setattr(bootstrap, "_COPY_BATCH_BYTES", 64)
+        with pytest.raises(NetworkCustomAddressSourceError):
+            await _prepare(fixture, seed.revision, arguments=arguments)
+    assert await _prepare(fixture, seed.revision, arguments=arguments)
+
+
+async def test_custom_retained_copy_checks_full_row_parity(custom_db, monkeypatch):
+    """Matching COPY counts cannot hide altered retained values."""
+    import process.network_custom_address_source as custom
+
+    fixture = custom_db
+    seed = await _seed(fixture)
+    arguments = _arguments(fixture, seed.revision)
+    original_copy = custom._copy_projection_rows
+
+    async def altered_copy(connection, schema_name, query):
+        copied = await original_copy(connection, schema_name, query)
+        await connection.execute(f"UPDATE \"{schema_name}\".entity_address_unified SET first_line='Altered native row'")
+        return copied
+
+    with monkeypatch.context() as altered:
+        altered.setattr(custom, "_copy_projection_rows", altered_copy)
+        with pytest.raises(NetworkCustomAddressSourceError, match="full-row parity"):
+            await _prepare(fixture, seed.revision, arguments=arguments)
+    assert await _prepare(fixture, seed.revision, arguments=arguments)
+
+
+async def test_custom_retained_copy_rejects_source_oid_swap_before_copy(custom_db, monkeypatch):
+    """The copied relation must remain the physical source admitted by the recipe."""
+    import process.network_custom_address_source as custom
+
+    fixture = custom_db
+    seed = await _seed(fixture)
+    arguments = _arguments(fixture, seed.revision)
+    original_identity = custom._source_identity
+
+    async def swapped_identity(connection, source, roles, *, address=False, control_schema=None):
+        identity = await original_identity(connection, source, roles, address=address, control_schema=control_schema)
+        if address:
+            namespace = '"' + source.schema_name + '"'
+            await connection.execute(f"ALTER TABLE {namespace}.entity_address_unified RENAME TO old_address")
+            await connection.execute(
+                f"CREATE TABLE {namespace}.entity_address_unified (LIKE {namespace}.old_address INCLUDING ALL)"
+            )
+        return identity
+
+    with monkeypatch.context() as swapped:
+        swapped.setattr(custom, "_source_identity", swapped_identity)
+        with pytest.raises(NetworkCustomAddressSourceError, match="native identity"):
+            await _prepare(fixture, seed.revision, arguments=arguments)
+    assert await _prepare(fixture, seed.revision, arguments=arguments)
+
+
+@pytest.fixture
+async def aca_office_db(serving_schema, request):
+    """Reuse the exact office fixture without a collection-time import cycle."""
+    from contextlib import aclosing
+
+    from tests.test_network_initial_source_office_bindings_postgres import office_db
+
+    async with aclosing(office_db.__wrapped__(serving_schema, request)) as fixtures:
+        async for fixture in fixtures:
+            yield fixture
+
+
+@pytest.mark.parametrize("aca_office_db", ["typed"], indirect=True)
+async def test_aca_carry_adds_only_new_exact_office_and_replays_readonly(aca_office_db):
+    from process.network_custom_address_source import CustomAddressSourceArguments, prepare_recipe_address_source
+    from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+
+    fixture = aca_office_db
+    namespace = '"' + fixture.address_schema + '"'
+    await fixture.connection.execute(
+        f"DELETE FROM {namespace}.entity_address_unified WHERE address_key=$1", fixture.sites[1]
+    )
+    composition_id = str(uuid4())
+    target_schema = "network_composition_" + UUID(composition_id).hex
+    arguments = CustomAddressSourceArguments(
+        composition_id,
+        fixture.batch.approved_source.approved_revision,
+        fixture.owner,
+        (fixture.reader,),
+        fixture.control,
+    )
+    recipes = (RegistrySourceMembershipRecipe(fixture.source, fixture.coordinates),)
+    try:
+        async with fixture.connection.transaction(isolation="repeatable_read"):
+            receipt = await prepare_recipe_address_source(
+                fixture.connection, fixture.address_source, arguments, (recipes, None)
+            )
+            assert receipt.aca_carry_sha256 is not None and receipt.as_dict()["revision"] == 4
+            sites = await fixture.connection.fetch(
+                f'SELECT npi,address_key,row_origin,type,address_precision FROM "{target_schema}".entity_address_unified'
+            )
+            assert {site["address_key"] for site in sites} == set(fixture.sites)
+            assert all(
+                (site["npi"], site["row_origin"], site["type"], site["address_precision"])
+                == (1000000491, "base", "practice", "street")
+                for site in sites
+            )
+            assert (
+                await fixture.connection.fetchval(f'SELECT count(*) FROM "{target_schema}".provider_location_binding')
+                == 2
+            )
+        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+            assert (
+                await prepare_recipe_address_source(
+                    fixture.connection, fixture.address_source, arguments, (recipes, None)
+                )
+                == receipt
+            )
+        assert await fixture.connection.fetchval(f"SELECT count(*) FROM {namespace}.entity_address_unified") == 1
+    finally:
+        await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{target_schema}" CASCADE')
+
+
+@pytest.mark.parametrize("aca_office_db", ["typed"], indirect=True)
+@pytest.mark.parametrize("damage", ["canonical", "collision"])
+async def test_aca_carry_invalid_source_or_existing_pair_rolls_back_artifact(aca_office_db, damage):
+    from process.network_custom_address_source import CustomAddressSourceArguments, prepare_recipe_address_source
+    from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+
+    fixture = aca_office_db
+    composition_id = str(uuid4())
+    target_schema = "network_composition_" + UUID(composition_id).hex
+    arguments = CustomAddressSourceArguments(
+        composition_id,
+        fixture.batch.approved_source.approved_revision,
+        fixture.owner,
+        (fixture.reader,),
+        fixture.control,
+    )
+    if damage == "canonical":
+        await fixture.connection.execute(
+            f'UPDATE "{fixture.coordinates.dataset_schema}".mrf_canonical_address SET source_bits=0'
+        )
+    else:
+        await fixture.connection.execute(
+            f"UPDATE \"{fixture.address_schema}\".entity_address_unified SET entity_id='1000000000' WHERE address_key=$1",
+            fixture.sites[1],
+        )
+    recipes = (RegistrySourceMembershipRecipe(fixture.source, fixture.coordinates),)
+    try:
+        with pytest.raises(ValueError):
+            async with fixture.connection.transaction(isolation="repeatable_read"):
+                await prepare_recipe_address_source(
+                    fixture.connection, fixture.address_source, arguments, (recipes, None)
+                )
+        assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", target_schema) is None
+    finally:
+        await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{target_schema}" CASCADE')

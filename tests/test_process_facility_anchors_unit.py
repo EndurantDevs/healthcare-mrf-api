@@ -1,6 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import importlib
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -60,7 +63,9 @@ def test_stable_hrsa_site_id_prefers_location_identifier(anchors_module):
         "Site Address": "Changed Address",
     }
 
-    assert anchors_module._stable_hrsa_site_id(site_by_field) == anchors_module._stable_hrsa_site_id(changed_site_by_field)
+    assert anchors_module._stable_hrsa_site_id(site_by_field) == anchors_module._stable_hrsa_site_id(
+        changed_site_by_field
+    )
     assert anchors_module._stable_hrsa_site_id(site_by_field) != anchors_module._stable_hrsa_site_id(
         {**site_by_field, "Health Center Location Identification Number": "12346"}
     )
@@ -89,7 +94,9 @@ def test_stable_hrsa_site_id_falls_back_to_normalized_source_fields(anchors_modu
         "Site Postal Code": "02108",
     }
 
-    assert anchors_module._stable_hrsa_site_id(site_by_field) == anchors_module._stable_hrsa_site_id(equivalent_site_by_field)
+    assert anchors_module._stable_hrsa_site_id(site_by_field) == anchors_module._stable_hrsa_site_id(
+        equivalent_site_by_field
+    )
 
 
 @pytest.mark.asyncio
@@ -119,3 +126,60 @@ async def test_backfill_hospital_coordinates_uses_existing_live_table(monkeypatc
     assert "FROM mrf.facility_anchor AS live" in sql
     assert "live.id = stage.id" in sql
     assert "stage.facility_type = 'Hospital'" in sql
+
+
+@pytest.mark.asyncio
+async def test_facility_enrollment_follows_contribution_and_precedes_rotation(monkeypatch, anchors_module):
+    events = []
+    original_session = object()
+
+    @asynccontextmanager
+    async def transaction():
+        events.append("begin")
+        yield original_session
+        events.append("commit")
+
+    async def status(sql):
+        assert "enroll" in events
+        events.append(str(sql))
+
+    database = SimpleNamespace(transaction=transaction, scalar=AsyncMock(side_effect=[3, 0, 0]), status=status)
+
+    async def prepare(session, **scope):
+        assert session is original_session
+        assert "metadata" in events and not any("ALTER TABLE" in event for event in events)
+        assert scope == dict(
+            ledger_schema="mrf",
+            relations=(
+                ("facility_anchor", "facility_stage"),
+                ("facility_address_contribution", "facility_address_contribution_test"),
+            ),
+        )
+        events.append("enroll")
+
+    async def metadata(*args, **kwargs):
+        events.append("metadata")
+
+    monkeypatch.setattr(anchors_module, "db", database)
+    monkeypatch.setattr(anchors_module, "make_class", lambda *args: SimpleNamespace(__tablename__="facility_stage"))
+    monkeypatch.setattr(anchors_module, "ensure_database", AsyncMock())
+    monkeypatch.setattr(anchors_module, "_backfill_hospital_coordinates_from_existing_live", AsyncMock(return_value=0))
+    monkeypatch.setattr(anchors_module, "source_enabled", lambda *args: False)
+    monkeypatch.setattr(anchors_module, "require_local_family_publication", AsyncMock())
+    monkeypatch.setattr(anchors_module, "capture_metadata", metadata)
+    monkeypatch.setattr(anchors_module, "prepare_local_native_input_publication", prepare)
+    generation = AsyncMock()
+    monkeypatch.setattr(anchors_module, "publish_local_reference_family_generation", generation)
+    monkeypatch.setattr(anchors_module, "mark_control_run", AsyncMock())
+    monkeypatch.setattr(anchors_module, "print_time_info", lambda *args: None)
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
+    await anchors_module.publish_facility_anchors_generation(
+        {"import_date": "test", "context": {"run": 1, "test_mode": True}}
+    )
+    assert (
+        events.index("metadata")
+        < events.index("enroll")
+        < next(i for i, event in enumerate(events) if "ALTER TABLE" in event)
+    )
+    generation.assert_awaited_once_with(database, importer_id="facility-anchors", schema_name="mrf")
+    assert events[-1] == "commit"

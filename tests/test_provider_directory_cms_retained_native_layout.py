@@ -111,6 +111,14 @@ def _clone_catalog_fixture(catalog_by_field, model_name):
     return clone
 
 
+def _native_catalog_transport(catalog):
+    """Return fresh transport fields while preserving fixture mutation visibility."""
+    return {
+        **{name: catalog[name] for name in ("attributes", "constraints", "triggers", "database_oid")},
+        "indexes": [dict(index, physical_present=True) for index in catalog["indexes"]],
+    }
+
+
 def _fixture(model_name="entity_address_unified", *, database_oid=3):
     """Use real declarations with synthetic PostgreSQL catalog identities."""
     model = next(model for model in layout.ENTITY_ADDRESS_RESULT_MODELS if model.__tablename__ == model_name)
@@ -159,11 +167,11 @@ def _fixture(model_name="entity_address_unified", *, database_oid=3):
         _identity_hash=_hash,
         _pagination_checkpoint_row_mapping=lambda row: row,
         _profile_capacity_relation_row=AsyncMock(return_value=(catalog_by_field["relation"], 12)),
-        _profile_capacity_relation_catalog=AsyncMock(
-            return_value=(attributes, indexes, catalog_by_field["constraints"], [])
-        ),
         _profile_capacity_tablespaces=lambda *_args: (42,),
-        db=SimpleNamespace(scalar=AsyncMock(return_value=database_oid)),
+        db=SimpleNamespace(
+            scalar=AsyncMock(return_value=database_oid),
+            first=AsyncMock(side_effect=lambda *_args, **_kwargs: _native_catalog_transport(catalog_by_field)),
+        ),
     )
     return fhir, source_relation, catalog_by_field, clone
 
@@ -196,18 +204,21 @@ async def _source_and_clone(monkeypatch, model_name="entity_address_unified"):
     fhir, source_relation, original, clone = _fixture(model_name)
     if model_name == "entity_address_evidence":
         original_sequence, clone_sequence = _sequence(original), _sequence(clone)
-        fhir.db.all = AsyncMock(return_value=[original_sequence])
-    monkeypatch.setattr(layout, "_index_physical_details", AsyncMock())
+        fhir.db.evidence_sequences = [original_sequence]
+        fhir.db.first.side_effect = lambda query, **_kwargs: (
+            {"evidence_sequences": fhir.db.evidence_sequences}
+            if "AS evidence_sequences" in query
+            else _native_catalog_transport(original)
+        )
     source = await layout.capture_retained_native_source(fhir, source_relation, (model_name,))
     relation = OwnedRelation(clone["relation"]["schema_name"], model_name, 21, 0, "p")
     if model_name == "entity_address_evidence":
-        fhir.db.all.return_value = [clone_sequence]
+        fhir.db.evidence_sequences = [clone_sequence]
     fhir._profile_capacity_relation_row.return_value = (clone["relation"], 22)
-    fhir._profile_capacity_relation_catalog.return_value = (
-        clone["attributes"],
-        clone["indexes"],
-        clone["constraints"],
-        clone["triggers"],
+    fhir.db.first.side_effect = lambda query, **_kwargs: (
+        {"evidence_sequences": fhir.db.evidence_sequences}
+        if "AS evidence_sequences" in query
+        else _native_catalog_transport(clone)
     )
     return fhir, source, relation, original, clone
 
@@ -224,7 +235,7 @@ async def test_complete_declared_family_has_exact_clone_compatibility(monkeypatc
 @pytest.mark.parametrize("change", ["missing", "duplicate", "schema", "name", "type", "default", "parameters"])
 async def test_evidence_sequence_requires_exact_native_dependency_and_default(monkeypatch, change):
     fhir, source, relation, _original, _clone = await _source_and_clone(monkeypatch, "entity_address_evidence")
-    rows = fhir.db.all.return_value
+    rows = fhir.db.evidence_sequences
     if change == "missing":
         rows.clear()
     elif change == "duplicate":
@@ -240,7 +251,7 @@ async def test_evidence_sequence_requires_exact_native_dependency_and_default(mo
         rows[0][field] = "changed"
     with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
         await layout.capture_retained_native_layout(fhir, relation, source, ("entity_address_evidence",))
-    query = fhir.db.all.await_args.args[0]
+    query = fhir.db.first.await_args.args[0]
     assert "pg_attrdef" in query and "pg_depend" in query and "pg_sequence" in query
     assert "ownership.refobjsubid=attribute.attnum" in query
 
@@ -333,7 +344,6 @@ async def test_source_evidence_refuses_wrong_model_or_malformed_identity(monkeyp
 @pytest.mark.asyncio
 async def test_final_source_rejects_missing_primary_or_declared_indexes(monkeypatch):
     fhir, source, catalog, _clone = _fixture()
-    monkeypatch.setattr(layout, "_index_physical_details", AsyncMock())
     catalog["indexes"].pop(0)
     with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
         await layout.capture_retained_native_source(fhir, source, ("entity_address_unified",))
@@ -345,7 +355,6 @@ async def test_final_source_rejects_missing_primary_or_declared_indexes(monkeypa
 )
 async def test_original_source_must_pass_declared_native_checks(monkeypatch, change):
     fhir, source_relation, catalog_by_field, _clone = _fixture()
-    monkeypatch.setattr(layout, "_index_physical_details", AsyncMock())
     if change == "unknown_index":
         catalog_by_field["indexes"][1]["index_name"] = "unknown"
     if change == "wrong_method":
@@ -392,15 +401,24 @@ async def test_signed_clone_dispatch_preserves_profile_default(monkeypatch):
     producer, relation, annotation, request = _annotated_producer()
     capture = AsyncMock(return_value=layout.NativeRelationLayout(21, (42,), "a" * 64))
     monkeypatch.setattr(layout, "capture_retained_native_layout", capture)
+    observed_catalog = ({"relation": {"relation_oid": relation.oid}}, None)
+    batch = AsyncMock(return_value={(relation.schema, relation.relation, relation.oid): observed_catalog})
+    monkeypatch.setattr(layout, "observe_native_catalog_batch", batch)
     producer._current_wal_bytes = AsyncMock(return_value=0)
     await producer._assert_physical(request, {"data_tablespace_oid": 42})
     capture.assert_awaited_once_with(
-        producer.fhir, relation, annotation.source_layout, producer.plan.native_address_targets
+        producer.fhir,
+        relation,
+        annotation.source_layout,
+        producer.plan.native_address_targets,
+        observed_catalog=observed_catalog,
     )
+    batch.assert_awaited_once_with(producer.fhir, [relation], database=producer.fhir.db)
     profile = AsyncMock(return_value=SimpleNamespace(relation_oid=21, effective_tablespace_oids=(42,)))
     producer.fhir._provider_directory_profile_relation_storage_fingerprint = profile
     await producer._assert_physical(replace(request, native_relations=()), {"data_tablespace_oid": 42})
     profile.assert_awaited_once_with(21, expected_persistence="p")
+    assert batch.await_count == 1
 
 
 @pytest.mark.parametrize(
