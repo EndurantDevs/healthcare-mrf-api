@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.dialects.postgresql import dialect
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 from process.custom_import import capture_store as store
 from process.custom_import.capture import CaptureManifest
@@ -251,7 +252,48 @@ async def test_successful_part_read_cannot_hide_reader_close_failure(monkeypatch
         async with store.open_segmented_cursor_part(session, **_PART_IDS, stream_slot=1, part_ordinal=1) as part:
             assert part.capture.payload == row[4]
     assert caught.value is failure
+    assert failure._custom_import_retry_blocked is True
     closed.assert_awaited_once()
+
+
+@pytest.mark.parametrize("kind", [InterfaceError, OperationalError])
+@pytest.mark.parametrize("preserve_primary", [False, True])
+async def test_cursor_close_disconnect_blocks_retry_of_first_or_same_error(monkeypatch, kind, preserve_primary):
+    row = _part_row(1)
+    _headers(monkeypatch, [row])
+    session = _PartReadSession([row])
+    failure = kind(None, None, OSError("synthetic-disconnect"), connection_invalidated=True)
+    close = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(_PartRows, "close", close)
+
+    with pytest.raises(kind) as caught:
+        async with store.open_segmented_cursor_part(session, **_PART_IDS, stream_slot=1, part_ordinal=1) as part:
+            assert part.capture.payload == row[4]
+            if preserve_primary:
+                raise failure
+
+    assert caught.value is failure and failure._custom_import_retry_blocked is True
+    assert failure.__cause__ is None and not getattr(failure, "__notes__", ())
+    close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("kind", [InterfaceError, OperationalError])
+async def test_complete_metadata_close_disconnect_blocks_retry(monkeypatch, kind):
+    row = _part_row(1)
+    _headers(monkeypatch, [row])
+    session = _PartReadSession([row[:4] + row[5:]])
+    failure = kind(None, None, OSError("synthetic-disconnect"), connection_invalidated=True)
+    close = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(_PartRows, "close", close)
+
+    with pytest.raises(kind) as caught:
+        await store.verify_segmented_stream_metadata(
+            session, **_PART_IDS, stream_slot=1, deadline=time.monotonic() + 60
+        )
+
+    assert caught.value is failure and failure._custom_import_retry_blocked is True
+    assert failure.__cause__ is None and not getattr(failure, "__notes__", ())
+    close.assert_awaited_once()
 
 
 @pytest.mark.parametrize("is_cancel", [False, True])
@@ -292,7 +334,8 @@ async def test_metadata_drift_and_close_failure_keep_drift_as_primary(monkeypatc
     assert isinstance(caught.value.__cause__, RuntimeError) and caught.value._custom_import_retry_blocked
 
 
-async def test_cursor_result_cleanup_drains_repeated_cancellation():
+@pytest.mark.parametrize("cancellation_count", [1, 2])
+async def test_cursor_result_cleanup_drains_repeated_cancellation(cancellation_count):
     entered, release = asyncio.Event(), asyncio.Event()
     close_events = []
 
@@ -305,10 +348,11 @@ async def test_cursor_result_cleanup_drains_repeated_cancellation():
 
     task = asyncio.create_task(store._close_cursor_result(SimpleNamespace(close=close)))
     await entered.wait()
-    task.cancel()
-    await asyncio.sleep(0)
-    task.cancel()
+    for _ in range(cancellation_count):
+        task.cancel()
+        await asyncio.sleep(0)
     release.set()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as caught:
         await task
+    assert caught.value._custom_import_retry_blocked is True
     assert close_events == [True]

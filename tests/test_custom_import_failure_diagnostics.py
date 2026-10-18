@@ -6,6 +6,7 @@ import asyncio
 import json
 
 import pytest
+from sqlalchemy import exc as database_errors
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
@@ -141,6 +142,124 @@ def test_driver_chain_traversal_has_a_fixed_bound():
         current = current.orig
     current.sqlstate = "57014"
     assert diagnostics.classify_failure(root) == ("database", "unknown")
+
+
+@pytest.mark.parametrize(
+    "kind,subtype",
+    [
+        (database_errors.InterfaceError, "sqlalchemy_interface"),
+        (database_errors.OperationalError, "sqlalchemy_operational"),
+        (database_errors.ProgrammingError, "sqlalchemy_programming"),
+        (database_errors.IntegrityError, "sqlalchemy_integrity"),
+        (database_errors.DataError, "sqlalchemy_data"),
+        (database_errors.InternalError, "sqlalchemy_internal"),
+        (database_errors.DatabaseError, "sqlalchemy_database"),
+        (DBAPIError, "sqlalchemy_dbapi"),
+    ],
+)
+def test_closed_wrapper_subtypes(kind, subtype):
+    error = kind("synthetic SQL", {"synthetic": "parameters"}, Exception("synthetic driver"))
+    assert diagnostics.database_failure_details(error) == (subtype, False, False)
+    assert subtype in diagnostics.DATABASE_SUBTYPES
+
+
+@pytest.mark.parametrize(
+    "error,subtype",
+    [
+        (database_errors.PendingRollbackError(), "sqlalchemy_pending_rollback"),
+        (database_errors.ResourceClosedError(), "sqlalchemy_resource_closed"),
+        (database_errors.InvalidRequestError(), "sqlalchemy_invalid_request"),
+        (database_errors.DisconnectionError(), "sqlalchemy_disconnection"),
+        (database_errors.StatementError("synthetic detail", "synthetic SQL", {}, Exception()), "sqlalchemy_statement"),
+        (SQLAlchemyTimeoutError(), "sqlalchemy_timeout"),
+        (SQLAlchemyError(), "unknown"),
+        (RuntimeError(), "not_applicable"),
+    ],
+)
+def test_direct_subtype_precedence(error, subtype):
+    assert diagnostics.database_failure_details(error) == (subtype, False, False)
+    assert subtype in diagnostics.DATABASE_SUBTYPES
+
+
+@pytest.mark.parametrize("flag", [True, False, None, 1, "true", object()])
+def test_invalidation_requires_boolean(flag):
+    error = DBAPIError("synthetic SQL", {}, Exception(), connection_invalidated=flag)
+    assert diagnostics.database_failure_details(error) == ("sqlalchemy_dbapi", flag is True, False)
+
+
+def test_wrapped_cancellation_retains_subtype():
+    error = database_errors.InterfaceError("synthetic SQL", {}, Exception())
+    error.__cause__ = asyncio.CancelledError()
+    assert diagnostics.database_failure_details(error) == ("sqlalchemy_interface", False, False)
+    assert diagnostics.classify_failure(error) == ("database", "unknown")
+
+
+def test_details_ignore_hostile_attributes():
+    class SensitiveInterfaceError(database_errors.InterfaceError):
+        def __init__(self):
+            BaseException.__init__(self, "synthetic detail")
+
+        @property
+        def connection_invalidated(self):
+            raise AssertionError("property evaluated")
+
+        def __getattribute__(self, name):
+            if name in {"connection_invalidated", "orig", "__cause__"}:
+                raise AssertionError("attribute hook evaluated")
+            return super().__getattribute__(name)
+
+        def __str__(self):
+            raise AssertionError("exception rendered")
+
+    assert diagnostics.database_failure_details(SensitiveInterfaceError()) == (
+        "sqlalchemy_interface",
+        False,
+        False,
+    )
+    unrelated = RuntimeError()
+    unrelated.connection_invalidated = True
+    assert diagnostics.database_failure_details(unrelated) == ("not_applicable", False, False)
+
+
+def test_details_bound_cyclic_chains():
+    root = current = RuntimeError()
+    for _ in range(8):
+        current.orig = RuntimeError()
+        current = current.orig
+    current.orig = DBAPIError("synthetic SQL", {}, Exception(), connection_invalidated=True)
+    assert diagnostics.database_failure_details(root) == ("not_applicable", False, False)
+    root = RuntimeError()
+    root.orig = root
+    root.__cause__ = DBAPIError("synthetic SQL", {}, Exception(), connection_invalidated=True)
+    root.__cause__.__cause__ = root
+    assert diagnostics.database_failure_details(root) == ("sqlalchemy_dbapi", True, False)
+
+
+@pytest.mark.parametrize("flag", [True, False, None, 1, "true", object()])
+def test_retry_blocked_requires_exact_boolean(flag):
+    error = DBAPIError("synthetic SQL", {}, Exception())
+    error._custom_import_retry_blocked = flag
+    assert diagnostics.database_failure_details(error) == ("sqlalchemy_dbapi", False, flag is True)
+
+
+def test_retry_blocked_uses_bounded_chain():
+    error = database_errors.InterfaceError("synthetic SQL", {}, Exception())
+    error.orig._custom_import_retry_blocked = True
+    assert diagnostics.database_failure_details(error) == ("sqlalchemy_interface", False, True)
+
+
+def test_retry_blocked_ignores_hostile_property():
+    class SensitiveError(RuntimeError):
+        @property
+        def _custom_import_retry_blocked(self):
+            raise AssertionError("property evaluated")
+
+        def __getattribute__(self, name):
+            if name == "_custom_import_retry_blocked":
+                raise AssertionError("attribute hook evaluated")
+            return super().__getattribute__(name)
+
+    assert diagnostics.database_failure_details(SensitiveError()) == ("not_applicable", False, False)
 
 
 @pytest.mark.parametrize("identifier", [None, True, False, 0, -1, 2**63, 1.5, "41", object()])

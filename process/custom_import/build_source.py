@@ -968,7 +968,8 @@ async def _close_source_pages(pages, primary):
 
 def _source_cleanup_failure(primary, failure):
     if primary is None or isinstance(primary, GeneratorExit):
-        return failure
+        primary = failure
+    primary._custom_import_retry_blocked = True
     if primary is not failure:
         primary.add_note(f"source decoder cleanup also failed: {type(failure).__name__}")
         primary.__cause__ = failure
@@ -1024,8 +1025,7 @@ async def _drain_cleanup(cleanup, primary: BaseException | None) -> BaseExceptio
         except asyncio.CancelledError as exc:
             if primary is None:
                 primary = exc
-            else:
-                primary._custom_import_retry_blocked = True
+            primary._custom_import_retry_blocked = True
         except BaseException:
             break
     try:
@@ -1033,8 +1033,8 @@ async def _drain_cleanup(cleanup, primary: BaseException | None) -> BaseExceptio
     except BaseException as exc:
         if primary is None:
             primary = exc
-        elif primary is not exc:
-            primary._custom_import_retry_blocked = True
+        primary._custom_import_retry_blocked = True
+        if primary is not exc:
             primary.add_note(f"source replay cleanup also failed: {type(exc).__name__}")
             primary.__cause__ = exc
     return primary

@@ -9,11 +9,14 @@ credential, user-selected query or uploaded row is accepted by this handler.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from datetime import datetime, timezone
+from inspect import getattr_static
 
 from sanic import Blueprint
 from sanic.exceptions import BadRequest, PayloadTooLarge
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 from api import control_admission_batch as admission
 from api.control_batch_diagnostics import BatchFailureStage, log_batch_failure
@@ -30,24 +33,43 @@ class SourceProgressConflict(RuntimeError):
     """The original cursor is no longer current; no retry is authorized."""
 
 
+def _can_retry_source_operation(error):
+    """Require a known invalidated connection and completed, uncanceled cleanup."""
+
+    try:
+        task = asyncio.current_task()
+        return (
+            getattr_static(error, "connection_invalidated", False) is True
+            and getattr_static(error, "_custom_import_retry_blocked", False) is False
+            and (task is None or not task.cancelling())
+        )
+    except Exception:
+        return False
+
+
 async def _source_operation(session_factory, verified):
     # Delay the engine import so authorization has no capture-store import cycle.
     from process.custom_import.source_batch import SourceCursor, SourceCursorConflict, serve_source_batch
 
     pins = verified.pins
-    try:
-        return await serve_source_batch(
-            session_factory,
-            execution_id=pins.execution_id,
-            build_id=pins.build_id,
-            fence=pins.fence,
-            stream_slot=pins.stream_slot,
-            expected_cursor=SourceCursor(**asdict(pins.expected_cursor)),
-            lease_token=verified.token.value,
-            source_permit=verified.permit,
-        )
-    except SourceCursorConflict:
-        raise SourceProgressConflict("custom_import_source_progress_conflict") from None
+    operation_dict = dict(
+        execution_id=pins.execution_id,
+        build_id=pins.build_id,
+        fence=pins.fence,
+        stream_slot=pins.stream_slot,
+        expected_cursor=SourceCursor(**asdict(pins.expected_cursor)),
+        lease_token=verified.token.value,
+        source_permit=verified.permit,
+    )
+    for attempt in range(2):
+        try:
+            return await serve_source_batch(session_factory, **operation_dict)
+        except SourceCursorConflict:
+            raise SourceProgressConflict("custom_import_source_progress_conflict") from None
+        except (InterfaceError, OperationalError) as error:
+            if attempt or not _can_retry_source_operation(error):
+                raise
+            log_batch_failure(BatchFailureStage.SOURCE_EXECUTE, error, is_retry=True)
 
 
 def _receipt(verified, result):

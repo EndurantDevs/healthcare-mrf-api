@@ -5,13 +5,14 @@
 import asyncio
 import json
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sanic.compat import Header
-from sqlalchemy.exc import StatementError
+from sqlalchemy.exc import DataError, InterfaceError, OperationalError, StatementError
 
 from api import control_admission_batch as admission
 from api import control_source_batch as service
@@ -100,6 +101,278 @@ async def test_engine_cursor_conflict_cannot_leak_cursors_or_grant_retry(monkeyp
         await service._source_operation(None, verified)
 
 
+def _disconnected(kind=InterfaceError):
+    return kind(
+        "synthetic-sql", {"value": "synthetic-payload"}, OSError("synthetic-driver"), connection_invalidated=True
+    )
+
+
+def _install_retry_step(monkeypatch, outcomes, *, commit_error=None, close_error=None):
+    from process.custom_import import source_batch as engine
+
+    state = SimpleNamespace(calls=[], events=[], sessions=[])
+
+    @asynccontextmanager
+    async def transaction(index):
+        state.events.append((index, "begin"))
+        try:
+            yield
+        except BaseException:
+            state.events.append((index, "rollback"))
+            raise
+        else:
+            state.events.append((index, "commit"))
+            if index == 0 and commit_error is not None:
+                raise commit_error
+
+    @asynccontextmanager
+    async def factory():
+        index = len(state.sessions)
+        session = SimpleNamespace(begin=lambda: transaction(index))
+        state.sessions.append(session)
+        state.events.append((index, "open"))
+        try:
+            yield session
+        finally:
+            state.events.append((index, "close"))
+            if index == 0 and close_error is not None:
+                raise close_error
+
+    async def step(used_factory, **operation):
+        assert used_factory is factory
+        state.calls.append(operation)
+        async with engine._read_session(used_factory):
+            outcome = outcomes[len(state.calls) - 1]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    monkeypatch.setitem(
+        sys.modules,
+        "process.custom_import.source_batch",
+        SimpleNamespace(
+            SourceCursor=engine.SourceCursor, SourceCursorConflict=engine.SourceCursorConflict, serve_source_batch=step
+        ),
+    )
+    state.factory = factory
+    state.engine = engine
+    return state
+
+
+@pytest.mark.parametrize("kind", [InterfaceError, OperationalError])
+async def test_invalidated_source_connection_retries_after_close_with_identical_authority(monkeypatch, caplog, kind):
+    request, verified = _wire()
+    authorize = Mock(return_value=verified)
+    deadline = Mock(wraps=admission.extend_batch_response_deadline)
+    monkeypatch.setattr(service.authorization, "verify_request", authorize)
+    monkeypatch.setattr(admission, "extend_batch_response_deadline", deadline)
+    failure = _disconnected(kind)
+    if kind is OperationalError:
+        failure._custom_import_retry_blocked = False
+    state = _install_retry_step(monkeypatch, [failure, _committed()])
+
+    reply = await _serve(request, state.factory)
+
+    assert reply.status == 200 and json.loads(reply.body) == asdict(_committed())
+    assert state.events == [
+        (0, "open"),
+        (0, "begin"),
+        (0, "rollback"),
+        (0, "close"),
+        (1, "open"),
+        (1, "begin"),
+        (1, "commit"),
+        (1, "close"),
+    ]
+    assert len(state.sessions) == 2 and state.sessions[0] is not state.sessions[1]
+    first, second = state.calls
+    assert first == second
+    assert asdict(first["expected_cursor"]) == asdict(verified.pins.expected_cursor)
+    for name, expected in (("source_permit", verified.permit), ("lease_token", verified.token.value)):
+        assert first[name] is second[name] is expected
+    assert first["expected_cursor"] is second["expected_cursor"]
+    authorize.assert_called_once()
+    deadline.assert_called_once_with(request, expires_at=verified.permit.expires_at, trusted_now=envelope.legacy.NOW)
+    assert len(caplog.records) == 1 and "connection_invalidated=True" in caplog.text
+    assert caplog.records[0].getMessage().startswith("custom_import_batch_retry_attempted ")
+    assert "custom_import_batch_unavailable" not in caplog.text
+    assert "synthetic-" not in caplog.text and not caplog.records[0].exc_info
+
+
+@pytest.mark.parametrize("kind", [InterfaceError, OperationalError])
+@pytest.mark.parametrize("failure_phase", ["commit", "close"])
+async def test_uncertain_commit_or_session_cleanup_failure_is_terminal(monkeypatch, caplog, kind, failure_phase):
+    request, _ = _wire()
+    failure = _disconnected(kind)
+    state = _install_retry_step(
+        monkeypatch,
+        [_committed(), _committed()],
+        commit_error=failure if failure_phase == "commit" else None,
+        close_error=failure if failure_phase == "close" else None,
+    )
+
+    reply = await _serve(request, state.factory)
+
+    assert reply.status == 503 and json.loads(reply.body) == {"error": "source_unavailable"}
+    assert state.events == [(0, "open"), (0, "begin"), (0, "commit"), (0, "close")]
+    assert len(state.calls) == len(state.sessions) == 1
+    assert failure._custom_import_retry_blocked is True
+    assert len(caplog.records) == 1
+    assert caplog.records[0].getMessage().startswith("custom_import_batch_unavailable ")
+    assert "retry_blocked=True" in caplog.text
+    assert "custom_import_batch_retry_attempted" not in caplog.text and "synthetic-" not in caplog.text
+
+
+async def test_retried_source_operation_preserves_existing_cursor_conflict(monkeypatch, caplog):
+    from process.custom_import import source_batch as engine
+
+    request, _ = _wire()
+    conflict = engine.SourceCursorConflict(engine.SourceCursor(1, 3, 3, 1), False, "source")
+    state = _install_retry_step(monkeypatch, [_disconnected(), conflict])
+
+    reply = await _serve(request, state.factory)
+
+    assert reply.status == 409 and json.loads(reply.body) == {"error": "source_progress_conflict"}
+    assert state.events == [
+        (0, "open"),
+        (0, "begin"),
+        (0, "rollback"),
+        (0, "close"),
+        (1, "open"),
+        (1, "begin"),
+        (1, "rollback"),
+        (1, "close"),
+    ]
+    assert len(state.calls) == 2
+    assert state.calls[0]["expected_cursor"] is state.calls[1]["expected_cursor"]
+    assert len(caplog.records) == 1 and "connection_invalidated=True" in caplog.text
+    assert caplog.records[0].getMessage().startswith("custom_import_batch_retry_attempted ")
+    assert "custom_import_batch_unavailable" not in caplog.text
+    assert b"after" not in reply.body and b"rollback" not in reply.body
+
+
+async def test_second_source_disconnect_is_terminal_and_preserves_both_closed_logs(monkeypatch, caplog):
+    request, _ = _wire()
+    state = _install_retry_step(monkeypatch, [_disconnected(), _disconnected(OperationalError), _committed()])
+
+    reply = await _serve(request, state.factory)
+
+    assert reply.status == 503 and json.loads(reply.body) == {"error": "source_unavailable"}
+    assert len(state.calls) == len(state.sessions) == 2
+    assert state.events[-2:] == [(1, "rollback"), (1, "close")]
+    assert len(caplog.records) == 2
+    assert caplog.records[0].getMessage().startswith("custom_import_batch_retry_attempted ")
+    assert caplog.records[1].getMessage().startswith("custom_import_batch_unavailable ")
+    assert "database_subtype=sqlalchemy_interface" in caplog.records[0].getMessage()
+    assert "database_subtype=sqlalchemy_operational" in caplog.records[1].getMessage()
+    assert "synthetic-" not in caplog.text
+
+
+@pytest.mark.parametrize("blocked", [True, None, 0, "unknown", object()])
+async def test_unknown_or_blocked_source_cleanup_marker_prevents_retry(monkeypatch, blocked):
+    _, verified = _wire()
+    failure = _disconnected()
+    failure._custom_import_retry_blocked = blocked
+    state = _install_retry_step(monkeypatch, [failure, _committed()])
+    with pytest.raises(InterfaceError) as caught:
+        await service._source_operation(state.factory, verified)
+    assert caught.value is failure and len(state.calls) == 1
+
+
+@pytest.mark.parametrize("invalidated", [None, 1, "true", object()])
+async def test_source_retry_requires_a_literal_invalidated_boolean(monkeypatch, invalidated):
+    _, verified = _wire()
+    failure = _disconnected()
+    failure.connection_invalidated = invalidated
+    state = _install_retry_step(monkeypatch, [failure, _committed()])
+    with pytest.raises(InterfaceError) as caught:
+        await service._source_operation(state.factory, verified)
+    assert caught.value is failure and len(state.calls) == 1
+
+
+@pytest.mark.parametrize("attribute", ["connection_invalidated", "_custom_import_retry_blocked"])
+async def test_source_retry_does_not_invoke_exception_descriptors(monkeypatch, attribute):
+    class ObservedInterfaceError(InterfaceError):
+        pass
+
+    _, verified = _wire()
+    failure = _disconnected(ObservedInterfaceError)
+    forbidden = Mock(side_effect=AssertionError("exception descriptor must remain unread"))
+    monkeypatch.setattr(ObservedInterfaceError, attribute, property(forbidden), raising=False)
+    state = _install_retry_step(monkeypatch, [failure, _committed()])
+    with pytest.raises(InterfaceError) as caught:
+        await service._source_operation(state.factory, verified)
+    assert caught.value is failure and len(state.calls) == 1
+    forbidden.assert_not_called()
+
+
+async def test_source_retry_inspection_failure_preserves_original_error(monkeypatch):
+    _, verified = _wire()
+    failure = _disconnected()
+    state = _install_retry_step(monkeypatch, [failure, _committed()])
+    inspect_attribute = Mock(side_effect=RuntimeError("synthetic-inspection-failure"))
+    monkeypatch.setattr(service, "getattr_static", inspect_attribute)
+
+    with pytest.raises(InterfaceError) as caught:
+        await service._source_operation(state.factory, verified)
+
+    assert caught.value is failure and len(state.calls) == len(state.sessions) == 1
+    assert state.events == [(0, "open"), (0, "begin"), (0, "rollback"), (0, "close")]
+    inspect_attribute.assert_called_once_with(failure, "connection_invalidated", False)
+
+
+async def test_failed_cleanup_blocks_retry_of_preserved_source_disconnect(monkeypatch):
+    _, verified = _wire()
+    failure, cleanup = _disconnected(), RuntimeError("synthetic-close")
+    state = _install_retry_step(monkeypatch, [failure, _committed()], close_error=cleanup)
+    with pytest.raises(InterfaceError) as caught:
+        await service._source_operation(state.factory, verified)
+    assert caught.value is failure and failure.__cause__ is cleanup
+    assert failure._custom_import_retry_blocked is True and len(state.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        InterfaceError(None, None, OSError(), connection_invalidated=False),
+        DataError(None, None, OSError(), connection_invalidated=True),
+        StatementError("synthetic", None, None, None),
+        LeaseAuthorityLost("synthetic"),
+        CancellationRequested("synthetic"),
+        RuntimeError("synthetic"),
+        asyncio.CancelledError(),
+    ],
+)
+async def test_other_source_failures_never_retry(monkeypatch, failure):
+    _, verified = _wire()
+    state = _install_retry_step(monkeypatch, [failure, _committed()])
+    with pytest.raises(type(failure)) as caught:
+        await service._source_operation(state.factory, verified)
+    assert caught.value is failure and len(state.calls) == 1
+
+
+async def test_source_retry_refuses_a_current_task_with_pending_cancellation(monkeypatch):
+    _, verified = _wire()
+    failure = _disconnected()
+    state = _install_retry_step(monkeypatch, [failure, _committed()])
+    waiting = asyncio.Event()
+
+    async def cancel_before_operation():
+        waiting.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            assert asyncio.current_task().cancelling()
+        return await service._source_operation(state.factory, verified)
+
+    task = asyncio.create_task(cancel_before_operation())
+    await waiting.wait()
+    task.cancel()
+    with pytest.raises(InterfaceError) as caught:
+        await task
+    assert caught.value is failure and len(state.calls) == 1
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -175,9 +448,10 @@ async def test_unavailable_diagnostics_keep_private_values(monkeypatch, caplog, 
     assert len(caplog.records) == 1
     log_entry = caplog.records[0]
     assert log_entry.getMessage() == (
-        f"custom_import_batch_unavailable stage=source_{stage} category=database database_reason=unknown"
+        f"custom_import_batch_unavailable stage=source_{stage} category=database database_reason=unknown "
+        "database_subtype=sqlalchemy_statement connection_invalidated=False retry_blocked=False"
     )
-    assert log_entry.args == (f"source_{stage}", "database", "unknown")
+    assert log_entry.args == (f"source_{stage}", "database", "unknown", "sqlalchemy_statement", False, False)
     assert not log_entry.exc_info and log_entry.exc_text is None and log_entry.stack_info is None
     assert not any(sentinel in caplog.text for sentinel in ("synthetic-", "synthetic_sql"))
     assert request.body == b"" or request.body.decode() not in caplog.text
