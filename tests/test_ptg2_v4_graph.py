@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import struct
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-import struct
 
 import pytest
 
+from api import ptg2_serving
 from api import ptg2_v4_graph as graph
 from api import ptg2_v4_intersection as intersection
-from api import ptg2_serving
 from api.ptg2_shared_blocks import PTG2SharedBlockError
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_snapshot_candidates import CANDIDATE_TABLES
@@ -28,45 +28,44 @@ def test_v4_locator_and_member_pages_decode_fixed_width_contract() -> None:
     ) == (2, 7, 11)
 
 
-def test_v4_member_page_uses_native_decoder_after_framing_validation(
-    monkeypatch,
-) -> None:
-    calls: list[bytes] = []
-
-    def fake_native(payload: bytes) -> list[int]:
-        calls.append(payload)
-        return [2, 7, 11]
-
-    payload = struct.pack("<III", 2, 7, 11)
-    monkeypatch.setattr(graph, "_native_u32_decoder", fake_native)
-    assert graph._decode_member_page(payload, entry_count=3) == (2, 7, 11)
-    assert calls == [payload]
-
-
-def test_v4_member_page_python_fallback_is_exact(monkeypatch) -> None:
-    monkeypatch.setattr(graph, "_native_u32_decoder", None)
-    assert graph._decode_member_page(
-        struct.pack("<IIII", 0, 2, 0xFFFFFFFE, 0xFFFFFFFF),
-        entry_count=4,
-    ) == (0, 2, 0xFFFFFFFE, 0xFFFFFFFF)
+@pytest.mark.parametrize(
+    "members",
+    [(0, 2, 0xFFFFFFFE, 0xFFFFFFFF), (0xFFFFFFFF, 0, 0xFFFFFFFF)],
+)
+def test_v4_member_pages_preserve_unsigned_values_and_page_order(members) -> None:
+    payload = struct.pack(f"<{len(members)}I", *members)
+    assert graph._decode_member_page(payload, entry_count=len(members)) == members
 
 
 @pytest.mark.parametrize(
-    "native_result, error_match",
+    ("payload", "entry_count", "maximum_entries"),
     [
-        ([2], "changed framing"),
-        ([2, 0x1_0000_0000], "changed framing"),
-        ([2, "not-an-integer"], "decoder failed"),
+        (b"", -1, graph.PTG2_V4_MEMBERS_PER_PAGE),
+        (b"\0" * 3, 1, graph.PTG2_V4_MEMBERS_PER_PAGE),
+        (b"\0" * 8, 1, graph.PTG2_V4_MEMBERS_PER_PAGE),
+        (
+            b"\0" * ((graph.PTG2_V4_MEMBERS_PER_PAGE + 1) * 4),
+            graph.PTG2_V4_MEMBERS_PER_PAGE + 1,
+            graph.PTG2_V4_MEMBERS_PER_PAGE,
+        ),
+        (b"\0" * 12, 3, 2),
+        (b"", 0, -1),
     ],
 )
-def test_v4_member_page_rejects_malformed_native_results(
-    monkeypatch,
-    native_result,
-    error_match: str,
+def test_v4_member_pages_reject_invalid_count_bytes_and_capacity(
+    payload,
+    entry_count,
+    maximum_entries,
 ) -> None:
-    monkeypatch.setattr(graph, "_native_u32_decoder", lambda _payload: native_result)
-    with pytest.raises(PTG2SharedBlockError, match=error_match):
-        graph._decode_member_page(struct.pack("<II", 2, 7), entry_count=2)
+    with pytest.raises(PTG2SharedBlockError, match="member page is malformed"):
+        graph._decode_member_page(payload, entry_count=entry_count, maximum_entries=maximum_entries)
+
+
+@pytest.mark.parametrize("maximum_entries", [0, 3, graph.PTG2_V4_MEMBERS_PER_PAGE, graph.PTG2_V4_MEMBERS_PER_PAGE + 1])
+def test_v4_member_pages_accept_exact_configured_capacity(maximum_entries) -> None:
+    members = tuple(range(maximum_entries))
+    payload = struct.pack(f"<{len(members)}I", *members)
+    assert graph._decode_member_page(payload, entry_count=len(members), maximum_entries=maximum_entries) == members
 
 
 def test_v4_page_decoders_reject_truncation_and_out_of_range_owner() -> None:
@@ -371,24 +370,24 @@ class _HeavyBitmapFragmentFixture:
 
     @staticmethod
     def _frame(fragment_no: int, entry_count: int, payload: bytes) -> bytes:
-        return struct.pack(
-            "<8sIIIIII",
-            b"PTG2V4BF",
-            7,
-            100,
-            24,
-            6,
-            fragment_no,
-            entry_count,
-        ) + payload
+        return (
+            struct.pack(
+                "<8sIIIIII",
+                b"PTG2V4BF",
+                7,
+                100,
+                24,
+                6,
+                fragment_no,
+                entry_count,
+            )
+            + payload
+        )
 
     async def coordinates(self, *_args, **kwargs):
         coordinate_pairs = tuple(kwargs["coordinate_pairs"])
         self.requested_coordinate_pairs.append(coordinate_pairs)
-        return {
-            pair: self.coordinates_by_key[pair]
-            for pair in coordinate_pairs
-        }
+        return {pair: self.coordinates_by_key[pair] for pair in coordinate_pairs}
 
     async def blocks(self, *_args, **kwargs):
         return {
@@ -483,10 +482,13 @@ async def test_v4_scoped_lookup_returns_before_unneeded_graph_io(
         "mrf",
         8,
     )
-    assert await graph._lookup_v4_relation_members_scoped(
-        object(),
-        empty_request,
-    ) == {}
+    assert (
+        await graph._lookup_v4_relation_members_scoped(
+            object(),
+            empty_request,
+        )
+        == {}
+    )
     prepared_lookup = _regular_lookup_fixture(allowed_member_keys=())
     monkeypatch.setattr(
         graph,
@@ -755,16 +757,8 @@ class _DirectRelationFixture:
         kind = kwargs["object_kind"]
         if kind.endswith("locators_v1"):
             locator_payload = struct.pack("<QI", 0, 1) + struct.pack("<QI", 1, 2)
-            return {
-                b"l" * 32: graph._CachedPhysicalBlock(
-                    b"l" * 32, kind, 2, locator_payload
-                )
-            }
-        return {
-            b"m" * 32: graph._CachedPhysicalBlock(
-                b"m" * 32, kind, 3, struct.pack("<III", 5, 7, 9)
-            )
-        }
+            return {b"l" * 32: graph._CachedPhysicalBlock(b"l" * 32, kind, 2, locator_payload)}
+        return {b"m" * 32: graph._CachedPhysicalBlock(b"m" * 32, kind, 3, struct.pack("<III", 5, 7, 9))}
 
     def install(self, monkeypatch) -> None:
         monkeypatch.setattr(graph, "load_v4_graph_root", self.root)
@@ -818,15 +812,8 @@ class _OversizedPatternFixture:
         self.requested_kinds.append(kind)
         if kind.endswith("members_v1"):
             raise AssertionError("member blocks must not be decoded")
-        locator_payload = b"".join(
-            struct.pack("<QI", 0, 1_872_272 if owner == 7 else 0)
-            for owner in range(8)
-        )
-        return {
-            b"l" * 32: graph._CachedPhysicalBlock(
-                b"l" * 32, kind, 8, locator_payload
-            )
-        }
+        locator_payload = b"".join(struct.pack("<QI", 0, 1_872_272 if owner == 7 else 0) for owner in range(8))
+        return {b"l" * 32: graph._CachedPhysicalBlock(b"l" * 32, kind, 8, locator_payload)}
 
     def install(self, monkeypatch) -> None:
         monkeypatch.setattr(graph, "load_v4_graph_root", self.root)
@@ -840,6 +827,8 @@ class _OversizedPatternFixture:
 async def test_heavy_owner_loader_caches_scoped_hits_and_misses(
     monkeypatch,
 ) -> None:
+    """Reuse scoped hits and misses without querying cached owners again."""
+
     class Session:
         def __init__(self) -> None:
             self.calls = []
@@ -865,30 +854,33 @@ async def test_heavy_owner_loader_caches_scoped_hits_and_misses(
     assert "owner_key = ANY(CAST(:owner_keys AS bigint[]))" in sql
     assert parameters["owner_keys"] == [7, 8]
 
-    assert await graph.load_v4_heavy_owners(
+    cached = await graph.load_v4_heavy_owners(
         session,
         snapshot_key=17,
         relation="npi_groups_exact",
         owner_keys=(7, 8),
         schema_name="mrf",
-    ) == loaded
+    )
+    assert cached == loaded
     assert len(session.calls) == 1
 
-    assert await graph.load_v4_heavy_owners(
+    cached = await graph.load_v4_heavy_owners(
         session,
         snapshot_key=17,
         relation="npi_groups_exact",
         owner_keys=(7, 8, 9),
         schema_name="mrf",
-    ) == loaded
+    )
+    assert cached == loaded
     assert session.calls[1][1]["owner_keys"] == [9]
-    assert await graph.load_v4_heavy_owners(
+    cached = await graph.load_v4_heavy_owners(
         session,
         snapshot_key=17,
         relation="npi_groups_exact",
         owner_keys=(9,),
         schema_name="mrf",
-    ) == {}
+    )
+    assert cached == {}
     assert len(session.calls) == 2
 
 
@@ -930,9 +922,7 @@ async def test_heavy_owner_lrus_are_bounded_and_isolated(
     assert other[20].member_base == 200
     calls_before_namespace_checks = len(session.calls)
     assert (await load(3, snapshot_key=18))[3].owner_key == 3
-    assert (await load(3, relation="group_npis_exact"))[3].relation == (
-        "group_npis_exact"
-    )
+    assert (await load(3, relation="group_npis_exact"))[3].relation == ("group_npis_exact")
     assert len(session.calls) == calls_before_namespace_checks + 2
     assert len(graph._HEAVY_OWNER_CACHE) <= 2
     assert len(graph._HEAVY_OWNER_NEGATIVE_CACHE) <= 2
@@ -1066,16 +1056,8 @@ class _RegularIntersectionFixture:
         kind = kwargs["object_kind"]
         if kind.endswith("locators_v1"):
             payload = struct.pack("<QI", 0, 1) + struct.pack("<QI", 0, 3)
-            return {
-                b"l" * 32: graph._CachedPhysicalBlock(
-                    b"l" * 32, kind, 2, payload
-                )
-            }
-        return {
-            b"m" * 32: graph._CachedPhysicalBlock(
-                b"m" * 32, kind, 3, self.member_payload
-            )
-        }
+            return {b"l" * 32: graph._CachedPhysicalBlock(b"l" * 32, kind, 2, payload)}
+        return {b"m" * 32: graph._CachedPhysicalBlock(b"m" * 32, kind, 3, self.member_payload)}
 
     def install(self, monkeypatch) -> None:
         monkeypatch.setattr(graph, "load_v4_graph_root", self.root)
@@ -1157,16 +1139,19 @@ def _heavy_intersection_fragment(owner: graph.V4HeavyOwner) -> bytes:
         )
         + bytes(bitmap)
     )
-    return struct.pack(
-        "<8sIIIIII",
-        graph.PTG2_V4_HEAVY_BITMAP_FRAGMENT_MAGIC,
-        owner.owner_key,
-        owner.member_base,
-        owner.member_span,
-        owner.member_count,
-        0,
-        owner.member_count,
-    ) + logical_payload
+    return (
+        struct.pack(
+            "<8sIIIIII",
+            graph.PTG2_V4_HEAVY_BITMAP_FRAGMENT_MAGIC,
+            owner.owner_key,
+            owner.member_base,
+            owner.member_span,
+            owner.member_count,
+            0,
+            owner.member_count,
+        )
+        + logical_payload
+    )
 
 
 class _HeavyRelationIntersectionFixture:
@@ -1230,9 +1215,7 @@ class _HeavyRelationIntersectionFixture:
         monkeypatch.setattr(
             graph,
             "_decode_heavy_bitmap",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                AssertionError("full heavy bitmap must not be enumerated")
-            ),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("full heavy bitmap must not be enumerated")),
         )
 
 
@@ -1365,26 +1348,10 @@ def test_v4_graph_request_scope_records_provider_expansion_work() -> None:
         )
     after = graph.v4_graph_metrics_snapshot()
 
-    assert (
-        after["provider_expansion_rate_rows"]
-        - before["provider_expansion_rate_rows"]
-        == 64
-    )
-    assert (
-        after["provider_expansion_provider_sets"]
-        - before["provider_expansion_provider_sets"]
-        == 3
-    )
-    assert (
-        after["provider_expansion_graph_batches"]
-        - before["provider_expansion_graph_batches"]
-        == 2
-    )
-    assert (
-        after["provider_expansion_rejections"]
-        - before["provider_expansion_rejections"]
-        == 1
-    )
+    assert after["provider_expansion_rate_rows"] - before["provider_expansion_rate_rows"] == 64
+    assert after["provider_expansion_provider_sets"] - before["provider_expansion_provider_sets"] == 3
+    assert after["provider_expansion_graph_batches"] - before["provider_expansion_graph_batches"] == 2
+    assert after["provider_expansion_rejections"] - before["provider_expansion_rejections"] == 1
 
 
 def test_v4_runtime_cache_bounds(monkeypatch) -> None:
@@ -1498,13 +1465,16 @@ def test_v4_npi_scope_bounds() -> None:
 
 @pytest.mark.asyncio
 async def test_v4_empty_heavy_owners() -> None:
-    assert await graph.load_v4_heavy_owners(
-        object(),
-        snapshot_key=1,
-        relation="npi_groups_exact",
-        owner_keys=(),
-        schema_name="mrf",
-    ) == {}
+    assert (
+        await graph.load_v4_heavy_owners(
+            object(),
+            snapshot_key=1,
+            relation="npi_groups_exact",
+            owner_keys=(),
+            schema_name="mrf",
+        )
+        == {}
+    )
 
 
 def test_hot_npi_scope_enforces_sealed_second_hop_work() -> None:
@@ -1541,23 +1511,11 @@ def test_hot_npi_scope_enforces_sealed_second_hop_work() -> None:
                 )
     after = graph.v4_graph_metrics_snapshot()
     assert after["hot_group_npi_members"] - before["hot_group_npi_members"] == 5
-    assert (
-        after["hot_group_npi_locator_pages"]
-        - before["hot_group_npi_locator_pages"]
-        == 1
-    )
-    assert (
-        after["hot_group_npi_member_pages"]
-        - before["hot_group_npi_member_pages"]
-        == 2
-    )
+    assert after["hot_group_npi_locator_pages"] - before["hot_group_npi_locator_pages"] == 1
+    assert after["hot_group_npi_member_pages"] - before["hot_group_npi_member_pages"] == 2
     assert after["hot_group_npi_bytes"] - before["hot_group_npi_bytes"] == 81
     assert after["hot_group_npi_batches"] - before["hot_group_npi_batches"] == 1
-    assert (
-        after["hot_npi_dictionary_reads"]
-        - before["hot_npi_dictionary_reads"]
-        == 1
-    )
+    assert after["hot_npi_dictionary_reads"] - before["hot_npi_dictionary_reads"] == 1
 
 
 def _v4_serving_tables(*, patterns: int = 1024) -> PTG2ServingTables:
@@ -1773,9 +1731,7 @@ async def test_v4_forward_budget_stops_before_huge_pattern_dictionary_lookup(
         "lookup_v4_relation_member_prefixes",
         fake_prefix,
     )
-    monkeypatch.setattr(
-        ptg2_serving, "_shared_provider_group_ids_for_keys", fail_dictionary
-    )
+    monkeypatch.setattr(ptg2_serving, "_shared_provider_group_ids_for_keys", fail_dictionary)
 
     with pytest.raises(PTG2SharedBlockError, match="exceeds max_members"):
         await ptg2_serving._v4_shared_graph_members_many(
@@ -1791,9 +1747,7 @@ async def test_v4_forward_budget_stops_before_huge_pattern_dictionary_lookup(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("member_budget", [0, 1])
-async def test_v4_inverse_budget_preserves_exact_empty_orphan_groups(
-    monkeypatch, member_budget: int
-) -> None:
+async def test_v4_inverse_budget_preserves_exact_empty_orphan_groups(monkeypatch, member_budget: int) -> None:
     calls: list[tuple[str, tuple[int, ...], int | None]] = []
 
     async def fake_root(*_args, **_kwargs):
@@ -1938,9 +1892,7 @@ async def test_v4_pattern_npi_separates_projection_and_retained_set_budgets(
         ):
             await request
         return
-    assert await request == {
-        1234567890: tuple(range(1, provider_set_count + 1))
-    }
+    assert await request == {1234567890: tuple(range(1, provider_set_count + 1))}
 
 
 @pytest.mark.asyncio
@@ -2248,9 +2200,7 @@ async def test_v4_explicit_npi_defers_requested_code_to_serving_read(
     graph_calls: list[dict[str, object]] = []
     events: list[str] = []
 
-    rate_scope = AsyncMock(
-        side_effect=AssertionError("graph scope must not scan code rows")
-    )
+    rate_scope = AsyncMock(side_effect=AssertionError("graph scope must not scan code rows"))
 
     async def fake_graph(*_args, **kwargs):
         events.append("graph")
@@ -2262,12 +2212,8 @@ async def test_v4_explicit_npi_defers_requested_code_to_serving_read(
         "load_v4_graph_root",
         AsyncMock(return_value=graph.V4GraphRoot(17, "direct_v1", b"d" * 32)),
     )
-    monkeypatch.setattr(
-        ptg2_serving, "_shared_rate_provider_set_keys", rate_scope
-    )
-    monkeypatch.setattr(
-        ptg2_serving, "_v4_sets_by_npi", fake_graph
-    )
+    monkeypatch.setattr(ptg2_serving, "_shared_rate_provider_set_keys", rate_scope)
+    monkeypatch.setattr(ptg2_serving, "_v4_sets_by_npi", fake_graph)
     scope = await ptg2_serving._version_three_explicit_npi_graph_scope(
         object(),
         _v4_serving_tables(),
@@ -2317,13 +2263,15 @@ async def test_builder_cache_isolated_from_retry_and_serving(monkeypatch, candid
     for candidate_name, member_base in (("first_candidate", 100), ("retry_candidate", 200), (None, 300)):
         session.info.clear()
         if candidate_name:
-            session.info["ptg_snapshot_candidate_reads"] = {
-                '"fixture"': {candidate_table: candidate_name}
-            }
+            session.info["ptg_snapshot_candidate_reads"] = {'"fixture"': {candidate_table: candidate_name}}
         has_owner = has_candidate_owner or candidate_name is None
         session.execute.return_value = (_heavy_owner_row(7, member_base=member_base),) if has_owner else ()
         loaded = await graph.load_v4_heavy_owners(
-            session, schema_name="fixture", snapshot_key=17, relation="npi_groups_exact", owner_keys=(7,),
+            session,
+            schema_name="fixture",
+            snapshot_key=17,
+            relation="npi_groups_exact",
+            owner_keys=(7,),
         )
         assert {key: owner.member_base for key, owner in loaded.items()} == ({7: member_base} if has_owner else {})
     assert session.execute.await_count == 3
