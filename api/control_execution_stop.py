@@ -23,6 +23,7 @@ from process.custom_import.snowflake_source_binding import load_snowflake_source
 
 blueprint = Blueprint("control_execution_stop", url_prefix="/control/v1")
 _FIELDS = frozenset({"dataset_id", "definition_revision_id", "source_binding_revision_id", "idempotency_key"})
+_CONTINUATION_FIELD = "expected_continuation_id"
 _TOKEN_ENV = "HLTHPRT_CUSTOM_IMPORT_EXECUTION_STOP_TOKEN"
 
 
@@ -35,6 +36,7 @@ def _authorized(headers):
     other_tokens = {
         (os.getenv("HLTHPRT_CONTROL_API_TOKEN") or "").strip(),
         (os.getenv("HLTHPRT_CUSTOM_IMPORT_EVIDENCE_READ_TOKEN") or "").strip(),
+        (os.getenv("HLTHPRT_CUSTOM_IMPORT_CONTINUATION_TOKEN") or "").strip(),
     }
     if not expected or expected in other_tokens:
         return False
@@ -50,7 +52,7 @@ def _pins(request):
     if type(body) is not bytes or not 1 <= len(body) <= _MAX_BODY_BYTES or getattr(request, "query_string", ""):
         raise ValueError("invalid body")
     document = json.loads(body, object_pairs_hook=_object)
-    if type(document) is not dict or document.keys() != _FIELDS:
+    if type(document) is not dict or document.keys() not in (_FIELDS, _FIELDS | {_CONTINUATION_FIELD}):
         raise ValueError("invalid fields")
     key = document["idempotency_key"]
     if type(key) is not str or _IDEMPOTENCY_KEY.fullmatch(key) is None:
@@ -60,6 +62,7 @@ def _pins(request):
         _positive_id(document["definition_revision_id"]),
         _positive_id(document["source_binding_revision_id"]),
         key,
+        _positive_id(document[_CONTINUATION_FIELD]) if _CONTINUATION_FIELD in document else None,
     )
 
 
@@ -107,7 +110,7 @@ async def serve_execution_stop(request, session, *, finalize):
     if not _authorized(getattr(request, "headers", None)):
         return _error("forbidden", 403)
     try:
-        dataset_id, definition_revision_id, source_binding_revision_id, key = _pins(request)
+        dataset_id, definition_revision_id, source_binding_revision_id, key, continuation_id = _pins(request)
     except TypeError, ValueError, UnicodeError:
         return _error("invalid_request", 400)
     if session is None or session.in_transaction():
@@ -127,6 +130,7 @@ async def serve_execution_stop(request, session, *, finalize):
                 source_binding_revision_id=source_binding_revision_id,
                 idempotency_key=key,
                 request_identity_sha256=digest,
+                **({} if continuation_id is None else {_CONTINUATION_FIELD: continuation_id}),
             )
     except IdempotencyConflict:
         return _error("identity_conflict", 409)

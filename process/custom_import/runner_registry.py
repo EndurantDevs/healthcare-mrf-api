@@ -28,6 +28,7 @@ from db.models.custom_import import (
     CustomImportSelectionProfile,
     CustomImportSourceStream,
 )
+from process.custom_import.continuation_runtime import verify_and_bind_continuation
 from process.custom_import.definition import canonical_json
 from process.custom_import.execution import MAX_LEASE_SECONDS, LeaseGrant, _root_transaction_context, lease_token_sha256
 from process.custom_import.materialization import (
@@ -154,6 +155,7 @@ async def verify_live_attempt(
         or lease.expires_at <= now
     ):
         raise LeaseAuthorityLost("candidate execution lease is no longer current")
+    await verify_and_bind_continuation(session, request, execution, lease, now)
     return now
 
 

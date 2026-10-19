@@ -448,7 +448,9 @@ async def _locked_execution(session: AsyncSession, *, execution_id: int, dataset
     return execution
 
 
-async def _locked_lease(session: AsyncSession, execution_id: int) -> CustomImportLease:
+async def _locked_lease(
+    session: AsyncSession, execution_id: int, *, allow_missing: bool = False
+) -> CustomImportLease | None:
     lease = (
         await session.execute(
             select(CustomImportLease)
@@ -457,7 +459,7 @@ async def _locked_lease(session: AsyncSession, execution_id: int) -> CustomImpor
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    if lease is None:
+    if lease is None and not allow_missing:
         raise PublicationConflict("execution lease does not exist")
     return lease
 
@@ -667,9 +669,12 @@ def _has_live_lease_authority(
     fence: int,
     token_sha256: bytes,
     now: dt.datetime,
+    continuation_id: int | None = None,
 ) -> bool:
     return (
         lease.fence == fence
+        and getattr(lease, "continuation_id", None) == continuation_id
+        and (continuation_id is None or getattr(lease, "continuation_started_at", None) is not None)
         and lease.token_sha256 is not None
         and hmac.compare_digest(bytes(lease.token_sha256), token_sha256)
         and lease.expires_at is not None
@@ -2362,7 +2367,7 @@ async def _lock_generation_sealing_authority(
     session: AsyncSession,
     request: _GenerationSealRequest,
     generation_snapshot: CustomImportGeneration,
-) -> tuple[CustomImportExecution, CustomImportLease, CustomImportGeneration]:
+) -> tuple[CustomImportExecution, CustomImportLease | None, CustomImportGeneration]:
     """Acquire execution, lease, and candidate locks after the dataset lock."""
 
     execution = await _locked_execution(
@@ -2370,7 +2375,7 @@ async def _lock_generation_sealing_authority(
         execution_id=generation_snapshot.execution_id,
         dataset_id=request.dataset_id,
     )
-    lease = await _locked_lease(session, execution.execution_id)
+    lease = await _locked_lease(session, execution.execution_id, allow_missing=True)
     generation = await _locked_generation(
         session,
         dataset_id=request.dataset_id,
@@ -2402,19 +2407,37 @@ def _validate_generation_sealing_authority(
     materialization: _Materialization,
     request: _GenerationSealRequest,
     now: dt.datetime,
+    *,
+    continuation_request=None,
+    continuation_authorization=None,
 ) -> None:
     """Require the current holder and generation counts before issuing a seal."""
 
+    token_sha256, continuation_id = _sealing_lease_identity(request, continuation_request)
+    if continuation_id is not None:
+        from process.custom_import.continuation_runtime import verify_continuation_scope
+
+        verify_continuation_scope(continuation_request, execution, lease, continuation_authorization, now)
     if execution.state != "running" or not _has_live_lease_authority(
         lease,
         fence=request.lease_fence,
-        token_sha256=request.token_sha256,
+        token_sha256=token_sha256,
         now=now,
+        continuation_id=continuation_id,
     ):
         raise PublicationConflict("generation sealing requires a current running lease")
     _validate_generation_producing_authority(execution, generation, request)
     if generation.root_count != materialization.root_count or generation.family_count != materialization.family_count:
         raise PublicationConflict("generation root or family count does not match exact membership")
+
+
+def _sealing_lease_identity(request, continuation_request):
+    context = getattr(continuation_request, "continuation", None)
+    if context is None:
+        return request.token_sha256, None
+    if context.producer_token_sha256 != request.token_sha256 or continuation_request.fence != request.lease_fence:
+        raise PublicationConflict("sealing continuation producer differs")
+    return lease_token_sha256(continuation_request.lease_token), context.continuation_id
 
 
 def _new_generation_seal(
@@ -2470,9 +2493,12 @@ async def _complete_generation_sealing_execution(
     execution: CustomImportExecution,
     request: _GenerationSealRequest,
     now: dt.datetime,
+    *,
+    continuation_request=None,
 ) -> None:
     """Complete the producer and expire its exact fenced lease together."""
 
+    token_sha256, continuation_id = _sealing_lease_identity(request, continuation_request)
     execution_update = await session.execute(
         update(CustomImportExecution)
         .where(
@@ -2486,7 +2512,8 @@ async def _complete_generation_sealing_execution(
         .where(
             CustomImportLease.execution_id == execution.execution_id,
             CustomImportLease.fence == request.lease_fence,
-            CustomImportLease.token_sha256 == request.token_sha256,
+            CustomImportLease.token_sha256 == token_sha256,
+            CustomImportLease.continuation_id == continuation_id,
             CustomImportLease.expires_at > now,
         )
         .values(heartbeat_at=now, expires_at=now, updated_at=now)
@@ -2549,18 +2576,32 @@ async def seal_generation(
         dataset_id=request.dataset_id,
         generation_id=request.generation_id,
     )
-    replay = await _replayed_generation_seal(session, generation_snapshot, request)
-    if replay is not None:
-        return replay
     execution, lease, generation = await _lock_generation_sealing_authority(
         session,
         request,
         generation_snapshot,
     )
+    await _reject_continued_replay(session, execution.execution_id, lease)
     replay = await _replayed_generation_seal(session, generation, request)
     if replay is not None:
         return replay
+    if lease is None:
+        raise PublicationConflict("execution lease does not exist")
     return await _seal_live_generation(session, execution, lease, generation, request)
+
+
+async def _reject_continued_replay(session, execution_id, lease):
+    continuation_id = getattr(lease, "continuation_id", None)
+    if lease is None:
+        from db.models.custom_import_continuation import CustomImportBuildContinuation
+
+        continuation_id = await session.scalar(
+            select(CustomImportBuildContinuation.continuation_id)
+            .where(CustomImportBuildContinuation.execution_id == execution_id)
+            .limit(1)
+        )
+    if continuation_id is not None:
+        raise PublicationConflict("finality replay requires the current processing continuation")
 
 
 def _generation_publication_request(
@@ -2986,7 +3027,10 @@ async def _finalize_no_change_execution(
     session: AsyncSession,
     request: _NoChangeRequest,
     now: dt.datetime,
+    *,
+    continuation_request=None,
 ) -> None:
+    token_sha256, continuation_id = _sealing_lease_identity(request, continuation_request)
     execution_result = await session.execute(
         update(CustomImportExecution)
         .where(
@@ -3000,7 +3044,8 @@ async def _finalize_no_change_execution(
         .where(
             CustomImportLease.execution_id == request.execution_id,
             CustomImportLease.fence == request.lease_fence,
-            CustomImportLease.token_sha256 == request.token_sha256,
+            CustomImportLease.token_sha256 == token_sha256,
+            CustomImportLease.continuation_id == continuation_id,
             CustomImportLease.expires_at > now,
         )
         .values(heartbeat_at=now, expires_at=now, updated_at=now)
@@ -3285,6 +3330,9 @@ async def record_no_change(
         execution_id=request.execution_id,
         dataset_id=request.dataset_id,
     )
+    if execution.state == "no_change":
+        lease = await _locked_lease(session, request.execution_id, allow_missing=True)
+        await _reject_continued_replay(session, request.execution_id, lease)
     replay = await _replayed_no_change_receipt(session, request, execution)
     if replay is not None:
         return replay

@@ -93,7 +93,7 @@ from process.custom_import.build_source import (
 from process.custom_import.build_source import _call as _typed_call
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
 from process.custom_import.compact_materialization import frozen_materialization as _frozen_materialization
-from process.custom_import.execution import lease_token_sha256
+from process.custom_import.continuation_runtime import producer_token_sha256, verify_and_bind_continuation
 from process.custom_import.query_projection_values import configured_fields
 from process.custom_import.runner_codec import (
     digest_text,
@@ -1221,7 +1221,7 @@ def _attempt_query(models, request, model):
         select(row).where(
             row.execution_id == request.execution_id,
             row.producing_fence == request.fence,
-            row.producing_token_sha256 == lease_token_sha256(request.lease_token),
+            row.producing_token_sha256 == producer_token_sha256(request),
         ),
         keys,
         (row,),
@@ -1303,7 +1303,7 @@ async def _finalize_sealed_build(session, request, build, generation, candidate_
     await _prepare_statement(session)
     lease = await session.get(CustomImportLease, request.execution_id)
     seal_request = publication._GenerationSealRequest(
-        request.dataset_id, generation.generation_id, request.fence, lease_token_sha256(request.lease_token)
+        request.dataset_id, generation.generation_id, request.fence, producer_token_sha256(request)
     )
     no_change_request = None
     if unchanged_base is not None:
@@ -1315,7 +1315,7 @@ async def _finalize_sealed_build(session, request, build, generation, candidate_
             build.base_pointer_version,
             generation.generation_id,
             request.fence,
-            lease_token_sha256(request.lease_token),
+            producer_token_sha256(request),
         )
         session.add(
             publication._new_no_change_seal(no_change_request, execution, base, generation, base_seal, candidate_seal)
@@ -1323,12 +1323,26 @@ async def _finalize_sealed_build(session, request, build, generation, candidate_
         await _flush_page(session)
     await _prepare_statement(session)
     now = await publication._database_now(session)
-    publication._validate_generation_sealing_authority(execution, lease, generation, materialization, seal_request, now)
+    continuation_options_dict = {}
+    if request.continuation is not None:
+        authorization = await verify_and_bind_continuation(session, request, execution, lease, now, build=build)
+        continuation_options_dict = {"continuation_request": request, "continuation_authorization": authorization}
+    publication._validate_generation_sealing_authority(
+        execution, lease, generation, materialization, seal_request, now, **continuation_options_dict
+    )
     if no_change_request is None:
-        await publication._complete_generation_sealing_execution(session, execution, seal_request, now)
+        await publication._complete_generation_sealing_execution(
+            session,
+            execution,
+            seal_request,
+            now,
+            **({"continuation_request": request} if continuation_options_dict else {}),
+        )
         await _prepare_statement(session)
         return None
-    await publication._finalize_no_change_execution(session, no_change_request, now)
+    await publication._finalize_no_change_execution(
+        session, no_change_request, now, **({"continuation_request": request} if continuation_options_dict else {})
+    )
     event = publication._no_change_publication_event(no_change_request, unchanged_base[0])
     session.add(event)
     await _flush_page(session)
@@ -1353,12 +1367,16 @@ async def _terminal_seal(session_factory, request, build_id, materialization):
         await _prepare_statement(session)
         lease = await session.get(CustomImportLease, request.execution_id)
         seal_request = publication._GenerationSealRequest(
-            request.dataset_id, generation.generation_id, request.fence, lease_token_sha256(request.lease_token)
+            request.dataset_id, generation.generation_id, request.fence, producer_token_sha256(request)
         )
         await _prepare_statement(session)
         now = await publication._database_now(session)
+        continuation_options_dict = {}
+        if request.continuation is not None:
+            authorization = await verify_and_bind_continuation(session, request, execution, lease, now, build=build)
+            continuation_options_dict = {"continuation_request": request, "continuation_authorization": authorization}
         publication._validate_generation_sealing_authority(
-            execution, lease, generation, materialization, seal_request, now
+            execution, lease, generation, materialization, seal_request, now, **continuation_options_dict
         )
         candidate_seal = publication._new_generation_seal(generation, materialization, seal_request)
         session.add(candidate_seal)
@@ -1379,9 +1397,12 @@ async def _replay(session_factory, request, build_id):
         execution = await publication._locked_execution(
             session, execution_id=request.execution_id, dataset_id=request.dataset_id
         )
-        await publication._locked_lease(session, request.execution_id)
+        lease = await publication._locked_lease(session, request.execution_id)
         build = await session.get(CustomImportBuildAttempt, build_id, with_for_update=True)
         _verify_request(build, request, execution)
+        if request.continuation is not None or getattr(lease, "continuation_id", None) is not None:
+            now = await publication._database_now(session)
+            await verify_and_bind_continuation(session, request, execution, lease, now, build=build)
         if build.generation_id is None:
             return None
         generation = await publication._locked_generation(
@@ -1401,7 +1422,7 @@ async def _replay(session_factory, request, build_id):
                 build.base_pointer_version,
                 build.generation_id,
                 request.fence,
-                lease_token_sha256(request.lease_token),
+                producer_token_sha256(request),
             )
             receipt = await publication._replayed_no_change_receipt(session, no_change_request, execution)
             if receipt is None:
@@ -1410,7 +1431,7 @@ async def _replay(session_factory, request, build_id):
         if execution.state != "completed":
             raise CandidateRunnerError("sealed build producer is not terminal")
         seal_request = publication._GenerationSealRequest(
-            request.dataset_id, build.generation_id, request.fence, lease_token_sha256(request.lease_token)
+            request.dataset_id, build.generation_id, request.fence, producer_token_sha256(request)
         )
         return BuildOutputResult(
             build.generation_id, publication._generation_seal_replay(seal, generation, seal_request)
@@ -1428,7 +1449,7 @@ async def _freeze_output_snapshot(session_factory, request, build_id):
                 (
                     ("bigint", request.execution_id),
                     ("bigint", request.fence),
-                    ("bytea", lease_token_sha256(request.lease_token)),
+                    ("bytea", producer_token_sha256(request)),
                 ),
             )
         ).scalar_one()

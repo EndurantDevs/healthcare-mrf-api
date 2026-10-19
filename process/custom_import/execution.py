@@ -362,12 +362,44 @@ def _has_matching_lease_authority(
     fence: int,
     token_sha256: bytes,
     now: dt.datetime,
+    continuation_id: int | None = None,
 ) -> bool:
     return (
         _is_lease_unexpired(lease, now)
+        and getattr(lease, "continuation_id", None) == continuation_id
+        and (continuation_id is None or getattr(lease, "continuation_started_at", None) is not None)
         and lease.fence == fence
         and hmac.compare_digest(_persisted_digest(lease.token_sha256), token_sha256)
     )
+
+
+async def _has_matching_continuation(session, execution, lease, continuation_id, token_sha256, now):
+    if continuation_id is None:
+        return getattr(lease, "continuation_id", None) is None
+    if getattr(lease, "continuation_id", None) != continuation_id:
+        return False
+    from db.models.custom_import_continuation import CustomImportBuildContinuation
+    from process.custom_import.continuation_runtime import (
+        continuation_epoch_binding_statement,
+        execution_continuation_matches,
+    )
+
+    authorization = (
+        await session.execute(
+            select(CustomImportBuildContinuation).where(
+                CustomImportBuildContinuation.continuation_id == continuation_id
+            )
+        )
+    ).scalar_one_or_none()
+    if not execution_continuation_matches(authorization, execution, lease, continuation_id, token_sha256, now):
+        return False
+    await session.execute(continuation_epoch_binding_statement(continuation_id, token_sha256))
+    return True
+
+
+def _require_expected_continuation(lease, expected_continuation_id):
+    if getattr(lease, "continuation_id", None) != expected_continuation_id:
+        raise IdempotencyConflict("execution processing authority differs from the expected continuation")
 
 
 async def _lock_execution(
@@ -781,13 +813,8 @@ async def cancel_execution_request(
 async def request_bound_execution_cancellation(
     session: AsyncSession,
     *,
-    dataset_id: int,
-    definition_revision_id: int,
-    schema_revision_id: int,
-    source_binding_revision_id: int,
-    idempotency_key: str,
-    request_identity_sha256: bytes | bytearray | memoryview,
-    terminal_reason: str | None = None,
+    expected_continuation_id: int | None = None,
+    **request_pins,
 ) -> ExecutionTransition:
     """Fence one exact bound request before stopping its external worker.
 
@@ -795,25 +822,24 @@ async def request_bound_execution_cancellation(
     canceling until its worker finishes or a caller proves that it has stopped.
     """
 
-    terminal_reason = _bounded_text(terminal_reason, "terminal_reason", maximum=64, allow_none=True)
-    binding_id = _positive_id(source_binding_revision_id, "source_binding_revision_id")
-    identity = _request_identity_sha256(request_identity_sha256)
+    terminal_reason = _bounded_text(
+        request_pins.pop("terminal_reason", None), "terminal_reason", maximum=64, allow_none=True
+    )
+    expected_continuation_id = _positive_id(expected_continuation_id, "expected_continuation_id", allow_none=True)
+    _positive_id(request_pins.get("source_binding_revision_id"), "source_binding_revision_id")
+    identity = _request_identity_sha256(request_pins.get("request_identity_sha256"))
     if identity is None:
         raise ValueError("request_identity_sha256 is required")
     submission = await reserve_execution(
         session,
-        dataset_id=dataset_id,
-        definition_revision_id=definition_revision_id,
-        schema_revision_id=schema_revision_id,
-        source_binding_revision_id=binding_id,
-        idempotency_key=idempotency_key,
         mechanism="local",
-        request_identity_sha256=identity,
+        **request_pins,
     )
     return await request_cancellation(
         session,
         execution_id=submission.execution_id,
         terminal_reason=terminal_reason,
+        expected_continuation_id=expected_continuation_id,
     )
 
 
@@ -826,6 +852,7 @@ async def finalize_stopped_execution_request(
     source_binding_revision_id: int,
     idempotency_key: str,
     request_identity_sha256: bytes | bytearray | memoryview,
+    expected_continuation_id: int | None = None,
 ) -> ExecutionTransition:
     """Terminalize a pre-canceled exact request after its worker is stopped.
 
@@ -837,6 +864,7 @@ async def finalize_stopped_execution_request(
 
     _require_caller_transaction(session)
     _require_clean_lifecycle_session(session)
+    expected_continuation_id = _positive_id(expected_continuation_id, "expected_continuation_id", allow_none=True)
     request = _validated_execution_request(
         dataset_id=dataset_id,
         definition_revision_id=definition_revision_id,
@@ -858,6 +886,7 @@ async def finalize_stopped_execution_request(
     state = _validate_execution_state(execution)
     lease = await _lock_lease(session, execution.execution_id)
     _validate_lease(lease)
+    _require_expected_continuation(lease, expected_continuation_id)
     if state in TERMINAL_STATES:
         return ExecutionTransition(execution_id=execution.execution_id, state=state, changed=False)
     if state != "canceling":
@@ -1062,6 +1091,8 @@ async def _claim_or_resume_execution(
     lease = await _lock_lease(session, execution_id)
     now = await _database_now(session)
     _validate_lease(lease)
+    if getattr(lease, "continuation_id", None) is not None:
+        return None
     if state not in _ACTIVE_STATES or (state == "queued" and not allow_queued):
         return None
     if _is_lease_unexpired(lease, now):
@@ -1156,6 +1187,7 @@ async def heartbeat_execution(
     fence: int,
     token: str | bytes | bytearray | memoryview,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    continuation_id: int | None = None,
 ) -> LeaseGrant | None:
     """Renew one unexpired lease only when the holder still owns its fence."""
 
@@ -1165,6 +1197,7 @@ async def heartbeat_execution(
     fence = _fence(fence)
     token_sha256 = lease_token_sha256(token)
     lease_seconds = _lease_seconds(lease_seconds)
+    continuation_id = _positive_id(continuation_id, "continuation_id", allow_none=True)
 
     execution = await _locked_heartbeat_execution(session, execution_id)
     state = _validate_execution_state(execution)
@@ -1175,7 +1208,10 @@ async def heartbeat_execution(
         fence=fence,
         token_sha256=token_sha256,
         now=now,
+        continuation_id=continuation_id,
     ):
+        return None
+    if not await _has_matching_continuation(session, execution, lease, continuation_id, token_sha256, now):
         return None
 
     expires_at = now + dt.timedelta(seconds=lease_seconds)
@@ -1197,29 +1233,21 @@ async def request_cancellation(
     *,
     execution_id: int,
     terminal_reason: str | None = None,
+    expected_continuation_id: int | None = None,
 ) -> ExecutionTransition:
-    """Record an idempotent cancellation request without bypassing a lease.
-
-    Queued work becomes terminal immediately because it has no worker-owned
-    authority.  Running work becomes ``canceling`` so its active holder can
-    observe the request and finish as ``canceled``; completion is thereafter
-    refused by :func:`finish_execution`.
-    """
+    """Cancel queued work immediately; fence running work until its holder acknowledges."""
 
     _require_caller_transaction(session)
     _require_clean_lifecycle_session(session)
     execution_id = _positive_id(execution_id, "execution_id")
-    terminal_reason = _bounded_text(
-        terminal_reason,
-        "terminal_reason",
-        maximum=64,
-        allow_none=True,
-    )
+    expected_continuation_id = _positive_id(expected_continuation_id, "expected_continuation_id", allow_none=True)
+    terminal_reason = _bounded_text(terminal_reason, "terminal_reason", maximum=64, allow_none=True)
     execution = await _locked_lifecycle_execution(session, execution_id)
     state = _validate_execution_state(execution)
     lease = await _lock_lease(session, execution_id)
     now = await _database_now(session)
     _validate_lease(lease)
+    _require_expected_continuation(lease, expected_continuation_id)
 
     if state in TERMINAL_STATES or state == "canceling":
         return ExecutionTransition(execution_id=execution_id, state=state, changed=False)
@@ -1267,12 +1295,14 @@ def _can_finish_execution(
     fence: int,
     token_sha256: bytes,
     now: dt.datetime,
+    continuation_id: int | None = None,
 ) -> bool:
     return state in _terminal_transition_states(terminal_state) and _has_matching_lease_authority(
         lease,
         fence=fence,
         token_sha256=token_sha256,
         now=now,
+        continuation_id=continuation_id,
     )
 
 
@@ -1315,6 +1345,7 @@ async def finish_execution(
     token: str | bytes | bytearray | memoryview,
     terminal_state: str,
     terminal_reason: str | None = None,
+    continuation_id: int | None = None,
 ) -> ExecutionTransition:
     """Apply a fenced terminal transition and expire, never clear, its lease.
 
@@ -1331,6 +1362,7 @@ async def finish_execution(
     fence = _fence(fence)
     token_sha256 = lease_token_sha256(token)
     terminal_state = _terminal_state(terminal_state)
+    continuation_id = _positive_id(continuation_id, "continuation_id", allow_none=True)
     terminal_reason = _bounded_text(
         terminal_reason,
         "terminal_reason",
@@ -1351,7 +1383,10 @@ async def finish_execution(
         fence=fence,
         token_sha256=token_sha256,
         now=now,
+        continuation_id=continuation_id,
     ):
+        return ExecutionTransition(execution_id=execution_id, state=state, changed=False)
+    if not await _has_matching_continuation(session, execution, lease, continuation_id, token_sha256, now):
         return ExecutionTransition(execution_id=execution_id, state=state, changed=False)
 
     await _apply_terminal_transition(

@@ -64,6 +64,7 @@ from process.custom_import.storage_layout import snapshot_schema
 
 POSTGRES_DSN_ENV = "HLTHPRT_CUSTOM_IMPORT_POSTGRES_DSN"
 _TEST_DATABASE = re.compile(r"(?:^test(?:[_-]|$)|(?:^|[_-])test(?:[_-]|$))", re.IGNORECASE)
+_FIXTURE_DDL_LOCK_NAME = "custom_import_publication_fixture_ddl"
 _ROOT = Path(__file__).resolve().parents[1]
 _BASE_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20260914120000_custom_import_v1_schema.py"
 _FINALITY_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
@@ -174,6 +175,29 @@ def _install_custom_import_migrations(
 
     install_materialization_contract_migration(sync_connection, schema_name)
     install_query_projection_metadata(sync_connection, schema_name)
+    install_build_continuation_migration(
+        sync_connection,
+        schema_name,
+        install_authority=is_segmented_capture_enabled and is_snapshot_storage_enabled and migration_through is None,
+    )
+
+
+def install_build_continuation_migration(sync_connection, schema_name: str, *, install_authority=True) -> None:
+    """Keep lease metadata current without replacing deliberately historical gates."""
+    path = _ROOT / "alembic" / "versions" / "20261019010000_custom_import_build_continuation.py"
+    migration = _migration(path, "custom_import_continuation_test_migration")
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(sync_connection))
+    if install_authority:
+        migration.upgrade()
+    else:
+        has_snapshot = (
+            sync_connection.scalar(
+                text("SELECT to_regclass(:relation)"), {"relation": f"{schema_name}.custom_import_snapshot_family"}
+            )
+            is not None
+        )
+        migration._schema_changes(schema_name, ledger=has_snapshot)
 
 
 def install_materialization_contract_migration(sync_connection, schema_name: str) -> None:
@@ -280,6 +304,10 @@ async def isolated_publication_case(
             await connection.execute(text(f"CREATE SCHEMA {quoted_schema}"))
         is_schema_created = True
         async with raw_engine.begin() as connection:
+            # Cutover reviews other installations; their fixture teardown must wait for this transaction.
+            await connection.scalar(
+                text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"), {"lock_name": _FIXTURE_DDL_LOCK_NAME}
+            )
             await connection.run_sync(
                 _install_custom_import_migrations,
                 schema_name,
@@ -296,6 +324,10 @@ async def isolated_publication_case(
         try:
             if is_schema_created:
                 async with raw_engine.begin() as connection:
+                    await connection.scalar(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"),
+                        {"lock_name": _FIXTURE_DDL_LOCK_NAME},
+                    )
                     await _drop_snapshot_families(connection, schema_name)
                     await connection.execute(text(f"DROP SCHEMA {quoted_schema} CASCADE"))
         finally:
