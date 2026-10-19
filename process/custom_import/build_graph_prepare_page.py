@@ -61,7 +61,7 @@ from db.models.custom_import import (
 from process.custom_import import build_graph as graph
 from process.custom_import import graph_payloads, runner_codec
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
-from process.custom_import.execution import lease_token_sha256
+from process.custom_import.continuation_runtime import producer_token_sha256
 from process.custom_import.runner_codec import (
     digest_text,
     payload_values,
@@ -80,7 +80,7 @@ def _build_scope(request):
         Build.schema_revision_id == request.schema_revision_id,
         Build.execution_id == request.execution_id,
         Build.producing_fence == request.fence,
-        Build.producing_token_sha256 == lease_token_sha256(request.lease_token),
+        Build.producing_token_sha256 == producer_token_sha256(request),
         Build.phase == "graph",
         Build.plan_complete_at.is_not(None),
     )

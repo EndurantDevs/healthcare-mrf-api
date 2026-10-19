@@ -802,6 +802,12 @@ class CustomImportLease(_CustomImportModel):
             + " AND expires_at IS NOT NULL))",
             name="custom_import_lease_shape_check",
         ),
+        CheckConstraint(
+            "(continuation_id IS NULL AND continuation_started_at IS NULL) OR "
+            "(continuation_id > 0 AND fence > 0 AND token_sha256 IS NOT NULL AND expires_at IS NOT NULL "
+            "AND isfinite(expires_at) AND (continuation_started_at IS NULL OR isfinite(continuation_started_at)))",
+            name="custom_import_lease_continuation_shape",
+        ),
     )
 
     execution_id = Column(
@@ -811,6 +817,15 @@ class CustomImportLease(_CustomImportModel):
     )
     fence = Column(BigInteger, nullable=False, server_default=text("0"))
     token_sha256 = Column(LargeBinary(32))
+    continuation_id = Column(
+        BigInteger,
+        ForeignKey(
+            _reference("custom_import_build_continuation", "continuation_id"),
+            ondelete="RESTRICT",
+            name="custom_import_lease_continuation_fkey",
+        ),
+    )
+    continuation_started_at = Column(TIMESTAMP(timezone=True))
     heartbeat_at = Column(TIMESTAMP(timezone=True))
     expires_at = Column(TIMESTAMP(timezone=True))
     updated_at = _timestamp_column()

@@ -95,6 +95,7 @@ async def test_publication_fixture_preserves_explicit_schema_override():
 def test_fixture_installs_snapshot_prerequisites_exactly_once(
     monkeypatch, segmented, snapshots, migration_through, expected_tail
 ):
+    """Install current metadata while preserving intentionally historical authority."""
     installed_migrations = []
     installed_metadata_revisions = []
     has_snapshot_storage = "20261005030000_custom_import_snapshot_storage" in expected_tail
@@ -110,13 +111,14 @@ def test_fixture_installs_snapshot_prerequisites_exactly_once(
             assert migration.op is connection
             installed_migrations.append(path.stem)
 
-        def seal_metadata(selected_schema):
+        def record_metadata(selected_schema, *, ledger=None):
             assert selected_schema == schema
-            installed_metadata_revisions.append(path.stem)
+            installed_metadata_revisions.append((path.stem, ledger))
             record_install()
 
         migration.upgrade = record_install
-        migration._seal_metadata = seal_metadata
+        migration._seal_metadata = record_metadata
+        migration._schema_changes = record_metadata
         return migration
 
     monkeypatch.setattr(support, "_migration", load)
@@ -136,12 +138,18 @@ def test_fixture_installs_snapshot_prerequisites_exactly_once(
     expected_migrations.extend(expected_tail)
     expected_migrations.append("20261010010000_custom_import_materialization_contract")
     expected_migrations.append("20261015020000_custom_import_query_projections")
+    expected_migrations.append("20261019010000_custom_import_build_continuation")
     assert installed_migrations == expected_migrations
     assert len(installed_migrations) == len(set(installed_migrations))
+    installs_continuation_authority = segmented and snapshots and migration_through is None
     assert installed_metadata_revisions == (
-        [] if has_snapshot_storage else ["20261015020000_custom_import_query_projections"]
+        [] if has_snapshot_storage else [("20261015020000_custom_import_query_projections", None)]
+    ) + (
+        []
+        if installs_continuation_authority
+        else [("20261019010000_custom_import_build_continuation", has_snapshot_storage)]
     )
-    connection.scalar.assert_called_once()
+    assert connection.scalar.call_count == (1 if installs_continuation_authority else 2)
     assert str(connection.scalar.call_args.args[0]) == "SELECT to_regclass(:relation)"
     assert connection.scalar.call_args.args[1] == {"relation": f"{schema}.custom_import_snapshot_family"}
 
