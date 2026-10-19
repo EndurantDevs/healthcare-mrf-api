@@ -36,6 +36,7 @@ from db.models.custom_import import (
     CustomImportRootScalar,
     CustomImportSourceStream,
 )
+from db.models.custom_import_continuation import CustomImportBuildContinuation
 from process.custom_import import materialization as material
 from process.custom_import import publication
 from process.custom_import.build_graph_source_page import append_source_child_page
@@ -45,6 +46,7 @@ from process.custom_import.build_source import (
     _close_contexts,
     _enter_context,
     _flush_page,
+    _page_expiry,
     _page_session,
     _prepare_snapshot_indexes,
     _prepare_statement,
@@ -53,6 +55,11 @@ from process.custom_import.build_source import (
     _call as _source_call,
 )
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
+from process.custom_import.continuation_runtime import (
+    continuation_binding_statement,
+    producer_token_sha256,
+    verify_continuation_scope,
+)
 from process.custom_import.execution import lease_token_sha256
 from process.custom_import.runner_codec import (
     candidate_hash_ordered,
@@ -121,11 +128,21 @@ def _read_authority(session, request, build_id):
         or execution.capture_bundle_id != build.capture_bundle_id
         or lease.fence != request.fence
         or lease.token_sha256 is None
-        or not hmac.compare_digest(bytes(lease.token_sha256), bytes(build.producing_token_sha256))
+        or not hmac.compare_digest(bytes(lease.token_sha256), lease_token_sha256(request.lease_token))
         or lease.expires_at is None
     ):
         raise LeaseAuthorityLost("build read requires the current running attempt")
-    remaining = (min(lease.expires_at, build.build_deadline_at) - now).total_seconds() - 0.001
+    authorization = None
+    if request.continuation is not None:
+        authorization = session.execute(
+            select(CustomImportBuildContinuation).where(
+                CustomImportBuildContinuation.continuation_id == request.continuation.continuation_id
+            )
+        ).scalar_one_or_none()
+    verify_continuation_scope(request, execution, lease, authorization, now, build=build)
+    if request.continuation is not None:
+        session.execute(continuation_binding_statement(request))
+    remaining = (_page_expiry(request, lease.expires_at) - now).total_seconds() - 0.001
     if remaining <= 0:
         raise LeaseAuthorityLost("build read deadline elapsed")
     deadline = started + remaining
@@ -413,7 +430,8 @@ async def _snapshot(session_factory, request, build_id):
 
 
 async def _heartbeat(session_factory, request):
-    async with _page_session(session_factory, request) as (session, _build):
+    build_id = None if request.continuation is None else request.continuation.build_id
+    async with _page_session(session_factory, request, build_id) as (session, _build):
         await _prepare_statement(session)
 
 
@@ -820,7 +838,7 @@ def _retained_page_models(request, registry, family_input, current, family, chil
     """Reuse canonical child validation and account for one retained pack."""
 
     collection, stream_slot = _retained_page_scope(request, registry, current, children)
-    pack = CustomImportPack(stream_slot=stream_slot, producing_token_sha256=lease_token_sha256(request.lease_token))
+    pack = CustomImportPack(stream_slot=stream_slot, producing_token_sha256=producer_token_sha256(request))
     fields = fields_by_collection(request.definition).get(collection)
     child_ids, context_child_ids, profile_slots, context_keys, copied_models, payload_hashes = [], [], [], [], [], []
     projection_values = []
@@ -871,7 +889,7 @@ def _retained_array_arguments(request, registry, family_input, current, family, 
         ("bigint", plan.build_id),
         ("bigint", request.execution_id),
         ("bigint", request.fence),
-        ("bytea", lease_token_sha256(request.lease_token)),
+        ("bytea", producer_token_sha256(request)),
         ("bigint", plan.root_record_id),
         ("bigint", family.family_revision_id),
         ("bigint", current.attached_child_count),
@@ -900,7 +918,7 @@ def _retained_root_arguments(request, registry, family_input):
     """Preflight root copy cost and regenerate only current-definition contexts."""
     plan = family_input.plan
     root = family_input.root
-    token_hash = lease_token_sha256(request.lease_token)
+    token_hash = producer_token_sha256(request)
     family = CustomImportFamilyRevision(
         family_revision_id=plan.base_family_revision_id,
         dataset_id=request.dataset_id,
@@ -957,7 +975,7 @@ def _source_root_values(request, registry, family_input):
         raise CandidateRunnerError("build root payload is not canonical")
     if digest_text("root-payload", root.canonical_payload) != bytes(root.payload_sha256):
         raise CandidateRunnerError("build root payload is not canonical")
-    token_hash = lease_token_sha256(request.lease_token)
+    token_hash = producer_token_sha256(request)
     # Provisional positive IDs validate the existing context contract. SQL derives
     # permanent entity/family IDs; neither provisional ID enters context bytes.
     family = CustomImportFamilyRevision(
@@ -1000,7 +1018,7 @@ def _source_root_arguments(request, registry, family_input):
         ("bigint", plan.build_id),
         ("bigint", request.execution_id),
         ("bigint", request.fence),
-        ("bytea", lease_token_sha256(request.lease_token)),
+        ("bytea", producer_token_sha256(request)),
         ("bigint", plan.root_record_id),
         ("bigint", plan.source_root_occurrence_id),
         ("bigint", root.root_revision_id),
@@ -1362,7 +1380,7 @@ async def _open_output(session_factory, request, build_id, capture_bundle_id):
             root_count=count,
             family_count=count,
             producing_fence=request.fence,
-            producing_token_sha256=lease_token_sha256(request.lease_token),
+            producing_token_sha256=producer_token_sha256(request),
         )
         session.add(generation)
         await _flush_page(session)

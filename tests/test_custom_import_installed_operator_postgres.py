@@ -12,12 +12,13 @@ import shlex
 import shutil
 import sys
 import warnings
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
 from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from db.models.custom_import import (
     CustomImportCaptureBundle,
@@ -53,11 +54,68 @@ from process.custom_import.snowflake_candidate import bundle_request_identity_sh
 from process.custom_import.snowflake_python import _parquet_reader
 from process.custom_import.snowflake_source_binding import load_snowflake_source_binding
 from tests.custom_import_installed_acquisition import failure_metadata
-from tests.custom_import_postgres_support import POSTGRES_DSN_ENV, isolated_publication_case, seed_publication_graph
+from tests.custom_import_postgres_support import (
+    _FIXTURE_DDL_LOCK_NAME,
+    POSTGRES_DSN_ENV,
+    _database_url,
+    isolated_publication_case,
+    seed_publication_graph,
+)
 from tests.test_custom_import_snowflake_operator_cli import _loaded_binding, _registration_document
 
 _ROOT = Path(__file__).resolve().parents[1]
 pytestmark = pytest.mark.asyncio
+
+
+async def _wait_for_fixture_ddl_waiter(observer, operation):
+    statement = text(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks held JOIN pg_locks waiting "
+        "USING (locktype, database, classid, objid, objsubid) "
+        "WHERE held.pid = pg_backend_pid() AND held.locktype = 'advisory' "
+        "AND held.granted AND NOT waiting.granted)"
+    )
+    async with asyncio.timeout(10):
+        while not await observer.scalar(statement):
+            assert not operation.done(), "fixture DDL did not wait for the other connection"
+            await asyncio.sleep(0.01)
+    assert not operation.done()
+
+
+async def _run_blocked_fixture_phase(observer, operation):
+    pending = None
+    try:
+        async with observer.begin():
+            async with asyncio.timeout(60):
+                await observer.scalar(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"),
+                    {"lock_name": _FIXTURE_DDL_LOCK_NAME},
+                )
+            pending = asyncio.create_task(operation())
+            await _wait_for_fixture_ddl_waiter(observer, pending)
+    finally:
+        if pending is not None:
+            completed = await asyncio.wait_for(pending, timeout=60)
+    return completed
+
+
+async def test_fixture_ddl_lifecycle_exclusion():
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.connect() as observer, AsyncExitStack() as fixtures:
+            case = await _run_blocked_fixture_phase(
+                observer, lambda: fixtures.enter_async_context(isolated_publication_case())
+            )
+            async with observer.begin():
+                assert await observer.scalar(
+                    text("SELECT to_regnamespace(:schema) IS NOT NULL"), {"schema": case.schema_name}
+                )
+            await _run_blocked_fixture_phase(observer, fixtures.aclose)
+            async with observer.begin():
+                assert await observer.scalar(
+                    text("SELECT to_regnamespace(:schema) IS NULL"), {"schema": case.schema_name}
+                )
+    finally:
+        await engine.dispose()
 
 
 @pytest.fixture(scope="module")

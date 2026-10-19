@@ -58,7 +58,7 @@ def _assert_receipt_columns_match_model(elements) -> None:
 
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["20261017010000_custom_import_raw_objects"]
+    assert script.get_heads() == ["20261019010000_custom_import_build_continuation"]
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )

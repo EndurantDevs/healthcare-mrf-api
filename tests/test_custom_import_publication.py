@@ -1003,12 +1003,12 @@ async def test_generation_sealing_returns_a_replay_found_after_authority_lock(mo
     monkeypatch.setattr(
         publication,
         "_replayed_generation_seal",
-        AsyncMock(side_effect=(None, receipt)),
+        AsyncMock(return_value=receipt),
     )
     monkeypatch.setattr(
         publication,
         "_lock_generation_sealing_authority",
-        AsyncMock(return_value=(SimpleNamespace(), SimpleNamespace(), generation)),
+        AsyncMock(return_value=(SimpleNamespace(execution_id=4), SimpleNamespace(), generation)),
     )
     assert (
         await publication.seal_generation(

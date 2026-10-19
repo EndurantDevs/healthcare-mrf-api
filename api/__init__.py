@@ -8,6 +8,7 @@ from api.control import blueprint as control_blueprint
 from api.control import control_error
 from api.control_admission_batch import blueprint as admission_batch_blueprint
 from api.control_admission_batch import register_batch_response_deadline
+from api.control_build_continuation import blueprint as build_continuation_blueprint
 from api.control_execution_evidence import blueprint as execution_evidence_blueprint
 from api.control_execution_stop import blueprint as execution_stop_blueprint
 from api.control_query_projection_batch import blueprint as query_projection_batch_blueprint
@@ -91,6 +92,7 @@ def init_api(api):
     api.blueprint(query_projection_batch_blueprint)
     api.blueprint(execution_evidence_blueprint)
     api.blueprint(execution_stop_blueprint)
+    api.blueprint(build_continuation_blueprint)
     api.blueprint(registry_ptg_scope_control_blueprint, url_prefix="/control/v1/registry/ptg-source-scopes")
     api.blueprint(registration_authority_blueprint)
     api.blueprint(profile_capacity_blueprint)

@@ -120,13 +120,11 @@ async def _postgres_case() -> AsyncIterator[_PostgresCase]:
             await connection.execute(text(f"CREATE SCHEMA {schema}"))
         is_schema_created = True
         async with engine.begin() as connection:
-            await connection.run_sync(
-                lambda sync_connection: Base.metadata.create_all(
-                    sync_connection,
-                    tables=_TABLES,
-                    checkfirst=False,
-                )
+            # This lifecycle-only fixture cannot opt in; retain its referenced identity table.
+            await connection.execute(
+                text(f"CREATE TABLE {schema}.custom_import_build_continuation (continuation_id BIGINT PRIMARY KEY)")
             )
+            await connection.run_sync(Base.metadata.create_all, tables=_TABLES, checkfirst=False)
         async with sessions() as session:
             async with session.begin():
                 dataset = CustomImportDataset(dataset_key="synthetic_execution")

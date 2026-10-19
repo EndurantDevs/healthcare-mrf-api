@@ -50,7 +50,7 @@ from process.custom_import import graph_payloads
 from process.custom_import.build_graph_prepared import _CHILD_FIELDS, PreparedChild
 from process.custom_import.build_graph_source_page import _SCALAR_COLUMNS
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
-from process.custom_import.execution import lease_token_sha256
+from process.custom_import.continuation_runtime import producer_token_sha256
 from process.custom_import.runner_codec import digest_text, fields_by_collection, payload_values
 from process.custom_import.runner_graph import verify_stored_child
 from process.custom_import.runner_types import CandidateRunnerError, StoredCandidateChild
@@ -304,7 +304,7 @@ def _build_child_scope(request, plan, child):
         Build.schema_revision_id == request.schema_revision_id,
         Build.execution_id == request.execution_id,
         Build.producing_fence == request.fence,
-        Build.producing_token_sha256 == lease_token_sha256(request.lease_token),
+        Build.producing_token_sha256 == producer_token_sha256(request),
         Build.phase == "graph",
         Build.plan_complete_at.is_not(None),
         child.child_revision_id.is_not(None),
@@ -869,7 +869,7 @@ def _child_arguments(request, registry, groups, *, retained_bytes=0):
         ("bigint", current.build_id),
         ("bigint", request.execution_id),
         ("bigint", request.fence),
-        ("bytea", lease_token_sha256(request.lease_token)),
+        ("bytea", producer_token_sha256(request)),
         *(
             (kind, tuple(getattr(group.state.current, field) for group in groups))
             for kind, field in (

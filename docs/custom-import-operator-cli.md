@@ -169,6 +169,56 @@ original current-pointer compare-and-swap; a conflict retains a sealed but
 unpublished candidate. Identical effective output records `no_change` only while
 the original base and pointer version remain current.
 
+### Explicit retained-build continuation
+
+Ordinary `resume` replays retained captures under a new claim; it does not adopt
+an expired build's admitted tables or partial GRAPH checkpoint. For an explicitly
+authorized stopped build, the separate continuation control can retain that exact
+snapshot and remove its processing wall-clock cap without editing the historical
+deadline or producer identity. This is not an automatic retry policy.
+
+`POST /control/v1/custom-import/build-continuation-status` reads bounded progress.
+`POST /control/v1/custom-import/build-continuation-authorize` records the transfer.
+Both require a distinct `HLTHPRT_CUSTOM_IMPORT_CONTINUATION_TOKEN`, the exact
+dataset, definition revision, source-binding revision and idempotency key. The
+authorization additionally binds the build, snapshot, capture, original producer,
+base pointer, previous authority, replacement worker identity and nonce digest.
+The caller must establish that the previous worker has stopped. A live lease,
+cancellation, changed source identity or changed base pointer rejects transfer.
+
+The processing worker consumes a single-use launch authorization and a separate
+32-byte nonce from fixed protected files:
+
+```sh
+python -m process.custom_import.continuation_cli run \
+  --authorization-file /var/run/custom-import-processing/authorization.json \
+  --nonce-file /var/run/custom-import-processing/nonce --lease-seconds 3600
+```
+
+The first authorization requires a stopped, admitted, unsealed GRAPH build with
+no opened generation. That continuation can progress normally through GRAPH,
+OUTPUT and verification on the retained snapshot without another authorization;
+it never replays SOURCE or admission. A later authorization may resume OUTPUT or
+verification only through an existing continuation chain, with the same
+stopped-worker and expired-lease requirements. The short launch window is not a
+processing timer. Finite renewable leases, statement and memory bounds,
+cancellation, complete validation and normal publication compare-and-swap still
+apply. Old bearers and legacy write paths are
+fenced after opt-in; stopped or expired continuation workers need a fresh explicit
+authorization. Stop requests after opt-in must include the current
+`expected_continuation_id`. Credentials and the raw nonce never belong in control
+request bodies or diagnostic output.
+
+For configured query projections under a restricted worker database role, mount
+the approved TLS CA at `/var/run/custom-import-processing/writer-ca.pem` and pin
+`HLTHPRT_CUSTOM_IMPORT_CONTINUATION_PROJECTION_ORIGIN` to the trusted HTTPS control
+origin. The worker sends one nonce-authenticated, cursor-bound request to
+`/control/v1/custom-import/build-continuation-projection` per bounded projection
+step. The engine owner performs only the existing projection operation after
+rechecking the current epoch; no snapshot ownership or general control credential
+is given to the worker. Uncertain delivery permits one retained progress read,
+not an implicit resend.
+
 ### Frozen materialization verification
 
 Bounded builds use `custom-import/materialization/v2` inside the existing

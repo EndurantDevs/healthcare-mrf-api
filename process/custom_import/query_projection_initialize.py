@@ -11,7 +11,7 @@ from db.models.custom_import import CustomImportDefinitionRevision, CustomImport
 from db.models.custom_import_query_projection import CustomImportQueryProjection
 from db.models.custom_import_storage import CustomImportSnapshotFamily, CustomImportSnapshotRelation
 from process.custom_import.build_source import _flush_page, _prepare_statement
-from process.custom_import.execution import lease_token_sha256
+from process.custom_import.continuation_runtime import producer_token_sha256
 from process.custom_import.query_projection_binding import lock_projection_tables, projection_table_identity
 from process.custom_import.query_projection_sources import capability_sha256
 from process.custom_import.query_projection_storage import QUERY_PROJECTION_CONTRACT, query_projection_load_statements
@@ -79,7 +79,7 @@ async def _parent(session, request, build):
         "capture_bundle_id": build.capture_bundle_id,
         "producing_fence": request.fence,
     }
-    token = lease_token_sha256(request.lease_token)
+    token = producer_token_sha256(request)
     if any(getattr(build, name) != expected for name, expected in expected_by_name.items()) or not hmac.compare_digest(
         bytes(build.producing_token_sha256), token
     ):

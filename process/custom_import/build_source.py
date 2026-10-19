@@ -33,6 +33,11 @@ from db.models.custom_import import (
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS, encode_landing_batch
 from process.custom_import.capture import SealedCapture, iter_records
 from process.custom_import.capture_store import open_segmented_parquet_parts
+from process.custom_import.continuation_runtime import (
+    BuildContinuationContext,
+    processing_deadline,
+    producer_token_sha256,
+)
 from process.custom_import.definition import CustomImportDefinition, SourceStream
 from process.custom_import.execution import MAX_LEASE_SECONDS, LeaseGrant, heartbeat_execution, lease_token_sha256
 from process.custom_import.failure_diagnostics import FailurePhase, failure_identifiers, failure_phase
@@ -93,6 +98,7 @@ class SourceBuildRequest:
     lease_seconds: int
     # Request-local authority, never a retained build identity or bound.
     authorization_expires_at: dt.datetime | None = field(default=None, compare=False)
+    continuation: BuildContinuationContext | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         for name in ("dataset_id", "definition_revision_id", "schema_revision_id", "execution_id", "fence"):
@@ -112,6 +118,8 @@ class SourceBuildRequest:
         if type(self.complete_scope) is not bool or type(self.lease_token) not in (str, bytes):
             raise ValueError("build scope and immutable lease token are required")
         lease_token_sha256(self.lease_token)
+        if self.continuation is not None and not isinstance(self.continuation, BuildContinuationContext):
+            raise ValueError("build continuation context is malformed")
         if (
             not isinstance(self.build_deadline_at, dt.datetime)
             or self.build_deadline_at.tzinfo is None
@@ -182,7 +190,7 @@ def _assert_build_identity(build, request: SourceBuildRequest, execution) -> Non
         or build.capture_bundle_id != execution.capture_bundle_id
         or build.request_identity_sha256 != execution.request_identity_sha256
         or build.producing_fence != request.fence
-        or not hmac.compare_digest(bytes(build.producing_token_sha256), lease_token_sha256(request.lease_token))
+        or not hmac.compare_digest(bytes(build.producing_token_sha256), producer_token_sha256(request))
         or build.base_generation_id != request.expected_base_generation_id
         or build.base_pointer_version != request.expected_pointer_version
         or build.complete_scope != request.complete_scope
@@ -191,8 +199,17 @@ def _assert_build_identity(build, request: SourceBuildRequest, execution) -> Non
         or build.page_byte_limit != request.page_byte_limit
         or build.statement_timeout_ms != request.statement_timeout_ms
         or build.build_deadline_at != request.build_deadline_at
+        or (request.continuation is not None and build.build_id != request.continuation.build_id)
     ):
         raise CandidateRunnerError("build identity or bounds do not match the request")
+
+
+def _page_expiry(request, lease_expires_at):
+    return min(
+        value
+        for value in (lease_expires_at, processing_deadline(request), request.authorization_expires_at)
+        if value is not None
+    )
 
 
 async def _initial_page_window(session, request):
@@ -210,11 +227,7 @@ async def _initial_page_window(session, request):
     if isolation != "read committed" or expires_at is None:
         raise CandidateRunnerError("build pages require a live READ COMMITTED lease")
     session.info[_WINDOW] = _PageWindow(
-        started
-        + (
-            min(expires_at, request.build_deadline_at, request.authorization_expires_at or request.build_deadline_at)
-            - now
-        ).total_seconds(),
+        started + (_page_expiry(request, expires_at) - now).total_seconds(),
         request.statement_timeout_ms,
     )
     return expires_at
@@ -227,6 +240,8 @@ async def _lock_page(
 
     if not session.in_transaction() or session.new or session.dirty or session.deleted:
         raise CandidateRunnerError("build pages require a clean caller-owned transaction")
+    if request.continuation is not None and build_id != request.continuation.build_id:
+        raise CandidateRunnerError("processing continuation requires its retained build")
     expires_at = await _initial_page_window(session, request)
     await _prepare_statement(session)
     await lock_dataset(session, request.dataset_id)
@@ -249,7 +264,8 @@ async def _lock_page(
             )
         ).one()
         _assert_build_identity(build, request, execution)
-    if request.build_deadline_at <= now:
+    deadline = processing_deadline(request)
+    if deadline is not None and deadline <= now:
         raise LeaseAuthorityLost("build deadline elapsed")
     await _renew_page_window(session, request)
     return build
@@ -265,6 +281,7 @@ async def _renew_page_window(session, request):
         fence=request.fence,
         token=request.lease_token,
         lease_seconds=request.lease_seconds,
+        continuation_id=None if request.continuation is None else request.continuation.continuation_id,
     )
     if renewed is None or renewed.state != "running":
         raise LeaseAuthorityLost("build lease is no longer current")
@@ -272,15 +289,7 @@ async def _renew_page_window(session, request):
     await _prepare_statement(session)
     now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
     session.info[_WINDOW] = _PageWindow(
-        started
-        + (
-            min(
-                renewed.expires_at,
-                request.build_deadline_at,
-                request.authorization_expires_at or request.build_deadline_at,
-            )
-            - now
-        ).total_seconds(),
+        started + (_page_expiry(request, renewed.expires_at) - now).total_seconds(),
         request.statement_timeout_ms,
     )
     await _prepare_statement(session)
@@ -312,7 +321,8 @@ async def _page_session(
             execution,
             lease,
         )
-        if now >= request.build_deadline_at:
+        deadline = processing_deadline(request)
+        if deadline is not None and now >= deadline:
             raise LeaseAuthorityLost("build deadline elapsed before page commit")
         if request.authorization_expires_at is not None and now >= request.authorization_expires_at:
             raise LeaseAuthorityLost("writer authorization expired before page commit")
@@ -405,7 +415,7 @@ async def _begin_build(session_factory, request):
                 (
                     ("bigint", request.execution_id),
                     ("bigint", request.fence),
-                    ("bytea", lease_token_sha256(request.lease_token)),
+                    ("bytea", producer_token_sha256(request)),
                     ("bigint", request.expected_base_generation_id),
                     ("bigint", request.expected_pointer_version),
                     ("boolean", request.complete_scope),
@@ -647,7 +657,7 @@ async def _store_pages(session_factory, context, pages, *, verified_parts=()):
                     ("bigint", context.build_id),
                     ("smallint", context.stream_slot),
                     ("bigint", context.request.fence),
-                    ("bytea", lease_token_sha256(context.request.lease_token)),
+                    ("bytea", producer_token_sha256(context.request)),
                     ("integer", len(preview.records)),
                     ("bigint", preview.byte_count),
                 ),
@@ -1199,6 +1209,8 @@ async def stage_segmented_source(
 
     if not isinstance(request, SourceBuildRequest):
         raise TypeError("source staging requires SourceBuildRequest")
+    if request.continuation is not None:
+        raise CandidateRunnerError("processing continuation cannot replay source or admission")
     if writer_transports is not None:
         request = writer_transports.source.bind_request(writer_transports.admission.bind_request(request))
     with failure_phase(FailurePhase.BEGIN_BUILD):
