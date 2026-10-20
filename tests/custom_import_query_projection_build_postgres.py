@@ -2,6 +2,7 @@
 
 """Native projection lifecycle on finalized bounded-build winners."""
 
+import asyncio
 from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
@@ -29,10 +30,12 @@ from process.custom_import.query_projection_build import (
     projection_step,
     stage_query_projections,
 )
+from process.custom_import.query_projection_evidence import ProjectionDigest
 from process.custom_import.query_projection_storage import query_projection_tables
 from process.custom_import.query_projection_values import configured_fields
+from process.custom_import.runner_codec import child_key_document
 from process.custom_import.runner_registry import load_registry
-from process.custom_import.runner_types import CandidateRunnerError
+from process.custom_import.runner_types import CandidateRunnerError, LeaseAuthorityLost
 from tests.custom_import_grouped_child_support import child_descriptor
 from tests.test_custom_import_build_output_postgres import _activate, _build, _request_for
 from tests.test_custom_import_build_source_postgres import _source_case
@@ -95,6 +98,19 @@ async def _winning_build(case):
     return request, build_id
 
 
+def _expected_projection_digest(definition):
+    digest = ProjectionDigest(definition)
+    digest.add_root("1003000126", 10, {"combined_score": None})
+    for period in (10, 20):
+        digest.add_root("1234567893", period, {"combined_score": Decimal("0")})
+    for ordinal in range(260):
+        key = child_key_document(definition, "rates", {"service_code": f"S{ordinal:03}"})
+        digest.add_child("1234567893", 10, key, {"combined_quality": None, "merged_cost": Decimal("3")})
+    key = child_key_document(definition, "rates", {"service_code": "S000"})
+    digest.add_child("1234567893", 20, key, {"combined_quality": Decimal("9"), "merged_cost": Decimal("3")})
+    return digest.finish()
+
+
 async def _assert_physical_projection_reads(case, request, generation_id):
     await _activate(case, request, generation_id)
     service = _service()
@@ -142,7 +158,10 @@ async def _assert_physical_projection_reads(case, request, generation_id):
 
 
 @pytest.mark.asyncio
-async def test_projection_resumes_context_pages_and_preserves_all_null_rows():
+@pytest.mark.parametrize("physical_pages", (1, 32))
+async def test_projection_resumes_context_pages_and_preserves_all_null_rows(monkeypatch, physical_pages):
+    monkeypatch.setattr(projection, "_MAX_LOGICAL_PAGES", physical_pages)
+    monkeypatch.setattr(projection, "time", SimpleNamespace(monotonic=lambda: 0.0))
     async with _source_case() as case:
         request, build_id = await _winning_build(case)
         first = await projection_step(case.sessions, request, build_id)
@@ -150,7 +169,10 @@ async def test_projection_resumes_context_pages_and_preserves_all_null_rows():
             await projection_step(case.sessions, request, build_id, expected=first.before)
         for _ in range(100):
             page = await projection_step(case.sessions, request, build_id)
-            if page.after.phase == "digest_child" and page.after.proof_count > page.before.proof_count:
+            if (
+                "digest_child" in (page.before.phase, page.after.phase)
+                and page.after.proof_count > page.before.proof_count
+            ):
                 break
         else:
             pytest.fail("projection did not reach a retained child digest page")
@@ -164,6 +186,7 @@ async def test_projection_resumes_context_pages_and_preserves_all_null_rows():
         async with case.sessions() as session, session.begin():
             manifest = (await session.scalars(select(CustomImportQueryProjection))).one()
             assert (manifest.root_count, manifest.child_count, manifest.index_count) == (3, 261, 4)
+            assert manifest.projection_sha256 == _expected_projection_digest(request.definition).projection_sha256
             tables = query_projection_tables(manifest.family_id, request.definition)
             roots = (await session.execute(select(tables["custom_import_derived_root"]))).all()
             assert sorted(
@@ -186,6 +209,42 @@ async def test_projection_resumes_context_pages_and_preserves_all_null_rows():
             await projection_step(case.sessions, request, build_id)
         assert (await output.build_output(case.sessions, request, build_id)).seal.replayed
         await _assert_physical_projection_reads(case, request, sealed.generation_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", (CandidateRunnerError, LeaseAuthorityLost, asyncio.CancelledError))
+async def test_later_projection_chunk_rolls_back(monkeypatch, failure_type):
+    monkeypatch.setattr(projection, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    async with _source_case() as case:
+        request, build_id = await _winning_build(case)
+        monkeypatch.setattr(projection, "_MAX_LOGICAL_PAGES", 32)
+        before = (await projection_step(case.sessions, request, build_id)).after
+        assert before.phase == "child" and before.child_count == 0
+        original = projection._advance_projection
+        written_counts = []
+
+        async def fail_later(session, bound_request, build, manifest):
+            await original(session, bound_request, build, manifest)
+            written_counts.append(manifest.child_count)
+            if len(written_counts) == 2:
+                assert manifest.child_count == 2 * request.page_row_limit
+                raise failure_type("synthetic later projection chunk failure")
+
+        monkeypatch.setattr(projection, "_advance_projection", fail_later)
+        with pytest.raises(failure_type):
+            await projection_step(case.sessions, request, build_id, expected=before)
+        assert written_counts == [request.page_row_limit, 2 * request.page_row_limit]
+        async with case.sessions() as session:
+            manifest = (await session.scalars(select(CustomImportQueryProjection))).one()
+            assert projection.ProjectionProgress.from_manifest(manifest) == before
+            table = query_projection_tables(manifest.family_id, request.definition)["custom_import_derived_child"]
+            assert await session.scalar(select(func.count()).select_from(table)) == 0
+        monkeypatch.setattr(projection, "_advance_projection", original)
+        await stage_query_projections(case.sessions, request, build_id)
+        async with case.sessions() as session:
+            manifest = (await session.scalars(select(CustomImportQueryProjection))).one()
+            assert (manifest.root_count, manifest.child_count) == (3, 261)
+            assert manifest.projection_sha256 == _expected_projection_digest(request.definition).projection_sha256
 
 
 class _WriterReadProbe:
