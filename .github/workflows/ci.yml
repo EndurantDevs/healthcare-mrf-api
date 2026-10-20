@@ -69,7 +69,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -133,7 +133,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -156,7 +156,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -193,7 +193,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -307,7 +307,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -366,7 +366,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -398,7 +398,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -450,7 +450,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -497,7 +497,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -535,7 +535,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -592,14 +592,15 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
       with:
-        rust: ${{ matrix.shard == 'core-services' || matrix.shard == 'core-snapshots' || matrix.shard == 'core-snapshots-2'
-          || matrix.shard == 'core-ptg' || matrix.shard == 'directory-source' || startsWith(matrix.shard, 'registry-') }}
+        rust: ${{ (matrix.shard == 'core-services' || matrix.shard == 'core-services-2') || matrix.shard == 'core-snapshots'
+          || matrix.shard == 'core-snapshots-2' || matrix.shard == 'core-ptg' || matrix.shard == 'directory-source' || matrix.shard
+          == 'directory-address' || matrix.shard == 'profile-publication' || startsWith(matrix.shard, 'registry-') }}
     - name: Install PostgreSQL client
       run: "sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq\nsudo\
         \ apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --yes --no-install-recommends\
@@ -651,6 +652,7 @@ jobs:
         printf ''%s=%s\n'' "$ARTIFACT_OUTPUT" "$ARTIFACT_ID" >> "$GITHUB_OUTPUT"'
     outputs:
       artifact_core_services: ${{ steps.coverage-output.outputs.artifact_core_services }}
+      artifact_core_services_2: ${{ steps.coverage-output.outputs.artifact_core_services_2 }}
       artifact_core_imports: ${{ steps.coverage-output.outputs.artifact_core_imports }}
       artifact_core_imports_2: ${{ steps.coverage-output.outputs.artifact_core_imports_2 }}
       artifact_core_snapshots: ${{ steps.coverage-output.outputs.artifact_core_snapshots }}
@@ -672,6 +674,38 @@ jobs:
       artifact_registry_13: ${{ steps.coverage-output.outputs.artifact_registry_13 }}
       artifact_registry_14: ${{ steps.coverage-output.outputs.artifact_registry_14 }}
       artifact_registry_15: ${{ steps.coverage-output.outputs.artifact_registry_15 }}
+      artifact_registry_16: ${{ steps.coverage-output.outputs.artifact_registry_16 }}
+      artifact_registry_17: ${{ steps.coverage-output.outputs.artifact_registry_17 }}
+      artifact_registry_18: ${{ steps.coverage-output.outputs.artifact_registry_18 }}
+      artifact_registry_19: ${{ steps.coverage-output.outputs.artifact_registry_19 }}
+      artifact_registry_20: ${{ steps.coverage-output.outputs.artifact_registry_20 }}
+      artifact_registry_21: ${{ steps.coverage-output.outputs.artifact_registry_21 }}
+      artifact_registry_22: ${{ steps.coverage-output.outputs.artifact_registry_22 }}
+      artifact_registry_23: ${{ steps.coverage-output.outputs.artifact_registry_23 }}
+      artifact_registry_24: ${{ steps.coverage-output.outputs.artifact_registry_24 }}
+      artifact_registry_25: ${{ steps.coverage-output.outputs.artifact_registry_25 }}
+      artifact_registry_26: ${{ steps.coverage-output.outputs.artifact_registry_26 }}
+      artifact_registry_27: ${{ steps.coverage-output.outputs.artifact_registry_27 }}
+      artifact_registry_28: ${{ steps.coverage-output.outputs.artifact_registry_28 }}
+      artifact_registry_29: ${{ steps.coverage-output.outputs.artifact_registry_29 }}
+      artifact_registry_30: ${{ steps.coverage-output.outputs.artifact_registry_30 }}
+      artifact_registry_31: ${{ steps.coverage-output.outputs.artifact_registry_31 }}
+      artifact_registry_32: ${{ steps.coverage-output.outputs.artifact_registry_32 }}
+      artifact_registry_33: ${{ steps.coverage-output.outputs.artifact_registry_33 }}
+      artifact_registry_34: ${{ steps.coverage-output.outputs.artifact_registry_34 }}
+      artifact_registry_35: ${{ steps.coverage-output.outputs.artifact_registry_35 }}
+      artifact_registry_36: ${{ steps.coverage-output.outputs.artifact_registry_36 }}
+      artifact_registry_37: ${{ steps.coverage-output.outputs.artifact_registry_37 }}
+      artifact_registry_38: ${{ steps.coverage-output.outputs.artifact_registry_38 }}
+      artifact_registry_39: ${{ steps.coverage-output.outputs.artifact_registry_39 }}
+      artifact_registry_40: ${{ steps.coverage-output.outputs.artifact_registry_40 }}
+      artifact_registry_41: ${{ steps.coverage-output.outputs.artifact_registry_41 }}
+      artifact_registry_42: ${{ steps.coverage-output.outputs.artifact_registry_42 }}
+      artifact_registry_43: ${{ steps.coverage-output.outputs.artifact_registry_43 }}
+      artifact_registry_44: ${{ steps.coverage-output.outputs.artifact_registry_44 }}
+      artifact_registry_45: ${{ steps.coverage-output.outputs.artifact_registry_45 }}
+      artifact_registry_46: ${{ steps.coverage-output.outputs.artifact_registry_46 }}
+      artifact_registry_47: ${{ steps.coverage-output.outputs.artifact_registry_47 }}
       artifact_directory_source: ${{ steps.coverage-output.outputs.artifact_directory_source }}
       artifact_directory_storage: ${{ steps.coverage-output.outputs.artifact_directory_storage }}
       artifact_directory_address: ${{ steps.coverage-output.outputs.artifact_directory_address }}
@@ -684,6 +718,9 @@ jobs:
         - shard: core-services
           label: Database tests (services)
           output: artifact_core_services
+        - shard: core-services-2
+          label: Database tests (services 2)
+          output: artifact_core_services_2
         - shard: core-imports
           label: Database tests (imports)
           output: artifact_core_imports
@@ -747,6 +784,102 @@ jobs:
         - shard: registry-15
           label: Database tests (registry 16)
           output: artifact_registry_15
+        - shard: registry-16
+          label: Database tests (registry 17)
+          output: artifact_registry_16
+        - shard: registry-17
+          label: Database tests (registry 18)
+          output: artifact_registry_17
+        - shard: registry-18
+          label: Database tests (registry 19)
+          output: artifact_registry_18
+        - shard: registry-19
+          label: Database tests (registry 20)
+          output: artifact_registry_19
+        - shard: registry-20
+          label: Database tests (registry 21)
+          output: artifact_registry_20
+        - shard: registry-21
+          label: Database tests (registry 22)
+          output: artifact_registry_21
+        - shard: registry-22
+          label: Database tests (registry 23)
+          output: artifact_registry_22
+        - shard: registry-23
+          label: Database tests (registry 24)
+          output: artifact_registry_23
+        - shard: registry-24
+          label: Database tests (registry 25)
+          output: artifact_registry_24
+        - shard: registry-25
+          label: Database tests (registry 26)
+          output: artifact_registry_25
+        - shard: registry-26
+          label: Database tests (registry 27)
+          output: artifact_registry_26
+        - shard: registry-27
+          label: Database tests (registry 28)
+          output: artifact_registry_27
+        - shard: registry-28
+          label: Database tests (registry 29)
+          output: artifact_registry_28
+        - shard: registry-29
+          label: Database tests (registry 30)
+          output: artifact_registry_29
+        - shard: registry-30
+          label: Database tests (registry 31)
+          output: artifact_registry_30
+        - shard: registry-31
+          label: Database tests (registry 32)
+          output: artifact_registry_31
+        - shard: registry-32
+          label: Database tests (registry 33)
+          output: artifact_registry_32
+        - shard: registry-33
+          label: Database tests (registry 34)
+          output: artifact_registry_33
+        - shard: registry-34
+          label: Database tests (registry 35)
+          output: artifact_registry_34
+        - shard: registry-35
+          label: Database tests (registry 36)
+          output: artifact_registry_35
+        - shard: registry-36
+          label: Database tests (registry 37)
+          output: artifact_registry_36
+        - shard: registry-37
+          label: Database tests (registry 38)
+          output: artifact_registry_37
+        - shard: registry-38
+          label: Database tests (registry 39)
+          output: artifact_registry_38
+        - shard: registry-39
+          label: Database tests (registry 40)
+          output: artifact_registry_39
+        - shard: registry-40
+          label: Database tests (registry 41)
+          output: artifact_registry_40
+        - shard: registry-41
+          label: Database tests (registry 42)
+          output: artifact_registry_41
+        - shard: registry-42
+          label: Database tests (registry 43)
+          output: artifact_registry_42
+        - shard: registry-43
+          label: Database tests (registry 44)
+          output: artifact_registry_43
+        - shard: registry-44
+          label: Database tests (registry 45)
+          output: artifact_registry_44
+        - shard: registry-45
+          label: Database tests (registry 46)
+          output: artifact_registry_45
+        - shard: registry-46
+          label: Database tests (registry 47)
+          output: artifact_registry_46
+        - shard: registry-47
+          label: Database tests (registry 48)
+          output: artifact_registry_47
         - shard: directory-source
           label: Database tests (directory source)
           output: artifact_directory_source
@@ -797,7 +930,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -823,23 +956,41 @@ jobs:
         artifact-ids: ${{ needs.python-tests.outputs.artifact_0 }},${{ needs.python-tests.outputs.artifact_1 }},${{ needs.python-tests.outputs.artifact_2
           }},${{ needs.python-tests.outputs.artifact_3 }},${{ needs.python-tests.outputs.artifact_4 }},${{ needs.python-tests.outputs.artifact_5
           }},${{ needs.capacity-evidence.outputs.artifact_id }},${{ needs.rust-scanner.outputs.artifact_id }},${{ needs.address-canonical-db-tests.outputs.artifact_core_services
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_imports }},${{ needs.address-canonical-db-tests.outputs.artifact_core_imports_2
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_snapshots }},${{ needs.address-canonical-db-tests.outputs.artifact_core_snapshots_2
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_ptg }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_0
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_1 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_2
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_3 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_4
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_5 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_6
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_7 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_8
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_9 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_10
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_11 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_12
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_13 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_14
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_15 }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_storage }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_address
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_storage }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_publication
-          }}
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_services_2 }},${{ needs.address-canonical-db-tests.outputs.artifact_core_imports
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_imports_2 }},${{ needs.address-canonical-db-tests.outputs.artifact_core_snapshots
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_snapshots_2 }},${{ needs.address-canonical-db-tests.outputs.artifact_core_ptg
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_0 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_1
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_2 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_3
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_4 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_5
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_6 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_7
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_8 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_9
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_10 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_11
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_12 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_13
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_14 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_15
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_16 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_17
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_18 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_19
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_20 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_21
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_22 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_23
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_24 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_25
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_26 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_27
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_28 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_29
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_30 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_31
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_32 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_33
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_34 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_35
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_36 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_37
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_38 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_39
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_40 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_41
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_42 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_43
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_44 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_45
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_46 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_47
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_storage
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_address }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_storage
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_publication }}
         digest-mismatch: error
         path: ${{ runner.temp }}/healthcare-coverage-staging
         merge-multiple: false
+    - name: Install pinned coverage combiner
+      run: 'uv --no-config pip install --require-hashes --only-binary=:all: -r "$CI_ROOT/scripts/healthcare/requirements-coverage.lock"'
     - name: Validate and bind public measurement
       run: python3 ci/scripts/healthcare/measurement.py
     - name: Upload public measurement
@@ -904,7 +1055,7 @@ jobs:
       actions: read
       packages: write
     env:
-      CI_REVISION: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+      CI_REVISION: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
       PYTHONDONTWRITEBYTECODE: '1'
       IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
       MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
@@ -913,7 +1064,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -988,7 +1139,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+        ref: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -1016,7 +1167,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: daa02cd9fdedb68dcccf9be05c8cdf6c4e3a1f54
+  CI_REVISION: f5454d6c95da6d06485f98325ddb0e75ce50d8ee
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'

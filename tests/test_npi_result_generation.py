@@ -111,6 +111,9 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261017010000_custom_import_raw_objects",
     "20261019010000_custom_import_build_continuation",
     "20261020150000_custom_import_staged_verification",
+    "20261020180000_custom_import_verification_arms",
+    "20261020190000_custom_import_verification_root_ranges",
+    "20261020200000_custom_import_manual_acceptance",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -121,7 +124,7 @@ _SERVICE_NETWORK_UPGRADE_REVISIONS = (
 
 def _assert_current_registry_head(script: ScriptDirectory) -> None:
     """Require one registry head after the unchanged published custom-import chain."""
-    assert script.get_heads() == ["20261020150000_custom_import_staged_verification"]
+    assert script.get_heads() == ["20261020200000_custom_import_manual_acceptance"]
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )

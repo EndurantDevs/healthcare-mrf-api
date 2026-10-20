@@ -47,12 +47,13 @@ MATRIX_ROWS_BY_JOB = {
         {"shard": shard, "label": f"Database tests ({label})", "output": f"artifact_{shard.replace('-', '_')}"}
         for shard, label in (
             ("core-services", "services"),
+            ("core-services-2", "services 2"),
             ("core-imports", "imports"),
             ("core-imports-2", "imports 2"),
             ("core-snapshots", "snapshot imports"),
             ("core-snapshots-2", "snapshot imports 2"),
             ("core-ptg", "PTG"),
-            *((f"registry-{index}", f"registry {index + 1}") for index in range(16)),
+            *((f"registry-{index}", f"registry {index + 1}") for index in range(48)),
             ("directory-source", "directory source"),
             ("directory-storage", "directory storage"),
             ("directory-address", "directory address"),
@@ -434,7 +435,7 @@ def test_publisher_requires_every_matrix_result_and_all_immutable_artifacts():
         for matrix_row in MATRIX_ROWS_BY_JOB["address-canonical-db-tests"]
     )
     assert identities == expected_ids
-    assert len(set(identities)) == 35
+    assert len(set(identities)) == 68
     assert download["with"]["digest-mismatch"] == "error"
     assert download["with"]["merge-multiple"] is False
     assert jobs["source-validation"]["needs"] == ["measurement"]
