@@ -133,9 +133,17 @@ async def _read_service_payload(request, session, parsed, verified):
         native_args=parsed.native_args,
         import_context=ProviderServiceImportQuery(prepared, query.require_match, scope_preparer.prepare),
     )
-    if reply.status != 200 or len(reply.body) > transport._MAX_RESPONSE_BYTES:
+    maximum_native_bytes = _provider_response_limit(parsed, parsed.maximum_family_rows)
+    if reply.status != 200 or len(reply.body) > maximum_native_bytes:
         raise CustomImportReadUnavailableError("provider-service response is unavailable")
     response_by_field = _service_payload(reply.body, plan_release_id=parsed.native_args.get("plan_release_id"))
+    if len(reply.body) > _provider_response_limit(parsed, len(response_by_field["items"])):
+        raise CustomImportReadUnavailableError("provider-service response is unavailable")
+    # The public default omits this duplicate legacy alias while retaining all prices.
+    if str(parsed.native_args.get("include_legacy_fields") or "").lower() != "true":
+        for provider_item in response_by_field["items"]:
+            if "prices" in provider_item and provider_item.get("tic_prices") == provider_item["prices"]:
+                provider_item.pop("tic_prices", None)
     await _hydrate_provider_rows(
         session,
         service,
