@@ -374,6 +374,52 @@ async def test_service_inclusion_keeps_native_page_under_one_signed_snapshot(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "native_byte_count,include_filter,status", [(400000, True, 200), (524288, True, 503), (400000, False, 503)]
+)
+async def test_native_service_page_uses_existing_complete_response_bound(
+    monkeypatch, native_byte_count, include_filter, status
+):
+    session = _Session()
+    provider_by_field = {"npi": 1104212877, "evidence": "x" * native_byte_count}
+    _install(monkeypatch, session, page_items=[provider_by_field])
+    reply = await service_http.serve_custom_import_provider_service(
+        _request(_body(include_filter=include_filter)), session
+    )
+    assert reply.status == status
+    if status == 200:
+        response_by_field = json.loads(reply.body)
+        assert response_by_field["items"][0]["evidence"] == provider_by_field["evidence"]
+        assert response_by_field["items"][0]["custom_import"] is not None
+        assert transport._MAX_RESPONSE_BYTES < len(reply.body) <= 2 * transport._MAX_RESPONSE_BYTES
+    else:
+        assert session.rolled_back and "hydrate" not in session.events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_legacy", [False, True])
+async def test_native_price_alias_is_compacted_only_when_unrequested(monkeypatch, include_legacy):
+    session = _Session()
+    prices = [{"negotiated_rate": 42, "evidence": "x" * 180000}]
+    provider_by_field = {"npi": 1104212877, "prices": prices, "tic_prices": prices}
+    _install(monkeypatch, session, page_items=[provider_by_field])
+    body = _body(
+        native_query={"code_system": "CPT", "code": "99213", "include_legacy_fields": str(include_legacy).lower()}
+    )
+    reply = await service_http.serve_custom_import_provider_service(_request(body), session)
+    assert reply.status == 200
+    provider_item = json.loads(reply.body)["items"][0]
+    assert provider_item["prices"] == prices and provider_item["custom_import"] is not None
+    expected_by_field = {**provider_by_field, "npi": "1104212877"}
+    if not include_legacy:
+        expected_by_field.pop("tic_prices")
+    assert {key: value for key, value in provider_item.items() if key != "custom_import"} == expected_by_field
+    assert ("tic_prices" in provider_item) is include_legacy
+    if include_legacy:
+        assert provider_item["tic_prices"] == prices
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("has_plan_release", [False, True])
 async def test_signed_plan_storage_precedes_read_only_snapshot(monkeypatch, has_plan_release):
     session = SimpleNamespace()
