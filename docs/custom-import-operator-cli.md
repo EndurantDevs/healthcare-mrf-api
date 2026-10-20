@@ -145,7 +145,7 @@ execution path and identity; it does not inherit current operator settings.
 
 All limits are explicit positive integers; unknown, missing, incoherent, or
 over-ceiling values fail validation. Logical build pages admit at most 256 records
-and 256 MiB. Physical SOURCE and trusted admission batches may combine logical
+and 256 MiB. Physical SOURCE, trusted admission and projection batches may combine logical
 pages within a 100,000-record/256-MiB ceiling without changing their identity or
 validation rules. Declaration ceilings are not recommended sizing or throughput claims.
 Changing any retained limit requires a new binding revision, not a retry of an
@@ -218,6 +218,22 @@ step. The engine owner performs only the existing projection operation after
 rechecking the current epoch; no snapshot ownership or general control credential
 is given to the worker. Uncertain delivery permits one retained progress read,
 not an implicit resend.
+
+Local, signed-permit and continuation projection writers share the same physical
+step. Request authority covers this bounded physical operation; the retained
+logical limits and wire contract do not change. Existing signed scope or current
+continuation authority and the supplied exact progress are checked under the
+same locks, with fresh authority verified before commit.
+Root, child and semantic-digest steps may coalesce up to 32 logical pages in one
+transaction. Each iteration reserves its full retained row and byte
+allowance, including empty windows, within the 100,000-row/256-MiB physical
+envelope. Payloads and metadata remain bounded to one logical page at a time;
+the byte allowance does not measure Python or database executor memory. No next
+page starts after the one-second soft coalescing budget or half the remaining
+fenced window. Existing statement, lease and permit deadlines still apply.
+Coalescing stops at a phase change, and an index step builds at most one index.
+All rows and the final exact checkpoint commit together; any failure rolls back
+that physical transaction without authorizing an automatic resend.
 
 ### Frozen materialization verification
 

@@ -1362,7 +1362,9 @@ async def _build_graph(session_factory, request: SourceBuildRequest, build_id: i
 
 async def _open_output(session_factory, request, build_id, capture_bundle_id):
     async with _session(session_factory) as session:
-        candidate_digest, count = await session.run_sync(lambda sync: _candidate_digest(sync, request, build_id))
+        candidate_digest, count = await session.run_sync(
+            lambda sync: _candidate_digest(sync, request, build_id, bounds=_ReadPage(physical=True))
+        )
         source_digest = await session.run_sync(lambda sync: _source_digest(sync, request, build_id, capture_bundle_id))
     async with _page_session(session_factory, request, build_id) as (session, build):
         if build.generation_id is not None:

@@ -2,6 +2,7 @@
 
 """Fenced, bounded context writes after winners and before normal output freeze."""
 
+import time
 from dataclasses import dataclass
 
 from sqlalchemy import func, select, text, tuple_
@@ -9,7 +10,8 @@ from sqlalchemy import func, select, text, tuple_
 from db.models.custom_import import CustomImportGeneration, CustomImportWinner
 from process.custom_import.admission_sql import _verify_writer_permit
 from process.custom_import.build_graph import _build_storage_models
-from process.custom_import.build_source import _flush_page, _page_session, _prepare_statement
+from process.custom_import.build_source import _WINDOW, _flush_page, _page_session, _prepare_statement
+from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
 from process.custom_import.query_projection_authorization import (
     PROJECTION_PATH,
     PROJECTION_PERMIT_CONTRACT,
@@ -34,6 +36,8 @@ from process.custom_import.runner_registry import load_registry
 from process.custom_import.runner_types import CandidateRunnerError
 
 _MAX_INTEGER = 2**63 - 1
+_MAX_LOGICAL_PAGES = 32
+_COALESCING_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -284,7 +288,7 @@ def _match_progress(before, expected):
 
 
 async def projection_step(session_factory, request, build_id, *, expected=None, permit=None):
-    """Commit one data or index page with the existing locks and fresh lease check."""
+    """Commit one physical data batch or index with a fresh final lease check."""
 
     async with _page_session(session_factory, request, build_id) as (session, build):
         if permit is not None:
@@ -294,7 +298,7 @@ async def projection_step(session_factory, request, build_id, *, expected=None, 
         manifest = await initialize_projection(session, request, build)
         before = ProjectionProgress.from_manifest(manifest)
         _match_progress(before, expected)
-        await _advance_projection(session, request, build, manifest)
+        await _advance_projection_batch(session, request, build, manifest)
         await _flush_page(session)
         receipt = ProjectionBatchReceipt(
             request.execution_id,
@@ -306,6 +310,32 @@ async def projection_step(session_factory, request, build_id, *, expected=None, 
             ProjectionProgress.from_manifest(manifest),
         )
     return receipt
+
+
+async def _advance_projection_batch(session, request, build, manifest):
+    """Reserve whole logical pages, including empty windows, in one transaction."""
+
+    phase = manifest.phase
+    if phase not in {"root", "child", "digest_root", "digest_child"}:
+        await _advance_projection(session, request, build, manifest)
+        return
+    page_limit = min(
+        _MAX_LOGICAL_PAGES,
+        MAX_BATCH_ROWS // request.page_row_limit,
+        MAX_BATCH_BYTES // request.page_byte_limit,
+    )
+    started = time.monotonic()
+    # Leave half the fenced window for the final authority check and commit.
+    deadline = min(
+        started + _COALESCING_SECONDS,
+        started + (session.info[_WINDOW].deadline - started) / 2,
+    )
+    for page_index in range(page_limit):
+        if page_index and time.monotonic() >= deadline:
+            break
+        await _advance_projection(session, request, build, manifest)
+        if manifest.phase != phase:
+            break
 
 
 async def _advance_projection(session, request, build, manifest):
