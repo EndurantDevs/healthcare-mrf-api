@@ -17,7 +17,7 @@ from db.models.company_registry import CompanyRegistry
 ROOT = Path(__file__).parents[1]
 REVISION = "20261012010000_company_registry_name_origin"
 PREDECESSOR = "20261011010000_company_registry_group_assertions"
-CURRENT_HEAD = "20261020150000_custom_import_staged_verification"
+CURRENT_HEAD = "20261020200000_custom_import_manual_acceptance"
 
 
 def _migration(revision=REVISION):
@@ -115,7 +115,13 @@ def test_origin_migration_extends_the_sole_existing_head():
     readiness = "20261017210000_provider_directory_readiness_indexes"
     raw_objects = "20261017010000_custom_import_raw_objects"
     continuation = "20261019010000_custom_import_build_continuation"
-    assert script.get_revision(CURRENT_HEAD).down_revision == continuation
+    staged_verification = "20261020150000_custom_import_staged_verification"
+    verification_arms = "20261020180000_custom_import_verification_arms"
+    root_ranges = "20261020190000_custom_import_verification_root_ranges"
+    assert script.get_revision(CURRENT_HEAD).down_revision == root_ranges
+    assert script.get_revision(root_ranges).down_revision == verification_arms
+    assert script.get_revision(verification_arms).down_revision == staged_verification
+    assert script.get_revision(staged_verification).down_revision == continuation
     assert script.get_revision(continuation).down_revision == raw_objects
     assert script.get_revision(raw_objects).down_revision == readiness
     assert script.get_revision(readiness).down_revision == query_projections
@@ -130,5 +136,8 @@ def test_origin_migration_extends_the_sole_existing_head():
         readiness,
         raw_objects,
         continuation,
+        staged_verification,
+        verification_arms,
+        root_ranges,
         CURRENT_HEAD,
     ]

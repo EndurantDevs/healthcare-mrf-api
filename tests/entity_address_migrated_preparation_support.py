@@ -30,7 +30,7 @@ async def _migrated_tables(resources, monkeypatch):
     database = Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
     try:
         script = ScriptDirectory.from_config(Config("alembic.ini"))
-        assert script.get_heads() == ["20261020150000_custom_import_staged_verification"]
+        assert script.get_heads() == ["20261020200000_custom_import_manual_acceptance"]
         assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
             "20261010000000_custom_import_admission_indexes"
         )
@@ -65,7 +65,7 @@ async def _migrated_tables(resources, monkeypatch):
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", _SCHEMA)
         await _upgrade_disposable_schema_to_head(url.render_as_string(hide_password=False), _SCHEMA)
         assert await database.scalar(f'SELECT version_num FROM "{_SCHEMA}".alembic_version') == (
-            "20261020150000_custom_import_staged_verification"
+            "20261020200000_custom_import_manual_acceptance"
         )
         metadata = MetaData(schema=_SCHEMA)
         for model in preparation.destination.restore._models():

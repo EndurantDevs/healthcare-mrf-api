@@ -33,6 +33,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import deferred
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -2790,13 +2791,13 @@ class CustomImportBuildCandidateContext(_CustomImportModel):
 
 
 class CustomImportBuildVerification(_CustomImportModel):
-    """SQL-derived structural scan progress; immutable when complete."""
+    """Structural progress or explicitly attributed manual acceptance; immutable when complete."""
 
     __tablename__ = "custom_import_build_verification"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
         CheckConstraint(
-            "verification_contract = 'custom-import/build-structure/v1' AND "
+            "verification_contract IN ('custom-import/build-structure/v1','custom-import/manual-acceptance/v1') AND "
             "((verification_state = 'scanning' AND scan_stage IN "
             "('capture','profiles','families','root_scalars','child_scalars','winners') AND verified_at IS NULL) OR "
             "(verification_state = 'complete' AND scan_stage = 'complete' AND verified_at IS NOT NULL)) AND "
@@ -2806,6 +2807,15 @@ class CustomImportBuildVerification(_CustomImportModel):
             "AND current_family_seen_child_count IS NOT NULL AND current_family_expected_child_count >= 0 "
             "AND current_family_seen_child_count >= 0))",
             name="custom_import_build_verification_shape",
+        ),
+        CheckConstraint(
+            "(verification_contract = 'custom-import/build-structure/v1' AND manual_acceptance IS NULL) OR "
+            "(verification_contract = 'custom-import/manual-acceptance/v1' AND manual_acceptance IS NOT NULL "
+            "AND jsonb_typeof(manual_acceptance) = 'object' "
+            "AND manual_acceptance->>'contract' = 'custom-import/manual-acceptance/v1' AND "
+            "((verification_state = 'scanning' AND scan_stage = 'winners' AND page_sequence = 61) OR "
+            "(verification_state = 'complete' AND scan_stage = 'complete' AND page_sequence = 62)))",
+            name="custom_import_build_verification_acceptance",
         ),
         CheckConstraint(
             "num_nonnulls(after_child_collection_slot,after_child_revision_id) IN (0,2) AND "
@@ -2825,6 +2835,8 @@ class CustomImportBuildVerification(_CustomImportModel):
     verification_contract = Column(
         String(63), nullable=False, server_default=text("'custom-import/build-structure/v1'")
     )
+    # Operator-only provenance need not be loaded by ordinary progress readers.
+    manual_acceptance = deferred(Column(JSONB(none_as_null=True)))
     verification_state = Column(String(16), nullable=False, server_default=text("'scanning'"))
     scan_stage = Column(String(16), nullable=False, server_default=text("'capture'"))
     page_sequence = _capture_counter("page_sequence")

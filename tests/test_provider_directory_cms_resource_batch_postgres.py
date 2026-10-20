@@ -2,6 +2,7 @@
 """CMS resource COPY against the actual retained-resource migrations and guards."""
 
 import asyncio
+import importlib
 import json
 import os
 from compression import zstd
@@ -757,7 +758,7 @@ async def _assert_registry_handoff_retry(monkeypatch, directory, acquired, clien
 def _damage_registry_handoff(monkeypatch, damage):
     """Alter actual queried proof material while keeping native storage and guards intact."""
     if damage == "seal":
-        from process import provider_directory_admission_backfill as backfill
+        backfill = importlib.import_module("process.provider_directory_admission_backfill")
 
         original_seal = backfill._validated_row_seal
 

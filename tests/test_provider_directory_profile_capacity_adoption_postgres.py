@@ -241,14 +241,20 @@ def _current_migration_heads():
     """Check the current head without weakening the historical predecessor chain."""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     expected_heads = set(script.get_heads())
-    assert expected_heads == {"20261020150000_custom_import_staged_verification"}
+    assert expected_heads == {"20261020200000_custom_import_manual_acceptance"}
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )
     readiness = script.get_revision("20261017210000_provider_directory_readiness_indexes")
     raw_objects = script.get_revision("20261017010000_custom_import_raw_objects")
     continuation = script.get_revision("20261019010000_custom_import_build_continuation")
-    assert script.get_revision(next(iter(expected_heads))).down_revision == continuation.revision
+    staged_verification = script.get_revision("20261020150000_custom_import_staged_verification")
+    verification_arms = script.get_revision("20261020180000_custom_import_verification_arms")
+    root_ranges = script.get_revision("20261020190000_custom_import_verification_root_ranges")
+    assert script.get_revision(next(iter(expected_heads))).down_revision == root_ranges.revision
+    assert root_ranges.down_revision == verification_arms.revision
+    assert verification_arms.down_revision == staged_verification.revision
+    assert staged_verification.down_revision == continuation.revision
     assert continuation.down_revision == raw_objects.revision
     assert raw_objects.down_revision == readiness.revision
     assert readiness.down_revision == "20261015020000_custom_import_query_projections"

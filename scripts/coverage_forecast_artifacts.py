@@ -5,16 +5,23 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
 
 from coverage import __version__ as coverage_package_version
+from coverage_forecast_cohort import validate_cohort_data
 from coverage_reports import CoverageRatchetError
 
 BASELINE_NAME = "test-coverage-baseline.json"
 PROVENANCE_SCHEMA_VERSION = 1
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+POSTGRES_COHORT_NAME = ".coverage-postgres-cohort.json"
+POSTGRES_COVERAGE_NAME = ".coverage.postgres.combined"
+MAX_COHORT_FILE_BYTES = 32 * 1024 * 1024
+MAX_COHORT_TOTAL_BYTES = 128 * 1024 * 1024
 
 REPORT_SPEC_BY_NAME = {
     "python": {
@@ -47,6 +54,7 @@ SHARD_SPEC_BY_KIND = {
         "report_name": "python",
         "shards": (
             "core-services",
+            "core-services-2",
             "core-imports",
             "core-imports-2",
             "core-snapshots",
@@ -68,6 +76,38 @@ SHARD_SPEC_BY_KIND = {
             "registry-13",
             "registry-14",
             "registry-15",
+            "registry-16",
+            "registry-17",
+            "registry-18",
+            "registry-19",
+            "registry-20",
+            "registry-21",
+            "registry-22",
+            "registry-23",
+            "registry-24",
+            "registry-25",
+            "registry-26",
+            "registry-27",
+            "registry-28",
+            "registry-29",
+            "registry-30",
+            "registry-31",
+            "registry-32",
+            "registry-33",
+            "registry-34",
+            "registry-35",
+            "registry-36",
+            "registry-37",
+            "registry-38",
+            "registry-39",
+            "registry-40",
+            "registry-41",
+            "registry-42",
+            "registry-43",
+            "registry-44",
+            "registry-45",
+            "registry-46",
+            "registry-47",
             "directory-source",
             "directory-storage",
             "directory-address",
@@ -358,6 +398,135 @@ def _expected_shard_provenance(
     return _shard_provenance(root, kind, shard, coverage_path, base_sha, head_sha)
 
 
+def _cohort_files(artifact_directory: Path) -> dict[str, Path]:
+    """Require one bounded, closed PostgreSQL cohort with every original sidecar."""
+
+    expected_names = {
+        POSTGRES_COHORT_NAME,
+        POSTGRES_COVERAGE_NAME,
+        *(shard_file_names("postgres", shard)[1] for shard in SHARD_SPEC_BY_KIND["postgres"]["shards"]),
+    }
+    try:
+        paths_by_name = {path.name: path for path in artifact_directory.iterdir()}
+        if artifact_directory.is_symlink() or set(paths_by_name) != expected_names:
+            raise CoverageForecastError("postgres: cohort files differ from the exact producer set")
+        total_bytes = 0
+        for path in paths_by_name.values():
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= MAX_COHORT_FILE_BYTES:
+                raise CoverageForecastError("postgres: cohort members must be bounded regular files")
+            total_bytes += metadata.st_size
+        if total_bytes > MAX_COHORT_TOTAL_BYTES:
+            raise CoverageForecastError("postgres: cohort exceeds the aggregate limit")
+    except OSError as exc:
+        raise CoverageForecastError("postgres: cohort files are unavailable") from exc
+    return paths_by_name
+
+
+def _read_cohort_json(path: Path) -> dict[str, Any]:
+    """Reject ambiguous JSON before comparing immutable cohort provenance."""
+
+    def unique_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        """Reject duplicate object fields at every nesting level."""
+
+        fields_by_name: dict[str, Any] = {}
+        for name, value in pairs:
+            if name in fields_by_name:
+                raise ValueError("duplicate JSON key")
+            fields_by_name[name] = value
+        return fields_by_name
+
+    def reject_constant(value: str) -> None:
+        """Refuse values outside the JSON number grammar."""
+
+        raise ValueError(f"unsupported JSON constant: {value}")
+
+    try:
+        document = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=unique_fields, parse_constant=reject_constant
+        )
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise CoverageForecastError(f"postgres: invalid cohort JSON: {path.name}") from exc
+    if not isinstance(document, dict):
+        raise CoverageForecastError("postgres: cohort JSON must be an object")
+    return document
+
+
+def _is_cohort_digest(value: Any) -> bool:
+    """Recognize only complete lowercase SHA-256 strings, without coercion."""
+
+    return isinstance(value, str) and SHA256_PATTERN.fullmatch(value) is not None
+
+
+def _verify_cohort_sidecars(
+    paths_by_name: dict[str, Path], manifest: dict[str, Any], header_by_name: dict[str, Any]
+) -> None:
+    """Bind each unchanged original producer sidecar without requiring its raw database."""
+
+    inputs_by_shard = manifest.get("inputs")
+    shards = SHARD_SPEC_BY_KIND["postgres"]["shards"]
+    if not isinstance(inputs_by_shard, dict) or set(inputs_by_shard) != set(shards):
+        raise CoverageForecastError("postgres: cohort inputs differ from the exact producer set")
+    for shard in shards:
+        original_coverage_name, provenance_name = shard_file_names("postgres", shard)
+        input_hashes = inputs_by_shard[shard]
+        if (
+            not isinstance(input_hashes, dict)
+            or set(input_hashes) != {"coverage_sha256", "provenance_sha256"}
+            or not all(_is_cohort_digest(digest) for digest in input_hashes.values())
+        ):
+            raise CoverageForecastError(f"postgres/{shard}: malformed cohort input hashes")
+        provenance_path = paths_by_name[provenance_name]
+        provenance = _read_cohort_json(provenance_path)
+        expected_by_field = {
+            "schema_version": PROVENANCE_SCHEMA_VERSION,
+            "kind": "postgres",
+            "shard": shard,
+            "report_name": "python",
+            **header_by_name,
+            "coverage_file": original_coverage_name,
+            "coverage_sha256": input_hashes["coverage_sha256"],
+        }
+        if "common_test_execution" in provenance:
+            if not isinstance(provenance["common_test_execution"], dict):
+                raise CoverageForecastError(f"postgres/{shard}: common test execution must be an object")
+            expected_by_field["common_test_execution"] = provenance["common_test_execution"]
+        if type(provenance.get("schema_version")) is not int or provenance != expected_by_field:
+            raise CoverageForecastError(f"postgres/{shard}: cohort provenance differs from the exact CI input")
+        if _sha256_file(provenance_path) != input_hashes["provenance_sha256"]:
+            raise CoverageForecastError(f"postgres/{shard}: cohort provenance digest differs")
+
+
+def _verify_postgres_cohort(root: Path, artifact_directory: Path, base_sha: str, head_sha: str) -> list[Path]:
+    """Accept one provenance-bound PostgreSQL union while preserving all producer identities."""
+
+    paths_by_name = _cohort_files(artifact_directory)
+    manifest = _read_cohort_json(paths_by_name[POSTGRES_COHORT_NAME])
+    _baseline(root)
+    header_by_name = {
+        "head_sha": head_sha,
+        "base_sha": base_sha,
+        "baseline_sha256": _sha256_file(root / BASELINE_NAME),
+        "coverage_version": _coverage_version(),
+    }
+    expected_by_field = {
+        "schema": "python-coverage-cohort/v1",
+        "kind": "postgres",
+        **header_by_name,
+        "coverage_file": POSTGRES_COVERAGE_NAME,
+        "coverage_sha256": _sha256_file(paths_by_name[POSTGRES_COVERAGE_NAME]),
+        "inputs": manifest.get("inputs"),
+    }
+    if manifest != expected_by_field:
+        raise CoverageForecastError("postgres: cohort manifest differs from the exact CI input")
+    _verify_cohort_sidecars(paths_by_name, manifest, header_by_name)
+    try:
+        validate_cohort_data(paths_by_name[POSTGRES_COVERAGE_NAME])
+    except ValueError as exc:
+        raise CoverageForecastError("postgres: invalid cohort coverage data") from exc
+    return [paths_by_name[POSTGRES_COVERAGE_NAME]]
+
+
 def verify_shard_artifacts(
     root: Path,
     artifact_directory: Path,
@@ -368,6 +537,9 @@ def verify_shard_artifacts(
     """Reject missing, stale, renamed, or mixed Python coverage producers."""
 
     specification = _shard_spec(kind)
+    cohort_path = artifact_directory / POSTGRES_COHORT_NAME
+    if kind == "postgres" and (cohort_path.exists() or cohort_path.is_symlink()):
+        return _verify_postgres_cohort(root, artifact_directory, base_sha, head_sha)
     expected_names = {file_name for shard in specification["shards"] for file_name in shard_file_names(kind, shard)}
     try:
         actual_names = {path.name for path in artifact_directory.iterdir() if path.is_file()}
