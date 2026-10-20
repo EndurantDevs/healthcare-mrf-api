@@ -31,7 +31,9 @@ def test_projection_migration_extends_the_single_installed_head():
     readiness = "20261017210000_provider_directory_readiness_indexes"
     raw_objects = "20261017010000_custom_import_raw_objects"
     continuation = "20261019010000_custom_import_build_continuation"
-    assert script.get_heads() == [continuation]
+    staged_verification = "20261020150000_custom_import_staged_verification"
+    assert script.get_heads() == [staged_verification]
+    assert script.get_revision(staged_verification).down_revision == continuation
     assert script.get_revision(continuation).down_revision == raw_objects
     assert script.get_revision(raw_objects).down_revision == readiness
     assert script.get_revision(readiness).down_revision == module.revision
@@ -40,6 +42,7 @@ def test_projection_migration_extends_the_single_installed_head():
         readiness,
         raw_objects,
         continuation,
+        staged_verification,
     ]
 
 

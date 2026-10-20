@@ -110,6 +110,7 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261017210000_provider_directory_readiness_indexes",
     "20261017010000_custom_import_raw_objects",
     "20261019010000_custom_import_build_continuation",
+    "20261020150000_custom_import_staged_verification",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -120,7 +121,7 @@ _SERVICE_NETWORK_UPGRADE_REVISIONS = (
 
 def _assert_current_registry_head(script: ScriptDirectory) -> None:
     """Require one registry head after the unchanged published custom-import chain."""
-    assert script.get_heads() == ["20261019010000_custom_import_build_continuation"]
+    assert script.get_heads() == ["20261020150000_custom_import_staged_verification"]
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )
@@ -215,62 +216,13 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
 def test_profile_migrations_follow_custom_import_processing_policy() -> None:
     """The initial publication upgrade extends the prior migration head in order."""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert tuple(
-        step.revision.revision
-        for step in script._upgrade_revs("head", "20261002020000_custom_import_processing_policy")
-    ) == (
-        "20261002030000_custom_import_identical_children",
-        "20261002040000_custom_import_child_memberships",
-        "20261003000000_address_alias_generation_guard",
-        "20261004000000_geo_assurance_dependency_bindings",
-        "20261001100000_profile_failed_cleanup_claim",
-        "20261001110000_profile_initial_publication",
-        "20261005020000_custom_import_sealed_append_plans",
-        "20261005030000_source_profile_statement_pins",
-        "20261005100000_rooted_graph_set_validation",
-        "20261005110000_ptg_set_validation",
-        "20261005120000_practitioner_set_validation",
-        "20261005130000_provider_dataset_candidates",
-        "20261005030000_custom_import_snapshot_storage",
-        "20261005040000_custom_import_bulk_snapshot_writers",
-        "20261005050000_custom_import_legacy_snapshot_writers",
-        "20261005060000_custom_import_snapshot_finality",
-        "20261005070000_custom_import_materialization_storage",
-        "20261005080000_custom_import_writer_cutover",
-        "20261007000000_custom_import_rejection_anti_joins",
-        "20261006010000_nucc_reference_result_generation",
-        "20261009000000_custom_import_child_presence_decode",
-        "20261010000000_custom_import_admission_indexes",
-        "20261010010000_custom_import_materialization_contract",
-        "20261007010000_managed_network_registry",
-        "20261007020000_registry_revision_history",
-        "20261007030000_network_serving_control",
-        "20261007040000_registry_source_evidence",
-        "20261007050000_canonical_address_network_ids",
-        "20261007060000_registry_approved_selection",
-        "20261007070000_registry_company_links",
-        "20261007080000_manual_directory_registry",
-        "20261007090000_network_membership_drafts",
-        "20261007100000_registry_publication_requests",
-        "20261007110000_registry_site_bindings",
-        "20261007120000_company_network_assertions",
-        "20261007130000_registry_network_bindings",
-        "20261007140000_registry_source_recipes",
-        "20261007150000_provider_directory_content_cursor_index",
-        "20261009010000_registry_ptg_producer_scope",
-        "20261009020000_company_registry_assertions",
-        "20261009030000_network_catalog_evidence",
-        "20261009040000_registry_ptg_published_plan_scope",
-        "20261010010000_registry_ptg_office_approval",
-        "20261010020000_registry_ptg_office_retention",
-        "20261010030000_registry_source_admission_receipt",
-        "20261011010000_company_registry_group_assertions",
-        "20261012010000_company_registry_name_origin",
-        "20261013010000_registry_custom_history_events",
-        "20261015020000_custom_import_query_projections",
-        "20261017210000_provider_directory_readiness_indexes",
-        "20261017010000_custom_import_raw_objects",
-        "20261019010000_custom_import_build_continuation",
+    followup_index = _HOSPITAL_UPGRADE_REVISIONS.index("20261002030000_custom_import_identical_children")
+    assert (
+        tuple(
+            step.revision.revision
+            for step in script._upgrade_revs("head", "20261002020000_custom_import_processing_policy")
+        )
+        == _HOSPITAL_UPGRADE_REVISIONS[followup_index:]
     )
 
 
