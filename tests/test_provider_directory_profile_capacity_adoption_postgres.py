@@ -241,13 +241,15 @@ def _current_migration_heads():
     """Check the current head without weakening the historical predecessor chain."""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     expected_heads = set(script.get_heads())
-    assert expected_heads == {"20261019010000_custom_import_build_continuation"}
+    assert expected_heads == {"20261020150000_custom_import_staged_verification"}
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )
     readiness = script.get_revision("20261017210000_provider_directory_readiness_indexes")
     raw_objects = script.get_revision("20261017010000_custom_import_raw_objects")
-    assert script.get_revision(next(iter(expected_heads))).down_revision == raw_objects.revision
+    continuation = script.get_revision("20261019010000_custom_import_build_continuation")
+    assert script.get_revision(next(iter(expected_heads))).down_revision == continuation.revision
+    assert continuation.down_revision == raw_objects.revision
     assert raw_objects.down_revision == readiness.revision
     assert readiness.down_revision == "20261015020000_custom_import_query_projections"
     assert script.get_revision("20261015020000_custom_import_query_projections").down_revision == (
