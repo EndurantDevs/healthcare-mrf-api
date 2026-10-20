@@ -451,6 +451,44 @@ def test_occurrence_copy_keeps_native_binary_identifiers(binary_type):
 
 
 @pytest.mark.asyncio
+async def test_occurrence_batches_span_sparse_shards_without_losing_repeated_rates(monkeypatch):
+    monkeypatch.setattr(plan_staging, "_PROVIDER_KEY_BATCH_SIZE", 2)
+    scope = imported._NativeScope(
+        _selection().in_network_bindings[0], _selection()._validated_serving_tables[0][1], {}, None
+    )
+    provider_keys = (0, 7, 1024, 8192, 1048576)
+    batches = []
+
+    async def forward(_session, _tables, **options):
+        batch = options["provider_set_keys"]
+        batches.append(batch)
+        assert options["limit"] is None and options["offset"] == 0
+        return [_rate(1, key + 1, key) for key in batch for _ in range(2)]
+
+    monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", forward)
+    monkeypatch.setattr(serving, "_hydrate_provider_set_network_names", AsyncMock())
+    async with _plan_session() as session:
+        await plan_staging.copy_plan_rows(
+            session,
+            plan_sql.MEMBERSHIPS,
+            ("binding_ordinal", "npi", "provider_set_key", "membership_ordinal"),
+            [(0, npi, key, ordinal) for npi in (1000000001, 1000000002) for ordinal, key in enumerate(provider_keys)],
+        )
+        await plan_staging.stage_native_occurrences(session, scope, [dict(code_key=1)], serving)
+        occurrences = (
+            await session.execute(
+                text(
+                    f"SELECT occurrence_id, provider_set_key FROM pg_temp.{plan_sql.OCCURRENCES} ORDER BY occurrence_id"
+                )
+            )
+        ).all()
+    assert batches == [(0, 7), (1024, 8192), (1048576,)]
+    assert [tuple(occurrence) for occurrence in occurrences] == list(
+        enumerate(key for key in provider_keys for _ in range(2))
+    )
+
+
+@pytest.mark.asyncio
 async def test_plan_missing_validated_native_binding_fails_closed(monkeypatch):
     forward_read, prices, providers = _native_fixture(monkeypatch)
     selection = replace(_selection(), _validated_serving_tables=())
