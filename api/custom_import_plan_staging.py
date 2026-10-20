@@ -8,10 +8,10 @@ import json
 from sqlalchemy import text
 
 from api.custom_import_plan_sql import CANDIDATES, MEMBERSHIPS, OCCURRENCE_COPY_COLUMNS, OCCURRENCES, PRICES
-from api.ptg2_db_sidecars import _normalized_provider_shard_span
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 _NPI_BATCH_SIZE = 1024
+_PROVIDER_KEY_BATCH_SIZE = 1024
 _PRICE_BATCH_SIZE = 512
 
 
@@ -92,33 +92,21 @@ def _native_binary_json(binary_value):
     raise TypeError("the native occurrence contains unsupported JSON metadata")
 
 
-async def _next_provider_shard(session, scope, span, after_shard):
-    query_result = await session.execute(
-        text(f"""SELECT MIN(provider_set_key) FROM pg_temp.{MEMBERSHIPS}
-                 WHERE binding_ordinal = :binding AND provider_set_key >= :first_key"""),
-        dict(binding=scope.binding.binding_ordinal, first_key=(after_shard + 1) * span),
-    )
-    first_key = query_result.scalar_one_or_none()
-    return None if first_key is None else int(first_key) // span
-
-
-async def _provider_keys_in_shard(session, scope, span, shard):
+async def _provider_key_batch(session, scope, after_key):
     query_result = await session.execute(
         text(f"""SELECT DISTINCT provider_set_key FROM pg_temp.{MEMBERSHIPS}
-                 WHERE binding_ordinal = :binding AND provider_set_key >= :first_key
-                   AND provider_set_key < :last_key ORDER BY provider_set_key"""),
-        dict(binding=scope.binding.binding_ordinal, first_key=shard * span, last_key=(shard + 1) * span),
+                 WHERE binding_ordinal = :binding AND provider_set_key > :after_key
+                 ORDER BY provider_set_key LIMIT :batch_size"""),
+        dict(binding=scope.binding.binding_ordinal, after_key=after_key, batch_size=_PROVIDER_KEY_BATCH_SIZE),
     )
     return tuple(int(provider_key) for provider_key in query_result.scalars())
 
 
 async def stage_native_occurrences(session, scope, code_rows, serving):
-    """Decode each relevant sealed provider shard once, never an order prefix."""
+    """Read bounded exact key batches across sparse shards, never an order prefix."""
 
-    span = _normalized_provider_shard_span(scope.serving_tables.provider_shard_span)
-    after_shard, occurrence_id = -1, 0
-    while (shard := await _next_provider_shard(session, scope, span, after_shard)) is not None:
-        provider_keys = await _provider_keys_in_shard(session, scope, span, int(shard))
+    after_key, occurrence_id = -1, 0
+    while provider_keys := await _provider_key_batch(session, scope, after_key):
         serving_rows = await serving._merge_manifest_code_variant_rows(
             session,
             scope.serving_tables,
@@ -139,7 +127,7 @@ async def stage_native_occurrences(session, scope, code_rows, serving):
         )
         await copy_plan_rows(session, OCCURRENCES, OCCURRENCE_COPY_COLUMNS, records)
         occurrence_id += len(serving_rows)
-        after_shard = int(shard)
+        after_key = provider_keys[-1]
 
 
 async def stage_native_prices(session, scope, serving):
