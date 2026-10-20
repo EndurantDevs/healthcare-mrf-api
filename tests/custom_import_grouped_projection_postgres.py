@@ -5,6 +5,7 @@
 import json
 from dataclasses import replace
 from decimal import Decimal
+from itertools import product
 
 import pytest
 from sqlalchemy import BigInteger, LargeBinary, Numeric, Text, and_, column, select, values
@@ -276,18 +277,19 @@ async def test_root_rollup_keeps_siblings_and_year(projection_case):
 async def test_native_count_order_page_parity(projection_case):
     session, legacy, projected = projection_case
     for metric, selectors in (("root_cost", ()), ("child_cost", (_KEY,))):
-        for direction in ("asc", "desc"):
+        for direction, require_match in product(("asc", "desc"), (False, True)):
             prepared_relations = [
                 _prepare(
                     context,
                     context_filters=selectors,
                     order_terms=(read_core.ReadOrderTerm(metric, direction, "last"),),
-                    require_match=False,
+                    require_match=require_match,
                 )
                 for context in (legacy, projected)
             ]
+            assert all(prepared.effective_require_match is require_match for prepared in prepared_relations)
             for is_geo in (False, True):
-                expected_total = (5 if is_geo else 4) if not selectors else (3 if is_geo else 2)
+                expected_total = (3 if is_geo else 2) if require_match else (5 if is_geo else 4)
                 pages = [
                     await _native_pages(session, prepared, is_geo=is_geo, expected_total=expected_total)
                     for prepared in prepared_relations
@@ -297,7 +299,7 @@ async def test_native_count_order_page_parity(projection_case):
                     [native._A, native._B] if metric == "root_cost" or direction == "asc" else [native._B, native._A]
                 )
                 expected_npis = [npi for npi in positive_order for _ in range(2 if is_geo and npi == native._A else 1)]
-                if not selectors:
+                if not require_match:
                     expected_npis += [native._C, child_native._ABSENT]
                 assert [identity[0] for identity, _score in pages[0]] == expected_npis
 

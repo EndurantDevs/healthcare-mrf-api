@@ -95,8 +95,18 @@ def normalize_plan(context, query, scope, *, projection="query_projection", use_
         raise core.CustomImportReadRequestError("metric predicates require imported membership")
     projection = "full_family" if query.family_entitlement == "full_family" else projection
     fingerprint = _query_fingerprint(context, query, selectors, metrics, order, selected_value, projection, scope)
+    child_membership = bool(child_selectors) and not _optional_child_order(query, selectors, metrics)
     return GroupedReadPlan(
-        selected_value, selectors, metrics, order, fingerprint, projection, query.require_match or bool(child_selectors)
+        selected_value, selectors, metrics, order, fingerprint, projection, query.require_match or child_membership
+    )
+
+
+def _optional_child_order(query, selectors, metrics):
+    return (
+        not query.require_match
+        and bool(query.order_terms)
+        and not metrics
+        and any(predicate.field.collection is not None for predicate in selectors)
     )
 
 
@@ -191,6 +201,8 @@ def _query_fingerprint(context, query, selectors, metrics, order, selected_value
     if query.grouped_child_query is not None:
         descriptor_map["grouped_child_query"] = query.grouped_child_query
         domain = b"custom-import-grouped-child-read/v1\0"
+    if _optional_child_order(query, selectors, metrics):
+        descriptor_map["native_membership"] = "optional-order/v1"
     return hashlib.sha256(domain + canonical_read_document(descriptor_map)).hexdigest()
 
 

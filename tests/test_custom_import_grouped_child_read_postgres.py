@@ -525,12 +525,17 @@ async def _native_rows(session, prepared, *, is_geo, require_match=False, anchor
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_geo", [False, True])
 @pytest.mark.parametrize("direction", ["asc", "desc"])
-async def test_native_exact_counts_and_stable_child_order_pagination(is_geo, direction):
+@pytest.mark.parametrize("child_key", ("service_code", "child_alias"))
+async def test_native_exact_counts_and_stable_child_order_pagination(is_geo, direction, child_key):
     async with native._case(children=_children()) as (case, target), case.sessions() as session:
-        prepared, rows = await native._relation(session, target, _ordered_query(direction=direction))
+        query = replace(
+            _ordered_query(direction=direction), context_filters=(_PANEL, ReadFilter(child_key, "eq", "chosen"))
+        )
+        prepared, rows = await native._relation(session, target, query)
         assert set(tuple(row) for row in rows) == {(native._A, Decimal("2")), (native._B, Decimal("5"))}
+        assert prepared.effective_require_match is False
         received, anchor = [], None
-        total = 3 if is_geo else 2
+        total = 5 if is_geo else 4
         for offset in range(total):
             count, page = await _native_rows(session, prepared, is_geo=is_geo, anchor=anchor, offset=offset)
             assert count == total and len(page) == 1
@@ -540,6 +545,7 @@ async def test_native_exact_counts_and_stable_child_order_pagination(is_geo, dir
         expected = [native._A] * (2 if is_geo else 1) + [native._B]
         if direction == "desc":
             expected = [native._B] + [native._A] * (2 if is_geo else 1)
+        expected += [native._C, _ABSENT]
         assert [npi for npi, _address in received] == expected
         assert (await _native_rows(session, prepared, is_geo=is_geo, anchor=anchor, offset=total))[1] == []
 
@@ -547,24 +553,24 @@ async def test_native_exact_counts_and_stable_child_order_pagination(is_geo, dir
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_geo", [False, True])
 @pytest.mark.parametrize("direction", ["asc", "desc"])
-async def test_present_null_sorts_last_and_missing_child_excludes_native_rows(is_geo, direction):
+async def test_present_null_precedes_missing_child_and_import(is_geo, direction):
     async with native._case(children=_children()) as (case, target), case.sessions() as session:
         query = _ordered_query("nullable", direction, family_entitlement="full_family")
         prepared, rows = await native._relation(session, target, query)
         assert set(tuple(row) for row in rows) == {(native._A, Decimal("2")), (native._B, None)}
         first_count, first = await _native_rows(session, prepared, is_geo=is_geo)
-        assert first_count == (3 if is_geo else 2) and first[0]["npi_code"] == native._A
+        assert first_count == (5 if is_geo else 4) and first[0]["npi_code"] == native._A
         anchor = None
         selected_npis = []
         for offset in range(first_count):
             _count, page = await _native_rows(session, prepared, is_geo=is_geo, anchor=anchor, offset=offset)
             selected_npis.append(page[0]["npi_code"])
             anchor = (page[0]["npi_code"], str(page[0]["address_key"]))
-        assert selected_npis == [native._A] * (2 if is_geo else 1) + [native._B]
+        assert selected_npis == [native._A] * (2 if is_geo else 1) + [native._B, native._C, _ABSENT]
         missing = _ordered_query("both", direction, family_entitlement="full_family")
         missing_prepared, missing_rows = await native._relation(session, target, missing)
         assert len(missing_rows) == 1 and missing_rows[0].entity_value == native._A
-        assert (await _native_rows(session, missing_prepared, is_geo=is_geo))[0] == (2 if is_geo else 1)
+        assert (await _native_rows(session, missing_prepared, is_geo=is_geo))[0] == (5 if is_geo else 4)
         assert set(await native._page(session, target, missing)) == {native._A}
 
 
@@ -650,7 +656,7 @@ async def _signed_page_reply(session, prepared, *, is_geo):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_geo", [False, True])
-async def test_signed_child_pages_require_selected_episode_and_keep_complete_families(monkeypatch, is_geo):
+async def test_signed_child_order_keeps_optional_rows(monkeypatch, is_geo):
     http_fixture._install_keyring(monkeypatch)
     module = geo_http if is_geo else provider_http
     path = geo_http.CUSTOM_IMPORT_PROVIDER_GEO_PATH if is_geo else provider_http.CUSTOM_IMPORT_PROVIDERS_PATH
@@ -674,7 +680,7 @@ async def test_signed_child_pages_require_selected_episode_and_keep_complete_fam
         reply = await endpoint(http_fixture._Request(body, headers, path=path), session)
         assert reply.status == 200, reply.body
         result_map = json.loads(reply.body)
-        assert result_map["total_count" if is_geo else "total"] == (2 if is_geo else 1)
+        assert result_map["total_count" if is_geo else "total"] == (5 if is_geo else 4)
         families = []
         for provider_row in result_map["items" if is_geo else "rows"]:
             if provider_row["npi"] == native._A:
@@ -929,6 +935,10 @@ async def test_reduced_scores_preserve_panel_membership_nulls_and_mixed_raw_metr
     async with native._case(children=_children()) as (case, pinned_target), case.sessions() as session:
         prepared, selected_rows = await native._relation(session, pinned_target, query)
         assert [tuple(selected_row) for selected_row in selected_rows] == [(native._A, Decimal("15"))]
+        assert prepared.effective_require_match is False
+        for is_geo in (False, True):
+            count, page = await _native_rows(session, prepared, is_geo=is_geo)
+            assert count == (5 if is_geo else 4) and page[0]["npi_code"] == native._A
         assert "FROM projected_score_values" in str(prepared.statement)
         nullable = replace(
             query,
@@ -1127,14 +1137,18 @@ async def test_materialized_complete_child_identity_retains_native_ambiguity_fai
         assert (await values_connection.execute(statement)).scalar_one() == 3
 
 
-def test_episode_alias_promotes_membership_but_root_order_retains_native_nulls():
+def test_child_and_root_order_retain_native_nulls():
     child_query = fixture.query(
         context_filters=(ReadFilter("panel_alias", "eq", "segment_a"), ReadFilter("child_alias", "eq", "chosen")),
         order_terms=(ReadOrderTerm("cost_alias", "asc", "last"),),
         require_match=False,
     )
     context, scope = fixture.context(), ExtensionReadScope("synthetic:grouped")
-    assert grouped_read.prepare_relation(context, child_query, scope).effective_require_match is True
+    assert grouped_read.prepare_relation(context, child_query, scope).effective_require_match is False
+    assert (
+        grouped_read.prepare_relation(context, replace(child_query, order_terms=None), scope).effective_require_match
+        is True
+    )
     root_query = replace(child_query, context_filters=(_PANEL,), order_terms=(ReadOrderTerm("score", "asc", "last"),))
     assert grouped_read.prepare_relation(context, root_query, scope).effective_require_match is False
 
