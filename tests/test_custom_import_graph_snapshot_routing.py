@@ -2,9 +2,9 @@
 
 """Graph query routing and authority freshness; no native execution is claimed."""
 
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import select
@@ -182,7 +182,8 @@ def _paged_session(monkeypatch, pages, *, fail_resolution=None):
             if session.transaction_count == fail_resolution:
                 raise CandidateRunnerError("binding unavailable")
             return SimpleNamespace(one=lambda: (17, 18))
-        session.events.append("metadata" if statement._limit_clause is not None else "payload")
+        description_by_key = statement.column_descriptions[0]
+        session.events.append("payload" if description_by_key["expr"] is description_by_key["entity"] else "metadata")
         rows = next(responses)
         return SimpleNamespace(all=lambda: rows)
 
@@ -238,15 +239,20 @@ def test_resolver_elapsed_deadline_prevents_metadata_fetch(monkeypatch):
     assert not session.has_transaction
 
 
-def test_candidate_digest_reads_only_resolved_plan_and_preserves_hash(monkeypatch):
+@pytest.mark.parametrize("physical", [False, True])
+def test_candidate_digest_reads_only_resolved_plan_and_preserves_hash(monkeypatch, physical):
     root_hashes = (b"a" * 32, b"b" * 32)
     families = [SimpleNamespace(complete_at=object(), root_key_sha256=digest) for digest in root_hashes]
+    records = [
+        (family, family.root_key_sha256, index, len(families)) if physical else (family,)
+        for index, family in enumerate(families, 1)
+    ]
     session = _paged_session(
         monkeypatch,
-        [[(root_hashes[0], 1, 1), (root_hashes[1], 2, 1)], [(family,) for family in families], []],
+        [[(root_hashes[0], 1, 1), (root_hashes[1], 2, 1)], records, []],
     )
     request = _request()
-    digest, count = graph._candidate_digest(session, request, 7)
+    digest, count = graph._candidate_digest(session, request, 7, bounds=graph._ReadPage(physical=physical))
     assert count == 2
     assert digest == candidate_hash_ordered(
         execution_id=request.execution_id,
@@ -259,6 +265,80 @@ def test_candidate_digest_reads_only_resolved_plan_and_preserves_hash(monkeypatc
         if not isinstance(call.args[0], TextClause):
             assert "ci_snapshot_17.custom_import_build_family" in str(call.args[0])
             assert "mrf.custom_import_build_family" not in str(call.args[0])
+
+
+@pytest.mark.asyncio
+async def test_output_opening_coalesces_candidate_fingerprint_before_generation_write(monkeypatch):
+    request = _request(page_row_limit=1)
+    root_hashes = (b"a" * 32, b"b" * 32)
+    families = [SimpleNamespace(complete_at=object(), root_key_sha256=digest) for digest in root_hashes]
+    sync_session = _paged_session(
+        monkeypatch,
+        [
+            [(digest, index, 1) for index, digest in enumerate(root_hashes, 1)],
+            [(family, family.root_key_sha256, index, 2) for index, family in enumerate(families, 1)],
+            [],
+        ],
+    )
+    read_session = SimpleNamespace(run_sync=AsyncMock(side_effect=lambda read: read(sync_session)))
+    write_session = SimpleNamespace(add=Mock())
+    build = SimpleNamespace(generation_id=None, capture_bundle_id=9, base_generation_id=None)
+
+    @asynccontextmanager
+    async def reading(_factory):
+        yield read_session
+
+    @asynccontextmanager
+    async def writing(_factory, supplied_request, build_id):
+        assert supplied_request is request and build_id == 7
+        assert sync_session.transaction_count == 2 and not sync_session.has_transaction
+        yield write_session, build
+
+    async def flush(session):
+        assert session is write_session
+        session.add.call_args.args[0].generation_id = 11
+
+    monkeypatch.setattr(graph, "_session", reading)
+    monkeypatch.setattr(graph, "_page_session", writing)
+    monkeypatch.setattr(graph, "_source_digest", Mock(return_value=b"s" * 32))
+    monkeypatch.setattr(graph, "_flush_page", flush)
+    protected_call = AsyncMock(return_value="output")
+    monkeypatch.setattr(graph, "_call", protected_call)
+    assert await graph._open_output(object(), request, 7, 9) == 11
+    generation = write_session.add.call_args.args[0]
+    assert generation.root_count == generation.family_count == 2
+    assert generation.candidate_sha256 == candidate_hash_ordered(
+        execution_id=request.execution_id,
+        fence=request.fence,
+        base_generation_id=request.expected_base_generation_id,
+        root_key_hashes=iter(root_hashes),
+    )
+    assert generation.source_bundle_sha256 == b"s" * 32
+    graph._source_digest.assert_called_once_with(sync_session, request, 7, 9)
+    protected_call.assert_awaited_once_with(write_session, "open_custom_import_build_output", (7, 11))
+    assert sync_session.events == ["resolve", "metadata", "payload", "resolve", "metadata"]
+
+
+@pytest.mark.parametrize("failure", ["incomplete", "byte_limit", "binding"])
+def test_physical_candidate_fingerprint_preserves_fail_closed_reads(monkeypatch, failure):
+    family = SimpleNamespace(complete_at=None if failure == "incomplete" else object(), root_key_sha256=b"a" * 32)
+    session = _paged_session(
+        monkeypatch,
+        [[(family.root_key_sha256, 1, 2)], [(family, family.root_key_sha256, 1, 1)]],
+        fail_resolution=2 if failure == "binding" else None,
+    )
+    request = _request(page_byte_limit=1 if failure == "byte_limit" else 2)
+    message = {
+        "incomplete": "requires completed families",
+        "byte_limit": "one build record exceeds",
+        "binding": "binding unavailable",
+    }[failure]
+    with pytest.raises(CandidateRunnerError, match=message):
+        graph._candidate_digest(session, request, 7, bounds=graph._ReadPage(physical=True))
+    assert not session.has_transaction
+    assert session.transaction_count == (2 if failure == "binding" else 1)
+    if failure == "byte_limit":
+        assert session.events == ["resolve", "metadata"]
 
 
 def test_one_query_row_closes_without_resolving_another_page(monkeypatch):

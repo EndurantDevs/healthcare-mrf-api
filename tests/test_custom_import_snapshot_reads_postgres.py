@@ -79,6 +79,9 @@ from tests.custom_import_query_projection_authority_postgres import (
     test_signed_scope_rejections_leave_native_projection_state_untouched as test_signed_scope_rejections_leave_native_projection_state_untouched,
 )
 from tests.custom_import_query_projection_build_postgres import (
+    test_later_projection_chunk_rolls_back as test_later_projection_chunk_rolls_back,
+)
+from tests.custom_import_query_projection_build_postgres import (
     test_projection_resumes_context_pages_and_preserves_all_null_rows as test_projection_resumes_context_pages_and_preserves_all_null_rows,
 )
 from tests.custom_import_query_projection_build_postgres import (
