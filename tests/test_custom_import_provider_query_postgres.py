@@ -790,7 +790,7 @@ async def test_sql_plan_incomplete_native_data_fails_closed(monkeypatch, missing
 
 
 @pytest.mark.asyncio
-async def test_sql_plan_reads_each_physical_provider_shard_once(monkeypatch):
+async def test_sql_plan_batches_sparse_provider_shards_without_changing_groups(monkeypatch):
     forward_read, _prices, _providers = _native_fixture(monkeypatch)
     provider_keys = (1000, 1023, 1024, 2049)
     keys_by_id = {f"{provider_key:032x}": provider_key for provider_key in provider_keys}
@@ -813,12 +813,35 @@ async def test_sql_plan_reads_each_physical_provider_shard_once(monkeypatch):
         )
     assert response["pagination"]["total"] == 12
     assert len(response["items"]) == 12
-    assert [native_call.kwargs["provider_set_keys"] for native_call in forward_read.await_args_list] == [
-        (1000, 1023),
-        (1024,),
-        (2049,),
-    ]
+    assert [native_call.kwargs["provider_set_keys"] for native_call in forward_read.await_args_list] == [provider_keys]
     assert all(native_call.kwargs["limit"] is None for native_call in forward_read.await_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "npi,require_match,total",
+    [(1000000001, True, 2), (1000000002, True, 0), (1000000003, True, 0), (1000000003, False, 2)],
+)
+async def test_exact_plan_provider_preserves_score_match_and_missing_membership(monkeypatch, npi, require_match, total):
+    forward_read, _prices, _providers = _native_fixture(monkeypatch)
+    scores = union_all(
+        select(literal("1000000001").label("entity_value"), literal(5).label("cost"), literal(3).label("quality")),
+        select(literal("1000000002"), literal(2), literal(5)),
+    ).subquery()
+    matching = select(scores.c.entity_value).where(scores.c.cost == 5, scores.c.quality >= 3)
+    query = ProviderServiceImportQuery(PreparedNpiEntityRelation(matching, (), "a" * 64, "b" * 64), require_match)
+    async with _plan_session() as session:
+        payload = await imported.search_imported_plan_providers(
+            session,
+            dict(code="27447", code_system="CPT", npi=npi),
+            SimpleNamespace(offset=0, limit=1, page=1),
+            _selection(),
+            query,
+        )
+    assert payload["pagination"]["total"] == total
+    assert [item["npi"] for item in payload["items"]] == ([npi] if total else [])
+    if not total:
+        forward_read.assert_not_awaited()
 
 
 @pytest.mark.asyncio
