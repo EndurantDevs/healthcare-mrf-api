@@ -216,6 +216,71 @@ def test_child_order_requires_exact_context():
         _plan(context_filters=(_PANEL,), filters=(_KEY,), order_terms=order)
 
 
+@pytest.mark.parametrize("field_id", ("service_code", "child_alias"))
+@pytest.mark.parametrize("direction", ("asc", "desc"))
+def test_child_order_retains_optional_membership(field_id, direction):
+    query = fixture.query(
+        context_filters=(_PANEL, ReadFilter(field_id, "eq", "chosen")),
+        order_terms=(ReadOrderTerm("cost_alias", direction, "last"),),
+        require_match=False,
+    )
+    prepared = grouped_read.prepare_relation(fixture.context(), query, _SCOPE)
+    assert prepared.effective_require_match is False
+    assert prepared.normalized_order_terms == (ReadOrderTerm("amount", direction, "last"),)
+
+
+@pytest.mark.parametrize("use_default_order", (False, True))
+def test_child_context_preserves_nonordering_membership(use_default_order):
+    document = fixture.definition_document()
+    document["query"]["order"] = [{"field": "amount", "direction": "asc", "nulls": "last"}]
+    context = replace(fixture.context(), definition=CustomImportDefinition.from_mapping(document))
+    query = fixture.query(context_filters=(_PANEL, _KEY), require_match=False)
+    plan = grouped_read.normalize_plan(context, query, _SCOPE, use_default_order=use_default_order)
+    assert plan.require_match is True
+    assert bool(plan.order_terms) is use_default_order
+    assert grouped_read.normalize_plan(context, replace(query, require_match=True), _SCOPE).require_match is True
+
+
+@pytest.mark.parametrize("field_id", ("service_code", "child_alias"))
+@pytest.mark.parametrize("mode", ("optional", "required", "no_order", "metric"))
+def test_child_order_versions_only_changed_cursors(field_id, mode):
+    query = fixture.query(
+        context_filters=(_PANEL, ReadFilter(field_id, "eq", "chosen")),
+        filters=(ReadFilter("amount", "gt", "1"),) if mode == "metric" else (),
+        order_terms=None if mode == "no_order" else (ReadOrderTerm("cost_alias", "asc", "last"),),
+        require_match=mode in {"required", "metric"},
+    )
+    plan = grouped_read.normalize_plan(fixture.context(), query, _SCOPE)
+    legacy_descriptor_map = {
+        "contract": "custom-import/grouped-entity-selection/v1",
+        "target": read_core._target_document(fixture.context().target),
+        "grouped_entity_selection": grouped.selection_document(),
+        "selection": {"mode": "max_per_entity"},
+        "context": [predicate.descriptor for predicate in plan.context_filters],
+        "filters": [predicate.descriptor for predicate in plan.filters],
+        "order": [
+            {"field": term.field_id, "direction": term.direction, "nulls": term.nulls} for term in plan.order_terms
+        ],
+        "projection": plan.projection,
+        "require_match": query.require_match,
+        "authorization_scope_sha256": read_core._scope_digest(_SCOPE),
+        "grouped_child_query": fixture.child_descriptor(),
+    }
+    previous = hashlib.sha256(
+        b"custom-import-grouped-child-read/v1\0" + canonical_read_document(legacy_descriptor_map)
+    ).hexdigest()
+    token = cursor_fixture.geo.issue_geo_cursor(
+        replace(cursor_fixture.STATE, query_fingerprint=previous), secret=cursor_fixture.SECRET
+    )
+    if mode == "optional":
+        assert plan.require_match is False and plan.fingerprint != previous
+        with pytest.raises(cursor_fixture.CustomImportReadCursorError):
+            cursor_fixture._open(token, query_fingerprint=plan.fingerprint)
+    else:
+        assert plan.require_match is True and plan.fingerprint == previous
+        assert cursor_fixture._open(token, query_fingerprint=plan.fingerprint).query_fingerprint == previous
+
+
 @pytest.mark.parametrize("field_id", ["service_code", "child_alias"])
 def test_child_key_cannot_be_a_metric(field_id):
     with pytest.raises(CustomImportReadRequestError, match="metric filters are invalid"):

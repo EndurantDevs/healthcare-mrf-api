@@ -587,12 +587,29 @@ async def _assert_child_filter_parity(session, pinned_target):
 
 async def _assert_grouped_order_parity(session, pinned_target):
     ordered = child_fixture._ordered_query()
-    prepared_query, ordered_rows = await native._relation(session, pinned_target, ordered)
-    assert set(map(tuple, ordered_rows)) == {(native._A, Decimal("2")), (native._B, Decimal("5"))}
-    for offset, expected_entity in enumerate((native._A, native._B)):
-        count, page = await child_fixture._native_rows(session, prepared_query, is_geo=False, offset=offset)
-        assert count == 2 and len(page) == 1 and page[0]["npi_code"] == expected_entity
-    assert (await child_fixture._native_rows(session, prepared_query, is_geo=False, offset=2))[1] == []
+    for require_match in (False, True):
+        prepared_query, ordered_rows = await native._relation(
+            session, pinned_target, replace(ordered, require_match=require_match)
+        )
+        assert prepared_query.effective_require_match is require_match
+        assert set(map(tuple, ordered_rows)) == {(native._A, Decimal("2")), (native._B, Decimal("5"))}
+        for is_geo in (False, True):
+            expected_rows = [(native._A, Decimal("2"))] * (2 if is_geo else 1) + [(native._B, Decimal("5"))]
+            if not require_match:
+                expected_rows += [(native._C, None), (child_fixture._ABSENT, None)]
+            anchor = None
+            for offset, (expected_entity, expected_score) in enumerate(expected_rows):
+                count, page = await child_fixture._native_rows(
+                    session, prepared_query, is_geo=is_geo, anchor=anchor, offset=offset
+                )
+                assert count == len(expected_rows) and len(page) == 1 and page[0]["npi_code"] == expected_entity
+                assert page[0]["sort_0"] == expected_score
+                anchor = (page[0]["npi_code"], str(page[0]["address_key"]))
+            assert (
+                await child_fixture._native_rows(
+                    session, prepared_query, is_geo=is_geo, anchor=anchor, offset=len(expected_rows)
+                )
+            )[1] == []
     root_ordered = fixture.query(
         context_filters=(child_fixture._PANEL,),
         order_terms=(read_core.ReadOrderTerm("score", "asc", "last"),),
