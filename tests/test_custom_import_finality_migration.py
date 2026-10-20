@@ -61,6 +61,7 @@ _SEALED_APPEND_FOLLOWUP_REVISIONS = (
     "20261017210000_provider_directory_readiness_indexes",
     "20261017010000_custom_import_raw_objects",
     "20261019010000_custom_import_build_continuation",
+    "20261020150000_custom_import_staged_verification",
 )
 
 
@@ -206,7 +207,7 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
     revision = _plans_migration().revision
-    assert script.get_heads() == ["20261019010000_custom_import_build_continuation"]
+    assert script.get_heads() == ["20261020150000_custom_import_staged_verification"]
     assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
         "20261010000000_custom_import_admission_indexes"
     )

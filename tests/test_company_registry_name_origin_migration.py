@@ -17,7 +17,7 @@ from db.models.company_registry import CompanyRegistry
 ROOT = Path(__file__).parents[1]
 REVISION = "20261012010000_company_registry_name_origin"
 PREDECESSOR = "20261011010000_company_registry_group_assertions"
-CURRENT_HEAD = "20261019010000_custom_import_build_continuation"
+CURRENT_HEAD = "20261020150000_custom_import_staged_verification"
 
 
 def _migration(revision=REVISION):
@@ -114,7 +114,9 @@ def test_origin_migration_extends_the_sole_existing_head():
     query_projections = "20261015020000_custom_import_query_projections"
     readiness = "20261017210000_provider_directory_readiness_indexes"
     raw_objects = "20261017010000_custom_import_raw_objects"
-    assert script.get_revision(CURRENT_HEAD).down_revision == raw_objects
+    continuation = "20261019010000_custom_import_build_continuation"
+    assert script.get_revision(CURRENT_HEAD).down_revision == continuation
+    assert script.get_revision(continuation).down_revision == raw_objects
     assert script.get_revision(raw_objects).down_revision == readiness
     assert script.get_revision(readiness).down_revision == query_projections
     assert script.get_revision(query_projections).down_revision == history
@@ -127,5 +129,6 @@ def test_origin_migration_extends_the_sole_existing_head():
         query_projections,
         readiness,
         raw_objects,
+        continuation,
         CURRENT_HEAD,
     ]
