@@ -410,28 +410,22 @@ class _ManifestRateScope:
 
 
 def _ptg2_geo_distance_miles_sql(lat_sql: str, long_sql: str) -> str:
-    """Return a PostgreSQL expression for great-circle distance in miles."""
-    request_lat = "CAST(:geo_lat AS double precision)"
-    request_long = "CAST(:geo_long AS double precision)"
-    return (
-        "(2 * 3958.7613 * asin(least(1.0, sqrt("
-        f"power(sin(radians(({lat_sql}) - {request_lat}) / 2), 2) + "
-        f"cos(radians({request_lat})) * cos(radians({lat_sql})) * "
-        f"power(sin(radians(({long_sql}) - {request_long}) / 2), 2)"
-        "))))"
-    )
+    """Use the same native spherical distance as the indexed KNN order."""
+    return f"(({_ptg2_geo_knn_meters_sql(lat_sql, long_sql)}) / 1609.344)"
 
 
 def _ptg2_geo_dwithin_sql(lat_sql: str, long_sql: str) -> str:
-    """Return an indexable PostGIS radius predicate for address-table geo scans."""
+    """Index nearby candidates, then enforce the exact displayed-mile radius."""
     request_lat = "CAST(:geo_lat AS double precision)"
     request_long = "CAST(:geo_long AS double precision)"
+    # Only the index prefilter gets roundoff margin; the final radius stays exact.
     return (
-        "ST_DWithin("
+        "(ST_DWithin("
         f"Geography(ST_MakePoint(({long_sql})::double precision, ({lat_sql})::double precision)), "
         f"Geography(ST_MakePoint({request_long}, {request_lat})), "
-        "CAST(:geo_radius_miles AS double precision) * 1609.34, true"
-        ")"
+        "CAST(:geo_radius_miles AS double precision) * 1609.344 + 0.001, false"
+        f") AND {_ptg2_geo_distance_miles_sql(lat_sql, long_sql)} "
+        "<= CAST(:geo_radius_miles AS double precision))"
     )
 
 

@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
@@ -14,10 +15,13 @@ import pytest
 from sqlalchemy import select, text, update
 
 from api import control_imports
+from api.control_imports import ACTIVE_STATUSES, TERMINAL_STATUSES
+from api.ptg_membership_contract import IMPORTER as MEMBERSHIP_IMPORTER
 from db.models import ImportRun, db
 from tests.test_control_imports_db import (
     _drop_import_run_schema,
     _fake_enqueue,
+    _require_disposable_database,
     _reset_import_run_schema,
 )
 
@@ -334,3 +338,188 @@ async def test_active_idempotency_key_is_unique_per_importer(
         ]
     finally:
         await _drop_import_run_schema()
+
+
+MEMBERSHIP_REVISION = "20261021110000_ptg_membership_import_idempotency"
+MEMBERSHIP_PREVIOUS_REVISION = "20261020200000_custom_import_manual_acceptance"
+MEMBERSHIP_INDEX = "import_run_ptg_membership_idempotency_idx"
+
+
+@asynccontextmanager
+async def _migration_schema():
+    _require_disposable_database()
+    schema = "membership_idempotency_" + uuid.uuid4().hex
+    connection = await asyncpg.connect(
+        host=os.getenv("HLTHPRT_DB_HOST", "127.0.0.1"),
+        port=int(os.getenv("HLTHPRT_DB_PORT", "5432")),
+        user=os.getenv("HLTHPRT_DB_USER", "postgres"),
+        password=os.getenv("HLTHPRT_DB_PASSWORD", ""),
+        database=os.environ["HLTHPRT_DB_DATABASE"],
+    )
+    is_created = False
+    try:
+        await connection.execute(f'CREATE SCHEMA "{schema}"')
+        is_created = True
+        await connection.execute(
+            f'CREATE TABLE "{schema}".import_run '
+            "(run_id text PRIMARY KEY, importer text NOT NULL, "
+            "idempotency_key text, status text NOT NULL)"
+        )
+        await connection.execute(f'CREATE INDEX existing_status_idx ON "{schema}".import_run (status)')
+        stamped = _run_alembic(schema, "stamp", MEMBERSHIP_PREVIOUS_REVISION)
+        assert stamped.returncode == 0, stamped.stdout + stamped.stderr
+        yield connection, schema
+    finally:
+        try:
+            if is_created:
+                await connection.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        finally:
+            await connection.close()
+
+
+async def _indexes(connection, schema):
+    return await connection.fetch(
+        "SELECT indexrelid, pg_get_indexdef(indexrelid), indisvalid, indisready, indislive "
+        "FROM pg_index WHERE indrelid = to_regclass($1) ORDER BY indexrelid",
+        f'"{schema}".import_run',
+    )
+
+
+async def _insert(connection, schema, *, run_id, importer=MEMBERSHIP_IMPORTER, key="shared", status="succeeded"):
+    await connection.execute(
+        f'INSERT INTO "{schema}".import_run (run_id, importer, idempotency_key, status) VALUES ($1,$2,$3,$4)',
+        run_id,
+        importer,
+        key,
+        status,
+    )
+
+
+async def _assert_all_statuses_unique(connection, schema):
+    statuses = sorted(ACTIVE_STATUSES | TERMINAL_STATUSES)
+    for existing_status in statuses:
+        await _insert(connection, schema, run_id=existing_status, key=existing_status, status=existing_status)
+        for new_status in statuses:
+            with pytest.raises(asyncpg.UniqueViolationError) as rejected:
+                await _insert(connection, schema, run_id="duplicate", key=existing_status, status=new_status)
+            assert rejected.value.constraint_name == MEMBERSHIP_INDEX
+    await _insert(connection, schema, run_id="distinct", key="distinct")
+    with pytest.raises(asyncpg.UniqueViolationError) as rejected:
+        await connection.execute(
+            f'UPDATE "{schema}".import_run SET idempotency_key=$1 WHERE run_id=$2', statuses[0], "distinct"
+        )
+    assert rejected.value.constraint_name == MEMBERSHIP_INDEX
+
+
+async def _assert_unrelated_runs_permitted(connection, schema):
+    for status in sorted(ACTIVE_STATUSES | TERMINAL_STATUSES):
+        for occurrence in range(2):
+            suffix = f"{status}-{occurrence}"
+            await _insert(connection, schema, run_id="null-" + suffix, key=None, status=status)
+            await _insert(connection, schema, run_id="other-" + suffix, importer="npi", status=status)
+    await _insert(connection, schema, run_id="shared-membership")
+
+
+async def test_membership_migration_enforces_all_status_identity_and_reversible_index_scope():
+    async with _migration_schema() as (connection, schema):
+        before = await _indexes(connection, schema)
+        upgraded = _run_alembic(schema, "upgrade", MEMBERSHIP_REVISION)
+        assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+        assert await connection.fetchval(f'SELECT version_num FROM "{schema}".alembic_version') == MEMBERSHIP_REVISION
+        after = await _indexes(connection, schema)
+        assert [row for row in after if row in before] == before
+        assert len(after) == len(before) + 1
+        assert tuple(next(row for row in after if row not in before)[2:]) == (True, True, True)
+        await _assert_all_statuses_unique(connection, schema)
+        await _assert_unrelated_runs_permitted(connection, schema)
+        rows = await connection.fetch(f'SELECT * FROM "{schema}".import_run ORDER BY run_id')
+
+        downgraded = _run_alembic(schema, "downgrade", MEMBERSHIP_PREVIOUS_REVISION)
+        assert downgraded.returncode == 0, downgraded.stdout + downgraded.stderr
+        assert (
+            await connection.fetchval(f'SELECT version_num FROM "{schema}".alembic_version')
+            == MEMBERSHIP_PREVIOUS_REVISION
+        )
+        assert await _indexes(connection, schema) == before
+        assert await connection.fetch(f'SELECT * FROM "{schema}".import_run ORDER BY run_id') == rows
+        await _insert(connection, schema, run_id="after-downgrade")
+        with pytest.raises(asyncpg.UniqueViolationError) as rejected:
+            await _insert(connection, schema, run_id="after-downgrade", key="new-key")
+        assert rejected.value.constraint_name == "import_run_pkey"
+
+
+async def test_membership_migration_adopts_exact_existing_index_without_rebuilding():
+    async with _migration_schema() as (connection, schema):
+        upgraded = _run_alembic(schema, "upgrade", MEMBERSHIP_REVISION)
+        assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+        await _insert(connection, schema, run_id="existing")
+        before = await _indexes(connection, schema)
+        rows = await connection.fetch(f'SELECT * FROM "{schema}".import_run ORDER BY run_id')
+        stamped = _run_alembic(schema, "stamp", MEMBERSHIP_PREVIOUS_REVISION)
+        assert stamped.returncode == 0, stamped.stdout + stamped.stderr
+
+        adopted = _run_alembic(schema, "upgrade", MEMBERSHIP_REVISION)
+
+        assert adopted.returncode == 0, adopted.stdout + adopted.stderr
+        assert await connection.fetchval(f'SELECT version_num FROM "{schema}".alembic_version') == MEMBERSHIP_REVISION
+        assert await _indexes(connection, schema) == before
+        assert await connection.fetch(f'SELECT * FROM "{schema}".import_run ORDER BY run_id') == rows
+        with pytest.raises(asyncpg.UniqueViolationError) as rejected:
+            await _insert(connection, schema, run_id="duplicate")
+        assert rejected.value.constraint_name == MEMBERSHIP_INDEX
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        "INDEX {index} ON {table} (importer,idempotency_key) WHERE {predicate}",
+        "UNIQUE INDEX {index} ON {table} (importer,idempotency_key,status) WHERE {predicate}",
+        "UNIQUE INDEX {index} ON {table} (importer,idempotency_key) WHERE {predicate} AND status='queued'",
+    ],
+)
+async def test_membership_migration_rejects_mismatched_existing_index(definition):
+    async with _migration_schema() as (connection, schema):
+        await connection.execute(
+            "CREATE "
+            + definition.format(
+                index=MEMBERSHIP_INDEX,
+                table=f'"{schema}".import_run',
+                predicate="importer = 'ptg-provider-membership-projection' AND idempotency_key IS NOT NULL",
+            )
+        )
+        before = await _indexes(connection, schema)
+
+        rejected = _run_alembic(schema, "upgrade", MEMBERSHIP_REVISION)
+
+        assert rejected.returncode != 0
+        assert f"existing_schema_index_mismatch:{schema}.{MEMBERSHIP_INDEX}" in rejected.stderr
+        assert (
+            await connection.fetchval(f'SELECT version_num FROM "{schema}".alembic_version')
+            == MEMBERSHIP_PREVIOUS_REVISION
+        )
+        assert await _indexes(connection, schema) == before
+
+
+async def test_membership_migration_rejects_invalid_index_without_replacing_it():
+    async with _migration_schema() as (connection, schema):
+        await _insert(connection, schema, run_id="first")
+        await _insert(connection, schema, run_id="duplicate")
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await connection.execute(
+                f'CREATE UNIQUE INDEX CONCURRENTLY {MEMBERSHIP_INDEX} ON "{schema}".import_run (importer,idempotency_key) '
+                "WHERE importer = 'ptg-provider-membership-projection' AND idempotency_key IS NOT NULL"
+            )
+        before = await _indexes(connection, schema)
+        assert any(not row[2] for row in before)
+        rows = await connection.fetch(f'SELECT * FROM "{schema}".import_run ORDER BY run_id')
+
+        rejected = _run_alembic(schema, "upgrade", MEMBERSHIP_REVISION)
+
+        assert rejected.returncode != 0
+        assert f"existing_schema_index_invalid:{schema}.{MEMBERSHIP_INDEX}" in rejected.stderr
+        assert (
+            await connection.fetchval(f'SELECT version_num FROM "{schema}".alembic_version')
+            == MEMBERSHIP_PREVIOUS_REVISION
+        )
+        assert await _indexes(connection, schema) == before
+        assert await connection.fetch(f'SELECT * FROM "{schema}".import_run ORDER BY run_id') == rows
