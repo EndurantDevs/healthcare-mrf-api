@@ -817,13 +817,14 @@ async def load_v4_graph_root(
     snapshot_key: int,
     *,
     schema_name: str,
+    refresh: bool = False,
 ) -> V4GraphRoot:
     """Load and fail-close one immutable completed V4 map root."""
 
     normalized_snapshot_key = int(snapshot_key)
     cache_key = (_graph_cache_scope(session, schema_name), normalized_snapshot_key)
     cached = _ROOT_CACHE.get(cache_key)
-    if cached is not None:
+    if cached is not None and not refresh:
         _ROOT_CACHE.move_to_end(cache_key)
         return cached
     schema = _quote_ident(schema_name)

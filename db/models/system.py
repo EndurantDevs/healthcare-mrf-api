@@ -171,6 +171,12 @@ class ImportRun(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ["run_id"]
     __my_additional_indexes__ = [
+        {
+            "index_elements": ("importer", "idempotency_key"),
+            "name": "import_run_ptg_membership_idempotency_idx",
+            "unique": True,
+            "where": "importer = 'ptg-provider-membership-projection' AND idempotency_key IS NOT NULL",
+        },
         {"index_elements": ("status", "heartbeat_at"), "name": "import_run_status_heartbeat_idx"},
         {"index_elements": ("importer", "created_at"), "name": "import_run_importer_created_idx"},
         {

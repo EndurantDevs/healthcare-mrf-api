@@ -11,6 +11,9 @@ from tests.test_ptg2_graph_runtime_boundaries import _local_distance_tables
 
 
 def _install_distance_reads(monkeypatch, exact_npis):
+    from api import ptg_membership_reader
+
+    monkeypatch.setattr(ptg_membership_reader, "indexed_memberships", AsyncMock(return_value=None))
     monkeypatch.setenv("HLTHPRT_NPI_SEARCH_TAXONOMY_PROJECTION_ENABLED", "1")
     exact_npi_reader = AsyncMock(return_value=exact_npis)
     location_reader = AsyncMock(return_value=[])
