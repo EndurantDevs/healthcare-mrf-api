@@ -16,7 +16,8 @@ STOP_REQUEST_PATH = "/control/v1/custom-import/execution-stop-request"
 STOP_FINALIZE_PATH = "/control/v1/custom-import/execution-stop-finalize"
 ADMISSION_PATH = "/control/v1/custom-import/admission-batch"
 SOURCE_PATH = "/control/v1/custom-import/source-batch"
-PRIVATE_PATHS = (EVIDENCE_PATH, STOP_REQUEST_PATH, STOP_FINALIZE_PATH, ADMISSION_PATH, SOURCE_PATH)
+REJECTION_PATH = "/control/v1/custom-import/rejection-page"
+PRIVATE_PATHS = (EVIDENCE_PATH, STOP_REQUEST_PATH, STOP_FINALIZE_PATH, ADMISSION_PATH, SOURCE_PATH, REJECTION_PATH)
 
 
 def _unused_port():
@@ -25,10 +26,13 @@ def _unused_port():
         return listener.getsockname()[1]
 
 
-def _request(port, path, *, no_store=False):
+def _request(port, path, *, no_store=False, host=None):
     connection = HTTPConnection("127.0.0.1", port, timeout=2)
     try:
-        connection.request("POST", path, headers={"Authorization": "Bearer synthetic"})
+        headers_by_name = {"Authorization": "Bearer synthetic"}
+        if host is not None:
+            headers_by_name["Host"] = host
+        connection.request("POST", path, headers=headers_by_name)
         reply = connection.getresponse()
         reply.read()
         if no_store:
@@ -85,8 +89,29 @@ def _encoded_leaf(path):
     return prefix + "/%" + format(ord(leaf[0]), "02x") + leaf[1:]
 
 
+def _assert_public_denials(public_port, external_port):
+    """Exercise path normalization and forged hosts on both normal listeners."""
+    for port, private_path, host in product(
+        (public_port, external_port), PRIVATE_PATHS, (None, "internal.invalid:8080", "external.invalid:8082")
+    ):
+        for path in (
+            private_path,
+            private_path + "/",
+            private_path + "/nested",
+            private_path + "?probe=1",
+            private_path.replace("/control/v1/", "/control//v1/"),
+            _encoded_leaf(private_path),
+            private_path.replace("/custom-import/", "/custom-import%2f"),
+            "/api/../" + private_path.removeprefix("/"),
+        ):
+            assert _request(
+                port, path, no_store=private_path in (ADMISSION_PATH, SOURCE_PATH, REJECTION_PATH), host=host
+            ) == (404, None), path
+
+
 @pytest.mark.parametrize("private_enabled", (False, True))
 def test_evidence_is_private_and_other_routes_still_proxy(tmp_path, private_enabled):
+    """Keep private paths closed without changing unrelated public or private reads."""
     nginx = shutil.which("nginx")
     if nginx is None:
         pytest.skip("native Nginx is required for the routing check")
@@ -114,25 +139,12 @@ def test_evidence_is_private_and_other_routes_still_proxy(tmp_path, private_enab
         try:
             _wait_for_listener(process, public_port)
             _wait_for_listener(process, external_port)
-            for port, private_path in product((public_port, external_port), PRIVATE_PATHS):
-                for path in (
-                    private_path,
-                    private_path + "/",
-                    private_path + "/nested",
-                    private_path + "?probe=1",
-                    private_path.replace("/control/v1/", "/control//v1/"),
-                    _encoded_leaf(private_path),
-                    private_path.replace("/custom-import/", "/custom-import%2f"),
-                    "/api/../" + private_path.removeprefix("/"),
-                ):
-                    assert _request(port, path, no_store=private_path in (ADMISSION_PATH, SOURCE_PATH)) == (
-                        404,
-                        None,
-                    ), path
+            _assert_public_denials(public_port, external_port)
             for path in (
                 "/api/v1/healthcheck/live",
                 "/control/v1/custom-import/another-route",
                 EVIDENCE_PATH + "-status",
+                REJECTION_PATH + "-status",
             ):
                 assert _request(public_port, path) == (204, "Bearer synthetic")
             if private_enabled:
