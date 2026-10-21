@@ -8567,6 +8567,9 @@ def _ptg2_distance_sort_key(
         int(provider_item.get("npi") or 2**63 - 1),
         _ptg2_provider_price_sort_value(provider_item),
         str(provider_item.get("provider_name") or ""),
+        _ptg2_provider_rate_group_key(provider_item) or (),
+        str(provider_item.get("network") or provider_item.get("source_key") or ""),
+        str(provider_item.get("snapshot_id") or ""),
         int(provider_item["_ptg_price_key"] if provider_item.get("_ptg_price_key") is not None else 2**32),
     )
 
@@ -12089,17 +12092,22 @@ class _LocalDistanceGraphRequest:
     candidate_limit: int
     code_rows: Sequence[Mapping[str, Any]]
     forward_limits: _V4GeoRateForwardLimits
+    code_system: str | None = None
+    code: str | None = None
 
 
 @dataclass
 class _LocalDistanceGraphState:
     seen_npis: set[int] = field(default_factory=set)
-    observed_prefix: tuple[int, ...] = ()
+    observed_prefix: tuple[tuple[int, str, str], ...] = ()
     matched_locations: list[dict[str, Any]] = field(default_factory=list)
     matching_sets_by_npi: dict[int, set[int]] = field(default_factory=dict)
     code_sets: set[int] = field(default_factory=set)
     noncode_sets: set[int] = field(default_factory=set)
     retained_memberships: int = 0
+    membership_index_checked: bool = False
+    membership_index: Any = None
+    indexed_projection_members: int = 0
 
     def candidates(self) -> _GraphLocationCandidates:
         """Return the exact code-matched prefix accumulated so far."""
@@ -12117,18 +12125,20 @@ def _new_local_taxonomy_locations(
 ) -> list[dict[str, Any]]:
     """Validate one stable ordered prefix and return its newly seen rows."""
 
-    current_npis = tuple(int(location["npi"]) for location in locations if location.get("npi") not in (None, ""))
-    if current_npis[: len(state.observed_prefix)] != state.observed_prefix:
+    valid_locations = [location for location in locations if location.get("npi") not in (None, "")]
+    current_prefix = tuple(
+        (
+            int(location["npi"]),
+            str(location.get("location_hash") or _ptg2_row_address_key(location) or ""),
+            str(location.get("distance_miles") or ""),
+        )
+        for location in valid_locations
+    )
+    previous_count = len(state.observed_prefix)
+    if current_prefix[:previous_count] != state.observed_prefix:
         raise PTG2ManifestArtifactError("PTG2 nearby location prefix changed during bounded traversal")
-    state.observed_prefix = current_npis
-    new_locations = [
-        location
-        for location in locations
-        if location.get("npi") not in (None, "") and int(location["npi"]) not in state.seen_npis
-    ]
-    new_npis = tuple(int(location["npi"]) for location in new_locations)
-    state.seen_npis.update(new_npis)
-    return new_locations
+    state.observed_prefix = current_prefix
+    return valid_locations[previous_count:]
 
 
 async def _local_v4_memberships(
@@ -12139,6 +12149,15 @@ async def _local_v4_memberships(
     state: _LocalDistanceGraphState,
 ) -> dict[int, tuple[int, ...]]:
     """Resolve exact new-NPI memberships under the cumulative sealed cap."""
+
+    if not npis:
+        return {}
+
+    from api.ptg_membership_reader import indexed_memberships
+
+    indexed = await indexed_memberships(session, serving_tables, npis, request, state)
+    if indexed is not None:
+        return indexed
 
     remaining = request.forward_limits.maximum_retained_memberships - state.retained_memberships
     try:
@@ -12264,17 +12283,21 @@ async def _scan_local_distance_graph(
         if locations is None:
             return None
         new_locations = _new_local_taxonomy_locations(locations, state)
-        new_npis = tuple(int(location["npi"]) for location in new_locations)
+        new_npis = tuple(
+            dict.fromkeys(
+                int(location["npi"]) for location in new_locations if int(location["npi"]) not in state.seen_npis
+            )
+        )
         memberships = await _local_v4_memberships(session, serving_tables, new_npis, request, state)
         await _classify_local_code_sets(session, serving_tables, memberships, request, state)
+        state.seen_npis.update(new_npis)
+        for location in new_locations:
+            npi = int(location["npi"])
+            memberships.setdefault(npi, tuple(state.matching_sets_by_npi.get(npi, ())))
         _append_local_code_matches(new_locations, memberships, request.candidate_limit, state)
         if len(state.matched_locations) >= request.candidate_limit:
             return state.candidates()
-        if (
-            not locations
-            or _is_graph_location_source_exhausted(locations, probe_limit)
-            or (candidate_npis is not None and probe_limit >= len(candidate_npis))
-        ):
+        if not locations or _is_graph_location_source_exhausted(locations, probe_limit):
             break
         if probe_limit >= max_candidates:
             raise PTG2ManifestArtifactError("PTG2 location traversal reached its configured exactness bound")
@@ -12343,7 +12366,7 @@ async def _local_inferred_distance_graph_candidates(
     if not code_rows:
         return _GraphLocationCandidates([], {}, taxonomy_filtered=True)
     forward_limits = _v4_geo_rate_forward_limits(serving_tables)
-    request = _LocalDistanceGraphRequest(candidate_limit, code_rows, forward_limits)
+    request = _LocalDistanceGraphRequest(candidate_limit, code_rows, forward_limits, requested_system, requested_code)
     batch_size = _graph_location_probe_batch_size(candidate_limit, taxonomy_filter_requested=False)
     max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
     candidate_npis, coarse_taxonomy_knn = await _bounded_exact_distance_npis(
@@ -21077,6 +21100,11 @@ async def _search_multi_ptg2_snapshots(
         args,
         pagination,
         total,
+        total_is_exact=all(
+            (network_response.get("pagination") or {}).get("total_is_exact") is True
+            for _, _, network_response in network_responses
+            if network_response is not None
+        ),
     )
     if release_selection is not None:
         return annotate_plan_release_response(response_by_field, release_selection)
@@ -21091,6 +21119,8 @@ def _multi_snapshot_response(
     args: Mapping[str, Any],
     pagination,
     total: int,
+    *,
+    total_is_exact: bool = False,
 ) -> dict[str, Any]:
     """Shape one globally ordered page from immutable network responses."""
 
@@ -21118,6 +21148,8 @@ def _multi_snapshot_response(
             "offset": pagination.offset,
             "page": ((pagination.offset // pagination.limit) + 1 if pagination.limit else 1),
             "has_more": (int(pagination.offset) + len(page_items)) < total,
+            "total_is_exact": total_is_exact,
+            "total_lower_bound": total,
         },
         "query": query_by_field,
     }
