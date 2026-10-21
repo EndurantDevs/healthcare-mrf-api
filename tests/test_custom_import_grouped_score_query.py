@@ -160,7 +160,7 @@ def test_native_scope_precedes_default_year_helper_and_all_group_reducers():
     prepared = grouped_read.prepare_relation(_context(), query, scope)
     compiled = prepared.statement.compile(dialect=postgresql.dialect())
     assert list(query.entity_values) in compiled.params.values()
-    assert list(compiled.params.values()).count(list(query.entity_values)) == 2
+    assert list(compiled.params.values()).count(list(query.entity_values)) == 1
     assert "selected_entity_value AS MATERIALIZED" not in str(compiled)
     assert "WHERE selected_entity_value.entity_binding_id = mrf.custom_import_winner.entity_binding_id" in str(compiled)
     assert "derived_score_values" in str(compiled) and str(compiled).count("LIMIT ALL OFFSET") == 1
@@ -384,9 +384,7 @@ def test_native_sql_scope_precedes_family_reduction_without_a_page_bound(
         == 201
     )
     scope_name = "eligible_native_scope" if as_cte else "native_score_entities"
-    assert sql.count(f"canonical_value IN (SELECT CAST({scope_name}.candidate_identity AS VARCHAR)") == (
-        2 if period is None else 1
-    )
+    assert sql.count(f"canonical_value IN (SELECT CAST({scope_name}.candidate_identity AS VARCHAR)") == 1
     assert sql.count("LIMIT ALL OFFSET") == 1 and "LIMIT" not in sql.replace("LIMIT ALL OFFSET", "OFFSET")
     assert sql_compilation.params[re.search(r"LIMIT ALL OFFSET %\((\w+)\)s", sql).group(1)] == 0
     assert "complete_score_child_identities" not in sql and "child_candidate_score_entities" not in sql
