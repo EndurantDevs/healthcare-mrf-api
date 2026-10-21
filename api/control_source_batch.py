@@ -9,6 +9,7 @@ credential, user-selected query or uploaded row is accepted by this handler.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from datetime import datetime, timezone
 
@@ -21,6 +22,7 @@ from api.control_batch_diagnostics import BatchFailureStage, can_retry_batch_ope
 from db.connection import db
 from process.custom_import import source_authorization as authorization
 from process.custom_import.admission_authorization import AdmissionAuthorizationError
+from process.custom_import.build_source import batch_operation_deadline
 from process.custom_import.runner_types import CancellationRequested, LeaseAuthorityLost
 from process.custom_import.source_worker import validate_receipt
 
@@ -89,11 +91,13 @@ async def serve_source_batch(request, session_factory, *, keyring, expected_orig
             expected_origin=expected_origin,
             keyring=keyring,
         )
-        admission.extend_batch_response_deadline(
+        operation_deadline = admission.extend_batch_response_deadline(
             request, expires_at=verified.permit.expires_at, trusted_now=trusted_now
         )
         stage = BatchFailureStage.SOURCE_EXECUTE
-        committed = await _source_operation(session_factory, verified)
+        with batch_operation_deadline(operation_deadline):
+            async with asyncio.timeout_at(operation_deadline):
+                committed = await _source_operation(session_factory, verified)
         stage = BatchFailureStage.SOURCE_RECEIPT
         return admission._reply(_receipt(verified, committed))
     except AdmissionAuthorizationError:

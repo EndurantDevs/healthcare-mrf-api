@@ -18,10 +18,13 @@ from sanic.models.asgi import MockTransport
 from sanic.request import Request
 
 from api import control_admission_batch as admission
+from api import control_query_projection_batch as projection
 from api import control_source_batch as source
 from process.custom_import import admission_sql
+from process.custom_import import build_source as staging
 from process.custom_import.runner_types import LeaseAuthorityLost
 from tests import test_custom_import_admission_service as admission_fixture
+from tests import test_custom_import_query_projection_service as projection_fixture
 from tests import test_custom_import_source_service as source_fixture
 
 _DEFAULT_TIMEOUT = 0.1
@@ -32,6 +35,10 @@ def _batch_state(kind):
     if kind == "admission":
         wire, verified, keyring = admission_fixture._wire()
         receipt = admission_sql.AdmissionResult("graph", 1, 1, 0)
+    elif kind == "projection":
+        wire, verified = projection_fixture._wire(), projection_fixture.envelope.verify()
+        keyring = projection_fixture.envelope.legacy.keyring()
+        receipt = projection_fixture._committed()
     else:
         wire, verified = source_fixture._wire()
         keyring = source_fixture.envelope.legacy.keyring()
@@ -55,6 +62,7 @@ def _batch_state(kind):
 def _install_writers(state, monkeypatch):
     clock = SimpleNamespace(now=lambda _timezone: state.now)
     monkeypatch.setattr(admission, "datetime", clock)
+    monkeypatch.setattr(projection, "datetime", clock)
     monkeypatch.setattr(source, "datetime", clock)
     retained = admission_fixture._request(
         lease_seconds=2,
@@ -78,6 +86,7 @@ def _install_writers(state, monkeypatch):
 
     monkeypatch.setattr(admission_sql, "admit_source_batch", delayed_batch)
     monkeypatch.setattr(source, "_source_operation", delayed_batch)
+    monkeypatch.setattr(projection, "_projection_operation", delayed_batch)
 
 
 async def _close_server(server, state):
@@ -94,7 +103,7 @@ async def _close_server(server, state):
     )
 
 
-@pytest.fixture(params=("admission", "source"))
+@pytest.fixture(params=("admission", "source", "projection"))
 async def batch_server(request, monkeypatch):
     state = _batch_state(request.param)
     _install_writers(state, monkeypatch)
@@ -104,6 +113,7 @@ async def batch_server(request, monkeypatch):
     app.ctx.custom_import_admission_authority = (state.keyring, admission_fixture.ORIGIN)
     app.blueprint(admission.blueprint)
     app.blueprint(source.blueprint)
+    app.blueprint(projection.blueprint)
     admission.register_batch_response_deadline(app)
 
     @app.on_response
@@ -170,9 +180,7 @@ async def test_denied_authority_never_extends_response_deadline(batch_server, fa
     if failure == "expired":
         state.now = state.verified.permit.expires_at
     else:
-        header = (
-            "X-Custom-Import-Admission-Signature" if state.kind == "admission" else "X-Custom-Import-Source-Signature"
-        )
+        header = f"X-Custom-Import-{state.kind.title()}-Signature"
         state.wire.headers[header] = "invalid"
     reply = await _post(state)
     assert reply.status_code == 403 and state.attempted == 0
@@ -211,10 +219,47 @@ async def test_shorter_retained_deadline_rearms_the_provisional_timer(batch_serv
 
     monkeypatch.setattr(admission, "_retained_request", delayed_read)
     reply = await _post(state)
-    assert reply.status_code == 503
-    assert state.attempted == 1 and state.cancelled and not state.committed
+    assert reply.status_code == 409
+    assert state.attempted == 0 and not state.cancelled and not state.committed
     assert state.observations[-1][2] == 0.6
     assert state.app.config.RESPONSE_TIMEOUT == _DEFAULT_TIMEOUT
+
+
+async def test_operation_expires_before_http_without_committed_receipt(batch_server, monkeypatch):
+    state = batch_server
+    monkeypatch.setattr(admission, "MAX_BATCH_RESPONSE_SECONDS", 1.2)
+    monkeypatch.setattr(admission, "BATCH_RESPONSE_MARGIN_SECONDS", 0.2)
+    timeouts = []
+
+    async def record_timeout(_session, milliseconds):
+        timeouts.append(milliseconds)
+
+    async def bounded_batch(*args, **kwargs):
+        deadline = (
+            args[1].operation_deadline if state.kind == "admission" else admission_fixture._request().operation_deadline
+        )
+        state.attempted += 1
+        session = SimpleNamespace(info={staging._WINDOW: staging._PageWindow(deadline, 900_000)})
+        await staging._prepare_statement(session)
+        assert 0 < timeouts[-1] < 600
+        try:
+            await asyncio.sleep(max(0, deadline - staging.time.monotonic()) + 0.01)
+        except asyncio.CancelledError:
+            state.cancelled = True
+            raise
+        pytest.fail("expired work must not reach a write or committed receipt")
+
+    monkeypatch.setattr(staging, "_set_timeout", record_timeout)
+    monkeypatch.setattr(admission_sql, "admit_source_batch", bounded_batch)
+    monkeypatch.setattr(source, "_source_operation", bounded_batch)
+    monkeypatch.setattr(projection, "_projection_operation", bounded_batch)
+    reply = await _post(state)
+    assert reply.status_code == 503
+    assert reply.json() == {"error": f"{state.kind}_unavailable"}
+    assert state.attempted == 1 and not state.committed and state.cancelled
+    assert len(timeouts) == 1
+    assert state.observations[-1][2] == 1.2
+    assert admission_fixture._request().operation_deadline is None
 
 
 async def test_long_batch_preserves_lease_authority_failure_without_receipt(batch_server):

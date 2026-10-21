@@ -8,9 +8,11 @@ import asyncio
 import datetime as dt
 import hmac
 import json
+import math
 import time
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from uuid import UUID
 
@@ -75,6 +77,17 @@ from process.custom_import.snowflake_bundle_replay import (
 from process.custom_import.storage_layout import snapshot_models, snapshot_schema
 
 _WINDOW = "custom_import_build_page_window"
+_OPERATION_DEADLINE: ContextVar[float | None] = ContextVar("custom_import_operation_deadline", default=None)
+
+
+@contextmanager
+def batch_operation_deadline(deadline):
+    """Capture an HTTP ceiling at request construction, then restore the caller's context."""
+    token = _OPERATION_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _OPERATION_DEADLINE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -99,6 +112,7 @@ class SourceBuildRequest:
     # Request-local authority, never a retained build identity or bound.
     authorization_expires_at: dt.datetime | None = field(default=None, compare=False)
     continuation: BuildContinuationContext | None = field(default=None, repr=False)
+    operation_deadline: float | None = field(default_factory=_OPERATION_DEADLINE.get, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("dataset_id", "definition_revision_id", "schema_revision_id", "execution_id", "fence"):
@@ -118,6 +132,10 @@ class SourceBuildRequest:
         if type(self.complete_scope) is not bool or type(self.lease_token) not in (str, bytes):
             raise ValueError("build scope and immutable lease token are required")
         lease_token_sha256(self.lease_token)
+        if self.operation_deadline is not None and (
+            type(self.operation_deadline) not in (int, float) or not math.isfinite(self.operation_deadline)
+        ):
+            raise ValueError("operation deadline must be a finite monotonic time")
         if self.continuation is not None and not isinstance(self.continuation, BuildContinuationContext):
             raise ValueError("build continuation context is malformed")
         if (
@@ -215,7 +233,11 @@ def _page_expiry(request, lease_expires_at):
 async def _initial_page_window(session, request):
     """Bound lock acquisition before trusting any mutable ownership snapshot."""
 
-    await _set_timeout(session, request.statement_timeout_ms)
+    if request.operation_deadline is None:
+        await _set_timeout(session, request.statement_timeout_ms)
+    else:
+        session.info[_WINDOW] = _PageWindow(request.operation_deadline, request.statement_timeout_ms)
+        await _prepare_statement(session)
     started = time.monotonic()
     expires_at, now, isolation = (
         await session.execute(
@@ -226,8 +248,9 @@ async def _initial_page_window(session, request):
     ).one()
     if isolation != "read committed" or expires_at is None:
         raise CandidateRunnerError("build pages require a live READ COMMITTED lease")
+    deadline = started + (_page_expiry(request, expires_at) - now).total_seconds()
     session.info[_WINDOW] = _PageWindow(
-        started + (_page_expiry(request, expires_at) - now).total_seconds(),
+        deadline if request.operation_deadline is None else min(deadline, request.operation_deadline),
         request.statement_timeout_ms,
     )
     return expires_at
@@ -288,8 +311,9 @@ async def _renew_page_window(session, request):
     started = time.monotonic()
     await _prepare_statement(session)
     now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+    deadline = started + (_page_expiry(request, renewed.expires_at) - now).total_seconds()
     session.info[_WINDOW] = _PageWindow(
-        started + (_page_expiry(request, renewed.expires_at) - now).total_seconds(),
+        deadline if request.operation_deadline is None else min(deadline, request.operation_deadline),
         request.statement_timeout_ms,
     )
     await _prepare_statement(session)

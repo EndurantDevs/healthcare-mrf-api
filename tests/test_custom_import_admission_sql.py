@@ -328,7 +328,8 @@ async def test_operation_preserves_return_shape_and_fresh_authority_before_commi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("driver", ["asyncpg", "psycopg"])
-async def test_decision_timeout_retries_fresh_page(monkeypatch, driver):
+@pytest.mark.parametrize("operation_deadline", [None, 123.0])
+async def test_decision_timeout_retries_fresh_page(monkeypatch, driver, operation_deadline):
     rows = _rows()
     rows[1] = _database_error(driver=driver)
     failed, build = _page(monkeypatch, rows)
@@ -336,7 +337,7 @@ async def test_decision_timeout_retries_fresh_page(monkeypatch, driver):
     retry.rows[1]["rows_processed"] = retry.rows[3]["rows_processed"] = 256
     fresh_build = SimpleNamespace(**vars(build))
     staging._lock_page.side_effect = [build, fresh_build]
-    request = _request(page_row_limit=256)
+    request = _request(page_row_limit=256, operation_deadline=operation_deadline)
 
     def sessions():
         if not failed.events:
@@ -346,6 +347,8 @@ async def test_decision_timeout_retries_fresh_page(monkeypatch, driver):
 
     assert await admission.admit_source_batch(sessions, request, 1, 0) == ("rejected", 999, 256, 2)
     assert staging._lock_page.await_args_list == [call(failed, request, 1), call(retry, request, 1)]
+    assert all(item.args[1] is request for item in staging._lock_page.await_args_list)
+    assert request.operation_deadline == operation_deadline
     assert not failed.durable and retry.durable == ["apply", "advance"]
     assert failed.search_path == retry.search_path == '"synthetic_untrusted", pg_catalog'
     assert retry.events[-3:] == ["verify_before_commit", "commit", "close"]

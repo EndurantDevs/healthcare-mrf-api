@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections import Counter
 from dataclasses import replace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
-from sqlalchemy import bindparam, event, func, select, text
+from sqlalchemy import bindparam, event, func, select, text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 import process.custom_import.admission_sql as admission
@@ -72,9 +73,12 @@ async def test_staging_routes_the_existing_owner_through_ordinary_admission(monk
         admitted.assert_awaited_once()
 
 
-async def test_timeout_retries_one_logical_group(monkeypatch):
+@pytest.mark.parametrize("has_operation_deadline", [False, True])
+async def test_timeout_retries_one_logical_group(monkeypatch, has_operation_deadline):
     async with _source_case() as case:
         request = await _request_for(case, _records(1), page_rows=2)
+        if has_operation_deadline:
+            request = replace(request, operation_deadline=time.monotonic() + 10)
         statements, pages = admission._statements, []
 
         async def timeout_first_decision(session, family_id):
@@ -83,6 +87,8 @@ async def test_timeout_retries_one_logical_group(monkeypatch):
                 queries = (queries[0], text("SELECT pg_catalog.pg_sleep(3)"), *queries[2:])
             else:
                 assert session is not pages[0] and not pages[0].in_transaction()
+            if has_operation_deadline:
+                assert session.info[staging._WINDOW].deadline == request.operation_deadline
             pages.append(session)
             return queries, relations
 
@@ -95,6 +101,38 @@ async def test_timeout_retries_one_logical_group(monkeypatch):
         assert admitted.await_args_list[0].kwargs == {}
         assert admitted.await_args_list[1].kwargs == {"physical_row_cap": 2}
         assert [arguments.args[2] for arguments in admitted.await_args_list] == [0, 0]
+
+
+async def test_operation_deadline_cancels_real_sql_rolls_back_and_allows_fresh_request():
+    async with _source_case() as case:
+        context, _ = await _root_page(case, [_root()])
+        request = replace(context.request, operation_deadline=time.monotonic() + 1)
+        receipts = []
+        with pytest.raises(DBAPIError) as caught:
+            async with staging._page_session(case.sessions, request, context.build_id) as (session, _):
+                await session.execute(
+                    update(CustomImportBuildAttempt)
+                    .where(CustomImportBuildAttempt.build_id == context.build_id)
+                    .values(candidate_error_count=1)
+                )
+                await staging._renew_page_window(session, request)
+                assert session.info[staging._WINDOW].deadline == request.operation_deadline
+                timeout_ms = await session.scalar(
+                    text("SELECT setting::int FROM pg_settings WHERE name='statement_timeout'")
+                )
+                assert 0 < timeout_ms < request.statement_timeout_ms
+                await session.execute(text("SELECT pg_catalog.pg_sleep(2)"))
+            receipts.append("committed")
+        assert caught.value.orig.sqlstate == "57014"
+        assert not receipts
+        async with case.sessions() as session:
+            build = await session.get(CustomImportBuildAttempt, context.build_id)
+            assert build.phase == "source" and build.candidate_error_count == build.source_occurrence_count == 0
+            assert build.generation_id is None and build.source_frozen_at is None
+        fresh_request = replace(request, operation_deadline=time.monotonic() + 5)
+        outcome = await staging.stage_segmented_source(case.sessions, fresh_request)
+        assert outcome.build_id == context.build_id and outcome.phase == "graph"
+        assert outcome.source_occurrence_count == 1 and outcome.candidate_error_count == 0
 
 
 async def _root_page(case, records):
