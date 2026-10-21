@@ -280,8 +280,8 @@ def selected_family_statement(
         if default_selected_value is not None:
             selected_value = default_selected_value
         elif materialize_default:
-            # Address the guarded helper by its indexed entity key instead of rescanning all entities.
-            latest = _selected_value_relation(context, entity_values)
+            # The outer family already enforces entity scope; correlate the guarded helper by its indexed key.
+            latest = _selected_value_relation(context)
             selected_value = (
                 select(latest.c.selected_value)
                 .where(latest.c.entity_binding_id == winner_model.entity_binding_id)

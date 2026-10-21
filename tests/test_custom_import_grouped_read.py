@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import orjson
 import pytest
+from sqlalchemy import column, select, table
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.sql import operators, visitors
 from sqlalchemy.sql.elements import BinaryExpression
@@ -27,7 +28,10 @@ from tests import test_custom_import_read_http as http_fixture
 _SCOPE = ExtensionReadScope("synthetic:grouped")
 
 
-@pytest.mark.parametrize("entity_values", [None, ("1234567893", "1000000012")])
+@pytest.mark.parametrize(
+    "entity_values",
+    [None, ("1234567893", "1000000012"), select(table("native_scope", column("npi")).c.npi)],
+)
 def test_unpaged_default_selection_looks_up_the_guarded_helper_for_each_entity(entity_values):
     context = fixture.context()
     plan = grouped_read.normalize_plan(context, fixture.query(), _SCOPE)
@@ -48,6 +52,20 @@ def test_unpaged_default_selection_looks_up_the_guarded_helper_for_each_entity(e
         helper.c.entity_binding_id == context.model(read_core.CustomImportWinner).entity_binding_id
     )
     assert lookup._correlate
+    assert not any(
+        isinstance(element, BinaryExpression)
+        and element.operator is operators.in_op
+        and getattr(element.left, "name", None) == "canonical_value"
+        for element in visitors.iterate(helper.element)
+    )
+    if entity_values is not None:
+        assert any(
+            isinstance(element, BinaryExpression)
+            and element.operator is operators.in_op
+            and getattr(element.left, "name", None) == "canonical_value"
+            for criterion in statement._where_criteria
+            for element in visitors.iterate(criterion)
+        )
     sql = str(statement.compile(dialect=postgresql.dialect()))
     assert "selected_entity_value AS MATERIALIZED" not in sql
     assert "WHERE selected_entity_value.entity_binding_id = mrf.custom_import_winner.entity_binding_id" in sql
