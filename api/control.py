@@ -31,6 +31,7 @@ from api.control_ptg_source_attempt_errors import (
 )
 from api.control_snapshot_rollback import register_source_snapshot_rollback_route
 from api.control_ptg_v4 import register_v4_control_routes
+from api.control_ptg_membership import register_membership_projection_routes
 from api.provider_directory_control_catalog import (
     provider_directory_control_catalog,
 )
@@ -63,6 +64,7 @@ blueprint = register_control_routes(Blueprint("control", url_prefix="/control/v1
 register_source_attempt_error_handler(blueprint)
 register_source_snapshot_rollback_route(blueprint)
 register_v4_control_routes(blueprint)
+register_membership_projection_routes(blueprint)
 register_uhc_provider_file_catalog_routes(blueprint)
 register_profile_selection_route(blueprint)
 register_profile_capacity_preflight_route(blueprint)

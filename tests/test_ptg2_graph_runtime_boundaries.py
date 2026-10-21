@@ -36,6 +36,9 @@ def _local_distance_tables():
 
 
 def _install_local_distance_reads(monkeypatch):
+    from api import ptg_membership_reader
+
+    monkeypatch.setattr(ptg_membership_reader, "indexed_memberships", AsyncMock(return_value=None))
     location_limits: list[int] = []
 
     async def location_rows(*_args, limit, **_kwargs):
