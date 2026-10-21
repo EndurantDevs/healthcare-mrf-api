@@ -12,7 +12,7 @@ import os
 import re
 import ssl
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import httpx
@@ -188,10 +188,18 @@ async def serve_continuation_projection(request, session_factory):
             session_factory, document, nonce
         )
         now = dt.datetime.now(dt.UTC)
-        extend_batch_response_deadline(
+        operation_deadline = extend_batch_response_deadline(
             request, expires_at=min(expires_at, now + dt.timedelta(seconds=MAX_RESPONSE_SECONDS)), trusted_now=now
         )
-        async with asyncio.timeout(MAX_RESPONSE_SECONDS):
+        if operation_deadline is not None:
+            operation_deadline = min(operation_deadline, asyncio.get_running_loop().time() + MAX_RESPONSE_SECONDS)
+            retained = replace(retained, operation_deadline=operation_deadline)
+        operation_timeout = (
+            asyncio.timeout(MAX_RESPONSE_SECONDS)
+            if operation_deadline is None
+            else asyncio.timeout_at(operation_deadline)
+        )
+        async with operation_timeout:
             receipt = await projection_step(session_factory, retained, document["build_id"], expected=expected)
         pins = projection_worker._pins(document["build_id"], retained.execution_id, retained.fence, expected)
         receipt_document = asdict(receipt)
