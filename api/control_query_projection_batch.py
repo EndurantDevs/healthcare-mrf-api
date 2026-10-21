@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from datetime import datetime, timezone
 
@@ -14,6 +15,7 @@ from api import control_admission_batch as admission
 from db.connection import db
 from process.custom_import import query_projection_authorization as authorization
 from process.custom_import.admission_authorization import AdmissionAuthorizationError
+from process.custom_import.build_source import batch_operation_deadline
 from process.custom_import.query_projection_worker import validate_receipt
 from process.custom_import.runner_types import CancellationRequested, LeaseAuthorityLost
 
@@ -61,10 +63,12 @@ async def serve_projection_batch(request, session_factory, *, keyring, expected_
             expected_origin=expected_origin,
             keyring=keyring,
         )
-        admission.extend_batch_response_deadline(
+        operation_deadline = admission.extend_batch_response_deadline(
             request, expires_at=verified.permit.expires_at, trusted_now=trusted_now
         )
-        committed = await _projection_operation(session_factory, verified)
+        with batch_operation_deadline(operation_deadline):
+            async with asyncio.timeout_at(operation_deadline):
+                committed = await _projection_operation(session_factory, verified)
         return admission._reply(_receipt(verified, committed))
     except AdmissionAuthorizationError:
         return admission._reply({"error": "projection_forbidden"}, 403)

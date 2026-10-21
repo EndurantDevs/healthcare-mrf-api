@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
+import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from sanic import Blueprint, response
@@ -46,6 +48,7 @@ KEYRING_FILE_ENV = "HLTHPRT_CUSTOM_IMPORT_ADMISSION_KEYRING_FILE"
 ORIGIN_ENV = "HLTHPRT_CUSTOM_IMPORT_ADMISSION_ORIGIN"
 MAX_BODY_BYTES = 512
 MAX_BATCH_RESPONSE_SECONDS = 300
+BATCH_RESPONSE_MARGIN_SECONDS = 1
 blueprint = Blueprint("custom_import_admission", url_prefix="/control/v1")
 
 
@@ -219,7 +222,7 @@ def _reply(payload, status=200):
 
 
 def extend_batch_response_deadline(request, *, expires_at, trusted_now):
-    """Let verified batch work finish without changing other requests' deadlines."""
+    """Return one operation ceiling inside this verified request's HTTP deadline."""
 
     if getattr(request, "transport", None) is None:
         return
@@ -227,6 +230,10 @@ def extend_batch_response_deadline(request, *, expires_at, trusted_now):
     if getattr(protocol, "response_timeout", None) is not None:
         remaining = min(MAX_BATCH_RESPONSE_SECONDS, (expires_at - trusted_now).total_seconds())
         _set_response_timeout(protocol, max(request.app.config.RESPONSE_TIMEOUT, remaining))
+        deadline = protocol._time + protocol.response_timeout - BATCH_RESPONSE_MARGIN_SECONDS
+        if deadline <= time.monotonic():
+            raise LeaseAuthorityLost("batch response deadline elapsed")
+        return deadline
 
 
 def _set_response_timeout(protocol, seconds):
@@ -313,13 +320,14 @@ async def admission_batch(request):
 async def _load_admission_request(request, session_factory, verified, trusted_now):
     """Keep the existing bounded preload and its response deadlines together."""
 
-    extend_batch_response_deadline(
+    preload_deadline = extend_batch_response_deadline(
         request,
         expires_at=min(verified.permit.expires_at, trusted_now + timedelta(seconds=5)),
         trusted_now=trusted_now,
     )
-    retained = await _retained_request(session_factory, verified)
-    extend_batch_response_deadline(
+    async with asyncio.timeout_at(preload_deadline):
+        retained = await _retained_request(session_factory, verified)
+    operation_deadline = extend_batch_response_deadline(
         request,
         expires_at=min(
             verified.permit.expires_at,
@@ -328,7 +336,7 @@ async def _load_admission_request(request, session_factory, verified, trusted_no
         ),
         trusted_now=trusted_now,
     )
-    return retained
+    return retained if operation_deadline is None else replace(retained, operation_deadline=operation_deadline)
 
 
 async def _admission_operation(session_factory, retained, verified):
@@ -374,7 +382,8 @@ async def serve_admission_batch(
         stage = BatchFailureStage.ADMISSION_RETAINED
         retained = await _load_admission_request(request, session_factory, verified, trusted_now)
         stage = BatchFailureStage.ADMISSION_EXECUTE
-        admission_result = await _admission_operation(session_factory, retained, verified)
+        async with asyncio.timeout_at(retained.operation_deadline):
+            admission_result = await _admission_operation(session_factory, retained, verified)
         stage = BatchFailureStage.ADMISSION_RECEIPT
         return _reply(_receipt(verified, admission_result))
     except AdmissionAuthorizationError:
