@@ -97,6 +97,7 @@ def test_init_api_registers_group(monkeypatch):
     assert "custom_import_admission" not in EXPECTED_PUBLIC_BLUEPRINT_NAMES
     assert init_api.__globals__["source_batch_blueprint"] in app.registered_blueprints
     assert "custom_import_source" not in EXPECTED_PUBLIC_BLUEPRINT_NAMES
+    assert app.registered_blueprints.count(init_api.__globals__["rejection_evidence_blueprint"]) == 1
 
 
 @pytest.mark.parametrize("distance", [0.1, 1, 5])
