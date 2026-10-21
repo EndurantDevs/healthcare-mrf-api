@@ -57,6 +57,7 @@ from process.custom_import.publication import (
     activate_generation,
     rollback_generation,
 )
+from process.custom_import.rejection_evidence import MAX_EVENTS, read_rejection_page
 from process.custom_import.runner_types import CandidateRunResult
 from process.custom_import.s3 import S3Object
 from process.custom_import.upload import UploadObject
@@ -136,6 +137,13 @@ def _parser() -> argparse.ArgumentParser:
     captures.add_argument("--dataset-id", required=True, type=_positive_identifier)
     captures.add_argument("--execution-id", required=True, type=_positive_identifier)
 
+    rejections = commands.add_parser("rejections", allow_abbrev=False, help="read one terminal rejection page")
+    for identifier in ("dataset-id", "execution-id", "build-id"):
+        rejections.add_argument(f"--{identifier}", required=True, type=_positive_identifier)
+    rejections.add_argument("--after-ordinal", type=_pointer_version)
+    rejections.add_argument("--scope-sha256")
+    rejections.add_argument("--limit", type=_positive_identifier, default=MAX_EVENTS)
+
     cancel = commands.add_parser("cancel", allow_abbrev=False, help="request cancellation for one execution")
     cancel.add_argument("--execution-id", required=True, type=_positive_identifier)
 
@@ -191,6 +199,14 @@ def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
     parser = _parser()
     parsed = parser.parse_args(arguments)
     if parsed.command == "activate" and parsed.expected_generation_id is None and parsed.expected_pointer_version != 0:
+        parser.error("invalid")
+    if parsed.command == "rejections" and (
+        parsed.limit > MAX_EVENTS
+        or parsed.after_ordinal is not None
+        and parsed.scope_sha256 is None
+        or parsed.scope_sha256 is not None
+        and re.fullmatch(r"[a-f0-9]{64}", parsed.scope_sha256, flags=re.ASCII) is None
+    ):
         parser.error("invalid")
     return parsed
 
@@ -570,8 +586,20 @@ async def _database_receipt(database: Any, parsed: argparse.Namespace, prepared:
             run_candidate = run_object_candidate
         else:
             raise _DefinitionInputError("source request is unavailable")
-        result = await run_candidate(database.session, prepared, resume=parsed.command == "resume")
-        return _candidate_receipt(result)
+        candidate_result = await run_candidate(database.session, prepared, resume=parsed.command == "resume")
+        return _candidate_receipt(candidate_result)
+    if parsed.command == "rejections":
+        async with database.session() as session:
+            page = await read_rejection_page(
+                session,
+                dataset_id=parsed.dataset_id,
+                execution_id=parsed.execution_id,
+                build_id=parsed.build_id,
+                after_ordinal=parsed.after_ordinal,
+                scope_sha256=parsed.scope_sha256,
+                limit=parsed.limit,
+            )
+        return json.dumps(page, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
     async with database.transaction() as session:
         if parsed.command == "register":
             if not isinstance(prepared, bytes):

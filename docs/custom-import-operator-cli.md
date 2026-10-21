@@ -9,7 +9,7 @@ service is required. IDs below are synthetic examples, not default targets.
 | `custom_import_cli` | `validate` | Validate a definition from stdin without database access. |
 | `custom_import_cli` | `register` | Register an immutable definition from stdin. |
 | `custom_import_cli` | `execute`, `resume` with `--source https`, `s3` or `upload` | Run a bounded object import or replay its exact retained capture. |
-| `custom_import_cli` | `status`, `captures` | Read exact retained lifecycle evidence. |
+| `custom_import_cli` | `status`, `captures`, `rejections` | Read exact retained lifecycle evidence or one bounded rejection page. |
 | `custom_import_cli` | `cancel`, `activate`, `rollback` | Request cancellation or perform guarded publication. |
 | `custom_import_snowflake_operator` | `register`, `register-authority` | Register a canonical binding using local database authority or a fixed mounted capability. |
 | `custom_import_snowflake_operator` | `execute`, `resume` | Acquire an approved source or resume a retained capture. |
@@ -99,6 +99,82 @@ Mismatched or ambiguous retained evidence fails with a redacted `failed` receipt
 It does not acquire source data or inspect replay payloads, manifest contents,
 per-stream metadata, storage paths, credentials or samples. A retained manifest
 digest alone does not establish that capture payloads are still replayable.
+
+Read one page of retained rejection evidence for an exact terminal build:
+
+```sh
+python -m custom_import_cli rejections --dataset-id 5 --execution-id 17 --build-id 23
+```
+
+This operator command uses the configured database identity; it does not
+authorize a client or create a download endpoint. That identity must already
+have SELECT access to the exact retained metadata, collection and snapshot
+registries and rejection leaf, namespace USAGE, and EXECUTE on the existing
+materialization-storage read-lock helper. The command never changes roles or
+grants. Missing privileges, nonterminal executions, mismatched pins and
+unavailable storage return the fixed `failed` error without partial stdout.
+The full retained identity is checked before selecting rejection rows. Each
+page owns a fresh repeatable-read, read-only transaction and reacquires the
+registered relation locks and statement-bound relation identity checks.
+
+The JSON page contains at most 100 events and 65,536 UTF-8 bytes, followed by a
+newline. `--limit` may lower the event limit to any value from 1 through 100;
+the byte bound may produce fewer events. Logical keys preserve their configured
+types and leading zeros. Non-retained offending values remain explicitly
+unavailable; raw rejection evidence and source credentials are never returned.
+
+When `complete` is false, repeat the same command with `--after-ordinal` set to
+the returned `next_after_ordinal` and `--scope-sha256` set to the returned
+`scope_sha256`. Both continuation values must come from that same page. The
+digest binds the retained scope; it is not an authorization token. A genuine
+empty page has `complete:true`. One page is not a complete export: a caller must
+consume every page until `complete:true` and treat any nonzero exit as an
+incomplete result. This command provides neither an automatic export nor
+client-owner authorization or signed cursors. Existing activation-evidence
+HTTP authorization is unchanged.
+
+### Dedicated rejection-page control
+
+`POST /control/v1/custom-import/rejection-page` exposes the same retained reader
+through a separate read-only service capability. Configure a distinct
+`HLTHPRT_CUSTOM_IMPORT_REJECTION_READ_TOKEN` and send it as a Bearer token. The
+route fails closed if this token is absent or reused as a control, registry,
+activation-evidence, execution-stop or build-continuation token. It never grants
+worker launch, import mutation or client-owner authorization. A calling service
+must authorize its caller independently before requesting a page.
+
+Send UTF-8 JSON with exactly these fields and no query parameters:
+
+```json
+{
+  "dataset_id": 5,
+  "definition_revision_id": 7,
+  "idempotency_key": "synthetic-run",
+  "build_id": null,
+  "after_ordinal": null,
+  "scope_sha256": null,
+  "limit": 100
+}
+```
+
+The body limit is 4,096 bytes. Trusted dataset, immutable definition and original
+request pins must identify one terminal execution. A null `build_id` requires
+exactly one retained build; ambiguity fails rather than choosing the newest
+attempt. An explicit build must belong to that same execution. Continuations
+must repeat the returned build ID, last ordinal and scope digest. IDs in the
+response are decimal strings; request IDs and ordinals are JSON integers.
+
+Each successful response is the reader page itself, bounded to 61,440 UTF-8
+bytes and at most 100 events. This reserves space for a calling service's
+authorization/cursor envelope without changing the CLI's larger page budget.
+No-store applies to route-boundary failures too. Missing or foreign execution
+locators share `404 not_found`; nonterminal evidence returns
+`409 evidence_not_final`; unavailable or ambiguous storage returns the fixed
+`503 evidence_unavailable` without retained values. Invalid requests return
+`400 invalid_request`, and absent or incorrect credentials return
+`403 forbidden`. The configured database role needs the same SELECT, USAGE and
+existing read-lock-helper privileges as the CLI; this endpoint never changes
+roles, privileges or storage. One HTTP page is not a complete download.
 
 Request cooperative cancellation; a terminal execution can return an unchanged
 receipt. This does not guarantee that an active worker has already stopped:
