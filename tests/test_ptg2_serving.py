@@ -1796,9 +1796,10 @@ def test_membership_geo_sql_uses_postgis_for_unified_addresses():
         parameter_map=params_by_name,
     )
 
-    assert "3958.7613" in distance_sql
-    assert "asin" in distance_sql
+    assert "<->" in distance_sql
+    assert "/ 1609.344" in distance_sql
     assert any("ST_DWithin" in sql for sql in filters)
+    assert any("false" in sql and "<= CAST(:geo_radius_miles" in sql for sql in filters)
     assert "COALESCE(addr.address_precision, '') <> 'city_zip'" in filters
     assert params_by_name["geo_radius_miles"] == 12.0
 
@@ -1832,8 +1833,8 @@ def test_membership_geo_sql_uses_bounded_non_unified_predicates():
         parameter_map=params_by_name,
     )
 
-    assert "3958.7613" in distance_sql
-    assert "asin" in distance_sql
+    assert "<->" in distance_sql
+    assert "/ 1609.344" in distance_sql
     assert "addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat" in filters
     assert "addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long" in filters
     assert any(":geo_radius_miles" in sql for sql in filters)
@@ -1864,8 +1865,8 @@ def test_membership_filter_requires_coherence_before_zip_or_radius():
     assert "ST_DWithin" in filter_sql
     assert "addr.npi = ANY(CAST(:candidate_npis AS bigint[]))" in filter_sql
     assert "addr.npi = :provider_npi" in filter_sql
-    assert "3958.7613" in distance_sql
-    assert "asin" in distance_sql
+    assert "<->" in distance_sql
+    assert "/ 1609.344" in distance_sql
 
 
 def test_knn_order_allows_exact_zip_on_unscoped_first_page_coordinate_search():
