@@ -19,7 +19,7 @@ async def persist_cms_dataset_rows(
     bound_publisher()
     if fhir._bound_upsert_session() is not session:
         raise RuntimeError("cms_npd_resource_batch_transaction_missing")
-    if not resource_rows or len(resource_rows) > 1_000:
+    if not resource_rows or len(resource_rows) > 4_096:
         raise RuntimeError("cms_npd_resource_batch_size_invalid")
     rows = fhir._endpoint_dataset_resource_rows(
         model, resource_rows, dataset_id=candidate.dataset_id, resource_hash_contract=candidate.resource_hash_contract
