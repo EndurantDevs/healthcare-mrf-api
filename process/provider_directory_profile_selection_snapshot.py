@@ -16,17 +16,17 @@ from db.models import (
 )
 from process import provider_directory_profile as profile_artifact
 from process.provider_directory_profile_selection_contract import (
-    PROFILE_EXECUTION_CONTRACT_ID,
-    PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID,
-    ProviderDirectoryProfileSelectionDrift,
-    _validated_desired_selection,
-    desired_selection_fingerprint,
-    PROFILE_SELECTION_ATTESTATION_CONTRACT_ID,
-    PROFILE_SELECTION_LINEAGE_AUTHORITY,
     _GLOBAL_PROFILE_PARAMS,
+    PROFILE_EXECUTION_CONTRACT_ID,
+    PROFILE_SELECTION_ATTESTATION_CONTRACT_ID,
+    PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID,
+    PROFILE_SELECTION_LINEAGE_AUTHORITY,
+    ProviderDirectoryProfileSelectionDrift,
     _clean_text,
     _required_hash,
     _required_text,
+    _validated_desired_selection,
+    desired_selection_fingerprint,
     stable_hash,
 )
 from process.provider_directory_profile_selection_dataset import (
@@ -38,15 +38,15 @@ from process.provider_directory_profile_selection_dataset import (
     _source_selection_indexes,
 )
 from process.provider_directory_profile_uhc_flex import (
+    UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS,
     load_profile_selection_dataset_rows,
     lock_uhc_flex_profile_publication,
-    UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS,
 )
 
 
 @dataclass(frozen=True)
 class _ComputedProfileSelection:
-    """Current request projection plus authoritative proof identity fields."""
+    """Request projection and identity; only exact reads include input proofs."""
 
     request_projection: tuple[dict[str, str], ...]
     identity_payload: dict[str, Any]
@@ -88,11 +88,7 @@ def _catalog_source_groups(
 ) -> tuple[tuple[str, ...], ...]:
     catalog_digest = catalog_map.get("catalog_digest")
     catalog_entries = catalog_map.get("items")
-    if (
-        not isinstance(catalog_digest, str)
-        or len(catalog_digest) != 64
-        or not isinstance(catalog_entries, list)
-    ):
+    if not isinstance(catalog_digest, str) or len(catalog_digest) != 64 or not isinstance(catalog_entries, list):
         raise RuntimeError("provider_directory_profile_selection_catalog_invalid")
     source_groups: list[tuple[str, ...]] = []
     seen_source_ids: set[str] = set()
@@ -107,20 +103,13 @@ def _catalog_source_groups(
         if not isinstance(raw_source_ids, list) or not raw_source_ids:
             raise RuntimeError("provider_directory_profile_selection_catalog_invalid")
         source_ids = tuple(
-            sorted(
-                _required_text({"source_id": source_id}, "source_id", limit=96)
-                for source_id in raw_source_ids
-            )
+            sorted(_required_text({"source_id": source_id}, "source_id", limit=96) for source_id in raw_source_ids)
         )
-        if len(source_ids) != len(set(source_ids)) or seen_source_ids.intersection(
-            source_ids
-        ):
+        if len(source_ids) != len(set(source_ids)) or seen_source_ids.intersection(source_ids):
             raise RuntimeError("provider_directory_profile_selection_catalog_invalid")
         seen_source_ids.update(source_ids)
         source_groups.append(source_ids)
-    dataset_scoped_source_ids = (
-        profile_artifact.configured_dataset_scoped_profile_source_ids()
-    )
+    dataset_scoped_source_ids = profile_artifact.configured_dataset_scoped_profile_source_ids()
     if seen_source_ids.intersection(dataset_scoped_source_ids):
         raise RuntimeError("provider_directory_profile_selection_catalog_invalid")
     source_groups.extend((source_id,) for source_id in dataset_scoped_source_ids)
@@ -131,10 +120,7 @@ def _dataset_scoped_variant_source_groups() -> tuple[tuple[str, ...], ...]:
     """Return explicit alternative source groups without their review labels."""
 
     return tuple(
-        source_ids
-        for _group_id, source_ids in (
-            profile_artifact.configured_dataset_scoped_profile_variant_groups()
-        )
+        source_ids for _group_id, source_ids in (profile_artifact.configured_dataset_scoped_profile_variant_groups())
     )
 
 
@@ -142,20 +128,16 @@ async def _lock_profile_selection_tables() -> None:
     """Freeze every table that can alter the global current selection."""
 
     await lock_uhc_flex_profile_publication(db)
-    await db.status(
-        f"LOCK TABLE {_table_ref(ProviderDirectoryAPIEndpoint)} IN SHARE MODE;"
-    )
+    await db.status(f"LOCK TABLE {_table_ref(ProviderDirectoryAPIEndpoint)} IN SHARE MODE;")
     await db.status(f"LOCK TABLE {_table_ref(ProviderDirectorySource)} IN SHARE MODE;")
     dependent_relation_refs = [
         _table_ref(ProviderDirectoryEndpointDataset),
         *(
-            f"{_quote_identifier(_schema())}." f"{_quote_identifier(relation_name)}"
+            f"{_quote_identifier(_schema())}.{_quote_identifier(relation_name)}"
             for relation_name in UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS
         ),
     ]
-    await db.status(
-        "LOCK TABLE " + ", ".join(dependent_relation_refs) + " IN SHARE MODE;"
-    )
+    await db.status("LOCK TABLE " + ", ".join(dependent_relation_refs) + " IN SHARE MODE;")
 
 
 async def _selection_source_rows() -> list[Mapping[str, Any]]:
@@ -191,6 +173,8 @@ def _selection_records_for_group(
     dataset_row: Mapping[str, Any],
     source_by_id: Mapping[str, Mapping[str, Any]],
     desired_cms_dataset: Mapping[str, Any] | None = None,
+    *,
+    include_input_proof: bool = True,
 ) -> _SelectionRecords:
     endpoint_id = _required_text(dataset_row, "endpoint_id", limit=128)
     dataset_id = _required_text(dataset_row, "dataset_id", limit=128)
@@ -206,10 +190,7 @@ def _selection_records_for_group(
     group_records = _SelectionRecords([], [], [], [])
     for source_id in source_group:
         source_row = source_by_id.get(source_id)
-        if (
-            source_row is None
-            or _clean_text(source_row.get("endpoint_id")) != endpoint_id
-        ):
+        if source_row is None or _clean_text(source_row.get("endpoint_id")) != endpoint_id:
             raise RuntimeError("provider_directory_profile_selection_source_invalid")
         pair_map = _selection_pair(
             source_id,
@@ -221,15 +202,10 @@ def _selection_records_for_group(
         if desired_cms_dataset is not None and source_id == "cms-npd":
             pair_map = dict(desired_cms_dataset)
         group_records.pairs.append(pair_map)
-        group_records.request_projection.append(
-            {"source_id": source_id, "dataset_id": dataset_id}
-        )
-        group_records.source_contexts.append(
-            _source_context(source_id, endpoint_id, source_row)
-        )
-        group_records.profile_inputs.append(
-            _profile_input(pair_map, dataset_row, publication_metadata)
-        )
+        group_records.request_projection.append({"source_id": source_id, "dataset_id": dataset_id})
+        group_records.source_contexts.append(_source_context(source_id, endpoint_id, source_row))
+        if include_input_proof:
+            group_records.profile_inputs.append(_profile_input(pair_map, dataset_row, publication_metadata))
     return group_records
 
 
@@ -263,9 +239,7 @@ def _source_context(
         "canonical_api_base": source_row.get("canonical_api_base"),
         "org_name": source_row.get("org_name"),
         "plan_name": source_row.get("plan_name"),
-        "authority_id": profile_artifact.profile_reviewed_source_authority_id(
-            source_id
-        ),
+        "authority_id": profile_artifact.profile_reviewed_source_authority_id(source_id),
     }
 
 
@@ -276,23 +250,14 @@ def _profile_input(
 ) -> dict[str, Any]:
     scoped_fields = (
         {
-            "dataset_scoped_admission_id": dataset_row.get(
-                "dataset_scoped_admission_id"
-            ),
-            "dataset_scoped_authority_id": dataset_row.get(
-                "dataset_scoped_authority_id"
-            ),
-            "dataset_scoped_operation_key": dataset_row.get(
-                "dataset_scoped_operation_key"
-            ),
-            "dataset_scoped_projection_as_of": _canonical_scalar(
-                dataset_row.get("dataset_scoped_projection_as_of")
-            ),
+            "dataset_scoped_admission_id": dataset_row.get("dataset_scoped_admission_id"),
+            "dataset_scoped_authority_id": dataset_row.get("dataset_scoped_authority_id"),
+            "dataset_scoped_operation_key": dataset_row.get("dataset_scoped_operation_key"),
+            "dataset_scoped_projection_as_of": _canonical_scalar(dataset_row.get("dataset_scoped_projection_as_of")),
             "dataset_scoped_ready": True,
             "dataset_scoped_variant": dataset_row.get("dataset_scoped_variant"),
         }
-        if pair_map["source_id"]
-        in profile_artifact.configured_dataset_scoped_profile_source_ids()
+        if pair_map["source_id"] in profile_artifact.configured_dataset_scoped_profile_source_ids()
         else {}
     )
     return {
@@ -313,6 +278,8 @@ def _selection_records(
     dataset_by_group: Mapping[tuple[str, ...], Mapping[str, Any]],
     source_by_id: Mapping[str, Mapping[str, Any]],
     desired_cms_dataset: Mapping[str, Any] | None = None,
+    *,
+    include_input_proof: bool = True,
 ) -> _SelectionRecords:
     all_records = _SelectionRecords([], [], [], [])
     for source_group in source_groups:
@@ -324,6 +291,7 @@ def _selection_records(
             dataset_row,
             source_by_id,
             desired_cms_dataset,
+            include_input_proof=include_input_proof,
         )
         all_records.pairs.extend(group_records.pairs)
         all_records.profile_inputs.extend(group_records.profile_inputs)
@@ -342,9 +310,7 @@ def _selection_records(
             projection_map["dataset_id"],
         )
     )
-    all_records.source_contexts.sort(
-        key=lambda context_map: (context_map["source_id"], context_map["endpoint_id"])
-    )
+    all_records.source_contexts.sort(key=lambda context_map: (context_map["source_id"], context_map["endpoint_id"]))
     all_records.profile_inputs.sort(
         key=lambda input_map: (
             input_map["source_id"],
@@ -410,9 +376,7 @@ def _profile_input_digest(
 ) -> str:
     input_identity_map = {
         "catalog_digest": catalog_digest,
-        "configured_profile_source_ids": list(
-            profile_artifact.configured_profile_source_ids()
-        ),
+        "configured_profile_source_ids": list(profile_artifact.configured_profile_source_ids()),
         "global_profile_params": _GLOBAL_PROFILE_PARAMS,
         "profile_inputs": profile_inputs,
         "profile_schema_version": profile_artifact.PROFILE_SCHEMA_VERSION,
@@ -431,6 +395,7 @@ def _computed_selection_from_rows(
     node_id: str,
     source_rows: list[Mapping[str, Any]],
     dataset_rows: list[Mapping[str, Any]],
+    include_input_proof: bool = True,
 ) -> _ComputedProfileSelection:
     """Compute canonical proof identity fields from one immutable DB view."""
 
@@ -447,6 +412,7 @@ def _computed_selection_from_rows(
         source_groups,
         dataset_by_group,
         source_by_id,
+        include_input_proof=include_input_proof,
     )
     return _ComputedProfileSelection(
         request_projection=tuple(selection_records.request_projection),
@@ -474,13 +440,19 @@ async def _compute_current_selection(
         dataset_rows=await _selection_dataset_rows(
             exact_readiness=exact_readiness,
         ),
+        include_input_proof=exact_readiness,
     )
 
 
 def _computed_desired_selection_from_rows(
-    catalog_map: Mapping[str, Any], *, node_id: str,
-    source_rows: list[Mapping[str, Any]], dataset_rows: list[Mapping[str, Any]],
-    desired_dataset_row: Mapping[str, Any], desired_selection: Mapping[str, Any],
+    catalog_map: Mapping[str, Any],
+    *,
+    node_id: str,
+    source_rows: list[Mapping[str, Any]],
+    dataset_rows: list[Mapping[str, Any]],
+    desired_dataset_row: Mapping[str, Any],
+    desired_selection: Mapping[str, Any],
+    include_input_proof: bool = True,
 ) -> _ComputedProfileSelection:
     """Replace only CMS in the full current vector using an exact desired tuple."""
     desired_selection = _validated_desired_selection(desired_selection)
@@ -495,28 +467,42 @@ def _computed_desired_selection_from_rows(
         raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_cms_not_enabled")
     source_by_id, source_ids_by_endpoint = _source_selection_indexes(source_rows)
     _assert_dataset_variant_registry_coordinates(source_by_id)
-    dataset_by_group = _dataset_selection_by_group(dataset_rows, source_groups,
-        source_ids_by_endpoint, _dataset_scoped_variant_source_groups())
+    dataset_by_group = _dataset_selection_by_group(
+        dataset_rows, source_groups, source_ids_by_endpoint, _dataset_scoped_variant_source_groups()
+    )
     dataset_by_group[("cms-npd",)] = desired_dataset_row
-    selection_records = _selection_records(source_groups, dataset_by_group, source_by_id, desired)
+    selection_records = _selection_records(
+        source_groups, dataset_by_group, source_by_id, desired, include_input_proof=include_input_proof
+    )
     identity = _selection_identity(str(catalog_map["catalog_digest"]), node_id, selection_records)
-    identity.update({"contract_id": PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID,
-                     **desired_selection,
-                     "selection_fingerprint": desired_selection_fingerprint(node_id,
-                        str(catalog_map["catalog_digest"]), selection_records.request_projection, desired_selection),
-                     "profile_input_digest": stable_hash({"current_input_digest": identity["profile_input_digest"],
-                        **desired_selection}, domain="provider_directory_profile_input.v2")})
+    identity.update(
+        {
+            "contract_id": PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID,
+            **desired_selection,
+            "selection_fingerprint": desired_selection_fingerprint(
+                node_id, str(catalog_map["catalog_digest"]), selection_records.request_projection, desired_selection
+            ),
+            "profile_input_digest": stable_hash(
+                {"current_input_digest": identity["profile_input_digest"], **desired_selection},
+                domain="provider_directory_profile_input.v2",
+            ),
+        }
+    )
     return _ComputedProfileSelection(tuple(selection_records.request_projection), identity)
 
 
 async def _compute_desired_selection(
-    catalog_map: Mapping[str, Any], *, node_id: str, lock_selection: bool,
-    desired_selection: Mapping[str, Any], exact_readiness: bool = True,
+    catalog_map: Mapping[str, Any],
+    *,
+    node_id: str,
+    lock_selection: bool,
+    desired_selection: Mapping[str, Any],
+    exact_readiness: bool = True,
 ) -> _ComputedProfileSelection:
     if lock_selection:
         await _lock_profile_selection_tables()
     desired = desired_selection["desired_cms_dataset"]
-    row = await db.first(
+    desired_dataset_row = await db.first(
         f"SELECT endpoint_id, dataset_id, acquisition_root_run_id, dataset_hash, "
         "status, is_current, resource_count, validated_at, published_at, superseded_at, publication_metadata_json "
         f"FROM {_table_ref(ProviderDirectoryEndpointDataset)} WHERE dataset_id=:dataset_id;",
@@ -529,10 +515,16 @@ async def _compute_desired_selection(
         f"FROM {_table_ref(ProviderDirectoryEndpointDataset)} WHERE endpoint_id=:endpoint_id AND is_current=true;",
         endpoint_id=desired["endpoint_id"],
     )
-    current_rows = [current_row for current_row in current_rows
-                    if current_row.get("endpoint_id") != desired["endpoint_id"]]
+    current_rows = [
+        current_row for current_row in current_rows if current_row.get("endpoint_id") != desired["endpoint_id"]
+    ]
     current_rows.extend(_row_mapping(incumbent_row) for incumbent_row in incumbent_rows)
-    return _computed_desired_selection_from_rows(catalog_map, node_id=node_id,
+    return _computed_desired_selection_from_rows(
+        catalog_map,
+        node_id=node_id,
         source_rows=await _selection_source_rows(),
         dataset_rows=current_rows,
-        desired_dataset_row=_row_mapping(row), desired_selection=desired_selection)
+        desired_dataset_row=_row_mapping(desired_dataset_row),
+        desired_selection=desired_selection,
+        include_input_proof=exact_readiness,
+    )
