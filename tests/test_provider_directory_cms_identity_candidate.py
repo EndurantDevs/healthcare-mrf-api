@@ -466,7 +466,7 @@ async def test_forced_different_key_canonical_uuid_winner_requires_whole_candida
     statement = publisher.connection.statements[0]
     assert "WITH needed AS MATERIALIZED" in statement
     assert "ON CONFLICT" in statement and "DO NOTHING RETURNING" in statement
-    assert "LEFT JOIN inserted" in statement
+    assert "count(DISTINCT" in statement and "FROM inserted" in statement
     assert not any(statement.startswith("INSERT INTO") for statement in publisher.connection.statements)
 
 
