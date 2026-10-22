@@ -614,3 +614,27 @@ async def test_registered_geo_route_forwards_the_bound_session(monkeypatch):
     assert result.status_code == 200
     assert result.json == {"ok": True}
     assert observed_calls == [("POST", geo.CUSTOM_IMPORT_PROVIDER_GEO_PATH, session)]
+
+
+@pytest.mark.asyncio
+async def test_geo_legacy_body_cap_precedes_signature_and_snapshot(monkeypatch):
+    from unittest.mock import Mock
+
+    verifier = Mock(wraps=transport._verify_provider_transport)
+    monkeypatch.setattr(transport, "_verify_provider_transport", verifier)
+    session = _Session()
+    fixtures._install_keyring(monkeypatch, session)
+    body = _body()
+    request = _request(body)
+    monkeypatch.setattr(transport, "_MAX_BODY_BYTES", len(body) - 1)
+    reply = await geo.serve_custom_import_provider_geo(request, session)
+    assert reply.status == 404 and session.events == []
+
+    verifier.assert_not_called()
+
+
+@pytest.mark.parametrize("items,anchor", [([{"npi": "invalid"}], None), ([], ["1000000001", _ADDRESS_A])])
+def test_geo_payload_rejects_invalid_npi_or_unexpected_final_anchor(items, anchor):
+    body = _geo_reply(items, anchor=anchor).body
+    with pytest.raises(CustomImportReadUnavailableError):
+        geo._geo_payload(body, 3)

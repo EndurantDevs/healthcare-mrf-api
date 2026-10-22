@@ -13,7 +13,7 @@ from sqlalchemy.dialects import postgresql
 from api import custom_import_provider_http as provider_http
 from api import custom_import_read_http as transport
 from db.models.custom_import import CustomImportFamilyRevision, CustomImportWinner
-from process.custom_import import grouped_child_read, grouped_read, read_core
+from process.custom_import import grouped_child_read, grouped_query, grouped_read, read_core
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.read_contracts import canonical_read_document
 from process.custom_import.read_core import CustomImportReadRequestError, ExtensionReadScope, ReadFilter, ReadOrderTerm
@@ -27,6 +27,25 @@ from tests import test_custom_import_read_http as http_fixture
 _SCOPE = ExtensionReadScope("synthetic:grouped")
 _PANEL = ReadFilter("segment", "eq", "segment_a")
 _KEY = ReadFilter("service_code", "eq", "chosen")
+
+
+@pytest.mark.parametrize("operator,expected", [("is_missing", "IS NULL"), ("is_null", "= 'null'")])
+def test_grouped_state_predicates_do_not_compare_scalar_values(operator, expected):
+    from sqlalchemy import column
+
+    expression = grouped_query._comparison(SimpleNamespace(operator=operator), column("metric"), column("state"))
+    sql = str(expression.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+    assert expected in sql and "metric" not in sql
+
+
+def test_grouped_child_selector_joins_one_complete_child_identity_before_values():
+    context = fixture.context()
+    plan = _plan(context_filters=(_KEY,), require_match=False)
+    result = grouped_query._joined_values(context, plan)
+    sql = str(result[1].compile(dialect=postgresql.dialect()))
+    assert "LEFT OUTER JOIN" in sql
+    assert "child_revision_id" in str(result[-1])
+    assert "count(" in sql and "complete_score_child_identities" in sql and "matching_count" in sql
 
 
 def _plan(**changes):

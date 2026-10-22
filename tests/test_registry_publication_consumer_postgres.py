@@ -804,6 +804,7 @@ def _pause_heartbeat_verification(monkeypatch, boundary):
 @pytest.mark.parametrize("boundary", ["before_check", "after_check"])
 async def test_heartbeat_revocation_retains_lease(worker_permissions, monkeypatch, boundary):
     fixture = worker_permissions
+    heartbeat_seconds = consumer._HEARTBEAT_SECONDS
     paused = _pause_heartbeat_verification(monkeypatch, boundary)
     async with _consumer(fixture, authority_hook=paused.authorize) as (arguments, _):
         queued = await _enqueue_ordinary(fixture)
@@ -836,6 +837,7 @@ async def test_heartbeat_revocation_retains_lease(worker_permissions, monkeypatc
                 UUID(queued["request_id"]),
             )
             paused.hold.set()
+            monkeypatch.setattr(consumer, "_HEARTBEAT_SECONDS", heartbeat_seconds)
             completed = await consume_registry_publication_once(**arguments)
             assert completed["request_id"] == queued["request_id"]
             assert (await _status(fixture, queued))["state"] == "completed" and await _head(fixture) is not None

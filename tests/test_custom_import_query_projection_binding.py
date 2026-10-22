@@ -528,3 +528,26 @@ async def test_expired_writer_callback_stops_before_catalog_or_lock():
     with pytest.raises(TimeoutError, match="expired window"):
         await binding.lock_projection_tables(session, _manifest(), _DEFINITION, prepare=prepare)
     session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_projection_parent_absence_prevents_catalog_or_lock_work():
+    session = _session(_result(None))
+    with pytest.raises(binding.QueryProjectionUnavailable, match="parent is missing"):
+        await binding.lock_projection_tables(session, _manifest(), _DEFINITION)
+    assert session.execute.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_index_manifest_count_must_match_declared_capabilities():
+    session = _session()
+    with pytest.raises(binding.QueryProjectionUnavailable, match="index coverage differs"):
+        await binding.validate_projection_indexes(session, _manifest(index_count=3, phase="indexes"), _DEFINITION)
+    session.execute.assert_not_awaited()
+
+
+def test_projection_shape_refuses_unsupported_model_type():
+    from sqlalchemy import JSON, Column
+
+    with pytest.raises(binding.QueryProjectionUnavailable, match="column type is unsupported"):
+        binding._column_shape(Column("unsupported", JSON), 1)

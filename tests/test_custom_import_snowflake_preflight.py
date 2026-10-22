@@ -1703,3 +1703,28 @@ def test_preflight_counts_supported_wire_scalars_and_rejects_unsafe_values():
     assert not snowflake_preflight._is_generic_rejection_code("Invalid")
     with pytest.raises(SnowflakePreflightError):
         snowflake_preflight._clock(lambda: True)
+
+
+def test_preflight_statement_builder_must_return_a_typed_request():
+    from process.custom_import.snowflake_bundle import SnowflakeBundleStatementBuilder
+
+    class InvalidBuilder(SnowflakeBundleStatementBuilder):
+        def prepare_request(self, *_args, **_options):
+            return object()
+
+    definition = _definition()
+    binding = _binding(definition)
+    approved, _ = binding.bundle_components(definition)
+    with pytest.raises(snowflake_preflight.SnowflakePreflightError):
+        snowflake_preflight._prepare_preflight(
+            definition, binding, InvalidBuilder(approved_relations=approved), SnowflakePreflightLimits()
+        )
+
+
+def test_preflight_mapping_requires_exact_request_before_columns():
+    definition = _definition()
+    binding = _binding(definition)
+    statement, request, approved = _bundle_statement(definition, binding)
+    changed = replace(request, capture_limits=replace(request.capture_limits, maximum_records=1))
+    with pytest.raises(ValueError):
+        snowflake_preflight._validate_statement_mapping(statement, changed, request, approved)

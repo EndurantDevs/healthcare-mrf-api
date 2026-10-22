@@ -164,6 +164,30 @@ def test_read_pages_fetch_only_admitted_keys_and_resume(monkeypatch):
     assert any(value == 1 for value in queries[2].params.values())
 
 
+def test_changed_frozen_page_closes_before_yielding_any_payload(monkeypatch):
+    session = _read_session(monkeypatch, [[(1, 3), (2, 3)], [("first",)]])
+    original_transaction = graph._read_transaction
+    closed_pages = []
+
+    @contextmanager
+    def transaction(*args):
+        try:
+            with original_transaction(*args) as page:
+                yield page
+        finally:
+            closed_pages.append(True)
+
+    monkeypatch.setattr(graph, "_read_transaction", transaction)
+    root, received_payloads = CustomImportRootRevision, []
+    with pytest.raises(CandidateRunnerError, match="frozen build page changed during its read"):
+        received_payloads.extend(
+            graph._read_rows(session, _request(), 7, select(root), (root.root_revision_id,), (root,))
+        )
+    assert received_payloads == [] and closed_pages == [True]
+    assert session.execute.call_count == 2
+    assert all(call.args[0].is_select for call in session.execute.call_args_list)
+
+
 def test_one_read_page_stops_at_the_metadata_byte_boundary(monkeypatch):
     session = _read_session(monkeypatch, [[(1, 3), (2, 3)], [("first",)]])
     root = CustomImportRootRevision
@@ -993,3 +1017,63 @@ async def test_retained_eof_requires_sql_completion(monkeypatch, complete):
     call.assert_awaited_once()
     assert call.await_args.args[:2] == (session, "retained_array_finalize")
     assert call.await_args.args[2][9:] == (("bigint[]", ()), ("bigint[]", ()), ("smallint[]", ()), ("text[]", ()))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("capture_state", "pending"), ("dataset_id", 99), ("definition_revision_id", 99), ("schema_revision_id", 99)],
+)
+def test_source_digest_refuses_unsealed_or_foreign_capture_before_scanning(monkeypatch, field, value):
+    request = _request()
+    bundle = SimpleNamespace(
+        capture_state="sealed",
+        dataset_id=request.dataset_id,
+        definition_revision_id=request.definition_revision_id,
+        schema_revision_id=request.schema_revision_id,
+    )
+    setattr(bundle, field, value)
+    before = vars(bundle).copy()
+    lookup, scan = Mock(return_value=(bundle,)), Mock()
+    monkeypatch.setattr(graph, "_one_row", lookup)
+    monkeypatch.setattr(graph, "_read_rows", scan)
+    with pytest.raises(CandidateRunnerError, match="build capture identity is not sealed"):
+        graph._source_digest(None, request, 7, 20)
+    lookup.assert_called_once()
+    scan.assert_not_called()
+    assert vars(bundle) == before
+
+
+@pytest.mark.asyncio
+async def test_open_output_replay_reuses_generation_without_allocating_or_advancing(monkeypatch):
+    request = _request()
+    build = SimpleNamespace(generation_id=10, capture_bundle_id=20, base_generation_id=None, phase="output")
+    before_build_state = vars(build).copy()
+    read_session = SimpleNamespace(run_sync=AsyncMock(side_effect=lambda operation: operation(read_session)))
+    write_session = SimpleNamespace(add=Mock(), execute=AsyncMock(), flush=AsyncMock())
+    closed_pages = []
+
+    @asynccontextmanager
+    async def page(*_args):
+        try:
+            yield write_session, build
+        finally:
+            closed_pages.append(True)
+
+    candidate = Mock(return_value=(b"c" * 32, 1))
+    source_digest_probe, writer = Mock(return_value=b"s" * 32), AsyncMock()
+    monkeypatch.setattr(graph, "_session", lambda *_args: nullcontext(read_session))
+    monkeypatch.setattr(graph, "_page_session", page)
+    monkeypatch.setattr(graph, "_candidate_digest", candidate)
+    monkeypatch.setattr(graph, "_source_digest", source_digest_probe)
+    monkeypatch.setattr(graph, "_call", writer)
+
+    assert await graph._open_output(None, request, 7, 20) == 10
+
+    candidate.assert_called_once_with(read_session, request, 7, bounds=graph._ReadPage(physical=True))
+    source_digest_probe.assert_called_once_with(read_session, request, 7, 20)
+    assert read_session.run_sync.await_count == 2 and closed_pages == [True]
+    assert vars(build) == before_build_state
+    write_session.add.assert_not_called()
+    write_session.execute.assert_not_awaited()
+    write_session.flush.assert_not_awaited()
+    writer.assert_not_awaited()

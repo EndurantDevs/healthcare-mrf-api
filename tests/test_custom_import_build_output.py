@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
@@ -842,3 +842,159 @@ def test_projection_revision_transition_cannot_hide_missing_scalar(monkeypatch):
     with pytest.raises(CandidateRunnerError, match="typed scalar projection differs"):
         list(output._verified_projection_rows(None, _request(), None, 7, None, child=False))
     expected.assert_called_once()
+
+
+def _materialization_case():
+    build, generation, proof = _proof_tuple()
+    generation.source_bundle_sha256 = b"s" * 32
+    generation.candidate_sha256 = b"c" * 32
+    generation.root_count = generation.family_count = 1
+    counts = dict.fromkeys(output._COUNT_NAMES, 1)
+    for name, value in counts.items():
+        setattr(proof, name, value)
+    materialization = output.publication._Materialization(
+        source_bundle_sha256=generation.source_bundle_sha256,
+        materialization_sha256=b"m" * 32,
+        effective_output_sha256=b"e" * 32,
+        **counts,
+    )
+    return build, generation, proof, materialization
+
+
+@pytest.mark.parametrize("corruption", ["source", "candidate", "roots", "families", "winners", *output._COUNT_NAMES])
+def test_exhaustive_materialization_refuses_inconsistent_frozen_evidence(monkeypatch, corruption):
+    request = _request()
+    build, generation, proof, _ = _materialization_case()
+    if corruption in {"roots", "families"}:
+        setattr(generation, "root_count" if corruption == "roots" else "family_count", 2)
+    elif corruption in output._COUNT_NAMES:
+        setattr(proof, corruption, 2)
+    before_model_states = [vars(model).copy() for model in (build, generation, proof)]
+    session = SimpleNamespace(execute=Mock(), add=Mock(), flush=Mock())
+    monkeypatch.setattr(output, "_read_transaction", lambda *_args: nullcontext((build, 20)))
+    for name, helper_return in (
+        ("_source_digest", b"x" * 32 if corruption == "source" else generation.source_bundle_sha256),
+        ("_candidate_digest", (b"x" * 32 if corruption == "candidate" else generation.candidate_sha256, 1)),
+        ("_identity_material", None),
+        ("_shape_material", 1),
+        ("_attempt_material", None),
+        ("_graph_material", (1, 1, 1, 1)),
+        ("_verify_winner_groups", 1),
+        ("_winner_material", 0 if corruption == "winners" else 1),
+    ):
+        monkeypatch.setattr(output, name, Mock(return_value=helper_return))
+    is_header_failure = corruption in {"source", "candidate", "roots", "families"}
+    message = (
+        "frozen generation header"
+        if is_header_failure
+        else "frozen winner count"
+        if corruption == "winners"
+        else "trusted materialization counts"
+    )
+    with pytest.raises(CandidateRunnerError, match=message):
+        output._exhaustive_materialization(session, request, _registry(request.definition), 7, generation, proof)
+    if is_header_failure:
+        output._identity_material.assert_not_called()
+        output._winner_material.assert_not_called()
+    else:
+        output._winner_material.assert_called_once()
+    assert [vars(model) for model in (build, generation, proof)] == before_model_states
+    session.execute.assert_not_called()
+    session.add.assert_not_called()
+    session.flush.assert_not_called()
+
+
+def _finality_session(monkeypatch):
+    session = SimpleNamespace(execute=AsyncMock(), get=AsyncMock(), add=Mock(), flush=AsyncMock())
+    monkeypatch.setattr(output, "_session", lambda *_args, **_kwargs: nullcontext(session))
+    monkeypatch.setattr(output, "_prepare_statement", AsyncMock())
+    monkeypatch.setattr(output.publication, "_begin_finality_operation", AsyncMock())
+    return session
+
+
+@pytest.mark.parametrize("count", output._COUNT_NAMES)
+@pytest.mark.asyncio
+async def test_terminal_seal_refuses_changed_proof_counts_before_writes(monkeypatch, count):
+    build, generation, proof, materialization = _materialization_case()
+    setattr(proof, count, 2)
+    before_model_states = [vars(model).copy() for model in (build, generation, proof)]
+    session = _finality_session(monkeypatch)
+    session.get.side_effect = [generation, proof]
+    monkeypatch.setattr(output, "_lock_page", AsyncMock(return_value=build))
+    monkeypatch.setattr(output, "_unchanged_base", AsyncMock())
+    monkeypatch.setattr(output, "_finalize_sealed_build", AsyncMock())
+    monkeypatch.setattr(output.publication, "_new_generation_seal", Mock())
+    with pytest.raises(CandidateRunnerError, match="final structural proof counts differ"):
+        await output._terminal_seal(None, _request(), 7, materialization)
+    output._unchanged_base.assert_not_awaited()
+    output._finalize_sealed_build.assert_not_awaited()
+    output.publication._new_generation_seal.assert_not_called()
+    assert [vars(model) for model in (build, generation, proof)] == before_model_states
+    assert all(call.args[0].is_select for call in session.execute.await_args_list)
+    session.add.assert_not_called()
+    session.flush.assert_not_awaited()
+
+
+@pytest.mark.parametrize("state", ["no_change", "running", "canceling", "failed"])
+@pytest.mark.asyncio
+async def test_output_replay_refuses_missing_receipt_or_nonterminal_producer(monkeypatch, state):
+    request = _request(expected_base_generation_id=9, expected_pointer_version=2)
+    build, generation, _, materialization = _materialization_case()
+    for name in ("complete_scope", "page_row_limit", "page_byte_limit", "statement_timeout_ms", "build_deadline_at"):
+        setattr(build, name, getattr(request, name))
+    build.refresh_mode = request.definition.refresh_mode
+    build.base_generation_id = request.expected_base_generation_id
+    build.base_pointer_version = request.expected_pointer_version
+    build.request_identity_sha256 = b"r" * 32
+    execution = SimpleNamespace(
+        state=state, capture_bundle_id=20, request_identity_sha256=build.request_identity_sha256
+    )
+    seal_request = output.publication._GenerationSealRequest(
+        request.dataset_id, generation.generation_id, request.fence, lease_token_sha256(request.lease_token)
+    )
+    seal = output.publication._new_generation_seal(generation, materialization, seal_request)
+    before_model_states = [vars(model).copy() for model in (build, generation, execution, seal)]
+    session = _finality_session(monkeypatch)
+    session.get.return_value = build
+    for name, helper_return in (
+        ("_locked_dataset", None),
+        ("_locked_execution", execution),
+        ("_locked_lease", SimpleNamespace(continuation_id=None)),
+        ("_locked_generation", generation),
+        ("_locked_generation_seal", seal),
+        ("_replayed_no_change_receipt", None),
+    ):
+        monkeypatch.setattr(output.publication, name, AsyncMock(return_value=helper_return))
+    monkeypatch.setattr(output.publication, "_generation_seal_replay", Mock())
+    monkeypatch.setattr(output.publication, "_seal_receipt", Mock())
+    message = "terminal no-change execution has no receipt" if state == "no_change" else "producer is not terminal"
+    with pytest.raises(CandidateRunnerError, match=message):
+        await output._replay(None, request, 7)
+    if state == "no_change":
+        output.publication._replayed_no_change_receipt.assert_awaited_once()
+    else:
+        output.publication._replayed_no_change_receipt.assert_not_awaited()
+    output.publication._generation_seal_replay.assert_not_called()
+    output.publication._seal_receipt.assert_not_called()
+    assert [vars(model) for model in (build, generation, execution, seal)] == before_model_states
+    assert all(call.args[0].is_select for call in session.execute.await_args_list)
+    session.add.assert_not_called()
+    session.flush.assert_not_awaited()
+
+
+@pytest.mark.parametrize("phase,generation_id", [("source", 10), ("graph", 10), ("output", None), ("verified", None)])
+@pytest.mark.asyncio
+async def test_output_requires_open_generation_before_any_write_page(monkeypatch, phase, generation_id):
+    build = SimpleNamespace(phase=phase, generation_id=generation_id)
+    before = vars(build).copy()
+    monkeypatch.setattr(output, "_replay", AsyncMock(return_value=None))
+    monkeypatch.setattr(output, "_renew_while_reading", lambda *_args: nullcontext())
+    monkeypatch.setattr(output, "_snapshot", AsyncMock(return_value=build))
+    monkeypatch.setattr(output, "_page_session", Mock())
+    monkeypatch.setattr(output, "_terminal_seal", AsyncMock())
+    with pytest.raises(CandidateRunnerError, match="output requires an atomically opened generation"):
+        await output.build_output(None, _request(), 7)
+    output._snapshot.assert_awaited_once()
+    output._page_session.assert_not_called()
+    output._terminal_seal.assert_not_awaited()
+    assert vars(build) == before

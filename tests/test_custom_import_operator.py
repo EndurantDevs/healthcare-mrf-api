@@ -14,8 +14,8 @@ from process.custom_import.operator import (
     OperatorInvariantError,
     OperatorObjectNotFound,
     OperatorTransactionRequired,
-    inspect_execution_evidence,
     inspect_execution,
+    inspect_execution_evidence,
     inspect_generation,
 )
 
@@ -704,3 +704,79 @@ async def test_generation_status_hides_missing_or_cross_dataset_objects():
         await inspect_generation(session, dataset_id=4, generation_id=19)
 
     assert len(session.statements) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,invalid_value",
+    [
+        ("state", "unknown"),
+        ("mechanism", "unknown"),
+        ("lease_fence", -1),
+        ("lease_fence", 0),
+        ("lease_expires_at", None),
+    ],
+)
+async def test_execution_status_refuses_inconsistent_lifecycle_evidence(field, invalid_value):
+    evidence_by_field = {**_execution_row(), field: invalid_value}
+    before_by_field = evidence_by_field.copy()
+    session = _Session(evidence_by_field)
+
+    with pytest.raises(OperatorInvariantError, match="evidence is invalid"):
+        await inspect_execution(session, dataset_id=3, execution_id=17)
+
+    assert evidence_by_field == before_by_field
+    assert len(session.statements) == 1
+    assert session.statements[0].is_select
+    assert session.statements[0].get_execution_options()["autoflush"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,invalid_value",
+    [
+        ("seal_contract", "unknown-seal"),
+        ("pointer_version", 0),
+        ("no_change_contract", "unknown-no-change"),
+        ("ever_published", None),
+        ("no_change_event_exists", 1),
+    ],
+)
+async def test_generation_status_refuses_invalid_finality_evidence(field, invalid_value):
+    evidence_by_field = {
+        **_generation_row(sealed=True, current_generation_id=13, no_change=True),
+        field: invalid_value,
+    }
+    before_by_field = evidence_by_field.copy()
+    session = _Session(evidence_by_field)
+
+    with pytest.raises(OperatorInvariantError, match="evidence is invalid"):
+        await inspect_generation(session, dataset_id=3, generation_id=19)
+
+    assert evidence_by_field == before_by_field
+    assert len(session.statements) == 1
+    assert session.statements[0].is_select
+    assert session.statements[0].get_execution_options()["autoflush"] is False
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_refuses_seal_identity_without_contract():
+    evidence_by_field = {
+        **_execution_evidence_row(current_generation_id=None),
+        "state": "running",
+        "finished_at": None,
+        "ever_published": False,
+    }
+    valid = await inspect_execution_evidence(_Session(evidence_by_field), dataset_id=3, execution_id=17)
+    assert valid.generation is not None and valid.generation.seal is not None
+    evidence_by_field["seal_contract"] = None
+    before_by_field = evidence_by_field.copy()
+    session = _Session(evidence_by_field)
+
+    with pytest.raises(OperatorInvariantError, match="evidence is invalid"):
+        await inspect_execution_evidence(session, dataset_id=3, execution_id=17)
+
+    assert evidence_by_field == before_by_field
+    assert len(session.statements) == 1
+    assert session.statements[0].is_select
+    assert session.statements[0].get_execution_options()["autoflush"] is False

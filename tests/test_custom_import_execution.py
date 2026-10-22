@@ -1289,3 +1289,62 @@ async def test_lifecycle_storage_fails_when_required_rows_disappear(monkeypatch)
             idempotency_key="disappearing-row",
             mechanism="queued",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation,override_by_field,message",
+    [
+        ("reserve_execution", {"request_identity_sha256": "synthetic-identity"}, "must be bytes-like"),
+        ("reserve_execution", {"source_binding_revision_id": 44}, "requires request_identity_sha256"),
+        ("lookup_execution_request", {"request_identity_sha256": None}, "request_identity_sha256 is required"),
+        ("cancel_execution_request", {"request_identity_sha256": None}, "request_identity_sha256 is required"),
+    ],
+)
+async def test_request_identity_refusals_leave_storage_untouched(operation, override_by_field, message):
+    session = _SyntheticSession()
+    request_by_field = {
+        "dataset_id": 11,
+        "definition_revision_id": 22,
+        "schema_revision_id": 33,
+        "idempotency_key": "synthetic-invalid-request",
+        "mechanism": "queued",
+        **override_by_field,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        await getattr(lifecycle, operation)(session, **request_by_field)
+
+    assert session.statements == []
+    assert session.executions == {}
+    assert session.execution_by_request == {}
+    assert session.leases == {}
+
+
+@pytest.mark.asyncio
+async def test_capture_binding_replays_without_rewriting_execution_or_lease():
+    session = _SyntheticSession()
+    submission = await _submission(session)
+    grant = await lifecycle.claim_execution(session, execution_id=submission.execution_id, token=_WORKER)
+    assert grant is not None
+    binding_by_field = {
+        "execution_id": submission.execution_id,
+        "dataset_id": 11,
+        "definition_revision_id": 22,
+        "schema_revision_id": 33,
+        "capture_bundle_id": 44,
+        "fence": grant.fence,
+        "token": _WORKER,
+    }
+    first = await lifecycle.bind_execution_capture_bundle(session, **binding_by_field)
+    assert first is not None and first.capture_bundle_id == 44
+    before_execution_by_field = vars(session.executions[submission.execution_id]).copy()
+    before_lease_by_field = vars(session.leases[submission.execution_id]).copy()
+    statement_count = len(session.statements)
+
+    replay = await lifecycle.bind_execution_capture_bundle(session, **binding_by_field)
+
+    assert replay == first and replay.created is False
+    assert vars(session.executions[submission.execution_id]) == before_execution_by_field
+    assert vars(session.leases[submission.execution_id]) == before_lease_by_field
+    assert all(statement.is_select for statement in session.statements[statement_count:])

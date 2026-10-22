@@ -389,3 +389,21 @@ async def test_scoped_service_rejects_paging_before_wrapping(window):
     with pytest.raises(CustomImportReadUnavailableError, match="not unpaged"):
         await service_sql._prepare_provider_service_native_scope(grouped, context, None, None)
     scope_preparer.assert_not_awaited()
+
+
+def test_provider_service_order_refuses_unknown_fields():
+    from sanic.exceptions import InvalidUsage
+
+    fields = (
+        "npi",
+        "total_services",
+        "total_allowed_amount",
+        "total_submitted_charges",
+        "total_beneficiaries",
+        "matched_service_codes",
+    )
+    relation = select(
+        *(literal(1).label(name) for name in fields), literal("Synthetic").label("provider_name")
+    ).subquery()
+    with pytest.raises(InvalidUsage, match="Unsupported order_by"):
+        service_sql._ordered_provider_service_statement(select(relation), relation, "unknown", "asc")

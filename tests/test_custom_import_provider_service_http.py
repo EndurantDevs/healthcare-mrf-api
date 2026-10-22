@@ -663,3 +663,87 @@ async def test_legacy_service_native_refusal_remains_unavailable(monkeypatch, st
     assert session.rolled_back and session.events[-1] == "end"
     assert "hydrate" not in session.events and "finality" not in session.events
     refused.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_service_legacy_body_cap_precedes_signature_and_snapshot(monkeypatch):
+    from unittest.mock import Mock
+
+    verifier = Mock(wraps=transport._verify_provider_transport)
+    monkeypatch.setattr(transport, "_verify_provider_transport", verifier)
+    session = _Session()
+    fixtures._install_keyring(monkeypatch, session)
+    body = _body()
+    request = _request(body)
+    monkeypatch.setattr(transport, "_MAX_BODY_BYTES", len(body) - 1)
+    reply = await service_http.serve_custom_import_provider_service(request, session)
+    assert reply.status == 404 and session.events == []
+
+    verifier.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_serialized_service_page_bound_rolls_back_without_partial_items(monkeypatch):
+    session = _Session()
+    _install(monkeypatch, session)
+    reader = AsyncMock(return_value={"items": [{"npi": "1104212877", "notes": "x" * 3000}]})
+    monkeypatch.setattr(service_http, "_read_service_payload", reader)
+    monkeypatch.setattr(transport, "_MAX_RESPONSE_BYTES", 1024)
+    reply = await service_http.serve_custom_import_provider_service(_request(), session)
+    assert reply.status == 503 and session.rolled_back
+    reader.assert_awaited_once()
+    assert "items" not in json.loads(reply.body)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"items": {}, "pagination": {}, "query": {}},
+        {"items": [None], "pagination": {}, "query": {}},
+        {"items": [{"npi": True}], "pagination": {}, "query": {}},
+    ],
+)
+def test_service_payload_rejects_invalid_native_page_before_hydration(payload):
+    with pytest.raises(CustomImportReadUnavailableError, match="response is unavailable"):
+        service_http._service_payload(transport._canonical_json_bytes(payload))
+
+
+@pytest.mark.asyncio
+async def test_service_dispatch_without_native_args_preserves_handler_contract(monkeypatch):
+    from api.endpoint import pricing
+
+    request = object()
+    handler = AsyncMock(return_value=object())
+    monkeypatch.setattr(pricing, "list_providers_by_procedure", handler)
+    expected = handler.return_value
+    assert await service_http._service_page(request, session="synthetic-session") is expected
+    handler.assert_awaited_once_with(request, session="synthetic-session")
+
+
+@pytest.mark.asyncio
+async def test_managed_service_limit_is_checked_before_transport_or_reader(monkeypatch):
+    from tests.test_custom_import_managed_service import _signed_request
+
+    request = _signed_request(limit="51", include_filter=False)
+    verify = AsyncMock(side_effect=AssertionError("unbounded request must not verify or serve"))
+    monkeypatch.setattr(transport, "_verify_provider_transport", verify)
+    reply = await service_http.serve_custom_import_provider_service(request, None)
+    assert reply.status == 400 and "items" not in json.loads(reply.body)
+    verify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_legacy_service_cannot_expose_managed_source_refusal(monkeypatch):
+    from tests.test_provider_collection_network_read import _service_refusal
+
+    session = _Session()
+    _install(monkeypatch, session)
+    reader = AsyncMock(
+        side_effect=service_http.ProviderCollectionServiceRefusal(transport._canonical_json_bytes(_service_refusal()))
+    )
+    monkeypatch.setattr(service_http, "_read_service_payload", reader)
+    reply = await service_http.serve_custom_import_provider_service(_request(), session)
+    assert reply.status == 503 and session.rolled_back
+    assert set(json.loads(reply.body)) == {"error"}

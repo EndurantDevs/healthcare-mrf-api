@@ -182,3 +182,16 @@ def test_foreign_domain_and_noncanonical_signed_json_are_rejected():
             _open(_base64url_encode(altered_payload + signed))
     with pytest.raises(CustomImportReadRequestError):
         geo.issue_geo_cursor(STATE, secret=b"short")
+
+
+@pytest.mark.parametrize("anchor", ["{00000000-0000-4000-8000-000000000001}", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"])
+def test_geo_anchor_requires_canonical_uuid_spelling(anchor):
+    with pytest.raises(CustomImportReadCursorError):
+        geo.issue_geo_cursor(replace(STATE, anchor_address_key=anchor), secret=SECRET)
+
+
+def test_geo_cursor_keeps_the_output_bound_after_signing(monkeypatch):
+    token = geo.issue_geo_cursor(STATE, secret=SECRET)
+    monkeypatch.setattr(geo, "MAX_CURSOR_CHARACTERS", len(token) - 1)
+    with pytest.raises(CustomImportReadCursorError):
+        geo.issue_geo_cursor(STATE, secret=SECRET)

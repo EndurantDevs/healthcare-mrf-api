@@ -27,6 +27,66 @@ from tests.test_custom_import_build_graph_prepare import child_row, root_row
 from tests.test_custom_import_definition import _rate, _raw_definition
 
 
+def test_projection_capability_preserves_a_chained_allocation_failure(monkeypatch):
+    def layout(*_args):
+        raise ValueError("synthetic wrapper") from MemoryError("allocation failed")
+
+    monkeypatch.setattr(sets.graph_payloads, "native_projector", lambda: object())
+    monkeypatch.setattr(sets.graph_payloads, "_projection_layout", layout)
+    request = _request()
+    with pytest.raises(ValueError, match="synthetic wrapper") as caught:
+        sets._can_project_sources(request, _registry(request.definition))
+    assert isinstance(caught.value.__cause__, MemoryError)
+
+
+@pytest.mark.parametrize("damage", ["zero_progress", "oversized_page"])
+async def test_invalid_preview_stops_before_child_write_and_preserves_committed_tip(monkeypatch, damage):
+    request = _request(page_row_limit=128)
+    family = family_input(request, 1)
+    db = CallerDatabase(monkeypatch, request, (family,))
+    if damage == "zero_progress":
+        original = sets._child_arguments
+
+        def arguments(*args, **kwargs):
+            name, values = original(*args, **kwargs)
+            return name, (*values[:-1], (values[-1][0], (0,)))
+
+        monkeypatch.setattr(sets, "_child_arguments", arguments)
+    else:
+        read = sets._read_child_batch
+
+        def oversized(*args, **kwargs):
+            monkeypatch.setattr(sets, "_child_argument_bytes", lambda *_args: sets.MAX_BATCH_BYTES + 1)
+            return read(*args, **kwargs)
+
+        monkeypatch.setattr(sets, "_read_child_batch", oversized)
+    with pytest.raises(CandidateRunnerError, match="durable progress|admitted byte page"):
+        await sets.consume_family_page(None, request, _registry(request.definition), (family[0],))
+    assert db.progress[1].attached_child_count == 0
+    assert not db.seen and not db.read_open and not db.write_open
+    assert len(db.calls) == 1
+
+
+def test_empty_complete_child_receipt_keeps_the_exact_existing_tip():
+    request = _request()
+    item, _children = family_input(request, 1, count=0)
+    receipt = SimpleNamespace(
+        root_record_id=1,
+        family_revision_id=20_001,
+        root_revision_id=item.root.root_revision_id,
+        entity_binding_id=6001,
+        attached_child_count=0,
+        last_child_collection_slot=None,
+        last_child_key_sha256=None,
+        last_input_child_revision_id=None,
+        complete=True,
+    )
+    states = sets._root_receipts(request, _registry(request.definition), (item,), (receipt,))
+    updated = sets._child_receipts((sets._ChildGroup(states[0], ()),), (receipt,))
+    assert updated[0].complete is True and updated[0].current.attached_child_count == 0
+    assert updated[0].current.last_child_key_sha256 is None
+
+
 def family_input(request, root_id, *, retained=False, count=1, values=None):
     npi = f"{root_id:010d}"
     values = values or [_rate(npi, f"A{index:05d}") for index in range(count)]

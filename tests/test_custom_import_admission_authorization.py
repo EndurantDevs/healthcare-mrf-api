@@ -615,3 +615,29 @@ def test_sensitive_malformed_inputs_never_enter_errors_or_logs(caplog):
     rejected(verify, headers=signed_headers(b'{"DO-NOT-LOG":'))
     rejected(auth.load_keyring, b'{"key_base64url":"DO-NOT-LOG"')
     assert caplog.records == []
+
+
+@pytest.mark.parametrize("key_id", ["invalid key", 1, ""])
+def test_keyring_refuses_invalid_entry_identifier(key_id):
+    document = keyring_document()
+    document["keys"][1]["key_id"] = key_id
+    rejected(auth.load_keyring, canonical(document))
+
+
+@pytest.mark.parametrize("entry", [(), ("Content-Type",), ("Content-Type", "application/json", "extra"), "invalid"])
+def test_header_framing_requires_exact_name_value_pairs(entry):
+    rejected(verify, headers=[entry, *signed_headers()[1:]])
+
+
+def test_authority_purpose_cannot_be_caller_selected():
+    rejected(
+        auth._verify_authority,
+        headers=signed_headers(),
+        method="POST",
+        path=auth.ADMISSION_PATH,
+        query_string="",
+        trusted_now=NOW,
+        expected_origin=ORIGIN,
+        keyring=keyring(),
+        purpose="caller-selected",
+    )

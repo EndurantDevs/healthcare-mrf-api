@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -27,6 +28,74 @@ from process.custom_import.publication import (
     _positive_integer,
     _PublicationEventDetails,
 )
+
+
+def test_verification_counts_refuse_boolean_population_before_reading_evidence():
+    with pytest.raises(PublicationConflict, match="invalid verification population"):
+        publication._validate_verification_counts({}, (True, 0, 0, 0))
+
+
+def test_publication_receipt_refuses_missing_persisted_material():
+    with pytest.raises(PublicationConflict, match="receipt is not canonical"):
+        publication.verify_publication_event_material(SimpleNamespace())
+
+
+async def test_finality_binding_refuses_an_unbound_control_schema_before_sql():
+    model_schema = custom_import_models.CustomImportGeneration.__table__.schema
+    session = SimpleNamespace(
+        in_transaction=lambda: True,
+        connection=AsyncMock(
+            return_value=SimpleNamespace(
+                sync_connection=SimpleNamespace(
+                    get_execution_options=lambda: {"schema_translate_map": {model_schema: None}}
+                )
+            )
+        ),
+        execute=AsyncMock(),
+    )
+    with pytest.raises(PublicationConflict, match="explicit model schema"):
+        await publication._finality_materialization_models(session, object())
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize("damage", ["unavailable", "different"])
+def test_seal_replay_refuses_unavailable_or_different_query_projection_evidence(damage):
+    generation, materialization, seal, _token = _generation_seal_fixtures()
+    if damage == "unavailable":
+        seal.query_projection_contract = "unknown-contract"
+    else:
+        materialization = replace(materialization, query_projection_evidence=object())
+    with pytest.raises(PublicationConflict, match="projection"):
+        publication._validate_generation_seal(seal, generation, materialization)
+
+
+async def test_projection_finality_failure_preserves_publication_error_contract(monkeypatch):
+    from process.custom_import import query_projection_finality
+    from process.custom_import.query_projection_binding import QueryProjectionUnavailable
+
+    failure = QueryProjectionUnavailable("synthetic projection unavailable")
+    monkeypatch.setattr(query_projection_finality, "validate_sealed_projection", AsyncMock(side_effect=failure))
+    with pytest.raises(PublicationConflict, match="synthetic projection unavailable") as caught:
+        await publication._validate_sealed_projection(object(), object(), object())
+    assert caught.value.__cause__ is failure
+
+
+async def test_family_materialization_refuses_a_missing_declared_child(monkeypatch):
+    from tests.test_custom_import_build_graph import _request
+    from tests.test_custom_import_build_output import _generation
+    from tests.test_custom_import_output_bulk_verification import _family
+
+    request = _request()
+    family, _children = _family(request, 1, ({"rate_npi": "0000000001", "service_code": "S", "amount": Decimal("1")},))
+    windows = iter([(family[:5],), ()])
+
+    async def records(*_args, **_kwargs):
+        for row in next(windows):
+            yield row
+
+    monkeypatch.setattr(publication, "_stream_materialization_records", records)
+    with pytest.raises(PublicationConflict, match="child count does not match exact membership"):
+        await publication._add_family_material(object(), publication._new_digest("test"), _generation(request))
 
 
 @pytest.mark.parametrize("caller_timeout", ["0", "1s", "250ms"])

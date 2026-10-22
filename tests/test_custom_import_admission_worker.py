@@ -710,3 +710,39 @@ async def test_terminal_reconciliation_returns_retained_aggregates_not_a_fabrica
         outcome = await staging._stage_admission_handoff("existing-pool", request, 8, transport)
         assert outcome == staging.SourceBuildResult(8, 4, "graph", 10, 0)
     assert len(attempted_requests) == 1 and state.snapshots == 3
+
+
+@pytest.mark.parametrize("body", [b"", b"x" * 513])
+def test_transport_rejects_oversize_framing_before_network(body):
+    async def run():
+        async with _transport(lambda _request: pytest.fail("invalid framing must not dispatch")) as transport:
+            request = transport.bind_request(_build_request())
+            with pytest.raises(worker.AdmissionTransportError):
+                await transport._exchange(request, body)
+
+    asyncio.run(run())
+
+
+def test_invalid_retained_phase_stops_before_http(monkeypatch):
+    state = _pages(monkeypatch, phases=("unrecognized",))
+
+    async def run():
+        async with _transport(lambda _request: pytest.fail("invalid retained phase must not dispatch")) as transport:
+            with pytest.raises(worker.AdmissionTransportError):
+                await worker.admit_next_batch("existing-pool", _build_request(), 8, transport)
+
+    asyncio.run(run())
+    assert state.snapshots == 1 and not state.active
+
+
+def test_regressed_reconciliation_cursor_is_not_presented_as_progress(monkeypatch):
+    state = _pages(monkeypatch, cursors=(5, 4))
+
+    async def run():
+        async with _transport(lambda _request: _reply(status=503)) as transport:
+            with pytest.raises(worker.AdmissionReconciliationRequired) as caught:
+                await worker.admit_next_batch("existing-pool", _build_request(), 8, transport)
+            assert caught.value.pins == PINS and caught.value.progress is None
+
+    asyncio.run(run())
+    assert state.snapshots == 2 and not state.active

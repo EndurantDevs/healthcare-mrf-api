@@ -998,3 +998,31 @@ async def test_synchronous_deadline_expiry_cannot_escape_to_claimed_runner(coord
     finally:
         monkeypatch.setattr(loop, "time", original_time)
     coordinator.mocks_by_name["run_claimed_candidate"].assert_not_awaited()
+
+
+@pytest.mark.parametrize("changes", [{"objects": []}, {"objects": (object(),)}, {"complete_scope": False}])
+def test_https_invalid_scope_and_object_types_never_reach_acquisition(coordinator, changes):
+    with pytest.raises(HttpsCandidateError, match="^https_request_invalid$"):
+        https_candidate._checked_request(replace(coordinator.request, **changes))
+    coordinator.acquire.assert_not_awaited()
+    assert coordinator.sessions == []
+
+
+def test_https_replay_does_not_mix_original_and_segmented_capture_formats():
+    request, payloads = _request()
+    retained = _retained(request, payloads)[0]
+    item, stream = request.objects[0], request.definition.source_streams[0]
+    sealed = capture_stream(
+        BytesIO(payloads[stream.stream_id]), stream, source_snapshot_token=request.source_snapshot_token
+    )
+    original_request = SimpleNamespace(source_kind="uploaded")
+    with pytest.raises(HttpsCandidateError, match="^https_capture_mismatch$"):
+        https_candidate._reconstructed_capture(original_request, item, stream, retained)
+    with pytest.raises(HttpsCandidateError, match="^https_capture_mismatch$"):
+        https_candidate._reconstructed_capture(request, item, stream, sealed)
+
+
+def test_https_shared_request_fields_require_complete_scope():
+    request, _ = _request()
+    with pytest.raises(HttpsCandidateError, match="^https_request_invalid$"):
+        https_candidate._checked_request_fields(replace(request, complete_scope=False))

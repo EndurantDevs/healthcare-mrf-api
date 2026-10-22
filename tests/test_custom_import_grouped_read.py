@@ -28,6 +28,35 @@ from tests import test_custom_import_read_http as http_fixture
 _SCOPE = ExtensionReadScope("synthetic:grouped")
 
 
+@pytest.mark.parametrize("damage", ["helper", "profile", "require_match", "exact_context", "predicate_budget"])
+def test_grouped_plan_refuses_missing_profiles_and_untyped_or_overbudget_membership(monkeypatch, damage):
+    context, query = fixture.context(), fixture.query()
+    if damage == "helper":
+        context = replace(context, default_profile_slot=None)
+    elif damage == "profile":
+        context = replace(context, target=replace(context.target, profile_id="latest_period"))
+    elif damage == "require_match":
+        query = replace(query, require_match=1)
+    elif damage == "exact_context":
+        query = replace(query, require_exact_context=1)
+    else:
+        monkeypatch.setattr(read_core, "_relation_predicate_limit", lambda _query: 0)
+    expected = (
+        read_core.CustomImportReadUnavailableError if damage in {"helper", "profile"} else CustomImportReadRequestError
+    )
+    with pytest.raises(expected, match="profiles are unavailable|membership mode|predicate count"):
+        grouped_read.normalize_plan(context, query, _SCOPE)
+
+
+async def test_grouped_family_read_refuses_duplicate_results_above_entity_bound():
+    context = fixture.context()
+    plan = grouped_read.normalize_plan(context, fixture.query(), _SCOPE)
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(all=lambda: [object()] * 3)))
+    with pytest.raises(read_core.CustomImportReadUnavailableError, match="family count exceeds"):
+        await grouped_read._selected_family_rows(session, context, plan, ("1234567893",))
+    session.execute.assert_awaited_once()
+
+
 @pytest.mark.parametrize(
     "entity_values",
     [None, ("1234567893", "1000000012"), select(table("native_scope", column("npi")).c.npi)],

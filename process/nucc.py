@@ -649,6 +649,8 @@ async def _handoff_protected_source(ctx):
             stage = replace(stage, ready=ready)
             context["nucc_source_stage_bound"] = stage
             context["nucc_native_commit_unknown"] = True
+    except asyncio.CancelledError:
+        raise
     except BaseException:
         if stage.ready is None:
             raise

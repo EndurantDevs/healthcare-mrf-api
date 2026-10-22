@@ -45,6 +45,104 @@ def _proof(**changes):
     return SimpleNamespace(**(values_by_name | changes))
 
 
+@pytest.mark.parametrize("damage", ["source", "shape"])
+def test_frozen_finish_refuses_changed_header_or_profile_accounting(monkeypatch, damage):
+    request = _request()
+    generation = _prepare_compact_finish(monkeypatch, request)
+    if damage == "source":
+        generation.source_bundle_sha256 = b"x" * 32
+    else:
+        monkeypatch.setattr(output, "_shape_material", lambda *_args: 1)
+    with pytest.raises(CandidateRunnerError, match="generation header differs|profile count differs"):
+        compact.frozen_materialization(None, request, _registry(request.definition), 7, generation, _proof())
+    output._attempt_material.assert_not_called()
+
+
+@pytest.mark.parametrize("damage", ["missing", "ordinal"])
+def test_child_probes_refuse_missing_or_reordered_coverage(monkeypatch, damage):
+    count = compact.CHILD_SAMPLE_LIMIT
+    sample_rows = [(index, 11) for index in range(1, count + 1)]
+    if damage == "missing":
+        sample_rows.pop()
+    else:
+        sample_rows[0] = (2, 11)
+    monkeypatch.setattr(compact, "_aggregate", Mock(side_effect=[[(1, 1, 1, 11, 11)], sample_rows]))
+    with pytest.raises(CandidateRunnerError, match="child sample coverage changed"):
+        compact._sample_children(None, _request(), 7, _generation(_request()), (1,), (1,), b"s" * 32)
+
+
+def test_child_sampling_handles_a_root_with_no_child_scopes(monkeypatch):
+    aggregate = Mock(return_value=[])
+    monkeypatch.setattr(compact, "_aggregate", aggregate)
+    assert compact._sample_children(None, _request(), 7, _generation(_request()), (1,), (1,), b"s" * 32) == {}
+    aggregate.assert_called_once()
+
+
+@pytest.mark.parametrize("damage", ["child_digest", "selected_plan"])
+def test_revision_samples_reject_payload_digest_or_selected_plan_drift(monkeypatch, damage):
+    request = _request()
+    family, child, _roots, _children, complete = _sampled_family(monkeypatch, request, oversized=True)
+    if damage == "child_digest":
+        child.payload_sha256 = b"x" * 32
+    else:
+        family[5].selection_kind = "unknown"
+    with pytest.raises(CandidateRunnerError, match="payload digest differs|selected plan"):
+        compact._verify_revisions(
+            None,
+            request,
+            _registry(request.definition),
+            7,
+            _generation(request),
+            (1,),
+            {1: {(child.collection_slot, child.child_revision_id)}},
+        )
+    complete.assert_not_called()
+
+
+def test_revision_audit_with_no_samples_does_not_read_projection_rows(monkeypatch):
+    request = _request()
+    monkeypatch.setattr(output, "_output_rows", lambda *_args, **_kwargs: (row for row in ()))
+    projection = Mock(side_effect=AssertionError("no revisions were selected"))
+    monkeypatch.setattr(output, "_verified_projection_rows", projection)
+    assert (
+        compact._verify_revisions(None, request, _registry(request.definition), 7, _generation(request), (), {}) == {}
+    )
+    projection.assert_not_called()
+
+
+def test_complete_family_sample_requires_the_requested_root(monkeypatch):
+    request = _request()
+    monkeypatch.setattr(output, "_output_rows", lambda *_args, **_kwargs: (row for row in ()))
+    with pytest.raises(CandidateRunnerError, match="frozen family sample coverage"):
+        compact._verify_family_samples(
+            None,
+            request,
+            _registry(request.definition),
+            7,
+            _generation(request),
+            (1,),
+            compact._sample_read_budget((1,), {}),
+        )
+
+
+def test_winner_snapshot_drift_before_cursor_open_refuses_the_read(monkeypatch):
+    from process.custom_import import build_graph
+    from tests.test_custom_import_compact_winner_cursor import _cursor_session
+
+    session, cursor, events, _deadlines = _cursor_session(monkeypatch, [[]])
+    monkeypatch.setattr(
+        build_graph,
+        "_build_storage_models",
+        Mock(side_effect=[(snapshot_models(41), None), (snapshot_models(42), None)]),
+    )
+    request = _request()
+    with pytest.raises(CandidateRunnerError, match="winner snapshot changed"):
+        list(compact._winner_rows(session, request, 7, _generation(request)))
+    session.execute.assert_not_called()
+    cursor.close.assert_not_called()
+    assert events[-1] == "rollback"
+
+
 def _coverage(proof=None, *, contexts=((1, 3, 2), (2, 5, 4))):
     """Keep both root and child profiles independent of origin-specific scalar closure."""
     return compact._check_coverage(proof or _proof(), [(1, 5, 10)], [(1, 0), (2, 1)], contexts)

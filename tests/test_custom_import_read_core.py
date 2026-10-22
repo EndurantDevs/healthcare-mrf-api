@@ -1434,3 +1434,44 @@ async def test_entity_detail_rejects_a_winner_removed_between_selection_and_hydr
     )
     with pytest.raises(CustomImportReadUnavailableError, match="selected entity is not eligible"):
         await read_core._entity_winner_locator(session, query_context, EntityLocator("synthetic", "value"))
+
+
+@pytest.mark.asyncio
+async def test_uncacheable_root_details_never_write_cache(monkeypatch):
+    @asynccontextmanager
+    async def window(_session, **_options):
+        yield
+
+    cache = _CacheSpy()
+    service = CustomImportReadService(authorizer=_AllowingAuthorizer(), cache=cache)
+    winner = WinnerLocator(1, 2, 3, b"w" * 32)
+    scope = read_core.ExtensionReadScope("synthetic:scope")
+    detail = read_core.RootDetail(_target(), winner, (), (), read_core._scope_digest(scope))
+    context = SimpleNamespace(definition=SimpleNamespace(query=SimpleNamespace(entity_selection=None)))
+    monkeypatch.setattr(read_core, "_bounded_read_window", window)
+    monkeypatch.setattr(read_core, "_load_read_context", AsyncMock(return_value=context))
+    monkeypatch.setattr(read_core, "_entity_winner_locator", AsyncMock(return_value=winner))
+    hydration = AsyncMock(return_value=(detail, None))
+    monkeypatch.setattr(service, "_root_detail_from_context", hydration)
+    request = RootDetailRequest(_target(), EntityLocator("synthetic", "value"), read_core._FULL_FAMILY_ENTITLEMENT)
+    assert (
+        await service.root_detail_for_entity(
+            object(), authorization=ExtensionReadAuthorization("synthetic-secret"), request=request
+        )
+        is detail
+    )
+    assert await service._root_detail(object(), target=_target(), winner=winner, authorization_scope=scope) is detail
+    assert hydration.await_count == 2 and cache.set_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_complete_provider_family_bound_precedes_all_hydration(monkeypatch):
+    selected_rows = tuple(
+        (None, SimpleNamespace(family_revision_id=index), None, None)
+        for index in range(read_core.MAX_FULL_FAMILY_PAGE_SIZE + 1)
+    )
+    hydrate = AsyncMock(side_effect=AssertionError("unbounded page must not hydrate"))
+    monkeypatch.setattr(read_core, "_hydrate_complete_family_entities", hydrate)
+    with pytest.raises(CustomImportReadUnavailableError, match="page exceeds its bound"):
+        await read_core._hydrate_provider_page_items(object(), object(), selected_rows, "synthetic-scope")
+    hydrate.assert_not_awaited()

@@ -18,9 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from process.custom_import import snowflake
-from process.custom_import import snowflake_bundle
 import process.custom_import.capture as capture_module
+from process.custom_import import snowflake, snowflake_bundle
 from process.custom_import.capture import CaptureLimits
 from process.custom_import.definition import CustomImportDefinition
 
@@ -1193,3 +1192,51 @@ def test_acquisition_and_capture_replay_detect_tampered_evidence(monkeypatch):
             source_snapshot_token=acquisition.manifest.source_snapshot_token,
             capture_limits=CaptureLimits(),
         )
+
+
+def test_fixed_provider_refuses_missing_directory(tmp_path):
+    with pytest.raises(snowflake.SnowflakeCredentialError, match="directory is unavailable"):
+        snowflake.FixedLocalKeyPairCredentialProvider(tmp_path / "missing")
+
+
+def test_fixed_provider_detects_directory_replacement_while_opening(tmp_path, monkeypatch):
+    directory = _credential_directory(tmp_path)
+    actual_stat = snowflake.os.stat
+
+    def stale_stat(path, **kwargs):
+        metadata = actual_stat(path, **kwargs)
+        return SimpleNamespace(st_dev=metadata.st_dev, st_ino=metadata.st_ino + 1)
+
+    monkeypatch.setattr(snowflake.os, "stat", stale_stat)
+    with pytest.raises(snowflake.SnowflakeCredentialError, match="identity changed while opening"):
+        snowflake.FixedLocalKeyPairCredentialProvider(directory)
+
+
+@pytest.mark.parametrize("failure", ["read_error", "oversize", "truncated"])
+def test_fixed_credential_read_failures_close_descriptor(tmp_path, monkeypatch, failure):
+    directory = _credential_directory(tmp_path)
+    _write_credential_document(directory, _credential_document())
+    with snowflake.FixedLocalKeyPairCredentialProvider(directory) as provider:
+        actual_read = snowflake.os.read
+        actual_close = snowflake.os.close
+        closed_descriptors = []
+
+        def read(descriptor, length):
+            if failure == "read_error":
+                raise OSError("synthetic read failure")
+            if failure == "oversize":
+                return b"x" * (snowflake.MAX_CREDENTIAL_FILE_BYTES + 1)
+            if failure == "truncated":
+                return b""
+            return actual_read(descriptor, length)
+
+        def close(descriptor):
+            closed_descriptors.append(descriptor)
+            return actual_close(descriptor)
+
+        with monkeypatch.context() as context:
+            context.setattr(snowflake.os, "read", read)
+            context.setattr(snowflake.os, "close", close)
+            with pytest.raises(snowflake.SnowflakeCredentialError):
+                provider.load_key_pair()
+        assert len(closed_descriptors) == 1 and closed_descriptors[0] != provider._credential_directory_descriptor

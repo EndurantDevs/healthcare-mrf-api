@@ -28,6 +28,53 @@ from tests.test_custom_import_segmented_runner import _install_flow, _run
 _ROOT = Path(__file__).resolve().parents[1]
 _BATCH = UUID(int=17)
 
+
+def test_finalization_refuses_a_malformed_packaged_sql_resource(monkeypatch):
+    finalizer._load_sql.cache_clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(finalizer.Path, "read_text", lambda *_args: "-- query: only\nSELECT 1")
+        with pytest.raises(finalizer.SourceFinalizationError, match="SQL resource is malformed"):
+            finalizer._load_sql()
+    finalizer._load_sql.cache_clear()
+
+
+async def test_finalization_requires_explicit_translated_control_schema():
+    session = _Session()
+    session.schema = None
+    with pytest.raises(finalizer.SourceFinalizationError, match="explicit model schema"):
+        await finalizer._statements(session, 7)
+    assert not session.executed
+
+
+async def test_finalization_invalid_batch_fails_before_sql(monkeypatch):
+    session, called = _page(monkeypatch)
+    async with session.begin():
+        with pytest.raises(finalizer.SourceFinalizationError, match="UUID batch"):
+            await finalizer.finalize_source_batch(session, "untrusted-batch", [])
+    called.assert_not_awaited()
+    assert session.executed == []
+
+
+async def test_finalization_skips_analyze_and_truncate_when_other_batch_rows_remain(monkeypatch):
+    original = _row
+
+    def row(name, close_copy, role):
+        if name == "needs_occurrence_analyze":
+            return {"needed": False}
+        if name == "landing_empty":
+            return {"empty": False}
+        return original(name, close_copy, role)
+
+    monkeypatch.setattr(__import__(__name__, fromlist=["_row"]), "_row", row)
+    session, called = _page(monkeypatch)
+    async with session.begin():
+        assert await _finalize(session) == 1
+    assert "analyze_occurrences" not in session.events
+    assert "truncate_landing" not in session.events
+    assert "close_authorization" in session.durable
+    called.assert_awaited()
+
+
 _NATIVE_SCALAR_FORMS = [
     [
         "sha256(decode('637573746f6d2d696d706f72742f76310063616e6469646174652d72756e6e65722f3100','hex')\n            ||convert_to('root-key','UTF8')||decode('00','hex')||convert_to(l.typed_key,'UTF8'))",
