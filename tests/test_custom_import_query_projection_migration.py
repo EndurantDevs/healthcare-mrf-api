@@ -87,6 +87,7 @@ def _assert_projection_upgrade_order(script, module):
         "20261019150000_registry_source_check_idempotency",
         "20261020160000_registry_staged_verification_join",
         "20261020210000_registry_manual_acceptance_join",
+        "20261022110000_ptg_checker_execution",
     ]
 
 
@@ -98,7 +99,7 @@ def test_projection_migration_extends_the_single_installed_head():
     script = ScriptDirectory.from_config(config)
     module = migration()
     assert module.down_revision == "20261013010000_registry_custom_history_events"
-    assert script.get_heads() == ["20261020210000_registry_manual_acceptance_join"]
+    assert script.get_heads() == ["20261022110000_ptg_checker_execution"]
     _assert_custom_import_manual_acceptance_lineage(script)
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision

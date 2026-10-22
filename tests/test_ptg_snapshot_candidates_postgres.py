@@ -1011,6 +1011,15 @@ async def test_candidate_non_superuser_definer_keeps_native_privileges(monkeypat
             assert await connection.scalar(text(f"SELECT count(*) FROM {schema}.witness WHERE snapshot_key=10")) == 1
 
 
+@pytest.mark.asyncio
+async def test_checker_upgrade_preserves_writer_security(monkeypatch):
+    """Authenticated writer families retain COPY; Reader TEMP triggers lose permanent locks."""
+    from tests.ptg_checker_execution_postgres_support import checker_execution_case
+
+    async with _candidate_database(monkeypatch) as (engine, schema, writer):
+        await checker_execution_case(engine, schema, writer)
+
+
 async def _prepare_dictionary_family(connection, schema, snapshot_key, token):
     """Prepare two indexed detached heaps through the real native COPY APIs."""
     from process.ptg_parts.ptg2_snapshot_candidates import copy_candidate_records

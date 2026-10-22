@@ -58,7 +58,7 @@ def _assert_receipt_columns_match_model(elements) -> None:
 
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["20261020210000_registry_manual_acceptance_join"]
+    assert script.get_heads() == ["20261022110000_ptg_checker_execution"]
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision
         == "20261019020000_registry_continuation_join"

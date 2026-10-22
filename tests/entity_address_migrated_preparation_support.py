@@ -21,7 +21,7 @@ from tests.test_entity_address_alias_guard_postgres import _admin_url, _owned_gu
 from tests.test_provider_directory_profile_capacity_adoption_postgres import _upgrade_disposable_schema_to_head
 
 _SCHEMA = "migrated_address"
-_HEAD = "20261020210000_registry_manual_acceptance_join"
+_HEAD = "20261022110000_ptg_checker_execution"
 _ROLE_SCHEMA_REVISION = "20261019030000_provider_directory_role_schema"
 
 
