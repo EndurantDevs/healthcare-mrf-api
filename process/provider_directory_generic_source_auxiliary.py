@@ -59,6 +59,7 @@ async def prepare_identity_candidate(publisher, identity, prefix):
         await connection.execute(
             f"CREATE TABLE {storage_relation(policy.schema, name)} (LIKE {storage_relation(policy.schema, root)} "
             "INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING CONSTRAINTS INCLUDING STORAGE)"
+            + storage.PRIVATE_HEAP_OPTIONS
         )
         await storage._close_grants(connection, policy, name)
     await helper.prepare_identity_stages(publisher, identity, _cms_receipts(names_by_root))
