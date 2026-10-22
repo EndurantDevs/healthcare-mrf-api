@@ -107,6 +107,7 @@ async def run_object_candidate(
     resume: bool = False,
     credential_provider=None,
     upload_provider=None,
+    capture_handoff=None,
 ) -> CandidateRunResult:
     """Acquire only an unbound first lease; bound resume never accesses either provider."""
     try:
@@ -117,7 +118,14 @@ async def run_object_candidate(
         acquire_one = partial(
             _acquire_object, request, credential_provider=credential_provider, upload_provider=upload_provider
         )
-        return await https_candidate._run(session_factory, request, identity, resume=resume, acquire_one=acquire_one)
+        return await https_candidate._run_candidate(
+            session_factory,
+            request,
+            identity,
+            resume=resume,
+            acquire_one=acquire_one,
+            capture_handoff=capture_handoff,
+        )
     except asyncio.CancelledError:
         raise asyncio.CancelledError from None
     except Exception:
