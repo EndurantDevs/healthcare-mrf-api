@@ -75,15 +75,19 @@ class HttpsCandidateRequest:
     maximum_dataset_retained_bytes: int | None = None
 
 
-def _uses_originals(request):
-    return getattr(request, "source_kind", "https") != "https" or any(
-        stream.format != "parquet" or stream.compression != "none" for stream in request.definition.source_streams
+def _uses_originals(request, *, raw_originals=False):
+    return (
+        raw_originals
+        or getattr(request, "source_kind", "https") != "https"
+        or any(
+            stream.format != "parquet" or stream.compression != "none" for stream in request.definition.source_streams
+        )
     )
 
 
-def _check_retention_cap(request):
+def _check_retention_cap(request, *, raw_originals=False):
     cap = request.maximum_dataset_retained_bytes
-    if _uses_originals(request):
+    if _uses_originals(request, raw_originals=raw_originals):
         if isinstance(cap, bool) or not isinstance(cap, int) or not 0 <= cap <= 2**63 - 1:
             raise HttpsCandidateError("https_request_invalid")
     elif cap is not None:
@@ -110,20 +114,20 @@ def _candidate_request(request, execution_id, records_by_stream=None):
     )
 
 
-def _checked_request(request):
+def _checked_request(request, *, raw_originals=False):
     if not isinstance(request, HttpsCandidateRequest) or request.complete_scope is not True:
         raise HttpsCandidateError("https_request_invalid")
     if not isinstance(request.objects, tuple) or not all(
         isinstance(source_object, HttpsObject) for source_object in request.objects
     ):
         raise HttpsCandidateError("https_request_invalid")
-    request = _checked_request_fields(request)
+    request = _checked_request_fields(request, raw_originals=raw_originals)
     for source_object in request.objects:
         https._https_url(source_object.url)
     return request
 
 
-def _checked_request_fields(request):
+def _checked_request_fields(request, *, raw_originals=False):
     """Normalize bundle-wide limits and pins after transport-specific type checks."""
     if request.complete_scope is not True:
         raise HttpsCandidateError("https_request_invalid")
@@ -143,7 +147,7 @@ def _checked_request_fields(request):
         raise HttpsCandidateError("https_request_invalid")
     runner.validate_candidate_request(lambda: None, _candidate_request(request, 1))
     validate_snapshot_token(request.source_snapshot_token)
-    _check_retention_cap(request)
+    _check_retention_cap(request, raw_originals=raw_originals)
     objects_by_stream = {source_object.stream_id: source_object for source_object in request.objects}
     streams = request.definition.source_streams
     if len(objects_by_stream) != len(request.objects) or set(objects_by_stream) != {
@@ -155,21 +159,21 @@ def _checked_request_fields(request):
         https._validate_identity(
             source_object.expected_sha256, source_object.expected_bytes, limits, request.timeout_seconds
         )
-        minimum_bytes = 0 if _uses_originals(request) else 1
+        minimum_bytes = 0 if _uses_originals(request, raw_originals=raw_originals) else 1
         if not minimum_bytes <= source_object.expected_bytes <= _MAX_PARQUET_PART_BYTES:
             raise HttpsCandidateError("https_request_invalid")
     bundle_limit = min(limits.maximum_compressed_bytes, _MAX_PARQUET_BYTES_PER_BUNDLE)
-    if not _uses_originals(request):
+    if not _uses_originals(request, raw_originals=raw_originals):
         bundle_limit = min(bundle_limit, limits.maximum_decoded_bytes)
     if sum(source_object.expected_bytes for source_object in request.objects) > bundle_limit:
         raise HttpsCandidateError("https_request_invalid")
     return replace(request, objects=tuple(objects_by_stream[stream.stream_id] for stream in streams), limits=limits)
 
 
-def https_request_identity_sha256(request: HttpsCandidateRequest) -> bytes:
+def https_request_identity_sha256(request: HttpsCandidateRequest, *, raw_originals=False) -> bytes:
     """Bind source content, definition, full scope and limits without retaining URLs."""
     try:
-        request = _checked_request(request)
+        request = _checked_request(request, raw_originals=raw_originals)
         document_by_key = {
             "contract": _CONTRACT,
             "dataset_id": request.dataset_id,
@@ -211,9 +215,9 @@ def _check_capture(request, item, stream, sealed):
         raise HttpsCandidateError("https_capture_mismatch")
 
 
-def _retained_capture(request, item, stream, sealed):
+def _retained_capture(request, item, stream, sealed, *, raw_originals=False):
     _check_capture(request, item, stream, sealed)
-    if _uses_originals(request):
+    if _uses_originals(request, raw_originals=raw_originals):
         return sealed
     manifest = sealed.manifest
     return ReplayableParquetCapture(
@@ -229,8 +233,8 @@ def _retained_capture(request, item, stream, sealed):
     )
 
 
-def _reconstructed_capture(request, item, stream, retained):
-    if _uses_originals(request):
+def _reconstructed_capture(request, item, stream, retained, *, raw_originals=False):
+    if _uses_originals(request, raw_originals=raw_originals):
         if not isinstance(retained, SealedCapture):
             raise HttpsCandidateError("https_capture_mismatch")
         _check_capture(request, item, stream, retained)
@@ -299,7 +303,7 @@ async def _acquire_https_object(item, stream, **options):
     )
 
 
-async def _acquire(session_factory, request, grant, deadline, *, acquire_one=None):
+async def _acquire(session_factory, request, grant, deadline, *, acquire_one=None, raw_originals=False):
     acquire_one = _acquire_https_object if acquire_one is None else acquire_one
     retained_captures = []
     async with asyncio.timeout_at(deadline):
@@ -312,7 +316,7 @@ async def _acquire(session_factory, request, grant, deadline, *, acquire_one=Non
                 limits=request.limits,
                 timeout_seconds=_remaining_seconds(deadline),
             )
-            retained_captures.append(_retained_capture(request, item, stream, sealed))
+            retained_captures.append(_retained_capture(request, item, stream, sealed, raw_originals=raw_originals))
             await _heartbeat(session_factory, request, grant)
         _remaining_seconds(deadline)
     return tuple(retained_captures)
@@ -419,7 +423,7 @@ async def _bounded_arrow_bytes(sealed, limits, record_count, arrow_bytes, deadli
     return arrow_bytes
 
 
-async def _replay(request, captures, *, deadline=None):
+async def _replay(request, captures, *, deadline=None, raw_originals=False):
     deadline = asyncio.get_running_loop().time() + request.timeout_seconds if deadline is None else deadline
     by_stream = {
         retained.manifest.stream_id if isinstance(retained, SealedCapture) else retained.receipt.stream_id: retained
@@ -432,7 +436,9 @@ async def _replay(request, captures, *, deadline=None):
     records_by_stream, tokens = {}, {}
     decoded_bytes = record_count = arrow_bytes = record_bytes = 0
     for source_object, stream in zip(request.objects, request.definition.source_streams, strict=True):
-        sealed = _reconstructed_capture(request, source_object, stream, by_stream[stream.stream_id])
+        sealed = _reconstructed_capture(
+            request, source_object, stream, by_stream[stream.stream_id], raw_originals=raw_originals
+        )
         tokens[stream.stream_id] = [sealed.manifest.source_snapshot_token]
         decoded_bytes += sealed.manifest.decoded_bytes
         if decoded_bytes > request.limits.maximum_decoded_bytes:
@@ -481,19 +487,41 @@ async def _finish(session_factory, request, grant, *, canceled=False):
     )
 
 
-async def _load_replayed_records(session_factory, request, grant, submission, deadline, *, acquire_one=None):
+async def _capture_acquisition_deadline(session_factory, request, grant, deadline, *, capture_handoff):
+    """Check acquisition authority before source access, without retaining local locks."""
+    async with asyncio.timeout_at(deadline):
+        if capture_handoff is not None:
+            deadline = min(deadline, await capture_handoff.preflight(request, grant))
+            _remaining_seconds(deadline)
+        elif _uses_originals(request):
+            async with session_factory() as session, session.begin():
+                await require_raw_capture_authority(session)
+    return deadline
+
+
+async def _load_replayed_records(
+    session_factory, request, grant, submission, deadline, *, acquire_one=None, capture_handoff=None
+):
     """Bind a complete acquisition, then verify its fresh-session durable readback."""
     bundle_id = submission.capture_bundle_id
     captures = None
+    acquisition_deadline = deadline
     if bundle_id is None:
         if submission.state != "queued" or grant.fence != 1:
             await _finish(session_factory, request, grant)
             raise HttpsCandidateError("https_unbound_capture")
         try:
-            if _uses_originals(request):
-                async with asyncio.timeout_at(deadline), session_factory() as session, session.begin():
-                    await require_raw_capture_authority(session)
-            captures = await _acquire(session_factory, request, grant, deadline, acquire_one=acquire_one)
+            acquisition_deadline = await _capture_acquisition_deadline(
+                session_factory, request, grant, deadline, capture_handoff=capture_handoff
+            )
+            captures = await _acquire(
+                session_factory,
+                request,
+                grant,
+                acquisition_deadline,
+                acquire_one=acquire_one,
+                raw_originals=capture_handoff is not None,
+            )
         except CancellationRequested, LeaseAuthorityLost:
             raise
         except Exception:
@@ -501,23 +529,34 @@ async def _load_replayed_records(session_factory, request, grant, submission, de
             raise
     async with asyncio.timeout_at(deadline):
         if captures is not None:
-            bundle_id = await _store(session_factory, request, grant, captures)
+            # Registration may commit without acknowledgement; never terminalize or refetch here.
+            if capture_handoff is None:
+                bundle_id = await _store(session_factory, request, grant, captures)
+            else:
+                async with asyncio.timeout_at(acquisition_deadline):
+                    _remaining_seconds(acquisition_deadline)
+                    bundle_id = await capture_handoff.register(request, grant, captures)
             del captures
-        async with session_factory() as session, session.begin():
-            loader = load_replayable_raw_bundle if _uses_originals(request) else load_replayable_parquet_bundle
-            extra_by_name = {"limits": request.limits} if _uses_originals(request) else {}
-            captures = await loader(
-                session,
-                capture_bundle_id=bundle_id,
-                dataset_id=request.dataset_id,
-                definition_revision_id=request.definition_revision_id,
-                schema_revision_id=request.schema_revision_id,
-                **extra_by_name,
-            )
-        return await _replay(request, captures, deadline=deadline)
+        if capture_handoff is not None:
+            captures = await capture_handoff.retained(request, grant, bundle_id)
+        else:
+            async with session_factory() as session, session.begin():
+                loader = load_replayable_raw_bundle if _uses_originals(request) else load_replayable_parquet_bundle
+                extra_by_name = {"limits": request.limits} if _uses_originals(request) else {}
+                captures = await loader(
+                    session,
+                    capture_bundle_id=bundle_id,
+                    dataset_id=request.dataset_id,
+                    definition_revision_id=request.definition_revision_id,
+                    schema_revision_id=request.schema_revision_id,
+                    **extra_by_name,
+                )
+        return await _replay(request, captures, deadline=deadline, raw_originals=capture_handoff is not None)
 
 
-async def _run(session_factory, request, identity, *, resume, acquire_one=None):
+async def _run_candidate(session_factory, request, identity, *, resume, acquire_one=None, capture_handoff=None):
+    if capture_handoff is not None:
+        capture_handoff.require_candidate_binding(request)
     submission, grant = await _reserve(session_factory, request, identity, resume)
     if grant is None:
         return CandidateRunResult(status="not_claimed", execution_id=submission.execution_id)
@@ -526,10 +565,16 @@ async def _run(session_factory, request, identity, *, resume, acquire_one=None):
     try:
         deadline = asyncio.get_running_loop().time() + request.timeout_seconds
         async with _renew_while_preparing(session_factory, request, grant):
-            records = await _load_replayed_records(
-                session_factory, request, grant, submission, deadline, acquire_one=acquire_one
+            records_by_stream = await _load_replayed_records(
+                session_factory,
+                request,
+                grant,
+                submission,
+                deadline,
+                acquire_one=acquire_one,
+                capture_handoff=capture_handoff,
             )
-            candidate = _candidate_request(request, grant.execution_id, records)
+            candidate = _candidate_request(request, grant.execution_id, records_by_stream)
             admitted = runner.reject_duplicate_canonical_root_keys(
                 request.definition,
                 assemble_root_families(request.definition, candidate.roots, candidate.children_by_collection),
@@ -546,7 +591,7 @@ async def _run(session_factory, request, identity, *, resume, acquire_one=None):
 
 
 async def run_https_candidate(
-    session_factory: SessionFactory, request: HttpsCandidateRequest, *, resume: bool = False
+    session_factory: SessionFactory, request: HttpsCandidateRequest, *, resume: bool = False, capture_handoff=None
 ) -> CandidateRunResult:
     """Acquire once, durably bind, then replay through the existing claimed runner.
 
@@ -556,9 +601,9 @@ async def run_https_candidate(
     try:
         if not callable(session_factory) or not isinstance(resume, bool):
             raise HttpsCandidateError("https_request_invalid")
-        request = _checked_request(request)
-        identity = https_request_identity_sha256(request)
-        return await _run(session_factory, request, identity, resume=resume)
+        request = _checked_request(request, raw_originals=capture_handoff is not None)
+        identity = https_request_identity_sha256(request, raw_originals=capture_handoff is not None)
+        return await _run_candidate(session_factory, request, identity, resume=resume, capture_handoff=capture_handoff)
     except asyncio.CancelledError:
         raise asyncio.CancelledError from None
     except HttpsCandidateError:

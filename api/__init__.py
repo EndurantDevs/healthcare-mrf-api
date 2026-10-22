@@ -9,6 +9,7 @@ from api.control import control_error
 from api.control_admission_batch import blueprint as admission_batch_blueprint
 from api.control_admission_batch import register_batch_response_deadline
 from api.control_build_continuation import blueprint as build_continuation_blueprint
+from api.control_capture_handoff import blueprint as capture_handoff_blueprint
 from api.control_execution_evidence import blueprint as execution_evidence_blueprint
 from api.control_execution_stop import blueprint as execution_stop_blueprint
 from api.control_query_projection_batch import blueprint as query_projection_batch_blueprint
@@ -93,6 +94,7 @@ def init_api(api):
     register_rejection_private_responses(api)
     api.blueprint(control_blueprint)
     api.blueprint(admission_batch_blueprint)
+    api.blueprint(capture_handoff_blueprint)
     api.blueprint(source_batch_blueprint)
     api.blueprint(query_projection_batch_blueprint)
     api.blueprint(execution_evidence_blueprint)

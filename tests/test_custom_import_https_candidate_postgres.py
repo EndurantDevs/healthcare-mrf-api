@@ -5,8 +5,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import timedelta
 from decimal import Decimal
 from io import BytesIO
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import aiohttp
 import pyarrow as pa
@@ -24,12 +28,16 @@ from db.models.custom_import import (
     CustomImportNoChangeSeal,
     CustomImportRejection,
 )
-from process.custom_import import https_candidate, runner
+from db.models.custom_import_raw_capture import CustomImportCaptureRawObject
+from process.custom_import import capture_handoff, execution, https_candidate, runner
 from process.custom_import.capture import capture_stream
 from process.custom_import.capture_store import load_replayable_parquet_bundle
-from process.custom_import.https_candidate import run_https_candidate
+from process.custom_import.definition_store import register_definition
+from process.custom_import.https_candidate import https_request_identity_sha256, run_https_candidate
 from process.custom_import.read_core import ExtensionReadAuthorization, PinnedReadTarget, SearchRequest
+from process.custom_import.runner_types import LeaseAuthorityLost
 from tests import test_custom_import_runner_postgres as runner_fixture
+from tests.capture_handoff_test_support import fixture as capture_handoff_fixture
 from tests.custom_import_postgres_support import isolated_publication_case
 from tests.test_custom_import_https_candidate import _request as source_request
 from tests.test_custom_import_read_core_postgres import _service
@@ -329,3 +337,79 @@ async def test_https_invalid_child_rejects_whole_family_and_retains_previous_sna
         assert next(field.value for field in detail.children[0].fields if field.field_id == "amount") == Decimal(
             "10.00"
         )
+
+
+async def _claimed_handoff_capture(case):
+    """Persist exactly the revisions and request hash the capture boundary checks."""
+
+    state = capture_handoff_fixture()
+    async with case.sessions() as session, session.begin():
+        seed = await register_definition(session, "synthetic_capture_" + uuid4().hex[:16], state.request.definition)
+    request = replace(
+        state.request,
+        dataset_id=seed.dataset_id,
+        definition_revision_id=seed.definition_revision_id,
+        schema_revision_id=seed.schema_revision_id,
+        timeout_seconds=300,
+    )
+    identity = https_request_identity_sha256(request, raw_originals=True)
+    async with case.sessions() as session, session.begin():
+        submission = await execution.reserve_execution(
+            session,
+            dataset_id=request.dataset_id,
+            definition_revision_id=request.definition_revision_id,
+            schema_revision_id=request.schema_revision_id,
+            idempotency_key=request.idempotency_key,
+            mechanism="local",
+            request_identity_sha256=identity,
+        )
+        grant = await execution.claim_execution(
+            session, execution_id=submission.execution_id, token=request.lease_token
+        )
+        now = await execution._database_now(session)
+    permit = replace(
+        state.verified.permit,
+        dataset_id=request.dataset_id,
+        definition_revision_id=request.definition_revision_id,
+        schema_revision_id=request.schema_revision_id,
+        request_identity_sha256=identity.hex(),
+        timeout_seconds=300,
+        issued_at=now - timedelta(seconds=1),
+        expires_at=now + timedelta(minutes=15),
+    )
+    verified = replace(state.verified, permit=permit, execution_id=grant.execution_id, fence=grant.fence)
+    return SimpleNamespace(verified=verified, captures=state.captures)
+
+
+async def _raw_capture_counts(case):
+    async with case.sessions() as session:
+        return tuple(
+            [
+                await session.scalar(select(func.count()).select_from(model))
+                for model in (CustomImportCaptureBundle, CustomImportCaptureRawObject)
+            ]
+        )
+
+
+async def test_complete_capture_and_exact_execution_binding_commit_together():
+    async with isolated_publication_case() as case:
+        state = await _claimed_handoff_capture(case)
+        await capture_handoff.preflight_capture(case.sessions, state.verified)
+        bundle_id = await capture_handoff.register_capture(case.sessions, state.verified, state.captures)
+        assert await _raw_capture_counts(case) == (1, 2)
+        async with case.sessions() as session:
+            retained = await session.get(CustomImportExecution, state.verified.execution_id)
+            assert retained.capture_bundle_id == bundle_id
+        assert await capture_handoff.retained_capture(case.sessions, state.verified) == (bundle_id, state.captures)
+
+
+async def test_lease_loss_after_native_copy_rolls_back_payload_and_binding(monkeypatch):
+    async with isolated_publication_case() as case:
+        state = await _claimed_handoff_capture(case)
+        monkeypatch.setattr(execution, "bind_execution_capture_bundle", AsyncMock(return_value=None))
+        with pytest.raises(LeaseAuthorityLost):
+            await capture_handoff.register_capture(case.sessions, state.verified, state.captures)
+        assert await _raw_capture_counts(case) == (0, 0)
+        async with case.sessions() as session:
+            retained = await session.get(CustomImportExecution, state.verified.execution_id)
+            assert retained.capture_bundle_id is None

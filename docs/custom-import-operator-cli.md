@@ -649,3 +649,39 @@ files, load credentials, sign URLs or access a source network.
 
 These standalone operator paths require no external control service. They do not
 enable hosted HTTPS, S3-compatible or upload endpoints or credential submission.
+
+### Optional authenticated capture handoff
+
+Application callers may supply `CaptureHandoffTransport` to
+`run_https_candidate` or `run_object_candidate`. This replaces capture preflight,
+registration and retained readback with three fixed authenticated POSTs through
+the existing application pool. It does not replace execution claiming or the
+claimed runner, enable a hosted source, or provision source credentials.
+The ordinary CLI remains standalone and unchanged.
+
+The server capability is off by default. Explicit
+`HLTHPRT_CUSTOM_IMPORT_CAPTURE_HANDOFF_ENABLED=1` requires the existing startup-
+pinned admission keyring and origin; partial or invalid configuration fails
+startup. A separate capture signature domain prevents admission, SOURCE or
+projection permits from authorizing capture writes. Only the issuer holds
+signing keys; launch bootstrap must independently authenticate the signed permit
+and approved TLS origin before constructing the worker transport.
+
+The permit binds the immutable definition, request/content digests, retention
+ceiling and tightened capture limits. Preflight checks the exact execution,
+lease and registrar authority before source access. The binary bundle contains
+a bounded canonical manifest header followed by exact original bytes; transport
+compression, duplicate streams, truncation and trailing bytes are rejected.
+Registration rechecks authority after transfer and uses the existing raw
+registrar and execution binding in one transaction. Raw originals are explicit
+for this path, including plain HTTPS Parquet; legacy standalone storage and
+request identities remain unchanged.
+
+Acquisition expires at the earlier of permit expiry and the execution's first
+start plus the signed timeout. A new HTTP request never renews that budget.
+Uncertain completion does not prove rollback and is never retried or followed
+by a source refetch. A later bound resume reads the exact retained bundle over
+the authenticated path, without falling back to local owner access. Retained-
+only observation requires valid current authority but cannot reopen acquisition.
+Managed configuration/issuer wiring, effective database roles and source-specific
+runtime/security/capacity qualification are separate enablement requirements.
