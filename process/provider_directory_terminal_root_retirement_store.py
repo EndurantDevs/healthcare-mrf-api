@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from typing import Any
 
+from process.provider_directory_generic_source_policy import is_source_storage_required
 from process.provider_directory_source_checkpoint_control import source_checkpoint_transaction
 from process.provider_directory_terminal_root_retirement_contract import (
     RETIREMENT_STATUS,
@@ -18,6 +20,7 @@ from process.provider_directory_terminal_root_retirement_contract import (
     quoted_relation,
     schema_name,
 )
+from process.provider_directory_terminal_root_retirement_controls import require_retirement_controls
 from process.provider_directory_terminal_root_retirement_selection import (
     selected_terminal_root_retirement,
 )
@@ -27,6 +30,24 @@ async def _require_read_committed(database: Any) -> None:
     isolation = await database.scalar("SELECT pg_catalog.current_setting('transaction_isolation');")
     if isolation != "read committed":
         raise TerminalRootRetirementError("state_invalid")
+
+
+@asynccontextmanager
+async def _retirement_transaction(database: Any, request: TerminalRootRetirementRequest):
+    if not request.expect_no_current_dataset or is_source_storage_required():
+        async with source_checkpoint_transaction(database, schema=schema_name()):
+            yield
+        return
+    async with database.transaction():
+        administrator = await database.scalar(
+            "SELECT session_user = current_user AND role.rolsuper "
+            "FROM pg_catalog.pg_roles AS role WHERE role.rolname = session_user;"
+        )
+        if administrator is not True:
+            raise TerminalRootRetirementError("administrator_required")
+        await require_retirement_controls(database)
+        yield
+        await require_retirement_controls(database)
 
 
 async def _require_valid_retirement(
@@ -53,7 +74,7 @@ async def preview_terminal_root_retirement_transaction(
 
     if request.expected_evidence_sha256 is not None:
         raise TerminalRootRetirementError("request_invalid")
-    async with source_checkpoint_transaction(database, schema=schema_name()):
+    async with _retirement_transaction(database, request):
         await _require_read_committed(database)
         selection = await selected_terminal_root_retirement(database, request)
         if selection.prior_status == RETIREMENT_STATUS:
@@ -90,7 +111,7 @@ async def _apply_parent_cas(
            AND endpoint_id = :endpoint_id
            AND import_run_id = :owner_run_id
            AND acquisition_root_run_id = :root_run_id
-           AND previous_dataset_id = :predecessor_id
+           AND previous_dataset_id IS NOT DISTINCT FROM :predecessor_id
            AND status = :prior_status
            AND is_current = false
            AND dataset_hash IS NULL
@@ -126,7 +147,7 @@ async def apply_terminal_root_retirement_transaction(
 
     if request.expected_evidence_sha256 is None:
         raise TerminalRootRetirementError("request_invalid")
-    async with source_checkpoint_transaction(database, schema=schema_name()):
+    async with _retirement_transaction(database, request):
         await _require_read_committed(database)
         selection = await selected_terminal_root_retirement(database, request)
         marker_sha256 = canonical_json_sha256(selection.marker_by_field)

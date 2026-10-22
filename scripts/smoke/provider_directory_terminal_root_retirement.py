@@ -23,6 +23,7 @@ SIGNALS = (signal.SIGTERM, signal.SIGINT)
 _RETIREMENT_ENABLED_ENV = "HLTHPRT_PROVIDER_DIRECTORY_TERMINAL_ROOT_RETIREMENT_ENABLED"
 SAFE_ERROR_CODES = frozenset(
     {
+        "administrator_required",
         "busy",
         "canceled",
         "disabled",
@@ -57,7 +58,9 @@ def _add_selectors(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset-id", required=True)
     parser.add_argument("--acquisition-root-run-id", required=True)
     parser.add_argument("--owner-run-id", required=True)
-    parser.add_argument("--expected-current-dataset-id", required=True)
+    current = parser.add_mutually_exclusive_group(required=True)
+    current.add_argument("--expected-current-dataset-id")
+    current.add_argument("--expect-no-current-dataset", action="store_true")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -142,6 +145,7 @@ def _request(arguments: argparse.Namespace) -> Any:
         acquisition_root_run_id=arguments.acquisition_root_run_id,
         owner_run_id=arguments.owner_run_id,
         expected_current_dataset_id=arguments.expected_current_dataset_id,
+        expect_no_current_dataset=getattr(arguments, "expect_no_current_dataset", False),
         expected_evidence_sha256=getattr(arguments, "expected_evidence_sha256", None),
     )
 
