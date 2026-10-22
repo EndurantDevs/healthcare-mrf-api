@@ -36,7 +36,11 @@ from process import cms_npd_source as source
 from process import provider_directory_cms_npd as cms
 from process import provider_directory_cms_npd_relationship as relationships
 from process import provider_directory_generic_source_completion as completion
+from process import provider_directory_cms_identity_candidate as cms_identity
+from process import provider_directory_cms_serving_coverage as coverage
+from process import provider_directory_generic_source_auxiliary as auxiliary
 from process import provider_directory_generic_source_storage as storage
+from process import provider_directory_resource_identity_candidate as resource_identity
 from tests import cms_npd_admission_postgres_support as support
 from tests.cms_npd_admission_postgres_support import cms_admission_template, cms_artifact_root  # noqa: F401
 from tests.test_cms_npd_source import _client, _source
@@ -158,6 +162,19 @@ class Timers:
             (cms, "_validate_candidate", "candidate_validation", None),
             (fhir, "_assert_candidate_semantic_content_proof", "content_proof_rehash", None),
             (cms, "_prepare_serving_candidate", "coverage", None),
+            (coverage, "prepare_cms_candidate_coverage", "coverage_prepare", None),
+            (completion, "_finish_derived_indexes", "attach_derived_indexes", None),
+            (completion, "_relationships", "attach_relationship_checks", None),
+            (completion, "_witness_relationships", "attach_witness_checks", None),
+            (completion, "_attach_final_tables", "attach_final_tables", None),
+            (auxiliary, "publish_identity_candidate", "attach_publish_identity", None),
+            (cms_identity, "publish_identity_stages", "attach_publish_identity_stages", None),
+            (cms_identity, "_canonical_authority", "attach_canonical_authority", None),
+            (cms_identity, "_global_replay", "attach_identity_global_replay", None),
+            (cms_identity, "_publish_canonical_ids", "attach_publish_canonical_ids", None),
+            (resource_identity, "publish_resource_identity_stage", "attach_publish_resource_identity", None),
+            (resource_identity, "_global_replay", "attach_resource_global_replay", None),
+            (storage, "_capture", "custody_capture", None),
         ):
             self.wrap(monkeypatch, module, name, label, family_position=family_position)
 
