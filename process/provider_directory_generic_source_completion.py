@@ -115,20 +115,102 @@ def _witness(row):
     return witness_by_field
 
 
+def _active_where(key):
+    """Select observations after the locked reset cutoffs; one predicate for every reader."""
+    content_filter = "AND resource_type NOT LIKE 'LU:%:pass:%' " if key == "resource_input" else ""
+    return "WHERE batch_ordinal>greatest($1::bigint,coalesce(($2::jsonb->>resource_type)::bigint,0)) " + content_filter
+
+
+def _active_arguments(binding_by_field):
+    resets = binding_by_field["resets"]
+    return resets.get("*", 0), storage._encoded(resets)
+
+
 async def _active_rows(connection, policy, binding_by_field, key, columns):
     table = storage_relation(policy.schema, binding_by_field["tables"][key]["name"])
-    resets = binding_by_field["resets"]
     # Reset facts are fixed by the locked header. One indexed ordered scan replaces
     # every historical per-key SELECT/FOR UPDATE and every per-row retry DELETE.
-    content_filter = "AND resource_type NOT LIKE 'LU:%:pass:%' " if key == "resource_input" else ""
     query = (
         f"SELECT {','.join(storage_identifier(name) for name in columns)} FROM {table} "
-        "WHERE batch_ordinal>greatest($1::bigint,coalesce(($2::jsonb->>resource_type)::bigint,0)) "
-        + content_filter
+        + _active_where(key)
         + 'ORDER BY resource_type COLLATE "C",resource_id COLLATE "C",batch_ordinal,row_ordinal'
     )
-    async for row in connection.cursor(query, resets.get("*", 0), storage._encoded(resets), prefetch=4096):
+    async for row in connection.cursor(query, *_active_arguments(binding_by_field), prefetch=4096):
         yield dict(row)
+
+
+_DIVERGENCE_FIELDS = {
+    "resource_input": "payload_hash,coalesce(acquired_resource_sha256,'')",
+    "witness_input": "source_id,release_id,raw_payload_sha256,normalized_payload_hash",
+}
+_SET_REDUCTION_WORK_MEM = "256MB"
+_RECHECK_ROWS = 10_000
+
+
+async def _observed_divergence(connection, policy, binding_by_field, key):
+    """Report whether any complete key observed differing payload facts."""
+    table = storage_relation(policy.schema, binding_by_field["tables"][key]["name"])
+    return await connection.fetchval(
+        f"SELECT EXISTS(SELECT FROM {table} {_active_where(key)}"
+        f"GROUP BY resource_type,resource_id HAVING count(DISTINCT ({_DIVERGENCE_FIELDS[key]}))>1)",
+        *_active_arguments(binding_by_field),
+    )
+
+
+async def _reduce_input_sql(connection, policy, binding_by_field, key, target, columns):
+    """Keep the last observation of every complete key with one set-based statement.
+
+    Identical duplicates make the pure semantic union a no-op, so this equals the
+    ordered Python reduction whenever no key observed differing payload facts.
+    """
+    table = storage_relation(policy.schema, binding_by_field["tables"][key]["name"])
+    fields = ",".join(storage_identifier(name) for name in columns)
+    await connection.execute(f"SET LOCAL work_mem='{_SET_REDUCTION_WORK_MEM}'")
+    status = await connection.execute(
+        f"INSERT INTO {storage_relation(policy.schema, target)} ({fields}) "
+        f'SELECT DISTINCT ON (resource_type COLLATE "C",resource_id COLLATE "C") {fields} FROM {table} '
+        + _active_where(key)
+        + 'ORDER BY resource_type COLLATE "C",resource_id COLLATE "C",batch_ordinal DESC,row_ordinal DESC',
+        *_active_arguments(binding_by_field),
+    )
+    storage._require(status.startswith("INSERT 0 "), "copy_incomplete")
+    return int(status.rsplit(" ", 1)[1])
+
+
+async def _recheck_reduced_rows(connection, policy, name, columns, validate, count):
+    """Re-run the existing per-row validators on every row of a small heap or a bounded sample."""
+    relation = storage_relation(policy.schema, name)
+    fields = ",".join(storage_identifier(column) for column in columns)
+    if count <= _RECHECK_ROWS:
+        query = f"SELECT {fields} FROM {relation}"
+    else:
+        percent = min(100.0, max(0.01, 300.0 * _RECHECK_ROWS / count))
+        query = f"SELECT {fields} FROM {relation} TABLESAMPLE SYSTEM ({percent:.4f}) LIMIT {_RECHECK_ROWS}"
+    async for row in connection.cursor(query, prefetch=1024):
+        validate(dict(row))
+
+
+async def _reduce_payloads_sql(connection, policy, previous, candidate, directory, tables_by_root, release_id):
+    """Set-based reduction of both input heaps with the same raw-identity guards."""
+    prepare, _ = _resource_callbacks(directory, candidate)
+    resource_name = tables_by_root[storage.RESOURCE]["name"]
+    resource_count = await _reduce_input_sql(
+        connection, policy, previous, "resource_input", resource_name, RESOURCE_COLUMNS
+    )
+    await _recheck_reduced_rows(connection, policy, resource_name, RESOURCE_COLUMNS, prepare, resource_count)
+    witness_name = tables_by_root[storage.WITNESS]["name"]
+    witness_count = await _reduce_input_sql(connection, policy, previous, "witness_input", witness_name, WITNESS_COLUMNS)
+    if witness_count:
+        storage._require(release_id is not None, "unexpected_witness")
+        witness = storage_relation(policy.schema, witness_name)
+        invalid = await connection.fetchval(
+            f"SELECT EXISTS(SELECT FROM {witness} WHERE source_id<>'cms-npd' OR release_id<>$1 "
+            "OR raw_payload_json->>'id' IS DISTINCT FROM resource_id "
+            "OR raw_payload_json->>'resourceType' IS DISTINCT FROM resource_type)",
+            release_id,
+        )
+        storage._require(invalid is False, "raw_identity_changed")
+        await _recheck_reduced_rows(connection, policy, witness_name, WITNESS_COLUMNS, _witness, witness_count)
 
 
 async def _reduced_rows(rows, *, dataset_id, prepare, merge):
@@ -197,9 +279,20 @@ async def _indexes(connection, policy, root, name):
     await connection.execute(f"ANALYZE {relation}")
 
 
-async def _complete_payloads(connection, policy, previous, candidate, directory, tables_by_root):
-    """Reduce every complete payload key before finishing its native indexes."""
+async def _order_indexes(connection, policy, binding_by_field):
+    """Index both inputs for the ordered cursor reduction only when it runs."""
+    for key in ("resource_input", "witness_input"):
+        name = binding_by_field["tables"][key]["name"]
+        await connection.execute(
+            f"CREATE INDEX {storage_identifier(name + '_order')} ON {storage_relation(policy.schema, name)} "
+            '(resource_type COLLATE "C",resource_id COLLATE "C",batch_ordinal,row_ordinal)'
+        )
+
+
+async def _reduce_payloads_python(connection, policy, previous, candidate, directory, tables_by_root, release_id):
+    """Ordered cursor reduction with the pure semantic union for differing observations."""
     prepare, merge = _resource_callbacks(directory, candidate)
+    await _order_indexes(connection, policy, previous)
     resources = _reduced_rows(
         _active_rows(connection, policy, previous, "resource_input", RESOURCE_COLUMNS),
         dataset_id=candidate.dataset_id,
@@ -207,7 +300,6 @@ async def _complete_payloads(connection, policy, previous, candidate, directory,
         merge=merge,
     )
     await _copy_rows(connection, policy, tables_by_root[storage.RESOURCE]["name"], RESOURCE_COLUMNS, resources)
-    release_id = (candidate.source_release or {}).get("vector_sha256")
     witnesses = _active_rows(connection, policy, previous, "witness_input", WITNESS_COLUMNS)
     if release_id is not None:
         await _copy_rows(
@@ -220,6 +312,22 @@ async def _complete_payloads(connection, policy, previous, candidate, directory,
     else:
         async for _ in witnesses:
             raise storage.GenericCandidateError("provider_directory_generic_source_unexpected_witness")
+
+
+async def _complete_payloads(connection, policy, previous, candidate, directory, tables_by_root):
+    """Reduce every complete payload key before finishing its native indexes.
+
+    Keys that never observed differing payload facts reduce with one set-based
+    statement per heap; witness conflicts stay a hard error, and resources with
+    differing observations fall back to the ordered semantic union.
+    """
+    release_id = (candidate.source_release or {}).get("vector_sha256")
+    if await _observed_divergence(connection, policy, previous, "witness_input"):
+        raise storage.GenericCandidateError("provider_directory_generic_candidate_witness_replay_conflict")
+    if await _observed_divergence(connection, policy, previous, "resource_input"):
+        await _reduce_payloads_python(connection, policy, previous, candidate, directory, tables_by_root, release_id)
+    else:
+        await _reduce_payloads_sql(connection, policy, previous, candidate, directory, tables_by_root, release_id)
     for root in (storage.RESOURCE, storage.WITNESS):
         await _indexes(connection, policy, root, tables_by_root[root]["name"])
 
@@ -242,12 +350,6 @@ async def complete_generic_source_candidate(database, directory, candidate):
             return previous
         tables_by_root = dict(previous["tables"])
         prefix = tables_by_root["resource_input"]["name"][:-3]
-        for key in ("resource_input", "witness_input"):
-            name = tables_by_root[key]["name"]
-            await connection.execute(
-                f"CREATE INDEX {storage_identifier(name + '_order')} ON {storage_relation(policy.schema, name)} "
-                '(resource_type COLLATE "C",resource_id COLLATE "C",batch_ordinal,row_ordinal)'
-            )
         for root in storage.RELATIONS:
             name = prefix + "_" + storage._SUFFIXES[root]
             await connection.execute(
