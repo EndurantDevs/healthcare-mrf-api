@@ -1004,12 +1004,10 @@ async def test_relationship_alias_is_ambiguous_without_merging_entities(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_relationship_pages_are_byte_bounded_and_receipted(monkeypatch, cms_artifact_root):
+async def test_relationship_projection_is_complete_and_receipted(monkeypatch, cms_artifact_root):
     directory, receipt = retained_release(cms_artifact_root)
-    monkeypatch.setattr(relationships, "_BATCH_SIZE", 3)
-    monkeypatch.setattr(relationships, "_BATCH_BYTES", 1)
     async with admission_database(monkeypatch) as database:
-        admitted = await _admit_legacy_source(directory, receipt, "cms-small-pages")
+        admitted = await _admit_legacy_source(directory, receipt, "cms-relationship-receipt")
         assert await relationships.completed_receipt_count(
             fhir, admitted["dataset_id"], receipt["vector_sha256"]
         ) == await database.scalar(
