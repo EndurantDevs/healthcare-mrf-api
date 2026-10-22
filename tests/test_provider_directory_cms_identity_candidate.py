@@ -284,7 +284,7 @@ def test_reference_copy_query_compiles_complete_identity_binds_with_no_insert_ta
     sql = "SELECT * FROM (" + _projection_sql(directory) + ") AS relationships"
     compiled = text(sql).compile(dialect=PGDialect_asyncpg())
     assert str(compiled).startswith("SELECT ") and "INSERT INTO" not in str(compiled)
-    assert set(compiled.positiontup) == {"dataset_id", "release_id", "after_type", "after_id", "last_type", "last_id"}
+    assert set(compiled.positiontup) == {"dataset_id", "release_id", "resource_type"}
 
 
 @pytest.mark.asyncio
@@ -372,7 +372,6 @@ async def test_relationship_indexes_are_sealed_after_copy_before_complete_read_a
         events.append("identity seal")
 
     async def copy_pages(*args, **kwargs):
-        assert kwargs["write"] is True
         events.append("copy all pages")
         return 5
 
@@ -398,7 +397,7 @@ async def test_relationship_indexes_are_sealed_after_copy_before_complete_read_a
     )
     source_candidate = SimpleNamespace(dataset_id="candidate-one", already_validated=False, already_published=False)
     monkeypatch.setattr(relationship, "completed_receipt_count", AsyncMock(side_effect=[None, 5]))
-    monkeypatch.setattr(relationship, "_scan_pages", copy_pages)
+    monkeypatch.setattr(relationship, "_project_families", copy_pages)
     monkeypatch.setattr(relationship, "assert_complete", complete)
     monkeypatch.setattr(auxiliary, "seal_identity_candidate", seal_identity)
     monkeypatch.setattr(auxiliary, "seal_relationship_candidate", seal_relationship)
@@ -429,7 +428,7 @@ async def test_relationship_unsealed_rows_require_whole_reprepare_without_delete
     source_candidate = SimpleNamespace(dataset_id="candidate-one", already_validated=False, already_published=False)
     copy_pages = AsyncMock()
     monkeypatch.setattr(relationship, "completed_receipt_count", AsyncMock(return_value=None))
-    monkeypatch.setattr(relationship, "_scan_pages", copy_pages)
+    monkeypatch.setattr(relationship, "_project_families", copy_pages)
     monkeypatch.setattr(auxiliary, "seal_identity_candidate", AsyncMock())
     with pytest.raises(RuntimeError, match="unsealed_candidate_reprepare"):
         await relationship.materialize(directory, source_candidate, "a" * 64)
