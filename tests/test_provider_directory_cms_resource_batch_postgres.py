@@ -196,6 +196,8 @@ async def test_one_and_thousand_resources_have_fixed_native_operations(
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT", "false")
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS", "2000")
     monkeypatch.setattr(fhir, "_upsert_rows_values", _forbid_values)
+    # Custody capture is bounded per interval; verify on every batch so the counts stay size-only.
+    monkeypatch.setattr(source_storage, "_VERIFY_INTERVAL_SECONDS", 0.0)
     async with source_transaction(database):
         publisher = bound_publisher()
         binding = await source_storage._locked(
