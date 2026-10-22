@@ -12,8 +12,9 @@ import importlib.util
 import json
 import os
 import tempfile
+import time
 from compression import zstd
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -638,6 +639,13 @@ async def _insert_verified_witnesses(session: Any, witness_by_id: dict[str, dict
     await append_generic_source_batch(fhir.db, fhir, candidate, (), witnesses)
 
 
+def _count_staged_rows(ctx: dict, count: int) -> None:
+    """Accumulate staged input rows across all file slots for the overall progress percentage."""
+    context = ctx.get("context") if isinstance(ctx, dict) else None
+    if isinstance(context, dict):
+        context["cms_intake_completed_rows"] = context.get("cms_intake_completed_rows", 0) + count
+
+
 async def _persist_source_batch(
     fhir: Any,
     model: type,
@@ -690,6 +698,7 @@ async def _stream_file(fhir: Any, path: Path, candidate: Any, resource_type: str
             resource = _resource_from_line(line, resource_type)
             if resource_rows and batch_bytes + len(line) > BATCH_MAX_DECODED_BYTES:
                 await _persist_source_batch(fhir, model, resource_rows, raw_resources, candidate, resource_type)
+                _count_staged_rows(ctx, len(resource_rows))
                 _observe_intake(ctx, phase="staging", family=resource_type, completed_rows=row_count)
                 resource_rows.clear()
                 raw_resources.clear()
@@ -704,6 +713,7 @@ async def _stream_file(fhir: Any, path: Path, candidate: Any, resource_type: str
             batch_bytes += len(line)
             if len(resource_rows) >= BATCH_SIZE or batch_bytes >= BATCH_MAX_DECODED_BYTES:
                 await _persist_source_batch(fhir, model, resource_rows, raw_resources, candidate, resource_type)
+                _count_staged_rows(ctx, len(resource_rows))
                 _observe_intake(ctx, phase="staging", family=resource_type, completed_rows=row_count)
                 resource_rows.clear()
                 raw_resources.clear()
@@ -711,6 +721,7 @@ async def _stream_file(fhir: Any, path: Path, candidate: Any, resource_type: str
                 await fhir._raise_if_resource_import_cancelled(ctx, task)
     if resource_rows:
         await _persist_source_batch(fhir, model, resource_rows, raw_resources, candidate, resource_type)
+        _count_staged_rows(ctx, len(resource_rows))
     _observe_intake(ctx, phase="staging", family=resource_type, completed_rows=row_count, force=True)
     return row_count
 
@@ -1253,10 +1264,15 @@ async def _prepare_serving_candidate(fhir, candidate, identity, directory, recei
     return state, await _serving_candidate_descriptor(fhir, state, proof_by_field)
 
 
+_GUARD_POLL_SECONDS = 1.0
+_GUARD_PROBE_SECONDS = 10.0
+_GUARD_LOSS_SECONDS = 60.0
+
+
 async def _assert_intake_guard(connection, lock_key, backend_id):
     """Reject connection replacement or loss of the exact endpoint advisory lock."""
     try:
-        async with asyncio.timeout(2):
+        async with asyncio.timeout(_GUARD_PROBE_SECONDS):
             is_owner = await connection.scalar(
                 text("""SELECT pg_backend_pid()=:backend_id AND EXISTS (
                 SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory' AND granted
@@ -1273,14 +1289,26 @@ async def _assert_intake_guard(connection, lock_key, backend_id):
 
 
 async def _watch_intake_guard(connection, lock_key, backend_id, owner, failures, stop):
-    """Cancel active staging promptly if its dedicated ownership backend disappears."""
+    """Cancel active staging once ownership is confirmed lost, or probes keep timing out."""
+    confirmed_at = time.monotonic()
     try:
         while not stop.is_set():
             try:
-                async with asyncio.timeout(1):
+                async with asyncio.timeout(_GUARD_POLL_SECONDS):
                     await stop.wait()
             except TimeoutError:
-                await _assert_intake_guard(connection, lock_key, backend_id)
+                try:
+                    await _assert_intake_guard(connection, lock_key, backend_id)
+                except RuntimeError as error:
+                    # A slow probe is not a lost lock; a confirmed loss or a minute of timeouts is.
+                    if not isinstance(error.__cause__, TimeoutError) or (
+                        time.monotonic() - confirmed_at >= _GUARD_LOSS_SECONDS
+                    ):
+                        raise
+                    with suppress(Exception):
+                        await connection.rollback()
+                    continue
+                confirmed_at = time.monotonic()
     except Exception as error:
         failures.append(error)
         owner.cancel()
@@ -1400,6 +1428,9 @@ async def _stage_acquired(
     fhir = importlib.import_module("process.provider_directory_fhir")
 
     identity = release_identity(receipt_by_field)
+    ctx.setdefault("context", {})["cms_intake_total_rows"] = sum(
+        file_by_field["row_count"] for file_by_field in identity["files"].values()
+    )
     _observe_intake(ctx, phase="release_validation")
     await _verify_release(directory, receipt_by_field, client, task)
     _observe_intake(ctx, phase="candidate_setup")
