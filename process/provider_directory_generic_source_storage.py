@@ -10,7 +10,9 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -379,6 +381,31 @@ async def _verify_auxiliary_tables(connection, policy, auxiliary):
         )
 
 
+_VERIFY_INTERVAL_SECONDS = 60.0
+_VERIFIED_CUSTODY: ContextVar[tuple[str, float] | None] = ContextVar(
+    "provider_directory_generic_source_verified_custody", default=None
+)
+
+
+async def _verify_tables_recently(connection, policy, binding_by_field):
+    """Re-read native custody at most once per interval for an unchanged loading binding.
+
+    Every batch still re-reads and compares the locked header binding; only the
+    catalog capture behind it is bounded, because the private heaps are reachable
+    solely through this owner's own transactions.
+    """
+    key = _encoded(
+        {"schema": policy.schema, "owner": policy.owner_role, "phase": binding_by_field["phase"],
+         "tables": binding_by_field["tables"], "auxiliary": binding_by_field["auxiliary"]}
+    )
+    verified = _VERIFIED_CUSTODY.get()
+    now = time.monotonic()
+    if verified is not None and verified[0] == key and now - verified[1] < _VERIFY_INTERVAL_SECONDS:
+        return
+    await _verify_tables(connection, policy, binding_by_field)
+    _VERIFIED_CUSTODY.set((key, now))
+
+
 async def prepare_generic_source_candidate(database, directory, candidate):
     """Initialize two unindexed private input heaps, or authenticate exact resume."""
     identity = candidate_identity(directory, candidate)
@@ -522,7 +549,7 @@ async def append_generic_source_batch(database, directory, candidate, resources,
             await _lock_resource_family(connection, policy, candidate.dataset_id, resource_type)
         previous = await _locked(connection, policy, identity, lock="KEY SHARE")
         _require(previous is not None, "preparation_required")
-        await _verify_tables(connection, policy, previous)
+        await _verify_tables_recently(connection, policy, previous)
         ordinal = await connection.fetchval(
             "SELECT nextval(pg_get_serial_sequence($1,'batch_ordinal'))",
             storage_relation(policy.schema, previous["tables"]["resource_input"]["name"]),

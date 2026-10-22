@@ -125,6 +125,8 @@ def _source_dispatch_fixture(monkeypatch, tmp_path, *, configured=5, size=2, ove
         "_parse_batch_row",
         lambda _fhir, resource, _candidate: (models_by_type[resource["resourceType"]], {"resource_id": resource["id"]}),
     )
+    # Each synthetic file holds exactly one batch, so slot overlap is observed mid-file.
+    monkeypatch.setattr(cms, "BATCH_SIZE", 1_000)
     _dispatch_validation_fences(monkeypatch, fixture)
     return fixture
 

@@ -35,8 +35,8 @@ SOURCE_ID = source.SOURCE_ID
 RESOURCE_TYPES = tuple(resource_type for _, resource_type in source.RESOURCE_FILES)
 RESOURCE_SET = frozenset(RESOURCE_TYPES)
 ADAPTER_CONTRACT = "cms-npd-bulk-fhir-v1"
-BATCH_SIZE = 1_000
-BATCH_MAX_DECODED_BYTES = 8 * 1024 * 1024
+BATCH_SIZE = 4_000
+BATCH_MAX_DECODED_BYTES = 24 * 1024 * 1024
 IDENTITY_BATCH_SIZE = 1_000
 _NETWORK_ROLE_SQL = (
     'organization.payload_json::jsonb @> \'{"type":[{"text":"ntwk"}]}\'::jsonb '
