@@ -381,7 +381,7 @@ async def _verify_auxiliary_tables(connection, policy, auxiliary):
         )
 
 
-async def refresh_owned_statistics(connection, schema, names):
+async def refresh_statistics(connection, schema, names):
     """Refresh planner statistics on global roots this transaction just filled.
 
     Set-based replay comparisons that follow a bulk INSERT otherwise plan against

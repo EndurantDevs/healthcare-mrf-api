@@ -591,9 +591,9 @@ async def publish_identity_stages(publisher, identity, receipts):
                     f"INSERT INTO {storage_relation(policy.schema, root)} ({fields}) "
                     f"SELECT {fields} FROM {relation} ORDER BY {keys} ON CONFLICT ({keys}) DO NOTHING"
                 )
-            from process.provider_directory_generic_source_storage import refresh_owned_statistics
+            from process.provider_directory_generic_source_storage import refresh_statistics
 
-            await refresh_owned_statistics(connection, policy.schema, relations)
+            await refresh_statistics(connection, policy.schema, relations)
             await _global_replay(connection, policy, receipts, complete=True)
     except asyncpg.SerializationError as error:
         raise CMSIdentityReprepareRequired(

@@ -165,7 +165,6 @@ async def _reduce_input_sql(connection, policy, binding_by_field, key, target, c
     """
     table = storage_relation(policy.schema, binding_by_field["tables"][key]["name"])
     fields = ",".join(storage_identifier(name) for name in columns)
-    await connection.execute(f"SET LOCAL work_mem='{_SET_REDUCTION_WORK_MEM}'")
     status = await connection.execute(
         f"INSERT INTO {storage_relation(policy.schema, target)} ({fields}) "
         f'SELECT DISTINCT ON (resource_type COLLATE "C",resource_id COLLATE "C") {fields} FROM {table} '
@@ -184,6 +183,7 @@ async def _recheck_reduced_rows(connection, policy, name, columns, validate, cou
     if count <= _RECHECK_ROWS:
         query = f"SELECT {fields} FROM {relation}"
     else:
+        # Sample about three times the rows wanted, then LIMIT; SYSTEM sampling is page-clustered.
         percent = min(100.0, max(0.01, 300.0 * _RECHECK_ROWS / count))
         query = f"SELECT {fields} FROM {relation} TABLESAMPLE SYSTEM ({percent:.4f}) LIMIT {_RECHECK_ROWS}"
     async for row in connection.cursor(query, prefetch=1024):
@@ -193,6 +193,9 @@ async def _recheck_reduced_rows(connection, policy, name, columns, validate, cou
 async def _reduce_payloads_sql(connection, policy, previous, candidate, directory, tables_by_root, release_id):
     """Set-based reduction of both input heaps with the same raw-identity guards."""
     prepare, _ = _resource_callbacks(directory, candidate)
+    # SET LOCAL would otherwise outlive the reductions for the whole validation transaction.
+    previous_work_mem = await connection.fetchval("SHOW work_mem")
+    await connection.execute(f"SET LOCAL work_mem='{_SET_REDUCTION_WORK_MEM}'")
     resource_name = tables_by_root[storage.RESOURCE]["name"]
     resource_count = await _reduce_input_sql(
         connection, policy, previous, "resource_input", resource_name, RESOURCE_COLUMNS
@@ -211,6 +214,7 @@ async def _reduce_payloads_sql(connection, policy, previous, candidate, director
         )
         storage._require(invalid is False, "raw_identity_changed")
         await _recheck_reduced_rows(connection, policy, witness_name, WITNESS_COLUMNS, _witness, witness_count)
+    await connection.execute(f"SET LOCAL work_mem='{previous_work_mem}'")
 
 
 async def _reduced_rows(rows, *, dataset_id, prepare, merge):
