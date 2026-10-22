@@ -69,7 +69,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -133,7 +133,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -156,7 +156,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -193,7 +193,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -307,7 +307,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -366,7 +366,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -398,7 +398,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -450,7 +450,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -497,7 +497,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -535,7 +535,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -592,7 +592,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -603,18 +603,7 @@ jobs:
           || matrix.shard == 'directory-address' || matrix.shard == 'profile-publication' || startsWith(matrix.shard, 'registry-')
           }}
     - name: Install PostgreSQL client
-      run: "sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq\nsudo\
-        \ apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --yes --no-install-recommends\
-        \ ca-certificates curl\nsudo install -d -m 0755 /usr/share/postgresql-common/pgdg\nsudo curl --fail --location --silent\
-        \ --show-error --retry 3 --retry-delay 2 --retry-all-errors \\\n  --connect-timeout 15 --max-time 60 \\\n  --output\
-        \ /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \\\n  https://www.postgresql.org/media/keys/ACCC4CF8.asc\n\
-        . /etc/os-release\nprintf '%s\\n' \\\n  'Types: deb' \\\n  'URIs: https://apt.postgresql.org/pub/repos/apt' \\\n \
-        \ \"Suites: ${VERSION_CODENAME}-pgdg\" \\\n  'Components: main' \\\n  'Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc'\
-        \ |\n  sudo tee /etc/apt/sources.list.d/pgdg.sources >/dev/null\nsudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30\
-        \ -o Acquire::https::Timeout=30 update -qq\nsudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30\
-        \ install --yes --no-install-recommends postgresql-client-18\nprintf '%s\\n' /usr/lib/postgresql/18/bin >> \"$GITHUB_PATH\"\
-        \nfor tool in psql pg_dump pg_restore; do\n  \"/usr/lib/postgresql/18/bin/$tool\" --version | grep -Eq \"^$tool \\\
-        \\(PostgreSQL\\\\) 18\\\\.\"\ndone\n"
+      run: bash "$CI_ROOT/scripts/install_postgres_client"
     - name: Download exact-source Rust test binaries
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
@@ -936,7 +925,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -1062,7 +1051,7 @@ jobs:
       actions: read
       packages: write
     env:
-      CI_REVISION: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+      CI_REVISION: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
       PYTHONDONTWRITEBYTECODE: '1'
       IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
       MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
@@ -1071,7 +1060,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -1146,7 +1135,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+        ref: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -1174,7 +1163,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: 0f9e8bc28659c03d0d0a4027c6afff220a38e649
+  CI_REVISION: 50b605666e770adff1f4ff06b7fe9445fbf8cd25
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'
