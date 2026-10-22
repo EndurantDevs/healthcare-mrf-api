@@ -381,6 +381,17 @@ async def _verify_auxiliary_tables(connection, policy, auxiliary):
         )
 
 
+async def refresh_owned_statistics(connection, schema, names):
+    """Refresh planner statistics on global roots this transaction just filled.
+
+    Set-based replay comparisons that follow a bulk INSERT otherwise plan against
+    stale or absent statistics. PostgreSQL only warns and skips a root the current
+    role may not analyze, so no privilege probe is needed.
+    """
+    for name in names:
+        await connection.execute(f"ANALYZE {storage_relation(schema, name)}")
+
+
 _VERIFY_INTERVAL_SECONDS = 60.0
 _VERIFIED_CUSTODY: ContextVar[tuple[str, float] | None] = ContextVar(
     "provider_directory_generic_source_verified_custody", default=None

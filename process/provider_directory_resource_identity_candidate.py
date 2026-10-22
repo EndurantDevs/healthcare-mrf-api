@@ -240,6 +240,9 @@ async def publish_resource_identity_stage(publisher, identity, receipt):
                 f"SELECT {fields} FROM {relation} ORDER BY source_id,resource_type,resource_id "
                 "ON CONFLICT(source_id,resource_type,resource_id) DO NOTHING"
             )
+            from process.provider_directory_generic_source_storage import refresh_owned_statistics
+
+            await refresh_owned_statistics(connection, schema, (RESOURCE_IDENTITY_ROOT,))
             await _global_replay(connection, schema, relation, complete=True)
     except (asyncpg.SerializationError, asyncpg.UniqueViolationError) as error:
         raise CMSIdentityReprepareRequired(
