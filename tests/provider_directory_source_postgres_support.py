@@ -550,6 +550,11 @@ async def _drop_native_source_roles(connection, created, admin):
         await connection.execute(text(f'DROP ROLE "{role}"'))
 
 
+_CANCEL_AUTOVACUUM_SQL = """SELECT pg_cancel_backend(pid) FROM pg_stat_activity
+WHERE datname=current_database() AND backend_type='autovacuum worker'
+AND pg_has_role(current_user,'pg_signal_autovacuum_worker','USAGE')"""
+
+
 async def _cleanup_native_source_component(engine, database, is_owned_reader, retention_oid, created, admin):
     """Retry only whole rolled-back ownership cleanup when native autovacuum deadlocks."""
     if database is not None:
@@ -559,6 +564,9 @@ async def _cleanup_native_source_component(engine, database, is_owned_reader, re
     for attempt in range(3):
         try:
             async with engine.begin() as connection:
+                # Fast bulk loads leave autovacuum mid-flight on this disposable database; its catalog
+                # updates deadlock with REASSIGN OWNED, so stop the workers first when allowed to.
+                await connection.execute(text(_CANCEL_AUTOVACUUM_SQL))
                 if retention_oid is not None:
                     assert (
                         await connection.scalar(text("SELECT to_regnamespace('hp_snapshot_retention')::oid"))
