@@ -61,6 +61,18 @@ _WITNESS = "provider_directory_cms_npd_resource_witness"
 _RECEIPT = "provider_directory_cms_npd_relationship_receipt"
 _BINDING = "provider_directory_entity_source_binding"
 CONTRACT = "cms-npd-reference-ledger-v1"
+_WORK_MEM = "256MB"  # whole-family joins and sorts spill at the server default
+
+
+async def _raised_work_mem(session):
+    """Raise work_mem for the family statements; the caller restores the returned value."""
+    previous = (await session.execute(text("SHOW work_mem"))).scalar_one()
+    await session.execute(text(f"SET LOCAL work_mem='{_WORK_MEM}'"))
+    return previous
+
+
+async def _restore_work_mem(session, previous):
+    await session.execute(text(f"SET LOCAL work_mem='{previous}'"))
 _VALUES = ", ".join(
     f"('{kind}', '{field}', '{target}', {'true' if is_array else 'false'})"
     for kind, fields in FIELDS.items()
@@ -258,11 +270,15 @@ async def _insert_family(fhir, session, dataset_id, release_id, resource_type):
 async def _project_families(fhir, dataset_id, release_id, *, ctx=None, task=None):
     """Project every family once with one set-based statement each."""
     count = 0
+    async with fhir.db.session() as session:
+        previous_work_mem = await _raised_work_mem(session)
     for resource_type in FIELDS:
         async with fhir.db.session() as session:
             count += await _insert_family(fhir, session, dataset_id, release_id, resource_type)
         if ctx is not None and task is not None:
             await fhir._raise_if_resource_import_cancelled(ctx, task)
+    async with fhir.db.session() as session:
+        await _restore_work_mem(session, previous_work_mem)
     return count
 
 
@@ -270,8 +286,10 @@ async def assert_complete(fhir, dataset_id, release_id):
     """Require every explicit reference, one indexed family comparison at a time."""
     verified_count = 0
     async with fhir.db.session() as session:
+        previous_work_mem = await _raised_work_mem(session)
         for resource_type in FIELDS:
             verified_count += await _family_complete(fhir, session, dataset_id, release_id, resource_type)
+        await _restore_work_mem(session, previous_work_mem)
     actual = await fhir.db.scalar(
         f"SELECT count(*) FROM {fhir._qt(fhir._schema(), _TABLE)} WHERE dataset_id=:dataset_id", dataset_id=dataset_id
     )
