@@ -563,3 +563,10 @@ def test_preflight_statement_rejects_constructor_supplied_sql():
             limits=SnowflakePreflightLimits(maximum_root_keys=1),
             sql="SELECT synthetic_value",
         )
+
+
+def test_inspection_adapter_rejects_untyped_statement_before_credentials(credentials):
+    adapter, provider = _adapter(credentials)
+    with pytest.raises(SnowflakeConnectorError, match="generated Snowflake inspection statement"):
+        adapter.open_inspection(object(), timeout_seconds=4)
+    assert provider.calls == 0

@@ -29,6 +29,39 @@ from tests.test_custom_import_snowflake_capture import _policy
 from tests.test_custom_import_source_batch import _CURSOR, _PERMIT
 
 
+def test_oversized_text_and_native_byte_bounds_preselect_serial(monkeypatch):
+    assert not preparation._has_native_scalar_values({"field": "é" * (preparation.MAX_TEXT_BYTES // 2 + 1)})
+    context = _bulk_context()
+    fields = context.request.definition.root_fields
+    layout = preparation.native_layout(context.request.definition, context.stream)
+    monkeypatch.setattr(preparation, "MAX_INPUT_BYTES", 1)
+    assert preparation._native_row(context, fields, layout, _root()) is None
+
+
+@pytest.mark.parametrize("damage", ["row_shape", "child_identity", "output_bytes"])
+async def test_native_encoding_refusals_do_not_emit_a_partial_page(monkeypatch, damage):
+    events = _decoded(monkeypatch, [_root()])
+
+    def encode(layout, rows):
+        encoded = _reference_encoder(layout, rows)
+        if damage == "row_shape":
+            return [list(encoded[0])]
+        if damage == "child_identity":
+            return [(*encoded[0][:4], "key", b"k" * 32)]
+        monkeypatch.setattr(preparation, "MAX_OUTPUT_BYTES", 1)
+        return encoded
+
+    calls = _native_double(monkeypatch, encode)
+    pages = staging._source_pages(_bulk_context(), _part(1), _policy(), (1, 0, 0))
+    try:
+        with pytest.raises(CandidateRunnerError, match="source serializer returned"):
+            await staging._next_source_page(pages)
+    finally:
+        assert await staging._close_source_pages(pages, None) is None
+    assert len(calls) == 1
+    assert events == ["closed"]
+
+
 def _reference_encoder(layout, cell_rows):
     child, fields, root_key, child_key = layout
 

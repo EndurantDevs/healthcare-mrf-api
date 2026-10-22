@@ -949,3 +949,99 @@ async def test_binding_allowlist_downgrade_preserves_legacy_and_rejects_v2():
         assert retained == original
         with pytest.raises(DBAPIError, match="source_binding_revision_shape_check"):
             await _register_and_load_policy_binding(case, _v2_binding(_definition()))
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 2**63, "11"])
+def test_retained_binding_requires_native_positive_identifiers(value):
+    rows = _loaded_rows(_definition(), _binding(_definition()))
+    rows[0].dataset_id = value
+    with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError, match="identifiers"):
+        source_binding._loaded_snowflake_source_binding(*rows)
+
+
+def test_retained_binding_refuses_foreign_rows_and_unreadable_digest():
+    definition = _definition()
+    rows = _loaded_rows(definition, _binding(definition))
+    rows[1].dataset_id = 99
+    with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError, match="row identity"):
+        source_binding._loaded_snowflake_source_binding(*rows)
+    rows[1].dataset_id = 11
+    rows[0].binding_sha256 = object()
+    with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError, match="persisted identity"):
+        source_binding._loaded_snowflake_source_binding(*rows)
+
+
+def test_registration_rebuilds_binding_instead_of_accepting_mutated_seals():
+    definition = _definition()
+    binding = _binding(definition)
+    object.__setattr__(binding, "canonical", "{}")
+    with pytest.raises(source_binding.SnowflakeSourceBindingError, match="registration inputs"):
+        source_binding._validated_registration_binding(definition, binding)
+    binding = _binding(definition)
+    object.__setattr__(binding, "digest", "f" * 64)
+    with pytest.raises(source_binding.SnowflakeSourceBindingError, match="not canonical"):
+        source_binding._validated_registration_binding(definition, binding)
+
+
+def test_registration_preserves_binding_scope_error():
+    definition = _definition()
+    binding = _binding_at_version(definition, "synthetic-version")
+    document = json.loads(definition.canonical)
+    document["revision"]["definition"] = 2
+    wrong_definition = CustomImportDefinition.from_mapping(document)
+    with pytest.raises(source_binding.SnowflakeSourceBindingError):
+        source_binding._validated_registration_binding(wrong_definition, binding)
+
+
+def test_binding_refuses_non_mapping_policy_and_non_parquet_streams():
+    definition = _definition()
+    with pytest.raises(source_binding.SnowflakeSourceBindingError, match="object shape"):
+        binding_contract.SnowflakeSourceBinding.from_mapping([])
+    with pytest.raises(source_binding.SnowflakeSourceBindingError, match="processing policy"):
+        binding_contract._validated_processing_policy(object())
+    document = json.loads(definition.canonical)
+    document["streams"][0]["format"] = "csv"
+    changed = CustomImportDefinition.from_mapping(document)
+    with pytest.raises(source_binding.SnowflakeSourceBindingError, match="Parquet stream shapes"):
+        _binding(changed).bundle_components(changed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["load", "columns"])
+async def test_bound_source_refuses_unavailable_or_changed_mapping(monkeypatch, failure):
+    definition = _definition()
+    loaded = source_binding._loaded_snowflake_source_binding(*_loaded_rows(definition, _binding(definition)))
+    connector = SnowflakeBundleAcquisitionConnector(
+        approved_relations=loaded.approved_relations,
+        credential_provider=SimpleNamespace(load_key_pair=lambda: None),
+        adapter=SimpleNamespace(fetch_bundle=lambda *_args: None),
+    )
+    bundle = connector.prepare_request(definition, bindings=loaded.bundle_bindings)
+    request = SnowflakeBundleCandidateRequest(
+        loaded.dataset_id,
+        loaded.definition_revision_id,
+        loaded.schema_revision_id,
+        definition,
+        bundle,
+        "synthetic-bound-candidate",
+        "synthetic-owner",
+        source_binding_revision_id=loaded.source_binding_revision_id,
+        source_binding_sha256=loaded.source_binding_sha256,
+    )
+    statement = connector.build_statement(bundle)
+    loader = AsyncMock(return_value=loaded)
+    if failure == "load":
+        loader.side_effect = source_binding.SnowflakeSourceBindingError("synthetic unavailable binding")
+    else:
+        changed = replace(statement.selected_columns_by_stream[0][0], column_identifier="OTHER_COLUMN")
+        statement = replace(
+            statement,
+            selected_columns_by_stream=(
+                (changed, *statement.selected_columns_by_stream[0][1:]),
+                *statement.selected_columns_by_stream[1:],
+            ),
+        )
+    monkeypatch.setattr(snowflake_candidate, "load_snowflake_source_binding", loader)
+    with pytest.raises(SnowflakeCandidateError, match="source binding identity is invalid"):
+        await snowflake_candidate._validate_bound_source_identity(object(), request, statement)
+    loader.assert_awaited_once()

@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
@@ -21,6 +21,7 @@ import pytest
 import process.custom_import.family as family
 import process.custom_import.runner as runner
 import process.custom_import.runner_codec as runner_codec
+import process.custom_import.runner_graph as runner_graph
 import process.custom_import.runner_registry as runner_registry
 from process.custom_import.definition import ChildCollection, CustomImportDefinition, Field, KeyPart
 from process.custom_import.execution import LeaseGrant
@@ -35,6 +36,56 @@ from process.custom_import.runner import CandidateRunnerError, CandidateRunReque
 from process.custom_import.runner_codec import decode_payload_scalar, value_document
 
 _FIXTURE = Path(__file__).with_name("fixtures") / "custom_import" / "v1_valid.json"
+
+
+def test_graph_batches_reject_a_nonpositive_size_before_yield():
+    with pytest.raises(ValueError, match="batch size must be positive"):
+        list(runner_graph.batches((1,), size=0))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["schema", "duplicate_roots"])
+async def test_retained_selection_refuses_schema_crossing_and_duplicate_roots(monkeypatch, damage):
+    request = _request(_definition())
+    monkeypatch.setattr(runner_graph, "prepare_materialization_statement", AsyncMock())
+    prior = SimpleNamespace(root_record=SimpleNamespace(logical_key_sha256=b"r" * 32))
+    load = AsyncMock(return_value=(prior, prior))
+    monkeypatch.setattr(runner_graph, "load_previous_families", load)
+    pointer = SimpleNamespace(schema_revision_id=request.schema_revision_id + (damage == "schema"))
+    with pytest.raises(CandidateRunnerError, match="schema revision|duplicate root identities"):
+        await runner_graph.select_candidate_families(
+            object(), request, SimpleNamespace(families=(), rejections=()), pointer
+        )
+    assert load.await_count == int(damage != "schema")
+
+
+@pytest.mark.parametrize("damage", ["key_contract", "key_digest"])
+def test_retained_root_rejects_key_contract_and_identity_drift(monkeypatch, damage):
+    request = _request(_definition())
+    root_values_by_field = {"npi": "1234567893", "display_name": "Synthetic Clinic"}
+    canonical = runner_graph.root_key_document(request.definition, root_values_by_field)
+    record = SimpleNamespace(
+        key_contract_sha256=runner_graph.root_key_contract_hash(request.definition),
+        canonical_logical_key=canonical,
+        logical_key_sha256=runner_graph.digest_text("root-key", canonical),
+    )
+    if damage == "key_contract":
+        record.key_contract_sha256 = b"x" * 32
+    else:
+        record.logical_key_sha256 = b"x" * 32
+    monkeypatch.setattr(runner_graph, "payload_values", lambda *_args, **_kwargs: root_values_by_field)
+    with pytest.raises(CandidateRunnerError, match="root-key contract|root identity"):
+        runner_graph.stored_root_values(request, record, SimpleNamespace(canonical_payload="verified"), object())
+
+
+def test_retained_family_rejects_missing_child_membership():
+    with pytest.raises(CandidateRunnerError, match="child count"):
+        runner_graph.stored_family_children(_request(_definition()), object(), SimpleNamespace(child_count=1), ())
+
+
+def test_child_winners_ignore_children_from_another_collection():
+    family = SimpleNamespace(root_values_by_field={}, children=(SimpleNamespace(collection="other"),))
+    assert runner_graph.child_winner_candidates(family, "rates", 1, (), ()) == ()
 
 
 def _definition() -> CustomImportDefinition:

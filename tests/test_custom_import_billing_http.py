@@ -216,3 +216,35 @@ async def test_pinned_definition_request_error_retains_redacted_400(monkeypatch)
             "message": "Invalid custom import read request.",
         }
     }
+
+
+@pytest.mark.asyncio
+async def test_billing_legacy_body_cap_precedes_all_authority_and_snapshot_work(monkeypatch):
+    from unittest.mock import Mock
+
+    verifier = Mock(wraps=transport._verify_provider_transport)
+    monkeypatch.setattr(transport, "_verify_provider_transport", verifier)
+    session = Session()
+    install_pipeline(monkeypatch, session)
+    request = signed_request()
+    monkeypatch.setattr(transport, "_MAX_BODY_BYTES", len(request.body) - 1)
+    reply = await billing.serve_custom_import_billing_search(request, session)
+    assert reply.status == 404 and session.events == []
+
+    verifier.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bound_plan_refusal_is_returned_without_query_or_hydration(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from sanic import response
+
+    session = Session()
+    install_pipeline(monkeypatch, session)
+    refusal = response.json({"error": "plan unavailable"}, status=409)
+    admission = AsyncMock(return_value=refusal)
+    monkeypatch.setattr(billing, "admit_bound_plan_release_read", admission)
+    assert await billing.serve_custom_import_billing_search(signed_request(), session) is refusal
+    admission.assert_awaited_once()
+    assert session.prepared_count == 0 and session.hydration_pages == [] and not session.active

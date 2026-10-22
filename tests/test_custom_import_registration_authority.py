@@ -139,3 +139,58 @@ def test_stored_result_rejects_extra_content_before_exposing_history():
 
     with pytest.raises(authority.RegistrationAuthorityError, match="stored registration receipt is invalid"):
         authority._state(stored_by_name)
+
+
+@pytest.mark.parametrize("identifier_name", ["role", "warehouse"])
+def test_registration_requires_canonical_source_identifiers(identifier_name):
+    document_by_name = _document_by_name()
+    binding_by_name = document_by_name["source_binding"]
+    binding_by_name[identifier_name] = binding_by_name[identifier_name].lower()
+    parsed = authority.SnowflakeSourceBinding.from_mapping(binding_by_name)
+    assert canonical_json(binding_by_name) != parsed.canonical
+
+    with pytest.raises(authority.RegistrationAuthorityError, match="registration input is invalid"):
+        authority._registration(document_by_name)
+
+
+def test_semantic_input_digest_rejects_the_actual_utf8_byte_bound():
+    with pytest.raises(authority.RegistrationAuthorityError, match="registration input exceeds its bound"):
+        authority._semantic_input_digest({"payload": "x" * authority.MAX_REGISTRATION_INPUT_BYTES})
+
+
+@pytest.mark.parametrize(
+    ("missing_pins", "revoked", "retain_result", "message"),
+    [
+        (("input_sha256",), False, False, "pins are incomplete"),
+        (("token_sha256",), False, False, "pins are incomplete"),
+        (("expires_at",), False, False, "pins are incomplete"),
+        (("input_sha256", "token_sha256", "expires_at"), False, False, "tombstone is invalid"),
+        (("input_sha256", "token_sha256", "expires_at"), True, True, "tombstone is invalid"),
+    ],
+)
+def test_stored_authority_refuses_partial_pins_and_invalid_tombstones(missing_pins, revoked, retain_result, message):
+    now = dt.datetime(2030, 1, 1, tzinfo=dt.UTC)
+    stored_by_name = {
+        "authority_id": "synthetic_authority",
+        "input_sha256": hashlib.sha256(b"synthetic input").digest(),
+        "token_sha256": hashlib.sha256(b"synthetic digest").digest(),
+        "expires_at": now + dt.timedelta(minutes=5),
+        "created_at": now,
+        "revoked_at": now if revoked else None,
+        "result_receipt": (
+            authority._graph_receipt(_receipt(), authority._registration(_document_by_name()))
+            if retain_result
+            else None
+        ),
+    }
+    stored_by_name.update(dict.fromkeys(missing_pins))
+
+    with pytest.raises(authority.RegistrationAuthorityError, match=message):
+        authority._state(stored_by_name)
+
+
+def test_graph_result_rejects_a_receipt_for_a_different_source_binding():
+    prepared = authority._registration(_document_by_name())
+
+    with pytest.raises(authority.RegistrationAuthorityError, match="receipt binding is invalid"):
+        authority._graph_receipt(replace(_receipt(), source_binding_sha256=b"x" * 32), prepared)

@@ -502,3 +502,49 @@ def test_cli_redacts_inspection_failure(monkeypatch, capsys):
     output = capsys.readouterr()
     assert output.out == ""
     assert json.loads(output.err) == {"code": "query_unavailable", "status": "error"}
+
+
+@pytest.mark.parametrize(
+    "operation,ordinal", [("discover", True), ("discover", -1), ("discover", 2), ("estimate", 0), ("unsupported", None)]
+)
+def test_inspection_statement_rejects_invalid_operation_and_stream_scope(operation, ordinal):
+    loaded = _loaded_binding()
+    builder = SnowflakeBundleStatementBuilder(approved_relations=loaded.approved_relations)
+    bundle = inspection._prepare_preflight(
+        loaded.definition, loaded.binding, builder, SnowflakePreflightLimits()
+    ).statement.bundle_statement
+    with pytest.raises(SnowflakeInspectionError, match="^result_invalid$"):
+        inspection.SnowflakeInspectionStatement(bundle, operation, ordinal)
+
+
+def test_unknown_inspection_operation_never_opens_source(source):
+    adapter, run = source
+    with pytest.raises(SnowflakeInspectionError, match="^result_invalid$"):
+        run("unsupported")
+    assert adapter.statements == adapter.cursors == []
+
+
+def test_estimate_rejects_fractional_count_metadata_before_fetch(source):
+    adapter, run = source
+    adapter.after_open = lambda cursor: setattr(cursor.description[1], "scale", 1)
+    with pytest.raises(SnowflakeInspectionError, match="^result_invalid$"):
+        run("estimate")
+    assert adapter.cursors[0].fetches == 0 and adapter.cursors[0].closed
+
+
+def test_successful_inspection_cannot_hide_failed_cursor_cleanup(source):
+    adapter, run = source
+
+    def failed_cleanup(cursor):
+        original_close = cursor.close
+
+        def close():
+            original_close()
+            raise OSError("synthetic cleanup failure")
+
+        cursor.close = close
+
+    adapter.after_open = failed_cleanup
+    with pytest.raises(SnowflakeInspectionError, match="^query_unavailable$") as caught:
+        run("estimate")
+    assert caught.value.__cause__ is None and adapter.cursors[0].closed

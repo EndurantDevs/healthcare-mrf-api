@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Protected taxonomy acquisition uses the managed Source boundary."""
 
+import asyncio
 import importlib
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -400,6 +401,30 @@ async def test_source_ready_does_not_arm_handoff_until_fresh_native_closed_readb
             await nucc._handoff_protected_source({"context": context_by_field})
         assert "control_run_handoff_committed" not in context_by_field
         assert context_by_field.get("nucc_native_commit_unknown", False) is (readback == "unavailable")
+
+
+async def test_source_ready_commit_cancellation_preserves_recovery_without_waiting(monkeypatch):
+    stage = source.NuccSourceStage.from_wire(copying_marker())
+    ready = ready_input(stage.marker)
+    context_by_field = {"nucc_source_stage_bound": stage, "nucc_source_files": ready["source_files"]}
+
+    @asynccontextmanager
+    async def transaction():
+        yield "original-session"
+        raise asyncio.CancelledError
+
+    readback = AsyncMock(return_value=closed_marker()["handoff"])
+    monkeypatch.setattr(nucc.db, "transaction", transaction)
+    monkeypatch.setattr(source, "record_nucc_source_ready", AsyncMock(return_value=ready))
+    monkeypatch.setattr(source, "wait_nucc_source_handoff", readback)
+    with pytest.raises(asyncio.CancelledError):
+        await nucc._handoff_protected_source({"context": context_by_field})
+    readback.assert_not_awaited()
+    assert context_by_field["nucc_source_stage_bound"].ready == ready
+    assert context_by_field["nucc_native_commit_unknown"] is True
+    assert (
+        "control_run_handoff_committed" not in context_by_field and "_control_committed_result" not in context_by_field
+    )
 
 
 async def test_plain_copy_uses_no_legacy_insert_fallback_and_preserves_null_encoding(monkeypatch):

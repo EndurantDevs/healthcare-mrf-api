@@ -519,3 +519,38 @@ def test_provider_response_rejects_invalid_counts_even_without_import_payload(in
     parsed = batch._parse_batch_request(_body(include_filter=include_filter)).provider
     with pytest.raises(CustomImportReadUnavailableError, match="page exceeds its bound"):
         batch.provider_http._provider_response_limit(parsed, row_count)
+
+
+@pytest.mark.asyncio
+async def test_batch_legacy_body_cap_precedes_signature_and_snapshot(monkeypatch):
+    from unittest.mock import Mock
+
+    verifier = Mock(wraps=transport._verify_provider_transport)
+    monkeypatch.setattr(transport, "_verify_provider_transport", verifier)
+    session = _Session()
+    fixtures._install_keyring(monkeypatch, session)
+    body = _body()
+    request = _request(body)
+    monkeypatch.setattr(transport, "_MAX_BODY_BYTES", len(body) - 1)
+    reply = await batch.serve_custom_import_provider_batch(request, session)
+    assert reply.status == 404 and session.events == []
+
+    verifier.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,status", [("registry_network_catalog_detail_denied", 404), ("registry_network_catalog_unavailable", 503)]
+)
+async def test_managed_detail_catalog_failure_is_closed_before_payload(monkeypatch, error, status):
+    from process.registry_network_catalog_read import RegistryNetworkCatalogError
+    from tests.test_custom_import_provider_detail import _body as detail_body
+
+    session = _Session()
+    fixtures._install_keyring(monkeypatch, session)
+    reader = AsyncMock(side_effect=RegistryNetworkCatalogError(error))
+    monkeypatch.setattr(batch, "_serve_managed_batch", reader)
+    reply = await batch.serve_custom_import_provider_batch(_request(detail_body()), session)
+    assert reply.status == status and set(json.loads(reply.body)) == {"error"}
+    assert session.events == []
+    reader.assert_awaited_once()

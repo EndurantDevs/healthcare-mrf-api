@@ -28,6 +28,38 @@ from process.custom_import import (
 FIXTURES = Path(__file__).with_name("fixtures") / "custom_import"
 
 
+def test_yaml_numeric_keys_are_rejected_before_definition_parsing():
+    with pytest.raises(DefinitionError, match="YAML object keys must be strings"):
+        load_yaml_definition("1: synthetic\n")
+
+
+@pytest.mark.parametrize(
+    "mutate,message",
+    [
+        (lambda raw: raw["revision"].update(definition=True), "integer >= 1"),
+        (lambda raw: raw.update(contract="custom-import/unknown"), "definition.contract"),
+        (lambda raw: raw["query"].update(aliases=[]), "aliases must be an object"),
+    ],
+)
+def test_definition_refuses_invalid_contract_schema_and_query_shapes(mutate, message):
+    _assert_invalid_definition(mutate, message)
+
+
+def test_grouped_selection_refuses_an_incomplete_root_identity():
+    from tests.custom_import_grouped_support import definition_document
+
+    document = definition_document()
+    document["schema"]["root"]["logical_key"].pop()
+    document["schema"]["children"][0]["parent_key"].pop()
+    with pytest.raises(DefinitionError, match="complete entity, selection, and group root key"):
+        CustomImportDefinition.from_mapping(document)
+
+
+def test_field_identity_validation_requires_a_root_scope():
+    with pytest.raises(DefinitionError, match="root.fields must not be empty"):
+        custom_import_definition._validate_field_identity((), ())
+
+
 @pytest.fixture
 def definition():
     return CustomImportDefinition.from_json((FIXTURES / "v1_valid.json").read_text())

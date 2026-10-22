@@ -587,3 +587,8 @@ async def test_seal_cancellation_is_observed(transport, monkeypatch):
     assert acquisition.cancelled()
     _assert_redacted(caught.value)
     _assert_closed(transport)
+
+
+def test_exact_signed_url_cannot_change_normalized_authority():
+    with pytest.raises(https.HttpsAcquisitionError, match="^https_url_denied$"):
+        https._acquisition_url("https://éxample.test/records.csv", True)

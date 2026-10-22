@@ -100,6 +100,29 @@ class _Session:
         return SimpleNamespace(scalar_one=lambda: 1)
 
 
+def _pending_lookup_case(monkeypatch, request, bundle, streams=()):
+    execution = SimpleNamespace(
+        request_identity_sha256=request.request_identity_sha256,
+        source_binding_revision_id=request.source_binding_revision_id,
+        capture_bundle_id=None,
+    )
+    monkeypatch.setattr(
+        pending.lifecycle, "_lock_current_capture_binding", AsyncMock(return_value=(execution, "running", None))
+    )
+    monkeypatch.setattr(pending, "_fresh_remaining_seconds", AsyncMock(return_value=30))
+    session = _Session()
+    results = iter((bundle, streams))
+
+    async def execute(statement):
+        session.statements.append(statement)
+        assert statement.is_select, "refused capture must not mutate retained state"
+        value = next(results)
+        return SimpleNamespace(scalar_one_or_none=lambda: value, scalars=lambda: SimpleNamespace(all=lambda: value))
+
+    session.execute = execute
+    return session, execution
+
+
 def _capture(request):
     stream = _stream(format_name="parquet")
     return capture_stream(
@@ -133,6 +156,62 @@ def test_attempt_identity_never_accepts_a_different_digest(field):
     setattr(bundle, field, _digest("different"))
     with pytest.raises(CaptureBundleConflict, match="identity"):
         pending._validate_bundle(bundle, request)
+
+
+@pytest.mark.parametrize(
+    "damage,expected",
+    [
+        ("missing_bundle", "does not exist"),
+        ("different_capture", "bound to a different capture"),
+        ("execution_request", "execution request has drifted"),
+    ],
+)
+async def test_append_checks_retained_execution_and_bundle_before_writing(monkeypatch, damage, expected):
+    request = _request()
+    bundle = None if damage == "missing_bundle" else _bundle(request)
+    session, execution = _pending_lookup_case(monkeypatch, request, bundle)
+    if damage == "different_capture":
+        execution.capture_bundle_id = 6
+    elif damage == "execution_request":
+        execution.request_identity_sha256 = _digest("other-request")
+    monkeypatch.setattr(pending, "_source_stream", AsyncMock(return_value=_stream(format_name="parquet")))
+    with pytest.raises(CaptureBundleConflict, match=expected):
+        await pending.append_pending_parquet_part(
+            session,
+            request=request,
+            capture_bundle_id=5,
+            capture=_capture(request),
+            ordinal=1,
+            record_count=0,
+            arrow_byte_count=0,
+        )
+    assert len(session.statements) == (0 if damage == "execution_request" else 1)
+    pending._fresh_remaining_seconds.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "damage,expected",
+    [
+        ("missing_stream", "stream coverage has drifted"),
+        ("different_capture", "bound to a different capture"),
+        ("unbound_seal", "not bound to its producer"),
+        ("already_bound", "already has a sealed capture"),
+    ],
+)
+async def test_begin_refuses_conflicting_retained_state_without_allocating(monkeypatch, damage, expected):
+    request = _request()
+    bundle = None if damage == "already_bound" else _bundle(request)
+    streams = () if damage == "missing_stream" else (_stream_header(),)
+    session, execution = _pending_lookup_case(monkeypatch, request, bundle, streams)
+    if damage in {"different_capture", "already_bound"}:
+        execution.capture_bundle_id = 6
+    elif damage == "unbound_seal":
+        bundle.capture_state = "sealed"
+    monkeypatch.setattr(pending, "_validated_streams", AsyncMock(return_value=(("records", 1),)))
+    monkeypatch.setattr(pending, "_validated_replayable_parquet_streams", AsyncMock())
+    with pytest.raises(CaptureBundleConflict, match=expected):
+        await pending.begin_pending_parquet_bundle(session, request=request)
+    assert len(session.statements) == (1 if bundle is None else 2)
 
 
 async def _append_setup(monkeypatch, request, header, bundle):
@@ -263,6 +342,34 @@ async def test_append_rejects_payload_corruption_before_any_lock(monkeypatch):
             arrow_byte_count=0,
         )
     lock.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "damage,expected",
+    [("capture", "SealedCapture"), ("manifest", "CaptureManifest"), ("snapshot", "snapshot has drifted")],
+)
+async def test_append_rejects_invalid_part_identity_before_database_work(monkeypatch, damage, expected):
+    request = _request()
+    capture = _capture(request)
+    if damage == "capture":
+        capture = object()
+    elif damage == "manifest":
+        capture = replace(capture, manifest=object())
+    else:
+        capture = _capture(replace(request, source_snapshot_token="different-snapshot"))
+    monkeypatch.setattr(pending, "_source_stream", AsyncMock(return_value=_stream(format_name="parquet")))
+    session = _Session()
+    with pytest.raises(CaptureStoreError, match=expected):
+        await pending.append_pending_parquet_part(
+            session,
+            request=request,
+            capture_bundle_id=5,
+            capture=capture,
+            ordinal=1,
+            record_count=0,
+            arrow_byte_count=0,
+        )
+    assert session.statements == []
 
 
 async def test_append_rejects_aggregate_quota_without_insertion(monkeypatch):
@@ -412,6 +519,31 @@ async def test_statement_timeout_is_armed_before_the_stream_seal_statement(monke
     assert session.statements[1].is_update
 
 
+@pytest.mark.parametrize("damage", ["duplicate_receipt", "wrong_stream", "wrong_slot", "seal_expiry"])
+async def test_bundle_seal_refuses_incomplete_authority_before_updates(monkeypatch, damage):
+    request = _request()
+    receipt = _receipt(request)
+    document = json.loads(receipt.canonical_manifest)
+    header = _stream_header(
+        eof_at=dt.datetime.now(dt.UTC), **{"committed_" + name: document[name] for name in pending._ACCOUNTING_FIELDS}
+    )
+    session, _ = _pending_lookup_case(monkeypatch, request, _bundle(request), (header,))
+    monkeypatch.setattr(pending, "_validated_streams", AsyncMock(return_value=(("records", 1),)))
+    receipts = (receipt,)
+    if damage == "duplicate_receipt":
+        receipts = (receipt, receipt)
+    elif damage == "wrong_stream":
+        receipts = (replace(receipt, stream_id="undeclared"),)
+    elif damage == "wrong_slot":
+        header.stream_slot = 2
+    else:
+        pending._fresh_remaining_seconds.return_value = 0.001
+    expected = "insufficient seal authority" if damage == "seal_expiry" else "stream coverage has drifted"
+    with pytest.raises(CaptureBundleConflict, match=expected):
+        await pending.seal_pending_parquet_bundle(session, request=request, capture_bundle_id=5, receipts=receipts)
+    assert len(session.statements) == 2
+
+
 @pytest.mark.parametrize("damage", ["boolean_slot", "boolean_count", "duplicate_slot", "extra_entry_field"])
 def test_bundle_receipt_entries_are_closed_typed_and_strictly_sorted(damage):
     request = _request()
@@ -544,6 +676,82 @@ async def test_named_segmented_iterator_preserves_complete_manifests_and_cleanup
         assert len([part async for part in parts]) == 2
     assert case.session.rows.close_count == 1
     assert len(case.session.statement.selected_columns) == 11
+
+
+@pytest.mark.parametrize(
+    "owner,field,value,expected",
+    [
+        ("stream", "capture_state", "pending", "stream is not sealed"),
+        ("stream", "eof_at", None, "stream is not sealed"),
+        ("stream", "payload_contract", "unsupported", "stream is not sealed"),
+        ("stream", "payload_part_count", 3, "stream final metadata has drifted"),
+        ("stream", "payload_set_sha256", _digest("other"), "stream final metadata has drifted"),
+        ("stream", "manifest_set_sha256", _digest("other"), "stream final metadata has drifted"),
+        ("bundle", "policy_sha256", _digest("other"), "sealed bundle identity has drifted"),
+        ("bundle", "manifest_sha256", _digest("other"), "sealed bundle identity has drifted"),
+        ("bundle", "snapshot_token_sha256", _digest("other"), "sealed bundle identity has drifted"),
+        ("bundle", "stream_count", 3, "sealed bundle identity has drifted"),
+    ],
+)
+async def test_segmented_header_tampering_is_refused_before_payload_access(monkeypatch, owner, field, value, expected):
+    case, _ = _segmented_read_case(monkeypatch)
+    setattr(case.bundle if owner == "bundle" else case.captures_by_slot[1], field, value)
+    with pytest.raises(CaptureBundleConflict, match="sealed metadata is invalid") as failure:
+        async with capture_store.open_segmented_parquet_parts(case.session, **_PART_IDS):
+            pytest.fail("tampered headers opened a payload reader")
+    assert isinstance(failure.value.__cause__, CaptureBundleConflict)
+    assert expected in str(failure.value.__cause__)
+    assert case.session.rows is None and case.session.statement is None
+    assert not case.session.autoflush_suppressed
+
+
+@pytest.mark.parametrize(
+    "damage", ["receipt_accounting", "aggregate_accounting", "missing_streams", "empty_streams", "incomplete_streams"]
+)
+async def test_segmented_bundle_receipt_tampering_is_refused_before_payload_access(monkeypatch, damage):
+    case, _ = _segmented_read_case(monkeypatch)
+    document = json.loads(case.bundle.canonical_manifest)
+    if damage in {"receipt_accounting", "aggregate_accounting"}:
+        document["record_count"] += 1
+        if damage == "aggregate_accounting":
+            case.bundle.committed_record_count += 1
+    elif damage == "missing_streams":
+        document["streams"] = None
+    elif damage == "empty_streams":
+        document["streams"] = []
+    else:
+        document["streams"].pop()
+    case.bundle.canonical_manifest = pending.canonical_json(document)
+    case.bundle.manifest_sha256 = hashlib.sha256(case.bundle.canonical_manifest.encode()).digest()
+    expected = "sealed bundle accounting has drifted" if damage.endswith("accounting") else "stream receipt coverage"
+    with pytest.raises(CaptureBundleConflict, match="sealed metadata is invalid") as failure:
+        async with capture_store.open_segmented_parquet_parts(case.session, **_PART_IDS):
+            pytest.fail("tampered receipt opened a payload reader")
+    assert isinstance(failure.value.__cause__, CaptureBundleConflict)
+    assert expected in str(failure.value.__cause__)
+    assert case.session.rows is None and case.session.statement is None
+    assert not case.session.autoflush_suppressed
+
+
+async def test_segmented_replay_checks_manifest_set_at_complete_eof_and_closes_reader(monkeypatch):
+    case, _ = _segmented_read_case(monkeypatch)
+    header = case.captures_by_slot[1]
+    document = json.loads(header.canonical_manifest)
+    header.manifest_set_sha256 = _digest("other-manifest-set")
+    document["manifest_set_sha256"] = header.manifest_set_sha256.hex()
+    header.canonical_manifest = pending.canonical_json(document)
+    header.manifest_sha256 = hashlib.sha256(header.canonical_manifest.encode()).digest()
+    bundle_document = json.loads(case.bundle.canonical_manifest)
+    bundle_document["streams"][0]["manifest_sha256"] = header.manifest_sha256.hex()
+    case.bundle.canonical_manifest = pending.canonical_json(bundle_document)
+    case.bundle.manifest_sha256 = hashlib.sha256(case.bundle.canonical_manifest.encode()).digest()
+    received_payloads = []
+    with pytest.raises(CaptureBundleConflict, match="complete manifest accounting has drifted"):
+        async with capture_store.open_segmented_parquet_parts(case.session, **_PART_IDS) as parts:
+            async for part in parts:
+                received_payloads.append(part.capture.payload)
+    assert received_payloads == [b"first", b"second", b"third"]
+    assert case.session.rows.read_count == 4 and case.session.rows.close_count == 1
 
 
 async def test_eager_legacy_loader_rejects_segmented_capture_before_accumulating_parts(monkeypatch):

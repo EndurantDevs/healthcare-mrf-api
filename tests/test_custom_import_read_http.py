@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import orjson
 import pytest
@@ -387,6 +388,8 @@ def test_detail_full_family_entitlement_cannot_be_changed_without_resigning() ->
         ),
         pytest.param(lambda: http.custom_import_read_signature_message("Bad", b"x"), id="key-id"),
         pytest.param(lambda: http.custom_import_read_signature_message("test-1", b""), id="context"),
+        pytest.param(lambda: http.custom_import_provider_signature_message("Bad", b"x"), id="provider-key-id"),
+        pytest.param(lambda: http.custom_import_provider_signature_message("test-1", b""), id="provider-context"),
         pytest.param(lambda: http._base64url_decode(None), id="base64-type"),
         pytest.param(lambda: http._base64url_decode("A"), id="base64-content"),
         pytest.param(lambda: http._base64url_decode("AB"), id="base64-noncanonical"),
@@ -551,16 +554,28 @@ def test_search_parser_requires_canonical_json() -> None:
     "document",
     (
         {"target": _TARGET},
-        {"entity": "synthetic", "target": _TARGET},
+        {"entity": "synthetic", "family_entitlement": "full_family", "target": _TARGET},
         {"entity": {"adapter_id": "synthetic", "value": "synthetic"}, "family_entitlement": False, "target": _TARGET},
         {
             "entity": {"adapter_id": "synthetic", "value": "synthetic"},
             "family_entitlement": "root_fields",
             "target": _TARGET,
         },
-        {"entity": {"adapter_id": "synthetic", "value": ""}, "target": _TARGET},
-        {"entity": {"adapter_id": "wrong-adapter", "value": "synthetic"}, "target": _TARGET},
-        {"entity": {"adapter_id": "synthetic", "value": "x" * 513}, "target": _TARGET},
+        {
+            "entity": {"adapter_id": "synthetic", "value": ""},
+            "family_entitlement": "full_family",
+            "target": _TARGET,
+        },
+        {
+            "entity": {"adapter_id": "wrong-adapter", "value": "synthetic"},
+            "family_entitlement": "full_family",
+            "target": _TARGET,
+        },
+        {
+            "entity": {"adapter_id": "synthetic", "value": "x" * 513},
+            "family_entitlement": "full_family",
+            "target": _TARGET,
+        },
         {"entity": {"adapter_id": "synthetic", "value": "synthetic"}, "target": _TARGET, "cursor": None},
     ),
 )
@@ -576,6 +591,40 @@ def test_detail_parser_binds_generic_entity_without_a_vendor_policy() -> None:
     assert request.target == PinnedReadTarget(11, 101, 21, 31, "synthetic_profile")
     assert (request.entity.adapter_id, request.entity.value) == ("synthetic", "binding-synthetic")
     assert request.family_entitlement == "full_family"
+
+
+def test_detail_parser_requires_canonical_json() -> None:
+    with pytest.raises(http.CustomImportReadTransportError):
+        http._parse_detail_request(json.dumps(json.loads(_DETAIL_BODY)).encode("ascii"))
+
+
+@pytest.mark.parametrize("operator", ("is_missing", "is_null"))
+def test_state_filters_do_not_require_a_scalar_value(operator) -> None:
+    request_by_field = {**json.loads(_BODY), "filters": [{"field_id": "name", "operator": operator}]}
+
+    parsed = http._parse_search_request(http._canonical_json_bytes(request_by_field))
+
+    assert len(parsed.filters) == 1
+    assert (parsed.filters[0].field_id, parsed.filters[0].operator, parsed.filters[0].value) == ("name", operator, None)
+
+
+@pytest.mark.parametrize("collection", (None, SimpleNamespace(query=SimpleNamespace(kind="geo"))))
+def test_managed_collection_transport_rejects_a_missing_or_different_route(collection) -> None:
+    path = "/api/v1/extensions/custom-import/providers"
+    with pytest.raises(http.CustomImportReadTransportError):
+        http._verify_provider_transport(
+            headers=_provider_headers(body=_PROVIDER_VECTOR_BODY, path=path),
+            body=_PROVIDER_VECTOR_BODY,
+            request=SimpleNamespace(managed_collection=collection),
+            trusted_now=_NOW,
+            keyring=http._load_keyring(_keyring_document()),
+            path=path,
+            managed_collection=True,
+        )
+
+
+def test_optional_provider_projection_preserves_absence() -> None:
+    assert http._provider_import_payload(None, http._parse_target(_TARGET)) is None
 
 
 @pytest.mark.parametrize(
@@ -969,6 +1018,36 @@ async def test_stalled_dataset_resolution_uses_the_shared_read_timeout(monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("serve", "body", "path"),
+    (
+        (http.serve_custom_import_search, _BODY, http.CUSTOM_IMPORT_READ_PATH),
+        (http.serve_custom_import_detail, _DETAIL_BODY, http.CUSTOM_IMPORT_DETAIL_PATH),
+    ),
+)
+async def test_dataset_resolution_exhausting_budget_stops_before_service(monkeypatch, serve, body, path) -> None:
+    _install_keyring(monkeypatch)
+    now = asyncio.get_running_loop().time()
+    read_times = iter((now, now + http.DEFAULT_READ_TIMEOUT_MS / 1_000 + 1))
+    clock = SimpleNamespace(time=lambda: next(read_times))
+    monkeypatch.setattr(
+        http,
+        "asyncio",
+        SimpleNamespace(get_running_loop=lambda: clock, timeout_at=asyncio.timeout_at),
+    )
+    monkeypatch.setattr(http, "_resolve_pinned_target", _resolved_target)
+
+    service_factory = Mock(side_effect=AssertionError("an exhausted read budget reached the service"))
+    monkeypatch.setattr(http, "CustomImportReadService", service_factory)
+
+    result = await serve(_Request(body, _headers(body=body, path=path), path=path), cold_caller())
+
+    assert result.status == 503
+    assert result.headers["Cache-Control"] == "private, no-store"
+    service_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_wrong_path_stops_before_keyring_and_service(monkeypatch) -> None:
     def forbidden(*_args, **_kwargs):
         raise AssertionError("wrong path crossed the route gate")
@@ -984,28 +1063,47 @@ async def test_wrong_path_stops_before_keyring_and_service(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_wrong_method_and_invalid_body_use_bounded_errors(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("serve", "body", "path"),
+    (
+        (http.serve_custom_import_search, _BODY, http.CUSTOM_IMPORT_READ_PATH),
+        (http.serve_custom_import_detail, _DETAIL_BODY, http.CUSTOM_IMPORT_DETAIL_PATH),
+    ),
+)
+async def test_wrong_method_and_invalid_body_use_bounded_errors(monkeypatch, serve, body, path) -> None:
     def forbidden(*_args, **_kwargs):
         raise AssertionError("invalid request crossed the route gate")
 
     monkeypatch.setattr(http, "_keyring", forbidden)
-    wrong_method = await http.serve_custom_import_search(_Request(_BODY, _headers(), method="GET"), cold_caller())
-    invalid_body = await http.serve_custom_import_search(_Request(b"", _headers()), cold_caller())
+    headers = _headers(body=body, path=path)
+    wrong_method = await serve(_Request(body, headers, method="GET", path=path), cold_caller())
+    invalid_body = await serve(_Request(b"", headers, path=path), cold_caller())
 
     assert wrong_method.status == 404
     assert invalid_body.status == 404
 
 
 @pytest.mark.asyncio
-async def test_oversized_response_fails_closed(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("serve", "body", "path"),
+    (
+        (http.serve_custom_import_search, _BODY, http.CUSTOM_IMPORT_READ_PATH),
+        (http.serve_custom_import_detail, _DETAIL_BODY, http.CUSTOM_IMPORT_DETAIL_PATH),
+    ),
+)
+async def test_oversized_response_fails_closed(monkeypatch, serve, body, path) -> None:
     _install_keyring(monkeypatch)
     monkeypatch.setattr(http, "CustomImportReadService", _Service)
     monkeypatch.setattr(http, "_resolve_pinned_target", _resolved_target)
     monkeypatch.setattr(http, "_MAX_RESPONSE_BYTES", 1)
 
-    result = await http.serve_custom_import_search(_Request(_BODY, _headers()), cold_caller())
+    result = await serve(_Request(body, _headers(body=body, path=path), path=path), cold_caller())
 
     assert result.status == 503
+    assert result.headers["Cache-Control"] == "private, no-store"
+    assert orjson.loads(result.body) == {
+        "error": {"code": "custom_import_read_unavailable", "message": "Custom import read is temporarily unavailable."}
+    }
 
 
 @pytest.mark.asyncio
@@ -1151,6 +1249,17 @@ async def test_nonunique_dataset_resolution_fails_closed() -> None:
             return Result()
 
     with pytest.raises(http.CustomImportReadUnavailableError):
+        await http._resolve_pinned_target(Session(), http._parse_target(_TARGET))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dataset_id", (0, "11"))
+async def test_invalid_persisted_dataset_identity_fails_closed(dataset_id) -> None:
+    class Session:
+        async def execute(self, _statement):
+            return SimpleNamespace(scalar_one_or_none=lambda: dataset_id)
+
+    with pytest.raises(http.CustomImportReadUnavailableError, match="pinned dataset is unavailable"):
         await http._resolve_pinned_target(Session(), http._parse_target(_TARGET))
 
 

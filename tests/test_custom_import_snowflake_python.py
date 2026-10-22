@@ -1037,3 +1037,38 @@ def test_bundle_transport_rejects_invalid_stream_ownership_and_result_rows():
     assert snowflake_python._uses_decimal_storage("TEXT") is False
     with pytest.raises(SnowflakeConnectorError, match="selected fields"):
         snowflake_python._result_row_variable_bytes(("a", "b"), (SnowflakeResultColumn("value", "TEXT", True),))
+
+
+def test_bundle_partition_sources_are_single_use_and_close_on_replay_refusal(monkeypatch, credentials):
+    cursor = _Cursor((_metadata_row(), _data_row("1234567893", "Cardiology")))
+    connection, _ = _connect(monkeypatch, cursor)
+    result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+        _bundle_statement(), credentials
+    )
+    sources = result.stream_results[0].parquet_result.partition_sources
+    readers = list(sources)
+    for reader in readers:
+        reader.close()
+    with pytest.raises(SnowflakeConnectorError, match="already consumed"):
+        list(sources)
+    result.close()
+    assert cursor.closed and connection.closed
+
+
+def test_bundle_source_ordinal_regression_closes_cursor_without_replay(monkeypatch):
+    from tests.test_custom_import_snowflake_bundle import _Credentials
+    from tests.test_custom_import_snowflake_shared_capture import _runtime, _shared_row
+
+    other_row = (1, 2, "other_source", None, None, None, None, None, None, None, "1003000126", "x", 2)
+    connector, request, adapter, cursor, connection = _runtime(
+        monkeypatch, (other_row, _shared_row() + (None, None, None)), interleaved=True
+    )
+    result = adapter.fetch_bundle(connector.build_statement(request), _Credentials().load_key_pair())
+    try:
+        with pytest.raises(SnowflakeConnectorError, match="not ordered by stream"):
+            for stream in result.stream_results:
+                for reader in stream.parquet_result.partition_sources:
+                    reader.close()
+        assert cursor.closed and connection.closed
+    finally:
+        result.close()
