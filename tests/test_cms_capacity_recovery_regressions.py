@@ -415,6 +415,8 @@ async def npd_case(monkeypatch):
         EndpointDatasetCandidate=fhir.EndpointDatasetCandidate,
         FHIRAcquisitionContext=fhir.FHIRAcquisitionContext,
         parse_fhir_resource=fhir.parse_fhir_resource,
+        _endpoint_dataset_resource_rows=fhir._endpoint_dataset_resource_rows,
+        _assert_practitioner_semantic_projection_as_of=fhir._assert_practitioner_semantic_projection_as_of,
         ProviderDirectoryOrganization=fhir.ProviderDirectoryOrganization,
         ProviderDirectoryDatasetResource=fhir.ProviderDirectoryDatasetResource,
         _insurance_plan_network_references=fhir._insurance_plan_network_references,
@@ -559,7 +561,7 @@ async def test_decoded_source_failure_never_reaches_batch_writer(npd_case, monke
     path = tmp_path / "source.zst"
     path.write_bytes(zstd.compress(body))
     writer = AsyncMock()
-    monkeypatch.setattr(cms, "_persist_source_batch", writer)
+    monkeypatch.setattr(cms, "_persist_prepared_batch", writer)
     with pytest.raises(cms.source.CmsNpdSourceError, match=reason):
         await cms._stream_file(case.fhir, path, case.candidate, "Location", {}, {})
     writer.assert_not_awaited()
@@ -573,27 +575,29 @@ async def test_valid_source_batch_binds_exact_raw_and_normalized_witness(npd_cas
     path = tmp_path / "source.zst"
     path.write_bytes(zstd.compress(json.dumps(resource_dict, ensure_ascii=False).encode() + b"\n"))
     witnessed_resources = []
+    persisted_rows = []
 
-    async def persist(importer, session, _model, rows, candidate):
+    async def persist(importer, session, rows, proof, candidate):
         assert importer is case.fhir and session is case.fhir.db.session
         assert case.fhir.db.binding is not None and candidate is case.candidate
         assert candidate.resource_hash_contract == fhir.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
         assert candidate.semantic_projection_as_of == case.identity["generated_at"]
-        assert rows[0]["resource_id"] == resource_dict["id"] and rows[0]["name"] == resource_dict["name"]
-        return [{**rows[0], "dataset_id": candidate.dataset_id, "resource_type": "Location", "payload_hash": "a" * 64}]
+        assert rows[0]["resource_id"] == resource_dict["id"] and len(rows[0]["payload_hash"]) == 64
+        assert proof[0]["resource_counts"] == {"Location": 1} and proof[0]["artifact_byte_count"] == len(proof[1])
+        persisted_rows.extend(rows)
 
     async def witness(session, by_id):
         assert session is case.fhir.db.session and case.fhir.db.binding is not None
         witnessed_resources.append(deepcopy(by_id))
 
     batch_writer = AsyncMock(side_effect=persist)
-    monkeypatch.setattr(cms, "persist_cms_dataset_rows", batch_writer)
+    monkeypatch.setattr(cms, "persist_prepared_cms_dataset_rows", batch_writer)
     insert = AsyncMock(side_effect=witness)
     monkeypatch.setattr(cms, "_insert_verified_witnesses", insert)
     assert await cms._stream_file(case.fhir, path, case.candidate, "Location", {}, {}) == 1
     stored = witnessed_resources[0][resource_dict["id"]]
-    assert stored["raw_payload_json"] == resource_dict
-    assert stored["normalized_payload_hash"] == "a" * 64
+    assert json.loads(stored["raw_payload_json"]) == resource_dict
+    assert stored["normalized_payload_hash"] == persisted_rows[0]["payload_hash"]
     assert (stored["dataset_id"], stored["release_id"], stored["resource_type"]) == (
         case.candidate.dataset_id,
         case.identity["vector_sha256"],
@@ -638,8 +642,10 @@ async def test_source_witnesses_cannot_commit_another_projection(npd_case, monke
         normalized_resources[0]["dataset_id"] = "other-dataset"
     else:
         normalized_resources[0]["resource_type"] = "Organization"
-    batch_writer = AsyncMock(return_value=normalized_resources)
-    monkeypatch.setattr(cms, "persist_cms_dataset_rows", batch_writer)
+    batch_builder = Mock(return_value=(normalized_resources, ({}, b"")))
+    monkeypatch.setattr(cms, "prepare_cms_dataset_rows", batch_builder)
+    batch_writer = AsyncMock()
+    monkeypatch.setattr(cms, "persist_prepared_cms_dataset_rows", batch_writer)
     witnesses = AsyncMock()
     monkeypatch.setattr(cms, "_insert_verified_witnesses", witnesses)
     with pytest.raises(RuntimeError, match=reason):
@@ -647,10 +653,11 @@ async def test_source_witnesses_cannot_commit_another_projection(npd_case, monke
             case.fhir, object, submitted_resources, raw_resources, case.candidate, "Location"
         )
     witnesses.assert_not_awaited()
+    batch_writer.assert_not_awaited()
     if fault in {"length", "duplicate"}:
-        batch_writer.assert_not_awaited()
+        batch_builder.assert_not_called()
     else:
-        batch_writer.assert_awaited_once()
+        batch_builder.assert_called_once()
     case.fhir._persist_endpoint_dataset_rows.assert_not_awaited()
     case.fhir._finalize_endpoint_dataset_candidate.assert_not_awaited()
     assert case.fhir.db.binding is None
@@ -1191,11 +1198,11 @@ async def test_stream_cancellation_stops_after_committed_bounded_batch(npd_case,
     path.write_bytes(zstd.compress(b"".join(json.dumps(row).encode() + b"\n" for row in rows)))
     batches = []
 
-    async def write(_fhir, _model, _rows, raw, _candidate, _kind):
-        batches.append(deepcopy(raw))
+    async def write(_fhir, prepared, _candidate):
+        batches.append([json.loads(witness["raw_payload_json"]) for witness in prepared.witness_by_id.values()])
 
     monkeypatch.setattr(cms, "BATCH_SIZE", 2)
-    monkeypatch.setattr(cms, "_persist_source_batch", write)
+    monkeypatch.setattr(cms, "_persist_prepared_batch", write)
     case.fhir._raise_if_resource_import_cancelled.side_effect = RuntimeError("synthetic_cancelled")
     with pytest.raises(RuntimeError, match="synthetic_cancelled"):
         await cms._stream_file(case.fhir, path, case.candidate, "Location", {}, {})
@@ -1269,10 +1276,10 @@ async def test_new_staging_row_count_change_stops_before_vector_validation(stage
     rows = [{"resourceType": kind, "id": f"resource-{index}"} for index in range(2)]
     (tmp_path / (name + ".zst")).write_bytes(zstd.compress(b"".join(json.dumps(row).encode() + b"\n" for row in rows)))
     writer = AsyncMock()
-    monkeypatch.setattr(cms, "_persist_source_batch", writer)
+    monkeypatch.setattr(cms, "_persist_prepared_batch", writer)
     with pytest.raises(RuntimeError, match="cms_npd_file_row_count_changed"):
         await cms._stage_acquired({}, {}, "run-synthetic", tmp_path, _receipt(), None, case.candidate.endpoint_id)
-    assert writer.await_count == 1 and len(writer.call_args.args[3]) == 2
+    assert writer.await_count == 1 and writer.call_args.args[1].input_count == 2
     case.fhir.db.all.assert_not_awaited()
     case.fhir._finalize_endpoint_dataset_candidate.assert_not_awaited()
 
@@ -1328,7 +1335,7 @@ async def test_failed_finalization_cannot_produce_serving_candidate(stage_case, 
         [(kind, 1, 1) for kind in cms.RESOURCE_TYPES],
     ]
     case.fhir._finalize_endpoint_dataset_candidate.return_value = {"validated": False}
-    monkeypatch.setattr(cms, "_persist_source_batch", AsyncMock())
+    monkeypatch.setattr(cms, "_persist_prepared_batch", AsyncMock())
     monkeypatch.setattr(cms, "_materialize_identity_evidence", AsyncMock())
     monkeypatch.setattr(cms.relationships, "materialize", AsyncMock())
     prepare = AsyncMock()

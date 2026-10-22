@@ -19,6 +19,7 @@ TEST_ENV_DEFAULTS = {
     "HLTHPRT_DB_ECHO": "False",
     "HLTHPRT_REDIS_ADDRESS": "redis://127.0.0.1:6379",
     "HLTHPRT_PTG2_SOURCE_IMPORT_LOCK_ENABLED": "false",
+    "HLTHPRT_CMS_NPD_STAGE_WORKERS": "0",
 }
 
 for key, value in TEST_ENV_DEFAULTS.items():

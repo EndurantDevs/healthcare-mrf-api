@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 from compression import zstd
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import aclosing, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
@@ -29,7 +30,7 @@ from process.network_fhir_source_custody import (
     capture_retained_cms_fhir_source_custody,
     require_retained_cms_fhir_source_custody,
 )
-from process.provider_directory_cms_resource_batch import persist_cms_dataset_rows
+from process.provider_directory_cms_resource_batch import persist_prepared_cms_dataset_rows, prepare_cms_dataset_rows
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_completion import complete_generic_source_candidate
 from process.provider_directory_generic_source_policy import (
@@ -360,11 +361,48 @@ async def test_changed_edition_cannot_attach_witnesses_to_another_release(resour
 async def test_batch_requires_the_same_caller_transaction(resource_candidate):
     database, candidate, _directory = resource_candidate
     model, parsed_by_field = cms._parse_batch_row(fhir, {"resourceType": "Location", "id": "office"}, candidate)
+    rows, proof = prepare_cms_dataset_rows(fhir, model, [parsed_by_field], candidate)
     async with source_transaction(database):
         async with database.session_factory() as other_session:
             with pytest.raises(RuntimeError, match="cms_npd_resource_batch_transaction_missing"):
-                await persist_cms_dataset_rows(fhir, other_session, model, [parsed_by_field], candidate)
+                await persist_prepared_cms_dataset_rows(fhir, other_session, rows, proof, candidate)
     assert await _snapshot(database, candidate) == []
+
+
+async def test_worker_pool_stages_the_same_rows_witnesses_and_proofs(resource_candidate, monkeypatch, tmp_path):
+    """A spawned worker prepares the batches; the publisher process commits the same facts as the inline path."""
+    database, candidate, _directory = resource_candidate
+    resources = [{"resourceType": "Location", "id": f"office-{ordinal}", "name": "Example"} for ordinal in range(3)]
+    path = tmp_path / "locations.zst"
+    path.write_bytes(zstd.compress(b"".join(json.dumps(resource).encode() + b"\n" for resource in resources)))
+    monkeypatch.setattr(cms, "BATCH_SIZE", 2)
+    with ProcessPoolExecutor(max_workers=1) as executor:
+        async with source_transaction(database):
+            assert await cms._stream_file(fhir, path, candidate, "Location", {}, {}, executor) == 3
+    snapshot = await _snapshot(database, candidate)
+    model = fhir.RESOURCE_MODELS_BY_TYPE["Location"]
+    prepared_rows, _proof = prepare_cms_dataset_rows(
+        fhir, model, [cms._parse_batch_row(fhir, resource, candidate)[1] for resource in resources], candidate
+    )
+    witness_by_id = cms._source_witnesses_by_id(resources, candidate, "Location")
+    assert [stored_row[1] for stored_row in snapshot] == [row_by_field["resource_id"] for row_by_field in prepared_rows]
+    assert all(
+        stored_row[2] == stored_row[6] == expected["payload_hash"]
+        and json.loads(stored_row[3]) == json.loads(expected["payload_json"])
+        for stored_row, expected in zip(snapshot, prepared_rows)
+    )
+    assert all(
+        stored_row[5] == witness_by_id[stored_row[1]]["raw_payload_sha256"]
+        and json.loads(stored_row[4]) == json.loads(witness_by_id[stored_row[1]]["raw_payload_json"])
+        for stored_row in snapshot
+    )
+    assert (
+        await database.scalar(
+            "SELECT count(*) FROM mrf.provider_directory_dataset_proof_shard WHERE dataset_id=:dataset_id",
+            dataset_id=candidate.dataset_id,
+        )
+        == 2
+    )
 
 
 async def test_stream_preappend_bounds_and_cancellation_rollback(resource_candidate, monkeypatch, tmp_path):
@@ -374,17 +412,17 @@ async def test_stream_preappend_bounds_and_cancellation_rollback(resource_candid
     path = tmp_path / "locations.zst"
     path.write_bytes(zstd.compress(b"".join(lines)))
     monkeypatch.setattr(cms, "BATCH_MAX_DECODED_BYTES", len(lines[0]) * 2 - 1)
-    original_persist = cms._persist_source_batch
+    original_persist = cms._persist_prepared_batch
     batch_counts = []
 
     async def tracked_persist(*args):
-        batch_counts.append(len(args[3]))
+        batch_counts.append(args[1].input_count)
         return await original_persist(*args)
 
     async def cancelled(*_args):
         raise asyncio.CancelledError("synthetic_cancelled")
 
-    monkeypatch.setattr(cms, "_persist_source_batch", tracked_persist)
+    monkeypatch.setattr(cms, "_persist_prepared_batch", tracked_persist)
     monkeypatch.setattr(fhir, "_raise_if_resource_import_cancelled", cancelled)
     with pytest.raises(asyncio.CancelledError, match="synthetic_cancelled"):
         async with source_transaction(database):
