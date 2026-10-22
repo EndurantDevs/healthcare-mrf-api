@@ -1288,6 +1288,20 @@ async def _assert_intake_guard(connection, lock_key, backend_id):
         raise RuntimeError("cms_npd_intake_guard_lost")
 
 
+async def _probe_intake_guard(connection, lock_key, backend_id, confirmed_at):
+    """Return when ownership was last confirmed; a probe timeout inside the loss window keeps the old time."""
+    try:
+        await _assert_intake_guard(connection, lock_key, backend_id)
+    except RuntimeError as error:
+        # A slow probe is not a lost lock; a confirmed loss or a minute of timeouts is.
+        if not isinstance(error.__cause__, TimeoutError) or time.monotonic() - confirmed_at >= _GUARD_LOSS_SECONDS:
+            raise
+        with suppress(Exception):
+            await connection.rollback()
+        return confirmed_at
+    return time.monotonic()
+
+
 async def _watch_intake_guard(connection, lock_key, backend_id, owner, failures, stop):
     """Cancel active staging once ownership is confirmed lost, or probes keep timing out."""
     confirmed_at = time.monotonic()
@@ -1297,18 +1311,7 @@ async def _watch_intake_guard(connection, lock_key, backend_id, owner, failures,
                 async with asyncio.timeout(_GUARD_POLL_SECONDS):
                     await stop.wait()
             except TimeoutError:
-                try:
-                    await _assert_intake_guard(connection, lock_key, backend_id)
-                except RuntimeError as error:
-                    # A slow probe is not a lost lock; a confirmed loss or a minute of timeouts is.
-                    if not isinstance(error.__cause__, TimeoutError) or (
-                        time.monotonic() - confirmed_at >= _GUARD_LOSS_SECONDS
-                    ):
-                        raise
-                    with suppress(Exception):
-                        await connection.rollback()
-                    continue
-                confirmed_at = time.monotonic()
+                confirmed_at = await _probe_intake_guard(connection, lock_key, backend_id, confirmed_at)
     except Exception as error:
         failures.append(error)
         owner.cancel()

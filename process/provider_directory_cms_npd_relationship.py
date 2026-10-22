@@ -73,6 +73,8 @@ async def _raised_work_mem(session):
 
 async def _restore_work_mem(session, previous):
     await session.execute(text(f"SET LOCAL work_mem='{previous}'"))
+
+
 _VALUES = ", ".join(
     f"('{kind}', '{field}', '{target}', {'true' if is_array else 'false'})"
     for kind, fields in FIELDS.items()

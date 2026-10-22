@@ -193,7 +193,7 @@ async def _recheck_reduced_rows(connection, policy, name, columns, validate, cou
 async def _reduce_payloads_sql(connection, policy, previous, candidate, directory, tables_by_root, release_id):
     """Set-based reduction of both input heaps with the same raw-identity guards."""
     prepare, _ = _resource_callbacks(directory, candidate)
-    # SET LOCAL would otherwise outlive the reductions for the whole validation transaction.
+    # Restored below: SET LOCAL would otherwise outlive the reductions for the whole validation transaction.
     previous_work_mem = await connection.fetchval("SHOW work_mem")
     await connection.execute(f"SET LOCAL work_mem='{_SET_REDUCTION_WORK_MEM}'")
     resource_name = tables_by_root[storage.RESOURCE]["name"]
@@ -202,7 +202,9 @@ async def _reduce_payloads_sql(connection, policy, previous, candidate, director
     )
     await _recheck_reduced_rows(connection, policy, resource_name, RESOURCE_COLUMNS, prepare, resource_count)
     witness_name = tables_by_root[storage.WITNESS]["name"]
-    witness_count = await _reduce_input_sql(connection, policy, previous, "witness_input", witness_name, WITNESS_COLUMNS)
+    witness_count = await _reduce_input_sql(
+        connection, policy, previous, "witness_input", witness_name, WITNESS_COLUMNS
+    )
     if witness_count:
         storage._require(release_id is not None, "unexpected_witness")
         witness = storage_relation(policy.schema, witness_name)

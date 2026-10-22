@@ -345,7 +345,10 @@ async def test_relationship_key_join_preserves_scope_hash_and_raw_rows(monkeypat
             for fields, expected_ids in (
                 ({"release_id": "0" * 64}, []),
                 ({"resource_type": "Organization"}, ["insurer-1", "network-1"]),
-                ({"dataset_id": other.dataset_id, "release_id": other_release}, ["page-a", "page-b", "page-c", "site-1"]),
+                (
+                    {"dataset_id": other.dataset_id, "release_id": other_release},
+                    ["page-a", "page-b", "page-c", "site-1"],
+                ),
             ):
                 selected = await _relationship_page_rows(session, {**params_by_field, **fields})
                 assert [witness_row[1] for witness_row in selected] == expected_ids
