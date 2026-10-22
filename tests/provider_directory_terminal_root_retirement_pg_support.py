@@ -525,13 +525,15 @@ async def retirement_postgres(
     try:
         _configure_runtime(monkeypatch, schema_name)
         scenario = RetirementPostgres(connection, None, schema_name, load_migration())
-        await _create_foundation(connection, schema_name)
-        await seed_exact_fixture(scenario)
-        await scenario.migrate("upgrade")
+        async with connection.transaction():
+            await _create_foundation(connection, schema_name)
+            await seed_exact_fixture(scenario)
+            await scenario.migrate("upgrade")
+            if current_runtime:
+                await _install_checkpoint_guards(scenario)
         if not current_runtime:
             yield scenario
             return
-        await _install_checkpoint_guards(scenario)
         url = make_url(os.environ[POSTGRES_DSN_ENV]).set(drivername="postgresql+asyncpg")
         engine = create_async_engine(url)
         async with native_source_component(engine, schema_name, monkeypatch) as component:

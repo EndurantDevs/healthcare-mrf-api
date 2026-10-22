@@ -17,7 +17,7 @@ _FUNCTIONS = {
         "settings": ["search_path=pg_catalog"],
     },
     "guard_provider_directory_terminal_root_retirement_run": {
-        "source_sha256": "6716ee8b525eff2d51f055b180a00b88660802852df1dd290dfd3e655e5c01fa",
+        "source_sha256": "c83036d5fe7a21f9360cf4378d6bc6fbfddded6bc22a210d593502101e1bb7c5",
         "argument_types": "",
         "argument_names": None,
         "return_type": "trigger",

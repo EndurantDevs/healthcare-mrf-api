@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from db import migration_provider_directory_first_acquisition_retirement as first_retirement
 from db import migration_provider_directory_terminal_root_retirement_guards as terminal
 
 _MIGRATIONS = Path(__file__).resolve().parents[1] / "alembic" / "versions"
@@ -50,7 +51,7 @@ def _migration_statements(schema):
         module = _module("20260810090000_provider_directory_terminal_root_retirement.py")
         module.op = Recorder()
         module._create_import_run_triggers(schema)
-    statements.extend((terminal.run_retired_function_sql(schema), terminal.import_run_guard_function_sql(schema)))
+    statements.extend((terminal.run_retired_function_sql(schema), first_retirement.run_sql(schema)))
     quoted = '"' + schema.replace('"', '""') + '"'
     triggers = [
         sql
@@ -172,11 +173,12 @@ async def _measure_ordinary_update(connection):
     assert wal_delta >= 0
     assert len(plan[0]["Triggers"]) == 8
     assert all(trigger_entry["Calls"] == 1 for trigger_entry in plan[0]["Triggers"])
-    assert (
-        await connection.scalar(
-            sa.text("SELECT count(*) FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory'")
-        )
-        == 0
+    assert await connection.scalar(
+        sa.text("""SELECT count(*)=1 AND bool_and(granted AND mode='ExclusiveLock' AND objsubid=1
+            AND classid::bigint=((hashtextextended(:identity,0)>>32)&4294967295)
+            AND objid::bigint=(hashtextextended(:identity,0)&4294967295))
+            FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory'"""),
+        {"identity": "provider-directory-terminal-root-retirement:run_" + "e" * 32},
     )
     locks = (
         (
@@ -195,7 +197,7 @@ async def _measure_ordinary_update(connection):
         "wal_insert_delta_bytes": wal_delta,
         "explain": plan,
         "relation_lock_modes": locks,
-        "advisory_lock_count": 0,
+        "advisory_lock_count": 1,
         "statement_timeout_ms": 5000,
         "lock_timeout_ms": 500,
     }

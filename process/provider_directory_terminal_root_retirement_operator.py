@@ -44,6 +44,18 @@ def _runtime_database(database: Any | None) -> Any:
     return db
 
 
+def _runtime_error(error: Exception) -> TerminalRootRetirementError:
+    cause = getattr(error, "orig", error)
+    locked = any(getattr(item, "sqlstate", None) == "55P03" for item in (error, cause))
+    return TerminalRootRetirementError("busy" if locked else "state_invalid")
+
+
+def _operation_timeout(request: TerminalRootRetirementRequest) -> int:
+    # Complete retained-payload evidence can exceed the ordinary maintenance budget.
+    first_acquisition = isinstance(request, TerminalRootRetirementRequest) and request.expect_no_current_dataset
+    return 3600 if first_acquisition else RETIREMENT_TIMEOUT_SECONDS
+
+
 async def preview_terminal_root_retirement(
     request: TerminalRootRetirementRequest,
     *,
@@ -53,16 +65,14 @@ async def preview_terminal_root_retirement(
 
     require_terminal_root_retirement_gate()
     try:
-        async with asyncio.timeout(RETIREMENT_TIMEOUT_SECONDS):
-            return await preview_terminal_root_retirement_transaction(
-                _runtime_database(database), request
-            )
-    except (asyncio.CancelledError, TimeoutError):
+        async with asyncio.timeout(_operation_timeout(request)):
+            return await preview_terminal_root_retirement_transaction(_runtime_database(database), request)
+    except asyncio.CancelledError, TimeoutError:
         raise
     except TerminalRootRetirementError:
         raise
-    except Exception:
-        raise TerminalRootRetirementError("state_invalid") from None
+    except Exception as error:
+        raise _runtime_error(error) from None
 
 
 async def apply_terminal_root_retirement(
@@ -74,16 +84,14 @@ async def apply_terminal_root_retirement(
 
     require_terminal_root_retirement_gate()
     try:
-        async with asyncio.timeout(RETIREMENT_TIMEOUT_SECONDS):
-            return await apply_terminal_root_retirement_transaction(
-                _runtime_database(database), request
-            )
-    except (asyncio.CancelledError, TimeoutError):
+        async with asyncio.timeout(_operation_timeout(request)):
+            return await apply_terminal_root_retirement_transaction(_runtime_database(database), request)
+    except asyncio.CancelledError, TimeoutError:
         raise
     except TerminalRootRetirementError:
         raise
-    except Exception:
-        raise TerminalRootRetirementError("state_invalid") from None
+    except Exception as error:
+        raise _runtime_error(error) from None
 
 
 __all__ = (
