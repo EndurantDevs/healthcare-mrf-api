@@ -1,17 +1,17 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-from contextlib import asynccontextmanager
 import datetime as dt
 import json
 import os
-from unittest.mock import AsyncMock
 import uuid
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.exc import OperationalError
 
-from api import provider_directory_source_outcomes as outcomes
 from api import provider_directory_source_dataset_selection as selection
+from api import provider_directory_source_outcomes as outcomes
 from api.provider_directory_source_dataset_selection import (
     _source_local_current_published_dataset_statement,
 )
@@ -34,9 +34,7 @@ async def _disposable_outcome_database() -> Database:
     database = Database()
     try:
         await database.connect()
-        database_name = str(
-            await database.scalar("SELECT current_database();") or ""
-        )
+        database_name = str(await database.scalar("SELECT current_database();") or "")
     except (OSError, OperationalError) as error:
         await database.disconnect()
         pytest.skip(f"PostgreSQL source outcome proof unavailable: {error}")
@@ -103,8 +101,8 @@ async def _insert_outcome_selection_sources(
         "('source-validated', 'endpoint-validated', NULL), "
         "('source-reassigned', 'endpoint-new', NULL), "
         "('source-rotated', 'endpoint-rotated-serving', "
-        " '{\"provider_directory_configured_endpoint_id\": "
-        "\"endpoint-rotated-configured\"}'::jsonb), "
+        ' \'{"provider_directory_configured_endpoint_id": '
+        '"endpoint-rotated-configured"}\'::jsonb), '
         "('source-multi-a', 'endpoint-multi', NULL), "
         "('source-multi-b', 'endpoint-multi', NULL), "
         "('source-shared', 'endpoint-published', NULL), "
@@ -170,49 +168,135 @@ async def _insert_outcome_dataset(
     )
 
 
-def _outcome_selection_dataset_states():
-    return (
-        ("published-old", "endpoint-published", "source-published",
-         "superseded", False, dt.datetime(2026, 7, 20, 7),
-         dt.datetime(2026, 7, 20, 8), dt.datetime(2026, 7, 20, 8, 5)),
-        ("published-current", "endpoint-published", "source-published",
-         "published", True, dt.datetime(2026, 7, 20, 8, 30),
-         dt.datetime(2026, 7, 20, 9), None),
-        ("validated-incumbent", "endpoint-validated", "source-validated",
-         "published", True, dt.datetime(2026, 7, 20, 7),
-         dt.datetime(2026, 7, 20, 8), None),
-        ("validated-candidate", "endpoint-validated", "source-validated",
-         "validated", False, dt.datetime(2026, 7, 20, 10), None, None),
-        ("reassigned-current", "endpoint-new", "source-reassigned",
-         "published", True, dt.datetime(2026, 7, 20, 6, 30),
-         dt.datetime(2026, 7, 20, 7), None),
-        ("reassigned-stale", "endpoint-old", "source-reassigned",
-         "validated", False, dt.datetime(2026, 7, 20, 11), None, None),
-        ("rotated-incumbent", "endpoint-rotated-serving", "source-rotated",
-         "published", True, dt.datetime(2026, 7, 20, 6),
-         dt.datetime(2026, 7, 20, 6, 30), None),
-        ("rotated-candidate", "endpoint-rotated-configured", "source-rotated",
-         "validated", False, dt.datetime(2026, 7, 20, 11), None, None),
-        ("unrequested-current", "endpoint-unrequested", "source-unrequested",
-         "published", True, dt.datetime(2026, 7, 20, 11, 30),
-         dt.datetime(2026, 7, 20, 12), None),
-        ("invalid-validated-superseded", "endpoint-validated", "source-validated",
-         "validated", False, dt.datetime(2026, 7, 20, 13), None,
-         dt.datetime(2026, 7, 20, 13, 5)),
-        ("invalid-published-superseded", "endpoint-published", "source-published",
-         "published", True, dt.datetime(2026, 7, 20, 13),
-         dt.datetime(2026, 7, 20, 13, 5), dt.datetime(2026, 7, 20, 13, 10)),
-        ("invalid-superseded-unsealed", "endpoint-new", "source-reassigned",
-         "superseded", False, dt.datetime(2026, 7, 20, 13),
-         dt.datetime(2026, 7, 20, 13, 5), None),
-    )
+_OUTCOME_SELECTION_DATASET_STATES = (
+    (
+        "published-old",
+        "endpoint-published",
+        "source-published",
+        "superseded",
+        False,
+        dt.datetime(2026, 7, 20, 7),
+        dt.datetime(2026, 7, 20, 8),
+        dt.datetime(2026, 7, 20, 8, 5),
+    ),
+    (
+        "published-current",
+        "endpoint-published",
+        "source-published",
+        "published",
+        True,
+        dt.datetime(2026, 7, 20, 8, 30),
+        dt.datetime(2026, 7, 20, 9),
+        None,
+    ),
+    (
+        "validated-incumbent",
+        "endpoint-validated",
+        "source-validated",
+        "published",
+        True,
+        dt.datetime(2026, 7, 20, 7),
+        dt.datetime(2026, 7, 20, 8),
+        None,
+    ),
+    (
+        "validated-candidate",
+        "endpoint-validated",
+        "source-validated",
+        "validated",
+        False,
+        dt.datetime(2026, 7, 20, 10),
+        None,
+        None,
+    ),
+    (
+        "reassigned-current",
+        "endpoint-new",
+        "source-reassigned",
+        "published",
+        True,
+        dt.datetime(2026, 7, 20, 6, 30),
+        dt.datetime(2026, 7, 20, 7),
+        None,
+    ),
+    (
+        "reassigned-stale",
+        "endpoint-old",
+        "source-reassigned",
+        "validated",
+        False,
+        dt.datetime(2026, 7, 20, 11),
+        None,
+        None,
+    ),
+    (
+        "rotated-incumbent",
+        "endpoint-rotated-serving",
+        "source-rotated",
+        "published",
+        True,
+        dt.datetime(2026, 7, 20, 6),
+        dt.datetime(2026, 7, 20, 6, 30),
+        None,
+    ),
+    (
+        "rotated-candidate",
+        "endpoint-rotated-configured",
+        "source-rotated",
+        "validated",
+        False,
+        dt.datetime(2026, 7, 20, 11),
+        None,
+        None,
+    ),
+    (
+        "unrequested-current",
+        "endpoint-unrequested",
+        "source-unrequested",
+        "published",
+        True,
+        dt.datetime(2026, 7, 20, 11, 30),
+        dt.datetime(2026, 7, 20, 12),
+        None,
+    ),
+    (
+        "invalid-validated-superseded",
+        "endpoint-validated",
+        "source-validated",
+        "validated",
+        False,
+        dt.datetime(2026, 7, 20, 13),
+        None,
+        dt.datetime(2026, 7, 20, 13, 5),
+    ),
+    (
+        "invalid-published-superseded",
+        "endpoint-published",
+        "source-published",
+        "published",
+        True,
+        dt.datetime(2026, 7, 20, 13),
+        dt.datetime(2026, 7, 20, 13, 5),
+        dt.datetime(2026, 7, 20, 13, 10),
+    ),
+    (
+        "invalid-superseded-unsealed",
+        "endpoint-new",
+        "source-reassigned",
+        "superseded",
+        False,
+        dt.datetime(2026, 7, 20, 13),
+        dt.datetime(2026, 7, 20, 13, 5),
+        None,
+    ),
+)
 
 
 async def _seed_outcome_selection_datasets(
     database: Database,
     schema: str,
 ) -> None:
-    for dataset_state_tuple in _outcome_selection_dataset_states():
+    for dataset_state_tuple in _OUTCOME_SELECTION_DATASET_STATES:
         await _insert_outcome_dataset(
             database,
             schema,
@@ -226,10 +310,12 @@ async def _seed_outcome_selection_datasets(
         "'multi-current', 'endpoint-multi', 'root-multi', :dataset_hash, "
         "'published', true, now(), now(), NULL, 1, CAST(:metadata AS jsonb));",
         dataset_hash="a" * 64,
-        metadata=json.dumps({
-            "source_ids": ["source-multi-b", "source-multi-a"],
-            "selected_resources": ["Practitioner"],
-        }),
+        metadata=json.dumps(
+            {
+                "source_ids": ["source-multi-b", "source-multi-a"],
+                "selected_resources": ["Practitioner"],
+            }
+        ),
     )
     await database.status(
         f"INSERT INTO {schema}.provider_directory_endpoint_dataset "
@@ -241,19 +327,12 @@ async def _seed_outcome_selection_datasets(
         "json_build_array('bulk-source-' || value)) "
         "FROM generate_series(1, 2000) AS value;"
     )
-    await database.status(
-        f"ANALYZE {schema}.provider_directory_source;"
-    )
-    await database.status(
-        f"ANALYZE {schema}.provider_directory_endpoint_dataset;"
-    )
+    await database.status(f"ANALYZE {schema}.provider_directory_source;")
+    await database.status(f"ANALYZE {schema}.provider_directory_endpoint_dataset;")
 
 
 async def _seal_outcome_selection_datasets(database: Database, schema: str) -> None:
-    digest = (
-        f'"{schema}".'
-        "provider_directory_endpoint_dataset_admission_metadata_sha256"
-    )
+    digest = f'"{schema}".provider_directory_endpoint_dataset_admission_metadata_sha256'
     proof_sha256 = "b" * 64
     await database.status(
         f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
@@ -291,9 +370,7 @@ async def _outcome_selection_schema(monkeypatch):
 
 
 def test_source_local_query_is_bounded_ranked_and_metadata_only():
-    source_id_groups = {SOURCE_IDS} | {
-        (f"synthetic-source-{index}",) for index in range(39)
-    }
+    source_id_groups = {SOURCE_IDS} | {(f"synthetic-source-{index}",) for index in range(39)}
     statement = outcomes._current_published_dataset_statement(source_id_groups)
     selected_sql = str(statement)
     bound_values = statement.compile().params.values()
@@ -312,10 +389,13 @@ def test_source_local_query_is_bounded_ranked_and_metadata_only():
     assert "array_agg" in selected_sql.lower()
     assert "jsonb_array_length" in selected_sql.lower()
     assert "CASE WHEN" in selected_sql
-    assert selected_sql.count("@>") == 2 * len(source_id_groups)
+    assert selected_sql.count("@>") == 2
     assert "ORDER BY" in selected_sql
     assert "LIMIT" in selected_sql
-    assert selected_sql.count("LIMIT") == 40
+    assert selected_sql.count("LIMIT") == 1
+    assert "VALUES" in selected_sql
+    assert "JOIN LATERAL" in selected_sql
+    assert "cardinality(source_scopes.source_ids)" in selected_sql
     assert any(bound_value == list(SOURCE_IDS) for bound_value in bound_values)
     assert "resource_count" in selected_sql
     assert "superseded_at" in selected_sql
@@ -323,9 +403,7 @@ def test_source_local_query_is_bounded_ranked_and_metadata_only():
 
 
 def test_current_source_local_query_uses_exact_profile_publication_state():
-    source_id_groups = {SOURCE_IDS} | {
-        (f"synthetic-source-{index}",) for index in range(39)
-    }
+    source_id_groups = {SOURCE_IDS} | {(f"synthetic-source-{index}",) for index in range(39)}
     statement = _source_local_current_published_dataset_statement(source_id_groups)
     selected_sql = str(statement)
     bound_values = statement.compile().params.values()
@@ -336,7 +414,7 @@ def test_current_source_local_query_uses_exact_profile_publication_state():
     assert "superseded_at IS NULL" in selected_sql
     assert "validated_at IS NOT NULL" not in selected_sql
     assert "LIMIT" in selected_sql
-    assert selected_sql.count("LIMIT") == 40
+    assert selected_sql.count("LIMIT") == 1
     assert "publication_metadata_json" not in selected_sql
     assert "artifact_selection_receipt_json" not in selected_sql
     assert "admission_metadata_sha256" in selected_sql
@@ -353,9 +431,7 @@ async def test_newer_validated_source_local_dataset_is_reported(monkeypatch):
         outcome_resource_counts_v1=_identity_proof(),
         **_relation_metadata(),
     )
-    publication_metadata["outcome_resource_counts_v1"][
-        "dataset_id"
-    ] = "pdds-validated"
+    publication_metadata["outcome_resource_counts_v1"]["dataset_id"] = "pdds-validated"
     for relation_proof in (
         publication_metadata["dataset_network_plan"],
         publication_metadata["dataset_affiliation_organization"],
@@ -382,9 +458,7 @@ async def test_newer_validated_source_local_dataset_is_reported(monkeypatch):
         ),
     )
 
-    summary = (
-        await outcomes.enrich_provider_directory_source_catalog(_catalog())
-    )["items"][0]["outcome_summary"]
+    summary = (await outcomes.enrich_provider_directory_source_catalog(_catalog()))["items"][0]["outcome_summary"]
 
     assert summary == {
         "dataset_id": "pdds-validated",
@@ -416,9 +490,7 @@ async def test_superseded_outcome_keeps_historic_state_truthful(monkeypatch):
         ),
     )
 
-    summary = (
-        await outcomes.enrich_provider_directory_source_catalog(_catalog())
-    )["items"][0]["outcome_summary"]
+    summary = (await outcomes.enrich_provider_directory_source_catalog(_catalog()))["items"][0]["outcome_summary"]
 
     assert summary == {
         "dataset_id": DATASET_ID,
