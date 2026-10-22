@@ -252,8 +252,9 @@ async def test_publication_is_insert_select_with_immutable_replay(scope):
     publisher, _, identity, receipt = scope
     _seal(publisher)
     await candidate.publish_resource_identity_stage(publisher, identity, receipt)
-    assert len(publisher.connection.statements) == 1
-    query = publisher.connection.statements[0]
+    statements = [query for query in publisher.connection.statements if not query.startswith("ANALYZE")]
+    assert len(statements) == 1
+    query = statements[0]
     assert "SELECT source_id,resource_type,resource_id,entity_id,created_at FROM" in query
     assert "ON CONFLICT(source_id,resource_type,resource_id) DO NOTHING" in query
     assert "VALUES" not in query and "UPDATE" not in query
