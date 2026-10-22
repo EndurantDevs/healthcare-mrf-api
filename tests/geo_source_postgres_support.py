@@ -90,7 +90,7 @@ async def geo_source_component_database(monkeypatch):
         return tuple(prefixes)
 
     async def bootstrap(engine, policy):
-        historical = create_async_engine(engine.url.set(username=policy.control_runtime_roles[0], password=None))
+        historical = create_async_engine(engine.url.set(username=policy.control_runtime_roles[0]))
         try:
             async with historical.begin() as connection:
                 table = GeoZipLookup.__table__.to_metadata(MetaData(), schema=policy.schema)

@@ -153,3 +153,4 @@ async def source_owned_wal_transaction(directory, *, isolation="read committed")
                     source._require(source._FACTORY.get() is factory, "policy_changed")
                     yield outcome
                     source._require(source._FACTORY.get() is factory, "policy_changed")
+                source._require(source._FACTORY.get() is factory, "policy_changed")

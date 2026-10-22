@@ -208,9 +208,12 @@ async def source_callable_capability(connection, policy):
 @asynccontextmanager
 async def original_source_publication(database, session):
     """Authenticate the already-open original final owner, preserving its outcome."""
-    async with _publication_factory().bind_existing_transaction(database, session, isolation="read committed"):
+    factory = _publication_factory()
+    async with factory.bind_existing_transaction(database, session, isolation="read committed"):
+        _require(_FACTORY.get() is factory, "policy_changed")
         async with source_publication_body(database):
             yield session
+    _require(_FACTORY.get() is factory, "policy_changed")
 
 
 def _require_isolation(publisher, isolation):
