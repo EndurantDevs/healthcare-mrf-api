@@ -2155,6 +2155,29 @@ async def test_intake_chain_distinguishes_implicit_poll_timeout_from_probe_cause
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("loss_window,expect_loss", [(60.0, False), (0.0, True)])
+async def test_intake_watcher_tolerates_probe_timeouts_until_the_loss_window(monkeypatch, loss_window, expect_loss):
+    monkeypatch.setattr(cms, "_GUARD_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(cms, "_GUARD_LOSS_SECONDS", loss_window)
+    probes = iter([TimeoutError("synthetic-probe-text")])
+
+    async def probe(*_args, **_kwargs):
+        failure = next(probes, None)
+        if failure is not None:
+            raise failure
+        return True
+
+    connection = SimpleNamespace(scalar=probe, commit=AsyncMock(), rollback=AsyncMock())
+    owner, failures, stop = SimpleNamespace(cancel=Mock()), [], asyncio.Event()
+    watcher = asyncio.create_task(cms._watch_intake_guard(connection, "synthetic-lock", 1, owner, failures, stop))
+    await asyncio.sleep(0.1)
+    stop.set()
+    await watcher
+    assert bool(failures) is expect_loss and owner.cancel.called is expect_loss
+    assert connection.rollback.await_count == (0 if expect_loss else 1)
+
+
+@pytest.mark.asyncio
 async def test_unchanged_publication_helper_keeps_three_argument_call_compatible(monkeypatch):
     observation = _observation()
     state_by_field = {"endpoint_id": "endpoint-synthetic", "dataset_id": "dataset-synthetic", "resource_count": 8}

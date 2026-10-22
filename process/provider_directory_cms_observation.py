@@ -67,16 +67,19 @@ def _publish_intake_observation(context, state, now, error, has_changed, force):
     context["audit"] = {**(audit if isinstance(audit, dict) else {}), "cms_intake": observation_by_field}
     if error is not None:
         return
+    total_rows = context.get("cms_intake_total_rows")
+    has_total = type(total_rows) is int and total_rows > 0
+    staged_rows = min(context.get("cms_intake_completed_rows", 0), total_rows) if has_total else 0
     if has_changed or force or state["last_emitted"] is None or now - state["last_emitted"] >= 15:
         state["last_emitted"] = now
         enqueue_live_progress(
             source="cms-intake",
             confidence="observed",
             phase="cms-npd-" + state["phase"],
-            unit="run",
-            done=0,
-            total=1,
-            pct=0,
+            unit="input_rows" if has_total else "run",
+            done=staged_rows,
+            total=total_rows if has_total else 1,
+            pct=round(100.0 * staged_rows / total_rows, 1) if has_total else 0,
             message="CMS intake",
             label=state["family"],
             counters={"completed_input_rows": state["completed_rows"]},
