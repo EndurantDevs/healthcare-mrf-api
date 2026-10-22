@@ -330,6 +330,9 @@ async def _complete_payloads(connection, policy, previous, candidate, directory,
     differing observations fall back to the ordered semantic union.
     """
     release_id = (candidate.source_release or {}).get("vector_sha256")
+    await storage.refresh_statistics(
+        connection, policy.schema, [previous["tables"][key]["name"] for key in ("resource_input", "witness_input")]
+    )
     if await _observed_divergence(connection, policy, previous, "witness_input"):
         raise storage.GenericCandidateError("provider_directory_generic_candidate_witness_replay_conflict")
     if await _observed_divergence(connection, policy, previous, "resource_input"):
@@ -363,6 +366,7 @@ async def complete_generic_source_candidate(database, directory, candidate):
             await connection.execute(
                 f"CREATE TABLE {storage_relation(policy.schema, name)} (LIKE {storage_relation(policy.schema, root)} "
                 "INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING CONSTRAINTS INCLUDING STORAGE)"
+                + storage.PRIVATE_HEAP_OPTIONS
             )
             await storage._close_grants(connection, policy, name)
             tables_by_root[root] = {"name": name}
@@ -466,6 +470,7 @@ async def _attach_final_tables(connection, policy, binding_by_field):
         name = binding_by_field["tables"][root]["name"]
         relation = storage_relation(policy.schema, name)
         await connection.execute(f"ALTER TABLE {relation} ADD CHECK (dataset_id={literal})")
+        await connection.execute(f"ALTER TABLE {relation} RESET (autovacuum_enabled)")
         await storage._close_grants(connection, policy, name, readable=True)
         await connection.execute(
             f"ALTER TABLE {storage_relation(policy.schema, root)} ATTACH PARTITION {relation} FOR VALUES IN ({literal})"
