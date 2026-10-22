@@ -797,3 +797,57 @@ async def test_registered_provider_route_forwards_the_bound_session(monkeypatch)
     assert result.status_code == 200
     assert result.json == {"ok": True}
     assert observed_calls == [("POST", provider_http.CUSTOM_IMPORT_PROVIDERS_PATH, session)]
+
+
+@pytest.mark.asyncio
+async def test_legacy_body_cap_is_enforced_after_valid_parse_before_signature(monkeypatch):
+    from unittest.mock import Mock
+
+    verifier = Mock(wraps=transport._verify_provider_transport)
+    monkeypatch.setattr(transport, "_verify_provider_transport", verifier)
+    session = _Session()
+    fixtures._install_keyring(monkeypatch, session)
+    body = _body()
+    request = _request(body)
+    monkeypatch.setattr(transport, "_MAX_BODY_BYTES", len(body) - 1)
+    reply = await provider_http.serve_custom_import_providers(request, session)
+    assert reply.status == 404 and session.events == []
+
+    verifier.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_serialized_provider_page_bound_cannot_be_bypassed_by_payload_reader(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    session = _Session()
+    _install(monkeypatch, session)
+    reader = AsyncMock(return_value={"rows": [{"npi": "1000000001", "notes": "x" * 3000}]})
+    monkeypatch.setattr(provider_http, "_read_provider_payload", reader)
+    monkeypatch.setattr(transport, "_MAX_RESPONSE_BYTES", 1024)
+    reply = await provider_http.serve_custom_import_providers(_request(), session)
+    assert reply.status == 503 and session.rolled_back
+    reader.assert_awaited_once()
+    assert "rows" not in json.loads(reply.body)
+
+
+@pytest.mark.asyncio
+async def test_managed_provider_native_failure_keeps_status_without_hydrating(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from sanic.exceptions import SanicException
+
+    from tests.test_custom_import_provider_collection import _body as collection_body
+
+    session = _Session()
+    _install(monkeypatch, session)
+    parsed = provider_http._parse_provider_request(
+        collection_body(), allow_network_binding=True, allow_managed_collection=True
+    )
+    verified = SimpleNamespace(credential="synthetic-secret", scope="a" * 64)
+    monkeypatch.setattr(
+        provider_http, "_provider_page", AsyncMock(return_value=response.json({"error": "denied"}, status=404))
+    )
+    with pytest.raises(SanicException) as caught:
+        await provider_http._read_provider_payload(_request(), session, parsed, verified)
+    assert caught.value.status_code == 404

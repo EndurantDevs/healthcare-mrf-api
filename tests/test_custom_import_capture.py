@@ -9,10 +9,13 @@ import json
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -31,6 +34,62 @@ from process.custom_import import (
 )
 
 FIXTURES = Path(__file__).with_name("fixtures") / "custom_import"
+
+
+def test_source_column_replay_rejects_a_valid_nonparquet_capture():
+    stream = _stream()
+    with pytest.raises(CaptureError, match="requires Parquet"):
+        list(capture_module.iter_parquet_source_batches(_capture(b"id\n1\n", stream), stream, limits=CaptureLimits()))
+
+
+@pytest.mark.parametrize("damage", ["decoded_bytes", "too_many_rows", "row_overrun", "early_eof", "empty_batch"])
+def test_source_column_replay_checks_native_batch_bounds_and_closes_reader(monkeypatch, damage):
+    batch = pa.record_batch({"source_value": ["x"] * (65 if damage == "too_many_rows" else 1)})
+    batches = [batch]
+    expected = 0 if damage == "row_overrun" else 2 if damage == "early_eof" else batch.num_rows
+    if damage == "empty_batch":
+        batches.insert(0, pa.record_batch({"source_value": pa.array([], type=pa.string())}))
+    close_events = []
+
+    @contextmanager
+    def reader(*_args, **_kwargs):
+        try:
+            yield SimpleNamespace(iter_batches=lambda **_options: iter(batches)), ("source_value",), expected
+        finally:
+            close_events.append(True)
+
+    monkeypatch.setattr(capture_module, "verify_capture", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(capture_module, "_validated_parquet_reader", reader)
+    limits = (
+        replace(CaptureLimits(), maximum_decoded_bytes=1, maximum_record_bytes=1)
+        if damage == "decoded_bytes"
+        else CaptureLimits()
+    )
+    operation = capture_module.iter_parquet_source_batches(
+        SimpleNamespace(payload=b"validated", manifest=SimpleNamespace(decoded_bytes=1, decoded_sha256="digest")),
+        _stream(format_name="parquet"),
+        limits=limits,
+    )
+    if damage == "empty_batch":
+        assert list(operation) == [batch]
+    else:
+        with pytest.raises(CaptureError, match="decoded-byte limit|inconsistent row metadata"):
+            list(operation)
+    assert close_events == [True]
+
+
+def test_parquet_buffer_allocation_failure_prevents_reader_creation(monkeypatch):
+    failure = MemoryError("synthetic allocation failure")
+    monkeypatch.setattr(capture_module.pa, "BufferReader", Mock(side_effect=failure))
+    reader = Mock()
+    monkeypatch.setattr(capture_module.pq, "ParquetFile", reader)
+    with pytest.raises(MemoryError, match="synthetic allocation failure") as caught:
+        with capture_module._open_parquet_reader(b"validated", CaptureLimits()):
+            pytest.fail("allocation failure yielded a reader")
+    assert caught.value is failure
+    reader.assert_not_called()
+
+
 _CAPTURE_EXPORTS = (
     "CaptureError",
     "CaptureLimits",

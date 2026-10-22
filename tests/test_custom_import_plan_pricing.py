@@ -849,3 +849,27 @@ def test_complete_contributors_preserve_unscoped_response_bytes():
         selection, query_by_field, pagination, 0, [], [], serving, contributing_bindings=selection.in_network_bindings
     )
     assert json.dumps(explicit, separators=(",", ":")) == json.dumps(original, separators=(",", ":"))
+
+
+@pytest.mark.asyncio
+async def test_plan_temp_tables_preserve_rows_only_when_requested():
+    from api import custom_import_plan_sql as plan_sql
+
+    session = SimpleNamespace(execute=AsyncMock())
+    await plan_sql.prepare_plan_query_tables(session, preserve_rows=True)
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    table_statements = [statement for statement in statements if statement.startswith("CREATE TEMP TABLE")]
+    assert len(table_statements) == 6
+    assert all(
+        "ON COMMIT PRESERVE ROWS" in statement and "ON COMMIT DROP" not in statement for statement in table_statements
+    )
+    assert len(statements) == 9
+
+
+def test_plan_order_without_a_metric_keeps_stable_native_tiebreakers():
+    from api import custom_import_plan_sql as plan_sql
+
+    context = SimpleNamespace(prepared=SimpleNamespace(normalized_order_terms=()))
+    order = plan_sql._group_order(context, {"order_by": "npi", "order": "desc"})
+    assert order.startswith('npi, binding_ordinal, location_key COLLATE "C"')
+    assert "ASC" not in order and "DESC" not in order

@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
 from io import BytesIO
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -20,7 +22,11 @@ from process.custom_import.capture import capture_stream
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.family import assemble_root_families
 from process.custom_import.runner_codec import child_key_hash, new_family_hash, root_key_hash
-from process.custom_import.snowflake_bundle import SnowflakeBundleBinding, SnowflakeBundleRequest
+from process.custom_import.snowflake_bundle import (
+    SnowflakeBundleBinding,
+    SnowflakeBundleRequest,
+    SnowflakeBundleStatement,
+)
 from process.custom_import.snowflake_candidate import (
     SnowflakeBundleCandidateRequest,
     SnowflakeCandidateError,
@@ -652,3 +658,106 @@ def test_bridge_preserves_fixed_transport_shape(stream_update):
 
     with pytest.raises(SnowflakeCandidateError, match="fixed Parquet"):
         _prepare_candidate(request)
+
+
+@pytest.mark.parametrize(
+    "value_type,column_type,valid",
+    [
+        ("integer", pa.int64(), True),
+        ("integer", pa.string(), False),
+        ("boolean", pa.bool_(), True),
+        ("boolean", pa.int64(), False),
+        ("date", pa.date32(), False),
+    ],
+)
+def test_candidate_schema_preserves_scalar_types_without_coercion(value_type, column_type, valid):
+    field = replace(_definition().fields[1], value_type=value_type)
+    assert snowflake_candidate._is_column_type_valid(column_type, field) is valid
+
+
+@pytest.mark.asyncio
+async def test_bundle_candidate_requires_session_factory_before_connector_use():
+    with pytest.raises(SnowflakeCandidateError, match="session factory"):
+        await snowflake_candidate.run_snowflake_bundle_candidate(
+            object(), object(), _bundle_candidate_request(_definition())
+        )
+
+
+def _candidate_statement(bundle_request):
+    return SnowflakeBundleStatement(
+        bundle_request,
+        tuple(
+            tuple(snowflake.SnowflakeDeclaredColumn(field_id, field_id) for field_id in binding.selected_field_ids)
+            for binding in bundle_request.bindings
+        ),
+        tuple(
+            snowflake.SnowflakeDeclaredColumn(binding.semantic_token_metadata_key, "SNAPSHOT")
+            for binding in bundle_request.bindings
+        ),
+    )
+
+
+def test_candidate_scope_rejects_duplicate_physical_columns():
+    definition = _definition()
+    acquisition = _acquisition(definition)
+    object.__setattr__(
+        acquisition.statement.request,
+        "selected_columns",
+        tuple(snowflake.SnowflakeDeclaredColumn(field_id, "SAME_COLUMN") for field_id in ("npi", "display_name")),
+    )
+    with pytest.raises(SnowflakeCandidateError, match="source columns must be unique"):
+        snowflake_candidate._validate_stream_scope(definition, definition.source_streams[0], acquisition)
+
+
+def test_prepared_bundle_cannot_substitute_another_valid_request():
+    request = _bundle_candidate_request(_definition())
+    other = replace(
+        request.bundle_request, capture_limits=replace(request.bundle_request.capture_limits, maximum_records=1)
+    )
+    with pytest.raises(SnowflakeCandidateError, match="does not match the configured bundle"):
+        snowflake_candidate._prepared_bundle_statement(lambda _request: _candidate_statement(other), request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["legacy", "reservation", "registration"])
+async def test_registered_identity_failure_prevents_candidate_writes(monkeypatch, stage):
+    events = []
+
+    @asynccontextmanager
+    async def transaction():
+        try:
+            yield
+        except BaseException:
+            events.append("rollback")
+            raise
+        else:
+            events.append("commit")
+
+    @asynccontextmanager
+    async def session_factory():
+        yield SimpleNamespace(begin=transaction)
+
+    validation = AsyncMock(side_effect=snowflake_candidate.CandidateRunnerError("synthetic revision mismatch"))
+    writers = [AsyncMock() for _ in range(3)]
+    monkeypatch.setattr(snowflake_candidate, "validate_revision_identity", validation)
+    for name, writer in zip(
+        ("register_capture_bundle", "reserve_execution", "register_replayable_parquet_bundle"), writers, strict=True
+    ):
+        monkeypatch.setattr(snowflake_candidate, name, writer)
+    definition = _definition()
+    bundle = _bundle_candidate_request(definition)
+    with pytest.raises(SnowflakeCandidateError, match="registered definition does not match"):
+        if stage == "legacy":
+            await run_snowflake_candidate(session_factory, _request(definition, _acquisition(definition)))
+        elif stage == "reservation":
+            await snowflake_candidate._reserve_bundle_execution(
+                session_factory, bundle, _candidate_statement(bundle.bundle_request), b"a" * 32
+            )
+        else:
+            await snowflake_candidate._register_bundle_captures(
+                session_factory, bundle, SimpleNamespace(execution_id=1, fence=1), ()
+            )
+    assert events == ["rollback"]
+    validation.assert_awaited_once()
+    for writer in writers:
+        writer.assert_not_awaited()

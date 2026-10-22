@@ -1132,3 +1132,89 @@ async def test_incompatible_landing_signature_rejected_before_reservation(monkey
     with pytest.raises(capture.SnowflakeCaptureError, match="explicit landing contract"):
         await harness.run()
     assert harness.timeline == []
+
+
+@pytest.mark.asyncio
+async def test_capture_projection_bound_precedes_reservation_or_source(monkeypatch):
+    policy = _policy()
+    policy = replace(policy, part_limits=replace(policy.part_limits, maximum_fields_per_record=1))
+    harness = _Harness(monkeypatch, capture_policy=policy)
+    with pytest.raises(capture.SnowflakeCaptureError, match="projection exceeds the field limit"):
+        await harness.run()
+    assert harness.timeline == [] and harness.pending is None and harness.parts == []
+
+
+def test_affinity_source_open_failure_is_retained_for_cleanup(monkeypatch):
+    harness = _Harness(monkeypatch)
+    statement = harness.builder.build_statement(harness.request.bundle_request)
+    owner = capture._AffinityLanding(
+        harness.builder,
+        harness.adapter,
+        harness.credentials,
+        statement,
+        harness.policy,
+        17,
+        capture._Attempt(capture.time.monotonic() + 60),
+    )
+
+    def failed_open(*_args, **_options):
+        raise OSError("synthetic source open failure")
+
+    monkeypatch.setattr(harness.adapter, "open_bundle_landing", failed_open)
+    with pytest.raises(OSError, match="source open failure"):
+        owner.open()
+    assert owner.source_failed and owner.result is None
+    owner.close()
+    assert harness.pending is None and harness.parts == []
+
+
+@pytest.mark.asyncio
+async def test_owned_source_failure_after_cancellation_preserves_original_cancellation():
+    future = asyncio.get_running_loop().create_future()
+    attempt = capture._Attempt(capture.time.monotonic() + 30)
+    task = asyncio.create_task(capture._await_owned(future, attempt))
+    await asyncio.sleep(0)
+    task.cancel("original cancellation")
+    await asyncio.sleep(0)
+    future.set_exception(RuntimeError("late source failure"))
+    with pytest.raises(asyncio.CancelledError, match="original cancellation"):
+        await asyncio.wait_for(task, 1)
+    assert attempt.stopped.is_set() and future.done()
+
+
+def test_converted_receipt_cannot_reissue_a_hash_for_drifted_source_metadata():
+    from process.custom_import.snowflake import SnowflakeResultColumn
+    from tests.test_custom_import_snowflake_decimal_conversions import _binding, _statement
+
+    definition, binding = _binding()
+    statement = _statement(definition, binding)
+    receipts = []
+    for stream in statement.request.bindings:
+        columns = tuple(
+            SnowflakeResultColumn(field_id, "REAL" if field_id == "score" else "TEXT", False)
+            for field_id in stream.selected_field_ids
+        )
+        source_metadata_by_name = capture._schema_source(statement, stream, columns, "synthetic-query")
+        receipt_by_name = dict(
+            stream_id=stream.stream_id,
+            source_snapshot_token="synthetic-token",
+            source_request_sha256=statement.request.request_sha256,
+            statement_sha256=statement.statement_sha256,
+            source=source_metadata_by_name,
+        )
+        encoded = json.dumps(receipt_by_name, sort_keys=True, separators=(",", ":"))
+        receipts.append(
+            SimpleNamespace(
+                stream_id=stream.stream_id,
+                source_snapshot_token="synthetic-token",
+                canonical_manifest=encoded,
+                manifest_sha256=hashlib.sha256(encoded.encode()).hexdigest(),
+            )
+        )
+    capture._validate_decimal_receipts(statement, "synthetic-token", tuple(receipts))
+    receipt_by_name = json.loads(receipts[0].canonical_manifest)
+    receipt_by_name["source"]["relation"] = ["SYNTHETIC", "PUBLIC", "OTHER_SOURCE"]
+    receipts[0].canonical_manifest = json.dumps(receipt_by_name, sort_keys=True, separators=(",", ":"))
+    receipts[0].manifest_sha256 = hashlib.sha256(receipts[0].canonical_manifest.encode()).hexdigest()
+    with pytest.raises(capture.SnowflakeCaptureError, match="decimal conversion metadata is invalid"):
+        capture._validate_decimal_receipts(statement, "synthetic-token", tuple(receipts))

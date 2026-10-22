@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import process.custom_import.definition_store as definition_store
 from db.models.custom_import import (
     CustomImportChildCollection,
     CustomImportDataset,
@@ -20,7 +21,6 @@ from db.models.custom_import import (
     CustomImportSourceStream,
 )
 from process.custom_import.definition import CustomImportDefinition, load_json_definition
-import process.custom_import.definition_store as definition_store
 from process.custom_import.definition_store import (
     DefinitionRegistrationConflict,
     DefinitionRegistrationError,
@@ -111,6 +111,68 @@ class _SyntheticSession:
 
 def _definition() -> CustomImportDefinition:
     return CustomImportDefinition.from_json(_FIXTURE.read_text())
+
+
+def _stored_state(session):
+    rows = session._models_by_table
+    return definition_store._LockedDefinitionState(
+        rows["custom_import_dataset"][0],
+        tuple(rows["custom_import_definition_revision"]),
+        tuple(rows["custom_import_schema_revision"]),
+        tuple(rows["custom_import_field_slot"]),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["canonical_slot", "missing_history"])
+async def test_affected_slot_history_refuses_canonical_or_missing_bindings(damage):
+    session = _SyntheticSession()
+    await register_definition(session, "synthetic_store", _definition())
+    ledger = session._models_by_table["custom_import_field_slot"][0]
+    field = session._models_by_table["custom_import_field"][0]
+    if damage == "canonical_slot":
+        ledger.field_id = field.field_name = "other_field"
+    else:
+        session._models_by_table["custom_import_field"].remove(field)
+    requested = (replace(_definition().fields[0], field_id="replacement"),)
+    before = _table_counts(session)
+    with pytest.raises(DefinitionRegistrationError, match="persisted field slot identity"):
+        await definition_store._validate_affected_field_slot_history(session, _stored_state(session), requested)
+    assert _table_counts(session) == before
+
+
+@pytest.mark.asyncio
+async def test_orphaned_schema_candidate_is_rejected_before_conflict_classification():
+    session = _SyntheticSession()
+    await register_definition(session, "synthetic_store", _definition())
+    state = replace(_stored_state(session), definition_rows=())
+    with pytest.raises(DefinitionRegistrationError, match="schema is unavailable"):
+        definition_store._validate_registration_candidates(state, (), state.schema_rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["definition_schema", "schema_content"])
+async def test_existing_registration_refuses_rebinding_valid_stored_revisions(damage):
+    session = _SyntheticSession()
+    await register_definition(session, "synthetic_store", _definition())
+    document = _raw_definition()
+    if damage == "definition_schema":
+        document["revision"]["schema"] = 2
+    else:
+        document["revision"]["definition"] = 2
+        document["schema"]["root"]["fields"][1]["nullable"] = True
+    with pytest.raises(DefinitionRegistrationConflict, match="different schema|different content"):
+        definition_store._existing_registration(_stored_state(session), CustomImportDefinition.from_mapping(document))
+    assert _table_counts(session) == (1, 1, 5, 1, 5, 1, 2, 5, 1)
+
+
+@pytest.mark.asyncio
+async def test_replay_graph_requires_every_persisted_profile():
+    session = _SyntheticSession()
+    registration = await register_definition(session, "synthetic_store", _definition())
+    session._models_by_table["custom_import_selection_profile"].clear()
+    with pytest.raises(DefinitionRegistrationError, match="graph does not match"):
+        await definition_store._validate_replay_graph(session, registration, _definition())
 
 
 def _raw_definition() -> dict[str, object]:
@@ -302,9 +364,7 @@ async def test_retired_field_slot_preserves_conflict_only_for_valid_history(corr
     await register_definition(session, "synthetic_store", _definition())
     added = _raw_definition()
     added["revision"] = {"definition": 2, "schema": 2}
-    added["schema"]["root"]["fields"].append(
-        {"id": "retired_field", "slot": 6, "type": "string", "nullable": True}
-    )
+    added["schema"]["root"]["fields"].append({"id": "retired_field", "slot": 6, "type": "string", "nullable": True})
     await register_definition(session, "synthetic_store", CustomImportDefinition.from_mapping(added))
     removed = copy.deepcopy(added)
     removed["revision"] = {"definition": 3, "schema": 3}

@@ -31,6 +31,44 @@ _IDENTITY = {"dataset_id": 1, "definition_revision_id": 2, "schema_revision_id":
 _QUOTA = 1024 * 1024
 
 
+@pytest.mark.parametrize("damage", ["limits_type", "captures_type", "empty", "unsealed", "payload_type", "size"])
+async def test_raw_input_shapes_fail_before_authority_quota_or_writes(monkeypatch, damage):
+    session, captures, quota = _case(monkeypatch)
+    options_by_name = {"limits": object()} if damage == "limits_type" else {}
+    captures_by_damage = {
+        "limits_type": captures,
+        "captures_type": list(captures),
+        "empty": (),
+        "unsealed": (object(),),
+        "payload_type": (replace(captures[0], payload=bytearray(captures[0].payload)),),
+        "size": (replace(captures[0], manifest=replace(captures[0].manifest, decoded_bytes=True)),),
+    }
+    captures = captures_by_damage[damage]
+    with pytest.raises(CaptureStoreError):
+        await _register(session, captures, **options_by_name)
+    assert not session.events and not session.bundles and not session.copy_calls
+    quota.assert_not_awaited()
+
+
+async def test_raw_registration_slot_drift_stops_before_copy(monkeypatch):
+    session, captures, _ = _case(monkeypatch)
+    monkeypatch.setattr(capture_store, "_validated_streams", AsyncMock(return_value=(("providers", 99),)))
+    with pytest.raises(CaptureBundleConflict, match="stream slots have drifted"):
+        await raw_capture_store._copy_raw_objects(
+            session, SimpleNamespace(stream_slots=(7, 2)), SimpleNamespace(**_IDENTITY), captures
+        )
+    assert not session.copy_calls
+
+
+async def test_raw_invalid_persisted_definition_stops_before_authority(monkeypatch):
+    session, captures, quota = _case(monkeypatch)
+    session.definition.canonical_definition = "not-json"
+    with pytest.raises(CaptureBundleConflict, match="definition is invalid"):
+        await _register(session, captures)
+    assert not session.events
+    quota.assert_not_awaited()
+
+
 def _query_result(query_rows):
     return SimpleNamespace(
         all=lambda: query_rows,

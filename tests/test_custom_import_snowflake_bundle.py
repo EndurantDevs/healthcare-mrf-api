@@ -2557,3 +2557,37 @@ async def test_bundle_candidate_wraps_acquisition_failure(monkeypatch, error_cla
     assert isinstance(failure.value.__cause__, error_class)
     assert to_thread_calls == [snowflake_candidate._acquired_bundle]
     _assert_fenced_failure(transitions, "synthetic-acquisition-failure-lease")
+
+
+def test_bundle_receipt_outer_identity_must_match_sealed_document():
+    connector = _connector(_Adapter(lambda: _result(query_id="synthetic-query")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    acquisition = connector.acquire(request)
+    captures = replayable_parquet_captures(acquisition)
+    changed = replace(captures[0], receipt=replace(captures[0].receipt, source_snapshot_token="other-snapshot"))
+    with pytest.raises(SnowflakeBundleError, match="receipt is invalid"):
+        snowflake_bundle._durable_bundle_receipt(changed)
+
+
+def test_bundle_statement_cannot_omit_declared_snapshot_columns():
+    connector = _connector(_Adapter(lambda: _result(query_id="synthetic-query")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    statement = connector.build_statement(request)
+    with pytest.raises(SnowflakeBundleError, match="snapshot columns must use declared column values"):
+        replace(
+            statement,
+            source_snapshot_token_columns_by_stream=(None, *statement.source_snapshot_token_columns_by_stream[1:]),
+        )
+
+
+def test_bundle_request_rejects_corrupt_processing_policy_and_decimal_conversions():
+    from tests.test_custom_import_snowflake_source_binding import _definition as binding_definition
+    from tests.test_custom_import_snowflake_source_binding import _v2_binding
+
+    policy = _v2_binding(binding_definition()).processing_policy
+    object.__setattr__(policy, "driver_timeout_seconds", 0)
+    request = SnowflakeBundleRequest(definition=_definition(), bindings=_bindings())
+    with pytest.raises(SnowflakeBundleError, match="processing policy is invalid"):
+        replace(request, processing_policy=policy)
+    with pytest.raises(SnowflakeBundleError, match="decimal conversions are invalid"):
+        replace(request, decimal_conversions={"npi": "unsupported"})

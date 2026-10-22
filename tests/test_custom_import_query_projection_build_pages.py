@@ -15,6 +15,103 @@ from tests.test_custom_import_query_projection_pages import _source
 from tests.test_custom_import_query_projection_storage import _definition
 
 
+@pytest.mark.parametrize(
+    "phase,operation,next_phase",
+    [("root", "_write_contexts", "child"), ("verify_root", "_verify_contexts", "verify_child")],
+)
+async def test_empty_projection_scope_advances_without_source_reads(monkeypatch, phase, operation, next_phase):
+    monkeypatch.setattr(build, "configured_fields", lambda _definition: ())
+    source = AsyncMock()
+    monkeypatch.setattr(build, "_source_context", source)
+    manifest = SimpleNamespace(phase=phase)
+    await getattr(build, operation)(object(), SimpleNamespace(definition=object()), object(), manifest)
+    assert manifest.phase == next_phase
+    source.assert_not_awaited()
+
+
+async def test_projection_insert_coverage_failure_preserves_cursor(monkeypatch):
+    request = SimpleNamespace(definition=_definition(), page_row_limit=256, page_byte_limit=1024)
+    source = _source()
+    manifest = SimpleNamespace(family_id=17, phase="root", after_entity_binding_id=0, root_count=0)
+    monkeypatch.setattr(build, "_source_context", AsyncMock(return_value=object()))
+    monkeypatch.setattr(build, "_entity_window", AsyncMock(return_value=[1]))
+    monkeypatch.setattr(build, "root_source", Mock(return_value=(source, {})))
+    monkeypatch.setattr(build, "_bounded_key_metadata", AsyncMock(return_value=[(1, 2024)]))
+    monkeypatch.setattr(
+        build,
+        "_validated_source",
+        AsyncMock(return_value=(source, {"score": source.c.metric, "weight": source.c.weight})),
+    )
+    monkeypatch.setattr(build, "_execute", AsyncMock(return_value=SimpleNamespace(rowcount=0)))
+    with pytest.raises(CandidateRunnerError, match="context coverage differs"):
+        await build._write_contexts(object(), request, object(), manifest)
+    assert manifest.after_entity_binding_id == manifest.root_count == 0
+
+
+async def test_projection_verify_coverage_failure_preserves_cursor_and_count(monkeypatch):
+    from process.custom_import import query_projection_verify
+
+    request = SimpleNamespace(definition=_definition(), page_row_limit=256)
+    manifest = SimpleNamespace(phase="verify_root", after_entity_binding_id=0, verified_root_count=0)
+    monkeypatch.setattr(build, "_source_context", AsyncMock(return_value=object()))
+    monkeypatch.setattr(build, "_entity_window", AsyncMock(return_value=[1]))
+    monkeypatch.setattr(query_projection_verify, "_verify_window", AsyncMock(return_value=(2, 1)))
+    with pytest.raises(CandidateRunnerError, match="verified coverage differs"):
+        await build._verify_contexts(object(), request, object(), manifest)
+    assert manifest.after_entity_binding_id == manifest.verified_root_count == 0
+
+
+@pytest.mark.parametrize("damage", ["final_count", "completed_evidence"])
+async def test_projection_completion_rejects_counts_or_reloaded_evidence(monkeypatch, damage):
+    from process.custom_import import query_projection_evidence
+
+    evidence = SimpleNamespace(projection_sha256=b"p" * 32)
+    manifest = SimpleNamespace(
+        family_id=17,
+        phase="digest_child",
+        root_count=1,
+        verified_root_count=1,
+        digested_root_count=1,
+        child_count=0,
+        verified_child_count=0,
+        digested_child_count=0,
+    )
+    monkeypatch.setattr(digest, "retained_projection_digest", lambda *_args: SimpleNamespace(finish=lambda: evidence))
+    monkeypatch.setattr(build, "validate_projection_indexes", AsyncMock())
+    monkeypatch.setattr(build, "_flush_page", AsyncMock())
+    monkeypatch.setattr(build, "_prepare_statement", AsyncMock())
+    monkeypatch.setattr(query_projection_evidence, "completed_projection_evidence", lambda *_args, **_kwargs: object())
+    counts = iter([0 if damage == "final_count" else 1, 0, object()])
+    monkeypatch.setattr(
+        build, "_execute", AsyncMock(side_effect=lambda *_args: SimpleNamespace(scalar_one=lambda: next(counts)))
+    )
+    session = SimpleNamespace(refresh=AsyncMock())
+    with pytest.raises(CandidateRunnerError, match="final coverage differs|completed evidence differs"):
+        await build._finish_projection(
+            session, SimpleNamespace(definition=_definition()), SimpleNamespace(generation_id=1), manifest
+        )
+    assert session.refresh.await_count == int(damage == "completed_evidence")
+
+
+async def test_projection_transport_binds_request_once_and_stops_at_completed_receipt(monkeypatch):
+    from process.custom_import import query_projection_worker
+
+    bound = SimpleNamespace(definition=_definition())
+    transport = SimpleNamespace(bind_request=Mock(return_value=bound))
+    step = AsyncMock(
+        side_effect=[
+            SimpleNamespace(after=SimpleNamespace(phase="root")),
+            SimpleNamespace(after=SimpleNamespace(phase="complete")),
+        ]
+    )
+    monkeypatch.setattr(query_projection_worker, "projection_next_batch", step)
+    request, factory = SimpleNamespace(definition=_definition()), object()
+    await build.stage_query_projections(factory, request, 7, transport=transport)
+    transport.bind_request.assert_called_once_with(request)
+    assert step.await_count == 2
+    assert all(call.args == (factory, bound, 7, transport) for call in step.await_args_list)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["root", "complete"])
 async def test_digest_rejects_open_or_completed_rows_before_source_access(monkeypatch, phase):
