@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import json
 import sys
+import threading
 from compression import zstd
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 from functools import partial
 from itertools import count
@@ -122,8 +125,10 @@ def _source_dispatch_fixture(monkeypatch, tmp_path, *, configured=5, size=2, ove
     fixture.identity = cms.release_identity(receipt)
     monkeypatch.setattr(
         cms,
-        "_parse_batch_row",
-        lambda _fhir, resource, _candidate: (models_by_type[resource["resourceType"]], {"resource_id": resource["id"]}),
+        "_prepare_source_lines",
+        lambda lines, kind, _candidate, fhir=None: cms._PreparedBatch(
+            kind, len(lines), [{"resource_id": json.loads(line)["id"]} for line in lines], {}, ({}, b"")
+        ),
     )
     # Each synthetic file holds exactly one batch, so slot overlap is observed mid-file.
     monkeypatch.setattr(cms, "BATCH_SIZE", 1_000)
@@ -143,8 +148,9 @@ async def test_source_dispatch_overlaps_only_connected_admitted_file_slots(
     release = asyncio.Event()
     staged_types = []
 
-    async def persist(_fhir, _model, rows, raw, _candidate, kind):
-        assert len(rows) == len(raw) == 1000
+    async def persist(_fhir, prepared, _candidate):
+        kind = prepared.resource_type
+        assert len(prepared.rows) == prepared.input_count == 1000
         fixture.writing.add(kind)
         fixture.peaks["writing"] = max(fixture.peaks["writing"], len(fixture.writing))
         assert len(fixture.opened) <= expected and len(fixture.writing) <= expected
@@ -156,7 +162,7 @@ async def test_source_dispatch_overlaps_only_connected_admitted_file_slots(
         finally:
             fixture.writing.remove(kind)
 
-    monkeypatch.setattr(cms, "_persist_source_batch", persist)
+    monkeypatch.setattr(cms, "_persist_prepared_batch", persist)
 
     def drained():
         assert not fixture.opened and not fixture.writing
@@ -192,7 +198,8 @@ def _dispatch_failure_writer(fixture, failure_mode, both_started, drain, failure
     """Hold both active writers until the test releases their cancellation cleanup."""
     first_kind = RESOURCE_FILES[0][1]
 
-    async def persist(_fhir, _model, _rows, _raw, _candidate, kind):
+    async def persist(_fhir, prepared, _candidate):
+        kind = prepared.resource_type
         fixture.writing.add(kind)
         if len(fixture.writing) == 2:
             both_started.set()
@@ -229,7 +236,7 @@ async def test_source_dispatch_drains_every_reader_and_writer_before_failure_ret
 
     persist = _dispatch_failure_writer(fixture, failure_mode, both_started, drain, failure)
 
-    monkeypatch.setattr(cms, "_persist_source_batch", persist)
+    monkeypatch.setattr(cms, "_persist_prepared_batch", persist)
     staging = asyncio.create_task(
         cms._stage_and_validate_candidate(
             fixture.fhir, fixture.directory, fixture.candidate, fixture.identity, fixture.receipt, {}, {}
@@ -277,7 +284,7 @@ async def test_source_dispatch_replay_verifies_retained_bytes_without_source_wri
     fixture.candidate.already_validated = validated
     fixture.candidate.already_published = published
     writer = AsyncMock(side_effect=AssertionError("finalized candidate attempted a source write"))
-    monkeypatch.setattr(cms, "_persist_source_batch", writer)
+    monkeypatch.setattr(cms, "_persist_prepared_batch", writer)
     assert await cms._stage_and_validate_candidate(
         fixture.fhir, fixture.directory, fixture.candidate, fixture.identity, fixture.receipt, {}, {}
     ) == {"validated": True}
@@ -788,23 +795,14 @@ async def _reduced_witness_rows(witness_rows):
     ]
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("raw_payload", [{"value": "bad\x00value"}, {"bad\x00key": "value"}])
-async def test_raw_witness_copy_rejects_lossy_normalization(monkeypatch, raw_payload):
+def test_raw_witness_rejects_lossy_normalization(raw_payload):
     """Never store sanitized JSON under the original source hash."""
-    from process import provider_directory_generic_source_storage as storage
-    from tests.test_provider_directory_generic_source_policy import synthetic_source_publisher
-
-    copy_rows, resolve, append = AsyncMock(), AsyncMock(), AsyncMock()
-    monkeypatch.setattr(fhir, "_copy_upsert_rows", copy_rows)
-    monkeypatch.setattr(storage, "resolve_existing_source_candidate", resolve)
-    monkeypatch.setattr(storage, "append_generic_source_batch", append)
-    async with synthetic_source_publisher(monkeypatch, fhir.db) as (session, _):
-        with pytest.raises(CmsNpdSourceError, match="cms_npd_resource_invalid"):
-            await cms._insert_verified_witnesses(session, {"site-1": {"raw_payload_json": raw_payload}})
-    copy_rows.assert_not_awaited()
-    resolve.assert_not_awaited()
-    append.assert_not_awaited()
+    candidate = SimpleNamespace(dataset_id="dataset-synthetic", source_release={"vector_sha256": "a" * 64})
+    with pytest.raises(CmsNpdSourceError, match="cms_npd_resource_invalid"):
+        cms._source_witnesses_by_id(
+            [{"resourceType": "Location", "id": "site-1", **raw_payload}], candidate, "Location"
+        )
 
 
 @pytest.mark.asyncio
@@ -1345,15 +1343,15 @@ async def test_stream_flushes_on_decoded_byte_bound(monkeypatch, tmp_path: Path)
     with zstd.open(path, "wb") as encoded:
         for index in range(3):
             encoded.write(f'{{"resourceType":"Organization","id":"org-{index}"}}\n'.encode())
-    model = object()
     persist = AsyncMock()
-    fake_fhir = SimpleNamespace(
-        RESOURCE_MODELS_BY_TYPE={"Organization": model},
-        _raise_if_resource_import_cancelled=AsyncMock(),
-    )
-    monkeypatch.setattr(cms, "_persist_source_batch", persist)
+    fake_fhir = SimpleNamespace(_raise_if_resource_import_cancelled=AsyncMock())
+    monkeypatch.setattr(cms, "_persist_prepared_batch", persist)
     monkeypatch.setattr(cms, "BATCH_MAX_DECODED_BYTES", 1)
-    monkeypatch.setattr(cms, "_parse_batch_row", lambda *_args: (model, {"id": "synthetic"}))
+    monkeypatch.setattr(
+        cms,
+        "_prepare_source_lines",
+        lambda lines, kind, _candidate, fhir=None: cms._PreparedBatch(kind, len(lines), [], {}, ({}, b"")),
+    )
     candidate = SimpleNamespace(
         dataset_id="dataset-synthetic",
         resource_hash_contract="synthetic",
@@ -1371,6 +1369,55 @@ async def test_stream_flushes_on_decoded_byte_bound(monkeypatch, tmp_path: Path)
     assert caught.value is failure and persist.await_count == 2
     observed = ctx_by_field["context"]["audit"]["cms_intake"]
     assert observed["family"] == "Organization" and observed["completed_input_rows"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_persists_pool_prepared_batches_in_file_order(monkeypatch, tmp_path: Path):
+    """Workers may finish out of order; commits keep file order with one batch per worker in flight."""
+    path = tmp_path / "organization.ndjson.zst"
+    with zstd.open(path, "wb") as encoded:
+        for index in range(6):
+            encoded.write(f'{{"resourceType":"Organization","id":"org-{index}"}}\n'.encode())
+    monkeypatch.setattr(cms, "BATCH_SIZE", 1)
+    second_started = threading.Event()
+    in_flight_by_metric = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def prepare(lines, kind, _candidate, fhir=None):
+        with lock:
+            in_flight_by_metric["now"] += 1
+            in_flight_by_metric["peak"] = max(in_flight_by_metric["peak"], in_flight_by_metric["now"])
+        resource_id = json.loads(lines[0])["id"]
+        if resource_id == "org-0":
+            assert second_started.wait(5), "the next batch never overlapped the first"
+        else:
+            second_started.set()
+        with lock:
+            in_flight_by_metric["now"] -= 1
+        return cms._PreparedBatch(kind, len(lines), [resource_id], {}, ({}, b""))
+
+    persisted_ids = []
+
+    async def persist(_fhir, prepared, _candidate):
+        persisted_ids.extend(prepared.rows)
+
+    monkeypatch.setattr(cms, "_prepare_source_lines", prepare)
+    monkeypatch.setattr(cms, "_persist_prepared_batch", persist)
+    fake_fhir = SimpleNamespace(_raise_if_resource_import_cancelled=AsyncMock())
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert await cms._stream_file(fake_fhir, path, object(), "Organization", {}, {}, executor) == 6
+    assert persisted_ids == [f"org-{index}" for index in range(6)] and in_flight_by_metric["peak"] == 2
+
+
+def test_stage_executor_follows_the_worker_setting(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CMS_NPD_STAGE_WORKERS", "0")
+    assert cms._stage_executor() is None
+    monkeypatch.setenv("HLTHPRT_CMS_NPD_STAGE_WORKERS", "2")
+    executor = cms._stage_executor()
+    try:
+        assert executor._max_workers == 2
+    finally:
+        executor.shutdown(wait=False)
 
 
 @pytest.mark.asyncio

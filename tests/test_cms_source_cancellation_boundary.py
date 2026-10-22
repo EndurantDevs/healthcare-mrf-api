@@ -23,8 +23,8 @@ def _cancellation_dispatch(monkeypatch, tmp_path):
         fixture.worker_tasks.extend(tasks)
         return await original_gather(tasks)
 
-    async def persist(_fhir, _model, rows, _raw, _candidate, _kind):
-        fixture.committed_rows.extend(rows)
+    async def persist(_fhir, prepared, _candidate):
+        fixture.committed_rows.extend(prepared.rows)
         await asyncio.sleep(0)
 
     async def probe(*args):
@@ -32,7 +32,7 @@ def _cancellation_dispatch(monkeypatch, tmp_path):
 
     fixture.fhir._gather_provider_directory_profile_tasks = gather
     fixture.fhir._raise_if_resource_import_cancelled = probe
-    monkeypatch.setattr(cms, "_persist_source_batch", persist)
+    monkeypatch.setattr(cms, "_persist_prepared_batch", persist)
     return fixture
 
 
@@ -40,7 +40,7 @@ def _cancellation_dispatch(monkeypatch, tmp_path):
 async def test_cancellation_fixture_stops_after_third_acknowledged_commit(monkeypatch, tmp_path):
     """A sibling cannot make a fourth commit; the original replay assertions still run."""
     fixture = _cancellation_dispatch(monkeypatch, tmp_path)
-    original_persist = cms._persist_source_batch
+    original_persist = cms._persist_prepared_batch
     probe = AsyncMock()
     monkeypatch.setattr(fhir, "_raise_if_resource_import_cancelled", probe)
     database = SimpleNamespace(first=AsyncMock(return_value=(fixture.candidate.dataset_id,)))
@@ -67,7 +67,7 @@ async def test_cancellation_fixture_stops_after_third_acknowledged_commit(monkey
     monkeypatch.setattr(native_case, "_retained_input_count", retained_count)
     await native_case.test_committed_batch_cancellation_keeps_incumbent_and_replays_safely(monkeypatch, tmp_path)
     retained_count.assert_awaited_once_with(database, fixture.candidate.dataset_id)
-    assert cms._persist_source_batch is original_persist
+    assert cms._persist_prepared_batch is original_persist
     assert len(fixture.committed_rows) == 3
     assert len(fixture.worker_tasks) == 2 and all(task.done() for task in fixture.worker_tasks)
     assert not fixture.opened and fixture.events == []

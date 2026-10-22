@@ -512,10 +512,15 @@ def _records(rows, columns, ordinal):
             set(row) <= set(columns) and all(name in row for name in columns if name != "acquired_resource_sha256"),
             "copy_columns_changed",
         )
-        yield tuple(_encoded(row.get(name)) if name.endswith("_json") else row.get(name) for name in columns) + (
+        yield tuple(_json_text(row.get(name)) if name.endswith("_json") else row.get(name) for name in columns) + (
             ordinal,
             index,
         )
+
+
+def _json_text(value):
+    """Staging workers hand over canonical JSON text already; encode only Python values."""
+    return value if isinstance(value, str) else _encoded(value)
 
 
 async def _copy(connection, policy, table, columns, records):

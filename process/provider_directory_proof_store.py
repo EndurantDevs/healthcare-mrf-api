@@ -662,6 +662,50 @@ async def _assert_persisted_shard_replay(
         raise ProviderDirectoryProofStoreError("provider directory proof shard replay changed")
 
 
+async def _proof_lineage_for_contract(
+    connection: Any,
+    schema: str,
+    dataset_id: str,
+    expected_resource_hash_contract: str | None,
+) -> tuple[str, str, list[str], list[str] | None, str]:
+    """Lock the parent and require the hash contract the rows were built under."""
+    from process.provider_directory_source_proof_control import require_proof_executor
+
+    publisher = await require_proof_executor(connection, schema)
+    (
+        endpoint_id,
+        root_run_id,
+        source_ids,
+        _selected_resources,
+        proof_resource_scope,
+        resource_hash_contract,
+    ) = await _locked_dataset_proof_lineage(connection, schema, dataset_id, publisher=publisher)
+    if expected_resource_hash_contract is not None and resource_hash_contract != expected_resource_hash_contract:
+        raise ProviderDirectoryProofStoreError("provider directory proof parent hash contract changed")
+    return endpoint_id, root_run_id, source_ids, proof_resource_scope, resource_hash_contract
+
+
+async def _store_dataset_proof_shard(
+    connection: Any,
+    schema: str,
+    dataset_id: str,
+    descriptor_by_field: dict[str, Any],
+    compressed: bytes,
+    proof_resource_scope: list[str] | None,
+) -> dict[str, Any]:
+    """Insert one shard inside the parent's resource scope and require its exact replay."""
+    if proof_resource_scope is not None and not set(descriptor_by_field["resource_counts"]).issubset(
+        proof_resource_scope
+    ):
+        raise ProviderDirectoryProofStoreError("provider directory proof parent resource scope changed")
+    table_ref = f'"{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}"'
+    await _insert_dataset_proof_shard(
+        connection, table_ref, _proof_shard_insert_params(descriptor_by_field, compressed)
+    )
+    await _assert_persisted_shard_replay(connection, table_ref, dataset_id, descriptor_by_field, compressed)
+    return descriptor_by_field
+
+
 async def persist_dataset_proof_shard(
     connection: Any,
     schema: str,
@@ -671,20 +715,13 @@ async def persist_dataset_proof_shard(
     expected_resource_hash_contract: str | None = None,
 ) -> dict[str, Any]:
     """Persist one retry-idempotent resource-family batch proof."""
-    from process.provider_directory_source_proof_control import require_proof_executor
-
-    publisher = await require_proof_executor(connection, schema)
-
     (
         endpoint_id,
         root_run_id,
         source_ids,
-        selected_resources,
         proof_resource_scope,
         resource_hash_contract,
-    ) = await _locked_dataset_proof_lineage(connection, schema, dataset_id, publisher=publisher)
-    if expected_resource_hash_contract is not None and resource_hash_contract != expected_resource_hash_contract:
-        raise ProviderDirectoryProofStoreError("provider directory proof parent hash contract changed")
+    ) = await _proof_lineage_for_contract(connection, schema, dataset_id, expected_resource_hash_contract)
     descriptor_by_field, compressed = build_dataset_proof_shard(
         dataset_rows,
         dataset_id=dataset_id,
@@ -693,24 +730,35 @@ async def persist_dataset_proof_shard(
         source_ids=source_ids,
         resource_hash_contract=resource_hash_contract,
     )
-    if proof_resource_scope is not None and not set(descriptor_by_field["resource_counts"]).issubset(
-        proof_resource_scope
+    return await _store_dataset_proof_shard(
+        connection, schema, dataset_id, descriptor_by_field, compressed, proof_resource_scope
+    )
+
+
+async def persist_built_dataset_proof_shard(
+    connection: Any,
+    schema: str,
+    descriptor_by_field: dict[str, Any],
+    compressed: bytes,
+    *,
+    dataset_id: str,
+    expected_resource_hash_contract: str | None = None,
+) -> dict[str, Any]:
+    """Persist a shard built off the publisher; its lineage and artifact must match the locked parent."""
+    endpoint_id, root_run_id, source_ids, proof_resource_scope, _ = await _proof_lineage_for_contract(
+        connection, schema, dataset_id, expected_resource_hash_contract
+    )
+    lineage_fields = ("dataset_id", "endpoint_id", "acquisition_root_run_id", "source_ids")
+    if (
+        tuple(descriptor_by_field.get(field) for field in lineage_fields)
+        != _proof_shard_lineage(dataset_id, endpoint_id, root_run_id, source_ids)
+        or descriptor_by_field.get("artifact_sha256") != hashlib.sha256(compressed).hexdigest()
+        or descriptor_by_field.get("artifact_byte_count") != len(compressed)
     ):
-        raise ProviderDirectoryProofStoreError("provider directory proof parent resource scope changed")
-    table_ref = f'"{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}"'
-    await _insert_dataset_proof_shard(
-        connection,
-        table_ref,
-        _proof_shard_insert_params(descriptor_by_field, compressed),
+        raise ProviderDirectoryProofStoreError("provider directory proof shard lineage changed")
+    return await _store_dataset_proof_shard(
+        connection, schema, dataset_id, descriptor_by_field, compressed, proof_resource_scope
     )
-    await _assert_persisted_shard_replay(
-        connection,
-        table_ref,
-        dataset_id,
-        descriptor_by_field,
-        compressed,
-    )
-    return descriptor_by_field
 
 
 def _drain_proof_steps(steps: Generator[None, None, Any]) -> Any:

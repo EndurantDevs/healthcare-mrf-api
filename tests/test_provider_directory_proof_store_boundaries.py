@@ -248,6 +248,57 @@ async def test_persisted_shard_rejects_resource_outside_parent_scope():
     assert connection.shards == {}
 
 
+@pytest.mark.asyncio
+async def test_built_shard_must_match_locked_lineage_and_its_artifact():
+    """A worker-built shard persists once; a changed lineage field or artifact is refused."""
+
+    connection = _semantic_scope_connection()
+    practitioner = _semantic_resource(
+        "Practitioner",
+        "practitioner-1",
+        {
+            "npi": "123",
+            "names": [{"family": "Example", "given": ["A"]}],
+            "family_name": "Example",
+            "given_names": ["A"],
+            "full_name": "A Example",
+        },
+    )
+    descriptor_by_field, compressed = proof_store.build_dataset_proof_shard(
+        [practitioner],
+        dataset_id=DATASET_ID,
+        endpoint_id=ENDPOINT_ID,
+        acquisition_root_run_id=ROOT_RUN_ID,
+        source_ids=SOURCE_IDS,
+        resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    )
+    persisted_by_field = await proof_store.persist_built_dataset_proof_shard(
+        connection, "mrf", descriptor_by_field, compressed, dataset_id=DATASET_ID
+    )
+    assert persisted_by_field == descriptor_by_field and set(connection.shards) == {
+        (DATASET_ID, descriptor_by_field["shard_id"])
+    }
+    for changed_by_field, artifact in (
+        ({**descriptor_by_field, "endpoint_id": "other-endpoint"}, compressed),
+        ({**descriptor_by_field, "source_ids": ["other-source"]}, compressed),
+        (descriptor_by_field, compressed + b"\x00"),
+    ):
+        with pytest.raises(ProviderDirectoryProofStoreError, match="shard lineage changed"):
+            await proof_store.persist_built_dataset_proof_shard(
+                connection, "mrf", changed_by_field, artifact, dataset_id=DATASET_ID
+            )
+    with pytest.raises(ProviderDirectoryProofStoreError, match="hash contract changed"):
+        await proof_store.persist_built_dataset_proof_shard(
+            connection,
+            "mrf",
+            descriptor_by_field,
+            compressed,
+            dataset_id=DATASET_ID,
+            expected_resource_hash_contract="other-contract",
+        )
+    assert len(connection.shards) == 1
+
+
 async def _insert_unscoped_semantic_organization(
     connection: _MemoryProofConnection,
 ) -> None:
