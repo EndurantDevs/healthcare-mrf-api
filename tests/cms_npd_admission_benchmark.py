@@ -175,7 +175,10 @@ async def _digest(database, sql, **params):
 
 
 async def capture_parity(database, dataset_id, release_id):
-    """Digest every produced relation so two revisions can be compared exactly."""
+    """Digest every produced relation so two revisions can be compared exactly.
+
+    shortcut: string_agg digests hold to about 1M rows, switch to a hashed aggregate for full-release runs.
+    """
     schema = "mrf"
     agg = "encode(sha256(convert_to(coalesce(string_agg({expr}, E'\\n' ORDER BY {order}), ''), 'UTF8')), 'hex')"
 
@@ -312,10 +315,13 @@ async def test_cms_npd_admission_benchmark(monkeypatch, cms_artifact_root):
             result = await cms._run_acquired({"context": {}}, {}, "benchmark-run", directory, receipt, probe)
         wall = time.monotonic() - wall_started
         cpu = time.process_time() - cpu_started
+        out = os.getenv(_OUT_ENV)
+        if out:  # keep the timing even if a later capacity or parity query fails
+            Path(out).write_text(json.dumps({"partial": True, "admission_wall_seconds": round(wall, 3), "admission_cpu_seconds": round(cpu, 3), "phases": timers.records, "timeline": timers.timeline}, indent=1) + "\n", encoding="utf-8")
         after = await _capacity(database)
         wal_bytes = int(
             await database.scalar(
-                "SELECT pg_wal_lsn_diff(CAST(:after AS pg_lsn), CAST(:before AS pg_lsn))", after=after["wal_lsn"], before=before["wal_lsn"]
+                "SELECT pg_wal_lsn_diff(CAST(CAST(:after AS text) AS pg_lsn), CAST(CAST(:before AS text) AS pg_lsn))", after=after["wal_lsn"], before=before["wal_lsn"]
             )
         )
         parity = await capture_parity(database, result["dataset_id"], receipt["vector_sha256"])
@@ -351,7 +357,6 @@ async def test_cms_npd_admission_benchmark(monkeypatch, cms_artifact_root):
         "parity": parity,
     }
     rendered = json.dumps(summary, indent=1, sort_keys=False)
-    out = os.getenv(_OUT_ENV)
     if out:
         Path(out).write_text(rendered + "\n", encoding="utf-8")
     print("\nCMS NPD ADMISSION BENCHMARK\n" + rendered)
