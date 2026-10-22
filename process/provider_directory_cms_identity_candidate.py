@@ -560,7 +560,8 @@ async def _publish_canonical_ids(connection, policy, relations, table, column, r
         f"USING({keys}) WHERE candidate.{field} IS NOT NULL AND incumbent.source_id IS NULL), "
         f"inserted AS (INSERT INTO {storage_relation(policy.schema, table)} ({field},created_at) "
         f"SELECT {field},created_at FROM needed ORDER BY {field} ON CONFLICT ({field}) DO NOTHING RETURNING {field}) "
-        f"SELECT EXISTS(SELECT FROM needed LEFT JOIN inserted USING({field}) WHERE inserted.{field} IS NULL)"
+        # Every needed id must have been inserted; counting avoids a statistics-free join of two CTEs.
+        f"SELECT (SELECT count(DISTINCT {field}) FROM needed)<>(SELECT count(*) FROM inserted)"
     )
     if conflict:
         raise CMSIdentityReprepareRequired("provider_directory_cms_identity_whole_candidate_reprepare_required")
