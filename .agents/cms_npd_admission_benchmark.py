@@ -8,7 +8,7 @@ Not collected by default. Run it explicitly against a disposable local server:
     HLTHPRT_CMS_NPD_BENCHMARK_RELEASE=<retained release directory with eight .zst files + receipt.json>
     HLTHPRT_CMS_NPD_BENCHMARK_ROWS=200000
     HLTHPRT_CMS_NPD_BENCHMARK_OUT=<result json path>
-    python -m pytest tests/cms_npd_admission_benchmark.py -x -s
+    python -m pytest .agents/cms_npd_admission_benchmark.py -x -s
 
 The sample is a deterministic weighted prefix of every family (the same rows
 for the same release and row budget), packaged through the real acquisition
@@ -33,12 +33,12 @@ from pathlib import Path
 import pytest
 
 from process import cms_npd_source as source
+from process import provider_directory_cms_identity_candidate as cms_identity
 from process import provider_directory_cms_npd as cms
 from process import provider_directory_cms_npd_relationship as relationships
-from process import provider_directory_generic_source_completion as completion
-from process import provider_directory_cms_identity_candidate as cms_identity
 from process import provider_directory_cms_serving_coverage as coverage
 from process import provider_directory_generic_source_auxiliary as auxiliary
+from process import provider_directory_generic_source_completion as completion
 from process import provider_directory_generic_source_storage as storage
 from process import provider_directory_resource_identity_candidate as resource_identity
 from tests import cms_npd_admission_postgres_support as support
@@ -334,11 +334,26 @@ async def test_cms_npd_admission_benchmark(monkeypatch, cms_artifact_root):
         cpu = time.process_time() - cpu_started
         out = os.getenv(_OUT_ENV)
         if out:  # keep the timing even if a later capacity or parity query fails
-            Path(out).write_text(json.dumps({"partial": True, "admission_wall_seconds": round(wall, 3), "admission_cpu_seconds": round(cpu, 3), "phases": timers.records, "timeline": timers.timeline}, indent=1) + "\n", encoding="utf-8")
+            Path(out).write_text(
+                json.dumps(
+                    {
+                        "partial": True,
+                        "admission_wall_seconds": round(wall, 3),
+                        "admission_cpu_seconds": round(cpu, 3),
+                        "phases": timers.records,
+                        "timeline": timers.timeline,
+                    },
+                    indent=1,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         after = await _capacity(database)
         wal_bytes = int(
             await database.scalar(
-                "SELECT pg_wal_lsn_diff(CAST(CAST(:after AS text) AS pg_lsn), CAST(CAST(:before AS text) AS pg_lsn))", after=after["wal_lsn"], before=before["wal_lsn"]
+                "SELECT pg_wal_lsn_diff(CAST(CAST(:after AS text) AS pg_lsn), CAST(CAST(:before AS text) AS pg_lsn))",
+                after=after["wal_lsn"],
+                before=before["wal_lsn"],
             )
         )
         parity = await capture_parity(database, result["dataset_id"], receipt["vector_sha256"])
@@ -366,7 +381,10 @@ async def test_cms_npd_admission_benchmark(monkeypatch, cms_artifact_root):
         "rss_before_bytes": rss_before,
         "phases": dict(
             sorted(
-                ((key, {name: round(value, 3) for name, value in record.items()}) for key, record in timers.records.items()),
+                (
+                    (key, {name: round(value, 3) for name, value in record.items()})
+                    for key, record in timers.records.items()
+                ),
                 key=lambda item: -item[1]["wall"],
             )
         ),

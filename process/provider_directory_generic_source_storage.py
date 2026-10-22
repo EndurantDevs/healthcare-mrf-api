@@ -406,8 +406,13 @@ async def _verify_tables_recently(connection, policy, binding_by_field):
     solely through this owner's own transactions.
     """
     key = _encoded(
-        {"schema": policy.schema, "owner": policy.owner_role, "phase": binding_by_field["phase"],
-         "tables": binding_by_field["tables"], "auxiliary": binding_by_field["auxiliary"]}
+        {
+            "schema": policy.schema,
+            "owner": policy.owner_role,
+            "phase": binding_by_field["phase"],
+            "tables": binding_by_field["tables"],
+            "auxiliary": binding_by_field["auxiliary"],
+        }
     )
     verified = _VERIFIED_CUSTODY.get()
     now = time.monotonic()
