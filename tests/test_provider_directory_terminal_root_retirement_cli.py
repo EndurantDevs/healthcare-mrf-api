@@ -162,9 +162,11 @@ async def test_execute_renders_identifier_free_preview_and_apply(
     assert "private" not in preview_json + apply_json
 
 
+@pytest.mark.parametrize("error_code", ["evidence_invalid", "administrator_required"])
 def test_run_command_prints_closed_success_or_safe_error(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    error_code: str,
 ) -> None:
     monkeypatch.setenv(contract.RETIREMENT_ENABLED_ENV, "true")
 
@@ -181,10 +183,10 @@ def test_run_command_prints_closed_success_or_safe_error(
     assert captured.err == ""
 
     async def failure(_arguments: argparse.Namespace) -> str:
-        raise contract.TerminalRootRetirementError("evidence_invalid")
+        raise contract.TerminalRootRetirementError(error_code)
 
     monkeypatch.setattr(cli, "_run_operator", failure)
     assert cli.run_command(["preview", *SELECTOR_ARGUMENTS]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == '{"code":"evidence_invalid","status":"error"}\n'
+    assert json.loads(captured.err) == {"code": error_code, "status": "error"}

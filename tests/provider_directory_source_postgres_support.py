@@ -702,7 +702,8 @@ def source_component_migrations():
 def legacy_source_component_migrations():
     """Keep authentic Source custody without the later composite publication contract."""
     composite_prefixes = {"20260930100000", "20260930110000", "20260930130000", "20260930140000"}
-    return tuple(prefix for prefix in source_component_migrations() if prefix not in composite_prefixes)
+    prefixes = tuple(prefix for prefix in source_component_migrations() if prefix not in composite_prefixes)
+    return (*prefixes, "20261022120000")
 
 
 async def bootstrap_source_component(engine, policy, *, migration_prefixes=None):

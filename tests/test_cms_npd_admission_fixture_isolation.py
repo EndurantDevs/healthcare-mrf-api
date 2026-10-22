@@ -33,6 +33,37 @@ def test_source_fixture_inherits_common_retry():
 
 
 @pytest.mark.asyncio
+async def test_retained_legacy_fixture_keeps_its_heap_contract_with_current_retirement(monkeypatch):
+    from tests import provider_directory_source_postgres_support as source
+
+    prefixes = support.LEGACY_MIGRATION_PREFIXES
+    assert prefixes[-2:] == ("20261015015000", "20261022120000")
+    assert prefixes.count("20261022120000") == 1
+    assert prefixes[:-2] == support.MIGRATION_PREFIXES[: support.MIGRATION_PREFIXES.index("20260930100000")]
+    component = SimpleNamespace(admin_engine=object(), database=object(), factory=SimpleNamespace(transaction=Mock()))
+    administrator = SimpleNamespace()
+    migration_selections = []
+
+    @asynccontextmanager
+    async def source_database(bindings, *, bind_factory, before_provision, migration_prefixes):
+        assert not bind_factory and before_provision is None
+        migration_selections.append(migration_prefixes)
+        yield component
+
+    provision = AsyncMock()
+    monkeypatch.setattr(source, "source_component_database", source_database)
+    monkeypatch.setattr(support, "_provision_cms_epoch_controls", provision)
+    monkeypatch.setattr(support, "Database", Mock(return_value=administrator))
+    async with support.intake_admission_database(monkeypatch, migration_prefixes=prefixes) as database:
+        assert database is administrator and database._source_component is component
+    provision.assert_awaited_once_with(component)
+    assert migration_selections == [source.legacy_source_component_migrations()]
+    applied = migration_selections[0]
+    assert applied[-2:] == prefixes[-2:] and applied.count("20261022120000") == 1
+    assert {"20260930100000", "20260930110000", "20260930130000", "20260930140000"}.isdisjoint(applied)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("exit_kind", ["normal", "body_error", "cancellation"])
 async def test_intake_fixture_enrolls_original_calls_in_fresh_worker_context(monkeypatch, legacy, exit_kind):

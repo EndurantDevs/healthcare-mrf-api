@@ -25,14 +25,13 @@ from process.provider_directory_terminal_root_retirement_contract import (
     validated_retirement_marker,
 )
 from process.provider_directory_terminal_root_retirement_profile import (
+    LEGACY_RETIREMENT_PROFILE,
     RETIREMENT_METADATA_KEYS,
 )
 
 _INCOMPLETE_STATUSES = ("acquiring", "incomplete")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_SYNTHETIC_EVIDENCE_RELATIONS = frozenset(
-    {"provider_directory_endpoint_dataset_previous_reference"}
-)
+_SYNTHETIC_EVIDENCE_RELATIONS = frozenset({"provider_directory_endpoint_dataset_previous_reference"})
 
 
 def _one_row(rows: list[Any], error_code: str = "evidence_invalid") -> dict[str, Any]:
@@ -45,7 +44,7 @@ async def _initial_endpoint(database: Any, endpoint_id: str) -> dict[str, Any]:
     rows = await database.all(
         f"""
         SELECT endpoint.endpoint_id, endpoint.canonical_api_base
-          FROM {quoted_relation('provider_directory_api_endpoint')} AS endpoint
+          FROM {quoted_relation("provider_directory_api_endpoint")} AS endpoint
          WHERE endpoint.endpoint_id = :endpoint_id
          LIMIT 2;
         """,
@@ -88,7 +87,7 @@ async def _lock_endpoint_scope(
     rows = await database.all(
         f"""
         SELECT endpoint.endpoint_id, endpoint.canonical_api_base
-          FROM {quoted_relation('provider_directory_api_endpoint')} AS endpoint
+          FROM {quoted_relation("provider_directory_api_endpoint")} AS endpoint
          WHERE endpoint.endpoint_id = :endpoint_id
          FOR UPDATE OF endpoint;
         """,
@@ -115,12 +114,12 @@ async def _locked_target(
     rows = await database.all(
         f"""
         SELECT dataset.*
-          FROM {quoted_relation('provider_directory_endpoint_dataset')} AS dataset
+          FROM {quoted_relation("provider_directory_endpoint_dataset")} AS dataset
          WHERE dataset.dataset_id = :dataset_id
            AND dataset.endpoint_id = :endpoint_id
            AND dataset.import_run_id = :owner_run_id
            AND dataset.acquisition_root_run_id = :root_run_id
-           AND dataset.previous_dataset_id = :predecessor_id
+           AND dataset.previous_dataset_id IS NOT DISTINCT FROM :predecessor_id
          FOR UPDATE OF dataset;
         """,
         dataset_id=request.dataset_id,
@@ -138,7 +137,9 @@ def _target_metadata(
 ) -> tuple[dict[str, Any], TerminalRootRetirementProfile]:
     metadata = json_object(target.get("publication_metadata_json"))
     profile = terminal_root_retirement_profile(metadata)
-    if metadata.get("source_ids") != [request.source_id]:
+    if metadata.get("source_ids") != [request.source_id] or (
+        request.expect_no_current_dataset and profile is not LEGACY_RETIREMENT_PROFILE
+    ):
         raise TerminalRootRetirementError("evidence_invalid")
     return metadata, profile
 
@@ -174,7 +175,7 @@ async def _locked_source(
     rows = await database.all(
         f"""
         SELECT source.source_id, source.endpoint_id, source.canonical_api_base
-          FROM {quoted_relation('provider_directory_source')} AS source
+          FROM {quoted_relation("provider_directory_source")} AS source
          WHERE source.source_id = :source_id
          FOR UPDATE OF source;
         """,
@@ -193,10 +194,24 @@ async def _locked_predecessor(
     database: Any,
     request: TerminalRootRetirementRequest,
 ) -> None:
-    rows = await database.all(
+    if request.expect_no_current_dataset:
+        published_datasets = await database.all(
+            f"""
+            SELECT dataset.dataset_id
+              FROM {quoted_relation("provider_directory_endpoint_dataset")} AS dataset
+             WHERE dataset.endpoint_id = :endpoint_id
+               AND (dataset.is_current OR dataset.published_at IS NOT NULL)
+             FOR UPDATE OF dataset NOWAIT;
+            """,
+            endpoint_id=request.endpoint_id,
+        )
+        if published_datasets:
+            raise TerminalRootRetirementError("evidence_changed")
+        return
+    predecessor_records = await database.all(
         f"""
         SELECT dataset.*
-          FROM {quoted_relation('provider_directory_endpoint_dataset')} AS dataset
+          FROM {quoted_relation("provider_directory_endpoint_dataset")} AS dataset
          WHERE dataset.dataset_id = :predecessor_id
            AND dataset.endpoint_id = :endpoint_id
          FOR UPDATE OF dataset;
@@ -204,7 +219,7 @@ async def _locked_predecessor(
         predecessor_id=request.expected_current_dataset_id,
         endpoint_id=request.endpoint_id,
     )
-    predecessor = _one_row(rows)
+    predecessor = _one_row(predecessor_records)
     dataset_hash = predecessor.get("dataset_hash")
     if (
         predecessor.get("status") != "published"
@@ -225,7 +240,7 @@ async def _require_no_competing_candidate(
     rows = await database.all(
         f"""
         SELECT dataset.dataset_id
-          FROM {quoted_relation('provider_directory_endpoint_dataset')} AS dataset
+          FROM {quoted_relation("provider_directory_endpoint_dataset")} AS dataset
          WHERE dataset.endpoint_id = :endpoint_id
            AND dataset.dataset_id <> :dataset_id
            AND dataset.status = ANY(CAST(:statuses AS varchar[]))
@@ -244,17 +259,18 @@ async def _locked_lineage(
     database: Any,
     request: TerminalRootRetirementRequest,
 ) -> tuple[dict[str, Any], ...]:
+    row_lock = "FOR UPDATE OF run NOWAIT" if request.expect_no_current_dataset else ""
     run_rows = await database.all(
         f"""
         WITH RECURSIVE lineage AS (
             SELECT run.run_id, run.retry_of_run_id, 0 AS depth,
                    ARRAY[run.run_id]::varchar[] AS path
-              FROM {quoted_relation('import_run')} AS run
+              FROM {quoted_relation("import_run")} AS run
              WHERE run.run_id = :root_run_id
             UNION ALL
             SELECT child.run_id, child.retry_of_run_id, parent.depth + 1,
                    parent.path || child.run_id
-              FROM {quoted_relation('import_run')} AS child
+              FROM {quoted_relation("import_run")} AS child
               JOIN lineage AS parent
                 ON child.retry_of_run_id = parent.run_id
              WHERE NOT child.run_id = ANY(parent.path)
@@ -266,9 +282,10 @@ async def _locked_lineage(
                    - pg_catalog.make_interval(secs => :minimum_age)
                    AS terminal_age_satisfied
           FROM lineage
-          JOIN {quoted_relation('import_run')} AS run
+          JOIN {quoted_relation("import_run")} AS run
             ON run.run_id = lineage.run_id
-         ORDER BY lineage.depth, run.run_id;
+         ORDER BY lineage.depth, run.run_id
+         {row_lock};
         """,
         root_run_id=request.acquisition_root_run_id,
         minimum_age=request.minimum_terminal_age_seconds,
@@ -276,6 +293,28 @@ async def _locked_lineage(
     lineage_records = tuple(row_mapping(run_record) for run_record in run_rows)
     _validate_lineage(lineage_records, request)
     return lineage_records
+
+
+async def _lock_first_acquisition_controls(database: Any, request: TerminalRootRetirementRequest, lineage) -> None:
+    """Freeze this root's small control rows; payload writers fence its locked header."""
+    for run in sorted(lineage, key=lambda row: row["run_id"]):
+        await _try_scope_lock(database, f"provider-directory-terminal-root-retirement:{run['run_id']}")
+        await _try_scope_lock(database, f"control-run-worker-action:v1:{run['run_id']}")
+    # Retry inserts lock their direct parent; reject any child committed before its lock.
+    if await _locked_lineage(database, request) != lineage:
+        raise TerminalRootRetirementError("evidence_changed")
+    for table in (
+        "provider_directory_bulk_acquisition_checkpoint",
+        "provider_directory_pagination_checkpoint",
+        "provider_directory_dataset_rehydration_checkpoint",
+    ):
+        await database.all(
+            f"SELECT 1 FROM {quoted_relation(table)} WHERE dataset_id = :dataset_id FOR UPDATE NOWAIT;",
+            dataset_id=request.dataset_id,
+        )
+    from process.provider_directory_terminal_root_retirement_runtime import require_stopped_lineage
+
+    await require_stopped_lineage(lineage)
 
 
 def _validate_lineage(
@@ -321,16 +360,10 @@ def _validate_evidence_counts(
     if (
         evidence["terminal_run_count"] != lineage_count
         or evidence["parent_resource_count"] != target["resource_count"]
-        or evidence["actual_resource_count"]
-        != sum(evidence["resource_counts"].values())
-        or relation_evidence["provider_directory_dataset_resource"]["row_count"]
-        != evidence["actual_resource_count"]
-        or relation_evidence["provider_directory_dataset_proof_shard"]["row_count"]
-        != evidence["proof_shard_count"]
-        or relation_evidence["provider_directory_endpoint_dataset_previous_reference"][
-            "row_count"
-        ]
-        != 0
+        or evidence["actual_resource_count"] != sum(evidence["resource_counts"].values())
+        or relation_evidence["provider_directory_dataset_resource"]["row_count"] != evidence["actual_resource_count"]
+        or relation_evidence["provider_directory_dataset_proof_shard"]["row_count"] != evidence["proof_shard_count"]
+        or relation_evidence["provider_directory_endpoint_dataset_previous_reference"]["row_count"] != 0
     ):
         raise TerminalRootRetirementError("evidence_invalid")
 
@@ -347,14 +380,18 @@ async def _new_selection(
     await _locked_source(database, request, canonical_api_base)
     await _locked_predecessor(database, request)
     await _require_no_competing_candidate(database, request)
+    if request.expect_no_current_dataset:
+        await _try_scope_lock(
+            database,
+            f"provider-directory-terminal-root-retirement:{request.acquisition_root_run_id}",
+        )
     lineage = await _locked_lineage(database, request)
+    if request.expect_no_current_dataset:
+        await _lock_first_acquisition_controls(database, request, lineage)
     evidence = await _locked_evidence(database, request.dataset_id, profile)
     _validate_evidence_counts(evidence, target_by_field, len(lineage))
     evidence_sha256 = canonical_json_sha256(evidence)
-    if (
-        request.expected_evidence_sha256 is not None
-        and request.expected_evidence_sha256 != evidence_sha256
-    ):
+    if request.expected_evidence_sha256 is not None and request.expected_evidence_sha256 != evidence_sha256:
         raise TerminalRootRetirementError("evidence_changed")
     retired_at = await database.scalar(
         """
@@ -393,9 +430,7 @@ async def _replay_selection(
         profile=profile,
     )
     evidence_sha256 = canonical_json_sha256(marker["evidence"])
-    if target.get(
-        "is_current"
-    ) is not False or request.expected_evidence_sha256 not in (None, evidence_sha256):
+    if target.get("is_current") is not False or request.expected_evidence_sha256 not in (None, evidence_sha256):
         raise TerminalRootRetirementError("evidence_changed")
     return TerminalRootRetirementSelection(
         request=request,
@@ -417,7 +452,8 @@ async def selected_terminal_root_retirement(
         raise TerminalRootRetirementError("request_invalid")
     initial_endpoint = await _initial_endpoint(database, request.endpoint_id)
     canonical_api_base = await _lock_endpoint_scope(database, request, initial_endpoint)
-    await _share_evidence_relations(database)
+    if not request.expect_no_current_dataset:
+        await _share_evidence_relations(database)
     target_by_field = await _locked_target(database, request)
     metadata, profile = _target_metadata(target_by_field, request)
     if target_by_field.get("status") == RETIREMENT_STATUS:

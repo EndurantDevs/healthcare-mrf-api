@@ -101,7 +101,10 @@ async def fence_bulk_parents(publisher, dataset_ids, root_run_ids, checkpoint_id
         all_roots,
     )
     _require(
-        all(checkpoint_row["status"] != "acquisition_abandoned" for checkpoint_row in parents),
+        all(
+            checkpoint_row["status"] not in {"acquisition_abandoned", "acquisition_retired"}
+            for checkpoint_row in parents
+        ),
         "checkpoint_parent_abandoned",
     )
     # Headers lock before checkpoint rows, matching terminal operators. A

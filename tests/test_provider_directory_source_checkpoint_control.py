@@ -50,8 +50,9 @@ async def test_fence_includes_old_and_new_dataset_and_root_coordinates():
 
 
 @pytest.mark.asyncio
-async def test_abandoned_parent_found_only_by_root_refuses_before_checkpoint_mutation():
-    publisher = _publisher(parents=[{"dataset_id": "another-dataset", "status": "acquisition_abandoned"}])
+@pytest.mark.parametrize("status", ["acquisition_abandoned", "acquisition_retired"])
+async def test_abandoned_parent_found_only_by_root_refuses_before_checkpoint_mutation(status):
+    publisher = _publisher(parents=[{"dataset_id": "another-dataset", "status": status}])
     with pytest.raises(GenericCandidateError, match="checkpoint_parent_abandoned"):
         await control.fence_bulk_parents(publisher, ["new"], ["shared-root"], ["checkpoint"])
     assert publisher.connection.fetch.await_count == 2

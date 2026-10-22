@@ -320,7 +320,7 @@ _REACHABLE_FUNCTIONS = {
         ("search_path=pg_catalog",),
     ),
     "guard_provider_directory_terminal_root_retirement_parent": (
-        "3e5b6e56434b575dbed134d24b05e8ab0abdfa44b7940db3fa306a81d0fddace",
+        "b21b66d6c03896ff7277e164a9acb8e173ad90566053958db0ba055ecf2bef56",
         "plpgsql",
         "v",
         True,
@@ -453,14 +453,14 @@ _REACHABLE_FUNCTIONS = {
         ("search_path=pg_catalog",),
     ),
     "provider_directory_terminal_root_retirement_eligible": (
-        "1eb12057312878315448b44f6376f328318d18720277399ae8f7efdb266bbb96",
+        "d85161ad9c25758b6def57b222be66c39b715f88091f9776f79f2a4120f79344",
         "sql",
         "s",
         True,
         ("search_path=pg_catalog",),
     ),
     "provider_directory_terminal_root_retirement_evidence": (
-        "44df84acba4f184300af188a01711ef958664b54bee01454fddc5d1f896f641f",
+        "3f7258913fbbbe0929a1ff2f47b911696cf41beb9f4a0c70cc374d3c5085faf7",
         "sql",
         "s",
         True,
