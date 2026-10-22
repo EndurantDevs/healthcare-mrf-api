@@ -315,7 +315,7 @@ async def test_cms_npd_admission_benchmark(monkeypatch, cms_artifact_root):
         after = await _capacity(database)
         wal_bytes = int(
             await database.scalar(
-                "SELECT pg_wal_lsn_diff(:after::pg_lsn, :before::pg_lsn)", after=after["wal_lsn"], before=before["wal_lsn"]
+                "SELECT pg_wal_lsn_diff(CAST(:after AS pg_lsn), CAST(:before AS pg_lsn))", after=after["wal_lsn"], before=before["wal_lsn"]
             )
         )
         parity = await capture_parity(database, result["dataset_id"], receipt["vector_sha256"])
