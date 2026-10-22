@@ -637,6 +637,109 @@ def _function_permissions(schema, signature, writers):
         op.execute(f"GRANT EXECUTE ON FUNCTION {qualified} TO {'PUBLIC' if writer == 'PUBLIC' else _q(writer)}")
 
 
+def _checker_definition(schema):
+    """Authenticate the existing checker before changing only its native EXECUTE ACL."""
+    bind, quoted = op.get_bind(), _q(schema)
+    checker = f"{quoted}.check_ptg_snapshot_write(oid,text,name)"
+    definition_query = sa.text("""SELECT p.oid,p.proowner,p.prosrc,p.prosecdef,p.proconfig,
+        p.provolatile::text,p.prorettype::bigint,p.proargtypes::text,l.lanname,
+        p.prosupport::bigint,p.provariadic::bigint,p.pronargdefaults,p.proallargtypes IS NULL AS input_only
+        FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang
+        WHERE p.oid=CAST(:signature AS regprocedure)""")
+    definition_by_field = dict(bind.execute(definition_query, {"signature": checker}).mappings().one())
+    canonical_body = (
+        (Path(__file__).parents[2] / "db/sql/ptg_snapshot_candidates.sql")
+        .read_text()
+        .split("CREATE FUNCTION __S__.check_ptg_snapshot_write", 1)[1]
+        .split("$body$", 2)[1]
+        .replace("__S__", quoted)
+        .replace("__Q__", quoted.replace("'", "''"))
+    )
+    expected_by_field = dict(
+        prosecdef=True,
+        proconfig=["search_path=pg_catalog"],
+        provolatile="v",
+        prorettype=2278,
+        proargtypes="26 25 19",
+        lanname="plpgsql",
+        prosupport=0,
+        provariadic=0,
+        pronargdefaults=0,
+        input_only=True,
+    )
+    if any(definition_by_field[key] != expected_value for key, expected_value in expected_by_field.items()) or (
+        " ".join(definition_by_field["prosrc"].split()) != " ".join(canonical_body.split())
+    ):
+        raise RuntimeError("ptg_snapshot_checker_definition_changed")
+    return definition_by_field
+
+
+def _checker_writers(schema, owner_oid):
+    """Resolve complete protected writer roles and native trigger-owner authority."""
+    bind, quoted = op.get_bind(), _q(schema)
+    boundary = f"{quoted}.ptg2_snapshot_partition_boundary"
+    candidates = f"{quoted}.ptg2_snapshot_candidate"
+    for name in ("ptg2_snapshot_partition_boundary", "ptg2_snapshot_candidate"):
+        closed = bind.scalar(
+            sa.text("""SELECT c.relkind='r' AND NOT c.relrowsecurity
+            AND NOT c.relforcerowsecurity AND c.relowner=:owner
+            AND NOT EXISTS(SELECT FROM aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) a
+              WHERE a.grantee<>c.relowner AND (a.is_grantable OR a.privilege_type<>'SELECT'))
+            AND NOT EXISTS(SELECT FROM pg_attribute f CROSS JOIN LATERAL aclexplode(f.attacl) a
+              WHERE f.attrelid=c.oid AND a.grantee<>c.relowner AND
+                (a.is_grantable OR a.privilege_type<>'SELECT'))
+            FROM pg_class c WHERE c.oid=CAST(:relation AS regclass)"""),
+            {"owner": owner_oid, "relation": f"{quoted}.{name}"},
+        )
+        if closed is not True:
+            raise RuntimeError("ptg_snapshot_checker_writer_authority_unclosed")
+    boundary_rows = (
+        bind.execute(sa.text(f"SELECT table_name,writer_roles FROM {boundary} ORDER BY table_name")).mappings().all()
+    )
+    if len(boundary_rows) != len(TABLES) or {boundary_row["table_name"] for boundary_row in boundary_rows} != set(
+        TABLES
+    ):
+        raise RuntimeError("ptg_snapshot_checker_writer_manifest_incomplete")
+    writer_roles = {role for boundary_row in boundary_rows for role in boundary_row["writer_roles"]}
+    root_names = [f"{quoted}.{_q(name)}" for table in TABLES for name in (table, table + "_history")]
+    owner_roles = bind.scalars(
+        sa.text(f"""WITH RECURSIVE family(oid) AS (
+        SELECT CAST(name AS regclass)::oid FROM unnest(CAST(:root_names AS text[])) x(name)
+        UNION SELECT table_oid FROM {candidates}
+        UNION SELECT i.inhrelid FROM pg_inherits i JOIN family f ON i.inhparent=f.oid)
+        SELECT DISTINCT pg_get_userbyid(c.relowner) FROM family f JOIN pg_class c ON c.oid=f.oid
+        UNION SELECT pg_get_userbyid(proowner) FROM pg_proc
+         WHERE oid=CAST(:begin_function AS regprocedure)"""),
+        {"root_names": root_names, "begin_function": f"{quoted}.begin_ptg_snapshot_candidate(text,bigint,text)"},
+    ).all()
+    writer_roles.update(owner_roles)
+    if (
+        not writer_roles
+        or len(writer_roles) > 128
+        or any(type(role) is not str or not role or role == "PUBLIC" for role in writer_roles)
+    ):
+        raise RuntimeError("ptg_snapshot_checker_writer_manifest_invalid")
+    if bind.scalar(
+        sa.text("SELECT count(*) FROM pg_roles WHERE rolname=ANY(CAST(:roles AS text[]))"),
+        {"roles": sorted(writer_roles)},
+    ) != len(writer_roles):
+        raise RuntimeError("ptg_snapshot_checker_writer_role_missing")
+    return writer_roles
+
+
+def _close_checker_execution(schema):
+    """Close only checker execution after stable complete writer authority is known."""
+    quoted = _q(schema)
+    op.execute(
+        f"LOCK TABLE {quoted}.ptg2_snapshot_partition_boundary,{quoted}.ptg2_snapshot_candidate IN SHARE MODE NOWAIT"
+    )
+    definition_by_field = _checker_definition(schema)
+    writer_roles = _checker_writers(schema, definition_by_field["proowner"])
+    _function_permissions(schema, "check_ptg_snapshot_write(oid,text,name)", writer_roles)
+    if _checker_definition(schema) != definition_by_field:
+        raise RuntimeError("ptg_snapshot_checker_definition_changed")
+
+
 def _install_candidate_functions(schema, writers):
     """Install only the protected interfaces for captured writers and GC roles."""
     quoted = _q(schema)
@@ -668,8 +771,7 @@ def _install_candidate_functions(schema, writers):
         "guard_ptg2_provider_tax_identity_completion()",
     ):
         _function_permissions(schema, signature, ())
-    # The checker only authorizes its explicit actor; it has no write side effects.
-    _function_permissions(schema, "check_ptg_snapshot_write(oid,text,name)", ("PUBLIC",))
+    _close_checker_execution(schema)
     _function_permissions(schema, "guard_ptg_snapshot_write()", ())
     for table in TABLES:
         for relation in (table, table + "_history"):
