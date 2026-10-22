@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Project exact CMS FHIR references from one retained eight-resource dataset."""
 
+import json
+
 from sqlalchemy import text
 
 # These are explicit FHIR Reference fields, including ones omitted from the
@@ -58,8 +60,6 @@ _RESOURCE = "provider_directory_dataset_resource"
 _WITNESS = "provider_directory_cms_npd_resource_witness"
 _RECEIPT = "provider_directory_cms_npd_relationship_receipt"
 _BINDING = "provider_directory_entity_source_binding"
-_BATCH_SIZE = 5_000
-_BATCH_BYTES = 8 * 1024 * 1024
 CONTRACT = "cms-npd-reference-ledger-v1"
 _VALUES = ", ".join(
     f"('{kind}', '{field}', '{target}', {'true' if is_array else 'false'})"
@@ -75,7 +75,7 @@ _NESTED_VALUES = ", ".join(
 def _references(page_sql):
     return f"""WITH specs(resource_type, reference_field, target_type, is_array) AS (VALUES {_VALUES}),
       nested_specs(resource_type, parent_field, child_field, target_type, is_array) AS (VALUES {_NESTED_VALUES}),
-      page AS MATERIALIZED ({page_sql}),
+      page AS ({page_sql}),
       reference_objects AS (
         SELECT p.resource_type, p.resource_id, p.payload_hash, p.raw_payload_sha256,
                p.raw_payload_json AS payload, s.reference_field, s.target_type,
@@ -114,17 +114,15 @@ def _references(page_sql):
       )"""
 
 
-def _page_sql(resource, witness):
-    """Look up at most one qualifying witness for each full source key."""
+def _family_page_sql(resource, witness):
+    """Join every retained row of one family with its exact qualifying witness."""
     return f"""SELECT source.resource_type, source.resource_id, source.payload_hash,
         witness.raw_payload_sha256, witness.raw_payload_json FROM {resource} source
       JOIN {witness} witness ON witness.dataset_id=source.dataset_id
         AND witness.resource_type=source.resource_type AND witness.resource_id=source.resource_id
         AND witness.source_id='cms-npd' AND witness.release_id=:release_id
         AND witness.normalized_payload_hash=source.payload_hash
-      WHERE source.dataset_id=:dataset_id
-        AND (source.resource_type, source.resource_id) > (:after_type, :after_id)
-        AND (source.resource_type, source.resource_id) <= (:last_type, :last_id)"""
+      WHERE source.dataset_id=:dataset_id AND source.resource_type=:resource_type"""
 
 
 def _projection_sql(fhir):
@@ -132,7 +130,7 @@ def _projection_sql(fhir):
     resource = fhir._qt(schema, _RESOURCE)
     witness = fhir._qt(schema, _WITNESS)
     binding = fhir._qt(schema, _BINDING)
-    page = _page_sql(resource, witness)
+    page = _family_page_sql(resource, witness)
     return (
         _references(page)
         + f""",
@@ -178,23 +176,16 @@ def _projection_sql(fhir):
     )
 
 
-async def _page_complete(fhir, session, dataset_id, release_id, after_type, after_id, last_type, last_id):
-    """Compare the complete indexed projection, including resolved target identity."""
+async def _family_complete(fhir, session, dataset_id, release_id, resource_type):
+    """Compare one family's complete indexed projection, including resolved target identity."""
     relationship = fhir._qt(fhir._schema(), _TABLE)
-    params_by_field = {
-        "dataset_id": dataset_id,
-        "release_id": release_id,
-        "after_type": after_type,
-        "after_id": after_id,
-        "last_type": last_type,
-        "last_id": last_id,
-    }
+    params_by_field = {"dataset_id": dataset_id, "release_id": release_id, "resource_type": resource_type}
     fields = ",".join(_COLUMNS)
     different = " OR ".join(f"link.{column} IS DISTINCT FROM expected.{column}" for column in _COLUMNS)
     expected, missing = (
         await session.execute(
             text(
-                f"WITH expected({fields}) AS MATERIALIZED ({_projection_sql(fhir)}) "
+                f"WITH expected({fields}) AS ({_projection_sql(fhir)}) "
                 f"SELECT count(*),coalesce(bool_or(link.resource_type IS NULL OR {different}),false) "
                 f"FROM expected LEFT JOIN {relationship} link ON link.dataset_id=expected.dataset_id "
                 "AND link.resource_type=expected.resource_type AND link.resource_id=expected.resource_id "
@@ -206,49 +197,13 @@ async def _page_complete(fhir, session, dataset_id, release_id, after_type, afte
     ).one()
     actual = (
         await session.execute(
-            text(
-                f"SELECT count(*) FROM {relationship} WHERE dataset_id=:dataset_id "
-                "AND (resource_type, resource_id) > (:after_type, :after_id) "
-                "AND (resource_type, resource_id) <= (:last_type, :last_id)"
-            ),
+            text(f"SELECT count(*) FROM {relationship} WHERE dataset_id=:dataset_id AND resource_type=:resource_type"),
             params_by_field,
         )
     ).scalar_one()
     if int(expected or 0) != int(actual or 0) or missing:
         raise RuntimeError("cms_npd_relationship_projection_incomplete")
     return int(actual or 0)
-
-
-async def _page_keys(session, resource, witness, dataset_id, after_type, after_id):
-    """Choose a bounded key range using the stored witness size as a cap."""
-    keys = (
-        await session.execute(
-            text(
-                f"SELECT source.resource_type, source.resource_id, "
-                f"coalesce(pg_column_size(witness.raw_payload_json), 0) "
-                f"FROM {resource} source LEFT JOIN {witness} witness "
-                "ON witness.dataset_id=source.dataset_id "
-                "AND witness.resource_type=source.resource_type AND witness.resource_id=source.resource_id "
-                "WHERE source.dataset_id=:dataset_id "
-                "AND (source.resource_type, source.resource_id) > (:after_type, :after_id) "
-                "ORDER BY source.resource_type, source.resource_id LIMIT :batch_size"
-            ),
-            {
-                "dataset_id": dataset_id,
-                "after_type": after_type,
-                "after_id": after_id,
-                "batch_size": _BATCH_SIZE,
-            },
-        )
-    ).all()
-    page_bytes = 0
-    last_type = last_id = ""
-    for resource_type, resource_id, stored_bytes in keys:
-        if last_id and page_bytes + int(stored_bytes) > _BATCH_BYTES:
-            break
-        last_type, last_id = resource_type, resource_id
-        page_bytes += int(stored_bytes)
-    return last_type, last_id
 
 
 _COLUMNS = (
@@ -271,13 +226,10 @@ _COLUMNS = (
 )
 
 
-async def _copy_page(fhir, session, parameters):
-    """COPY one bounded reference page only into its protected private heap."""
-    from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
-
+async def _insert_family(fhir, session, dataset_id, release_id, resource_type):
+    """Project one family's references server-side into the protected private heap."""
     from db.plan_release_storage import storage_relation
     from process.provider_directory_cms_identity_candidate import identity_candidate
-    from process.reference_family_archive import native_copy_projection
 
     publisher, identity, _ = await identity_candidate(session, phases=("sealed",))
     raw = await publisher.connection.fetchval(
@@ -285,73 +237,47 @@ async def _copy_page(fhir, session, parameters):
         "WHERE dataset_id=$1",
         identity["dataset_id"],
     )
-    import json
-
     binding = json.loads(raw) if isinstance(raw, str) else raw
     table = binding["tables"][_TABLE]["name"]
     if (
-        parameters["dataset_id"] != identity["dataset_id"]
+        dataset_id != identity["dataset_id"]
         or table == _TABLE
         or fhir._qt(fhir._schema(), _TABLE) != storage_relation(publisher.policy.schema, table)
     ):
         raise RuntimeError("cms_npd_relationship_private_candidate_required")
-    compiled = text("SELECT * FROM (" + _projection_sql(fhir) + ") AS cms_relationship_rows").compile(
-        dialect=PGDialect_asyncpg()
+    inserted = await session.execute(
+        text(
+            f"INSERT INTO {fhir._qt(fhir._schema(), _TABLE)} ({','.join(_COLUMNS)}) "
+            f"SELECT * FROM ({_projection_sql(fhir)}) AS cms_relationship_rows"
+        ),
+        {"dataset_id": dataset_id, "release_id": release_id, "resource_type": resource_type},
     )
-    arguments = tuple(parameters[name] for name in compiled.positiontup)
-    await native_copy_projection(
-        session,
-        str(compiled),
-        *arguments,
-        schema_name=publisher.policy.schema,
-        table_name=table,
-        columns=_COLUMNS,
-        max_bytes=32 * 1024 * 1024,
-        timeout=300,
-    )
+    return int(inserted.rowcount)
 
 
-async def _scan_pages(fhir, dataset_id, release_id, *, write, ctx=None, task=None):
-    """Project and verify key pages without materializing the full raw release."""
-    schema = fhir._schema()
-    resource = fhir._qt(schema, _RESOURCE)
-    witness = fhir._qt(schema, _WITNESS)
-    relationship = fhir._qt(schema, _TABLE)
-    after_type = after_id = ""
-    verified_count = 0
-    while True:
+async def _project_families(fhir, dataset_id, release_id, *, ctx=None, task=None):
+    """Project every family once with one set-based statement each."""
+    count = 0
+    for resource_type in FIELDS:
         async with fhir.db.session() as session:
-            last_type, last_id = await _page_keys(session, resource, witness, dataset_id, after_type, after_id)
-            if not last_id:
-                break
-            params_by_field = {
-                "dataset_id": dataset_id,
-                "release_id": release_id,
-                "after_type": after_type,
-                "after_id": after_id,
-                "last_type": last_type,
-                "last_id": last_id,
-            }
-            if write:
-                await _copy_page(fhir, session, params_by_field)
-            if not write:
-                verified_count += await _page_complete(
-                    fhir, session, dataset_id, release_id, after_type, after_id, last_type, last_id
-                )
-        after_type, after_id = last_type, last_id
+            count += await _insert_family(fhir, session, dataset_id, release_id, resource_type)
         if ctx is not None and task is not None:
             await fhir._raise_if_resource_import_cancelled(ctx, task)
-    actual = await fhir.db.scalar(
-        f"SELECT count(*) FROM {relationship} WHERE dataset_id=:dataset_id", dataset_id=dataset_id
-    )
-    if not write and int(actual or 0) != verified_count:
-        raise RuntimeError("cms_npd_relationship_projection_incomplete")
-    return int(actual or 0) if write else verified_count
+    return count
 
 
 async def assert_complete(fhir, dataset_id, release_id):
-    """Require every explicit reference through bounded key pages."""
-    return await _scan_pages(fhir, dataset_id, release_id, write=False)
+    """Require every explicit reference, one indexed family comparison at a time."""
+    verified_count = 0
+    async with fhir.db.session() as session:
+        for resource_type in FIELDS:
+            verified_count += await _family_complete(fhir, session, dataset_id, release_id, resource_type)
+    actual = await fhir.db.scalar(
+        f"SELECT count(*) FROM {fhir._qt(fhir._schema(), _TABLE)} WHERE dataset_id=:dataset_id", dataset_id=dataset_id
+    )
+    if int(actual or 0) != verified_count:
+        raise RuntimeError("cms_npd_relationship_projection_incomplete")
+    return verified_count
 
 
 async def completed_receipt_count(fhir, dataset_id, release_id):
@@ -422,7 +348,7 @@ async def _insert_relationship_receipt(fhir, candidate, release_id, count):
 
 
 async def materialize(fhir, candidate, release_id, ctx=None, task=None):
-    """Write bounded, restartable batches before source-local publication."""
+    """Project the complete reference ledger before source-local publication."""
     sealed_count = await completed_receipt_count(fhir, candidate.dataset_id, release_id)
     if sealed_count is not None:
         if candidate.already_validated or candidate.already_published:
@@ -438,7 +364,7 @@ async def materialize(fhir, candidate, release_id, ctx=None, task=None):
         f"SELECT EXISTS(SELECT FROM {relationship} WHERE dataset_id=:dataset_id)", dataset_id=candidate.dataset_id
     ):
         raise RuntimeError("cms_npd_relationship_unsealed_candidate_reprepare_required")
-    count = await _scan_pages(fhir, candidate.dataset_id, release_id, write=True, ctx=ctx, task=task)
+    count = await _project_families(fhir, candidate.dataset_id, release_id, ctx=ctx, task=task)
     from process.provider_directory_generic_source_auxiliary import seal_relationship_candidate
 
     await seal_relationship_candidate(fhir.db, fhir, candidate)

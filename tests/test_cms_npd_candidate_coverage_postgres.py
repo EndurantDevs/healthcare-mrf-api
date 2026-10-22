@@ -247,14 +247,7 @@ async def _assert_other_candidate_writes(monkeypatch, directory, database, candi
 
 
 def _relationship_page_params(candidate, identity):
-    return {
-        "dataset_id": candidate.dataset_id,
-        "release_id": identity["vector_sha256"],
-        "after_type": "",
-        "after_id": "",
-        "last_type": "zzzz",
-        "last_id": "zzzz",
-    }
+    return {"dataset_id": candidate.dataset_id, "release_id": identity["vector_sha256"], "resource_type": "Location"}
 
 
 def _page_resources():
@@ -303,7 +296,7 @@ async def _refuse_corrupt_witness(monkeypatch, directory, database):
 
 
 async def _relationship_page_rows(session, params_by_field):
-    page = relationships._page_sql(
+    page = relationships._family_page_sql(
         fhir._qt(fhir._schema(), relationships._RESOURCE),
         fhir._qt(fhir._schema(), relationships._WITNESS),
     )
@@ -338,11 +331,10 @@ async def test_relationship_key_join_preserves_scope_hash_and_raw_rows(monkeypat
             other, other_release, _ = await _stage(independent, cms_artifact_root)
         assert other.dataset_id != candidate.dataset_id and other.endpoint_id != candidate.endpoint_id
         params_by_field = _relationship_page_params(candidate, {"vector_sha256": release_id})
-        params_by_field.update(after_type="Location", after_id="page-a", last_type="Location", last_id="page-c")
         async with database.session() as session:
             witness_rows = await _relationship_page_rows(session, params_by_field)
-            assert [witness_row[1] for witness_row in witness_rows] == ["page-b", "page-c"]
-            assert [witness_row[4] for witness_row in witness_rows] == resources[1:]
+            assert [witness_row[1] for witness_row in witness_rows] == ["page-a", "page-b", "page-c", "site-1"]
+            assert [witness_row[4] for witness_row in witness_rows[:3]] == resources
             assert all(
                 witness_row[3]
                 == hashlib.sha256(
@@ -351,15 +343,14 @@ async def test_relationship_key_join_preserves_scope_hash_and_raw_rows(monkeypat
                 for witness_row in witness_rows
             )
             for fields, expected_ids in (
-                ({"last_id": "page-b"}, ["page-b"]),
-                ({"after_id": "page-b"}, ["page-c"]),
                 ({"release_id": "0" * 64}, []),
-                ({"dataset_id": other.dataset_id, "release_id": other_release}, ["page-b", "page-c"]),
+                ({"resource_type": "Organization"}, ["insurer-1", "network-1"]),
+                ({"dataset_id": other.dataset_id, "release_id": other_release}, ["page-a", "page-b", "page-c", "site-1"]),
             ):
                 selected = await _relationship_page_rows(session, {**params_by_field, **fields})
                 assert [witness_row[1] for witness_row in selected] == expected_ids
                 if fields.get("dataset_id") == other.dataset_id:
-                    assert selected[0][4]["name"] == "Other dataset"
+                    assert selected[1][4]["name"] == "Other dataset"
 
 
 @pytest.mark.asyncio
@@ -376,30 +367,21 @@ async def test_relationship_key_join_replay_completeness_and_rollback(monkeypatc
         ],
     )
     async with support.intake_admission_database(monkeypatch) as database:
-        original = relationships._copy_page
+        original = relationships._insert_family
         copied_datasets = []
 
-        async def fail_after_copy(directory, session, parameters):
+        async def fail_after_copy(directory, session, dataset_id, release_id, resource_type):
             assert source_policy.source_copy_session() is session
-            await original(directory, session, parameters)
-            copied_datasets.append(parameters["dataset_id"])
-            assert (
-                await relationships._page_complete(
-                    fhir,
-                    session,
-                    parameters["dataset_id"],
-                    parameters["release_id"],
-                    "Location",
-                    "",
-                    "Location",
-                    "page-site",
-                )
-                == 2
-            )
+            inserted = await original(directory, session, dataset_id, release_id, resource_type)
+            if resource_type != "Location":
+                return inserted
+            copied_datasets.append(dataset_id)
+            # page-site carries two endpoint references, the fixture's site-1 three more.
+            assert await relationships._family_complete(fhir, session, dataset_id, release_id, "Location") == 5
             raise RuntimeError("synthetic_relationship_page_failure")
 
         with monkeypatch.context() as interrupted:
-            interrupted.setattr(relationships, "_copy_page", fail_after_copy)
+            interrupted.setattr(relationships, "_insert_family", fail_after_copy)
             with pytest.raises(RuntimeError, match="^synthetic_relationship_page_failure$"):
                 await _stage(interrupted, cms_artifact_root)
         assert len(copied_datasets) == 1
@@ -408,7 +390,7 @@ async def test_relationship_key_join_replay_completeness_and_rollback(monkeypatc
         candidate, release_id, _ = await _stage(monkeypatch, cms_artifact_root)
         assert candidate.dataset_id == copied_datasets[0]
         with monkeypatch.context() as replay:
-            replay.setattr(relationships, "_copy_page", AsyncMock(side_effect=AssertionError("unexpected_recopy")))
+            replay.setattr(relationships, "_insert_family", AsyncMock(side_effect=AssertionError("unexpected_recopy")))
             repeated, repeated_release, _ = await _stage(replay, cms_artifact_root)
             assert repeated.dataset_id == candidate.dataset_id and repeated_release == release_id
         links = await database.all(
@@ -429,6 +411,4 @@ async def _assert_missing_relationship(database, candidate, release_id):
     )
     async with database.session() as session:
         with pytest.raises(RuntimeError, match="^cms_npd_relationship_projection_incomplete$"):
-            await relationships._page_complete(
-                fhir, session, candidate.dataset_id, release_id, "Location", "", "Location", "page-site"
-            )
+            await relationships._family_complete(fhir, session, candidate.dataset_id, release_id, "Location")
