@@ -1156,7 +1156,7 @@ async def test_pre_witness_published_release_is_reacquired_without_mutating_curr
                 await _assert_current(database, legacy["dataset_id"])
                 raise RuntimeError("synthetic_witness_upgrade_pause")
 
-            interrupted.setattr(cms, "_persist_source_batch", pause_before_first_witness)
+            interrupted.setattr(cms, "_persist_prepared_batch", pause_before_first_witness)
             with pytest.raises(RuntimeError, match="synthetic_witness_upgrade_pause"):
                 await _admit_legacy_source(directory, receipt, "cms-upgrade-interrupted")
         interrupted_candidate = await database.first(
@@ -1424,7 +1424,7 @@ async def test_committed_batch_cancellation_keeps_incumbent_and_replays_safely(m
     async with admission_database(monkeypatch) as database:
         incumbent = await _admit_legacy_source(directory, receipt, "cms-test-incumbent")
         next_directory, next_receipt = retained_release(cms_artifact_root, revision="cancelled")
-        original_persist = cms._persist_source_batch
+        original_persist = cms._persist_prepared_batch
         batch_gate = asyncio.Lock()
         committed_batch_numbers = []
         cancellation = asyncio.CancelledError()
@@ -1440,7 +1440,7 @@ async def test_committed_batch_cancellation_keeps_incumbent_and_replays_safely(m
 
         monkeypatch.setattr(cms, "BATCH_SIZE", 1)
         with monkeypatch.context() as cancelled:
-            cancelled.setattr(cms, "_persist_source_batch", cancel_after_three_commits)
+            cancelled.setattr(cms, "_persist_prepared_batch", cancel_after_three_commits)
             with pytest.raises(asyncio.CancelledError) as caught:
                 await _admit_legacy_source(next_directory, next_receipt, "cms-test-cancelled")
         assert caught.value is cancellation

@@ -23,54 +23,80 @@ from process.provider_directory_generic_candidate import GenericCandidateError
 async def test_cms_missing_publisher_refuses_before_projection_session_or_target_io():
     fhir = SimpleNamespace(_bound_upsert_session=Mock(side_effect=AssertionError("target reached")))
     with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
-        await cms_batch.persist_cms_dataset_rows(fhir, object(), object(), [{}], object())
+        await cms_batch.persist_prepared_cms_dataset_rows(fhir, object(), [{}], ({}, b""), object())
     fhir._bound_upsert_session.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_cms_prepares_and_copies_without_locked_union_upsert_or_values(monkeypatch):
     session = object()
-    rows = [{"dataset_id": "dataset", "resource_type": "Organization", "resource_id": "example"}]
+    retained_rows = [
+        {
+            "dataset_id": "dataset",
+            "resource_type": "Organization",
+            "resource_id": "example",
+            "payload_json": {"b": 1, "a": [2]},
+        }
+    ]
     fhir = SimpleNamespace(
         db=object(),
         _schema=lambda: "source_schema",
         _bound_upsert_session=lambda: session,
-        _endpoint_dataset_resource_rows=Mock(return_value=rows),
+        _endpoint_dataset_resource_rows=Mock(return_value=retained_rows),
         _assert_practitioner_semantic_projection_as_of=Mock(),
-        persist_dataset_proof_shard=AsyncMock(),
         _accumulated_endpoint_dataset_rows=AsyncMock(),
         _copy_upsert_rows=AsyncMock(),
         _upsert_rows_values=AsyncMock(),
     )
-    candidate = SimpleNamespace(dataset_id="dataset", resource_hash_contract="contract", semantic_projection_as_of=None)
+    candidate = SimpleNamespace(
+        dataset_id="dataset",
+        endpoint_id="endpoint",
+        acquisition_root_run_id="run",
+        source_ids=("cms-npd",),
+        resource_hash_contract="contract",
+        semantic_projection_as_of=None,
+    )
     monkeypatch.setattr(policy, "bound_publisher", Mock())
+    build = Mock(return_value=({"shard_id": "shard"}, b"compressed"))
+    monkeypatch.setattr(cms_batch, "build_dataset_proof_shard", build)
+    persist_proof = AsyncMock()
+    monkeypatch.setattr(cms_batch, "persist_built_dataset_proof_shard", persist_proof)
     copy = AsyncMock(return_value=1)
     monkeypatch.setattr(storage, "append_generic_source_batch", copy)
-    assert await cms_batch.persist_cms_dataset_rows(fhir, session, object(), [{}], candidate) == rows
-    copy.assert_awaited_once_with(fhir.db, fhir, candidate, rows)
+    prepared_rows, proof = cms_batch.prepare_cms_dataset_rows(fhir, object(), [{}], candidate)
+    assert prepared_rows == [{**retained_rows[0], "payload_json": '{"a":[2],"b":1}'}] and proof == build.return_value
+    build.assert_called_once_with(
+        retained_rows,
+        dataset_id="dataset",
+        endpoint_id="endpoint",
+        acquisition_root_run_id="run",
+        source_ids=("cms-npd",),
+        resource_hash_contract="contract",
+    )
+    await cms_batch.persist_prepared_cms_dataset_rows(fhir, session, prepared_rows, proof, candidate)
+    copy.assert_awaited_once_with(fhir.db, fhir, candidate, prepared_rows)
+    persist_proof.assert_awaited_once_with(
+        fhir.db, "source_schema", proof[0], proof[1], dataset_id="dataset", expected_resource_hash_contract="contract"
+    )
     fhir._accumulated_endpoint_dataset_rows.assert_not_awaited()
     fhir._copy_upsert_rows.assert_not_awaited()
     fhir._upsert_rows_values.assert_not_awaited()
-    fhir.persist_dataset_proof_shard.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_copy_failure_propagates_before_proof_and_never_uses_values(monkeypatch):
     session = object()
-    fhir = SimpleNamespace(
-        db=object(),
-        _schema=lambda: "source_schema",
-        _bound_upsert_session=lambda: session,
-        _endpoint_dataset_resource_rows=lambda *args, **kwargs: [{"dataset_id": "dataset"}],
-        _assert_practitioner_semantic_projection_as_of=Mock(),
-        persist_dataset_proof_shard=AsyncMock(),
-    )
+    fhir = SimpleNamespace(db=object(), _schema=lambda: "source_schema", _bound_upsert_session=lambda: session)
     monkeypatch.setattr(policy, "bound_publisher", Mock())
     monkeypatch.setattr(storage, "append_generic_source_batch", AsyncMock(side_effect=RuntimeError("COPY refused")))
-    candidate = SimpleNamespace(dataset_id="dataset", resource_hash_contract="contract", semantic_projection_as_of=None)
+    persist_proof = AsyncMock()
+    monkeypatch.setattr(cms_batch, "persist_built_dataset_proof_shard", persist_proof)
+    candidate = SimpleNamespace(dataset_id="dataset", resource_hash_contract="contract")
     with pytest.raises(RuntimeError, match="COPY refused"):
-        await cms_batch.persist_cms_dataset_rows(fhir, session, object(), [{}], candidate)
-    fhir.persist_dataset_proof_shard.assert_not_awaited()
+        await cms_batch.persist_prepared_cms_dataset_rows(
+            fhir, session, [{"dataset_id": "dataset"}], ({}, b""), candidate
+        )
+    persist_proof.assert_not_awaited()
 
 
 def test_repeatable_read_is_required_for_validation_and_cutover(monkeypatch):

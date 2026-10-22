@@ -13,11 +13,13 @@ import json
 import os
 import tempfile
 import time
+from collections import deque
 from compression import zstd
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 from sqlalchemy import select, text
@@ -28,7 +30,7 @@ from process import cms_npd_source as source
 from process import provider_directory_cms_npd_recovery as recovery
 from process import provider_directory_cms_npd_relationship as relationships
 from process.provider_directory_cms_observation import observe_intake as _observe_intake
-from process.provider_directory_cms_resource_batch import persist_cms_dataset_rows
+from process.provider_directory_cms_resource_batch import persist_prepared_cms_dataset_rows, prepare_cms_dataset_rows
 from process.provider_directory_profile_selection_dataset import _cms_dataset_pair
 from process.provider_directory_registry_network_metadata import fhir_network_binding_metadata
 
@@ -596,14 +598,16 @@ def _parse_batch_row(fhir: Any, resource: dict[str, Any], candidate: Any) -> tup
 def _source_witnesses_by_id(
     raw_resources: list[dict[str, Any]], candidate: Any, resource_type: str
 ) -> dict[str, dict[str, Any]]:
-    """Deduplicate identical raw occurrences under one release identity."""
+    """Deduplicate identical raw occurrences under one release identity; payloads stay canonical text."""
+    from process import provider_directory_generic_source_storage as storage
 
+    fhir = importlib.import_module("process.provider_directory_fhir")
     witness_by_id: dict[str, dict[str, Any]] = {}
     for raw_resource_by_field in raw_resources:
+        if fhir._strip_postgres_nuls(raw_resource_by_field) != raw_resource_by_field:
+            raise source.CmsNpdSourceError("cms_npd_resource_invalid")  # never store sanitized JSON under the raw hash
         resource_id = raw_resource_by_field["id"]
-        raw_payload = json.dumps(
-            raw_resource_by_field, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-        )
+        raw_payload = storage._encoded(raw_resource_by_field)
         raw_hash = hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
         existing_witness = witness_by_id.get(resource_id)
         if existing_witness is not None and existing_witness["raw_payload_sha256"] != raw_hash:
@@ -615,7 +619,7 @@ def _source_witnesses_by_id(
             "resource_type": resource_type,
             "resource_id": resource_id,
             "raw_payload_sha256": raw_hash,
-            "raw_payload_json": raw_resource_by_field,
+            "raw_payload_json": raw_payload,
         }
     return witness_by_id
 
@@ -633,8 +637,6 @@ async def _insert_verified_witnesses(session: Any, witness_by_id: dict[str, dict
     if not witness_by_id or fhir._bound_upsert_session() is not session:
         raise RuntimeError("cms_npd_resource_batch_transaction_missing")
     witnesses = list(witness_by_id.values())
-    if any(fhir._strip_postgres_nuls(row["raw_payload_json"]) != row["raw_payload_json"] for row in witnesses):
-        raise source.CmsNpdSourceError("cms_npd_resource_invalid")
     candidate = await resolve_existing_source_candidate(fhir.db, fhir, witnesses[0]["dataset_id"])
     await append_generic_source_batch(fhir.db, fhir, candidate, (), witnesses)
 
@@ -646,6 +648,64 @@ def _count_staged_rows(ctx: dict, count: int) -> None:
         context["cms_intake_completed_rows"] = context.get("cms_intake_completed_rows", 0) + count
 
 
+class _PreparedBatch(NamedTuple):
+    """One decoded, hashed and proof-framed batch; built off the publisher process, committed on it."""
+
+    resource_type: str
+    input_count: int
+    rows: list[dict[str, Any]]
+    witness_by_id: dict[str, dict[str, Any]]
+    proof: tuple[dict[str, Any], bytes]
+
+
+def _prepare_source_batch(
+    fhir: Any,
+    model: type,
+    resource_rows: list[dict[str, Any]],
+    raw_resources: list[dict[str, Any]],
+    candidate: Any,
+    resource_type: str,
+) -> _PreparedBatch:
+    """Bind normalized rows, raw witnesses and the batch proof without touching the database."""
+    if len(resource_rows) != len(raw_resources):
+        raise RuntimeError("cms_npd_witness_batch_invalid")
+    witness_by_id = _source_witnesses_by_id(raw_resources, candidate, resource_type)
+    rows, proof = prepare_cms_dataset_rows(fhir, model, resource_rows, candidate)
+    normalized_by_id = {normalized_row["resource_id"]: normalized_row for normalized_row in rows}
+    if set(normalized_by_id) != set(witness_by_id) or any(
+        normalized_row["resource_type"] != resource_type or normalized_row["dataset_id"] != candidate.dataset_id
+        for normalized_row in rows
+    ):
+        raise RuntimeError("cms_npd_witness_projection_mismatch")
+    for resource_id, witness in witness_by_id.items():
+        witness["normalized_payload_hash"] = normalized_by_id[resource_id]["payload_hash"]
+    return _PreparedBatch(resource_type, len(raw_resources), rows, witness_by_id, proof)
+
+
+def _prepare_source_lines(lines: list[bytes], resource_type: str, candidate: Any, fhir: Any = None) -> _PreparedBatch:
+    """Decode, normalize, hash and frame one batch; importable so a worker process can run it."""
+    fhir = fhir or importlib.import_module("process.provider_directory_fhir")
+    model = fhir.RESOURCE_MODELS_BY_TYPE[resource_type]
+    raw_resources = [_resource_from_line(line, resource_type) for line in lines]
+    resource_rows: list[dict[str, Any]] = []
+    for resource in raw_resources:
+        parsed_model, resource_row_by_field = _parse_batch_row(fhir, resource, candidate)
+        if parsed_model is not model:
+            raise source.CmsNpdSourceError("cms_npd_resource_invalid")
+        resource_rows.append(resource_row_by_field)
+    return _prepare_source_batch(fhir, model, resource_rows, raw_resources, candidate, resource_type)
+
+
+async def _persist_prepared_batch(fhir: Any, prepared: _PreparedBatch, candidate: Any) -> None:
+    """Commit one prepared batch and its complete CMS witnesses together."""
+    from process.provider_directory_generic_source_policy import source_transaction
+
+    async with source_transaction(fhir.db):
+        async with fhir.db.transaction() as session:
+            await persist_prepared_cms_dataset_rows(fhir, session, prepared.rows, prepared.proof, candidate)
+            await _insert_verified_witnesses(session, prepared.witness_by_id)
+
+
 async def _persist_source_batch(
     fhir: Any,
     model: type,
@@ -655,23 +715,8 @@ async def _persist_source_batch(
     resource_type: str,
 ) -> None:
     """Commit normalized rows and their complete CMS witnesses together."""
-    from process.provider_directory_generic_source_policy import source_transaction
-
-    async with source_transaction(fhir.db):
-        if len(resource_rows) != len(raw_resources):
-            raise RuntimeError("cms_npd_witness_batch_invalid")
-        witness_by_id = _source_witnesses_by_id(raw_resources, candidate, resource_type)
-        async with fhir.db.transaction() as session:
-            normalized_rows = await persist_cms_dataset_rows(fhir, session, model, resource_rows, candidate)
-            normalized_by_id = {normalized_row["resource_id"]: normalized_row for normalized_row in normalized_rows}
-            if set(normalized_by_id) != set(witness_by_id) or any(
-                normalized_row["resource_type"] != resource_type or normalized_row["dataset_id"] != candidate.dataset_id
-                for normalized_row in normalized_rows
-            ):
-                raise RuntimeError("cms_npd_witness_projection_mismatch")
-            for resource_id, witness in witness_by_id.items():
-                witness["normalized_payload_hash"] = normalized_by_id[resource_id]["payload_hash"]
-            await _insert_verified_witnesses(session, witness_by_id)
+    prepared = _prepare_source_batch(fhir, model, resource_rows, raw_resources, candidate, resource_type)
+    await _persist_prepared_batch(fhir, prepared, candidate)
 
 
 def _resource_from_line(line: bytes, resource_type: str) -> dict[str, Any]:
@@ -687,41 +732,50 @@ def _resource_from_line(line: bytes, resource_type: str) -> dict[str, Any]:
     return resource
 
 
-async def _stream_file(fhir: Any, path: Path, candidate: Any, resource_type: str, ctx: dict, task: dict) -> int:
-    model = fhir.RESOURCE_MODELS_BY_TYPE[resource_type]
-    resource_rows: list[dict[str, Any]] = []
-    raw_resources: list[dict[str, Any]] = []
-    row_count = 0
+def _line_batches(path: Path):
+    """Yield bounded raw-line batches of one retained file in order."""
+    lines: list[bytes] = []
     batch_bytes = 0
     with zstd.open(path, "rb") as decoded:
         while line := decoded.readline(source.MAX_RESOURCE_LINE_BYTES + 1):
-            resource = _resource_from_line(line, resource_type)
-            if resource_rows and batch_bytes + len(line) > BATCH_MAX_DECODED_BYTES:
-                await _persist_source_batch(fhir, model, resource_rows, raw_resources, candidate, resource_type)
-                _count_staged_rows(ctx, len(resource_rows))
-                _observe_intake(ctx, phase="staging", family=resource_type, completed_rows=row_count)
-                resource_rows.clear()
-                raw_resources.clear()
-                batch_bytes = 0
-                await fhir._raise_if_resource_import_cancelled(ctx, task)
-            parsed_model, resource_row_by_field = _parse_batch_row(fhir, resource, candidate)
-            if parsed_model is not model:
-                raise source.CmsNpdSourceError("cms_npd_resource_invalid")
-            resource_rows.append(resource_row_by_field)
-            raw_resources.append(resource)
-            row_count += 1
+            if lines and batch_bytes + len(line) > BATCH_MAX_DECODED_BYTES:
+                yield lines
+                lines, batch_bytes = [], 0
+            lines.append(line)
             batch_bytes += len(line)
-            if len(resource_rows) >= BATCH_SIZE or batch_bytes >= BATCH_MAX_DECODED_BYTES:
-                await _persist_source_batch(fhir, model, resource_rows, raw_resources, candidate, resource_type)
-                _count_staged_rows(ctx, len(resource_rows))
-                _observe_intake(ctx, phase="staging", family=resource_type, completed_rows=row_count)
-                resource_rows.clear()
-                raw_resources.clear()
-                batch_bytes = 0
-                await fhir._raise_if_resource_import_cancelled(ctx, task)
-    if resource_rows:
-        await _persist_source_batch(fhir, model, resource_rows, raw_resources, candidate, resource_type)
-        _count_staged_rows(ctx, len(resource_rows))
+            if len(lines) >= BATCH_SIZE or batch_bytes >= BATCH_MAX_DECODED_BYTES:
+                yield lines
+                lines, batch_bytes = [], 0
+    if lines:
+        yield lines
+
+
+async def _prepared_batches(fhir: Any, path: Path, candidate: Any, resource_type: str, executor):
+    """Prepare batches in file order, keeping one batch per worker process in flight."""
+    if executor is None:
+        for lines in _line_batches(path):
+            yield _prepare_source_lines(lines, resource_type, candidate, fhir)
+        return
+    loop = asyncio.get_running_loop()
+    pending: deque = deque()
+    for lines in _line_batches(path):
+        pending.append(loop.run_in_executor(executor, _prepare_source_lines, lines, resource_type, candidate))
+        if len(pending) >= executor._max_workers:
+            yield await pending.popleft()
+    while pending:
+        yield await pending.popleft()
+
+
+async def _stream_file(
+    fhir: Any, path: Path, candidate: Any, resource_type: str, ctx: dict, task: dict, executor=None
+) -> int:
+    row_count = 0
+    async for prepared in _prepared_batches(fhir, path, candidate, resource_type, executor):
+        await _persist_prepared_batch(fhir, prepared, candidate)
+        row_count += prepared.input_count
+        _count_staged_rows(ctx, prepared.input_count)
+        _observe_intake(ctx, phase="staging", family=resource_type, completed_rows=row_count)
+        await fhir._raise_if_resource_import_cancelled(ctx, task)
     _observe_intake(ctx, phase="staging", family=resource_type, completed_rows=row_count, force=True)
     return row_count
 
@@ -1370,6 +1424,12 @@ async def _tax_candidate_followup_status(fhir: Any, directory: Path, candidate: 
         return {"status": "failed", "retryable": True, "retry_via": "same_byte_import"}
 
 
+def _stage_executor():
+    """Spare CPUs prepare batches in worker processes; 0 keeps staging on the publisher process."""
+    workers = int(os.getenv("HLTHPRT_CMS_NPD_STAGE_WORKERS") or max(1, (os.cpu_count() or 2) - 1))
+    return ProcessPoolExecutor(max_workers=workers) if workers > 0 else None
+
+
 def _source_stage_workers(fhir):
     """Bound file writers by connected capacity after reserving the intake guard."""
     pool = getattr(getattr(getattr(fhir, "db", None), "engine", None), "pool", None)
@@ -1385,22 +1445,29 @@ async def _stage_and_validate_candidate(fhir, directory, candidate, identity, re
     """Retain bounded resources and verify their counts, witnesses, and resolved evidence."""
     if not candidate.already_validated and not candidate.already_published:
         files = iter(source.RESOURCE_FILES)
+        executor = _stage_executor()
 
         async def stage_files():
             """Stage each claimed retained file and require its exact admitted row count."""
             for name, resource_type in files:
                 _observe_intake(ctx, phase="staging", family=resource_type)
-                count = await _stream_file(fhir, directory / f"{name}.zst", candidate, resource_type, ctx, task)
+                count = await _stream_file(
+                    fhir, directory / f"{name}.zst", candidate, resource_type, ctx, task, executor
+                )
                 if count != identity["files"][name]["row_count"]:
                     raise RuntimeError("cms_npd_file_row_count_changed")
 
-        workers = _source_stage_workers(fhir)
-        if workers == 1:
-            await stage_files()
-        else:
-            await fhir._gather_provider_directory_profile_tasks(
-                [asyncio.create_task(stage_files()) for _ in range(workers)]
-            )
+        try:
+            workers = _source_stage_workers(fhir)
+            if workers == 1:
+                await stage_files()
+            else:
+                await fhir._gather_provider_directory_profile_tasks(
+                    [asyncio.create_task(stage_files()) for _ in range(workers)]
+                )
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
     from process.provider_directory_generic_source_adapters import completed_source_scope
     from process.provider_directory_generic_source_policy import source_transaction
 

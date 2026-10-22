@@ -346,13 +346,13 @@ async def test_complete_source_intake_uses_bounded_distinct_native_workers(monke
     monkeypatch.setenv("HLTHPRT_DB_POOL_MIN_SIZE", "1")
     monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", str(workers + 1))
     directory, receipt = support.retained_release(cms_artifact_root)
-    original_persist = cms.persist_cms_dataset_rows
+    original_persist = cms.persist_prepared_cms_dataset_rows
     active_backends = set()
     first_backends = set()
     reached = asyncio.Event()
     worker_counts_by_metric = {"peak": 0}
 
-    async def persist(fhir_module, session, model, batch_rows, candidate):
+    async def persist(fhir_module, session, batch_rows, proof, candidate):
         assert fhir_module.db._transaction_binding().session is session
         connection = await session.connection()
         backend = await connection.scalar(text("SELECT pg_backend_pid()"))
@@ -367,11 +367,11 @@ async def test_complete_source_intake_uses_bounded_distinct_native_workers(monke
                     reached.set()
                 async with asyncio.timeout(5):
                     await reached.wait()
-            return await original_persist(fhir_module, session, model, batch_rows, candidate)
+            return await original_persist(fhir_module, session, batch_rows, proof, candidate)
         finally:
             active_backends.remove(backend)
 
-    monkeypatch.setattr(cms, "persist_cms_dataset_rows", persist)
+    monkeypatch.setattr(cms, "persist_prepared_cms_dataset_rows", persist)
     async with support.intake_admission_database(monkeypatch) as database:
         assert cms._source_stage_workers(fhir) == workers
         async with asyncio.timeout(30):

@@ -8,6 +8,7 @@ Not collected by default. Run it explicitly against a disposable local server:
     HLTHPRT_CMS_NPD_BENCHMARK_RELEASE=<retained release directory with eight .zst files + receipt.json>
     HLTHPRT_CMS_NPD_BENCHMARK_ROWS=200000
     HLTHPRT_CMS_NPD_BENCHMARK_OUT=<result json path>
+    HLTHPRT_CMS_NPD_STAGE_WORKERS=<staging worker processes; 0 keeps staging inline; default spare CPUs>
     python -m pytest .agents/cms_npd_admission_benchmark.py -x -s
 
 The sample is a deterministic weighted prefix of every family (the same rows
@@ -40,6 +41,7 @@ from process import provider_directory_cms_serving_coverage as coverage
 from process import provider_directory_generic_source_auxiliary as auxiliary
 from process import provider_directory_generic_source_completion as completion
 from process import provider_directory_generic_source_storage as storage
+from process import provider_directory_proof_store as proof_store
 from process import provider_directory_resource_identity_candidate as resource_identity
 from tests import cms_npd_admission_postgres_support as support
 from tests.cms_npd_admission_postgres_support import cms_admission_template, cms_artifact_root  # noqa: F401
@@ -140,11 +142,11 @@ class Timers:
         self.observe(monkeypatch)
         for module, name, label, family_position in (
             (cms, "_stream_file", "staging_file", 3),
-            (cms, "_persist_source_batch", "staging_persist_batch", None),
+            (cms, "_persist_prepared_batch", "staging_persist_batch", None),
             (storage, "append_generic_source_batch", "append_generic_source_batch", None),
             (storage, "_verify_tables", "custody_verify_tables", None),
             (storage, "_copy", "native_copy", None),
-            (fhir, "persist_dataset_proof_shard", "proof_shard_persist", None),
+            (proof_store, "persist_built_dataset_proof_shard", "proof_shard_persist", None),
             (completion, "complete_generic_source_candidate", "completion", None),
             (completion, "_complete_payloads", "completion_reduce_copy", None),
             (completion, "_indexes", "completion_indexes", None),
