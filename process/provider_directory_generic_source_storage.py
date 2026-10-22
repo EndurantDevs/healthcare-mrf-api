@@ -49,6 +49,9 @@ CMS_IDENTITY_ROOTS = (
 CMS_RESOURCE_IDENTITY_ROOT = "provider_directory_resource_identity"
 AUXILIARY_ROOTS = (*CMS_IDENTITY_ROOTS, CMS_RESOURCE_IDENTITY_ROOT)
 CONTRACT = "generic-source-candidate-v2"
+# Autovacuum on a private heap competes with the bulk load and reduce for I/O; statistics come from
+# explicit ANALYZE and attached heaps get the default back right before they join their root.
+PRIVATE_HEAP_OPTIONS = " WITH (autovacuum_enabled = false)"
 _NAME = re.compile(r"pdgs_[0-9a-f]{32}_(?:ri|wi|r|ip|np|ao|w|rl|eb|ee|nb|ne|re)")
 _SUFFIXES = dict(zip((*RELATIONS, *AUXILIARY_ROOTS), ("r", "ip", "np", "ao", "w", "rl", "eb", "ee", "nb", "ne", "re")))
 _BINDING_KEYS = {"contract", "identity", "phase", "ordinal", "resets", "tables", "auxiliary", "relationship_sha256"}
@@ -382,10 +385,10 @@ async def _verify_auxiliary_tables(connection, policy, auxiliary):
 
 
 async def refresh_statistics(connection, schema, names):
-    """Refresh planner statistics on global roots this transaction just filled.
+    """Refresh planner statistics on relations this transaction just filled.
 
-    Set-based replay comparisons that follow a bulk INSERT otherwise plan against
-    stale or absent statistics. PostgreSQL only warns and skips a root the current
+    Set-based statements that follow a bulk load otherwise plan against stale or
+    absent statistics. PostgreSQL only warns and skips a root the current
     role may not analyze, so no privilege probe is needed.
     """
     for name in names:
@@ -445,6 +448,7 @@ async def prepare_generic_source_candidate(database, directory, candidate):
             await connection.execute(
                 f"CREATE TABLE {relation} (LIKE {storage_relation(policy.schema, root)} "
                 f"INCLUDING STORAGE, batch_ordinal bigint{identity_clause} NOT NULL, row_ordinal integer NOT NULL)"
+                + PRIVATE_HEAP_OPTIONS
             )
             await _close_grants(connection, policy, names_by_kind[key])
             if key == "resource_input":
