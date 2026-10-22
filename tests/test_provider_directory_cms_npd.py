@@ -2161,13 +2161,13 @@ async def test_intake_watcher_tolerates_probe_timeouts_until_the_loss_window(mon
     monkeypatch.setattr(cms, "_GUARD_LOSS_SECONDS", loss_window)
     probes = iter([TimeoutError("synthetic-probe-text")])
 
-    async def probe(*_args, **_kwargs):
+    async def is_owner(*_args, **_kwargs):
         failure = next(probes, None)
         if failure is not None:
             raise failure
         return True
 
-    connection = SimpleNamespace(scalar=probe, commit=AsyncMock(), rollback=AsyncMock())
+    connection = SimpleNamespace(scalar=is_owner, commit=AsyncMock(), rollback=AsyncMock())
     owner, failures, stop = SimpleNamespace(cancel=Mock()), [], asyncio.Event()
     watcher = asyncio.create_task(cms._watch_intake_guard(connection, "synthetic-lock", 1, owner, failures, stop))
     await asyncio.sleep(0.1)
