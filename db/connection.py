@@ -578,7 +578,7 @@ class Database:
 
     @staticmethod
     def _is_pinned_read_path(path) -> bool:
-        """Preserve account, control and unrelated ordinary route ownership."""
+        """Pin pricing data and immutable code readiness while retaining other owners."""
         route, _, parameter = path.rstrip("/").rpartition("/")
         if route == "/api/v1/npi/id" and parameter != "batch":
             return False  # Detail owns a bounded Reader that closes before geocoding.
@@ -587,6 +587,7 @@ class Database:
             path in roots
             or path.startswith(tuple(root + "/" for root in roots))
             or path == "/api/v1/coverage/statistics"
+            or path.rstrip("/") == "/control/v1/plan-pricing/code-projection"
         )
 
     async def _connect_reader(self) -> Database:
@@ -920,7 +921,9 @@ class Database:
 
         @app.middleware("request")
         async def _bind_session(request):
-            is_pinned_reader = self.is_api_reader_enabled() and self._is_pinned_read_path(request.path)
+            is_pinned_reader = (
+                self.is_api_reader_enabled() and self._is_pinned_read_path(request.path)
+            ) or request.path.rstrip("/") == "/control/v1/plan-pricing/code-projection"
             if is_pinned_reader:
                 scope = self.reader_session()
                 session = await scope.__aenter__()
