@@ -5664,6 +5664,8 @@ async def test_group_plan_99213_card_aggregate_allows_bounded_taxonomy_fallback(
             "query": {"status": "no_match"},
         }
     )
+    guard = AsyncMock(return_value=selection)
+    monkeypatch.setattr(pricing_module, "resolve_plan_release_guard_selection", guard)
     monkeypatch.setattr(
         pricing_module,
         "resolve_plan_release_serving",
@@ -5693,6 +5695,7 @@ async def test_group_plan_99213_card_aggregate_allows_bounded_taxonomy_fallback(
     assert response.status == 200
     assert "result_type" not in json.loads(response.body)
     assert strict_search.await_args.args[1]["classification"] == "Family Medicine"
+    guard.assert_awaited_once_with(request.ctx.sa_session, selection.plan_release_id)
 
 
 def _build_allowed_amount_page_row(*, total: int = 12501) -> dict:

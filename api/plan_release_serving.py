@@ -13,7 +13,9 @@ from sqlalchemy import text
 from api.plan_release_pricing_projection import (
     has_pricing_projection_relation,
     plan_release_serving_queries,
+    plan_release_serving_sql,
 )
+from api.plan_release_read_storage import is_retained_session_read
 from api.plan_release_readiness import is_release_binding_serving_ready
 from api.plan_release_serving_metadata import (
     plan_release_header_from_rows as _release_header_from_rows,
@@ -347,9 +349,13 @@ async def resolve_plan_release_serving(
     normalized_release_id = normalize_plan_release_id(plan_release_id)
     if normalized_release_id is None:
         return None
+    retained = await is_retained_session_read(session, PTG2_SCHEMA)
+    include_projection = await has_pricing_projection_relation(session, PTG2_SCHEMA)
     release_sql = (
-        _PLAN_RELEASE_SERVING_SQL
-        if await has_pricing_projection_relation(session, PTG2_SCHEMA)
+        plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=include_projection, retained=True)
+        if retained
+        else _PLAN_RELEASE_SERVING_SQL
+        if include_projection
         else _PLAN_RELEASE_SERVING_WITHOUT_PROJECTION_SQL
     )
     release_query_result = await session.execute(

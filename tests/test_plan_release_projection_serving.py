@@ -69,8 +69,8 @@ def test_guard_release_resolution_never_reads_projection_metadata():
 
     assert selection is not None
     assert selection.pricing_projection_id is None
-    assert len(session.calls) == 1
-    sql = session.calls[0][0]
+    assert len(session.calls) == 2
+    sql = session.calls[1][0]
     assert "to_regclass" not in sql
     assert "plan_pricing_projection_candidate" not in sql
 

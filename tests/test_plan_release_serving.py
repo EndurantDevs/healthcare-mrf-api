@@ -3,9 +3,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from api import plan_release_serving
-from api import ptg2_serving
-
+from api import plan_release_serving, ptg2_serving
 
 PLAN_RELEASE_ID = "hprelease_" + "0" * 26
 PLAN_ID = "hpplan_" + "1" * 26
@@ -64,9 +62,7 @@ def _release_selection(
 ):
     if validated_serving_tables is None:
         validated_serving_tables = tuple(
-            (binding.snapshot_id, object())
-            for binding in bindings
-            if binding.role == "in_network"
+            (binding.snapshot_id, object()) for binding in bindings if binding.role == "in_network"
         )
     return plan_release_serving.PlanReleaseServingSelection(
         serving_revision_id=SERVING_REVISION_ID,
@@ -111,15 +107,9 @@ def _install_single_snapshot_search(
             "query": {"snapshot_id": snapshot_id},
         }
 
-    monkeypatch.setattr(
-        ptg2_serving, "resolve_plan_release_serving", fake_release_resolver
-    )
-    monkeypatch.setattr(
-        ptg2_serving, "resolve_current_ptg2_snapshot_id", fail_current_pointer
-    )
-    monkeypatch.setattr(
-        ptg2_serving, "_search_one_ptg2_snapshot", fake_snapshot_search
-    )
+    monkeypatch.setattr(ptg2_serving, "resolve_plan_release_serving", fake_release_resolver)
+    monkeypatch.setattr(ptg2_serving, "resolve_current_ptg2_snapshot_id", fail_current_pointer)
+    monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_snapshot_search)
 
 
 def _install_multi_snapshot_search(monkeypatch, selection, calls):
@@ -137,12 +127,8 @@ def _install_multi_snapshot_search(monkeypatch, selection, calls):
         calls.append((network_snapshots, release_selection))
         return {"items": [], "pagination": {"total": 0}, "query": {}}
 
-    monkeypatch.setattr(
-        ptg2_serving, "resolve_plan_release_serving", fake_release_resolver
-    )
-    monkeypatch.setattr(
-        ptg2_serving, "_search_multi_ptg2_snapshots", fake_multi_search
-    )
+    monkeypatch.setattr(ptg2_serving, "resolve_plan_release_serving", fake_release_resolver)
+    monkeypatch.setattr(ptg2_serving, "_search_multi_ptg2_snapshots", fake_multi_search)
 
 
 class _Session:
@@ -154,10 +140,10 @@ class _Session:
     async def execute(self, statement, params):
         sql = str(statement)
         self.calls.append((sql, params))
+        if "AS readable" in sql:
+            return [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)]
         if "to_regclass" in sql:
-            return SimpleNamespace(
-                scalar_one=lambda: self.pricing_projection_relation
-            )
+            return SimpleNamespace(scalar_one=lambda: self.pricing_projection_relation)
         return list(self.rows)
 
 
@@ -166,13 +152,8 @@ async def _is_serving_binding_ready(
     binding,
     **readiness_context,
 ):
-    validated_serving_tables_by_snapshot_id = readiness_context.get(
-        "validated_serving_tables_by_snapshot_id"
-    )
-    if (
-        binding.role == "in_network"
-        and validated_serving_tables_by_snapshot_id is not None
-    ):
+    validated_serving_tables_by_snapshot_id = readiness_context.get("validated_serving_tables_by_snapshot_id")
+    if binding.role == "in_network" and validated_serving_tables_by_snapshot_id is not None:
         validated_serving_tables_by_snapshot_id[binding.snapshot_id] = object()
     return True
 
@@ -210,12 +191,8 @@ def test_release_resolver_requires_complete_published_pinned_binding_set(
         "ptg2:release-old",
         "ptg2:release-allowed",
     ]
-    assert [binding.snapshot_id for binding in selection.in_network_bindings] == [
-        "ptg2:release-old"
-    ]
-    assert [binding.snapshot_id for binding in selection.allowed_amount_bindings] == [
-        "ptg2:release-allowed"
-    ]
+    assert [binding.snapshot_id for binding in selection.in_network_bindings] == ["ptg2:release-old"]
+    assert [binding.snapshot_id for binding in selection.allowed_amount_bindings] == ["ptg2:release-allowed"]
     sql, params = session.calls[-1]
     assert "ptg2_current" not in sql
     assert "plan_release_snapshot_binding" in sql
@@ -267,9 +244,7 @@ def test_release_resolver_rejects_malformed_id_without_database_fallback():
 def test_release_query_uses_bound_snapshot_when_current_pointer_differs(monkeypatch):
     """The canonical route must ignore a newer current pointer."""
 
-    selection = _release_selection(
-        _network_binding(0, "ptg2:release-old", "aetna-network-a")
-    )
+    selection = _release_selection(_network_binding(0, "ptg2:release-old", "aetna-network-a"))
     calls = []
     _install_single_snapshot_search(monkeypatch, selection, calls)
 
@@ -297,9 +272,7 @@ def test_release_query_uses_bound_snapshot_when_current_pointer_differs(monkeypa
     ]
     assert response["plan_release_id"] == PLAN_RELEASE_ID
     assert response["serving_revision_id"] == SERVING_REVISION_ID
-    assert response["serving_revision_published_at"] == (
-        SERVING_REVISION_PUBLISHED_AT
-    )
+    assert response["serving_revision_published_at"] == (SERVING_REVISION_PUBLISHED_AT)
     assert response["release_status"] == "published"
     assert response["is_current"] is True
     assert response["resolved"] is True

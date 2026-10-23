@@ -52,6 +52,7 @@ async def test_uniquely_located_release_without_serving_bindings_never_falls_bac
         execute=AsyncMock(
             side_effect=[
                 SimpleNamespace(scalars=lambda: [selection.plan_release_id]),
+                [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)],
                 SimpleNamespace(scalar_one=lambda: True),
                 [],
             ]
@@ -60,7 +61,8 @@ async def test_uniquely_located_release_without_serving_bindings_never_falls_bac
     request, native, cache = _native_read_boundary(monkeypatch, session)
     with _scope(), pytest.raises(PlanPricingProjectionUnavailable, match="managed legacy release is unavailable"):
         await service._service_page(request, native_args=fixtures._args(source_key="source-allowed"))
-    assert session.execute.await_count == 3
+    assert session.execute.await_count == 4
+    assert "AS readable" in str(session.execute.await_args_list[1].args[0])
     assert session.execute.await_args.args[1]["plan_release_id"] == selection.plan_release_id
     native.assert_not_called()
     assert cache.mock_calls == [] and legacy.service_legacy_selection_sha256() is None

@@ -215,7 +215,8 @@ async def test_report_consumes_descriptor_phase(monkeypatch, retained_export):
     assert provenance["full_readiness"] == "not_assessed"
     assert provenance["networks"][0]["pricing_refs"][0]["resolved"] is False
     assert result["targets"] == REPORT["targets"] and result["totals"] == REPORT["totals"]
-    assert len(driver.calls) == 10 and driver.lifecycle == ["start", "release"] * 4
+    assert len(driver.calls) == 11 and driver.lifecycle == ["start", "release"] * 4
+    assert sum("AS readable" in sql for sql, _ in driver.calls) == 1
     assert all(task is asyncio.current_task() for task in driver.tasks)
 
 

@@ -46,9 +46,10 @@ async def native_admission(monkeypatch):
     owner = await _native_admission_owner()
     schema = "read_admission_" + uuid4().hex
     reader = "read_admission_reader_" + uuid4().hex
+    reader_password = uuid4().hex
     await db.disconnect()
     try:
-        await owner.execute(f'CREATE ROLE "{reader}" LOGIN; CREATE SCHEMA "{schema}"')
+        await owner.execute(f'CREATE ROLE "{reader}" LOGIN PASSWORD \'{reader_password}\'; CREATE SCHEMA "{schema}"')
         await owner.execute(f"""
             CREATE TABLE {schema}.plan_release_serving_revision
                 (serving_revision_id text, published_at timestamptz, plan_release_id text,
@@ -83,11 +84,12 @@ async def native_admission(monkeypatch):
         from api import plan_release_serving_resolution as resolution
         from api.plan_release_pricing_projection import plan_release_serving_sql
 
+        monkeypatch.setattr(resolution, "PTG2_SCHEMA", schema)
         monkeypatch.setattr(
             resolution, "_PLAN_RELEASE_GUARD_SQL", plan_release_serving_sql(schema, include_pricing_projection=False)
         )
         monkeypatch.setenv("HLTHPRT_DB_READER_USER", reader)
-        monkeypatch.setenv("HLTHPRT_DB_READER_PASSWORD", "")
+        monkeypatch.setenv("HLTHPRT_DB_READER_PASSWORD", reader_password)
         yield owner, schema, reader
     finally:
         await db.disconnect()
