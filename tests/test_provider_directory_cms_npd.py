@@ -1445,8 +1445,12 @@ async def test_failed_staging_drains_running_preparations_before_returning(monke
         with pytest.raises(RuntimeError, match="synthetic-commit-failed"):
             await staging
     else:
-        monkeypatch.setattr(cms, "_persist_prepared_batch", AsyncMock(side_effect=lambda *_: asyncio.Event().wait()))
-        await asyncio.sleep(0.05)
+
+        async def blocked_commit(*_args):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(cms, "_persist_prepared_batch", blocked_commit)
+        await asyncio.sleep(0.5)  # preparations are done and the first commits are blocked
         staging.cancel()
         with pytest.raises(asyncio.CancelledError):
             await staging
@@ -2231,6 +2235,7 @@ async def test_intake_chain_distinguishes_implicit_poll_timeout_from_probe_cause
     probe_timeout = TimeoutError("synthetic-probe-text")
     connection = SimpleNamespace(
         scalar=AsyncMock(side_effect=probe_timeout) if probe_times_out else AsyncMock(return_value=False),
+        execute=AsyncMock(),
         commit=AsyncMock(),
     )
     # The watcher invokes this actual guard probe while handling its routine polling timeout.
@@ -2262,7 +2267,7 @@ async def test_intake_watcher_tolerates_probe_timeouts_until_the_loss_window(mon
             raise failure
         return True
 
-    connection = SimpleNamespace(scalar=is_owner, commit=AsyncMock(), rollback=AsyncMock())
+    connection = SimpleNamespace(scalar=is_owner, execute=AsyncMock(), commit=AsyncMock(), rollback=AsyncMock())
     owner, failures, stop = SimpleNamespace(cancel=Mock()), [], asyncio.Event()
     watcher = asyncio.create_task(cms._watch_intake_guard(connection, "synthetic-lock", 1, owner, failures, stop))
     await asyncio.sleep(0.1)
