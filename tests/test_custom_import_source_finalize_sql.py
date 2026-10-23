@@ -125,6 +125,32 @@ def _checks(query):
     return re.findall(r"IF ([\s\S]+?) THEN\s*RAISE EXCEPTION '([^']+)'; END IF;", query)
 
 
+def _legacy_position_guard(name, query):
+    """Expand the Parquet branch's scoped CTE before comparing historical guards."""
+    if name not in ("verified_parts", "positions"):
+        return query
+    cte, query = query.split("\nSELECT CASE WHEN ", 1)
+    assert "SELECT part.part_ordinal,part.record_count,NULL::bigint first_source_ordinal" in cte
+    assert "part.capture_bundle_id=:b_capture_bundle_id AND part.stream_slot=:a_stream_slot" in cte
+    assert "part.part_ordinal BETWEEN :a_first_part AND :last_part" in cte
+    query = "SELECT CASE WHEN " + query.replace("replay_parts p", "__CONTROL__.custom_import_capture_parquet_part p")
+    if name == "verified_parts":
+        query = query.replace(
+            "WHERE p.part_ordinal BETWEEN",
+            "WHERE p.capture_bundle_id=:b_capture_bundle_id AND p.stream_slot=:a_stream_slot AND p.part_ordinal BETWEEN",
+        )
+    else:
+        query = query.replace(
+            "ON p.part_ordinal=o.part_ordinal",
+            "ON p.capture_bundle_id=:b_capture_bundle_id AND p.stream_slot=:a_stream_slot AND p.part_ordinal=o.part_ordinal",
+        )
+        query = query.replace(
+            "(p.first_source_ordinal IS NOT NULL AND o.source_ordinal<>p.first_source_ordinal-1+o.part_row_ordinal) OR ",
+            "",
+        )
+    return query
+
+
 def _fused_dictionary_checks(checks):
     """Normalize one fused guard only after matching its complete historical scope."""
     dictionary_checks = [
@@ -177,7 +203,9 @@ def test_error_predicates_preserve_canonical_provenance_null_positions_and_bound
     )
     checks = _fused_dictionary_checks(_checks(historical))
     ordinary_checks = [
-        re.fullmatch(r"SELECT CASE WHEN ([\s\S]+) THEN '([^']+)' END problem;\s*", _unbound(query)).groups()
+        re.fullmatch(
+            r"SELECT CASE WHEN ([\s\S]+) THEN '([^']+)' END problem;\s*", _unbound(_legacy_position_guard(name, query))
+        ).groups()
         for name, query in finalizer._load_sql().items()
         if name not in ("fresh_lease",) and " END problem;" in query
     ]

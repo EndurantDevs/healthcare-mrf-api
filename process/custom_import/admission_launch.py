@@ -21,10 +21,12 @@ from pathlib import Path
 
 from process.custom_import import admission_authorization as authorization
 from process.custom_import import admission_worker, query_projection_worker, source_worker
+from process.custom_import.object_processing_policy import ObjectProcessingPolicy
 from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.query_projection_values import configured_fields
 from process.custom_import.snowflake import _credential_file_identity, _validate_fixed_credential_directory
 from process.custom_import.snowflake_source_binding import LoadedSnowflakeSourceBinding
+from process.custom_import.source_binding_store import LoadedObjectSourceBinding
 
 FIXED_ADMISSION_DIRECTORY = Path("/run/custom-import-operator")
 _LAUNCH_NAME = "admission-launch.json"
@@ -142,11 +144,15 @@ def _stage_files():
 def _require_retained_scope(permit, loaded, idempotency_key):
     """Compare the entire permit scope with an already verified retained load."""
 
-    if not isinstance(loaded, LoadedSnowflakeSourceBinding) or not isinstance(
-        loaded.binding.processing_policy, ProcessingPolicy
-    ):
+    if isinstance(loaded, LoadedSnowflakeSourceBinding):
+        policy_type = ProcessingPolicy
+    elif isinstance(loaded, LoadedObjectSourceBinding):
+        policy_type = ObjectProcessingPolicy
+    else:
         _unavailable()
-    ProcessingPolicy.from_mapping(loaded.binding.processing_policy.to_mapping())
+    if not isinstance(loaded.binding.processing_policy, policy_type):
+        _unavailable()
+    policy_type.from_mapping(loaded.binding.processing_policy.to_mapping())
     for name in ("dataset_id", "definition_revision_id", "schema_revision_id", "source_binding_revision_id"):
         value = getattr(loaded, name)
         if type(value) is not int or value != getattr(permit, name):
@@ -255,7 +261,7 @@ def _stage_transports(stage, loaded, idempotency_key):
 
 
 def load_admission_launch(
-    loaded: LoadedSnowflakeSourceBinding, *, idempotency_key: str
+    loaded: LoadedSnowflakeSourceBinding | LoadedObjectSourceBinding, *, idempotency_key: str
 ) -> WriterBatchTransports | None:
     """Verify the complete fixed stage before any worker claim; absent stages stay direct.
 

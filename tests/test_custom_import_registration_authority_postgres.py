@@ -21,6 +21,7 @@ from db.models.custom_import import (
     CustomImportSourceBindingRevision,
 )
 from process.custom_import.definition import CustomImportDefinition, canonical_json
+from process.custom_import.object_source_binding import ObjectSourceBinding
 from process.custom_import.registration_authority import (
     RegistrationAuthorityConflict,
     RegistrationAuthorityDenied,
@@ -35,6 +36,7 @@ from process.custom_import.snowflake_source_binding import register_snowflake_so
 from tests.custom_import_postgres_support import isolated_publication_case
 from tests.test_custom_import_definition_store_postgres import _counts as _definition_graph_counts
 from tests.test_custom_import_snowflake_operator_cli import _definition, _loaded_binding
+from tests.test_custom_import_source_binding_store import _object_binding
 
 
 @asynccontextmanager
@@ -46,16 +48,21 @@ async def _authority_case():
         yield case
 
 
-def _registration(*, dataset_key: str = "synthetic_authority", unicode_alias: bool = False, refresh_mode="snapshot"):
+def _registration(
+    *, dataset_key: str = "synthetic_authority", unicode_alias: bool = False, refresh_mode="snapshot", connector=None
+):
     definition_document = json.loads(_definition().canonical)
     definition_document["refresh_mode"] = refresh_mode
     if unicode_alias:
         definition_document["aliases"]["root_source"] = {"RÓOT_NPI": "npi"}
     definition = CustomImportDefinition.from_mapping(definition_document)
-    binding_document = json.loads(_loaded_binding().binding.canonical)
-    binding_document["definition_sha256"] = definition.digest
-    binding_document["schema_sha256"] = definition.schema_digest
-    binding = SnowflakeSourceBinding.from_mapping(binding_document)
+    if connector is None:
+        binding_document = json.loads(_loaded_binding().binding.canonical)
+        binding_document["definition_sha256"] = definition.digest
+        binding_document["schema_sha256"] = definition.schema_digest
+        binding = SnowflakeSourceBinding.from_mapping(binding_document)
+    else:
+        binding = _object_binding(definition, connector)
     return {
         "dataset_key": dataset_key,
         "definition": json.loads(definition.canonical),
@@ -114,8 +121,9 @@ async def _wait_for_authority_lock(case, authority_id):
 
 
 @pytest.mark.asyncio
-async def test_exact_mint_register_and_completed_replay_preserve_one_graph(monkeypatch):
-    registration = _registration()
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+async def test_exact_mint_register_and_completed_replay_preserve_one_graph(monkeypatch, connector):
+    registration = _registration(connector=connector)
     authority_id, token, token_sha256, expires_at = _intent()
     async with _authority_case() as case:
         minted = await _mint(case, authority_id, registration, expires_at, token_sha256)
@@ -149,7 +157,7 @@ async def test_exact_mint_register_and_completed_replay_preserve_one_graph(monke
         async def unexpected_graph_call(*_args, **_kwargs):
             raise AssertionError("completed replay must not invoke graph registration")
 
-        monkeypatch.setattr(authority_store, "register_snowflake_source_binding", unexpected_graph_call)
+        monkeypatch.setattr(authority_store, "register_source_binding", unexpected_graph_call)
         revoked = await _revoke(case, authority_id)
         assert revoked.revoked_at is not None
         assert revoked.result == completed.result
@@ -184,13 +192,14 @@ async def test_existing_definition_identity_conflict_is_not_a_retryable_failure(
 
 
 @pytest.mark.asyncio
-async def test_invalid_graph_result_rolls_back_and_is_not_unavailable(monkeypatch):
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+async def test_invalid_graph_result_rolls_back_and_is_not_unavailable(monkeypatch, connector):
     import process.custom_import.registration_authority as authority_store
     from process.custom_import.snowflake_binding import SnowflakeSourceBindingError
 
-    registration = _registration(dataset_key="synthetic_invalid_graph")
+    registration = _registration(connector=connector, dataset_key="synthetic_invalid_graph")
     authority_id, token, token_sha256, expires_at = _intent()
-    original_register = authority_store.register_snowflake_source_binding
+    original_register = authority_store.register_source_binding
 
     async def invalid_graph(*args, **kwargs):
         await original_register(*args, **kwargs)
@@ -198,7 +207,7 @@ async def test_invalid_graph_result_rolls_back_and_is_not_unavailable(monkeypatc
 
     async with _authority_case() as case:
         await _mint(case, authority_id, registration, expires_at, token_sha256)
-        monkeypatch.setattr(authority_store, "register_snowflake_source_binding", invalid_graph)
+        monkeypatch.setattr(authority_store, "register_source_binding", invalid_graph)
         with pytest.raises(RegistrationAuthorityError):
             await _register(case, authority_id, registration, token)
         async with case.sessions() as session:
@@ -294,8 +303,9 @@ async def test_unicode_alias_is_rejected_before_authority_insert():
 
 
 @pytest.mark.asyncio
-async def test_registration_locks_authority_before_contended_dataset():
-    registration = _registration(dataset_key="synthetic_contended")
+@pytest.mark.parametrize("connector", (None, "https"))
+async def test_registration_locks_authority_before_contended_dataset(connector):
+    registration = _registration(connector=connector, dataset_key="synthetic_contended")
     authority_id, token, token_sha256, expires_at = _intent()
     async with _authority_case() as case:
         await _mint(case, authority_id, registration, expires_at, token_sha256)
@@ -331,8 +341,9 @@ async def test_registration_locks_authority_before_contended_dataset():
 
 
 @pytest.mark.asyncio
-async def test_expiry_is_checked_after_authority_lock_wait():
-    registration = _registration(dataset_key="synthetic_expiring")
+@pytest.mark.parametrize("connector", (None, "https"))
+async def test_expiry_is_checked_after_authority_lock_wait(connector):
+    registration = _registration(connector=connector, dataset_key="synthetic_expiring")
     async with _authority_case() as case:
         authority_id, token, token_sha256, expires_at = _intent(seconds=1)
         await _mint(case, authority_id, registration, expires_at, token_sha256)
@@ -358,8 +369,9 @@ async def test_expiry_is_checked_after_authority_lock_wait():
 
 
 @pytest.mark.asyncio
-async def test_completed_result_replays_after_original_expiry(monkeypatch):
-    registration = _registration(dataset_key="synthetic_completed_expiry")
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+async def test_completed_result_replays_after_original_expiry(monkeypatch, connector):
+    registration = _registration(connector=connector, dataset_key="synthetic_completed_expiry")
     async with _authority_case() as case:
         authority_id, token, token_sha256, expires_at = _intent(seconds=1)
         await _mint(case, authority_id, registration, expires_at, token_sha256)
@@ -372,15 +384,16 @@ async def test_completed_result_replays_after_original_expiry(monkeypatch):
         async def unexpected_graph_call(*_args, **_kwargs):
             raise AssertionError("completed replay must not invoke graph registration")
 
-        monkeypatch.setattr(authority_store, "register_snowflake_source_binding", unexpected_graph_call)
+        monkeypatch.setattr(authority_store, "register_source_binding", unexpected_graph_call)
         replay = await _register(case, authority_id, registration, token)
         assert replay == completed
         assert await _dataset_count(case) == 1
 
 
 @pytest.mark.asyncio
-async def test_expiry_after_dataset_wait_rolls_back_graph_and_result():
-    registration = _registration(dataset_key="synthetic_waited_expiry")
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+async def test_expiry_after_dataset_wait_rolls_back_graph_and_result(connector):
+    registration = _registration(connector=connector, dataset_key="synthetic_waited_expiry")
     async with _authority_case() as case:
         async with case.sessions() as session, session.begin():
             session.add(CustomImportDataset(dataset_key=registration["dataset_key"]))
@@ -436,8 +449,9 @@ async def test_committed_revoke_wins_against_waiting_registration():
 
 
 @pytest.mark.asyncio
-async def test_refused_result_write_rolls_back_graph_even_if_caller_catches():
-    registration = _registration(dataset_key="synthetic_refused")
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+async def test_refused_result_write_rolls_back_graph_even_if_caller_catches(connector):
+    registration = _registration(connector=connector, dataset_key="synthetic_refused")
     authority_id, token, token_sha256, expires_at = _intent()
     async with _authority_case() as case:
         await _mint(case, authority_id, registration, expires_at, token_sha256)
@@ -470,3 +484,28 @@ async def test_refused_result_write_rolls_back_graph_even_if_caller_catches():
             assert state is not None and state.result is None
             assert await _definition_graph_counts(session) == (0,) * 9
             assert await session.scalar(select(func.count()).select_from(CustomImportSourceBindingRevision)) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ("policy", "connector", "definition", "owner"))
+async def test_object_authority_denies_changed_semantic_pins(change):
+    registration = _registration(connector="https")
+    changed = _registration(
+        connector="s3" if change == "connector" else "https",
+        dataset_key="synthetic_other" if change == "owner" else registration["dataset_key"],
+        refresh_mode="upsert" if change == "definition" else "snapshot",
+    )
+    if change == "policy":
+        changed["source_binding"]["processing_policy"]["prepared"]["part_row_limit"] += 1
+        changed["source_binding"] = json.loads(ObjectSourceBinding.from_mapping(changed["source_binding"]).canonical)
+    authority_id, token, token_sha256, expires_at = _intent()
+    async with _authority_case() as case:
+        await _mint(case, authority_id, registration, expires_at, token_sha256)
+        for is_completed in (False, True):
+            with pytest.raises(RegistrationAuthorityConflict):
+                await _register(case, authority_id, changed, token)
+            with pytest.raises(RegistrationAuthorityDenied):
+                await _register(case, authority_id, registration, secrets.token_bytes(32))
+            assert await _dataset_count(case) == int(is_completed)
+            if not is_completed:
+                await _register(case, authority_id, registration, token)

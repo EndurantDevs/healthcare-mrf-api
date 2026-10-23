@@ -43,12 +43,12 @@ def _write_private(path, content):
 
 
 @pytest.fixture
-def mounted_case(tmp_path, monkeypatch):
+def mounted_case(tmp_path, monkeypatch, request):
     """Create only owned synthetic pytest files with the fixed mount contract."""
 
     directory = tmp_path / "authority"
     directory.mkdir(mode=0o700)
-    loaded = _loaded_binding()
+    loaded = _loaded_binding(getattr(request, "param", None))
     registration_dict = {
         "dataset_key": "synthetic_authority",
         "definition": json.loads(loaded.definition.canonical),
@@ -145,6 +145,7 @@ class _TrackedStream(httpx.AsyncByteStream):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replayed", [False, True])
+@pytest.mark.parametrize("mounted_case", (None, "https", "s3", "upload"), indirect=True)
 async def test_registration_posts_exact_scoped_bearer_and_returns_canonical_receipt(mounted_case, replayed):
     case = mounted_case
     receipt = _receipt(case, replayed=replayed)
@@ -181,6 +182,7 @@ async def test_registration_posts_exact_scoped_bearer_and_returns_canonical_rece
 @pytest.mark.asyncio
 @pytest.mark.parametrize("completed", [True, False])
 @pytest.mark.parametrize("expires_at", ["2020-01-01T00:00:00Z", "2020-01-01T00:00:00+00:00"])
+@pytest.mark.parametrize("mounted_case", (None, "https", "s3", "upload"), indirect=True)
 async def test_expired_authority_reaches_server_for_completed_replay_or_unfinished_denial(
     mounted_case, completed, expires_at
 ):
@@ -259,6 +261,7 @@ def _install_cli_transport(monkeypatch, case, handler):
 
 
 @pytest.mark.parametrize("entry", ["command", "module", "script"])
+@pytest.mark.parametrize("mounted_case", (None, "https", "s3", "upload"), indirect=True)
 def test_cli_composition_uses_no_database_and_emits_only_receipt(mounted_case, monkeypatch, capsys, caplog, entry):
     case = mounted_case
     receipt = _receipt(case)

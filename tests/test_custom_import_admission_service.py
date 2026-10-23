@@ -19,9 +19,11 @@ import process.custom_import.admission_authorization as auth
 import process.custom_import.admission_sql as admission
 import process.custom_import.build_source as staging
 from process.custom_import.snowflake_source_binding import _loaded_snowflake_source_binding
+from process.custom_import.source_binding_store import _loaded_object_source_binding
 from tests.admission_transport_test_support import AuthorizedRequest
 from tests.test_custom_import_build_source import _request as existing_request
 from tests.test_custom_import_snowflake_source_binding import _definition, _loaded_rows, _v2_binding
+from tests.test_custom_import_source_binding_store import _object_binding, _object_rows
 
 NOW = datetime(2030, 1, 1, tzinfo=timezone.utc)
 ORIGIN = "https://engine.example.invalid"
@@ -157,12 +159,16 @@ class Session:
         return Result(self.values.pop(0) if self.values else None)
 
 
-def _retained(monkeypatch):
+def _retained(monkeypatch, connector=None):
     definition = _definition()
-    binding = _v2_binding(definition)
-    rows = _loaded_rows(definition, binding)
-    rows[0].binding_contract = binding.contract
-    loaded = _loaded_snowflake_source_binding(*rows)
+    if connector is None:
+        binding = _v2_binding(definition)
+        retained_rows = _loaded_rows(definition, binding)
+        retained_rows[0].binding_contract = binding.contract
+        loaded = _loaded_snowflake_source_binding(*retained_rows)
+    else:
+        binding = _object_binding(definition, connector)
+        loaded = _loaded_object_source_binding(*_object_rows(definition, binding))
     wire, verified, ring = _wire(digest=loaded.source_binding_sha256.hex())
     policy = binding.processing_policy.build
     build = SimpleNamespace(
@@ -182,13 +188,14 @@ def _retained(monkeypatch):
         source_binding_revision_id=14,
     )
     session = Session([None, None, (build, execution)])
-    monkeypatch.setattr(service, "load_snowflake_source_binding", AsyncMock(return_value=loaded))
+    monkeypatch.setattr(service, "load_source_binding", AsyncMock(return_value=loaded))
     return wire, verified, ring, session, build, execution, loaded
 
 
 @pytest.mark.asyncio
-async def test_retained_reconstruction_is_read_only_and_closes_before_admission(monkeypatch):
-    wire, verified, ring, session, build, _, loaded = _retained(monkeypatch)
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+async def test_retained_reconstruction_is_read_only_and_closes_before_admission(monkeypatch, connector):
+    wire, verified, ring, session, build, _, loaded = _retained(monkeypatch, connector)
 
     async def admit(factory, request, build_id, cursor, *, admission_permit):
         assert session.events[-1] == "close" and not session.active
@@ -500,7 +507,7 @@ async def test_missing_or_mismatched_retained_policy_and_digest_never_admit(monk
         loaded = replace(loaded, binding=replace(loaded.binding, processing_policy=None))
     else:
         build.page_byte_limit += 1
-    monkeypatch.setattr(service, "load_snowflake_source_binding", AsyncMock(return_value=loaded))
+    monkeypatch.setattr(service, "load_source_binding", AsyncMock(return_value=loaded))
     operation = AsyncMock()
     monkeypatch.setattr(admission, "admit_source_batch", operation)
     reply = await service.serve_admission_batch(

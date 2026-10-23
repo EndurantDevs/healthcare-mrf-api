@@ -36,6 +36,20 @@ from process.custom_import.runner_codec import digest_text, pack_hash
 from process.custom_import.runner_types import CancellationRequested, LeaseAuthorityLost
 from process.custom_import.storage_layout import snapshot_models
 from tests.custom_import_postgres_support import isolated_publication_case
+
+# Prepared-source cases share this native suite's collection entry point.
+from tests.custom_import_prepared_source_retention_postgres_cases import (
+    test_prepared_header_bytes_remain_charged_for_every_retained_state as test_prepared_header_bytes_remain_charged_for_every_retained_state,
+)
+from tests.custom_import_prepared_source_store_postgres_cases import (
+    test_driver_reuses_native_prefix_reaches_eof_and_seals_exact_retained_parts as test_driver_reuses_native_prefix_reaches_eof_and_seals_exact_retained_parts,
+)
+from tests.custom_import_prepared_source_store_postgres_cases import (
+    test_native_append_accounts_original_policy_progress_payload_and_manifest as test_native_append_accounts_original_policy_progress_payload_and_manifest,
+)
+from tests.custom_import_prepared_source_store_postgres_cases import (
+    test_real_expired_lease_takeover_rejects_stale_append_and_adopts_exact_prefix as test_real_expired_lease_takeover_rejects_stale_append_and_adopts_exact_prefix,
+)
 from tests.test_custom_import_capture_pending_postgres import _receipt, _retain, _start_attempt
 from tests.test_custom_import_snowflake_bundle import _definition
 

@@ -500,9 +500,10 @@ decoder accepts them; for example, an empty NDJSON stream is not a missing strea
 
 If any stream is not uncompressed Parquet, supply a non-boolean integer
 `maximum_dataset_retained_bytes` between zero and `2**63 - 1`. There is no implicit
-retention allowance for this path. The limit checks original bytes plus retained
-Parquet payload and part-manifest charges across all revisions and pending or
-abandoned attempts in the dataset. Exact retained replay does not charge again.
+retention allowance for this path. The limit checks original bytes, retained
+Parquet payload and part manifests, and prepared-source accounting across all
+revisions and pending or abandoned attempts in the dataset. Exact retained
+replay does not charge again.
 This is an admission limit for the requested attempt, not a persistent dataset
 policy. Changing it changes the execution request identity.
 
@@ -541,12 +542,17 @@ GRANT SELECT (dataset_id, retained_bytes)
     ON application_schema.custom_import_capture_usage TO capture_quota_reader;
 GRANT SELECT (dataset_id, byte_count)
     ON application_schema.custom_import_capture_raw_object TO capture_quota_reader;
+GRANT SELECT (dataset_id, retained_byte_count)
+    ON application_schema.custom_import_prepared_source TO capture_quota_reader;
 ```
 
-Both grants are needed even when the raw table is empty. Do not grant raw payload
-reads, raw writes, counter writes or owner membership to satisfy the quota query.
-These grants do not make the role a trusted registrar or enable raw acquisition.
-They are explicit deployment provisioning, not automatic migration grants.
+All three grants are needed even when the raw and prepared tables are empty.
+Apply the schema migration and provision these columns before starting updated
+restricted writers, including legacy Snowflake acquisition. Do not grant raw or
+prepared payload reads, writes, counter writes or owner membership to satisfy
+the quota query. These grants do not make the role a trusted registrar or enable
+raw acquisition. They are explicit deployment provisioning, not automatic
+migration grants.
 Fresh segmented acquisition checks these metadata privileges without reading rows
 before opening the source; bound replay does not require this acquisition preflight.
 
@@ -685,3 +691,50 @@ the authenticated path, without falling back to local owner access. Retained-
 only observation requires valid current authority but cannot reopen acquisition.
 Managed configuration/issuer wiring, effective database roles and source-specific
 runtime/security/capacity qualification are separate enablement requirements.
+
+### Owner-only preparation of retained object sources
+
+The Python integration also accepts immutable `custom-import/source-binding/v3`
+bindings for HTTPS, S3-compatible objects and uploads. A binding pins the
+definition, schema, approved stream locations and a
+`custom-import/object-processing-policy/v1` policy. It has no credential fields,
+arbitrary SQL, environment references or caller-selected filesystem paths.
+Existing Snowflake v1/v2 bindings and operator commands keep their behavior once
+the accounting-column permissions above are provisioned for restricted writers.
+
+The existing `custom_import_snowflake_operator register` and `register-authority`
+commands also accept v3 object bindings in the same canonical envelope containing
+exactly `dataset_key`, `definition` and `source_binding`. They return the existing
+numeric-ID/digest receipt; `register-authority` uses the same fixed mounted
+capability and exact input pins. Registration only retains the definition and
+binding. That entry point's execution, resume and inspection commands remain
+Snowflake-specific. Registration does not enable managed issuer or worker-launch
+integration and makes no database grants.
+
+After acquisition has sealed and bound the original bundle, a trusted owner may
+call `prepare_retained_source` with the exact execution, live fence/token and
+SOURCE permit. Preparation reads retained originals, never reacquires the
+source. All six supported formats and gzip use the same bounded decoders.
+Prepared parts use the internal `custom-import/prepared-source-rows/v1`
+representation, preserving source ordinals, field names, missing/null states
+and decoded scalar values. They are not relabelled as Parquet.
+
+Preparation progresses from pending to closed only after every declared stream
+reaches decoder EOF and cleanup succeeds. Sealing verifies the bounded part
+metadata and commits its original-bundle and processing-policy identity. Exact
+committed prefixes are observed on resume; an uncertain write is not blindly
+retried. Resume keeps the execution's original deadline. Dataset retention
+accounting includes originals, prepared payloads, manifests and control metadata,
+including pending or abandoned attempts.
+
+`prepared_source_build.build_request` creates the value-only request for the
+existing bounded SOURCE pipeline. Each write transaction independently rechecks
+ownership, immutable pins, current authority and the seal. SOURCE reads one
+prepared part at a time and uses native COPY, the existing set-based admission
+and the ordinary graph/output checks. The original capture bundle remains the
+provenance identity. Preparing or sealing input does not publish or activate a
+generation; the normal verified publication and rollback lifecycle still applies.
+
+This path requires effective database ownership at its application-owned write
+seams. An EXECUTE-only worker is insufficient. Installing its schema does not
+grant worker access, issue permits or enable hosted object sources.

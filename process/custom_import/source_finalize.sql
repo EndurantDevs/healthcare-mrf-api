@@ -137,12 +137,41 @@ SELECT CASE WHEN :stream_stream_slot IS NULL OR ROW(:stream_dataset_id,:stream_s
         IS DISTINCT FROM ROW(:b_dataset_id,:b_schema_revision_id) OR :stream_record_kind NOT IN ('root','child') THEN 'source_bulk_stream_mismatch' END problem;
 
 -- query: metadata
+WITH prepared_header AS (SELECT h.* FROM __CONTROL__.custom_import_prepared_source h
+        JOIN __CONTROL__.custom_import_execution e ON e.execution_id=h.execution_id
+        JOIN __CONTROL__.custom_import_source_binding_revision binding
+            ON binding.source_binding_revision_id=e.source_binding_revision_id
+        JOIN __CONTROL__.custom_import_capture_bundle original ON original.capture_bundle_id=e.capture_bundle_id
+        WHERE h.execution_id=:b_execution_id AND h.state='sealed' AND h.sealed_at IS NOT NULL
+            AND h.encoding_contract='custom-import/prepared-source-rows/v1'
+            AND binding.binding_contract='custom-import/source-binding/v3'
+            AND original.capture_state='sealed' AND original.payload_contract IS NULL
+            AND ROW(h.dataset_id,h.definition_revision_id,h.schema_revision_id,h.capture_bundle_id)
+                IS NOT DISTINCT FROM ROW(:b_dataset_id,:b_definition_revision_id,:b_schema_revision_id,:b_capture_bundle_id)
+            AND ROW(e.dataset_id,e.definition_revision_id,e.schema_revision_id,e.capture_bundle_id)
+                IS NOT DISTINCT FROM ROW(h.dataset_id,h.definition_revision_id,h.schema_revision_id,h.capture_bundle_id)
+            AND ROW(binding.dataset_id,binding.definition_revision_id,binding.schema_revision_id)
+                IS NOT DISTINCT FROM ROW(h.dataset_id,h.definition_revision_id,h.schema_revision_id)
+            AND ROW(original.dataset_id,original.definition_revision_id,original.schema_revision_id)
+                IS NOT DISTINCT FROM ROW(h.dataset_id,h.definition_revision_id,h.schema_revision_id)
+            AND h.source_binding_revision_id=binding.source_binding_revision_id
+            AND h.source_binding_sha256=binding.binding_sha256
+            AND h.request_identity_sha256=e.request_identity_sha256 AND h.raw_manifest_sha256=original.manifest_sha256
+            AND h.preparation_deadline_at=:b_build_deadline_at
+            AND h.canonical_processing_policy::jsonb=binding.canonical_binding::jsonb->'processing_policy'
+            AND h.processing_policy_sha256=sha256(convert_to('custom-import/object-processing-policy/v1:'||h.canonical_processing_policy,'UTF8'))
+            AND h.prepared_sha256=sha256(convert_to(h.encoding_contract||':'||h.canonical_summary,'UTF8')))
 SELECT :stream_record_kind AS kind,
     CASE WHEN :stream_record_kind='root' THEN 'root' ELSE collection.value->>'name' END label,
     __CONTROL__.source_bulk_digest('root-key-contract',__CONTROL__.source_bulk_canonical(jsonb_build_object(
         'contract','custom-import-root-key/v1','fields',d.canonical_definition::jsonb#>'{schema,root,logical_key}'))) key_contract,
     (SELECT payload_part_count FROM __CONTROL__.custom_import_capture
-        WHERE capture_bundle_id=:b_capture_bundle_id AND stream_slot=:a_stream_slot AND capture_state='sealed') part_count
+        WHERE capture_bundle_id=:b_capture_bundle_id AND stream_slot=:a_stream_slot AND capture_state='sealed'
+            AND payload_contract='custom-import/parquet-parts/v2'
+        UNION ALL
+        SELECT (stream->>'part_count')::integer FROM prepared_header h,
+            LATERAL jsonb_array_elements(h.canonical_summary::jsonb->'streams') stream
+        WHERE (stream->>'stream_slot')::integer=:a_stream_slot) part_count
 FROM __CONTROL__.custom_import_definition_revision d
 LEFT JOIN LATERAL (
     SELECT x value FROM jsonb_array_elements(d.canonical_definition::jsonb#>'{schema,children}') x
@@ -209,30 +238,104 @@ SELECT max(part_row_ordinal)+1 AS last_row FROM __CANDIDATE__.source_bulk_landin
         WHERE batch_id=:p_batch AND part_ordinal=:last_part;
 
 -- query: verified_parts
+WITH prepared_header AS (SELECT h.* FROM __CONTROL__.custom_import_prepared_source h
+        JOIN __CONTROL__.custom_import_execution e ON e.execution_id=h.execution_id
+        JOIN __CONTROL__.custom_import_source_binding_revision binding
+            ON binding.source_binding_revision_id=e.source_binding_revision_id
+        JOIN __CONTROL__.custom_import_capture_bundle original ON original.capture_bundle_id=e.capture_bundle_id
+        WHERE h.execution_id=:b_execution_id AND h.state='sealed' AND h.sealed_at IS NOT NULL
+            AND h.encoding_contract='custom-import/prepared-source-rows/v1'
+            AND binding.binding_contract='custom-import/source-binding/v3'
+            AND original.capture_state='sealed' AND original.payload_contract IS NULL
+            AND ROW(h.dataset_id,h.definition_revision_id,h.schema_revision_id,h.capture_bundle_id)
+                IS NOT DISTINCT FROM ROW(:b_dataset_id,:b_definition_revision_id,:b_schema_revision_id,:b_capture_bundle_id)
+            AND ROW(e.dataset_id,e.definition_revision_id,e.schema_revision_id,e.capture_bundle_id)
+                IS NOT DISTINCT FROM ROW(h.dataset_id,h.definition_revision_id,h.schema_revision_id,h.capture_bundle_id)
+            AND ROW(binding.dataset_id,binding.definition_revision_id,binding.schema_revision_id)
+                IS NOT DISTINCT FROM ROW(h.dataset_id,h.definition_revision_id,h.schema_revision_id)
+            AND ROW(original.dataset_id,original.definition_revision_id,original.schema_revision_id)
+                IS NOT DISTINCT FROM ROW(h.dataset_id,h.definition_revision_id,h.schema_revision_id)
+            AND h.source_binding_revision_id=binding.source_binding_revision_id
+            AND h.source_binding_sha256=binding.binding_sha256
+            AND h.request_identity_sha256=e.request_identity_sha256 AND h.raw_manifest_sha256=original.manifest_sha256
+            AND h.preparation_deadline_at=:b_build_deadline_at
+            AND h.canonical_processing_policy::jsonb=binding.canonical_binding::jsonb->'processing_policy'
+            AND h.processing_policy_sha256=sha256(convert_to('custom-import/object-processing-policy/v1:'||h.canonical_processing_policy,'UTF8'))
+            AND h.prepared_sha256=sha256(convert_to(h.encoding_contract||':'||h.canonical_summary,'UTF8'))), replay_parts AS (
+    SELECT part.part_ordinal,part.record_count,NULL::bigint first_source_ordinal
+    FROM __CONTROL__.custom_import_capture_parquet_part part
+    JOIN __CONTROL__.custom_import_capture_bundle original ON original.capture_bundle_id=part.capture_bundle_id
+    WHERE part.capture_bundle_id=:b_capture_bundle_id AND part.stream_slot=:a_stream_slot
+        AND original.payload_contract='custom-import/parquet-parts/v2' AND original.capture_state='sealed'
+        AND part.part_ordinal BETWEEN :a_first_part AND :last_part
+    UNION ALL
+    SELECT part.part_ordinal,part.record_count,part.first_source_ordinal
+    FROM __CONTROL__.custom_import_prepared_source_part part JOIN prepared_header h ON h.execution_id=part.execution_id
+    WHERE part.stream_slot=:a_stream_slot AND part.dataset_id=h.dataset_id
+        AND part.definition_revision_id=h.definition_revision_id AND part.schema_revision_id=h.schema_revision_id
+        AND part.payload_contract=h.encoding_contract
+        AND part.part_ordinal BETWEEN :a_first_part AND :last_part
+)
 SELECT CASE WHEN :last_part>:part_count OR :p_verified_parts IS NULL
         OR cardinality(:p_verified_parts)<>(SELECT count(DISTINCT value) FROM unnest(:p_verified_parts) value)
         OR cardinality(:p_verified_parts)<>:last_part-:a_first_part
         OR EXISTS(SELECT 1 FROM unnest(:p_verified_parts) value
             WHERE value IS NULL OR value<:a_first_part OR value>=:last_part)
-        OR (SELECT count(*) FROM __CONTROL__.custom_import_capture_parquet_part p
-            WHERE p.capture_bundle_id=:b_capture_bundle_id AND p.stream_slot=:a_stream_slot
-                AND p.part_ordinal BETWEEN :a_first_part AND :last_part-1)<>:last_part-:a_first_part
-        OR EXISTS(SELECT 1 FROM __CONTROL__.custom_import_capture_parquet_part p
+        OR (SELECT count(*) FROM replay_parts p
+            WHERE p.part_ordinal BETWEEN :a_first_part AND :last_part-1)<>:last_part-:a_first_part
+        OR EXISTS(SELECT 1 FROM replay_parts p
             LEFT JOIN (SELECT part_ordinal,max(part_row_ordinal)+1 row_end
                 FROM __CANDIDATE__.source_bulk_landing WHERE batch_id=:p_batch GROUP BY part_ordinal) l
                 ON l.part_ordinal=p.part_ordinal
-            WHERE p.capture_bundle_id=:b_capture_bundle_id AND p.stream_slot=:a_stream_slot
-                AND p.part_ordinal BETWEEN :a_first_part AND :last_part-1
+            WHERE p.part_ordinal BETWEEN :a_first_part AND :last_part-1
                 AND (NOT(p.part_ordinal=ANY(:p_verified_parts)) OR p.record_count<>coalesce(l.row_end,
                     CASE WHEN p.part_ordinal=:a_first_part THEN :a_first_row ELSE 0 END))) THEN 'source_set_earlier_part_not_verified' END problem;
 
 -- query: positions
+WITH prepared_header AS (SELECT h.* FROM __CONTROL__.custom_import_prepared_source h
+        JOIN __CONTROL__.custom_import_execution e ON e.execution_id=h.execution_id
+        JOIN __CONTROL__.custom_import_source_binding_revision binding
+            ON binding.source_binding_revision_id=e.source_binding_revision_id
+        JOIN __CONTROL__.custom_import_capture_bundle original ON original.capture_bundle_id=e.capture_bundle_id
+        WHERE h.execution_id=:b_execution_id AND h.state='sealed' AND h.sealed_at IS NOT NULL
+            AND h.encoding_contract='custom-import/prepared-source-rows/v1'
+            AND binding.binding_contract='custom-import/source-binding/v3'
+            AND original.capture_state='sealed' AND original.payload_contract IS NULL
+            AND ROW(h.dataset_id,h.definition_revision_id,h.schema_revision_id,h.capture_bundle_id)
+                IS NOT DISTINCT FROM ROW(:b_dataset_id,:b_definition_revision_id,:b_schema_revision_id,:b_capture_bundle_id)
+            AND ROW(e.dataset_id,e.definition_revision_id,e.schema_revision_id,e.capture_bundle_id)
+                IS NOT DISTINCT FROM ROW(h.dataset_id,h.definition_revision_id,h.schema_revision_id,h.capture_bundle_id)
+            AND ROW(binding.dataset_id,binding.definition_revision_id,binding.schema_revision_id)
+                IS NOT DISTINCT FROM ROW(h.dataset_id,h.definition_revision_id,h.schema_revision_id)
+            AND ROW(original.dataset_id,original.definition_revision_id,original.schema_revision_id)
+                IS NOT DISTINCT FROM ROW(h.dataset_id,h.definition_revision_id,h.schema_revision_id)
+            AND h.source_binding_revision_id=binding.source_binding_revision_id
+            AND h.source_binding_sha256=binding.binding_sha256
+            AND h.request_identity_sha256=e.request_identity_sha256 AND h.raw_manifest_sha256=original.manifest_sha256
+            AND h.preparation_deadline_at=:b_build_deadline_at
+            AND h.canonical_processing_policy::jsonb=binding.canonical_binding::jsonb->'processing_policy'
+            AND h.processing_policy_sha256=sha256(convert_to('custom-import/object-processing-policy/v1:'||h.canonical_processing_policy,'UTF8'))
+            AND h.prepared_sha256=sha256(convert_to(h.encoding_contract||':'||h.canonical_summary,'UTF8'))), replay_parts AS (
+    SELECT part.part_ordinal,part.record_count,NULL::bigint first_source_ordinal
+    FROM __CONTROL__.custom_import_capture_parquet_part part
+    JOIN __CONTROL__.custom_import_capture_bundle original ON original.capture_bundle_id=part.capture_bundle_id
+    WHERE part.capture_bundle_id=:b_capture_bundle_id AND part.stream_slot=:a_stream_slot
+        AND original.payload_contract='custom-import/parquet-parts/v2' AND original.capture_state='sealed'
+        AND part.part_ordinal BETWEEN :a_first_part AND :last_part
+    UNION ALL
+    SELECT part.part_ordinal,part.record_count,part.first_source_ordinal
+    FROM __CONTROL__.custom_import_prepared_source_part part JOIN prepared_header h ON h.execution_id=part.execution_id
+    WHERE part.stream_slot=:a_stream_slot AND part.dataset_id=h.dataset_id
+        AND part.definition_revision_id=h.definition_revision_id AND part.schema_revision_id=h.schema_revision_id
+        AND part.payload_contract=h.encoding_contract
+        AND part.part_ordinal BETWEEN :a_first_part AND :last_part
+)
 SELECT CASE WHEN EXISTS(WITH ordered AS (SELECT l.*,lag(part_ordinal) OVER w previous_part,
             lag(part_row_ordinal) OVER w previous_row,lag(pack_ordinal) OVER w previous_pack
             FROM __CANDIDATE__.source_bulk_landing l WHERE batch_id=:p_batch WINDOW w AS (ORDER BY landing_ordinal))
-        SELECT 1 FROM ordered o LEFT JOIN __CONTROL__.custom_import_capture_parquet_part p
-            ON p.capture_bundle_id=:b_capture_bundle_id AND p.stream_slot=:a_stream_slot AND p.part_ordinal=o.part_ordinal
-        WHERE p.part_ordinal IS NULL OR o.part_ordinal<:a_first_part OR o.part_row_ordinal>=p.record_count
+        SELECT 1 FROM ordered o LEFT JOIN replay_parts p
+            ON p.part_ordinal=o.part_ordinal
+        WHERE p.part_ordinal IS NULL OR (p.first_source_ordinal IS NOT NULL AND o.source_ordinal<>p.first_source_ordinal-1+o.part_row_ordinal) OR o.part_ordinal<:a_first_part OR o.part_row_ordinal>=p.record_count
             OR (o.landing_ordinal=0 AND (ROW(o.pack_ordinal,o.source_ordinal) IS DISTINCT FROM ROW(:a_first_pack,:a_first_source)
                 OR o.part_row_ordinal<>CASE WHEN o.part_ordinal=:a_first_part THEN :a_first_row ELSE 0 END))
             OR (o.landing_ordinal>0 AND NOT ((o.part_ordinal=o.previous_part AND o.part_row_ordinal=o.previous_row+1)

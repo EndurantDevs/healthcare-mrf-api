@@ -148,13 +148,13 @@ def _loaded_snowflake_source_binding(
     )
 
 
-async def load_snowflake_source_binding(
+async def _source_binding_rows(
     session: AsyncSession,
     *,
     definition_revision_id: int,
     source_binding_revision_id: int,
-) -> LoadedSnowflakeSourceBinding:
-    """Load one immutable binding without accepting a source-controlled selector."""
+) -> tuple[CustomImportSourceBindingRevision, CustomImportDefinitionRevision, CustomImportSchemaRevision]:
+    """Load exactly one binding with its definition and schema owner joins."""
 
     definition_revision_id = _positive_id(definition_revision_id)
     source_binding_revision_id = _positive_id(source_binding_revision_id)
@@ -189,7 +189,23 @@ async def load_snowflake_source_binding(
     if len(binding_rows) != 1:
         raise SnowflakeSourceBindingUnavailableError("source binding is unavailable")
     binding_row, definition_row, schema_row = binding_rows[0]
-    return _loaded_snowflake_source_binding(binding_row, definition_row, schema_row)
+    return binding_row, definition_row, schema_row
+
+
+async def load_snowflake_source_binding(
+    session: AsyncSession,
+    *,
+    definition_revision_id: int,
+    source_binding_revision_id: int,
+) -> LoadedSnowflakeSourceBinding:
+    """Load one immutable binding without accepting a source-controlled selector."""
+
+    rows = await _source_binding_rows(
+        session,
+        definition_revision_id=definition_revision_id,
+        source_binding_revision_id=source_binding_revision_id,
+    )
+    return _loaded_snowflake_source_binding(*rows)
 
 
 def _validated_registration_binding(

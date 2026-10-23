@@ -541,8 +541,9 @@ class CustomImportSourceBindingRevision(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "binding_contract IN ('custom-import/source-binding/v1', 'custom-import/source-binding/v2') AND "
-            "connector_kind = 'snowflake_bundle' AND revision_number > 0 AND "
+            "((binding_contract IN ('custom-import/source-binding/v1', 'custom-import/source-binding/v2') AND "
+            "connector_kind = 'snowflake_bundle') OR (binding_contract = 'custom-import/source-binding/v3' AND "
+            "connector_kind IN ('https', 's3', 'upload'))) AND revision_number > 0 AND "
             + _sha256_check("definition_sha256")
             + " AND "
             + _sha256_check("schema_sha256")

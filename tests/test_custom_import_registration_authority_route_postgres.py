@@ -11,6 +11,7 @@ import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 from sanic import Sanic
 from sqlalchemy import func, select
@@ -19,7 +20,12 @@ from api.control_registration_authority import blueprint
 from db.models.custom_import import CustomImportDataset, CustomImportRegistrationAuthority
 from process.custom_import.definition import canonical_json
 from process.custom_import.registration_authority import get_registration_authority
+from process.custom_import.registration_authority_operator import register_authority
 from tests.custom_import_postgres_support import isolated_publication_case
+from tests.test_custom_import_registration_authority_operator import (
+    _rewrite_authority,
+    mounted_case,
+)
 from tests.test_custom_import_registration_authority_postgres import _registration
 
 
@@ -41,11 +47,12 @@ def _mounted_client(publication_case):
 
 
 @pytest.mark.asyncio
-async def test_mounted_registration_authority_commits_and_replays_exact_graph(monkeypatch):
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+async def test_mounted_registration_authority_commits_and_replays_exact_graph(monkeypatch, connector):
     """Exercise mounted HTTP auth, store transaction, and committed readback."""
 
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-control-token")
-    registration = _registration()
+    registration = _registration(connector=connector)
     authority_id = secrets.token_hex(32)
     token = secrets.token_bytes(32)
     bearer = base64.urlsafe_b64encode(token).decode("ascii").rstrip("=")
@@ -97,4 +104,54 @@ async def test_mounted_registration_authority_commits_and_replays_exact_graph(mo
         _, replay = await client.post(path + "/register", data=registration_body, headers=capability_headers_by_name)
         assert replay.status == 200 and replay.json == registered.json
         async with case.sessions() as session:
+            assert await session.scalar(select(func.count()).select_from(CustomImportDataset)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mounted_case", ("https", "s3", "upload"), indirect=True)
+async def test_scoped_operator_recovers_committed_result_after_lost_ack(mounted_case, monkeypatch):
+    """The unchanged scoped transport can recover a committed generic graph."""
+
+    case = mounted_case
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-control-token")
+    authority_id = case.authority["authority_id"]
+    path = f"/control/v1/custom-import/registration-authorities/{authority_id}"
+    async with isolated_publication_case() as publication:
+        async with publication.engine.begin() as connection:
+            await connection.run_sync(CustomImportRegistrationAuthority.__table__.create)
+        client = _mounted_client(publication)
+        _, minted = await client.put(
+            path,
+            json={
+                "registration": case.registration,
+                "expires_at": case.authority["expires_at"],
+                "token_sha256": case.authority["token_sha256"],
+            },
+            headers={"Authorization": "Bearer synthetic-control-token"},
+        )
+        assert minted.status == 200
+        responses = []
+
+        async def handler(request):
+            assert request.content == canonical_json(case.registration).encode("utf-8")
+            _, reply = await client.post(request.url.path, data=request.content, headers=dict(request.headers))
+            assert reply.status == 200
+            responses.append(reply.json)
+            if len(responses) == 1:
+                raise httpx.ReadError("synthetic lost acknowledgement")
+            return httpx.Response(200, json=reply.json, headers={"Cache-Control": "no-store"})
+
+        transport = httpx.MockTransport(handler)
+        with pytest.raises(ValueError, match="^registration authority is unavailable$"):
+            await register_authority(case.dataset_key, case.definition, case.binding, transport=transport)
+        _, revoked = await client.post(
+            path + "/revoke", data=b"{}", headers={"Authorization": "Bearer synthetic-control-token"}
+        )
+        assert revoked.status == 200
+        _rewrite_authority(case, document={**case.authority, "expires_at": "2020-01-01T00:00:00Z"})
+        rendered = await register_authority(case.dataset_key, case.definition, case.binding, transport=transport)
+        assert json.loads(rendered) == responses[0] == responses[1]
+        async with publication.sessions() as session:
+            retained = await get_registration_authority(session, authority_id)
+            assert retained.result == responses[0]
             assert await session.scalar(select(func.count()).select_from(CustomImportDataset)) == 1
