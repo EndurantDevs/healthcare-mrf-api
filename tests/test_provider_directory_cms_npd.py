@@ -1484,11 +1484,13 @@ async def test_drain_waits_for_running_preparations_even_when_cancelled():
 
     executor.submit(busy)
     drain = asyncio.create_task(cms._drain_stage_executor(executor))
-    async with asyncio.timeout(5):
-        while not executor._shutdown:
-            await asyncio.sleep(0.01)
-    drain.cancel()
-    release.set()
+    try:
+        async with asyncio.timeout(5):
+            while not executor._shutdown:
+                await asyncio.sleep(0.01)
+        drain.cancel()
+    finally:
+        release.set()
     with pytest.raises(asyncio.CancelledError):
         await drain
     assert finished.is_set()
