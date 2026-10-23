@@ -205,7 +205,17 @@ async def test_reader_configuration_never_falls_back_to_writer(monkeypatch, user
     assert writer.engine is None and writer.session_factory is None
 
 
-@pytest.mark.parametrize("path", ["/api/v1/npi", "/api/v1/npi/", "/api/v1/npi/id/batch", "/api/v1/codes"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/npi",
+        "/api/v1/npi/",
+        "/api/v1/npi/id/batch",
+        "/api/v1/codes",
+        "/control/v1/plan-pricing/code-projection",
+        "/control/v1/plan-pricing/code-projection/",
+    ],
+)
 def test_reader_path_includes_root_and_post_read_routes(path):
     assert Database._is_pinned_read_path(path)
 
@@ -214,6 +224,9 @@ def test_reader_path_includes_root_and_post_read_routes(path):
     "path",
     [
         "/control/imports",
+        "/control/v1/imports",
+        "/control/v1/plan-pricing/code-projection-extra",
+        "/control/v1/plan-pricing/code-projection/nested",
         "/api/v1/npi-extra",
         "/account",
         "/api/v1/geo/",
@@ -537,8 +550,16 @@ async def test_npi_optional_count_recovers_savepoint_before_reader_page(monkeypa
 
 
 @pytest.mark.parametrize("status", [200, 503])
-async def test_public_request_routes_helpers_and_releases_reader(monkeypatch, status):
-    monkeypatch.setenv("HLTHPRT_API_READER_ENABLED", "true")
+@pytest.mark.parametrize(
+    "path, enabled",
+    [
+        ("/api/v1/npi/", "true"),
+        ("/control/v1/plan-pricing/code-projection", "true"),
+        ("/control/v1/plan-pricing/code-projection", "false"),
+    ],
+)
+async def test_public_request_routes_helpers_and_releases_reader(monkeypatch, status, path, enabled):
+    monkeypatch.setenv("HLTHPRT_API_READER_ENABLED", enabled)
     monkeypatch.setattr("api.reference_family_reads.pin_claims_reader", AsyncMock())
     session = ReaderSession()
     database = reader_database(monkeypatch, [session])
@@ -556,9 +577,16 @@ async def test_public_request_routes_helpers_and_releases_reader(monkeypatch, st
             return register
 
     database.init_app(App())
-    request = SimpleNamespace(path="/api/v1/npi/", ctx=SimpleNamespace())
+    request = SimpleNamespace(path=path, ctx=SimpleNamespace())
     await middleware_by_kind["request"](request)
     assert request.ctx.session is session
+    if path.startswith("/control/"):
+        from api import plan_release_read_boundary as boundary
+
+        monkeypatch.setattr(boundary, "db", database)
+        request.headers = SimpleNamespace(getall=lambda _name, _default: ["internal"])
+        request.get_args = lambda **_kwargs: {"plan_release_id": "hprelease_01J00000000000000000000000"}
+        assert await boundary.require_internal_plan_release_read(request) is None
     await database.scalar("SELECT 1")
     await middleware_by_kind["response"](request, SimpleNamespace(status=status))
     assert session.closed and request.ctx.session is None

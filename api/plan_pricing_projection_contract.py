@@ -8,6 +8,8 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
 from string import Template
 from typing import Any, Mapping
 
@@ -26,6 +28,21 @@ FACTORIZED_V3_PROJECTION_CONTRACT = "plan_pricing_factorized_v3"
 PROJECTION_CONTRACT = "plan_pricing_factorized_v4"
 PROJECTION_BUILD_REVISION = "sealed-physical-read-dedup-v2"
 FACTORIZED_PROJECTION_CONTRACTS = frozenset({FACTORIZED_V3_PROJECTION_CONTRACT, PROJECTION_CONTRACT})
+_CODE_RELATIONS = ContextVar("plan_pricing_code_relations", default=None)
+
+
+def current_code_projection():
+    return _CODE_RELATIONS.get()
+
+
+@contextmanager
+def code_projection_scope(capability):
+    """Keep an authenticated physical family local to one asynchronous read."""
+    token = _CODE_RELATIONS.set(capability)
+    try:
+        yield
+    finally:
+        _CODE_RELATIONS.reset(token)
 
 
 def _projection_schema() -> str:
@@ -169,7 +186,10 @@ class PlanPricingProjectionUnavailable(RuntimeError):
 def table(name: str) -> str:
     """Qualify one projection dependency in the configured schema."""
 
-    return f'"{SCHEMA}"."{name}"'
+    capability = current_code_projection()
+    return (
+        capability.relation(name) if capability is not None and name in capability.relations else f'"{SCHEMA}"."{name}"'
+    )
 
 
 def row_mapping(database_row: Any) -> dict[str, Any]:

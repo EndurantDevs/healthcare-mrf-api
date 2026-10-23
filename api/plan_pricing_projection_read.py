@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 from typing import Any, Mapping
 
 import orjson
@@ -23,6 +24,8 @@ from api.plan_pricing_projection_contract import (
     PlanPricingProjectionUnsupported,
     projection_code_identity,
     table,
+    current_code_projection,
+    code_projection_scope,
 )
 from api.plan_release_serving import (
     PlanReleaseServingSelection,
@@ -283,7 +286,11 @@ def _validated_projection_request(
     if contract not in {
         LEGACY_PROJECTION_CONTRACT,
         *FACTORIZED_PROJECTION_CONTRACTS,
-    }:
+    } and not (
+        current_code_projection() is not None
+        and contract == current_code_projection().identity["contract"]
+        and selection.pricing_projection_id == current_code_projection().projection_id
+    ):
         raise PlanPricingProjectionUnavailable("the selected pricing projection contract is unsupported")
     return _ProjectionRequest(
         result_type,
@@ -446,6 +453,17 @@ async def search_plan_pricing_projection(
     pagination: Any,
 ) -> dict[str, Any] | None:
     """Admit source contributors before reading an immutable card or aggregate page."""
+    if (
+        selection is not None
+        and not selection.pricing_projection_id
+        and projection_result_type(args) == "rate_aggregates"
+    ):
+        from api.plan_pricing_code_read import resolve_code_pricing
+
+        capability = await resolve_code_pricing(session, selection, args)
+        if capability is not None:
+            with code_projection_scope(capability):
+                return await search_plan_pricing_projection(session, capability.selection(selection), args, pagination)
     request = _validated_projection_request(selection, args)
     if request is None:
         return None
@@ -456,7 +474,9 @@ async def search_plan_pricing_projection(
         if current_network_address_scope() is not None
         else None
     )
-    response = await _projection_page_response(session, request, args, pagination, contributing_bindings, selection)
+    scope = current_code_projection()
+    with code_projection_scope(scope.contributors(contributing_bindings)) if scope is not None else nullcontext():
+        response = await _projection_page_response(session, request, args, pagination, contributing_bindings, selection)
     if response is None:
         return None
     return annotate_plan_release_response(response, selection, contributing_bindings=contributing_bindings) or response

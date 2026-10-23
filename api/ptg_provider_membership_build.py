@@ -7,8 +7,8 @@ from uuid import uuid4
 
 from sqlalchemy import text
 
-from api.ptg2_db_sidecars import ForwardReadBudget
-from api.ptg2_v4_graph import load_v4_relation_manifest, lookup_v4_relation_members
+from api.ptg2_db_sidecars import ForwardReadBudget, _forward_code_block_bounds, lookup_code_prefix_occurrences_from_db
+from api.ptg2_v4_graph import load_v4_relation_manifest, lookup_v4_relation_members, v4_graph_request_scope
 from api.ptg_membership_contract import (
     MAX_BUILD_BYTES,
     MAX_BUILD_EDGES,
@@ -34,6 +34,9 @@ from process import reference_family_archive as native
 from process.live_progress import enqueue_live_progress
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts.ptg2_v4_snapshot_maps import summarize_persisted_v4_snapshot_maps
+from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
+
+_MAX_SOURCE_READ_BYTES = 256 * 1024 * 1024
 
 
 async def _copy(session, ownership, model, rows):
@@ -65,7 +68,10 @@ async def _authenticate_root(session, tables, root):
         .mappings()
         .one()
     )
-    if not 0 < expected["stored_map_byte_count"] <= MAX_MAP_BYTES or expected["coordinate_count"] > MAX_BUILD_EDGES:
+    if (
+        not 0 < expected["stored_map_byte_count"] <= min(MAX_MAP_BYTES, _MAX_SOURCE_READ_BYTES)
+        or expected["coordinate_count"] > MAX_BUILD_EDGES
+    ):
         raise ValueError("membership source map exceeds the bounded build contract")
     actual = await summarize_persisted_v4_snapshot_maps(
         session,
@@ -76,6 +82,7 @@ async def _authenticate_root(session, tables, root):
     )
     if actual.map_digest != root.map_digest or any(getattr(actual, name) != value for name, value in expected.items()):
         raise PTG2ManifestArtifactError("membership source CAS mapping root differs")
+    return expected["stored_map_byte_count"]
 
 
 async def _copy_relation(session, tables, root, relation, ownership, model, hasher, *, edge_allowance):
@@ -91,8 +98,10 @@ async def _copy_relation(session, tables, root, relation, ownership, model, hash
     hasher.update(relation.encode("ascii") + b"\0")
     count = 0
     reported = 0
-    for start in range(manifest.owner_base, manifest.owner_base + manifest.owner_count, 256):
-        owners = tuple(range(start, min(start + 256, manifest.owner_base + manifest.owner_count)))
+    # Coalesce one sealed locator page so adjacent owners do not repay its I/O.
+    owner_batch = manifest.locator_owner_span
+    for start in range(manifest.owner_base, manifest.owner_base + manifest.owner_count, owner_batch):
+        owners = tuple(range(start, min(start + owner_batch, manifest.owner_base + manifest.owner_count)))
         members = await lookup_v4_relation_members(
             session,
             snapshot_key=root.snapshot_key,
@@ -103,6 +112,8 @@ async def _copy_relation(session, tables, root, relation, ownership, model, hash
         )
         if set(members) != set(owners):
             raise PTG2ManifestArtifactError("membership factor owner coverage is incomplete")
+        if sum(map(len, members.values())) > min(MAX_FACTOR_BATCH_MEMBERS, edge_allowance - count):
+            raise PTG2ManifestArtifactError("membership factor batch exceeds its retained member allowance")
         edge_rows = []
         for owner in owners:
             members_for_owner = members[owner]
@@ -173,6 +184,38 @@ async def _physical_code_rows(session, tables, code_system, code):
     return code_rows
 
 
+async def _reserve_forward_maps(session, tables, identity, code_key, budget):
+    """Reserve complete discovery and mapping pack visits before forward reads."""
+    from api import ptg2_serving as serving
+
+    if identity["finalizer"]["state"] == "legacy_relational":
+        return
+    schema = serving._payload_schema(tables)
+    lower, upper = _forward_code_block_bounds(code_key)
+    counts = (
+        (
+            await session.execute(
+                text(
+                    f"SELECT count(*) AS pages,COALESCE(sum(block.raw_byte_count),0) AS raw_bytes,"
+                    f"count(*) FILTER (WHERE block.block_hash IS NULL OR block.raw_byte_count<=0) AS invalid "
+                    f'FROM "{schema}".ptg2_v4_finalizer_map_pack pack '
+                    f'LEFT JOIN "{schema}".ptg2_v3_block block ON block.block_hash=pack.map_block_hash '
+                    "WHERE pack.snapshot_key=:key AND pack.object_kind='by_code_provider_shard_v1' "
+                    "AND pack.last_block_key>=:lower AND pack.first_block_key<:upper"
+                ),
+                {"key": serving._required_shared_snapshot_key(tables), "lower": lower, "upper": upper},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    if counts["invalid"]:
+        raise PTG2ManifestArtifactError("membership forward map byte metadata is invalid")
+    # The unfiltered prefix discovers the full code range, then streams its
+    # mapping once. Range packs conservatively cover both selections.
+    budget.claim_page_capacity(page_count=2 * counts["pages"], raw_payload_bytes=2 * counts["raw_bytes"])
+
+
 async def _copy_code(session, tables, identity, ownership, hasher, *, byte_allowance):
     from api import ptg2_serving as serving
 
@@ -183,11 +226,28 @@ async def _copy_code(session, tables, identity, ownership, hasher, *, byte_allow
         maximum_row_capacity=MAX_CODE_OCCURRENCES + 1,
     )
     coverage_rows = []
+    provider_sets = set()
     for row in rows:
-        entries = await serving._shared_forward_entries_for_code_rows(session, tables, [row], scan_budget=budget)
+        await _reserve_forward_maps(session, tables, identity, int(row["code_key"]), budget)
+        limit = int(row["rate_count"]) + 1
+        budget.reserve_row_capacity(read_rows=limit, result_rows=limit)
+        try:
+            entries = await lookup_code_prefix_occurrences_from_db(
+                session,
+                int(row["code_key"]),
+                limit=limit,
+                shared_snapshot_key=serving._required_shared_snapshot_key(tables),
+                source_count=serving._required_source_count(tables),
+                scan_budget=budget,
+                **serving._version_three_forward_lookup_hints(tables),
+                schema_name=serving._payload_schema(tables),
+            )
+        finally:
+            budget.release_row_capacity(read_rows=limit, result_rows=limit)
         if len(entries) != int(row["rate_count"]):
             raise PTG2ManifestArtifactError("membership requested code occurrence coverage is incomplete")
-        sets = sorted({int(entry.provider_set_key) for entry in entries})
+        sets = sorted({int(entry[0]) for entry in entries})
+        provider_sets.update(sets)
         set_digest = hashlib.sha256(b"".join(struct.pack(">I", key) for key in sets)).hexdigest()
         coverage_by_field = {
             "code_key": int(row["code_key"]),
@@ -199,7 +259,65 @@ async def _copy_code(session, tables, identity, ownership, hasher, *, byte_allow
         hasher.update(encoded(coverage_by_field).encode("ascii"))
         await _copy(session, ownership, PTGMembershipCode, [(coverage_by_field["code_key"], key) for key in sets])
         await _copy(session, ownership, PTGMembershipCodeCoverage, [tuple(coverage_by_field.values())])
-    return coverage_rows
+        del entries
+    return coverage_rows, tuple(sorted(provider_sets)), budget.raw_payload_bytes
+
+
+async def _copy_code_factor(session, tables, root, ownership, provider_sets, hasher, *, edge_allowance):
+    """Transpose complete covered-set owners without expanding other codes."""
+    from api import ptg2_serving as serving
+
+    relations = {
+        "pattern_v1": ("pattern_sets", "set_patterns"),
+        "direct_v1": ("group_sets_direct", "set_groups_direct"),
+    }
+    relation, inverse = relations[root.representation]
+    schema = serving._payload_schema(tables)
+    manifest = await load_v4_relation_manifest(
+        session, snapshot_key=root.snapshot_key, relation=relation, schema_name=schema
+    )
+    if manifest.owner_count > MAX_BUILD_OWNERS:
+        raise ValueError("membership factor relation exceeds the bounded build contract")
+    inverse_manifest = await load_v4_relation_manifest(
+        session, snapshot_key=root.snapshot_key, relation=inverse, schema_name=schema
+    )
+    if inverse_manifest.logical_member_count != manifest.logical_member_count or any(
+        not inverse_manifest.owner_base <= key < inverse_manifest.owner_base + inverse_manifest.owner_count
+        for key in provider_sets
+    ):
+        raise PTG2ManifestArtifactError("membership inverse factor domain differs from the sealed source")
+    hasher.update(relation.encode("ascii") + b"\0")
+    count = 0
+    for start in range(0, len(provider_sets), 128):
+        owners = provider_sets[start : start + 128]
+        members = await lookup_v4_relation_members(
+            session,
+            snapshot_key=root.snapshot_key,
+            relation=inverse,
+            owner_keys=owners,
+            schema_name=schema,
+            max_members=min(MAX_FACTOR_BATCH_MEMBERS, edge_allowance - count),
+        )
+        if set(members) != set(owners):
+            raise PTG2ManifestArtifactError("membership factor owner coverage is incomplete")
+        if sum(map(len, members.values())) > min(MAX_FACTOR_BATCH_MEMBERS, edge_allowance - count):
+            raise PTG2ManifestArtifactError("membership factor batch exceeds its retained member allowance")
+        rows = []
+        for owner in owners:
+            factors = members[owner]
+            if tuple(factors) != tuple(sorted(set(factors))) or any(
+                not manifest.owner_base <= factor < manifest.owner_base + manifest.owner_count for factor in factors
+            ):
+                raise PTG2ManifestArtifactError("membership inverse factor vector is noncanonical or out of domain")
+            for factor in factors:
+                rows.append((factor, owner))
+                hasher.update(struct.pack(">II", factor, owner))
+                if len(rows) == 5000:
+                    await _copy(session, ownership, PTGMembershipSecond, rows)
+                    rows = []
+            count += len(factors)
+        await _copy(session, ownership, PTGMembershipSecond, rows)
+    return dict(relation=relation, owner_base=manifest.owner_base, owner_count=manifest.owner_count, edge_count=count)
 
 
 async def _validate_candidate(session, ownership, factors, coverage):
@@ -275,35 +393,32 @@ async def build_in_session(session, *, source_key, snapshot_id, code_system, cod
     enqueue_live_progress(
         phase="membership source authentication", message="Authenticating the complete source map and CAS closure"
     )
-    await _authenticate_root(session, tables, root)
+    map_bytes = await _authenticate_root(session, tables, root)
     ownership = await native.precreate_model_family_stage(session, SPEC, uuid4())
     hasher = hashlib.sha256(encoded(identity).encode("ascii"))
-    relations = (
-        ("npi_patterns", "pattern_sets")
-        if root.representation == "pattern_v1"
-        else ("npi_groups_exact", "group_sets_direct")
-    )
-    factors = []
-    edges = 0
-    for relation, model in zip(relations, (PTGMembershipFirst, PTGMembershipSecond), strict=True):
-        factor = await _copy_relation(
-            session,
-            tables,
-            root,
-            relation,
-            ownership,
-            model,
-            hasher,
-            edge_allowance=min(MAX_BUILD_EDGES, MAX_BUILD_BYTES // 8) - edges,
-        )
-        factors.append(factor)
-        edges += factor["edge_count"]
     enqueue_live_progress(
         phase="membership procedure coverage", message="Authenticating complete requested-code occurrence coverage"
     )
-    coverage = await _copy_code(
-        session, tables, identity, ownership, hasher, byte_allowance=MAX_BUILD_BYTES - edges * 8
+    coverage, provider_sets, code_bytes = await _copy_code(
+        session, tables, identity, ownership, hasher, byte_allowance=_MAX_SOURCE_READ_BYTES - map_bytes
     )
+    edge_allowance = min(MAX_BUILD_EDGES, (MAX_BUILD_BYTES - code_bytes) // 8)
+    read_budget = RegistryPTGGraphReadBudget(maximum_bytes=_MAX_SOURCE_READ_BYTES - map_bytes - code_bytes)
+    with v4_graph_request_scope(read_budget=read_budget):
+        first = await _copy_relation(
+            session,
+            tables,
+            root,
+            "npi_patterns" if root.representation == "pattern_v1" else "npi_groups_exact",
+            ownership,
+            PTGMembershipFirst,
+            hasher,
+            edge_allowance=edge_allowance,
+        )
+        second = await _copy_code_factor(
+            session, tables, root, ownership, provider_sets, hasher, edge_allowance=edge_allowance - first["edge_count"]
+        )
+    factors = [first, second]
     counts_by_name = {"factors": factors, "code_coverage": coverage}
     await _copy(
         session, ownership, PTGMembershipManifest, [(1, encoded(identity), hasher.hexdigest(), encoded(counts_by_name))]

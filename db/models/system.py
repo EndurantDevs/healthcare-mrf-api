@@ -174,6 +174,12 @@ class ImportRun(Base, JSONOutputMixin):
     __my_additional_indexes__ = [
         {
             "index_elements": ("importer", "idempotency_key"),
+            "name": "import_run_code_pricing_idempotency_idx",
+            "unique": True,
+            "where": "importer = 'plan-pricing-code-projection' AND idempotency_key IS NOT NULL",
+        },
+        {
+            "index_elements": ("importer", "idempotency_key"),
             "name": "import_run_ptg_membership_idempotency_idx",
             "unique": True,
             "where": "importer = 'ptg-provider-membership-projection' AND idempotency_key IS NOT NULL",
