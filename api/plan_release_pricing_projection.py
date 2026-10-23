@@ -66,16 +66,9 @@ SELECT revision.serving_revision_id,
             WHERE pin.owner_type = {pin_owner_parameter}
               AND pin.owner_id = revision.serving_revision_id
               AND pin.snapshot_id = binding.snapshot_id
-       ) OR (
-           {pin_owner_parameter} = 'plan_release_serving_revision'
-           AND EXISTS (
-               SELECT 1 FROM {schema}.plan_release_snapshot_pin pin
-                WHERE pin.serving_revision_id = revision.serving_revision_id
-                  AND pin.snapshot_id = binding.snapshot_id
-           )
-       ) AS is_pinned
+       ){native_pin_sql} AS is_pinned
   FROM {schema}.plan_release_serving_revision revision
-  JOIN {schema}.plan_release_snapshot_binding binding
+  JOIN {binding_relation} binding
     ON binding.serving_revision_id = revision.serving_revision_id
   LEFT JOIN {schema}.ptg2_snapshot snapshot
     ON snapshot.snapshot_id = binding.snapshot_id
@@ -87,6 +80,15 @@ SELECT revision.serving_revision_id,
  ORDER BY CASE binding.role WHEN 'in_network' THEN 0 ELSE 1 END,
           binding.binding_ordinal
 """
+
+_NATIVE_PIN_SQL = """ OR (
+           {pin_owner_parameter} = 'plan_release_serving_revision'
+           AND EXISTS (
+               SELECT 1 FROM {schema}.plan_release_snapshot_pin pin
+                WHERE pin.serving_revision_id = revision.serving_revision_id
+                  AND pin.snapshot_id = binding.snapshot_id
+           )
+       )"""
 
 
 def pricing_projection_relation(schema: str) -> str:
@@ -101,6 +103,7 @@ def _plan_release_serving_sql(
     include_pricing_projection: bool,
     release_predicate: str,
     pin_owner_parameter: str,
+    retained: bool = False,
 ) -> str:
     """Build release resolution SQL with an optional projection binding."""
 
@@ -120,6 +123,14 @@ def _plan_release_serving_sql(
     )
     return _PLAN_RELEASE_SERVING_SQL_TEMPLATE.format(
         schema=schema,
+        binding_relation=(
+            f"ONLY {schema}.plan_release_snapshot_binding_legacy"
+            if retained
+            else f"{schema}.plan_release_snapshot_binding"
+        ),
+        native_pin_sql=""
+        if retained
+        else _NATIVE_PIN_SQL.format(schema=schema, pin_owner_parameter=pin_owner_parameter),
         pricing_projection_id_sql=projection_id_sql,
         pricing_projection_contract_sql=projection_contract_sql,
         pricing_projection_join_sql=projection_join_sql,
@@ -128,21 +139,23 @@ def _plan_release_serving_sql(
     )
 
 
-def plan_release_serving_sql(schema: str, *, include_pricing_projection: bool) -> str:
+def plan_release_serving_sql(schema: str, *, include_pricing_projection: bool, retained: bool = False) -> str:
     """Build the original singleton query without changing its predicates."""
     return _plan_release_serving_sql(
         schema,
         include_pricing_projection=include_pricing_projection,
+        retained=retained,
         release_predicate="revision.plan_release_id = :plan_release_id",
         pin_owner_parameter=":pin_owner_type",
     )
 
 
-def plan_release_binding_set_sql(schema: str, *, include_pricing_projection: bool) -> str:
+def plan_release_binding_set_sql(schema: str, *, include_pricing_projection: bool, retained: bool = False) -> str:
     """Build complete native-driver binding metadata for one bound release set."""
     return _plan_release_serving_sql(
         schema,
         include_pricing_projection=include_pricing_projection,
+        retained=retained,
         release_predicate="revision.plan_release_id = ANY($1::text[])",
         pin_owner_parameter="$2",
     )

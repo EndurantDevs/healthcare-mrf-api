@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from api import plan_release_serving
 from api.plan_release_pricing_projection import plan_release_serving_sql
+from api.plan_release_read_storage import is_retained_session_read
 from api.plan_release_serving import (
     PLAN_RELEASE_PIN_OWNER_TYPE,
     PTG2_SCHEMA,
@@ -126,8 +127,15 @@ async def _load_release_rows(
     session: Any,
     plan_release_id: str,
 ) -> list[Any]:
+    retained = await is_retained_session_read(session, PTG2_SCHEMA)
+    sql = (
+        plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=False, retained=True)
+        + f"\n LIMIT {MAX_BILLING_SEARCH_RELEASE_BINDINGS + 1}"
+        if retained
+        else _PLAN_RELEASE_SERVING_SQL
+    )
     result = await session.execute(
-        text(_PLAN_RELEASE_SERVING_SQL),
+        text(sql),
         {
             "plan_release_id": plan_release_id,
             "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE,
@@ -160,8 +168,14 @@ async def resolve_plan_release_guard_selection(
     normalized = normalize_plan_release_id(plan_release_id)
     if normalized is None:
         return None
+    retained = await is_retained_session_read(session, PTG2_SCHEMA)
+    sql = (
+        plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=False, retained=True)
+        if retained
+        else _PLAN_RELEASE_GUARD_SQL
+    )
     result = await session.execute(
-        text(_PLAN_RELEASE_GUARD_SQL),
+        text(sql),
         {"plan_release_id": normalized, "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE},
     )
     return _selection_from_rows(normalized, result)

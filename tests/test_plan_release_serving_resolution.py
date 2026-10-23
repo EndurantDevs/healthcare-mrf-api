@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from api import plan_release_serving_resolution as resolution
@@ -19,6 +20,8 @@ class _Session:
 
     async def execute(self, statement, params):
         self.calls.append((str(statement), params))
+        if "AS readable" in str(statement):
+            return [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)]
         return list(self.rows)
 
 
@@ -29,6 +32,8 @@ class _SequenceSession:
 
     async def execute(self, statement, params):
         self.calls.append((str(statement), params))
+        if "AS readable" in str(statement):
+            return [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)]
         return list(self.results.pop(0))
 
 
@@ -89,9 +94,7 @@ def test_typed_resolution_distinguishes_absent_from_unavailable():
     assert absent_resolution.selection is None
     assert unavailable_resolution.state == "unavailable"
     assert unavailable_resolution.selection is None
-    assert repr(absent_resolution) == (
-        "<plan-release-serving-resolution state=not_found>"
-    )
+    assert repr(absent_resolution) == ("<plan-release-serving-resolution state=not_found>")
 
 
 def test_typed_resolution_marks_existing_unpublished_release_unavailable():
@@ -111,7 +114,7 @@ def test_typed_resolution_marks_existing_unpublished_release_unavailable():
 
     assert serving_resolution.state == "unavailable"
     assert serving_resolution.selection is None
-    assert len(session.calls) == 2
+    assert len(session.calls) == 3
 
 
 def test_existence_probe_detects_release_without_snapshot_bindings():
@@ -129,8 +132,8 @@ def test_existence_probe_detects_release_without_snapshot_bindings():
         )
     )
 
-    ready_sql = session.calls[0][0]
-    existence_sql = session.calls[1][0]
+    ready_sql = session.calls[1][0]
+    existence_sql = session.calls[2][0]
     assert "plan_release_snapshot_binding" in ready_sql
     assert "plan_release_snapshot_binding" not in existence_sql
     assert serving_resolution.state == "unavailable"
@@ -186,8 +189,8 @@ def test_typed_resolution_rejects_release_binding_fanout_before_readiness(
 
     assert serving_resolution.state == "unavailable"
     assert serving_resolution.selection is None
-    assert len(session.calls) == 1
-    assert f"LIMIT {row_limit}" in session.calls[0][0]
+    assert len(session.calls) == 2
+    assert f"LIMIT {row_limit}" in session.calls[1][0]
     readiness.assert_not_awaited()
 
 
@@ -197,9 +200,7 @@ def test_typed_resolution_pins_billing_source_metadata(monkeypatch):
 
     async def is_source_ready(_session, binding, **readiness_context):
         readiness_calls.append(readiness_context)
-        readiness_context["validated_serving_tables_by_snapshot_id"][
-            binding.snapshot_id
-        ] = object()
+        readiness_context["validated_serving_tables_by_snapshot_id"][binding.snapshot_id] = object()
         return True
 
     monkeypatch.setattr(

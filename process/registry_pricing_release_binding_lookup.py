@@ -9,6 +9,7 @@ from dataclasses import asdict
 import asyncpg
 
 from api.plan_release_pricing_projection import plan_release_binding_set_sql, pricing_projection_relation
+from api.plan_release_read_storage import is_retained_binding_read
 from api.plan_release_serving import (
     PLAN_RELEASE_PIN_OWNER_TYPE,
     PTG2_SCHEMA,
@@ -64,7 +65,9 @@ async def _fetch_release_binding_rows(connection, release_ids, max_report_bytes)
     if not required_names <= available_names:
         return None
     binding_sql = plan_release_binding_set_sql(
-        PTG2_SCHEMA, include_pricing_projection=projection_name in available_names
+        PTG2_SCHEMA,
+        include_pricing_projection=projection_name in available_names,
+        retained=await is_retained_binding_read(connection.fetch, PTG2_SCHEMA),
     )
     page = await connection.fetchrow(
         _BOUNDED_METADATA_SQL.format(binding_sql=binding_sql),

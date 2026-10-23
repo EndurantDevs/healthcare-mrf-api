@@ -51,7 +51,8 @@ async def custody_db(prepared_db):
 @asynccontextmanager
 async def _operator(fixture, *, ordinary=False):
     role = fixture.roles_by_kind["api"] if ordinary else fixture.operator
-    engine = create_async_engine(fixture.sessions.kw["bind"].url.set(username=role, password=None))
+    password = fixture.api_password if ordinary else fixture.operator_password
+    engine = create_async_engine(fixture.sessions.kw["bind"].url.set(username=role, password=password))
     try:
         async with engine.begin() as connection:
             await connection.execute(text("SET LOCAL statement_timeout='3s'"))

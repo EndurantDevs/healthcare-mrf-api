@@ -414,6 +414,8 @@ def _scan_reader(held, bindings, rows):
 
     async def execute(statement, parameters=None):
         sql = str(statement)
+        if "AS readable" in sql:
+            return [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)]
         if "to_regclass" in sql:
             return SimpleNamespace(scalar_one=lambda: True)
         if "pin_owner_type" in (parameters or {}):

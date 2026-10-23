@@ -42,7 +42,8 @@ _CHANGES = (
 async def prepared_db(permissions_db, monkeypatch):
     fixture = permissions_db
     await _install(fixture)
-    await fixture.connection.execute(f'ALTER ROLE "{fixture.roles_by_kind["api"]}" LOGIN')
+    api_role, fixture.api_password = fixture.roles_by_kind["api"], uuid4().hex
+    await fixture.connection.execute(f"ALTER ROLE \"{api_role}\" LOGIN PASSWORD '{fixture.api_password}'")
     monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", fixture.schema)
     # Build the actual old physical layout; DROP COLUMN would retain a dropped attnum.
     await fixture.connection.execute(f'DROP TABLE "{fixture.schema}".registry_network_binding')
@@ -75,7 +76,11 @@ async def _upgrade(fixture, revision, role, *, validate=False):
     migration = registry_migration(revision)
     shared_engine = fixture.sessions.kw["bind"]
     is_ordinary = role == fixture.roles_by_kind["api"]
-    engine = create_async_engine(shared_engine.url.set(username=role, password=None)) if is_ordinary else shared_engine
+    engine = (
+        create_async_engine(shared_engine.url.set(username=role, password=fixture.api_password))
+        if is_ordinary
+        else shared_engine
+    )
     try:
         async with engine.begin() as connection:
             if not is_ordinary:
@@ -255,7 +260,10 @@ async def test_office_enrollment_refuses_other_drift(prepared_db, drift):
 async def _maintenance(fixture):
     """Model the existing dedicated maintenance membership, never ordinary membership."""
     owner, operator = fixture.roles_by_kind["owner"], fixture.roles_by_kind["ancestor"]
-    await fixture.connection.execute(f'ALTER ROLE "{operator}" LOGIN NOINHERIT')
+    fixture.operator_password = uuid4().hex
+    await fixture.connection.execute(
+        f"ALTER ROLE \"{operator}\" LOGIN NOINHERIT PASSWORD '{fixture.operator_password}'"
+    )
     await fixture.connection.execute(f'GRANT "{owner}" TO "{operator}" WITH INHERIT FALSE, SET TRUE')
     await fixture.connection.execute(f'GRANT EXECUTE ON FUNCTION pg_control_system() TO "{owner}"')
     return operator
@@ -265,7 +273,9 @@ async def test_atomic_owner_preparation_then_ordinary_adoption(prepared_db):
     fixture = prepared_db
     operator = await _maintenance(fixture)
     before = await _acl(fixture)
-    engine = create_async_engine(fixture.sessions.kw["bind"].url.set(username=operator, password=None))
+    engine = create_async_engine(
+        fixture.sessions.kw["bind"].url.set(username=operator, password=fixture.operator_password)
+    )
     try:
         async with engine.begin() as connection:
             assert await connection.scalar(text("SELECT session_user=current_user")) is True
