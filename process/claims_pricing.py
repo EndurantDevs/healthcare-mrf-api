@@ -2,28 +2,27 @@
 
 from __future__ import annotations
 
+import asyncio
+import csv
 import datetime
 import hashlib
 import json
 import logging
+import math
 import os
 import re
-import asyncio
-import csv
-import sys
-import shutil
 import secrets
+import shutil
+import sys
 import time
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import aiohttp
-from aiofile import async_open
 from aiocsv import AsyncDictReader
-from arq import create_pool
-from arq import Retry
+from aiofile import async_open
+from arq import Retry, create_pool
 
 from db.connection import db
 from db.models import (
@@ -31,27 +30,27 @@ from db.models import (
     CodeCrosswalk,
     PricingProcedure,
     PricingProcedureGeoBenchmark,
+    PricingProcedurePeerStats,
+    PricingProcedureTaxonomySignal,
     PricingProvider,
-    PricingProviderProcedureCostProfile,
     PricingProviderProcedure,
+    PricingProviderProcedureCostProfile,
     PricingProviderProcedureLocation,
     PricingProviderQualityFeature,
-    PricingProcedureTaxonomySignal,
-    PricingProcedurePeerStats,
 )
+from process.control_lifecycle import mark_control_run
+from process.entity_address_cutover_contract import postgres_sqlstate
 from process.ext.utils import (
     download_it_and_save,
     ensure_database,
-    get_import_schema,
     get_http_client,
+    get_import_schema,
     make_class,
     push_objects,
     return_checksum,
 )
-from process.redis_config import build_redis_settings
-from process.serialization import deserialize_job, serialize_job
-from process.control_lifecycle import mark_control_run
 from process.live_progress import enqueue_live_progress
+from process.native_publication_read_access import preserve_publication_reads
 from process.procedure_taxonomy_signals import materialize_procedure_taxonomy_signals
 from process.provider_quality_parts.state import (
     _has_global_finalize_lock,
@@ -59,6 +58,8 @@ from process.provider_quality_parts.state import (
     _release_global_finalize_lock_safely,
 )
 from process.provider_quality_parts.table_helpers import _index_name_for_table
+from process.redis_config import build_redis_settings
+from process.serialization import deserialize_job, serialize_job
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ logger = logging.getLogger(__name__)
 def _safe_print(*args: Any, **kwargs: Any) -> None:
     try:
         print(*args, **kwargs)
-    except (BrokenPipeError, OSError, ValueError):
+    except BrokenPipeError, OSError, ValueError:
         return
 
 
@@ -95,8 +96,12 @@ GEO_SERVICE_LANDING_PAGE = (
 )
 
 TEST_PROVIDER_ROW_LIMIT = int(os.getenv("HLTHPRT_CLAIMS_TEST_PROVIDER_ROWS", "5000"))
-TEST_PROVIDER_SERVICE_ROW_LIMIT = int(os.getenv("HLTHPRT_CLAIMS_TEST_PROVIDER_SERVICE_ROWS", os.getenv("HLTHPRT_CLAIMS_TEST_PROVIDER_DRUG_ROWS", "10000")))
-TEST_GEO_SERVICE_ROW_LIMIT = int(os.getenv("HLTHPRT_CLAIMS_TEST_GEO_SERVICE_ROWS", os.getenv("HLTHPRT_CLAIMS_TEST_DRUG_SPENDING_ROWS", "2000")))
+TEST_PROVIDER_SERVICE_ROW_LIMIT = int(
+    os.getenv("HLTHPRT_CLAIMS_TEST_PROVIDER_SERVICE_ROWS", os.getenv("HLTHPRT_CLAIMS_TEST_PROVIDER_DRUG_ROWS", "10000"))
+)
+TEST_GEO_SERVICE_ROW_LIMIT = int(
+    os.getenv("HLTHPRT_CLAIMS_TEST_GEO_SERVICE_ROWS", os.getenv("HLTHPRT_CLAIMS_TEST_DRUG_SPENDING_ROWS", "2000"))
+)
 TEST_MAX_DOWNLOAD_BYTES = int(os.getenv("HLTHPRT_CLAIMS_TEST_MAX_DOWNLOAD_BYTES", str(25 * 1024 * 1024)))
 IMPORT_BATCH_SIZE = max(int(os.getenv("HLTHPRT_CLAIMS_IMPORT_BATCH_SIZE", "100000")), 100)
 DOWNLOAD_RETRIES = max(int(os.getenv("HLTHPRT_CLAIMS_DOWNLOAD_RETRIES", "3")), 1)
@@ -137,9 +142,7 @@ CLAIMS_DB_DEADLOCK_RETRIES = max(int(os.getenv("HLTHPRT_CLAIMS_DB_DEADLOCK_RETRI
 CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS = max(
     float(os.getenv("HLTHPRT_CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS", "0.25")), 0.05
 )
-CLAIMS_PROVIDER_DRUG_MAX_BUCKETS = max(
-    int(os.getenv("HLTHPRT_CLAIMS_PROVIDER_DRUG_MAX_BUCKETS", "64")), 1
-)
+CLAIMS_PROVIDER_DRUG_MAX_BUCKETS = max(int(os.getenv("HLTHPRT_CLAIMS_PROVIDER_DRUG_MAX_BUCKETS", "64")), 1)
 CLAIMS_MARK_DONE_RETRIES = max(int(os.getenv("HLTHPRT_CLAIMS_MARK_DONE_RETRIES", "8")), 1)
 CLAIMS_MARK_DONE_RETRY_BASE_SECONDS = max(float(os.getenv("HLTHPRT_CLAIMS_MARK_DONE_RETRY_BASE_SECONDS", "0.5")), 0.05)
 CLAIMS_MARK_DONE_RETRY_MAX_SECONDS = max(
@@ -229,7 +232,7 @@ def _safe_int(raw: Any, default: int = 0) -> int:
         raw = raw.decode("utf-8")
     try:
         return int(raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
@@ -324,10 +327,7 @@ async def _is_claims_finalize_lock_released(
     if redis is None or not run_id or not owner_token:
         return False
     lock_key = _state_key(run_id, "finalize_lock")
-    release_script = (
-        "if redis.call('get', KEYS[1]) == ARGV[1] then "
-        "return redis.call('del', KEYS[1]) else return 0 end"
-    )
+    release_script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
     released = await redis.eval(
         release_script,
         1,
@@ -340,10 +340,7 @@ async def _is_claims_finalize_lock_released(
 def _print_row_progress(stage: str, parsed: int, accepted: int, start_time: float, final: bool = False) -> None:
     elapsed = max(time.monotonic() - start_time, 0.001)
     rate = parsed / elapsed
-    line = (
-        f"\r[rows:{stage}] parsed={parsed:,} accepted={accepted:,} "
-        f"rate={rate:,.0f} rows/s"
-    )
+    line = f"\r[rows:{stage}] parsed={parsed:,} accepted={accepted:,} rate={rate:,.0f} rows/s"
     _safe_print(line, end="\n" if final else "", flush=True)
 
 
@@ -365,8 +362,7 @@ def _step_failed(
 ) -> None:
     elapsed = max(time.monotonic() - started_at, 0.001)
     _safe_print(
-        f"[step] FAILED {label} in {elapsed:.1f}s "
-        f"({type(error).__name__})",
+        f"[step] FAILED {label} in {elapsed:.1f}s ({type(error).__name__})",
         flush=True,
     )
 
@@ -404,7 +400,7 @@ def _dedupe_rows(rows: list[dict[str, Any]], key_fields: tuple[str, ...]) -> lis
 def _chunk_rows(rows: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
     if not rows:
         return []
-    return [rows[idx: idx + size] for idx in range(0, len(rows), size)]
+    return [rows[idx : idx + size] for idx in range(0, len(rows), size)]
 
 
 def _sum_optional(a: float | None, b: float | None) -> float | None:
@@ -480,12 +476,7 @@ def _csv_distributions(dataset: dict[str, Any]) -> list[dict[str, Any]]:
         media_type = str(distribution.get("mediaType") or "").lower()
         fmt = str(distribution.get("format") or "").lower()
         lower_url = url.lower()
-        if not (
-            "csv" in media_type
-            or fmt == "csv"
-            or lower_url.endswith(".csv")
-            or lower_url.endswith(".csv.gz")
-        ):
+        if not ("csv" in media_type or fmt == "csv" or lower_url.endswith(".csv") or lower_url.endswith(".csv.gz")):
             continue
         candidates.append(distribution)
     return candidates
@@ -542,7 +533,7 @@ def _to_float(value: Any) -> float | None:
         return None
     try:
         return float(str(value).replace(",", ""))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -551,7 +542,7 @@ def _to_int(value: Any) -> int | None:
         return None
     try:
         return int(float(str(value).replace(",", "")))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -692,10 +683,7 @@ _row_allowed_for_test = _is_row_allowed_for_test
 
 
 async def _ensure_indexes(model_class: type, db_schema: str) -> None:
-    if (
-        hasattr(model_class, "__my_index_elements__")
-        and model_class.__my_index_elements__
-    ):
+    if hasattr(model_class, "__my_index_elements__") and model_class.__my_index_elements__:
         cols = ", ".join(model_class.__my_index_elements__)
         primary_name = _index_name_for_table(
             model_class.__tablename__,
@@ -705,21 +693,13 @@ async def _ensure_indexes(model_class: type, db_schema: str) -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS "
             + f"{primary_name} ON {db_schema}.{model_class.__tablename__} ({cols});"
         )
-    if (
-        hasattr(model_class, "__my_additional_indexes__")
-        and model_class.__my_additional_indexes__
-    ):
+    if hasattr(model_class, "__my_additional_indexes__") and model_class.__my_additional_indexes__:
         for idx in model_class.__my_additional_indexes__:
             elements = idx.get("index_elements")
             if not elements:
                 continue
-            base_name = idx.get("name") or (
-                f"{model_class.__tablename__}_{'_'.join(elements)}_idx"
-            )
-            is_staged = (
-                getattr(model_class, "__main_table__", model_class.__tablename__)
-                != model_class.__tablename__
-            )
+            base_name = idx.get("name") or (f"{model_class.__tablename__}_{'_'.join(elements)}_idx")
+            is_staged = getattr(model_class, "__main_table__", model_class.__tablename__) != model_class.__tablename__
             if is_staged:
                 staging_name = idx.get("staging_name") or base_name
                 name = f"{model_class.__tablename__}_{staging_name}"
@@ -729,10 +709,7 @@ async def _ensure_indexes(model_class: type, db_schema: str) -> None:
             using = idx.get("using")
             where = idx.get("where")
             cols = ", ".join(elements)
-            statement = (
-                f"CREATE INDEX IF NOT EXISTS {name} "
-                f"ON {db_schema}.{model_class.__tablename__}"
-            )
+            statement = f"CREATE INDEX IF NOT EXISTS {name} ON {db_schema}.{model_class.__tablename__}"
             if using:
                 statement += f" USING {using}"
             statement += f" ({cols})"
@@ -1172,7 +1149,9 @@ async def _split_source_into_chunks(
             chunk_writer.close_chunk(parsed_rows, accepted_rows)
 
     if not chunk_entries:
-        _safe_print(f"[warn] no chunks generated for {dataset_key} (parsed={parsed_rows:,}, accepted={accepted_rows:,})")
+        _safe_print(
+            f"[warn] no chunks generated for {dataset_key} (parsed={parsed_rows:,}, accepted={accepted_rows:,})"
+        )
     else:
         _safe_print(
             f"[split:{dataset_key}] chunks={len(chunk_entries)} parsed={parsed_rows:,} accepted={accepted_rows:,}",
@@ -1231,9 +1210,7 @@ def _provider_row_from_source(
         "zip5": _normalize_zip5(_row_value(source_row, "Rndrng_Prvdr_Zip5", "Prscrbr_zip5")),
         "country": _to_str(_row_value(source_row, "Rndrng_Prvdr_Cntry", "Prscrbr_Cntry")),
         "total_services": _to_float(_row_value(source_row, "Tot_Srvcs", "Tot_Clms")),
-        "total_distinct_hcpcs_codes": _to_float(
-            _row_value(source_row, "Tot_HCPCS_Cds", "Tot_30day_Fills")
-        ),
+        "total_distinct_hcpcs_codes": _to_float(_row_value(source_row, "Tot_HCPCS_Cds", "Tot_30day_Fills")),
         "total_allowed_amount": _to_float(_row_value(source_row, "Tot_Mdcr_Alowd_Amt", "Tot_Drug_Cst")),
         "total_submitted_charges": _to_float(_row_value(source_row, "Tot_Sbmtd_Chrg", "Tot_Day_Suply")),
         "total_beneficiaries": _to_float(_row_value(source_row, "Tot_Benes")),
@@ -1376,9 +1353,7 @@ def _provider_service_candidate(
             service_description=_to_str(_row_value(source_row, "HCPCS_Desc", "HCPCS_DESC")),
             reported_code=service_code,
             total_services=total_services,
-            total_beneficiary_day_services=_to_float(
-                _row_value(source_row, "Tot_Bene_Day_Srvcs", "Tot_30day_Fills")
-            ),
+            total_beneficiary_day_services=_to_float(_row_value(source_row, "Tot_Bene_Day_Srvcs", "Tot_30day_Fills")),
             total_submitted_charges=_weighted_total(average_submitted_charge, total_services),
             total_allowed_amount=_weighted_total(average_allowed_amount, total_services),
             total_beneficiaries=_to_float(_row_value(source_row, "Tot_Benes")),
@@ -1386,9 +1361,7 @@ def _provider_service_candidate(
             state=state,
             zip5=_normalize_zip5(_row_value(source_row, "Rndrng_Prvdr_Zip5", "Prscrbr_zip5")),
             place_of_service=_to_str(_row_value(source_row, "Place_Of_Srvc", "PLACE_OF_SRVC")),
-            state_fips=_normalize_state_fips(
-                _row_value(source_row, "Rndrng_Prvdr_State_FIPS", "Prscrbr_State_FIPS")
-            ),
+            state_fips=_normalize_state_fips(_row_value(source_row, "Rndrng_Prvdr_State_FIPS", "Prscrbr_State_FIPS")),
             country=_to_str(_row_value(source_row, "Rndrng_Prvdr_Cntry", "Prscrbr_Cntry")) or "US",
         ),
         False,
@@ -1529,9 +1502,7 @@ async def _load_provider_service_rows(
 
 
 def _geo_level_priority(source_row: dict[str, Any]) -> int:
-    geo_level = str(
-        _row_value(source_row, "Rndrng_Prvdr_Geo_Lvl", "RNDRNG_PRVDR_GEO_LVL") or ""
-    ).strip().lower()
+    geo_level = str(_row_value(source_row, "Rndrng_Prvdr_Geo_Lvl", "RNDRNG_PRVDR_GEO_LVL") or "").strip().lower()
     if geo_level == "national":
         return 3
     if geo_level == "state":
@@ -1542,9 +1513,7 @@ def _geo_level_priority(source_row: dict[str, Any]) -> int:
 
 
 def _geo_scope_value_from_row(source_row: dict[str, Any]) -> tuple[str, str] | None:
-    geo_level = str(
-        _row_value(source_row, "Rndrng_Prvdr_Geo_Lvl", "RNDRNG_PRVDR_GEO_LVL") or ""
-    ).strip().lower()
+    geo_level = str(_row_value(source_row, "Rndrng_Prvdr_Geo_Lvl", "RNDRNG_PRVDR_GEO_LVL") or "").strip().lower()
     if geo_level == "national":
         return "national", "US"
     if geo_level == "state":
@@ -1577,15 +1546,9 @@ def _geo_service_candidate(source_row: dict[str, Any], year: int) -> _GeoService
         return None
     procedure_code = _procedure_code_from_service(_detect_code_system(service_code), service_code)
     total_services = _to_float(_row_value(source_row, "Tot_Srvcs", "TOT_SRVCS")) or 0.0
-    average_allowed_amount = _to_float(
-        _row_value(source_row, "Avg_Mdcr_Alowd_Amt", "AVG_MDCR_ALOWD_AMT")
-    )
-    average_payment_amount = _to_float(
-        _row_value(source_row, "Avg_Mdcr_Pymt_Amt", "AVG_MDCR_PYMT_AMT")
-    )
-    average_standardized_amount = _to_float(
-        _row_value(source_row, "Avg_Mdcr_Stdzd_Amt", "AVG_MDCR_STDZD_AMT")
-    )
+    average_allowed_amount = _to_float(_row_value(source_row, "Avg_Mdcr_Alowd_Amt", "AVG_MDCR_ALOWD_AMT"))
+    average_payment_amount = _to_float(_row_value(source_row, "Avg_Mdcr_Pymt_Amt", "AVG_MDCR_PYMT_AMT"))
+    average_standardized_amount = _to_float(_row_value(source_row, "Avg_Mdcr_Stdzd_Amt", "AVG_MDCR_STDZD_AMT"))
     procedure_row_by_field = {
         "procedure_code": procedure_code,
         "service_description": _to_str(_row_value(source_row, "HCPCS_Desc", "HCPCS_DESC")),
@@ -2297,14 +2260,10 @@ async def _materialize_cost_level_rows(classes: dict[str, type], schema: str) ->
     await db.status(f"TRUNCATE TABLE {schema}.{provider_cost_profile_table};")
     await db.status(f"TRUNCATE TABLE {schema}.{procedure_peer_table};")
 
-    await db.status(
-        _COST_LEVEL_SQL[0].format(**sql_identifier_by_name)
-    )
+    await db.status(_COST_LEVEL_SQL[0].format(**sql_identifier_by_name))
 
     # Robust peer cutoffs: log-space IQR trimming prevents outlier providers from skewing percentiles.
-    await db.status(
-        _COST_LEVEL_SQL[1].format(**sql_identifier_by_name)
-    )
+    await db.status(_COST_LEVEL_SQL[1].format(**sql_identifier_by_name))
 
 
 async def _materialize_procedure_provider_counts(
@@ -2439,18 +2398,9 @@ async def _collect_cost_level_diagnostics(classes: dict[str, type], schema: str)
         """
     )
 
-    profile_scope_rows = [
-        dict(getattr(query_row, "_mapping", query_row))
-        for query_row in profile_scope_result
-    ]
-    peer_scope_rows = [
-        dict(getattr(query_row, "_mapping", query_row))
-        for query_row in peer_scope_result
-    ]
-    coverage_rows = [
-        dict(getattr(query_row, "_mapping", query_row))
-        for query_row in coverage_result
-    ]
+    profile_scope_rows = [dict(getattr(query_row, "_mapping", query_row)) for query_row in profile_scope_result]
+    peer_scope_rows = [dict(getattr(query_row, "_mapping", query_row)) for query_row in peer_scope_result]
+    coverage_rows = [dict(getattr(query_row, "_mapping", query_row)) for query_row in coverage_result]
 
     _safe_print(
         "[diagnostic] cost-level profile scope rows: "
@@ -2497,24 +2447,25 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
         PricingProcedureTaxonomySignal,
     )
 
-    async with db.transaction():
+    async with db.transaction() as session:
+        # Materialize SQLAlchemy's transaction before the native ACL guard borrows its driver.
+        await db.status("SELECT 1;")
+        connection = await session.connection()
+        driver = (await connection.get_raw_connection()).driver_connection
         for cls in final_classes:
             staged_class = classes[cls.__name__]
             table = cls.__main_table__
-            await db.status(f"DROP TABLE IF EXISTS {schema}.{table};")
-            await db.status(
-                f"ALTER TABLE {schema}.{staged_class.__tablename__} "
-                f"RENAME TO {table};"
+            await preserve_publication_reads(
+                driver, schema=schema, live_table=table, stage_table=staged_class.__tablename__
             )
+            await db.status(f"DROP TABLE IF EXISTS {schema}.{table};")
+            await db.status(f"ALTER TABLE {schema}.{staged_class.__tablename__} RENAME TO {table};")
 
             staged_primary_name = _index_name_for_table(
                 staged_class.__tablename__,
                 f"{staged_class.__tablename__}_idx_primary",
             )
-            await db.status(
-                f"ALTER INDEX IF EXISTS {schema}.{staged_primary_name} "
-                f"RENAME TO {table}_idx_primary;"
-            )
+            await db.status(f"ALTER INDEX IF EXISTS {schema}.{staged_primary_name} RENAME TO {table}_idx_primary;")
 
             move_indexes = []
             if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
@@ -2532,10 +2483,7 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                     staged_class.__tablename__,
                     f"{staged_class.__tablename__}_{staging_name}",
                 )
-                await db.status(
-                    f"ALTER INDEX IF EXISTS {schema}.{staged_index_name} "
-                    f"RENAME TO {base_name};"
-                )
+                await db.status(f"ALTER INDEX IF EXISTS {schema}.{staged_index_name} RENAME TO {base_name};")
 
 
 @dataclass(frozen=True)
@@ -2617,9 +2565,7 @@ async def _download_split_claims_source(
             chunk_entries = await _split_source_into_chunks(
                 dataset_key,
                 local_path,
-                run_identity.chunks_root
-                / dataset_key
-                / f"{reporting_year}_{source_index:04d}",
+                run_identity.chunks_root / dataset_key / f"{reporting_year}_{source_index:04d}",
                 run_identity.test_mode,
             )
             for chunk_by_field in chunk_entries:
@@ -2801,37 +2747,23 @@ def _validate_claims_finalize_manifest(
     sources_by_dataset = manifest_by_field.get("sources")
     total_chunks = _safe_int(manifest_by_field.get("total_chunks"), -1)
     if not isinstance(chunk_entries, list) or not chunk_entries:
-        raise RuntimeError(
-            "Claims pricing finalize requires a nonempty chunk manifest."
-        )
+        raise RuntimeError("Claims pricing finalize requires a nonempty chunk manifest.")
     if total_chunks != len(chunk_entries):
-        raise RuntimeError(
-            "Claims pricing finalize chunk count does not match its manifest."
-        )
+        raise RuntimeError("Claims pricing finalize chunk count does not match its manifest.")
     if not isinstance(sources_by_dataset, dict):
-        raise RuntimeError(
-            "Claims pricing finalize requires source descriptors."
-        )
+        raise RuntimeError("Claims pricing finalize requires source descriptors.")
     missing_sources = _find_missing_claim_sources(
         sources_by_dataset,
         chunk_entries,
     )
     if missing_sources:
-        raise RuntimeError(
-            "Claims pricing finalize is missing required source chunks: "
-            f"{', '.join(missing_sources)}"
-        )
+        raise RuntimeError(f"Claims pricing finalize is missing required source chunks: {', '.join(missing_sources)}")
     if (
-        str(manifest_by_field.get("import_id") or "")
-        != finalize_spec.import_id
-        or str(manifest_by_field.get("run_id") or "")
-        != finalize_spec.run_id
-        or str(manifest_by_field.get("stage_suffix") or "")
-        != finalize_spec.stage_suffix
+        str(manifest_by_field.get("import_id") or "") != finalize_spec.import_id
+        or str(manifest_by_field.get("run_id") or "") != finalize_spec.run_id
+        or str(manifest_by_field.get("stage_suffix") or "") != finalize_spec.stage_suffix
     ):
-        raise RuntimeError(
-            "Claims pricing finalize identity does not match its manifest."
-        )
+        raise RuntimeError("Claims pricing finalize identity does not match its manifest.")
 
 
 async def _fail_empty_claim_sources(
@@ -2891,8 +2823,7 @@ async def claims_pricing_start(ctx, task: dict[str, Any] | None = None) -> dict[
     if missing_sources:
         await _fail_empty_claim_sources(run_identity, missing_sources)
         raise RuntimeError(
-            "Claims pricing import produced no processable rows for required "
-            f"sources: {', '.join(missing_sources)}"
+            f"Claims pricing import produced no processable rows for required sources: {', '.join(missing_sources)}"
         )
     manifest_by_field = _claims_manifest_by_field(run_identity, schema, sources_by_dataset, chunk_entries)
     manifest_path = _manifest_path(run_identity.work_dir)
@@ -2932,13 +2863,8 @@ def _claims_chunk_spec(task_by_field: dict[str, Any]) -> _ClaimsChunkSpec:
         chunk_id=str(task_by_field.get("chunk_id") or ""),
         chunk_path=str(task_by_field.get("chunk_path") or ""),
         run_id=run_id,
-        stage_suffix=str(
-            task_by_field.get("stage_suffix") or _build_stage_suffix(import_id, run_id)
-        ),
-        schema=str(
-            task_by_field.get("schema")
-            or get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
-        ),
+        stage_suffix=str(task_by_field.get("stage_suffix") or _build_stage_suffix(import_id, run_id)),
+        schema=str(task_by_field.get("schema") or get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)),
         reporting_year=max(_safe_int(task_by_field.get("reporting_year"), 2013), 2013),
         test_mode=test_mode,
     )
@@ -3032,10 +2958,7 @@ def _claims_finalize_spec(
     import_id = _normalize_import_id(task_by_field.get("import_id"))
     run_id = str(task_by_field.get("run_id") or manifest_by_field.get("run_id") or "")
     test_mode = bool(task_by_field.get("test_mode", False))
-    schema = str(
-        task_by_field.get("schema")
-        or get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
-    )
+    schema = str(task_by_field.get("schema") or get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode))
     stage_suffix = str(
         task_by_field.get("stage_suffix")
         or manifest_by_field.get("stage_suffix")
@@ -3060,9 +2983,7 @@ async def _wait_for_claims_finalize_turn(
     finalize_spec: _ClaimsFinalizeSpec,
 ) -> dict[str, Any] | None:
     if redis is None:
-        raise RuntimeError(
-            "ARQ redis context is unavailable for claims pricing finalize job."
-        )
+        raise RuntimeError("ARQ redis context is unavailable for claims pricing finalize job.")
     if not finalize_spec.run_id:
         raise RuntimeError("Claims pricing finalize run_id is required.")
     finalized_key = _state_key(finalize_spec.run_id, "finalized")
@@ -3090,8 +3011,7 @@ async def _wait_for_claims_finalize_turn(
             message=f"waiting for chunks {done_chunks}/{total_chunks}",
         )
         _safe_print(
-            f"[finalize] waiting for chunks: done={done_chunks}/{total_chunks} "
-            f"run_id={finalize_spec.run_id}",
+            f"[finalize] waiting for chunks: done={done_chunks}/{total_chunks} run_id={finalize_spec.run_id}",
             flush=True,
         )
         raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
@@ -3166,10 +3086,16 @@ async def _materialize_and_publish_claims(
             "build staging indexes",
             _build_staging_indexes(classes_by_name, schema),
         )
-    await _timed_value(
-        "publish staging -> final (transactional rename)",
-        _publish_by_table_rename(classes_by_name, schema),
-    )
+    try:
+        await _timed_value(
+            "publish staging -> final (transactional rename)",
+            _publish_by_table_rename(classes_by_name, schema),
+        )
+    except Exception as error:
+        if postgres_sqlstate(error) != "55P03":
+            raise
+        # The publication transaction has rolled back; retain stages for the queued retry.
+        raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS) from error
     return cost_level_diagnostics
 
 
@@ -3209,9 +3135,7 @@ def _cleanup_claims_work_dir(
     if not work_dir_text or CLAIMS_KEEP_WORKDIR:
         return
     work_dir_root = Path(CLAIMS_WORKDIR).expanduser().resolve()
-    expected_work_dir = (
-        work_dir_root / finalize_spec.import_id / finalize_spec.run_id
-    ).resolve()
+    expected_work_dir = (work_dir_root / finalize_spec.import_id / finalize_spec.run_id).resolve()
     run_work_dir = Path(work_dir_text).expanduser().resolve()
     try:
         expected_work_dir.relative_to(work_dir_root)
@@ -3300,8 +3224,7 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
             await _record_claims_finalized(redis, finalize_spec)
             _cleanup_claims_work_dir(manifest_by_field, finalize_spec)
             logger.info(
-                "CMS claims pricing import finalized: "
-                "test_mode=%s import_id=%s run_id=%s",
+                "CMS claims pricing import finalized: test_mode=%s import_id=%s run_id=%s",
                 finalize_spec.test_mode,
                 finalize_spec.import_id,
                 finalize_spec.run_id,
@@ -3387,9 +3310,7 @@ async def finish_main(
     redis = await _create_claims_pool()
     normalized_import_id = _normalize_import_id(import_id)
     stage_suffix = _build_stage_suffix(normalized_import_id, run_id)
-    resolved_manifest_path = manifest_path or str(
-        _manifest_path(_run_dir(normalized_import_id, run_id))
-    )
+    resolved_manifest_path = manifest_path or str(_manifest_path(_run_dir(normalized_import_id, run_id)))
     finalize_job_by_field = {
         "import_id": import_id,
         "run_id": run_id,
