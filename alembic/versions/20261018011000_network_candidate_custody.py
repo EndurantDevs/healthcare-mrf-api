@@ -2,8 +2,11 @@
 """Retain independent candidate custody outside ordinary publisher writes."""
 
 from sqlalchemy import MetaData, text
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateTable
 
 from alembic import op
+from db.migration_network_candidate_custody import can_adopt_prepared_candidate_custody, candidate_custody_readers
 from db.models.network_serving import NetworkCandidateCustody, NetworkMembershipCandidate
 from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
@@ -32,6 +35,21 @@ def upgrade():
     """Create one control ledger and preserve existing explicit candidate readers."""
     bind = op.get_bind()
     schema = registry_schema()
+    if can_adopt_prepared_candidate_custody(op, schema):
+        return
+    _create(bind, schema)
+
+
+def _postimage(schema):
+    """Canonical native storage; adoption validates the permanent-parent FK separately."""
+    table = _table(schema)
+    for constraint in tuple(table.foreign_key_constraints):
+        table.constraints.remove(constraint)
+    return str(CreateTable(table).compile(dialect=postgresql.dialect()))
+
+
+def _create(bind, schema):
+    """Keep the original table, foreign key, and exact explicit reader enrollment."""
     namespace = _identifier(schema)
     owner = bind.execute(
         text(
@@ -39,20 +57,7 @@ def upgrade():
         ),
         {"schema": schema},
     ).scalar_one()
-    readers = list(
-        bind.execute(
-            text(
-                "SELECT DISTINCT role.rolname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-                "CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) acl "
-                "JOIN pg_roles role ON role.oid=acl.grantee WHERE n.nspname=:schema "
-                "AND c.relname='network_membership_candidate' AND acl.privilege_type='SELECT' "
-                "AND acl.grantee<>c.relowner AND NOT acl.is_grantable ORDER BY role.rolname"
-            ),
-            {"schema": schema},
-        ).scalars()
-    )
-    if len(readers) > 128:
-        raise RuntimeError("Candidate custody reader inventory exceeds its bound")
+    readers = candidate_custody_readers(bind, schema)
     _table(schema).create(bind)
     relation = namespace + ".network_candidate_custody"
     bind.execute(text(f"ALTER TABLE {relation} OWNER TO {_identifier(owner)}"))
