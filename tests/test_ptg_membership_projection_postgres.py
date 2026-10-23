@@ -157,9 +157,9 @@ async def _database(monkeypatch):
         await admin.dispose()
 
 
-def _source(monkeypatch, *, fail_at=None, empty_code=False):
+def _source(monkeypatch, *, fail_at=None, empty_code=False, representation="pattern_v1"):
     tables = SimpleNamespace(source_key="synthetic-source", snapshot_id="synthetic-snapshot", physical_binding=None)
-    root = V4GraphRoot(1, "pattern_v1", bytes.fromhex("ab" * 32))
+    root = V4GraphRoot(1, representation, bytes.fromhex("ab" * 32))
     identity = make_identity(
         tables,
         root,
@@ -174,36 +174,46 @@ def _source(monkeypatch, *, fail_at=None, empty_code=False):
     )
     first_by_owner = {0: (0, 1), 1: (1,), 2: ()}
     second_by_owner = {0: (10, 11), 1: (11, 12)}
+    inverse_by_owner = {10: (0,), 11: (0, 1), 12: (1,)}
+    first = "npi_patterns" if representation == "pattern_v1" else "npi_groups_exact"
+    second = "pattern_sets" if representation == "pattern_v1" else "group_sets_direct"
+    inverse = "set_patterns" if representation == "pattern_v1" else "set_groups_direct"
+    relations = {first: first_by_owner, second: second_by_owner, inverse: inverse_by_owner}
+
+    source_calls = 0
 
     async def source(*_args, **_kwargs):
-        return tables, root, identity | {"code": _kwargs.get("code", "99213")}
+        nonlocal source_calls
+        source_calls += 1
+        code = "99214" if fail_at == "drift" and source_calls > 1 else _kwargs.get("code", "99213")
+        return tables, root, identity | {"code": code}
 
     async def authenticate(*_args):
         if fail_at == "root":
             raise PTG2ManifestArtifactError("source CAS root differs")
+        return 1
 
     async def manifest(_session, *, relation, **_kwargs):
-        values = first_by_owner if relation == "npi_patterns" else second_by_owner
+        values = relations[relation]
         count = sum(map(len, values.values()))
         return V4RelationManifest(
-            1, relation, "members", "locators", 0, len(values), count, count, 4, 16384, 12288, 1024
+            1, relation, "members", "locators", min(values), len(values), count, count, 4, 16384, 12288, 1024
         )
 
     async def members(_session, *, relation, owner_keys, **_kwargs):
-        if fail_at == "factor" and relation == "pattern_sets":
+        if fail_at == "factor" and relation == inverse:
             raise asyncio.CancelledError
-        values = first_by_owner if relation == "npi_patterns" else second_by_owner
+        assert relation != second, "national second factor must not be copied"
+        values = relations[relation]
+        if fail_at == "missing" and relation == inverse:
+            return {}
         return {key: values[key] for key in owner_keys}
 
     async def codes(*_args):
         return [] if empty_code else [{"code_key": 7, "rate_count": 3}]
 
     async def forward(*_args, **_kwargs):
-        return [
-            SimpleNamespace(provider_set_key=10),
-            SimpleNamespace(provider_set_key=10),
-            SimpleNamespace(provider_set_key=11),
-        ]
+        return [(10, 0, 0), (10, 1, 0), (11, 1, 0)]
 
     from api import ptg2_serving as serving
 
@@ -213,7 +223,10 @@ def _source(monkeypatch, *, fail_at=None, empty_code=False):
     monkeypatch.setattr(build, "lookup_v4_relation_members", members)
     monkeypatch.setattr(build, "_physical_code_rows", codes)
     monkeypatch.setattr(serving, "_payload_schema", lambda _tables: "mrf")
-    monkeypatch.setattr(serving, "_shared_forward_entries_for_code_rows", forward)
+    monkeypatch.setattr(build, "lookup_code_prefix_occurrences_from_db", forward)
+    monkeypatch.setattr(serving, "_required_shared_snapshot_key", lambda _tables: 1)
+    monkeypatch.setattr(serving, "_required_source_count", lambda _tables: 1)
+    monkeypatch.setattr(serving, "_version_three_forward_lookup_hints", lambda _tables: {})
     return tables, identity
 
 
@@ -293,8 +306,11 @@ async def _assert_retention(db, identity, ready_receipt):
 
 
 @pytest.mark.asyncio
-async def test_native_candidate_code_parity_adoption_dependency_retention_and_safe_retirement(monkeypatch):
-    tables, identity = _source(monkeypatch)
+@pytest.mark.parametrize("representation", ["pattern_v1", "direct_v1"])
+async def test_native_candidate_code_parity_adoption_dependency_retention_and_safe_retirement(
+    monkeypatch, representation
+):
+    tables, identity = _source(monkeypatch, representation=representation)
     async with _database(monkeypatch) as db:
 
         async def principals(*_args):
@@ -316,7 +332,7 @@ async def test_native_candidate_code_parity_adoption_dependency_retention_and_sa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["root", "factor"])
+@pytest.mark.parametrize("failure", ["root", "factor", "drift", "missing"])
 async def test_failed_or_lost_worker_leaves_no_ready_attachment_or_source_pin(monkeypatch, failure):
     _, identity = _source(monkeypatch, fail_at=failure)
     async with _database(monkeypatch) as db:
@@ -349,6 +365,48 @@ async def test_explicit_empty_code_coverage_is_ready_and_not_an_absent_index(mon
                 await session.scalar(text(f'SELECT count(*) FROM "{db.stages[0].schema_name}".ptg_membership_code'))
                 == 0
             )
+
+
+@pytest.mark.asyncio
+async def test_native_alias_union_retains_independent_complete_code_membership(monkeypatch):
+    _source(monkeypatch)
+
+    async def codes(*_args):
+        return [{"code_key": 7, "rate_count": 3}, {"code_key": 8, "rate_count": 1}]
+
+    async def forward(_session, code_key, **_kwargs):
+        return [(10, 0, 0), (10, 1, 0), (11, 1, 0)] if code_key == 7 else [(12, 1, 0)]
+
+    monkeypatch.setattr(build, "_physical_code_rows", codes)
+    monkeypatch.setattr(build, "lookup_code_prefix_occurrences_from_db", forward)
+    async with _database(monkeypatch) as db:
+
+        async def principals(*_args):
+            return ['"' + db.reader + '"']
+
+        monkeypatch.setattr(build, "_reader_principals", principals)
+        ready = await _build(db)
+        assert [row["set_count"] for row in ready["code_coverage"]] == [2, 1]
+        assert ready["counts"]["factors"][1]["edge_count"] == 4
+        await _assert_code_parity(db, db.stages[0].schema_name)
+        async with db.sessions() as session, session.begin():
+            row = (
+                (
+                    await session.execute(
+                        membership_statement(db.stages[0].schema_name),
+                        {
+                            "npis": [1000000001, 1000000002, 1000000003],
+                            "keys": [0, 1, 2],
+                            "code_keys": [8],
+                            "projection_limit": 100,
+                            "retained_limit": 100,
+                        },
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            assert row["pairs"] == [[1000000001, 12], [1000000002, 12]]
 
 
 @pytest.mark.asyncio
