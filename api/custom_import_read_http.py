@@ -23,8 +23,9 @@ import orjson
 from sanic import response
 from sqlalchemy import select, text
 
-from api.signed_request_reader import signed_request_reader
+from api.signed_request_reader import _request_uuid, _safe_reader_identity, signed_request_reader
 from db.models.custom_import import CustomImportDataset
+from process.custom_import.failure_diagnostics import _failure_chain, _static_attribute, database_sqlstate
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     MAX_FAMILY_RESPONSE_BYTES,
@@ -648,6 +649,7 @@ class _VerifiedTransport:
     credential: str
     scope: str
     target: _TransportTarget
+    request_id: str
 
 
 def _verified_context(
@@ -730,7 +732,7 @@ def _verify_transport(
     if transport_target != request.target or _target_document(transport_target) != context_fields["target"]:
         raise _fail()
     credential = _framed_sha256(transport_contract.credential_domain, context)
-    return _VerifiedTransport(credential=credential, scope=scope, target=transport_target)
+    return _VerifiedTransport(credential=credential, scope=scope, target=transport_target, request_id=str(request_id))
 
 
 def _verify_provider_transport(
@@ -811,20 +813,24 @@ async def _resolve_pinned_target(session: Any, target: _TransportTarget) -> Pinn
             select(CustomImportDataset.dataset_id).where(CustomImportDataset.dataset_key == target.dataset_key)
         )
         dataset_id = result.scalar_one_or_none()
-    except Exception:
-        raise CustomImportReadUnavailableError("pinned dataset is unavailable") from None
-    if dataset_id is None:
-        raise CustomImportReadAuthorizationError("extension read is not authorized")
-    try:
-        return PinnedReadTarget(
-            dataset_id=dataset_id,
-            generation_id=target.generation_id,
-            definition_revision_id=target.definition_revision_id,
-            schema_revision_id=target.schema_revision_id,
-            profile_id=target.profile_id,
-        )
-    except Exception:
-        raise CustomImportReadUnavailableError("pinned dataset is unavailable") from None
+        if dataset_id is not None:
+            return PinnedReadTarget(
+                dataset_id=dataset_id,
+                generation_id=target.generation_id,
+                definition_revision_id=target.definition_revision_id,
+                schema_revision_id=target.schema_revision_id,
+                profile_id=target.profile_id,
+            )
+    except Exception as failure:
+        unavailable = CustomImportReadUnavailableError("pinned dataset is unavailable")
+        try:
+            unavailable.sqlstate = database_sqlstate(failure)
+            unavailable._read_caught_class = type.__dict__["__name__"].__get__(type(failure), type)
+        except Exception:
+            unavailable.sqlstate = None
+            unavailable._read_caught_class = "unknown"
+        raise unavailable from None
+    raise CustomImportReadAuthorizationError("extension read is not authorized")
 
 
 @lru_cache(maxsize=1)
@@ -924,10 +930,40 @@ def _failure_status(failure: Exception) -> int:
 
 
 def _log_failure(failure: BaseException) -> None:
-    logger.warning(
-        "Custom import extension read failed",
-        extra={"custom_import_read_failure_class": type(failure).__name__},
-    )
+    try:
+        fields_by_name = {"sqlstate": database_sqlstate(failure)}
+        for class_field, class_name in (
+            ("exception_class", type.__dict__["__name__"].__get__(type(failure), type)),
+            ("caught_exception_class", _static_attribute(failure, "_read_caught_class")),
+        ):
+            if type(class_name) is str and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", class_name):
+                fields_by_name[class_field] = class_name
+        for chained_failure in _failure_chain(failure):
+            snapshot = _static_attribute(chained_failure, "_api_reader_diagnostic")
+            if type(snapshot) is not dict or snapshot.get("boundary") not in {"signed_read", "claims_pin"}:
+                continue
+            request_id_source = snapshot.get("request_id_source")
+            fields_by_name.update(
+                boundary=snapshot["boundary"],
+                reader=_safe_reader_identity(snapshot.get("reader")),
+                request_id=_request_uuid(snapshot.get("request_id")),
+                request_id_source=request_id_source
+                if request_id_source in {"verified_transport", "forwarded", "core"}
+                else None,
+                forwarded_request_id=_request_uuid(snapshot.get("forwarded_request_id")),
+                core_request_id=_request_uuid(snapshot.get("core_request_id")),
+            )
+            break
+        logger.warning(
+            "Custom import extension read failed %s",
+            json.dumps(fields_by_name, separators=(",", ":"), sort_keys=True),
+            extra={"custom_import_read_failure_class": fields_by_name.get("exception_class", "unknown")},
+            exc_info=False,
+            stack_info=False,
+        )
+    except Exception:
+        # Diagnostics cannot replace the existing closed error response.
+        return
 
 
 async def serve_custom_import_search(request: Any, session: Any):
@@ -951,7 +987,10 @@ async def serve_custom_import_search(request: Any, session: Any):
         cursor_secret = _cursor_secret()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + DEFAULT_READ_TIMEOUT_MS / 1_000
-        async with asyncio.timeout_at(deadline), signed_request_reader(request, session) as session:
+        async with (
+            asyncio.timeout_at(deadline),
+            signed_request_reader(request, session, verified_request_id=verified.request_id) as session,
+        ):
             pinned_target = await _resolve_pinned_target(session, parsed_request.target)
             remaining_timeout_ms = int((deadline - loop.time()) * 1_000)
             if remaining_timeout_ms < 1:
@@ -997,7 +1036,10 @@ async def serve_custom_import_detail(request: Any, session: Any):
         )
         loop = asyncio.get_running_loop()
         deadline = loop.time() + DEFAULT_READ_TIMEOUT_MS / 1_000
-        async with asyncio.timeout_at(deadline), signed_request_reader(request, session) as session:
+        async with (
+            asyncio.timeout_at(deadline),
+            signed_request_reader(request, session, verified_request_id=verified.request_id) as session,
+        ):
             if parsed_request.grouped_entity_selection is not None:
                 return await _serve_grouped_detail(session, parsed_request, verified)
             pinned_target = await _resolve_pinned_target(session, parsed_request.target)

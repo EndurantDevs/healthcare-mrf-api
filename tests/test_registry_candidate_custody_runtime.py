@@ -195,9 +195,10 @@ def _custody_pool_creator(config, case):
 
 
 def _custody_finalizer(config, case):
-    async def finalize(connection, actual, *, control_schema, runtime_roles, authorize):
+    async def finalize(connection, actual, *, control_schema, runtime_roles, authorize, pre_enrolled_only=False):
         assert connection is case.custodian and actual is case.copy_target and not case.custodian.active
         assert case.execution_pool.active and case.custody_pool.active
+        assert pre_enrolled_only is case.pre_enrolled_only
         assert control_schema == config.consumer.control_schema
         assert runtime_roles == tuple(
             role for role in publication._custody_roles(config) if role != case.identity_by_name["custody_owner_role"]
@@ -295,7 +296,9 @@ def _runtime_custody_case(monkeypatch, config, outcome, protected_store_owner):
     return case, create_pool, finalizer, verifier, completions
 
 
-async def _exercise_runtime_custody_callback(monkeypatch, parser, factory, outcome, *, protected_store_owner=False):
+async def _exercise_runtime_custody_callback(
+    monkeypatch, parser, factory, outcome, *, protected_store_owner=False, pre_enrolled_only=False
+):
     import asyncio
     from contextlib import AsyncExitStack
 
@@ -304,6 +307,7 @@ async def _exercise_runtime_custody_callback(monkeypatch, parser, factory, outco
     case, create_pool, finalizer, verifier, completions = _runtime_custody_case(
         monkeypatch, config, outcome, protected_store_owner
     )
+    case.pre_enrolled_only = pre_enrolled_only
     execution_pool, custody_pool = case.execution_pool, case.custody_pool
     execution, copy_target, events = case.execution, case.copy_target, case.events
 
@@ -313,7 +317,7 @@ async def _exercise_runtime_custody_callback(monkeypatch, parser, factory, outco
                 consumer = await publication._custody_runtime(config, stack, config.consumer, original)
                 assert consumer is not config.consumer and config.consumer.seal_candidate is None
                 assert consumer.writer_roles == config.consumer.writer_roles
-                await consumer.seal_candidate(copy_target)
+                await consumer.seal_candidate(copy_target, pre_enrolled_only=pre_enrolled_only)
                 completions.append(True)
 
     if outcome == "complete":
@@ -340,10 +344,13 @@ async def _exercise_runtime_custody_callback(monkeypatch, parser, factory, outco
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("parser,factory", WORKERS)
+@pytest.mark.parametrize("pre_enrolled_only", [False, True])
 async def test_runtime_callback_uses_one_distinct_connection_and_checks_exact_final_receipt(
-    monkeypatch, parser, factory
+    monkeypatch, parser, factory, pre_enrolled_only
 ):
-    await _exercise_runtime_custody_callback(monkeypatch, parser, factory, "complete")
+    await _exercise_runtime_custody_callback(
+        monkeypatch, parser, factory, "complete", pre_enrolled_only=pre_enrolled_only
+    )
 
 
 @pytest.mark.asyncio

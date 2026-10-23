@@ -241,6 +241,9 @@ Existing operator credentials remain valid on Registry routes. Configure the
 client and receiver with the same dedicated secret through your runtime secret
 store; leave the setting blank when separate Registry access is not needed.
 
+See [initial network inventory publication](docs/network-initial-publication.md)
+for the administrator command that preserves existing drafts.
+
 Create a dedicated application role using your PostgreSQL administrator (shown
 as `postgres`), put its password in `.env`, then create the local database and
 run the bundled ZIP import. This reads the public

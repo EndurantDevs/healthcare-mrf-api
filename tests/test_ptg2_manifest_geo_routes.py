@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import ptg2_serving as serving
-from tests.test_ptg2_geo_rate_prefix import _production_tables, _tables as _v4_tables
+from tests.test_ptg2_geo_rate_prefix import _production_tables
+from tests.test_ptg2_geo_rate_prefix import _tables as _v4_tables
 from tests.test_ptg2_manifest_search_transitions import (
     _CODE_ROW,
     _NPI,
@@ -54,9 +55,7 @@ async def test_manifest_cost_geo_uses_strict_rate_first_route(monkeypatch):
     """Keep inferred-taxonomy scopes on the strict local-first route."""
 
     _install_base_dependencies(monkeypatch)
-    broad_location_lookup = AsyncMock(
-        side_effect=AssertionError("cost-first search must skip broad geo traversal")
-    )
+    broad_location_lookup = AsyncMock(side_effect=AssertionError("cost-first search must skip broad geo traversal"))
     monkeypatch.setattr(
         serving,
         "_ptg2_manifest_location_provider_matches",
@@ -70,12 +69,7 @@ async def test_manifest_cost_geo_uses_strict_rate_first_route(monkeypatch):
         selector,
     )
     serving_tables = _production_tables()
-    rate_count = (
-        serving._v4_hot_prefix_limits(
-            serving_tables
-        ).maximum_provider_expansion_rate_rows
-        + 1
-    )
+    rate_count = serving._v4_hot_prefix_limits(serving_tables).maximum_provider_expansion_rate_rows + 1
 
     response, _session = await _search(
         args=_query_args(
@@ -86,9 +80,7 @@ async def test_manifest_cost_geo_uses_strict_rate_first_route(monkeypatch):
             radius_miles=25,
             order_by="total_allowed_amount",
         ),
-        code_rows=[
-            {**_CODE_ROW, "reported_code": "27447", "rate_count": rate_count}
-        ],
+        code_rows=[{**_CODE_ROW, "reported_code": "27447", "rate_count": rate_count}],
         serving_tables=serving_tables,
     )
 
@@ -108,7 +100,6 @@ async def test_manifest_cost_geo_uses_strict_rate_first_route(monkeypatch):
         ("93306", {"include_providers": True}, True),
         ("93458", {"include_providers": True}, True),
         ("59400", {"include_providers": True}, True),
-        ("36415", {"include_providers": False}, True),
         (
             "36415",
             {
@@ -128,21 +119,12 @@ async def test_manifest_cost_geo_refuses_oversized_scope_before_geo(
     """Refuse each broad cost lane before reverse-geo or rate traversal."""
 
     _install_base_dependencies(monkeypatch)
-    selector = AsyncMock(
-        side_effect=AssertionError("oversized cost scope must be refused")
-    )
+    selector = AsyncMock(side_effect=AssertionError("oversized cost scope must be refused"))
     monkeypatch.setattr(serving, "_strict_cost_provider_expansion_selection", selector)
     location_lookup = AsyncMock()
-    monkeypatch.setattr(
-        serving, "_ptg2_manifest_location_provider_matches", location_lookup
-    )
+    monkeypatch.setattr(serving, "_ptg2_manifest_location_provider_matches", location_lookup)
     serving_tables = _production_tables()
-    rate_count = (
-        serving._v4_hot_prefix_limits(
-            serving_tables
-        ).maximum_provider_expansion_rate_rows
-        + 1
-    )
+    rate_count = serving._v4_hot_prefix_limits(serving_tables).maximum_provider_expansion_rate_rows + 1
 
     with pytest.raises(serving.PTG2LocationScopeError) as exc_info:
         await _search(
@@ -154,9 +136,7 @@ async def test_manifest_cost_geo_refuses_oversized_scope_before_geo(
                 order_by="total_allowed_amount",
                 **query_overrides,
             ),
-            code_rows=[
-                {**_CODE_ROW, "reported_code": code, "rate_count": rate_count}
-            ],
+            code_rows=[{**_CODE_ROW, "reported_code": code, "rate_count": rate_count}],
             serving_tables=serving_tables,
         )
 
@@ -205,8 +185,8 @@ def test_oversized_cost_geo_gate_preserves_bounded_routes(args, gate_overrides):
     )
 
 
-def test_oversized_cost_geo_gate_defaults_aggregate_to_cost_order():
-    assert serving._uses_oversized_cost_ordered_geo_gate(
+def test_oversized_cost_geo_gate_leaves_aggregate_to_its_bounded_selector():
+    assert not serving._uses_oversized_cost_ordered_geo_gate(
         _production_tables(),
         _query_args(code="36415", include_providers=False),
         location_filter_requested=True,
@@ -215,6 +195,49 @@ def test_oversized_cost_geo_gate_defaults_aggregate_to_cost_order():
         requested_npi=None,
         explicit_provider_filter_requested=False,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code_system,code", [("CPT", "27447"), ("MS_DRG", "470")])
+@pytest.mark.parametrize("outcome", ["matched", "empty", "budget"])
+async def test_manifest_geo_aggregate_uses_bounded_selector_for_oversized_code(monkeypatch, code_system, code, outcome):
+    """Apply geography before rate admission without expanding provider responses."""
+    _install_base_dependencies(monkeypatch)
+    tables = _production_tables()
+    rate_row_by_field = {**_RATE_ROW, "reported_code_system": code_system, "reported_code": code}
+    selector = AsyncMock(
+        return_value=serving._GeoRateSelection((rate_row_by_field,) if outcome == "matched" else (), True),
+        side_effect=(serving.PTG2OnlineWorkBudgetExceeded("candidate_members") if outcome == "budget" else None),
+    )
+    monkeypatch.setattr(serving, "_select_geo_filtered_rate_prefix", selector)
+    provider_reads = AsyncMock(side_effect=AssertionError("aggregate response expanded providers"))
+    monkeypatch.setattr(serving, "_provider_rows_for_sets", provider_reads)
+    args = _query_args(code_system=code_system, code=code, zip5="60001", include_providers=False)
+    code_rows = [
+        {
+            **_CODE_ROW,
+            "reported_code_system": code_system,
+            "reported_code": code,
+            "rate_count": serving._v4_hot_prefix_limits(tables).maximum_provider_expansion_rate_rows + 1,
+        }
+    ]
+    if outcome == "budget":
+        with pytest.raises(serving.PTG2LocationScopeError, match="sealed online work budget"):
+            await _search(args=args, code_rows=code_rows, serving_tables=tables)
+    else:
+        response, _session = await _search(args=args, code_rows=code_rows, serving_tables=tables)
+        assert len(response["items"]) == int(outcome == "matched")
+        assert response["pagination"]["total_is_exact"] is True
+        assert response["pagination"]["has_more"] is False
+        assert response["query"]["include_providers"] is False
+        if outcome == "matched":
+            assert response["items"][0]["procedure_code"] == code
+            assert response["query"]["code_system"] == code_system
+    selector.assert_awaited_once()
+    assert selector.await_args.kwargs["args"] == args
+    assert selector.await_args.kwargs["target_count"] == 11
+    assert selector.await_args.kwargs["code_rows"] == code_rows
+    provider_reads.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -232,9 +255,7 @@ async def test_manifest_geo_without_projection_keeps_location_first_route(
             {_PROVIDER_SET_ID: [dict(_PROVIDER_ROW)]},
         )
     )
-    strict_selector = AsyncMock(
-        side_effect=AssertionError("optional projection route must stay disabled")
-    )
+    strict_selector = AsyncMock(side_effect=AssertionError("optional projection route must stay disabled"))
     monkeypatch.setattr(
         serving,
         "_ptg2_manifest_location_provider_matches",
@@ -246,15 +267,12 @@ async def test_manifest_geo_without_projection_keeps_location_first_route(
         strict_selector,
     )
     serving_tables = _v4_tables()
-    rate_count = 1 if explicit_cost_order else (
-        serving._v4_hot_prefix_limits(
-            serving_tables
-        ).maximum_provider_expansion_rate_rows
-        + 1
+    rate_count = (
+        1
+        if explicit_cost_order
+        else (serving._v4_hot_prefix_limits(serving_tables).maximum_provider_expansion_rate_rows + 1)
     )
-    order_args_by_name = (
-        {"order_by": "total_allowed_amount"} if explicit_cost_order else {}
-    )
+    order_args_by_name = {"order_by": "total_allowed_amount"} if explicit_cost_order else {}
 
     response, _session = await _search(
         args=_query_args(include_providers=True, state="IL", **order_args_by_name),
@@ -277,9 +295,7 @@ async def test_exhaustive_rate_only_geo_scopes_merge_with_local_graph(monkeypatc
             taxonomy_filtered=True,
         )
     )
-    projection = AsyncMock(
-        return_value=({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: [_PROVIDER_ROW]})
-    )
+    projection = AsyncMock(return_value=({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: [_PROVIDER_ROW]}))
     national_scope = AsyncMock(side_effect=AssertionError("national scope used"))
     monkeypatch.setattr(
         serving,
@@ -309,9 +325,7 @@ async def test_exhaustive_rate_only_geo_scopes_merge_with_local_graph(monkeypatc
     assert local_scope.await_args.kwargs["candidate_limit"] == 5_001
     national_scope.assert_not_awaited()
     projection.assert_awaited_once()
-    assert serving._merge_manifest_code_variant_rows.await_args.kwargs[
-        "provider_set_keys"
-    ] == [3]
+    assert serving._merge_manifest_code_variant_rows.await_args.kwargs["provider_set_keys"] == [3]
 
 
 @pytest.mark.asyncio
@@ -323,13 +337,11 @@ async def test_non_v4_exact_rate_geo_keeps_price_first_order(monkeypatch):
         "_prices_for_price_sets",
         AsyncMock(return_value={_PRICE_SET_ID: [{"negotiated_rate": "125.00"}]}),
     )
-    merge = AsyncMock(
-        side_effect=lambda *_args, **_kwargs: events.append("merge")
-        or [dict(_RATE_ROW)]
-    )
+    merge = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("merge") or [dict(_RATE_ROW)])
     location = AsyncMock(
-        side_effect=lambda *_args, **_kwargs: events.append("location")
-        or ({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: [_PROVIDER_ROW]})
+        side_effect=lambda *_args, **_kwargs: (
+            events.append("location") or ({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: [_PROVIDER_ROW]})
+        )
     )
     monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", merge)
     monkeypatch.setattr(
@@ -363,14 +375,12 @@ async def test_v4_distance_exact_rate_geo_keeps_price_first_order(monkeypatch):
     monkeypatch.setattr(
         serving,
         "_merge_manifest_code_variant_rows",
-        AsyncMock(
-            side_effect=lambda *_args, **_kwargs: events.append("merge")
-            or [dict(_RATE_ROW)]
-        ),
+        AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("merge") or [dict(_RATE_ROW)]),
     )
     location = AsyncMock(
-        side_effect=lambda *_args, **_kwargs: events.append("location")
-        or ({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: [_PROVIDER_ROW]})
+        side_effect=lambda *_args, **_kwargs: (
+            events.append("location") or ({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: [_PROVIDER_ROW]})
+        )
     )
     monkeypatch.setattr(
         serving,
@@ -399,28 +409,17 @@ async def test_v4_distance_exact_rate_geo_keeps_price_first_order(monkeypatch):
 @pytest.mark.asyncio
 async def test_manifest_distance_page_uses_deep_offset_sentinel(monkeypatch):
     _install_base_dependencies(monkeypatch)
-    providers = [
-        {**_PROVIDER_ROW, "npi": _NPI + index, "distance_miles": float(index)}
-        for index in range(3)
-    ]
-    location_lookup = AsyncMock(
-        return_value=({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: providers})
-    )
-    monkeypatch.setattr(
-        serving, "_ptg2_manifest_location_provider_matches", location_lookup
-    )
+    providers = [{**_PROVIDER_ROW, "npi": _NPI + index, "distance_miles": float(index)} for index in range(3)]
+    location_lookup = AsyncMock(return_value=({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: providers}))
+    monkeypatch.setattr(serving, "_ptg2_manifest_location_provider_matches", location_lookup)
 
     response, _session = await _search(
-        args=_query_args(
-            include_providers=True, lat=41.9, long=-87.65, order_by="distance"
-        ),
+        args=_query_args(include_providers=True, lat=41.9, long=-87.65, order_by="distance"),
         pagination=SimpleNamespace(limit=1, offset=1),
     )
 
     assert location_lookup.await_args.kwargs["candidate_limit"] == 3
-    assert [provider_item["npi"] for provider_item in response["items"]] == [
-        _NPI + 1
-    ]
+    assert [provider_item["npi"] for provider_item in response["items"]] == [_NPI + 1]
     assert response["pagination"] == {
         "total": 3,
         "total_is_exact": False,
@@ -435,16 +434,10 @@ async def test_manifest_distance_page_uses_deep_offset_sentinel(monkeypatch):
 @pytest.mark.asyncio
 async def test_manifest_descending_distance_keeps_exhaustive_floor(monkeypatch):
     _install_base_dependencies(monkeypatch)
-    monkeypatch.delenv(
-        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", raising=False
-    )
-    monkeypatch.delenv(
-        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", raising=False
-    )
+    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", raising=False)
+    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", raising=False)
     location_lookup = AsyncMock(return_value=(set(), {}))
-    monkeypatch.setattr(
-        serving, "_ptg2_manifest_location_provider_matches", location_lookup
-    )
+    monkeypatch.setattr(serving, "_ptg2_manifest_location_provider_matches", location_lookup)
 
     response, _session = await _search(
         args=_query_args(
@@ -468,11 +461,7 @@ async def test_local_distance_converts_pattern_member_limit_to_budget(monkeypatc
     monkeypatch.setattr(
         serving,
         "_v4_sets_by_npi",
-        AsyncMock(
-            side_effect=serving.PTG2ManifestArtifactError(
-                "PTG2 V4 graph selection exceeds max_members"
-            )
-        ),
+        AsyncMock(side_effect=serving.PTG2ManifestArtifactError("PTG2 V4 graph selection exceeds max_members")),
     )
     request = serving._LocalDistanceGraphRequest(
         1,

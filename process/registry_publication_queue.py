@@ -18,7 +18,12 @@ from process.registry_record_store import RegistryActor, _bounded_text, _validat
 from process.registry_source_observation_store import _namespace
 
 _CLAIM_OPERATIONS = {
-    "publication": ("reactivate_generation", "prepare_source_rollback", "publish_source_rollback"),
+    "publication": (
+        "reactivate_generation",
+        "prepare_source_rollback",
+        "publish_source_rollback",
+        "publish_initial_inventory",
+    ),
     "office": ("prepare_ptg_office_capture", "approve_ptg_office_capture"),
 }
 
@@ -105,6 +110,95 @@ def _reactivation_actor(actor):
     if actor.kind != "platform_admin" or actor.client_id != "system" or actor.impersonator_id is not None:
         raise ValueError("registry_reactivation_actor_invalid")
     return actor_by_name
+
+
+def validated_registry_initial_inventory_command(document_by_name):
+    """Bind initial publication to one genuine retained bootstrap and zero inventory."""
+    try:
+        if type(document_by_name) is not dict or set(document_by_name) != {
+            "operation",
+            "bootstrap_id",
+            "bootstrap_generation_sha256",
+            "expected_serving_generation",
+            "expected_approved_revision",
+            "reason",
+            "idempotency_key",
+        }:
+            raise ValueError
+        identity = UUID(document_by_name["bootstrap_id"])
+        if (
+            document_by_name["operation"] != "publish_initial_inventory"
+            or not identity.int
+            or str(identity) != document_by_name["bootstrap_id"]
+            or type(document_by_name["bootstrap_generation_sha256"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", document_by_name["bootstrap_generation_sha256"]) is None
+            or _head(document_by_name["expected_serving_generation"]) != 0
+            or _head(document_by_name["expected_approved_revision"]) != 0
+        ):
+            raise ValueError
+        _reactivation_document(
+            RegistryReactivationCommand(
+                1,
+                1,
+                0,
+                document_by_name["reason"],
+                document_by_name["idempotency_key"],
+            )
+        )
+        return dict(document_by_name)
+    except ValueError, TypeError, AttributeError, UnicodeError:
+        raise ValueError("registry_initial_inventory_command_invalid") from None
+
+
+def _initial_inventory_record(request_record):
+    stored = _document(request_record["command_json"])
+    if type(stored) is not dict or "idempotency_key" in stored:
+        raise ValueError("registry_initial_inventory_command_invalid")
+    return validated_registry_initial_inventory_command(
+        {
+            **stored,
+            "idempotency_key": request_record["idempotency_key"],
+        }
+    ), _administrator_record_actor(request_record)
+
+
+def _initial_inventory_result(result_by_name, command_by_name, state):
+    if state in {"queued", "running", "rejected"}:
+        _reactivation_result(result_by_name, command_by_name, state)
+        return
+    try:
+        if type(result_by_name) is not dict or set(result_by_name) != {
+            "operation",
+            "candidate_id",
+            "previous_generation_id",
+            "generation_id",
+            "approved_custom_revision",
+            "membership_rows",
+            "manifest_sha256",
+            "policy_revision",
+        }:
+            raise ValueError
+        identity = UUID(result_by_name["candidate_id"])
+        if not identity.int or str(identity) != result_by_name["candidate_id"]:
+            raise ValueError
+        if (
+            result_by_name["operation"] != "publish_initial_inventory"
+            or any(
+                _head(result_by_name[field]) != 0
+                for field in (
+                    "previous_generation_id",
+                    "approved_custom_revision",
+                    "membership_rows",
+                )
+            )
+            or _head(result_by_name["generation_id"]) == 0
+            or type(result_by_name["manifest_sha256"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", result_by_name["manifest_sha256"]) is None
+        ):
+            raise ValueError
+        _head(result_by_name["policy_revision"])
+    except ValueError, TypeError, AttributeError:
+        raise ValueError("registry_initial_inventory_result_invalid") from None
 
 
 def _retained_operation_record(request_record, operation):
@@ -494,6 +588,21 @@ async def enqueue_registry_source_rollback_publication(
     )
 
 
+async def enqueue_registry_initial_inventory(
+    connection, document_by_name, actor, *, session_token_sha256, control_schema=None
+):
+    """Queue initial inventory without creating an approval or changing drafts."""
+    command_by_name = validated_registry_initial_inventory_command(document_by_name)
+    return await _enqueue_administrator_document(
+        connection,
+        {key: value for key, value in command_by_name.items() if key != "idempotency_key"},
+        actor,
+        session_token_sha256=session_token_sha256,
+        idempotency_key=command_by_name["idempotency_key"],
+        control_schema=control_schema,
+    )
+
+
 async def _enqueue_administrator_document(
     connection, command_by_name, actor, *, session_token_sha256, idempotency_key, control_schema=None
 ):
@@ -516,6 +625,8 @@ async def _enqueue_administrator_document(
             command_by_name["expected_serving_generation"],
         ):
             raise RegistryApprovalConflict("registry_queue_revision_conflict")
+        if command_by_name["operation"] == "publish_initial_inventory":
+            await _require_empty_initial_inventory(connection, namespace)
         inserted = await connection.fetchrow(
             f"INSERT INTO {namespace}.registry_publication_request "
             "(request_id,actor_key,session_token_sha256,actor_json,command_json,idempotency_key,request_sha256) "
@@ -534,6 +645,13 @@ async def _enqueue_administrator_document(
                 raise RegistryApprovalConflict("registry_queue_idempotency_conflict")
             return replay
         return _queued_receipt(inserted, False)
+
+
+async def _require_empty_initial_inventory(connection, namespace):
+    if await connection.fetchval(
+        f"SELECT EXISTS(SELECT 1 FROM {namespace}.registry_approved_record WHERE approved_revision=0)"
+    ):
+        raise RegistryApprovalConflict("registry_initial_inventory_not_empty")
 
 
 async def _existing_request(connection, namespace, metadata, idempotency_key):
@@ -625,7 +743,10 @@ async def read_registry_publication_request(connection, request_id: UUID, *, con
     command_by_name = _document(request_record["command_json"])
     if "operation" in command_by_name:
         operation = command_by_name["operation"]
-        if operation == "publish_source_rollback":
+        if operation == "publish_initial_inventory":
+            operation_command_by_name, _actor = _initial_inventory_record(request_record)
+            _initial_inventory_result(status_by_name["result"], operation_command_by_name, status_by_name["state"])
+        elif operation == "publish_source_rollback":
             operation_command_by_name, _actor = _source_rollback_publication_record(request_record)
             _source_rollback_publication_result(
                 status_by_name["result"], operation_command_by_name, status_by_name["state"]

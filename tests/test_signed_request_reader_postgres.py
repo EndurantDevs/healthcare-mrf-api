@@ -2,8 +2,9 @@
 """Native signed HTTP ownership, fixed workspace and cancellation cleanup."""
 
 import asyncio
+import json
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sanic import Blueprint, Sanic
@@ -27,6 +28,42 @@ from tests.signed_request_reader_postgres_support import (
     observe_reader_phases,
     signed_reader_case,
 )
+
+
+async def test_signed_reader_failure_records_same_native_principal_and_target(signed_reader_case, caplog):
+    prepared = signed_reader_case
+    case, database = prepared.case, prepared.database
+    await prepared.admin.execute(f"CREATE TABLE {case.relation('unread_payload')}(value text)")
+    expected = await prepared.admin.fetchrow(
+        "SELECT (SELECT oid FROM pg_roles WHERE rolname=$1), "
+        "(SELECT oid FROM pg_database WHERE datname=current_database()), "
+        "host(inet_server_addr()),inet_server_port()",
+        case.reader,
+    )
+    phases = await observe_reader_phases(database)
+    ordinary = SimpleNamespace()
+    request_id = "00000000-0000-4000-8000-000000000003"
+    request = SimpleNamespace(
+        headers={"X-Request-ID": request_id},
+        id=UUID(request_id),
+        ctx=SimpleNamespace(sa_session=ordinary, session=ordinary),
+    )
+    with pytest.raises(DBAPIError) as caught:
+        async with database.reader_session() as reader:
+            backend = await native_reader_witness(reader, case.reader)
+            with boundary._bind_request_reader(request, reader):
+                await reader.execute(text(f"SELECT * FROM {case.relation('unread_payload')}"))
+    assert reader.info == {} and not database.has_reader_session()
+    assert request.ctx.sa_session is ordinary and request.ctx.session is ordinary
+    transport._log_failure(caught.value)
+    fields = json.loads(caplog.records[-1].getMessage().partition(" failed ")[2])
+    identity = fields["reader"]
+    assert tuple(identity[key] for key in ("role_oid", "database_oid", "server_address", "server_port")) == tuple(
+        expected
+    )
+    assert identity["backend_pid"] == backend
+    assert fields["sqlstate"] == "42501" and fields["request_id"] == request_id
+    assert sum(statement.startswith("SELECT session_user, current_user,") for statement, *_ in phases) == 1
 
 
 @pytest.mark.asyncio

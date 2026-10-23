@@ -10,6 +10,7 @@ import pytest
 from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_publication_queue import (
     RegistryReactivationCommand,
+    _initial_inventory_result,
     claim_registry_publication_request,
     enqueue_registry_publication,
     enqueue_registry_reactivation,
@@ -30,6 +31,39 @@ from tests.test_network_serving_schema_postgres import serving_schema as serving
 from tests.test_registry_approval_store_postgres import _actor, _command, _create, _draft
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"selected_count": 0},
+        {"membership_rows": True},
+        {"membership_rows": 1},
+        {"previous_generation_id": 1},
+        {"approved_custom_revision": 1},
+        {"generation_id": 0},
+        {"generation_id": True},
+        {"policy_revision": True},
+        {"policy_revision": -1},
+        {"candidate_id": str(UUID(int=0))},
+        {"manifest_sha256": "B" * 64},
+        {"operation": "reactivate_generation"},
+    ],
+)
+async def test_initial_result_has_exact_zero_inventory_shape(change):
+    result_by_name = dict(
+        operation="publish_initial_inventory",
+        candidate_id=str(uuid4()),
+        previous_generation_id=0,
+        generation_id=1,
+        approved_custom_revision=0,
+        membership_rows=0,
+        manifest_sha256="a" * 64,
+        policy_revision=5,
+    )
+    _initial_inventory_result(result_by_name, {}, "completed")
+    with pytest.raises(ValueError, match="initial_inventory_result_invalid"):
+        _initial_inventory_result({**result_by_name, **change}, {}, "completed")
 
 
 async def _enqueue(connection, schema, command, actor, **changes):

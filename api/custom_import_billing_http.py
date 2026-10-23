@@ -258,7 +258,10 @@ async def serve_custom_import_billing_search(request, session):
         is_managed_mode = parsed.managed_collection is not None
         if is_managed_mode:
             return await _serve_managed_billing(request, parsed, verified, access, cursor_keyring, trusted_now)
-        async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), signed_request_reader(request, session) as session:
+        async with (
+            asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000),
+            signed_request_reader(request, session, verified_request_id=verified.request_id) as session,
+        ):
             conflict = await admit_bound_plan_release_read(session, parsed.provider.native_args)
             if conflict is not None:
                 return conflict

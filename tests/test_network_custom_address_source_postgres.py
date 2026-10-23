@@ -711,6 +711,107 @@ async def test_bootstrap_same_snapshot_allows_concurrent_parent_writes_and_exact
     await _assert_bootstrap_read_only(fixture, namespace)
 
 
+async def test_bootstrap_preserves_appended_network_column_and_exact_native_shape(bootstrap_db):
+    """A column appended by an additive migration retains all named payload values."""
+    import process.network_bootstrap_sources as bootstrap
+
+    fixture = bootstrap_db
+    parent = f'"{fixture.source_schema}".entity_address_unified'
+    await fixture.connection.execute(f"UPDATE {parent} SET canonical_network_ids=ARRAY[7,11]")
+    await fixture.connection.execute(f"ALTER TABLE {parent} RENAME COLUMN canonical_network_ids TO prior_network_ids")
+    await fixture.connection.execute(
+        f"ALTER TABLE {parent} ADD COLUMN canonical_network_ids integer[] NOT NULL DEFAULT '{{}}'::integer[]"
+    )
+    await fixture.connection.execute(f"UPDATE {parent} SET canonical_network_ids=prior_network_ids")
+    await fixture.connection.execute(f"ALTER TABLE {parent} DROP COLUMN prior_network_ids")
+    specification = await _bootstrap_specification(fixture)
+    parent_columns, parent_shape = await bootstrap._shape(fixture.connection, specification.address_table_oid)
+    assert parent_columns[-1] == "canonical_network_ids"
+    assert parent_columns != tuple(EntityAddressUnified.__table__.columns.keys())
+    parent_index = await fixture.connection.fetchval(
+        "SELECT indexrelid::bigint FROM pg_index WHERE indrelid=$1::oid AND indisprimary",
+        specification.address_table_oid,
+    )
+    receipt = await _bootstrap_prepare(fixture, specification)
+    capture_oid = dict(receipt.relation_oids)["entity_address_unified"]
+    assert await bootstrap._shape(fixture.connection, capture_oid) == (parent_columns, parent_shape)
+    assert receipt.parent_receipts[0].shape_sha256 == parent_shape
+    assert receipt.specification == specification
+    assert (
+        await fixture.connection.fetchval(
+            "SELECT indexrelid::bigint FROM pg_index WHERE indrelid=$1::oid AND indisprimary",
+            specification.address_table_oid,
+        )
+        == parent_index
+    )
+    for table_name in ("entity_address_unified", "npi"):
+        assert await fixture.connection.fetchval(f"""SELECT NOT EXISTS(
+          (SELECT to_jsonb(original) FROM "{fixture.source_schema}".{table_name} original
+           EXCEPT ALL SELECT to_jsonb(retained) FROM "{receipt.address_source.schema_name}".{table_name} retained)
+          UNION ALL
+          (SELECT to_jsonb(retained) FROM "{receipt.address_source.schema_name}".{table_name} retained
+           EXCEPT ALL SELECT to_jsonb(original) FROM "{fixture.source_schema}".{table_name} original))""")
+    assert await fixture.connection.fetchval(
+        f'SELECT canonical_network_ids FROM "{receipt.address_source.schema_name}".entity_address_unified'
+    ) == [7, 11]
+    assert await _bootstrap_prepare(fixture, specification) == receipt
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        await fixture.connection.execute(f'SET LOCAL ROLE "{fixture.roles["reader"]}"')
+        assert await verify_network_bootstrap_sources(fixture.connection, receipt) == receipt
+    await _assert_bootstrap_read_only(fixture, '"' + receipt.address_source.schema_name + '"')
+
+
+@pytest.mark.parametrize("invalid", ["missing", "extra", "type", "array_type", "varchar_typmod", "numeric_typmod"])
+async def test_bootstrap_rejects_named_column_or_type_drift_before_capture(bootstrap_db, invalid):
+    fixture = bootstrap_db
+    parent = f'"{fixture.source_schema}".entity_address_unified'
+    statement_by_invalid = {
+        "missing": f"ALTER TABLE {parent} DROP COLUMN city_name",
+        "extra": f"ALTER TABLE {parent} ADD COLUMN unexpected_column text",
+        "type": f"ALTER TABLE {parent} ALTER COLUMN source_count TYPE bigint",
+        "array_type": f"ALTER TABLE {parent} ALTER COLUMN canonical_network_ids TYPE bigint[]",
+        "varchar_typmod": f"ALTER TABLE {parent} ALTER COLUMN entity_name TYPE varchar(255)",
+        "numeric_typmod": f"ALTER TABLE {parent} ALTER COLUMN lat TYPE numeric(12,8)",
+    }
+    await fixture.connection.execute(statement_by_invalid[invalid])
+    specification = await _bootstrap_specification(fixture)
+    with pytest.raises(NetworkBootstrapSourceError, match="Parent model (shape|type) differs"):
+        await _bootstrap_prepare(fixture, specification)
+    assert (
+        await fixture.connection.fetchval(
+            "SELECT to_regnamespace($1)", "network_bootstrap_" + UUID(specification.bootstrap_id).hex
+        )
+        is None
+    )
+
+
+async def test_bootstrap_rejects_duplicate_column_metadata(bootstrap_db, monkeypatch):
+    """The admission check rejects duplicate names even in malformed catalog metadata."""
+    import process.network_bootstrap_sources as bootstrap
+
+    fixture = bootstrap_db
+    specification = await _bootstrap_specification(fixture)
+    original_shape = bootstrap._shape
+
+    async def duplicate_shape(connection, table_oid):
+        columns, fingerprint = await original_shape(connection, table_oid)
+        return (
+            (columns[:-1] + (columns[0],), fingerprint)
+            if table_oid == specification.address_table_oid
+            else (columns, fingerprint)
+        )
+
+    monkeypatch.setattr(bootstrap, "_shape", duplicate_shape)
+    with pytest.raises(NetworkBootstrapSourceError, match="Parent model shape differs"):
+        await _bootstrap_prepare(fixture, specification)
+    assert (
+        await fixture.connection.fetchval(
+            "SELECT to_regnamespace($1)", "network_bootstrap_" + UUID(specification.bootstrap_id).hex
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("tamper", ["content", "column", "owner_member", "extra", "oid", "receipt", "receipt_scalar"])
 async def test_bootstrap_native_tamper_denied(bootstrap_db, tamper):
     fixture = bootstrap_db

@@ -2225,6 +2225,20 @@ async def _materialize_forward_prefix(
     )
 
 
+async def lookup_code_prefix_occurrences_from_db(
+    session: Any,
+    code_key: int,
+    *,
+    limit: int,
+    descending: bool = False,
+    **read_options: Any,
+) -> list[tuple[int, int, int]]:
+    """Return dense occurrences while validating every complete forward fragment."""
+    from api.ptg2_forward_prefix import collect_dense_code_prefix
+
+    return await collect_dense_code_prefix(session, code_key, limit=limit, descending=descending, **read_options)
+
+
 async def lookup_code_prefix_rows_from_db(
     session: Any,
     code_key: int,
@@ -2235,44 +2249,9 @@ async def lookup_code_prefix_rows_from_db(
 ) -> tuple[PTG2ServingBinaryRow, ...]:
     """Return the exact best bounded prefix while validating the full code block."""
 
-    if isinstance(limit, bool) or int(limit) <= 0:
-        raise ValueError("PTG2 serving binary prefix limit must be positive")
-    normalized_limit = int(limit)
-    options = _ForwardLookupOptions(**read_options)
-    normalized_code_key = _normalized_code_key(code_key)
-    shard_keys_by_code, normalized_provider_filter, require_all = await _forward_shard_keys_for_read(
-        session,
-        options,
-        (normalized_code_key,),
-    )
-    block_keys = shard_keys_by_code[normalized_code_key]
-    if not block_keys:
-        return ()
-    collector = _forward_prefix_collector(
-        options,
-        normalized_code_key,
-        normalized_provider_filter,
-        block_keys,
-        bool(descending),
-        normalized_limit,
-    )
-    await _collect_forward_prefix(
-        session,
-        options,
-        block_keys,
-        require_all,
-        collector,
-    )
-    decoded_keys = collector.selected_keys()
-    if not decoded_keys:
-        return ()
-    return await _materialize_forward_prefix(
-        session,
-        options,
-        normalized_code_key,
-        decoded_keys,
-        bool(descending),
-    )
+    from api.ptg2_forward_prefix import materialize_code_prefix_rows
+
+    return await materialize_code_prefix_rows(session, code_key, limit=limit, descending=descending, **read_options)
 
 
 async def lookup_price_ids_from_db(

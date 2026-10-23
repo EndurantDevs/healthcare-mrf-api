@@ -8230,6 +8230,51 @@ paths:
         verified. Imported unresolved rows contribute to unresolved_count. Omitted
         rows are intentional source-binding exclusions. These counts describe this
         selection and do not establish overall network coverage.
+  /registry/publication/initial-inventory:
+    post:
+      operationId: queueRegistryInitialInventory
+      summary: Queue initial inventory without approving saved drafts
+      description: Requires an absent serving head, approved revision zero and no approved
+        records. A current unimpersonated platform administrator authorizes the exact
+        retained bootstrap identity. The worker verifies preparation and pre-enrolled
+        independent custody before atomically publishing the manifest and completion.
+        This operation neither provisions access nor approves drafts. Requests accept
+        no query parameters and are limited to 4096 UTF-8 bytes. An exact completed
+        replay retains its result after the serving head advances.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistryInitialInventoryCommand'
+      responses:
+        '200':
+          description: Durable queue receipt; poll the publication request for completion.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/DirectoryCacheControl'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [request_id, state, created_at, replayed]
+                properties:
+                  request_id: {type: string, format: uuid}
+                  state: {type: string, enum: [queued, running, completed, rejected]}
+                  created_at: {type: string, format: date-time}
+                  replayed: {type: boolean}
+        '400':
+          $ref: '#/components/responses/RegistryInvalidRequest'
+        '403':
+          $ref: '#/components/responses/RegistryControlDenied'
+        '409':
+          $ref: '#/components/responses/RegistryConflict'
+        '503':
+          $ref: '#/components/responses/RegistryUnavailable'
   /registry/publication/reactivate:
     post:
       operationId: queueRegistryGenerationReactivation
@@ -19065,6 +19110,44 @@ components:
         session_token_sha256:
           type: string
           pattern: ^[0-9a-f]{64}$
+    RegistryInitialInventoryCommand:
+      type: object
+      additionalProperties: false
+      required:
+      - operation
+      - bootstrap_id
+      - bootstrap_generation_sha256
+      - expected_serving_generation
+      - expected_approved_revision
+      - reason
+      - idempotency_key
+      - actor
+      - session_token_sha256
+      properties:
+        operation:
+          type: string
+          enum: [publish_initial_inventory]
+        bootstrap_id:
+          type: string
+          format: uuid
+          description: Canonical nonzero UUID of the verified retained bootstrap.
+        bootstrap_generation_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        expected_serving_generation:
+          type: integer
+          enum: [0]
+        expected_approved_revision:
+          type: integer
+          enum: [0]
+        reason:
+          $ref: '#/components/schemas/RegistryReactivationCommand/properties/reason'
+        idempotency_key:
+          $ref: '#/components/schemas/RegistryReactivationCommand/properties/idempotency_key'
+        actor:
+          $ref: '#/components/schemas/RegistryReactivationCommand/properties/actor'
+        session_token_sha256:
+          $ref: '#/components/schemas/RegistryReactivationCommand/properties/session_token_sha256'
     RegistryReactivationCommand:
       type: object
       additionalProperties: false

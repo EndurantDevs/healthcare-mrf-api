@@ -206,6 +206,22 @@ async def _existing_readers(connection, catalog, runtime_roles):
     return readers
 
 
+async def _require_reader_enrollment(connection, readers, control_schema):
+    """Require the direct owner-issued ledger grants a normal seal would emit."""
+    _require(
+        await connection.fetchval(
+            "SELECT NOT EXISTS(SELECT FROM unnest($1::text[]) configured(name) "
+            "LEFT JOIN pg_roles r ON r.rolname=configured.name WHERE NOT EXISTS("
+            "SELECT FROM pg_class c CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) a "
+            "WHERE c.oid=to_regclass($2) AND a.grantee=r.oid AND a.grantor=c.relowner "
+            "AND a.privilege_type='SELECT' AND NOT a.is_grantable))",
+            list(readers),
+            f"{_identifier(control_schema)}.network_candidate_custody",
+        )
+        is True
+    )
+
+
 async def _census_closed(connection, control, catalog, runtime_roles):
     _require(
         await connection.fetchval(
@@ -471,8 +487,17 @@ async def verify_network_candidate_custody(connection, copy_target, *, control_s
 
 
 async def _store_candidate_seal(
-    connection, copy_target, candidate, control, control_schema, runtime_roles, revision, final_closure
+    connection,
+    copy_target,
+    candidate,
+    control,
+    control_schema,
+    runtime_roles,
+    final_closure,
+    *,
+    pre_enrolled_only=False,
 ):
+    revision = 2 if SOURCE_EVENT_ASSERTION in _json_object(candidate["validation_json"]) else 1
     receipt_by_name = {
         "component": "network_candidate_custody",
         "revision": revision,
@@ -495,6 +520,8 @@ async def _store_candidate_seal(
         ),
     }
     _require(len(_encoded(receipt_by_name)) <= MAX_RECEIPT_BYTES)
+    if pre_enrolled_only:
+        await _require_reader_enrollment(connection, final_closure["reader_roles"], control_schema)
     async with _control_owner(connection, control["rolname"]):
         await connection.execute(
             f"INSERT INTO {_identifier(control_schema)}.network_candidate_custody "
@@ -503,10 +530,11 @@ async def _store_candidate_seal(
             _digest(receipt_by_name),
             _encoded(receipt_by_name).decode(),
         )
-        for role in final_closure["reader_roles"]:
-            await connection.execute(
-                f"GRANT SELECT ON {_identifier(control_schema)}.network_candidate_custody TO {_identifier(role)}"
-            )
+        if not pre_enrolled_only:
+            for role in final_closure["reader_roles"]:
+                await connection.execute(
+                    f"GRANT SELECT ON {_identifier(control_schema)}.network_candidate_custody TO {_identifier(role)}"
+                )
         stored = await _seal(connection, copy_target, control_schema)
     return await _verify(
         connection,
@@ -519,7 +547,9 @@ async def _store_candidate_seal(
     )
 
 
-async def _seal_ready_candidate(connection, copy_target, candidate, control, control_schema, runtime_roles, actor):
+async def _seal_ready_candidate(
+    connection, copy_target, candidate, control, control_schema, runtime_roles, actor, *, pre_enrolled_only=False
+):
     _require(candidate["state"] == "ready")
     report = _json_object(candidate["validation_json"])
     revision = 2 if SOURCE_EVENT_ASSERTION in report else 1
@@ -541,11 +571,20 @@ async def _seal_ready_candidate(connection, copy_target, candidate, control, con
     await _check_closed(connection, roles, closed)
     await _census_closed(connection, control, closed, runtime_roles)
     return await _store_candidate_seal(
-        connection, copy_target, candidate, control, control_schema, runtime_roles, revision, after
+        connection,
+        copy_target,
+        candidate,
+        control,
+        control_schema,
+        runtime_roles,
+        after,
+        pre_enrolled_only=pre_enrolled_only,
     )
 
 
-async def seal_network_candidate_custody(connection, copy_target, *, control_schema, runtime_roles, authorize):
+async def seal_network_candidate_custody(
+    connection, copy_target, *, control_schema, runtime_roles, authorize, pre_enrolled_only=False
+):
     """Commit exact READY custody on an independent original authorized operator.
 
     All preparation must already be committed. `authorize(connection, target)`
@@ -554,10 +593,11 @@ async def seal_network_candidate_custody(connection, copy_target, *, control_sch
     and recheck authority, source selection and expected head at publication.
     The seal closes READY storage; it grants no publication authority.
     `runtime_roles` is the trusted complete ordinary publisher/loader/reader census.
+    `pre_enrolled_only` requires existing ledger reader grants and never enrolls them.
     """
     from process.network_membership_publication import _publication_readiness
 
-    _require(not connection.is_in_transaction() and callable(authorize))
+    _require(not connection.is_in_transaction() and callable(authorize) and type(pre_enrolled_only) is bool)
     _require(
         type(runtime_roles) is tuple and 0 < len(runtime_roles) <= 128 and len(set(runtime_roles)) == len(runtime_roles)
     )
@@ -582,9 +622,20 @@ async def seal_network_candidate_custody(connection, copy_target, *, control_sch
                 connection, copy_target, control_schema, control, candidate, existing, operator=True
             )
             _require(sealed_result["receipt"]["runtime_roles"] == sorted(runtime_roles))
+            if pre_enrolled_only:
+                await _require_reader_enrollment(
+                    connection, sealed_result["receipt"]["closure"]["reader_roles"], control_schema
+                )
         else:
             sealed_result = await _seal_ready_candidate(
-                connection, copy_target, candidate, control, control_schema, runtime_roles, actor
+                connection,
+                copy_target,
+                candidate,
+                control,
+                control_schema,
+                runtime_roles,
+                actor,
+                pre_enrolled_only=pre_enrolled_only,
             )
         _require(await authorize(connection, copy_target) is True)
         _require(asyncio.current_task() is task and await _original_actor(connection) == actor)

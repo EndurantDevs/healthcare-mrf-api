@@ -35,6 +35,13 @@ pytestmark = pytest.mark.asyncio
 async def worker_permissions(custom_db):
     fixture = custom_db
     seed = await _seed(fixture)
+    async with _worker_roles(fixture, seed) as worker:
+        yield worker
+
+
+@asynccontextmanager
+async def _worker_roles(fixture, seed):
+    """Reuse the direct-login contract with either approved or initial fixture state."""
     roles_by_kind = {
         kind: "wp_" + kind + "_" + uuid4().hex for kind in ("queue", "physical", "api", "lifecycle", "execution")
     }
