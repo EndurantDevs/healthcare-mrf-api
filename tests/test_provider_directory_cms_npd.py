@@ -1339,15 +1339,18 @@ async def test_rollback_requires_previous_superseded_publication():
 
 
 @pytest.mark.asyncio
-async def test_stream_flushes_on_decoded_byte_bound(monkeypatch, tmp_path: Path):
+@pytest.mark.parametrize("extra_bytes", [0, 1])
+async def test_stream_flushes_on_decoded_byte_bound(monkeypatch, tmp_path: Path, extra_bytes):
+    """A line that no longer fits flushes the pending batch first; a full batch flushes right away."""
     path = tmp_path / "organization.ndjson.zst"
+    line = b'{"resourceType":"Organization","id":"org-0"}\n'
     with zstd.open(path, "wb") as encoded:
         for index in range(3):
-            encoded.write(f'{{"resourceType":"Organization","id":"org-{index}"}}\n'.encode())
+            encoded.write(line.replace(b"org-0", f"org-{index}".encode()))
     persist = AsyncMock()
     fake_fhir = SimpleNamespace(_raise_if_resource_import_cancelled=AsyncMock())
     monkeypatch.setattr(cms, "_persist_prepared_batch", persist)
-    monkeypatch.setattr(cms, "BATCH_MAX_DECODED_BYTES", 1)
+    monkeypatch.setattr(cms, "BATCH_MAX_DECODED_BYTES", 1 if not extra_bytes else len(line) + extra_bytes)
     monkeypatch.setattr(
         cms,
         "_prepare_source_lines",
@@ -1456,6 +1459,61 @@ async def test_failed_staging_drains_running_preparations_before_returning(monke
             await staging
     assert executor._shutdown and running_by_metric["now"] == 0 and running_by_metric["started"] >= 2
     fixture.publisher.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guard_probe_statement_timeout_counts_as_a_probe_timeout():
+    """A statement cancelled by the server's statement_timeout keeps the loss-window tolerance."""
+    cancelled = RuntimeError("canceling statement due to statement timeout")
+    cancelled.sqlstate = "57014"
+    connection = SimpleNamespace(scalar=AsyncMock(side_effect=cancelled), execute=AsyncMock(), commit=AsyncMock())
+    with pytest.raises(RuntimeError, match="cms_npd_intake_guard_lost") as caught:
+        await cms._assert_intake_guard(connection, "synthetic-lock", 1)
+    assert isinstance(caught.value.__cause__, TimeoutError)
+    assert "statement_timeout" in str(connection.execute.await_args.args[0])
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_running_preparations_even_when_cancelled():
+    executor = ThreadPoolExecutor(max_workers=1)
+    finished = threading.Event()
+
+    def busy():
+        time.sleep(0.3)
+        finished.set()
+
+    executor.submit(busy)
+    drain = asyncio.create_task(cms._drain_stage_executor(executor))
+    await asyncio.sleep(0.05)
+    drain.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await drain
+    assert finished.is_set() and executor._shutdown
+
+
+def test_prepare_source_lines_rejects_a_family_mismatch(monkeypatch):
+    monkeypatch.setattr(cms, "_parse_batch_row", lambda *_args: (object(), {"resource_id": "org-1"}))
+    with pytest.raises(CmsNpdSourceError, match="cms_npd_resource_invalid"):
+        cms._prepare_source_lines([b'{"resourceType":"Organization","id":"org-1"}\n'], "Organization", object())
+
+
+@pytest.mark.asyncio
+async def test_relationship_completeness_requires_matching_row_count(monkeypatch):
+    @asynccontextmanager
+    async def session():
+        yield SimpleNamespace()
+
+    families = len(cms.relationships.FIELDS)
+    fake_fhir = SimpleNamespace(
+        db=SimpleNamespace(session=session, scalar=AsyncMock(return_value=families + 1)),
+        _qt=lambda schema, table: f"{schema}.{table}",
+        _schema=lambda: "mrf",
+    )
+    monkeypatch.setattr(cms.relationships, "_raised_work_mem", AsyncMock(return_value="4MB"))
+    monkeypatch.setattr(cms.relationships, "_restore_work_mem", AsyncMock())
+    monkeypatch.setattr(cms.relationships, "_family_complete", AsyncMock(return_value=1))
+    with pytest.raises(RuntimeError, match="cms_npd_relationship_projection_incomplete"):
+        await cms.relationships.assert_complete(fake_fhir, "dataset-synthetic", "a" * 64)
 
 
 def test_stage_executor_follows_the_worker_setting(monkeypatch):
