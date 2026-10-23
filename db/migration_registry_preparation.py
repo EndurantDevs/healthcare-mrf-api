@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Adopt four owner-prepared registry changes without ordinary-role DDL authority."""
+"""Adopt owner-prepared registry changes without ordinary-role DDL authority."""
 
 import importlib.util
 import re
@@ -15,6 +15,7 @@ _REVISIONS = {
     "20261016070000_registry_allowed_plan_scope",
     "20261017010000_registry_cms_source_notifications",
     "20261017030000_registry_ptg_office_recipe_selection",
+    "20261018011000_network_candidate_custody",
     "20261018040000_registry_aca_source_notifications",
 }
 _TABLES = {
@@ -142,6 +143,8 @@ def _validate_acl(connection, relation, owner):
             is_allowed |= privilege == "UPDATE" and column in _BINDING_UPDATE
         elif relation["relname"] == "registry_ptg_published_plan_scope":
             is_allowed |= privilege == "INSERT" and column is None
+        elif relation["relname"] == "network_candidate_custody":
+            is_allowed = privilege == "SELECT" and column is None
         else:
             is_allowed = False
         if not is_allowed or grant["is_grantable"] or grant["grantor"] != owner["oid"]:

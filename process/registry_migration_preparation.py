@@ -5,6 +5,7 @@ from sqlalchemy import text
 
 from db.migration_registry_preparation import registry_migration, validate_prepared_registry_table
 from process.network_address_projection import _identifier
+from process.registry_candidate_custody_preparation import prepare_candidate_custody_table
 from process.registry_company_approval_fence import _fence_key
 from process.registry_management_permissions import assume_registry_source_owner
 from process.registry_source_admission_receipt import _TABLES as _SOURCE_TABLES
@@ -13,6 +14,7 @@ _CHANGES = (
     ("20261016070000_registry_allowed_plan_scope", "registry_ptg_published_plan_scope"),
     ("20261017010000_registry_cms_source_notifications", "registry_cms_source_notification"),
     ("20261017030000_registry_ptg_office_recipe_selection", "registry_network_binding"),
+    ("20261018011000_network_candidate_custody", "network_candidate_custody"),
     ("20261018040000_registry_aca_source_notifications", "registry_aca_source_notification"),
 )
 _EXISTING = ("registry_ptg_published_plan_scope", "registry_network_binding")
@@ -34,7 +36,7 @@ def _acl_manifest(connection, schema):
 
 
 def _prepare(connection, schema):
-    """Apply only the frozen four changes, preserving existing grants and Alembic versions."""
+    """Apply the five protected changes, preserving existing grants and Alembic versions."""
     before = _acl_manifest(connection, schema)
     for revision, table in (
         ("20261009040000_registry_ptg_published_plan_scope", _EXISTING[0]),
@@ -44,6 +46,9 @@ def _prepare(connection, schema):
         count = 2 if table == "registry_network_binding" else 1
         validate_prepared_registry_table(connection, schema, table, lambda name: migration._ddl(name)[:count])
     for revision, table in _CHANGES:
+        if table == "network_candidate_custody":
+            prepare_candidate_custody_table(connection, schema)
+            continue
         migration = registry_migration(revision)
         if table == "registry_aca_source_notification":
             migration._create(connection, schema)

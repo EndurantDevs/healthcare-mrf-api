@@ -1,9 +1,9 @@
 # Protected registry migrations
 
-Ordinary application migrations retain their existing database identity. Four
+Ordinary application migrations retain their existing database identity. Five
 registry changes require the existing protected owner: the published-plan review
 constraint, CMS notification storage, the nullable office-recipe binding column,
-and ACA notification storage. Prepare those changes separately with existing
+candidate custody, and ACA notification storage. Prepare those changes separately with existing
 maintenance credentials. The ordinary Alembic upgrade then validates their full
 native postimages before recording its normal revision progress. It does not
 assume the protected owner, grant permissions, or skip an unprepared revision.
@@ -33,7 +33,7 @@ python -m process.registry_migration_preparation \
 Use existing operator credentials in the environment; do not change ordinary
 application credentials or owner membership. The owner must already satisfy
 source custody, including its existing native system-identity read permission.
-The command validates the old layouts and executes the four frozen changes in
+The command validates the old layouts and executes the five protected changes in
 one transaction with bounded timeouts. It checks complete native columns,
 defaults, constraints, indexes, ownership and bounded ACLs, preserves existing
 object identities and grants, and creates owner-only notification storage.
@@ -41,6 +41,28 @@ Unexpected default grants cause refusal. It writes no migration version.
 Failure rolls back the whole preparation. A successful preparation is not a
 command to repeat: proceed through ordinary Alembic adoption, or verify the exact
 prepared postimage when recovering a later deployment failure.
+
+If the original four changes have already committed while `network_candidate_custody`
+is absent, do not repeat the complete preparation command. In a caller-owned
+maintenance transaction with the same bounded timeouts, call
+`prepare_registry_candidate_custody(connection, owner_role=..., control_schema=...)`
+from `process.registry_candidate_custody_preparation`. Retain the same scoped
+admission hold and physical-work drain. This forward-only call assumes the existing
+protected owner, takes an immediate shared lock on the candidate parent, and
+creates only missing custody storage. It preserves parent ownership, OID, and all
+ACLs while granting custody SELECT only to the existing explicit nongrantable
+candidate readers. Its real foreign key must target the existing candidate primary
+key. A pre-existing custody relation is fully validated without repair or new grants.
+Malformed storage or ACLs refuse; errors roll back the call and restore the caller
+role. Existing readers remain permitted during the shared parent lock.
+
+Custody adoption compares all native columns, defaults, checks, and indexes using
+private temporary storage. It separately verifies the real permanent-parent foreign
+key, enforcement, validation, match and action modes, and deferrability, plus exact
+owner and reader ACLs. It never substitutes a same-named reference relation or grants
+ordinary migration authority. After custody-only preparation commits, run the narrow
+office-column enrollment below and the ordinary Alembic upgrade; preserve all four
+previously prepared postimages and immutable data throughout.
 
 Keep old management processes stopped after preparation. Their exact catalogue
 column verifier deliberately refuses the new binding layout, but some old write
