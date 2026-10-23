@@ -4,6 +4,7 @@
 from sqlalchemy import text
 
 from alembic import op
+from db.migration_registry_preparation import can_adopt_prepared_registry_table, registry_migration
 from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
 
@@ -67,9 +68,17 @@ def _ddl(schema, *, include_allowed):
     )
 
 
+def _postimage(schema):
+    original = registry_migration("20261009040000_registry_ptg_published_plan_scope")
+    return (original._ddl(schema)[0], *_ddl(schema, include_allowed=True)[1:])
+
+
 def upgrade():
     """Keep original receipt invariants and permit only the new closed role tuple."""
-    for statement in _ddl(registry_schema(), include_allowed=True):
+    schema = registry_schema()
+    if can_adopt_prepared_registry_table(op, schema, "registry_ptg_published_plan_scope", _postimage):
+        return
+    for statement in _ddl(schema, include_allowed=True):
         op.execute(statement)
 
 
