@@ -36,7 +36,6 @@ JOB_LABELS = {
     "measurement": "Coverage results",
     "source-validation": "Validation complete",
     "dev-image-publication": "DEV image publication",
-    "artifact-cleanup": "CI artifact cleanup",
 }
 MATRIX_ROWS_BY_JOB = {
     "python-tests": [
@@ -81,7 +80,9 @@ def _assert_job_actions(job_id, job, revision) -> None:
     """Require hosted actions and the approved package before local setup."""
     has_pinned_checkout = False
     for step in job.get("steps", []):
-        assert not step.get("continue-on-error")
+        if step.get("continue-on-error"):
+            assert job_id == "dev-image-publication"
+            assert step.get("name") == "Queue independent artifact cleanup"
         action = step.get("uses")
         if not action:
             continue
@@ -247,11 +248,9 @@ def _assert_hosted_job_policies(workflow, revision):
             assert job["permissions"] == {
                 "contents": "read",
                 "pull-requests": "read",
-                "actions": "read",
+                "actions": "write",
                 "packages": "write",
             }
-        elif job_id == "artifact-cleanup":
-            assert job["permissions"] == {"contents": "read", "actions": "write"}
         elif job_id in COMMON_TEST_JOBS | {"measurement"}:
             assert job["permissions"] == {
                 "contents": "read",
@@ -324,7 +323,12 @@ def test_stale_artifact_cleanup_is_main_only_and_pinned():
     revision = yaml.safe_load((path.parent / "ci.yml").read_text())["env"]["CI_REVISION"]
     assert workflow.get("on", workflow.get(True)) == {
         "schedule": [{"cron": "47 2 * * *"}],
-        "workflow_dispatch": None,
+        "workflow_dispatch": {
+            "inputs": {
+                "source_run_id": {"description": "Completed source CI run", "required": False, "type": "string"},
+                "source_run_attempt": {"description": "Exact source CI attempt", "required": False, "type": "string"},
+            }
+        },
     }
     assert workflow["permissions"] == {
         "contents": "read",
@@ -332,10 +336,11 @@ def test_stale_artifact_cleanup_is_main_only_and_pinned():
         "actions": "write",
     }
     assert workflow["concurrency"] == {
-        "group": "public-artifact-cleanup",
+        "group": "${{ inputs.source_run_id && format('public-artifact-cleanup-{0}-{1}', "
+        "inputs.source_run_id, inputs.source_run_attempt) || 'public-artifact-cleanup' }}",
         "cancel-in-progress": False,
     }
-    assert set(workflow["jobs"]) == {"stale-cleanup"}
+    assert set(workflow["jobs"]) == {"stale-cleanup", "completed-cleanup"}
     job = workflow["jobs"]["stale-cleanup"]
     assert job["if"] == ("github.repository == 'EndurantDevs/healthcare-mrf-api' && github.ref == 'refs/heads/main'")
     assert job["runs-on"] == "ubuntu-latest"
@@ -418,7 +423,6 @@ def test_publisher_requires_every_matrix_result_and_all_immutable_artifacts():
         "measurement",
         "source-validation",
         "dev-image-publication",
-        "artifact-cleanup",
     }
     download = next(
         step for step in publisher["steps"] if step.get("name") == "Download immutable measurement artifacts"
@@ -452,8 +456,52 @@ def test_publisher_requires_every_matrix_result_and_all_immutable_artifacts():
         "IMAGE_ARTIFACT_ID": "${{ needs.container-package.outputs.image_artifact_id }}",
         "MEASUREMENT_ARTIFACT_ID": "${{ needs.measurement.outputs.measurement_artifact_id }}",
     }
-    assert jobs["artifact-cleanup"]["needs"] == [
-        "dev-image-publication",
-        "container-package",
-        "measurement",
-    ]
+
+
+def test_completed_cleanup_is_independent_and_executes_only_a_pinned_helper():
+    path = Path(__file__).resolve().parents[1] / ".github/workflows/artifact-cleanup.yml"
+    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+    source_workflow = yaml.safe_load((path.parent / "ci.yml").read_text())
+    assert "artifact-cleanup" not in source_workflow["jobs"]
+    assert not any("cleanup" in str(job.get("needs", [])) for job in source_workflow["jobs"].values())
+    assert workflow["run-name"] == (
+        "${{ inputs.source_run_id && format('CI artifact cleanup for run {0}, attempt {1}', "
+        "inputs.source_run_id, inputs.source_run_attempt) || 'Stale artifact cleanup' }}"
+    )
+    publication = source_workflow["jobs"]["dev-image-publication"]
+    dispatch = publication["steps"][-1]
+    assert dispatch["name"] == "Queue independent artifact cleanup"
+    assert dispatch["continue-on-error"] is True
+    assert dispatch["env"] == {"GH_TOKEN": "${{ github.token }}"}
+    assert dispatch["if"] == (
+        "success() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)"
+    )
+    assert dispatch["run"] == (
+        'timeout 15s gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/artifact-cleanup.yml/dispatches" '
+        '-f ref=dev -f "inputs[source_run_id]=$GITHUB_RUN_ID" '
+        '-f "inputs[source_run_attempt]=$GITHUB_RUN_ATTEMPT"'
+    )
+    job = workflow["jobs"]["completed-cleanup"]
+    assert "needs" not in job
+    assert not job.get("continue-on-error")
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["timeout-minutes"] == 15
+    assert job["permissions"] == {"contents": "read", "actions": "write"}
+    assert job["if"] == (
+        "github.repository == 'EndurantDevs/healthcare-mrf-api' && "
+        "github.ref == 'refs/heads/dev' && github.event_name == 'workflow_dispatch' && "
+        "inputs.source_run_id && inputs.source_run_attempt"
+    )
+    checkout, uv_step, python_step, remove = job["steps"]
+    assert checkout["uses"] == "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+    assert checkout["with"]["repository"] == "EndurantDevs/endurant-ci"
+    assert re.fullmatch(r"[0-9a-f]{40}", checkout["with"]["ref"])
+    assert checkout["with"]["path"] == "ci"
+    assert checkout["with"]["persist-credentials"] is False
+    assert uv_step == {"name": "Install pinned uv", "run": "bash ci/scripts/install_uv"}
+    assert python_step == {"name": "Install uv-managed Python", "run": "bash ci/scripts/setup_python"}
+    assert remove == {
+        "name": "Remove validated CI intermediates",
+        "env": {"GH_TOKEN": "${{ github.token }}", "PYTHONDONTWRITEBYTECODE": "1"},
+        "run": "python3 ci/scripts/artifact_cleanup.py --completed",
+    }

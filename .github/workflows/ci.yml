@@ -1048,7 +1048,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      actions: read
+      actions: write
       packages: write
     env:
       CI_REVISION: 2857847e4654d2f71391b81279588d958a7fa197
@@ -1112,44 +1112,17 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: python3 ci/scripts/source_image.py reconcile
+    - name: Queue independent artifact cleanup
+      if: success() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: timeout 15s gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/artifact-cleanup.yml/dispatches" -f
+        ref=dev -f "inputs[source_run_id]=$GITHUB_RUN_ID" -f "inputs[source_run_attempt]=$GITHUB_RUN_ATTEMPT"
     outputs:
       receipt_artifact_id: ${{ steps.receipt-artifact.outputs.artifact-id }}
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
-  artifact-cleanup:
-    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-      && 'CI artifact cleanup (metadata only)' || 'CI artifact cleanup' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs:
-    - dev-image-publication
-    - container-package
-    - measurement
-    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (success()) }}
-    permissions:
-      contents: read
-      actions: write
-    steps:
-    - name: Check out trusted cleanup helper
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      with:
-        repository: EndurantDevs/endurant-ci
-        ref: 2857847e4654d2f71391b81279588d958a7fa197
-        path: ci
-        persist-credentials: false
-    - name: Install pinned uv
-      run: bash ci/scripts/install_uv
-    - name: Install uv-managed Python
-      run: bash ci/scripts/setup_python
-    - name: Remove validated CI intermediates
-      env:
-        GH_TOKEN: ${{ github.token }}
-        PYTHONDONTWRITEBYTECODE: '1'
-        IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
-        MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
-        IMAGE_RECEIPT_ARTIFACT_ID: ${{ needs.dev-image-publication.outputs.receipt_artifact_id }}
-      run: python3 ci/scripts/artifact_cleanup.py
 'on':
   pull_request:
     types:
