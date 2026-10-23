@@ -52,6 +52,7 @@ def test_notification_upgrade_preserves_schema_selection(monkeypatch, configured
         monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", configured)
     statements = []
     monkeypatch.setattr(migration.op, "execute", statements.append)
+    monkeypatch.setattr(migration.op, "get_bind", lambda: None)
     migration.upgrade()
     assert statements == list(migration._ddl(configured or "fallback_schema"))
 

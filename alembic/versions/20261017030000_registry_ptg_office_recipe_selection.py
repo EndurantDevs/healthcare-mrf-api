@@ -1,6 +1,8 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Retain a reviewed exact office recipe beside the unchanged plan source proof."""
 
 from alembic import op
+from db.migration_registry_preparation import can_adopt_prepared_registry_table, registry_migration
 from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
 
@@ -19,9 +21,17 @@ def _ddl(schema):
     ]
 
 
+def _postimage(schema):
+    original = registry_migration("20261007130000_registry_network_bindings")
+    return (*original._ddl(schema)[:2], *_ddl(schema))
+
+
 def upgrade():
     """Add nullable selection storage without changing existing records or plan evidence."""
-    for statement in _ddl(registry_schema()):
+    schema = registry_schema()
+    if can_adopt_prepared_registry_table(op, schema, "registry_network_binding", _postimage):
+        return
+    for statement in _ddl(schema):
         op.execute(statement)
 
 
