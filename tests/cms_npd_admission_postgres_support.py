@@ -218,9 +218,14 @@ async def cms_admission_template(request):
                     await connection.exec_driver_sql("VACUUM (FREEZE)")
         finally:
             await engine.dispose()
-        assert not await admin.fetchval(
-            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=$1)", template_url.database
-        )
+        for _attempt in range(120):  # autovacuum may still be analyzing the freshly migrated template
+            if not await admin.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=$1)", template_url.database
+            ):
+                break
+            await asyncio.sleep(0.5)
+        else:
+            raise AssertionError("template database still has connections")
         await admin.execute(f'ALTER DATABASE "{template_url.database}" ALLOW_CONNECTIONS false')
         with pytest.MonkeyPatch.context() as clone_scope:
             clone_scope.setattr(
