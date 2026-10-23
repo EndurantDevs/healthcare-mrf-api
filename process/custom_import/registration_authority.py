@@ -24,11 +24,20 @@ from process.custom_import.definition_store import (
     _require_clean_session,
     _require_transaction,
 )
+from process.custom_import.object_source_binding import (
+    OBJECT_SOURCE_BINDING_CONTRACT,
+    ObjectSourceBinding,
+    ObjectSourceBindingError,
+)
 from process.custom_import.snowflake_binding import SnowflakeSourceBinding, SnowflakeSourceBindingError
 from process.custom_import.snowflake_source_binding import (
     SnowflakeSourceBindingReceipt,
     SnowflakeSourceBindingUnavailableError,
-    register_snowflake_source_binding,
+)
+from process.custom_import.source_binding_store import (
+    ObjectSourceBindingReceipt,
+    ObjectSourceBindingUnavailableError,
+    register_source_binding,
 )
 
 _TABLE = CustomImportRegistrationAuthority.__table__
@@ -84,7 +93,7 @@ class _Registration:
 
     dataset_key: str
     definition: CustomImportDefinition
-    binding: SnowflakeSourceBinding
+    binding: ObjectSourceBinding | SnowflakeSourceBinding
     input_sha256: bytes
 
 
@@ -135,13 +144,21 @@ def _registration(document: object) -> _Registration:
             raise ValueError("invalid registration envelope")
         dataset_key = _normalized_dataset_key(document["dataset_key"])
         definition = CustomImportDefinition.from_mapping(document["definition"])
-        binding = SnowflakeSourceBinding.from_mapping(document["source_binding"])
+        source_binding = document["source_binding"]
+        binding = (
+            ObjectSourceBinding.from_mapping(source_binding)
+            if isinstance(source_binding, dict) and source_binding.get("contract") == OBJECT_SOURCE_BINDING_CONTRACT
+            else SnowflakeSourceBinding.from_mapping(source_binding)
+        )
         if (
             canonical_json(document["definition"]) != definition.canonical
             or canonical_json(document["source_binding"]) != binding.canonical
         ):
             raise ValueError("noncanonical registration documents")
-        binding.bundle_components(definition)
+        if isinstance(binding, ObjectSourceBinding):
+            binding.validate_definition(definition)
+        else:
+            binding.bundle_components(definition)
         input_sha256 = _semantic_input_digest(document)
     except TypeError, ValueError, RecursionError:
         raise RegistrationAuthorityError("registration input is invalid") from None
@@ -281,10 +298,17 @@ async def revoke_registration_authority(session: AsyncSession, authority_id: str
     return state
 
 
-def _graph_receipt(registration: SnowflakeSourceBindingReceipt, prepared: _Registration) -> str:
+def _graph_receipt(
+    registration: ObjectSourceBindingReceipt | SnowflakeSourceBindingReceipt, prepared: _Registration
+) -> str:
     """Retain the existing redacted receipt, never the registration document."""
 
-    if not isinstance(registration, SnowflakeSourceBindingReceipt) or type(registration.created) is not bool:
+    receipt_type = (
+        ObjectSourceBindingReceipt
+        if isinstance(prepared.binding, ObjectSourceBinding)
+        else SnowflakeSourceBindingReceipt
+    )
+    if not isinstance(registration, receipt_type) or type(registration.created) is not bool:
         raise RegistrationAuthorityError("registration receipt is invalid")
     receipt_by_name = {
         "dataset_id": registration.dataset_id,
@@ -304,18 +328,20 @@ def _graph_receipt(registration: SnowflakeSourceBindingReceipt, prepared: _Regis
     return _receipt_text(receipt_by_name)
 
 
-async def _register_graph(session: AsyncSession, prepared: _Registration) -> SnowflakeSourceBindingReceipt:
+async def _register_graph(
+    session: AsyncSession, prepared: _Registration
+) -> ObjectSourceBindingReceipt | SnowflakeSourceBindingReceipt:
     """Translate deterministic graph rejection without masking unavailable state."""
 
     try:
-        return await register_snowflake_source_binding(
+        return await register_source_binding(
             session, dataset_key=prepared.dataset_key, definition=prepared.definition, binding=prepared.binding
         )
     except DefinitionRegistrationConflict as exc:
         raise RegistrationAuthorityConflict("registration graph identity conflicts") from exc
-    except SnowflakeSourceBindingUnavailableError:
+    except ObjectSourceBindingUnavailableError, SnowflakeSourceBindingUnavailableError:
         raise
-    except SnowflakeSourceBindingError as exc:
+    except (ObjectSourceBindingError, SnowflakeSourceBindingError) as exc:
         raise RegistrationAuthorityError("registration graph input is invalid") from exc
 
 

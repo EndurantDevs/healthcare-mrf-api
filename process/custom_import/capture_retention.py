@@ -10,6 +10,7 @@ from db.models.custom_import import (
     CustomImportCaptureParquetPart,
     CustomImportCaptureUsage,
 )
+from db.models.custom_import_prepared_source import CustomImportPreparedSource
 from db.models.custom_import_raw_capture import CustomImportCaptureRawObject
 from process.custom_import.capture_store import (
     CaptureBundleConflict,
@@ -30,6 +31,7 @@ async def require_capture_retention_read_access(session: AsyncSession) -> None:
     for columns in (
         (CustomImportCaptureUsage.dataset_id, CustomImportCaptureUsage.retained_bytes),
         (CustomImportCaptureRawObject.dataset_id, CustomImportCaptureRawObject.byte_count),
+        (CustomImportPreparedSource.dataset_id, CustomImportPreparedSource.retained_byte_count),
     ):
         await session.execute(select(*columns).limit(0))
 
@@ -89,7 +91,12 @@ def _retained_bytes_statement(dataset_id: int, new_byte_count: int):
         .where(CustomImportCaptureRawObject.dataset_id == dataset_id)
         .scalar_subquery()
     )
+    prepared_bytes = (
+        select(func.coalesce(func.sum(cast(CustomImportPreparedSource.retained_byte_count, Numeric)), 0))
+        .where(CustomImportPreparedSource.dataset_id == dataset_id)
+        .scalar_subquery()
+    )
     return select(
         func.current_setting("transaction_isolation"),
-        func.coalesce(usage, parquet_bytes) + raw_bytes + new_byte_count,
+        func.coalesce(usage, parquet_bytes) + raw_bytes + prepared_bytes + new_byte_count,
     )

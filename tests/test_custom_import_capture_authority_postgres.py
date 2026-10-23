@@ -157,7 +157,12 @@ async def _legacy_grants(case, role):
     async with case.engine.begin() as connection:
         await connection.execute(text(f'GRANT USAGE ON SCHEMA {schema} TO "{role}"'))
         await connection.execute(text(f'GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO "{role}"'))
-        for relation in ("custom_import_capture_usage", "custom_import_capture_raw_object"):
+        for relation in (
+            "custom_import_capture_usage",
+            "custom_import_capture_raw_object",
+            "custom_import_prepared_source",
+            "custom_import_prepared_source_part",
+        ):
             await connection.execute(text(f'REVOKE ALL ON {schema}.{relation} FROM "{role}"'))
         for relation in ("custom_import_capture_bundle", "custom_import_capture", "custom_import_capture_parquet_part"):
             await connection.execute(text(f'GRANT INSERT ON {schema}.{relation} TO "{role}"'))
@@ -212,6 +217,7 @@ async def test_metadata_provisioning_preserves_restricted_segmented_writes(captu
         for relation, columns in (
             ("custom_import_capture_usage", "dataset_id, retained_bytes"),
             ("custom_import_capture_raw_object", "dataset_id, byte_count"),
+            ("custom_import_prepared_source", "dataset_id, retained_byte_count"),
         ):
             with pytest.raises(DBAPIError) as rejected:
                 await _append_as(capture_case, roles.writer, request, registered, part)
@@ -222,11 +228,15 @@ async def test_metadata_provisioning_preserves_restricted_segmented_writes(captu
         await _metadata_remains_read_only(capture_case, roles.writer)
 
 
-@pytest.mark.parametrize("missing_relation", ("custom_import_capture_usage", "custom_import_capture_raw_object"))
-async def test_retention_preflight_requires_both_metadata_grants(capture_case, missing_relation):
+@pytest.mark.parametrize(
+    "missing_relation",
+    ("custom_import_capture_usage", "custom_import_capture_raw_object", "custom_import_prepared_source"),
+)
+async def test_retention_preflight_requires_every_metadata_grant(capture_case, missing_relation):
     columns_by_relation = {
         "custom_import_capture_usage": "dataset_id, retained_bytes",
         "custom_import_capture_raw_object": "dataset_id, byte_count",
+        "custom_import_prepared_source": "dataset_id, retained_byte_count",
     }
     async with _roles(capture_case) as roles:
         await _legacy_grants(capture_case, roles.writer)
@@ -250,6 +260,13 @@ async def _metadata_remains_read_only(case, role):
     await _denied_statement(case, role, text(f"SELECT payload FROM {schema}.custom_import_capture_raw_object"))
     await _denied_statement(case, role, text(f"UPDATE {schema}.custom_import_capture_usage SET retained_bytes=0"))
     await _denied_statement(case, role, text(f"DELETE FROM {schema}.custom_import_capture_raw_object"))
+    for column in ("canonical_processing_policy", "canonical_progress", "canonical_summary"):
+        await _denied_statement(case, role, text(f"SELECT {column} FROM {schema}.custom_import_prepared_source"))
+    await _denied_statement(case, role, text(f"SELECT payload FROM {schema}.custom_import_prepared_source_part"))
+    await _denied_statement(case, role, text(f"UPDATE {schema}.custom_import_prepared_source SET byte_count=0"))
+    await _denied_statement(case, role, text(f"DELETE FROM {schema}.custom_import_prepared_source"))
+    for relation in ("custom_import_prepared_source", "custom_import_prepared_source_part"):
+        await _denied_statement(case, role, text(f"INSERT INTO {schema}.{relation} DEFAULT VALUES"))
     async with case.sessions() as session, session.begin():
         with pytest.raises(CaptureStoreError, match="closed capture write grants"):
             await require_raw_capture_authority(session)

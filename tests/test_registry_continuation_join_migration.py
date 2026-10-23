@@ -22,7 +22,8 @@ MANUAL_JOIN = "20261020210000_registry_manual_acceptance_join"
 CHECKER_EXECUTION = "20261022110000_ptg_checker_execution"
 FIRST_RETIREMENT = "20261022120000_provider_directory_first_retirement"
 DIRECTORY_PRICING_JOIN = "20261023220000_merge_directory_pricing_controls"
-CURRENT_HEAD = "20261024050000_provider_directory_first_retirement_owner_lineage"
+OWNER_LINEAGE = "20261024050000_provider_directory_first_retirement_owner_lineage"
+CURRENT_HEAD = "20261023010000_custom_import_prepared_source"
 PTG_MEMBERSHIP = "20261021110000_ptg_membership_import_idempotency"
 
 
@@ -38,8 +39,9 @@ def test_join_preserves_both_completed_parent_histories():
         "20261023100000_provider_directory_retirement_parent_updates",
         "20261023110000_code_pricing_import_idempotency",
     )
-    assert script.get_revision(CURRENT_HEAD).down_revision == DIRECTORY_PRICING_JOIN
     assert script.get_revision(DIRECTORY_PRICING_JOIN).down_revision == parents
+    assert script.get_revision(CURRENT_HEAD).down_revision == OWNER_LINEAGE
+    assert script.get_revision(OWNER_LINEAGE).down_revision == DIRECTORY_PRICING_JOIN
     assert all(script.get_revision(parent).down_revision == FIRST_RETIREMENT for parent in parents)
     assert script.get_revision(FIRST_RETIREMENT).down_revision == CHECKER_EXECUTION
     assert script.get_heads() == [CURRENT_HEAD]

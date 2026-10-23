@@ -48,6 +48,20 @@ def _endpoint(value: str) -> str:
     return str(checked.origin())
 
 
+def _validated_locator(*, endpoint: str, region: str, bucket: str, key: str, addressing: str) -> str:
+    """Validate reusable location fields without inventing per-run content pins."""
+
+    endpoint = _endpoint(endpoint)
+    if addressing != "path" or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", region):
+        raise ValueError
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
+        raise ValueError
+    if any(fragment in bucket for fragment in ("..", ".-", "-.")):
+        raise ValueError
+    _bounded_text(key, 1024)
+    return endpoint
+
+
 @dataclass(frozen=True)
 class S3Object:
     """One exact original object; only explicit path-style addressing is supported.
@@ -71,14 +85,17 @@ class S3Object:
         try:
             if not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", self.stream_id):
                 raise ValueError
-            object.__setattr__(self, "endpoint", _endpoint(self.endpoint))
-            if self.addressing != "path" or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self.region):
-                raise ValueError
-            if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", self.bucket):
-                raise ValueError
-            if any(fragment in self.bucket for fragment in ("..", ".-", "-.")):
-                raise ValueError
-            _bounded_text(self.key, 1024)
+            object.__setattr__(
+                self,
+                "endpoint",
+                _validated_locator(
+                    endpoint=self.endpoint,
+                    region=self.region,
+                    bucket=self.bucket,
+                    key=self.key,
+                    addressing=self.addressing,
+                ),
+            )
             if self.version_id is not None:
                 _bounded_text(self.version_id, 1024)
             https._validate_identity(self.expected_sha256, self.expected_bytes, CaptureLimits(), 1)

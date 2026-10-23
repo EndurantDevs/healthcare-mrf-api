@@ -405,7 +405,12 @@ async def _is_source_writer_owner(session: AsyncSession) -> bool:
 async def _begin_build(session_factory, request):
     """Begin or reload a build and bind its complete snapshot before commit."""
 
+    from process.custom_import import prepared_source_build
+
     async with _page_session(session_factory, request) as (session, _):
+        is_prepared = isinstance(request, prepared_source_build.PreparedSourceBuildRequest)
+        if is_prepared:
+            await prepared_source_build.require_build_scope(session, request)
         await _prepare_statement(session)
         registry = await load_registry(session, request)
         expected = selection_profile_models(
@@ -433,23 +438,27 @@ async def _begin_build(session_factory, request):
         ):
             raise CandidateRunnerError("persisted selection profiles do not match the definition")
         build_id = (
-            await _call(
-                session,
-                "begin_custom_import_build",
-                (
-                    ("bigint", request.execution_id),
-                    ("bigint", request.fence),
-                    ("bytea", producer_token_sha256(request)),
-                    ("bigint", request.expected_base_generation_id),
-                    ("bigint", request.expected_pointer_version),
-                    ("boolean", request.complete_scope),
-                    ("integer", request.page_row_limit),
-                    ("bigint", request.page_byte_limit),
-                    ("integer", request.statement_timeout_ms),
-                    ("timestamptz", request.build_deadline_at),
-                ),
-            )
-        ).scalar_one()
+            await prepared_source_build.begin_build(session, request, registry)
+            if is_prepared
+            else (
+                await _call(
+                    session,
+                    "begin_custom_import_build",
+                    (
+                        ("bigint", request.execution_id),
+                        ("bigint", request.fence),
+                        ("bytea", producer_token_sha256(request)),
+                        ("bigint", request.expected_base_generation_id),
+                        ("bigint", request.expected_pointer_version),
+                        ("boolean", request.complete_scope),
+                        ("integer", request.page_row_limit),
+                        ("bigint", request.page_byte_limit),
+                        ("integer", request.statement_timeout_ms),
+                        ("timestamptz", request.build_deadline_at),
+                    ),
+                )
+            ).scalar_one()
+        )
         await _resolve_build_snapshot(session, build_id)
     return build_id, registry
 
@@ -877,7 +886,15 @@ async def _compare_committed_page(session_factory, context, page):
 
 
 async def _finish_part(session_factory, request, build_id, slot, ordinal):
-    async with _page_session(session_factory, request, build_id) as (session, _):
+    from process.custom_import import prepared_source_build
+
+    async with _page_session(session_factory, request, build_id) as (session, build):
+        if isinstance(request, prepared_source_build.PreparedSourceBuildRequest):
+            from process.custom_import.source_batch import _cursor
+
+            stream = await _cursor(session, build_id, slot)
+            await prepared_source_build.finish_part(session, request, build, stream, ordinal)
+            return
         await _call(
             session,
             "finish_custom_import_build_source_part",
@@ -1258,6 +1275,10 @@ async def _stage_local_source(session_factory, request, build_id, registry):
     """Preserve standalone replay and select only the current connection's writer."""
 
     from process.custom_import import admission_sql as admission
+    from process.custom_import import prepared_source_build
+
+    if isinstance(request, prepared_source_build.PreparedSourceBuildRequest):
+        return await prepared_source_build.stage_local_source(session_factory, request, build_id)
 
     async with _page_session(session_factory, request, build_id) as (session, build):
         phase, bundle_id = build.phase, build.capture_bundle_id

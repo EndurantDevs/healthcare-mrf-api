@@ -140,6 +140,7 @@ def _install_custom_import_migrations(
     is_segmented_capture_enabled: bool,
     is_snapshot_storage_enabled: bool = True,
     migration_through: str | None = None,
+    is_prepared_source_enabled: bool = True,
 ) -> None:
     """Install the exact custom-import DDL needed by the focused PostgreSQL proofs."""
 
@@ -180,6 +181,12 @@ def _install_custom_import_migrations(
         schema_name,
         install_authority=is_segmented_capture_enabled and is_snapshot_storage_enabled and migration_through is None,
     )
+    if is_segmented_capture_enabled and is_prepared_source_enabled:
+        path = _ROOT / "alembic" / "versions" / "20261023010000_custom_import_prepared_source.py"
+        migration = _migration(path, "custom_import_prepared_source_test_migration")
+        migration._schema = lambda: schema_name
+        migration.op = Operations(MigrationContext.configure(sync_connection))
+        migration.upgrade()
 
 
 def install_build_continuation_migration(sync_connection, schema_name: str, *, install_authority=True) -> None:
@@ -290,6 +297,7 @@ async def isolated_publication_case(
     is_segmented_capture_enabled: bool = True,
     is_snapshot_storage_enabled: bool = True,
     migration_through: str | None = None,
+    is_prepared_source_enabled: bool = True,
 ) -> AsyncIterator[IsolatedPublicationCase]:
     """Use current DDL by default; historical migration proofs name an inclusive stop."""
 
@@ -314,6 +322,7 @@ async def isolated_publication_case(
                 is_segmented_capture_enabled,
                 is_snapshot_storage_enabled,
                 migration_through,
+                is_prepared_source_enabled,
             )
         yield IsolatedPublicationCase(
             engine=engine,
