@@ -30,6 +30,7 @@ from db.models import ProviderDirectoryCMSNPDResourceWitness
 from process import cms_npd_source as source
 from process import provider_directory_cms_npd_recovery as recovery
 from process import provider_directory_cms_npd_relationship as relationships
+from process.entity_address_cutover_contract import postgres_sqlstate
 from process.provider_directory_cms_observation import observe_intake as _observe_intake
 from process.provider_directory_cms_resource_batch import persist_prepared_cms_dataset_rows, prepare_cms_dataset_rows
 from process.provider_directory_profile_selection_dataset import _cms_dataset_pair
@@ -1327,7 +1328,10 @@ _GUARD_LOSS_SECONDS = 60.0
 async def _assert_intake_guard(connection, lock_key, backend_id):
     """Reject connection replacement or loss of the exact endpoint advisory lock."""
     try:
-        async with asyncio.timeout(_GUARD_PROBE_SECONDS):
+        # The server bounds the probe, so no client-side cancel can wedge the guard connection; the
+        # outer bound only catches an unreachable server and then already equals the loss window.
+        async with asyncio.timeout(_GUARD_LOSS_SECONDS):
+            await connection.execute(text(f"SET LOCAL statement_timeout={int(_GUARD_PROBE_SECONDS * 1000)}"))
             is_owner = await connection.scalar(
                 text("""SELECT pg_backend_pid()=:backend_id AND EXISTS (
                 SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory' AND granted
@@ -1338,6 +1342,8 @@ async def _assert_intake_guard(connection, lock_key, backend_id):
             )
             await connection.commit()
     except Exception as error:
+        if postgres_sqlstate(error) == "57014":  # query_canceled: the probe statement timed out
+            raise RuntimeError("cms_npd_intake_guard_lost") from TimeoutError(str(error))
         raise RuntimeError("cms_npd_intake_guard_lost") from error
     if is_owner is not True:
         raise RuntimeError("cms_npd_intake_guard_lost")

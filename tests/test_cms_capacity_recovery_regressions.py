@@ -1421,7 +1421,7 @@ async def test_current_observation_does_not_admit_uncovered_or_other_release(npd
 
 async def test_intake_connects_then_releases_backend_with_lost_lock_before_staging():
     engine = object()
-    connection = SimpleNamespace(scalar=AsyncMock(side_effect=[123, False]), commit=AsyncMock())
+    connection = SimpleNamespace(scalar=AsyncMock(side_effect=[123, False]), execute=AsyncMock(), commit=AsyncMock())
     database = SimpleNamespace(engine=None)
 
     async def connect():
