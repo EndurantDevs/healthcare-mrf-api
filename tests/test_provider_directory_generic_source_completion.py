@@ -255,3 +255,23 @@ async def test_derived_edges_keep_explicit_unresolved_targets_but_require_their_
         await completion._relationships(connection, SimpleNamespace(schema="source_schema"), binding_by_field)
         checked_origins = [call.args[2] for call in connection.fetchval.await_args_list[1:]]
         assert checked_origins == ["InsurancePlan", "InsurancePlan", "OrganizationAffiliation"]
+
+
+@pytest.mark.asyncio
+async def test_recheck_samples_large_heaps_in_random_order():
+    """Small heaps are read whole; large ones take a shuffled TABLESAMPLE bounded by the recheck size."""
+    rows = [{"resource_type": "Location", "resource_id": f"site-{index}"} for index in range(3)]
+    statements = []
+
+    async def cursor(query, prefetch):
+        statements.append(query)
+        for row in rows:
+            yield row
+
+    connection, policy, seen = SimpleNamespace(cursor=cursor), SimpleNamespace(schema="mrf"), []
+    columns = ("resource_type", "resource_id")
+    await completion._recheck_reduced_rows(connection, policy, "pdgs_x_r", columns, seen.append, 25_000)
+    await completion._recheck_reduced_rows(connection, policy, "pdgs_x_r", columns, seen.append, 3)
+    assert seen == rows + rows
+    assert "TABLESAMPLE SYSTEM" in statements[0] and "ORDER BY random()" in statements[0]
+    assert f"LIMIT {completion._RECHECK_ROWS}" in statements[0] and "TABLESAMPLE" not in statements[1]
