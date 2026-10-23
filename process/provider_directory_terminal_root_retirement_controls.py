@@ -8,6 +8,7 @@ from db import migration_provider_directory_first_acquisition_retirement as firs
 from db import migration_provider_directory_terminal_root_retirement_evidence as evidence
 from db import migration_provider_directory_terminal_root_retirement_guards as guards
 from process.provider_directory_terminal_root_retirement_contract import TerminalRootRetirementError, schema_name
+from process.provider_directory_terminal_root_retirement_native import require_native_retirement_controls
 
 
 def _function_contract(sql):
@@ -24,9 +25,7 @@ def _function_contract(sql):
     }
 
 
-async def require_retirement_controls(database):
-    """Use the existing migration contracts without issuing SOURCE authority."""
-    schema = schema_name()
+def _retirement_contracts(schema, native):
     functions = [
         _function_contract(sql)
         for sql in (
@@ -52,7 +51,19 @@ async def require_retirement_controls(database):
         }
         for table, suffix, function in roots
         for action, kind in (("row", 31), ("truncate", 34))
+        if not (
+            table in native
+            and (action == "row" or table == "provider_directory_uhc_flex_practitioner_dataset_resource")
+        )
     ]
+    return functions, triggers
+
+
+async def require_retirement_controls(database):
+    """Use the existing migration contracts without issuing SOURCE authority."""
+    schema = schema_name()
+    native = await require_native_retirement_controls(database)
+    functions, triggers = _retirement_contracts(schema, native)
     valid = await database.scalar(
         r"""
         SELECT NOT EXISTS (
@@ -75,7 +86,9 @@ async def require_retirement_controls(database):
               ON t.tgrelid=pg_catalog.to_regclass(expected.relation) AND t.tgname=expected.name
             WHERE t.oid IS NULL OR t.tgisinternal OR t.tgenabled<>'A' OR t.tgtype<>expected.kind
                OR t.tgfoid<>pg_catalog.to_regprocedure(expected.function)
-               OR t.tgqual IS NOT NULL OR t.tgattr::text<>'' OR t.tgnargs<>0
+               OR t.tgqual IS NOT NULL OR t.tgnargs<>0 OR t.tgargs<>'\x'::bytea
+               OR t.tgoldtable IS NOT NULL OR t.tgnewtable IS NOT NULL
+               OR t.tgattr::text<>''
                OR t.tgdeferrable OR t.tginitdeferred
         );
         """,

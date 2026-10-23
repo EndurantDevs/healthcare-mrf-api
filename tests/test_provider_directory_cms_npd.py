@@ -2354,3 +2354,73 @@ async def test_unchanged_publication_helper_keeps_three_argument_call_compatible
     result = await cms._unchanged_publication_result(observation, state_by_field, object())
     assert result["cms_serving_candidate"] == descriptor_by_field and result["replayed"] is True
     cms_observation.enqueue_live_progress.assert_not_called()
+
+
+def test_source_preparation_rejects_a_mismatched_normalized_resource_model(monkeypatch):
+    expected_model = object()
+    directory = SimpleNamespace(RESOURCE_MODELS_BY_TYPE={"Organization": expected_model})
+    monkeypatch.setattr(cms, "_parse_batch_row", Mock(return_value=(object(), {})))
+    prepare = Mock()
+    monkeypatch.setattr(cms, "_prepare_source_batch", prepare)
+    with pytest.raises(CmsNpdSourceError, match="cms_npd_resource_invalid"):
+        cms._prepare_source_lines(
+            [b'{"resourceType":"Organization","id":"first"}'], "Organization", object(), directory
+        )
+    prepare.assert_not_called()
+
+
+def test_source_line_batches_split_before_exceeding_the_byte_bound(monkeypatch, tmp_path):
+    lines = [f'{{"resourceType":"Organization","id":"org-{index}"}}\n'.encode() for index in range(3)]
+    path = tmp_path / "organization.ndjson.zst"
+    with zstd.open(path, "wb") as encoded:
+        encoded.write(b"".join(lines))
+    monkeypatch.setattr(cms, "BATCH_SIZE", 100)
+    monkeypatch.setattr(cms, "BATCH_MAX_DECODED_BYTES", 2 * len(lines[0]) - 1)
+    batches = list(cms._line_batches(path))
+    assert batches == [[line] for line in lines]
+    assert all(sum(map(len, batch)) <= cms.BATCH_MAX_DECODED_BYTES for batch in batches)
+
+
+@pytest.mark.asyncio
+async def test_server_canceled_intake_probe_preserves_timeout_classification():
+    class QueryCanceledError(RuntimeError):
+        sqlstate = "57014"
+
+    cancellation = QueryCanceledError("statement timeout")
+    connection = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(side_effect=cancellation), commit=AsyncMock())
+    with pytest.raises(RuntimeError, match="cms_npd_intake_guard_lost") as caught:
+        await cms._assert_intake_guard(connection, "synthetic-lock", 1)
+    assert isinstance(caught.value.__cause__, TimeoutError)
+    connection.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_executor_drain_defers_repeated_cancellation_until_workers_finish():
+    release, started = threading.Event(), threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    def prepare():
+        started.set()
+        release.wait()
+
+    worker = executor.submit(prepare)
+    drain = None
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        drain = asyncio.create_task(cms._drain_stage_executor(executor))
+        async with asyncio.timeout(2):
+            while not executor._shutdown:
+                await asyncio.sleep(0)
+        for _ in range(2):
+            drain.cancel()
+            await asyncio.sleep(0)
+            assert not drain.done() and not worker.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(drain, 2)
+        assert worker.done()
+    finally:
+        release.set()
+        if drain is not None:
+            await asyncio.gather(drain, return_exceptions=True)
+        executor.shutdown(wait=True, cancel_futures=True)

@@ -961,6 +961,87 @@ async def test_first_retirement_rejects_exact_competing_locks(monkeypatch, lock_
 
 
 @pytest.mark.asyncio
+async def test_migrated_standalone_retirement_preserves_rows_and_native_guards(monkeypatch):
+    from tests.provider_directory_retirement_native_pg_support import assert_migrated_retirement
+
+    await assert_migrated_retirement(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_retired_parent_rejects_valid_admission_receipt_and_future_column_updates(monkeypatch):
+    from tests.provider_directory_retirement_native_pg_support import assert_retired_parent_update_coverage
+
+    await assert_retired_parent_update_coverage(monkeypatch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True], ids=["legacy", "native"])
+async def test_parent_update_migration_preserves_rows_and_control_identity(monkeypatch, native):
+    from tests.provider_directory_retirement_native_pg_support import assert_parent_update_migration_roundtrip
+
+    await assert_parent_update_migration_roundtrip(monkeypatch, native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True], ids=["legacy", "native"])
+async def test_parent_update_migration_cannot_remove_retired_row_protection(monkeypatch, native):
+    from tests.provider_directory_retirement_native_pg_support import (
+        assert_retired_parent_downgrade_refused,
+    )
+
+    await assert_retired_parent_downgrade_refused(monkeypatch, native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["body", "settings", "overload", "disabled", "partial-columns"])
+async def test_parent_update_migration_refuses_changed_controls(monkeypatch, case):
+    from tests.provider_directory_retirement_native_pg_support import assert_parent_update_migration_refuses_drift
+
+    await assert_parent_update_migration_refuses_drift(monkeypatch, case)
+
+
+@pytest.mark.asyncio
+async def test_parent_update_migration_bounds_lock_wait(monkeypatch):
+    from tests.provider_directory_retirement_native_pg_support import assert_parent_update_migration_bounds_locks
+
+    await assert_parent_update_migration_bounds_locks(monkeypatch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "drop-root",
+        "disable-root",
+        "drop-leaf",
+        "disable-leaf",
+        "rewire",
+        "arguments",
+        "transition",
+        "condition",
+        "parent-columns",
+        "legacy-parent-columns",
+        "extra-parent-column",
+        "plan",
+        "partial",
+        "overload",
+        "body",
+        "truncate-grant",
+        "trigger-grant",
+        "row-security",
+        "sealed-disabled",
+        "replica",
+        "foreign-owner",
+        "split-replica",
+    ],
+)
+async def test_migrated_retirement_rejects_changed_write_boundaries(monkeypatch, case):
+    from tests.provider_directory_retirement_native_pg_support import assert_changed_native_boundary
+
+    await assert_changed_native_boundary(monkeypatch, case)
+
+
+@pytest.mark.asyncio
 async def test_first_retirement_allows_unrelated_work_and_serializes_late_retry(monkeypatch):
     async with _scenario(monkeypatch) as scenario:
         other = await open_test_connection()

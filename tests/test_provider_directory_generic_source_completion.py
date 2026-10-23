@@ -3,7 +3,7 @@
 
 import hashlib
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -15,6 +15,41 @@ from tests.test_provider_directory_generic_candidate import _merge, _resource
 async def _stream(rows):
     for row in rows:
         yield row
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [completion._RECHECK_ROWS, completion._RECHECK_ROWS + 1, 10**10])
+async def test_reduced_heap_rechecks_validate_every_returned_row_with_bounded_sampling(count):
+    rows = [{"resource_id": "first"}, {"resource_id": "second"}]
+    connection = SimpleNamespace(cursor=Mock(return_value=_stream(rows)))
+    validate = Mock()
+    await completion._recheck_reduced_rows(
+        connection, SimpleNamespace(schema="source_schema"), "candidate_resource", ("resource_id",), validate, count
+    )
+    assert [call.args[0] for call in validate.call_args_list] == rows
+    query = connection.cursor.call_args.args[0]
+    assert ("TABLESAMPLE SYSTEM" in query) is (count > completion._RECHECK_ROWS)
+    if count > completion._RECHECK_ROWS:
+        assert f"ORDER BY random() LIMIT {completion._RECHECK_ROWS}" in query
+
+
+@pytest.mark.asyncio
+async def test_reduced_heap_sample_rejects_invalid_rows():
+    rows = [{"resource_id": "first"}, {"resource_id": "invalid"}, {"resource_id": "last"}]
+    connection = SimpleNamespace(cursor=Mock(return_value=_stream(rows)))
+    failure = ValueError("invalid resource")
+    validate = Mock(side_effect=[None, failure])
+    with pytest.raises(ValueError) as caught:
+        await completion._recheck_reduced_rows(
+            connection,
+            SimpleNamespace(schema="source_schema"),
+            "candidate_resource",
+            ("resource_id",),
+            validate,
+            completion._RECHECK_ROWS + 1,
+        )
+    assert caught.value is failure
+    assert [call.args[0] for call in validate.call_args_list] == rows[:2]
 
 
 @pytest.mark.asyncio
