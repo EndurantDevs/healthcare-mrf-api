@@ -14,6 +14,8 @@ Brotli
 cryptography>=50.0.2,<51
 curl_cffi==0.16.3
 fastcrc>=0.5.0
+# shortcut: keep connector-compatible exclusive locks; upgrade the connector before filelock 4.
+filelock==3.20.3
 frozenlist>=1.8.0
 geopandas
 greenlet>=3.5.6
@@ -45,6 +47,7 @@ redis[hiredis]>=5.3.1,<6
 ruamel.ext.msgpack
 sanic>=25.12.1
 shapely>=2.1.2
+setuptools==84.1.0
 snowflake-connector-python==4.8.0
 socksio
 SQLAlchemy>=2.1.4

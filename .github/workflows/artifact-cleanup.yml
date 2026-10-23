@@ -1,14 +1,24 @@
 name: Public artifact cleanup
+run-name: ${{ inputs.source_run_id && format('CI artifact cleanup for run {0}, attempt {1}', inputs.source_run_id, inputs.source_run_attempt) || 'Stale artifact cleanup' }}
 'on':
   schedule:
     - cron: '47 2 * * *'
   workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Completed source CI run
+        required: false
+        type: string
+      source_run_attempt:
+        description: Exact source CI attempt
+        required: false
+        type: string
 permissions:
   contents: read
   pull-requests: read
   actions: write
 concurrency:
-  group: public-artifact-cleanup
+  group: ${{ inputs.source_run_id && format('public-artifact-cleanup-{0}-{1}', inputs.source_run_id, inputs.source_run_attempt) || 'public-artifact-cleanup' }}
   cancel-in-progress: false
 jobs:
   stale-cleanup:
@@ -32,3 +42,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PYTHONDONTWRITEBYTECODE: '1'
         run: python3 ci/scripts/artifact_cleanup.py --stale
+  completed-cleanup:
+    name: CI artifact cleanup
+    if: github.repository == 'EndurantDevs/healthcare-mrf-api' && github.ref == 'refs/heads/dev' && github.event_name == 'workflow_dispatch'
+      && inputs.source_run_id && inputs.source_run_attempt
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+    steps:
+    - name: Check out trusted cleanup helper
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 7564ab52be4877268375179e1bb305267312ac9a
+        path: ci
+        persist-credentials: false
+    - name: Install pinned uv
+      run: bash ci/scripts/install_uv
+    - name: Install uv-managed Python
+      run: bash ci/scripts/setup_python
+    - name: Remove validated CI intermediates
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PYTHONDONTWRITEBYTECODE: '1'
+      run: python3 ci/scripts/artifact_cleanup.py --completed
