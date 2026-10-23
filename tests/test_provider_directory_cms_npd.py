@@ -8,6 +8,7 @@ import importlib
 import json
 import sys
 import threading
+import time
 from compression import zstd
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager, nullcontext
@@ -1407,6 +1408,37 @@ async def test_stream_persists_pool_prepared_batches_in_file_order(monkeypatch, 
     with ThreadPoolExecutor(max_workers=2) as executor:
         assert await cms._stream_file(fake_fhir, path, object(), "Organization", {}, {}, executor) == 6
     assert persisted_ids == [f"org-{index}" for index in range(6)] and in_flight_by_metric["peak"] == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_staging_drains_running_preparations_before_returning(monkeypatch, tmp_path):
+    """A commit failure must not leave preparation jobs running once the intake guard is released."""
+    fixture = _source_dispatch_fixture(monkeypatch, tmp_path)
+    executor = ThreadPoolExecutor(max_workers=2)
+    running_by_metric = {"now": 0, "started": 0}
+    lock = threading.Lock()
+    original_prepare = cms._prepare_source_lines
+
+    def slow_prepare(lines, kind, candidate, fhir=None):
+        with lock:
+            running_by_metric["now"] += 1
+            running_by_metric["started"] += 1
+        time.sleep(0.2)
+        try:
+            return original_prepare(lines, kind, candidate, fhir)
+        finally:
+            with lock:
+                running_by_metric["now"] -= 1
+
+    monkeypatch.setattr(cms, "_stage_executor", lambda: executor)
+    monkeypatch.setattr(cms, "_prepare_source_lines", slow_prepare)
+    monkeypatch.setattr(cms, "_persist_prepared_batch", AsyncMock(side_effect=RuntimeError("synthetic-commit-failed")))
+    with pytest.raises(RuntimeError, match="synthetic-commit-failed"):
+        await cms._stage_and_validate_candidate(
+            fixture.fhir, fixture.directory, fixture.candidate, fixture.identity, fixture.receipt, {}, {}
+        )
+    assert executor._shutdown and running_by_metric["now"] == 0 and running_by_metric["started"] >= 2
+    fixture.publisher.assert_not_awaited()
 
 
 def test_stage_executor_follows_the_worker_setting(monkeypatch):

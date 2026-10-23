@@ -178,19 +178,27 @@ async def _reduce_input_sql(connection, policy, binding_by_field, key, target, c
     return int(status.rsplit(" ", 1)[1])
 
 
-async def _recheck_reduced_rows(connection, policy, name, columns, validate, count):
-    """Re-run the existing per-row validators on every row of a small heap or a bounded sample."""
+async def _every_row(connection, policy, name, columns, validate):
+    """Re-run a per-row validator on every row; raw witness hashes have no later complete check."""
     relation = storage_relation(policy.schema, name)
     fields = ",".join(storage_identifier(column) for column in columns)
+    async for row in connection.cursor(f"SELECT {fields} FROM {relation}", prefetch=1024):
+        validate(dict(row))
+
+
+async def _recheck_reduced_rows(connection, policy, name, columns, validate, count):
+    """Re-run the existing per-row validators on every row of a small heap or a bounded sample."""
     if count <= _RECHECK_ROWS:
-        query = f"SELECT {fields} FROM {relation}"
-    else:
-        # SYSTEM sampling is page-clustered and the heap is key-ordered: shuffle the sample before LIMIT.
-        percent = min(100.0, max(0.01, 300.0 * _RECHECK_ROWS / count))
-        query = (
-            f"SELECT {fields} FROM (SELECT {fields} FROM {relation} TABLESAMPLE SYSTEM ({percent:.4f})) sampled "
-            f"ORDER BY random() LIMIT {_RECHECK_ROWS}"
-        )
+        await _every_row(connection, policy, name, columns, validate)
+        return
+    relation = storage_relation(policy.schema, name)
+    fields = ",".join(storage_identifier(column) for column in columns)
+    # SYSTEM sampling is page-clustered and the heap is key-ordered: shuffle the sample before LIMIT.
+    percent = min(100.0, max(0.01, 300.0 * _RECHECK_ROWS / count))
+    query = (
+        f"SELECT {fields} FROM (SELECT {fields} FROM {relation} TABLESAMPLE SYSTEM ({percent:.4f})) sampled "
+        f"ORDER BY random() LIMIT {_RECHECK_ROWS}"
+    )
     async for row in connection.cursor(query, prefetch=1024):
         validate(dict(row))
 
@@ -220,7 +228,7 @@ async def _reduce_payloads_sql(connection, policy, previous, candidate, director
             release_id,
         )
         storage._require(invalid is False, "raw_identity_changed")
-        await _recheck_reduced_rows(connection, policy, witness_name, WITNESS_COLUMNS, _witness, witness_count)
+        await _every_row(connection, policy, witness_name, WITNESS_COLUMNS, _witness)
     await connection.execute(f"SET LOCAL work_mem='{previous_work_mem}'")
 
 
