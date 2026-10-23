@@ -97,7 +97,30 @@ def test_delegated_provider_detail_queries_follow_native_parser():
     functions_by_name = {node.name: node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)}
     delegation = functions_by_name["get_npi"].body[-1]
     assert isinstance(delegation, ast.Return) and isinstance(delegation.value, ast.Await)
-    assert delegation.value.value.func.id == "read_npi_detail"
+    assert ast.unparse(delegation.value.value) == (
+        "provider_detail_network_metadata.read_direct_detail_response(request, npi)"
+    )
+    assert "from api import provider_detail_network_metadata" in [
+        ast.unparse(node) for node in tree.body if isinstance(node, ast.ImportFrom)
+    ]
+    bridge_tree = ast.parse((ENDPOINT_DIR.parent / "provider_detail_network_metadata.py").read_text())
+    bridge = next(
+        node
+        for node in bridge_tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "read_direct_detail_response"
+    )
+    assert "from api.endpoint import npi as provider" in [
+        ast.unparse(node) for node in bridge.body if isinstance(node, ast.ImportFrom)
+    ]
+    native_calls = [
+        ast.unparse(node.value)
+        for node in ast.walk(bridge)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "read_npi_detail"
+    ]
+    assert native_calls == ["provider.read_npi_detail(request, npi)"] * 2
     native_parameters = _collect_query_params(functions_by_name["read_npi_detail"])
     assert native_parameters == openapi_support.ROUTE_QUERY_PARAM_ADDITIONS[("get", "/npi/id/{npi}")]
 

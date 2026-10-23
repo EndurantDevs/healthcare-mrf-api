@@ -29,6 +29,7 @@ from sqlalchemy import false, func, or_, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.sql import literal_column, text, tuple_
 
+from api import provider_detail_network_metadata
 from api.code_systems import EXTERNAL_PROCEDURE_CODE_SYSTEMS, INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.custom_import_provider_sql import ProviderImportQuery
 from api.endpoint.pagination import parse_pagination
@@ -53,12 +54,6 @@ from api.npi_detail_cache_identity import (
     npi_detail_cache_key as _format_npi_detail_cache_key,
 )
 from api.provider_demographic_filters import normalize_provider_sex_code
-from api.provider_detail_network_metadata import (
-    attach_provider_source_details as _attach_selected_address_source_details,
-)
-from api.provider_detail_network_metadata import (
-    project_provider_network_metadata as _project_provider_network_metadata,
-)
 from api.provider_detail_sql import _npi_detail_address_filters, _npi_detail_taxonomy_aggregate
 from api.provider_directory_dataset_sql import (
     PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
@@ -192,6 +187,9 @@ from process.ext.utils import download_it
 from process.florida_mqa_profile import STANDARD_CATEGORIES
 from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+
+_attach_selected_address_source_details = provider_detail_network_metadata.attach_provider_source_details
+_project_provider_network_metadata = provider_detail_network_metadata.project_provider_network_metadata
 
 blueprint = Blueprint("npi", url_prefix="/npi", version=1)
 logger = logging.getLogger(__name__)
@@ -11548,7 +11546,7 @@ async def get_npi_batch(request):
 @canonical_network_read
 async def get_npi(request, npi):
     """Return one NPPES- or profile-backed provider with optional provenance."""
-    return await read_npi_detail(request, npi)
+    return await provider_detail_network_metadata.read_direct_detail_response(request, npi)
 
 
 async def read_npi_detail(request, npi, *, native_args=None):
