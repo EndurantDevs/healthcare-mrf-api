@@ -795,36 +795,6 @@ jobs:
       receipt_artifact_id: ${{ steps.receipt-artifact.outputs.artifact-id }}
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
-  artifact-cleanup:
-    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-      && 'CI artifact cleanup (metadata only)' || 'CI artifact cleanup' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs:
-    - dev-image-publication
-    - container-package
-    - measurement
-    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (success()) }}
-    permissions:
-      contents: read
-      actions: write
-    steps:
-    - name: Check out trusted cleanup helper
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      with:
-        repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
-        path: ci
-        persist-credentials: false
-    - name: Remove validated CI intermediates
-      env:
-        GH_TOKEN: ${{ github.token }}
-        PYTHONDONTWRITEBYTECODE: '1'
-        IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
-        MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
-        IMAGE_RECEIPT_ARTIFACT_ID: ${{ needs.dev-image-publication.outputs.receipt_artifact_id }}
-      run: python3 ci/scripts/artifact_cleanup.py
 'on':
   pull_request:
     types:
