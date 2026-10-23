@@ -1411,8 +1411,9 @@ async def test_stream_persists_pool_prepared_batches_in_file_order(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_failed_staging_drains_running_preparations_before_returning(monkeypatch, tmp_path):
-    """A commit failure must not leave preparation jobs running once the intake guard is released."""
+@pytest.mark.parametrize("interruption", ["failure", "cancel"])
+async def test_failed_staging_drains_running_preparations_before_returning(monkeypatch, tmp_path, interruption):
+    """Neither a commit failure nor a cancellation may leave preparation jobs running past the guard."""
     fixture = _source_dispatch_fixture(monkeypatch, tmp_path)
     executor = ThreadPoolExecutor(max_workers=2)
     running_by_metric = {"now": 0, "started": 0}
@@ -1432,11 +1433,23 @@ async def test_failed_staging_drains_running_preparations_before_returning(monke
 
     monkeypatch.setattr(cms, "_stage_executor", lambda: executor)
     monkeypatch.setattr(cms, "_prepare_source_lines", slow_prepare)
-    monkeypatch.setattr(cms, "_persist_prepared_batch", AsyncMock(side_effect=RuntimeError("synthetic-commit-failed")))
-    with pytest.raises(RuntimeError, match="synthetic-commit-failed"):
-        await cms._stage_and_validate_candidate(
+    staging = asyncio.create_task(
+        cms._stage_and_validate_candidate(
             fixture.fhir, fixture.directory, fixture.candidate, fixture.identity, fixture.receipt, {}, {}
         )
+    )
+    if interruption == "failure":
+        monkeypatch.setattr(
+            cms, "_persist_prepared_batch", AsyncMock(side_effect=RuntimeError("synthetic-commit-failed"))
+        )
+        with pytest.raises(RuntimeError, match="synthetic-commit-failed"):
+            await staging
+    else:
+        monkeypatch.setattr(cms, "_persist_prepared_batch", AsyncMock(side_effect=lambda *_: asyncio.Event().wait()))
+        await asyncio.sleep(0.05)
+        staging.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await staging
     assert executor._shutdown and running_by_metric["now"] == 0 and running_by_metric["started"] >= 2
     fixture.publisher.assert_not_awaited()
 
